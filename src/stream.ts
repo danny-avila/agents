@@ -1813,9 +1813,22 @@ hasToolCallChunks: ${hasToolCallChunks}
 }
 
 export function createContentAggregator(): t.ContentAggregatorResult {
+  type ToolStepContentState = {
+    indices: Set<number>;
+    chunkIndices: Map<number, number>;
+    unclaimedIndices: Set<number>;
+    unboundIndices: Set<number>;
+    callIdsByIndex: Map<number, string>;
+  };
+
   const contentParts: Array<t.MessageContentComplex | undefined> = [];
   const stepMap = new Map<string, t.RunStep>();
-  const toolCallIdMap = new Map<string, string>();
+  const toolCallContentIndexMap = new Map<string, number>();
+  const sourceContentIndexMap = new Map<number, number>();
+  const toolStepContentMap = new Map<string, ToolStepContentState>();
+  let indexedContentLength = 0;
+  /** Physical append cursor; event/chunk indices are correlation keys, not array offsets. */
+  let nextContentIndex = 0;
   // Track agentId and groupId for each content index (applied to content parts)
   const contentMetaMap = new Map<
     number,
@@ -1828,6 +1841,124 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       return undefined;
     }
     return Array.isArray(content) ? content[0] : content;
+  };
+  const indexContentPart = (
+    index: number,
+    contentPart?: t.MessageContentComplex
+  ): void => {
+    if (contentPart == null) {
+      return;
+    }
+    if (contentPart.type === ContentTypes.TOOL_CALL) {
+      const toolCallId = contentPart.tool_call.id;
+      if (toolCallId != null && toolCallId !== '') {
+        toolCallContentIndexMap.set(toolCallId, index);
+      }
+    }
+    const hasAgentId =
+      contentPart.agentId != null && contentPart.agentId !== '';
+    const hasGroupId = contentPart.groupId != null;
+    if (hasAgentId || hasGroupId) {
+      const existingMeta = contentMetaMap.get(index) ?? {};
+      if (hasAgentId) {
+        existingMeta.agentId = contentPart.agentId;
+      }
+      if (hasGroupId) {
+        existingMeta.groupId = contentPart.groupId;
+      }
+      contentMetaMap.set(index, existingMeta);
+    }
+  };
+  const syncSeededContent = (): void => {
+    /** Hosts can seed pre-pause content after creating the aggregator. */
+    for (
+      let index = indexedContentLength;
+      index < contentParts.length;
+      index++
+    ) {
+      indexContentPart(index, contentParts[index]);
+    }
+    indexedContentLength = contentParts.length;
+    nextContentIndex = Math.max(nextContentIndex, contentParts.length);
+  };
+  const getToolCallContentIndex = (
+    toolCallId: string | undefined
+  ): number | undefined => {
+    if (toolCallId == null || toolCallId === '') {
+      return undefined;
+    }
+    syncSeededContent();
+    return toolCallContentIndexMap.get(toolCallId);
+  };
+  const allocateContentIndex = (minimumIndex = 0): number => {
+    syncSeededContent();
+    const contentIndex = Math.max(nextContentIndex, minimumIndex);
+    nextContentIndex = contentIndex + 1;
+    return contentIndex;
+  };
+  const resolveSourceContentIndex = (sourceIndex: number): number => {
+    const existingIndex = sourceContentIndexMap.get(sourceIndex);
+    if (existingIndex != null) {
+      return existingIndex;
+    }
+    const contentIndex = allocateContentIndex(sourceIndex);
+    sourceContentIndexMap.set(sourceIndex, contentIndex);
+    return contentIndex;
+  };
+  const createToolStepContentState = (
+    contentIndex: number
+  ): ToolStepContentState => ({
+    indices: new Set<number>([contentIndex]),
+    chunkIndices: new Map<number, number>(),
+    unclaimedIndices: new Set<number>([contentIndex]),
+    unboundIndices: new Set<number>([contentIndex]),
+    callIdsByIndex: new Map<number, string>(),
+  });
+  const registerToolContentIndex = (
+    state: ToolStepContentState,
+    contentIndex: number,
+    toolCallId?: string
+  ): void => {
+    if (!state.indices.has(contentIndex)) {
+      state.indices.add(contentIndex);
+      state.unclaimedIndices.add(contentIndex);
+      state.unboundIndices.add(contentIndex);
+    }
+    if (toolCallId != null && toolCallId !== '') {
+      const existingToolCallId = state.callIdsByIndex.get(contentIndex);
+      if (
+        existingToolCallId != null &&
+        existingToolCallId !== toolCallId &&
+        toolCallContentIndexMap.get(existingToolCallId) === contentIndex
+      ) {
+        toolCallContentIndexMap.delete(existingToolCallId);
+      }
+      toolCallContentIndexMap.set(toolCallId, contentIndex);
+      state.callIdsByIndex.set(contentIndex, toolCallId);
+      state.unboundIndices.delete(contentIndex);
+    }
+  };
+  const takeFirstIndex = (indices: Set<number>): number | undefined => {
+    const contentIndex = indices.values().next().value;
+    if (contentIndex != null) {
+      indices.delete(contentIndex);
+    }
+    return contentIndex;
+  };
+  const setContentMeta = (index: number, runStep: t.RunStep): void => {
+    const hasAgentId = runStep.agentId != null && runStep.agentId !== '';
+    const hasGroupId = runStep.groupId != null;
+    if (!hasAgentId && !hasGroupId) {
+      return;
+    }
+    const existingMeta = contentMetaMap.get(index) ?? {};
+    if (hasAgentId) {
+      existingMeta.agentId = runStep.agentId;
+    }
+    if (hasGroupId) {
+      existingMeta.groupId = runStep.groupId;
+    }
+    contentMetaMap.set(index, existingMeta);
   };
   const applyContentMetadata = (index: number): void => {
     const contentPart = contentParts[index];
@@ -1977,6 +2108,15 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       const name =
         getNonEmptyValue([incomingName, existingContent?.tool_call?.name]) ??
         '';
+      const existingToolCallId = existingContent?.tool_call?.id;
+      if (
+        existingToolCallId != null &&
+        existingToolCallId !== '' &&
+        existingToolCallId !== id &&
+        toolCallContentIndexMap.get(existingToolCallId) === index
+      ) {
+        toolCallContentIndexMap.delete(existingToolCallId);
+      }
 
       const newToolCall: ToolCall & t.PartMetadata = {
         id,
@@ -2004,6 +2144,8 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         type: ContentTypes.TOOL_CALL,
         tool_call: newToolCall,
       };
+      indexContentPart(index, contentParts[index]);
+      indexedContentLength = Math.max(indexedContentLength, index + 1);
     }
 
     // Apply agentId (for MultiAgentGraph) and groupId (for parallel execution) to content parts
@@ -2058,49 +2200,73 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     }
 
     if (event === GraphEvents.ON_RUN_STEP) {
-      const runStep = data as t.RunStep;
+      const incomingRunStep = data as t.RunStep;
+      const toolCalls =
+        incomingRunStep.stepDetails.type === StepTypes.TOOL_CALLS
+          ? (incomingRunStep.stepDetails.tool_calls as ToolCall[] | undefined)
+          : undefined;
+      syncSeededContent();
+      let runStepIndex: number;
+      const toolCallIndices: number[] = [];
+      if (toolCalls && toolCalls.length > 0) {
+        for (let index = 0; index < toolCalls.length; index++) {
+          const toolCallId = toolCalls[index].id;
+          let contentIndex = getToolCallContentIndex(toolCallId);
+          if (contentIndex == null) {
+            contentIndex =
+              index === 0
+                ? resolveSourceContentIndex(incomingRunStep.index)
+                : allocateContentIndex();
+          } else if (index === 0) {
+            sourceContentIndexMap.set(incomingRunStep.index, contentIndex);
+          }
+          toolCallIndices.push(contentIndex);
+        }
+        runStepIndex = toolCallIndices[0];
+      } else {
+        runStepIndex = resolveSourceContentIndex(incomingRunStep.index);
+      }
+      const runStep =
+        runStepIndex !== incomingRunStep.index
+          ? { ...incomingRunStep, index: runStepIndex }
+          : incomingRunStep;
       stepMap.set(runStep.id, runStep);
 
-      // Track agentId (MultiAgentGraph) and groupId (parallel execution) separately
-      // - agentId: present for all MultiAgentGraph runs (enables agent labels in UI)
-      // - groupId: present only for parallel execution (enables column rendering)
-      const hasAgentId = runStep.agentId != null && runStep.agentId !== '';
-      const hasGroupId = runStep.groupId != null;
-      if (hasAgentId || hasGroupId) {
-        const existingMeta = contentMetaMap.get(runStep.index) ?? {};
-        if (hasAgentId) {
-          existingMeta.agentId = runStep.agentId;
-        }
-        if (hasGroupId) {
-          existingMeta.groupId = runStep.groupId;
-        }
-        contentMetaMap.set(runStep.index, existingMeta);
-      }
+      setContentMeta(runStep.index, runStep);
 
       if (runStep.summary != null) {
         updateContent(runStep.index, runStep.summary);
       }
 
-      if (
-        runStep.stepDetails.type === StepTypes.TOOL_CALLS &&
-        runStep.stepDetails.tool_calls
-      ) {
-        (runStep.stepDetails.tool_calls as ToolCall[]).forEach((toolCall) => {
-          const toolCallId = toolCall.id ?? '';
-          if ('id' in toolCall && toolCallId) {
-            toolCallIdMap.set(runStep.id, toolCallId);
-          }
-          const contentPart: t.MessageContentComplex = {
-            type: ContentTypes.TOOL_CALL,
-            tool_call: {
-              args: toolCall.args,
-              name: toolCall.name,
-              id: toolCallId,
-            },
-          };
+      if (runStep.stepDetails.type === StepTypes.TOOL_CALLS) {
+        const toolStepContent =
+          toolStepContentMap.get(runStep.id) ??
+          createToolStepContentState(runStep.index);
+        registerToolContentIndex(toolStepContent, runStep.index);
+        (runStep.stepDetails.tool_calls as ToolCall[] | undefined)?.forEach(
+          (toolCall, toolCallIndex) => {
+            const contentIndex =
+              toolCallIndices[toolCallIndex] ?? runStep.index;
+            const toolCallId = toolCall.id ?? '';
+            registerToolContentIndex(
+              toolStepContent,
+              contentIndex,
+              toolCallId
+            );
+            const contentPart: t.MessageContentComplex = {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                args: toolCall.args,
+                name: toolCall.name,
+                id: toolCallId,
+              },
+            };
 
-          updateContent(runStep.index, contentPart);
-        });
+            setContentMeta(contentIndex, runStep);
+            updateContent(contentIndex, contentPart);
+          }
+        );
+        toolStepContentMap.set(runStep.id, toolStepContent);
       }
     } else if (event === GraphEvents.ON_MESSAGE_DELTA) {
       const messageDelta = data as t.MessageDeltaEvent;
@@ -2122,7 +2288,16 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       if (!contentPart) {
         return;
       }
-      updateContent(contentPart.agent_update.index, contentPart);
+      const contentIndex = resolveSourceContentIndex(
+        contentPart.agent_update.index
+      );
+      updateContent(contentIndex, {
+        ...contentPart,
+        agent_update: {
+          ...contentPart.agent_update,
+          index: contentIndex,
+        },
+      });
     } else if (event === GraphEvents.ON_REASONING_DELTA) {
       const reasoningDelta = data as t.ReasoningDeltaEvent;
       const runStep = stepMap.get(reasoningDelta.id);
@@ -2147,8 +2322,62 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         runStepDelta.delta.type === StepTypes.TOOL_CALLS &&
         runStepDelta.delta.tool_calls
       ) {
+        const toolStepContent =
+          toolStepContentMap.get(runStepDelta.id) ??
+          createToolStepContentState(runStep.index);
         runStepDelta.delta.tool_calls.forEach((toolCallDelta) => {
-          const toolCallId = toolCallIdMap.get(runStepDelta.id);
+          const chunkIndex =
+            typeof toolCallDelta.index === 'number'
+              ? toolCallDelta.index
+              : undefined;
+          const explicitToolCallId =
+            toolCallDelta.id != null && toolCallDelta.id !== ''
+              ? toolCallDelta.id
+              : undefined;
+          let contentIndex = getToolCallContentIndex(explicitToolCallId);
+          if (contentIndex == null && chunkIndex != null) {
+            contentIndex = toolStepContent.chunkIndices.get(chunkIndex);
+          }
+          const soleContentIndex =
+            toolStepContent.indices.size === 1
+              ? toolStepContent.indices.values().next().value
+              : undefined;
+          if (
+            contentIndex == null &&
+            explicitToolCallId == null &&
+            soleContentIndex != null &&
+            (chunkIndex == null ||
+              toolStepContent.callIdsByIndex.has(soleContentIndex) ||
+              toolStepContent.unclaimedIndices.has(soleContentIndex))
+          ) {
+            contentIndex = soleContentIndex;
+          }
+          if (contentIndex == null) {
+            if (chunkIndex == null && explicitToolCallId == null) {
+              console.warn(
+                'No tool call id or chunk index found for run step delta event'
+              );
+              return;
+            }
+            contentIndex =
+              explicitToolCallId == null
+                ? takeFirstIndex(toolStepContent.unclaimedIndices)
+                : takeFirstIndex(toolStepContent.unboundIndices);
+            contentIndex ??= allocateContentIndex();
+          }
+          registerToolContentIndex(
+            toolStepContent,
+            contentIndex,
+            explicitToolCallId
+          );
+          if (chunkIndex != null) {
+            toolStepContent.chunkIndices.set(chunkIndex, contentIndex);
+            toolStepContent.unclaimedIndices.delete(contentIndex);
+            toolStepContent.unboundIndices.delete(contentIndex);
+          }
+          const toolCallId =
+            explicitToolCallId ??
+            toolStepContent.callIdsByIndex.get(contentIndex);
 
           const contentPart: t.MessageContentComplex = {
             type: ContentTypes.TOOL_CALL,
@@ -2161,8 +2390,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
             },
           };
 
-          updateContent(runStep.index, contentPart);
+          setContentMeta(contentIndex, runStep);
+          updateContent(contentIndex, contentPart);
         });
+        toolStepContentMap.set(runStepDelta.id, toolStepContent);
       }
     } else if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
       const { result } = data as unknown as {
@@ -2174,20 +2405,44 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       const { id: stepId } = result;
 
       const runStep = stepMap.get(stepId);
-      if (!runStep) {
-        console.warn('No run step or runId found for completed step event');
-        return;
-      }
 
       if (result.type === ContentTypes.SUMMARY && 'summary' in result) {
+        if (!runStep) {
+          console.warn('No run step or runId found for completed step event');
+          return;
+        }
         contentParts[runStep.index] = result.summary as t.MessageContentComplex;
         applyContentMetadata(runStep.index);
       } else if ('tool_call' in result) {
+        let contentIndex = getToolCallContentIndex(result.tool_call.id);
+        if (contentIndex == null && runStep != null) {
+          const toolStepContent = toolStepContentMap.get(runStep.id);
+          if (toolStepContent?.indices.size === 1) {
+            contentIndex = toolStepContent.indices.values().next().value;
+          } else if (toolStepContent == null) {
+            const declaredToolCalls =
+              runStep.stepDetails.type === StepTypes.TOOL_CALLS
+                ? runStep.stepDetails.tool_calls
+                : undefined;
+            if ((declaredToolCalls?.length ?? 0) <= 1) {
+              contentIndex = runStep.index;
+            }
+          }
+        }
+        if (contentIndex == null) {
+          console.warn(
+            'No run step or tool call found for completed step event'
+          );
+          return;
+        }
+        if (runStep != null) {
+          setContentMeta(contentIndex, runStep);
+        }
         const contentPart: t.MessageContentComplex = {
           type: ContentTypes.TOOL_CALL,
           tool_call: (result as t.ToolEndEvent).tool_call,
         };
-        updateContent(runStep.index, contentPart, true);
+        updateContent(contentIndex, contentPart, true);
       }
     }
   };
