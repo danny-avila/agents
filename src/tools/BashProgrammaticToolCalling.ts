@@ -7,6 +7,8 @@ import {
   BASH_SHELL_GUIDANCE,
   CODE_ARTIFACT_PATH_GUIDANCE,
   appendFailedExecutionFileReminder,
+  buildCodeApiExecutionErrorMessage,
+  CodeApiRequestError,
   getCodeBaseURL,
 } from './CodeExecutor';
 import {
@@ -434,15 +436,10 @@ export function createBashProgrammaticToolCallingTool(
         }
 
         if (response.status === 'error') {
-          throw new Error(
-            `Execution error: ${response.error}` +
-              (response.stderr != null && response.stderr !== ''
-                ? `\n\nStderr:\n${response.stderr}`
-                : '')
-          );
+          throw new Error(buildCodeApiExecutionErrorMessage(response));
         }
 
-        throw new Error(`Unexpected response status: ${response.status}`);
+        throw new CodeApiRequestError();
       } catch (error) {
         const messageWithReminder = appendFailedExecutionFileReminder(
           (error as Error).message,
