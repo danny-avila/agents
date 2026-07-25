@@ -42,6 +42,11 @@ export interface OverflowRecoveryPlan {
    * Provider-reported prompt size divided by our own estimate, when both are
    * known. Greater than 1 means we systematically under-count for this
    * provider.
+   *
+   * Derived from `info.promptTokens`, never from `info.requestedTokens`:
+   * several providers fold the requested completion allowance into the
+   * latter, which would inflate the ratio and shrink the prompt far more than
+   * the overflow actually calls for.
    */
   observedCalibrationRatio?: number;
 }
@@ -75,6 +80,21 @@ function toLocalUnits(limitTokens: number, ratio: number | undefined): number {
   return limitTokens / ratio;
 }
 
+/**
+ * The completion allowance the provider counted against the same ceiling,
+ * when it reported both the total and the prompt portion. The retry budget
+ * governs the prompt only, so this has to come off the ceiling first —
+ * otherwise a large `maxTokens` keeps the request over the limit no matter
+ * how far the prompt is compacted.
+ */
+function reservedForCompletion(info: ContextOverflowInfo): number {
+  if (!isUsable(info.requestedTokens) || !isUsable(info.promptTokens)) {
+    return 0;
+  }
+  const difference = info.requestedTokens - info.promptTokens;
+  return difference > 0 ? difference : 0;
+}
+
 function resolveTargetBudget(
   info: ContextOverflowInfo,
   ratio: number | undefined,
@@ -82,7 +102,11 @@ function resolveTargetBudget(
   estimatedPromptTokens: number | undefined
 ): number | null {
   if (isUsable(info.limitTokens)) {
-    return toLocalUnits(info.limitTokens, ratio) * CEILING_HEADROOM_RATIO;
+    /** Subtract in provider units, then convert the remainder to ours. */
+    const promptCeiling = info.limitTokens - reservedForCompletion(info);
+    if (promptCeiling > 0) {
+      return toLocalUnits(promptCeiling, ratio) * CEILING_HEADROOM_RATIO;
+    }
   }
   if (isUsable(estimatedPromptTokens)) {
     return estimatedPromptTokens * BLIND_SHRINK_RATIO;
@@ -123,8 +147,8 @@ export function planContextOverflowRecovery({
   }
 
   const observedCalibrationRatio =
-    isUsable(info.requestedTokens) && isUsable(estimatedPromptTokens)
-      ? info.requestedTokens / estimatedPromptTokens
+    isUsable(info.promptTokens) && isUsable(estimatedPromptTokens)
+      ? info.promptTokens / estimatedPromptTokens
       : undefined;
 
   const target = resolveTargetBudget(

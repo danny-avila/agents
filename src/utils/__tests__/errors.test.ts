@@ -135,6 +135,52 @@ describe('ambiguous signatures require corroboration', () => {
   });
 });
 
+describe('prompt size is separated from completion-inclusive totals', () => {
+  it('reads the input-only figure out of OpenRouter’s breakdown', () => {
+    const openrouter = OVERFLOW_SIGNATURES.find(
+      (s) => s.provider === Providers.OPENROUTER
+    );
+    const info = getContextOverflowInfo(openrouter?.error);
+    expect(info?.requestedTokens).toBe(56_827);
+    /** 56,811 of text input; the remaining 16 were the output allowance. */
+    expect(info?.promptTokens).toBe(56_811);
+  });
+
+  it('reads the input-only figure out of DeepSeek’s breakdown', () => {
+    const deepseek = OVERFLOW_SIGNATURES.find(
+      (s) => s.provider === Providers.DEEPSEEK
+    );
+    const info = getContextOverflowInfo(deepseek?.error);
+    expect(info?.requestedTokens).toBe(1_179_668);
+    expect(info?.promptTokens).toBe(1_179_652);
+  });
+
+  it('treats an unqualified input-only count as the prompt', () => {
+    const anthropic = OVERFLOW_SIGNATURES.find(
+      (s) => s.provider === Providers.ANTHROPIC
+    );
+    const info = getContextOverflowInfo(anthropic?.error);
+    expect(info?.promptTokens).toBe(info?.requestedTokens);
+  });
+
+  it('refuses to read a token-bucket total as a prompt measurement', () => {
+    const openai = OVERFLOW_SIGNATURES.find(
+      (s) => s.expected.kind === 'request_too_large'
+    );
+    const info = getContextOverflowInfo(openai?.error);
+    /** "Requested 480002" folds in the completion allowance. */
+    expect(info?.requestedTokens).toBe(480_002);
+    expect(info?.promptTokens).toBeUndefined();
+  });
+
+  it('refuses to read xAI’s request total as a prompt measurement', () => {
+    const xai = OVERFLOW_SIGNATURES.find((s) => s.provider === Providers.XAI);
+    const info = getContextOverflowInfo(xai?.error);
+    expect(info?.requestedTokens).toBe(332_986);
+    expect(info?.promptTokens).toBeUndefined();
+  });
+});
+
 describe('reported numbers are usable for recalibration', () => {
   it('reads the true ceiling even when it differs from what we configured', () => {
     const deepseek = OVERFLOW_SIGNATURES.find(

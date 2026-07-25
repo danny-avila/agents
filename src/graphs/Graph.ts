@@ -373,6 +373,46 @@ function clearCurrentDeltaStepMarkers({
 }
 
 /**
+ * Merge — never overwrite — the pruner's masking record into
+ * `pendingOriginalToolContent`, which the summarize node reads to restore
+ * full tool output before writing a summary. Skipping this leaves the
+ * summarizer working from truncated placeholders.
+ *
+ * Carry-over entries from a prior summarize (preserved by the recency window
+ * for masked tool messages still in the tail) and the current pruner's new
+ * entries are both keyed by indices in the current `state.messages`, so a
+ * key-wise union is correct. Overwriting would discard the carry-over and
+ * reduce summary fidelity when those masked tail messages eventually move
+ * into the head.
+ *
+ * Called from both paths that reach the summarize node: the configured
+ * trigger, and overflow recovery.
+ */
+function preserveOriginalToolContent(
+  agentContext: AgentContext,
+  originalToolContent: Map<number, string> | undefined
+): void {
+  if (originalToolContent == null || originalToolContent.size === 0) {
+    return;
+  }
+  if (agentContext.pendingOriginalToolContent == null) {
+    agentContext.pendingOriginalToolContent = originalToolContent;
+    return;
+  }
+  for (const [index, content] of originalToolContent) {
+    agentContext.pendingOriginalToolContent.set(index, content);
+  }
+  /**
+   * Re-apply the per-store char cap after the union. The pruner enforces
+   * ORIGINAL_CONTENT_MAX_CHARS inside its own map via the onContentStored
+   * callback, but a key-wise merge with recency carry-over bypasses that
+   * accounting and could let the merged map grow without bound across long
+   * sessions.
+   */
+  enforceOriginalContentCap(agentContext.pendingOriginalToolContent);
+}
+
+/**
  * Our own estimate of the prompt that was actually sent, derived from the
  * pre-invoke usage snapshot. Used to corroborate ambiguous provider errors
  * and to measure how far our token accounting sits from the provider's.
@@ -1482,13 +1522,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     agentContext,
     agentId,
     config,
+    originalToolContent,
   }: {
     recovery: OverflowRecoveryPlan;
     agentContext: AgentContext;
     agentId: string;
     config?: RunnableConfig;
+    /** Masking record from the prune pass that built the rejected prompt. */
+    originalToolContent?: Map<number, string>;
   }): Partial<t.AgentSubgraphState> {
     const previousBudget = agentContext.maxContextTokens;
+    /**
+     * Preserved before the detour for the same reason the configured trigger
+     * preserves it: the summarize node restores full tool output from this
+     * map, and without it a forced summary is written from truncated stubs.
+     */
+    preserveOriginalToolContent(agentContext, originalToolContent);
     agentContext.applyContextBudgetCorrection(recovery.budgetTokens);
 
     emitAgentLog(
@@ -1641,6 +1690,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       let messagesToUse = messages;
       let contextUsage: t.ContextUsageEvent | null = null;
+      /**
+       * Held outside the prune block so overflow recovery — which detours to
+       * the summarize node from the invoke catch below — can preserve the
+       * same masking record the configured trigger preserves.
+       */
+      let prunedOriginalToolContent: Map<number, string> | undefined;
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
@@ -1688,6 +1743,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           lastCallUsage: agentContext.lastCallUsage,
           totalTokensFresh: agentContext.totalTokensFresh,
         });
+        prunedOriginalToolContent = originalToolContent;
         agentContext.indexTokenCountMap = indexTokenCountMap;
         if (calibrationRatio != null && calibrationRatio > 0) {
           agentContext.calibrationRatio = calibrationRatio;
@@ -1768,37 +1824,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             });
 
           if (triggerResult) {
-            if (originalToolContent != null && originalToolContent.size > 0) {
-              /**
-               * Merge — never overwrite — the pruner's masking record
-               * into pendingOriginalToolContent.  Carry-over entries
-               * from a prior summarize (preserved by the recency
-               * window for masked tool messages still in the tail) and
-               * the current pruner's new entries are both keyed by
-               * indices in the current `state.messages`, so a key-wise
-               * union is correct.  Overwriting would discard the
-               * carry-over and reduce summary fidelity when those
-               * masked tail messages eventually move into the head.
-               */
-              if (agentContext.pendingOriginalToolContent == null) {
-                agentContext.pendingOriginalToolContent = originalToolContent;
-              } else {
-                for (const [idx, content] of originalToolContent) {
-                  agentContext.pendingOriginalToolContent.set(idx, content);
-                }
-                /**
-                 * Re-apply the per-store char cap after the union.  The
-                 * pruner enforces ORIGINAL_CONTENT_MAX_CHARS inside its
-                 * own map via the onContentStored callback, but a
-                 * key-wise merge with recency carry-over bypasses that
-                 * accounting and could let the merged map grow without
-                 * bound across long sessions.
-                 */
-                enforceOriginalContentCap(
-                  agentContext.pendingOriginalToolContent
-                );
-              }
-            }
+            preserveOriginalToolContent(agentContext, originalToolContent);
 
             emitAgentLog(
               config,
@@ -2301,36 +2327,61 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * down the fallback chain. Fallbacks still run for every other
          * failure, and for an overflow whose recovery budget is spent.
          */
-        const recovery = planContextOverflowRecovery({
-          error: primaryError,
-          provider: agentContext.provider,
-          maxContextTokens: agentContext.maxContextTokens,
-          estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
-          attemptsSoFar: agentContext.overflowRecoveryAttempts,
-        });
+        const planRecovery = (error: unknown): OverflowRecoveryPlan | null =>
+          planContextOverflowRecovery({
+            error,
+            provider: agentContext.provider,
+            maxContextTokens: agentContext.maxContextTokens,
+            estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
+            attemptsSoFar: agentContext.overflowRecoveryAttempts,
+          });
+
+        const recovery = planRecovery(primaryError);
         if (recovery != null) {
           return this.beginOverflowRecovery({
             recovery,
             agentContext,
             agentId,
             config,
+            originalToolContent: prunedOriginalToolContent,
           });
         }
-        result = await withLangfuseRuntimeScope(
-          resolveLangfuseRuntimeScope({
-            runLangfuse: this.langfuse,
-            langfuseOverlay: agentContext.langfuse,
-          }),
-          () =>
-            tryFallbackProviders({
-              fallbacks,
-              tools: agentContext.tools,
-              messages: finalMessages,
-              config: invokeConfig,
-              primaryError,
-              context: this,
-            })
-        );
+
+        /**
+         * A fallback can reject the same prompt as too large even when the
+         * primary failed for an unrelated reason — a fallback with a smaller
+         * window is the obvious case. Planning against the exhausted-chain
+         * error keeps that path recoverable instead of surfacing it.
+         */
+        try {
+          result = await withLangfuseRuntimeScope(
+            resolveLangfuseRuntimeScope({
+              runLangfuse: this.langfuse,
+              langfuseOverlay: agentContext.langfuse,
+            }),
+            () =>
+              tryFallbackProviders({
+                fallbacks,
+                tools: agentContext.tools,
+                messages: finalMessages,
+                config: invokeConfig,
+                primaryError,
+                context: this,
+              })
+          );
+        } catch (fallbackError) {
+          const fallbackRecovery = planRecovery(fallbackError);
+          if (fallbackRecovery == null) {
+            throw fallbackError;
+          }
+          return this.beginOverflowRecovery({
+            recovery: fallbackRecovery,
+            agentContext,
+            agentId,
+            config,
+            originalToolContent: prunedOriginalToolContent,
+          });
+        }
       } finally {
         await disposeLangfuseHandler(langfuseHandler);
       }

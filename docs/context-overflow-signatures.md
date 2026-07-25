@@ -103,15 +103,27 @@ turns a detection into a budget for the retry:
 1. **Believe the provider over the config.** If the error names a ceiling, that
    becomes the new budget — this is how a `maxContextTokens` that was simply
    wrong gets corrected mid-run.
-2. **Convert units.** If the error also names the size it attributed to the
-   prompt we just sent, the ratio against our own estimate is the conversion
-   factor between the two tokenizers. Targeting a raw ceiling from a provider
-   that counts 1.33× our tokens would just overflow again.
-3. **Shrink blindly when nothing was disclosed** — 70% of the prompt that was
+2. **Reserve what the completion will cost.** Several providers count the
+   requested `max_tokens` against the same ceiling and quote a combined total —
+   OpenRouter's `you requested about 56827 tokens (56811 of text input, 16 in
+the output)`, DeepSeek's `(1179652 in the messages, 16 in the completion)`,
+   and OpenAI's 429 `Requested 480002`. The retry budget governs the prompt
+   only, so a known completion allowance comes off the ceiling first;
+   otherwise a large `max_tokens` keeps the request over the limit no matter
+   how far the prompt is compacted.
+3. **Convert units.** If the error names the size it attributed to _the prompt_,
+   the ratio against our own estimate is the conversion factor between the two
+   tokenizers. Targeting a raw ceiling from a provider that counts 1.33× our
+   tokens would just overflow again. This uses `promptTokens`, never
+   `requestedTokens` — calibrating on a completion-inclusive total would invent
+   a ratio and shrink the prompt far past what the overflow calls for, so
+   providers that quote only a total (OpenAI's 429, xAI) contribute no ratio.
+4. **Shrink blindly when nothing was disclosed** — 70% of the prompt that was
    rejected.
-4. **Bound it.** Two forced compactions per agent per run. After that the error
-   propagates, so a model that rejects everything cannot make a run compact
-   forever.
+5. **Bound it.** Two forced compactions per agent per run, reset at the start of
+   each turn. After that the error propagates, so a model that rejects
+   everything cannot make a run compact forever — and a single overflow cannot
+   permanently shrink the budget for every later turn.
 
 In [`Graph.ts`](../src/graphs/Graph.ts), a failed model call that classifies as
 overflow applies the corrected budget and returns a summarization request

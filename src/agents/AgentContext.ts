@@ -329,6 +329,12 @@ export class AgentContext {
    */
   private _overflowRecoveryAttempts: number = 0;
   /**
+   * Budget in force before the first overflow correction of the current run.
+   * Recorded so `reset()` can undo the correction for the next run without
+   * disturbing a `maxContextTokens` that no correction ever touched.
+   */
+  private _preOverflowMaxContextTokens?: number;
+  /**
    * Handoff context when this agent receives control via handoff.
    * Contains source and parallel execution info for system message context.
    */
@@ -994,6 +1000,7 @@ export class AgentContext {
     this._lastSummarizationMsgCount = 0;
     this.lastCallUsage = undefined;
     this.totalTokensFresh = false;
+    this.restoreContextBudgetAfterOverflow();
 
     if (this.tokenCounter) {
       this.initializeSystemRunnable();
@@ -1329,10 +1336,30 @@ export class AgentContext {
    * needed.
    */
   applyContextBudgetCorrection(budgetTokens: number): void {
+    if (this._overflowRecoveryAttempts === 0) {
+      this._preOverflowMaxContextTokens = this.maxContextTokens;
+    }
     this.maxContextTokens = budgetTokens;
     this.pruneMessages = undefined;
     this._lastSummarizationMsgCount = 0;
     this._overflowRecoveryAttempts += 1;
+  }
+
+  /**
+   * Undoes overflow corrections so a reused context starts the next run with
+   * the budget it was configured with and a fresh recovery allowance.
+   *
+   * Without this, a single overflow would permanently shrink the budget for
+   * every later turn, and two would exhaust the per-run allowance for the
+   * lifetime of the context.
+   */
+  private restoreContextBudgetAfterOverflow(): void {
+    if (this._overflowRecoveryAttempts === 0) {
+      return;
+    }
+    this.maxContextTokens = this._preOverflowMaxContextTokens;
+    this._preOverflowMaxContextTokens = undefined;
+    this._overflowRecoveryAttempts = 0;
   }
 
   clearSummary(): void {

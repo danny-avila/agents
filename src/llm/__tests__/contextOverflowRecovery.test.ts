@@ -35,9 +35,9 @@ describe('planContextOverflowRecovery', () => {
   it('converts the reported ceiling into our units when we under-count', () => {
     const openrouter = signatureFor('qwen/qwen-2.5-7b-instruct');
     /**
-     * OpenRouter counted 56,827 tokens for a prompt we estimated at 42,599 —
-     * it bills roughly 1.33 of our tokens per token, so a budget set to its
-     * raw 32,768 ceiling would still overflow.
+     * OpenRouter counted 56,811 input tokens for a prompt we estimated at
+     * 42,599 — it bills roughly 1.33 of our tokens per token, so a budget set
+     * to its raw 32,768 ceiling would still overflow.
      */
     const plan = planContextOverflowRecovery({
       error: openrouter.error,
@@ -47,8 +47,49 @@ describe('planContextOverflowRecovery', () => {
       attemptsSoFar: 0,
     });
 
-    expect(plan?.observedCalibrationRatio).toBeCloseTo(1.334, 2);
+    expect(plan?.observedCalibrationRatio).toBeCloseTo(1.333, 2);
     expect(plan?.budgetTokens).toBeLessThan(32_768 / 1.3);
+  });
+
+  it('calibrates on the prompt, never on a completion-inclusive total', () => {
+    const openai = signatureFor('gpt-5-nano');
+    /**
+     * The 429 quotes "Requested 480002", which includes the output
+     * allowance. Reading that as the prompt size would invent a ratio and
+     * shrink the budget far past what the overflow calls for.
+     */
+    const plan = planContextOverflowRecovery({
+      error: openai.error,
+      provider: Providers.OPENAI,
+      maxContextTokens: 400_000,
+      estimatedPromptTokens: 240_000,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan?.observedCalibrationRatio).toBeUndefined();
+    expect(plan?.budgetTokens).toBe(Math.floor(200_000 * 0.95));
+  });
+
+  it('reserves the completion allowance the provider counted against the ceiling', () => {
+    /**
+     * A 64k completion allowance inside a 128k ceiling leaves 64k for the
+     * prompt; targeting the full ceiling would overflow again no matter how
+     * far the prompt is compacted.
+     */
+    const error = {
+      name: 'ContextOverflowError',
+      message:
+        '400 This model\'s maximum context length is 128000 tokens. However, you requested 190000 tokens (126000 in the messages, 64000 in the completion). Please reduce the length of the messages or completion.',
+    };
+    const plan = planContextOverflowRecovery({
+      error,
+      provider: Providers.DEEPSEEK,
+      maxContextTokens: 128_000,
+      estimatedPromptTokens: 126_000,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan?.budgetTokens).toBe(Math.floor((128_000 - 64_000) * 0.95));
   });
 
   it('shrinks blindly when the provider named no numbers', () => {

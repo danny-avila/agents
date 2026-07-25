@@ -212,6 +212,60 @@ describe('context overflow recovery', () => {
     expect(model.calls.length).toBeLessThanOrEqual(4);
   });
 
+  it('restores the configured budget and allowance for the next run', async () => {
+    const run = await createRun({
+      runId: 'overflow-recovery-reset',
+      maxContextTokens: 1_000_000,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    run.Graph.overrideModel = new OverflowThenSucceedModel(
+      signatureFor('claude-haiku-4-5-20251001')
+    );
+
+    await run.processStream({ messages: buildConversation(8) }, streamConfig);
+
+    const agentContext = run.Graph.agentContexts.get('default');
+    expect(agentContext?.maxContextTokens).toBeLessThanOrEqual(200_000);
+    expect(agentContext?.overflowRecoveryAttempts).toBe(1);
+
+    /** What `processStream` runs at the start of every turn. */
+    run.Graph.resetValues();
+
+    expect(agentContext?.maxContextTokens).toBe(1_000_000);
+    expect(agentContext?.overflowRecoveryAttempts).toBe(0);
+  });
+
+  it('recovers again on a later turn of the same run', async () => {
+    const run = await createRun({
+      runId: 'overflow-recovery-second-turn',
+      maxContextTokens: 1_000_000,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const signature = signatureFor('claude-haiku-4-5-20251001');
+
+    for (const turn of [1, 2, 3]) {
+      run.Graph.overrideModel = new OverflowThenSucceedModel(signature);
+      await run.processStream(
+        { messages: buildConversation(8) },
+        {
+          ...streamConfig,
+          configurable: { thread_id: `context-overflow-recovery-${turn}` },
+        }
+      );
+    }
+
+    const agentContext = run.Graph.agentContexts.get('default');
+    /**
+     * One recovery per turn, not three accumulated — an allowance that
+     * carried across turns would have stopped recovering by turn three.
+     */
+    expect(agentContext?.overflowRecoveryAttempts).toBe(1);
+  });
+
   it('does not intercept errors compaction cannot fix', async () => {
     const run = await createRun({
       runId: 'overflow-recovery-unrelated',

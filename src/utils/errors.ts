@@ -33,8 +33,20 @@ export interface ContextOverflowInfo {
   kind: ContextOverflowKind;
   /** Ceiling the provider reported, when it named one. */
   limitTokens?: number;
-  /** Token count the provider attributed to the request, when reported. */
+  /**
+   * Token count the provider attributed to the whole request. Several
+   * providers fold the requested completion allowance into this number, so it
+   * is not interchangeable with the prompt size.
+   */
   requestedTokens?: number;
+  /**
+   * The prompt alone, counted by the provider — set only when the provider
+   * distinguished input from output, either by reporting an input-only figure
+   * or by breaking the total down. Callers comparing provider counts against
+   * their own prompt estimate must use this and not `requestedTokens`, whose
+   * completion component would inflate the comparison.
+   */
+  promptTokens?: number;
   /** Which layer produced the verdict. Surfaced in logs and asserted in tests. */
   source: 'langchain' | 'pattern';
   provider?: Providers;
@@ -45,6 +57,12 @@ interface OverflowPattern {
   readonly re: RegExp;
   readonly limitGroup?: number;
   readonly requestedGroup?: number;
+  /**
+   * Whether `requestedGroup` counts the prompt alone. Providers that report a
+   * combined input+completion total leave this false, and their number is
+   * never used as a prompt measurement.
+   */
+  readonly requestedIsPromptOnly?: boolean;
   /**
    * Marks a signature that is consistent with overflow but not exclusive to
    * it, so it only counts when the caller can corroborate that the prompt was
@@ -82,18 +100,36 @@ const OVERFLOW_PATTERNS: readonly OverflowPattern[] = [
     re: /prompt is too long:\s*(\d+)\s*tokens\s*>\s*(\d+)\s*maximum/i,
     requestedGroup: 1,
     limitGroup: 2,
+    requestedIsPromptOnly: true,
   },
   /**
-   * OpenAI (`your messages resulted in`), OpenRouter (`you requested about`)
-   * and DeepSeek (`you requested`) share one sentence with three verbs.
+   * OpenAI's own wording, which measures the messages and nothing else.
+   * Ordered ahead of the shared sentence below so the prompt-only reading is
+   * preferred when OpenAI is the one answering.
    */
   {
     kind: 'context_window',
-    re: /maximum context length is\s*(\d+)\s*tokens\.\s*however,\s*(?:your messages resulted in|you requested(?:\s*about)?)\s*(\d+)/i,
+    re: /maximum context length is\s*(\d+)\s*tokens\.\s*however,\s*your messages resulted in\s*(\d+)/i,
+    limitGroup: 1,
+    requestedGroup: 2,
+    requestedIsPromptOnly: true,
+  },
+  /**
+   * OpenRouter (`you requested about`) and DeepSeek (`you requested`). Their
+   * total folds in the completion allowance — both then break it down in
+   * parentheses, which `PROMPT_ONLY_BREAKDOWN_RE` recovers.
+   */
+  {
+    kind: 'context_window',
+    re: /maximum context length is\s*(\d+)\s*tokens\.\s*however,\s*you requested(?:\s*about)?\s*(\d+)/i,
     limitGroup: 1,
     requestedGroup: 2,
   },
-  /** xAI. Says "prompt length" rather than "context length". */
+  /**
+   * xAI. Says "prompt length" rather than "context length", and does not say
+   * whether the count it quotes includes the completion allowance — so it is
+   * not trusted as a prompt measurement.
+   */
   {
     kind: 'context_window',
     re: /maximum prompt length is\s*(\d+)\s*(?:tokens\s*)?but the request contains\s*(\d+)\s*tokens/i,
@@ -106,6 +142,7 @@ const OVERFLOW_PATTERNS: readonly OverflowPattern[] = [
     re: /prompt contains\s*(\d+)\s*tokens[^.]*?too large for model with\s*(\d+)\s*maximum context length/i,
     requestedGroup: 1,
     limitGroup: 2,
+    requestedIsPromptOnly: true,
   },
   /** Google Gemini / Vertex. Reports the ceiling only. */
   {
@@ -181,6 +218,14 @@ const NON_RECOVERABLE_RE =
  */
 const OUTPUT_LIMIT_RE =
   /max_?(?:completion_?)?tokens\s*(?:must be|is too|cannot|exceeds|too large|greater than)|maximum number of output tokens|max_tokens.*less than or equal/i;
+
+/**
+ * Recovers the input-only figure from providers that quote a combined total
+ * and then break it down — OpenRouter's "(56811 of text input, 16 in the
+ * output)" and DeepSeek's "(1179652 in the messages, 16 in the completion)".
+ */
+const PROMPT_ONLY_BREAKDOWN_RE =
+  /\(\s*(\d+)\s*(?:of\s+text\s+input|in\s+the\s+messages|of\s+input|input\s+tokens)\b/i;
 
 /** Broader hints for the deliberately fuzzy `isLikelyContextOverflowError`. */
 const CONTEXT_OVERFLOW_HINT_RE =
@@ -267,6 +312,28 @@ function readNumber(
   }
   const parsed = Number(match[group]);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/**
+ * The provider's count of the prompt alone: its own breakdown when it gave
+ * one, otherwise the quoted total but only for providers that quote the
+ * prompt rather than the whole request. Returns undefined when the number on
+ * offer includes the completion allowance, since treating that as a prompt
+ * measurement would overstate how much the prompt has to shrink.
+ */
+function resolvePromptTokens(
+  haystack: string,
+  pattern: OverflowPattern,
+  requestedTokens: number | undefined
+): number | undefined {
+  const breakdown = haystack.match(PROMPT_ONLY_BREAKDOWN_RE);
+  if (breakdown != null) {
+    const parsed = Number(breakdown[1]);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return pattern.requestedIsPromptOnly === true ? requestedTokens : undefined;
 }
 
 /**
@@ -400,6 +467,7 @@ export function getContextOverflowInfo(
       kind: pattern.kind,
       limitTokens,
       requestedTokens,
+      promptTokens: resolvePromptTokens(haystack, pattern, requestedTokens),
       source: 'pattern',
       provider,
     };
