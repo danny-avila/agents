@@ -934,28 +934,26 @@ export class MultiAgentGraph extends StandardGraph {
           state.messages,
           agentId
         );
+        const agentContext = this.agentContexts.get(agentId);
+
+        if (
+          handoffContext?.sourceAgentName != null &&
+          handoffContext.sourceAgentName !== ''
+        ) {
+          agentContext?.setHandoffContext(
+            handoffContext.sourceAgentName,
+            handoffContext.parallelSiblings
+          );
+        } else {
+          agentContext?.clearHandoffContext();
+        }
 
         if (handoffContext !== null) {
           const {
             filteredMessages,
             instructions,
-            sourceAgentName,
-            parallelSiblings,
             parallelGroupId,
           } = handoffContext;
-
-          /**
-           * Set handoff context on the receiving agent.
-           * Uses pre-computed graph position for depth and parallel info.
-           */
-          const agentContext = this.agentContexts.get(agentId);
-          if (
-            agentContext &&
-            sourceAgentName != null &&
-            sourceAgentName !== ''
-          ) {
-            agentContext.setHandoffContext(sourceAgentName, parallelSiblings);
-          }
 
           /** Build messages for the receiving agent */
           let messagesForAgent = filteredMessages;
@@ -1039,7 +1037,6 @@ export class MultiAgentGraph extends StandardGraph {
            * When using agentMessages (excludeResults=true), we need to update
            * the token map to account for the new prompt message
            */
-          const agentContext = this.agentContexts.get(agentId);
           if (agentContext && agentContext.tokenCounter) {
             /** The agentMessages contains:
              * 1. Filtered messages (0 to startIndex) - already have token counts

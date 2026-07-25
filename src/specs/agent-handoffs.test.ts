@@ -953,6 +953,128 @@ describe('Agent Handoffs Tests', () => {
       expect(directPassMessages).toHaveLength(2);
     });
 
+    it('should clear the handoff identity before a direct re-entry', async () => {
+      const agents: t.AgentInputs[] = [
+        {
+          ...createBasicAgent('router', 'stale-context-router-marker'),
+          name: 'Router',
+        },
+        {
+          ...createBasicAgent('recipient', 'stale-context-recipient-marker'),
+          name: 'Recipient',
+        },
+        {
+          ...createBasicAgent('sibling', 'stale-context-sibling-marker'),
+          name: 'Sibling',
+        },
+        {
+          ...createBasicAgent('relay', 'stale-context-relay-marker'),
+          name: 'Relay',
+        },
+      ];
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'recipient',
+          edgeType: 'handoff',
+          prompt: 'Instructions for the recipient',
+        },
+        {
+          from: 'router',
+          to: 'sibling',
+          edgeType: 'handoff',
+          prompt: 'Instructions for the sibling',
+        },
+        {
+          from: 'recipient',
+          to: 'relay',
+          edgeType: 'handoff',
+          prompt: 'Instructions for the relay',
+        },
+        { from: 'relay', to: 'recipient', edgeType: 'direct' },
+      ];
+      const run = await Run.create(createTestConfig(agents, edges));
+      if (run.Graph == null) {
+        throw new Error('Expected a multi-agent graph');
+      }
+      const model = new ScriptedHandoffModel([
+        {
+          promptMarker: 'stale-context-router-marker',
+          response: 'Routing in parallel',
+          toolCalls: [
+            {
+              id: 'tool_call_stale_context_recipient',
+              name: `${Constants.LC_TRANSFER_TO_}recipient`,
+              args: { instructions: 'recipient-first-handoff-marker' },
+            },
+            {
+              id: 'tool_call_stale_context_sibling',
+              name: `${Constants.LC_TRANSFER_TO_}sibling`,
+              args: { instructions: 'sibling-first-handoff-marker' },
+            },
+          ],
+        },
+        {
+          promptMarker: 'recipient-first-handoff-marker',
+          response: 'Sending through relay',
+          toolCalls: [
+            {
+              id: 'tool_call_stale_context_relay',
+              name: `${Constants.LC_TRANSFER_TO_}relay`,
+              args: { instructions: 'relay-handoff-marker' },
+            },
+          ],
+        },
+        {
+          promptMarker: 'sibling-first-handoff-marker',
+          response: 'Sibling complete',
+        },
+        {
+          promptMarker: 'relay-handoff-marker',
+          response: 'relay-direct-reentry-marker',
+        },
+        {
+          promptMarker: 'relay-direct-reentry-marker',
+          response: 'Recipient direct complete',
+        },
+      ]);
+      run.Graph.overrideModel = model;
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-clear-handoff-context-direct-reentry-thread',
+        },
+        streamMode: 'values',
+        version: 'v2',
+      };
+      await run.processStream(
+        { messages: [new HumanMessage('stale-context-router-marker')] },
+        config
+      );
+
+      const recipientContext = run.Graph.agentContexts.get('recipient');
+      const recipientSystemRunnable = recipientContext?.systemRunnable;
+      if (recipientSystemRunnable == null) {
+        throw new Error('Expected recipient system instructions');
+      }
+      const recipientSystemPrompt = getBufferString(
+        await recipientSystemRunnable.invoke([])
+      );
+      expect(recipientSystemPrompt).toContain(
+        'stale-context-recipient-marker'
+      );
+      expect(recipientSystemPrompt).not.toContain('## Multi-Agent Workflow');
+      expect(recipientSystemPrompt).not.toContain(
+        'transferred from "Router"'
+      );
+      expect(recipientSystemPrompt).not.toContain(
+        'Running in parallel with:'
+      );
+    });
+
     it('should clear the runtime group after a parallel target hands off sequentially', async () => {
       const agents: t.AgentInputs[] = [
         createBasicAgent('router', 'router-script-marker'),
