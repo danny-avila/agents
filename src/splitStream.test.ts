@@ -273,6 +273,30 @@ describe('ContentAggregator resumed tool completions', () => {
         progress: 1,
       },
     });
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: { ...createRunStep('step_continuation'), index: 1 },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_MESSAGE_DELTA,
+      data: {
+        id: 'step_continuation',
+        delta: {
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              text: 'After approval',
+            },
+          ],
+        },
+      } as t.MessageDeltaEvent,
+    });
+
+    expect(contentParts[2]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'After approval',
+    });
   });
 
   it('rebinds a replacement run step to seeded content by tool call id', () => {
@@ -343,10 +367,145 @@ describe('ContentAggregator resumed tool completions', () => {
           progress: 1,
         },
       });
+      aggregateContent({
+        event: GraphEvents.ON_RUN_STEP,
+        data: { ...createRunStep('step_continuation'), index: 1 },
+      });
+      aggregateContent({
+        event: GraphEvents.ON_MESSAGE_DELTA,
+        data: {
+          id: 'step_continuation',
+          delta: {
+            content: [
+              {
+                type: ContentTypes.TEXT,
+                text: 'After approval',
+              },
+            ],
+          },
+        } as t.MessageDeltaEvent,
+      });
+      expect(stepMap.get('step_continuation')?.index).toBe(2);
+      expect(contentParts[2]).toEqual({
+        type: ContentTypes.TEXT,
+        text: 'After approval',
+      });
       expect(warnSpy).not.toHaveBeenCalled();
     } finally {
       warnSpy.mockRestore();
     }
+  });
+
+  it('matches parallel completions to their own seeded tool cards', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    contentParts.push(
+      { type: ContentTypes.TEXT, text: 'Before approval' },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'call_first',
+          name: 'approval_probe',
+          args: { value: 'first' },
+        },
+      },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'call_second',
+          name: 'approval_probe',
+          args: { value: 'second' },
+        },
+      }
+    );
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        id: 'step_parallel',
+        stepIndex: 0,
+        type: StepTypes.TOOL_CALLS,
+        index: 0,
+        stepDetails: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            {
+              id: 'call_first',
+              name: 'approval_probe',
+              args: { value: 'first' },
+            },
+            {
+              id: 'call_second',
+              name: 'approval_probe',
+              args: { value: 'second' },
+            },
+          ],
+        },
+        usage: null,
+      },
+    });
+
+    for (const [id, value] of [
+      ['call_first', 'first'],
+      ['call_second', 'second'],
+    ]) {
+      aggregateContent({
+        event: GraphEvents.ON_RUN_STEP_COMPLETED,
+        data: {
+          result: {
+            id: 'step_parallel',
+            index: 0,
+            type: 'tool_call',
+            tool_call: {
+              id,
+              name: 'approval_probe',
+              args: JSON.stringify({ value }),
+              output: `${value} approved`,
+              progress: 1,
+            } as t.ProcessedToolCall,
+          },
+        } as { result: t.ToolEndEvent },
+      });
+    }
+
+    expect(contentParts[1]).toMatchObject({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: 'call_first',
+        output: 'first approved',
+        progress: 1,
+      },
+    });
+    expect(contentParts[2]).toMatchObject({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: 'call_second',
+        output: 'second approved',
+        progress: 1,
+      },
+    });
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: { ...createRunStep('step_after_parallel'), index: 1 },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_MESSAGE_DELTA,
+      data: {
+        id: 'step_after_parallel',
+        delta: {
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              text: 'Parallel tools complete',
+            },
+          ],
+        },
+      } as t.MessageDeltaEvent,
+    });
+    expect(contentParts[3]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Parallel tools complete',
+    });
   });
 
   it('drops a completion that matches neither a step nor seeded tool call', () => {
