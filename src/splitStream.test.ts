@@ -225,6 +225,163 @@ describe('ContentAggregator empty deltas', () => {
   });
 });
 
+describe('ContentAggregator resumed tool completions', () => {
+  it('matches a completion to seeded content when a rebuilt run has no step id', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    contentParts.push(
+      { type: ContentTypes.TEXT, text: 'Before approval' },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'call_approval',
+          name: 'approval_probe',
+          args: { value: 'original' },
+        },
+      }
+    );
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_COMPLETED,
+      data: {
+        result: {
+          id: '',
+          index: 0,
+          type: 'tool_call',
+          tool_call: {
+            id: 'call_approval',
+            name: 'approval_probe',
+            args: '{"value":"original"}',
+            output: 'approved',
+            progress: 1,
+          } as t.ProcessedToolCall,
+        },
+      } as { result: t.ToolEndEvent },
+    });
+
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Before approval',
+    });
+    expect(contentParts[1]).toEqual({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: 'call_approval',
+        name: 'approval_probe',
+        args: '{"value":"original"}',
+        type: 'tool_call',
+        output: 'approved',
+        progress: 1,
+      },
+    });
+  });
+
+  it('rebinds a replacement run step to seeded content by tool call id', () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const { contentParts, aggregateContent, stepMap } =
+      createContentAggregator();
+    contentParts.push(
+      { type: ContentTypes.TEXT, text: 'Before approval' },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'call_approval',
+          name: 'approval_probe',
+          args: { value: 'original' },
+        },
+      }
+    );
+
+    try {
+      aggregateContent({
+        event: GraphEvents.ON_RUN_STEP,
+        data: {
+          id: 'step_rebuilt',
+          stepIndex: 0,
+          type: StepTypes.TOOL_CALLS,
+          index: 0,
+          stepDetails: {
+            type: StepTypes.TOOL_CALLS,
+            tool_calls: [
+              {
+                id: 'call_approval',
+                name: 'approval_probe',
+                args: { value: 'original' },
+              },
+            ],
+          },
+          usage: null,
+        },
+      });
+      aggregateContent({
+        event: GraphEvents.ON_RUN_STEP_COMPLETED,
+        data: {
+          result: {
+            id: 'step_rebuilt',
+            index: 0,
+            type: 'tool_call',
+            tool_call: {
+              id: 'call_approval',
+              name: 'approval_probe',
+              args: '{"value":"original"}',
+              output: 'approved',
+              progress: 1,
+            } as t.ProcessedToolCall,
+          },
+        } as { result: t.ToolEndEvent },
+      });
+
+      expect(stepMap.get('step_rebuilt')?.index).toBe(1);
+      expect(contentParts[0]).toEqual({
+        type: ContentTypes.TEXT,
+        text: 'Before approval',
+      });
+      expect(contentParts[1]).toMatchObject({
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'call_approval',
+          output: 'approved',
+          progress: 1,
+        },
+      });
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('drops a completion that matches neither a step nor seeded tool call', () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const { contentParts, aggregateContent } = createContentAggregator();
+
+    try {
+      aggregateContent({
+        event: GraphEvents.ON_RUN_STEP_COMPLETED,
+        data: {
+          result: {
+            id: '',
+            index: 0,
+            type: 'tool_call',
+            tool_call: {
+              id: 'call_unknown',
+              name: 'unknown',
+              args: '{}',
+              output: 'untrusted',
+              progress: 1,
+            } as t.ProcessedToolCall,
+          },
+        } as { result: t.ToolEndEvent },
+      });
+
+      expect(contentParts).toEqual([]);
+      expect(warnSpy).toHaveBeenCalledWith(
+        'No run step or tool call found for completed step event'
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
 describe('ContentAggregator provider-specific parts', () => {
   it('should preserve Gemini server-side tool content blocks', () => {
     const { contentParts, aggregateContent } = createContentAggregator();

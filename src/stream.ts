@@ -1829,6 +1829,23 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     }
     return Array.isArray(content) ? content[0] : content;
   };
+  const findToolCallIndex = (
+    toolCallId: string | undefined
+  ): number | undefined => {
+    if (toolCallId == null || toolCallId === '') {
+      return undefined;
+    }
+    for (let index = contentParts.length - 1; index >= 0; index--) {
+      const contentPart = contentParts[index];
+      if (
+        contentPart?.type === ContentTypes.TOOL_CALL &&
+        contentPart.tool_call.id === toolCallId
+      ) {
+        return index;
+      }
+    }
+    return undefined;
+  };
 
   const updateContent = (
     index: number,
@@ -2050,7 +2067,18 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     }
 
     if (event === GraphEvents.ON_RUN_STEP) {
-      const runStep = data as t.RunStep;
+      const incomingRunStep = data as t.RunStep;
+      const seededToolCallIndex =
+        incomingRunStep.stepDetails.type === StepTypes.TOOL_CALLS
+          ? incomingRunStep.stepDetails.tool_calls
+            ?.map((toolCall) => findToolCallIndex(toolCall.id))
+            .find((index) => index != null)
+          : undefined;
+      const runStep =
+        seededToolCallIndex != null &&
+        seededToolCallIndex !== incomingRunStep.index
+          ? { ...incomingRunStep, index: seededToolCallIndex }
+          : incomingRunStep;
       stepMap.set(runStep.id, runStep);
 
       // Track agentId (MultiAgentGraph) and groupId (parallel execution) separately
@@ -2166,19 +2194,27 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       const { id: stepId } = result;
 
       const runStep = stepMap.get(stepId);
-      if (!runStep) {
-        console.warn('No run step or runId found for completed step event');
-        return;
-      }
 
       if (result.type === ContentTypes.SUMMARY && 'summary' in result) {
+        if (!runStep) {
+          console.warn('No run step or runId found for completed step event');
+          return;
+        }
         contentParts[runStep.index] = result.summary as t.MessageContentComplex;
       } else if ('tool_call' in result) {
+        const contentIndex =
+          runStep?.index ?? findToolCallIndex(result.tool_call.id);
+        if (contentIndex == null) {
+          console.warn(
+            'No run step or tool call found for completed step event'
+          );
+          return;
+        }
         const contentPart: t.MessageContentComplex = {
           type: ContentTypes.TOOL_CALL,
           tool_call: (result as t.ToolEndEvent).tool_call,
         };
-        updateContent(runStep.index, contentPart, true);
+        updateContent(contentIndex, contentPart, true);
       }
     }
   };
