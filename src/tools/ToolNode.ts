@@ -1,3 +1,4 @@
+import { nanoid } from 'nanoid';
 import { ToolCall } from '@langchain/core/messages/tool';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
@@ -119,6 +120,9 @@ type RunToolBatchContext<T = unknown> = {
 };
 
 const TOOL_NODE_RUN_NAME = 'tool_batch';
+const NANOID_URL_ALPHABET =
+  '_-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const RUNTIME_HANDOFF_GROUP_OFFSET = 2 ** 48;
 
 /**
  * Per-batch context for `dispatchToolEvents` / `executeViaEvent`.
@@ -156,6 +160,41 @@ function isSend(value: unknown): value is Send {
 
 function isHandoffToolName(name: string): boolean {
   return name.startsWith(Constants.LC_TRANSFER_TO_);
+}
+
+/**
+ * Encodes 48 random bits from the persisted batch key into a safe integer.
+ * The high offset keeps runtime groups disjoint from low, structural group IDs.
+ */
+function getRuntimeHandoffGroupId(batch: string): number {
+  let value = 0;
+  for (const char of batch.slice(0, 8)) {
+    const digit = NANOID_URL_ALPHABET.indexOf(char);
+    value = value * 64 + Math.max(digit, 0);
+  }
+  return RUNTIME_HANDOFF_GROUP_OFFSET + value;
+}
+
+function findHandoffMessage(
+  messages: BaseMessage[],
+  destination: string
+): ToolMessage | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.getType() !== 'tool') {
+      continue;
+    }
+    const toolMessage = message as ToolMessage;
+    const isStandardHandoff =
+      toolMessage.name === `${Constants.LC_TRANSFER_TO_}${destination}`;
+    const isConditionalHandoff =
+      toolMessage.name === 'conditional_transfer' &&
+      toolMessage.additional_kwargs.handoff_destination === destination;
+    if (isStandardHandoff || isConditionalHandoff) {
+      return toolMessage;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -3854,21 +3893,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const goto = cmd.goto;
         return typeof goto === 'string' ? goto : (goto as string[])[0];
       });
+      const parallelBatch = nanoid();
+      const parallelGroupId = getRuntimeHandoffGroupId(parallelBatch);
 
       const sends = handoffCommands.map((cmd, idx) => {
         const destination = allDestinations[idx];
         /** Get siblings (other destinations, not this one) */
         const siblings = allDestinations.filter((d) => d !== destination);
 
-        /** Add siblings to ToolMessage additional_kwargs */
         const update = cmd.update as { messages?: BaseMessage[] } | undefined;
-        if (update && update.messages) {
-          for (const msg of update.messages) {
-            if (msg.getType() === 'tool') {
-              (msg as ToolMessage).additional_kwargs.handoff_parallel_siblings =
-                siblings;
-            }
-          }
+        const handoffMessage = update?.messages
+          ? findHandoffMessage(update.messages, destination)
+          : undefined;
+        if (handoffMessage) {
+          handoffMessage.additional_kwargs.handoff_parallel_siblings = siblings;
+          handoffMessage.additional_kwargs[Constants.HANDOFF_PARALLEL_BATCH] =
+            parallelBatch;
+          handoffMessage.additional_kwargs[Constants.HANDOFF_GROUP_ID] =
+            parallelGroupId;
         }
 
         return new Send(destination, cmd.update);
