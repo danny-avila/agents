@@ -315,6 +315,52 @@ export async function attemptInvoke(
 }
 
 /**
+ * Identifies which fallback produced an error, so a caller planning a
+ * recovery can reason about the client that actually failed rather than the
+ * primary's configuration — their context windows and output allowances
+ * differ, which is the whole reason a fallback exists.
+ */
+export interface FallbackErrorContext {
+  provider: Providers;
+  clientOptions?: t.ClientOptions;
+}
+
+/**
+ * Symbol-keyed so it never appears in `Object.keys`, `JSON.stringify`, or the
+ * error-message flattening the overflow classifier performs.
+ */
+const FALLBACK_ERROR_CONTEXT = Symbol.for(
+  '@librechat/agents.fallbackErrorContext'
+);
+
+function attachFallbackErrorContext(
+  error: unknown,
+  fallbackContext: FallbackErrorContext
+): void {
+  if (typeof error !== 'object' || error === null) {
+    return;
+  }
+  Object.defineProperty(error, FALLBACK_ERROR_CONTEXT, {
+    value: fallbackContext,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+}
+
+/** Reads back the fallback attribution attached by `tryFallbackProviders`. */
+export function getFallbackErrorContext(
+  error: unknown
+): FallbackErrorContext | undefined {
+  if (typeof error !== 'object' || error === null) {
+    return undefined;
+  }
+  return (error as Record<symbol, FallbackErrorContext | undefined>)[
+    FALLBACK_ERROR_CONTEXT
+  ];
+}
+
+/**
  * Best-effort read of the configured model name from client options.
  * Providers disagree on the key (`model` vs `modelName`).
  */
@@ -370,7 +416,14 @@ export async function tryFallbackProviders({
   const isOverflow = (error: unknown): boolean =>
     getContextOverflowInfo(error, overflowContext) != null;
   let lastError: unknown = primaryError;
-  let overflowError: unknown = isOverflow(primaryError)
+  /**
+   * Tracked apart from the primary's overflow. A caller reaching this
+   * function with an overflowing primary has already failed to recover from
+   * it, so a fallback overflow — which may sit against a different window and
+   * output allowance — is the more useful of the two to surface.
+   */
+  let fallbackOverflowError: unknown;
+  const primaryOverflowError: unknown = isOverflow(primaryError)
     ? primaryError
     : undefined;
   for (const fb of fallbacks) {
@@ -411,17 +464,25 @@ export async function tryFallbackProviders({
       return result;
     } catch (e) {
       lastError = e;
-      if (overflowError === undefined && isOverflow(e)) {
-        overflowError = e;
+      if (fallbackOverflowError === undefined && isOverflow(e)) {
+        attachFallbackErrorContext(e, {
+          provider: fb.provider,
+          clientOptions: fb.clientOptions,
+        });
+        fallbackOverflowError = e;
       }
       continue;
     }
   }
-  if (overflowError !== undefined) {
-    throw overflowError;
-  }
-  if (lastError !== undefined) {
-    throw lastError;
+  /**
+   * Preference order: a fallback overflow, then the primary's overflow, then
+   * whichever failure came last. An overflow is the only one of the three a
+   * caller can act on, and the fallback's carries the client attribution that
+   * makes a correct retry budget possible.
+   */
+  const preferred = fallbackOverflowError ?? primaryOverflowError ?? lastError;
+  if (preferred !== undefined) {
+    throw preferred;
   }
   return undefined;
 }

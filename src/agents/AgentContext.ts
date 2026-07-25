@@ -335,6 +335,13 @@ export class AgentContext {
    */
   private _preOverflowMaxContextTokens?: number;
   /**
+   * Prompt size, by our own estimate, at the last overflow correction. A
+   * later overflow whose prompt is no smaller proves the correction changed
+   * nothing, which is the only reliable way to detect the configurations
+   * where neither pruning nor summarization has anything left to remove.
+   */
+  private _lastOverflowPromptTokens?: number;
+  /**
    * Handoff context when this agent receives control via handoff.
    * Contains source and parallel execution info for system message context.
    */
@@ -1335,14 +1342,36 @@ export class AgentContext {
    * here the history has not changed and compaction is exactly what is
    * needed.
    */
-  applyContextBudgetCorrection(budgetTokens: number): void {
+  applyContextBudgetCorrection(
+    budgetTokens: number,
+    promptTokens?: number
+  ): void {
     if (this._overflowRecoveryAttempts === 0) {
       this._preOverflowMaxContextTokens = this.maxContextTokens;
     }
     this.maxContextTokens = budgetTokens;
     this.pruneMessages = undefined;
     this._lastSummarizationMsgCount = 0;
+    this._lastOverflowPromptTokens = promptTokens;
     this._overflowRecoveryAttempts += 1;
+  }
+
+  /**
+   * True when a previous correction failed to make the prompt any smaller —
+   * the signature of a state nothing can compact further (an emptied message
+   * list carrying its content in an injected summary, for example). Retrying
+   * from there resends a byte-identical prompt, so the caller should stop.
+   */
+  overflowRecoveryStalled(currentPromptTokens?: number): boolean {
+    const previous = this._lastOverflowPromptTokens;
+    if (
+      previous == null ||
+      currentPromptTokens == null ||
+      !Number.isFinite(currentPromptTokens)
+    ) {
+      return false;
+    }
+    return currentPromptTokens >= previous;
   }
 
   /**
@@ -1359,6 +1388,7 @@ export class AgentContext {
     }
     this.maxContextTokens = this._preOverflowMaxContextTokens;
     this._preOverflowMaxContextTokens = undefined;
+    this._lastOverflowPromptTokens = undefined;
     this._overflowRecoveryAttempts = 0;
   }
 

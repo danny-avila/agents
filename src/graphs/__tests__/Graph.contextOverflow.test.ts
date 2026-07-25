@@ -305,6 +305,31 @@ describe('context overflow recovery', () => {
     ).toBe(0);
   });
 
+  it('reports actionable guidance when a corrected budget fits nothing', async () => {
+    /**
+     * One message larger than the corrected budget. Rather than looping, the
+     * run surfaces the empty-prompt guidance with the token breakdown.
+     */
+    const run = await createRun({
+      runId: 'overflow-recovery-nothing-fits',
+      maxContextTokens: 1_000_000,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    run.Graph.overrideModel = new OverflowThenSucceedModel(
+      signatureFor('claude-haiku-4-5-20251001'),
+      Number.MAX_SAFE_INTEGER
+    );
+
+    await expect(
+      run.processStream(
+        { messages: [new HumanMessage('one oversized turn')] },
+        streamConfig
+      )
+    ).rejects.toThrow(/empty_messages/);
+  });
+
   it('does not intercept errors compaction cannot fix', async () => {
     const run = await createRun({
       runId: 'overflow-recovery-unrelated',

@@ -56,6 +56,11 @@ import {
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
 import {
+  attemptInvoke,
+  tryFallbackProviders,
+  getFallbackErrorContext,
+} from '@/llm/invoke';
+import {
   GraphNodeKeys,
   ContentTypes,
   GraphEvents,
@@ -77,7 +82,6 @@ import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
-import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { initializeLangfuseTracing } from '@/instrumentation';
 import { shouldTriggerSummarization } from '@/summarization';
@@ -1543,6 +1547,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     agentId,
     config,
     originalToolContent,
+    estimatedPromptTokens,
   }: {
     recovery: OverflowRecoveryPlan;
     agentContext: AgentContext;
@@ -1550,6 +1555,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     config?: RunnableConfig;
     /** Masking record from the prune pass that built the rejected prompt. */
     originalToolContent?: Map<number, string>;
+    /** Size of the rejected prompt, recorded to detect a correction that changed nothing. */
+    estimatedPromptTokens?: number;
   }): Partial<t.AgentSubgraphState> {
     const previousBudget = agentContext.maxContextTokens;
     /**
@@ -1558,7 +1565,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * map, and without it a forced summary is written from truncated stubs.
      */
     preserveOriginalToolContent(agentContext, originalToolContent);
-    agentContext.applyContextBudgetCorrection(recovery.budgetTokens);
+    agentContext.applyContextBudgetCorrection(
+      recovery.budgetTokens,
+      estimatedPromptTokens
+    );
 
     emitAgentLog(
       config,
@@ -2358,20 +2368,40 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.tokenCounter != null ||
           agentContext.summarizationEnabled === true;
 
-        const planRecovery = (error: unknown): OverflowRecoveryPlan | null =>
-          canReduceContext
-            ? planContextOverflowRecovery({
-              error,
-              provider: agentContext.provider,
-              maxContextTokens: agentContext.maxContextTokens,
-              estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
-              instructionTokens: agentContext.instructionTokens,
-              configuredCompletionTokens: getConfiguredCompletionTokens(
-                agentContext.clientOptions
-              ),
-              attemptsSoFar: agentContext.overflowRecoveryAttempts,
-            })
-            : null;
+        const estimatedPromptTokens = getEstimatedPromptTokens(contextUsage);
+
+        /**
+         * A previous correction that left the prompt no smaller proves this
+         * state has nothing left to compact — an emptied message list whose
+         * content rides along in an injected summary, for instance. Measuring
+         * that beats trying to predict every such configuration.
+         */
+        const recoveryStalled = agentContext.overflowRecoveryStalled(
+          estimatedPromptTokens
+        );
+
+        const planRecovery = (error: unknown): OverflowRecoveryPlan | null => {
+          if (!canReduceContext || recoveryStalled) {
+            return null;
+          }
+          /**
+           * When the rejection came from a fallback, plan against *that*
+           * client: its window and output allowance are why it was configured
+           * as an alternative in the first place.
+           */
+          const fallbackContext = getFallbackErrorContext(error);
+          return planContextOverflowRecovery({
+            error,
+            provider: fallbackContext?.provider ?? agentContext.provider,
+            maxContextTokens: agentContext.maxContextTokens,
+            estimatedPromptTokens,
+            instructionTokens: agentContext.instructionTokens,
+            configuredCompletionTokens: getConfiguredCompletionTokens(
+              fallbackContext?.clientOptions ?? agentContext.clientOptions
+            ),
+            attemptsSoFar: agentContext.overflowRecoveryAttempts,
+          });
+        };
 
         const recovery = planRecovery(primaryError);
         if (recovery != null) {
@@ -2381,6 +2411,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentId,
             config,
             originalToolContent: prunedOriginalToolContent,
+            estimatedPromptTokens,
           });
         }
 
@@ -2426,6 +2457,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentId,
             config,
             originalToolContent: prunedOriginalToolContent,
+            estimatedPromptTokens,
           });
         }
       } finally {

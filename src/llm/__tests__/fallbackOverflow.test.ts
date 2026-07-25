@@ -2,7 +2,7 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import { describe, expect, it, jest } from '@jest/globals';
 import type { BaseMessage } from '@langchain/core/messages';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
-import { tryFallbackProviders } from '@/llm/invoke';
+import { tryFallbackProviders, getFallbackErrorContext } from '@/llm/invoke';
 import { Providers } from '@/common';
 import * as init from '@/llm/init';
 
@@ -116,6 +116,47 @@ describe('tryFallbackProviders surfacing', () => {
         primaryError: new Error('primary boom'),
       })
     ).rejects.toThrow(/upstream unavailable/);
+  });
+
+  it('prefers a fallback overflow over the primary one', async () => {
+    /**
+     * Reaching this function with an overflowing primary means the caller
+     * already failed to recover from it, so the fallback's — which sits
+     * against a different window — is the more useful of the two.
+     */
+    const primary = signatureError('gpt-5-nano');
+    const fallbackOverflow = signatureError('claude-haiku-4-5-20251001');
+    stubModels([fallbackOverflow, new Error('503 upstream unavailable')]);
+
+    await expect(
+      tryFallbackProviders({ fallbacks, messages, primaryError: primary })
+    ).rejects.toThrow(/prompt is too long/i);
+  });
+
+  it('attributes a fallback overflow to the client that produced it', async () => {
+    const fallbackOverflow = signatureError('claude-haiku-4-5-20251001');
+    stubModels([fallbackOverflow, new Error('503 upstream unavailable')]);
+
+    const thrown = await tryFallbackProviders({
+      fallbacks,
+      messages,
+      primaryError: new Error('primary boom'),
+    }).catch((error: unknown) => error);
+
+    const attribution = getFallbackErrorContext(thrown);
+    expect(attribution?.provider).toBe(Providers.ANTHROPIC);
+  });
+
+  it('leaves a primary overflow unattributed', async () => {
+    stubModels([new Error('first failed'), new Error('second failed')]);
+
+    const thrown = await tryFallbackProviders({
+      fallbacks,
+      messages,
+      primaryError: signatureError('us.amazon.nova-lite-v1:0'),
+    }).catch((error: unknown) => error);
+
+    expect(getFallbackErrorContext(thrown)).toBeUndefined();
   });
 
   it('returns the first success without consulting later fallbacks', async () => {
