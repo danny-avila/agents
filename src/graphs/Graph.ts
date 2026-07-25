@@ -2404,6 +2404,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 config: invokeConfig,
                 primaryError,
                 context: this,
+                /**
+                 * Lets the chain recognise a fallback overflow whose signature
+                 * carries no reason of its own (Vertex AI's bare 400) and
+                 * surface it rather than a later unrelated failure.
+                 */
+                overflowContext: {
+                  estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
+                  maxContextTokens: agentContext.maxContextTokens,
+                },
               })
           );
         } catch (fallbackError) {

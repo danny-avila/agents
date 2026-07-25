@@ -88,6 +88,36 @@ describe('tryFallbackProviders surfacing', () => {
     ).rejects.toThrow(/Input Tokens Exceeded/i);
   });
 
+  it('recognises a reasonless Vertex overflow when given corroboration', async () => {
+    const vertex = signatureError('gemini-2.5-flash-lite');
+    stubModels([vertex, new Error('503 upstream unavailable')]);
+
+    await expect(
+      tryFallbackProviders({
+        fallbacks,
+        messages,
+        primaryError: new Error('primary boom'),
+        overflowContext: {
+          estimatedPromptTokens: 190_000,
+          maxContextTokens: 200_000,
+        },
+      })
+    ).rejects.toThrow(/Google request failed/);
+  });
+
+  it('leaves a bare Vertex 400 alone without corroboration', async () => {
+    const vertex = signatureError('gemini-2.5-flash-lite');
+    stubModels([vertex, new Error('503 upstream unavailable')]);
+
+    await expect(
+      tryFallbackProviders({
+        fallbacks,
+        messages,
+        primaryError: new Error('primary boom'),
+      })
+    ).rejects.toThrow(/upstream unavailable/);
+  });
+
   it('returns the first success without consulting later fallbacks', async () => {
     stubModels([signatureError('claude-haiku-4-5-20251001'), 'ok']);
 

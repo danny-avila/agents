@@ -138,9 +138,15 @@ function resolveTargetBudget(
     const promptCeiling =
       info.limitTokens -
       reservedForCompletion(info, configuredCompletionTokens);
-    if (promptCeiling > 0) {
-      return toLocalUnits(promptCeiling, ratio) * CEILING_HEADROOM_RATIO;
-    }
+    /**
+     * A completion allowance at or above the ceiling leaves nothing for the
+     * prompt: even an empty one plus the requested output overruns the limit.
+     * Compaction cannot fix that, so declining surfaces the real problem
+     * instead of burning the recovery budget on retries that must fail.
+     */
+    return promptCeiling > 0
+      ? toLocalUnits(promptCeiling, ratio) * CEILING_HEADROOM_RATIO
+      : null;
   }
   if (isUsable(estimatedPromptTokens)) {
     return estimatedPromptTokens * BLIND_SHRINK_RATIO;

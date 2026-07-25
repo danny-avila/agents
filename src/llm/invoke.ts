@@ -4,6 +4,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { ContextOverflowContext } from '@/utils/errors';
 import type * as t from '@/types';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
@@ -349,6 +350,7 @@ export async function tryFallbackProviders({
   primaryError,
   context,
   onChunk,
+  overflowContext,
 }: {
   fallbacks: Array<{ provider: Providers; clientOptions?: t.ClientOptions }>;
   tools?: t.GraphTools;
@@ -357,10 +359,20 @@ export async function tryFallbackProviders({
   primaryError: unknown;
   context?: InvokeContext;
   onChunk?: OnChunk;
+  /**
+   * Prompt-size corroboration for signatures that are not self-describing.
+   * Vertex AI's overflow is a bare `400` with no reason, so without this a
+   * fallback that overflows is indistinguishable from any other 400 and would
+   * be dropped in favour of whichever failure came last.
+   */
+  overflowContext?: ContextOverflowContext;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
+  const isOverflow = (error: unknown): boolean =>
+    getContextOverflowInfo(error, overflowContext) != null;
   let lastError: unknown = primaryError;
-  let overflowError: unknown =
-    getContextOverflowInfo(primaryError) != null ? primaryError : undefined;
+  let overflowError: unknown = isOverflow(primaryError)
+    ? primaryError
+    : undefined;
   for (const fb of fallbacks) {
     try {
       const fbModel = initializeModel({
@@ -399,7 +411,7 @@ export async function tryFallbackProviders({
       return result;
     } catch (e) {
       lastError = e;
-      if (overflowError === undefined && getContextOverflowInfo(e) != null) {
+      if (overflowError === undefined && isOverflow(e)) {
         overflowError = e;
       }
       continue;

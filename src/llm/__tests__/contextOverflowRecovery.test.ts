@@ -178,6 +178,25 @@ describe('planContextOverflowRecovery', () => {
     expect(withConfig?.budgetTokens).toBe(withoutConfig?.budgetTokens);
   });
 
+  it('declines when the completion allowance alone exceeds the ceiling', () => {
+    const openai = signatureFor('gpt-5-nano');
+    /**
+     * A 240k output allowance against a 200k bucket: no prompt, however
+     * small, makes this request fit. Spending recovery attempts on it would
+     * bury the real problem.
+     */
+    const plan = planContextOverflowRecovery({
+      error: openai.error,
+      provider: Providers.OPENAI,
+      maxContextTokens: 400_000,
+      estimatedPromptTokens: 240_000,
+      configuredCompletionTokens: 240_000,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan).toBeNull();
+  });
+
   it('declines when the corrected budget would not clear the instructions', () => {
     const anthropic = signatureFor('claude-haiku-4-5-20251001');
     /**
