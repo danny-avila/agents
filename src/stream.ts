@@ -1829,6 +1829,19 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     }
     return Array.isArray(content) ? content[0] : content;
   };
+  const applyContentMetadata = (index: number): void => {
+    const contentPart = contentParts[index];
+    if (contentPart == null) {
+      return;
+    }
+    const meta = contentMetaMap.get(index);
+    if (meta?.agentId != null) {
+      contentPart.agentId = meta.agentId;
+    }
+    if (meta?.groupId != null) {
+      contentPart.groupId = meta.groupId;
+    }
+  };
 
   const updateContent = (
     index: number,
@@ -1996,13 +2009,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     // Apply agentId (for MultiAgentGraph) and groupId (for parallel execution) to content parts
     // - agentId present → MultiAgentGraph (show agent labels)
     // - groupId present → parallel execution (render columns)
-    const meta = contentMetaMap.get(index);
-    if (meta?.agentId != null) {
-      (contentParts[index] as t.MessageContentComplex).agentId = meta.agentId;
-    }
-    if (meta?.groupId != null) {
-      (contentParts[index] as t.MessageContentComplex).groupId = meta.groupId;
-    }
+    applyContentMetadata(index);
   };
 
   const aggregateContent = ({
@@ -2046,6 +2053,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       // concatenate in updateContent.  This event carries only the correct
       // final text from the last stage.
       contentParts[runStep.index] = summary;
+      applyContentMetadata(runStep.index);
       return;
     }
 
@@ -2173,6 +2181,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
 
       if (result.type === ContentTypes.SUMMARY && 'summary' in result) {
         contentParts[runStep.index] = result.summary as t.MessageContentComplex;
+        applyContentMetadata(runStep.index);
       } else if ('tool_call' in result) {
         const contentPart: t.MessageContentComplex = {
           type: ContentTypes.TOOL_CALL,

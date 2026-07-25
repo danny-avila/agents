@@ -1,12 +1,22 @@
 // src/specs/agent-handoffs.test.ts
+import { MemorySaver } from '@langchain/langgraph';
 import { DynamicStructuredTool } from '@langchain/core/tools';
-import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  HumanMessage,
+  ToolMessage,
+  getBufferString,
+} from '@langchain/core/messages';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { Providers, GraphEvents, Constants } from '@/common';
+import { createHandlers } from '@/utils/handlers';
 import { StandardGraph } from '@/graphs/Graph';
 import { ToolNode } from '@/tools/ToolNode';
+import { FakeChatModel } from '@/llm/fake';
 import * as events from '@/utils/events';
 import { Run } from '@/run';
 
@@ -39,6 +49,100 @@ const findToolByName = (
   name: string
 ): t.GraphTools[0] | undefined => {
   return tools?.find((tool) => getToolName(tool) === name);
+};
+
+type HandoffModelScript = {
+  promptMarker: string;
+  response: string;
+  toolCalls?: ToolCall[];
+};
+
+function validateToolHistory(messages: t.BaseGraphState['messages']): void {
+  const toolCallIds = new Set<string>();
+  const toolResultIds = new Set<string>();
+  for (const message of messages) {
+    if (message.getType() === 'ai') {
+      for (const toolCall of (message as AIMessage).tool_calls ?? []) {
+        if (toolCall.id != null) {
+          toolCallIds.add(toolCall.id);
+        }
+      }
+    } else if (message.getType() === 'tool') {
+      toolResultIds.add((message as ToolMessage).tool_call_id);
+    }
+  }
+  for (const toolCallId of toolCallIds) {
+    if (!toolResultIds.has(toolCallId)) {
+      throw new Error(`Tool call ${toolCallId} has no matching result`);
+    }
+  }
+  for (const toolResultId of toolResultIds) {
+    if (!toolCallIds.has(toolResultId)) {
+      throw new Error(`Tool result ${toolResultId} has no matching call`);
+    }
+  }
+}
+
+class ScriptedHandoffModel extends FakeChatModel {
+  private scripts: HandoffModelScript[];
+
+  constructor(scripts: HandoffModelScript[]) {
+    super({ responses: [''] });
+    this.scripts = scripts;
+  }
+
+  override async *_streamResponseChunks(
+    messages: t.BaseGraphState['messages'],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    validateToolHistory(messages);
+    const prompt = getBufferString(messages);
+    let script: HandoffModelScript | undefined;
+    let latestMarkerIndex = -1;
+    for (const candidate of this.scripts) {
+      const markerIndex = prompt.lastIndexOf(candidate.promptMarker);
+      if (markerIndex > latestMarkerIndex) {
+        script = candidate;
+        latestMarkerIndex = markerIndex;
+      }
+    }
+    if (script == null) {
+      throw new Error(`No handoff model script matched prompt: ${prompt}`);
+    }
+    const model = new FakeChatModel({
+      responses: [script.response],
+      toolCalls: script.toolCalls,
+    });
+    yield* model._streamResponseChunks(messages, options, runManager);
+  }
+}
+
+type HandoffReceptionProbe = {
+  processHandoffReception(
+    messages: t.BaseGraphState['messages'],
+    agentId: string
+  ): {
+    instructions: string | null;
+    parallelGroupId?: number;
+  } | null;
+};
+
+type PendingSend = {
+  node: string;
+  args: { messages?: t.BaseGraphState['messages'] };
+};
+
+const isPendingSend = (value: unknown): value is PendingSend => {
+  if (value == null || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as { node?: unknown; args?: unknown };
+  return (
+    typeof candidate.node === 'string' &&
+    candidate.args != null &&
+    typeof candidate.args === 'object'
+  );
 };
 
 /**
@@ -510,6 +614,632 @@ describe('Agent Handoffs Tests', () => {
     });
   });
 
+  describe('Parallel Handoffs', () => {
+    it('should expose one runtime group on simultaneous destination content', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'You are a router'),
+        createBasicAgent('left', 'You are the left specialist'),
+        createBasicAgent('right', 'You are the right specialist'),
+      ];
+      const edges: t.GraphEdge[] = [
+        { from: 'router', to: 'left', edgeType: 'handoff' },
+        { from: 'router', to: 'right', edgeType: 'handoff' },
+      ];
+      const { contentParts, handlers } = createHandlers();
+      const runConfig = createTestConfig(agents, edges);
+      runConfig.customHandlers = handlers;
+      const run = await Run.create(runConfig);
+
+      run.Graph?.overrideTestModel(
+        ['Routing', 'Left complete', 'Right complete'],
+        10,
+        [
+          {
+            id: 'tool_call_left',
+            name: `${Constants.LC_TRANSFER_TO_}left`,
+            args: {},
+          } as ToolCall,
+          {
+            id: 'tool_call_right',
+            name: `${Constants.LC_TRANSFER_TO_}right`,
+            args: {},
+          } as ToolCall,
+        ]
+      );
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: { thread_id: 'test-parallel-handoff-group-thread' },
+        streamMode: 'values',
+        version: 'v2',
+      };
+      await run.processStream(
+        { messages: [new HumanMessage('Run both specialists')] },
+        config
+      );
+
+      const definedParts = contentParts.filter(
+        (part): part is t.MessageContentComplex => part != null
+      );
+      const routerParts = definedParts.filter(
+        (part) => part.agentId === 'router'
+      );
+      const leftParts = definedParts.filter((part) => part.agentId === 'left');
+      const rightParts = definedParts.filter(
+        (part) => part.agentId === 'right'
+      );
+      const leftGroupId = leftParts[0]?.groupId;
+
+      expect(routerParts.length).toBeGreaterThan(0);
+      expect(routerParts.every((part) => part.groupId == null)).toBe(true);
+      expect(leftParts.length).toBeGreaterThan(0);
+      expect(rightParts.length).toBeGreaterThan(0);
+      expect(leftGroupId).toEqual(expect.any(Number));
+      expect(leftParts.every((part) => part.groupId === leftGroupId)).toBe(
+        true
+      );
+      expect(rightParts.every((part) => part.groupId === leftGroupId)).toBe(
+        true
+      );
+    });
+
+    it('should checkpoint one durable group ID before parallel recipients run', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'You are a router'),
+        createBasicAgent('left', 'You are the left specialist'),
+        createBasicAgent('right', 'You are the right specialist'),
+      ];
+      const edges: t.GraphEdge[] = [
+        { from: 'router', to: 'left', edgeType: 'handoff' },
+        { from: 'router', to: 'right', edgeType: 'handoff' },
+      ];
+      const checkpointer = new MemorySaver();
+      const runConfig = createTestConfig(agents, edges);
+      runConfig.graphConfig.compileOptions = { checkpointer };
+      const run = await Run.create(runConfig);
+
+      run.Graph?.overrideTestModel(
+        ['Routing', 'Left complete', 'Right complete'],
+        10,
+        [
+          {
+            id: 'tool_call_checkpoint_left',
+            name: `${Constants.LC_TRANSFER_TO_}left`,
+            args: {},
+          } as ToolCall,
+          {
+            id: 'tool_call_checkpoint_right',
+            name: `${Constants.LC_TRANSFER_TO_}right`,
+            args: {},
+          } as ToolCall,
+        ]
+      );
+
+      const threadId = 'test-parallel-handoff-checkpoint-thread';
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+        durability: 'sync';
+      } = {
+        configurable: { thread_id: threadId },
+        streamMode: 'values',
+        version: 'v2',
+        durability: 'sync',
+      };
+      const historicalToolCall = {
+        id: 'tool_call_before_parallel_handoff',
+        name: 'historical_lookup',
+        args: {},
+      };
+      await run.processStream(
+        {
+          messages: [
+            new HumanMessage('Look this up first'),
+            new AIMessage({ content: '', tool_calls: [historicalToolCall] }),
+            new ToolMessage({
+              content: 'Historical result',
+              name: historicalToolCall.name,
+              tool_call_id: historicalToolCall.id,
+            }),
+            new HumanMessage('Run both specialists'),
+          ],
+        },
+        config
+      );
+
+      let persistedHandoffs: ToolMessage[] = [];
+      let persistedSends: PendingSend[] = [];
+      for await (const tuple of checkpointer.list({
+        configurable: { thread_id: threadId },
+      })) {
+        const sends = (tuple.pendingWrites ?? [])
+          .filter(([, channel]) => channel === '__pregel_tasks')
+          .map(([, , value]) => value)
+          .filter(isPendingSend)
+          .filter(({ node }) => node === 'left' || node === 'right');
+        const handoffs = sends.flatMap((send) =>
+          (send.args.messages ?? []).filter(
+            (message): message is ToolMessage =>
+              message.getType() === 'tool' &&
+              message.name === `${Constants.LC_TRANSFER_TO_}${send.node}`
+          )
+        );
+        if (handoffs.length === 2) {
+          persistedHandoffs = handoffs;
+          persistedSends = sends;
+          break;
+        }
+      }
+
+      expect(persistedHandoffs).toHaveLength(2);
+      const persistedGroupIds = persistedHandoffs.map(
+        (message) => message.additional_kwargs[Constants.HANDOFF_GROUP_ID]
+      );
+      const persistedBatchIds = persistedHandoffs.map(
+        (message) => message.additional_kwargs[Constants.HANDOFF_PARALLEL_BATCH]
+      );
+      const persistedGroupId = persistedGroupIds[0];
+      if (typeof persistedGroupId !== 'number') {
+        throw new Error('Expected a persisted numeric handoff group ID');
+      }
+
+      expect(Number.isSafeInteger(persistedGroupId)).toBe(true);
+      expect(persistedGroupId).toBeGreaterThanOrEqual(2 ** 48);
+      expect(persistedGroupIds[1]).toBe(persistedGroupId);
+      expect(persistedBatchIds[0]).toEqual(expect.any(String));
+      expect(persistedBatchIds[1]).toBe(persistedBatchIds[0]);
+
+      const historicalResults = persistedSends.flatMap((send) =>
+        (send.args.messages ?? []).filter(
+          (message): message is ToolMessage =>
+            message.getType() === 'tool' &&
+            (message as ToolMessage).tool_call_id === historicalToolCall.id
+        )
+      );
+      expect(historicalResults).toHaveLength(2);
+      for (const result of historicalResults) {
+        expect(
+          result.additional_kwargs[Constants.HANDOFF_PARALLEL_BATCH]
+        ).toBeUndefined();
+        expect(
+          result.additional_kwargs[Constants.HANDOFF_GROUP_ID]
+        ).toBeUndefined();
+        expect(
+          result.additional_kwargs.handoff_parallel_siblings
+        ).toBeUndefined();
+      }
+    });
+
+    it('should suppress a static group when a hybrid router selects one handoff', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'You are a router'),
+        createBasicAgent('left', 'You are the left specialist'),
+        createBasicAgent('right', 'You are the right specialist'),
+      ];
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: ['left', 'right'],
+          edgeType: 'direct',
+        },
+        { from: 'router', to: 'left', edgeType: 'handoff' },
+        { from: 'router', to: 'right', edgeType: 'handoff' },
+      ];
+      const { contentParts, handlers } = createHandlers();
+      const runConfig = createTestConfig(agents, edges);
+      runConfig.customHandlers = handlers;
+      const run = await Run.create(runConfig);
+
+      run.Graph?.overrideTestModel(['Routing', 'Left complete'], 10, [
+        {
+          id: 'tool_call_left_only',
+          name: `${Constants.LC_TRANSFER_TO_}left`,
+          args: {},
+        } as ToolCall,
+      ]);
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: { thread_id: 'test-hybrid-handoff-group-thread' },
+        streamMode: 'values',
+        version: 'v2',
+      };
+      await run.processStream(
+        { messages: [new HumanMessage('Run only the left specialist')] },
+        config
+      );
+
+      const definedParts = contentParts.filter(
+        (part): part is t.MessageContentComplex => part != null
+      );
+      const leftParts = definedParts.filter((part) => part.agentId === 'left');
+      const rightParts = definedParts.filter(
+        (part) => part.agentId === 'right'
+      );
+
+      expect(leftParts.length).toBeGreaterThan(0);
+      expect(leftParts.every((part) => part.groupId == null)).toBe(true);
+      expect(rightParts).toHaveLength(0);
+    });
+
+    it('should not reuse a historical handoff when a target is later reached directly', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'historical-router-marker'),
+        createBasicAgent('recipient', 'historical-recipient-agent-marker'),
+        createBasicAgent('sibling', 'historical-sibling-agent-marker'),
+      ];
+      const edges: t.GraphEdge[] = [
+        { from: 'router', to: 'recipient', edgeType: 'direct' },
+        {
+          from: 'router',
+          to: 'recipient',
+          edgeType: 'handoff',
+          prompt: 'Instructions for the recipient',
+        },
+        {
+          from: 'router',
+          to: 'sibling',
+          edgeType: 'handoff',
+          prompt: 'Instructions for the sibling',
+        },
+      ];
+      const run = await Run.create(createTestConfig(agents, edges));
+      if (run.Graph == null) {
+        throw new Error('Expected a multi-agent graph');
+      }
+      run.Graph.overrideModel = new ScriptedHandoffModel([
+        {
+          promptMarker: 'stale-recipient-instructions-marker',
+          response: 'Historical recipient complete',
+        },
+        {
+          promptMarker: 'second-direct-request-marker',
+          response: 'Direct pass complete',
+        },
+      ]);
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-historical-handoff-direct-thread',
+        },
+        streamMode: 'values',
+        version: 'v2',
+      };
+      const historicalToolCall = {
+        id: 'tool_call_historical_recipient',
+        name: `${Constants.LC_TRANSFER_TO_}recipient`,
+        args: { instructions: 'stale-recipient-instructions-marker' },
+      };
+      await run.processStream(
+        {
+          messages: [
+            new HumanMessage('first-historical-request-marker'),
+            new AIMessage({ content: '', tool_calls: [historicalToolCall] }),
+            new ToolMessage({
+              content:
+                'Successfully transferred to recipient\n\nInstructions: stale-recipient-instructions-marker',
+              name: historicalToolCall.name,
+              tool_call_id: historicalToolCall.id,
+              additional_kwargs: {
+                handoff_source_name: 'Router',
+                handoff_instructions: 'stale-recipient-instructions-marker',
+                handoff_parallel_siblings: ['sibling'],
+                [Constants.HANDOFF_GROUP_ID]: 2 ** 48 + 1,
+              },
+            }),
+            new HumanMessage('second-direct-request-marker'),
+          ],
+        },
+        config
+      );
+
+      const recipientSteps = run.Graph.getRunSteps('recipient');
+      expect(recipientSteps.length).toBeGreaterThan(0);
+      expect(recipientSteps.every((step) => step.groupId == null)).toBe(true);
+      const directPassMessages = run
+        .getRunMessages()
+        ?.filter(
+          (message) =>
+            message.getType() === 'ai' &&
+            message.content === 'Direct pass complete'
+        );
+      expect(directPassMessages).toHaveLength(2);
+    });
+
+    it('should clear the handoff identity before a direct re-entry', async () => {
+      const agents: t.AgentInputs[] = [
+        {
+          ...createBasicAgent('router', 'stale-context-router-marker'),
+          name: 'Router',
+        },
+        {
+          ...createBasicAgent('recipient', 'stale-context-recipient-marker'),
+          name: 'Recipient',
+        },
+        {
+          ...createBasicAgent('sibling', 'stale-context-sibling-marker'),
+          name: 'Sibling',
+        },
+        {
+          ...createBasicAgent('relay', 'stale-context-relay-marker'),
+          name: 'Relay',
+        },
+      ];
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'recipient',
+          edgeType: 'handoff',
+          prompt: 'Instructions for the recipient',
+        },
+        {
+          from: 'router',
+          to: 'sibling',
+          edgeType: 'handoff',
+          prompt: 'Instructions for the sibling',
+        },
+        {
+          from: 'recipient',
+          to: 'relay',
+          edgeType: 'handoff',
+          prompt: 'Instructions for the relay',
+        },
+        { from: 'relay', to: 'recipient', edgeType: 'direct' },
+      ];
+      const run = await Run.create(createTestConfig(agents, edges));
+      if (run.Graph == null) {
+        throw new Error('Expected a multi-agent graph');
+      }
+      const model = new ScriptedHandoffModel([
+        {
+          promptMarker: 'stale-context-router-marker',
+          response: 'Routing in parallel',
+          toolCalls: [
+            {
+              id: 'tool_call_stale_context_recipient',
+              name: `${Constants.LC_TRANSFER_TO_}recipient`,
+              args: { instructions: 'recipient-first-handoff-marker' },
+            },
+            {
+              id: 'tool_call_stale_context_sibling',
+              name: `${Constants.LC_TRANSFER_TO_}sibling`,
+              args: { instructions: 'sibling-first-handoff-marker' },
+            },
+          ],
+        },
+        {
+          promptMarker: 'recipient-first-handoff-marker',
+          response: 'Sending through relay',
+          toolCalls: [
+            {
+              id: 'tool_call_stale_context_relay',
+              name: `${Constants.LC_TRANSFER_TO_}relay`,
+              args: { instructions: 'relay-handoff-marker' },
+            },
+          ],
+        },
+        {
+          promptMarker: 'sibling-first-handoff-marker',
+          response: 'Sibling complete',
+        },
+        {
+          promptMarker: 'relay-handoff-marker',
+          response: 'relay-direct-reentry-marker',
+        },
+        {
+          promptMarker: 'relay-direct-reentry-marker',
+          response: 'Recipient direct complete',
+        },
+      ]);
+      run.Graph.overrideModel = model;
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-clear-handoff-context-direct-reentry-thread',
+        },
+        streamMode: 'values',
+        version: 'v2',
+      };
+      await run.processStream(
+        { messages: [new HumanMessage('stale-context-router-marker')] },
+        config
+      );
+
+      const recipientContext = run.Graph.agentContexts.get('recipient');
+      const recipientSystemRunnable = recipientContext?.systemRunnable;
+      if (recipientSystemRunnable == null) {
+        throw new Error('Expected recipient system instructions');
+      }
+      const recipientSystemPrompt = getBufferString(
+        await recipientSystemRunnable.invoke([])
+      );
+      expect(recipientSystemPrompt).toContain('stale-context-recipient-marker');
+      expect(recipientSystemPrompt).not.toContain('## Multi-Agent Workflow');
+      expect(recipientSystemPrompt).not.toContain('transferred from "Router"');
+      expect(recipientSystemPrompt).not.toContain('Running in parallel with:');
+    });
+
+    it('should clear the runtime group after a parallel target hands off sequentially', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'router-script-marker'),
+        createBasicAgent('left', 'left-script-marker'),
+        createBasicAgent('right', 'right-script-marker'),
+        createBasicAgent('final', 'final-script-marker'),
+      ];
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'left',
+          edgeType: 'handoff',
+          prompt: 'Instructions for the left specialist',
+        },
+        {
+          from: 'router',
+          to: 'right',
+          edgeType: 'handoff',
+          prompt: 'Instructions for the right specialist',
+        },
+        {
+          from: 'left',
+          to: 'final',
+          edgeType: 'handoff',
+          prompt: 'Instructions for the final specialist',
+        },
+      ];
+      const run = await Run.create(createTestConfig(agents, edges));
+      if (run.Graph == null) {
+        throw new Error('Expected a multi-agent graph');
+      }
+      run.Graph.overrideModel = new ScriptedHandoffModel([
+        {
+          promptMarker: 'router-script-marker',
+          response: 'Routing',
+          toolCalls: [
+            {
+              id: 'tool_call_nested_left',
+              name: `${Constants.LC_TRANSFER_TO_}left`,
+              args: { instructions: 'left-script-marker' },
+            },
+            {
+              id: 'tool_call_nested_right',
+              name: `${Constants.LC_TRANSFER_TO_}right`,
+              args: { instructions: 'right-script-marker' },
+            },
+          ],
+        },
+        {
+          promptMarker: 'left-script-marker',
+          response: 'Forwarding',
+          toolCalls: [
+            {
+              id: 'tool_call_nested_final',
+              name: `${Constants.LC_TRANSFER_TO_}final`,
+              args: { instructions: 'final-script-marker' },
+            },
+          ],
+        },
+        {
+          promptMarker: 'right-script-marker',
+          response: 'Right complete',
+        },
+        {
+          promptMarker: 'final-script-marker',
+          response: 'Final complete',
+        },
+      ]);
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: { thread_id: 'test-nested-handoff-group-thread' },
+        streamMode: 'values',
+        version: 'v2',
+      };
+      await run.processStream(
+        { messages: [new HumanMessage('router-script-marker')] },
+        config
+      );
+
+      const leftSteps = run.Graph.getRunSteps('left');
+      const rightSteps = run.Graph.getRunSteps('right');
+      const finalSteps = run.Graph.getRunSteps('final');
+      const parallelGroupId = leftSteps[0]?.groupId;
+
+      expect(parallelGroupId).toEqual(expect.any(Number));
+      expect(rightSteps.length).toBeGreaterThan(0);
+      expect(rightSteps.every((step) => step.groupId === parallelGroupId)).toBe(
+        true
+      );
+      expect(finalSteps.length).toBeGreaterThan(0);
+      expect(finalSteps.every((step) => step.groupId == null)).toBe(true);
+    });
+
+    it('should remove every transfer call from mixed conditional recipient history', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'mixed-router-marker'),
+        createBasicAgent('left', 'mixed-left-marker'),
+        createBasicAgent('right', 'mixed-right-marker'),
+      ];
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'left',
+          edgeType: 'handoff',
+          prompt: 'Instructions for the left specialist',
+        },
+        {
+          from: 'router',
+          to: 'right',
+          condition: () => 'right',
+          prompt: 'Instructions for the right specialist',
+        },
+      ];
+      const run = await Run.create(createTestConfig(agents, edges));
+      if (run.Graph == null) {
+        throw new Error('Expected a multi-agent graph');
+      }
+      run.Graph.overrideModel = new ScriptedHandoffModel([
+        {
+          promptMarker: 'mixed-router-marker',
+          response: 'Routing',
+          toolCalls: [
+            {
+              id: 'tool_call_mixed_left',
+              name: `${Constants.LC_TRANSFER_TO_}left`,
+              args: { instructions: 'mixed-left-marker' },
+            },
+            {
+              id: 'tool_call_mixed_right',
+              name: 'conditional_transfer',
+              args: { instructions: 'mixed-right-marker' },
+            },
+          ],
+        },
+        {
+          promptMarker: 'mixed-left-marker',
+          response: 'Left complete',
+        },
+        {
+          promptMarker: 'mixed-right-marker',
+          response: 'Right complete',
+        },
+      ]);
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: { thread_id: 'test-mixed-parallel-handoff-thread' },
+        streamMode: 'values',
+        version: 'v2',
+      };
+      await expect(
+        run.processStream(
+          { messages: [new HumanMessage('mixed-router-marker')] },
+          config
+        )
+      ).resolves.toBeDefined();
+
+      const leftSteps = run.Graph.getRunSteps('left');
+      const rightSteps = run.Graph.getRunSteps('right');
+      const groupId = leftSteps[0]?.groupId;
+      expect(groupId).toEqual(expect.any(Number));
+      expect(rightSteps.length).toBeGreaterThan(0);
+      expect(rightSteps.every((step) => step.groupId === groupId)).toBe(true);
+    });
+  });
+
   describe('Handoffs with Prompts', () => {
     it('should create handoff tool with prompt parameter when prompt is specified', async () => {
       const agents: t.AgentInputs[] = [
@@ -627,6 +1357,178 @@ describe('Agent Handoffs Tests', () => {
       expect(handoffMessage).toBeDefined();
       // Tool message should contain the prompt key and value
       expect(handoffMessage?.content).toContain('Context:');
+    });
+
+    it('should deliver custom prompt key content to the receiving agent', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+          prompt: 'Brief for agent B',
+          promptKey: 'brief',
+        },
+      ];
+      const run = await Run.create(createTestConfig(agents, edges));
+      const brief = 'Investigate the cache invalidation path';
+      const rawBrief = `  ${brief}\n`;
+
+      run.Graph?.overrideTestModel(
+        ['Transferring', 'Investigation complete'],
+        10,
+        [
+          {
+            id: 'tool_call_custom_prompt',
+            name: `${Constants.LC_TRANSFER_TO_}agent_b`,
+            args: { brief: rawBrief },
+          } as ToolCall,
+        ]
+      );
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: { thread_id: 'test-custom-prompt-key-thread' },
+        streamMode: 'values',
+        version: 'v2',
+      };
+      await run.processStream(
+        { messages: [new HumanMessage('Delegate this investigation')] },
+        config
+      );
+
+      const receivedBrief = run
+        .getRunMessages()
+        ?.some(
+          (message) =>
+            message.getType() === 'human' && message.content === brief
+        );
+      expect(receivedBrief).toBe(true);
+      expect(
+        run
+          .getRunMessages()
+          ?.some(
+            (message) =>
+              message.getType() === 'human' && message.content === rawBrief
+          )
+      ).toBe(false);
+    });
+
+    it('should deliver custom prompt key content through a conditional handoff', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          condition: () => 'agent_b',
+          prompt: 'Brief for agent B',
+          promptKey: 'brief',
+        },
+      ];
+      const run = await Run.create(createTestConfig(agents, edges));
+      const brief = 'Review the conditional routing result';
+
+      run.Graph?.overrideTestModel(['Transferring', 'Review complete'], 10, [
+        {
+          id: 'tool_call_conditional_prompt',
+          name: 'conditional_transfer',
+          args: { brief },
+        } as ToolCall,
+      ]);
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-conditional-custom-prompt-key-thread',
+        },
+        streamMode: 'values',
+        version: 'v2',
+      };
+      await run.processStream(
+        { messages: [new HumanMessage('Delegate conditionally')] },
+        config
+      );
+
+      const receivedBrief = run
+        .getRunMessages()
+        ?.some(
+          (message) =>
+            message.getType() === 'human' && message.content === brief
+        );
+      expect(receivedBrief).toBe(true);
+    });
+
+    it('should recover a complete custom-key payload from a legacy checkpoint', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+          prompt: 'Brief for agent B',
+          promptKey: 'brief',
+        },
+      ];
+      const run = await Run.create(createTestConfig(agents, edges));
+      const graph = run.Graph as unknown as HandoffReceptionProbe;
+      const toolCall = {
+        id: 'tool_call_legacy_prompt',
+        name: `${Constants.LC_TRANSFER_TO_}agent_b`,
+        args: {},
+      };
+      const payload =
+        'Inspect the routing decision.\nContext: retain this entire line.';
+      const context = graph.processHandoffReception(
+        [
+          new AIMessage({ content: '', tool_calls: [toolCall] }),
+          new ToolMessage({
+            content: `Successfully transferred to agent_b\n\nBrief: ${payload}`,
+            name: toolCall.name,
+            tool_call_id: toolCall.id,
+          }),
+        ],
+        'agent_b'
+      );
+
+      expect(context?.instructions).toBe(payload);
+
+      const whitespaceContext = graph.processHandoffReception(
+        [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              {
+                id: 'tool_call_whitespace_prompt',
+                name: `${Constants.LC_TRANSFER_TO_}agent_b`,
+                args: {},
+              },
+            ],
+          }),
+          new ToolMessage({
+            content: 'Successfully transferred to agent_b\n\nBrief:   ',
+            name: `${Constants.LC_TRANSFER_TO_}agent_b`,
+            tool_call_id: 'tool_call_whitespace_prompt',
+            additional_kwargs: {
+              handoff_instructions: '  \n ',
+            },
+          }),
+        ],
+        'agent_b'
+      );
+      expect(whitespaceContext?.instructions).toBe('');
     });
   });
 

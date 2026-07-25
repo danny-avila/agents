@@ -125,6 +125,89 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
     expect(part.model).toBe('claude-sonnet-4-5');
   });
 
+  it('preserves agent and parallel-group metadata on summary completion', () => {
+    const { aggregateContent, contentParts } = createContentAggregator();
+
+    const runStep: t.RunStep = {
+      stepIndex: 0,
+      id: 'step_sum_3',
+      type: StepTypes.MESSAGE_CREATION,
+      index: 0,
+      agentId: 'researcher',
+      groupId: 7,
+      stepDetails: {
+        type: StepTypes.MESSAGE_CREATION,
+        message_creation: { message_id: 'step_sum_3' },
+      },
+      summary: {
+        type: ContentTypes.SUMMARY,
+        content: [],
+        tokenCount: 0,
+        provider: 'openai',
+      },
+      usage: null,
+    };
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: runStep,
+    });
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_COMPLETED,
+      data: {
+        result: {
+          id: 'step_sum_3',
+          index: 0,
+          type: ContentTypes.SUMMARY,
+          summary: {
+            type: ContentTypes.SUMMARY,
+            content: [{ type: ContentTypes.TEXT, text: 'Step summary' }],
+            tokenCount: 4,
+            provider: 'openai',
+          },
+        },
+      } as unknown as { result: t.ToolEndEvent },
+    });
+
+    expect(contentParts[0]).toEqual(
+      expect.objectContaining({
+        type: ContentTypes.SUMMARY,
+        content: [{ type: ContentTypes.TEXT, text: 'Step summary' }],
+        agentId: 'researcher',
+        groupId: 7,
+      })
+    );
+
+    aggregateContent({
+      event: GraphEvents.ON_SUMMARIZE_COMPLETE,
+      data: {
+        id: 'step_sum_3',
+        agentId: 'researcher',
+        summary: {
+          type: ContentTypes.SUMMARY,
+          content: [{ type: ContentTypes.TEXT, text: 'Final summary' }],
+          tokenCount: 5,
+          provider: 'openai',
+          boundary: {
+            messageId: 'step_sum_3',
+            contentIndex: 0,
+          },
+        },
+      } as t.SummarizeCompleteEvent,
+    });
+
+    expect(contentParts[0]).toEqual(
+      expect.objectContaining({
+        type: ContentTypes.SUMMARY,
+        content: [{ type: ContentTypes.TEXT, text: 'Final summary' }],
+        tokenCount: 5,
+        agentId: 'researcher',
+        groupId: 7,
+      })
+    );
+  });
+
   it('handles delta when no run step exists', () => {
     const { aggregateContent, contentParts } = createContentAggregator();
 
