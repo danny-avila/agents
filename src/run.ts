@@ -727,10 +727,18 @@ export class Run<_T extends t.BaseGraphState> {
         typeof config.configurable?.checkpoint_ns === 'string'
           ? config.configurable.checkpoint_ns
           : '';
+      const checkpointId =
+        typeof config.configurable?.checkpoint_id === 'string'
+          ? config.configurable.checkpoint_id
+          : '';
       const checkpointScope =
         checkpointThreadId == null
           ? undefined
-          : `${checkpointThreadId.length}:${checkpointThreadId}:${checkpointNamespace}`;
+          : JSON.stringify([
+            checkpointThreadId,
+            checkpointNamespace,
+            checkpointId,
+          ]);
       graph.resetValues(streamOptions?.keepContent, checkpointScope);
     }
     this._interrupt = undefined;

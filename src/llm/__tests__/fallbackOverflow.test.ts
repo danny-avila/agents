@@ -181,6 +181,23 @@ describe('tryFallbackProviders surfacing', () => {
     expect(attribution?.provider).toBe(Providers.ANTHROPIC);
   });
 
+  it('continues past a frozen fallback error', async () => {
+    const fallbackOverflow = Object.freeze(
+      signatureError('claude-haiku-4-5-20251001')
+    );
+    stubModels([fallbackOverflow, 'ok']);
+
+    const result = await tryFallbackProviders({
+      fallbacks,
+      messages,
+      primaryError: new Error('primary boom'),
+    });
+
+    expect((result?.messages?.[0] as AIMessageChunk | undefined)?.content).toBe(
+      'ok'
+    );
+  });
+
   it('leaves a primary overflow unattributed', async () => {
     stubModels([new Error('first failed'), new Error('second failed')]);
 

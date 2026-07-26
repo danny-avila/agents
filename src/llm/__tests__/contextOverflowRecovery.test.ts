@@ -2,6 +2,7 @@ import { describe, expect, it } from '@jest/globals';
 import {
   planContextOverflowRecovery,
   DEFAULT_MAX_OVERFLOW_RECOVERIES,
+  translateRecoveryBudget,
 } from '@/llm/contextOverflowRecovery';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
 import { Providers } from '@/common';
@@ -50,6 +51,28 @@ describe('planContextOverflowRecovery', () => {
 
     expect(plan?.observedCalibrationRatio).toBeCloseTo(1.333, 2);
     expect(plan?.budgetTokens).toBe(Math.floor((32_768 - 16) * 0.95));
+  });
+
+  it('calibrates message tokens without scaling fixed instruction overhead', () => {
+    const error = {
+      message:
+        'This model\'s maximum context length is 4096 tokens. However, your messages resulted in 1400 tokens.',
+    };
+    const plan = planContextOverflowRecovery({
+      error,
+      provider: Providers.OPENAI,
+      maxContextTokens: 4_096,
+      estimatedPromptTokens: 1_000,
+      calibrationRatio: 2,
+      instructionTokens: 600,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan?.observedCalibrationRatio).toBe(4);
+  });
+
+  it('translates fallback budgets into the primary pruner calibration', () => {
+    expect(translateRecoveryBudget(80_000, 2, 1.5)).toBe(60_000);
   });
 
   it('recovers on a small-window model despite the absolute floor', () => {

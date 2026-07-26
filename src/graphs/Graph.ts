@@ -59,6 +59,10 @@ import {
   StepTypes,
 } from '@/common';
 import {
+  planContextOverflowRecovery,
+  translateRecoveryBudget,
+} from '@/llm/contextOverflowRecovery';
+import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
@@ -77,7 +81,6 @@ import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
-import { planContextOverflowRecovery } from '@/llm/contextOverflowRecovery';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
@@ -1546,8 +1549,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     agentContext.preserveOriginalToolContent(originalToolContent);
     agentContext.applyContextBudgetCorrection(
       recovery.budgetTokens,
-      estimatedPromptTokens,
-      !allowSummarization
+      estimatedPromptTokens
     );
     agentContext.applyObservedOverflowCalibration(
       recovery.info.provider,
@@ -1770,13 +1772,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * AgentContext bounds what accumulates.
          */
         agentContext.preserveOriginalToolContent(originalToolContent);
-        /**
-         * Consumed once per pass so a compression-only retry suppresses the
-         * configured trigger exactly here — the summarize node's skip would
-         * otherwise hand control straight back and the ordinary trigger would
-         * spend the summarization call the staging exists to avoid.
-         */
-        const compressionRetryPending = agentContext.consumeCompressionRetry();
         agentContext.indexTokenCountMap = indexTokenCountMap;
         if (calibrationRatio != null && calibrationRatio > 0) {
           agentContext.calibrationRatio = calibrationRatio;
@@ -1845,7 +1840,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           );
           const triggerResult =
             !shouldSkip &&
-            !compressionRetryPending &&
             shouldTriggerSummarization({
               trigger: agentContext.summarizationConfig?.trigger,
               maxContextTokens: agentContext.maxContextTokens,
@@ -2392,7 +2386,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
            * as an alternative in the first place.
            */
           const fallbackContext = getFallbackErrorContext(error);
-          return planContextOverflowRecovery({
+          const recovery = planContextOverflowRecovery({
             error,
             provider: fallbackContext?.provider ?? agentContext.provider,
             maxContextTokens:
@@ -2406,6 +2400,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             ),
             attemptsSoFar: agentContext.overflowRecoveryAttempts,
           });
+          if (
+            recovery == null ||
+            fallbackContext == null ||
+            fallbackContext.provider === agentContext.provider
+          ) {
+            return recovery;
+          }
+          return {
+            ...recovery,
+            budgetTokens: translateRecoveryBudget(
+              recovery.budgetTokens,
+              recovery.observedCalibrationRatio,
+              agentContext.calibrationRatio
+            ),
+          };
         };
 
         const recovery = planRecovery(primaryError);

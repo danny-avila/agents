@@ -1,11 +1,11 @@
 import { MemorySaver } from '@langchain/langgraph';
 import { describe, expect, it } from '@jest/globals';
+import { Runnable } from '@langchain/core/runnables';
 import {
   AIMessageChunk,
   HumanMessage,
   AIMessage,
 } from '@langchain/core/messages';
-import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
@@ -40,13 +40,16 @@ function throwable(fields: Record<string, unknown>): Error {
  * answers normally — the shape of a run that overflows and then fits after
  * compaction.
  */
-class OverflowThenSucceedModel implements t.ChatModel {
+class OverflowThenSucceedModel extends Runnable<BaseMessage[], AIMessageChunk> {
+  lc_namespace = ['tests'];
   readonly calls: BaseMessage[][] = [];
 
   constructor(
     private readonly error: Record<string, unknown>,
     private readonly failures = 1
-  ) {}
+  ) {
+    super();
+  }
 
   private record(messages: BaseMessage[]): void {
     this.calls.push(messages);
@@ -58,16 +61,6 @@ class OverflowThenSucceedModel implements t.ChatModel {
   async invoke(messages: BaseMessage[]): Promise<AIMessageChunk> {
     this.record(messages);
     return new AIMessageChunk({ content: 'recovered' });
-  }
-
-  async stream(
-    messages: BaseMessage[],
-    _config?: RunnableConfig
-  ): Promise<AsyncIterable<AIMessageChunk>> {
-    this.record(messages);
-    return (async function* chunks(): AsyncGenerator<AIMessageChunk> {
-      yield new AIMessageChunk({ content: 'recovered' });
-    })();
   }
 }
 
@@ -154,6 +147,33 @@ describe('context overflow recovery', () => {
     agentContext.preserveOriginalToolContent(new Map([[2, 'thread A']]));
 
     run.Graph.resetValues(undefined, '8:thread-b:branch');
+
+    expect(agentContext.pendingOriginalToolContent).toBeUndefined();
+  });
+
+  it('does not share masked tool originals across checkpoint branches', async () => {
+    const run = await createRun({
+      runId: 'overflow-originals-branch-isolated',
+      maxContextTokens: 1_000_000,
+      checkpointer: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const agentContext = run.Graph.agentContexts.get('default');
+    if (agentContext == null) {
+      throw new Error('Expected default agent context');
+    }
+    run.Graph.resetValues(
+      undefined,
+      JSON.stringify(['thread-a', 'namespace', 'checkpoint-a'])
+    );
+    agentContext.preserveOriginalToolContent(new Map([[2, 'branch A']]));
+
+    run.Graph.resetValues(
+      undefined,
+      JSON.stringify(['thread-a', 'namespace', 'checkpoint-b'])
+    );
 
     expect(agentContext.pendingOriginalToolContent).toBeUndefined();
   });
@@ -355,13 +375,11 @@ describe('context overflow recovery', () => {
     ).toBe(0);
   });
 
-  it('spends no summarization call on the first recovery', async () => {
+  it('summarizes conversation messages pruned on the first recovery', async () => {
     /**
-     * The regression this guards: suppressing the summarize node alone is not
-     * enough, because it hands control straight back to the agent node, where
-     * the *configured* trigger fires by default on the very messages the
-     * re-prune produced — spending the model call the staging exists to
-     * avoid.
+     * The initial overflow detour avoids an unconditional summarization call,
+     * but the corrected prune must still summarize any conversation messages
+     * it moves out of the retained tail.
      */
     const summarizeStarts: unknown[] = [];
     const run = await Run.create<t.IState>({
@@ -402,8 +420,7 @@ describe('context overflow recovery', () => {
 
     expect(content).toEqual([{ type: 'text', text: 'recovered' }]);
     expect(model.calls).toHaveLength(2);
-    /** Recovered on tool-output compression alone. */
-    expect(summarizeStarts).toHaveLength(0);
+    expect(summarizeStarts).toHaveLength(1);
   });
 
   it('keeps the corrected budget in provider units and seeds calibration', async () => {

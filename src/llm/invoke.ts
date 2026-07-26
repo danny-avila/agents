@@ -326,13 +326,7 @@ export interface FallbackErrorContext {
   maxContextTokens?: number;
 }
 
-/**
- * Symbol-keyed so it never appears in `Object.keys`, `JSON.stringify`, or the
- * error-message flattening the overflow classifier performs.
- */
-const FALLBACK_ERROR_CONTEXT = Symbol.for(
-  '@librechat/agents.fallbackErrorContext'
-);
+const fallbackErrorContexts = new WeakMap<object, FallbackErrorContext>();
 
 function attachFallbackErrorContext(
   error: unknown,
@@ -341,12 +335,7 @@ function attachFallbackErrorContext(
   if (typeof error !== 'object' || error === null) {
     return;
   }
-  Object.defineProperty(error, FALLBACK_ERROR_CONTEXT, {
-    value: fallbackContext,
-    enumerable: false,
-    configurable: true,
-    writable: true,
-  });
+  fallbackErrorContexts.set(error, fallbackContext);
 }
 
 /** Reads back the fallback attribution attached by `tryFallbackProviders`. */
@@ -356,9 +345,7 @@ export function getFallbackErrorContext(
   if (typeof error !== 'object' || error === null) {
     return undefined;
   }
-  return (error as Record<symbol, FallbackErrorContext | undefined>)[
-    FALLBACK_ERROR_CONTEXT
-  ];
+  return fallbackErrorContexts.get(error);
 }
 
 /**

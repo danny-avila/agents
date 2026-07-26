@@ -51,13 +51,15 @@ export interface OverflowRecoveryPlan {
   /** What the provider disclosed. Carried through for logging. */
   info: ContextOverflowInfo;
   /**
-   * Provider-reported prompt size divided by our own estimate, when both are
-   * known. Greater than 1 means we under-count relative to this provider.
+   * Provider-reported message tokens divided by our own message estimate,
+   * when both are known. Greater than 1 means we under-count relative to this
+   * provider.
    *
    * Returned separately so the graph can seed the pruner's calibration;
-   * applying it to this plan's budget as well would double-count. Derived
-   * from `info.promptTokens`, never `info.requestedTokens`, since several
-   * providers fold the completion allowance into the latter.
+   * applying it to this plan's budget as well would double-count. Fixed
+   * instruction overhead is removed before deriving it from
+   * `info.promptTokens`, never `info.requestedTokens`, since several providers
+   * fold the completion allowance into the latter.
    */
   observedCalibrationRatio?: number;
 }
@@ -91,6 +93,27 @@ export interface OverflowRecoveryParams {
 
 function isUsable(value: number | undefined): value is number {
   return value != null && Number.isFinite(value) && value > 0;
+}
+
+/**
+ * Converts a provider-space retry budget into the units consumed by a pruner
+ * calibrated for another provider while preserving the same raw-token limit.
+ */
+export function translateRecoveryBudget(
+  budgetTokens: number | undefined,
+  sourceCalibrationRatio: number | undefined,
+  targetCalibrationRatio: number | undefined
+): number | undefined {
+  if (
+    !isUsable(budgetTokens) ||
+    !isUsable(sourceCalibrationRatio) ||
+    !isUsable(targetCalibrationRatio)
+  ) {
+    return budgetTokens;
+  }
+  return Math.floor(
+    (budgetTokens * targetCalibrationRatio) / sourceCalibrationRatio
+  );
 }
 
 /**
@@ -182,10 +205,21 @@ export function planContextOverflowRecovery({
     return null;
   }
 
+  const currentCalibrationRatio = isUsable(calibrationRatio)
+    ? calibrationRatio
+    : 1;
+  const estimatedMessageTokens =
+    isUsable(estimatedPromptTokens) && isUsable(instructionTokens)
+      ? estimatedPromptTokens - instructionTokens
+      : estimatedPromptTokens;
+  const observedMessageTokens =
+    isUsable(info.promptTokens) && isUsable(instructionTokens)
+      ? info.promptTokens - instructionTokens
+      : info.promptTokens;
   const observedCalibrationRatio =
-    isUsable(info.promptTokens) && isUsable(estimatedPromptTokens)
-      ? (info.promptTokens / estimatedPromptTokens) *
-        (isUsable(calibrationRatio) ? calibrationRatio : 1)
+    isUsable(observedMessageTokens) && isUsable(estimatedMessageTokens)
+      ? (observedMessageTokens / estimatedMessageTokens) *
+        currentCalibrationRatio
       : undefined;
 
   const target = resolveTargetBudget(
