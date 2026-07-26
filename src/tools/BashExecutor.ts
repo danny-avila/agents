@@ -11,7 +11,9 @@ import {
   appendCodeSessionFileSummary,
   emptyOutputMessage,
   buildCodeApiHttpErrorMessage,
+  CodeApiRequestError,
   getCodeBaseURL,
+  normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
 } from './CodeExecutor';
 import { Constants } from '@/common';
@@ -250,7 +252,7 @@ function createBashExecutionTool(
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {
-          throw new Error(
+          throw new CodeApiRequestError(
             await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
           );
         }
@@ -291,7 +293,7 @@ function createBashExecutionTool(
         ];
       } catch (error) {
         const messageWithReminder = appendFailedExecutionFileReminder(
-          (error as Error | undefined)?.message ?? '',
+          normalizeCodeApiRequestError(error).message,
           command
         );
         throw new Error(`Execution error:\n\n${messageWithReminder}`);

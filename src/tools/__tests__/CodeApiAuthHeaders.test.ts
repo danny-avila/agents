@@ -145,6 +145,38 @@ describe('CodeAPI auth header injection', () => {
     );
   });
 
+  it('maps dynamic auth-header failures to the safe authorization error', async () => {
+    const authHeaders = jest.fn(async () => {
+      throw new Error(
+        'credential helper failed for secret codeapi-signing-key in namespace internal-auth'
+      );
+    });
+    const tool = createProgrammaticToolCallingTool({ authHeaders });
+
+    const error = await tool
+      .invoke(
+        { code: 'print("hello")' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution is not authorized. Verify access before trying again.'
+    );
+    expect((error as Error).message).not.toContain('Please retry');
+    expect((error as Error).message).not.toContain('codeapi-signing-key');
+    expect((error as Error).message).not.toContain('internal-auth');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('forwards Authorization for direct code execution', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ session_id: 'session_123', stdout: '1\n' })
@@ -202,12 +234,274 @@ describe('CodeAPI auth header injection', () => {
     ).not.toHaveProperty('authHeaders');
   });
 
-  it('includes the CodeAPI endpoint and response body on direct execution failures', async () => {
+  it('redacts the CodeAPI endpoint and response body on direct execution failures', async () => {
     fetchMock.mockResolvedValueOnce(errorResponse(404, 'Cannot POST /exec'));
     const tool = createBashExecutionTool();
 
-    await expect(tool.invoke({ command: 'echo 1' })).rejects.toThrow(
-      /CodeAPI request failed: POST .*\/exec returned 404, body: Cannot POST \/exec/
+    const error = await tool
+      .invoke({ command: 'echo 1' })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution is temporarily unavailable. Please retry.'
+    );
+    expect((error as Error).message).not.toContain('/exec');
+    expect((error as Error).message).not.toContain('Cannot POST');
+  });
+
+  it.each([401, 403])(
+    'reports CodeAPI HTTP %s authorization failures as non-retryable',
+    async (status) => {
+      fetchMock.mockResolvedValueOnce(
+        errorResponse(
+          status,
+          'Invalid bearer token for codeapi.internal.svc.cluster.local'
+        )
+      );
+      const tool = createBashExecutionTool();
+
+      const error = await tool
+        .invoke({ command: 'echo 1' })
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain(
+        'Code execution is not authorized. Verify access before trying again.'
+      );
+      expect((error as Error).message).not.toContain('Please retry');
+      expect((error as Error).message).not.toContain('svc.cluster.local');
+      expect((error as Error).message).not.toContain('Invalid bearer token');
+    }
+  );
+
+  it('preserves only a bounded retry delay from CodeAPI rate-limit failures', async () => {
+    fetchMock.mockResolvedValueOnce(
+      errorResponse(
+        429,
+        JSON.stringify({
+          error: 'rate_limited',
+          message:
+            'Too many CodeAPI execution requests from internal deployment details.',
+          retry_after_seconds: 8.2,
+        })
+      )
+    );
+    const tool = createBashExecutionTool();
+
+    const error = await tool
+      .invoke({ command: 'echo 1' })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution is temporarily rate-limited. Retry after 9 seconds.'
+    );
+    expect((error as Error).message).not.toContain('CodeAPI');
+    expect((error as Error).message).not.toContain('internal deployment');
+  });
+
+  it('redacts network details from direct execution failures', async () => {
+    fetchMock.mockRejectedValueOnce(
+      new Error(
+        'request to http://codeapi.internal.svc.cluster.local/exec failed: getaddrinfo ENOTFOUND'
+      )
+    );
+    const tool = createBashExecutionTool();
+
+    const error = await tool
+      .invoke({ command: 'echo 1' })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution is temporarily unavailable. Please retry.'
+    );
+    expect((error as Error).message).not.toContain('svc.cluster.local');
+    expect((error as Error).message).not.toContain('ENOTFOUND');
+  });
+
+  it('redacts network details from programmatic execution failures', async () => {
+    fetchMock.mockRejectedValueOnce(
+      new Error(
+        'request to http://codeapi.internal.svc.cluster.local/exec/programmatic failed'
+      )
+    );
+    const tool = createProgrammaticToolCallingTool();
+
+    const error = await tool
+      .invoke(
+        { code: 'print("hello")' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution is temporarily unavailable. Please retry.'
+    );
+    expect((error as Error).message).not.toContain('svc.cluster.local');
+  });
+
+  it('redacts CodeAPI programmatic errors while preserving execution stderr', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        status: 'error',
+        error:
+          'sandbox worker codeapi-runtime-7f9d failed in internal namespace',
+        stderr: 'NameError: tenant_variable is not defined',
+      })
+    );
+    const tool = createProgrammaticToolCallingTool();
+
+    const error = await tool
+      .invoke(
+        { code: 'print(tenant_variable)' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('Code execution failed.');
+    expect((error as Error).message).toContain(
+      'NameError: tenant_variable is not defined'
+    );
+    expect((error as Error).message).not.toContain('codeapi-runtime');
+    expect((error as Error).message).not.toContain('internal namespace');
+  });
+
+  it('preserves an allowlisted programmatic execution error when stderr is absent', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        status: 'error',
+        error: 'Time limit exceeded',
+      })
+    );
+    const tool = createProgrammaticToolCallingTool();
+
+    const error = await tool
+      .invoke(
+        { code: 'while True: pass' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution failed. Execution exceeded the time limit.'
+    );
+  });
+
+  it('preserves an allowlisted execution error alongside stderr', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        status: 'error',
+        error: 'Time limit exceeded',
+        stderr: 'processed 42 records before termination',
+      })
+    );
+    const tool = createProgrammaticToolCallingTool();
+
+    const error = await tool
+      .invoke(
+        { code: 'while True: process_next_record()' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution failed. Execution exceeded the time limit.'
+    );
+    expect((error as Error).message).toContain(
+      'Stderr:\nprocessed 42 records before termination'
+    );
+  });
+
+  it('keeps arbitrary programmatic execution errors redacted when stderr is absent', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        status: 'error',
+        error:
+          'sandbox worker codeapi-runtime-7f9d failed in internal namespace',
+      })
+    );
+    const tool = createProgrammaticToolCallingTool();
+
+    const error = await tool
+      .invoke(
+        { code: 'print("hello")' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('Code execution failed.');
+    expect((error as Error).message).not.toContain('codeapi-runtime');
+    expect((error as Error).message).not.toContain('internal namespace');
+  });
+
+  it('preserves an allowlisted bash execution error when stderr is absent', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        status: 'error',
+        error: 'Out of memory',
+      })
+    );
+    const tool = createBashProgrammaticToolCallingTool();
+
+    const error = await tool
+      .invoke(
+        { code: 'lookup_user "{}"' },
+        {
+          toolCall: {
+            name: 'bash_programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution failed. Execution exceeded the memory limit.'
     );
   });
 
