@@ -69,6 +69,8 @@ export interface OverflowRecoveryParams {
   maxContextTokens?: number;
   /** Our own estimate of the prompt we actually sent. */
   estimatedPromptTokens?: number;
+  /** Provider/local calibration already applied to the prompt estimate. */
+  calibrationRatio?: number;
   /**
    * System prompt plus tool schemas — the part of the budget compaction
    * cannot touch. A corrected budget at or below this leaves no room for
@@ -161,6 +163,7 @@ export function planContextOverflowRecovery({
   provider,
   maxContextTokens,
   estimatedPromptTokens,
+  calibrationRatio,
   instructionTokens,
   configuredCompletionTokens,
   attemptsSoFar,
@@ -181,7 +184,8 @@ export function planContextOverflowRecovery({
 
   const observedCalibrationRatio =
     isUsable(info.promptTokens) && isUsable(estimatedPromptTokens)
-      ? info.promptTokens / estimatedPromptTokens
+      ? (info.promptTokens / estimatedPromptTokens) *
+        (isUsable(calibrationRatio) ? calibrationRatio : 1)
       : undefined;
 
   const target = resolveTargetBudget(

@@ -94,26 +94,60 @@ describe('tryFallbackProviders surfacing', () => {
 
     await expect(
       tryFallbackProviders({
-        fallbacks,
+        fallbacks: [
+          { provider: Providers.VERTEXAI, maxContextTokens: 200_000 },
+          { provider: Providers.OPENAI },
+        ],
+        messages,
+        primaryError: new Error('primary boom'),
+        overflowContext: {
+          estimatedPromptTokens: 190_000,
+        },
+      })
+    ).rejects.toThrow(/Google request failed/);
+  });
+
+  it('uses the fallback context window to corroborate a Vertex overflow', async () => {
+    const vertex = signatureError('gemini-2.5-flash-lite');
+    stubModels([vertex, new Error('503 upstream unavailable')]);
+
+    const error = await tryFallbackProviders({
+      fallbacks: [
+        { provider: Providers.VERTEXAI, maxContextTokens: 32_000 },
+        { provider: Providers.OPENAI },
+      ],
+      messages,
+      primaryError: new Error('primary boom'),
+      overflowContext: {
+        estimatedPromptTokens: 50_000,
+        maxContextTokens: 200_000,
+      },
+    }).catch((fallbackError: Error) => fallbackError);
+
+    expect(error).toBe(vertex);
+    expect(getFallbackErrorContext(error)).toEqual({
+      provider: Providers.VERTEXAI,
+      clientOptions: undefined,
+      maxContextTokens: 32_000,
+    });
+  });
+
+  it('does not corroborate Vertex against the primary context window', async () => {
+    const vertex = signatureError('gemini-2.5-flash-lite');
+    stubModels([vertex, new Error('503 upstream unavailable')]);
+
+    await expect(
+      tryFallbackProviders({
+        fallbacks: [
+          { provider: Providers.VERTEXAI },
+          { provider: Providers.OPENAI },
+        ],
         messages,
         primaryError: new Error('primary boom'),
         overflowContext: {
           estimatedPromptTokens: 190_000,
           maxContextTokens: 200_000,
         },
-      })
-    ).rejects.toThrow(/Google request failed/);
-  });
-
-  it('leaves a bare Vertex 400 alone without corroboration', async () => {
-    const vertex = signatureError('gemini-2.5-flash-lite');
-    stubModels([vertex, new Error('503 upstream unavailable')]);
-
-    await expect(
-      tryFallbackProviders({
-        fallbacks,
-        messages,
-        primaryError: new Error('primary boom'),
       })
     ).rejects.toThrow(/upstream unavailable/);
   });

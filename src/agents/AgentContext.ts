@@ -992,7 +992,7 @@ export class AgentContext {
   /**
    * Reset context for a new run
    */
-  reset(): void {
+  reset(options?: { preserveOriginalToolContent?: boolean }): void {
     this.systemMessageTokens = 0;
     this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;
@@ -1010,7 +1010,9 @@ export class AgentContext {
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
-    this.pendingOriginalToolContent = undefined;
+    if (options?.preserveOriginalToolContent !== true) {
+      this.pendingOriginalToolContent = undefined;
+    }
 
     this.summaryText = this._durableSummaryText;
     this.summaryTokenCount = this._durableSummaryTokenCount;

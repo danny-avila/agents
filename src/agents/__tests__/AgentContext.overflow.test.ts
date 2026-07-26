@@ -82,6 +82,16 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.pendingOriginalToolContent).toBeUndefined();
   });
 
+  it('preserves tool output snapshots when checkpointed messages survive reset', () => {
+    const context = createContext(1_000_000);
+    context.preserveOriginalToolContent(new Map([[2, 'full output']]));
+    context.reset({ preserveOriginalToolContent: true });
+
+    expect(context.pendingOriginalToolContent).toEqual(
+      new Map([[2, 'full output']])
+    );
+  });
+
   it('restores the pre-correction budget on reset', () => {
     const context = createContext(1_000_000);
     context.applyContextBudgetCorrection(190_000, 274_468);

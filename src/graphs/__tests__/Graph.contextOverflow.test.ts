@@ -1,3 +1,4 @@
+import { MemorySaver } from '@langchain/langgraph';
 import { describe, expect, it } from '@jest/globals';
 import {
   AIMessageChunk,
@@ -83,6 +84,7 @@ function buildConversation(turns: number): BaseMessage[] {
 async function createRun(options: {
   runId: string;
   maxContextTokens: number;
+  checkpointer?: boolean;
 }): Promise<Run<t.IState>> {
   return Run.create<t.IState>({
     runId: options.runId,
@@ -94,6 +96,10 @@ async function createRun(options: {
         streamUsage: false,
       },
       maxContextTokens: options.maxContextTokens,
+      compileOptions:
+        options.checkpointer === true
+          ? { checkpointer: new MemorySaver() }
+          : undefined,
     },
     returnContent: true,
     skipCleanup: true,
@@ -108,6 +114,28 @@ const streamConfig = {
 };
 
 describe('context overflow recovery', () => {
+  it('preserves masked tool originals while checkpointed messages survive', async () => {
+    const run = await createRun({
+      runId: 'overflow-originals-checkpoint',
+      maxContextTokens: 1_000_000,
+      checkpointer: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const agentContext = run.Graph.agentContexts.get('default');
+    if (agentContext == null) {
+      throw new Error('Expected default agent context');
+    }
+    agentContext.preserveOriginalToolContent(new Map([[2, 'full output']]));
+
+    run.Graph.resetValues();
+
+    expect(agentContext.pendingOriginalToolContent).toEqual(
+      new Map([[2, 'full output']])
+    );
+  });
+
   it('compacts and retries instead of surfacing the provider error', async () => {
     const run = await createRun({
       runId: 'overflow-recovery-numbers',
@@ -370,18 +398,23 @@ describe('context overflow recovery', () => {
     if (!run.Graph) {
       throw new Error('Expected graph to be initialized');
     }
-    run.Graph.overrideModel = new OverflowThenSucceedModel(
+    const model = new OverflowThenSucceedModel(
       signatureFor('claude-haiku-4-5-20251001')
     );
+    run.Graph.overrideModel = model;
 
     const messages = buildConversation(8);
+    const agentContext = run.Graph.agentContexts.get('default');
+    if (agentContext == null) {
+      throw new Error('Expected default agent context');
+    }
+    agentContext.calibrationRatio = 1.5;
     await run.processStream({ messages }, streamConfig);
 
-    const estimatedPrompt = messages.length * TOKENS_PER_MESSAGE;
-    const agentContext = run.Graph.agentContexts.get('default');
-    expect(agentContext?.maxContextTokens).toBe(Math.floor(200_000 * 0.95));
-    expect(agentContext?.calibrationRatio).toBeCloseTo(
-      274_468 / estimatedPrompt
+    const uncalibratedPrompt = model.calls[0].length * TOKENS_PER_MESSAGE;
+    expect(agentContext.maxContextTokens).toBe(Math.floor(200_000 * 0.95));
+    expect(agentContext.calibrationRatio).toBeCloseTo(
+      274_468 / uncalibratedPrompt
     );
   });
 

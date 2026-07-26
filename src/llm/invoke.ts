@@ -323,6 +323,7 @@ export async function attemptInvoke(
 export interface FallbackErrorContext {
   provider: Providers;
   clientOptions?: t.ClientOptions;
+  maxContextTokens?: number;
 }
 
 /**
@@ -398,7 +399,7 @@ export async function tryFallbackProviders({
   onChunk,
   overflowContext,
 }: {
-  fallbacks: Array<{ provider: Providers; clientOptions?: t.ClientOptions }>;
+  fallbacks: t.FallbackConfig[];
   tools?: t.GraphTools;
   messages: BaseMessage[];
   config?: RunnableConfig;
@@ -413,8 +414,10 @@ export async function tryFallbackProviders({
    */
   overflowContext?: ContextOverflowContext;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
-  const isOverflow = (error: unknown): boolean =>
-    getContextOverflowInfo(error, overflowContext) != null;
+  const isOverflow = (
+    error: unknown,
+    contextOverride = overflowContext
+  ): boolean => getContextOverflowInfo(error, contextOverride) != null;
   let lastError: unknown = primaryError;
   /**
    * Tracked apart from the primary's overflow. A caller reaching this
@@ -464,10 +467,19 @@ export async function tryFallbackProviders({
       return result;
     } catch (e) {
       lastError = e;
-      if (fallbackOverflowError === undefined && isOverflow(e)) {
+      const fallbackOverflowContext: ContextOverflowContext = {
+        ...overflowContext,
+        provider: fb.provider,
+        maxContextTokens: fb.maxContextTokens,
+      };
+      if (
+        fallbackOverflowError === undefined &&
+        isOverflow(e, fallbackOverflowContext)
+      ) {
         attachFallbackErrorContext(e, {
           provider: fb.provider,
           clientOptions: fb.clientOptions,
+          maxContextTokens: fb.maxContextTokens,
         });
         fallbackOverflowError = e;
       }

@@ -1025,8 +1025,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       new Map()
     );
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
+    const preserveOriginalToolContent =
+      this.compileOptions?.checkpointer != null;
     for (const context of this.agentContexts.values()) {
-      context.reset();
+      context.reset({ preserveOriginalToolContent });
     }
   }
 
@@ -1035,8 +1037,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
+    const preserveOriginalToolContent =
+      this.compileOptions?.checkpointer != null;
     for (const context of this.agentContexts.values()) {
-      context.reset();
+      context.reset({ preserveOriginalToolContent });
     }
   }
 
@@ -2382,8 +2386,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           return planContextOverflowRecovery({
             error,
             provider: fallbackContext?.provider ?? agentContext.provider,
-            maxContextTokens: agentContext.maxContextTokens,
+            maxContextTokens:
+              fallbackContext?.maxContextTokens ??
+              agentContext.maxContextTokens,
             estimatedPromptTokens,
+            calibrationRatio: agentContext.calibrationRatio,
             instructionTokens: agentContext.instructionTokens,
             configuredCompletionTokens: getConfiguredCompletionTokens(
               fallbackContext?.clientOptions ?? agentContext.clientOptions
