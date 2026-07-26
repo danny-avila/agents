@@ -336,10 +336,10 @@ export class AgentContext {
    */
   private _preOverflowMaxContextTokens?: number;
   /**
-   * Prompt size, by our own estimate, at the last overflow correction. A
-   * later overflow whose prompt is no smaller proves the correction changed
-   * nothing, which is the only reliable way to detect the configurations
-   * where neither pruning nor summarization has anything left to remove.
+   * Prompt size, normalized into the local counter's uncalibrated units, at
+   * the last overflow correction. Keeping both measurements in the same units
+   * lets a later overflow prove whether compaction changed anything even when
+   * the provider observation updated calibration between attempts.
    */
   private _lastOverflowPromptTokens?: number;
   /**
@@ -1382,19 +1382,39 @@ export class AgentContext {
    * needed.
    */
   applyContextBudgetCorrection(
-    budgetTokens: number,
+    budgetTokens: number | undefined,
     promptTokens?: number,
     compressionOnly = false
   ): void {
     if (this._overflowRecoveryAttempts === 0) {
       this._preOverflowMaxContextTokens = this.maxContextTokens;
     }
-    this.maxContextTokens = budgetTokens;
+    if (budgetTokens != null) {
+      this.maxContextTokens = budgetTokens;
+    }
     this.pruneMessages = undefined;
     this._lastSummarizationMsgCount = 0;
-    this._lastOverflowPromptTokens = promptTokens;
+    this._lastOverflowPromptTokens =
+      promptTokens != null && this.calibrationRatio > 0
+        ? promptTokens / this.calibrationRatio
+        : promptTokens;
     this._compressionRetryPending = compressionOnly;
     this._overflowRecoveryAttempts += 1;
+  }
+
+  /** Applies token calibration only when the observation came from this provider. */
+  applyObservedOverflowCalibration(
+    provider: Providers | undefined,
+    observedCalibrationRatio: number | undefined
+  ): void {
+    if (
+      provider !== this.provider ||
+      observedCalibrationRatio == null ||
+      observedCalibrationRatio <= 0
+    ) {
+      return;
+    }
+    this.calibrationRatio = observedCalibrationRatio;
   }
 
   /**
@@ -1423,7 +1443,11 @@ export class AgentContext {
     ) {
       return false;
     }
-    return currentPromptTokens >= previous;
+    const rawCurrent =
+      this.calibrationRatio > 0
+        ? currentPromptTokens / this.calibrationRatio
+        : currentPromptTokens;
+    return rawCurrent >= previous;
   }
 
   /**

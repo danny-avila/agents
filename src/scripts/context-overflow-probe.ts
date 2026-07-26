@@ -27,6 +27,7 @@ import { config as loadEnv } from 'dotenv';
 import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
+import { isSecretKey, redactSecrets } from '@/utils/redactSecrets';
 import { initializeModel } from '@/llm/init';
 import { Providers } from '@/common';
 
@@ -152,8 +153,6 @@ function overflowTokenTarget(
   return Math.max(scaled, target.contextWindow + MIN_OVERSHOOT_TOKENS);
 }
 
-const SECRET_KEY_RE = /key|token|secret|credential|authorization|password/i;
-
 function readString(
   source: Record<string, unknown>,
   key: string
@@ -183,7 +182,9 @@ function stringifySafe(value: unknown, limit = 4_000): string {
     return value.slice(0, limit);
   }
   try {
-    return JSON.stringify(value)?.slice(0, limit) ?? String(value);
+    return (
+      JSON.stringify(redactSecrets(value))?.slice(0, limit) ?? String(value)
+    );
   } catch {
     return String(value).slice(0, limit);
   }
@@ -192,16 +193,12 @@ function stringifySafe(value: unknown, limit = 4_000): string {
 function collectOwnProperties(error: object): Record<string, string> {
   const collected: Record<string, string> = {};
   for (const key of Object.keys(error)) {
-    if (SECRET_KEY_RE.test(key)) {
-      continue;
-    }
     if (key === 'stack' || key === 'message') {
       continue;
     }
-    collected[key] = stringifySafe(
-      (error as Record<string, unknown>)[key],
-      800
-    );
+    collected[key] = isSecretKey(key)
+      ? '[REDACTED]'
+      : stringifySafe((error as Record<string, unknown>)[key], 800);
   }
   return collected;
 }

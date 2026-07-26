@@ -568,7 +568,7 @@ export abstract class Graph<
   T extends t.BaseGraphState = t.BaseGraphState,
   _TNodeName extends string = string,
 > {
-  abstract resetValues(): void;
+  abstract resetValues(keepContent?: boolean, checkpointScope?: string): void;
   abstract initializeTools({
     currentTools,
     currentToolMap,
@@ -913,6 +913,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   messages: BaseMessage[] = [];
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
+  /** Checkpoint scope whose messages match index-keyed tool snapshots. */
+  private originalToolContentCheckpointScope?: string;
   runId: string | undefined;
   /**
    * Boundary between historical messages (loaded from conversation state)
@@ -977,7 +979,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   /* Init */
 
-  resetValues(keepContent?: boolean): void {
+  resetValues(keepContent?: boolean, checkpointScope?: string): void {
     this.messages = [];
     this.cachedRunMessages = undefined;
     this.config = resetIfNotEmpty(this.config, undefined);
@@ -1025,11 +1027,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       new Map()
     );
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
+    const hasScopedCheckpoint =
+      this.compileOptions?.checkpointer != null &&
+      checkpointScope != null &&
+      checkpointScope !== '';
     const preserveOriginalToolContent =
-      this.compileOptions?.checkpointer != null;
+      hasScopedCheckpoint &&
+      this.originalToolContentCheckpointScope === checkpointScope;
     for (const context of this.agentContexts.values()) {
       context.reset({ preserveOriginalToolContent });
     }
+    this.originalToolContentCheckpointScope = hasScopedCheckpoint
+      ? checkpointScope
+      : undefined;
   }
 
   override clearHeavyState(): void {
@@ -1038,7 +1048,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.messages = [];
     this.overrideModel = undefined;
     const preserveOriginalToolContent =
-      this.compileOptions?.checkpointer != null;
+      this.compileOptions?.checkpointer != null &&
+      this.originalToolContentCheckpointScope != null;
     for (const context of this.agentContexts.values()) {
       context.reset({ preserveOriginalToolContent });
     }
@@ -1533,16 +1544,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const allowSummarization = agentContext.shouldSummarizeOverflow();
 
     agentContext.preserveOriginalToolContent(originalToolContent);
-    if (
-      recovery.observedCalibrationRatio != null &&
-      recovery.observedCalibrationRatio > 0
-    ) {
-      agentContext.calibrationRatio = recovery.observedCalibrationRatio;
-    }
     agentContext.applyContextBudgetCorrection(
       recovery.budgetTokens,
       estimatedPromptTokens,
       !allowSummarization
+    );
+    agentContext.applyObservedOverflowCalibration(
+      recovery.info.provider,
+      recovery.observedCalibrationRatio
     );
 
     emitAgentLog(

@@ -127,13 +127,35 @@ describe('context overflow recovery', () => {
     if (agentContext == null) {
       throw new Error('Expected default agent context');
     }
+    run.Graph.resetValues(undefined, '8:thread-a:');
     agentContext.preserveOriginalToolContent(new Map([[2, 'full output']]));
 
-    run.Graph.resetValues();
+    run.Graph.resetValues(undefined, '8:thread-a:');
 
     expect(agentContext.pendingOriginalToolContent).toEqual(
       new Map([[2, 'full output']])
     );
+  });
+
+  it('does not share masked tool originals across checkpoint scopes', async () => {
+    const run = await createRun({
+      runId: 'overflow-originals-isolated',
+      maxContextTokens: 1_000_000,
+      checkpointer: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const agentContext = run.Graph.agentContexts.get('default');
+    if (agentContext == null) {
+      throw new Error('Expected default agent context');
+    }
+    run.Graph.resetValues(undefined, '8:thread-a:branch');
+    agentContext.preserveOriginalToolContent(new Map([[2, 'thread A']]));
+
+    run.Graph.resetValues(undefined, '8:thread-b:branch');
+
+    expect(agentContext.pendingOriginalToolContent).toBeUndefined();
   });
 
   it('compacts and retries instead of surfacing the provider error', async () => {

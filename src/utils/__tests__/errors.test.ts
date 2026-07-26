@@ -227,6 +227,21 @@ describe('back-compatible helpers', () => {
     expect(isContextOverflowError('context length exceeded')).toBe(true);
   });
 
+  it('reads structured overflow reason fields alongside generic messages', () => {
+    expect(
+      isContextOverflowError({
+        message: 'Bad Request',
+        code: 'context_length_exceeded',
+      })
+    ).toBe(true);
+    expect(
+      isContextOverflowError({
+        message: 'Bad Request',
+        error: { type: 'context_length_exceeded' },
+      })
+    ).toBe(true);
+  });
+
   it('treats body-size rejections as likely overflow only in the loose check', () => {
     const payload = { status: 413, message: 'request entity too large' };
     expect(isContextOverflowError(payload)).toBe(false);

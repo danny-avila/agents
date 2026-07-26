@@ -322,4 +322,18 @@ describe('planContextOverflowRecovery', () => {
 
     expect(second?.budgetTokens).toBeLessThan(first?.budgetTokens ?? 0);
   });
+
+  it('plans summary-only recovery when no token budget is configured', () => {
+    const bedrock = signatureFor(
+      'us.anthropic.claude-sonnet-4-5-20250929-v1:0'
+    );
+    const plan = planContextOverflowRecovery({
+      error: bedrock.error,
+      provider: Providers.BEDROCK,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan).not.toBeNull();
+    expect(plan?.budgetTokens).toBeUndefined();
+  });
 });

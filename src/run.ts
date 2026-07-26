@@ -719,7 +719,19 @@ export class Run<_T extends t.BaseGraphState> {
      * boundary.
      */
     if (!isResume) {
-      graph.resetValues(streamOptions?.keepContent);
+      const checkpointThreadId =
+        typeof config.configurable?.thread_id === 'string'
+          ? config.configurable.thread_id
+          : undefined;
+      const checkpointNamespace =
+        typeof config.configurable?.checkpoint_ns === 'string'
+          ? config.configurable.checkpoint_ns
+          : '';
+      const checkpointScope =
+        checkpointThreadId == null
+          ? undefined
+          : `${checkpointThreadId.length}:${checkpointThreadId}:${checkpointNamespace}`;
+      graph.resetValues(streamOptions?.keepContent, checkpointScope);
     }
     this._interrupt = undefined;
     this._haltedReason = undefined;

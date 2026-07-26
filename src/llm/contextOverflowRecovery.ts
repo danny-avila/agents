@@ -46,8 +46,8 @@ const MIN_MESSAGE_HEADROOM_TOKENS = 2_000;
 export const DEFAULT_MAX_OVERFLOW_RECOVERIES = 2;
 
 export interface OverflowRecoveryPlan {
-  /** Budget the retry should target, in provider token units. */
-  budgetTokens: number;
+  /** Budget the retry should target, in provider token units when known. */
+  budgetTokens?: number;
   /** What the provider disclosed. Carried through for logging. */
   info: ContextOverflowInfo;
   /**
@@ -195,7 +195,13 @@ export function planContextOverflowRecovery({
     configuredCompletionTokens
   );
   if (target == null) {
-    return null;
+    const hasNumericBasis =
+      isUsable(info.limitTokens) ||
+      isUsable(maxContextTokens) ||
+      isUsable(estimatedPromptTokens);
+    return hasNumericBasis
+      ? null
+      : { info, observedCalibrationRatio, budgetTokens: undefined };
   }
 
   /**

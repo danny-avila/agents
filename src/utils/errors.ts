@@ -235,6 +235,10 @@ const MAX_CAUSE_DEPTH = 4;
 
 interface NestedErrorShape {
   message?: unknown;
+  code?: unknown;
+  type?: unknown;
+  status?: unknown;
+  reason?: unknown;
   error?: unknown;
   cause?: unknown;
   body?: unknown;
@@ -272,6 +276,16 @@ function collectErrorText(error: unknown, depth = 0): string {
   const parts: string[] = [];
   if (typeof record.message === 'string') {
     parts.push(record.message);
+  }
+  for (const reason of [
+    record.code,
+    record.type,
+    record.status,
+    record.reason,
+  ]) {
+    if (typeof reason === 'string') {
+      parts.push(reason);
+    }
   }
   for (const nested of [
     record.error,

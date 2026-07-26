@@ -129,6 +129,25 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.consumeCompressionRetry()).toBe(false);
   });
 
+  it('keeps fallback calibration out of the primary agent context', () => {
+    const context = createContext(1_000_000);
+    context.calibrationRatio = 1.5;
+
+    context.applyObservedOverflowCalibration(Providers.VERTEXAI, 2);
+    expect(context.calibrationRatio).toBe(1.5);
+
+    context.applyObservedOverflowCalibration(Providers.ANTHROPIC, 2);
+    expect(context.calibrationRatio).toBe(2);
+  });
+
+  it('records a summary-only recovery without inventing a token budget', () => {
+    const context = createContext();
+    context.applyContextBudgetCorrection(undefined, undefined, false);
+
+    expect(context.maxContextTokens).toBeUndefined();
+    expect(context.overflowRecoveryAttempts).toBe(1);
+  });
+
   it('clears the compression marker on reset', () => {
     const context = createContext(1_000_000);
     context.applyContextBudgetCorrection(190_000, 274_468, true);
@@ -150,6 +169,15 @@ describe('AgentContext overflow recovery state', () => {
     context.applyContextBudgetCorrection(190_000, 250_000);
 
     expect(context.overflowRecoveryStalled(180_000)).toBe(false);
+  });
+
+  it('compares stall measurements in uncalibrated token units', () => {
+    const context = createContext(1_000_000);
+    context.applyContextBudgetCorrection(190_000, 250_000);
+    context.calibrationRatio = 2;
+
+    expect(context.overflowRecoveryStalled(360_000)).toBe(false);
+    expect(context.overflowRecoveryStalled(500_000)).toBe(true);
   });
 
   it('reports no stall before any correction, or without a measurement', () => {
