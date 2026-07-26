@@ -17,6 +17,7 @@ import { createKeenableScraper } from './keenable-scraper';
 import { createSerperScraper } from './serper-scraper';
 import { createTavilyScraper } from './tavily-scraper';
 import { createFirecrawlScraper } from './firecrawl';
+import { createExaScraper } from './exa-scraper';
 import { createCrwScraper } from './crw-scraper';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
@@ -380,6 +381,10 @@ export const createSearchTool = (
     keenableApiUrl,
     keenableSearchOptions,
     keenableScraperOptions,
+    exaApiKey,
+    exaApiUrl,
+    exaSearchOptions,
+    exaScraperOptions,
     rerankerType = 'cohere',
     rerankerTimeout,
     topResults = 5,
@@ -428,7 +433,11 @@ export const createSearchTool = (
     news: newsSchema,
   };
 
-  if (searchProvider === 'serper' || searchProvider === 'tavily') {
+  if (
+    searchProvider === 'serper' ||
+    searchProvider === 'tavily' ||
+    searchProvider === 'exa'
+  ) {
     schemaProperties.country = countrySchema;
   }
 
@@ -449,6 +458,9 @@ export const createSearchTool = (
     keenableApiKey,
     keenableApiUrl,
     keenableSearchOptions,
+    exaApiKey,
+    exaApiUrl,
+    exaSearchOptions,
     crwApiKey,
     crwApiUrl,
     crwSearchOptions,
@@ -473,6 +485,14 @@ export const createSearchTool = (
         process.env.TAVILY_API_KEY,
       apiUrl: tavilyScraperOptions?.apiUrl ?? tavilyExtractUrl,
       timeout: scraperTimeout ?? tavilyScraperOptions?.timeout,
+      logger,
+    });
+  } else if (scraperProvider === 'exa') {
+    scraperInstance = createExaScraper({
+      ...exaScraperOptions,
+      apiKey: exaScraperOptions?.apiKey ?? exaApiKey ?? process.env.EXA_API_KEY,
+      apiUrl: exaScraperOptions?.apiUrl ?? exaApiUrl,
+      timeout: scraperTimeout ?? exaScraperOptions?.timeout,
       logger,
     });
   } else if (scraperProvider === 'crw') {
@@ -538,11 +558,14 @@ export const createSearchTool = (
     safeSearch,
     // Keenable is organic-only: its API ignores `type`, so image/news
     // sub-searches would spend rate limit and merge nothing.
-    supportsImages: searchProvider !== 'keenable',
+    // Exa has no image or video search, but supports news via its
+    // dedicated `news` category.
+    supportsImages: searchProvider !== 'keenable' && searchProvider !== 'exa',
     supportsVideos:
       searchProvider !== 'tavily' &&
       searchProvider !== 'keenable' &&
-      searchProvider !== 'crw',
+      searchProvider !== 'crw' &&
+      searchProvider !== 'exa',
     supportsNews: searchProvider !== 'keenable',
     sourceProcessor,
     onGetHighlights,
