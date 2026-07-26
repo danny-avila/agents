@@ -51,6 +51,11 @@ import {
   sleep,
 } from '@/utils';
 import {
+  getBlindRecoveryBudget,
+  planContextOverflowRecovery,
+  translateRecoveryBudget,
+} from '@/llm/contextOverflowRecovery';
+import {
   Constants,
   GraphNodeKeys,
   ContentTypes,
@@ -58,10 +63,6 @@ import {
   Providers,
   StepTypes,
 } from '@/common';
-import {
-  planContextOverflowRecovery,
-  translateRecoveryBudget,
-} from '@/llm/contextOverflowRecovery';
 import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
@@ -2360,10 +2361,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * retry would resend a byte-identical prompt. Skipping the detour
          * keeps the original error and one round trip instead of three.
          */
-        const canReduceContext =
-          agentContext.tokenCounter != null ||
-          agentContext.summarizationEnabled === true;
-
         const estimatedPromptTokens = getEstimatedPromptTokens(contextUsage);
 
         /**
@@ -2377,7 +2374,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
 
         const planRecovery = (error: unknown): OverflowRecoveryPlan | null => {
-          if (!canReduceContext || recoveryStalled) {
+          if (recoveryStalled) {
             return null;
           }
           /**
@@ -2395,26 +2392,35 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             estimatedPromptTokens,
             calibrationRatio: agentContext.calibrationRatio,
             instructionTokens: agentContext.instructionTokens,
+            canSummarize: agentContext.summarizationEnabled === true,
             configuredCompletionTokens: getConfiguredCompletionTokens(
               fallbackContext?.clientOptions ?? agentContext.clientOptions
             ),
             attemptsSoFar: agentContext.overflowRecoveryAttempts,
           });
-          if (
-            recovery == null ||
-            fallbackContext == null ||
-            fallbackContext.provider === agentContext.provider
-          ) {
-            return recovery;
+          if (recovery == null) {
+            return null;
           }
-          return {
-            ...recovery,
-            budgetTokens: translateRecoveryBudget(
-              recovery.budgetTokens,
-              recovery.observedCalibrationRatio,
-              agentContext.calibrationRatio
-            ),
-          };
+          const translatedRecovery =
+            fallbackContext != null &&
+            fallbackContext.provider !== agentContext.provider
+              ? {
+                ...recovery,
+                budgetTokens:
+                    recovery.observedCalibrationRatio == null
+                      ? getBlindRecoveryBudget(agentContext.maxContextTokens)
+                      : translateRecoveryBudget(
+                        recovery.budgetTokens,
+                        recovery.observedCalibrationRatio,
+                        agentContext.calibrationRatio
+                      ),
+              }
+              : recovery;
+          const canReduceContext =
+            agentContext.summarizationEnabled === true ||
+            (agentContext.tokenCounter != null &&
+              translatedRecovery.budgetTokens != null);
+          return canReduceContext ? translatedRecovery : null;
         };
 
         const recovery = planRecovery(primaryError);

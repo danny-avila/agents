@@ -121,6 +121,16 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.calibrationRatio).toBe(2);
   });
 
+  it('clamps provider-observed calibration to the shared safe range', () => {
+    const context = createContext(1_000_000);
+
+    context.applyObservedOverflowCalibration(Providers.ANTHROPIC, 10);
+    expect(context.calibrationRatio).toBe(5);
+
+    context.applyObservedOverflowCalibration(Providers.ANTHROPIC, 0.1);
+    expect(context.calibrationRatio).toBe(0.5);
+  });
+
   it('records a summary-only recovery without inventing a token budget', () => {
     const context = createContext();
     context.applyContextBudgetCorrection(undefined, undefined);

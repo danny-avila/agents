@@ -1,5 +1,6 @@
 import { describe, expect, it } from '@jest/globals';
 import {
+  getBlindRecoveryBudget,
   planContextOverflowRecovery,
   DEFAULT_MAX_OVERFLOW_RECOVERIES,
   translateRecoveryBudget,
@@ -75,6 +76,10 @@ describe('planContextOverflowRecovery', () => {
     expect(translateRecoveryBudget(80_000, 2, 1.5)).toBe(60_000);
   });
 
+  it('uses a primary-space blind shrink when fallback units cannot be translated', () => {
+    expect(getBlindRecoveryBudget(100_000)).toBe(70_000);
+  });
+
   it('recovers on a small-window model despite the absolute floor', () => {
     /** 4,096-token window: 95% of the ceiling lands under MIN_RECOVERY_BUDGET. */
     const error = {
@@ -88,6 +93,23 @@ describe('planContextOverflowRecovery', () => {
       maxContextTokens: 8_192,
       estimatedPromptTokens: 6_000,
       instructionTokens: 200,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan?.budgetTokens).toBe(Math.floor(4_096 * 0.95));
+  });
+
+  it('permits small-window summary-only recovery below the pruning floor', () => {
+    const error = {
+      message:
+        '400 This model\'s maximum context length is 4096 tokens. However, your messages resulted in 6000 tokens.',
+    };
+    const plan = planContextOverflowRecovery({
+      error,
+      provider: Providers.OPENAI,
+      maxContextTokens: 8_192,
+      instructionTokens: 0,
+      canSummarize: true,
       attemptsSoFar: 0,
     });
 

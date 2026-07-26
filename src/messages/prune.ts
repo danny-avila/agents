@@ -85,6 +85,14 @@ const CALIBRATION_RATIO_MIN = 0.5;
 /** Maximum cumulative calibration ratio — sanity cap for the running ratio. */
 const CALIBRATION_RATIO_MAX = 5;
 
+/** Keeps provider/local token calibration within the shared safe range. */
+export function clampCalibrationRatio(ratio: number): number {
+  return Math.max(
+    CALIBRATION_RATIO_MIN,
+    Math.min(CALIBRATION_RATIO_MAX, ratio)
+  );
+}
+
 export type PruneMessagesFactoryParams = {
   provider?: Providers;
   maxTokens: number;
@@ -1479,10 +1487,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         cumulativeRawSent += rawSentThisTurn;
         cumulativeProviderReported += providerMessageTokens;
         const newRatio = cumulativeProviderReported / cumulativeRawSent;
-        calibrationRatio = Math.max(
-          CALIBRATION_RATIO_MIN,
-          Math.min(CALIBRATION_RATIO_MAX, newRatio)
-        );
+        calibrationRatio = clampCalibrationRatio(newRatio);
 
         const calibratedOurTotal =
           instructionOverhead + rawSentThisTurn * calibrationRatio;

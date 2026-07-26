@@ -164,6 +164,8 @@ export class Run<_T extends t.BaseGraphState> {
   private _interrupt: t.RunInterruptResult<unknown> | undefined;
   /** Per-run sequence for batch-unique activity-label trace-seed fallbacks. */
   private activityLabelSeq = 0;
+  /** Distinguishes sibling forks started from the same explicit checkpoint. */
+  private checkpointForkSeq = 0;
   private _haltedReason: string | undefined;
 
   private constructor(config: Partial<t.RunConfig>) {
@@ -738,6 +740,7 @@ export class Run<_T extends t.BaseGraphState> {
             checkpointThreadId,
             checkpointNamespace,
             checkpointId,
+            checkpointId === '' ? 0 : ++this.checkpointForkSeq,
           ]);
       graph.resetValues(streamOptions?.keepContent, checkpointScope);
     }

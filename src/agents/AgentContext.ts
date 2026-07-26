@@ -19,18 +19,19 @@ import {
   type PromptCacheTtl,
 } from '@/messages/cache';
 import {
+  DEFAULT_RESERVE_RATIO,
+  clampCalibrationRatio,
+  createPruneMessages,
+  enforceOriginalContentCap,
+  syncBudgetDerivedFields,
+} from '@/messages';
+import {
   ANTHROPIC_TOOL_TOKEN_MULTIPLIER,
   DEFAULT_TOOL_TOKEN_MULTIPLIER,
   ContentTypes,
   Constants,
   Providers,
 } from '@/common';
-import {
-  DEFAULT_RESERVE_RATIO,
-  createPruneMessages,
-  enforceOriginalContentCap,
-  syncBudgetDerivedFields,
-} from '@/messages';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
@@ -1404,7 +1405,7 @@ export class AgentContext {
     ) {
       return;
     }
-    this.calibrationRatio = observedCalibrationRatio;
+    this.calibrationRatio = clampCalibrationRatio(observedCalibrationRatio);
   }
 
   /**

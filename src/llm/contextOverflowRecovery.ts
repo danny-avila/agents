@@ -80,6 +80,8 @@ export interface OverflowRecoveryParams {
    * rather than entered.
    */
   instructionTokens?: number;
+  /** Whether a model-backed summary can compact messages without a pruner. */
+  canSummarize?: boolean;
   /**
    * Completion allowance the caller configured. Providers count it against
    * the same ceiling, so it has to come off the top when the error itself did
@@ -114,6 +116,15 @@ export function translateRecoveryBudget(
   return Math.floor(
     (budgetTokens * targetCalibrationRatio) / sourceCalibrationRatio
   );
+}
+
+/** Applies the conservative shrink used when no provider-space ceiling is usable. */
+export function getBlindRecoveryBudget(
+  maxContextTokens: number | undefined
+): number | undefined {
+  return isUsable(maxContextTokens)
+    ? Math.floor(maxContextTokens * BLIND_SHRINK_RATIO)
+    : undefined;
 }
 
 /**
@@ -188,6 +199,7 @@ export function planContextOverflowRecovery({
   estimatedPromptTokens,
   calibrationRatio,
   instructionTokens,
+  canSummarize = false,
   configuredCompletionTokens,
   attemptsSoFar,
   maxAttempts = DEFAULT_MAX_OVERFLOW_RECOVERIES,
@@ -245,7 +257,7 @@ export function planContextOverflowRecovery({
    */
   const bounded =
     isUsable(maxContextTokens) && target >= maxContextTokens
-      ? maxContextTokens * BLIND_SHRINK_RATIO
+      ? (getBlindRecoveryBudget(maxContextTokens) ?? target)
       : target;
 
   const budgetTokens = Math.floor(bounded);
@@ -258,9 +270,12 @@ export function planContextOverflowRecovery({
    * lets the existing "instructions exceed context budget" guidance surface
    * instead.
    */
-  const floorTokens = isUsable(instructionTokens)
-    ? instructionTokens + MIN_MESSAGE_HEADROOM_TOKENS
-    : MIN_RECOVERY_BUDGET_TOKENS;
+  let floorTokens = MIN_RECOVERY_BUDGET_TOKENS;
+  if (isUsable(instructionTokens)) {
+    floorTokens = instructionTokens + MIN_MESSAGE_HEADROOM_TOKENS;
+  } else if (canSummarize) {
+    floorTokens = 1;
+  }
   if (budgetTokens < floorTokens) {
     return null;
   }

@@ -151,7 +151,7 @@ describe('context overflow recovery', () => {
     expect(agentContext.pendingOriginalToolContent).toBeUndefined();
   });
 
-  it('does not share masked tool originals across checkpoint branches', async () => {
+  it('does not share masked tool originals across sibling checkpoint forks', async () => {
     const run = await createRun({
       runId: 'overflow-originals-branch-isolated',
       maxContextTokens: 1_000_000,
@@ -166,13 +166,13 @@ describe('context overflow recovery', () => {
     }
     run.Graph.resetValues(
       undefined,
-      JSON.stringify(['thread-a', 'namespace', 'checkpoint-a'])
+      JSON.stringify(['thread-a', 'namespace', 'checkpoint-a', 1])
     );
     agentContext.preserveOriginalToolContent(new Map([[2, 'branch A']]));
 
     run.Graph.resetValues(
       undefined,
-      JSON.stringify(['thread-a', 'namespace', 'checkpoint-b'])
+      JSON.stringify(['thread-a', 'namespace', 'checkpoint-a', 2])
     );
 
     expect(agentContext.pendingOriginalToolContent).toBeUndefined();
@@ -375,6 +375,40 @@ describe('context overflow recovery', () => {
     ).toBe(0);
   });
 
+  it('does not retry without a configured pruning budget', async () => {
+    const run = await Run.create<t.IState>({
+      runId: 'overflow-recovery-no-pruning-budget',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.ANTHROPIC,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+      },
+      returnContent: true,
+      skipCleanup: true,
+      tokenCounter,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(
+      signatureFor('us.anthropic.claude-sonnet-4-5-20250929-v1:0'),
+      Number.MAX_SAFE_INTEGER
+    );
+    run.Graph.overrideModel = model;
+
+    await expect(
+      run.processStream({ messages: buildConversation(8) }, streamConfig)
+    ).rejects.toThrow(/too long/i);
+
+    expect(model.calls).toHaveLength(1);
+    expect(
+      run.Graph.agentContexts.get('default')?.overflowRecoveryAttempts
+    ).toBe(0);
+  });
+
   it('summarizes conversation messages pruned on the first recovery', async () => {
     /**
      * The initial overflow detour avoids an unconditional summarization call,
@@ -452,9 +486,8 @@ describe('context overflow recovery', () => {
 
     const uncalibratedPrompt = model.calls[0].length * TOKENS_PER_MESSAGE;
     expect(agentContext.maxContextTokens).toBe(Math.floor(200_000 * 0.95));
-    expect(agentContext.calibrationRatio).toBeCloseTo(
-      274_468 / uncalibratedPrompt
-    );
+    expect(274_468 / uncalibratedPrompt).toBeLessThan(0.5);
+    expect(agentContext.calibrationRatio).toBe(0.5);
   });
 
   it('does not intercept errors compaction cannot fix', async () => {
