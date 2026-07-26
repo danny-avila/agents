@@ -177,6 +177,16 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.overflowRecoveryStalled(500_000)).toBe(true);
   });
 
+  it('leaves fixed instruction overhead out of calibration normalization', () => {
+    const context = createContext(1_000_000);
+    context.systemMessageTokens = 100_000;
+    context.applyContextBudgetCorrection(190_000, 250_000);
+    context.calibrationRatio = 0.5;
+
+    expect(context.overflowRecoveryStalled(160_000)).toBe(false);
+    expect(context.overflowRecoveryStalled(175_000)).toBe(true);
+  });
+
   it('reports no stall before any correction, or without a measurement', () => {
     const context = createContext(1_000_000);
     expect(context.overflowRecoveryStalled(250_000)).toBe(false);

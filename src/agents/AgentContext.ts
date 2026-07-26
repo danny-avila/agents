@@ -20,9 +20,9 @@ import {
 } from '@/messages/cache';
 import {
   DEFAULT_RESERVE_RATIO,
+  ORIGINAL_CONTENT_MAX_CHARS,
   clampCalibrationRatio,
   createPruneMessages,
-  enforceOriginalContentCap,
   syncBudgetDerivedFields,
 } from '@/messages';
 import {
@@ -222,8 +222,22 @@ export class AgentContext {
   calibrationRatio: number = 1;
   /** Provider-observed instruction overhead from the pruner's best-variance turn. */
   resolvedInstructionOverhead?: number;
+  private _pendingOriginalToolContent?: Map<number, string>;
+  private pendingOriginalToolContentChars = 0;
   /** Pre-masking tool content keyed by message index, consumed by the summarize node. */
-  pendingOriginalToolContent?: Map<number, string>;
+  get pendingOriginalToolContent(): Map<number, string> | undefined {
+    return this._pendingOriginalToolContent;
+  }
+  set pendingOriginalToolContent(value: Map<number, string> | undefined) {
+    this._pendingOriginalToolContent = value;
+    this.pendingOriginalToolContentChars = 0;
+    if (value != null) {
+      for (const content of value.values()) {
+        this.pendingOriginalToolContentChars += content.length;
+      }
+      this.enforcePendingOriginalContentCap();
+    }
+  }
 
   /** Total instruction overhead: system message + tool schemas + pending summary. */
   get instructionTokens(): number {
@@ -1354,16 +1368,36 @@ export class AgentContext {
       return;
     }
     if (this.pendingOriginalToolContent == null) {
-      this.pendingOriginalToolContent = new Map(originalToolContent);
-      enforceOriginalContentCap(this.pendingOriginalToolContent);
-      return;
+      this.pendingOriginalToolContent = new Map();
     }
     for (const [index, content] of originalToolContent) {
       if (!this.pendingOriginalToolContent.has(index)) {
         this.pendingOriginalToolContent.set(index, content);
+        this.pendingOriginalToolContentChars += content.length;
       }
     }
-    enforceOriginalContentCap(this.pendingOriginalToolContent);
+    this.enforcePendingOriginalContentCap();
+  }
+
+  private enforcePendingOriginalContentCap(): void {
+    const pending = this._pendingOriginalToolContent;
+    if (pending == null) {
+      return;
+    }
+    while (
+      this.pendingOriginalToolContentChars > ORIGINAL_CONTENT_MAX_CHARS &&
+      pending.size > 0
+    ) {
+      const oldest = pending.keys().next();
+      if (oldest.done === true) {
+        break;
+      }
+      const removed = pending.get(oldest.value);
+      if (removed != null) {
+        this.pendingOriginalToolContentChars -= removed.length;
+      }
+      pending.delete(oldest.value);
+    }
   }
 
   /**
@@ -1389,8 +1423,8 @@ export class AgentContext {
     this.pruneMessages = undefined;
     this._lastSummarizationMsgCount = 0;
     this._lastOverflowPromptTokens =
-      promptTokens != null && this.calibrationRatio > 0
-        ? promptTokens / this.calibrationRatio
+      promptTokens != null
+        ? this.normalizePromptTokens(promptTokens)
         : promptTokens;
     this._overflowRecoveryAttempts += 1;
   }
@@ -1425,11 +1459,16 @@ export class AgentContext {
     ) {
       return false;
     }
-    const rawCurrent =
-      this.calibrationRatio > 0
-        ? currentPromptTokens / this.calibrationRatio
-        : currentPromptTokens;
+    const rawCurrent = this.normalizePromptTokens(currentPromptTokens);
     return rawCurrent >= previous;
+  }
+
+  private normalizePromptTokens(promptTokens: number): number {
+    if (this.calibrationRatio <= 0) {
+      return promptTokens;
+    }
+    const messageTokens = Math.max(0, promptTokens - this.instructionTokens);
+    return this.instructionTokens + messageTokens / this.calibrationRatio;
   }
 
   /**

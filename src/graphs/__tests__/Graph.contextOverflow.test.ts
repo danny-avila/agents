@@ -412,6 +412,43 @@ describe('context overflow recovery', () => {
     ).toBe(0);
   });
 
+  it('does not retry when recency preserves the entire first turn', async () => {
+    const run = await Run.create<t.IState>({
+      runId: 'overflow-recovery-recent-first-turn',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.ANTHROPIC,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+        summarizationEnabled: true,
+      },
+      returnContent: true,
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(
+      signatureFor('us.anthropic.claude-sonnet-4-5-20250929-v1:0'),
+      Number.MAX_SAFE_INTEGER
+    );
+    run.Graph.overrideModel = model;
+
+    await expect(
+      run.processStream(
+        { messages: [new HumanMessage('oversized first turn')] },
+        streamConfig
+      )
+    ).rejects.toThrow(/too long/i);
+
+    expect(model.calls).toHaveLength(1);
+    expect(
+      run.Graph.agentContexts.get('default')?.overflowRecoveryAttempts
+    ).toBe(0);
+  });
+
   it('does not retry without a configured pruning budget', async () => {
     const run = await Run.create<t.IState>({
       runId: 'overflow-recovery-no-pruning-budget',

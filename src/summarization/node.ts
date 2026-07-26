@@ -16,6 +16,10 @@ import {
   type PromptCacheTtl,
 } from '@/messages/cache';
 import {
+  DEFAULT_RETAIN_RECENT_TURNS,
+  splitAtRecencyBoundary,
+} from '@/messages/recency';
+import {
   Constants,
   ContentTypes,
   GraphEvents,
@@ -25,7 +29,6 @@ import {
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { createRemoveAllMessage } from '@/messages/reducer';
-import { splitAtRecencyBoundary } from '@/messages/recency';
 import { getMaxOutputTokensKey } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
@@ -43,8 +46,6 @@ const SUMMARIZATION_PARAM_KEYS = new Set(['maxSummaryTokens']);
  * `retainRecent.turns` to `0` reverts to the legacy "summarize every
  * message" behavior.
  */
-const DEFAULT_RETAIN_RECENT_TURNS = 2;
-
 /**
  * Token overhead of the XML wrapper + instruction text added around the
  * summary at injection time in AgentContext.buildSystemRunnable:

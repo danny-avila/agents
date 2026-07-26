@@ -1010,8 +1010,8 @@ export function maskConsumedToolResults(params: {
   /** When provided, original (pre-masking) content is stored here keyed by
    *  message index — only for entries that actually get truncated. */
   originalContentStore?: Map<number, string>;
-  /** Called after storing content with the char length of the stored entry. */
-  onContentStored?: (charLength: number) => void;
+  /** Called after storing a newly captured entry. */
+  onContentStored?: (index: number, content: string) => void;
 }): number {
   const { messages, indexTokenCountMap, tokenCounter } = params;
   let maskedCount = 0;
@@ -1087,7 +1087,7 @@ export function maskConsumedToolResults(params: {
     if (params.originalContentStore && !params.originalContentStore.has(i)) {
       params.originalContentStore.set(i, content);
       if (params.onContentStored) {
-        params.onContentStored(content.length);
+        params.onContentStored(i, content);
       }
     }
 
@@ -1319,6 +1319,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     remainingContextTokens?: number;
     contextPressure?: number;
     originalToolContent?: Map<number, string>;
+    newOriginalToolContent?: Map<number, string>;
     calibrationRatio?: number;
     resolvedInstructionOverhead?: number;
     /** Usable budget this call: maxTokens minus output reserve */
@@ -1326,6 +1327,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     /** Calibrated instruction overhead actually applied this call */
     effectiveInstructionTokens?: number;
   } {
+    let newOriginalToolContent: Map<number, string> | undefined;
     if (params.messages.length === 0) {
       /** Post-compaction calls still invoke the model — report the same
        *  reserve-adjusted budget fields as the populated paths */
@@ -1666,8 +1668,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             : undefined,
         onContentStored:
           factoryParams.summarizationEnabled === true
-            ? (charLen: number): void => {
-              originalToolContentSize += charLen;
+            ? (index: number, content: string): void => {
+              originalToolContentSize += content.length;
+              if (newOriginalToolContent == null) {
+                newOriginalToolContent = new Map();
+              }
+              newOriginalToolContent.set(index, content);
               while (
                 originalToolContentSize > ORIGINAL_CONTENT_MAX_CHARS &&
                   originalToolContent.size > 0
@@ -1803,6 +1809,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         contextPressure,
         originalToolContent:
           originalToolContent.size > 0 ? originalToolContent : undefined,
+        newOriginalToolContent,
         calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
         contextBudget: pruningBudget,
@@ -2187,6 +2194,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       contextPressure,
       originalToolContent:
         originalToolContent.size > 0 ? originalToolContent : undefined,
+      newOriginalToolContent,
       calibrationRatio,
       resolvedInstructionOverhead: bestInstructionOverhead,
       contextBudget: pruningBudget,

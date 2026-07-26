@@ -36,6 +36,8 @@ import {
   getMessageId,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
+  DEFAULT_RETAIN_RECENT_TURNS,
+  splitAtRecencyBoundary,
 } from '@/messages';
 import {
   createLangfuseHandler,
@@ -1770,7 +1772,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           messagesToRefine,
           prePruneContextTokens,
           remainingContextTokens,
-          originalToolContent,
+          newOriginalToolContent,
           calibrationRatio,
           resolvedInstructionOverhead,
           contextBudget,
@@ -1781,7 +1783,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           lastCallUsage: agentContext.lastCallUsage,
           totalTokensFresh: agentContext.totalTokensFresh,
         });
-        prunedOriginalToolContent = originalToolContent;
+        prunedOriginalToolContent = newOriginalToolContent;
         /**
          * Masking rewrites tool content in `state.messages` in place, so this
          * map is the only surviving copy of the full output. Persist it on
@@ -1790,7 +1792,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * with it any chance of a later summary restoring the real content.
          * AgentContext bounds what accumulates.
          */
-        agentContext.preserveOriginalToolContent(originalToolContent);
+        agentContext.preserveOriginalToolContent(newOriginalToolContent);
         agentContext.indexTokenCountMap = indexTokenCountMap;
         if (calibrationRatio != null && calibrationRatio > 0) {
           agentContext.calibrationRatio = calibrationRatio;
@@ -2390,6 +2392,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const recoveryStalled = agentContext.overflowRecoveryStalled(
           estimatedPromptTokens
         );
+        const canSummarizeOverflow =
+          agentContext.summarizationEnabled === true &&
+          splitAtRecencyBoundary(messages, {
+            turns:
+              agentContext.summarizationConfig?.retainRecent?.turns ??
+              DEFAULT_RETAIN_RECENT_TURNS,
+            tokens: agentContext.summarizationConfig?.retainRecent?.tokens,
+            tokenCounter: agentContext.tokenCounter,
+          }).head.length > 0;
 
         const planRecovery = (
           error: unknown,
@@ -2440,7 +2451,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               }
               : recovery;
           const canReduceContext =
-            agentContext.summarizationEnabled === true ||
+            canSummarizeOverflow ||
             (agentContext.tokenCounter != null &&
               translatedRecovery.budgetTokens != null);
           return canReduceContext ? translatedRecovery : null;

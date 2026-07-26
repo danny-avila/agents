@@ -1,5 +1,7 @@
 import type { BaseMessage } from '@langchain/core/messages';
 
+export const DEFAULT_RETAIN_RECENT_TURNS = 2;
+
 /**
  * Configuration for splitting a message list into a head (to be summarized)
  * and a tail (to be preserved verbatim).
@@ -68,7 +70,7 @@ export function splitAtRecencyBoundary(
   messages: BaseMessage[],
   options: RecencyWindowOptions = {}
 ): RecencySplit {
-  const turnsCap = options.turns ?? 2;
+  const turnsCap = options.turns ?? DEFAULT_RETAIN_RECENT_TURNS;
 
   if (messages.length === 0 || turnsCap <= 0) {
     return {
