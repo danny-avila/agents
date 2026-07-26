@@ -446,6 +446,47 @@ describe('context overflow recovery', () => {
     ).toBe(0);
   });
 
+  it('summarizes the first numberless overflow without a pruning budget', async () => {
+    const summarizeStarts: unknown[] = [];
+    const run = await Run.create<t.IState>({
+      runId: 'overflow-recovery-summary-without-budget',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.ANTHROPIC,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+        summarizationEnabled: true,
+      },
+      returnContent: true,
+      skipCleanup: true,
+      tokenCounter,
+      customHandlers: {
+        [GraphEvents.ON_SUMMARIZE_START]: {
+          handle: (_event: string, data: t.StreamEventData): void => {
+            summarizeStarts.push(data);
+          },
+        },
+      },
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(
+      signatureFor('us.anthropic.claude-sonnet-4-5-20250929-v1:0')
+    );
+    run.Graph.overrideModel = model;
+
+    const content = await run.processStream(
+      { messages: buildConversation(8) },
+      streamConfig
+    );
+
+    expect(content).toEqual([{ type: 'text', text: 'recovered' }]);
+    expect(summarizeStarts).toHaveLength(1);
+  });
+
   it('summarizes conversation messages pruned on the first recovery', async () => {
     /**
      * The initial overflow detour avoids an unconditional summarization call,

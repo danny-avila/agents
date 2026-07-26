@@ -326,7 +326,16 @@ export interface FallbackErrorContext {
   maxContextTokens?: number;
 }
 
+export interface FallbackOverflowCandidate {
+  error: unknown;
+  context: FallbackErrorContext;
+}
+
 const fallbackErrorContexts = new WeakMap<object, FallbackErrorContext>();
+const fallbackOverflowCandidates = new WeakMap<
+  object,
+  FallbackOverflowCandidate[]
+>();
 
 function attachFallbackErrorContext(
   error: unknown,
@@ -346,6 +355,16 @@ export function getFallbackErrorContext(
     return undefined;
   }
   return fallbackErrorContexts.get(error);
+}
+
+/** Returns every fallback overflow retained from an exhausted provider chain. */
+export function getFallbackOverflowCandidates(
+  error: unknown
+): FallbackOverflowCandidate[] {
+  if (typeof error !== 'object' || error === null) {
+    return [];
+  }
+  return [...(fallbackOverflowCandidates.get(error) ?? [])];
 }
 
 /**
@@ -412,7 +431,7 @@ export async function tryFallbackProviders({
    * it, so a fallback overflow — which may sit against a different window and
    * output allowance — is the more useful of the two to surface.
    */
-  let fallbackOverflowError: unknown;
+  const overflowCandidates: FallbackOverflowCandidate[] = [];
   const primaryOverflowError: unknown = isOverflow(primaryError)
     ? primaryError
     : undefined;
@@ -455,20 +474,22 @@ export async function tryFallbackProviders({
     } catch (e) {
       lastError = e;
       const fallbackOverflowContext: ContextOverflowContext = {
-        ...overflowContext,
         provider: fb.provider,
         maxContextTokens: fb.maxContextTokens,
+        ...(overflowContext?.provider === fb.provider
+          ? {
+            estimatedPromptTokens: overflowContext.estimatedPromptTokens,
+          }
+          : {}),
       };
-      if (
-        fallbackOverflowError === undefined &&
-        isOverflow(e, fallbackOverflowContext)
-      ) {
-        attachFallbackErrorContext(e, {
+      if (isOverflow(e, fallbackOverflowContext)) {
+        const errorContext: FallbackErrorContext = {
           provider: fb.provider,
           clientOptions: fb.clientOptions,
           maxContextTokens: fb.maxContextTokens,
-        });
-        fallbackOverflowError = e;
+        };
+        attachFallbackErrorContext(e, errorContext);
+        overflowCandidates.push({ error: e, context: errorContext });
       }
       continue;
     }
@@ -479,7 +500,15 @@ export async function tryFallbackProviders({
    * caller can act on, and the fallback's carries the client attribution that
    * makes a correct retry budget possible.
    */
-  const preferred = fallbackOverflowError ?? primaryOverflowError ?? lastError;
+  const preferred =
+    overflowCandidates[0]?.error ?? primaryOverflowError ?? lastError;
+  if (
+    overflowCandidates.length > 0 &&
+    typeof preferred === 'object' &&
+    preferred !== null
+  ) {
+    fallbackOverflowCandidates.set(preferred, overflowCandidates);
+  }
   if (preferred !== undefined) {
     throw preferred;
   }

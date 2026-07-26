@@ -1340,7 +1340,9 @@ export class AgentContext {
   shouldSummarizeOverflow(): boolean {
     return (
       this.summarizationEnabled === true &&
-      (this.tokenCounter == null || this._overflowRecoveryAttempts > 0)
+      (this.tokenCounter == null ||
+        this.maxContextTokens == null ||
+        this._overflowRecoveryAttempts > 0)
     );
   }
 

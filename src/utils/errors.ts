@@ -174,7 +174,7 @@ const OVERFLOW_PATTERNS: readonly OverflowPattern[] = [
   /** Bedrock (Claude Sonnet upstream). */
   {
     kind: 'context_window',
-    re: /input is too long for requested model/i,
+    re: /\binput (?:is )?too long(?: for requested model)?\b/i,
   },
   /** OpenAI-compatible error code, and the phrases LangChain itself keys on. */
   {

@@ -12,6 +12,7 @@ import type {
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
+import type { FallbackErrorContext } from '@/llm/invoke';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import {
@@ -57,6 +58,12 @@ import {
   translateRecoveryBudget,
 } from '@/llm/contextOverflowRecovery';
 import {
+  attemptInvoke,
+  tryFallbackProviders,
+  getFallbackErrorContext,
+  getFallbackOverflowCandidates,
+} from '@/llm/invoke';
+import {
   Constants,
   GraphNodeKeys,
   ContentTypes,
@@ -68,11 +75,6 @@ import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
-import {
-  attemptInvoke,
-  tryFallbackProviders,
-  getFallbackErrorContext,
-} from '@/llm/invoke';
 import {
   appendCallbacks,
   findCallback,
@@ -2389,7 +2391,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           estimatedPromptTokens
         );
 
-        const planRecovery = (error: unknown): OverflowRecoveryPlan | null => {
+        const planRecovery = (
+          error: unknown,
+          attributedFallbackContext?: FallbackErrorContext
+        ): OverflowRecoveryPlan | null => {
           if (recoveryStalled) {
             return null;
           }
@@ -2398,7 +2403,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
            * client: its window and output allowance are why it was configured
            * as an alternative in the first place.
            */
-          const fallbackContext = getFallbackErrorContext(error);
+          const fallbackContext =
+            attributedFallbackContext ?? getFallbackErrorContext(error);
           const recovery = planContextOverflowRecovery({
             error,
             provider: fallbackContext?.provider ?? agentContext.provider,
@@ -2418,8 +2424,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             return null;
           }
           const translatedRecovery =
-            fallbackContext != null &&
-            fallbackContext.provider !== agentContext.provider
+            fallbackContext != null
               ? {
                 ...recovery,
                 budgetTokens: minDefined(
@@ -2431,6 +2436,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                     agentContext.calibrationRatio
                   )
                 ),
+                observedCalibrationRatio: undefined,
               }
               : recovery;
           const canReduceContext =
@@ -2478,13 +2484,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                  * surface it rather than a later unrelated failure.
                  */
                 overflowContext: {
+                  provider: agentContext.provider,
                   estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
                   maxContextTokens: agentContext.maxContextTokens,
                 },
               })
           );
         } catch (fallbackError) {
-          const fallbackRecovery = planRecovery(fallbackError);
+          const overflowCandidates =
+            getFallbackOverflowCandidates(fallbackError);
+          let fallbackRecovery: OverflowRecoveryPlan | null = null;
+          for (const candidate of overflowCandidates) {
+            fallbackRecovery = planRecovery(candidate.error, candidate.context);
+            if (fallbackRecovery != null) {
+              break;
+            }
+          }
+          if (overflowCandidates.length === 0) {
+            fallbackRecovery = planRecovery(fallbackError);
+          }
           if (fallbackRecovery == null) {
             throw fallbackError;
           }

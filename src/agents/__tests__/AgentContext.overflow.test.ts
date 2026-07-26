@@ -33,6 +33,20 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.shouldSummarizeOverflow()).toBe(true);
   });
 
+  it('summarizes immediately when no pruning budget is configured', () => {
+    const context = AgentContext.fromConfig(
+      {
+        agentId: 'overflow-agent',
+        provider: Providers.ANTHROPIC,
+        instructions: 'Test instructions',
+        summarizationEnabled: true,
+      } as Partial<t.AgentInputs> as t.AgentInputs,
+      () => 1
+    );
+
+    expect(context.shouldSummarizeOverflow()).toBe(true);
+  });
+
   it('stages deterministic pruning before summarization when a counter exists', () => {
     const context = AgentContext.fromConfig(
       {

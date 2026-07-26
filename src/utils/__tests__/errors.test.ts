@@ -227,6 +227,11 @@ describe('back-compatible helpers', () => {
     expect(isContextOverflowError('context length exceeded')).toBe(true);
   });
 
+  it('retains the legacy input-too-long signature', () => {
+    expect(getContextOverflowInfo(new Error('Input too long'))).not.toBeNull();
+    expect(isContextOverflowError('Input too long')).toBe(true);
+  });
+
   it('reads structured overflow reason fields alongside generic messages', () => {
     expect(
       isContextOverflowError({

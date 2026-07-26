@@ -1,8 +1,12 @@
 import { AIMessageChunk } from '@langchain/core/messages';
 import { describe, expect, it, jest } from '@jest/globals';
 import type { BaseMessage } from '@langchain/core/messages';
+import {
+  tryFallbackProviders,
+  getFallbackErrorContext,
+  getFallbackOverflowCandidates,
+} from '@/llm/invoke';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
-import { tryFallbackProviders, getFallbackErrorContext } from '@/llm/invoke';
 import { Providers } from '@/common';
 import * as init from '@/llm/init';
 
@@ -101,6 +105,7 @@ describe('tryFallbackProviders surfacing', () => {
         messages,
         primaryError: new Error('primary boom'),
         overflowContext: {
+          provider: Providers.VERTEXAI,
           estimatedPromptTokens: 190_000,
         },
       })
@@ -119,6 +124,7 @@ describe('tryFallbackProviders surfacing', () => {
       messages,
       primaryError: new Error('primary boom'),
       overflowContext: {
+        provider: Providers.VERTEXAI,
         estimatedPromptTokens: 50_000,
         maxContextTokens: 200_000,
       },
@@ -145,6 +151,7 @@ describe('tryFallbackProviders surfacing', () => {
         messages,
         primaryError: new Error('primary boom'),
         overflowContext: {
+          provider: Providers.OPENAI,
           estimatedPromptTokens: 190_000,
           maxContextTokens: 200_000,
         },
@@ -179,6 +186,60 @@ describe('tryFallbackProviders surfacing', () => {
 
     const attribution = getFallbackErrorContext(thrown);
     expect(attribution?.provider).toBe(Providers.ANTHROPIC);
+  });
+
+  it('retains every fallback overflow candidate', async () => {
+    const first = new Error(
+      'This model\'s maximum context length is 4096 tokens. However, your messages resulted in 6000 tokens.'
+    );
+    const second = signatureError('claude-haiku-4-5-20251001');
+    stubModels([first, second]);
+
+    const thrown = await tryFallbackProviders({
+      fallbacks,
+      messages,
+      primaryError: new Error('primary boom'),
+    }).catch((error: unknown) => error);
+
+    expect(getFallbackOverflowCandidates(thrown)).toEqual([
+      {
+        error: first,
+        context: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: undefined,
+          maxContextTokens: undefined,
+        },
+      },
+      {
+        error: second,
+        context: {
+          provider: Providers.OPENAI,
+          clientOptions: undefined,
+          maxContextTokens: undefined,
+        },
+      },
+    ]);
+  });
+
+  it('declines ambiguous pressure from another provider token space', async () => {
+    const vertex = signatureError('gemini-2.5-flash-lite');
+    stubModels([vertex, new Error('503 upstream unavailable')]);
+
+    await expect(
+      tryFallbackProviders({
+        fallbacks: [
+          { provider: Providers.VERTEXAI, maxContextTokens: 32_000 },
+          { provider: Providers.OPENAI },
+        ],
+        messages,
+        primaryError: new Error('primary boom'),
+        overflowContext: {
+          provider: Providers.OPENAI,
+          estimatedPromptTokens: 50_000,
+          maxContextTokens: 200_000,
+        },
+      })
+    ).rejects.toThrow(/upstream unavailable/);
   });
 
   it('continues past a frozen fallback error', async () => {
