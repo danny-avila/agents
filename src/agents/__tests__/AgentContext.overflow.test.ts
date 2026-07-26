@@ -26,6 +26,62 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.pruneMessages).toBeUndefined();
   });
 
+  it('summarizes the first overflow when deterministic pruning is unavailable', () => {
+    const context = createContext(1_000_000);
+    context.summarizationEnabled = true;
+
+    expect(context.shouldSummarizeOverflow()).toBe(true);
+  });
+
+  it('stages deterministic pruning before summarization when a counter exists', () => {
+    const context = AgentContext.fromConfig(
+      {
+        agentId: 'overflow-agent',
+        provider: Providers.ANTHROPIC,
+        instructions: 'Test instructions',
+        maxContextTokens: 1_000_000,
+        summarizationEnabled: true,
+      } as Partial<t.AgentInputs> as t.AgentInputs,
+      () => 1
+    );
+
+    expect(context.shouldSummarizeOverflow()).toBe(false);
+    context.applyContextBudgetCorrection(190_000, 274_468, true);
+    expect(context.shouldSummarizeOverflow()).toBe(true);
+  });
+
+  it('preserves the earliest full tool output when masking records collide', () => {
+    const context = createContext(1_000_000);
+    context.preserveOriginalToolContent(
+      new Map([
+        [2, 'full output'],
+        [4, 'another output'],
+      ])
+    );
+    context.preserveOriginalToolContent(
+      new Map([
+        [2, 'truncated placeholder'],
+        [6, 'new output'],
+      ])
+    );
+
+    expect(context.pendingOriginalToolContent).toEqual(
+      new Map([
+        [2, 'full output'],
+        [4, 'another output'],
+        [6, 'new output'],
+      ])
+    );
+  });
+
+  it('releases index-keyed tool output snapshots on reset', () => {
+    const context = createContext(1_000_000);
+    context.preserveOriginalToolContent(new Map([[2, 'full output']]));
+    context.reset();
+
+    expect(context.pendingOriginalToolContent).toBeUndefined();
+  });
+
   it('restores the pre-correction budget on reset', () => {
     const context = createContext(1_000_000);
     context.applyContextBudgetCorrection(190_000, 274_468);

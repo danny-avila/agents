@@ -28,6 +28,7 @@ import {
 import {
   DEFAULT_RESERVE_RATIO,
   createPruneMessages,
+  enforceOriginalContentCap,
   syncBudgetDerivedFields,
 } from '@/messages';
 import { createSchemaOnlyTools } from '@/tools/schema';
@@ -1009,6 +1010,7 @@ export class AgentContext {
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
+    this.pendingOriginalToolContent = undefined;
 
     this.summaryText = this._durableSummaryText;
     this.summaryTokenCount = this._durableSummaryTokenCount;
@@ -1338,6 +1340,33 @@ export class AgentContext {
 
   get overflowRecoveryAttempts(): number {
     return this._overflowRecoveryAttempts;
+  }
+
+  shouldSummarizeOverflow(): boolean {
+    return (
+      this.summarizationEnabled === true &&
+      (this.tokenCounter == null || this._overflowRecoveryAttempts > 0)
+    );
+  }
+
+  /** Preserves the earliest full tool output recorded for each message index. */
+  preserveOriginalToolContent(
+    originalToolContent: Map<number, string> | undefined
+  ): void {
+    if (originalToolContent == null || originalToolContent.size === 0) {
+      return;
+    }
+    if (this.pendingOriginalToolContent == null) {
+      this.pendingOriginalToolContent = new Map(originalToolContent);
+      enforceOriginalContentCap(this.pendingOriginalToolContent);
+      return;
+    }
+    for (const [index, content] of originalToolContent) {
+      if (!this.pendingOriginalToolContent.has(index)) {
+        this.pendingOriginalToolContent.set(index, content);
+      }
+    }
+    enforceOriginalContentCap(this.pendingOriginalToolContent);
   }
 
   /**

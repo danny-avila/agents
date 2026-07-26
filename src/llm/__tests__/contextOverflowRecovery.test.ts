@@ -32,15 +32,13 @@ describe('planContextOverflowRecovery', () => {
     expect(plan?.info.limitTokens).toBe(200_000);
   });
 
-  it('scales our own estimate by the measured overage, needing no unit conversion', () => {
+  it('keeps the corrected budget in provider token units', () => {
     const openrouter = signatureFor('qwen/qwen-2.5-7b-instruct');
     /**
      * OpenRouter counted 56,811 input tokens for a prompt we estimated at
-     * 42,599 — a ~1.33 divergence. The ratio `promptCeiling / promptTokens`
-     * is unit-free, so applying it to our estimate lands on a correct target
-     * without converting between tokenizers. Converting instead would
-     * double-count against the pruner's own calibration, which already
-     * divides the budget by its learned ratio.
+     * 42,599 — a ~1.33 divergence. `maxContextTokens` remains in provider
+     * units, while the observed ratio seeds the pruner's conversion into its
+     * local counter units.
      */
     const plan = planContextOverflowRecovery({
       error: openrouter.error,
@@ -51,8 +49,7 @@ describe('planContextOverflowRecovery', () => {
     });
 
     expect(plan?.observedCalibrationRatio).toBeCloseTo(1.333, 2);
-    const overageScale = (32_768 - 16) / 56_811;
-    expect(plan?.budgetTokens).toBe(Math.floor(42_599 * overageScale * 0.95));
+    expect(plan?.budgetTokens).toBe(Math.floor((32_768 - 16) * 0.95));
   });
 
   it('recovers on a small-window model despite the absolute floor', () => {

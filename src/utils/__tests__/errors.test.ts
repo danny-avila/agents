@@ -223,6 +223,10 @@ describe('back-compatible helpers', () => {
     expect(isContextOverflowError('connection reset')).toBe(false);
   });
 
+  it('retains the legacy space-separated context overflow signature', () => {
+    expect(isContextOverflowError('context length exceeded')).toBe(true);
+  });
+
   it('treats body-size rejections as likely overflow only in the loose check', () => {
     const payload = { status: 413, message: 'request entity too large' };
     expect(isContextOverflowError(payload)).toBe(false);

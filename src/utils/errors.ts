@@ -179,7 +179,7 @@ const OVERFLOW_PATTERNS: readonly OverflowPattern[] = [
   /** OpenAI-compatible error code, and the phrases LangChain itself keys on. */
   {
     kind: 'context_window',
-    re: /context_length_exceeded|input tokens exceed the configured limit|exceeds the context window|exceeds model context window/i,
+    re: /context[_ ]length[_ ]exceeded|input tokens exceed the configured limit|exceeds the context window|exceeds model context window/i,
   },
   /** Generic long-tail phrasings observed across OpenAI-compatible gateways. */
   {

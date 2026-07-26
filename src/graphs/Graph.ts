@@ -23,7 +23,6 @@ import {
   extractToolDiscoveries,
   addBedrockTailCacheControl,
   formatArtifactPayload,
-  enforceOriginalContentCap,
   formatContentStrings,
   isLegacyConvertible,
   createPruneMessages,
@@ -375,46 +374,6 @@ function clearCurrentDeltaStepMarkers({
     graph.messageStepHasTextDeltas.delete(stepId);
     graph.reasoningStepHasDeltas.delete(stepId);
   }
-}
-
-/**
- * Merge — never overwrite — the pruner's masking record into
- * `pendingOriginalToolContent`, which the summarize node reads to restore
- * full tool output before writing a summary. Skipping this leaves the
- * summarizer working from truncated placeholders.
- *
- * Carry-over entries from a prior summarize (preserved by the recency window
- * for masked tool messages still in the tail) and the current pruner's new
- * entries are both keyed by indices in the current `state.messages`, so a
- * key-wise union is correct. Overwriting would discard the carry-over and
- * reduce summary fidelity when those masked tail messages eventually move
- * into the head.
- *
- * Called from both paths that reach the summarize node: the configured
- * trigger, and overflow recovery.
- */
-function preserveOriginalToolContent(
-  agentContext: AgentContext,
-  originalToolContent: Map<number, string> | undefined
-): void {
-  if (originalToolContent == null || originalToolContent.size === 0) {
-    return;
-  }
-  if (agentContext.pendingOriginalToolContent == null) {
-    agentContext.pendingOriginalToolContent = originalToolContent;
-    return;
-  }
-  for (const [index, content] of originalToolContent) {
-    agentContext.pendingOriginalToolContent.set(index, content);
-  }
-  /**
-   * Re-apply the per-store char cap after the union. The pruner enforces
-   * ORIGINAL_CONTENT_MAX_CHARS inside its own map via the onContentStored
-   * callback, but a key-wise merge with recency carry-over bypasses that
-   * accounting and could let the merged map grow without bound across long
-   * sessions.
-   */
-  enforceOriginalContentCap(agentContext.pendingOriginalToolContent);
 }
 
 /**
@@ -1567,11 +1526,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * message content lost. A summarization call is held back until that has
      * been tried and the provider rejected the prompt again.
      */
-    const allowSummarization =
-      agentContext.summarizationEnabled === true &&
-      agentContext.overflowRecoveryAttempts > 0;
+    const allowSummarization = agentContext.shouldSummarizeOverflow();
 
-    preserveOriginalToolContent(agentContext, originalToolContent);
+    agentContext.preserveOriginalToolContent(originalToolContent);
+    if (
+      recovery.observedCalibrationRatio != null &&
+      recovery.observedCalibrationRatio > 0
+    ) {
+      agentContext.calibrationRatio = recovery.observedCalibrationRatio;
+    }
     agentContext.applyContextBudgetCorrection(
       recovery.budgetTokens,
       estimatedPromptTokens,
@@ -1791,9 +1754,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * every prune, not just when a summary is about to be written — the
          * pruner closure that produced it is discarded on the next reset, and
          * with it any chance of a later summary restoring the real content.
-         * `enforceOriginalContentCap` bounds what accumulates.
+         * AgentContext bounds what accumulates.
          */
-        preserveOriginalToolContent(agentContext, originalToolContent);
+        agentContext.preserveOriginalToolContent(originalToolContent);
         /**
          * Consumed once per pass so a compression-only retry suppresses the
          * configured trigger exactly here — the summarize node's skip would

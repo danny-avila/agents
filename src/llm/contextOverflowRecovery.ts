@@ -13,9 +13,9 @@
  * apply the same correction twice and prune toward roughly `limit / ratio²`,
  * silently discarding far more history than the overflow called for.
  *
- * `observedCalibrationRatio` is still reported, because a large divergence
- * between the provider's count and ours is worth surfacing, but it is
- * deliberately not applied to the budget.
+ * `observedCalibrationRatio` is returned separately so the caller can seed
+ * the pruner's conversion without folding the same correction into the
+ * provider-space budget.
  */
 import type { ContextOverflowInfo } from '@/utils/errors';
 import type { Providers } from '@/common';
@@ -46,7 +46,7 @@ const MIN_MESSAGE_HEADROOM_TOKENS = 2_000;
 export const DEFAULT_MAX_OVERFLOW_RECOVERIES = 2;
 
 export interface OverflowRecoveryPlan {
-  /** Budget the retry should target, in the SDK's own token units. */
+  /** Budget the retry should target, in provider token units. */
   budgetTokens: number;
   /** What the provider disclosed. Carried through for logging. */
   info: ContextOverflowInfo;
@@ -54,10 +54,10 @@ export interface OverflowRecoveryPlan {
    * Provider-reported prompt size divided by our own estimate, when both are
    * known. Greater than 1 means we under-count relative to this provider.
    *
-   * Reported for observability only — the pruner applies its own learned
-   * calibration to the budget, so applying this as well would double-count.
-   * Derived from `info.promptTokens`, never `info.requestedTokens`, since
-   * several providers fold the completion allowance into the latter.
+   * Returned separately so the graph can seed the pruner's calibration;
+   * applying it to this plan's budget as well would double-count. Derived
+   * from `info.promptTokens`, never `info.requestedTokens`, since several
+   * providers fold the completion allowance into the latter.
    */
   observedCalibrationRatio?: number;
 }
@@ -135,20 +135,6 @@ function resolveTargetBudget(
      */
     if (promptCeiling <= 0) {
       return null;
-    }
-
-    /**
-     * Preferred path: scale by how far over the prompt actually was.
-     *
-     * `promptCeiling / promptTokens` is a pure ratio in the provider's units,
-     * so applying it to our own estimate needs no unit conversion — which is
-     * what makes this immune to the tokenizer divergence that the absolute
-     * ceiling below has to be careful about. It also targets the prompt that
-     * was rejected rather than a budget it may have been sitting well under.
-     */
-    if (isUsable(info.promptTokens) && isUsable(estimatedPromptTokens)) {
-      const overageScale = promptCeiling / info.promptTokens;
-      return estimatedPromptTokens * overageScale * CEILING_HEADROOM_RATIO;
     }
 
     return promptCeiling * CEILING_HEADROOM_RATIO;

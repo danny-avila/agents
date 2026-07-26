@@ -356,13 +356,12 @@ describe('context overflow recovery', () => {
     expect(summarizeStarts).toHaveLength(0);
   });
 
-  it('shrinks the budget in proportion to the measured overage', async () => {
+  it('keeps the corrected budget in provider units and seeds calibration', async () => {
     /**
      * The provider counted 274,468 for a prompt it caps at 200,000 — 1.37×
-     * over. Applying that ratio to our own estimate is unit-free, so it needs
-     * no tokenizer conversion; converting instead would double-count against
-     * the pruner's own calibration and discard far more than the overflow
-     * called for.
+     * over the provider ceiling. The corrected budget stays in provider units,
+     * and the provider/local ratio is installed on the pruner so it is applied
+     * exactly once on this retry and later tool-call turns.
      */
     const run = await createRun({
       runId: 'overflow-recovery-proportional',
@@ -379,9 +378,10 @@ describe('context overflow recovery', () => {
     await run.processStream({ messages }, streamConfig);
 
     const estimatedPrompt = messages.length * TOKENS_PER_MESSAGE;
-    const expected = Math.floor(estimatedPrompt * (200_000 / 274_468) * 0.95);
-    expect(run.Graph.agentContexts.get('default')?.maxContextTokens).toBe(
-      expected
+    const agentContext = run.Graph.agentContexts.get('default');
+    expect(agentContext?.maxContextTokens).toBe(Math.floor(200_000 * 0.95));
+    expect(agentContext?.calibrationRatio).toBeCloseTo(
+      274_468 / estimatedPrompt
     );
   });
 
