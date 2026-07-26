@@ -854,6 +854,7 @@ export class MultiAgentGraph extends StandardGraph {
    * Create the multi-agent workflow with dynamic handoffs
    */
   override createWorkflow(): t.CompiledMultiAgentWorkflow {
+    this.hasCompiledCheckpointer = this.compileOptions?.checkpointer != null;
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: (a, b) => {

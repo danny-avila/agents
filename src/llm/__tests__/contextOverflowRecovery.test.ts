@@ -6,6 +6,7 @@ import {
   translateRecoveryBudget,
 } from '@/llm/contextOverflowRecovery';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
+import { clampCalibrationRatio } from '@/messages';
 import { Providers } from '@/common';
 
 function signatureFor(model: string) {
@@ -78,6 +79,22 @@ describe('planContextOverflowRecovery', () => {
 
   it('uses a primary-space blind shrink when fallback units cannot be translated', () => {
     expect(getBlindRecoveryBudget(100_000)).toBe(70_000);
+  });
+
+  it('conservatively translates an uncalibrated fallback ceiling', () => {
+    const primaryBlindBudget = getBlindRecoveryBudget(1_000_000);
+    const fallbackBound = translateRecoveryBudget(
+      32_000,
+      clampCalibrationRatio(Number.POSITIVE_INFINITY),
+      1
+    );
+
+    expect(
+      Math.min(
+        primaryBlindBudget ?? Number.POSITIVE_INFINITY,
+        fallbackBound ?? Number.POSITIVE_INFINITY
+      )
+    ).toBe(6_400);
   });
 
   it('recovers on a small-window model despite the absolute floor', () => {

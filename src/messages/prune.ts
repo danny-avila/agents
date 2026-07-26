@@ -80,10 +80,10 @@ export function enforceOriginalContentCap(map: Map<number, string>): void {
 
 /** Minimum cumulative calibration ratio — provider can't count fewer tokens
  *  than our raw estimate (within reason). Prevents divide-by-zero edge cases. */
-const CALIBRATION_RATIO_MIN = 0.5;
+export const CALIBRATION_RATIO_MIN = 0.5;
 
 /** Maximum cumulative calibration ratio — sanity cap for the running ratio. */
-const CALIBRATION_RATIO_MAX = 5;
+export const CALIBRATION_RATIO_MAX = 5;
 
 /** Keeps provider/local token calibration within the shared safe range. */
 export function clampCalibrationRatio(ratio: number): number {

@@ -25,6 +25,7 @@ import {
   formatArtifactPayload,
   formatContentStrings,
   isLegacyConvertible,
+  CALIBRATION_RATIO_MAX,
   createPruneMessages,
   syncBudgetDerivedFields,
   addTailCacheControl,
@@ -420,6 +421,19 @@ function getEstimatedPromptTokens(
   }
   const used = budget - remaining;
   return used > 0 ? used : undefined;
+}
+
+function minDefined(
+  left: number | undefined,
+  right: number | undefined
+): number | undefined {
+  if (left == null) {
+    return right;
+  }
+  if (right == null) {
+    return left;
+  }
+  return Math.min(left, right);
 }
 
 async function dispatchMessageCreationStep({
@@ -914,6 +928,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   overrideModel?: t.ChatModel;
   /** Optional compile options passed into workflow.compile() */
   compileOptions?: t.CompileOptions | undefined;
+  /** Whether the workflow was actually compiled with a checkpointer. */
+  hasCompiledCheckpointer: boolean = false;
   messages: BaseMessage[] = [];
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
@@ -1032,7 +1048,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     );
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
     const hasScopedCheckpoint =
-      this.compileOptions?.checkpointer != null &&
+      this.hasCompiledCheckpointer &&
       checkpointScope != null &&
       checkpointScope !== '';
     const preserveOriginalToolContent =
@@ -1052,7 +1068,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.messages = [];
     this.overrideModel = undefined;
     const preserveOriginalToolContent =
-      this.compileOptions?.checkpointer != null &&
+      this.hasCompiledCheckpointer &&
       this.originalToolContentCheckpointScope != null;
     for (const context of this.agentContexts.values()) {
       context.reset({ preserveOriginalToolContent });
@@ -2406,14 +2422,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             fallbackContext.provider !== agentContext.provider
               ? {
                 ...recovery,
-                budgetTokens:
-                    recovery.observedCalibrationRatio == null
-                      ? getBlindRecoveryBudget(agentContext.maxContextTokens)
-                      : translateRecoveryBudget(
-                        recovery.budgetTokens,
-                        recovery.observedCalibrationRatio,
-                        agentContext.calibrationRatio
-                      ),
+                budgetTokens: minDefined(
+                  getBlindRecoveryBudget(agentContext.maxContextTokens),
+                  translateRecoveryBudget(
+                    recovery.budgetTokens,
+                    recovery.observedCalibrationRatio ??
+                        CALIBRATION_RATIO_MAX,
+                    agentContext.calibrationRatio
+                  )
+                ),
               }
               : recovery;
           const canReduceContext =
@@ -2920,6 +2937,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   createWorkflow(): t.CompiledStateWorkflow {
+    this.hasCompiledCheckpointer = this.compileOptions?.checkpointer != null;
     const agentNode = this.createAgentNode(this.defaultAgentId);
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({

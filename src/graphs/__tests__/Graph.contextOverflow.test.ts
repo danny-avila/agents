@@ -178,6 +178,43 @@ describe('context overflow recovery', () => {
     expect(agentContext.pendingOriginalToolContent).toBeUndefined();
   });
 
+  it('preserves snapshots with the auto-installed HITL checkpointer', async () => {
+    const run = await Run.create<t.IState>({
+      runId: 'overflow-originals-hitl-checkpointer',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.ANTHROPIC,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+        maxContextTokens: 1_000_000,
+        compileOptions: { interruptAfter: [] },
+      },
+      humanInTheLoop: { enabled: true },
+      returnContent: true,
+      skipCleanup: true,
+      tokenCounter,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const agentContext = run.Graph.agentContexts.get('default');
+    if (agentContext == null) {
+      throw new Error('Expected default agent context');
+    }
+    expect(run.Graph.compileOptions?.checkpointer).toBeUndefined();
+    expect(run.Graph.hasCompiledCheckpointer).toBe(true);
+    run.Graph.resetValues(undefined, 'checkpoint-scope');
+    agentContext.preserveOriginalToolContent(new Map([[2, 'full output']]));
+
+    run.Graph.resetValues(undefined, 'checkpoint-scope');
+
+    expect(agentContext.pendingOriginalToolContent).toEqual(
+      new Map([[2, 'full output']])
+    );
+  });
+
   it('compacts and retries instead of surfacing the provider error', async () => {
     const run = await createRun({
       runId: 'overflow-recovery-numbers',
