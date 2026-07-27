@@ -78,6 +78,7 @@ export type GoogleThinkingConfig = {
 export type ManagedRequestOptions = {
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
+  nativeProgrammaticToolCalling?: boolean;
 };
 export type OpenAIClientOptions = ChatOpenAIFields & ManagedRequestOptions;
 export type AnthropicClientOptions = Omit<AnthropicInput, 'thinking'> & {
