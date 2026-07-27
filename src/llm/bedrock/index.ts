@@ -391,7 +391,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
 
       const stream: AsyncIterable<ConverseStreamOutput> | undefined =
         response.stream;
-      if (stream == null) {
+      if (!stream) {
         return;
       }
 
