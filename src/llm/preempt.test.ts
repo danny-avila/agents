@@ -194,18 +194,12 @@ describe('canSealPreempt', () => {
       ).toBe(false);
     });
 
-    it('after an Anthropic server tool result has landed', () => {
+    it('while one of several server tool calls is still unanswered', () => {
       expect(
         canSealPreempt(
           chunk({
             content: [
-              { type: 'text', text: 'Here is what I found.' },
-              {
-                type: 'server_tool_use',
-                id: 'srvtoolu_1',
-                name: 'web_search',
-                input: { query: 'x' },
-              },
+              { type: 'text', text: 'Checking two sources.' },
               {
                 type: 'web_search_tool_result',
                 tool_use_id: 'srvtoolu_1',
@@ -214,6 +208,7 @@ describe('canSealPreempt', () => {
             ],
             tool_call_chunks: [
               { id: 'srvtoolu_1', name: 'web_search', args: '', index: 0 },
+              { id: 'srvtoolu_2', name: 'web_search', args: '', index: 1 },
             ],
           })
         )
@@ -274,6 +269,38 @@ describe('canSealPreempt', () => {
               { type: 'text', text: 'Here is what I found.' },
               { type: 'toolCall', id: 'gcall_1', name: 'google_search' },
               { type: 'toolResponse', id: 'gcall_1', response: {} },
+            ],
+          })
+        )
+      ).toBe(true);
+    });
+
+    /**
+     * Provider-side tools never reach `ToolNode`, so no `PostToolBatch`
+     * boundary exists to drain into. Refusing forever after a search would
+     * defer a queued message to the end of the turn rather than to the next
+     * tool step, so a call whose result has landed counts as settled.
+     */
+    it('once an Anthropic server tool result has landed', () => {
+      expect(
+        canSealPreempt(
+          chunk({
+            content: [
+              { type: 'text', text: 'Here is what I found.' },
+              {
+                type: 'server_tool_use',
+                id: 'srvtoolu_1',
+                name: 'web_search',
+                input: { query: 'x' },
+              },
+              {
+                type: 'web_search_tool_result',
+                tool_use_id: 'srvtoolu_1',
+                content: [],
+              },
+            ],
+            tool_call_chunks: [
+              { id: 'srvtoolu_1', name: 'web_search', args: '', index: 0 },
             ],
           })
         )

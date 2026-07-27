@@ -76,6 +76,50 @@ function hasOpenGoogleServerToolCall(
 }
 
 /**
+ * Ids of Anthropic server-side tool calls whose paired result block is already
+ * on the accumulated content. Those calls are answered and cannot be orphaned
+ * by a seal.
+ */
+function settledServerToolCallIds(
+  content: AIMessageChunk['content']
+): Set<string> {
+  const settled = new Set<string>();
+  if (typeof content === 'string') {
+    return settled;
+  }
+  for (const block of content) {
+    if (block.type !== 'web_search_tool_result') {
+      continue;
+    }
+    const id = block.tool_use_id;
+    if (typeof id === 'string') {
+      settled.add(id);
+    }
+  }
+  return settled;
+}
+
+/** Tool calls still awaiting an answer, ignoring ones already settled. */
+function countOpenToolCalls(
+  calls: ReadonlyArray<{ id?: string }> | undefined,
+  settled: Set<string>
+): number {
+  if (calls == null || calls.length === 0) {
+    return 0;
+  }
+  if (settled.size === 0) {
+    return calls.length;
+  }
+  let open = 0;
+  for (const call of calls) {
+    if (call.id == null || !settled.has(call.id)) {
+      open += 1;
+    }
+  }
+  return open;
+}
+
+/**
  * Cooperative mid-generation seal gate. Returns true ONLY when sealing here
  * yields a message sequence valid on EVERY supported provider:
  *  - non-whitespace TEXT content, so the FIRST injected user turn is preceded
@@ -104,10 +148,24 @@ export function canSealPreempt(chunk: AIMessageChunk | undefined): boolean {
   if (chunk == null) {
     return false;
   }
-  if ((chunk.tool_calls?.length ?? 0) > 0) {
+  /**
+   * Anthropic's server-side tools run inside the provider, so unlike a client
+   * tool they never reach `ToolNode` and never produce a `PostToolBatch`
+   * boundary. `concat` also keeps their `server_tool_use` chunk on the
+   * accumulated message for the rest of the turn. Together that means a naive
+   * tool-call gate makes a turn permanently unsealable the moment a web
+   * search starts, with no later boundary to drain into — the queued message
+   * waits for the whole turn to finish rather than for the next tool step.
+   *
+   * So calls whose paired result block has already landed are treated as
+   * settled: they cannot be orphaned, because the provider has already
+   * answered them.
+   */
+  const settled = settledServerToolCallIds(chunk.content);
+  if (countOpenToolCalls(chunk.tool_calls, settled) > 0) {
     return false;
   }
-  if ((chunk.tool_call_chunks?.length ?? 0) > 0) {
+  if (countOpenToolCalls(chunk.tool_call_chunks, settled) > 0) {
     return false;
   }
   if ((chunk.invalid_tool_calls?.length ?? 0) > 0) {

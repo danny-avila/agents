@@ -31,7 +31,11 @@ import { manualToolStreamProviders } from '@/llm/providers';
 import { appendCallbacks } from '@/utils/callbacks';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
-import { modifyDeltaProperties } from '@/messages';
+import {
+  modifyDeltaProperties,
+  coalesceAdjacentUserTurns,
+  strictAlternationProviders,
+} from '@/messages';
 import { canSealPreempt } from '@/llm/preempt';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { initializeModel } from '@/llm/init';
@@ -581,11 +585,26 @@ export async function attemptInvoke(
   });
   const registry = context?.getOrCreateToolOutputRegistry();
   const runId = config?.configurable?.run_id as string | undefined;
-  const messagesForProvider = annotateMessagesForLLM(
+  const annotated = annotateMessagesForLLM(
     invocationMessages,
     registry,
     runId
   );
+  /**
+   * Keyed on the provider ACTUALLY serving this call, not the agent's primary.
+   * `createCallModel` normalizes for the primary, but `tryFallbackProviders`
+   * re-sends the same array — so an OpenAI primary that fails after a boundary
+   * injected two human turns would hand a Bedrock or Mistral fallback the
+   * consecutive user turns those APIs reject, and the recovery request would
+   * fail for a reason unrelated to the original failure.
+   *
+   * `attemptInvoke` is the single funnel for primary, fallback and
+   * summarization calls, so applying it here covers all three. Idempotent, so
+   * the primary simply re-runs a no-op over already-coalesced messages.
+   */
+  const messagesForProvider = strictAlternationProviders.has(provider)
+    ? coalesceAdjacentUserTurns(annotated)
+    : annotated;
 
   /**
    * Stamp the provider that is ACTUALLY serving this invocation onto the

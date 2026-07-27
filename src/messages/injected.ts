@@ -2,6 +2,7 @@
 import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { InjectedMessage } from '@/types/tools';
+import { ContentTypes } from '@/common';
 import { toLangChainContent } from './langchain';
 
 /**
@@ -17,11 +18,44 @@ import { toLangChainContent } from './langchain';
  * shape to the one the already-shipped tool boundary emits, so the two sites
  * must not be able to drift.
  */
+/**
+ * True when an entry carries nothing a provider will accept as a turn.
+ *
+ * The public `InjectedMessage` type admits `content: ''` and `content: []`,
+ * and a host hook is free to return one. Converting it anyway produces a
+ * `HumanMessage` that passes the caller's `length > 0` test, so the graph
+ * resumes and sends a trailing EMPTY user turn — which Anthropic and other
+ * strict providers reject outright, turning a cooperative seal into a failed
+ * run. Permissive providers merely burn a model call.
+ *
+ * Whitespace counts as empty, matching the standard `canSealPreempt` applies
+ * to the assistant side of the same pair. Non-text blocks count as content: a
+ * media-only steer is a real turn and must survive.
+ */
+function isEmptyInjectedContent(content: InjectedMessage['content']): boolean {
+  if (typeof content === 'string') {
+    return content.trim() === '';
+  }
+  if (content.length === 0) {
+    return true;
+  }
+  return content.every((block) => {
+    if (block.type !== ContentTypes.TEXT) {
+      return false;
+    }
+    const text = block[ContentTypes.TEXT];
+    return typeof text !== 'string' || text.trim() === '';
+  });
+}
+
 export function convertInjectedMessages(
   messages: InjectedMessage[]
 ): BaseMessage[] {
   const converted: BaseMessage[] = [];
   for (const msg of messages) {
+    if (isEmptyInjectedContent(msg.content)) {
+      continue;
+    }
     const additional_kwargs: Record<string, unknown> = {
       role: msg.role,
     };

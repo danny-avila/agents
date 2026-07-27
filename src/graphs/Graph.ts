@@ -1184,11 +1184,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   /** Internal seal preconditions only — no host callback, no side effects. */
   private canClaimPreemptSeal(): boolean {
+    /**
+     * Resolved and required here with the same rule `dispatchPreemptBoundary`
+     * uses. Without it a direct `StandardGraph` consumer that supplies no
+     * `runId` could claim a seal on the strength of a global matcher, then hit
+     * the boundary's own null-runId guard and get nothing back — truncating
+     * the answer for a drain that provably could not run.
+     */
+    const runId =
+      (this.config?.configurable?.run_id as string | undefined) ?? this.runId;
     return (
       !this.subagentScope &&
       this.preemption != null &&
       !this.preemptSealInFlight &&
       this.preemptSealBudgetUsed < resolveMaxSeals(this.preemption.maxSeals) &&
+      runId != null &&
       /**
        * A seal only buys room for an injection. With no `PreemptBoundary`
        * matcher live — never registered, or a `once` matcher already
@@ -1200,10 +1210,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * Same session resolution as `dispatchPreemptBoundary`, or a
        * session-scoped matcher would be visible at one site and not the other.
        */
-      this.hookRegistry?.hasDispatchableHookFor(
-        'PreemptBoundary',
-        (this.config?.configurable?.run_id as string | undefined) ?? this.runId
-      ) === true
+      this.hookRegistry?.hasDispatchableHookFor('PreemptBoundary', runId) ===
+        true
     );
   }
 
@@ -3449,9 +3457,42 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       },
       sessionId: runId,
       timeoutMs: PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
+      /**
+       * The host's own abort signal, deliberately NOT `config.signal` — inside
+       * a node the latter is LangGraph's composed signal, which also fires
+       * when an unrelated sibling in the same superstep throws. Cancellation
+       * already returns control in milliseconds without this; what it buys is
+       * that a drain does not keep running after the run it belongs to died.
+       */
+      signal: this.signal,
     }).catch((): undefined => undefined);
     if (result == null) {
       return EMPTY_PREEMPT_BOUNDARY;
+    }
+    /**
+     * `executeHooks` raises a registry halt whenever a hook returns
+     * `preventContinuation`. That halt has exactly one consumer — the poll in
+     * `Run.processStream` — and its `break` cancels the stream iterator, which
+     * aborts Pregel. The abort lands BEFORE the outer reducer commits
+     * `StandardGraph.messages`, so honoring the halt here would destroy the
+     * sealed assistant turn: the run returns empty content and the host
+     * persists nothing. Measured deterministically — the commit is several
+     * stream events downstream of the point the halt becomes observable.
+     *
+     * The `preventContinuation` branch in `createCallModel` already enforces
+     * the contract locally by declining to self-loop, and a sealed chunk
+     * provably carries no tool calls, so the turn routes to END after exactly
+     * one model call either way. Clearing the halt therefore costs nothing it
+     * was buying and saves the content the seal exists to preserve.
+     *
+     * Scoped to a halt this event raised, so a halt from an earlier hook in
+     * the same run — `haltRun` is first-write-wins — is left alone.
+     */
+    if (
+      result.preventContinuation === true &&
+      this.hookRegistry.getHaltSignal(runId)?.source === 'PreemptBoundary'
+    ) {
+      this.hookRegistry.clearHaltSignal(runId);
     }
     const injected: BaseMessage[] = [];
     /**
