@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "3.3.0",
+  "version": "3.3.1",
   "main": "./dist/cjs/main.cjs",
   "module": "./dist/esm/main.mjs",
   "types": "./dist/types/index.d.ts",
@@ -206,11 +206,9 @@
       "openai": "$openai"
     },
     "uuid": "$uuid",
-    "fast-xml-parser": "5.7.2",
     "ajv": "6.14.0",
-    "minimatch": "3.1.4",
     "@opentelemetry/core": "^2.9.0",
-    "js-yaml": "^4.2.0"
+    "js-yaml": "^4.3.0"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.103.0",
@@ -236,7 +234,7 @@
     "@scarf/scarf": "^1.4.0",
     "@types/diff": "^7.0.2",
     "ai-tokenizer": "^1.0.6",
-    "axios": "^1.16.0",
+    "axios": "^1.18.1",
     "cheerio": "^1.0.0",
     "diff": "^9.0.0",
     "dotenv": "^16.4.7",
@@ -248,7 +246,7 @@
     "uuid": "^11.1.1"
   },
   "peerDependencies": {
-    "@anthropic-ai/sandbox-runtime": "^0.0.54"
+    "@anthropic-ai/sandbox-runtime": "^0.0.67"
   },
   "peerDependenciesMeta": {
     "@anthropic-ai/sandbox-runtime": {
@@ -260,7 +258,7 @@
     "~/*": "./*"
   },
   "devDependencies": {
-    "@anthropic-ai/sandbox-runtime": "^0.0.54",
+    "@anthropic-ai/sandbox-runtime": "^0.0.67",
     "@anthropic-ai/vertex-sdk": "^0.12.0",
     "@eslint/compat": "^1.2.7",
     "@langchain/langgraph-checkpoint-mongodb": "^1.4.0",
@@ -271,7 +269,7 @@
     "@types/yargs-parser": "^21.0.3",
     "@typescript-eslint/eslint-plugin": "^8.24.0",
     "@typescript-eslint/parser": "^8.24.0",
-    "eslint": "^9.39.1",
+    "eslint": "^9.39.5",
     "eslint-import-resolver-typescript": "^3.7.0",
     "eslint-plugin-import": "^2.31.0",
     "husky": "^9.1.7",

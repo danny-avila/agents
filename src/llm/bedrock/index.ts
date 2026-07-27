@@ -26,12 +26,14 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
 import {
   ConverseStreamCommand,
+  type ConverseStreamOutput,
   type GuardrailConfiguration,
   type GuardrailStreamConfiguration,
 } from '@aws-sdk/client-bedrock-runtime';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, ResponseMetadata } from '@langchain/core/messages';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
+import type { ContentBlockDeltaEvent } from './types';
 import {
   convertToConverseMessages,
   createConverseToolUseStopChunk,
@@ -39,7 +41,6 @@ import {
   handleConverseStreamContentBlockDelta,
   handleConverseStreamMetadata,
 } from './utils';
-import type { ContentBlockDeltaEvent } from './types';
 import {
   resolveBedrockPromptCacheTtl,
   supportsBedrockToolCache,
@@ -100,6 +101,22 @@ function splitStreamToken(text: string): string[] {
   }
 
   return chunks;
+}
+
+/**
+ * Resolves the text a delta contributes to the smoothing cadence, preferring a
+ * text delta over a reasoning delta and ignoring non-string payloads.
+ */
+function resolveVisibleText(text?: string, reasoningText?: string): string {
+  if (typeof text === 'string') {
+    return text;
+  }
+
+  if (typeof reasoningText === 'string') {
+    return reasoningText;
+  }
+
+  return '';
 }
 
 function getCadencedStreamDelay({
@@ -282,10 +299,10 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     const toolConfig =
       this.promptCache === true && supportsBedrockToolCache(this.cacheModelId)
         ? insertBedrockToolCachePoint(
-            baseParams.toolConfig,
-            true,
-            resolveBedrockPromptCacheTtl(this.promptCacheTtl, this.cacheModelId)
-          )
+          baseParams.toolConfig,
+          true,
+          resolveBedrockPromptCacheTtl(this.promptCacheTtl, this.cacheModelId)
+        )
         : baseParams.toolConfig;
 
     /** Service tier from options or fall back to class-level setting */
@@ -372,7 +389,8 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
         abortSignal: streamAbortController.signal,
       });
 
-      const stream = response.stream;
+      const stream: AsyncIterable<ConverseStreamOutput> | undefined =
+        response.stream;
       if (!stream) {
         return;
       }
@@ -525,12 +543,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
         const text = delta.text;
         const reasoningContent = delta.reasoningContent;
         const reasoningText = reasoningContent?.text;
-        const visibleText =
-          typeof text === 'string'
-            ? text
-            : typeof reasoningText === 'string'
-              ? reasoningText
-              : '';
+        const visibleText = resolveVisibleText(text, reasoningText);
         const smooth = this._lc_stream_delay > 0 && visibleText !== '';
         const tokenChunks = smooth
           ? splitStreamToken(visibleText)
