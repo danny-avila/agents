@@ -1,21 +1,9 @@
 import { defineConfig, globalIgnores } from "eslint/config";
-import { fixupConfigRules, fixupPluginRules } from "@eslint/compat";
 import typescriptEslint from "@typescript-eslint/eslint-plugin";
-import _import from "eslint-plugin-import";
+import importX from "eslint-plugin-import-x";
 import globals from "globals";
 import tsParser from "@typescript-eslint/parser";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import js from "@eslint/js";
-import { FlatCompat } from "@eslint/eslintrc";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const compat = new FlatCompat({
-    baseDirectory: __dirname,
-    recommendedConfig: js.configs.recommended,
-    allConfig: js.configs.all
-});
 
 export default defineConfig([globalIgnores([
     "dist/**/*",
@@ -29,18 +17,13 @@ export default defineConfig([globalIgnores([
     "./script_docs.ts",
     "**/*.spec.ts",
 ]), {
-    extends: fixupConfigRules(compat.extends(
-        "eslint:recommended",
-        "plugin:@typescript-eslint/recommended",
-        "plugin:import/errors",
-        "plugin:import/warnings",
-        "plugin:import/typescript",
-    )),
-
-    plugins: {
-        "@typescript-eslint": fixupPluginRules(typescriptEslint),
-        import: fixupPluginRules(_import),
-    },
+    extends: [
+        js.configs.recommended,
+        ...typescriptEslint.configs["flat/recommended"],
+        importX.flatConfigs.errors,
+        importX.flatConfigs.warnings,
+        importX.flatConfigs.typescript,
+    ],
 
     languageOptions: {
         globals: {
@@ -57,7 +40,7 @@ export default defineConfig([globalIgnores([
     },
 
     settings: {
-        "import/resolver": {
+        "import-x/resolver": {
             typescript: {
                 alwaysTryTypes: true,
                 project: "./tsconfig.json",
@@ -93,6 +76,8 @@ export default defineConfig([globalIgnores([
         "no-nested-ternary": "error",
         "@typescript-eslint/no-unnecessary-condition": "warn",
         "@typescript-eslint/strict-boolean-expressions": "warn",
+        "no-useless-assignment": "warn",
+        "preserve-caught-error": "warn",
     },
 }, {
     files: ["src/stream.ts", "src/utils/logging.ts", "scripts/**/*.ts"],
