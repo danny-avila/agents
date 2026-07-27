@@ -1,11 +1,13 @@
 import { HumanMessage } from '@langchain/core/messages';
+import { Command, ParentCommand } from '@langchain/langgraph';
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import { CallbackManager } from '@langchain/core/callbacks/manager';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { handleConverseStreamMetadata } from '@/llm/bedrock/utils/message_outputs';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
-import { Providers } from '@/common';
+import { Constants, Providers } from '@/common';
 import { Run } from '@/run';
 
 const mockProcessorStarts: Array<{
@@ -387,6 +389,206 @@ describe('Langfuse callback composition', () => {
       'librechat.langfuse.tenant_export.enabled': 'true',
       'librechat.langfuse.destination': 'eu',
     });
+  });
+
+  it('ends nested ParentCommand control flow without reporting an error', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const langfuse = {
+      publicKey: 'pk-test',
+      secretKey: 'sk-test',
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    const runId = 'test-langfuse-parent-command';
+
+    await handler?.handleChainStart(
+      { lc: 1, type: 'not_implemented', id: ['HandoffChain'] },
+      { input: 'handoff' },
+      runId,
+      'parent-run'
+    );
+    await handler?.handleChainError(
+      new ParentCommand(
+        new Command({ graph: 'source:graph', goto: 'destination' })
+      ),
+      runId,
+      'parent-run'
+    );
+
+    expect(mockSpanAttributeSets).not.toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+      })
+    );
+    expect(mockSpanAttributeSets).toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify({
+          controlFlow: 'ParentCommand',
+        }),
+      })
+    );
+  });
+
+  it('reports a ParentCommand that escapes the root graph as an error', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const langfuse = {
+      publicKey: 'pk-root-parent-command',
+      secretKey: 'sk-root-parent-command',
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    const runId = 'test-langfuse-root-parent-command';
+
+    await handler?.handleChainStart(
+      { lc: 1, type: 'not_implemented', id: ['RootChain'] },
+      { input: 'root handoff' },
+      runId
+    );
+    await handler?.handleChainError(
+      new ParentCommand(
+        new Command({ graph: Command.PARENT, goto: 'destination' })
+      ),
+      runId
+    );
+
+    expect(mockSpanAttributeSets).toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+        [LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE]:
+          'ParentCommand',
+      })
+    );
+  });
+
+  it('continues reporting genuine nested chain failures as errors', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const langfuse = {
+      publicKey: 'pk-genuine-error',
+      secretKey: 'sk-genuine-error',
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    const runId = 'test-langfuse-genuine-error';
+
+    await handler?.handleChainStart(
+      { lc: 1, type: 'not_implemented', id: ['FailingChain'] },
+      { input: 'fail' },
+      runId,
+      'parent-run'
+    );
+    await handler?.handleChainError(new Error('boom'), runId, 'parent-run');
+
+    expect(mockSpanAttributeSets).toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+        [LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE]: 'Error: boom',
+      })
+    );
+  });
+
+  it('delegates null chain errors without throwing during classification', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const langfuse = {
+      publicKey: 'pk-null-error',
+      secretKey: 'sk-null-error',
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    const runId = 'test-langfuse-null-error';
+
+    await handler?.handleChainStart(
+      { lc: 1, type: 'not_implemented', id: ['NullErrorChain'] },
+      { input: 'fail' },
+      runId,
+      'parent-run'
+    );
+
+    await expect(
+      handler?.handleChainError(null, runId, 'parent-run')
+    ).resolves.toBeUndefined();
+  });
+
+  it('traces a completed two-agent handoff without false error spans', async () => {
+    const langfuse = {
+      publicKey: 'pk-handoff',
+      secretKey: 'sk-handoff',
+    };
+    const run = await Run.create<t.IState>({
+      runId: 'test-langfuse-completed-handoff',
+      graphConfig: {
+        type: 'multi-agent',
+        agents: [
+          {
+            agentId: 'agent_source',
+            name: 'Source Agent',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4' },
+            instructions: 'Transfer to the destination agent.',
+            tools: [],
+          },
+          {
+            agentId: 'agent_destination',
+            name: 'Destination Agent',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4' },
+            instructions: 'Complete the request.',
+            tools: [],
+          },
+        ],
+        edges: [
+          {
+            from: 'agent_source',
+            to: 'agent_destination',
+            edgeType: 'handoff',
+          },
+        ],
+      },
+      langfuse,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel(
+      ['Transferring to destination', 'Destination complete'],
+      10,
+      [
+        {
+          id: 'handoff-call',
+          name: `${Constants.LC_TRANSFER_TO_}agent_destination`,
+          args: {},
+        } as ToolCall,
+      ]
+    );
+
+    await run.processStream(
+      { messages: [new HumanMessage('Please hand this off')] },
+      {
+        configurable: {
+          thread_id: 'test-langfuse-completed-handoff-thread',
+        },
+        version: 'v2',
+      }
+    );
+
+    expect(
+      run
+        .getRunMessages()
+        ?.some((message) => message.content === 'Destination complete')
+    ).toBe(true);
+    expect(mockSpanAttributeSets).toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify({
+          controlFlow: 'ParentCommand',
+        }),
+      })
+    );
+    expect(mockSpanAttributeSets).not.toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+      })
+    );
   });
 
   it('exports Bedrock prompt-cache usage buckets to Langfuse', async () => {

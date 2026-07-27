@@ -1,4 +1,5 @@
 import { CallbackHandler } from '@langfuse/langchain';
+import { isParentCommand } from '@langchain/langgraph';
 import { context as otelContext } from '@opentelemetry/api';
 import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import {
@@ -202,6 +203,20 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     ...args: Parameters<CallbackHandler['handleChainStart']>
   ): ReturnType<CallbackHandler['handleChainStart']> {
     return this.withRuntimeContext(() => super.handleChainStart(...args));
+  }
+
+  override handleChainError(
+    ...args: Parameters<CallbackHandler['handleChainError']>
+  ): ReturnType<CallbackHandler['handleChainError']> {
+    const [error, runId, parentRunId] = args;
+    if (error != null && parentRunId != null && isParentCommand(error)) {
+      return super.handleChainEnd(
+        { controlFlow: 'ParentCommand' },
+        runId,
+        parentRunId
+      );
+    }
+    return super.handleChainError(...args);
   }
 
   override handleAgentAction(
