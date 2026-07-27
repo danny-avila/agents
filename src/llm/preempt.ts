@@ -58,8 +58,12 @@ function hasOpenGoogleServerToolCall(
 /**
  * Cooperative mid-generation seal gate. Returns true ONLY when sealing here
  * yields a message sequence valid on EVERY supported provider:
- *  - non-whitespace TEXT content, so the injected user turn is preceded by a
- *    NON-EMPTY assistant turn (no empty-content 400s, no adjacent user turns);
+ *  - non-whitespace TEXT content, so the FIRST injected user turn is preceded
+ *    by a non-empty assistant turn — no empty-content 400s. Note this says
+ *    nothing about adjacency AMONG several injected turns: a boundary that
+ *    drains two steers emits two consecutive user messages, which strict
+ *    providers reject. That is normalized at the provider-facing hop by
+ *    `coalesceAdjacentUserTurns`, not here;
  *  - no tool call in flight, so no `tool_use` can be orphaned AND no eagerly
  *    prestarted execution can be stripped out from under the model.
  *

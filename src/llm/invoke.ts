@@ -350,14 +350,52 @@ function countSealedTokens(
 }
 
 /**
+ * Instruction overhead the provider processed but that never appears in the
+ * message array: `createCallModel` pipes the model through
+ * `agentContext.systemRunnable` and binds tool schemas AFTER `messages` is
+ * formed, so the system prompt, dynamic instructions, summary and tool
+ * schemas are all billed yet invisible here.
+ *
+ * Read per-node via `getAgentContext(metadata)` rather than the graph-level
+ * accessor, which is hardcoded to `defaultAgentId` and would report the wrong
+ * agent's overhead in a `MultiAgentGraph`.
+ */
+function sealedInstructionOverhead(
+  context: InvokeContext | undefined,
+  metadata: Record<string, unknown> | undefined
+): number {
+  try {
+    const agentContext = context?.getAgentContext(metadata);
+    return (
+      agentContext?.resolvedInstructionOverhead ??
+      agentContext?.instructionTokens ??
+      0
+    );
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * Best-effort usage for a turn the provider never got to bill us for.
  *
- * The prompt matters as much as the completion here: the provider processed
- * the ENTIRE prompt before we sealed, and every resume re-sends it, so
- * reporting `input_tokens: 0` would under-count the most expensive half of a
- * preempted run. Both sides come from the host's own counter, so they are
- * estimates — but estimates in the right order of magnitude beat a fabricated
- * zero. When no counter is configured we report nothing rather than guess.
+ * The prompt matters as much as the completion: the provider processed the
+ * ENTIRE prompt — messages plus instruction overhead — before we sealed, and
+ * every resume re-sends it, so under-counting input hides the expensive half
+ * of a preempted run.
+ *
+ * ESTIMATE, NOT MEASUREMENT. Messages are counted with the host's tokenizer
+ * rather than the provider's, and `toolSchemaTokens` applies a heuristic
+ * multiplier. It is also an over-count on the fallback path, where
+ * `tryFallbackProviders` builds a bare model with no `systemRunnable` pipe so
+ * the system prompt genuinely is not sent. Accepted rather than threaded
+ * through a flag: only the fallback-plus-seal combination is affected, and an
+ * over-count is safer than the previous fabricated `input_tokens: 0`.
+ *
+ * Marked `estimated_usage` so calibration can refuse to learn from it — a
+ * ratio derived from the same counter that produced the estimate is
+ * self-consistent by construction and would drag a provider's real
+ * calibration toward 1.0.
  */
 function synthesizeSealedUsage(
   context: InvokeContext | undefined,
@@ -372,11 +410,17 @@ function synthesizeSealedUsage(
   if (outputTokens == null) {
     return;
   }
-  const inputTokens = countSealedTokens(context, metadata, prompt) ?? 0;
+  const inputTokens =
+    (countSealedTokens(context, metadata, prompt) ?? 0) +
+    sealedInstructionOverhead(context, metadata);
   chunk.usage_metadata = {
     input_tokens: inputTokens,
     output_tokens: outputTokens,
     total_tokens: inputTokens + outputTokens,
+  };
+  chunk.response_metadata = {
+    ...chunk.response_metadata,
+    estimated_usage: true,
   };
 }
 

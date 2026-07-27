@@ -48,6 +48,8 @@ import {
   DEFAULT_RETAIN_RECENT_TURNS,
   splitAtRecencyBoundary,
   convertInjectedMessages,
+  coalesceAdjacentUserTurns,
+  strictAlternationProviders,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -1175,7 +1177,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.preemption != null &&
       !this.preemptSealInFlight &&
       this.preemptSealBudgetUsed <
-        (this.preemption.maxSeals ?? DEFAULT_MAX_SEALS)
+        (this.preemption.maxSeals ?? DEFAULT_MAX_SEALS) &&
+      /**
+       * A seal only buys room for an injection. With no `PreemptBoundary`
+       * matcher live — never registered, or a `once` matcher already
+       * consumed — the boundary provably returns nothing and the answer is
+       * cut short for no gain, so refuse the seal instead. Failing closed
+       * lands on the documented no-preemption behavior: the model finishes
+       * and the message waits for the next tool boundary.
+       *
+       * Same session resolution as `dispatchPreemptBoundary`, or a
+       * session-scoped matcher would be visible at one site and not the other.
+       */
+      this.hookRegistry?.hasHookFor(
+        'PreemptBoundary',
+        (this.config?.configurable?.run_id as string | undefined) ?? this.runId
+      ) === true
     );
   }
 
@@ -2583,6 +2600,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           );
         }
       }
+
+      /**
+       * Bedrock Converse and Mistral require strict user/assistant
+       * alternation and reject consecutive user turns outright. Four sites
+       * can emit them — the `PostToolBatch` and `PreemptBoundary` hook
+       * boundaries (a consolidated context message followed by one
+       * `HumanMessage` per injected entry), a queue drain carrying more than
+       * one steer, and `run.ts`'s pre-stream context push onto a payload that
+       * already ends on a user turn.
+       *
+       * Normalized here, at the last provider-facing hop, rather than at any
+       * one boundary: the boundaries must keep per-message identity, because
+       * `additional_kwargs.source`/`skillName` drive steer rendering and the
+       * trailing-steer anchor downstream. Graph state and the host's
+       * persisted messages are untouched — this shapes only what goes on the
+       * wire, for the providers that actually care.
+       *
+       * Runs AFTER synthetic-context compaction: that pass can rewrite or
+       * drop messages, so coalescing has to see its output, and it is the
+       * last shaping step before the cache breakpoint is chosen.
+       */
+      if (strictAlternationProviders.has(agentContext.provider)) {
+        finalMessages = coalesceAdjacentUserTurns(finalMessages);
+      }
+
       // Determine the prompt-cache strategy up front. Two distinct facts:
       //
       //   `providerPromptCacheEnabled` — prompt caching is on for this provider
@@ -3269,8 +3311,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       const invokeElapsed = ((Date.now() - invokeStart) / 1000).toFixed(2);
       agentContext.currentUsage = this.getUsageMetadata(result.messages?.[0]);
+      /**
+       * Synthetic usage from a sealed turn is an estimate derived from the
+       * host's own counter, so feeding it to calibration would teach a ratio
+       * of exactly 1.0 — self-consistent by construction, and wrong for any
+       * provider whose real ratio differs. It still flows to `currentUsage`
+       * for host billing; it just does not get to move the EMA.
+       */
+      const estimatedUsage =
+        (result.messages?.[0] as AIMessageChunk | undefined)?.response_metadata
+          .estimated_usage === true;
       if (agentContext.currentUsage) {
-        agentContext.updateLastCallUsage(agentContext.currentUsage);
+        if (!estimatedUsage) {
+          agentContext.updateLastCallUsage(agentContext.currentUsage);
+        }
         emitAgentLog(
           config,
           'debug',
