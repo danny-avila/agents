@@ -117,6 +117,7 @@ async function createRun(options: {
   tools?: t.GraphTools;
   maxToolResultChars?: number;
   model?: string;
+  promptCache?: boolean;
   toolOutputReferences?: t.ToolOutputReferencesConfig;
 }): Promise<Run<t.IState>> {
   return Run.create<t.IState>({
@@ -126,6 +127,7 @@ async function createRun(options: {
       llmConfig: {
         provider: options.provider ?? Providers.ANTHROPIC,
         ...(options.model != null ? { model: options.model } : {}),
+        ...(options.promptCache === true ? { promptCache: true } : {}),
         disableStreaming: true,
         streamUsage: false,
       },
@@ -444,6 +446,243 @@ describe('context overflow recovery', () => {
     expect(
       run.Graph.agentContexts.get('default')?.overflowRecoveryAttempts
     ).toBe(0);
+  });
+
+  it('trusts the pruner baseline for an unchanged payload at high calibration', async () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('earlier question'),
+      new AIMessage('provider-counted answer'),
+      new HumanMessage('latest question'),
+    ];
+    const localCounter: t.TokenCounter = (message) =>
+      message.getType() === 'ai' ? 120 : 5;
+    const providerGroundedTokenMap = { 0: 5, 1: 10, 2: 5 };
+    const run = await createRun({
+      runId: 'provider-grounded-final-projection',
+      maxContextTokens: 200,
+      tokenCounter: localCounter,
+      indexTokenCountMap: providerGroundedTokenMap,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const agentContext = run.Graph.agentContexts.get('default');
+    if (agentContext == null) {
+      throw new Error('Expected default agent context');
+    }
+    agentContext.calibrationRatio = 5;
+    const model = new OverflowThenSucceedModel(
+      signatureFor('claude-haiku-4-5-20251001'),
+      0
+    );
+    run.Graph.overrideModel = model;
+
+    const content = await run.processStream({ messages }, streamConfig);
+
+    expect(content).toEqual([{ type: 'text', text: 'recovered' }]);
+    expect(model.calls).toHaveLength(1);
+    expect(model.calls[0]).toHaveLength(messages.length);
+    expect(agentContext.overflowRecoveryAttempts).toBe(0);
+  });
+
+  it('does not let an unrelated provider-format shrink hide artifact growth', async () => {
+    const toolCallId = 'tc-artifact-independent-growth';
+    const artifactSentinel = 'ARTIFACT_INDEPENDENT_GROWTH_SENTINEL';
+    const toolMessage = new ToolMessage({
+      content: 'rendered',
+      tool_call_id: toolCallId,
+      name: 'render_report',
+      artifact: {
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: artifactSentinel,
+          },
+        ],
+      },
+    });
+    const messages: BaseMessage[] = [
+      new HumanMessage('render the report'),
+      new AIMessageChunk({
+        content: 'calling render_report',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'render_report',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+    const transformCounter: t.TokenCounter = (message) => {
+      if (
+        message instanceof AIMessageChunk &&
+        typeof message.content === 'string'
+      ) {
+        return 100;
+      }
+      if (
+        message instanceof ToolMessage &&
+        JSON.stringify(message.content).includes(artifactSentinel)
+      ) {
+        return 50;
+      }
+      return 1;
+    };
+    const run = await createRun({
+      runId: 'artifact-independent-transform-growth',
+      maxContextTokens: 50,
+      provider: Providers.BEDROCK,
+      model: 'anthropic.claude-sonnet-4-5',
+      tokenCounter: transformCounter,
+      indexTokenCountMap: { 0: 1, 1: 1, 2: 1 },
+      tools: [
+        tool(async () => 'unused', {
+          name: 'render_report',
+          description: 'Renders a report',
+          schema: z.object({}),
+        }),
+      ],
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(
+      signatureFor('us.anthropic.claude-sonnet-4-5-20250929-v1:0'),
+      0
+    );
+    run.Graph.overrideModel = model;
+
+    await run.processStream({ messages }, streamConfig);
+
+    expect(model.calls).toHaveLength(1);
+    expect(
+      JSON.stringify(model.calls[0].map((message) => message.content))
+    ).not.toContain(artifactSentinel);
+    expect(toolMessage.artifact.content[0].text).toBe(artifactSentinel);
+  });
+
+  it('preserves provider attribution for an un-IDd AI clone during orphan sanitization', async () => {
+    const droppedCallId = 'tc-dropped-ai';
+    const missingCallId = 'tc-missing-result';
+    const unrelatedResultId = 'tc-unrelated-result';
+    const messages: BaseMessage[] = [
+      new HumanMessage('earlier question'),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: droppedCallId,
+            name: 'declared_tool',
+            input: {},
+          },
+        ],
+        tool_calls: [
+          {
+            id: droppedCallId,
+            name: 'declared_tool',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new AIMessage({
+        content: 'provider-counted answer',
+        tool_calls: [
+          {
+            id: missingCallId,
+            name: 'declared_tool',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'orphaned result',
+        tool_call_id: unrelatedResultId,
+        name: 'declared_tool',
+      }),
+      new HumanMessage('latest question'),
+    ];
+    const skewedCounter: t.TokenCounter = (message) => {
+      if (message.getType() !== 'ai') {
+        return 5;
+      }
+      return Array.isArray(message.content) ? 1 : 120;
+    };
+    const run = await createRun({
+      runId: 'orphan-sanitize-provider-origin',
+      maxContextTokens: 1_000,
+      provider: Providers.ANTHROPIC,
+      promptCache: true,
+      tokenCounter: skewedCounter,
+      indexTokenCountMap: { 0: 5, 1: 80, 2: 10, 3: 5, 4: 5 },
+      tools: [
+        tool(async () => 'unused', {
+          name: 'declared_tool',
+          description: 'Declared only to prevent tool-less folding',
+          schema: z.object({}),
+        }),
+      ],
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const agentContext = run.Graph.agentContexts.get('default');
+    if (agentContext == null) {
+      throw new Error('Expected default agent context');
+    }
+    agentContext.calibrationRatio = 5;
+    const model = new OverflowThenSucceedModel(
+      signatureFor('claude-haiku-4-5-20251001'),
+      0
+    );
+    run.Graph.overrideModel = model;
+
+    const content = await run.processStream({ messages }, streamConfig);
+
+    expect(content).toEqual([{ type: 'text', text: 'recovered' }]);
+    expect(model.calls).toHaveLength(1);
+    expect(model.calls[0]).toHaveLength(3);
+    expect(model.calls[0].some((message) => message.getType() === 'tool')).toBe(
+      false
+    );
+    const sanitizedAI = model.calls[0].find(
+      (message) => message.getType() === 'ai'
+    ) as AIMessage | undefined;
+    expect(sanitizedAI?.content).toBe('provider-counted answer');
+    expect(sanitizedAI?.tool_calls ?? []).toHaveLength(0);
+    expect(agentContext.overflowRecoveryAttempts).toBe(0);
+  });
+
+  it('reserves the reply primer before accepting fast-path context', async () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('earlier question'),
+      new AIMessage('earlier answer'),
+      new HumanMessage('latest question'),
+    ];
+    const run = await createRun({
+      runId: 'fast-path-reply-primer',
+      maxContextTokens: 100,
+      tokenCounter: () => 31,
+      indexTokenCountMap: { 0: 31, 1: 31, 2: 31 },
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(
+      signatureFor('claude-haiku-4-5-20251001'),
+      0
+    );
+    run.Graph.overrideModel = model;
+
+    await run.processStream({ messages }, streamConfig);
+
+    expect(model.calls).toHaveLength(1);
+    expect(model.calls[0].length).toBeLessThan(messages.length);
+    expect(3 + model.calls[0].length * 31).toBeLessThanOrEqual(95);
   });
 
   it('includes artifact expansion when it fits the post-prune budget', async () => {

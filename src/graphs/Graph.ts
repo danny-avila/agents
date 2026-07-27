@@ -30,8 +30,8 @@ import {
   addBedrockTailCacheControl,
   projectArtifactPayload,
   formatContentStrings,
-  isLegacyConvertible,
   CALIBRATION_RATIO_MAX,
+  REPLY_PRIMER_TOKENS,
   createPruneMessages,
   projectToolCallInputs,
   calculateMaxToolCallInputChars,
@@ -140,26 +140,6 @@ function createToolHandlerRegistry(
   const registry = new HandlerRegistry();
   registry.register(GraphEvents.ON_TOOL_EXECUTE, toolHandler);
   return registry;
-}
-
-/**
- * Start index of the span post-prune formatters can mutate in place: the
- * trailing tool batch plus its owning AI message (artifact formatting touches
- * every tool result after the last AI tool call; Bedrock rewrites the AI
- * message before a trailing tool result). Capped so the usage-snapshot
- * recount stays constant-cost.
- */
-function trailingMutationStart(messages: BaseMessage[]): number {
-  const MAX_SPAN = 16;
-  let index = messages.length - 1;
-  while (
-    index >= 0 &&
-    messages[index]?.getType() === 'tool' &&
-    messages.length - index < MAX_SPAN
-  ) {
-    index--;
-  }
-  return Math.max(0, Math.min(index, messages.length - 2));
 }
 
 type ReasoningKey = 'reasoning_content' | 'reasoning';
@@ -1942,49 +1922,136 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       let finalMessages = messagesToUse;
-      /** Tail snapshot for the dispatch-time usage delta: in-place
-       *  formatters (Bedrock content rewrites and legacy string conversion)
-       *  can mutate without changing length or identity —
-       *  capture before they run. Legacy string conversion can also touch
-       *  messages before the tail, so those convertible indices are
-       *  tracked separately (none exist in the common case). */
-      const tailStart = trailingMutationStart(messagesToUse);
-      let preFormatTailTokens: number | null = null;
-      let legacyIndices: number[] | null = null;
-      let preFormatLegacyTokens = 0;
+      /**
+       * Keep the pruner's provider-grounded aggregate as the authoritative
+       * baseline, then attribute it across retained messages. Provider
+       * transforms can shrink one message while expanding or adding another;
+       * per-origin accounting prevents that unrelated shrink from canceling
+       * the expansion. Raw counts are frozen before in-place formatters run.
+       */
+      let providerMessageBaseline:
+        | Array<{ rawTokens: number; accountingWeight: number }>
+        | undefined;
+      const providerMessageOrigins = new WeakMap<BaseMessage, number>();
       if (contextUsage != null && agentContext.tokenCounter != null) {
-        preFormatTailTokens = 0;
-        for (const message of messagesToUse.slice(tailStart)) {
-          preFormatTailTokens += agentContext.tokenCounter(message);
+        const sourceIndices = new WeakMap<BaseMessage, number>();
+        for (let i = 0; i < messages.length; i++) {
+          sourceIndices.set(messages[i], i);
         }
-        if (agentContext.useLegacyContent) {
-          legacyIndices = [];
-          for (let i = 0; i < tailStart; i++) {
-            if (isLegacyConvertible(messagesToUse[i])) {
-              legacyIndices.push(i);
-              preFormatLegacyTokens += agentContext.tokenCounter(
-                messagesToUse[i]
-              );
+        providerMessageBaseline = messagesToUse.map((message, index) => {
+          const rawTokens = agentContext.tokenCounter!(message);
+          const sourceIndex = sourceIndices.get(message);
+          const indexedTokens =
+            sourceIndex != null
+              ? agentContext.indexTokenCountMap[sourceIndex]
+              : undefined;
+          const accountingWeight =
+            indexedTokens != null &&
+            Number.isFinite(indexedTokens) &&
+            indexedTokens >= 0
+              ? indexedTokens
+              : rawTokens;
+          if (!providerMessageOrigins.has(message)) {
+            providerMessageOrigins.set(message, index);
+          }
+          return { rawTokens, accountingWeight };
+        });
+      }
+
+      const getProviderMessageOriginKey = (
+        message: BaseMessage
+      ): string | undefined => {
+        const type = message.getType();
+        if (
+          message instanceof ToolMessage &&
+          typeof message.tool_call_id === 'string' &&
+          message.tool_call_id.length > 0
+        ) {
+          return `tool:call:${message.tool_call_id}`;
+        }
+        if (typeof message.id === 'string' && message.id.length > 0) {
+          return `${type}:id:${message.id}`;
+        }
+        return undefined;
+      };
+
+      /**
+       * Provider projections clone messages. Preserve their baseline origin
+       * without writing tracking metadata onto the wire. Synthetic fold
+       * messages intentionally remain unattributed and are charged in full.
+       */
+      const trackProviderMessageOrigins = (
+        before: BaseMessage[],
+        after: BaseMessage[]
+      ): BaseMessage[] => {
+        if (providerMessageBaseline == null || before === after) {
+          return after;
+        }
+        if (before.length === after.length) {
+          for (let i = 0; i < after.length; i++) {
+            const origin = providerMessageOrigins.get(before[i]);
+            if (
+              origin != null &&
+              !providerMessageOrigins.has(after[i]) &&
+              before[i].getType() === after[i].getType() &&
+              !isSyntheticProviderContextMessage(after[i])
+            ) {
+              providerMessageOrigins.set(after[i], origin);
             }
           }
+          return after;
         }
-      }
+
+        const keyedOrigins = new Map<string, number | null>();
+        for (const message of before) {
+          const origin = providerMessageOrigins.get(message);
+          const key = getProviderMessageOriginKey(message);
+          if (origin == null || key == null) {
+            continue;
+          }
+          keyedOrigins.set(key, keyedOrigins.has(key) ? null : origin);
+        }
+        for (const message of after) {
+          if (
+            providerMessageOrigins.has(message) ||
+            isSyntheticProviderContextMessage(message)
+          ) {
+            continue;
+          }
+          const key = getProviderMessageOriginKey(message);
+          const origin = key != null ? keyedOrigins.get(key) : undefined;
+          if (origin != null) {
+            providerMessageOrigins.set(message, origin);
+          }
+        }
+        return after;
+      };
+
       if (agentContext.useLegacyContent) {
-        finalMessages = formatContentStrings(finalMessages);
+        const before = finalMessages;
+        finalMessages = trackProviderMessageOrigins(
+          before,
+          formatContentStrings(before)
+        );
       }
 
       const maxProviderToolResultChars =
         agentContext.maxToolResultChars ??
         calculateMaxToolResultChars(agentContext.maxContextTokens);
       if (isOpenAILike(agentContext.provider)) {
-        finalMessages = projectOpenAIToolMessageContent(
-          finalMessages,
-          maxProviderToolResultChars
+        const before = finalMessages;
+        finalMessages = trackProviderMessageOrigins(
+          before,
+          projectOpenAIToolMessageContent(before, maxProviderToolResultChars)
         );
       }
-      finalMessages = projectToolCallInputs(
-        finalMessages,
-        calculateMaxToolCallInputChars(agentContext.maxContextTokens)
+      const beforeToolInputProjection = finalMessages;
+      finalMessages = trackProviderMessageOrigins(
+        beforeToolInputProjection,
+        projectToolCallInputs(
+          beforeToolInputProjection,
+          calculateMaxToolCallInputChars(agentContext.maxContextTokens)
+        )
       );
 
       const lastMessageX =
@@ -2030,25 +2097,84 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           0,
           contextUsage.contextBudget - contextUsage.effectiveInstructionTokens
         );
-        // The dedicated empty-prompt guard below provides actionable
-        // instruction/tool-budget guidance; there is no provider payload yet.
-        if (candidate.length === 0) {
-          return {
-            fits: true,
-            projectedMessageTokens: 0,
-            availableMessageTokens,
-          };
-        }
-        let rawTokens = 3; // reply-primer allowance
-        for (const message of candidate) {
-          rawTokens += agentContext.tokenCounter(message);
-        }
-        const usageRatio =
+        let usageRatio =
+          agentContext.calibrationRatio > 0 ? agentContext.calibrationRatio : 1;
+        if (
           contextUsage.calibrationRatio != null &&
           contextUsage.calibrationRatio > 0
-            ? contextUsage.calibrationRatio
-            : agentContext.calibrationRatio;
-        const projectedMessageTokens = Math.round(rawTokens * usageRatio);
+        ) {
+          usageRatio = contextUsage.calibrationRatio;
+        }
+        const baselineRemaining = contextUsage.remainingContextTokens;
+        const accountedMessageTokens =
+          providerMessageBaseline != null &&
+          baselineRemaining != null &&
+          Number.isFinite(baselineRemaining)
+            ? availableMessageTokens -
+              Math.min(availableMessageTokens, Math.max(0, baselineRemaining))
+            : undefined;
+
+        let projectedMessageTokens: number;
+        if (accountedMessageTokens != null && providerMessageBaseline != null) {
+          const replyPrimerTokens = Math.round(
+            REPLY_PRIMER_TOKENS * usageRatio
+          );
+          const rawWeights: Record<string, number> = {};
+          let totalWeight = 0;
+          for (let i = 0; i < providerMessageBaseline.length; i++) {
+            const weight = providerMessageBaseline[i].accountingWeight;
+            rawWeights[i] = weight;
+            totalWeight += weight;
+          }
+          const attributableTokens =
+            totalWeight > 0
+              ? Math.min(
+                Math.max(0, accountedMessageTokens - replyPrimerTokens),
+                Math.round(totalWeight * usageRatio)
+              )
+              : 0;
+          const apportionedTokens =
+            totalWeight > 0
+              ? apportionTokenCounts(
+                rawWeights,
+                attributableTokens / totalWeight,
+                attributableTokens
+              )
+              : {};
+          const attributedByOrigin = providerMessageBaseline.map(
+            (_, origin) => apportionedTokens[origin] || 0
+          );
+          projectedMessageTokens = Math.max(
+            replyPrimerTokens,
+            accountedMessageTokens - attributableTokens
+          );
+          let newRawTokens = 0;
+          const usedOrigins = new Set<number>();
+          for (const message of candidate) {
+            const rawTokens = agentContext.tokenCounter(message);
+            const origin = providerMessageOrigins.get(message);
+            if (origin == null || usedOrigins.has(origin)) {
+              newRawTokens += rawTokens;
+              continue;
+            }
+            usedOrigins.add(origin);
+            projectedMessageTokens += Math.max(
+              0,
+              attributedByOrigin[origin] +
+                Math.round(
+                  (rawTokens - providerMessageBaseline[origin].rawTokens) *
+                    usageRatio
+                )
+            );
+          }
+          projectedMessageTokens += Math.round(newRawTokens * usageRatio);
+        } else {
+          let rawTokens = REPLY_PRIMER_TOKENS;
+          for (const message of candidate) {
+            rawTokens += agentContext.tokenCounter(message);
+          }
+          projectedMessageTokens = Math.round(rawTokens * usageRatio);
+        }
         return {
           fits: projectedMessageTokens <= availableMessageTokens,
           projectedMessageTokens,
@@ -2067,11 +2193,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
            * Current-run AI messages may validly omit a thinking block. The
            * boundary prevents them from being mistaken for foreign history.
            */
-          transformed = ensureThinkingBlockInMessages(
-            transformed,
-            agentContext.provider,
-            config,
-            this.startIndex
+          const before = transformed;
+          transformed = trackProviderMessageOrigins(
+            before,
+            ensureThinkingBlockInMessages(
+              before,
+              agentContext.provider,
+              config,
+              this.startIndex
+            )
           );
         }
 
@@ -2080,9 +2210,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * tool schema, so fold those interactions into provider-valid content.
          */
         if (toolsForBinding == null || toolsForBinding.length === 0) {
-          transformed = foldToolBlocksForToollessAgent(transformed, config);
+          const before = transformed;
+          transformed = trackProviderMessageOrigins(
+            before,
+            foldToolBlocksForToollessAgent(before, config)
+          );
           if (agentContext.useLegacyContent) {
-            transformed = formatContentStrings(transformed);
+            const beforeLegacyFormat = transformed;
+            transformed = trackProviderMessageOrigins(
+              beforeLegacyFormat,
+              formatContentStrings(beforeLegacyFormat)
+            );
           }
         }
         return transformed;
@@ -2093,7 +2231,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const projectProviderReferences = (
         candidate: BaseMessage[]
       ): BaseMessage[] =>
-        annotateMessagesForLLM(candidate, toolOutputRegistry, providerRunId);
+        trackProviderMessageOrigins(
+          candidate,
+          annotateMessagesForLLM(candidate, toolOutputRegistry, providerRunId)
+        );
 
       const compactSyntheticProviderContext = (
         candidate: BaseMessage[]
@@ -2163,18 +2304,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (lastMessageY instanceof ToolMessage) {
         let artifactCandidate = finalMessages;
         if (anthropicLike) {
-          artifactCandidate = projectAnthropicArtifactContent(
+          artifactCandidate = trackProviderMessageOrigins(
             finalMessages,
-            maxProviderToolResultChars
+            projectAnthropicArtifactContent(
+              finalMessages,
+              maxProviderToolResultChars
+            )
           );
         } else if (
           (isOpenAILike(agentContext.provider) &&
             agentContext.provider !== Providers.DEEPSEEK) ||
           isGoogleLike(agentContext.provider)
         ) {
-          artifactCandidate = projectArtifactPayload(
+          artifactCandidate = trackProviderMessageOrigins(
             finalMessages,
-            maxProviderToolResultChars
+            projectArtifactPayload(finalMessages, maxProviderToolResultChars)
           );
         }
 
@@ -2294,7 +2438,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           providerPromptCacheEnabled);
       if (needsOrphanSanitize) {
         const beforeSanitize = finalMessages.length;
-        finalMessages = sanitizeOrphanToolBlocks(finalMessages);
+        const beforeSanitizeMessages = finalMessages;
+        finalMessages = trackProviderMessageOrigins(
+          beforeSanitizeMessages,
+          sanitizeOrphanToolBlocks(beforeSanitizeMessages, (source, clone) => {
+            const origin = providerMessageOrigins.get(source);
+            if (origin != null) {
+              providerMessageOrigins.set(clone, origin);
+            }
+          })
+        );
         if (finalMessages.length !== beforeSanitize) {
           emitAgentLog(
             config,
@@ -2324,20 +2477,24 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         (anthropicPromptCacheEnabled || openRouterPromptCacheEnabled) &&
         !agentContext.systemRunnable
       ) {
-        finalMessages = addTailCacheControl<BaseMessage>(
-          finalMessages,
-          resolvePromptCacheTtl(
-            anthropicPromptCacheEnabled
-              ? (
-                  agentContext.clientOptions as
-                    | t.AnthropicClientOptions
-                    | undefined
-              )?.promptCacheTtl
-              : (
-                  agentContext.clientOptions as
-                    | t.ProviderOptionsMap[Providers.OPENROUTER]
-                    | undefined
-              )?.promptCacheTtl
+        const beforeCacheControl = finalMessages;
+        finalMessages = trackProviderMessageOrigins(
+          beforeCacheControl,
+          addTailCacheControl<BaseMessage>(
+            beforeCacheControl,
+            resolvePromptCacheTtl(
+              anthropicPromptCacheEnabled
+                ? (
+                    agentContext.clientOptions as
+                      | t.AnthropicClientOptions
+                      | undefined
+                )?.promptCacheTtl
+                : (
+                    agentContext.clientOptions as
+                      | t.ProviderOptionsMap[Providers.OPENROUTER]
+                      | undefined
+                )?.promptCacheTtl
+            )
           )
         );
       } else if (bedrockPromptCacheEnabled) {
@@ -2346,11 +2503,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           | undefined;
         // Non-Claude models (Nova) reject the extended 1h TTL, so resolve it
         // against the model — message/system caching stays on, clamped to 5m.
-        finalMessages = addBedrockTailCacheControl<BaseMessage>(
-          finalMessages,
-          resolveBedrockPromptCacheTtl(
-            bedrockOptions?.promptCacheTtl,
-            (bedrockOptions as { model?: string } | undefined)?.model
+        const beforeCacheControl = finalMessages;
+        finalMessages = trackProviderMessageOrigins(
+          beforeCacheControl,
+          addBedrockTailCacheControl<BaseMessage>(
+            beforeCacheControl,
+            resolveBedrockPromptCacheTtl(
+              bedrockOptions?.promptCacheTtl,
+              (bedrockOptions as { model?: string } | undefined)?.model
+            )
           )
         );
       }
@@ -2447,66 +2608,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       /** Past the empty-prompt guard — a model call is now guaranteed */
       if (contextUsage != null) {
-        const usageRatio =
-          contextUsage.calibrationRatio != null &&
-          contextUsage.calibrationRatio > 0
-            ? contextUsage.calibrationRatio
-            : 1;
         if (
-          agentContext.tokenCounter != null &&
-          finalMessages !== messagesToUse
+          finalProjection.projectedMessageTokens != null &&
+          finalProjection.availableMessageTokens != null
         ) {
-          /** Post-prune formatting restructured the payload (e.g. thinking
-           *  placeholder collapse, orphan drops) — recount so the gauge
-           *  reflects what is actually sent */
-          let rawTokens = 0;
-          for (const message of finalMessages) {
-            rawTokens += agentContext.tokenCounter(message);
-          }
           contextUsage.breakdown.messageCount = finalMessages.length;
-          if (
-            contextUsage.contextBudget != null &&
-            contextUsage.effectiveInstructionTokens != null
-          ) {
-            contextUsage.remainingContextTokens = Math.max(
-              0,
-              contextUsage.contextBudget -
-                contextUsage.effectiveInstructionTokens -
-                Math.round(rawTokens * usageRatio)
-            );
-          }
-        } else if (
-          preFormatTailTokens != null &&
-          agentContext.tokenCounter != null &&
-          contextUsage.remainingContextTokens != null
-        ) {
-          /** Same-length formatting can still mutate in place — the trailing
-           *  tool batch (artifacts, Bedrock rewrites) and any legacy-converted
-           *  messages before it — adjust remaining by the calibrated delta */
-          let postFormatTailTokens = 0;
-          for (const message of finalMessages.slice(tailStart)) {
-            postFormatTailTokens += agentContext.tokenCounter(message);
-          }
-          let formatDelta = postFormatTailTokens - preFormatTailTokens;
-          if (legacyIndices != null && legacyIndices.length > 0) {
-            let postFormatLegacyTokens = 0;
-            for (const index of legacyIndices) {
-              postFormatLegacyTokens += agentContext.tokenCounter(
-                finalMessages[index]
-              );
-            }
-            formatDelta += postFormatLegacyTokens - preFormatLegacyTokens;
-          }
-          if (formatDelta !== 0) {
-            contextUsage.remainingContextTokens = Math.max(
-              0,
-              Math.min(
-                contextUsage.contextBudget ?? Number.MAX_SAFE_INTEGER,
-                contextUsage.remainingContextTokens -
-                  Math.round(formatDelta * usageRatio)
-              )
-            );
-          }
+          contextUsage.remainingContextTokens = Math.max(
+            0,
+            finalProjection.availableMessageTokens -
+              finalProjection.projectedMessageTokens
+          );
         }
         syncBudgetDerivedFields(contextUsage);
         /** Awaited so async host handlers receive the pre-invoke snapshot

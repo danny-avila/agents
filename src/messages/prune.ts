@@ -43,6 +43,9 @@ function sumTokenCounts(
 /** Default fraction of the token budget reserved as headroom (5 %). */
 export const DEFAULT_RESERVE_RATIO = 0.05;
 
+/** Provider framing reserved for the assistant reply label. */
+export const REPLY_PRIMER_TOKENS = 3;
+
 /** Context pressure at which observation masking and context fading activate. */
 const PRESSURE_THRESHOLD_MASKING = 0.8;
 
@@ -410,7 +413,8 @@ function stripOrphanToolUseBlocks(
  * vice-versa, the original array is returned immediately with zero allocation.
  */
 export function sanitizeOrphanToolBlocks(
-  messages: BaseMessage[]
+  messages: BaseMessage[],
+  onMessageCloned?: (source: BaseMessage, clone: BaseMessage) => void
 ): BaseMessage[] {
   const allToolCallIds = new Set<string>();
   const allToolResultIds = new Set<string>();
@@ -502,6 +506,7 @@ export function sanitizeOrphanToolBlocks(
           const stripped = stripOrphanToolUseBlocks(msg, allToolResultIds);
           if (stripped != null) {
             strippedAiIndices.add(result.length);
+            onMessageCloned?.(msg, stripped);
             result.push(stripped);
           }
           continue;
@@ -537,6 +542,7 @@ export function sanitizeOrphanToolBlocks(
         );
         patched.tool_calls = keptToolCalls.length > 0 ? keptToolCalls : [];
         patched.content = keptContent;
+        onMessageCloned?.(msg, patched as BaseMessage);
         result.push(patched as BaseMessage);
         continue;
       }
@@ -690,7 +696,7 @@ export function getMessagesWithinTokenLimit({
 }): PruningResult {
   // Every reply is primed with <|start|>assistant<|message|>, so we
   // start with 3 tokens for the label after all messages have been counted.
-  let currentTokenCount = 3;
+  let currentTokenCount = REPLY_PRIMER_TOKENS;
   const instructions =
     _messages[0]?.getType() === 'system' ? _messages[0] : undefined;
   const instructionsTokenCount =
@@ -918,7 +924,7 @@ export function getMessagesWithinTokenLimit({
   const newThinkingMessageTokenCount =
     (indexTokenCountMap[thinkingStartIndex] ?? 0) + thinkingTokenCount;
   remainingContextTokens = initialContextTokens - newThinkingMessageTokenCount;
-  currentTokenCount = 3;
+  currentTokenCount = REPLY_PRIMER_TOKENS;
   let newContext: BaseMessage[] = [];
   const secondRoundMessages = [..._messages];
   let currentIndex = secondRoundMessages.length;
@@ -1808,6 +1814,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         (emptyReserveRatio > 0 && emptyReserveRatio < 1
           ? Math.round(factoryParams.maxTokens * emptyReserveRatio)
           : 0);
+      const emptyReplyPrimerTokens = Math.round(
+        REPLY_PRIMER_TOKENS * calibrationRatio
+      );
       return {
         context: [],
         indexTokenCountMap,
@@ -1815,7 +1824,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         prePruneContextTokens: 0,
         remainingContextTokens: Math.max(
           0,
-          emptyBudget - emptyInstructionTokens
+          emptyBudget - emptyInstructionTokens - emptyReplyPrimerTokens
         ),
         calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
@@ -2307,9 +2316,15 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     }
 
     lastTurnStartIndex = params.messages.length;
+    const calibratedReplyPrimerTokens = Math.round(
+      REPLY_PRIMER_TOKENS * calibrationRatio
+    );
     if (
       lastCutOffIndex === 0 &&
-      calibratedTotalTokens + currentInstructionTokens <= pruningBudget
+      calibratedTotalTokens +
+        calibratedReplyPrimerTokens +
+        currentInstructionTokens <=
+        pruningBudget
     ) {
       return {
         context: params.messages,
@@ -2317,7 +2332,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         messagesToRefine: [],
         prePruneContextTokens: calibratedTotalTokens,
         remainingContextTokens:
-          pruningBudget - calibratedTotalTokens - currentInstructionTokens,
+          pruningBudget -
+          calibratedTotalTokens -
+          calibratedReplyPrimerTokens -
+          currentInstructionTokens,
         contextPressure,
         originalToolContent:
           originalToolContent.size > 0 ? originalToolContent : undefined,

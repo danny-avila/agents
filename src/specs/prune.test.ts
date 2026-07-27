@@ -433,7 +433,14 @@ describe('Prune Messages Tests', () => {
       expect(result.context.length).toBe(3);
       expect(result.context).toEqual(messages);
       expect(result.messagesToRefine).toEqual([]);
-      expect(result.remainingContextTokens).toBeGreaterThan(0);
+      expect(result.remainingContextTokens).toBe(
+        95 -
+          Object.values(indexTokenCountMap).reduce(
+            (total, count) => total + count,
+            0
+          ) -
+          3
+      );
     });
 
     it('recounts and compacts omitted structured tool results before sending', () => {
@@ -1706,9 +1713,9 @@ describe('Prune Messages Tests', () => {
 
       // Total message tokens: 11 + 2 + 12 + 4 = 29
       // Instruction tokens: 20 (simulating system prompt overhead)
-      // Effective budget for messages: 50 - 20 = 30 → fits all 29 tokens
+      // Effective budget: 52 - 20 - 3 reply primer = 29 → exact fit
       const pruneMessages = createPruneMessages({
-        maxTokens: 50,
+        maxTokens: 52,
         startIndex: 0,
         tokenCounter,
         indexTokenCountMap,
@@ -1718,7 +1725,7 @@ describe('Prune Messages Tests', () => {
 
       const result = pruneMessages({ messages });
 
-      // All messages should fit: 29 message tokens + 20 instruction = 49 ≤ 50
+      // All messages fit exactly with instructions and reply framing.
       expect(result.context.length).toBe(4);
       expect(result.context).toEqual(messages);
       expect(result.messagesToRefine).toEqual([]);
@@ -2060,10 +2067,10 @@ describe('Prune Messages Tests', () => {
       expect(result.context).toEqual([]);
       expect(result.messagesToRefine).toEqual([]);
       expect(result.prePruneContextTokens).toBe(0);
-      /** Reserve-adjusted budget (8000 − 5%) minus instruction overhead */
+      /** Reserve-adjusted budget minus instructions and reply primer */
       expect(result.contextBudget).toBe(7600);
       expect(result.effectiveInstructionTokens).toBe(4000);
-      expect(result.remainingContextTokens).toBe(3600);
+      expect(result.remainingContextTokens).toBe(3597);
     });
   });
 
