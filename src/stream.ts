@@ -1422,10 +1422,7 @@ export function dispatchesChatModelStream(handler?: t.EventHandler): boolean {
   if (handler instanceof ChatModelStreamHandler) {
     return true;
   }
-  return (
-    (handler as unknown as Record<symbol, unknown>)[SDK_STREAM_DISPATCH] ===
-    true
-  );
+  return Reflect.get(handler, SDK_STREAM_DISPATCH) === true;
 }
 
 export class ChatModelStreamHandler implements t.EventHandler {

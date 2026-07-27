@@ -84,6 +84,7 @@ import {
   getToolContentCharLength,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
+import { resolveMaxSeals } from '@/llm/preempt';
 import {
   Constants,
   GraphNodeKeys,
@@ -91,7 +92,6 @@ import {
   GraphEvents,
   Providers,
   StepTypes,
-  DEFAULT_MAX_SEALS,
   PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
 } from '@/common';
 import {
@@ -1188,8 +1188,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       !this.subagentScope &&
       this.preemption != null &&
       !this.preemptSealInFlight &&
-      this.preemptSealBudgetUsed <
-        (this.preemption.maxSeals ?? DEFAULT_MAX_SEALS) &&
+      this.preemptSealBudgetUsed < resolveMaxSeals(this.preemption.maxSeals) &&
       /**
        * A seal only buys room for an injection. With no `PreemptBoundary`
        * matcher live — never registered, or a `once` matcher already

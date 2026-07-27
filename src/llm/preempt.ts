@@ -1,6 +1,26 @@
 // src/llm/preempt.ts
 import type { AIMessageChunk } from '@langchain/core/messages';
-import { ContentTypes } from '@/common';
+import { ContentTypes, DEFAULT_MAX_SEALS } from '@/common';
+
+/**
+ * Normalizes a host-supplied seal budget.
+ *
+ * Read in two places that interpret it differently — a numeric comparison in
+ * the seal gate and an addition into the recursion limit — so a value like
+ * `1.5` would permit two seals while reserving fractional headroom, `NaN`
+ * would poison the recursion limit outright, and `Infinity` would remove both
+ * bounds at once. Normalizing once keeps the two readings in agreement.
+ *
+ * `0` is honored as a deliberate "never seal"; anything not finite falls back
+ * to the default rather than silently disabling the feature.
+ */
+export function resolveMaxSeals(maxSeals: number | undefined): number {
+  if (maxSeals == null || !Number.isFinite(maxSeals)) {
+    return DEFAULT_MAX_SEALS;
+  }
+  const whole = Math.floor(maxSeals);
+  return whole > 0 ? whole : 0;
+}
 
 /**
  * True when the accumulated content carries at least one non-whitespace text

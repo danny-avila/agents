@@ -49,12 +49,12 @@ import {
   createTitleRunnable,
 } from '@/utils/title';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
+import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeLangfuseTracing } from './instrumentation';
 import {
   Callback,
   GraphEvents,
   TitleMethod,
-  DEFAULT_MAX_SEALS,
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
@@ -732,9 +732,7 @@ export class Run<_T extends t.BaseGraphState> {
      */
     const recursionLimit =
       (callerConfig.recursionLimit ?? DEFAULT_RECURSION_LIMIT) +
-      (this.preemption != null
-        ? (this.preemption.maxSeals ?? DEFAULT_MAX_SEALS)
-        : 0);
+      (this.preemption != null ? resolveMaxSeals(this.preemption.maxSeals) : 0);
 
     const config: t.RunStreamConfig = {
       ...callerConfig,

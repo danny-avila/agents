@@ -1,5 +1,38 @@
 import { AIMessageChunk } from '@langchain/core/messages';
-import { canSealPreempt } from './preempt';
+import { canSealPreempt, resolveMaxSeals } from './preempt';
+
+/**
+ * The budget is read by two consumers that interpret it differently — a
+ * numeric comparison in the seal gate, and an addition into the graph's
+ * recursion limit. Normalizing once keeps them in agreement.
+ */
+describe('resolveMaxSeals', () => {
+  it('defaults when unset', () => {
+    expect(resolveMaxSeals(undefined)).toBe(8);
+  });
+
+  it('passes a sane whole number through', () => {
+    expect(resolveMaxSeals(3)).toBe(3);
+  });
+
+  it('floors a fractional budget so both readers agree', () => {
+    expect(resolveMaxSeals(1.5)).toBe(1);
+  });
+
+  it('honors zero as a deliberate never-seal', () => {
+    expect(resolveMaxSeals(0)).toBe(0);
+  });
+
+  it('clamps a negative budget to never-seal', () => {
+    expect(resolveMaxSeals(-4)).toBe(0);
+  });
+
+  it('falls back rather than poisoning the recursion limit', () => {
+    expect(resolveMaxSeals(NaN)).toBe(8);
+    expect(resolveMaxSeals(Infinity)).toBe(8);
+    expect(resolveMaxSeals(-Infinity)).toBe(8);
+  });
+});
 
 function chunk(fields: Partial<AIMessageChunk>): AIMessageChunk {
   return new AIMessageChunk({

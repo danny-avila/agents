@@ -125,10 +125,19 @@ export type StandardGraphConfig = Omit<
  * Preconditions the host MUST satisfy:
  *   - `shouldPreempt` is polled once per streamed chunk on the top-level
  *     graph. It must be synchronous, allocation-free and O(1) — never I/O.
- *   - Sealing is only honored on the SDK's own dispatch loop. A host that
- *     registers its own `CHAT_MODEL_STREAM` handler consumes chunks through
- *     a decoupled `streamEvents` reader that can lag the accumulated chunk,
- *     which would invert content-part indices; those runs never seal.
+ *   - Sealing is only honored on the SDK's own dispatch loop. A run whose
+ *     registered `CHAT_MODEL_STREAM` handler IS the SDK dispatcher — or wraps
+ *     it, which `composeEventHandlers` and `createRunHandlers` both do —
+ *     consumes chunks through a decoupled `streamEvents` reader that can lag
+ *     the accumulated chunk, so those runs never seal.
+ *
+ *     Detection is by capability, not identity: the dispatcher carries
+ *     `SDK_STREAM_DISPATCH` and the SDK's wrappers propagate it. A handler
+ *     that merely OBSERVES the raw chunk echo — LibreChat's no-op
+ *     `OpenAIChatModelStreamHandler`, say — is unbranded and does NOT disable
+ *     sealing, because it assigns no content-part indices and so cannot be
+ *     inverted. A host that renders from the raw feed and wants the opt-out
+ *     should brand its handler with `SDK_STREAM_DISPATCH`.
  *   - `RunConfig.tokenCounter` should be set. A sealed turn ends before most
  *     providers send their usage chunk, so the synthetic `CHAT_MODEL_END`
  *     falls back to the counter to report `output_tokens`. Without one that
