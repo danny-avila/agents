@@ -2078,6 +2078,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           trimmed.length > 0 ? [{ type: 'text' as const, text: trimmed }] : '';
       }
 
+      const localProviderOverflowMeasurements = new WeakMap<
+        object,
+        {
+          contextBudget: number;
+          estimatedPromptTokens: number;
+        }
+      >();
       const measureProviderPayload = (
         candidate: BaseMessage[],
         contextBudgetOverride?: number,
@@ -2086,6 +2093,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         fits: boolean;
         projectedMessageTokens?: number;
         availableMessageTokens?: number;
+        contextBudget?: number;
+        effectiveInstructionTokens?: number;
       } => {
         const contextBudget =
           contextBudgetOverride ?? contextUsage?.contextBudget;
@@ -2189,7 +2198,42 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           fits: projectedMessageTokens <= availableMessageTokens,
           projectedMessageTokens,
           availableMessageTokens,
+          contextBudget,
+          effectiveInstructionTokens,
         };
+      };
+
+      const createProviderPayloadOverflowError = ({
+        projection,
+        provider,
+        info,
+      }: {
+        projection: ReturnType<typeof measureProviderPayload>;
+        provider?: Providers;
+        info: string;
+      }): ContextOverflowError => {
+        const error = new ContextOverflowError(
+          JSON.stringify({
+            type: 'final_context_overflow',
+            info,
+            provider,
+            projectedMessageTokens: projection.projectedMessageTokens,
+            availableMessageTokens: projection.availableMessageTokens,
+          })
+        );
+        if (
+          projection.projectedMessageTokens != null &&
+          projection.contextBudget != null &&
+          projection.effectiveInstructionTokens != null
+        ) {
+          localProviderOverflowMeasurements.set(error, {
+            contextBudget: projection.contextBudget,
+            estimatedPromptTokens:
+              projection.projectedMessageTokens +
+              projection.effectiveInstructionTokens,
+          });
+        }
+        return error;
       };
 
       const applyProviderMessageTransforms = (
@@ -2546,14 +2590,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        */
       finalProjection = measureProviderPayload(finalMessages);
       const preInvokeContextOverflowError = !finalProjection.fits
-        ? new ContextOverflowError(
-          JSON.stringify({
-            type: 'final_context_overflow',
-            info: 'Provider message formatting exceeded the context budget and no safe synthetic-context compaction could make it fit.',
-            projectedMessageTokens: finalProjection.projectedMessageTokens,
-            availableMessageTokens: finalProjection.availableMessageTokens,
-          })
-        )
+        ? createProviderPayloadOverflowError({
+          projection: finalProjection,
+          provider: agentContext.provider,
+          info: 'Provider message formatting exceeded the context budget and no safe synthetic-context compaction could make it fit.',
+        })
         : undefined;
 
       if (
@@ -2748,15 +2789,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          */
         const estimatedPromptTokens = getEstimatedPromptTokens(contextUsage);
 
-        /**
-         * A previous correction that left the prompt no smaller proves this
-         * state has nothing left to compact — an emptied message list whose
-         * content rides along in an injected summary, for instance. Measuring
-         * that beats trying to predict every such configuration.
-         */
-        const recoveryStalled = agentContext.overflowRecoveryStalled(
-          estimatedPromptTokens
-        );
         const canSummarizeOverflow =
           agentContext.summarizationEnabled === true &&
           splitAtRecencyBoundary(messages, {
@@ -2767,13 +2799,36 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             tokenCounter: agentContext.tokenCounter,
           }).head.length > 0;
 
+        const getLocalProviderOverflowMeasurement = (
+          error: unknown
+        ):
+          | {
+              contextBudget: number;
+              estimatedPromptTokens: number;
+            }
+          | undefined =>
+          typeof error === 'object' && error !== null
+            ? localProviderOverflowMeasurements.get(error)
+            : undefined;
+
+        const getRecoveryPromptEstimate = (
+          error: unknown,
+          fallbackContext?: FallbackErrorContext
+        ): number | undefined => {
+          const resolvedFallbackContext =
+            fallbackContext ?? getFallbackErrorContext(error);
+          return (
+            getLocalProviderOverflowMeasurement(error)?.estimatedPromptTokens ??
+            (resolvedFallbackContext == null
+              ? estimatedPromptTokens
+              : undefined)
+          );
+        };
+
         const planRecovery = (
           error: unknown,
           attributedFallbackContext?: FallbackErrorContext
         ): OverflowRecoveryPlan | null => {
-          if (recoveryStalled) {
-            return null;
-          }
           /**
            * When the rejection came from a fallback, plan against *that*
            * client: its window and output allowance are why it was configured
@@ -2781,13 +2836,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
            */
           const fallbackContext =
             attributedFallbackContext ?? getFallbackErrorContext(error);
+          const localMeasurement = getLocalProviderOverflowMeasurement(error);
+          const recoveryPromptEstimate = getRecoveryPromptEstimate(
+            error,
+            fallbackContext
+          );
+          /**
+           * A previous correction that left the rejected prompt no smaller
+           * proves this state has nothing left to compact. Use the fallback
+           * projection when one exists so unlike provider formats are never
+           * compared through the primary's cheaper pre-projection estimate.
+           */
+          if (agentContext.overflowRecoveryStalled(recoveryPromptEstimate)) {
+            return null;
+          }
           const recovery = planContextOverflowRecovery({
             error,
             provider: fallbackContext?.provider ?? agentContext.provider,
             maxContextTokens:
+              localMeasurement?.contextBudget ??
               fallbackContext?.maxContextTokens ??
               agentContext.maxContextTokens,
-            estimatedPromptTokens,
+            estimatedPromptTokens: recoveryPromptEstimate,
             calibrationRatio: agentContext.calibrationRatio,
             instructionTokens: agentContext.instructionTokens,
             canSummarize: agentContext.summarizationEnabled === true,
@@ -2805,12 +2875,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 ...recovery,
                 budgetTokens: minDefined(
                   getBlindRecoveryBudget(agentContext.maxContextTokens),
-                  translateRecoveryBudget(
-                    recovery.budgetTokens,
-                    recovery.observedCalibrationRatio ??
-                        CALIBRATION_RATIO_MAX,
-                    agentContext.calibrationRatio
-                  )
+                  localMeasurement != null
+                    ? recovery.budgetTokens
+                    : translateRecoveryBudget(
+                      recovery.budgetTokens,
+                      recovery.observedCalibrationRatio ??
+                            CALIBRATION_RATIO_MAX,
+                      agentContext.calibrationRatio
+                    )
                 ),
                 observedCalibrationRatio: undefined,
               }
@@ -2824,13 +2896,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
         const recovery = planRecovery(primaryError);
         if (recovery != null) {
+          const recoveryPromptEstimate =
+            getRecoveryPromptEstimate(primaryError);
           return this.beginOverflowRecovery({
             recovery,
             agentContext,
             agentId,
             config,
             originalToolContent: prunedOriginalToolContent,
-            estimatedPromptTokens,
+            estimatedPromptTokens: recoveryPromptEstimate,
           });
         }
         /**
@@ -2899,17 +2973,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                     true
                   );
                   if (!projection.fits) {
-                    throw new ContextOverflowError(
-                      JSON.stringify({
-                        type: 'final_context_overflow',
-                        info: 'Fallback provider message formatting exceeded the context budget before invocation.',
-                        provider: fallbackProvider,
-                        projectedMessageTokens:
-                          projection.projectedMessageTokens,
-                        availableMessageTokens:
-                          projection.availableMessageTokens,
-                      })
-                    );
+                    throw createProviderPayloadOverflowError({
+                      projection,
+                      provider: fallbackProvider,
+                      info: 'Fallback provider message formatting exceeded the context budget before invocation.',
+                    });
                   }
                   return projectedFallbackMessages;
                 },
@@ -2919,14 +2987,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const overflowCandidates =
             getFallbackOverflowCandidates(fallbackError);
           let fallbackRecovery: OverflowRecoveryPlan | null = null;
+          let fallbackRecoveryPromptEstimate: number | undefined;
           for (const candidate of overflowCandidates) {
             fallbackRecovery = planRecovery(candidate.error, candidate.context);
             if (fallbackRecovery != null) {
+              fallbackRecoveryPromptEstimate = getRecoveryPromptEstimate(
+                candidate.error,
+                candidate.context
+              );
               break;
             }
           }
           if (overflowCandidates.length === 0) {
             fallbackRecovery = planRecovery(fallbackError);
+            fallbackRecoveryPromptEstimate =
+              getRecoveryPromptEstimate(fallbackError);
           }
           if (fallbackRecovery == null) {
             throw fallbackError;
@@ -2937,7 +3012,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentId,
             config,
             originalToolContent: prunedOriginalToolContent,
-            estimatedPromptTokens,
+            estimatedPromptTokens: fallbackRecoveryPromptEstimate,
           });
         }
       } finally {
