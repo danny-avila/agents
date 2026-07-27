@@ -1400,7 +1400,37 @@ function shouldSkipLateOpenRouterReasoningChunk({
   );
 }
 
+/**
+ * Brands a handler as one that dispatches content parts for the SDK — either
+ * `ChatModelStreamHandler` itself or a wrapper forwarding to one.
+ *
+ * Identity alone is not a usable contract here. Hosts compose and wrap
+ * handlers (`composeEventHandlers`, `createRunHandlers`), and every wrapper
+ * fails `instanceof` while still driving the same dispatch. A brand survives
+ * wrapping, so "does this handler own content-part dispatch" can be answered
+ * about a value the SDK did not construct.
+ */
+export const SDK_STREAM_DISPATCH = Symbol.for(
+  '@librechat/agents:chatModelStreamDispatch'
+);
+
+/** True when `handler` is, or forwards to, the SDK's stream dispatcher. */
+export function dispatchesChatModelStream(handler?: t.EventHandler): boolean {
+  if (handler == null) {
+    return false;
+  }
+  if (handler instanceof ChatModelStreamHandler) {
+    return true;
+  }
+  return (
+    (handler as unknown as Record<symbol, unknown>)[SDK_STREAM_DISPATCH] ===
+    true
+  );
+}
+
 export class ChatModelStreamHandler implements t.EventHandler {
+  readonly [SDK_STREAM_DISPATCH] = true;
+
   async handle(
     event: string,
     data: t.StreamEventData,

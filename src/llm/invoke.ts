@@ -33,7 +33,7 @@ import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
 import { modifyDeltaProperties } from '@/messages';
 import { canSealPreempt } from '@/llm/preempt';
-import { ChatModelStreamHandler } from '@/stream';
+import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { initializeModel } from '@/llm/init';
 import { isOpenAILike } from '@/utils/llm';
 
@@ -222,13 +222,23 @@ export function projectMessagesForProvider({
   );
 }
 
+/**
+ * The registered handler that owns content-part dispatch, if any.
+ *
+ * Detected by brand rather than by `instanceof`: a host that registers
+ * `new ChatModelStreamHandler()` to opt out of sealing gets wrapped by
+ * `createRunHandlers` on every `AgentSession` run, and by
+ * `composeEventHandlers` on a key collision. Both wrappers forward to the same
+ * dispatcher while failing an identity check, so an identity test would
+ * silently revoke the opt-out documented on `StreamPreemption`.
+ */
 function getRegisteredDefaultChatStreamHandler(
   context?: InvokeContext
-): ChatModelStreamHandler | undefined {
+): t.EventHandler | undefined {
   const handler = context?.handlerRegistry?.getHandler(
     GraphEvents.CHAT_MODEL_STREAM
   );
-  return handler instanceof ChatModelStreamHandler ? handler : undefined;
+  return dispatchesChatModelStream(handler) ? handler : undefined;
 }
 
 function hasReasoningDetails(chunk: AIMessageChunk): boolean {
