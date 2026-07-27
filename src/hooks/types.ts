@@ -151,11 +151,24 @@ export interface PostToolBatchHookInput extends BaseHookInput {
  * — the second injection boundary, and the only one that exists during a
  * long text answer with no tool calls in it.
  *
- * Order: fires AFTER the sealed assistant turn is committed to graph state,
- * BEFORE the next model call. The `injectedMessages` a hook returns here are
- * appended verbatim and the agent node self-loops. Returning nothing is a
- * valid outcome (the host's queue was cancelled or already drained): the run
- * stops honestly rather than self-looping into an empty turn.
+ * Order: fires after the model stream is sealed and BEFORE the next model
+ * call. The `injectedMessages` a hook returns here are appended verbatim and
+ * the agent node self-loops. Returning nothing is a valid outcome (the host's
+ * queue was cancelled or already drained): the run stops honestly rather than
+ * self-looping into an empty turn.
+ *
+ * The sealed turn is NOT yet observable from graph state when this fires.
+ * Dispatch happens inside the agent node, and only the outer graph's reducer
+ * writes `StandardGraph.messages` — which cannot run until the node returns.
+ * A hook calling `Run.getRunMessages()` here sees the state as of the last
+ * completed superstep, so the sealed text is absent. `PostToolBatch` behaves
+ * the same way: a tool-boundary hook cannot see the assistant turn that
+ * requested the tool. This is a property of the single-node outer graph, not
+ * of preemption, and committing first would mean returning from the node and
+ * re-entering — precisely what the self-loop exists to avoid.
+ *
+ * A hook that needs the sealed text should therefore not go looking for it in
+ * graph state. Decide from the host's own queue, or read it after the run.
  *
  * Requires `RunConfig.preemption`. This event is deliberately NOT
  * result-altering, so registering it never disables eager tool execution.
