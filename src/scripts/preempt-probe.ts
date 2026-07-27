@@ -46,6 +46,10 @@ type Verdict = {
   boundarySealCount: number | null;
   modelEndEvents: number;
   usageEventsWithTokens: number;
+  chatModelStarts: number;
+  llmEnds: number;
+  llmErrors: number;
+  runsLeftOpen: number;
   sealedTextChars: number;
   resumedTextChars: number;
   sequence: string[];
@@ -112,6 +116,9 @@ async function probe(): Promise<Verdict> {
   let deltaCount = 0;
   let modelEndEvents = 0;
   let usageEventsWithTokens = 0;
+  let chatModelStarts = 0;
+  let llmEnds = 0;
+  let llmErrors = 0;
   let boundaryFired = false;
   let boundarySealCount: number | null = null;
   let injectedOnce = false;
@@ -205,11 +212,29 @@ async function probe(): Promise<Verdict> {
     skipCleanup: true,
   });
 
+  /**
+   * Counts the RAW LangChain model-run lifecycle, which is what a tracer
+   * (LangSmith, Langfuse) sees. A seal that fails to close its run shows up
+   * here as starts > ends — an span that would hang open forever.
+   */
   const streamConfig = {
     runId: uuidv4(),
     configurable: { user_id: 'probe-user', thread_id: 'preempt-probe' },
     streamMode: 'values',
     version: 'v2' as const,
+    callbacks: [
+      {
+        handleChatModelStart: (): void => {
+          chatModelStarts += 1;
+        },
+        handleLLMEnd: (): void => {
+          llmEnds += 1;
+        },
+        handleLLMError: (): void => {
+          llmErrors += 1;
+        },
+      },
+    ],
   };
 
   await run.processStream(
@@ -239,7 +264,8 @@ async function probe(): Promise<Verdict> {
     sealedText.trim().length > 0 &&
     resumedText.trim().length > 0 &&
     modelEndEvents >= 2 &&
-    usageEventsWithTokens >= 2;
+    usageEventsWithTokens >= 2 &&
+    chatModelStarts === llmEnds;
 
   return {
     provider: providerKey,
@@ -252,6 +278,10 @@ async function probe(): Promise<Verdict> {
     boundarySealCount,
     modelEndEvents,
     usageEventsWithTokens,
+    chatModelStarts,
+    llmEnds,
+    llmErrors,
+    runsLeftOpen: chatModelStarts - llmEnds,
     sealedTextChars: sealedText.length,
     resumedTextChars: resumedText.length,
     sequence,

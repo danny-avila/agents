@@ -1,5 +1,9 @@
 import { concat } from '@langchain/core/utils/stream';
 import { AIMessageChunk } from '@langchain/core/messages';
+import { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import { getCallbackManagerForConfig } from '@langchain/core/runnables';
+import type { Serialized } from '@langchain/core/load/serializable';
+import type { ChatGeneration } from '@langchain/core/outputs';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
@@ -22,8 +26,9 @@ import {
 } from '@/messages/cache';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
+import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import { manualToolStreamProviders } from '@/llm/providers';
-import { Constants, GraphEvents, Providers } from '@/common';
+import { appendCallbacks } from '@/utils/callbacks';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
 import { modifyDeltaProperties } from '@/messages';
@@ -375,36 +380,88 @@ function synthesizeSealedUsage(
   };
 }
 
+function getMessageText(chunk: AIMessageChunk): string {
+  if (typeof chunk.content === 'string') {
+    return chunk.content;
+  }
+  let text = '';
+  for (const block of chunk.content) {
+    if (block.type === ContentTypes.TEXT) {
+      const value = block[ContentTypes.TEXT];
+      if (typeof value === 'string') {
+        text += value;
+      }
+    }
+  }
+  return text;
+}
+
 /**
- * Emits `CHAT_MODEL_END` for a turn that was sealed mid-stream.
+ * Ends the real model run for a turn that was sealed mid-stream.
  *
  * Mandatory, not cosmetic. `@langchain/core`'s `_streamIterator` calls
  * `handleLLMEnd` after its try/catch with no `finally`, so breaking out of the
  * consumer's `for await` produces a *return* completion that fires neither
- * `handleLLMError` nor `handleLLMEnd` — the model-end event the host uses to
- * record token usage would never arrive. Since every seal re-sends the whole
- * prompt on resume, a user who preempts N times would otherwise spend N
- * unrecorded full prompts.
+ * `handleLLMError` nor `handleLLMEnd`. The run would stay open in every
+ * callback handler: the host records no usage — and since each seal re-sends
+ * the whole prompt, N preemptions cost N unrecorded prompts — while LangSmith
+ * and Langfuse hold a span that never closes.
  *
- * KNOWN LIMITATION. This is a custom event, so it reaches the host's handler
- * registry but NOT the model run manager: external tracers (LangSmith,
- * Langfuse) are left holding a model run that never closes. Ending the real
- * run is not reachable from here — `model` is a bound runnable, so the
- * binding consumes `config.runId` for its own run and `patchConfig` hands the
- * chat model a fresh id, leaving no way to name the run we need to end.
- * Reconstructing a manager against a pinned id was tried and fails live with
- * "No LLM run to end", and it also suppresses the host's model-end event,
- * which is strictly worse than an unclosed trace span. Closing this properly
- * needs a seam in `@langchain/core`.
+ * `runId` cannot be dictated from here (the bound runnable consumes
+ * `config.runId` for its own run and hands the chat model a fresh one), but it
+ * can be OBSERVED: the capture handler installed at the `model.stream` call
+ * records it from `handleChatModelStart`, which fires before the first chunk.
+ * Rebuilding the manager against that id closes the real run, and the host's
+ * `on_chat_model_end` then arrives through the ordinary `streamEvents` path.
+ *
+ * Falls back to a custom-event dispatch if the id was never observed, so the
+ * host still records usage even when the native close is unavailable.
  */
-async function dispatchSealedModelEnd(
+async function endSealedModelRun(
   context: InvokeContext | undefined,
   chunk: AIMessageChunk,
   prompt: BaseMessage[],
+  llmRunId: string | undefined,
   config?: RunnableConfig
 ): Promise<void> {
   const metadata = config?.metadata as Record<string, unknown> | undefined;
   synthesizeSealedUsage(context, chunk, prompt, metadata);
+  if (llmRunId != null) {
+    try {
+      const callbackManager = await getCallbackManagerForConfig(config);
+      if (callbackManager != null) {
+        const runManager = new CallbackManagerForLLMRun(
+          llmRunId,
+          callbackManager.handlers,
+          callbackManager.inheritableHandlers,
+          callbackManager.tags,
+          callbackManager.inheritableTags,
+          callbackManager.metadata,
+          callbackManager.inheritableMetadata,
+          callbackManager.getParentRunId()
+        );
+        const generation: ChatGeneration = {
+          text: getMessageText(chunk),
+          message: chunk,
+        };
+        await runManager.handleLLMEnd({
+          generations: [[generation]],
+          llmOutput: {},
+        });
+        return;
+      }
+    } catch (e) {
+      /**
+       * A sealed answer that reaches the user is worth more than a tidy
+       * trace. Fall through to the custom event rather than failing the run.
+       */
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[attemptInvoke] Native close of the sealed model run failed; falling back to a custom event:',
+        e instanceof Error ? e.message : e
+      );
+    }
+  }
   await safeDispatchCustomEvent(
     GraphEvents.CHAT_MODEL_END,
     { output: chunk },
@@ -494,7 +551,32 @@ export async function attemptInvoke(
   };
 
   if (model.stream) {
-    const stream = await model.stream(messagesForProvider, config);
+    /**
+     * Observed, not dictated. `handleChatModelStart` fires with the chat
+     * model's real run id before the first chunk, which is the only way to
+     * name the run a seal has to close — pinning `config.runId` does not
+     * survive the bound runnable. Installed only when preemption is
+     * configured, so a run that cannot seal carries no extra handler.
+     */
+    let sealedRunId: string | undefined;
+    const streamConfig =
+      context?.preemption == null
+        ? config
+        : {
+          ...config,
+          callbacks: appendCallbacks(config.callbacks, [
+            {
+              handleChatModelStart: (
+                _llm: Serialized,
+                _messages: BaseMessage[][],
+                runId: string
+              ): void => {
+                sealedRunId ??= runId;
+              },
+            },
+          ]),
+        };
+    const stream = await model.stream(messagesForProvider, streamConfig);
     let finalChunk: AIMessageChunk | undefined;
     let preempted = false;
     const registeredStreamHandler =
@@ -585,10 +667,11 @@ export async function attemptInvoke(
         ...finalChunk.response_metadata,
         preempted: true,
       };
-      await dispatchSealedModelEnd(
+      await endSealedModelRun(
         context,
         finalChunk,
         messagesForProvider,
+        sealedRunId,
         config
       );
     }
