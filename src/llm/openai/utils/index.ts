@@ -42,6 +42,7 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
+import { serializeStructuredValue } from '@/utils/toolContent';
 import { toLangChainContent } from '@/messages/langchain';
 
 export type { OpenAICallOptions, OpenAIChatInput };
@@ -598,7 +599,7 @@ export function _convertMessagesToOpenAIResponsesParams(
           id: toolMessage.id?.startsWith('fc_') ? toolMessage.id : undefined,
           output:
             typeof toolMessage.content !== 'string'
-              ? JSON.stringify(toolMessage.content)
+              ? serializeStructuredValue(toolMessage.content)
               : toolMessage.content,
         };
       }

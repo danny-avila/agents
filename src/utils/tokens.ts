@@ -1,5 +1,9 @@
 import { Tokenizer } from 'ai-tokenizer';
 import type { BaseMessage } from '@langchain/core/messages';
+import {
+  isAtomicToolContentBlock,
+  serializeStructuredValue,
+} from './toolContent';
 import { ContentTypes } from '@/common/enum';
 
 export type EncodingName = 'o200k_base' | 'claude';
@@ -393,7 +397,9 @@ function timedMediaKind(
     return 'video';
   }
   const mime =
-    type === 'media' && typeof block.mimeType === 'string' ? block.mimeType : type;
+    type === 'media' && typeof block.mimeType === 'string'
+      ? block.mimeType
+      : type;
   if (mime.startsWith('audio/')) {
     return 'audio';
   }
@@ -492,14 +498,26 @@ export function getTokenCountForMessage(
 
   type ContentBlock = Record<string, unknown> & {
     type?: string;
-    tool_call?: { name?: string; args?: string; output?: string };
+    tool_call?: { name?: string; args?: unknown; output?: unknown };
   };
 
   const processValue = (value: unknown): void => {
     if (Array.isArray(value)) {
       for (const raw of value) {
+        if (
+          typeof raw === 'string' ||
+          typeof raw === 'number' ||
+          typeof raw === 'boolean'
+        ) {
+          processValue(raw);
+          continue;
+        }
         const item = raw as ContentBlock | null | undefined;
-        if (item == null || typeof item.type !== 'string') {
+        if (item == null || typeof item !== 'object') {
+          continue;
+        }
+        if (typeof item.type !== 'string') {
+          numTokens += getTokenCount(serializeStructuredValue(item));
           continue;
         }
         if (item.type === ContentTypes.ERROR) {
@@ -507,9 +525,10 @@ export function getTokenCountForMessage(
         }
 
         if (
-          item.type === ContentTypes.IMAGE_URL ||
-          item.type === 'image_url' ||
-          item.type === 'image'
+          isAtomicToolContentBlock(item) &&
+          (item.type === ContentTypes.IMAGE_URL ||
+            item.type === 'image_url' ||
+            item.type === 'image')
         ) {
           numTokens += Math.ceil(
             estimateImageBlockTokens(item, encoding) * IMAGE_TOKEN_SAFETY_MARGIN
@@ -518,9 +537,10 @@ export function getTokenCountForMessage(
         }
 
         if (
-          item.type === 'document' ||
-          item.type === 'file' ||
-          item.type === ContentTypes.IMAGE_FILE
+          isAtomicToolContentBlock(item) &&
+          (item.type === 'document' ||
+            item.type === 'file' ||
+            item.type === ContentTypes.IMAGE_FILE)
         ) {
           numTokens += Math.ceil(
             estimateDocumentBlockTokens(item, encoding, getTokenCount) *
@@ -529,7 +549,7 @@ export function getTokenCountForMessage(
           continue;
         }
 
-        if (isTimedMediaType(item.type)) {
+        if (isAtomicToolContentBlock(item) && isTimedMediaType(item.type)) {
           numTokens += Math.ceil(
             estimateTimedMediaBlockTokens(item) * IMAGE_TOKEN_SAFETY_MARGIN
           );
@@ -542,18 +562,21 @@ export function getTokenCountForMessage(
             numTokens += getTokenCount(toolName);
           }
           const args = item.tool_call.args;
-          if (typeof args === 'string' && args.length > 0) {
-            numTokens += getTokenCount(args);
+          if (args != null) {
+            numTokens += getTokenCount(
+              typeof args === 'string' ? args : serializeStructuredValue(args)
+            );
           }
           const output = item.tool_call.output;
-          if (typeof output === 'string' && output.length > 0) {
-            numTokens += getTokenCount(output);
+          if (output != null) {
+            processValue(output);
           }
           continue;
         }
 
         const nestedValue = item[item.type];
         if (nestedValue == null) {
+          numTokens += getTokenCount(serializeStructuredValue(item));
           continue;
         }
 
@@ -565,6 +588,8 @@ export function getTokenCountForMessage(
       numTokens += getTokenCount(value.toString());
     } else if (typeof value === 'boolean') {
       numTokens += getTokenCount(value.toString());
+    } else if (value != null && typeof value === 'object') {
+      numTokens += getTokenCount(serializeStructuredValue(value));
     }
   };
 

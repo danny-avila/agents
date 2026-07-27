@@ -44,6 +44,11 @@ import {
   recordArgsEqual,
 } from '@/tools/eagerEventExecution';
 import {
+  cloneToolMessageWithContent,
+  compactToolContent,
+  serializeStructuredValue,
+} from '@/utils/toolContent';
+import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
@@ -1107,6 +1112,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
       if (isBaseMessage(output) && output._getType() === 'tool') {
         const toolMsg = output as ToolMessage;
+        const originalContent = toolMsg.content;
+        const compacted = compactToolContent(
+          originalContent,
+          this.maxToolResultChars
+        );
+        if (compacted.changed) {
+          toolMsg.content = compacted.content;
+        }
         const isError = toolMsg.status === 'error';
         if (isError) {
           /**
@@ -1125,14 +1138,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           return toolMsg;
         }
         if (this.toolOutputRegistry != null || unresolvedRefs.length > 0) {
-          if (typeof toolMsg.content === 'string') {
-            const rawContent = toolMsg.content;
+          if (typeof originalContent === 'string') {
+            const rawContent = originalContent;
             const registryContent = stripCodeSessionFileSummary(rawContent);
-            const llmContent = truncateToolResultContent(
-              rawContent,
-              this.maxToolResultChars
-            );
-            toolMsg.content = llmContent;
             const refMeta = this.recordOutputReference(
               runId,
               registryContent,
@@ -1148,7 +1156,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           } else {
             /**
              * Non-string content (multi-part content blocks — text +
-             * image). Known limitation: we cannot register under a
+             * image). It is now bounded for the LLM, but cannot register under a
              * reference key because there's no canonical serialized
              * form. Warn once per tool per run when the caller
              * intended to register. The unresolved-refs hint is still
@@ -1177,7 +1185,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         return toolMsg;
       }
       const rawContent =
-        typeof output === 'string' ? output : JSON.stringify(output);
+        typeof output === 'string' ? output : serializeStructuredValue(output);
       const truncated = truncateToolResultContent(
         rawContent,
         this.maxToolResultChars
@@ -1258,7 +1266,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           });
         }
       }
-      const errorContent = `Error: ${e.message}\n Please fix your mistakes.`;
+      const errorContent = truncateToolResultContent(
+        `Error: ${e.message}\n Please fix your mistakes.`,
+        this.maxToolResultChars
+      );
       const refMeta =
         unresolvedRefs.length > 0
           ? this.recordOutputReference(
@@ -1630,7 +1641,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           error:
             typeof output.content === 'string'
               ? output.content
-              : JSON.stringify(output.content),
+              : serializeStructuredValue(output.content),
           stepId,
           turn,
         },
@@ -1685,7 +1696,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const replaced =
           typeof postResult.updatedOutput === 'string'
             ? postResult.updatedOutput
-            : JSON.stringify(postResult.updatedOutput);
+            : serializeStructuredValue(postResult.updatedOutput);
         // Keep the tool-output registry in sync with what the model
         // actually sees. Without this, `runTool` already registered
         // the PRE-hook content under `_refKey`, and a later
@@ -1703,14 +1714,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         if (this.toolOutputRegistry != null && refKey != null) {
           this.toolOutputRegistry.set(refScope, refKey, replaced);
         }
-        return new ToolMessage({
-          status: output.status,
-          name: output.name,
-          content: replaced,
-          artifact: output.artifact,
-          tool_call_id: output.tool_call_id,
-          additional_kwargs: output.additional_kwargs,
-        });
+        return cloneToolMessageWithContent(
+          output,
+          compactToolContent(replaced, this.maxToolResultChars).content
+        );
       }
     }
 
@@ -1996,7 +2003,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const contentString =
         typeof toolMessage.content === 'string'
           ? toolMessage.content
-          : JSON.stringify(toolMessage.content);
+          : serializeStructuredValue(toolMessage.content);
 
       /**
        * Prefer the post-substitution args when a `{{…}}` placeholder
@@ -2886,7 +2893,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         let finalToolOutput: unknown = result.content;
 
         if (result.status === 'error') {
-          contentString = `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`;
+          contentString = truncateToolResultContent(
+            `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
+            this.maxToolResultChars
+          );
           /**
            * Error results bypass registration but stamp the
            * unresolved-refs hint into `additional_kwargs` so the lazy
@@ -2952,7 +2962,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           let registryRaw =
             typeof result.content === 'string'
               ? result.content
-              : JSON.stringify(result.content);
+              : serializeStructuredValue(result.content);
           contentString = truncateToolResultContent(
             registryRaw,
             this.maxToolResultChars
@@ -2986,7 +2996,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               const replaced =
                 typeof hookResult.updatedOutput === 'string'
                   ? hookResult.updatedOutput
-                  : JSON.stringify(hookResult.updatedOutput);
+                  : serializeStructuredValue(hookResult.updatedOutput);
               registryRaw = replaced;
               contentString = truncateToolResultContent(
                 replaced,
@@ -3330,11 +3340,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   ): Promise<boolean> {
     const output =
       result.status === 'error'
-        ? `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`
+        ? truncateToolResultContent(
+          `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
+          this.maxToolResultChars
+        )
         : truncateToolResultContent(
           typeof result.content === 'string'
             ? result.content
-            : JSON.stringify(result.content),
+            : serializeStructuredValue(result.content),
           this.maxToolResultChars
         );
     return this.dispatchStepCompleted(

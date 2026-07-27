@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { tool } from '@langchain/core/tools';
 import { MemorySaver } from '@langchain/langgraph';
 import { describe, expect, it } from '@jest/globals';
 import { Runnable } from '@langchain/core/runnables';
@@ -5,11 +7,12 @@ import {
   AIMessageChunk,
   HumanMessage,
   AIMessage,
+  ToolMessage,
 } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
-import { GraphEvents, Providers } from '@/common';
+import { ContentTypes, GraphEvents, Providers } from '@/common';
 import { Run } from '@/run';
 
 /**
@@ -64,6 +67,36 @@ class OverflowThenSucceedModel extends Runnable<BaseMessage[], AIMessageChunk> {
   }
 }
 
+class SizeBoundModel extends Runnable<BaseMessage[], AIMessageChunk> {
+  lc_namespace = ['tests'];
+  readonly toolContentChars: number[] = [];
+
+  constructor(
+    private readonly maxToolContentChars: number,
+    private readonly error: Record<string, unknown>
+  ) {
+    super();
+  }
+
+  async invoke(messages: BaseMessage[]): Promise<AIMessageChunk> {
+    let toolContentChars = 0;
+    for (const message of messages) {
+      if (message.getType() !== 'tool') {
+        continue;
+      }
+      toolContentChars +=
+        typeof message.content === 'string'
+          ? message.content.length
+          : JSON.stringify(message.content).length;
+    }
+    this.toolContentChars.push(toolContentChars);
+    if (toolContentChars > this.maxToolContentChars) {
+      throw throwable(this.error);
+    }
+    return new AIMessageChunk({ content: 'recovered' });
+  }
+}
+
 function buildConversation(turns: number): BaseMessage[] {
   const messages: BaseMessage[] = [];
   for (let i = 0; i < turns; i++) {
@@ -78,17 +111,26 @@ async function createRun(options: {
   runId: string;
   maxContextTokens: number;
   checkpointer?: boolean;
+  provider?: Providers;
+  tokenCounter?: t.TokenCounter;
+  indexTokenCountMap?: Record<string, number>;
+  tools?: t.GraphTools;
+  maxToolResultChars?: number;
+  model?: string;
 }): Promise<Run<t.IState>> {
   return Run.create<t.IState>({
     runId: options.runId,
     graphConfig: {
       type: 'standard',
       llmConfig: {
-        provider: Providers.ANTHROPIC,
+        provider: options.provider ?? Providers.ANTHROPIC,
+        ...(options.model != null ? { model: options.model } : {}),
         disableStreaming: true,
         streamUsage: false,
       },
       maxContextTokens: options.maxContextTokens,
+      maxToolResultChars: options.maxToolResultChars,
+      tools: options.tools,
       compileOptions:
         options.checkpointer === true
           ? { checkpointer: new MemorySaver() }
@@ -96,7 +138,8 @@ async function createRun(options: {
     },
     returnContent: true,
     skipCleanup: true,
-    tokenCounter,
+    tokenCounter: options.tokenCounter ?? tokenCounter,
+    indexTokenCountMap: options.indexTokenCountMap,
   });
 }
 
@@ -107,6 +150,459 @@ const streamConfig = {
 };
 
 describe('context overflow recovery', () => {
+  it('compacts cached structured tool output before the first provider call', async () => {
+    const toolCallId = 'tc-structured';
+    const messages: BaseMessage[] = [
+      new HumanMessage('query the table'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'run_select_query',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: JSON.stringify(
+              Array.from({ length: 240 }, (_, index) => ({
+                id: index,
+                value: `${'x'.repeat(100)}-${index}`,
+              }))
+            ),
+          },
+        ],
+        tool_call_id: toolCallId,
+        name: 'run_select_query',
+      }),
+      new AIMessage('The query returned 240 rows.'),
+      new HumanMessage('compact context'),
+    ];
+    const structuredTokenCounter: t.TokenCounter = (message) => {
+      const content =
+        typeof message.content === 'string'
+          ? message.content
+          : JSON.stringify(message.content);
+      return Math.ceil(content.length / 4);
+    };
+    const indexTokenCountMap: Record<string, number> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = i === 2 ? 0 : structuredTokenCounter(messages[i]);
+    }
+    const run = await createRun({
+      runId: 'structured-output-preflight',
+      maxContextTokens: 5_000,
+      provider: Providers.BEDROCK,
+      model: 'anthropic.claude-sonnet-4-5',
+      tokenCounter: structuredTokenCounter,
+      indexTokenCountMap,
+      tools: [
+        tool(async () => 'unused', {
+          name: 'run_select_query',
+          description: 'Queries ClickHouse',
+          schema: z.object({}),
+        }),
+      ],
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new SizeBoundModel(
+      1_500,
+      signatureFor('us.anthropic.claude-sonnet-4-5-20250929-v1:0')
+    );
+    run.Graph.overrideModel = model;
+
+    const content = await run.processStream({ messages }, streamConfig);
+
+    expect(content).toEqual([{ type: 'text', text: 'recovered' }]);
+    expect(model.toolContentChars).toHaveLength(1);
+    expect(model.toolContentChars[0]).toBeGreaterThan(0);
+    expect(model.toolContentChars[0]).toBeLessThanOrEqual(1_500);
+    expect(
+      run.Graph.agentContexts.get('default')?.overflowRecoveryAttempts
+    ).toBe(0);
+  });
+
+  it('compacts an unconsumed structured tool result before its first provider call', async () => {
+    const toolCallId = 'tc-unconsumed-structured';
+    const messages: BaseMessage[] = [
+      new HumanMessage('query the table'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'run_select_query',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: JSON.stringify(
+              Array.from({ length: 240 }, (_, index) => ({
+                id: index,
+                value: `${'x'.repeat(100)}-${index}`,
+              }))
+            ),
+          },
+        ],
+        tool_call_id: toolCallId,
+        name: 'run_select_query',
+      }),
+    ];
+    const structuredTokenCounter: t.TokenCounter = (message) => {
+      const content =
+        typeof message.content === 'string'
+          ? message.content
+          : JSON.stringify(message.content);
+      return Math.ceil(content.length / 4);
+    };
+    const run = await createRun({
+      runId: 'unconsumed-structured-output-preflight',
+      maxContextTokens: 5_000,
+      maxToolResultChars: 1_500,
+      provider: Providers.BEDROCK,
+      tokenCounter: structuredTokenCounter,
+      indexTokenCountMap: {
+        0: structuredTokenCounter(messages[0]),
+        1: structuredTokenCounter(messages[1]),
+        2: 0,
+      },
+      tools: [
+        tool(async () => 'unused', {
+          name: 'run_select_query',
+          description: 'Queries ClickHouse',
+          schema: z.object({}),
+        }),
+      ],
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new SizeBoundModel(
+      1_500,
+      signatureFor('us.anthropic.claude-sonnet-4-5-20250929-v1:0')
+    );
+    run.Graph.overrideModel = model;
+
+    const content = await run.processStream({ messages }, streamConfig);
+
+    expect(content).toEqual([{ type: 'text', text: 'recovered' }]);
+    expect(model.toolContentChars).toHaveLength(1);
+    expect(model.toolContentChars[0]).toBeGreaterThan(0);
+    expect(model.toolContentChars[0]).toBeLessThanOrEqual(1_500);
+    expect(
+      run.Graph.agentContexts.get('default')?.overflowRecoveryAttempts
+    ).toBe(0);
+  });
+
+  it('includes artifact expansion when it fits the post-prune budget', async () => {
+    const toolCallId = 'tc-artifact-fits';
+    const artifactSentinel = 'ARTIFACT_FITS_SENTINEL';
+    const toolMessage = new ToolMessage({
+      content: 'rendered',
+      tool_call_id: toolCallId,
+      name: 'render_report',
+      artifact: {
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: `${artifactSentinel}:complete`,
+          },
+        ],
+      },
+    });
+    const messages: BaseMessage[] = [
+      new HumanMessage('render the report'),
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'render_report',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+    const artifactTokenCounter: t.TokenCounter = (message) => {
+      const content =
+        typeof message.content === 'string'
+          ? message.content
+          : JSON.stringify(message.content);
+      return Math.ceil(content.length / 4);
+    };
+    const run = await createRun({
+      runId: 'artifact-budget-control',
+      maxContextTokens: 10_000,
+      maxToolResultChars: 2_000,
+      provider: Providers.BEDROCK,
+      model: 'anthropic.claude-sonnet-4-5',
+      tokenCounter: artifactTokenCounter,
+      indexTokenCountMap: {
+        0: artifactTokenCounter(messages[0]),
+        1: artifactTokenCounter(messages[1]),
+        2: artifactTokenCounter(messages[2]),
+      },
+      tools: [
+        tool(async () => 'unused', {
+          name: 'render_report',
+          description: 'Renders a report',
+          schema: z.object({}),
+        }),
+      ],
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(
+      signatureFor('us.anthropic.claude-sonnet-4-5-20250929-v1:0'),
+      0
+    );
+    run.Graph.overrideModel = model;
+
+    await run.processStream({ messages }, streamConfig);
+
+    expect(model.calls).toHaveLength(1);
+    expect(
+      JSON.stringify(model.calls[0].map((message) => message.content))
+    ).toContain(artifactSentinel);
+    expect(toolMessage.content).toBe('rendered');
+    expect(toolMessage.artifact.content[0].text).toContain(artifactSentinel);
+  });
+
+  it('rechecks artifact expansion after provider message transforms', async () => {
+    const toolCallId = 'tc-artifact-final-transform';
+    const artifactSentinel = 'ARTIFACT_FINAL_TRANSFORM_SENTINEL';
+    const toolMessage = new ToolMessage({
+      content: 'rendered',
+      tool_call_id: toolCallId,
+      name: 'render_report',
+      artifact: {
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: `${artifactSentinel}:complete`,
+          },
+        ],
+      },
+    });
+    const messages: BaseMessage[] = [
+      new HumanMessage('render the report'),
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'render_report',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+    const transformSensitiveCounter: t.TokenCounter = (message) => {
+      const content =
+        typeof message.content === 'string'
+          ? message.content
+          : JSON.stringify(message.content);
+      if (
+        message instanceof HumanMessage &&
+        content.includes(artifactSentinel)
+      ) {
+        return 10_000;
+      }
+      return Math.max(1, Math.ceil(content.length / 4));
+    };
+    const run = await createRun({
+      runId: 'artifact-final-transform-guard',
+      maxContextTokens: 5_000,
+      maxToolResultChars: 2_000,
+      provider: Providers.BEDROCK,
+      model: 'anthropic.claude-sonnet-4-5',
+      tokenCounter: transformSensitiveCounter,
+      indexTokenCountMap: {
+        0: transformSensitiveCounter(messages[0]),
+        1: transformSensitiveCounter(messages[1]),
+        2: transformSensitiveCounter(messages[2]),
+      },
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(
+      signatureFor('us.anthropic.claude-sonnet-4-5-20250929-v1:0'),
+      0
+    );
+    run.Graph.overrideModel = model;
+
+    await run.processStream({ messages }, streamConfig);
+
+    expect(model.calls).toHaveLength(1);
+    const providerContent = JSON.stringify(
+      model.calls[0].map((message) => message.content)
+    );
+    expect(providerContent).toContain('[Previous tool interaction]');
+    expect(providerContent).not.toContain(artifactSentinel);
+    expect(toolMessage.artifact.content[0].text).toContain(artifactSentinel);
+  });
+
+  it('compacts expanded synthetic context without an artifact', async () => {
+    const toolCallId = 'tc-final-transform-without-artifact';
+    const messages: BaseMessage[] = [
+      new HumanMessage('query the table'),
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'run_select_query',
+            args: { query: `SELECT '${'x'.repeat(5_000)}'` },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'query complete',
+        tool_call_id: toolCallId,
+        name: 'run_select_query',
+      }),
+    ];
+    const transformSensitiveCounter: t.TokenCounter = (message) => {
+      const content =
+        typeof message.content === 'string'
+          ? message.content
+          : JSON.stringify(message.content);
+      if (
+        message instanceof HumanMessage &&
+        content.includes('[Previous tool interaction]')
+      ) {
+        return content.length * 10;
+      }
+      return 1;
+    };
+    const run = await createRun({
+      runId: 'final-transform-without-artifact',
+      maxContextTokens: 500,
+      provider: Providers.BEDROCK,
+      model: 'anthropic.claude-sonnet-4-5',
+      tokenCounter: transformSensitiveCounter,
+      indexTokenCountMap: { 0: 1, 1: 1, 2: 1 },
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(
+      signatureFor('us.anthropic.claude-sonnet-4-5-20250929-v1:0'),
+      0
+    );
+    run.Graph.overrideModel = model;
+
+    await run.processStream({ messages }, streamConfig);
+
+    expect(model.calls).toHaveLength(1);
+    const humanMessages = model.calls[0].filter(
+      (message) => message instanceof HumanMessage
+    );
+    expect(humanMessages).toHaveLength(2);
+    expect(
+      JSON.stringify(humanMessages[humanMessages.length - 1].content).length
+    ).toBeLessThan(100);
+    expect(
+      JSON.stringify(humanMessages[humanMessages.length - 1].content)
+    ).not.toContain('x'.repeat(1_000));
+  });
+
+  it('omits artifact expansion that would exceed the post-prune budget', async () => {
+    const toolCallId = 'tc-artifact';
+    const artifactSentinel = 'ARTIFACT_SENTINEL';
+    const toolMessage = new ToolMessage({
+      content: 'result'.repeat(100),
+      tool_call_id: toolCallId,
+      name: 'render_report',
+      artifact: {
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: `${artifactSentinel}:${'a'.repeat(5_000)}`,
+          },
+        ],
+      },
+    });
+    const messages: BaseMessage[] = [
+      new HumanMessage('h'.repeat(2_400)),
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'render_report',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+    const artifactTokenCounter: t.TokenCounter = (message) => {
+      const content =
+        typeof message.content === 'string'
+          ? message.content
+          : JSON.stringify(message.content);
+      return Math.ceil(content.length / 4);
+    };
+    const indexTokenCountMap: Record<string, number> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = artifactTokenCounter(messages[i]);
+    }
+    const run = await createRun({
+      runId: 'artifact-budget-guard',
+      maxContextTokens: 1_000,
+      maxToolResultChars: 2_000,
+      provider: Providers.BEDROCK,
+      model: 'anthropic.claude-sonnet-4-5',
+      tokenCounter: artifactTokenCounter,
+      indexTokenCountMap,
+      tools: [
+        tool(async () => 'unused', {
+          name: 'render_report',
+          description: 'Renders a report',
+          schema: z.object({}),
+        }),
+      ],
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(
+      signatureFor('us.anthropic.claude-sonnet-4-5-20250929-v1:0'),
+      0
+    );
+    run.Graph.overrideModel = model;
+
+    await run.processStream({ messages }, streamConfig);
+
+    expect(model.calls).toHaveLength(1);
+    expect(
+      JSON.stringify(model.calls[0].map((message) => message.content))
+    ).not.toContain(artifactSentinel);
+    expect(toolMessage.content).toBe('result'.repeat(100));
+    expect(toolMessage.artifact.content[0].text).toContain(artifactSentinel);
+  });
+
   it('preserves masked tool originals while checkpointed messages survive', async () => {
     const run = await createRun({
       runId: 'overflow-originals-checkpoint',

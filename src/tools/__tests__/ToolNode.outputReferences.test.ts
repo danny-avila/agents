@@ -113,6 +113,54 @@ describe('ToolNode tool output references', () => {
 
       expect(capturedArgs).toEqual(['raw {{tool0turn0}}']);
     });
+
+    it('bounds structured ToolMessage output before its first model call', async () => {
+      const structuredTool = tool(
+        async () =>
+          new ToolMessage({
+            status: 'success',
+            content: [
+              {
+                type: 'json',
+                rows: Array.from({ length: 20 }, (_, index) => ({
+                  id: index,
+                  value: `${'x'.repeat(100)}-${index}`,
+                })),
+              },
+            ],
+            artifact: { source: 'clickhouse' },
+            metadata: { requestId: 'request-1' },
+            name: 'run_select_query',
+            tool_call_id: 'c1',
+          }),
+        {
+          name: 'run_select_query',
+          description: 'returns structured rows',
+          schema: z.object({ command: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+      const node = new ToolNode({
+        tools: [structuredTool],
+        maxToolResultChars: 200,
+      });
+
+      const [msg] = await invokeBatch(node, [
+        {
+          id: 'c1',
+          name: 'run_select_query',
+          command: 'SELECT * FROM events',
+        },
+      ]);
+
+      expect(typeof msg.content).toBe('string');
+      expect(msg.content).toContain('truncated');
+      expect((msg.content as string).length).toBeLessThanOrEqual(200);
+      expect(msg.tool_call_id).toBe('c1');
+      expect(msg.name).toBe('run_select_query');
+      expect(msg.status).toBe('success');
+      expect(msg.artifact).toEqual({ source: 'clickhouse' });
+      expect(msg.metadata).toEqual({ requestId: 'request-1' });
+    });
   });
 
   describe('enabled', () => {
@@ -823,7 +871,7 @@ describe('ToolNode tool output references', () => {
       expect(JSON.parse(stepCompletedArgs[1]).command).toBe('echo STORED');
     });
 
-    it('records unresolved refs as metadata on non-string ToolMessage content (content untouched)', async () => {
+    it('records unresolved refs on multipart ToolMessage content within the cap', async () => {
       const complexTool = tool(
         async () =>
           new ToolMessage({
@@ -855,8 +903,8 @@ describe('ToolNode tool output references', () => {
 
       expect(Array.isArray(msg.content)).toBe(true);
       const blocks = msg.content as Array<{ type: string; text?: string }>;
-      // Multi-part content is untouched at storage time — the lazy
-      // transform handles the unresolved-refs warning at request time.
+      // In-budget multi-part content stays intact; the lazy transform handles
+      // the unresolved-refs warning at request time.
       expect(blocks).toHaveLength(2);
       expect(blocks[0].type).toBe('text');
       expect(blocks[0].text).toBe('data');

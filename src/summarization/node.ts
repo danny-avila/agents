@@ -11,6 +11,11 @@ import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
 import {
+  cloneToolMessageWithContent,
+  compactToolContent,
+  serializeToolContent,
+} from '@/utils/toolContent';
+import {
   addTailCacheControl,
   resolvePromptCacheTtl,
   type PromptCacheTtl,
@@ -28,6 +33,7 @@ import {
 } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
+import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getMaxOutputTokensKey } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
@@ -206,10 +212,7 @@ function extractToolFailuresSection(messages: BaseMessage[]): string {
     }
 
     const toolName = toolMsg.name ?? 'tool';
-    const content =
-      typeof toolMsg.content === 'string'
-        ? toolMsg.content
-        : JSON.stringify(toolMsg.content);
+    const content = serializeToolContent(toolMsg.content);
     const normalized = content.replace(/\s+/g, ' ').trim();
     const summary =
       normalized.length > MAX_TOOL_FAILURE_CHARS
@@ -250,24 +253,41 @@ function enrichSummary(summaryText: string, messages: BaseMessage[]): string {
  */
 function restoreOriginalToolContent(
   messages: BaseMessage[],
-  originalToolContent: Map<number, string> | undefined
+  originalToolContent: Map<number, string> | undefined,
+  maxContextTokens?: number
 ): BaseMessage[] {
   if (originalToolContent == null || originalToolContent.size === 0) {
     return messages;
   }
-  const restored = [...messages];
-  for (const [idx, content] of originalToolContent) {
-    const msg = restored[idx];
-    if (msg instanceof ToolMessage) {
-      restored[idx] = new ToolMessage({
-        content,
-        tool_call_id: msg.tool_call_id,
-        name: msg.name,
-        id: msg.id,
-        additional_kwargs: msg.additional_kwargs,
-        response_metadata: msg.response_metadata,
-      });
+
+  const restorable: Array<{
+    index: number;
+    message: ToolMessage;
+    content: string;
+  }> = [];
+  for (const [index, content] of originalToolContent) {
+    const message = messages[index];
+    if (message instanceof ToolMessage) {
+      restorable.push({ index, message, content });
     }
+  }
+  if (restorable.length === 0) {
+    return messages;
+  }
+
+  /**
+   * Restored originals improve checkpoint quality, but they still feed a
+   * provider call. Share one tool-result budget across every restoration so
+   * several previously masked results cannot overflow the summarizer.
+   */
+  let remainingChars = calculateMaxToolResultChars(maxContextTokens);
+  const restored = [...messages];
+  for (let i = 0; i < restorable.length; i++) {
+    const { index, message, content } = restorable[i];
+    const maxChars = Math.floor(remainingChars / (restorable.length - i));
+    const compacted = compactToolContent(content, maxChars).content;
+    restored[index] = cloneToolMessageWithContent(message, compacted);
+    remainingChars -= serializeToolContent(compacted).length;
   }
   return restored;
 }
@@ -845,7 +865,8 @@ export function createSummarizeNode({
 
     const restoredMessages = restoreOriginalToolContent(
       state.messages,
-      originalPending
+      originalPending,
+      agentContext.maxContextTokens
     );
 
     const runnableConfig = config ?? graph.config;

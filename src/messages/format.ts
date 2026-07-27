@@ -27,6 +27,11 @@ import type {
   TPayload,
   TMessage,
 } from '@/types';
+import {
+  compactToolContent,
+  isAtomicToolContentBlock,
+  serializeStructuredValue,
+} from '@/utils/toolContent';
 import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
 import { Providers, ContentTypes, Constants } from '@/common';
@@ -459,6 +464,21 @@ function hasToolCallOutput(part: MessageContentComplex): boolean {
   return output != null && output !== '';
 }
 
+function formatToolCallOutput(
+  output: ToolCallPart['output'] | undefined
+): MessageContent {
+  if (output == null) {
+    return '';
+  }
+  if (typeof output === 'string') {
+    return output;
+  }
+  if (Array.isArray(output)) {
+    return compactToolContent(output, Number.MAX_SAFE_INTEGER).content;
+  }
+  return serializeStructuredValue(output);
+}
+
 /**
  * Helper function to format an assistant message
  * @param message The message to format
@@ -718,7 +738,7 @@ function formatAssistantMessage(
             new ToolMessage({
               tool_call_id: tool_call.id ?? '',
               name: tool_call.name,
-              content: output != null ? output : '',
+              content: formatToolCallOutput(output),
             }),
             'tool'
           )
@@ -1754,9 +1774,6 @@ export function shiftIndexTokenCountMap(
   return shiftedMap;
 }
 
-/** Block types that contain binary image data and must be preserved structurally. */
-const IMAGE_BLOCK_TYPES = new Set(['image_url', 'image']);
-
 /** Checks whether a BaseMessage is a tool-role message. */
 const isToolMessage = (m: BaseMessage): boolean =>
   m instanceof ToolMessage || ('role' in m && (m as any).role === 'tool');
@@ -1778,10 +1795,9 @@ function flushTextChunks(
 
 /**
  * Appends a single message's content to the running `textChunks` / `parts`
- * accumulators.  Image blocks are shallow-copied into `parts` as-is so that
- * binary data (base64 images) never becomes text tokens.  All other block
- * types are serialized to text — unrecognized types are JSON-serialized
- * rather than silently dropped.
+ * accumulators. Atomic media/resource blocks are shallow-copied into `parts`
+ * so binary data never becomes text tokens. All other block types are
+ * serialized to text rather than silently dropped.
  *
  * When `content` is an array containing tool_use blocks, `tool_calls` is NOT
  * additionally serialized (avoiding double output).  `tool_calls` is used as
@@ -1811,7 +1827,7 @@ function appendMessageContent(
   let hasToolUseBlock = false;
 
   for (const block of content as ExtendedMessageContent[]) {
-    if (IMAGE_BLOCK_TYPES.has(block.type ?? '')) {
+    if (isAtomicToolContentBlock(block)) {
       flushTextChunks(textChunks, parts);
       parts.push({ ...block } as MessageContentComplex);
       continue;
@@ -1864,7 +1880,7 @@ function appendMessageContent(
             if (innerBlock) {
               textChunks.push(`${role}: [tool_result] ${innerBlock}`);
             }
-          } else if (IMAGE_BLOCK_TYPES.has(innerBlock.type ?? '')) {
+          } else if (isAtomicToolContentBlock(innerBlock)) {
             flushTextChunks(textChunks, parts);
             parts.push({ ...innerBlock } as MessageContentComplex);
           } else {

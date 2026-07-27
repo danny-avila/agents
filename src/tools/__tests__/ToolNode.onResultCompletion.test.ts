@@ -124,6 +124,55 @@ describe('ToolNode per-call onResult completion emission', () => {
     expect(result.messages.map((m) => m.content)).toEqual(['sunny', '42']);
   });
 
+  it('serializes bigint output before early and batch completion paths', async () => {
+    const completions: CompletionEvent[] = [];
+    const structuredOutput = [{ rowsRead: BigInt(42), status: 'complete' }];
+
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push(data as CompletionEvent);
+          return;
+        }
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        batch.onResult?.({
+          toolCallId: 'call_query',
+          status: 'success',
+          content: structuredOutput,
+        });
+        await flushAsync();
+        batch.resolve([
+          {
+            toolCallId: 'call_query',
+            status: 'success',
+            content: structuredOutput,
+          },
+        ]);
+      });
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('query')],
+      eventDrivenMode: true,
+      toolCallStepIds: new Map([['call_query', 'step_query']]),
+    });
+    const result = (await toolNode.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          { id: 'call_query', name: 'query', args: {} },
+        ]),
+      ],
+    })) as { messages: ToolMessage[] };
+
+    const serialized = '[{"rowsRead":"42","status":"complete"}]';
+    expect(completions).toHaveLength(1);
+    expect(completions[0].result.tool_call.output).toBe(serialized);
+    expect(result.messages[0].content).toBe(serialized);
+  });
+
   it('ignores duplicate and unknown onResult reports', async () => {
     const completions: CompletionEvent[] = [];
 

@@ -36,6 +36,7 @@ import {
   truncateToolResultContent,
 } from '@/utils/truncation';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
+import { serializeStructuredValue } from '@/utils/toolContent';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { isGoogleLike } from '@/utils/llm';
 import { getMessageId } from '@/messages';
@@ -843,11 +844,14 @@ async function dispatchEagerToolCompletions(args: {
     }
     const output =
       result.status === 'error'
-        ? `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`
+        ? truncateToolResultContent(
+          `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
+          maxToolResultChars
+        )
         : truncateToolResultContent(
           typeof result.content === 'string'
             ? result.content
-            : JSON.stringify(result.content),
+            : serializeStructuredValue(result.content),
           maxToolResultChars
         );
 
@@ -2248,11 +2252,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
             const contentIndex =
               toolCallIndices[toolCallIndex] ?? runStep.index;
             const toolCallId = toolCall.id ?? '';
-            registerToolContentIndex(
-              toolStepContent,
-              contentIndex,
-              toolCallId
-            );
+            registerToolContentIndex(toolStepContent, contentIndex, toolCallId);
             const contentPart: t.MessageContentComplex = {
               type: ContentTypes.TOOL_CALL,
               tool_call: {

@@ -6,12 +6,16 @@ import {
   ToolMessage,
 } from '@langchain/core/messages';
 import type { MessageContentComplex, TPayload } from '@/types';
-import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import {
   convertMessagesToContent,
   formatAnthropicArtifactContent,
+  formatArtifactPayload,
+  projectAnthropicArtifactContent,
+  projectArtifactPayload,
 } from './core';
+import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { Constants, ContentTypes, Providers } from '@/common';
+import { serializeToolContent } from '@/utils/toolContent';
 import { formatAgentMessages } from './format';
 
 type AnthropicPayloadBlock = {
@@ -1551,7 +1555,7 @@ describe('formatAgentMessages', () => {
       configurable: true,
     });
 
-    formatAnthropicArtifactContent([
+    const originalMessages = [
       new AIMessageChunk({
         content: '',
         tool_calls: [
@@ -1564,12 +1568,149 @@ describe('formatAgentMessages', () => {
         ],
       }),
       toolMessage,
-    ]);
+    ];
+    const formattedMessages = projectAnthropicArtifactContent(originalMessages);
+    const formattedToolMessage = formattedMessages[1] as ToolMessage;
 
-    expect(toolMessage.content).toEqual([
+    expect(formattedToolMessage.content).toEqual([
       { type: ContentTypes.TEXT, text: '' },
       { type: ContentTypes.TEXT, text: 'artifact text' },
     ]);
+    expect(toolMessage.content).toBeUndefined();
+    expect(formattedMessages).not.toBe(originalMessages);
+  });
+
+  it('caps Anthropic artifact expansion after pruning', () => {
+    const toolMessage = new ToolMessage({
+      content: 'short result',
+      tool_call_id: 'call_artifact_capped',
+      artifact: {
+        content: 'artifact'.repeat(1_000),
+      },
+    });
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_artifact_capped',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+
+    const formatted = projectAnthropicArtifactContent(messages, 200);
+    const formattedTool = formatted[1] as ToolMessage;
+
+    expect(
+      serializeToolContent(formattedTool.content).length
+    ).toBeLessThanOrEqual(200);
+    expect(serializeToolContent(formattedTool.content)).toContain('truncated');
+    expect(toolMessage.content).toBe('short result');
+    expect(toolMessage.artifact.content).toContain('artifact');
+    expect(projectAnthropicArtifactContent(formatted, 200)).toBe(formatted);
+  });
+
+  it('caps the aggregate OpenAI/Google artifact payload', () => {
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_artifact_payload',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'short result',
+        tool_call_id: 'call_artifact_payload',
+        artifact: {
+          content: [
+            { type: ContentTypes.TEXT, text: 'artifact'.repeat(1_000) },
+          ],
+        },
+      }),
+    ];
+
+    const formatted = projectArtifactPayload(messages, 200);
+
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+    expect(payload).toBeInstanceOf(HumanMessage);
+    expect(serializeToolContent(payload.content).length).toBeLessThanOrEqual(
+      200
+    );
+    expect(messages).toHaveLength(2);
+    expect((messages[1] as ToolMessage).content).toBe('short result');
+    expect(projectArtifactPayload(formatted, 200)).toBe(formatted);
+  });
+
+  it('keeps the mutating artifact formatter API backward compatible', () => {
+    const anthropicToolMessage = new ToolMessage({
+      content: 'result',
+      tool_call_id: 'anthropic_legacy',
+      artifact: {
+        content: [{ type: ContentTypes.TEXT, text: 'anthropic artifact' }],
+      },
+    });
+    const anthropicMessages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'anthropic_legacy',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      anthropicToolMessage,
+    ];
+
+    expect(formatAnthropicArtifactContent(anthropicMessages)).toBeUndefined();
+    expect(anthropicToolMessage.content).toEqual([
+      { type: ContentTypes.TEXT, text: 'result' },
+      { type: ContentTypes.TEXT, text: 'anthropic artifact' },
+    ]);
+    expect(anthropicToolMessage.artifact.content).toHaveLength(1);
+
+    const payloadToolMessage = new ToolMessage({
+      content: 'result',
+      tool_call_id: 'payload_legacy',
+      artifact: {
+        content: [{ type: ContentTypes.TEXT, text: 'payload artifact' }],
+      },
+    });
+    const payloadMessages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'payload_legacy',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      payloadToolMessage,
+    ];
+
+    expect(formatArtifactPayload(payloadMessages)).toBeUndefined();
+    expect(payloadToolMessage.content).toContain(
+      'Tool response is included in the next message'
+    );
+    expect(payloadMessages[payloadMessages.length - 1]).toBeInstanceOf(
+      HumanMessage
+    );
+    expect(payloadToolMessage.artifact.content).toHaveLength(1);
   });
 
   it('should dynamically discover tools from tool_search output and keep their tool calls', () => {
@@ -2216,9 +2357,15 @@ describe('formatAgentMessages', () => {
       },
     ];
 
-    const result = formatAgentMessages(payload, undefined, undefined, undefined, {
-      preserveReasoningContent: true,
-    });
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      {
+        preserveReasoningContent: true,
+      }
+    );
 
     const toolCallMessage = result.messages[0] as AIMessage;
     expect(toolCallMessage.tool_calls).toHaveLength(1);
@@ -2254,15 +2401,19 @@ describe('formatAgentMessages', () => {
       },
     ];
 
-    const result = formatAgentMessages(payload, undefined, undefined, undefined, {
-      provider: Providers.DEEPSEEK,
-      preserveReasoningContent: false,
-    });
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      {
+        provider: Providers.DEEPSEEK,
+        preserveReasoningContent: false,
+      }
+    );
 
     const toolCallMessage = result.messages[0] as AIMessage;
-    expect(
-      toolCallMessage.additional_kwargs.reasoning_content
-    ).toBeUndefined();
+    expect(toolCallMessage.additional_kwargs.reasoning_content).toBeUndefined();
   });
 
   it('should preserve DeepSeek reasoning from supported hidden content blocks', () => {

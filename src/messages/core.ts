@@ -8,6 +8,10 @@ import {
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
+import {
+  cloneToolMessageWithContent,
+  compactToolContent,
+} from '@/utils/toolContent';
 import { ContentTypes, Providers } from '@/common';
 import { toLangChainContent } from './langchain';
 
@@ -181,15 +185,14 @@ function getReasoningDetailsText(
 function getAdditionalReasoningContent(
   message: BaseMessage
 ): string | undefined {
-  const additionalKwargs =
-    message.additional_kwargs as ReasoningAdditionalKwargs | undefined;
+  const additionalKwargs = message.additional_kwargs as
+    | ReasoningAdditionalKwargs
+    | undefined;
   if (additionalKwargs == null) {
     return undefined;
   }
 
-  const reasoningContent = getReasoningText(
-    additionalKwargs.reasoning_content
-  );
+  const reasoningContent = getReasoningText(additionalKwargs.reasoning_content);
   if (reasoningContent != null) {
     return reasoningContent;
   }
@@ -432,8 +435,7 @@ export function convertMessagesToContent(
         toolCallMap.set(tool_call.id, tool_call);
       }
 
-      currentAIMessageIndex =
-        addContentPart(message) ?? addToolCallBoundary();
+      currentAIMessageIndex = addContentPart(message) ?? addToolCallBoundary();
       continue;
     } else if (
       messageType === 'tool' &&
@@ -471,24 +473,27 @@ function stringifyToolMessageContent(
   return content == null ? '' : String(content);
 }
 
-export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
+export function projectAnthropicArtifactContent(
+  messages: BaseMessage[],
+  maxChars = Number.MAX_SAFE_INTEGER
+): BaseMessage[] {
   const lastMessage = messages[messages.length - 1];
-  if (!(lastMessage instanceof ToolMessage)) return;
+  if (!(lastMessage instanceof ToolMessage)) return messages;
 
   // Find the latest AIMessage with tool_calls that this tool message belongs to
   const latestAIParentIndex = findLastIndex(
     messages,
     (msg) =>
-      (msg instanceof AIMessageChunk &&
+      ((msg instanceof AIMessage || msg instanceof AIMessageChunk) &&
         (msg.tool_calls?.length ?? 0) > 0 &&
         msg.tool_calls?.some((tc) => tc.id === lastMessage.tool_call_id)) ??
       false
   );
 
-  if (latestAIParentIndex === -1) return;
+  if (latestAIParentIndex === -1) return messages;
 
   // Build tool call ID set and merge artifact content in a single forward pass.
-  const message = messages[latestAIParentIndex] as AIMessageChunk;
+  const message = messages[latestAIParentIndex] as AIMessage | AIMessageChunk;
   const toolCallIdSet = new Set<string>();
   if (message.tool_calls) {
     for (const tc of message.tool_calls) {
@@ -498,13 +503,17 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
     }
   }
 
+  let formattedMessages: BaseMessage[] | undefined;
   for (let j = latestAIParentIndex + 1; j < messages.length; j++) {
     const msg = messages[j];
     if (
       msg instanceof ToolMessage &&
       toolCallIdSet.has(msg.tool_call_id) &&
       msg.artifact != null &&
-      Array.isArray(msg.artifact?.content)
+      ((typeof msg.artifact?.content === 'string' &&
+        msg.artifact.content.length > 0) ||
+        (Array.isArray(msg.artifact?.content) &&
+          msg.artifact.content.length > 0))
     ) {
       const base = Array.isArray(msg.content)
         ? msg.content
@@ -514,35 +523,82 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
             text: stringifyToolMessageContent(msg.content),
           },
         ];
-      msg.content = base.concat(msg.artifact.content);
+      const artifactContent =
+        typeof msg.artifact.content === 'string'
+          ? [
+            {
+              type: ContentTypes.TEXT,
+              text: msg.artifact.content,
+            },
+          ]
+          : msg.artifact.content;
+      const content = compactToolContent(
+        base.concat(artifactContent),
+        maxChars
+      ).content;
+      formattedMessages ??= [...messages];
+      formattedMessages[j] = cloneToolMessageWithContent(msg, content, {
+        ...msg.artifact,
+        content: [],
+      });
+    }
+  }
+  return formattedMessages ?? messages;
+}
+
+/**
+ * Mutating compatibility wrapper retained for existing package consumers.
+ * New provider-call paths should use `projectAnthropicArtifactContent`.
+ */
+export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
+  const projected = projectAnthropicArtifactContent(messages);
+  if (projected === messages) {
+    return;
+  }
+  for (let i = 0; i < messages.length; i++) {
+    if (
+      messages[i] instanceof ToolMessage &&
+      projected[i] instanceof ToolMessage &&
+      projected[i] !== messages[i]
+    ) {
+      messages[i].content = projected[i].content;
     }
   }
 }
 
-export function formatArtifactPayload(messages: BaseMessage[]): void {
+export function projectArtifactPayload(
+  messages: BaseMessage[],
+  maxChars = Number.MAX_SAFE_INTEGER
+): BaseMessage[] {
   const lastMessageY = messages[messages.length - 1];
-  if (!(lastMessageY instanceof ToolMessage)) return;
+  if (!(lastMessageY instanceof ToolMessage)) return messages;
 
   // Find the latest AIMessage with tool_calls that this tool message belongs to
   const latestAIParentIndex = findLastIndex(
     messages,
     (msg) =>
-      (msg instanceof AIMessageChunk &&
+      ((msg instanceof AIMessage || msg instanceof AIMessageChunk) &&
         (msg.tool_calls?.length ?? 0) > 0 &&
         msg.tool_calls?.some((tc) => tc.id === lastMessageY.tool_call_id)) ??
       false
   );
 
-  if (latestAIParentIndex === -1) return;
+  if (latestAIParentIndex === -1) return messages;
 
   // Single pass: collect relevant tool messages with artifacts and aggregate
   const aggregatedContent: t.MessageContentComplex[] = [];
+  let formattedMessages: BaseMessage[] | undefined;
 
   for (let i = latestAIParentIndex + 1; i < messages.length; i++) {
     const msg = messages[i];
     if (
       !(msg instanceof ToolMessage) ||
-      !Array.isArray(msg.artifact?.content)
+      !(
+        (typeof msg.artifact?.content === 'string' &&
+          msg.artifact.content.length > 0) ||
+        (Array.isArray(msg.artifact?.content) &&
+          msg.artifact.content.length > 0)
+      )
     ) {
       continue;
     }
@@ -551,16 +607,55 @@ export function formatArtifactPayload(messages: BaseMessage[]): void {
       currentContent = [{ type: 'text', text: msg.content }];
     }
     aggregatedContent.push(...(currentContent as t.MessageContentComplex[]));
-    msg.content =
-      'Tool response is included in the next message as a Human message';
-    aggregatedContent.push(...msg.artifact.content);
+    formattedMessages ??= [...messages];
+    formattedMessages[i] = cloneToolMessageWithContent(
+      msg,
+      'Tool response is included in the next message as a Human message',
+      {
+        ...msg.artifact,
+        content: [],
+      }
+    );
+    if (typeof msg.artifact.content === 'string') {
+      aggregatedContent.push({
+        type: ContentTypes.TEXT,
+        text: msg.artifact.content,
+      });
+    } else {
+      aggregatedContent.push(...msg.artifact.content);
+    }
   }
 
   if (aggregatedContent.length > 0) {
-    messages.push(
-      new HumanMessage({ content: toLangChainContent(aggregatedContent) })
+    const compacted = compactToolContent(
+      toLangChainContent(aggregatedContent),
+      maxChars
     );
+    formattedMessages?.push(new HumanMessage({ content: compacted.content }));
   }
+  return formattedMessages ?? messages;
+}
+
+/**
+ * Mutating compatibility wrapper retained for existing package consumers.
+ * New provider-call paths should use `projectArtifactPayload`.
+ */
+export function formatArtifactPayload(messages: BaseMessage[]): void {
+  const originalLength = messages.length;
+  const projected = projectArtifactPayload(messages);
+  if (projected === messages) {
+    return;
+  }
+  for (let i = 0; i < originalLength; i++) {
+    if (
+      messages[i] instanceof ToolMessage &&
+      projected[i] instanceof ToolMessage &&
+      projected[i] !== messages[i]
+    ) {
+      messages[i].content = projected[i].content;
+    }
+  }
+  messages.push(...projected.slice(originalLength));
 }
 
 export function findLastIndex<T>(

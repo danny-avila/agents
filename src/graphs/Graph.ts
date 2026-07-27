@@ -3,8 +3,12 @@ import { nanoid } from 'nanoid';
 import { tool } from '@langchain/core/tools';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
-import { ToolMessage, AIMessageChunk } from '@langchain/core/messages';
 import { START, END, StateGraph, Annotation } from '@langchain/langgraph';
+import {
+  ToolMessage,
+  HumanMessage,
+  AIMessageChunk,
+} from '@langchain/core/messages';
 import type {
   UsageMetadata,
   BaseMessage,
@@ -16,14 +20,14 @@ import type { FallbackErrorContext } from '@/llm/invoke';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import {
-  formatAnthropicArtifactContent,
+  projectAnthropicArtifactContent,
   ensureThinkingBlockInMessages,
   foldToolBlocksForToollessAgent,
   convertMessagesToContent,
   sanitizeOrphanToolBlocks,
   extractToolDiscoveries,
   addBedrockTailCacheControl,
-  formatArtifactPayload,
+  projectArtifactPayload,
   formatContentStrings,
   isLegacyConvertible,
   CALIBRATION_RATIO_MAX,
@@ -40,20 +44,21 @@ import {
   splitAtRecencyBoundary,
 } from '@/messages';
 import {
-  createLangfuseHandler,
-  createLangfuseTraceMetadata,
-  disposeLangfuseHandler,
-  isLangfuseCallbackHandler,
-} from '@/langfuse';
-import {
   resetIfNotEmpty,
   isAnthropicLike,
   isOpenAILike,
   isGoogleLike,
   apportionTokenCounts,
+  calculateMaxToolResultChars,
   joinKeys,
   sleep,
 } from '@/utils';
+import {
+  createLangfuseHandler,
+  createLangfuseTraceMetadata,
+  disposeLangfuseHandler,
+  isLangfuseCallbackHandler,
+} from '@/langfuse';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -82,6 +87,10 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
+import {
+  compactToolContent,
+  getToolContentCharLength,
+} from '@/utils/toolContent';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
@@ -1924,8 +1933,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       let finalMessages = messagesToUse;
       /** Tail snapshot for the dispatch-time usage delta: in-place
-       *  formatters (artifact appends, Bedrock content rewrites, legacy
-       *  string conversion) mutate without changing length or identity —
+       *  formatters (Bedrock content rewrites and legacy string conversion)
+       *  can mutate without changing length or identity —
        *  capture before they run. Legacy string conversion can also touch
        *  messages before the tail, so those convertible indices are
        *  tracked separately (none exist in the common case). */
@@ -1979,56 +1988,241 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           trimmed.length > 0 ? [{ type: 'text' as const, text: trimmed }] : '';
       }
 
+      const measureProviderPayload = (
+        candidate: BaseMessage[]
+      ): {
+        fits: boolean;
+        projectedMessageTokens?: number;
+        availableMessageTokens?: number;
+      } => {
+        if (
+          agentContext.tokenCounter == null ||
+          contextUsage?.contextBudget == null ||
+          contextUsage.effectiveInstructionTokens == null
+        ) {
+          return { fits: true };
+        }
+        let rawTokens = 3; // reply-primer allowance
+        for (const message of candidate) {
+          rawTokens += agentContext.tokenCounter(message);
+        }
+        const usageRatio =
+          contextUsage.calibrationRatio != null &&
+          contextUsage.calibrationRatio > 0
+            ? contextUsage.calibrationRatio
+            : agentContext.calibrationRatio;
+        const projectedMessageTokens = Math.round(rawTokens * usageRatio);
+        const availableMessageTokens = Math.max(
+          0,
+          contextUsage.contextBudget - contextUsage.effectiveInstructionTokens
+        );
+        return {
+          fits: projectedMessageTokens <= availableMessageTokens,
+          projectedMessageTokens,
+          availableMessageTokens,
+        };
+      };
+
+      const applyProviderMessageTransforms = (
+        candidate: BaseMessage[]
+      ): BaseMessage[] => {
+        let transformed = candidate;
+        if (
+          isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
+        ) {
+          /**
+           * Current-run AI messages may validly omit a thinking block. The
+           * boundary prevents them from being mistaken for foreign history.
+           */
+          transformed = ensureThinkingBlockInMessages(
+            transformed,
+            agentContext.provider,
+            config,
+            this.startIndex
+          );
+        }
+
+        /**
+         * Tool-less destinations cannot send inherited tool blocks without a
+         * tool schema, so fold those interactions into provider-valid content.
+         */
+        if (toolsForBinding == null || toolsForBinding.length === 0) {
+          transformed = foldToolBlocksForToollessAgent(transformed, config);
+          if (agentContext.useLegacyContent) {
+            transformed = formatContentStrings(transformed);
+          }
+        }
+        return transformed;
+      };
+
+      const compactSyntheticProviderContext = (
+        candidate: BaseMessage[]
+      ): BaseMessage[] => {
+        const synthetic: Array<{
+          index: number;
+          message: HumanMessage;
+          chars: number;
+        }> = [];
+        for (let i = 0; i < candidate.length; i++) {
+          const message = candidate[i];
+          if (!(message instanceof HumanMessage)) {
+            continue;
+          }
+          const content = message.content;
+          let leadingText = '';
+          if (typeof content === 'string') {
+            leadingText = content;
+          } else if (
+            Array.isArray(content) &&
+            content[0]?.type === ContentTypes.TEXT &&
+            typeof content[0].text === 'string'
+          ) {
+            leadingText = content[0].text;
+          }
+          if (
+            !leadingText.startsWith('[Previous tool interaction]') &&
+            !leadingText.startsWith('[Previous agent context]')
+          ) {
+            continue;
+          }
+          synthetic.push({
+            index: i,
+            message,
+            chars: getToolContentCharLength(content),
+          });
+        }
+        if (synthetic.length === 0) {
+          return candidate;
+        }
+
+        const buildCandidate = (scale: number): BaseMessage[] => {
+          const compacted = [...candidate];
+          for (const { index, message, chars } of synthetic) {
+            const content = compactToolContent(
+              message.content,
+              Math.floor(chars * scale)
+            ).content;
+            compacted[index] = new HumanMessage({
+              content,
+              id: message.id,
+              name: message.name,
+              additional_kwargs: message.additional_kwargs,
+              response_metadata: message.response_metadata,
+            });
+          }
+          return compacted;
+        };
+
+        let best = buildCandidate(0);
+        if (!measureProviderPayload(best).fits) {
+          return candidate;
+        }
+        let low = 0;
+        let high = 1;
+        for (let i = 0; i < 12; i++) {
+          const scale = (low + high) / 2;
+          const attempt = buildCandidate(scale);
+          if (measureProviderPayload(attempt).fits) {
+            best = attempt;
+            low = scale;
+          } else {
+            high = scale;
+          }
+        }
+        return best;
+      };
+
+      let artifactBaseMessages: BaseMessage[] | undefined;
       if (lastMessageY instanceof ToolMessage) {
+        const maxArtifactPayloadChars = calculateMaxToolResultChars(
+          agentContext.maxContextTokens
+        );
+        let artifactCandidate = finalMessages;
         if (anthropicLike) {
-          formatAnthropicArtifactContent(finalMessages);
+          artifactCandidate = projectAnthropicArtifactContent(
+            finalMessages,
+            agentContext.maxToolResultChars ?? maxArtifactPayloadChars
+          );
         } else if (
           (isOpenAILike(agentContext.provider) &&
             agentContext.provider !== Providers.DEEPSEEK) ||
           isGoogleLike(agentContext.provider)
         ) {
-          formatArtifactPayload(finalMessages);
+          artifactCandidate = projectArtifactPayload(
+            finalMessages,
+            agentContext.maxToolResultChars ?? maxArtifactPayloadChars
+          );
+        }
+
+        if (artifactCandidate !== finalMessages) {
+          const projection = measureProviderPayload(artifactCandidate);
+          if (projection.fits) {
+            artifactBaseMessages = finalMessages;
+            finalMessages = artifactCandidate;
+          } else {
+            emitAgentLog(
+              config,
+              'warn',
+              'graph',
+              'Artifact payload omitted because it exceeds the remaining context budget',
+              {
+                projectedMessageTokens: projection.projectedMessageTokens,
+                availableMessageTokens: projection.availableMessageTokens,
+              },
+              { runId: this.runId, agentId }
+            );
+          }
         }
       }
 
-      if (
-        isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
-      ) {
-        /**
-         * Pass `this.startIndex` so the function can distinguish CURRENT-run
-         * AI messages (the agent's own iterations — possibly without a
-         * leading thinking block, which Claude is allowed to skip) from
-         * historical context that genuinely needs the
-         * `[Previous agent context]` placeholder. Without this signal the
-         * function would convert the agent's own in-run tool_use messages,
-         * polluting the next iteration's prompt with a placeholder the
-         * model treats as suspicious injected content.
-         */
-        finalMessages = ensureThinkingBlockInMessages(
-          finalMessages,
-          agentContext.provider,
-          config,
-          this.startIndex
+      finalMessages = applyProviderMessageTransforms(finalMessages);
+      let finalProjection = measureProviderPayload(finalMessages);
+      if (artifactBaseMessages != null) {
+        if (!finalProjection.fits) {
+          finalMessages = applyProviderMessageTransforms(artifactBaseMessages);
+          finalProjection = measureProviderPayload(finalMessages);
+          emitAgentLog(
+            config,
+            'warn',
+            'graph',
+            'Artifact payload omitted after final provider formatting exceeded the remaining context budget',
+            {
+              projectedMessageTokens: finalProjection.projectedMessageTokens,
+              availableMessageTokens: finalProjection.availableMessageTokens,
+            },
+            { runId: this.runId, agentId }
+          );
+        }
+      }
+      if (!finalProjection.fits) {
+        const compacted = compactSyntheticProviderContext(finalMessages);
+        if (compacted !== finalMessages) {
+          finalMessages = compacted;
+          finalProjection = measureProviderPayload(finalMessages);
+          emitAgentLog(
+            config,
+            finalProjection.fits ? 'warn' : 'error',
+            'graph',
+            finalProjection.fits
+              ? 'Synthetic provider context compacted to fit the final payload budget'
+              : 'Final provider payload still exceeds budget after synthetic context compaction',
+            {
+              projectedMessageTokens: finalProjection.projectedMessageTokens,
+              availableMessageTokens: finalProjection.availableMessageTokens,
+            },
+            { runId: this.runId, agentId }
+          );
+        }
+      }
+      if (!finalProjection.fits) {
+        throw new Error(
+          JSON.stringify({
+            type: 'final_context_overflow',
+            info: 'Provider message formatting exceeded the context budget and no safe synthetic-context compaction could make it fit.',
+            projectedMessageTokens: finalProjection.projectedMessageTokens,
+            availableMessageTokens: finalProjection.availableMessageTokens,
+          })
         );
-      }
-
-      /**
-       * A destination that binds no tools is invoked without a tool schema, but
-       * in a multi-agent graph it can still inherit a prior agent's toolUse/
-       * toolResult history. Bedrock's Converse API (and other tool-schema-strict
-       * providers) reject such a request when no top-level toolConfig is sent.
-       * Fold that historical tool content into plain text so the tool-less agent
-       * receives valid, context-preserving messages. Handoff tools count as
-       * bound tools, so a tool-less router mid-handoff is not affected.
-       */
-      if (toolsForBinding == null || toolsForBinding.length === 0) {
-        finalMessages = foldToolBlocksForToollessAgent(finalMessages, config);
-        // The fold emits structured (array) content; re-flatten for agents that
-        // opted into string-only messages (`useLegacyContent`, run earlier at
-        // the top of this block) so the folded turn isn't the lone exception.
-        if (agentContext.useLegacyContent) {
-          finalMessages = formatContentStrings(finalMessages);
-        }
       }
 
       // Determine the prompt-cache strategy up front. Two distinct facts:

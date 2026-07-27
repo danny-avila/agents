@@ -433,6 +433,190 @@ describe('Prune Messages Tests', () => {
       expect(result.remainingContextTokens).toBeGreaterThan(0);
     });
 
+    it('recounts and compacts omitted structured tool results before sending', () => {
+      const tokenCounter: t.TokenCounter = (message) => {
+        const content =
+          typeof message.content === 'string'
+            ? message.content
+            : JSON.stringify(message.content);
+        return content.length;
+      };
+      const toolCallId = 'tc-structured';
+      const messages: BaseMessage[] = [
+        new HumanMessage('query the table'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: toolCallId,
+              name: 'run_select_query',
+              args: {},
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              text: JSON.stringify(
+                Array.from({ length: 20 }, (_, index) => ({
+                  id: index,
+                  value: `${'x'.repeat(100)}-${index}`,
+                }))
+              ),
+            },
+          ],
+          tool_call_id: toolCallId,
+          name: 'run_select_query',
+        }),
+        new AIMessage('The query returned 20 rows.'),
+        new HumanMessage('compact context'),
+      ];
+      const indexTokenCountMap: Record<string, number | undefined> = {
+        0: tokenCounter(messages[0]),
+        1: tokenCounter(messages[1]),
+        3: tokenCounter(messages[3]),
+        4: tokenCounter(messages[4]),
+      };
+      const pruneMessages = createPruneMessages({
+        maxTokens: 2_000,
+        startIndex: messages.length,
+        tokenCounter,
+        indexTokenCountMap,
+        reserveRatio: 0,
+      });
+
+      const result = pruneMessages({ messages });
+
+      const structuredResult = result.context.find(
+        (message) => message.getType() === 'tool'
+      );
+      expect(structuredResult).toBeDefined();
+      expect(typeof structuredResult?.content).toBe('string');
+      expect(structuredResult?.content).toContain('truncated');
+      expect(result.indexTokenCountMap[2]).toBeGreaterThan(0);
+    });
+
+    it('excludes a corrected tiny new tool count from calibration input', () => {
+      const tokenCounter = createTestTokenCounter();
+      const history: BaseMessage[] = [
+        new HumanMessage('h'.repeat(50)),
+        new AIMessage('a'.repeat(50)),
+      ];
+      const indexTokenCountMap: Record<string, number | undefined> = {
+        0: 50,
+        1: 50,
+      };
+      const pruneMessages = createPruneMessages({
+        maxTokens: 10_000,
+        startIndex: history.length,
+        tokenCounter,
+        indexTokenCountMap,
+        reserveRatio: 0,
+      });
+
+      const first = pruneMessages({
+        messages: history,
+        usageMetadata: {
+          input_tokens: 100,
+          output_tokens: 10,
+          total_tokens: 110,
+        },
+      });
+      expect(first.calibrationRatio).toBe(1);
+
+      const toolCallId = 'new-output-with-tiny-count';
+      const secondMessages: BaseMessage[] = [
+        ...history,
+        new HumanMessage('q'.repeat(50)),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: toolCallId,
+              name: 'run_select_query',
+              args: {},
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'r'.repeat(50),
+          tool_call_id: toolCallId,
+        }),
+      ];
+      indexTokenCountMap[2] = 50;
+      indexTokenCountMap[4] = 1;
+
+      const second = pruneMessages({
+        messages: secondMessages,
+        usageMetadata: {
+          input_tokens: 100,
+          output_tokens: 10,
+          total_tokens: 110,
+        },
+      });
+
+      expect(second.indexTokenCountMap[4]).toBe(50);
+      expect(second.calibrationRatio).toBe(1);
+    });
+
+    it('preserves full structured output for summarization before masking', () => {
+      const tokenCounter: t.TokenCounter = (message) => {
+        const content =
+          typeof message.content === 'string'
+            ? message.content
+            : JSON.stringify(message.content);
+        return content.length;
+      };
+      const fullResult = JSON.stringify(
+        Array.from({ length: 50 }, (_, index) => ({
+          id: index,
+          value: `${'x'.repeat(100)}-${index}`,
+        }))
+      );
+      const messages: BaseMessage[] = [
+        new HumanMessage('query the table'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'tc-summary-structured',
+              name: 'run_select_query',
+              args: {},
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: [{ type: ContentTypes.TEXT, text: fullResult }],
+          tool_call_id: 'tc-summary-structured',
+        }),
+        new AIMessage('The query returned 50 rows.'),
+        new HumanMessage('summarize the context'),
+      ];
+      const indexTokenCountMap: Record<string, number | undefined> = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[i] = tokenCounter(messages[i]);
+      }
+      const pruneMessages = createPruneMessages({
+        maxTokens: 500,
+        startIndex: messages.length,
+        tokenCounter,
+        indexTokenCountMap,
+        reserveRatio: 0,
+        summarizationEnabled: true,
+      });
+
+      const result = pruneMessages({ messages });
+
+      expect(result.newOriginalToolContent?.get(2)).toBe(fullResult);
+      expect(messages[2].content).not.toEqual([
+        { type: ContentTypes.TEXT, text: fullResult },
+      ]);
+    });
+
     it('should prune messages when over token limit', () => {
       const tokenCounter = createTestTokenCounter();
       const messages = [

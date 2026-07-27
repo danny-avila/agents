@@ -12,8 +12,13 @@ import type {
 import type { ContextPruningConfig } from '@/types/graph';
 import type { TokenCounter } from '@/types/run';
 import {
+  cloneToolMessageWithContent,
+  compactToolContent,
+  getToolContentCharLength,
+  serializeToolContent,
+} from '@/utils/toolContent';
+import {
   calculateMaxToolResultChars,
-  truncateToolResultContent,
   truncateToolInput,
 } from '@/utils/truncation';
 import { resolveContextPruningSettings } from './contextPruningSettings';
@@ -1065,9 +1070,6 @@ export function maskConsumedToolResults(params: {
     const i = consumedIndices[c];
     const message = messages[i];
     const content = message.content;
-    if (typeof content !== 'string') {
-      continue;
-    }
 
     let maxChars: number;
     if (totalBudgetChars > 0) {
@@ -1080,25 +1082,23 @@ export function maskConsumedToolResults(params: {
       maxChars = MASKED_RESULT_MAX_CHARS;
     }
 
-    if (content.length <= maxChars) {
+    const compacted = compactToolContent(content, maxChars);
+    if (!compacted.changed) {
       continue;
     }
 
     if (params.originalContentStore && !params.originalContentStore.has(i)) {
-      params.originalContentStore.set(i, content);
+      const original = serializeToolContent(content);
+      params.originalContentStore.set(i, original);
       if (params.onContentStored) {
-        params.onContentStored(i, content);
+        params.onContentStored(i, original);
       }
     }
 
-    const cloned = new ToolMessage({
-      content: truncateToolResultContent(content, maxChars),
-      tool_call_id: (message as ToolMessage).tool_call_id,
-      name: message.name,
-      id: message.id,
-      additional_kwargs: message.additional_kwargs,
-      response_metadata: message.response_metadata,
-    });
+    const cloned = cloneToolMessageWithContent(
+      message as ToolMessage,
+      compacted.content
+    );
     messages[i] = cloned;
     indexTokenCountMap[i] = tokenCounter(cloned);
     maskedCount++;
@@ -1140,27 +1140,19 @@ export function preFlightTruncateToolResults(params: {
     const i = toolIndices[t];
     const message = messages[i];
     const content = message.content;
-    if (typeof content !== 'string') {
-      continue;
-    }
 
     const position = toolIndices.length > 1 ? t / (toolIndices.length - 1) : 1;
     const recencyFactor = 0.2 + 0.8 * position;
     const maxChars = Math.max(200, Math.floor(baseMaxChars * recencyFactor));
 
-    if (content.length <= maxChars) {
+    const compacted = compactToolContent(content, maxChars);
+    if (!compacted.changed) {
       continue;
     }
-
-    const truncated = truncateToolResultContent(content, maxChars);
-    const cloned = new ToolMessage({
-      content: truncated,
-      tool_call_id: (message as ToolMessage).tool_call_id,
-      name: message.name,
-      id: message.id,
-      additional_kwargs: message.additional_kwargs,
-      response_metadata: message.response_metadata,
-    });
+    const cloned = cloneToolMessageWithContent(
+      message as ToolMessage,
+      compacted.content
+    );
     messages[i] = cloned;
     indexTokenCountMap[i] = tokenCounter(cloned);
     truncatedCount++;
@@ -1281,6 +1273,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
   for (const key in indexTokenCountMap) {
     totalTokens += indexTokenCountMap[key] ?? 0;
   }
+  const reconciledToolMessages = new WeakSet<BaseMessage>();
   let runThinkingStartIndex = -1;
   /** Cumulative raw tiktoken tokens we've sent to the provider (messages only,
    *  excludes instruction overhead and new outputs not yet seen by provider). */
@@ -1416,6 +1409,50 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     }
 
     const newOutputs = new Set<number>();
+
+    // Host token maps predate LangChain formatting and may omit tool output or
+    // assign it a zero/tiny count. Reconcile every ToolMessage once against the
+    // exact provider payload before making any budget decision.
+    for (let i = 0; i < params.messages.length; i++) {
+      let message = params.messages[i];
+      const cachedCount = indexTokenCountMap[i];
+      if (message.getType() !== 'tool' || reconciledToolMessages.has(message)) {
+        continue;
+      }
+      const normalized = compactToolContent(
+        message.content,
+        Number.MAX_SAFE_INTEGER
+      );
+      if (normalized.changed) {
+        message = cloneToolMessageWithContent(
+          message as ToolMessage,
+          normalized.content
+        );
+        params.messages[i] = message;
+      }
+      const reconciledCount = factoryParams.tokenCounter(message);
+      reconciledToolMessages.add(message);
+      if (cachedCount === undefined) {
+        indexTokenCountMap[i] = reconciledCount;
+        totalTokens += reconciledCount;
+        if (i >= lastTurnStartIndex) {
+          newOutputs.add(i);
+        }
+        continue;
+      }
+      // Preserve a larger host estimate: reconciliation is a safety floor,
+      // not permission to reduce an upstream count that may include provider
+      // serialization overhead unavailable to the local counter.
+      if (reconciledCount <= cachedCount) {
+        continue;
+      }
+      indexTokenCountMap[i] = reconciledCount;
+      totalTokens += reconciledCount - cachedCount;
+      if (i >= lastTurnStartIndex) {
+        newOutputs.add(i);
+      }
+    }
+
     let outputTokensAssigned = false;
     for (let i = lastTurnStartIndex; i < params.messages.length; i++) {
       const message = params.messages[i];
@@ -2024,18 +2061,15 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           const message = emergencyMessages[i];
           if (message.getType() === 'tool') {
             const content = message.content;
-            if (
-              typeof content === 'string' &&
-              content.length > emergencyMaxChars
-            ) {
-              const cloned = new ToolMessage({
-                content: truncateToolResultContent(content, emergencyMaxChars),
-                tool_call_id: (message as ToolMessage).tool_call_id,
-                name: message.name,
-                id: message.id,
-                additional_kwargs: message.additional_kwargs,
-                response_metadata: message.response_metadata,
-              });
+            if (getToolContentCharLength(content) > emergencyMaxChars) {
+              const compacted = compactToolContent(content, emergencyMaxChars);
+              if (!compacted.changed) {
+                continue;
+              }
+              const cloned = cloneToolMessageWithContent(
+                message as ToolMessage,
+                compacted.content
+              );
               emergencyMessages[i] = cloned;
               indexTokenCountMap[i] = factoryParams.tokenCounter(cloned);
               emergencyTruncatedCount++;

@@ -6,7 +6,7 @@ import { maskConsumedToolResults } from '@/messages/prune';
 const charCounter: TokenCounter = (msg) => {
   const raw = msg.content;
   if (typeof raw === 'string') return raw.length;
-  return 0;
+  return JSON.stringify(raw).length;
 };
 
 function toolMsg(
@@ -207,6 +207,58 @@ describe('maskConsumedToolResults', () => {
     // Token count should be updated to match the masked content length
     expect(map[2]).toBeLessThan(2000);
     expect(map[2]).toBe((messages[2].content as string).length);
+  });
+
+  it('masks consumed structured tool results with a bounded text preview', () => {
+    const tcId = 'tc-structured';
+    const toolMessage = new ToolMessage({
+      content: [
+        {
+          type: 'json',
+          rows: Array.from({ length: 20 }, (_, index) => ({
+            id: index,
+            value: `${'x'.repeat(100)}-${index}`,
+          })),
+        },
+      ],
+      tool_call_id: tcId,
+      name: 'run_select_query',
+      status: 'success',
+      artifact: { source: 'clickhouse' },
+    });
+    const messages: BaseMessage[] = [
+      new HumanMessage('query the table'),
+      aiToolCall(tcId, 'run_select_query'),
+      toolMessage,
+      aiWithText('The query returned 20 rows.'),
+    ];
+    const map: Record<string, number | undefined> = {
+      0: 5,
+      1: 20,
+      2: 0,
+      3: 30,
+    };
+    const originalContentStore = new Map<number, string>();
+    const originalContent = JSON.stringify(toolMessage.content);
+
+    const count = maskConsumedToolResults({
+      messages,
+      indexTokenCountMap: map,
+      tokenCounter: charCounter,
+      originalContentStore,
+    });
+
+    expect(count).toBe(1);
+    expect(typeof messages[2].content).toBe('string');
+    expect(messages[2].content).toContain('truncated');
+    expect((messages[2].content as string).length).toBeLessThanOrEqual(300);
+    const masked = messages[2] as ToolMessage;
+    expect(masked.tool_call_id).toBe(tcId);
+    expect(masked.name).toBe('run_select_query');
+    expect(masked.status).toBe('success');
+    expect(masked.artifact).toEqual({ source: 'clickhouse' });
+    expect(map[2]).toBe(charCounter(masked));
+    expect(originalContentStore.get(2)).toBe(originalContent);
   });
 
   it('handles empty messages array', () => {

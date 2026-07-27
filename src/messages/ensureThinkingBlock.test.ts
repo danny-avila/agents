@@ -1117,7 +1117,7 @@ describe('ensureThinkingBlockInMessages', () => {
           content: [
             { type: 'text', text: 'Resource fetched' },
             {
-              type: 'resource',
+              type: 'custom_resource',
               resource: { uri: 'file:///data.csv', text: 'a,b,c' },
             },
           ],
@@ -1132,8 +1132,8 @@ describe('ensureThinkingBlockInMessages', () => {
 
       expect(result).toHaveLength(2);
       const allText = getTextContent(result[1]);
-      // The resource block should be serialized as text, not silently dropped
-      expect(allText).toContain('[resource]');
+      // Unknown blocks should be serialized as text, not silently dropped.
+      expect(allText).toContain('[custom_resource]');
       expect(allText).toContain('data.csv');
     });
 

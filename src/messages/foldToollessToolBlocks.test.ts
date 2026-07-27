@@ -338,7 +338,11 @@ describe('foldToolBlocksForToollessAgent', () => {
       }),
       new HumanMessage({
         content: [
-          { type: 'tool_result', tool_use_id: 'c1', content: 'Found roadmap.md' },
+          {
+            type: 'tool_result',
+            tool_use_id: 'c1',
+            content: 'Found roadmap.md',
+          },
         ],
       }),
       new HumanMessage('thanks'),
@@ -393,9 +397,7 @@ describe('foldToolBlocksForToollessAgent', () => {
       new HumanMessage('Render a chart'),
       new AIMessage({
         content: '',
-        tool_calls: [
-          { id: 'c', name: 'chart', args: {}, type: 'tool_call' },
-        ],
+        tool_calls: [{ id: 'c', name: 'chart', args: {}, type: 'tool_call' }],
       }),
       new ToolMessage({
         content: [
@@ -420,6 +422,33 @@ describe('foldToolBlocksForToollessAgent', () => {
         (b) => b.type === 'image_url'
       )
     ).toBe(true);
+  });
+
+  test('preserves non-image media blocks instead of JSON-expanding them', () => {
+    const document = {
+      type: 'document',
+      source: { type: 'url', url: 'https://example.com/report.pdf' },
+    };
+    const messages = [
+      new HumanMessage('Read the report'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'doc', name: 'read_document', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: [{ type: 'text', text: 'report:' }, document],
+        tool_call_id: 'doc',
+        name: 'read_document',
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+    const foldedContent = result[result.length - 1].content;
+
+    expect(Array.isArray(foldedContent)).toBe(true);
+    expect(foldedContent).toContainEqual(document);
   });
 
   test('leaves non-tool conversations untouched', () => {
