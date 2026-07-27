@@ -2002,6 +2002,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         ) {
           return { fits: true };
         }
+        const availableMessageTokens = Math.max(
+          0,
+          contextUsage.contextBudget - contextUsage.effectiveInstructionTokens
+        );
+        // The dedicated empty-prompt guard below provides actionable
+        // instruction/tool-budget guidance; there is no provider payload yet.
+        if (candidate.length === 0) {
+          return {
+            fits: true,
+            projectedMessageTokens: 0,
+            availableMessageTokens,
+          };
+        }
         let rawTokens = 3; // reply-primer allowance
         for (const message of candidate) {
           rawTokens += agentContext.tokenCounter(message);
@@ -2012,10 +2025,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             ? contextUsage.calibrationRatio
             : agentContext.calibrationRatio;
         const projectedMessageTokens = Math.round(rawTokens * usageRatio);
-        const availableMessageTokens = Math.max(
-          0,
-          contextUsage.contextBudget - contextUsage.effectiveInstructionTokens
-        );
         return {
           fits: projectedMessageTokens <= availableMessageTokens,
           projectedMessageTokens,

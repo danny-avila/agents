@@ -424,10 +424,11 @@ describe('foldToolBlocksForToollessAgent', () => {
     ).toBe(true);
   });
 
-  test('preserves non-image media blocks instead of JSON-expanding them', () => {
-    const document = {
-      type: 'document',
-      source: { type: 'url', url: 'https://example.com/report.pdf' },
+  test('bounds non-portable media blocks instead of preserving or JSON-expanding them', () => {
+    const blob = 'A'.repeat(20_000);
+    const resource = {
+      type: 'resource',
+      resource: { uri: 'file:///report.bin', blob },
     };
     const messages = [
       new HumanMessage('Read the report'),
@@ -438,7 +439,7 @@ describe('foldToolBlocksForToollessAgent', () => {
         ],
       }),
       new ToolMessage({
-        content: [{ type: 'text', text: 'report:' }, document],
+        content: [{ type: 'text', text: 'report:' }, resource],
         tool_call_id: 'doc',
         name: 'read_document',
       }),
@@ -446,9 +447,18 @@ describe('foldToolBlocksForToollessAgent', () => {
 
     const result = foldToolBlocksForToollessAgent(messages);
     const foldedContent = result[result.length - 1].content;
+    const foldedText = getTextContent(result[result.length - 1]);
 
-    expect(Array.isArray(foldedContent)).toBe(true);
-    expect(foldedContent).toContainEqual(document);
+    expect(
+      Array.isArray(foldedContent) &&
+        foldedContent.some(
+          (block) => typeof block === 'object' && block.type === 'resource'
+        )
+    ).toBe(false);
+    expect(foldedText).toContain('[resource]');
+    expect(foldedText).toContain('report.bin');
+    expect(foldedText.length).toBeLessThan(9_000);
+    expect(foldedText).not.toContain(blob);
   });
 
   test('leaves non-tool conversations untouched', () => {

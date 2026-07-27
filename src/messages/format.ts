@@ -1778,6 +1778,16 @@ export function shiftIndexTokenCountMap(
 const isToolMessage = (m: BaseMessage): boolean =>
   m instanceof ToolMessage || ('role' in m && (m as any).role === 'tool');
 
+const PORTABLE_FOLDED_MEDIA_TYPES = new Set(['image', 'image_url']);
+const MAX_FOLDED_BLOCK_CHARS = 8_000;
+
+function serializeFoldedValue(value: unknown): string {
+  const compacted = compactToolContent(value, MAX_FOLDED_BLOCK_CHARS).content;
+  return typeof compacted === 'string'
+    ? compacted
+    : serializeStructuredValue(compacted);
+}
+
 /** Flushes accumulated text chunks into `parts` as a single text block. */
 function flushTextChunks(
   textChunks: string[],
@@ -1795,9 +1805,10 @@ function flushTextChunks(
 
 /**
  * Appends a single message's content to the running `textChunks` / `parts`
- * accumulators. Atomic media/resource blocks are shallow-copied into `parts`
- * so binary data never becomes text tokens. All other block types are
- * serialized to text rather than silently dropped.
+ * accumulators. Portable image blocks are shallow-copied into `parts` so
+ * binary data never becomes text tokens. Provider-specific media/resource
+ * blocks are retained as bounded text so a folded cross-provider history
+ * cannot contain an unsupported native block or JSON-expand without limit.
  *
  * When `content` is an array containing tool_use blocks, `tool_calls` is NOT
  * additionally serialized (avoiding double output).  `tool_calls` is used as
@@ -1828,15 +1839,21 @@ function appendMessageContent(
 
   for (const block of content as ExtendedMessageContent[]) {
     if (isAtomicToolContentBlock(block)) {
-      flushTextChunks(textChunks, parts);
-      parts.push({ ...block } as MessageContentComplex);
+      if (PORTABLE_FOLDED_MEDIA_TYPES.has(block.type ?? '')) {
+        flushTextChunks(textChunks, parts);
+        parts.push({ ...block } as MessageContentComplex);
+      } else {
+        textChunks.push(
+          `${role}: [${String(block.type ?? 'media')}] ${serializeFoldedValue(block)}`
+        );
+      }
       continue;
     }
 
     if (block.type === 'tool_use') {
       hasToolUseBlock = true;
       textChunks.push(
-        `${role}: [tool_use] ${String(block.name ?? '')} ${JSON.stringify(block.input ?? {})}`
+        `${role}: [tool_use] ${String(block.name ?? '')} ${serializeFoldedValue(block.input ?? {})}`
       );
       continue;
     }
@@ -1852,11 +1869,15 @@ function appendMessageContent(
       const name = String(nested?.name ?? block.name ?? '');
       const rawArgs = nested?.args ?? block.args ?? {};
       const argsText =
-        typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs);
+        typeof rawArgs === 'string' ? rawArgs : serializeFoldedValue(rawArgs);
       textChunks.push(`${role}: [tool_use] ${name} ${argsText}`.trimEnd());
       const output = nested?.output;
       if (output != null && output !== '') {
-        textChunks.push(`Tool: ${String(output)}`);
+        textChunks.push(
+          `Tool: ${
+            typeof output === 'string' ? output : serializeFoldedValue(output)
+          }`
+        );
       }
       continue;
     }
@@ -1880,7 +1901,10 @@ function appendMessageContent(
             if (innerBlock) {
               textChunks.push(`${role}: [tool_result] ${innerBlock}`);
             }
-          } else if (isAtomicToolContentBlock(innerBlock)) {
+          } else if (
+            isAtomicToolContentBlock(innerBlock) &&
+            PORTABLE_FOLDED_MEDIA_TYPES.has(innerBlock.type ?? '')
+          ) {
             flushTextChunks(textChunks, parts);
             parts.push({ ...innerBlock } as MessageContentComplex);
           } else {
@@ -1889,13 +1913,15 @@ function appendMessageContent(
               `${role}: [tool_result] ${
                 typeof innerText === 'string' && innerText
                   ? innerText
-                  : JSON.stringify(innerBlock)
+                  : serializeFoldedValue(innerBlock)
               }`
             );
           }
         }
       } else if (inner != null) {
-        textChunks.push(`${role}: [tool_result] ${JSON.stringify(inner)}`);
+        textChunks.push(
+          `${role}: [tool_result] ${serializeFoldedValue(inner)}`
+        );
       }
       continue;
     }
@@ -1908,7 +1934,9 @@ function appendMessageContent(
 
     // Fallback: serialize unrecognized block types to preserve context
     if (block.type != null && block.type !== '') {
-      textChunks.push(`${role}: [${block.type}] ${JSON.stringify(block)}`);
+      textChunks.push(
+        `${role}: [${block.type}] ${serializeFoldedValue(block)}`
+      );
     }
   }
 
@@ -1930,7 +1958,9 @@ function appendToolCalls(
   const aiMsg = msg as AIMessage;
   if (aiMsg.tool_calls && aiMsg.tool_calls.length > 0) {
     for (const tc of aiMsg.tool_calls) {
-      textChunks.push(`AI: [tool_call] ${tc.name}(${JSON.stringify(tc.args)})`);
+      textChunks.push(
+        `AI: [tool_call] ${tc.name}(${serializeFoldedValue(tc.args)})`
+      );
     }
     return;
   }
