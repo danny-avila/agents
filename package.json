@@ -248,7 +248,7 @@
     "uuid": "^11.1.1"
   },
   "peerDependencies": {
-    "@anthropic-ai/sandbox-runtime": "^0.0.54"
+    "@anthropic-ai/sandbox-runtime": "^0.0.67"
   },
   "peerDependenciesMeta": {
     "@anthropic-ai/sandbox-runtime": {
@@ -260,7 +260,7 @@
     "~/*": "./*"
   },
   "devDependencies": {
-    "@anthropic-ai/sandbox-runtime": "^0.0.54",
+    "@anthropic-ai/sandbox-runtime": "^0.0.67",
     "@anthropic-ai/vertex-sdk": "^0.12.0",
     "@eslint/compat": "^1.2.7",
     "@langchain/langgraph-checkpoint-mongodb": "^1.4.0",
