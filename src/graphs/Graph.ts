@@ -47,6 +47,7 @@ import {
   partitionAndMarkAnthropicToolCache,
   DEFAULT_RETAIN_RECENT_TURNS,
   splitAtRecencyBoundary,
+  convertInjectedMessages,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -88,6 +89,8 @@ import {
   GraphEvents,
   Providers,
   StepTypes,
+  DEFAULT_MAX_SEALS,
+  PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
 } from '@/common';
 import {
   annotateMessagesForLLM,
@@ -125,6 +128,7 @@ import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
+import { executeHooks } from '@/hooks';
 
 const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 
@@ -961,6 +965,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   subagentUsageSink?: t.SubagentUsageSink;
   /** See {@link t.StandardGraphInput.subagentScope}. */
   subagentScope: boolean;
+  /** See {@link t.StandardGraphInput.preemption}. */
+  preemption?: t.StreamPreemption;
+  /** Seals honored so far in this run; bounded by `preemption.maxSeals`. */
+  preemptSealCount = 0;
+  /** Boundaries that produced nothing to inject, so the turn stopped early. */
+  preemptEmptyBoundaries = 0;
+  /**
+   * True when a seal ended the turn without a resume. The assistant turn is
+   * real and kept, but it is not the answer the model intended to finish —
+   * hosts persist it as unfinished rather than complete.
+   */
+  preemptIncomplete = false;
+  /**
+   * Agent IDs whose next superstep must return to the agent node. Keyed by
+   * agent because `MultiAgentGraph` routes every parallel agent through this
+   * same instance, and a single field would let one agent's boundary resume
+   * another's turn.
+   */
+  pendingPreemptReturn = new Set<string>();
 
   constructor({
     runId,
@@ -972,6 +995,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     calibrationRatio,
     subagentUsageSink,
     subagentScope,
+    preemption,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
@@ -979,6 +1003,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.langfuse = langfuse;
     this.subagentUsageSink = subagentUsageSink;
     this.subagentScope = subagentScope === true;
+    this.preemption = preemption;
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -1050,6 +1075,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       new Map()
     );
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
+    this.resetPreemptState();
     const hasScopedCheckpoint =
       this.hasCompiledCheckpointer &&
       checkpointScope != null &&
@@ -1070,12 +1096,53 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
+    this.resetPreemptState();
     const preserveOriginalToolContent =
       this.hasCompiledCheckpointer &&
       this.originalToolContentCheckpointScope != null;
     for (const context of this.agentContexts.values()) {
       context.reset({ preserveOriginalToolContent });
     }
+  }
+
+  /**
+   * Seal budget and pending-resume markers are per-run, not per-graph. Kept
+   * as one helper because `resetValues` is skipped on resume while
+   * `clearHeavyState` is not, and the two must not be able to drift.
+   */
+  private resetPreemptState(): void {
+    this.preemptSealCount = 0;
+    this.preemptEmptyBoundaries = 0;
+    this.preemptIncomplete = false;
+    this.pendingPreemptReturn.clear();
+  }
+
+  /**
+   * True when the host has requested a cooperative seal AND this graph may
+   * honor it. Read once per streamed chunk, so it stays property reads plus
+   * one host callback — no I/O, no allocation.
+   *
+   * Subagent scopes never seal: a steer targets the top-level conversation,
+   * and a child run must finish so its parent sees a complete result.
+   */
+  shouldPreemptStream(): boolean {
+    return (
+      !this.subagentScope &&
+      this.preemption != null &&
+      this.preemptSealCount < (this.preemption.maxSeals ?? DEFAULT_MAX_SEALS) &&
+      this.preemption.shouldPreempt() === true
+    );
+  }
+
+  notePreemptSeal(): void {
+    this.preemptSealCount += 1;
+  }
+
+  getPreemptStats(): t.PreemptStats {
+    return {
+      seals: this.preemptSealCount,
+      emptyBoundaries: this.preemptEmptyBoundaries,
+    };
   }
 
   /* Run Step Processing */
@@ -3157,9 +3224,76 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           { force: true }
         );
       }
+      if (
+        (responseMessage as AIMessageChunk | undefined)?.response_metadata
+          .preempted === true
+      ) {
+        const injected = await this.dispatchPreemptBoundary(agentId, config);
+        if (injected.length > 0) {
+          this.pendingPreemptReturn.add(agentId);
+          this.cleanupSignalListener();
+          return { messages: [...(result.messages ?? []), ...injected] };
+        }
+        /**
+         * Nothing to inject — the host cancelled or already drained. Do NOT
+         * self-loop: a trailing model turn with no new input is dropped by
+         * some Gemini models and read as prefill by Anthropic. Do NOT pretend
+         * the turn completed either; the answer really was cut short.
+         */
+        this.preemptEmptyBoundaries += 1;
+        this.preemptIncomplete = true;
+      }
+
       this.cleanupSignalListener();
       return result;
     };
+  }
+
+  /**
+   * Fires `PreemptBoundary` after a sealed turn and returns whatever the
+   * hooks asked to inject, converted through the same `convertInjectedMessages`
+   * the tool boundary uses so the two sites cannot emit different shapes.
+   *
+   * Never throws: a drain that fails or times out costs the injection, not the
+   * run. The caller treats an empty result as "nothing to resume with".
+   */
+  private async dispatchPreemptBoundary(
+    agentId: string,
+    config: RunnableConfig | undefined
+  ): Promise<BaseMessage[]> {
+    if (this.hookRegistry == null) {
+      return [];
+    }
+    const configurable = config?.configurable;
+    const runId = (configurable?.run_id as string | undefined) ?? this.runId;
+    if (runId == null) {
+      return [];
+    }
+    const result = await executeHooks({
+      registry: this.hookRegistry,
+      input: {
+        hook_event_name: 'PreemptBoundary',
+        runId,
+        threadId: configurable?.thread_id as string | undefined,
+        agentId: this.subagentScope ? agentId : undefined,
+        executingAgentId: agentId,
+        sealCount: this.preemptSealCount,
+      },
+      sessionId: runId,
+      timeoutMs: PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
+    }).catch((): undefined => undefined);
+    if (result == null || result.injectedMessages.length === 0) {
+      return [];
+    }
+    try {
+      return convertInjectedMessages(result.injectedMessages);
+    } catch (e) {
+      console.warn(
+        '[StandardGraph] Failed to convert PreemptBoundary injectedMessages:',
+        e instanceof Error ? e.message : e
+      );
+      return [];
+    }
   }
 
   createAgentNode(agentId: string): t.CompiledAgentWorfklow {
@@ -3325,6 +3459,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       config?: RunnableConfig
     ): string => {
       this.config = config;
+      /**
+       * A sealed turn that injected messages resumes in the SAME pregel run:
+       * back to the agent node as a new superstep, so the model continues in
+       * one assistant message instead of restarting the graph.
+       */
+      if (this.pendingPreemptReturn.delete(agentId)) {
+        return agentNode;
+      }
       if (state.summarizationRequest != null) {
         return summarizeNode;
       }

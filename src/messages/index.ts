@@ -7,6 +7,7 @@ export * from './cache';
 export * from './anthropicToolCache';
 export * from './content';
 export * from './tools';
+export * from './injected';
 export * from './contextPruning';
 export * from './contextPruningSettings';
 export * from './reducer';

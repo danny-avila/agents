@@ -70,7 +70,7 @@ import {
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
-import { toLangChainContent } from '@/messages/langchain';
+import { convertInjectedMessages } from '@/messages/injected';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { RunnableCallable } from '@/utils';
 import { executeHooks } from '@/hooks';
@@ -2934,7 +2934,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         if (result.injectedMessages && result.injectedMessages.length > 0) {
           try {
             injected.push(
-              ...this.convertInjectedMessages(result.injectedMessages)
+              ...convertInjectedMessages(result.injectedMessages)
             );
           } catch (e) {
             // eslint-disable-next-line no-console
@@ -3344,7 +3344,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      */
     if (hookInjectedMessages.length > 0) {
       try {
-        injected.push(...this.convertInjectedMessages(hookInjectedMessages));
+        injected.push(...convertInjectedMessages(hookInjectedMessages));
       } catch (e) {
         // eslint-disable-next-line no-console
         console.warn(
@@ -3424,34 +3424,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       config,
       request.turn
     );
-  }
-
-  /**
-   * Converts InjectedMessage instances to LangChain HumanMessage objects.
-   * Both 'user' and 'system' roles become HumanMessage to avoid provider
-   * rejections (Anthropic/Google reject non-leading SystemMessages).
-   * The original role is preserved in additional_kwargs for downstream consumers.
-   */
-  private convertInjectedMessages(
-    messages: t.InjectedMessage[]
-  ): BaseMessage[] {
-    const converted: BaseMessage[] = [];
-    for (const msg of messages) {
-      const additional_kwargs: Record<string, unknown> = {
-        role: msg.role,
-      };
-      if (msg.isMeta != null) additional_kwargs.isMeta = msg.isMeta;
-      if (msg.source != null) additional_kwargs.source = msg.source;
-      if (msg.skillName != null) additional_kwargs.skillName = msg.skillName;
-
-      converted.push(
-        new HumanMessage({
-          content: toLangChainContent(msg.content),
-          additional_kwargs,
-        })
-      );
-    }
-    return converted;
   }
 
   /**

@@ -30,7 +30,11 @@ import type {
   MessageDeltaEvent,
   ReasoningDeltaEvent,
 } from '@/types/stream';
-import type { TokenCounter, TokenBudgetBreakdown } from '@/types/run';
+import type {
+  TokenCounter,
+  StreamPreemption,
+  TokenBudgetBreakdown,
+} from '@/types/run';
 import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
@@ -346,6 +350,13 @@ export type StandardGraphInput = {
    * hook inputs carry only `executingAgentId`.
    */
   subagentScope?: boolean;
+  /**
+   * Cooperative preemption, forwarded from `RunConfig.preemption`. Only ever
+   * set on the top-level graph: a steer targets the conversation, so subagent
+   * children must run to completion and `buildChildInputs` does not propagate
+   * this field.
+   */
+  preemption?: StreamPreemption;
 };
 
 export type GraphEdge = {

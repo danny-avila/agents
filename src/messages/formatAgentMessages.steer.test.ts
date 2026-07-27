@@ -324,3 +324,120 @@ describe('formatAgentMessages steer replay', () => {
     ]);
   });
 });
+
+describe('formatAgentMessages trailing-steer anchor', () => {
+  const steerPart = (text: string): Record<string, unknown> =>
+    ({
+      type: ContentTypes.STEER,
+      [ContentTypes.STEER]: text,
+    }) as unknown as Record<string, unknown>;
+
+  /**
+   * A steer that ends an assistant message leaves the replay on a
+   * HumanMessage. Followed by the next turn's user message, that reaches the
+   * provider as two adjacent user turns — a hard error on Bedrock and
+   * Mistral. Reachable today through abort, not only through preemption.
+   */
+  it('anchors a trailing steer when another turn follows', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Working on it.' },
+          steerPart('Actually, stop and do the other thing.'),
+        ],
+      },
+      { role: 'user', content: 'Next turn' },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    const steerIndex = messages.findIndex(
+      (message) =>
+        message instanceof HumanMessage &&
+        message.additional_kwargs.source === 'steer'
+    );
+    expect(steerIndex).toBeGreaterThan(0);
+
+    const anchor = messages[steerIndex + 1];
+    expect(anchor).toBeInstanceOf(AIMessage);
+    expect(anchor.content).toBe('');
+
+    const following = messages[steerIndex + 2];
+    expect(following).toBeInstanceOf(HumanMessage);
+    expect(following.content).toEqual([{ type: 'text', text: 'Next turn' }]);
+  });
+
+  it('leaves the user turn last when the steer ends the payload', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Working on it.' },
+          steerPart('Actually, stop and do the other thing.'),
+        ],
+      },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    const last = messages[messages.length - 1];
+    expect(last).toBeInstanceOf(HumanMessage);
+    expect(last.additional_kwargs.source).toBe('steer');
+  });
+
+  it('does not anchor when assistant content follows the steer', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Working on it.' },
+          steerPart('Focus on item two.'),
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Focusing.' },
+        ],
+      },
+      { role: 'user', content: 'Next turn' },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    const emptyAssistants = messages.filter(
+      (message) => message instanceof AIMessage && message.content === ''
+    );
+    expect(emptyAssistants).toHaveLength(0);
+  });
+
+  it('never emits two adjacent user turns around a trailing steer', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Partial answer.' },
+          steerPart('Change of plan.'),
+        ],
+      },
+      { role: 'user', content: 'Next turn' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Second answer.' },
+          steerPart('Change again.'),
+        ],
+      },
+      { role: 'user', content: 'Third turn' },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    for (let i = 1; i < messages.length; i++) {
+      const adjacentHumans =
+        messages[i] instanceof HumanMessage &&
+        messages[i - 1] instanceof HumanMessage;
+      expect(adjacentHumans).toBe(false);
+    }
+  });
+});

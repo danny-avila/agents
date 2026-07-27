@@ -50,7 +50,13 @@ import {
 } from '@/utils/title';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { initializeLangfuseTracing } from './instrumentation';
-import { GraphEvents, Callback, TitleMethod } from '@/common';
+import {
+  Callback,
+  GraphEvents,
+  TitleMethod,
+  DEFAULT_MAX_SEALS,
+  DEFAULT_RECURSION_LIMIT,
+} from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 import { StandardGraph } from '@/graphs/Graph';
@@ -140,6 +146,7 @@ export class Run<_T extends t.BaseGraphState> {
   private interruptingToolNames?: string[];
   private toolExecution?: t.ToolExecutionConfig;
   private subagentUsageSink?: t.SubagentUsageSink;
+  private preemption?: t.StreamPreemption;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
   graphRunnable?: t.CompiledStateWorkflow;
@@ -201,6 +208,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.interruptingToolNames = config.interruptingToolNames;
     this.toolExecution = config.toolExecution;
     this.subagentUsageSink = config.subagentUsageSink;
+    this.preemption = config.preemption;
 
     if (!config.graphConfig) {
       throw new Error('Graph config not provided');
@@ -275,6 +283,7 @@ export class Run<_T extends t.BaseGraphState> {
       indexTokenCountMap: this.indexTokenCountMap,
       calibrationRatio: this.calibrationRatio,
       subagentUsageSink: this.subagentUsageSink,
+      preemption: this.preemption,
     });
     /** Propagate compile options from graph config */
     standardGraph.compileOptions = this.applyHITLCheckpointerFallback(
@@ -306,6 +315,7 @@ export class Run<_T extends t.BaseGraphState> {
       indexTokenCountMap: this.indexTokenCountMap,
       calibrationRatio: this.calibrationRatio,
       subagentUsageSink: this.subagentUsageSink,
+      preemption: this.preemption,
     });
 
     multiAgentGraph.compileOptions =
@@ -541,6 +551,15 @@ export class Run<_T extends t.BaseGraphState> {
     return this.Graph?.getResolvedInstructionOverhead();
   }
 
+  /**
+   * Cooperative-seal counters for this run. `emptyBoundaries` is the one to
+   * watch: it counts seals whose `PreemptBoundary` produced nothing to
+   * inject, which ends the turn early and leaves the answer unfinished.
+   */
+  getPreemptStats(): t.PreemptStats {
+    return this.Graph?.getPreemptStats() ?? { seals: 0, emptyBoundaries: 0 };
+  }
+
   getToolCount(): number {
     return this.Graph?.getToolCount() ?? 0;
   }
@@ -703,9 +722,23 @@ export class Run<_T extends t.BaseGraphState> {
     const isResume = inputs instanceof Command;
     const stateInputs = isResume ? undefined : (inputs as t.IState);
 
+    /**
+     * Every honored seal costs one extra superstep, so a preemption-enabled
+     * run reserves headroom for its whole seal budget. Without it, a
+     * tool-heavy agent that gets preempted could hit `GraphRecursionError` —
+     * which surfaces as a thrown stream, setting `streamThrew`, firing
+     * `StopFailure`, and wiping via `clearHeavyState()` exactly the partial
+     * content the seal existed to preserve.
+     */
+    const recursionLimit =
+      (callerConfig.recursionLimit ?? DEFAULT_RECURSION_LIMIT) +
+      (this.preemption != null
+        ? (this.preemption.maxSeals ?? DEFAULT_MAX_SEALS)
+        : 0);
+
     const config: t.RunStreamConfig = {
-      recursionLimit: 50,
       ...callerConfig,
+      recursionLimit,
       configurable: { ...callerConfig.configurable },
     };
 
@@ -923,10 +956,17 @@ export class Run<_T extends t.BaseGraphState> {
          * graph doesn't take another model turn after the halting
          * operation completes.
          *
-         * Limitation: the current step (in-flight model call, ongoing
-         * tool batch) is not aborted — only the next step is skipped.
-         * This matches Claude Code's `continue: false` semantic where
-         * the active operation finishes before halting takes effect.
+         * This `break` is NOT graceful, despite what a `continue: false`
+         * reading suggests. Leaving the `for await` calls the iterator's
+         * `return()`, which cancels the reader
+         * (`@langchain/core/utils/stream`), and langgraph's stream wrapper
+         * turns that cancel into `_abortController.abort()`
+         * (`pregel/stream.js`). The in-flight model call or tool batch is
+         * torn down where it stands — it does not finish first.
+         *
+         * A halt is therefore the wrong tool for "stop generating but keep
+         * what you have". That is what `RunConfig.preemption` is for: it
+         * seals the stream at a provider-safe boundary and keeps the run.
          */
         const haltSignal = this.hookRegistry?.getHaltSignal(this.id);
         if (haltSignal != null) {

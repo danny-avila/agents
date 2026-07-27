@@ -80,4 +80,5 @@ export { getChatModelClass } from './llm/providers';
 export { FakeChatModel, createFakeStreamingLLM } from './llm/fake';
 export { initializeModel } from './llm/init';
 export { attemptInvoke, tryFallbackProviders } from './llm/invoke';
+export { canSealPreempt } from './llm/preempt';
 export { isThinkingEnabled, getMaxOutputTokensKey } from './llm/request';

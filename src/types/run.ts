@@ -115,6 +115,37 @@ export type StandardGraphConfig = Omit<
   'edges' | 'type'
 > & { type?: 'standard'; signal?: AbortSignal };
 
+/**
+ * Cooperative mid-generation preemption. Lets a host seal the live model
+ * stream at the next provider-safe token boundary — the run is never
+ * aborted, the partial assistant turn is kept, and the graph self-loops
+ * into a fresh model call once the `PreemptBoundary` hook has injected
+ * whatever the host queued.
+ *
+ * Preconditions the host MUST satisfy:
+ *   - `shouldPreempt` is polled once per streamed chunk on the top-level
+ *     graph. It must be synchronous, allocation-free and O(1) — never I/O.
+ *   - Sealing is only honored on the SDK's own dispatch loop. A host that
+ *     registers its own `CHAT_MODEL_STREAM` handler consumes chunks through
+ *     a decoupled `streamEvents` reader that can lag the accumulated chunk,
+ *     which would invert content-part indices; those runs never seal.
+ */
+export interface StreamPreemption {
+  /** Polled once per streamed chunk. Synchronous, allocation-free, O(1). */
+  shouldPreempt: () => boolean;
+  /**
+   * Max cooperative seals per run. Each seal costs one extra superstep, so
+   * this also bounds the recursion-limit headroom the run reserves.
+   */
+  maxSeals?: number;
+}
+
+/** Seals honored and boundaries that had nothing to inject, per run. */
+export type PreemptStats = {
+  seals: number;
+  emptyBoundaries: number;
+};
+
 export type RunConfig = {
   runId: string;
   graphConfig: LegacyGraphConfig | StandardGraphConfig | MultiAgentGraphConfig;
@@ -146,6 +177,14 @@ export type RunConfig = {
    * block to prevent leaks.
    */
   hooks?: HookRegistry;
+  /**
+   * Opt-in cooperative preemption for this run. Requires a `hooks` registry
+   * with a `PreemptBoundary` matcher — the seal only stops the stream, the
+   * hook is what supplies the messages to resume with. Omit to keep the
+   * pre-preemption behavior, where a mid-run injection can only land at a
+   * tool boundary.
+   */
+  preemption?: StreamPreemption;
   returnContent?: boolean;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;

@@ -476,6 +476,19 @@ function formatToolCallOutput(
 }
 
 /**
+ * True when an assistant message replayed as a steer and nothing followed it,
+ * so the emitted run ends on the steer's `HumanMessage`.
+ */
+function endsWithSteerMessage(
+  formatted: Array<RoleBearingMessage<BaseMessage>>
+): boolean {
+  if (formatted.length === 0) {
+    return false;
+  }
+  return formatted[formatted.length - 1].additional_kwargs.source === 'steer';
+}
+
+/**
  * Helper function to format an assistant message
  * @param message The message to format
  * @param options Optional formatting options
@@ -1575,6 +1588,21 @@ export const formatAgentMessages = (
         options?.provider === Providers.DEEPSEEK,
       provider: options?.provider,
     });
+    /**
+     * A steer that ends an assistant message leaves the replay on a
+     * `HumanMessage`. The next payload message is itself a user turn, so the
+     * sequence would reach the provider as two adjacent user turns — rejected
+     * outright by Bedrock and Mistral. Anchor it with an empty assistant turn.
+     *
+     * Guarded on not-being-last: when the steer IS the final message, the
+     * user turn belongs at the end, which is exactly what the model is about
+     * to answer. Reachable today through abort, not only through preemption.
+     */
+    if (i < payload.length - 1 && endsWithSteerMessage(formattedMessages)) {
+      formattedMessages.push(
+        withMessageRole(new AIMessage({ content: '' }), 'assistant')
+      );
+    }
     if (sourceMessageId != null && sourceMessageId !== '') {
       for (const formattedMessage of formattedMessages) {
         formattedMessage.id = sourceMessageId;

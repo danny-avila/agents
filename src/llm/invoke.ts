@@ -22,10 +22,12 @@ import {
 } from '@/messages/cache';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
-import { Constants, GraphEvents, Providers } from '@/common';
 import { manualToolStreamProviders } from '@/llm/providers';
+import { Constants, GraphEvents, Providers } from '@/common';
+import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
 import { modifyDeltaProperties } from '@/messages';
+import { canSealPreempt } from '@/llm/preempt';
 import { ChatModelStreamHandler } from '@/stream';
 import { initializeModel } from '@/llm/init';
 import { isOpenAILike } from '@/utils/llm';
@@ -318,6 +320,56 @@ function getStreamHandlingChunk({
   );
 }
 
+/**
+ * Best-effort output-token count for a sealed turn, used only when the
+ * provider never got to send its usage chunk.
+ */
+function countSealedOutputTokens(
+  context: InvokeContext | undefined,
+  chunk: AIMessageChunk,
+  metadata: Record<string, unknown> | undefined
+): number | undefined {
+  try {
+    return context?.getAgentContext(metadata).tokenCounter?.(chunk);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Emits `CHAT_MODEL_END` for a turn that was sealed mid-stream.
+ *
+ * Mandatory, not cosmetic. `@langchain/core`'s `_streamIterator` calls
+ * `handleLLMEnd` after its try/catch with no `finally`, so breaking out of the
+ * consumer's `for await` produces a *return* completion that fires neither
+ * `handleLLMError` nor `handleLLMEnd` — the model-end event the host uses to
+ * record token usage would never arrive. Since every seal re-sends the whole
+ * prompt on resume, a user who preempts N times would otherwise spend N
+ * unrecorded full prompts.
+ */
+async function dispatchSealedModelEnd(
+  context: InvokeContext | undefined,
+  chunk: AIMessageChunk,
+  config?: RunnableConfig
+): Promise<void> {
+  const metadata = config?.metadata as Record<string, unknown> | undefined;
+  if (chunk.usage_metadata == null) {
+    const outputTokens = countSealedOutputTokens(context, chunk, metadata);
+    if (outputTokens != null) {
+      chunk.usage_metadata = {
+        input_tokens: 0,
+        output_tokens: outputTokens,
+        total_tokens: outputTokens,
+      };
+    }
+  }
+  await safeDispatchCustomEvent(
+    GraphEvents.CHAT_MODEL_END,
+    { output: chunk },
+    config
+  );
+}
+
 function appendStreamChunk({
   current,
   next,
@@ -402,6 +454,7 @@ export async function attemptInvoke(
   if (model.stream) {
     const stream = await model.stream(messagesForProvider, config);
     let finalChunk: AIMessageChunk | undefined;
+    let preempted = false;
     const registeredStreamHandler =
       getRegisteredDefaultChatStreamHandler(context);
 
@@ -436,6 +489,19 @@ export async function attemptInvoke(
           next: chunk,
           provider,
         });
+        /**
+         * Only this loop may seal. The registered-handler branch below
+         * dispatches through `run.ts`'s decoupled `streamEvents` consumer,
+         * which can lag the accumulated chunk — sealing there would let the
+         * host index a content part the user has not been shown yet.
+         */
+        if (
+          context?.shouldPreemptStream() === true &&
+          canSealPreempt(finalChunk)
+        ) {
+          preempted = true;
+          break;
+        }
       }
     } else {
       const metadata = config.metadata as Record<string, unknown> | undefined;
@@ -463,6 +529,15 @@ export async function attemptInvoke(
 
     if (manualToolStreamProviders.has(provider)) {
       finalChunk = modifyDeltaProperties(provider, finalChunk);
+    }
+
+    if (preempted && finalChunk != null) {
+      finalChunk.response_metadata = {
+        ...finalChunk.response_metadata,
+        preempted: true,
+      };
+      context?.notePreemptSeal();
+      await dispatchSealedModelEnd(context, finalChunk, config);
     }
 
     if ((finalChunk?.tool_calls?.length ?? 0) > 0) {
