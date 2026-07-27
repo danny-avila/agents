@@ -134,6 +134,18 @@ import { executeHooks } from '@/hooks';
 
 const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 
+/** What a `PreemptBoundary` drain resolved to. */
+type PreemptBoundaryResult = {
+  messages: BaseMessage[];
+  /** A hook asked for no further model turn; the seal must not self-loop. */
+  preventContinuation: boolean;
+};
+
+const EMPTY_PREEMPT_BOUNDARY: PreemptBoundaryResult = {
+  messages: [],
+  preventContinuation: false,
+};
+
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
 
@@ -1189,7 +1201,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * Same session resolution as `dispatchPreemptBoundary`, or a
        * session-scoped matcher would be visible at one site and not the other.
        */
-      this.hookRegistry?.hasHookFor(
+      this.hookRegistry?.hasDispatchableHookFor(
         'PreemptBoundary',
         (this.config?.configurable?.run_id as string | undefined) ?? this.runId
       ) === true
@@ -3358,12 +3370,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         (responseMessage as AIMessageChunk | undefined)?.response_metadata
           .preempted === true
       ) {
-        const injected = await this.dispatchPreemptBoundary(agentId, config);
+        const { messages: injected, preventContinuation } =
+          await this.dispatchPreemptBoundary(agentId, config);
         /**
          * Release before branching: the slot is held only for the duration of
          * the drain, and an early return below must not strand it.
          */
         this.releasePreemptSeal();
+        if (preventContinuation) {
+          /**
+           * A hook halted at the boundary. Commit the sealed turn and anything
+           * it injected, but do NOT self-loop: `preventContinuation` promises
+           * no further model turn, and the run-loop poll in `processStream`
+           * only sees the halt AFTER the next call would already have started
+           * — direct graph consumers never poll it at all. A trailing injected
+           * HumanMessage carries no tool calls, so `toolsCondition` routes it
+           * to END.
+           */
+          this.preemptIncomplete = true;
+          this.cleanupSignalListener();
+          return injected.length > 0
+            ? { messages: [...(result.messages ?? []), ...injected] }
+            : result;
+        }
         if (injected.length > 0) {
           this.pendingPreemptReturn.add(agentId);
           this.cleanupSignalListener();
@@ -3391,18 +3420,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    *
    * Never throws: a drain that fails or times out costs the injection, not the
    * run. The caller treats an empty result as "nothing to resume with".
+   *
+   * `preventContinuation` is surfaced alongside the messages rather than left
+   * to the registry halt signal, which `processStream` only polls between
+   * stream events — by then the self-loop it was meant to prevent has already
+   * issued another model call, and a direct graph consumer never polls it.
    */
   private async dispatchPreemptBoundary(
     agentId: string,
     config: RunnableConfig | undefined
-  ): Promise<BaseMessage[]> {
+  ): Promise<PreemptBoundaryResult> {
     if (this.hookRegistry == null) {
-      return [];
+      return EMPTY_PREEMPT_BOUNDARY;
     }
     const configurable = config?.configurable;
     const runId = (configurable?.run_id as string | undefined) ?? this.runId;
     if (runId == null) {
-      return [];
+      return EMPTY_PREEMPT_BOUNDARY;
     }
     const result = await executeHooks({
       registry: this.hookRegistry,
@@ -3418,7 +3452,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       timeoutMs: PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
     }).catch((): undefined => undefined);
     if (result == null) {
-      return [];
+      return EMPTY_PREEMPT_BOUNDARY;
     }
     const injected: BaseMessage[] = [];
     /**
@@ -3447,7 +3481,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
     }
-    return injected;
+    return {
+      messages: injected,
+      preventContinuation: result.preventContinuation === true,
+    };
   }
 
   createAgentNode(agentId: string): t.CompiledAgentWorfklow {

@@ -46,6 +46,47 @@ describe('PreemptBoundary hook event', () => {
     expect(registry.hasResultAlteringHooks()).toBe(true);
   });
 
+  /**
+   * `hasHookFor` answers "is one registered"; the seal gate needs "will one
+   * fire". A pattern-scoped matcher is inert for a query-less dispatch, so
+   * treating registration as a proxy would seal into a boundary that injects
+   * nothing and cut the answer short.
+   */
+  describe('hasDispatchableHookFor', () => {
+    it('is true for a wildcard matcher with a callback', () => {
+      const registry = new HookRegistry();
+      registry.register('PreemptBoundary', makeMatcher());
+      expect(registry.hasDispatchableHookFor('PreemptBoundary')).toBe(true);
+    });
+
+    it('is false for a pattern-scoped matcher that can never match', () => {
+      const registry = new HookRegistry();
+      registry.register('PreemptBoundary', { pattern: 'Bash', hooks: [noop] });
+      expect(registry.hasHookFor('PreemptBoundary')).toBe(true);
+      expect(registry.hasDispatchableHookFor('PreemptBoundary')).toBe(false);
+    });
+
+    it('is false for a matcher carrying no callbacks', () => {
+      const registry = new HookRegistry();
+      registry.register('PreemptBoundary', { hooks: [] });
+      expect(registry.hasDispatchableHookFor('PreemptBoundary')).toBe(false);
+    });
+
+    it('is false when nothing is registered at all', () => {
+      const registry = new HookRegistry();
+      expect(registry.hasDispatchableHookFor('PreemptBoundary')).toBe(false);
+    });
+
+    it('finds a session-scoped dispatchable matcher', () => {
+      const registry = new HookRegistry();
+      registry.registerSession('run_1', 'PreemptBoundary', makeMatcher());
+      expect(registry.hasDispatchableHookFor('PreemptBoundary')).toBe(false);
+      expect(registry.hasDispatchableHookFor('PreemptBoundary', 'run_1')).toBe(
+        true
+      );
+    });
+  });
+
   it('keeps registration isolated from the tool boundary event', () => {
     const registry = new HookRegistry();
     const matcher = makeMatcher();
