@@ -23,11 +23,22 @@ const config = {
   testEnvironment: 'node',
   testMatch: ['**/src/**/*.test.ts', '**/src/**/*.spec.ts'],
   transform: {
-    '^.+\\.tsx?$': ['ts-jest', { tsconfig: './tsconfig.json' }],
+    /**
+     * Declaring `transform` REPLACES the preset's entry, so the TypeScript
+     * rule has to be restated — including the `module: 'commonjs'` override
+     * the preset applies for us. The project targets `"module": "ESNext"`
+     * (tsconfig.json), and emitting that into Jest's CommonJS runtime fails
+     * at load with `ReferenceError: exports is not defined`.
+     *
+     * The object form merges over the project tsconfig rather than replacing
+     * it, so path aliases and the rest still apply.
+     */
+    '^.+\\.tsx?$': ['ts-jest', { tsconfig: { module: 'commonjs' } }],
     /**
      * `allowJs` so ts-jest will down-level the ESM-only packages above;
-     * `isolatedModules` because they are already type-checked upstream and we
-     * only need the syntax transform.
+     * `isolatedModules` and no diagnostics because they are third-party and
+     * already type-checked upstream — we want the syntax transform, not a
+     * typecheck of `node_modules`.
      */
     '^.+\\.m?js$': [
       'ts-jest',
