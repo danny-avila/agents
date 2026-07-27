@@ -369,6 +369,40 @@ describe('formatAgentMessages trailing-steer anchor', () => {
     expect(following.content).toEqual([{ type: 'text', text: 'Next turn' }]);
   });
 
+  /**
+   * `messagesStateReducer` treats a repeated id as replace-in-place, so an
+   * anchor stamped with the shared `sourceMessageId` would overwrite the very
+   * steer it exists to protect. It must reach the reducer unstamped.
+   */
+  it('does not stamp the anchor with the shared source message id', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        messageId: 'assistant_1',
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Partial answer.' },
+          steerPart('Change of plan.'),
+        ],
+      } as unknown as TPayload[number],
+      { role: 'user', content: 'Next turn' },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    const steerIndex = messages.findIndex(
+      (message) => message.additional_kwargs.source === 'steer'
+    );
+    expect(steerIndex).toBeGreaterThan(0);
+    expect(messages[steerIndex].id).toBe('assistant_1');
+    expect(messages[steerIndex - 1].id).toBe('assistant_1');
+
+    const anchor = messages[steerIndex + 1];
+    expect(anchor).toBeInstanceOf(AIMessage);
+    expect(anchor.content).toBe('');
+    expect(anchor.id).not.toBe('assistant_1');
+  });
+
   it('leaves the user turn last when the steer ends the payload', () => {
     const payload: TPayload = [
       { role: 'user', content: 'Original request' },

@@ -1588,6 +1588,11 @@ export const formatAgentMessages = (
         options?.provider === Providers.DEEPSEEK,
       provider: options?.provider,
     });
+    if (sourceMessageId != null && sourceMessageId !== '') {
+      for (const formattedMessage of formattedMessages) {
+        formattedMessage.id = sourceMessageId;
+      }
+    }
     /**
      * A steer that ends an assistant message leaves the replay on a
      * `HumanMessage`. The next payload message is itself a user turn, so the
@@ -1597,16 +1602,18 @@ export const formatAgentMessages = (
      * Guarded on not-being-last: when the steer IS the final message, the
      * user turn belongs at the end, which is exactly what the model is about
      * to answer. Reachable today through abort, not only through preemption.
+     *
+     * Pushed AFTER the id stamping above, deliberately. `messagesStateReducer`
+     * treats a repeated id as replace-in-place, so an anchor carrying the
+     * shared `sourceMessageId` would overwrite the steer it exists to protect.
+     * Left unstamped, it reaches the reducer with a null id and is assigned a
+     * fresh one. `endsWithSteerMessage` reads only `additional_kwargs.source`,
+     * so the reorder cannot change which messages get anchored.
      */
     if (i < payload.length - 1 && endsWithSteerMessage(formattedMessages)) {
       formattedMessages.push(
         withMessageRole(new AIMessage({ content: '' }), 'assistant')
       );
-    }
-    if (sourceMessageId != null && sourceMessageId !== '') {
-      for (const formattedMessage of formattedMessages) {
-        formattedMessage.id = sourceMessageId;
-      }
     }
     messages.push(...formattedMessages);
 

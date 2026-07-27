@@ -25,31 +25,20 @@ function hasNonEmptyTextContent(content: AIMessageChunk['content']): boolean {
 }
 
 /**
- * True when the accumulated content carries an Anthropic `server_tool_use`
- * block (web search). These pair with a `web_search_tool_result` that arrives
- * later in the stream, and an unpaired one is repaired by neither
- * `sanitizeOrphanToolBlocks` nor `preserveUnpairedServerToolUses`.
- */
-function hasServerToolUseBlock(content: AIMessageChunk['content']): boolean {
-  if (typeof content === 'string') {
-    return false;
-  }
-  for (const block of content) {
-    if (block.type === 'server_tool_use') {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
  * Cooperative mid-generation seal gate. Returns true ONLY when sealing here
  * yields a message sequence valid on EVERY supported provider:
  *  - non-whitespace TEXT content, so the injected user turn is preceded by a
  *    NON-EMPTY assistant turn (no empty-content 400s, no adjacent user turns);
  *  - no tool call in flight, so no `tool_use` can be orphaned AND no eagerly
- *    prestarted execution can be stripped out from under the model;
- *  - no unpaired Anthropic `server_tool_use`.
+ *    prestarted execution can be stripped out from under the model.
+ *
+ * Anthropic's server-side tools need no check of their own. Every
+ * `server_tool_use` content block also emits a `tool_call_chunk`
+ * (`_makeMessageChunkFromAnthropicEvent`), and `concat` keeps that chunk on
+ * the accumulated message for the remainder of the turn, so the tool-call
+ * gates below already cover it. The practical consequence is worth stating
+ * plainly: once a turn starts a web search it is no longer preemptible, and
+ * a queued message waits for the ordinary tool boundary instead.
  *
  * Nothing is stripped and nothing is repaired: when the accumulated shape is
  * not already safe the stream simply runs on, and whatever the host queued
@@ -67,9 +56,6 @@ export function canSealPreempt(chunk: AIMessageChunk | undefined): boolean {
     return false;
   }
   if ((chunk.invalid_tool_calls?.length ?? 0) > 0) {
-    return false;
-  }
-  if (hasServerToolUseBlock(chunk.content)) {
     return false;
   }
   return hasNonEmptyTextContent(chunk.content);

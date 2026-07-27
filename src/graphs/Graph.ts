@@ -967,10 +967,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   subagentScope: boolean;
   /** See {@link t.StandardGraphInput.preemption}. */
   preemption?: t.StreamPreemption;
-  /** Seals honored so far in this run; bounded by `preemption.maxSeals`. */
+  /**
+   * Seals charged against `preemption.maxSeals`. Per-turn: cleared by both
+   * reset paths so a fresh turn gets a fresh budget, while a HITL resume —
+   * which skips `resetValues` — keeps what it had left.
+   */
+  private preemptSealBudgetUsed = 0;
+  /**
+   * Seals honored over the graph's lifetime. Reported by
+   * {@link getPreemptStats}, so it deliberately SURVIVES `clearHeavyState()`
+   * — a host reads it after `processStream` returns, which is strictly after
+   * cleanup runs.
+   */
   preemptSealCount = 0;
   /** Boundaries that produced nothing to inject, so the turn stopped early. */
   preemptEmptyBoundaries = 0;
+  /**
+   * Set between claiming a seal and resolving its boundary. `MultiAgentGraph`
+   * fans parallel agents through this one instance against a single host
+   * request, so without a one-at-a-time gate several streams would each seal
+   * for the same queued message and every loser would take the
+   * nothing-to-inject path and cut its answer short.
+   */
+  private preemptSealInFlight = false;
   /**
    * True when a seal ended the turn without a resume. The assistant turn is
    * real and kept, but it is not the answer the model intended to finish —
@@ -1075,7 +1094,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       new Map()
     );
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
-    this.resetPreemptState();
+    this.resetPreemptTurnState();
+    this.resetPreemptTotals();
     const hasScopedCheckpoint =
       this.hasCompiledCheckpointer &&
       checkpointScope != null &&
@@ -1096,7 +1116,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
-    this.resetPreemptState();
+    /**
+     * Turn state only. The reported totals must outlive cleanup — this runs
+     * in `processStream`'s `finally`, and the host reads `getPreemptStats()`
+     * after that returns.
+     */
+    this.resetPreemptTurnState();
     const preserveOriginalToolContent =
       this.hasCompiledCheckpointer &&
       this.originalToolContentCheckpointScope != null;
@@ -1106,21 +1131,39 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   /**
-   * Seal budget and pending-resume markers are per-run, not per-graph. Kept
-   * as one helper because `resetValues` is skipped on resume while
-   * `clearHeavyState` is not, and the two must not be able to drift.
+   * Per-turn seal budget and routing markers. Cleared by both reset paths so
+   * a new turn starts with a full budget and no stale resume marker.
+   *
+   * The REPORTED counters are deliberately not touched here — see
+   * {@link resetPreemptTotals}.
    */
-  private resetPreemptState(): void {
+  private resetPreemptTurnState(): void {
+    this.preemptSealBudgetUsed = 0;
+    this.preemptSealInFlight = false;
+    this.pendingPreemptReturn.clear();
+  }
+
+  /**
+   * Lifetime seal totals, cleared only when a genuinely new run starts.
+   * `clearHeavyState()` must NOT call this: it runs in `processStream`'s
+   * `finally`, so zeroing here would make {@link getPreemptStats} and
+   * `preemptIncomplete` unreadable for every caller of the method that just
+   * produced them.
+   */
+  private resetPreemptTotals(): void {
     this.preemptSealCount = 0;
     this.preemptEmptyBoundaries = 0;
     this.preemptIncomplete = false;
-    this.pendingPreemptReturn.clear();
   }
 
   /**
    * True when the host has requested a cooperative seal AND this graph may
    * honor it. Read once per streamed chunk, so it stays property reads plus
    * one host callback — no I/O, no allocation.
+   *
+   * Non-mutating: a true result only means a seal is worth evaluating. The
+   * budget is taken by {@link claimPreemptSeal} once the accumulated chunk is
+   * known to be safe, so a chunk that cannot seal never spends budget.
    *
    * Subagent scopes never seal: a steer targets the top-level conversation,
    * and a child run must finish so its parent sees a complete result.
@@ -1129,13 +1172,35 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return (
       !this.subagentScope &&
       this.preemption != null &&
-      this.preemptSealCount < (this.preemption.maxSeals ?? DEFAULT_MAX_SEALS) &&
+      !this.preemptSealInFlight &&
+      this.preemptSealBudgetUsed <
+        (this.preemption.maxSeals ?? DEFAULT_MAX_SEALS) &&
       this.preemption.shouldPreempt() === true
     );
   }
 
-  notePreemptSeal(): void {
+  /**
+   * Takes the seal slot, or returns false if another stream already holds it.
+   *
+   * Every check and both mutations sit in one synchronous body, so no `await`
+   * can split them — which is the point. `shouldPreemptStream()` is polled
+   * from an async chunk loop, so two parallel agents can both observe it as
+   * true; only one can win here. The loser keeps streaming normally instead of
+   * sealing for a message it would never receive.
+   */
+  claimPreemptSeal(): boolean {
+    if (!this.shouldPreemptStream()) {
+      return false;
+    }
+    this.preemptSealInFlight = true;
+    this.preemptSealBudgetUsed += 1;
     this.preemptSealCount += 1;
+    return true;
+  }
+
+  /** Releases the seal slot once its boundary has resolved, win or lose. */
+  releasePreemptSeal(): void {
+    this.preemptSealInFlight = false;
   }
 
   getPreemptStats(): t.PreemptStats {
@@ -3229,6 +3294,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           .preempted === true
       ) {
         const injected = await this.dispatchPreemptBoundary(agentId, config);
+        /**
+         * Release before branching: the slot is held only for the duration of
+         * the drain, and an early return below must not strand it.
+         */
+        this.releasePreemptSeal();
         if (injected.length > 0) {
           this.pendingPreemptReturn.add(agentId);
           this.cleanupSignalListener();
@@ -3282,18 +3352,37 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       sessionId: runId,
       timeoutMs: PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
     }).catch((): undefined => undefined);
-    if (result == null || result.injectedMessages.length === 0) {
+    if (result == null) {
       return [];
     }
-    try {
-      return convertInjectedMessages(result.injectedMessages);
-    } catch (e) {
-      console.warn(
-        '[StandardGraph] Failed to convert PreemptBoundary injectedMessages:',
-        e instanceof Error ? e.message : e
+    const injected: BaseMessage[] = [];
+    /**
+     * `PreemptBoundaryHookOutput` is `BaseHookOutput`, so `additionalContext`
+     * is part of the contract here just as it is at the tool boundary. It has
+     * to be materialized BEFORE the emptiness test, or a hook that returns
+     * context alone would read as "nothing to resume with" and cut the answer
+     * short. Same system-flavored `HumanMessage` convention `ToolNode` uses —
+     * Anthropic and Google reject a mid-conversation `SystemMessage`.
+     */
+    if (result.additionalContexts.length > 0) {
+      injected.push(
+        new HumanMessage({
+          content: result.additionalContexts.join('\n\n'),
+          additional_kwargs: { role: 'system', isMeta: true, source: 'hook' },
+        })
       );
-      return [];
     }
+    if (result.injectedMessages.length > 0) {
+      try {
+        injected.push(...convertInjectedMessages(result.injectedMessages));
+      } catch (e) {
+        console.warn(
+          '[StandardGraph] Failed to convert PreemptBoundary injectedMessages:',
+          e instanceof Error ? e.message : e
+        );
+      }
+    }
+    return injected;
   }
 
   createAgentNode(agentId: string): t.CompiledAgentWorfklow {

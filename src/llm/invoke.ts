@@ -324,16 +324,55 @@ function getStreamHandlingChunk({
  * Best-effort output-token count for a sealed turn, used only when the
  * provider never got to send its usage chunk.
  */
-function countSealedOutputTokens(
+function countSealedTokens(
   context: InvokeContext | undefined,
-  chunk: AIMessageChunk,
-  metadata: Record<string, unknown> | undefined
+  metadata: Record<string, unknown> | undefined,
+  messages: BaseMessage[]
 ): number | undefined {
   try {
-    return context?.getAgentContext(metadata).tokenCounter?.(chunk);
+    const counter = context?.getAgentContext(metadata).tokenCounter;
+    if (counter == null) {
+      return undefined;
+    }
+    let total = 0;
+    for (const message of messages) {
+      total += counter(message);
+    }
+    return total;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Best-effort usage for a turn the provider never got to bill us for.
+ *
+ * The prompt matters as much as the completion here: the provider processed
+ * the ENTIRE prompt before we sealed, and every resume re-sends it, so
+ * reporting `input_tokens: 0` would under-count the most expensive half of a
+ * preempted run. Both sides come from the host's own counter, so they are
+ * estimates — but estimates in the right order of magnitude beat a fabricated
+ * zero. When no counter is configured we report nothing rather than guess.
+ */
+function synthesizeSealedUsage(
+  context: InvokeContext | undefined,
+  chunk: AIMessageChunk,
+  prompt: BaseMessage[],
+  metadata: Record<string, unknown> | undefined
+): void {
+  if (chunk.usage_metadata != null) {
+    return;
+  }
+  const outputTokens = countSealedTokens(context, metadata, [chunk]);
+  if (outputTokens == null) {
+    return;
+  }
+  const inputTokens = countSealedTokens(context, metadata, prompt) ?? 0;
+  chunk.usage_metadata = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: inputTokens + outputTokens,
+  };
 }
 
 /**
@@ -346,23 +385,26 @@ function countSealedOutputTokens(
  * record token usage would never arrive. Since every seal re-sends the whole
  * prompt on resume, a user who preempts N times would otherwise spend N
  * unrecorded full prompts.
+ *
+ * KNOWN LIMITATION. This is a custom event, so it reaches the host's handler
+ * registry but NOT the model run manager: external tracers (LangSmith,
+ * Langfuse) are left holding a model run that never closes. Ending the real
+ * run is not reachable from here — `model` is a bound runnable, so the
+ * binding consumes `config.runId` for its own run and `patchConfig` hands the
+ * chat model a fresh id, leaving no way to name the run we need to end.
+ * Reconstructing a manager against a pinned id was tried and fails live with
+ * "No LLM run to end", and it also suppresses the host's model-end event,
+ * which is strictly worse than an unclosed trace span. Closing this properly
+ * needs a seam in `@langchain/core`.
  */
 async function dispatchSealedModelEnd(
   context: InvokeContext | undefined,
   chunk: AIMessageChunk,
+  prompt: BaseMessage[],
   config?: RunnableConfig
 ): Promise<void> {
   const metadata = config?.metadata as Record<string, unknown> | undefined;
-  if (chunk.usage_metadata == null) {
-    const outputTokens = countSealedOutputTokens(context, chunk, metadata);
-    if (outputTokens != null) {
-      chunk.usage_metadata = {
-        input_tokens: 0,
-        output_tokens: outputTokens,
-        total_tokens: outputTokens,
-      };
-    }
-  }
+  synthesizeSealedUsage(context, chunk, prompt, metadata);
   await safeDispatchCustomEvent(
     GraphEvents.CHAT_MODEL_END,
     { output: chunk },
@@ -495,9 +537,16 @@ export async function attemptInvoke(
          * which can lag the accumulated chunk — sealing there would let the
          * host index a content part the user has not been shown yet.
          */
+        /**
+         * Cheap poll first, shape check second, budget claim last. The claim
+         * is what makes this safe under a parallel `MultiAgentGraph`: several
+         * agents share one graph and can each see the poll as true, but only
+         * one can take the slot, and a chunk that cannot seal never spends it.
+         */
         if (
           context?.shouldPreemptStream() === true &&
-          canSealPreempt(finalChunk)
+          canSealPreempt(finalChunk) &&
+          context.claimPreemptSeal()
         ) {
           preempted = true;
           break;
@@ -536,8 +585,12 @@ export async function attemptInvoke(
         ...finalChunk.response_metadata,
         preempted: true,
       };
-      context?.notePreemptSeal();
-      await dispatchSealedModelEnd(context, finalChunk, config);
+      await dispatchSealedModelEnd(
+        context,
+        finalChunk,
+        messagesForProvider,
+        config
+      );
     }
 
     if ((finalChunk?.tool_calls?.length ?? 0) > 0) {

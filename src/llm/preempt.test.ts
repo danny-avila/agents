@@ -100,7 +100,14 @@ describe('canSealPreempt', () => {
       expect(canSealPreempt(c)).toBe(false);
     });
 
-    it('with an unpaired Anthropic server_tool_use block', () => {
+    /**
+     * Anthropic emits a `tool_call_chunk` alongside every `server_tool_use`
+     * content block, and `concat` keeps it on the accumulated message for the
+     * rest of the turn. So a web-search turn is refused by the tool-call gate,
+     * both while the search is in flight and after its result has landed —
+     * this pins that invariant rather than a content-block check.
+     */
+    it('while an Anthropic server tool is in flight', () => {
       expect(
         canSealPreempt(
           chunk({
@@ -112,6 +119,35 @@ describe('canSealPreempt', () => {
                 name: 'web_search',
                 input: { query: 'x' },
               },
+            ],
+            tool_call_chunks: [
+              { id: 'srvtoolu_1', name: 'web_search', args: '', index: 0 },
+            ],
+          })
+        )
+      ).toBe(false);
+    });
+
+    it('after an Anthropic server tool result has landed', () => {
+      expect(
+        canSealPreempt(
+          chunk({
+            content: [
+              { type: 'text', text: 'Here is what I found.' },
+              {
+                type: 'server_tool_use',
+                id: 'srvtoolu_1',
+                name: 'web_search',
+                input: { query: 'x' },
+              },
+              {
+                type: 'web_search_tool_result',
+                tool_use_id: 'srvtoolu_1',
+                content: [],
+              },
+            ],
+            tool_call_chunks: [
+              { id: 'srvtoolu_1', name: 'web_search', args: '', index: 0 },
             ],
           })
         )
@@ -164,17 +200,13 @@ describe('canSealPreempt', () => {
       ).toBe(true);
     });
 
-    it('once a paired server tool result has landed', () => {
+    it('on a non-text block that carries no tool call', () => {
       expect(
         canSealPreempt(
           chunk({
             content: [
-              { type: 'text', text: 'Here is what I found.' },
-              {
-                type: 'web_search_tool_result',
-                tool_use_id: 'srvtoolu_1',
-                content: [],
-              },
+              { type: 'text', text: 'Here is the diagram.' },
+              { type: 'image_url', image_url: { url: 'https://x/y.png' } },
             ],
           })
         )

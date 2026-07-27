@@ -999,6 +999,16 @@ export class Run<_T extends t.BaseGraphState> {
             threadId,
             agentId: graph.defaultAgentId,
             messages: graph.getRunMessages() ?? stateInputs?.messages ?? [],
+            /**
+             * A seal whose boundary had nothing to inject ends the turn where
+             * it stands. The run really did stop, so `Stop` must still fire —
+             * but it did not stop because the model was finished, and a host
+             * that persists or notifies on completion needs to tell those
+             * apart.
+             */
+            stopReason: graph.preemptIncomplete
+              ? 'preempt_incomplete'
+              : undefined,
             stopHookActive: false, // will be true when stop is triggered by a hook (Phase 2)
           },
           sessionId: this.id,
