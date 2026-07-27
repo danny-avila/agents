@@ -1168,28 +1168,39 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * Subagent scopes never seal: a steer targets the top-level conversation,
    * and a child run must finish so its parent sees a complete result.
    */
-  shouldPreemptStream(): boolean {
+  /** Internal seal preconditions only — no host callback, no side effects. */
+  private canClaimPreemptSeal(): boolean {
     return (
       !this.subagentScope &&
       this.preemption != null &&
       !this.preemptSealInFlight &&
       this.preemptSealBudgetUsed <
-        (this.preemption.maxSeals ?? DEFAULT_MAX_SEALS) &&
-      this.preemption.shouldPreempt() === true
+        (this.preemption.maxSeals ?? DEFAULT_MAX_SEALS)
+    );
+  }
+
+  shouldPreemptStream(): boolean {
+    return (
+      this.canClaimPreemptSeal() && this.preemption?.shouldPreempt() === true
     );
   }
 
   /**
    * Takes the seal slot, or returns false if another stream already holds it.
    *
-   * Every check and both mutations sit in one synchronous body, so no `await`
-   * can split them — which is the point. `shouldPreemptStream()` is polled
-   * from an async chunk loop, so two parallel agents can both observe it as
-   * true; only one can win here. The loser keeps streaming normally instead of
-   * sealing for a message it would never receive.
+   * Assumes the caller already polled `shouldPreemptStream()` for THIS chunk,
+   * and deliberately does not poll the host again — `StreamPreemption`
+   * documents `shouldPreempt` as once per chunk, and a host that consumes a
+   * pending flag on read would lose the request to a second call.
+   *
+   * The guard and both mutations remain one synchronous body, which is what
+   * makes this safe under a parallel `MultiAgentGraph`: several agents share
+   * one graph and can each see the poll as true, but no `await` can split the
+   * claim, so only one takes the slot. The loser keeps streaming normally
+   * rather than sealing for a message it would never receive.
    */
   claimPreemptSeal(): boolean {
-    if (!this.shouldPreemptStream()) {
+    if (!this.canClaimPreemptSeal()) {
       return false;
     }
     this.preemptSealInFlight = true;

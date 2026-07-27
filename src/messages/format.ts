@@ -476,6 +476,12 @@ function formatToolCallOutput(
 }
 
 /**
+ * Content for the synthetic assistant turn that separates a trailing steer
+ * from the next user turn. Non-empty by necessity — see the push site.
+ */
+const STEER_ANCHOR_PLACEHOLDER = '_';
+
+/**
  * True when an assistant message replayed as a steer and nothing followed it,
  * so the emitted run ends on the steer's `HumanMessage`.
  */
@@ -1597,7 +1603,16 @@ export const formatAgentMessages = (
      * A steer that ends an assistant message leaves the replay on a
      * `HumanMessage`. The next payload message is itself a user turn, so the
      * sequence would reach the provider as two adjacent user turns — rejected
-     * outright by Bedrock and Mistral. Anchor it with an empty assistant turn.
+     * outright by Bedrock and Mistral. Anchor it with a placeholder assistant
+     * turn.
+     *
+     * The placeholder must be NON-EMPTY. A string-content assistant message
+     * with no tool calls passes through `_convertMessagesToAnthropicPayload`
+     * verbatim — the empty-text repair there only covers array content and
+     * tool-call turns — so an empty anchor would reach Anthropic as
+     * `{role: 'assistant', content: ''}` and trade one invalid sequence for
+     * another. Same single-underscore convention the Anthropic converter
+     * already uses when it has to synthesize a non-empty block.
      *
      * Guarded on not-being-last: when the steer IS the final message, the
      * user turn belongs at the end, which is exactly what the model is about
@@ -1612,7 +1627,10 @@ export const formatAgentMessages = (
      */
     if (i < payload.length - 1 && endsWithSteerMessage(formattedMessages)) {
       formattedMessages.push(
-        withMessageRole(new AIMessage({ content: '' }), 'assistant')
+        withMessageRole(
+          new AIMessage({ content: STEER_ANCHOR_PLACEHOLDER }),
+          'assistant'
+        )
       );
     }
     messages.push(...formattedMessages);

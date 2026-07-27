@@ -1,5 +1,6 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { TPayload } from '@/types';
+import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { ContentTypes, Constants, Providers } from '@/common';
 import { formatAgentMessages } from './format';
 
@@ -362,7 +363,7 @@ describe('formatAgentMessages trailing-steer anchor', () => {
 
     const anchor = messages[steerIndex + 1];
     expect(anchor).toBeInstanceOf(AIMessage);
-    expect(anchor.content).toBe('');
+    expect(anchor.content).not.toBe('');
 
     const following = messages[steerIndex + 2];
     expect(following).toBeInstanceOf(HumanMessage);
@@ -399,8 +400,50 @@ describe('formatAgentMessages trailing-steer anchor', () => {
 
     const anchor = messages[steerIndex + 1];
     expect(anchor).toBeInstanceOf(AIMessage);
-    expect(anchor.content).toBe('');
+    expect(anchor.content).not.toBe('');
     expect(anchor.id).not.toBe('assistant_1');
+  });
+
+  /**
+   * The anchor exists to keep the sequence provider-valid, so the assertion
+   * that matters is what a provider actually receives. An empty-string
+   * assistant turn with no tool calls survives the Anthropic converter
+   * verbatim — the empty-text repair covers only array content and tool-call
+   * turns — so an empty anchor would trade adjacent user turns for an
+   * empty-content 400.
+   */
+  it('survives the Anthropic converter with non-empty assistant content', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Partial answer.' },
+          steerPart('Change of plan.'),
+        ],
+      },
+      { role: 'user', content: 'Next turn' },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+    const { messages: anthropicMessages } =
+      _convertMessagesToAnthropicPayload(messages);
+
+    for (const message of anthropicMessages) {
+      if (message.role !== 'assistant') {
+        continue;
+      }
+      if (typeof message.content === 'string') {
+        expect(message.content.trim()).not.toBe('');
+        continue;
+      }
+      expect(message.content.length).toBeGreaterThan(0);
+    }
+
+    const roles = anthropicMessages.map((message) => message.role);
+    for (let i = 1; i < roles.length; i++) {
+      expect(roles[i] === 'user' && roles[i - 1] === 'user').toBe(false);
+    }
   });
 
   it('leaves the user turn last when the steer ends the payload', () => {

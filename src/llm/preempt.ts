@@ -25,6 +25,37 @@ function hasNonEmptyTextContent(content: AIMessageChunk['content']): boolean {
 }
 
 /**
+ * True while a Gemini server-side tool call is still awaiting its response.
+ *
+ * Google's server-side tools (Search, URL context) never populate
+ * `tool_calls` or `tool_call_chunks` — those are derived from `functionCall`
+ * parts only, while a server-side invocation arrives as a `toolCall` CONTENT
+ * block and its result as a later `toolResponse` block. The tool-call gates
+ * cannot see it, so sealing between the two would replay a model turn holding
+ * an unanswered server-side call.
+ *
+ * Counted rather than id-matched: Google answers calls in order, and counting
+ * stays correct when a part omits its id.
+ */
+function hasOpenGoogleServerToolCall(
+  content: AIMessageChunk['content']
+): boolean {
+  if (typeof content === 'string') {
+    return false;
+  }
+  let calls = 0;
+  let responses = 0;
+  for (const block of content) {
+    if (block.type === 'toolCall') {
+      calls += 1;
+    } else if (block.type === 'toolResponse') {
+      responses += 1;
+    }
+  }
+  return calls > responses;
+}
+
+/**
  * Cooperative mid-generation seal gate. Returns true ONLY when sealing here
  * yields a message sequence valid on EVERY supported provider:
  *  - non-whitespace TEXT content, so the injected user turn is preceded by a
@@ -56,6 +87,9 @@ export function canSealPreempt(chunk: AIMessageChunk | undefined): boolean {
     return false;
   }
   if ((chunk.invalid_tool_calls?.length ?? 0) > 0) {
+    return false;
+  }
+  if (hasOpenGoogleServerToolCall(chunk.content)) {
     return false;
   }
   return hasNonEmptyTextContent(chunk.content);

@@ -128,6 +128,39 @@ describe('canSealPreempt', () => {
       ).toBe(false);
     });
 
+    /**
+     * Gemini server-side tools land as `toolCall` / `toolResponse` content
+     * blocks and never populate `tool_calls` or `tool_call_chunks`, so the
+     * tool-call gates above cannot see them.
+     */
+    it('while a Google server tool call is unanswered', () => {
+      expect(
+        canSealPreempt(
+          chunk({
+            content: [
+              { type: 'text', text: 'Let me look that up.' },
+              { type: 'toolCall', id: 'gcall_1', name: 'google_search' },
+            ],
+          })
+        )
+      ).toBe(false);
+    });
+
+    it('with more Google server tool calls than responses', () => {
+      expect(
+        canSealPreempt(
+          chunk({
+            content: [
+              { type: 'text', text: 'Checking two things.' },
+              { type: 'toolCall', id: 'gcall_1', name: 'google_search' },
+              { type: 'toolResponse', id: 'gcall_1', response: {} },
+              { type: 'toolCall', id: 'gcall_2', name: 'google_search' },
+            ],
+          })
+        )
+      ).toBe(false);
+    });
+
     it('after an Anthropic server tool result has landed', () => {
       expect(
         canSealPreempt(
@@ -195,6 +228,20 @@ describe('canSealPreempt', () => {
             tool_calls: [],
             tool_call_chunks: [],
             invalid_tool_calls: [],
+          })
+        )
+      ).toBe(true);
+    });
+
+    it('once every Google server tool call has been answered', () => {
+      expect(
+        canSealPreempt(
+          chunk({
+            content: [
+              { type: 'text', text: 'Here is what I found.' },
+              { type: 'toolCall', id: 'gcall_1', name: 'google_search' },
+              { type: 'toolResponse', id: 'gcall_1', response: {} },
+            ],
           })
         )
       ).toBe(true);
