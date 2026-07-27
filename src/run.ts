@@ -164,6 +164,8 @@ export class Run<_T extends t.BaseGraphState> {
   private _interrupt: t.RunInterruptResult<unknown> | undefined;
   /** Per-run sequence for batch-unique activity-label trace-seed fallbacks. */
   private activityLabelSeq = 0;
+  /** Distinguishes sibling forks started from the same explicit checkpoint. */
+  private checkpointForkSeq = 0;
   private _haltedReason: string | undefined;
 
   private constructor(config: Partial<t.RunConfig>) {
@@ -719,7 +721,28 @@ export class Run<_T extends t.BaseGraphState> {
      * boundary.
      */
     if (!isResume) {
-      graph.resetValues(streamOptions?.keepContent);
+      const checkpointThreadId =
+        typeof config.configurable?.thread_id === 'string'
+          ? config.configurable.thread_id
+          : undefined;
+      const checkpointNamespace =
+        typeof config.configurable?.checkpoint_ns === 'string'
+          ? config.configurable.checkpoint_ns
+          : '';
+      const checkpointId =
+        typeof config.configurable?.checkpoint_id === 'string'
+          ? config.configurable.checkpoint_id
+          : '';
+      const checkpointScope =
+        checkpointThreadId == null
+          ? undefined
+          : JSON.stringify([
+            checkpointThreadId,
+            checkpointNamespace,
+            checkpointId,
+            checkpointId === '' ? 0 : ++this.checkpointForkSeq,
+          ]);
+      graph.resetValues(streamOptions?.keepContent, checkpointScope);
     }
     this._interrupt = undefined;
     this._haltedReason = undefined;

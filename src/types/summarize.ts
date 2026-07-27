@@ -63,6 +63,28 @@ export interface SummarizeResult {
 export interface SummarizationNodeInput {
   remainingContextTokens: number;
   agentId: string;
+  /**
+   * Why the detour was requested.
+   *
+   * - `trigger` (default): the configured summarization trigger fired during
+   *   the pre-call budget check.
+   * - `overflow`: the provider rejected the prompt as too large and the run
+   *   is compacting to recover. When summarization is not enabled, this
+   *   variant performs no model call — the corrected budget alone is what the
+   *   retry needs.
+   */
+  reason?: 'trigger' | 'overflow';
+  /**
+   * Whether an overflow recovery may spend a summarization model call.
+   *
+   * The first recovery deliberately does not: re-pruning against the
+   * corrected budget raises context pressure, which drives the pruner's
+   * existing tool-output compression and masking. That is cheaper, needs no
+   * model call, and cannot lose message content the way a summary can. Only
+   * when deterministic compression proves insufficient does the next attempt
+   * allow the summarizer to run.
+   */
+  allowSummarization?: boolean;
 }
 
 export interface SummarizeStartEvent {

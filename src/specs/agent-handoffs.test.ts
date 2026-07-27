@@ -1063,16 +1063,10 @@ describe('Agent Handoffs Tests', () => {
       const recipientSystemPrompt = getBufferString(
         await recipientSystemRunnable.invoke([])
       );
-      expect(recipientSystemPrompt).toContain(
-        'stale-context-recipient-marker'
-      );
+      expect(recipientSystemPrompt).toContain('stale-context-recipient-marker');
       expect(recipientSystemPrompt).not.toContain('## Multi-Agent Workflow');
-      expect(recipientSystemPrompt).not.toContain(
-        'transferred from "Router"'
-      );
-      expect(recipientSystemPrompt).not.toContain(
-        'Running in parallel with:'
-      );
+      expect(recipientSystemPrompt).not.toContain('transferred from "Router"');
+      expect(recipientSystemPrompt).not.toContain('Running in parallel with:');
     });
 
     it('should clear the runtime group after a parallel target hands off sequentially', async () => {

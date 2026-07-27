@@ -1303,3 +1303,142 @@ describe('emoji-heavy content does not break summarization', () => {
     expect(result.messages!.length).toBeGreaterThan(0);
   });
 });
+
+describe('createSummarizeNode — overflow recovery', () => {
+  /**
+   * The first recovery compacts deterministically: re-pruning under the
+   * corrected budget drives the pruner's tool-output compression. Spending a
+   * summarization call there would cost money and risk replacing message
+   * content that compression alone can shrink.
+   */
+  it('skips the model call when summarization is not yet escalated', async () => {
+    const modelFactory = jest.spyOn(providers, 'getChatModelClass');
+    const agentContext = createAgentContext();
+    const graph = mockGraph(() => {});
+    const node = createSummarizeNode({ agentContext, graph, generateStepId });
+
+    const result = await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+          reason: 'overflow',
+          allowSummarization: false,
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(modelFactory).not.toHaveBeenCalled();
+    expect(result.summarizationRequest).toBeUndefined();
+    /** State untouched, so the agent node re-prunes and retries. */
+    expect(result.messages).toBeUndefined();
+  });
+
+  it('runs the model call once the recovery escalates', async () => {
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel('Escalated summary');
+        }
+      } as never
+    );
+    const agentContext = createAgentContext();
+    const graph = mockGraph(() => {});
+    const node = createSummarizeNode({ agentContext, graph, generateStepId });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+          reason: 'overflow',
+          allowSummarization: true,
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(agentContext.getSummaryText()).toContain('Escalated summary');
+  });
+
+  /**
+   * The metadata stub describes the history instead of summarizing it, so
+   * committing it removes the head and keeps nothing of what it said. That is
+   * never an acceptable way to paper over an overflow.
+   */
+  it('keeps history when the escalated summarizer falls back to a stub', async () => {
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: (): never => {
+              throw new Error(
+                '400 prompt is too long: 900 tokens > 500 maximum'
+              );
+            },
+            stream: (): never => {
+              throw new Error(
+                '400 prompt is too long: 900 tokens > 500 maximum'
+              );
+            },
+          };
+        }
+      } as never
+    );
+    const agentContext = createAgentContext();
+    const graph = mockGraph(() => {});
+    const node = createSummarizeNode({ agentContext, graph, generateStepId });
+
+    const result = await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+          reason: 'overflow',
+          allowSummarization: true,
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(agentContext.hasSummary()).toBe(false);
+    expect(result.messages).toBeUndefined();
+  });
+
+  it('still commits a stub for a configured trigger, preserving prior behavior', async () => {
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: (): never => {
+              throw new Error('upstream unavailable');
+            },
+            stream: (): never => {
+              throw new Error('upstream unavailable');
+            },
+          };
+        }
+      } as never
+    );
+    const agentContext = createAgentContext();
+    const graph = mockGraph(() => {});
+    const node = createSummarizeNode({ agentContext, graph, generateStepId });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(agentContext.hasSummary()).toBe(true);
+  });
+});

@@ -80,10 +80,18 @@ export function enforceOriginalContentCap(map: Map<number, string>): void {
 
 /** Minimum cumulative calibration ratio — provider can't count fewer tokens
  *  than our raw estimate (within reason). Prevents divide-by-zero edge cases. */
-const CALIBRATION_RATIO_MIN = 0.5;
+export const CALIBRATION_RATIO_MIN = 0.5;
 
 /** Maximum cumulative calibration ratio — sanity cap for the running ratio. */
-const CALIBRATION_RATIO_MAX = 5;
+export const CALIBRATION_RATIO_MAX = 5;
+
+/** Keeps provider/local token calibration within the shared safe range. */
+export function clampCalibrationRatio(ratio: number): number {
+  return Math.max(
+    CALIBRATION_RATIO_MIN,
+    Math.min(CALIBRATION_RATIO_MAX, ratio)
+  );
+}
 
 export type PruneMessagesFactoryParams = {
   provider?: Providers;
@@ -1002,8 +1010,8 @@ export function maskConsumedToolResults(params: {
   /** When provided, original (pre-masking) content is stored here keyed by
    *  message index — only for entries that actually get truncated. */
   originalContentStore?: Map<number, string>;
-  /** Called after storing content with the char length of the stored entry. */
-  onContentStored?: (charLength: number) => void;
+  /** Called after storing a newly captured entry. */
+  onContentStored?: (index: number, content: string) => void;
 }): number {
   const { messages, indexTokenCountMap, tokenCounter } = params;
   let maskedCount = 0;
@@ -1079,7 +1087,7 @@ export function maskConsumedToolResults(params: {
     if (params.originalContentStore && !params.originalContentStore.has(i)) {
       params.originalContentStore.set(i, content);
       if (params.onContentStored) {
-        params.onContentStored(content.length);
+        params.onContentStored(i, content);
       }
     }
 
@@ -1311,6 +1319,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     remainingContextTokens?: number;
     contextPressure?: number;
     originalToolContent?: Map<number, string>;
+    newOriginalToolContent?: Map<number, string>;
     calibrationRatio?: number;
     resolvedInstructionOverhead?: number;
     /** Usable budget this call: maxTokens minus output reserve */
@@ -1318,6 +1327,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     /** Calibrated instruction overhead actually applied this call */
     effectiveInstructionTokens?: number;
   } {
+    let newOriginalToolContent: Map<number, string> | undefined;
     if (params.messages.length === 0) {
       /** Post-compaction calls still invoke the model — report the same
        *  reserve-adjusted budget fields as the populated paths */
@@ -1479,10 +1489,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         cumulativeRawSent += rawSentThisTurn;
         cumulativeProviderReported += providerMessageTokens;
         const newRatio = cumulativeProviderReported / cumulativeRawSent;
-        calibrationRatio = Math.max(
-          CALIBRATION_RATIO_MIN,
-          Math.min(CALIBRATION_RATIO_MAX, newRatio)
-        );
+        calibrationRatio = clampCalibrationRatio(newRatio);
 
         const calibratedOurTotal =
           instructionOverhead + rawSentThisTurn * calibrationRatio;
@@ -1661,8 +1668,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             : undefined,
         onContentStored:
           factoryParams.summarizationEnabled === true
-            ? (charLen: number): void => {
-              originalToolContentSize += charLen;
+            ? (index: number, content: string): void => {
+              originalToolContentSize += content.length;
+              if (newOriginalToolContent == null) {
+                newOriginalToolContent = new Map();
+              }
+              newOriginalToolContent.set(index, content);
               while (
                 originalToolContentSize > ORIGINAL_CONTENT_MAX_CHARS &&
                   originalToolContent.size > 0
@@ -1798,6 +1809,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         contextPressure,
         originalToolContent:
           originalToolContent.size > 0 ? originalToolContent : undefined,
+        newOriginalToolContent,
         calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
         contextBudget: pruningBudget,
@@ -2182,6 +2194,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       contextPressure,
       originalToolContent:
         originalToolContent.size > 0 ? originalToolContent : undefined,
+      newOriginalToolContent,
       calibrationRatio,
       resolvedInstructionOverhead: bestInstructionOverhead,
       contextBudget: pruningBudget,

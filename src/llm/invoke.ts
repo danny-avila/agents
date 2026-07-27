@@ -4,11 +4,13 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { ContextOverflowContext } from '@/utils/errors';
 import type * as t from '@/types';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { manualToolStreamProviders } from '@/llm/providers';
+import { getContextOverflowInfo } from '@/utils/errors';
 import { modifyDeltaProperties } from '@/messages';
 import { ChatModelStreamHandler } from '@/stream';
 import { initializeModel } from '@/llm/init';
@@ -313,6 +315,59 @@ export async function attemptInvoke(
 }
 
 /**
+ * Identifies which fallback produced an error, so a caller planning a
+ * recovery can reason about the client that actually failed rather than the
+ * primary's configuration — their context windows and output allowances
+ * differ, which is the whole reason a fallback exists.
+ */
+export interface FallbackErrorContext {
+  provider: Providers;
+  clientOptions?: t.ClientOptions;
+  maxContextTokens?: number;
+}
+
+export interface FallbackOverflowCandidate {
+  error: unknown;
+  context: FallbackErrorContext;
+}
+
+const fallbackErrorContexts = new WeakMap<object, FallbackErrorContext>();
+const fallbackOverflowCandidates = new WeakMap<
+  object,
+  FallbackOverflowCandidate[]
+>();
+
+function attachFallbackErrorContext(
+  error: unknown,
+  fallbackContext: FallbackErrorContext
+): void {
+  if (typeof error !== 'object' || error === null) {
+    return;
+  }
+  fallbackErrorContexts.set(error, fallbackContext);
+}
+
+/** Reads back the fallback attribution attached by `tryFallbackProviders`. */
+export function getFallbackErrorContext(
+  error: unknown
+): FallbackErrorContext | undefined {
+  if (typeof error !== 'object' || error === null) {
+    return undefined;
+  }
+  return fallbackErrorContexts.get(error);
+}
+
+/** Returns every fallback overflow retained from an exhausted provider chain. */
+export function getFallbackOverflowCandidates(
+  error: unknown
+): FallbackOverflowCandidate[] {
+  if (typeof error !== 'object' || error === null) {
+    return [];
+  }
+  return [...(fallbackOverflowCandidates.get(error) ?? [])];
+}
+
+/**
  * Best-effort read of the configured model name from client options.
  * Providers disagree on the key (`model` vs `modelName`).
  */
@@ -333,7 +388,12 @@ function extractClientOptionsModel(
 
 /**
  * Attempts each fallback provider in order until one succeeds.
- * Throws the last error if all fallbacks fail.
+ *
+ * When every fallback fails, a context overflow among them is thrown in
+ * preference to whichever failure happened to come last. An overflow is the
+ * one failure the caller can act on — it compacts and retries — and losing it
+ * behind a later unrelated error would surface a dead end instead. Ordinary
+ * failures still throw last-error-wins.
  */
 export async function tryFallbackProviders({
   fallbacks,
@@ -343,16 +403,38 @@ export async function tryFallbackProviders({
   primaryError,
   context,
   onChunk,
+  overflowContext,
 }: {
-  fallbacks: Array<{ provider: Providers; clientOptions?: t.ClientOptions }>;
+  fallbacks: t.FallbackConfig[];
   tools?: t.GraphTools;
   messages: BaseMessage[];
   config?: RunnableConfig;
   primaryError: unknown;
   context?: InvokeContext;
   onChunk?: OnChunk;
+  /**
+   * Prompt-size corroboration for signatures that are not self-describing.
+   * Vertex AI's overflow is a bare `400` with no reason, so without this a
+   * fallback that overflows is indistinguishable from any other 400 and would
+   * be dropped in favour of whichever failure came last.
+   */
+  overflowContext?: ContextOverflowContext;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
+  const isOverflow = (
+    error: unknown,
+    contextOverride = overflowContext
+  ): boolean => getContextOverflowInfo(error, contextOverride) != null;
   let lastError: unknown = primaryError;
+  /**
+   * Tracked apart from the primary's overflow. A caller reaching this
+   * function with an overflowing primary has already failed to recover from
+   * it, so a fallback overflow — which may sit against a different window and
+   * output allowance — is the more useful of the two to surface.
+   */
+  const overflowCandidates: FallbackOverflowCandidate[] = [];
+  const primaryOverflowError: unknown = isOverflow(primaryError)
+    ? primaryError
+    : undefined;
   for (const fb of fallbacks) {
     try {
       const fbModel = initializeModel({
@@ -391,11 +473,44 @@ export async function tryFallbackProviders({
       return result;
     } catch (e) {
       lastError = e;
+      const fallbackOverflowContext: ContextOverflowContext = {
+        provider: fb.provider,
+        maxContextTokens: fb.maxContextTokens,
+        ...(overflowContext?.provider === fb.provider
+          ? {
+            estimatedPromptTokens: overflowContext.estimatedPromptTokens,
+          }
+          : {}),
+      };
+      if (isOverflow(e, fallbackOverflowContext)) {
+        const errorContext: FallbackErrorContext = {
+          provider: fb.provider,
+          clientOptions: fb.clientOptions,
+          maxContextTokens: fb.maxContextTokens,
+        };
+        attachFallbackErrorContext(e, errorContext);
+        overflowCandidates.push({ error: e, context: errorContext });
+      }
       continue;
     }
   }
-  if (lastError !== undefined) {
-    throw lastError;
+  /**
+   * Preference order: a fallback overflow, then the primary's overflow, then
+   * whichever failure came last. An overflow is the only one of the three a
+   * caller can act on, and the fallback's carries the client attribution that
+   * makes a correct retry budget possible.
+   */
+  const preferred =
+    overflowCandidates[0]?.error ?? primaryOverflowError ?? lastError;
+  if (
+    overflowCandidates.length > 0 &&
+    typeof preferred === 'object' &&
+    preferred !== null
+  ) {
+    fallbackOverflowCandidates.set(preferred, overflowCandidates);
+  }
+  if (preferred !== undefined) {
+    throw preferred;
   }
   return undefined;
 }

@@ -137,10 +137,17 @@ export type SharedLLMConfig = {
   _lc_stream_delay?: number;
 };
 
+export interface FallbackConfig {
+  provider: Providers;
+  clientOptions?: ClientOptions;
+  /** Context window used to corroborate ambiguous fallback overflow errors. */
+  maxContextTokens?: number;
+}
+
 export type LLMConfig = SharedLLMConfig &
   ClientOptions & {
     /** Optional provider fallbacks in order of attempt */
-    fallbacks?: Array<{ provider: Providers; clientOptions?: ClientOptions }>;
+    fallbacks?: FallbackConfig[];
   };
 
 export type ProviderOptionsMap = {

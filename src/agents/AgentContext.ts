@@ -19,17 +19,19 @@ import {
   type PromptCacheTtl,
 } from '@/messages/cache';
 import {
+  DEFAULT_RESERVE_RATIO,
+  ORIGINAL_CONTENT_MAX_CHARS,
+  clampCalibrationRatio,
+  createPruneMessages,
+  syncBudgetDerivedFields,
+} from '@/messages';
+import {
   ANTHROPIC_TOOL_TOKEN_MULTIPLIER,
   DEFAULT_TOOL_TOKEN_MULTIPLIER,
   ContentTypes,
   Constants,
   Providers,
 } from '@/common';
-import {
-  DEFAULT_RESERVE_RATIO,
-  createPruneMessages,
-  syncBudgetDerivedFields,
-} from '@/messages';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
@@ -220,8 +222,22 @@ export class AgentContext {
   calibrationRatio: number = 1;
   /** Provider-observed instruction overhead from the pruner's best-variance turn. */
   resolvedInstructionOverhead?: number;
+  private _pendingOriginalToolContent?: Map<number, string>;
+  private pendingOriginalToolContentChars = 0;
   /** Pre-masking tool content keyed by message index, consumed by the summarize node. */
-  pendingOriginalToolContent?: Map<number, string>;
+  get pendingOriginalToolContent(): Map<number, string> | undefined {
+    return this._pendingOriginalToolContent;
+  }
+  set pendingOriginalToolContent(value: Map<number, string> | undefined) {
+    this._pendingOriginalToolContent = value;
+    this.pendingOriginalToolContentChars = 0;
+    if (value != null) {
+      for (const content of value.values()) {
+        this.pendingOriginalToolContentChars += content.length;
+      }
+      this.enforcePendingOriginalContentCap();
+    }
+  }
 
   /** Total instruction overhead: system message + tool schemas + pending summary. */
   get instructionTokens(): number {
@@ -322,6 +338,25 @@ export class AgentContext {
    * Summarization is allowed to fire again only when new messages appear.
    */
   private _lastSummarizationMsgCount: number = 0;
+  /**
+   * Forced compactions performed after a provider rejected a prompt as too
+   * large. Bounds the recovery loop so a model that keeps refusing cannot
+   * make the run compact indefinitely.
+   */
+  private _overflowRecoveryAttempts: number = 0;
+  /**
+   * Budget in force before the first overflow correction of the current run.
+   * Recorded so `reset()` can undo the correction for the next run without
+   * disturbing a `maxContextTokens` that no correction ever touched.
+   */
+  private _preOverflowMaxContextTokens?: number;
+  /**
+   * Prompt size, normalized into the local counter's uncalibrated units, at
+   * the last overflow correction. Keeping both measurements in the same units
+   * lets a later overflow prove whether compaction changed anything even when
+   * the provider observation updated calibration between attempts.
+   */
+  private _lastOverflowPromptTokens?: number;
   /**
    * Handoff context when this agent receives control via handoff.
    * Contains source and parallel execution info for system message context.
@@ -964,7 +999,7 @@ export class AgentContext {
   /**
    * Reset context for a new run
    */
-  reset(): void {
+  reset(options?: { preserveOriginalToolContent?: boolean }): void {
     this.systemMessageTokens = 0;
     this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;
@@ -982,12 +1017,16 @@ export class AgentContext {
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
+    if (options?.preserveOriginalToolContent !== true) {
+      this.pendingOriginalToolContent = undefined;
+    }
 
     this.summaryText = this._durableSummaryText;
     this.summaryTokenCount = this._durableSummaryTokenCount;
     this._lastSummarizationMsgCount = 0;
     this.lastCallUsage = undefined;
     this.totalTokensFresh = false;
+    this.restoreContextBudgetAfterOverflow();
 
     if (this.tokenCounter) {
       this.initializeSystemRunnable();
@@ -1306,6 +1345,148 @@ export class AgentContext {
    */
   markSummarizationTriggered(msgCount: number): void {
     this._lastSummarizationMsgCount = msgCount;
+  }
+
+  get overflowRecoveryAttempts(): number {
+    return this._overflowRecoveryAttempts;
+  }
+
+  shouldSummarizeOverflow(): boolean {
+    return (
+      this.summarizationEnabled === true &&
+      (this.tokenCounter == null ||
+        this.maxContextTokens == null ||
+        this._overflowRecoveryAttempts > 0)
+    );
+  }
+
+  /** Preserves the earliest full tool output recorded for each message index. */
+  preserveOriginalToolContent(
+    originalToolContent: Map<number, string> | undefined
+  ): void {
+    if (originalToolContent == null || originalToolContent.size === 0) {
+      return;
+    }
+    if (this.pendingOriginalToolContent == null) {
+      this.pendingOriginalToolContent = new Map();
+    }
+    for (const [index, content] of originalToolContent) {
+      if (!this.pendingOriginalToolContent.has(index)) {
+        this.pendingOriginalToolContent.set(index, content);
+        this.pendingOriginalToolContentChars += content.length;
+      }
+    }
+    this.enforcePendingOriginalContentCap();
+  }
+
+  private enforcePendingOriginalContentCap(): void {
+    const pending = this._pendingOriginalToolContent;
+    if (pending == null) {
+      return;
+    }
+    while (
+      this.pendingOriginalToolContentChars > ORIGINAL_CONTENT_MAX_CHARS &&
+      pending.size > 0
+    ) {
+      const oldest = pending.keys().next();
+      if (oldest.done === true) {
+        break;
+      }
+      const removed = pending.get(oldest.value);
+      if (removed != null) {
+        this.pendingOriginalToolContentChars -= removed.length;
+      }
+      pending.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Retargets the context budget after a provider rejected the prompt as too
+   * large, and clears the memoized pruner so the next call is planned against
+   * the corrected budget rather than the one that was evidently wrong.
+   *
+   * Also clears the "already summarized at this message count" guard: that
+   * guard exists to stop redundant summarization of an unchanged history, but
+   * here the history has not changed and compaction is exactly what is
+   * needed.
+   */
+  applyContextBudgetCorrection(
+    budgetTokens: number | undefined,
+    promptTokens?: number
+  ): void {
+    if (this._overflowRecoveryAttempts === 0) {
+      this._preOverflowMaxContextTokens = this.maxContextTokens;
+    }
+    if (budgetTokens != null) {
+      this.maxContextTokens = budgetTokens;
+    }
+    this.pruneMessages = undefined;
+    this._lastSummarizationMsgCount = 0;
+    this._lastOverflowPromptTokens =
+      promptTokens != null
+        ? this.normalizePromptTokens(promptTokens)
+        : promptTokens;
+    this._overflowRecoveryAttempts += 1;
+  }
+
+  /** Applies token calibration only when the observation came from this provider. */
+  applyObservedOverflowCalibration(
+    provider: Providers | undefined,
+    observedCalibrationRatio: number | undefined
+  ): void {
+    if (
+      provider !== this.provider ||
+      observedCalibrationRatio == null ||
+      observedCalibrationRatio <= 0
+    ) {
+      return;
+    }
+    this.calibrationRatio = clampCalibrationRatio(observedCalibrationRatio);
+  }
+
+  /**
+   * True when a previous correction failed to make the prompt any smaller —
+   * the signature of a state nothing can compact further (an emptied message
+   * list carrying its content in an injected summary, for example). Retrying
+   * from there resends a byte-identical prompt, so the caller should stop.
+   */
+  overflowRecoveryStalled(currentPromptTokens?: number): boolean {
+    const previous = this._lastOverflowPromptTokens;
+    if (
+      previous == null ||
+      currentPromptTokens == null ||
+      !Number.isFinite(currentPromptTokens)
+    ) {
+      return false;
+    }
+    const rawCurrent = this.normalizePromptTokens(currentPromptTokens);
+    return rawCurrent >= previous;
+  }
+
+  private normalizePromptTokens(promptTokens: number): number {
+    if (this.calibrationRatio <= 0) {
+      return promptTokens;
+    }
+    const messageTokens = Math.max(0, promptTokens - this.instructionTokens);
+    return this.instructionTokens + messageTokens / this.calibrationRatio;
+  }
+
+  /**
+   * Undoes overflow corrections so a reused context starts the next run with
+   * the budget it was configured with and a fresh recovery allowance.
+   *
+   * Without this, a single overflow would permanently shrink the budget for
+   * every later turn, and two would exhaust the per-run allowance for the
+   * lifetime of the context.
+   */
+  private restoreContextBudgetAfterOverflow(): void {
+    if (this._overflowRecoveryAttempts === 0) {
+      return;
+    }
+    this.maxContextTokens = this._preOverflowMaxContextTokens;
+    this._preOverflowMaxContextTokens = undefined;
+    this._lastOverflowPromptTokens = undefined;
+    this._overflowRecoveryAttempts = 0;
   }
 
   clearSummary(): void {
