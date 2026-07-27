@@ -1,5 +1,6 @@
 import { HumanMessage, AIMessage, ToolMessage } from '@langchain/core/messages';
 import type { TPayload } from '@/types';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { formatAgentMessages } from './format';
 import { ContentTypes } from '@/common';
 
@@ -99,6 +100,45 @@ describe('formatAgentMessages with tools parameter', () => {
 
     expect(typeof toolMessage.content).toBe('string');
     expect(toolMessage.content).toBe(JSON.stringify(output));
+  });
+
+  it('hard-caps persisted structured output without invoking toJSON', () => {
+    let toJSONCalls = 0;
+    const output = {
+      rows: [{ value: 'x'.repeat(HARD_MAX_TOOL_RESULT_CHARS + 1_000) }],
+      toJSON() {
+        toJSONCalls++;
+        return 'y'.repeat(HARD_MAX_TOOL_RESULT_CHARS * 2);
+      },
+    };
+    const payload: TPayload = [
+      { role: 'user', content: 'Query the table' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'query-bounded',
+              name: 'run_select_query',
+              args: '{}',
+              output,
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+    const content = (result.messages[2] as ToolMessage).content;
+
+    expect(toJSONCalls).toBe(0);
+    expect(typeof content).toBe('string');
+    expect((content as string).length).toBeLessThanOrEqual(
+      HARD_MAX_TOOL_RESULT_CHARS
+    );
+    expect(content).toContain('truncated');
+    expect(content).not.toContain('y'.repeat(1_000));
   });
 
   it('should filter out all tool calls when tools set is empty', () => {

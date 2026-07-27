@@ -3,7 +3,6 @@
 import { type OpenAI as OpenAIClient } from 'openai';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import {
-  convertLangChainToolCallToOpenAI,
   makeInvalidToolCall,
   parseToolCall,
 } from '@langchain/core/output_parsers/openai_tools';
@@ -42,7 +41,13 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
-import { serializeStructuredValue } from '@/utils/toolContent';
+import {
+  calculateMaxToolCallInputChars,
+  projectToolCallInputs,
+  serializeToolCallInput,
+} from '@/messages/prune';
+import { serializeStructuredValueBounded } from '@/utils/toolContent';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { toLangChainContent } from '@/messages/langchain';
 
 export type { OpenAICallOptions, OpenAIChatInput };
@@ -83,6 +88,32 @@ type OpenAIRoleEnum =
 
 type OpenAICompletionParam =
   OpenAIClient.Chat.Completions.ChatCompletionMessageParam;
+
+const MAX_PROVIDER_TOOL_CALL_INPUT_CHARS = calculateMaxToolCallInputChars();
+
+function convertLangChainToolCallToBoundedOpenAI(toolCall: ToolCall): {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
+} {
+  if (toolCall.id == null) {
+    throw new Error('All OpenAI tool calls must have an "id" field.');
+  }
+  return {
+    id: toolCall.id,
+    type: 'function',
+    function: {
+      name: toolCall.name,
+      arguments: serializeToolCallInput(
+        toolCall.args,
+        MAX_PROVIDER_TOOL_CALL_INPUT_CHARS
+      ),
+    },
+  };
+}
 
 function extractGenericMessageCustomRole(message: ChatMessage) {
   if (
@@ -309,9 +340,13 @@ export function _convertMessagesToOpenAIParams(
   model?: string,
   options?: ConvertMessagesOptions
 ): OpenAICompletionParam[] {
+  const projectedMessages = projectToolCallInputs(
+    messages,
+    MAX_PROVIDER_TOOL_CALL_INPUT_CHARS
+  );
   let hasReasoningToolCallContext = false;
   // TODO: Function messages do not support array content, fix cast
-  return messages.flatMap((message) => {
+  return projectedMessages.flatMap((message) => {
     let role = messageToOpenAIRole(message);
     if (role === 'system' && isReasoningModel(model)) {
       role = 'developer';
@@ -319,22 +354,33 @@ export function _convertMessagesToOpenAIParams(
 
     let hasAnthropicThinkingBlock: boolean = false;
 
-    const content =
-      typeof message.content === 'string'
-        ? message.content
-        : message.content.map((m) => {
-          if ('type' in m && m.type === 'thinking') {
-            hasAnthropicThinkingBlock = true;
-            return m;
-          }
-          if (isDataContentBlock(m)) {
-            return convertToProviderContentBlock(
-              m,
-              completionsApiContentBlockConverter
-            );
-          }
+    let content: unknown;
+    if (
+      role === 'tool' &&
+      typeof message.content !== 'string' &&
+      message.additional_kwargs.type !== 'computer_call_output'
+    ) {
+      content = serializeStructuredValueBounded(
+        message.content,
+        HARD_MAX_TOOL_RESULT_CHARS
+      ).content;
+    } else if (typeof message.content === 'string') {
+      content = message.content;
+    } else {
+      content = message.content.map((m) => {
+        if ('type' in m && m.type === 'thinking') {
+          hasAnthropicThinkingBlock = true;
           return m;
-        });
+        }
+        if (isDataContentBlock(m)) {
+          return convertToProviderContentBlock(
+            m,
+            completionsApiContentBlockConverter
+          );
+        }
+        return m;
+      });
+    }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const completionParam: Record<string, any> = {
       role,
@@ -352,7 +398,7 @@ export function _convertMessagesToOpenAIParams(
     if (isAIMessage(message) && !!message.tool_calls?.length) {
       messageHasToolCalls = true;
       completionParam.tool_calls = message.tool_calls.map(
-        convertLangChainToolCallToOpenAI
+        convertLangChainToolCallToBoundedOpenAI
       );
       completionParam.content = hasAnthropicThinkingBlock ? content : '';
       if (
@@ -528,7 +574,11 @@ export function _convertMessagesToOpenAIResponsesParams(
   model?: string,
   zdrEnabled?: boolean
 ): ResponsesInputItem[] {
-  return messages.flatMap(
+  const projectedMessages = projectToolCallInputs(
+    messages,
+    MAX_PROVIDER_TOOL_CALL_INPUT_CHARS
+  );
+  return projectedMessages.flatMap(
     (lcMsg): ResponsesInputItem | ResponsesInputItem[] => {
       const additional_kwargs =
         lcMsg.additional_kwargs as BaseMessageFields['additional_kwargs'] & {
@@ -599,7 +649,10 @@ export function _convertMessagesToOpenAIResponsesParams(
           id: toolMessage.id?.startsWith('fc_') ? toolMessage.id : undefined,
           output:
             typeof toolMessage.content !== 'string'
-              ? serializeStructuredValue(toolMessage.content)
+              ? serializeStructuredValueBounded(
+                toolMessage.content,
+                HARD_MAX_TOOL_RESULT_CHARS
+              ).content
               : toolMessage.content,
         };
       }
@@ -683,7 +736,10 @@ export function _convertMessagesToOpenAIResponsesParams(
               (toolCall): ResponsesInputItem => ({
                 type: 'function_call',
                 name: toolCall.name,
-                arguments: JSON.stringify(toolCall.args),
+                arguments: serializeToolCallInput(
+                  toolCall.args,
+                  MAX_PROVIDER_TOOL_CALL_INPUT_CHARS
+                ),
                 call_id: toolCall.id!,
                 ...(zdrEnabled ? { id: functionCallIds?.[toolCall.id!] } : {}),
               })

@@ -29,7 +29,7 @@ function createAIMessageWithToolCalls(
 type CompletionEvent = {
   result: {
     id: string;
-    tool_call: { id: string; output: string };
+    tool_call: { id: string; output: string; args?: string };
   };
 };
 
@@ -171,6 +171,56 @@ describe('ToolNode per-call onResult completion emission', () => {
     expect(completions).toHaveLength(1);
     expect(completions[0].result.tool_call.output).toBe(serialized);
     expect(result.messages[0].content).toBe(serialized);
+  });
+
+  it('bounds cyclic tool args without losing the completion event', async () => {
+    const completions: CompletionEvent[] = [];
+    const cyclicArgs: Record<string, unknown> = { city: 'NYC' };
+    cyclicArgs.self = cyclicArgs;
+
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push(data as CompletionEvent);
+          return;
+        }
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        batch.onResult?.({
+          toolCallId: 'call_weather',
+          status: 'success',
+          content: 'sunny',
+        });
+        await flushAsync();
+        batch.resolve([
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'sunny',
+          },
+        ]);
+      });
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    await toolNode.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          { id: 'call_weather', name: 'weather', args: cyclicArgs },
+        ]),
+      ],
+    });
+
+    expect(completions).toHaveLength(1);
+    expect(completions[0].result.tool_call.args).toContain('[Circular]');
+    expect(completions[0].result.tool_call.output).toBe('sunny');
   });
 
   it('ignores duplicate and unknown onResult reports', async () => {

@@ -755,6 +755,54 @@ describe('ensureThinkingBlockInMessages', () => {
       expect(result[0]).toBeInstanceOf(HumanMessage);
       expect(result[1]).toBeInstanceOf(ToolMessage);
     });
+
+    test('should not emit an empty user message after the shared fold budget is exhausted', () => {
+      const messages = [
+        new HumanMessage({ content: 'Run both tools' }),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'first', name: 'query', args: {}, type: 'tool_call' },
+          ],
+        }),
+        new ToolMessage({
+          content: Array.from({ length: 60 }, () => ({
+            type: 'text',
+            text: 'x'.repeat(8_000),
+          })),
+          tool_call_id: 'first',
+        }),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'second', name: 'query', args: {}, type: 'tool_call' },
+          ],
+        }),
+        new ToolMessage({
+          content: 'second result',
+          tool_call_id: 'second',
+        }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.ANTHROPIC
+      );
+
+      expect(result).toHaveLength(2);
+      expect(getTextContent(result[1])).toContain(
+        'additional folded context omitted'
+      );
+      expect(
+        result
+          .filter((message) => message instanceof HumanMessage)
+          .every((message) =>
+            typeof message.content === 'string'
+              ? message.content.length > 0
+              : message.content.length > 0
+          )
+      ).toBe(true);
+    });
   });
 
   describe('image content preservation (token amplification fix)', () => {

@@ -12,7 +12,12 @@ import {
   formatArtifactPayload,
   projectAnthropicArtifactContent,
   projectArtifactPayload,
+  projectOpenAIToolMessageContent,
 } from './core';
+import {
+  _convertMessagesToOpenAIParams,
+  _convertMessagesToOpenAIResponsesParams,
+} from '@/llm/openai/utils';
 import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { Constants, ContentTypes, Providers } from '@/common';
 import { serializeToolContent } from '@/utils/toolContent';
@@ -1649,6 +1654,118 @@ describe('formatAgentMessages', () => {
     expect(messages).toHaveLength(2);
     expect((messages[1] as ToolMessage).content).toBe('short result');
     expect(projectArtifactPayload(formatted, 200)).toBe(formatted);
+  });
+
+  it('bounds artifact block arrays without spreading them into call arguments', () => {
+    const repeatedBlock = {
+      type: ContentTypes.TEXT,
+      text: 'x',
+    } as MessageContentComplex;
+    const artifactContent = new Array<MessageContentComplex>(150_000).fill(
+      repeatedBlock
+    );
+    const toolMessage = new ToolMessage({
+      content: 'short result',
+      tool_call_id: 'call_artifact_many_blocks',
+      artifact: { content: artifactContent },
+    });
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_artifact_many_blocks',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+
+    const formatted = projectArtifactPayload(messages, 200);
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+
+    expect(payload).toBeInstanceOf(HumanMessage);
+    expect(serializeToolContent(payload.content).length).toBeLessThanOrEqual(
+      200
+    );
+    expect(toolMessage.content).toBe('short result');
+    expect(toolMessage.artifact.content).toBe(artifactContent);
+  });
+
+  it('projects structured tool content to the bounded string both OpenAI APIs send', () => {
+    let toJSONCalls = 0;
+    const toolMessage = new ToolMessage({
+      id: 'tool-message-id',
+      name: 'render',
+      status: 'success',
+      tool_call_id: 'call_openai_structured',
+      content: [
+        { type: ContentTypes.TEXT, text: 'rendered chart' },
+        {
+          type: 'image_url',
+          image_url: {
+            url: `data:image/png;base64,${'A'.repeat(2_000)}`,
+          },
+          toJSON() {
+            toJSONCalls++;
+            return { expanded: 'B'.repeat(20_000) };
+          },
+        },
+      ],
+      artifact: { retained: true },
+    });
+
+    const original = [toolMessage];
+    const projected = projectOpenAIToolMessageContent(original, 200);
+    const projectedTool = projected[0] as ToolMessage;
+    const chatPayload = _convertMessagesToOpenAIParams(projected);
+    const responsesPayload = _convertMessagesToOpenAIResponsesParams(projected);
+
+    expect(projected).not.toBe(original);
+    expect(typeof projectedTool.content).toBe('string');
+    expect((projectedTool.content as string).length).toBeLessThanOrEqual(200);
+    expect(projectedTool.tool_call_id).toBe(toolMessage.tool_call_id);
+    expect(projectedTool.status).toBe(toolMessage.status);
+    expect(projectedTool.artifact).toBe(toolMessage.artifact);
+    expect(Array.isArray(toolMessage.content)).toBe(true);
+    expect(toJSONCalls).toBe(0);
+    expect(chatPayload[0]).toMatchObject({
+      role: 'tool',
+      content: projectedTool.content,
+      tool_call_id: toolMessage.tool_call_id,
+    });
+    expect(responsesPayload[0]).toMatchObject({
+      type: 'function_call_output',
+      output: projectedTool.content,
+      call_id: toolMessage.tool_call_id,
+    });
+  });
+
+  it('preserves Responses computer outputs handled as provider-native media', () => {
+    const computerOutput = new ToolMessage({
+      content: [
+        {
+          type: 'computer_screenshot',
+          image_url: 'data:image/png;base64,AA==',
+        },
+      ],
+      tool_call_id: 'call_computer',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const messages = [computerOutput];
+
+    expect(projectOpenAIToolMessageContent(messages, 10)).toBe(messages);
+    expect(_convertMessagesToOpenAIResponsesParams(messages)[0]).toMatchObject({
+      type: 'computer_call_output',
+      call_id: 'call_computer',
+      output: {
+        type: 'computer_screenshot',
+        image_url: 'data:image/png;base64,AA==',
+      },
+    });
   });
 
   it('keeps the mutating artifact formatter API backward compatible', () => {

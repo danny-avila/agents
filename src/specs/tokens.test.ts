@@ -1,8 +1,9 @@
-import { HumanMessage, ToolMessage } from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import {
   encodingForModel,
   createTokenCounter,
   getTokenCountForMessage,
+  hasUnsafeStructuredSerialization,
   TokenEncoderManager,
   estimateImageBlockTokens,
   estimateDocumentBlockTokens,
@@ -84,6 +85,254 @@ describe('createTokenCounter with different encodings', () => {
 });
 
 describe('getTokenCountForMessage', () => {
+  const messageWithToolArgs = (args: unknown): AIMessage =>
+    ({
+      content: '',
+      tool_calls: [{ id: 'adversarial-call', name: 'stress', args }],
+      getType: () => 'ai',
+    }) as unknown as AIMessage;
+
+  test('bounds direct message strings before tokenization and charges omitted characters', () => {
+    const callbackLengths: number[] = [];
+    const content = 'x'.repeat(300_000);
+
+    const count = getTokenCountForMessage(new HumanMessage(content), (text) => {
+      callbackLengths.push(text.length);
+      return text.length;
+    });
+
+    expect(Math.max(...callbackLengths)).toBe(200_000);
+    expect(count).toBe(600_003);
+  });
+
+  test('bounds direct string tool args before tokenization and charges omitted characters', () => {
+    const callbackLengths: number[] = [];
+    const args = 'x'.repeat(300_000);
+
+    const count = getTokenCountForMessage(messageWithToolArgs(args), (text) => {
+      callbackLengths.push(text.length);
+      return text.length;
+    });
+
+    expect(Math.max(...callbackLengths)).toBe(200_000);
+    expect(count).toBeGreaterThan(args.length);
+  });
+
+  test('keeps nested dense strings on the bounded structured path', () => {
+    const callbackLengths: number[] = [];
+    const payload = 'x'.repeat(4 * 1024 * 1024);
+
+    const count = getTokenCountForMessage(
+      messageWithToolArgs({ payload }),
+      (text) => {
+        callbackLengths.push(text.length);
+        return text.length;
+      }
+    );
+
+    expect(Math.max(...callbackLengths)).toBeLessThanOrEqual(200_000);
+    expect(count).toBeGreaterThan(payload.length);
+  });
+
+  test('fails closed when prototype traps throw', () => {
+    let prototypeCalls = 0;
+    const args = new Proxy(
+      { safe: true },
+      {
+        getPrototypeOf() {
+          prototypeCalls++;
+          throw new Error('prototype denied');
+        },
+      }
+    );
+
+    expect(hasUnsafeStructuredSerialization(args)).toBe(true);
+    expect(
+      getTokenCountForMessage(messageWithToolArgs(args), (text) => text.length)
+    ).toBe(Number.MAX_SAFE_INTEGER);
+    expect(prototypeCalls).toBeLessThanOrEqual(2);
+  });
+
+  test('fails closed without recursing through self-referential prototype proxies', () => {
+    let prototypeCalls = 0;
+    const args: Record<string, unknown> = new Proxy<Record<string, unknown>>(
+      {},
+      {
+        getPrototypeOf(): object | null {
+          prototypeCalls++;
+          return args;
+        },
+      }
+    );
+
+    expect(hasUnsafeStructuredSerialization(args)).toBe(true);
+    expect(
+      getTokenCountForMessage(messageWithToolArgs(args), (text) => text.length)
+    ).toBe(Number.MAX_SAFE_INTEGER);
+    expect(prototypeCalls).toBeLessThanOrEqual(2);
+  });
+
+  test('fails closed when descriptor and own-key proxy traps throw', () => {
+    const descriptorProxy = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error('descriptor denied');
+        },
+      }
+    );
+    const ownKeysProxy = new Proxy(
+      {},
+      {
+        ownKeys() {
+          throw new Error('keys denied');
+        },
+      }
+    );
+
+    for (const args of [descriptorProxy, ownKeysProxy]) {
+      expect(hasUnsafeStructuredSerialization(args)).toBe(true);
+      expect(
+        getTokenCountForMessage(
+          messageWithToolArgs(args),
+          (text) => text.length
+        )
+      ).toBe(Number.MAX_SAFE_INTEGER);
+    }
+  });
+
+  test('fails closed on get traps and revoked proxies without invoking them', () => {
+    let getCalls = 0;
+    const getProxy = new Proxy(
+      {},
+      {
+        get() {
+          getCalls++;
+          return { payload: 'x'.repeat(1_000_000) };
+        },
+      }
+    );
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    const inheritedProxy = Object.create(getProxy);
+
+    for (const args of [
+      getProxy,
+      { nested: getProxy },
+      inheritedProxy,
+      revoked.proxy,
+    ]) {
+      expect(hasUnsafeStructuredSerialization(args)).toBe(true);
+      expect(
+        getTokenCountForMessage(
+          messageWithToolArgs(args),
+          (text) => text.length
+        )
+      ).toBe(Number.MAX_SAFE_INTEGER);
+    }
+    expect(getCalls).toBe(0);
+  });
+
+  test('fails closed on proxied content blocks without invoking their traps', () => {
+    let getCalls = 0;
+    const contentBlock = new Proxy(
+      { type: 'text', text: 'safe' },
+      {
+        get() {
+          getCalls++;
+          throw new Error('content read denied');
+        },
+      }
+    );
+    const message = {
+      content: [contentBlock],
+      getType: () => 'tool',
+    } as unknown as ToolMessage;
+
+    expect(getTokenCountForMessage(message, (text) => text.length)).toBe(
+      Number.MAX_SAFE_INTEGER
+    );
+    expect(getCalls).toBe(0);
+  });
+
+  test('detects inherited accessors without invoking them', () => {
+    let accessorCalls = 0;
+    const prototype = {};
+    Object.defineProperty(prototype, 'danger', {
+      enumerable: true,
+      get() {
+        accessorCalls++;
+        return 'x'.repeat(1_000_000);
+      },
+    });
+    const args = Object.assign(Object.create(prototype), { safe: true });
+
+    expect(hasUnsafeStructuredSerialization(args)).toBe(true);
+    expect(
+      getTokenCountForMessage(messageWithToolArgs(args), (text) => text.length)
+    ).toBe(Number.MAX_SAFE_INTEGER);
+    expect(accessorCalls).toBe(0);
+  });
+
+  test('counts tool_calls-only names and arguments', () => {
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [
+        {
+          id: 'tool-call-only',
+          name: 'evaluate_script',
+          args: { code: 'x'.repeat(5_000) },
+        },
+      ],
+    });
+
+    const count = getTokenCountForMessage(message, (text) => text.length);
+
+    expect(count).toBeGreaterThan(5_000);
+  });
+
+  test('counts adversarial structured tool-call args without invoking toJSON', () => {
+    let toJSONCalls = 0;
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [
+        {
+          id: 'adversarial-tool-call',
+          name: 'evaluate_script',
+          args: {
+            query: 'safe',
+            toJSON() {
+              toJSONCalls++;
+              return { code: 'y'.repeat(2_000_000) };
+            },
+          },
+        },
+      ],
+    });
+
+    const count = getTokenCountForMessage(message, (text) => text.length);
+
+    expect(count).toBeGreaterThanOrEqual(Number.MAX_SAFE_INTEGER);
+    expect(toJSONCalls).toBe(0);
+  });
+
+  test('retains conservative pressure when structured args exceed the preview', () => {
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [
+        {
+          id: 'large-structured-tool-call',
+          name: 'evaluate_script',
+          args: { code: 'x'.repeat(300_000) },
+        },
+      ],
+    });
+
+    const count = getTokenCountForMessage(message, (text) => text.length);
+
+    expect(count).toBeGreaterThan(300_000);
+  });
+
   test('counts opaque structured tool-result blocks as serialized content', () => {
     const message = new ToolMessage({
       content: [
@@ -118,6 +367,114 @@ describe('getTokenCountForMessage', () => {
 
     expect(count).toBeGreaterThan(5_000);
   });
+
+  test('prices Google image media blocks with the image estimator', () => {
+    const message = new ToolMessage({
+      content: [
+        {
+          type: 'media',
+          mimeType: 'image/png',
+          data: pngDataUri(1024, 768),
+        },
+      ],
+      tool_call_id: 'google-image-media',
+    });
+
+    const count = getTokenCountForMessage(
+      message,
+      (text) => text.length,
+      'o200k_base'
+    );
+
+    // 3 message tokens + ceil((85 + 4 * 170) * 1.05)
+    expect(count).toBe(807);
+  });
+
+  test('prices Google PDF media blocks per estimated page', () => {
+    const message = new ToolMessage({
+      content: [
+        {
+          type: 'media',
+          mime_type: 'application/pdf',
+          data: 'A'.repeat(150_000),
+        },
+      ],
+      tool_call_id: 'google-pdf-media',
+    });
+
+    const count = getTokenCountForMessage(
+      message,
+      (text) => text.length,
+      'o200k_base'
+    );
+
+    // 3 message tokens + ceil((2 pages * 1500) * 1.05)
+    expect(count).toBe(3153);
+  });
+
+  test('continues pricing Google audio and video media as timed content', () => {
+    const audio = new ToolMessage({
+      content: [
+        {
+          type: 'media',
+          mime_type: '  Audio/MP3 ; codecs=mp3 ',
+          data: 'A'.repeat(320_000),
+        },
+      ],
+      tool_call_id: 'google-audio-media',
+    });
+    const video = new ToolMessage({
+      content: [
+        {
+          type: 'media',
+          mimeType: 'video/mp4',
+          data: 'A'.repeat(1_000_000),
+        },
+      ],
+      tool_call_id: 'google-video-media',
+    });
+
+    expect(
+      getTokenCountForMessage(audio, (text) => text.length, 'o200k_base')
+    ).toBe(507);
+    expect(
+      getTokenCountForMessage(video, (text) => text.length, 'o200k_base')
+    ).toBe(948);
+  });
+
+  test.each([
+    ['mimeType', 'text/plain'],
+    ['mime_type', 'application/json'],
+  ])(
+    'conservatively prices unknown Google media MIME via %s',
+    (mimeKey, mimeType) => {
+      let toJSONCalls = 0;
+      const data = 'A'.repeat(100_000);
+      const message = new ToolMessage({
+        content: [
+          {
+            type: 'media',
+            [mimeKey]: mimeType,
+            data,
+            toJSON() {
+              toJSONCalls++;
+              return { expanded: 'x'.repeat(1_000_000) };
+            },
+          },
+        ],
+        tool_call_id: 'google-unknown-media',
+      });
+
+      const count = getTokenCountForMessage(
+        message,
+        (text) => text.length,
+        'o200k_base'
+      );
+
+      expect(count).toBeGreaterThan(data.length);
+      expect(toJSONCalls).toBe(0);
+    }
+  );
 });
 
 describe('estimateImageBlockTokens', () => {

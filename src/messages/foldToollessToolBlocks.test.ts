@@ -6,7 +6,11 @@ import {
   ToolMessage,
 } from '@langchain/core/messages';
 import type { ExtendedMessageContent } from '@/types';
-import { foldToolBlocksForToollessAgent } from './format';
+import {
+  foldToolBlocksForToollessAgent,
+  isSyntheticProviderContextMessage,
+} from './format';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 
 /** Concatenated text across a message's content (string or structured array). */
 function getTextContent(msg: {
@@ -96,6 +100,12 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(folded).toContain('file_search');
     expect(folded).toContain('roadmap');
     expect(folded).toContain('Found roadmap.md');
+    expect(isSyntheticProviderContextMessage(result[1])).toBe(true);
+    expect(
+      isSyntheticProviderContextMessage(
+        new HumanMessage('[Previous tool interaction] user-authored text')
+      )
+    ).toBe(false);
   });
 
   test('folds historical tool content that precedes the last human turn (the reported bug)', () => {
@@ -459,6 +469,115 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(foldedText).toContain('report.bin');
     expect(foldedText.length).toBeLessThan(9_000);
     expect(foldedText).not.toContain(blob);
+  });
+
+  test('does not invoke toJSON while folding a small non-portable media block', () => {
+    let toJSONCalls = 0;
+    const resource = {
+      type: 'resource',
+      resource: { uri: 'file:///report.bin', blob: 'AAAA' },
+      toJSON() {
+        toJSONCalls++;
+        return { expanded: 'x'.repeat(100_000) };
+      },
+    };
+    const messages = [
+      new HumanMessage('Read the report'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'doc', name: 'read_document', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: [resource],
+        tool_call_id: 'doc',
+        name: 'read_document',
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+    const foldedText = getTextContent(result[result.length - 1]);
+
+    expect(toJSONCalls).toBe(0);
+    expect(foldedText).toContain('report.bin');
+    expect(foldedText.length).toBeLessThan(9_000);
+    expect(foldedText).not.toContain('x'.repeat(1_000));
+  });
+
+  test('bounds the aggregate folded context across many large text blocks', () => {
+    const messages = [
+      new HumanMessage('Summarize the query'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'query', name: 'run_query', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: Array.from({ length: 100 }, (_, index) => ({
+          type: 'text',
+          text: `${index}:${'x'.repeat(8_000)}`,
+        })),
+        tool_call_id: 'query',
+        name: 'run_query',
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+    const foldedText = getTextContent(result[result.length - 1]);
+
+    expect(foldedText.length).toBeLessThanOrEqual(HARD_MAX_TOOL_RESULT_CHARS);
+    expect(foldedText).toContain('additional folded context omitted');
+  });
+
+  test('does not emit an empty user message when an earlier fold exhausts the shared budget', () => {
+    const messages = [
+      new HumanMessage('Run both queries'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'first', name: 'run_query', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: Array.from({ length: 60 }, () => ({
+          type: 'text',
+          text: 'x'.repeat(8_000),
+        })),
+        tool_call_id: 'first',
+        name: 'run_query',
+      }),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'second', name: 'run_query', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'second result',
+        tool_call_id: 'second',
+        name: 'run_query',
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+    const syntheticMessages = result.filter(isSyntheticProviderContextMessage);
+
+    expect(hasResidualToolContent(result)).toBe(false);
+    expect(syntheticMessages).toHaveLength(1);
+    expect(getTextContent(syntheticMessages[0])).toContain(
+      'additional folded context omitted'
+    );
+    expect(
+      result
+        .filter((message) => message instanceof HumanMessage)
+        .every((message) =>
+          typeof message.content === 'string'
+            ? message.content.length > 0
+            : message.content.length > 0
+        )
+    ).toBe(true);
   });
 
   test('leaves non-tool conversations untouched', () => {

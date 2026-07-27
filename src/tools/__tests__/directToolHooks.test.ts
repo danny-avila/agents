@@ -169,6 +169,39 @@ describe('Direct-path lifecycle hooks (in-process tools)', () => {
     expect(message.content).toBe('[{"rowsRead":"42","status":"complete"}]');
   });
 
+  it('bounds a large structured result without invoking toJSON', async () => {
+    let toJSONCalls = 0;
+    const structuredOutput = {
+      rows: [{ value: 'x'.repeat(20_000) }],
+      toJSON() {
+        toJSONCalls++;
+        return 'y'.repeat(100_000);
+      },
+    };
+    const query = createDirectTool('large_query', () => 'unused');
+    (
+      query as unknown as {
+        invoke: () => Promise<typeof structuredOutput>;
+      }
+    ).invoke = async () => structuredOutput;
+    const node = new ToolNode({
+      tools: [query],
+      eventDrivenMode: true,
+      directToolNames: new Set(['large_query']),
+      maxToolResultChars: 200,
+    });
+
+    const result = await node.invoke({
+      messages: [aiCall('call_large', 'large_query', {})],
+    });
+    const [message] = toolMessages(result);
+
+    expect(toJSONCalls).toBe(0);
+    expect(typeof message.content).toBe('string');
+    expect((message.content as string).length).toBeLessThanOrEqual(200);
+    expect(message.content).toContain('truncated');
+  });
+
   it('caps returned and thrown direct-tool errors before storing them', async () => {
     const returnedError = createDirectTool(
       'returned_error',

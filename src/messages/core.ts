@@ -11,7 +11,9 @@ import type * as t from '@/types';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
+  serializeStructuredValueBounded,
 } from '@/utils/toolContent';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { ContentTypes, Providers } from '@/common';
 import { toLangChainContent } from './langchain';
 
@@ -473,9 +475,75 @@ function stringifyToolMessageContent(
   return content == null ? '' : String(content);
 }
 
+function appendContentBlocks(
+  target: t.MessageContentComplex[],
+  content: BaseMessage['content']
+): void {
+  if (typeof content === 'string') {
+    target.push({ type: ContentTypes.TEXT, text: content });
+    return;
+  }
+  for (const block of content) {
+    target.push(block as t.MessageContentComplex);
+  }
+}
+
+/**
+ * Appends one artifact/tool-content segment without retaining an unbounded
+ * intermediate block array. Both operands are compacted before they are
+ * combined, and the combined result is compacted again under the aggregate
+ * cap.
+ */
+function appendBoundedContent(
+  current: BaseMessage['content'] | undefined,
+  next: unknown,
+  maxChars: number
+): BaseMessage['content'] {
+  const boundedNext = compactToolContent(next, maxChars).content;
+  if (current == null) {
+    return boundedNext;
+  }
+
+  const combined: t.MessageContentComplex[] = [];
+  appendContentBlocks(combined, current);
+  appendContentBlocks(combined, boundedNext);
+  return compactToolContent(toLangChainContent(combined), maxChars).content;
+}
+
+/**
+ * OpenAI Chat tool messages only accept strings or text-only parts, while the
+ * Responses API serializes any structured ToolMessage after graph accounting.
+ * Project every non-string tool result to one bounded string before the final
+ * provider payload is measured so both APIs receive the exact representation
+ * the budget guard counted. Native Responses computer screenshots stay
+ * structured because their dedicated converter sends the media block directly.
+ */
+export function projectOpenAIToolMessageContent(
+  messages: BaseMessage[],
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+): BaseMessage[] {
+  let projected: BaseMessage[] | undefined;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (
+      !(message instanceof ToolMessage) ||
+      typeof message.content === 'string' ||
+      message.additional_kwargs.type === 'computer_call_output'
+    ) {
+      continue;
+    }
+    projected ??= [...messages];
+    projected[i] = cloneToolMessageWithContent(
+      message,
+      serializeStructuredValueBounded(message.content, maxChars).content
+    );
+  }
+  return projected ?? messages;
+}
+
 export function projectAnthropicArtifactContent(
   messages: BaseMessage[],
-  maxChars = Number.MAX_SAFE_INTEGER
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
 ): BaseMessage[] {
   const lastMessage = messages[messages.length - 1];
   if (!(lastMessage instanceof ToolMessage)) return messages;
@@ -515,14 +583,6 @@ export function projectAnthropicArtifactContent(
         (Array.isArray(msg.artifact?.content) &&
           msg.artifact.content.length > 0))
     ) {
-      const base = Array.isArray(msg.content)
-        ? msg.content
-        : [
-          {
-            type: ContentTypes.TEXT,
-            text: stringifyToolMessageContent(msg.content),
-          },
-        ];
       const artifactContent =
         typeof msg.artifact.content === 'string'
           ? [
@@ -532,10 +592,14 @@ export function projectAnthropicArtifactContent(
             },
           ]
           : msg.artifact.content;
-      const content = compactToolContent(
-        base.concat(artifactContent),
+      const baseContent = Array.isArray(msg.content)
+        ? msg.content
+        : stringifyToolMessageContent(msg.content);
+      const content = appendBoundedContent(
+        compactToolContent(baseContent, maxChars).content,
+        artifactContent,
         maxChars
-      ).content;
+      );
       formattedMessages ??= [...messages];
       formattedMessages[j] = cloneToolMessageWithContent(msg, content, {
         ...msg.artifact,
@@ -568,7 +632,7 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
 
 export function projectArtifactPayload(
   messages: BaseMessage[],
-  maxChars = Number.MAX_SAFE_INTEGER
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
 ): BaseMessage[] {
   const lastMessageY = messages[messages.length - 1];
   if (!(lastMessageY instanceof ToolMessage)) return messages;
@@ -586,7 +650,7 @@ export function projectArtifactPayload(
   if (latestAIParentIndex === -1) return messages;
 
   // Single pass: collect relevant tool messages with artifacts and aggregate
-  const aggregatedContent: t.MessageContentComplex[] = [];
+  let aggregatedContent: BaseMessage['content'] | undefined;
   let formattedMessages: BaseMessage[] | undefined;
 
   for (let i = latestAIParentIndex + 1; i < messages.length; i++) {
@@ -602,11 +666,11 @@ export function projectArtifactPayload(
     ) {
       continue;
     }
-    let currentContent = msg.content;
-    if (!Array.isArray(currentContent)) {
-      currentContent = [{ type: 'text', text: msg.content }];
-    }
-    aggregatedContent.push(...(currentContent as t.MessageContentComplex[]));
+    aggregatedContent = appendBoundedContent(
+      aggregatedContent,
+      msg.content,
+      maxChars
+    );
     formattedMessages ??= [...messages];
     formattedMessages[i] = cloneToolMessageWithContent(
       msg,
@@ -616,22 +680,15 @@ export function projectArtifactPayload(
         content: [],
       }
     );
-    if (typeof msg.artifact.content === 'string') {
-      aggregatedContent.push({
-        type: ContentTypes.TEXT,
-        text: msg.artifact.content,
-      });
-    } else {
-      aggregatedContent.push(...msg.artifact.content);
-    }
-  }
-
-  if (aggregatedContent.length > 0) {
-    const compacted = compactToolContent(
-      toLangChainContent(aggregatedContent),
+    aggregatedContent = appendBoundedContent(
+      aggregatedContent,
+      msg.artifact.content,
       maxChars
     );
-    formattedMessages?.push(new HumanMessage({ content: compacted.content }));
+  }
+
+  if (aggregatedContent != null) {
+    formattedMessages?.push(new HumanMessage({ content: aggregatedContent }));
   }
   return formattedMessages ?? messages;
 }

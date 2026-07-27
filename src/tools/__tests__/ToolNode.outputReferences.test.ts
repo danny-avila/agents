@@ -412,6 +412,67 @@ describe('ToolNode tool output references', () => {
       ).toBe(raw);
     });
 
+    it('preserves structured output exactly up to the registry limit', async () => {
+      const structured = {
+        rows: Array.from({ length: 10 }, (_, index) => ({
+          id: index,
+          value: `row-${index}-${'x'.repeat(100)}`,
+        })),
+      };
+      const exact = JSON.stringify(structured);
+      const capturedArgs: string[] = [];
+      let callCount = 0;
+      const structuredTool = createEchoTool({
+        capturedArgs: [],
+        outputs: ['unused'],
+        name: 'structured',
+      });
+      (
+        structuredTool as unknown as {
+          invoke: (input: {
+            args: { command: string };
+          }) => Promise<typeof structured | string>;
+        }
+      ).invoke = async (input) => {
+        capturedArgs.push(input.args.command);
+        return callCount++ === 0 ? structured : 'done';
+      };
+      const node = new ToolNode({
+        tools: [structuredTool],
+        maxToolResultChars: 100,
+        toolOutputReferences: {
+          enabled: true,
+          maxOutputSize: exact.length,
+        },
+      });
+
+      const [first] = await invokeBatch(
+        node,
+        [{ id: 'c1', name: 'structured', command: 'first' }],
+        'structured-raw-preservation'
+      );
+      await invokeBatch(
+        node,
+        [
+          {
+            id: 'c2',
+            name: 'structured',
+            command: '{{tool0turn0}}',
+          },
+        ],
+        'structured-raw-preservation'
+      );
+
+      expect((first.content as string).length).toBeLessThanOrEqual(100);
+      expect(first.content).toContain('truncated');
+      expect(capturedArgs[1]).toBe(exact);
+      expect(
+        node
+          ._unsafeGetToolOutputRegistry()!
+          .get('structured-raw-preservation', 'tool0turn0')
+      ).toBe(exact);
+    });
+
     it('uses each batch\'s own turn when ToolNode is invoked concurrently within a run', async () => {
       const gates: Record<string, () => void> = {};
       const slowTool = tool(

@@ -22,7 +22,7 @@ import {
   compactToolContent,
   getToolContentCharLength,
   isAtomicToolContentBlock,
-  serializeToolContent,
+  serializeToolContentBounded,
 } from '@/utils/toolContent';
 import { resolveContextPruningSettings } from './contextPruningSettings';
 
@@ -173,7 +173,15 @@ export function applyContextPruning(params: {
       if (contentLength > settings.softTrim.maxChars) {
         const cloned = cloneToolMessageWithContent(
           message as ToolMessage,
-          softTrimContent(serializeToolContent(content), settings.softTrim)
+          softTrimContent(
+            typeof content === 'string'
+              ? content
+              : serializeToolContentBounded(
+                content,
+                settings.softTrim.maxChars
+              ),
+            settings.softTrim
+          )
         );
         messages[i] = cloned;
         indexTokenCountMap[i] = tokenCounter(cloned);

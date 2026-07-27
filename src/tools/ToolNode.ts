@@ -39,15 +39,16 @@ import type {
 } from '@/hooks';
 import type * as t from '@/types';
 import {
+  cloneToolMessageWithContent,
+  compactToolContent,
+  serializeStructuredValueBounded,
+  serializeToolContentBounded,
+} from '@/utils/toolContent';
+import {
   buildToolExecutionRequestPlan,
   resolveRuntimeSessionHint,
   recordArgsEqual,
 } from '@/tools/eagerEventExecution';
-import {
-  cloneToolMessageWithContent,
-  compactToolContent,
-  serializeStructuredValue,
-} from '@/utils/toolContent';
 import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
@@ -123,6 +124,40 @@ type RunToolBatchContext<T = unknown> = {
    */
   runInput?: T;
 };
+
+type BoundedToolOutput = {
+  content: string;
+  registryContent: string;
+};
+
+/**
+ * Produces the provider preview and, when requested, the exact registry prefix
+ * in one bounded traversal. String outputs already exist in memory when a tool
+ * returns them; structured outputs must never be fully JSON-materialized before
+ * either limit applies.
+ */
+function serializeToolOutputWithinLimits(
+  output: unknown,
+  maxToolResultChars: number,
+  registryPrefixChars = 0
+): BoundedToolOutput {
+  if (typeof output === 'string') {
+    return {
+      content: truncateToolResultContent(output, maxToolResultChars),
+      registryContent: registryPrefixChars > 0 ? output : '',
+    };
+  }
+
+  const serialized = serializeStructuredValueBounded(
+    output,
+    maxToolResultChars,
+    registryPrefixChars
+  );
+  return {
+    content: serialized.content,
+    registryContent: serialized.prefix,
+  };
+}
 
 const TOOL_NODE_RUN_NAME = 'tool_batch';
 const NANOID_URL_ALPHABET =
@@ -1184,22 +1219,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
         return toolMsg;
       }
-      const rawContent =
-        typeof output === 'string' ? output : serializeStructuredValue(output);
-      const truncated = truncateToolResultContent(
-        rawContent,
-        this.maxToolResultChars
+      const serialized = serializeToolOutputWithinLimits(
+        output,
+        this.maxToolResultChars,
+        this.toolOutputRegistry != null && refKey != null
+          ? this.toolOutputRegistry.perOutputLimit
+          : 0
       );
       const refMeta = this.recordOutputReference(
         runId,
-        stripCodeSessionFileSummary(rawContent),
+        stripCodeSessionFileSummary(serialized.registryContent),
         refKey,
         unresolvedRefs
       );
       return new ToolMessage({
         status: 'success',
         name: tool.name,
-        content: truncated,
+        content: serialized.content,
         tool_call_id: call.id!,
         ...(refMeta != null && {
           additional_kwargs: refMeta as Record<string, unknown>,
@@ -1641,7 +1677,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           error:
             typeof output.content === 'string'
               ? output.content
-              : serializeStructuredValue(output.content),
+              : serializeStructuredValueBounded(
+                output.content,
+                this.maxToolResultChars
+              ).content,
           stepId,
           turn,
         },
@@ -1693,10 +1732,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       if (postResult?.updatedOutput != null) {
-        const replaced =
-          typeof postResult.updatedOutput === 'string'
-            ? postResult.updatedOutput
-            : serializeStructuredValue(postResult.updatedOutput);
         // Keep the tool-output registry in sync with what the model
         // actually sees. Without this, `runTool` already registered
         // the PRE-hook content under `_refKey`, and a later
@@ -1711,13 +1746,21 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           | undefined;
         const refKey = refMeta?._refKey;
         const refScope = refMeta?._refScope;
-        if (this.toolOutputRegistry != null && refKey != null) {
-          this.toolOutputRegistry.set(refScope, refKey, replaced);
-        }
-        return cloneToolMessageWithContent(
-          output,
-          compactToolContent(replaced, this.maxToolResultChars).content
+        const replaced = serializeToolOutputWithinLimits(
+          postResult.updatedOutput,
+          this.maxToolResultChars,
+          this.toolOutputRegistry != null && refKey != null
+            ? this.toolOutputRegistry.perOutputLimit
+            : 0
         );
+        if (this.toolOutputRegistry != null && refKey != null) {
+          this.toolOutputRegistry.set(
+            refScope,
+            refKey,
+            replaced.registryContent
+          );
+        }
+        return cloneToolMessageWithContent(output, replaced.content);
       }
     }
 
@@ -2003,7 +2046,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const contentString =
         typeof toolMessage.content === 'string'
           ? toolMessage.content
-          : serializeStructuredValue(toolMessage.content);
+          : serializeStructuredValueBounded(
+            toolMessage.content,
+            this.maxToolResultChars
+          ).content;
 
       /**
        * Prefer the post-substitution args when a `{{…}}` placeholder
@@ -2013,10 +2059,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        */
       const effectiveArgs = resolvedArgsByCallId?.get(toolCallId) ?? call.args;
       const tool_call: t.ProcessedToolCall = {
-        args:
-          typeof effectiveArgs === 'string'
-            ? (effectiveArgs as string)
-            : JSON.stringify((effectiveArgs as unknown) ?? {}),
+        args: serializeToolContentBounded(
+          (effectiveArgs as unknown) ?? {},
+          this.maxToolResultChars
+        ),
         name: call.name,
         id: toolCallId,
         output: contentString,
@@ -2959,14 +3005,22 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             }
           }
         } else {
-          let registryRaw =
-            typeof result.content === 'string'
-              ? result.content
-              : serializeStructuredValue(result.content);
-          contentString = truncateToolResultContent(
-            registryRaw,
-            this.maxToolResultChars
+          const batchIndex = batchIndexByCallId.get(result.toolCallId);
+          const refKey =
+            this.toolOutputRegistry != null &&
+            batchIndex != null &&
+            turn != null
+              ? buildReferenceKey(batchIndex, turn)
+              : undefined;
+          let serialized = serializeToolOutputWithinLimits(
+            result.content,
+            this.maxToolResultChars,
+            this.toolOutputRegistry != null && refKey != null
+              ? this.toolOutputRegistry.perOutputLimit
+              : 0
           );
+          let registryRaw = serialized.registryContent;
+          contentString = serialized.content;
 
           if (hasPostHook) {
             const hookResult = await executeHooks({
@@ -2993,15 +3047,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               }
             }
             if (hookResult?.updatedOutput != null) {
-              const replaced =
-                typeof hookResult.updatedOutput === 'string'
-                  ? hookResult.updatedOutput
-                  : serializeStructuredValue(hookResult.updatedOutput);
-              registryRaw = replaced;
-              contentString = truncateToolResultContent(
-                replaced,
-                this.maxToolResultChars
+              serialized = serializeToolOutputWithinLimits(
+                hookResult.updatedOutput,
+                this.maxToolResultChars,
+                this.toolOutputRegistry != null && refKey != null
+                  ? this.toolOutputRegistry.perOutputLimit
+                  : 0
               );
+              registryRaw = serialized.registryContent;
+              contentString = serialized.content;
               finalToolOutput = hookResult.updatedOutput;
               /**
                * The hook ACTUALLY rewrote this output: any completion the
@@ -3015,14 +3069,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             }
           }
 
-          const batchIndex = batchIndexByCallId.get(result.toolCallId);
           const unresolved = unresolvedByCallId.get(result.toolCallId) ?? [];
-          const refKey =
-            this.toolOutputRegistry != null &&
-            batchIndex != null &&
-            turn != null
-              ? buildReferenceKey(batchIndex, turn)
-              : undefined;
           const successRefMeta = this.recordOutputReference(
             registryRunId,
             stripCodeSessionFileSummary(registryRaw),
@@ -3313,7 +3360,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           index: turn ?? this.toolUsageCount.get(toolName) ?? 0,
           type: 'tool_call' as const,
           tool_call: {
-            args: JSON.stringify(args),
+            args: serializeToolContentBounded(args, this.maxToolResultChars),
             name: toolName,
             id: toolCallId,
             output,
@@ -3344,12 +3391,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
           this.maxToolResultChars
         )
-        : truncateToolResultContent(
-          typeof result.content === 'string'
-            ? result.content
-            : serializeStructuredValue(result.content),
+        : serializeToolOutputWithinLimits(
+          result.content,
           this.maxToolResultChars
-        );
+        ).content;
     return this.dispatchStepCompleted(
       result.toolCallId,
       request.name,

@@ -20,7 +20,10 @@ import {
   sanitizeOrphanToolBlocks,
   enforceOriginalContentCap,
   ORIGINAL_CONTENT_MAX_CHARS,
+  calculateMaxToolCallInputChars,
   createPruneMessages,
+  projectToolCallInputs,
+  serializeToolCallInput,
 } from '@/messages/prune';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { ensureThinkingBlockInMessages } from '@/messages/format';
@@ -1183,6 +1186,296 @@ describe('Prune Messages Tests', () => {
     });
   });
 
+  describe('projectToolCallInputs', () => {
+    it('uses the shared 15%-of-context cap with a 200K ceiling', () => {
+      expect(calculateMaxToolCallInputChars()).toBe(200_000);
+      expect(calculateMaxToolCallInputChars(0)).toBe(200_000);
+      expect(calculateMaxToolCallInputChars(1_000)).toBe(600);
+      expect(calculateMaxToolCallInputChars(1_000_000)).toBe(200_000);
+      expect(serializeToolCallInput(undefined, 4)).toBe('null');
+    });
+
+    it('returns the original array when every input is already safe and bounded', () => {
+      const messages: BaseMessage[] = [
+        new HumanMessage('Run it'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'safe-call', name: 'lookup', args: { query: 'safe' } },
+          ],
+        }),
+      ];
+
+      const projected = projectToolCallInputs(messages, 1_000);
+
+      expect(projected).toBe(messages);
+      expect(projected[1]).toBe(messages[1]);
+    });
+
+    it('copy-on-write projects inline input and tool_calls args on AIMessageChunk', () => {
+      let toJSONCalls = 0;
+      const chunk = new AIMessageChunk({
+        content: [
+          { type: 'text', text: 'Running.' },
+          {
+            type: 'tool_use',
+            id: 'chunk-call',
+            name: 'evaluate_script',
+            input: { code: 'x'.repeat(2_000) },
+          },
+        ],
+        id: 'chunk-id',
+        additional_kwargs: { marker: 'keep' },
+        response_metadata: { model: 'chunk-model' },
+        tool_calls: [
+          {
+            id: 'chunk-call',
+            name: 'evaluate_script',
+            args: {
+              query: 'safe',
+              toJSON() {
+                toJSONCalls++;
+                return { code: 'y'.repeat(2_000_000) };
+              },
+            },
+          },
+        ],
+      });
+      chunk.tool_call_chunks = [
+        {
+          id: 'chunk-call',
+          index: 0,
+          name: 'evaluate_script',
+          args: '',
+          type: 'tool_call_chunk',
+        },
+      ];
+      const messages: BaseMessage[] = [chunk];
+
+      const projected = projectToolCallInputs(messages, 200);
+
+      expect(projected).not.toBe(messages);
+      expect(projected[0]).not.toBe(chunk);
+      expect(projected[0]).toBeInstanceOf(AIMessageChunk);
+      expect(toJSONCalls).toBe(0);
+      const projectedChunk = projected[0] as AIMessageChunk;
+      expect(projectedChunk.id).toBe('chunk-id');
+      expect(projectedChunk.additional_kwargs).toEqual({ marker: 'keep' });
+      expect(projectedChunk.response_metadata).toEqual({
+        model: 'chunk-model',
+      });
+      expect(projectedChunk.tool_call_chunks).toEqual(chunk.tool_call_chunks);
+      const inlineToolUse = (
+        projectedChunk.content as Array<Record<string, unknown>>
+      ).find((block) => block.type === 'tool_use');
+      expect(inlineToolUse?.input).toMatchObject({
+        _truncated: expect.stringContaining('truncated'),
+        _originalChars: expect.any(Number),
+      });
+      expect(projectedChunk.tool_calls?.[0].args).toEqual({ query: 'safe' });
+      expect(
+        (
+          (chunk.content as Array<Record<string, unknown>>)[1].input as {
+            code: string;
+          }
+        ).code
+      ).toHaveLength(2_000);
+    });
+
+    it('normalizes cyclic and bigint args into provider-safe JSON values', () => {
+      const cyclic: Record<string, unknown> = { query: 'safe' };
+      cyclic.self = cyclic;
+      const messages: BaseMessage[] = [
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'non-json-call',
+              name: 'lookup',
+              args: { cyclic, count: 7n },
+            },
+          ],
+        }),
+      ];
+
+      const projected = projectToolCallInputs(messages, 1_000);
+
+      expect(projected).not.toBe(messages);
+      const args = (projected[0] as AIMessage).tool_calls?.[0].args as {
+        cyclic: { self: string };
+        count: string;
+      };
+      expect(args.cyclic.self).toBe('[Circular]');
+      expect(args.count).toBe('7');
+      expect(() => JSON.stringify(args)).not.toThrow();
+    });
+
+    it('projects every provider-consumed tool-call representation to the same bounded wire args', () => {
+      let getterCalls = 0;
+      let toJSONCalls = 0;
+      const adversarialArgs: Record<string, unknown> = {
+        query: 'safe',
+        payload: 'x'.repeat(2_000),
+      };
+      Object.defineProperty(adversarialArgs, 'expanded', {
+        enumerable: true,
+        get() {
+          getterCalls++;
+          return 'y'.repeat(2_000_000);
+        },
+      });
+      adversarialArgs.self = adversarialArgs;
+      adversarialArgs.toJSON = (): Record<string, string> => {
+        toJSONCalls++;
+        return { payload: 'z'.repeat(2_000_000) };
+      };
+
+      const message = new AIMessageChunk({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'inline-use',
+            name: 'evaluate',
+            input: { code: 'i'.repeat(2_000) },
+          },
+          {
+            type: 'tool_call',
+            id: 'inline-call',
+            name: 'evaluate',
+            args: { code: 'a'.repeat(2_000) },
+            tool_call: {
+              type: 'tool_call',
+              id: 'nested-call',
+              name: 'evaluate',
+              args: { code: 'n'.repeat(2_000) },
+            },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'shared-call',
+            name: 'evaluate',
+            args: adversarialArgs,
+          },
+        ],
+        additional_kwargs: {
+          tool_calls: [
+            {
+              id: 'shared-call',
+              type: 'function',
+              function: {
+                name: 'evaluate',
+                arguments: `{"code":"${'r'.repeat(2_000)}"}`,
+              },
+            },
+            {
+              id: 'raw-only',
+              type: 'function',
+              function: {
+                name: 'evaluate',
+                arguments: `{"code":"${'o'.repeat(2_000)}"}`,
+              },
+            },
+          ],
+        },
+        response_metadata: {
+          output: [
+            {
+              type: 'function_call',
+              id: 'fc_shared',
+              call_id: 'shared-call',
+              name: 'evaluate',
+              arguments: `{"code":"${'w'.repeat(2_000)}"}`,
+            },
+            {
+              type: 'function_call',
+              id: 'fc_raw',
+              call_id: 'response-only',
+              name: 'evaluate',
+              arguments: `{"code":"${'q'.repeat(2_000)}"}`,
+            },
+          ],
+        },
+      });
+      Object.defineProperty(message, 'projectionMarker', {
+        configurable: false,
+        enumerable: false,
+        value: 'preserved',
+        writable: false,
+      });
+      const messages: BaseMessage[] = [message];
+
+      const projected = projectToolCallInputs(messages, 200);
+
+      expect(projected).not.toBe(messages);
+      expect(projected[0]).toBeInstanceOf(AIMessageChunk);
+      expect(getterCalls).toBe(0);
+      expect(toJSONCalls).toBe(0);
+      expect(
+        Object.getOwnPropertyDescriptor(projected[0], 'projectionMarker')
+      ).toEqual(Object.getOwnPropertyDescriptor(message, 'projectionMarker'));
+
+      const projectedMessage = projected[0] as AIMessageChunk;
+      const content = projectedMessage.content as Array<
+        Record<string, unknown>
+      >;
+      const inlineUse = content[0];
+      const inlineCall = content[1];
+      const nestedCall = inlineCall.tool_call as Record<string, unknown>;
+      for (const input of [
+        inlineUse.input,
+        inlineCall.args,
+        nestedCall.args,
+        projectedMessage.tool_calls?.[0].args,
+      ]) {
+        const serialized = serializeToolCallInput(input, 200);
+        expect(serialized.length).toBeLessThanOrEqual(200);
+        expect(() => JSON.parse(serialized)).not.toThrow();
+      }
+
+      const canonicalArguments = serializeToolCallInput(
+        projectedMessage.tool_calls?.[0].args,
+        200
+      );
+      const rawToolCalls = projectedMessage.additional_kwargs
+        .tool_calls as Array<{
+        id: string;
+        function: { arguments: string };
+      }>;
+      expect(rawToolCalls[0].function.arguments).toBe(canonicalArguments);
+      expect(rawToolCalls[1].function.arguments.length).toBeLessThanOrEqual(
+        200
+      );
+      expect(() =>
+        JSON.parse(rawToolCalls[1].function.arguments)
+      ).not.toThrow();
+
+      const responseOutput = projectedMessage.response_metadata
+        .output as Array<{
+        call_id: string;
+        arguments: string;
+      }>;
+      expect(responseOutput[0].arguments).toBe(canonicalArguments);
+      expect(responseOutput[1].arguments.length).toBeLessThanOrEqual(200);
+      expect(() => JSON.parse(responseOutput[1].arguments)).not.toThrow();
+
+      expect(
+        (
+          message.additional_kwargs.tool_calls as Array<{
+            function: { arguments: string };
+          }>
+        )[0].function.arguments.length
+      ).toBeGreaterThan(2_000);
+      expect(
+        (
+          message.response_metadata.output as Array<{
+            arguments: string;
+          }>
+        )[0].arguments.length
+      ).toBeGreaterThan(2_000);
+    });
+  });
+
   describe('preFlightTruncateToolCallInputs', () => {
     it('should truncate oversized tool_use input fields in AI messages', () => {
       const tokenCounter = createTestTokenCounter();
@@ -1248,6 +1541,88 @@ describe('Prune Messages Tests', () => {
       expect(aiMsg.tool_calls).toBeDefined();
       const tc = aiMsg.tool_calls![0];
       expect(tc.args).toHaveProperty('_truncated');
+    });
+
+    it('truncates tool_calls-only args and preserves AI message metadata', () => {
+      let recounts = 0;
+      const tokenCounter: t.TokenCounter = () => {
+        recounts++;
+        return 17;
+      };
+      const messages: BaseMessage[] = [
+        new AIMessage({
+          content: '',
+          id: 'ai-tool-call-only',
+          name: 'assistant',
+          additional_kwargs: { trace_marker: 'keep' },
+          response_metadata: { model: 'test-model' },
+          tool_calls: [
+            {
+              id: 'tool-exec',
+              name: 'evaluate_script',
+              args: { code: 'x'.repeat(5_000) },
+            },
+          ],
+        }),
+      ];
+      const indexTokenCountMap: Record<string, number | undefined> = { 0: 1 };
+
+      const truncated = preFlightTruncateToolCallInputs({
+        messages,
+        maxContextTokens: 1_000,
+        indexTokenCountMap,
+        tokenCounter,
+      });
+
+      expect(truncated).toBe(1);
+      expect(recounts).toBe(1);
+      expect(indexTokenCountMap[0]).toBe(17);
+      const projected = messages[0] as AIMessage;
+      expect(projected.content).toBe('');
+      expect(projected.id).toBe('ai-tool-call-only');
+      expect(projected.name).toBe('assistant');
+      expect(projected.additional_kwargs).toEqual({ trace_marker: 'keep' });
+      expect(projected.response_metadata).toEqual({ model: 'test-model' });
+      expect(projected.tool_calls?.[0].args).toMatchObject({
+        _truncated: expect.stringContaining('truncated'),
+        _originalChars: expect.any(Number),
+      });
+    });
+
+    it('neutralizes adversarial tool-call args without invoking toJSON', () => {
+      let toJSONCalls = 0;
+      const messages: BaseMessage[] = [
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'tool-adversarial',
+              name: 'lookup',
+              args: {
+                query: 'safe',
+                toJSON() {
+                  toJSONCalls++;
+                  return { query: 'x'.repeat(2_000_000) };
+                },
+              },
+            },
+          ],
+        }),
+      ];
+      const indexTokenCountMap: Record<string, number | undefined> = { 0: 1 };
+
+      const changed = preFlightTruncateToolCallInputs({
+        messages,
+        maxContextTokens: 1_000,
+        indexTokenCountMap,
+        tokenCounter: () => 5,
+      });
+
+      expect(changed).toBe(1);
+      expect(toJSONCalls).toBe(0);
+      expect((messages[0] as AIMessage).tool_calls?.[0].args).toEqual({
+        query: 'safe',
+      });
     });
 
     it('should not truncate inputs that fit within the budget', () => {
@@ -1601,6 +1976,63 @@ describe('Prune Messages Tests', () => {
       // At minimum, the newest messages should be present
       const types = result.context.map((m) => m.getType());
       expect(types).toContain('human');
+    });
+
+    it('emergency-truncates tool_calls-only args when content is empty', () => {
+      const tokenCounter: t.TokenCounter = (message) => {
+        let chars =
+          typeof message.content === 'string' ? message.content.length : 0;
+        if (message.getType() === 'ai') {
+          for (const toolCall of (message as AIMessage).tool_calls ?? []) {
+            chars +=
+              toolCall.name.length + JSON.stringify(toolCall.args).length;
+          }
+        }
+        return Math.max(1, Math.ceil(chars / 4));
+      };
+      const messages: BaseMessage[] = [
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'tool-call-only',
+              name: 'evaluate_script',
+              args: { code: 'x'.repeat(4_000) },
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'OK',
+          tool_call_id: 'tool-call-only',
+          name: 'evaluate_script',
+        }),
+      ];
+      const indexTokenCountMap: Record<string, number | undefined> = {
+        0: tokenCounter(messages[0]),
+        1: tokenCounter(messages[1]),
+      };
+      const pruneMessages = createPruneMessages({
+        maxTokens: 1_000,
+        startIndex: 0,
+        tokenCounter,
+        indexTokenCountMap,
+        getInstructionTokens: () => 900,
+        reserveRatio: 0,
+      });
+
+      const result = pruneMessages({ messages });
+
+      const projectedAI = result.context.find(
+        (message) => message.getType() === 'ai'
+      ) as AIMessage | undefined;
+      expect(projectedAI).toBeDefined();
+      expect(projectedAI?.content).toBe('');
+      const projectedArgs = projectedAI?.tool_calls?.[0].args as
+        | { _truncated?: string; _originalChars?: number }
+        | undefined;
+      expect(projectedArgs?._truncated).toContain('truncated');
+      expect(projectedArgs?._truncated?.length).toBeLessThanOrEqual(200);
+      expect(projectedArgs?._originalChars).toBeGreaterThan(200);
     });
   });
 

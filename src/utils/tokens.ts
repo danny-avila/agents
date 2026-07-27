@@ -1,8 +1,9 @@
 import { Tokenizer } from 'ai-tokenizer';
-import type { BaseMessage } from '@langchain/core/messages';
+import { isProxy } from 'node:util/types';
+import type { AIMessage, BaseMessage } from '@langchain/core/messages';
 import {
   isAtomicToolContentBlock,
-  serializeStructuredValue,
+  serializeStructuredValueBounded,
 } from './toolContent';
 import { ContentTypes } from '@/common/enum';
 
@@ -63,6 +64,15 @@ const TIMED_MEDIA_TYPES = new Set([
   'video_url',
   'input_audio',
 ]);
+/**
+ * Structured content is tokenized exactly up to this size. Larger values are
+ * traversed by the bounded serializer and priced conservatively for the omitted
+ * suffix, avoiding a full JSON string allocation in the context guard.
+ */
+const MAX_STRUCTURED_TOKENIZATION_CHARS = 200_000;
+/** One UTF-16 character can encode to several tokenizer pieces. */
+const MAX_TOKENS_PER_OMITTED_STRUCTURED_CHAR = 4;
+const MAX_STRUCTURED_SAFETY_INSPECTION_WORK = 10_000;
 
 /**
  * Extracts image dimensions from the first bytes of a base64-encoded
@@ -389,17 +399,16 @@ function mediaBlockByteLength(block: Record<string, unknown>): number {
 function timedMediaKind(
   block: Record<string, unknown>
 ): 'video' | 'audio' | null {
-  const type = typeof block.type === 'string' ? block.type : '';
+  const type =
+    typeof block.type === 'string' ? normalizeMediaMimeType(block.type) : '';
   if (type === 'input_audio' || type === 'audio') {
     return 'audio';
   }
   if (type === 'video_url' || type === 'video') {
     return 'video';
   }
-  const mime =
-    type === 'media' && typeof block.mimeType === 'string'
-      ? block.mimeType
-      : type;
+  const mediaMime = getMediaMimeType(block);
+  const mime = type === 'media' && mediaMime != null ? mediaMime : type;
   if (mime.startsWith('audio/')) {
     return 'audio';
   }
@@ -409,15 +418,143 @@ function timedMediaKind(
   return null;
 }
 
+function getMediaMimeType(block: Record<string, unknown>): string | undefined {
+  if (typeof block.mimeType === 'string') {
+    return normalizeMediaMimeType(block.mimeType);
+  }
+  if (typeof block.mime_type === 'string') {
+    return normalizeMediaMimeType(block.mime_type);
+  }
+  return undefined;
+}
+
+function normalizeMediaMimeType(mimeType: string): string {
+  return mimeType.split(';')[0].trim().toLowerCase();
+}
+
 /** Whether a content-block `type` can carry timed media — the fixed set plus the
  *  Google MIME-as-type shape (`audio/*` / `video/*`). Gates callers before they
  *  hand the block to {@link estimateTimedMediaBlockTokens}. */
 function isTimedMediaType(type: string): boolean {
+  const normalizedType = normalizeMediaMimeType(type);
   return (
-    TIMED_MEDIA_TYPES.has(type) ||
-    type.startsWith('audio/') ||
-    type.startsWith('video/')
+    TIMED_MEDIA_TYPES.has(normalizedType) ||
+    normalizedType.startsWith('audio/') ||
+    normalizedType.startsWith('video/')
   );
+}
+
+/** Conservatively prices unknown inline media without materializing JSON. */
+function estimateUnknownMediaBlockTokens(data: unknown): number {
+  if (typeof data === 'string') {
+    if (base64ByteLength(data) <= 0) {
+      return URL_DOCUMENT_FALLBACK_TOKENS;
+    }
+    return Math.max(URL_DOCUMENT_FALLBACK_TOKENS, data.length);
+  }
+  if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+    return Math.max(
+      URL_DOCUMENT_FALLBACK_TOKENS,
+      Math.ceil((data.byteLength * 4) / 3)
+    );
+  }
+  return URL_DOCUMENT_FALLBACK_TOKENS;
+}
+
+/**
+ * Estimates Google `type: "media"` blocks whose MIME describes static content.
+ * Timed audio/video continues through {@link estimateTimedMediaBlockTokens}.
+ */
+function estimateStaticMediaBlockTokens(
+  block: Record<string, unknown>,
+  encoding: EncodingName,
+  getTokenCount: (text: string) => number
+): number | undefined {
+  const mediaMime = getMediaMimeType(block);
+  if (block.type !== 'media' || mediaMime == null) {
+    return undefined;
+  }
+
+  const mimeType = mediaMime;
+  const nestedMedia =
+    block.media != null && typeof block.media === 'object'
+      ? (block.media as Record<string, unknown>)
+      : undefined;
+  const data =
+    block.data ?? block.bytes ?? nestedMedia?.data ?? nestedMedia?.bytes;
+  const reference =
+    block.url ??
+    block.fileUri ??
+    block.fileId ??
+    nestedMedia?.url ??
+    nestedMedia?.fileUri ??
+    nestedMedia?.fileId;
+
+  if (mimeType.startsWith('image/')) {
+    let encodedImage: string | undefined;
+    if (typeof data === 'string') {
+      encodedImage = data;
+    } else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+      const view =
+        data instanceof ArrayBuffer
+          ? new Uint8Array(data)
+          : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      encodedImage = Buffer.from(view.subarray(0, 80)).toString('base64');
+    }
+
+    if (encodedImage != null && encodedImage.length > 0) {
+      return estimateImageBlockTokens(
+        {
+          type: 'image',
+          source: { type: 'base64', data: encodedImage },
+        },
+        encoding
+      );
+    }
+    return estimateImageBlockTokens(
+      {
+        type: 'image_url',
+        image_url: { url: typeof reference === 'string' ? reference : '' },
+      },
+      encoding
+    );
+  }
+
+  if (mimeType === 'application/pdf') {
+    if (typeof data === 'string' && data.length > 0) {
+      const comma = data.startsWith('data:') ? data.indexOf(',') : -1;
+      const base64Data = comma >= 0 ? data.slice(comma + 1) : data;
+      return estimateDocumentBlockTokens(
+        {
+          type: 'file',
+          source_type: 'base64',
+          mime_type: mimeType,
+          data: base64Data,
+        },
+        encoding,
+        getTokenCount
+      );
+    }
+    if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+      const estimatedBase64Chars = Math.ceil((data.byteLength * 4) / 3);
+      const pdfTokensPerPage =
+        encoding === 'claude'
+          ? ANTHROPIC_PDF_TOKENS_PER_PAGE
+          : OPENAI_PDF_TOKENS_PER_PAGE;
+      return (
+        Math.max(
+          1,
+          Math.ceil(estimatedBase64Chars / BASE64_BYTES_PER_PDF_PAGE)
+        ) * pdfTokensPerPage
+      );
+    }
+    return URL_DOCUMENT_FALLBACK_TOKENS;
+  }
+
+  if (mimeType.startsWith('audio/') || mimeType.startsWith('video/')) {
+    return undefined;
+  }
+  return estimateUnknownMediaBlockTokens(data);
 }
 
 /**
@@ -489,19 +626,282 @@ export function encodingForModel(model: string): EncodingName {
   return 'o200k_base';
 }
 
+type StructuredSafetyInspection = {
+  remaining: number;
+};
+
+function consumeStructuredSafetyWork(
+  inspection: StructuredSafetyInspection
+): boolean {
+  if (inspection.remaining <= 0) {
+    return false;
+  }
+  inspection.remaining--;
+  return true;
+}
+
+function hasUnsafeToJSON(
+  value: object,
+  inspection: StructuredSafetyInspection
+): boolean {
+  let current: object | null = value;
+  const seen = new Set<object>();
+  try {
+    while (current != null) {
+      if (isProxy(current)) {
+        return true;
+      }
+      if (seen.has(current) || !consumeStructuredSafetyWork(inspection)) {
+        return true;
+      }
+      seen.add(current);
+      const descriptor = Object.getOwnPropertyDescriptor(current, 'toJSON');
+      if (descriptor != null) {
+        return (
+          ('value' in descriptor && typeof descriptor.value === 'function') ||
+          !('value' in descriptor)
+        );
+      }
+      current = Object.getPrototypeOf(current) as object | null;
+    }
+  } catch {
+    return true;
+  }
+  return false;
+}
+
+const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  'byteLength'
+)?.get;
+
+/**
+ * Tests native binary values without `instanceof`, whose prototype walk can
+ * recurse or throw for adversarial proxies.
+ */
+function isNativeBinaryValue(value: object): boolean {
+  try {
+    if (ArrayBuffer.isView(value)) {
+      return true;
+    }
+  } catch {
+    return true;
+  }
+  if (arrayBufferByteLengthGetter == null) {
+    return false;
+  }
+  try {
+    arrayBufferByteLengthGetter.call(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detects an inherited accessor without reading it. Any proxy/prototype trap or
+ * cyclic prototype chain is unsafe rather than observable to the caller.
+ */
+function hasUnsafeInheritedProperty(
+  value: object,
+  key: string,
+  inspection: StructuredSafetyInspection
+): boolean {
+  const seen = new Set<object>([value]);
+  let current: object | null;
+  try {
+    current = Object.getPrototypeOf(value) as object | null;
+  } catch {
+    return true;
+  }
+
+  while (current != null) {
+    if (isProxy(current)) {
+      return true;
+    }
+    if (seen.has(current) || !consumeStructuredSafetyWork(inspection)) {
+      return true;
+    }
+    seen.add(current);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(current, key);
+    } catch {
+      return true;
+    }
+    if (descriptor != null) {
+      return !('value' in descriptor);
+    }
+    try {
+      current = Object.getPrototypeOf(current) as object | null;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Detects values whose native JSON representation can differ after local
+ * measurement. Accessor properties and `toJSON` hooks are deliberately not
+ * invoked; values too large to inspect within bounded work are treated as
+ * unsafe so the caller can normalize or reject them conservatively.
+ */
+export function hasUnsafeStructuredSerialization(value: unknown): boolean {
+  if (typeof value === 'bigint') {
+    return true;
+  }
+  if (value == null || typeof value !== 'object') {
+    return false;
+  }
+  if (isProxy(value)) {
+    return true;
+  }
+  if (isNativeBinaryValue(value)) {
+    return true;
+  }
+
+  const stack: object[] = [value];
+  const seen = new Set<object>();
+  const inspection: StructuredSafetyInspection = {
+    remaining: MAX_STRUCTURED_SAFETY_INSPECTION_WORK,
+  };
+  while (stack.length > 0) {
+    const current = stack.pop() as object;
+    if (isProxy(current)) {
+      return true;
+    }
+    if (seen.has(current)) {
+      return true;
+    }
+    seen.add(current);
+    if (!consumeStructuredSafetyWork(inspection)) {
+      return true;
+    }
+
+    try {
+      if (hasUnsafeToJSON(current, inspection)) {
+        return true;
+      }
+      for (const key in current) {
+        if (!consumeStructuredSafetyWork(inspection)) {
+          return true;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(current, key);
+        if (descriptor == null) {
+          if (hasUnsafeInheritedProperty(current, key, inspection)) {
+            return true;
+          }
+          continue;
+        }
+        if (descriptor.enumerable !== true) {
+          continue;
+        }
+        if (!('value' in descriptor)) {
+          return true;
+        }
+        if ('value' in descriptor) {
+          if (typeof descriptor.value === 'bigint') {
+            return true;
+          }
+          if (
+            descriptor.value != null &&
+            typeof descriptor.value === 'object' &&
+            isNativeBinaryValue(descriptor.value)
+          ) {
+            return true;
+          }
+          if (
+            descriptor.value != null &&
+            typeof descriptor.value === 'object'
+          ) {
+            stack.push(descriptor.value);
+          }
+        }
+      }
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getBoundedTextTokenCount(
+  value: string,
+  getTokenCount: (text: string) => number
+): number {
+  const preview =
+    value.length > MAX_STRUCTURED_TOKENIZATION_CHARS
+      ? value.slice(0, MAX_STRUCTURED_TOKENIZATION_CHARS)
+      : value;
+  const previewTokens = getTokenCount(preview);
+  const omittedChars = value.length - preview.length;
+  if (omittedChars <= 0) {
+    return previewTokens;
+  }
+  return Math.min(
+    Number.MAX_SAFE_INTEGER,
+    previewTokens + omittedChars * MAX_TOKENS_PER_OMITTED_STRUCTURED_CHAR
+  );
+}
+
+function getBoundedStructuredTokenCount(
+  value: unknown,
+  getTokenCount: (text: string) => number
+): number {
+  if (hasUnsafeStructuredSerialization(value)) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  const serialized = serializeStructuredValueBounded(
+    value,
+    MAX_STRUCTURED_TOKENIZATION_CHARS
+  );
+  const previewTokens = getTokenCount(serialized.content);
+  if (!serialized.truncated) {
+    return previewTokens;
+  }
+  if (!Number.isSafeInteger(serialized.originalChars)) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  const omittedChars = Math.max(
+    0,
+    serialized.originalChars - serialized.content.length
+  );
+  return Math.min(
+    Number.MAX_SAFE_INTEGER,
+    previewTokens + omittedChars * MAX_TOKENS_PER_OMITTED_STRUCTURED_CHAR
+  );
+}
+
 export function getTokenCountForMessage(
   message: BaseMessage,
   getTokenCount: (text: string) => number,
   encoding: EncodingName = 'o200k_base'
 ): number {
   const tokensPerMessage = 3;
+  const countText = (text: string): number =>
+    getBoundedTextTokenCount(text, getTokenCount);
+  if (isProxy(message)) {
+    return Number.MAX_SAFE_INTEGER;
+  }
 
   type ContentBlock = Record<string, unknown> & {
     type?: string;
-    tool_call?: { name?: string; args?: unknown; output?: unknown };
+    tool_call?: {
+      id?: string;
+      name?: string;
+      args?: unknown;
+      output?: unknown;
+    };
   };
+  const representedToolCallIds = new Set<string>();
 
   const processValue = (value: unknown): void => {
+    if (value != null && typeof value === 'object' && isProxy(value)) {
+      numTokens = Number.MAX_SAFE_INTEGER;
+      return;
+    }
     if (Array.isArray(value)) {
       for (const raw of value) {
         if (
@@ -516,9 +916,20 @@ export function getTokenCountForMessage(
         if (item == null || typeof item !== 'object') {
           continue;
         }
+        if (isProxy(item)) {
+          numTokens = Number.MAX_SAFE_INTEGER;
+          return;
+        }
         if (typeof item.type !== 'string') {
-          numTokens += getTokenCount(serializeStructuredValue(item));
+          numTokens += getBoundedStructuredTokenCount(item, countText);
           continue;
+        }
+        if (item.type === ContentTypes.TOOL_CALL || item.type === 'tool_use') {
+          const inlineId =
+            typeof item.id === 'string' ? item.id : item.tool_call?.id;
+          if (typeof inlineId === 'string' && inlineId.length > 0) {
+            representedToolCallIds.add(inlineId);
+          }
         }
         if (item.type === ContentTypes.ERROR) {
           continue;
@@ -543,29 +954,47 @@ export function getTokenCountForMessage(
             item.type === ContentTypes.IMAGE_FILE)
         ) {
           numTokens += Math.ceil(
-            estimateDocumentBlockTokens(item, encoding, getTokenCount) *
+            estimateDocumentBlockTokens(item, encoding, countText) *
               IMAGE_TOKEN_SAFETY_MARGIN
           );
           continue;
         }
 
-        if (isAtomicToolContentBlock(item) && isTimedMediaType(item.type)) {
-          numTokens += Math.ceil(
-            estimateTimedMediaBlockTokens(item) * IMAGE_TOKEN_SAFETY_MARGIN
+        if (isAtomicToolContentBlock(item) && item.type === 'media') {
+          const staticMediaTokens = estimateStaticMediaBlockTokens(
+            item,
+            encoding,
+            countText
           );
-          continue;
+          if (staticMediaTokens != null) {
+            numTokens += Math.ceil(
+              staticMediaTokens * IMAGE_TOKEN_SAFETY_MARGIN
+            );
+            continue;
+          }
+        }
+
+        if (isAtomicToolContentBlock(item) && isTimedMediaType(item.type)) {
+          const timedMediaTokens = estimateTimedMediaBlockTokens(item);
+          if (timedMediaTokens > 0) {
+            numTokens += Math.ceil(
+              timedMediaTokens * IMAGE_TOKEN_SAFETY_MARGIN
+            );
+            continue;
+          }
         }
 
         if (item.type === ContentTypes.TOOL_CALL && item.tool_call != null) {
           const toolName = item.tool_call.name;
           if (typeof toolName === 'string' && toolName.length > 0) {
-            numTokens += getTokenCount(toolName);
+            numTokens += countText(toolName);
           }
           const args = item.tool_call.args;
           if (args != null) {
-            numTokens += getTokenCount(
-              typeof args === 'string' ? args : serializeStructuredValue(args)
-            );
+            numTokens +=
+              typeof args === 'string'
+                ? countText(args)
+                : getBoundedStructuredTokenCount(args, countText);
           }
           const output = item.tool_call.output;
           if (output != null) {
@@ -576,26 +1005,56 @@ export function getTokenCountForMessage(
 
         const nestedValue = item[item.type];
         if (nestedValue == null) {
-          numTokens += getTokenCount(serializeStructuredValue(item));
+          numTokens += getBoundedStructuredTokenCount(item, countText);
           continue;
         }
 
         processValue(nestedValue);
       }
     } else if (typeof value === 'string') {
-      numTokens += getTokenCount(value);
+      numTokens += countText(value);
     } else if (typeof value === 'number') {
-      numTokens += getTokenCount(value.toString());
+      numTokens += countText(value.toString());
     } else if (typeof value === 'boolean') {
-      numTokens += getTokenCount(value.toString());
+      numTokens += countText(value.toString());
     } else if (value != null && typeof value === 'object') {
-      numTokens += getTokenCount(serializeStructuredValue(value));
+      numTokens += getBoundedStructuredTokenCount(value, countText);
     }
   };
 
   let numTokens = tokensPerMessage;
   processValue(message.content);
-  return numTokens;
+  if (numTokens >= Number.MAX_SAFE_INTEGER) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  if (message.getType() === 'ai') {
+    const toolCalls = (message as AIMessage).tool_calls ?? [];
+    if (isProxy(toolCalls)) {
+      return Number.MAX_SAFE_INTEGER;
+    }
+    for (const toolCall of toolCalls) {
+      if (isProxy(toolCall)) {
+        return Number.MAX_SAFE_INTEGER;
+      }
+      if (
+        typeof toolCall.id === 'string' &&
+        representedToolCallIds.has(toolCall.id)
+      ) {
+        continue;
+      }
+      if (typeof toolCall.name === 'string' && toolCall.name.length > 0) {
+        numTokens += countText(toolCall.name);
+      }
+      const args: unknown = toolCall.args;
+      if (args != null) {
+        numTokens +=
+          typeof args === 'string'
+            ? countText(args)
+            : getBoundedStructuredTokenCount(args, countText);
+      }
+    }
+  }
+  return Math.min(Number.MAX_SAFE_INTEGER, numTokens);
 }
 
 /**

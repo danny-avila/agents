@@ -27,6 +27,10 @@ import {
   normalizeError,
 } from '@/tools/eagerEventExecution';
 import {
+  serializeStructuredValueBounded,
+  serializeToolContentBounded,
+} from '@/utils/toolContent';
+import {
   handleServerToolResult,
   handleToolCallChunks,
   handleToolCalls,
@@ -36,7 +40,6 @@ import {
   truncateToolResultContent,
 } from '@/utils/truncation';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
-import { serializeStructuredValue } from '@/utils/toolContent';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { isGoogleLike } from '@/utils/llm';
 import { getMessageId } from '@/messages';
@@ -842,18 +845,20 @@ async function dispatchEagerToolCompletions(args: {
     if (stepId === '') {
       continue;
     }
-    const output =
-      result.status === 'error'
-        ? truncateToolResultContent(
-          `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
-          maxToolResultChars
-        )
-        : truncateToolResultContent(
-          typeof result.content === 'string'
-            ? result.content
-            : serializeStructuredValue(result.content),
-          maxToolResultChars
-        );
+    let output: string;
+    if (result.status === 'error') {
+      output = truncateToolResultContent(
+        `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
+        maxToolResultChars
+      );
+    } else if (typeof result.content === 'string') {
+      output = truncateToolResultContent(result.content, maxToolResultChars);
+    } else {
+      output = serializeStructuredValueBounded(
+        result.content,
+        maxToolResultChars
+      ).content;
+    }
 
     try {
       const dispatched = await safeDispatchCustomEvent(
@@ -865,7 +870,10 @@ async function dispatchEagerToolCompletions(args: {
             type: 'tool_call' as const,
             eager: true,
             tool_call: {
-              args: JSON.stringify(record.request.args),
+              args: serializeToolContentBounded(
+                record.request.args,
+                maxToolResultChars
+              ),
               name: record.toolName,
               id: result.toolCallId,
               output,

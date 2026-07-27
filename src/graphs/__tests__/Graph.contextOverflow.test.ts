@@ -117,6 +117,7 @@ async function createRun(options: {
   tools?: t.GraphTools;
   maxToolResultChars?: number;
   model?: string;
+  toolOutputReferences?: t.ToolOutputReferencesConfig;
 }): Promise<Run<t.IState>> {
   return Run.create<t.IState>({
     runId: options.runId,
@@ -140,6 +141,7 @@ async function createRun(options: {
     skipCleanup: true,
     tokenCounter: options.tokenCounter ?? tokenCounter,
     indexTokenCountMap: options.indexTokenCountMap,
+    toolOutputReferences: options.toolOutputReferences,
   });
 }
 
@@ -150,6 +152,144 @@ const streamConfig = {
 };
 
 describe('context overflow recovery', () => {
+  it('projects structured OpenAI tool content before the final payload check', async () => {
+    const toolCallId = 'tc-openai-structured';
+    const toolMessage = new ToolMessage({
+      content: [
+        { type: ContentTypes.TEXT, text: 'rendered chart' },
+        {
+          type: 'image_url',
+          image_url: {
+            url: `data:image/png;base64,${'A'.repeat(2_000)}`,
+          },
+        },
+      ],
+      tool_call_id: toolCallId,
+      name: 'render_chart',
+    });
+    const messages: BaseMessage[] = [
+      new HumanMessage('render the chart'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'render_chart',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+    const measuredToolContents: string[] = [];
+    const projectionCounter: t.TokenCounter = (message) => {
+      if (message.getType() === 'tool' && typeof message.content === 'string') {
+        measuredToolContents.push(message.content);
+      }
+      return typeof message.content === 'string'
+        ? Math.max(1, Math.ceil(message.content.length / 4))
+        : 1;
+    };
+    const run = await createRun({
+      runId: 'openai-structured-final-projection',
+      maxContextTokens: 10_000,
+      maxToolResultChars: 200,
+      provider: Providers.OPENAI,
+      tokenCounter: projectionCounter,
+      indexTokenCountMap: {
+        0: projectionCounter(messages[0]),
+        1: projectionCounter(messages[1]),
+        2: projectionCounter(messages[2]),
+      },
+      tools: [
+        tool(async () => 'unused', {
+          name: 'render_chart',
+          description: 'Renders a chart',
+          schema: z.object({}),
+        }),
+      ],
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(signatureFor('gpt-4o-mini'), 0);
+    run.Graph.overrideModel = model;
+
+    await run.processStream({ messages }, streamConfig);
+
+    expect(model.calls).toHaveLength(1);
+    const projectedTool = model.calls[0].find(
+      (message) => message.getType() === 'tool'
+    ) as ToolMessage | undefined;
+    expect(typeof projectedTool?.content).toBe('string');
+    expect((projectedTool?.content as string).length).toBeLessThanOrEqual(200);
+    expect(measuredToolContents).toContain(projectedTool?.content);
+    expect(Array.isArray(toolMessage.content)).toBe(true);
+  });
+
+  it('projects unsafe tool-call args before measuring or invoking the provider', async () => {
+    let toJSONCalls = 0;
+    const toolCallId = 'tc-unsafe-input';
+    const unsafeArgs = {
+      query: 'safe',
+      toJSON() {
+        toJSONCalls++;
+        return { query: 'x'.repeat(100_000) };
+      },
+    };
+    const messages: BaseMessage[] = [
+      new HumanMessage('run the lookup'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'lookup_records',
+            args: unsafeArgs,
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'done',
+        tool_call_id: toolCallId,
+        name: 'lookup_records',
+      }),
+      new AIMessage('The lookup completed.'),
+      new HumanMessage('continue'),
+    ];
+    const run = await createRun({
+      runId: 'unsafe-tool-input-final-projection',
+      maxContextTokens: 10_000,
+      provider: Providers.OPENAI,
+      tokenCounter: () => 1,
+      indexTokenCountMap: { 0: 1, 1: 1, 2: 1, 3: 1, 4: 1 },
+      tools: [
+        tool(async () => 'unused', {
+          name: 'lookup_records',
+          description: 'Looks up records',
+          schema: z.object({}),
+        }),
+      ],
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(signatureFor('gpt-4o-mini'), 0);
+    run.Graph.overrideModel = model;
+
+    await run.processStream({ messages }, streamConfig);
+
+    const projectedCall = (
+      model.calls[0].find((message) => message.getType() === 'ai') as AIMessage
+    ).tool_calls?.[0];
+    expect(projectedCall?.args).toEqual({ query: 'safe' });
+    expect(toJSONCalls).toBe(0);
+    expect(messages[1]).toBeInstanceOf(AIMessage);
+    expect((messages[1] as AIMessage).tool_calls?.[0].args).toBe(unsafeArgs);
+  });
+
   it('compacts cached structured tool output before the first provider call', async () => {
     const toolCallId = 'tc-structured';
     const messages: BaseMessage[] = [
@@ -524,6 +664,92 @@ describe('context overflow recovery', () => {
     expect(
       JSON.stringify(humanMessages[humanMessages.length - 1].content)
     ).not.toContain('x'.repeat(1_000));
+  });
+
+  it('counts unresolved-reference annotations before invoking the provider', async () => {
+    const toolCallId = 'tc-unresolved-projection';
+    const unresolvedRefs = Array.from(
+      { length: 1_200 },
+      (_, index) => `missing_tool_${index}_turn_${index}`
+    );
+    const messages: BaseMessage[] = [
+      new HumanMessage(`old question ${'q'.repeat(5_500)}`),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'lookup_records',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: `old result ${'r'.repeat(3_000)}`,
+        tool_call_id: toolCallId,
+        name: 'lookup_records',
+        additional_kwargs: { _unresolvedRefs: unresolvedRefs },
+      }),
+      new AIMessage(`old answer ${'a'.repeat(4_500)}`),
+      new HumanMessage(`latest question ${'n'.repeat(3_500)}`),
+    ];
+    const projectionCounter: t.TokenCounter = (message) => {
+      const content =
+        typeof message.content === 'string'
+          ? message.content
+          : JSON.stringify(message.content);
+      return Math.max(1, content.length);
+    };
+    const indexTokenCountMap: Record<string, number> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = projectionCounter(messages[i]);
+    }
+    const run = await createRun({
+      runId: 'unresolved-reference-final-projection',
+      maxContextTokens: 20_000,
+      provider: Providers.ANTHROPIC,
+      tokenCounter: projectionCounter,
+      indexTokenCountMap,
+      toolOutputReferences: { enabled: true },
+      tools: [
+        tool(async () => 'unused', {
+          name: 'lookup_records',
+          description: 'Looks up records',
+          schema: z.object({}),
+        }),
+      ],
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(
+      signatureFor('claude-haiku-4-5-20251001'),
+      0
+    );
+    run.Graph.overrideModel = model;
+
+    const content = await run.processStream({ messages }, streamConfig);
+
+    expect(content).toEqual([{ type: 'text', text: 'recovered' }]);
+    expect(model.calls).toHaveLength(1);
+    expect(
+      run.Graph.agentContexts.get('default')?.overflowRecoveryAttempts
+    ).toBeGreaterThan(0);
+    const providerPayload = JSON.stringify(
+      model.calls[0].map((message) => message.content)
+    );
+    expect(providerPayload).not.toContain(unresolvedRefs[0]);
+    expect(providerPayload).not.toContain(unresolvedRefs.at(-1));
+    const sentMessageTokens =
+      3 +
+      model.calls[0].reduce(
+        (total, message) => total + projectionCounter(message),
+        0
+      );
+    expect(sentMessageTokens).toBeLessThan(
+      run.Graph.agentContexts.get('default')?.maxContextTokens ?? 0
+    );
   });
 
   it('omits artifact expansion that would exceed the post-prune budget', async () => {

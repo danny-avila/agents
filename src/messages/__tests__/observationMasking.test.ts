@@ -1,7 +1,10 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { TokenCounter } from '@/types/run';
-import { maskConsumedToolResults } from '@/messages/prune';
+import {
+  maskConsumedToolResults,
+  ORIGINAL_CONTENT_MAX_CHARS,
+} from '@/messages/prune';
 
 const charCounter: TokenCounter = (msg) => {
   const raw = msg.content;
@@ -259,6 +262,42 @@ describe('maskConsumedToolResults', () => {
     expect(masked.artifact).toEqual({ source: 'clickhouse' });
     expect(map[2]).toBe(charCounter(masked));
     expect(originalContentStore.get(2)).toBe(originalContent);
+  });
+
+  it('bounds stored structured originals without invoking custom toJSON', () => {
+    const tcId = 'tc-large-structured';
+    const toJSON = jest.fn(() => ({ expanded: 'should not run' }));
+    const messages: BaseMessage[] = [
+      new HumanMessage('query the table'),
+      aiToolCall(tcId, 'run_select_query'),
+      new ToolMessage({
+        content: [
+          {
+            type: 'json',
+            payload: 'x'.repeat(ORIGINAL_CONTENT_MAX_CHARS + 1_000),
+            toJSON,
+          },
+        ],
+        tool_call_id: tcId,
+        name: 'run_select_query',
+      }),
+      aiWithText('The query completed.'),
+    ];
+    const originalContentStore = new Map<number, string>();
+
+    const count = maskConsumedToolResults({
+      messages,
+      indexTokenCountMap: { 0: 1, 1: 1, 2: 1, 3: 1 },
+      tokenCounter: () => 1,
+      originalContentStore,
+    });
+
+    expect(count).toBe(1);
+    expect(toJSON).not.toHaveBeenCalled();
+    expect(originalContentStore.get(2)?.length).toBeLessThanOrEqual(
+      ORIGINAL_CONTENT_MAX_CHARS
+    );
+    expect(originalContentStore.get(2)).toContain('truncated');
   });
 
   it('handles empty messages array', () => {

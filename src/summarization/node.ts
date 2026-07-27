@@ -13,7 +13,7 @@ import type * as t from '@/types';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
-  serializeToolContent,
+  serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
   addTailCacheControl,
@@ -212,7 +212,10 @@ function extractToolFailuresSection(messages: BaseMessage[]): string {
     }
 
     const toolName = toolMsg.name ?? 'tool';
-    const content = serializeToolContent(toolMsg.content);
+    const content = serializeToolContentBounded(
+      toolMsg.content,
+      MAX_TOOL_FAILURE_CHARS * 4
+    );
     const normalized = content.replace(/\s+/g, ' ').trim();
     const summary =
       normalized.length > MAX_TOOL_FAILURE_CHARS
@@ -287,7 +290,7 @@ function restoreOriginalToolContent(
     const maxChars = Math.floor(remainingChars / (restorable.length - i));
     const compacted = compactToolContent(content, maxChars).content;
     restored[index] = cloneToolMessageWithContent(message, compacted);
-    remainingChars -= serializeToolContent(compacted).length;
+    remainingChars -= serializeToolContentBounded(compacted, maxChars).length;
   }
   return restored;
 }

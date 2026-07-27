@@ -2,6 +2,7 @@
 import { nanoid } from 'nanoid';
 import { tool } from '@langchain/core/tools';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
+import { ContextOverflowError } from '@langchain/core/errors';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import { START, END, StateGraph, Annotation } from '@langchain/langgraph';
 import {
@@ -32,11 +33,15 @@ import {
   isLegacyConvertible,
   CALIBRATION_RATIO_MAX,
   createPruneMessages,
+  projectToolCallInputs,
+  calculateMaxToolCallInputChars,
+  projectOpenAIToolMessageContent,
   syncBudgetDerivedFields,
   addTailCacheControl,
   resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
   supportsBedrockToolCache,
+  isSyntheticProviderContextMessage,
   getMessageId,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
@@ -71,6 +76,11 @@ import {
   getFallbackOverflowCandidates,
 } from '@/llm/invoke';
 import {
+  compactToolContent,
+  getToolContentCharLength,
+  serializeToolContentBounded,
+} from '@/utils/toolContent';
+import {
   Constants,
   GraphNodeKeys,
   ContentTypes,
@@ -78,6 +88,10 @@ import {
   Providers,
   StepTypes,
 } from '@/common';
+import {
+  annotateMessagesForLLM,
+  ToolOutputReferenceRegistry,
+} from '@/tools/toolOutputReferences';
 import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
@@ -87,16 +101,11 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
-import {
-  compactToolContent,
-  getToolContentCharLength,
-} from '@/utils/toolContent';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
-import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
@@ -1756,6 +1765,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           provider: agentContext.provider,
           tokenCounter: agentContext.tokenCounter,
           maxTokens: agentContext.maxContextTokens,
+          maxToolResultChars: agentContext.maxToolResultChars,
           thinkingEnabled: isThinkingEnabled(
             agentContext.provider,
             agentContext.clientOptions
@@ -1963,6 +1973,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         finalMessages = formatContentStrings(finalMessages);
       }
 
+      const maxProviderToolResultChars =
+        agentContext.maxToolResultChars ??
+        calculateMaxToolResultChars(agentContext.maxContextTokens);
+      if (isOpenAILike(agentContext.provider)) {
+        finalMessages = projectOpenAIToolMessageContent(
+          finalMessages,
+          maxProviderToolResultChars
+        );
+      }
+      finalMessages = projectToolCallInputs(
+        finalMessages,
+        calculateMaxToolCallInputChars(agentContext.maxContextTokens)
+      );
+
       const lastMessageX =
         finalMessages.length >= 2
           ? finalMessages[finalMessages.length - 2]
@@ -2064,6 +2088,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         return transformed;
       };
 
+      const toolOutputRegistry = this.getOrCreateToolOutputRegistry();
+      const providerRunId = config.configurable?.run_id as string | undefined;
+      const projectProviderReferences = (
+        candidate: BaseMessage[]
+      ): BaseMessage[] =>
+        annotateMessagesForLLM(candidate, toolOutputRegistry, providerRunId);
+
       const compactSyntheticProviderContext = (
         candidate: BaseMessage[]
       ): BaseMessage[] => {
@@ -2074,26 +2105,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }> = [];
         for (let i = 0; i < candidate.length; i++) {
           const message = candidate[i];
-          if (!(message instanceof HumanMessage)) {
+          if (
+            !(message instanceof HumanMessage) ||
+            !isSyntheticProviderContextMessage(message)
+          ) {
             continue;
           }
           const content = message.content;
-          let leadingText = '';
-          if (typeof content === 'string') {
-            leadingText = content;
-          } else if (
-            Array.isArray(content) &&
-            content[0]?.type === ContentTypes.TEXT &&
-            typeof content[0].text === 'string'
-          ) {
-            leadingText = content[0].text;
-          }
-          if (
-            !leadingText.startsWith('[Previous tool interaction]') &&
-            !leadingText.startsWith('[Previous agent context]')
-          ) {
-            continue;
-          }
           synthetic.push({
             index: i,
             message,
@@ -2143,14 +2161,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       let artifactBaseMessages: BaseMessage[] | undefined;
       if (lastMessageY instanceof ToolMessage) {
-        const maxArtifactPayloadChars = calculateMaxToolResultChars(
-          agentContext.maxContextTokens
-        );
         let artifactCandidate = finalMessages;
         if (anthropicLike) {
           artifactCandidate = projectAnthropicArtifactContent(
             finalMessages,
-            agentContext.maxToolResultChars ?? maxArtifactPayloadChars
+            maxProviderToolResultChars
           );
         } else if (
           (isOpenAILike(agentContext.provider) &&
@@ -2159,7 +2174,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         ) {
           artifactCandidate = projectArtifactPayload(
             finalMessages,
-            agentContext.maxToolResultChars ?? maxArtifactPayloadChars
+            maxProviderToolResultChars
           );
         }
 
@@ -2184,11 +2199,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
-      finalMessages = applyProviderMessageTransforms(finalMessages);
+      finalMessages = projectProviderReferences(
+        applyProviderMessageTransforms(finalMessages)
+      );
       let finalProjection = measureProviderPayload(finalMessages);
       if (artifactBaseMessages != null) {
         if (!finalProjection.fits) {
-          finalMessages = applyProviderMessageTransforms(artifactBaseMessages);
+          finalMessages = projectProviderReferences(
+            applyProviderMessageTransforms(artifactBaseMessages)
+          );
           finalProjection = measureProviderPayload(finalMessages);
           emitAgentLog(
             config,
@@ -2223,17 +2242,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           );
         }
       }
-      if (!finalProjection.fits) {
-        throw new Error(
-          JSON.stringify({
-            type: 'final_context_overflow',
-            info: 'Provider message formatting exceeded the context budget and no safe synthetic-context compaction could make it fit.',
-            projectedMessageTokens: finalProjection.projectedMessageTokens,
-            availableMessageTokens: finalProjection.availableMessageTokens,
-          })
-        );
-      }
-
       // Determine the prompt-cache strategy up front. Two distinct facts:
       //
       //   `providerPromptCacheEnabled` — prompt caching is on for this provider
@@ -2347,6 +2355,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
+      /**
+       * Prompt-cache placement and orphan sanitization are provider-wire
+       * transforms too. Re-measure after both so no content added after the
+       * earlier artifact/synthetic compaction decision can bypass the guard.
+       */
+      finalProjection = measureProviderPayload(finalMessages);
+      const preInvokeContextOverflowError = !finalProjection.fits
+        ? new ContextOverflowError(
+          JSON.stringify({
+            type: 'final_context_overflow',
+            info: 'Provider message formatting exceeded the context budget and no safe synthetic-context compaction could make it fit.',
+            projectedMessageTokens: finalProjection.projectedMessageTokens,
+            availableMessageTokens: finalProjection.availableMessageTokens,
+          })
+        )
+        : undefined;
+
       if (
         agentContext.lastStreamCall != null &&
         agentContext.streamBuffer != null
@@ -2429,7 +2454,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             : 1;
         if (
           agentContext.tokenCounter != null &&
-          finalMessages.length !== messagesToUse.length
+          finalMessages !== messagesToUse
         ) {
           /** Post-prune formatting restructured the payload (e.g. thinking
            *  placeholder collapse, orphan drops) — recount so the gauge
@@ -2549,6 +2574,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const metadata = config.metadata as Record<string, unknown>;
 
       try {
+        if (preInvokeContextOverflowError != null) {
+          throw preInvokeContextOverflowError;
+        }
         result = await withLangfuseRuntimeScope(
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,
@@ -2671,7 +2699,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             estimatedPromptTokens,
           });
         }
-
         /**
          * A fallback can reject the same prompt as too large even when the
          * primary failed for an unrelated reason — a fallback with a smaller
@@ -3368,6 +3395,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     }
 
     const { name, input: args, error } = data;
+    const eventValueLimit = calculateMaxToolResultChars();
+    const errorOutputPrefix = 'Error processing tool';
+    const errorDetail =
+      error?.message != null
+        ? `: ${serializeToolContentBounded(
+          error.message,
+          Math.max(0, eventValueLimit - errorOutputPrefix.length - 2)
+        )}`
+        : '';
 
     const runStep = graph.getRunStep(stepId);
     if (!runStep) {
@@ -3377,8 +3413,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const tool_call: t.ProcessedToolCall = {
       id: data.id,
       name: name || '',
-      args: typeof args === 'string' ? args : JSON.stringify(args),
-      output: `Error processing tool${error?.message != null ? `: ${error.message}` : ''}`,
+      args: serializeToolContentBounded(args, eventValueLimit),
+      output: `${errorOutputPrefix}${errorDetail}`,
       progress: 1,
     };
 
