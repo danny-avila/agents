@@ -13,6 +13,7 @@ import {
   DATE_RANGE,
 } from './schema';
 import { createSearchAPI, createSourceProcessor } from './search';
+import { createKeenableScraper } from './keenable-scraper';
 import { createSerperScraper } from './serper-scraper';
 import { createTavilyScraper } from './tavily-scraper';
 import { createFirecrawlScraper } from './firecrawl';
@@ -378,6 +379,7 @@ export const createSearchTool = (
     keenableApiKey,
     keenableApiUrl,
     keenableSearchOptions,
+    keenableScraperOptions,
     rerankerType = 'cohere',
     rerankerTimeout,
     topResults = 5,
@@ -476,11 +478,20 @@ export const createSearchTool = (
   } else if (scraperProvider === 'crw') {
     scraperInstance = createCrwScraper({
       ...crwScraperOptions,
-      apiKey:
-        crwScraperOptions?.apiKey ?? crwApiKey ?? process.env.CRW_API_KEY,
+      apiKey: crwScraperOptions?.apiKey ?? crwApiKey ?? process.env.CRW_API_KEY,
       apiUrl: crwScraperOptions?.apiUrl ?? crwApiUrl,
       timeout: scraperTimeout ?? crwScraperOptions?.timeout,
       formats: crwScraperOptions?.formats ?? ['markdown', 'rawHtml'],
+      logger,
+    });
+  } else if (scraperProvider === 'keenable') {
+    scraperInstance = createKeenableScraper({
+      ...keenableScraperOptions,
+      apiKey: keenableScraperOptions?.apiKey ?? keenableApiKey,
+      timeout: scraperTimeout ?? keenableScraperOptions?.timeout,
+      attributionTitle:
+        keenableScraperOptions?.attributionTitle ??
+        keenableSearchOptions?.attributionTitle,
       logger,
     });
   } else {
