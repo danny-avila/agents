@@ -450,6 +450,14 @@ export function shouldIncludeEncryptedReasoning(
   );
 }
 
+function usesHostedWebSearch(tools?: OpenAIClient.Responses.Tool[]): boolean {
+  return (
+    tools?.some(
+      (tool) => tool.type === 'web_search' || tool.type === 'web_search_preview'
+    ) === true
+  );
+}
+
 function getCacheWriteTokens(message: BaseMessage): number | undefined {
   const responseMetadata = message.response_metadata as {
     usage?: ResponsesUsageWithCacheWrite;
@@ -1548,6 +1556,14 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
       promptCacheExplicit: this.promptCacheExplicit,
       safetyIdentifier: this.safetyIdentifier,
     });
+    if (usesHostedWebSearch(params.tools)) {
+      params.include = [
+        ...new Set([
+          ...(params.include ?? []),
+          'web_search_call.action.sources' as const,
+        ]),
+      ];
+    }
     if (shouldIncludeEncryptedReasoning(this.model, params)) {
       params.include = [
         ...new Set([
@@ -1780,6 +1796,14 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       promptCacheExplicit: this.promptCacheExplicit,
       safetyIdentifier: this.safetyIdentifier,
     });
+    if (usesHostedWebSearch(params.tools)) {
+      params.include = [
+        ...new Set([
+          ...(params.include ?? []),
+          'web_search_call.action.sources' as const,
+        ]),
+      ];
+    }
     if (shouldIncludeEncryptedReasoning(this.model, params)) {
       params.include = [
         ...new Set([

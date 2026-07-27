@@ -66,6 +66,61 @@ type BedrockResponseMetadata = {
   };
 };
 
+type HostedWebSearchCall = {
+  id: string;
+  status?: string;
+  action?: Record<string, unknown>;
+};
+
+const HOSTED_WEB_SEARCH_TOOL = {
+  lc: 1,
+  type: 'not_implemented',
+  id: ['openai', 'web_search'],
+} as Parameters<CallbackHandler['handleToolStart']>[0];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function getHostedWebSearchCalls(output: LLMResult): HostedWebSearchCall[] {
+  const generationList = output.generations.at(-1);
+  const generation = generationList?.at(-1);
+  if (generation == null || !('message' in generation)) {
+    return [];
+  }
+
+  const message = (generation as ChatGeneration).message;
+  if (!(message instanceof AIMessage || message instanceof AIMessageChunk)) {
+    return [];
+  }
+
+  const toolOutputs = message.additional_kwargs.tool_outputs;
+  if (!Array.isArray(toolOutputs)) {
+    return [];
+  }
+
+  const calls = new Map<string, HostedWebSearchCall>();
+  for (const item of toolOutputs) {
+    if (
+      !isRecord(item) ||
+      item.type !== 'web_search_call' ||
+      typeof item.id !== 'string' ||
+      !isPresent(item.id) ||
+      calls.has(item.id)
+    ) {
+      continue;
+    }
+    calls.set(item.id, {
+      id: item.id,
+      ...(typeof item.status === 'string' && isPresent(item.status)
+        ? { status: item.status }
+        : {}),
+      ...(isRecord(item.action) ? { action: item.action } : {}),
+    });
+  }
+  return [...calls.values()];
+}
+
 function getLangfuseBedrockUsage(
   message: AIMessage | AIMessageChunk
 ): UsageMetadata | undefined {
@@ -195,6 +250,41 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     );
   }
 
+  private async traceHostedWebSearchCalls(
+    output: LLMResult,
+    parentRunId: string
+  ): Promise<void> {
+    for (const call of getHostedWebSearchCalls(output)) {
+      const { sources, ...action } = call.action ?? {};
+      const sourceList = Array.isArray(sources) ? sources : [];
+      const toolRunId = `${parentRunId}:web_search:${call.id}`;
+      await this.withRuntimeContext(() =>
+        super.handleToolStart(
+          HOSTED_WEB_SEARCH_TOOL,
+          JSON.stringify(action),
+          toolRunId,
+          parentRunId,
+          undefined,
+          {
+            hosted: true,
+            provider: 'openai',
+            providerCallId: call.id,
+          },
+          'web_search'
+        )
+      );
+      await super.handleToolEnd(
+        JSON.stringify({
+          status: call.status,
+          sourceCount: sourceList.length,
+          sources: sourceList,
+        }),
+        toolRunId,
+        parentRunId
+      );
+    }
+  }
+
   // LangChain may invoke callback handlers outside the caller's OTEL context.
   // Re-enter tenant scope only for callbacks that start Langfuse observations;
   // end/error/token callbacks use spans already bound to a processor at start.
@@ -228,16 +318,20 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     return this.withRuntimeContext(() => super.handleLLMStart(...args));
   }
 
-  override handleLLMEnd(
+  override async handleLLMEnd(
     output: LLMResult,
     runId: string,
     parentRunId?: string
   ): Promise<void> {
-    return super.handleLLMEnd(
-      normalizeBedrockUsageForLangfuse(output),
-      runId,
-      parentRunId
-    );
+    const normalizedOutput = normalizeBedrockUsageForLangfuse(output);
+    try {
+      await this.traceHostedWebSearchCalls(normalizedOutput, runId);
+    } catch (error) {
+      this.logger.debug(
+        `Failed to trace hosted web search: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    return super.handleLLMEnd(normalizedOutput, runId, parentRunId);
   }
 
   override handleToolStart(
