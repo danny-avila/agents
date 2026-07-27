@@ -92,14 +92,15 @@ function getLangfuseBedrockUsage(
   };
 }
 
-function cloneMessageWithUsage(
+function cloneMessageForLangfuse(
   message: AIMessage | AIMessageChunk,
-  usageMetadata: UsageMetadata
+  usageMetadata: UsageMetadata | undefined,
+  responseMetadata: AIMessageFields['response_metadata']
 ): AIMessage | AIMessageChunk {
   const fields: AIMessageFields = {
     content: message.content,
     additional_kwargs: message.additional_kwargs,
-    response_metadata: message.response_metadata,
+    response_metadata: responseMetadata,
     id: message.id,
     name: message.name,
     tool_calls: message.tool_calls,
@@ -118,6 +119,21 @@ function cloneMessageWithUsage(
   return new AIMessage(fields);
 }
 
+function getLangfuseResponseModel(
+  message: AIMessage | AIMessageChunk
+): string | undefined {
+  const model = message.response_metadata.model;
+  if (typeof model !== 'string' || model.trim() === '') {
+    return;
+  }
+
+  const trimmed = model.trim();
+  const routedModel = trimmed.startsWith('model-router')
+    ? trimmed.slice('model-router'.length)
+    : trimmed;
+  return routedModel || trimmed;
+}
+
 function normalizeGenerationForLangfuse(generation: Generation): Generation {
   if (!('message' in generation)) {
     return generation;
@@ -129,18 +145,27 @@ function normalizeGenerationForLangfuse(generation: Generation): Generation {
   }
 
   const usageMetadata = getLangfuseBedrockUsage(message);
-  if (usageMetadata == null || usageMetadata === message.usage_metadata) {
+  const responseModel = getLangfuseResponseModel(message);
+  const responseMetadata =
+    responseModel != null &&
+    responseModel !== message.response_metadata.model_name
+      ? { ...message.response_metadata, model_name: responseModel }
+      : message.response_metadata;
+  if (
+    usageMetadata === message.usage_metadata &&
+    responseMetadata === message.response_metadata
+  ) {
     return generation;
   }
 
   const chatGeneration: ChatGeneration = {
     ...(generation as ChatGeneration),
-    message: cloneMessageWithUsage(message, usageMetadata),
+    message: cloneMessageForLangfuse(message, usageMetadata, responseMetadata),
   };
   return chatGeneration;
 }
 
-function normalizeBedrockUsageForLangfuse(output: LLMResult): LLMResult {
+function normalizeOutputForLangfuse(output: LLMResult): LLMResult {
   if (output.generations.length === 0) {
     return output;
   }
@@ -234,7 +259,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     parentRunId?: string
   ): Promise<void> {
     return super.handleLLMEnd(
-      normalizeBedrockUsageForLangfuse(output),
+      normalizeOutputForLangfuse(output),
       runId,
       parentRunId
     );
