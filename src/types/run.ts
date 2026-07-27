@@ -129,6 +129,13 @@ export type StandardGraphConfig = Omit<
  *     registers its own `CHAT_MODEL_STREAM` handler consumes chunks through
  *     a decoupled `streamEvents` reader that can lag the accumulated chunk,
  *     which would invert content-part indices; those runs never seal.
+ *   - `RunConfig.tokenCounter` should be set. A sealed turn ends before most
+ *     providers send their usage chunk, so the synthetic `CHAT_MODEL_END`
+ *     falls back to the counter to report `output_tokens`. Without one that
+ *     fallback silently no-ops and the sealed turn's usage is lost — verified
+ *     live: OpenAI, Azure OpenAI and DeepSeek report no usage for the sealed
+ *     segment without a counter, while Anthropic streams usage incrementally
+ *     and reports it either way.
  */
 export interface StreamPreemption {
   /** Polled once per streamed chunk. Synchronous, allocation-free, O(1). */
