@@ -230,6 +230,38 @@ describe('preFlightTruncateToolResults', () => {
     expect(indexTokenCountMap[0]).toBe(tokenCounter(truncated));
   });
 
+  it('does not truncate indivisible native computer screenshots', () => {
+    const screenshot = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const stringOutput = new ToolMessage({
+      content: screenshot,
+      tool_call_id: 'computer-string',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const structuredOutput = new ToolMessage({
+      content: [{ type: 'computer_screenshot', image_url: screenshot }],
+      tool_call_id: 'computer-structured',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const messages: BaseMessage[] = [stringOutput, structuredOutput];
+    const indexTokenCountMap: Record<string, number | undefined> = {
+      0: tokenCounter(stringOutput),
+      1: tokenCounter(structuredOutput),
+    };
+
+    const count = preFlightTruncateToolResults({
+      messages,
+      maxContextTokens: 50,
+      indexTokenCountMap,
+      tokenCounter,
+    });
+
+    expect(count).toBe(0);
+    expect(messages[0]).toBe(stringOutput);
+    expect(messages[0].content).toBe(screenshot);
+    expect(messages[1]).toBe(structuredOutput);
+    expect(messages[1].content).toBe(structuredOutput.content);
+  });
+
   it('compacts text in multipart results without slicing media blocks', () => {
     const imageBlock = {
       type: 'image_url',

@@ -41,6 +41,9 @@ import type * as t from '@/types';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
+  hasComputerCallOutputMarker,
+  isComputerCallOutputContent,
+  isComputerCallOutputMessage,
   serializeStructuredValueBounded,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
@@ -1147,6 +1150,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
       if (isBaseMessage(output) && output._getType() === 'tool') {
         const toolMsg = output as ToolMessage;
+        if (isComputerCallOutputMessage(toolMsg)) {
+          return toolMsg;
+        }
         const originalContent = toolMsg.content;
         const compacted = compactToolContent(
           originalContent,
@@ -1732,6 +1738,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       if (postResult?.updatedOutput != null) {
+        if (hasComputerCallOutputMarker(output)) {
+          if (!isComputerCallOutputContent(postResult.updatedOutput)) {
+            throw new Error(
+              'PostToolUse updatedOutput for a computer call must be a valid screenshot URL or screenshot content block.'
+            );
+          }
+          return cloneToolMessageWithContent(output, postResult.updatedOutput);
+        }
         // Keep the tool-output registry in sync with what the model
         // actually sees. Without this, `runTool` already registered
         // the PRE-hook content under `_refKey`, and a later
@@ -2043,13 +2057,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         continue;
       }
 
-      const contentString =
-        typeof toolMessage.content === 'string'
-          ? toolMessage.content
-          : serializeStructuredValueBounded(
-            toolMessage.content,
-            this.maxToolResultChars
-          ).content;
+      let contentString: string;
+      if (isComputerCallOutputMessage(toolMessage)) {
+        contentString = truncateToolResultContent(
+          '[Computer screenshot omitted from completion event]',
+          this.maxToolResultChars
+        );
+      } else if (typeof toolMessage.content === 'string') {
+        contentString = toolMessage.content;
+      } else {
+        contentString = serializeStructuredValueBounded(
+          toolMessage.content,
+          this.maxToolResultChars
+        ).content;
+      }
 
       /**
        * Prefer the post-substitution args when a `{{…}}` placeholder

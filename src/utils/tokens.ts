@@ -2,6 +2,7 @@ import { Tokenizer } from 'ai-tokenizer';
 import { isProxy } from 'node:util/types';
 import type { AIMessage, BaseMessage } from '@langchain/core/messages';
 import {
+  isComputerCallOutputContent,
   isAtomicToolContentBlock,
   serializeStructuredValueBounded,
 } from './toolContent';
@@ -182,11 +183,20 @@ export function estimateImageBlockTokens(
 ): number {
   let base64Data: string | undefined;
 
-  if (block.type === ContentTypes.IMAGE_URL || block.type === 'image_url') {
+  if (
+    block.type === ContentTypes.IMAGE_URL ||
+    block.type === 'image_url' ||
+    block.type === 'computer_screenshot' ||
+    block.type === 'input_image'
+  ) {
     const imageUrl = block.image_url as string | { url?: string } | undefined;
     const url = typeof imageUrl === 'string' ? imageUrl : imageUrl?.url;
     if (typeof url === 'string' && url.startsWith('data:')) {
       base64Data = url;
+    } else if (typeof block.file_id === 'string' && block.file_id !== '') {
+      return block.detail === 'low'
+        ? OPENAI_IMAGE_LOW_TOKENS
+        : ANTHROPIC_IMAGE_MIN_TOKENS;
     } else {
       return ANTHROPIC_IMAGE_MIN_TOKENS;
     }
@@ -939,7 +949,9 @@ export function getTokenCountForMessage(
           isAtomicToolContentBlock(item) &&
           (item.type === ContentTypes.IMAGE_URL ||
             item.type === 'image_url' ||
-            item.type === 'image')
+            item.type === 'image' ||
+            item.type === 'computer_screenshot' ||
+            item.type === 'input_image')
         ) {
           numTokens += Math.ceil(
             estimateImageBlockTokens(item, encoding) * IMAGE_TOKEN_SAFETY_MARGIN
@@ -1022,12 +1034,51 @@ export function getTokenCountForMessage(
     }
   };
 
+  const rawAdditionalKwargs = message.additional_kwargs as unknown;
+  const additionalKwargs =
+    rawAdditionalKwargs != null && typeof rawAdditionalKwargs === 'object'
+      ? rawAdditionalKwargs
+      : undefined;
+  if (additionalKwargs != null && isProxy(additionalKwargs)) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  let additionalType: PropertyDescriptor | undefined;
+  try {
+    additionalType =
+      additionalKwargs != null
+        ? Object.getOwnPropertyDescriptor(additionalKwargs, 'type')
+        : undefined;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  if (additionalType != null && !('value' in additionalType)) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
   let numTokens = tokensPerMessage;
-  processValue(message.content);
+  const messageType = message.getType();
+  const isComputerCallOutput =
+    messageType === 'tool' &&
+    additionalType?.value === 'computer_call_output' &&
+    isComputerCallOutputContent(message.content);
+  if (isComputerCallOutput && typeof message.content === 'string') {
+    numTokens += Math.ceil(
+      estimateImageBlockTokens(
+        {
+          type: 'computer_screenshot',
+          image_url: message.content,
+        },
+        encoding
+      ) * IMAGE_TOKEN_SAFETY_MARGIN
+    );
+  } else {
+    processValue(message.content);
+  }
   if (numTokens >= Number.MAX_SAFE_INTEGER) {
     return Number.MAX_SAFE_INTEGER;
   }
-  if (message.getType() === 'ai') {
+  const messageRole = (message as BaseMessage & { role?: unknown }).role;
+  if (messageType === 'ai' || messageRole === 'assistant') {
     const toolCalls = (message as AIMessage).tool_calls ?? [];
     if (isProxy(toolCalls)) {
       return Number.MAX_SAFE_INTEGER;
@@ -1051,6 +1102,26 @@ export function getTokenCountForMessage(
           typeof args === 'string'
             ? countText(args)
             : getBoundedStructuredTokenCount(args, countText);
+      }
+    }
+    let legacyFunctionCall: PropertyDescriptor | undefined;
+    try {
+      legacyFunctionCall =
+        additionalKwargs != null
+          ? Object.getOwnPropertyDescriptor(additionalKwargs, 'function_call')
+          : undefined;
+    } catch {
+      return Number.MAX_SAFE_INTEGER;
+    }
+    if (legacyFunctionCall != null) {
+      if (!('value' in legacyFunctionCall)) {
+        return Number.MAX_SAFE_INTEGER;
+      }
+      if (legacyFunctionCall.value != null) {
+        numTokens += getBoundedStructuredTokenCount(
+          legacyFunctionCall.value,
+          countText
+        );
       }
     }
   }

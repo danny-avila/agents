@@ -390,7 +390,9 @@ function _convertLangChainContentToPart(
   }
 
   if (content.type === 'text') {
-    return { text: content.text };
+    return typeof content.text === 'string' && content.text !== ''
+      ? { text: content.text }
+      : undefined;
   } else if (content.type === 'executableCode') {
     return { executableCode: content.executableCode };
   } else if (content.type === 'codeExecutionResult') {
@@ -429,10 +431,14 @@ function _convertLangChainContentToPart(
   } else if (content.type === 'media') {
     return messageContentMedia(content);
   } else if (content.type === 'tool_use') {
+    const functionId = getGoogleFunctionId(
+      typeof content.id === 'string' ? content.id : undefined
+    );
     return {
       functionCall: {
         name: content.name,
         args: content.input,
+        ...(functionId != null ? { id: functionId } : {}),
       },
     };
   } else if (
@@ -553,7 +559,28 @@ export function convertMessageContentToParts(
     });
   }
 
-  return [...messageParts, ...functionCalls];
+  const parsedFunctionCallIds = new Set(
+    functionCalls.flatMap((part) => {
+      const functionCall = part.functionCall as GoogleFunctionCallWithId;
+      return functionCall.id != null ? [functionCall.id] : [];
+    })
+  );
+  const parsedFunctionCallNames = new Set(
+    functionCalls.map((part) => part.functionCall.name)
+  );
+  const contentWithoutParsedMirrors = messageParts.filter((part) => {
+    if (!('functionCall' in part) || part.functionCall == null) {
+      return true;
+    }
+    const functionCall = part.functionCall as GoogleFunctionCallWithId;
+    return !(
+      (functionCall.id != null && parsedFunctionCallIds.has(functionCall.id)) ||
+      (functionCall.id == null &&
+        parsedFunctionCallNames.has(functionCall.name))
+    );
+  });
+
+  return [...contentWithoutParsedMirrors, ...functionCalls];
 }
 
 export function convertBaseMessagesToContent(
@@ -665,7 +692,11 @@ export function dropUnsupportedModelTurnPrefill(
   contents: Content[] | undefined,
   model?: string
 ): Content[] | undefined {
-  if (contents == null || contents.length === 0 || !rejectsModelTurnPrefill(model)) {
+  if (
+    contents == null ||
+    contents.length === 0 ||
+    !rejectsModelTurnPrefill(model)
+  ) {
     return contents;
   }
   let end = contents.length;

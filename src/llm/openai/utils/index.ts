@@ -37,6 +37,12 @@ import type {
 } from '@langchain/openai';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import {
+  getBoundedCacheControlledTextToolContent,
+  getComputerCallOutputScreenshot,
+  isComputerCallOutputMessage,
+  serializeStructuredValueBounded,
+} from '@/utils/toolContent';
+import {
   STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
@@ -46,7 +52,6 @@ import {
   projectToolCallInputs,
   serializeToolCallInput,
 } from '@/messages/prune';
-import { serializeStructuredValueBounded } from '@/utils/toolContent';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { toLangChainContent } from '@/messages/langchain';
 
@@ -332,6 +337,8 @@ export interface ConvertMessagesOptions {
   includeReasoningDetails?: boolean;
   /** Convert reasoning_details to content blocks for Claude (requires content array format) */
   convertReasoningDetailsToContent?: boolean;
+  /** Preserve OpenRouter's canonical cache-decorated tool text block. */
+  preserveToolCacheControl?: boolean;
 }
 
 // Used in LangSmith, export is important here
@@ -358,9 +365,16 @@ export function _convertMessagesToOpenAIParams(
     if (
       role === 'tool' &&
       typeof message.content !== 'string' &&
-      message.additional_kwargs.type !== 'computer_call_output'
+      !isComputerCallOutputMessage(message)
     ) {
-      content = serializeStructuredValueBounded(
+      content =
+        options?.preserveToolCacheControl === true
+          ? getBoundedCacheControlledTextToolContent(
+            message.content,
+            HARD_MAX_TOOL_RESULT_CHARS
+          )
+          : undefined;
+      content ??= serializeStructuredValueBounded(
         message.content,
         HARD_MAX_TOOL_RESULT_CHARS
       ).content;
@@ -603,44 +617,29 @@ export function _convertMessagesToOpenAIResponsesParams(
 
         // Handle computer call output
         if (additional_kwargs.type === 'computer_call_output') {
-          const output = (() => {
-            if (typeof toolMessage.content === 'string') {
-              return {
-                type: 'computer_screenshot' as const,
-                image_url: toolMessage.content,
-              };
-            }
-
-            if (Array.isArray(toolMessage.content)) {
-              const oaiScreenshot = toolMessage.content.find(
-                (i) => i.type === 'computer_screenshot'
-              ) as { type: 'computer_screenshot'; image_url: string };
-
-              if (oaiScreenshot) return oaiScreenshot;
-
-              const lcImage = toolMessage.content.find(
-                (i) => i.type === 'image_url'
-              ) as MessageContentImageUrl;
-
-              if (lcImage) {
-                return {
-                  type: 'computer_screenshot' as const,
-                  image_url:
-                    typeof lcImage.image_url === 'string'
-                      ? lcImage.image_url
-                      : lcImage.image_url.url,
-                };
-              }
-            }
-
+          const screenshot = getComputerCallOutputScreenshot(
+            toolMessage.content
+          );
+          if (screenshot == null) {
             throw new Error('Invalid computer call output');
-          })();
+          }
 
-          return {
+          const output: OpenAIClient.Responses.ResponseComputerToolCallOutputScreenshot =
+            'image_url' in screenshot
+              ? {
+                type: 'computer_screenshot',
+                image_url: screenshot.image_url,
+              }
+              : {
+                type: 'computer_screenshot',
+                file_id: screenshot.file_id,
+              };
+          const computerCallOutput: ResponsesInputItem = {
             type: 'computer_call_output',
             output,
             call_id: toolMessage.tool_call_id,
           };
+          return computerCallOutput;
         }
 
         return {

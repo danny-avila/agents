@@ -1,4 +1,9 @@
-import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  ChatMessage,
+  HumanMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 import {
   encodingForModel,
   createTokenCounter,
@@ -116,6 +121,23 @@ describe('getTokenCountForMessage', () => {
 
     expect(Math.max(...callbackLengths)).toBe(200_000);
     expect(count).toBeGreaterThan(args.length);
+  });
+
+  test('counts legacy function_call arguments when parsed tool_calls are absent', () => {
+    const message = new AIMessage({
+      content: '',
+      additional_kwargs: {
+        function_call: {
+          name: 'legacy_lookup',
+          arguments: `{"query":"${'x'.repeat(5_000)}"}`,
+        },
+      },
+    });
+
+    const count = getTokenCountForMessage(message, (text) => text.length);
+
+    expect(message.tool_calls).toHaveLength(0);
+    expect(count).toBeGreaterThan(5_000);
   });
 
   test('keeps nested dense strings on the bounded structured path', () => {
@@ -388,6 +410,82 @@ describe('getTokenCountForMessage', () => {
 
     // 3 message tokens + ceil((85 + 4 * 170) * 1.05)
     expect(count).toBe(807);
+  });
+
+  test('prices computer screenshots as images instead of base64 text', () => {
+    const screenshot = pngDataUri(1024, 768);
+    const structured = new ToolMessage({
+      content: [{ type: 'computer_screenshot', image_url: screenshot }],
+      tool_call_id: 'computer-structured',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const string = new ToolMessage({
+      content: screenshot,
+      tool_call_id: 'computer-string',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(
+      getTokenCountForMessage(structured, (text) => text.length, 'o200k_base')
+    ).toBe(807);
+    expect(
+      getTokenCountForMessage(string, (text) => text.length, 'o200k_base')
+    ).toBe(807);
+    const file = new ToolMessage({
+      content: [
+        { type: 'input_image', file_id: 'file-screenshot123', detail: 'low' },
+      ],
+      tool_call_id: 'computer-file',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    expect(
+      getTokenCountForMessage(file, (text) => text.length, 'o200k_base')
+    ).toBe(93);
+    const highDetailFile = new ToolMessage({
+      content: [
+        { type: 'input_image', file_id: 'file-screenshot456', detail: 'high' },
+      ],
+      tool_call_id: 'computer-file-high',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    expect(
+      getTokenCountForMessage(
+        highDetailFile,
+        (text) => text.length,
+        'o200k_base'
+      )
+    ).toBe(1079);
+  });
+
+  test('does not image-price malformed marked computer output', () => {
+    const content = 'not a screenshot URL';
+    const message = new ToolMessage({
+      content,
+      tool_call_id: 'computer-invalid',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(
+      getTokenCountForMessage(message, (text) => text.length, 'o200k_base')
+    ).toBe(3 + content.length);
+  });
+
+  test('counts legacy calls on generic assistant messages', () => {
+    const argumentsValue = `{"query":"${'x'.repeat(5_000)}"}`;
+    const message = new ChatMessage({
+      role: 'assistant',
+      content: '',
+      additional_kwargs: {
+        function_call: {
+          name: 'legacy_lookup',
+          arguments: argumentsValue,
+        },
+      },
+    });
+
+    expect(
+      getTokenCountForMessage(message, (text) => text.length, 'o200k_base')
+    ).toBeGreaterThan(argumentsValue.length);
   });
 
   test('prices Google PDF media blocks per estimated page', () => {

@@ -1,3 +1,4 @@
+import { isProxy } from 'node:util/types';
 import {
   AIMessage,
   BaseMessage,
@@ -16,12 +17,14 @@ import {
   cloneToolMessageWithContent,
   compactToolContent,
   getToolContentCharLength,
+  isComputerCallOutputMessage,
   serializeStructuredValueBounded,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
   HARD_MAX_TOOL_RESULT_CHARS,
   calculateMaxToolResultChars,
+  truncateToolResultContent,
 } from '@/utils/truncation';
 import { resolveContextPruningSettings } from './contextPruningSettings';
 import { hasUnsafeStructuredSerialization } from '@/utils/tokens';
@@ -174,7 +177,8 @@ export type PruneMessagesParams = {
 };
 
 function getToolCallIds(message: BaseMessage): Set<string> {
-  if (message.getType() !== 'ai') {
+  const messageRole = (message as BaseMessage & { role?: unknown }).role;
+  if (message.getType() !== 'ai' && messageRole !== 'assistant') {
     return new Set<string>();
   }
 
@@ -202,7 +206,69 @@ function getToolCallIds(message: BaseMessage): Set<string> {
     }
   }
 
+  const toolOutputSource = getResponsesToolOutputSource(message);
+  if (toolOutputSource != null) {
+    for (const item of toolOutputSource.items) {
+      if (item == null || typeof item !== 'object') {
+        continue;
+      }
+      const record = item as {
+        type?: unknown;
+        call_id?: unknown;
+      };
+      if (
+        (record.type === 'function_call' ||
+          record.type === 'custom_tool_call' ||
+          record.type === 'computer_call') &&
+        typeof record.call_id === 'string' &&
+        record.call_id !== ''
+      ) {
+        ids.add(record.call_id);
+      }
+    }
+  }
+
   return ids;
+}
+
+type ResponsesToolOutputSource = {
+  source: 'response_metadata' | 'tool_outputs';
+  items: unknown[];
+};
+
+function getResponsesToolOutputSource(
+  message: BaseMessage
+): ResponsesToolOutputSource | undefined {
+  const responseOutput = readPropertyWithoutAccessors(
+    message.response_metadata,
+    'output'
+  );
+  if (
+    !responseOutput.accessor &&
+    Array.isArray(responseOutput.value) &&
+    !isProxy(responseOutput.value) &&
+    responseOutput.value.length > 0
+  ) {
+    return {
+      source: 'response_metadata',
+      items: responseOutput.value,
+    };
+  }
+  const fallbackOutput = readPropertyWithoutAccessors(
+    message.additional_kwargs,
+    'tool_outputs'
+  );
+  if (
+    !fallbackOutput.accessor &&
+    Array.isArray(fallbackOutput.value) &&
+    !isProxy(fallbackOutput.value)
+  ) {
+    return {
+      source: 'tool_outputs',
+      items: fallbackOutput.value,
+    };
+  }
+  return undefined;
 }
 
 function getToolResultId(message: BaseMessage): string | null {
@@ -305,7 +371,8 @@ export function repairOrphanedToolMessages({
       continue;
     }
 
-    if (message.getType() === 'ai' && message instanceof AIMessage) {
+    const messageRole = (message as BaseMessage & { role?: unknown }).role;
+    if (message.getType() === 'ai' || messageRole === 'assistant') {
       const toolCallIds = getToolCallIds(message);
       if (toolCallIds.size > 0) {
         let hasOrphanToolCalls = false;
@@ -357,16 +424,17 @@ export function repairOrphanedToolMessages({
  * Returns null if the message has no content left after stripping.
  */
 function stripOrphanToolUseBlocks(
-  message: AIMessage,
+  message: BaseMessage,
   presentToolResultIds: Set<string>
-): AIMessage | null {
-  const keptToolCalls = (message.tool_calls ?? []).filter(
+): BaseMessage | null {
+  const aiMessage = message as AIMessage;
+  const keptToolCalls = (aiMessage.tool_calls ?? []).filter(
     (tc) => typeof tc.id === 'string' && presentToolResultIds.has(tc.id)
   );
 
   let keptContent: MessageContentComplex[] | string;
-  if (Array.isArray(message.content)) {
-    const filtered = (message.content as MessageContentComplex[]).filter(
+  if (Array.isArray(aiMessage.content)) {
+    const filtered = (aiMessage.content as MessageContentComplex[]).filter(
       (block) => {
         if (typeof block !== 'object') {
           return true;
@@ -382,18 +450,60 @@ function stripOrphanToolUseBlocks(
       }
     );
 
-    if (filtered.length === 0) {
-      return null;
-    }
     keptContent = filtered;
   } else {
-    keptContent = message.content;
+    keptContent = aiMessage.content;
   }
 
-  return new AIMessage({
-    ...message,
+  const toolOutputSource = getResponsesToolOutputSource(message);
+  const keptToolOutputs =
+    toolOutputSource?.items.filter((item) => {
+      if (item == null || typeof item !== 'object') {
+        return true;
+      }
+      const record = item as {
+        type?: unknown;
+        call_id?: unknown;
+      };
+      if (
+        record.type !== 'function_call' &&
+        record.type !== 'custom_tool_call' &&
+        record.type !== 'computer_call'
+      ) {
+        return true;
+      }
+      return (
+        typeof record.call_id === 'string' &&
+        presentToolResultIds.has(record.call_id)
+      );
+    }) ?? [];
+
+  if (
+    keptToolCalls.length === 0 &&
+    Array.isArray(keptContent) &&
+    keptContent.length === 0 &&
+    keptToolOutputs.length === 0
+  ) {
+    return null;
+  }
+
+  let responseMetadata = message.response_metadata;
+  let additionalKwargs = message.additional_kwargs;
+  if (toolOutputSource?.source === 'response_metadata') {
+    responseMetadata = cloneWithProjectedProperties(responseMetadata, {
+      output: keptToolOutputs,
+    });
+  } else if (toolOutputSource?.source === 'tool_outputs') {
+    additionalKwargs = cloneWithProjectedProperties(additionalKwargs, {
+      tool_outputs: keptToolOutputs,
+    });
+  }
+
+  return cloneWithProjectedProperties(message, {
     content: toLangChainContent(keptContent),
     tool_calls: keptToolCalls.length > 0 ? keptToolCalls : undefined,
+    response_metadata: responseMetadata,
+    additional_kwargs: additionalKwargs,
   });
 }
 
@@ -421,6 +531,11 @@ export function sanitizeOrphanToolBlocks(
 
   for (const msg of messages) {
     const msgAny = msg as unknown as Record<string, unknown>;
+    if (typeof (msg as { getType?: unknown }).getType === 'function') {
+      for (const id of getToolCallIds(msg)) {
+        allToolCallIds.add(id);
+      }
+    }
     const toolCalls = msgAny.tool_calls as Array<{ id?: string }> | undefined;
     if (Array.isArray(toolCalls)) {
       for (const tc of toolCalls) {
@@ -1080,6 +1195,9 @@ export function maskConsumedToolResults(params: {
   for (let c = 0; c < count; c++) {
     const i = consumedIndices[c];
     const message = messages[i];
+    if (isComputerCallOutputMessage(message)) {
+      continue;
+    }
     const content = message.content;
 
     let maxChars: number;
@@ -1145,7 +1263,10 @@ export function preFlightTruncateToolResults(params: {
 
   const toolIndices: number[] = [];
   for (let i = 0; i < messages.length; i++) {
-    if (messages[i].getType() === 'tool') {
+    if (
+      messages[i].getType() === 'tool' &&
+      !isComputerCallOutputMessage(messages[i])
+    ) {
       toolIndices.push(i);
     }
   }
@@ -1217,6 +1338,9 @@ function readPropertyWithoutAccessors(
 ): PropertyRead {
   let current: object | null = value;
   for (let depth = 0; current != null && depth < 100; depth++) {
+    if (isProxy(current)) {
+      return { found: true, own: current === value, accessor: true };
+    }
     let descriptor: PropertyDescriptor | undefined;
     try {
       descriptor = Object.getOwnPropertyDescriptor(current, key);
@@ -1240,7 +1364,9 @@ function readPropertyWithoutAccessors(
       return { found: true, own: false, accessor: true };
     }
   }
-  return { found: false, own: false, accessor: false };
+  return current == null
+    ? { found: false, own: false, accessor: false }
+    : { found: true, own: false, accessor: true };
 }
 
 function cloneWithProjectedProperties<T extends object>(
@@ -1525,10 +1651,78 @@ function projectRawOpenAIToolCalls(
   };
 }
 
+function projectLegacyFunctionCall(
+  property: PropertyRead,
+  maxChars: number
+): { value: unknown; changed: boolean } {
+  if (!property.found) {
+    return { value: property.value, changed: false };
+  }
+  if (property.own && !property.accessor && property.value === undefined) {
+    return { value: undefined, changed: false };
+  }
+  if (
+    property.accessor ||
+    !property.own ||
+    property.value == null ||
+    typeof property.value !== 'object'
+  ) {
+    return { value: undefined, changed: true };
+  }
+
+  const nameProperty = readPropertyWithoutAccessors(property.value, 'name');
+  const argsProperty = readPropertyWithoutAccessors(
+    property.value,
+    'arguments'
+  );
+  if (
+    nameProperty.accessor ||
+    !nameProperty.own ||
+    typeof nameProperty.value !== 'string' ||
+    nameProperty.value === '' ||
+    nameProperty.value.length > normalizeToolInputLimit(maxChars) ||
+    !argsProperty.found ||
+    argsProperty.accessor ||
+    !argsProperty.own
+  ) {
+    return { value: undefined, changed: true };
+  }
+  try {
+    const prototype = Object.getPrototypeOf(property.value);
+    const enumerableKeys = Object.keys(property.value);
+    if (
+      (prototype === Object.prototype || prototype === null) &&
+      enumerableKeys.length === 2 &&
+      enumerableKeys.includes('name') &&
+      enumerableKeys.includes('arguments') &&
+      typeof argsProperty.value === 'string' &&
+      argsProperty.value.length <= normalizeToolInputLimit(maxChars) &&
+      !hasUnsafeStructuredSerialization(property.value)
+    ) {
+      return { value: property.value, changed: false };
+    }
+  } catch {
+    return { value: undefined, changed: true };
+  }
+  const projectedArgs = selectProjectedSerializedArguments(
+    argsProperty,
+    undefined,
+    maxChars
+  );
+  return {
+    value: {
+      name: nameProperty.value,
+      arguments: projectedArgs.value,
+    },
+    changed: true,
+  };
+}
+
 function projectResponsesOutput(
   output: unknown,
   maxChars: number,
-  canonicalArguments: ReadonlyMap<string, string>
+  canonicalArguments: ReadonlyMap<string, string>,
+  canonicalInputs: ReadonlyMap<string, unknown>
 ): { value: unknown; changed: boolean } {
   if (!Array.isArray(output)) {
     return { value: output, changed: false };
@@ -1540,28 +1734,87 @@ function projectResponsesOutput(
       return item;
     }
     const type = getStringProperty(item, 'type');
-    if (type !== 'function_call') {
+    if (
+      type !== 'function_call' &&
+      type !== 'custom_tool_call' &&
+      type !== 'computer_call'
+    ) {
       return item;
     }
-    const argsProperty = readPropertyWithoutAccessors(item, 'arguments');
-    if (!argsProperty.found) {
+    let inputKey = 'action';
+    if (type === 'function_call') {
+      inputKey = 'arguments';
+    } else if (type === 'custom_tool_call') {
+      inputKey = 'input';
+    }
+    const inputProperty = readPropertyWithoutAccessors(item, inputKey);
+    if (!inputProperty.found) {
       return item;
     }
     const callId =
       getStringProperty(item, 'call_id') ?? getStringProperty(item, 'id');
-    const canonical =
-      callId != null ? canonicalArguments.get(callId) : undefined;
-    const projectedArgs = selectProjectedSerializedArguments(
-      argsProperty,
-      canonical,
-      maxChars
-    );
-    if (!projectedArgs.changed && argsProperty.own) {
+    let projectedInput: ToolInputProjection;
+    if (type === 'function_call') {
+      const canonical =
+        callId != null ? canonicalArguments.get(callId) : undefined;
+      projectedInput = selectProjectedSerializedArguments(
+        inputProperty,
+        canonical,
+        maxChars
+      );
+    } else {
+      const canonicalArgs =
+        callId != null ? canonicalInputs.get(callId) : undefined;
+      const canonicalProperty =
+        canonicalArgs != null && typeof canonicalArgs === 'object'
+          ? readPropertyWithoutAccessors(canonicalArgs, inputKey)
+          : undefined;
+      let source = inputProperty.accessor
+        ? ACCESSOR_INPUT_PLACEHOLDER
+        : inputProperty.value;
+      if (canonicalProperty != null && canonicalProperty.found) {
+        source = canonicalProperty.accessor
+          ? ACCESSOR_INPUT_PLACEHOLDER
+          : canonicalProperty.value;
+      }
+      if (
+        type === 'custom_tool_call' &&
+        typeof source === 'string' &&
+        source.length <= normalizeToolInputLimit(maxChars)
+      ) {
+        projectedInput = {
+          value: source,
+          changed: !inputProperty.own || inputProperty.value !== source,
+        };
+      } else if (type === 'custom_tool_call') {
+        const value =
+          typeof source === 'string'
+            ? truncateToolResultContent(
+              source,
+              normalizeToolInputLimit(maxChars)
+            )
+            : serializeToolCallInput(source, maxChars);
+        projectedInput = {
+          value,
+          changed: !inputProperty.own || inputProperty.value !== value,
+        };
+      } else {
+        const projected = projectToolInputWithinLimit(source, maxChars);
+        projectedInput = {
+          value: projected.value,
+          changed:
+            projected.changed ||
+            !inputProperty.own ||
+            inputProperty.value !== projected.value,
+        };
+      }
+    }
+    if (!projectedInput.changed && inputProperty.own) {
       return item;
     }
     state.changed = true;
     return cloneWithProjectedProperties(item, {
-      arguments: projectedArgs.value,
+      [inputKey]: projectedInput.value,
     });
   });
   return {
@@ -1638,9 +1891,22 @@ export function projectToolCallInputs(
       (toolCall, toolCallIndex) => toolCall !== originalToolCalls[toolCallIndex]
     );
 
-    const rawAdditionalToolCalls = aiMessage.additional_kwargs.tool_calls;
-    const rawResponsesOutput = aiMessage.response_metadata.output;
+    const rawAdditionalToolCallsProperty = readPropertyWithoutAccessors(
+      aiMessage.additional_kwargs,
+      'tool_calls'
+    );
+    const rawAdditionalToolCalls = rawAdditionalToolCallsProperty.accessor
+      ? undefined
+      : rawAdditionalToolCallsProperty.value;
+    const rawResponsesOutputProperty = readPropertyWithoutAccessors(
+      aiMessage.response_metadata,
+      'output'
+    );
+    const rawResponsesOutput = rawResponsesOutputProperty.accessor
+      ? undefined
+      : rawResponsesOutputProperty.value;
     const canonicalArguments = new Map<string, string>();
+    const canonicalInputs = new Map<string, unknown>();
     if (
       Array.isArray(rawAdditionalToolCalls) ||
       Array.isArray(rawResponsesOutput)
@@ -1651,43 +1917,66 @@ export function projectToolCallInputs(
           continue;
         }
         const args = readPropertyWithoutAccessors(toolCall, 'args');
+        const canonicalInput = args.accessor
+          ? ACCESSOR_INPUT_PLACEHOLDER
+          : args.value;
+        canonicalInputs.set(id, canonicalInput);
         canonicalArguments.set(
           id,
-          serializeToolCallInput(
-            args.accessor ? ACCESSOR_INPUT_PLACEHOLDER : args.value,
-            normalizedMaxInputChars
-          )
+          serializeToolCallInput(canonicalInput, normalizedMaxInputChars)
         );
       }
     }
 
-    let projectedAdditionalKwargs = aiMessage.additional_kwargs;
-    let additionalKwargsChanged = false;
+    const additionalKwargsChanges: Record<string, unknown> =
+      rawAdditionalToolCallsProperty.accessor ? { tool_calls: undefined } : {};
     const rawToolCalls = projectRawOpenAIToolCalls(
       rawAdditionalToolCalls,
       normalizedMaxInputChars,
       canonicalArguments
     );
     if (rawToolCalls.changed) {
-      projectedAdditionalKwargs = cloneWithProjectedProperties(
+      additionalKwargsChanges.tool_calls = rawToolCalls.value;
+    }
+    const legacyFunctionCall = projectLegacyFunctionCall(
+      readPropertyWithoutAccessors(
         aiMessage.additional_kwargs,
-        { tool_calls: rawToolCalls.value }
-      );
-      additionalKwargsChanged = true;
+        'function_call'
+      ),
+      normalizedMaxInputChars
+    );
+    if (legacyFunctionCall.changed) {
+      additionalKwargsChanges.function_call = legacyFunctionCall.value;
+    }
+    const additionalKwargsChanged =
+      Object.keys(additionalKwargsChanges).length > 0;
+    let projectedAdditionalKwargs = aiMessage.additional_kwargs;
+    if (additionalKwargsChanged) {
+      projectedAdditionalKwargs = isProxy(aiMessage.additional_kwargs)
+        ? { ...additionalKwargsChanges }
+        : cloneWithProjectedProperties(
+          aiMessage.additional_kwargs,
+          additionalKwargsChanges
+        );
     }
 
     let projectedResponseMetadata = aiMessage.response_metadata;
-    let responseMetadataChanged = false;
+    let responseMetadataChanged = rawResponsesOutputProperty.accessor;
     const responsesOutput = projectResponsesOutput(
       rawResponsesOutput,
       normalizedMaxInputChars,
-      canonicalArguments
+      canonicalArguments,
+      canonicalInputs
     );
-    if (responsesOutput.changed) {
-      projectedResponseMetadata = cloneWithProjectedProperties(
-        aiMessage.response_metadata,
-        { output: responsesOutput.value }
-      );
+    if (responsesOutput.changed || rawResponsesOutputProperty.accessor) {
+      const output = rawResponsesOutputProperty.accessor
+        ? undefined
+        : responsesOutput.value;
+      projectedResponseMetadata = isProxy(aiMessage.response_metadata)
+        ? { output }
+        : cloneWithProjectedProperties(aiMessage.response_metadata, {
+          output,
+        });
       responseMetadataChanged = true;
     }
 
@@ -1770,6 +2059,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
   /** Best observed instruction overhead from a near-zero variance turn.
    *  Self-seeds from provider observations within the run. */
   let bestInstructionOverhead: number | undefined;
+  const reconciledLegacyAiMessages = new WeakSet<BaseMessage>();
   let bestVarianceAbs = Infinity;
   /** Local estimate at the time bestInstructionOverhead was observed.
    *  Used to invalidate the cached overhead when instructions change
@@ -1895,46 +2185,86 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     const newOutputs = new Set<number>();
 
     // Host token maps predate LangChain formatting and may omit tool output or
-    // assign it a zero/tiny count. Reconcile every ToolMessage once against the
-    // exact provider payload before making any budget decision.
-    for (let i = 0; i < params.messages.length; i++) {
-      let message = params.messages[i];
-      const cachedCount = indexTokenCountMap[i];
-      if (message.getType() !== 'tool' || reconciledToolMessages.has(message)) {
-        continue;
-      }
-      const normalized = compactToolContent(
-        message.content,
-        factoryParams.maxToolResultChars ?? HARD_MAX_TOOL_RESULT_CHARS
-      );
-      if (normalized.changed) {
-        message = cloneToolMessageWithContent(
-          message as ToolMessage,
-          normalized.content
-        );
-        params.messages[i] = message;
-      }
-      const reconciledCount = factoryParams.tokenCounter(message);
-      reconciledToolMessages.add(message);
+    // legacy function-call arguments. Reconcile those provider-bound shapes
+    // once before making any budget decision.
+    const applyReconciledCount = (
+      index: number,
+      cachedCount: number | undefined,
+      reconciledCount: number
+    ): void => {
       if (cachedCount === undefined) {
-        indexTokenCountMap[i] = reconciledCount;
+        indexTokenCountMap[index] = reconciledCount;
         totalTokens += reconciledCount;
-        if (i >= lastTurnStartIndex) {
-          newOutputs.add(i);
+        if (index >= lastTurnStartIndex) {
+          newOutputs.add(index);
         }
-        continue;
+        return;
       }
       // Preserve a larger host estimate: reconciliation is a safety floor,
       // not permission to reduce an upstream count that may include provider
       // serialization overhead unavailable to the local counter.
       if (reconciledCount <= cachedCount) {
+        return;
+      }
+      indexTokenCountMap[index] = reconciledCount;
+      totalTokens += reconciledCount - cachedCount;
+      if (index >= lastTurnStartIndex) {
+        newOutputs.add(index);
+      }
+    };
+    for (let i = 0; i < params.messages.length; i++) {
+      let message = params.messages[i];
+      const cachedCount = indexTokenCountMap[i];
+      const messageType = message.getType();
+      const messageRole = (message as BaseMessage & { role?: unknown }).role;
+      const isAssistant = messageType === 'ai' || messageRole === 'assistant';
+      const legacyFunctionCall = isAssistant
+        ? readPropertyWithoutAccessors(
+          message.additional_kwargs,
+          'function_call'
+        )
+        : undefined;
+      if (
+        legacyFunctionCall?.found === true &&
+        !reconciledLegacyAiMessages.has(message)
+      ) {
+        const [projected] = projectToolCallInputs(
+          [message],
+          calculateMaxToolCallInputChars(factoryParams.maxTokens)
+        );
+        if (projected !== message) {
+          message = projected;
+          params.messages[i] = message;
+        }
+        reconciledLegacyAiMessages.add(message);
+        if (cachedCount !== undefined || i < lastTurnStartIndex) {
+          applyReconciledCount(
+            i,
+            cachedCount,
+            factoryParams.tokenCounter(message)
+          );
+        }
         continue;
       }
-      indexTokenCountMap[i] = reconciledCount;
-      totalTokens += reconciledCount - cachedCount;
-      if (i >= lastTurnStartIndex) {
-        newOutputs.add(i);
+      if (messageType !== 'tool' || reconciledToolMessages.has(message)) {
+        continue;
       }
+      if (!isComputerCallOutputMessage(message)) {
+        const normalized = compactToolContent(
+          message.content,
+          factoryParams.maxToolResultChars ?? HARD_MAX_TOOL_RESULT_CHARS
+        );
+        if (normalized.changed) {
+          message = cloneToolMessageWithContent(
+            message as ToolMessage,
+            normalized.content
+          );
+          params.messages[i] = message;
+        }
+      }
+      const reconciledCount = factoryParams.tokenCounter(message);
+      reconciledToolMessages.add(message);
+      applyReconciledCount(i, cachedCount, reconciledCount);
     }
 
     let outputTokensAssigned = false;
@@ -2552,7 +2882,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         let emergencyTruncatedCount = 0;
         for (let i = 0; i < emergencyMessages.length; i++) {
           const message = emergencyMessages[i];
-          if (message.getType() === 'tool') {
+          if (
+            message.getType() === 'tool' &&
+            !isComputerCallOutputMessage(message)
+          ) {
             const content = message.content;
             if (getToolContentCharLength(content) > emergencyMaxChars) {
               const compacted = compactToolContent(content, emergencyMaxChars);

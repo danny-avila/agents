@@ -22,6 +22,7 @@ import {
   compactToolContent,
   getToolContentCharLength,
   isAtomicToolContentBlock,
+  isComputerCallOutputMessage,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import { resolveContextPruningSettings } from './contextPruningSettings';
@@ -127,6 +128,9 @@ export function applyContextPruning(params: {
   for (let i = 0; i < totalMessages; i++) {
     const message = messages[i];
     if (message.getType() !== 'tool') {
+      continue;
+    }
+    if (isComputerCallOutputMessage(message)) {
       continue;
     }
     if (protectedIndices.has(i)) {

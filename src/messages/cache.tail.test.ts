@@ -1,3 +1,4 @@
+import { convertMessagesToCompletionsMessageParams } from '@langchain/openai';
 import {
   AIMessage,
   HumanMessage,
@@ -10,7 +11,15 @@ import type {
 } from '@langchain/core/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessages } from '@/types/messages';
+import {
+  projectOpenAIChatToolMessageContent,
+  projectOpenAIToolMessageContent,
+  projectOpenAIResponsesToolMessageContent,
+  projectOpenRouterToolMessageContent,
+  projectComputerCallOutputsToText,
+} from './core';
 import { addTailCacheControl, addBedrockTailCacheControl } from './cache';
+import { convertToConverseMessages } from '@/llm/bedrock/utils';
 import { toLangChainContent } from './langchain';
 
 type CacheControlBlock = MessageContentComplex & {
@@ -84,6 +93,154 @@ describe('addTailCacheControl (single tail breakpoint)', () => {
 
     expect(countCacheMarkers(result)).toBe(1);
     expect(blocksOf(result[2])[0].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  test('skips native computer outputs and removes stale screenshot markers', () => {
+    const computerCall = new AIMessage({
+      content: '',
+      response_metadata: {
+        output: [
+          {
+            type: 'computer_call',
+            call_id: 'call_computer_cache',
+            action: { type: 'screenshot' },
+          },
+        ],
+      },
+    });
+    const computerOutput = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_computer_cache',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const canonical = projectOpenAIToolMessageContent([
+      new HumanMessage('Take a screenshot'),
+      computerCall,
+      computerOutput,
+    ]);
+
+    const cached = addTailCacheControl(canonical);
+
+    expect(countCacheMarkers(cached)).toBe(1);
+    expect(blocksOf(cached[0])[0].cache_control).toEqual({
+      type: 'ephemeral',
+    });
+    expect(blocksOf(cached[2])[0]).not.toHaveProperty('cache_control');
+    expect(() =>
+      projectOpenAIResponsesToolMessageContent(cached)
+    ).not.toThrow();
+
+    const canonicalOutput = canonical[2] as ToolMessage;
+    const staleOutput = new ToolMessage({
+      content: toLangChainContent([
+        {
+          ...(canonicalOutput.content[0] as MessageContentComplex),
+          cache_control: { type: 'ephemeral' },
+        },
+      ]),
+      tool_call_id: canonicalOutput.tool_call_id,
+      additional_kwargs: canonicalOutput.additional_kwargs,
+    });
+    const cleaned = addTailCacheControl([
+      canonical[0],
+      canonical[1],
+      staleOutput,
+    ]);
+
+    expect(countCacheMarkers(cleaned)).toBe(1);
+    expect(blocksOf(cleaned[2])[0]).not.toHaveProperty('cache_control');
+    expect(blocksOf(staleOutput)[0]).toHaveProperty('cache_control');
+    expect(() =>
+      projectOpenAIResponsesToolMessageContent(cleaned)
+    ).not.toThrow();
+  });
+
+  test('keeps a cached tool result structured through Chat projection', () => {
+    const toolCall = new AIMessage({
+      content: '',
+      tool_calls: [{ id: 'call_cached_tool', name: 'search', args: {} }],
+    });
+    const toolOutput = new ToolMessage({
+      content: 'result body',
+      tool_call_id: 'call_cached_tool',
+    });
+    const graphProjected = projectOpenAIToolMessageContent([
+      new HumanMessage('Search'),
+      toolCall,
+      toolOutput,
+    ]);
+    const cached = addTailCacheControl(graphProjected);
+    const attemptProjected = projectOpenRouterToolMessageContent(cached);
+    const payload = convertMessagesToCompletionsMessageParams({
+      messages: attemptProjected,
+      model: 'gpt-4o',
+    });
+
+    expect(blocksOf(cached[2])[0]).toMatchObject({
+      type: 'text',
+      text: 'result body',
+      cache_control: { type: 'ephemeral' },
+    });
+    expect((attemptProjected[2] as ToolMessage).content).toEqual(
+      (cached[2] as ToolMessage).content
+    );
+    expect(payload[2]).toMatchObject({
+      role: 'tool',
+      tool_call_id: 'call_cached_tool',
+      content: [
+        {
+          type: 'text',
+          text: 'result body',
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    });
+
+    const fallbackProjected = projectOpenAIChatToolMessageContent(cached);
+    const fallbackPayload = convertMessagesToCompletionsMessageParams({
+      messages: fallbackProjected,
+      model: 'gpt-4o',
+    });
+
+    expect((fallbackProjected[2] as ToolMessage).content).toBe('result body');
+    expect(fallbackPayload[2]).toMatchObject({
+      role: 'tool',
+      tool_call_id: 'call_cached_tool',
+      content: 'result body',
+    });
+    expect(JSON.stringify(fallbackPayload[2])).not.toContain('cache_control');
+
+    expect(
+      typeof (projectOpenAIToolMessageContent(cached)[2] as ToolMessage).content
+    ).toBe('string');
+  });
+
+  test('does not stringify noncanonical cache metadata into tool output', () => {
+    const messages = addTailCacheControl<BaseMessage>([
+      new HumanMessage('Search'),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call_nested_cache', name: 'search', args: {} }],
+      }),
+      new ToolMessage({
+        content: toLangChainContent([
+          {
+            type: 'tool_result',
+            tool_use_id: 'call_nested_cache',
+            content: 'result body',
+          },
+        ] as MessageContentComplex[]),
+        tool_call_id: 'call_nested_cache',
+      }),
+    ]);
+
+    const projected = projectOpenRouterToolMessageContent(messages);
+    const content = (projected[2] as ToolMessage).content;
+
+    expect(typeof content).toBe('string');
+    expect(content).toContain('result body');
+    expect(content).not.toContain('cache_control');
+    expect(JSON.stringify(messages[2].content)).toContain('cache_control');
   });
 
   test('strips ALL stale markers and re-anchors a single one at the tail', () => {
@@ -336,5 +493,41 @@ describe('addBedrockTailCacheControl (single tail cachePoint)', () => {
       { type: 'text', text: 'result body' },
       { cachePoint: { type: 'default' } },
     ]);
+  });
+
+  test('keeps the cachePoint before an omitted computer screenshot', () => {
+    const computerOutput = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_bedrock_computer',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const cached = addBedrockTailCacheControl([
+      new HumanMessage('Take a screenshot'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_bedrock_computer',
+            name: 'computer',
+            args: { action: 'screenshot' },
+          },
+        ],
+      }),
+      computerOutput,
+    ]);
+
+    expect(countCachePoints(cached)).toBe(1);
+    expect(blocksOf(cached[0])[1]).toEqual({
+      cachePoint: { type: 'default' },
+    });
+    expect(cached[2].content).toBe(computerOutput.content);
+
+    const projected = projectComputerCallOutputsToText(cached);
+    const converse = convertToConverseMessages(projected);
+    expect((projected[2] as ToolMessage).content).toBe(
+      '[Computer screenshot omitted for this provider]'
+    );
+    expect(JSON.stringify(converse).match(/"cachePoint"/g)).toHaveLength(1);
+    expect(computerOutput.content).toBe('data:image/png;base64,AA==');
   });
 });

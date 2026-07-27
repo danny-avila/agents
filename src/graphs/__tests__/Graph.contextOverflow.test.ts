@@ -1,8 +1,8 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { MemorySaver } from '@langchain/langgraph';
-import { describe, expect, it } from '@jest/globals';
 import { Runnable } from '@langchain/core/runnables';
+import { describe, expect, it, jest } from '@jest/globals';
 import {
   AIMessageChunk,
   HumanMessage,
@@ -13,6 +13,7 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
 import { ContentTypes, GraphEvents, Providers } from '@/common';
+import * as init from '@/llm/init';
 import { Run } from '@/run';
 
 /**
@@ -119,6 +120,7 @@ async function createRun(options: {
   model?: string;
   promptCache?: boolean;
   toolOutputReferences?: t.ToolOutputReferencesConfig;
+  fallbacks?: t.FallbackConfig[];
 }): Promise<Run<t.IState>> {
   return Run.create<t.IState>({
     runId: options.runId,
@@ -128,6 +130,7 @@ async function createRun(options: {
         provider: options.provider ?? Providers.ANTHROPIC,
         ...(options.model != null ? { model: options.model } : {}),
         ...(options.promptCache === true ? { promptCache: true } : {}),
+        ...(options.fallbacks != null ? { fallbacks: options.fallbacks } : {}),
         disableStreaming: true,
         streamUsage: false,
       },
@@ -228,6 +231,166 @@ describe('context overflow recovery', () => {
     expect((projectedTool?.content as string).length).toBeLessThanOrEqual(200);
     expect(measuredToolContents).toContain(projectedTool?.content);
     expect(Array.isArray(toolMessage.content)).toBe(true);
+  });
+
+  it('measures the bounded generic-provider tool payload that is invoked', async () => {
+    const toolCallId = 'tc-google-structured';
+    const structuredContent = Array.from({ length: 25_000 }, () => ({
+      type: ContentTypes.TEXT,
+      text: 'x',
+    }));
+    const toolMessage = new ToolMessage({
+      content: structuredContent,
+      tool_call_id: toolCallId,
+      name: 'dense_result',
+    });
+    const messages: BaseMessage[] = [
+      new HumanMessage('return the dense result'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'dense_result',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+    const measuredToolContents: string[] = [];
+    const projectionCounter: t.TokenCounter = (message) => {
+      if (message.getType() === 'tool' && typeof message.content === 'string') {
+        measuredToolContents.push(message.content);
+      }
+      return typeof message.content === 'string'
+        ? Math.max(1, Math.ceil(message.content.length / 4))
+        : 1;
+    };
+    const run = await createRun({
+      runId: 'google-structured-final-projection',
+      maxContextTokens: 10_000,
+      maxToolResultChars: 2_000,
+      provider: Providers.GOOGLE,
+      tokenCounter: projectionCounter,
+      indexTokenCountMap: {
+        0: projectionCounter(messages[0]),
+        1: projectionCounter(messages[1]),
+        2: projectionCounter(messages[2]),
+      },
+      tools: [
+        tool(async () => 'unused', {
+          name: 'dense_result',
+          description: 'Returns a dense structured result',
+          schema: z.object({}),
+        }),
+      ],
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(signatureFor('gpt-4o-mini'), 0);
+    run.Graph.overrideModel = model;
+
+    await run.processStream({ messages }, streamConfig);
+
+    expect(model.calls).toHaveLength(1);
+    const projectedTool = model.calls[0].find(
+      (message) => message.getType() === 'tool'
+    ) as ToolMessage | undefined;
+    expect(typeof projectedTool?.content).toBe('string');
+    expect((projectedTool?.content as string).length).toBeLessThanOrEqual(
+      2_000
+    );
+    expect(measuredToolContents).toContain(projectedTool?.content);
+    expect(toolMessage.content).toBe(structuredContent);
+  });
+
+  it('guards a fallback-specific projection before invoking the fallback', async () => {
+    const toolCallId = 'tc-fallback-structured';
+    const structuredContent = Array.from({ length: 25_000 }, () => ({
+      type: ContentTypes.TEXT,
+      text: '',
+    }));
+    const messages: BaseMessage[] = [
+      new HumanMessage('return the dense fallback result'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'dense_result',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: structuredContent,
+        tool_call_id: toolCallId,
+        name: 'dense_result',
+      }),
+    ];
+    const projectionCounter: t.TokenCounter = (message) =>
+      typeof message.content === 'string'
+        ? Math.max(1, message.content.length)
+        : 1;
+    const run = await createRun({
+      runId: 'fallback-structured-final-projection',
+      maxContextTokens: 1_000_000,
+      provider: Providers.ANTHROPIC,
+      tokenCounter: projectionCounter,
+      indexTokenCountMap: {
+        0: projectionCounter(messages[0]),
+        1: projectionCounter(messages[1]),
+        2: projectionCounter(messages[2]),
+      },
+      fallbacks: [
+        {
+          provider: Providers.GOOGLE,
+          maxContextTokens: 5_000,
+        },
+      ],
+      tools: [
+        tool(async () => 'unused', {
+          name: 'dense_result',
+          description: 'Returns a dense structured result',
+          schema: z.object({}),
+        }),
+      ],
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const primary = new OverflowThenSucceedModel(
+      { message: '503 primary unavailable' },
+      1
+    );
+    let fallbackInvocations = 0;
+    const fallback = {
+      invoke: async (): Promise<AIMessageChunk> => {
+        fallbackInvocations++;
+        return new AIMessageChunk({ content: 'fallback should not run' });
+      },
+    } as unknown as ReturnType<typeof init.initializeModel>;
+    const initializeSpy = jest
+      .spyOn(init, 'initializeModel')
+      .mockReturnValue(fallback);
+    run.Graph.overrideModel = primary;
+
+    try {
+      const content = await run.processStream({ messages }, streamConfig);
+
+      expect(content).toEqual([{ type: 'text', text: 'recovered' }]);
+      expect(primary.calls).toHaveLength(2);
+      expect(fallbackInvocations).toBe(0);
+      expect(
+        run.Graph.agentContexts.get('default')?.overflowRecoveryAttempts
+      ).toBe(1);
+    } finally {
+      initializeSpy.mockRestore();
+    }
   });
 
   it('projects unsafe tool-call args before measuring or invoking the provider', async () => {

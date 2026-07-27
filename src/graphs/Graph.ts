@@ -35,7 +35,7 @@ import {
   createPruneMessages,
   projectToolCallInputs,
   calculateMaxToolCallInputChars,
-  projectOpenAIToolMessageContent,
+  projectToolStreamContentForProvider,
   syncBudgetDerivedFields,
   addTailCacheControl,
   resolvePromptCacheTtl,
@@ -59,6 +59,13 @@ import {
   sleep,
 } from '@/utils';
 import {
+  attemptInvoke,
+  tryFallbackProviders,
+  getFallbackErrorContext,
+  getFallbackOverflowCandidates,
+  projectMessagesForProvider,
+} from '@/llm/invoke';
+import {
   createLangfuseHandler,
   createLangfuseTraceMetadata,
   disposeLangfuseHandler,
@@ -69,12 +76,6 @@ import {
   planContextOverflowRecovery,
   translateRecoveryBudget,
 } from '@/llm/contextOverflowRecovery';
-import {
-  attemptInvoke,
-  tryFallbackProviders,
-  getFallbackErrorContext,
-  getFallbackOverflowCandidates,
-} from '@/llm/invoke';
 import {
   compactToolContent,
   getToolContentCharLength,
@@ -2038,13 +2039,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const maxProviderToolResultChars =
         agentContext.maxToolResultChars ??
         calculateMaxToolResultChars(agentContext.maxContextTokens);
-      if (isOpenAILike(agentContext.provider)) {
-        const before = finalMessages;
-        finalMessages = trackProviderMessageOrigins(
-          before,
-          projectOpenAIToolMessageContent(before, maxProviderToolResultChars)
-        );
-      }
+      const beforeToolStreamProjection = finalMessages;
+      finalMessages = trackProviderMessageOrigins(
+        beforeToolStreamProjection,
+        projectToolStreamContentForProvider(beforeToolStreamProjection)
+      );
       const beforeToolInputProjection = finalMessages;
       finalMessages = trackProviderMessageOrigins(
         beforeToolInputProjection,
@@ -2080,33 +2079,44 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       const measureProviderPayload = (
-        candidate: BaseMessage[]
+        candidate: BaseMessage[],
+        contextBudgetOverride?: number,
+        forceRawRecount = false
       ): {
         fits: boolean;
         projectedMessageTokens?: number;
         availableMessageTokens?: number;
       } => {
+        const contextBudget =
+          contextBudgetOverride ?? contextUsage?.contextBudget;
+        const effectiveInstructionTokens =
+          contextUsage?.effectiveInstructionTokens ??
+          (forceRawRecount ? agentContext.instructionTokens : undefined);
         if (
           agentContext.tokenCounter == null ||
-          contextUsage?.contextBudget == null ||
-          contextUsage.effectiveInstructionTokens == null
+          contextBudget == null ||
+          effectiveInstructionTokens == null
         ) {
           return { fits: true };
         }
         const availableMessageTokens = Math.max(
           0,
-          contextUsage.contextBudget - contextUsage.effectiveInstructionTokens
+          contextBudget - effectiveInstructionTokens
         );
         let usageRatio =
           agentContext.calibrationRatio > 0 ? agentContext.calibrationRatio : 1;
         if (
-          contextUsage.calibrationRatio != null &&
+          contextUsage?.calibrationRatio != null &&
           contextUsage.calibrationRatio > 0
         ) {
           usageRatio = contextUsage.calibrationRatio;
         }
-        const baselineRemaining = contextUsage.remainingContextTokens;
+        if (forceRawRecount) {
+          usageRatio = Math.max(1, usageRatio);
+        }
+        const baselineRemaining = contextUsage?.remainingContextTokens;
         const accountedMessageTokens =
+          !forceRawRecount &&
           providerMessageBaseline != null &&
           baselineRemaining != null &&
           Number.isFinite(baselineRemaining)
@@ -2516,6 +2526,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
+      const fallbackBaseMessages = finalMessages;
+      const beforeFinalProviderProjection = fallbackBaseMessages;
+      finalMessages = trackProviderMessageOrigins(
+        beforeFinalProviderProjection,
+        projectMessagesForProvider({
+          model: (this.overrideModel ?? model) as t.ChatModel,
+          messages: beforeFinalProviderProjection,
+          provider: agentContext.provider,
+          maxToolResultChars: maxProviderToolResultChars,
+          callOptions: config,
+        })
+      );
+
       /**
        * Prompt-cache placement and orphan sanitization are provider-wire
        * transforms too. Re-measure after both so no content added after the
@@ -2826,7 +2849,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               tryFallbackProviders({
                 fallbacks,
                 tools: agentContext.tools,
-                messages: finalMessages,
+                messages: fallbackBaseMessages,
                 config: invokeConfig,
                 primaryError,
                 context: this,
@@ -2839,6 +2862,56 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   provider: agentContext.provider,
                   estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
                   maxContextTokens: agentContext.maxContextTokens,
+                },
+                prepareProviderMessages: ({
+                  model: fallbackModel,
+                  messages: fallbackMessages,
+                  provider: fallbackProvider,
+                  maxContextTokens: fallbackMaxContextTokens,
+                  config: fallbackConfig,
+                }) => {
+                  const fallbackToolResultChars =
+                    agentContext.maxToolResultChars ??
+                    calculateMaxToolResultChars(
+                      fallbackMaxContextTokens ?? agentContext.maxContextTokens
+                    );
+                  const projectedFallbackMessages = trackProviderMessageOrigins(
+                    fallbackMessages,
+                    projectMessagesForProvider({
+                      model: fallbackModel,
+                      messages: fallbackMessages,
+                      provider: fallbackProvider,
+                      maxToolResultChars: fallbackToolResultChars,
+                      callOptions: fallbackConfig,
+                    })
+                  );
+                  const primaryContextBudget = contextUsage?.contextBudget;
+                  const fallbackContextBudget =
+                    fallbackMaxContextTokens == null
+                      ? primaryContextBudget
+                      : Math.min(
+                        primaryContextBudget ?? fallbackMaxContextTokens,
+                        fallbackMaxContextTokens
+                      );
+                  const projection = measureProviderPayload(
+                    projectedFallbackMessages,
+                    fallbackContextBudget,
+                    true
+                  );
+                  if (!projection.fits) {
+                    throw new ContextOverflowError(
+                      JSON.stringify({
+                        type: 'final_context_overflow',
+                        info: 'Fallback provider message formatting exceeded the context budget before invocation.',
+                        provider: fallbackProvider,
+                        projectedMessageTokens:
+                          projection.projectedMessageTokens,
+                        availableMessageTokens:
+                          projection.availableMessageTokens,
+                      })
+                    );
+                  }
+                  return projectedFallbackMessages;
                 },
               })
           );

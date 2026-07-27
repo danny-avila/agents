@@ -173,6 +173,54 @@ describe('ToolNode per-call onResult completion emission', () => {
     expect(result.messages[0].content).toBe(serialized);
   });
 
+  it('omits native computer screenshots from completion events', async () => {
+    const completions: CompletionEvent[] = [];
+    const screenshot = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const computerOutput = new ToolMessage({
+      content: screenshot,
+      tool_call_id: 'call_computer',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const computer = createDummyTool('computer_use');
+    (
+      computer as unknown as {
+        invoke: () => Promise<ToolMessage>;
+      }
+    ).invoke = async () => computerOutput;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push(data as CompletionEvent);
+        }
+      });
+    const toolNode = new ToolNode({
+      tools: [computer],
+      eventDrivenMode: true,
+      directToolNames: new Set(['computer_use']),
+      toolCallStepIds: new Map([['call_computer', 'step_computer']]),
+      maxToolResultChars: 80,
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          { id: 'call_computer', name: 'computer_use', args: {} },
+        ]),
+      ],
+    })) as { messages: ToolMessage[] };
+
+    expect(result.messages[0]).toBe(computerOutput);
+    expect(result.messages[0].content).toBe(screenshot);
+    expect(completions).toHaveLength(1);
+    expect(completions[0].result.tool_call.output).toContain(
+      'Computer screenshot omitted'
+    );
+    expect(completions[0].result.tool_call.output.length).toBeLessThanOrEqual(
+      80
+    );
+  });
+
   it('bounds cyclic tool args without losing the completion event', async () => {
     const completions: CompletionEvent[] = [];
     const cyclicArgs: Record<string, unknown> = { city: 'NYC' };

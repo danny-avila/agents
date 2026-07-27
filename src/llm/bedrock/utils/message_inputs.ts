@@ -4,6 +4,7 @@
  */
 import {
   type BaseMessage,
+  type ToolMessage,
   isAIMessage,
   type Data,
   parseBase64DataUrl,
@@ -27,6 +28,8 @@ import type {
   BedrockContentBlock,
   MessageContentReasoningBlock,
 } from '../types';
+import { serializeStructuredValueBounded } from '@/utils/toolContent';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 
 /**
  * Reasoning blocks from other providers, relative to Bedrock. Bedrock's native
@@ -698,6 +701,13 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   if (typeof msg.content === 'string' && msg.content !== '') {
     assistantMsg.content?.push({ text: msg.content });
   } else if (Array.isArray(msg.content)) {
+    const parsedToolCallIds = new Set(
+      isAIMessage(msg)
+        ? (msg.tool_calls ?? []).flatMap((toolCall) =>
+          toolCall.id != null ? [toolCall.id] : []
+        )
+        : []
+    );
     const concatenatedBlocks = concatenateLangchainReasoningBlocks(
       msg.content as Array<MessageContentComplex | MessageContentReasoningBlock>
     );
@@ -707,6 +717,33 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
       if (block.type === 'text') {
         const text = (block as { text?: string }).text ?? '';
         appendSerializableBedrockTextBlock(contentBlocks, text);
+      } else if (block.type === 'tool_use') {
+        const toolUse = block as {
+          id?: unknown;
+          name?: unknown;
+          input?: unknown;
+        };
+        if (
+          typeof toolUse.id === 'string' &&
+          parsedToolCallIds.has(toolUse.id)
+        ) {
+          return;
+        }
+        if (
+          typeof toolUse.id !== 'string' ||
+          typeof toolUse.name !== 'string' ||
+          toolUse.input == null ||
+          typeof toolUse.input !== 'object'
+        ) {
+          throw new Error('Invalid Anthropic tool_use content block');
+        }
+        contentBlocks.push({
+          toolUse: {
+            toolUseId: toolUse.id,
+            name: toolUse.name,
+            input: toolUse.input as Record<string, unknown>,
+          },
+        } as BedrockContentBlock);
       } else if (block.type === 'reasoning_content') {
         const reasoningBlock = block as MessageContentReasoningBlock;
         // Bedrock Converse rejects reasoningContent whose reasoningText.text is
@@ -756,13 +793,20 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
 
   // Important: this must be placed after any reasoning content blocks
   if (isAIMessage(msg) && msg.tool_calls != null && msg.tool_calls.length > 0) {
-    const toolUseBlocks = msg.tool_calls.map((tc) => ({
-      toolUse: {
-        toolUseId: tc.id,
-        name: tc.name,
-        input: tc.args as Record<string, unknown>,
-      },
-    }));
+    const existingToolUseIds = new Set(
+      (assistantMsg.content ?? [])
+        .filter((content) => 'toolUse' in content)
+        .map((content) => content.toolUse?.toolUseId)
+    );
+    const toolUseBlocks = msg.tool_calls
+      .filter((toolCall) => !existingToolUseIds.has(toolCall.id))
+      .map((toolCall) => ({
+        toolUse: {
+          toolUseId: toolCall.id,
+          name: toolCall.name,
+          input: toolCall.args as Record<string, unknown>,
+        },
+      }));
     assistantMsg.content = [
       ...(assistantMsg.content ?? []),
       ...toolUseBlocks,
@@ -917,17 +961,45 @@ function convertHumanMessageToConverseMessage(
  */
 function convertToolMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   const toolCallId = (msg as { tool_call_id?: string }).tool_call_id;
+  let isError = (msg as ToolMessage).status === 'error';
 
   let content: BedrockContentBlock[];
   if (typeof msg.content === 'string') {
     content = [{ text: msg.content }];
   } else if (Array.isArray(msg.content)) {
-    content = msg.content.map((block) =>
-      convertLangChainContentBlockToConverseContentBlock({
-        block,
-        onUnknown: 'passthrough',
-      })
-    );
+    content = msg.content.flatMap((block) => {
+      if (typeof block === 'object' && block.type === 'tool_result') {
+        if ((block as { is_error?: unknown }).is_error === true) {
+          isError = true;
+        }
+        const toolResultContent = (block as { content?: unknown }).content;
+        if (typeof toolResultContent === 'string') {
+          return [{ text: toolResultContent }];
+        }
+        if (Array.isArray(toolResultContent)) {
+          return toolResultContent.map((nestedBlock) =>
+            convertLangChainContentBlockToConverseContentBlock({
+              block: nestedBlock,
+              onUnknown: 'passthrough',
+            })
+          );
+        }
+        return [
+          {
+            text: serializeStructuredValueBounded(
+              toolResultContent,
+              HARD_MAX_TOOL_RESULT_CHARS
+            ).content,
+          },
+        ];
+      }
+      return [
+        convertLangChainContentBlockToConverseContentBlock({
+          block,
+          onUnknown: 'passthrough',
+        }),
+      ];
+    });
   } else {
     content = [{ text: String(msg.content) }];
   }
@@ -958,6 +1030,7 @@ function convertToolMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
         toolResult: {
           toolUseId: toolCallId,
           content: toolResultContent as { text: string }[],
+          ...(isError ? { status: 'error' as const } : {}),
         },
       },
       ...trailingCachePoints,

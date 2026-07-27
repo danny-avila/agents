@@ -202,6 +202,123 @@ describe('Direct-path lifecycle hooks (in-process tools)', () => {
     expect(message.content).toContain('truncated');
   });
 
+  it('keeps native computer screenshots intact despite the generic result cap', async () => {
+    const screenshot = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const contents: ToolMessage['content'][] = [
+      screenshot,
+      [{ type: 'computer_screenshot', image_url: screenshot }],
+    ];
+
+    for (let i = 0; i < contents.length; i++) {
+      const name = `computer_output_${i}`;
+      const computerOutput = new ToolMessage({
+        content: contents[i],
+        tool_call_id: `computer-call-${i}`,
+        additional_kwargs: { type: 'computer_call_output' },
+      });
+      const computer = createDirectTool(name, () => 'unused');
+      (
+        computer as unknown as {
+          invoke: () => Promise<ToolMessage>;
+        }
+      ).invoke = async () => computerOutput;
+      const node = new ToolNode({
+        tools: [computer],
+        eventDrivenMode: true,
+        directToolNames: new Set([name]),
+        maxToolResultChars: 80,
+      });
+
+      const result = await node.invoke({
+        messages: [aiCall(`computer-call-${i}`, name, {})],
+      });
+      const [message] = toolMessages(result);
+
+      expect(message).toBe(computerOutput);
+      expect(message.content).toBe(contents[i]);
+      expect(message.additional_kwargs.type).toBe('computer_call_output');
+    }
+  });
+
+  it('preserves a valid PostToolUse computer screenshot replacement', async () => {
+    const original = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const replacement = `data:image/png;base64,${'B'.repeat(2_000)}`;
+    const computerOutput = new ToolMessage({
+      content: original,
+      tool_call_id: 'computer-hook-valid',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const computer = createDirectTool('computer_hook_valid', () => 'unused');
+    (
+      computer as unknown as {
+        invoke: () => Promise<ToolMessage>;
+      }
+    ).invoke = async () => computerOutput;
+    const registry = new HookRegistry();
+    registry.register('PostToolUse', {
+      hooks: [
+        async (): Promise<PostToolUseHookOutput> => ({
+          updatedOutput: replacement,
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [computer],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['computer_hook_valid']),
+      maxToolResultChars: 80,
+    });
+
+    const result = await node.invoke({
+      messages: [aiCall('computer-hook-valid', 'computer_hook_valid', {})],
+    });
+    const [message] = toolMessages(result);
+
+    expect(message.content).toBe(replacement);
+    expect(message.additional_kwargs.type).toBe('computer_call_output');
+  });
+
+  it('rejects an invalid PostToolUse computer output replacement', async () => {
+    const screenshot = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const computerOutput = new ToolMessage({
+      content: screenshot,
+      tool_call_id: 'computer-hook-invalid',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const computer = createDirectTool('computer_hook_invalid', () => 'unused');
+    (
+      computer as unknown as {
+        invoke: () => Promise<ToolMessage>;
+      }
+    ).invoke = async () => computerOutput;
+    const registry = new HookRegistry();
+    registry.register('PostToolUse', {
+      hooks: [
+        async (): Promise<PostToolUseHookOutput> => ({
+          updatedOutput: 'redacted screenshot',
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [computer],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['computer_hook_invalid']),
+      maxToolResultChars: 80,
+    });
+
+    await expect(
+      node.invoke({
+        messages: [
+          aiCall('computer-hook-invalid', 'computer_hook_invalid', {}),
+        ],
+      })
+    ).rejects.toThrow(
+      'PostToolUse updatedOutput for a computer call must be a valid screenshot'
+    );
+  });
+
   it('caps returned and thrown direct-tool errors before storing them', async () => {
     const returnedError = createDirectTool(
       'returned_error',

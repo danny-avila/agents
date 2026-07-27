@@ -84,6 +84,115 @@ describe('normalizeAnthropicToolCallId', () => {
 });
 
 describe('_convertMessagesToAnthropicPayload — cross-provider ID normalization', () => {
+  it('flattens an Anthropic-native tool_result returned by a tool', () => {
+    const toolCallId = 'toolu_native_result';
+    const payload = _convertMessagesToAnthropicPayload([
+      new HumanMessage('run the native tool'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'native_tool',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        tool_call_id: toolCallId,
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: toolCallId,
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+            is_error: true,
+            content: [
+              {
+                type: 'text',
+                text: 'native result',
+                cache_control: { type: 'ephemeral' },
+              },
+              {
+                type: 'image_url',
+                image_url: 'data:image/png;base64,AA==',
+              },
+            ],
+          },
+        ],
+      }),
+    ]);
+
+    const result = (
+      payload.messages.find(
+        (message) =>
+          message.role === 'user' &&
+          Array.isArray(message.content) &&
+          message.content.some((block) => block.type === 'tool_result')
+      )!.content as unknown as Array<Record<string, unknown>>
+    ).find((block) => block.type === 'tool_result')!;
+
+    expect(result).toEqual({
+      type: 'tool_result',
+      tool_use_id: toolCallId,
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+      is_error: true,
+      content: [
+        { type: 'text', text: 'native result' },
+        {
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: 'image/png',
+            data: 'AA==',
+          },
+        },
+      ],
+    });
+    expect(
+      (result.content as unknown as Array<Record<string, unknown>>).some(
+        (block) => block.type === 'tool_result'
+      )
+    ).toBe(false);
+  });
+
+  it('flattens a content-less native error tool_result', () => {
+    const toolCallId = 'toolu_empty_error';
+    const payload = _convertMessagesToAnthropicPayload([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'native_tool',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        tool_call_id: toolCallId,
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: toolCallId,
+            is_error: true,
+          },
+        ],
+      }),
+    ]);
+
+    const result = (
+      payload.messages.find((message) => message.role === 'user')!
+        .content as unknown as Array<Record<string, unknown>>
+    )[0];
+    expect(result).toEqual({
+      type: 'tool_result',
+      tool_use_id: toolCallId,
+      is_error: true,
+    });
+  });
+
   it('normalizes Responses-style IDs on tool_use AND matching tool_result', () => {
     const responsesId = 'fc_67abc1234def567|call_abc123def456ghi789jkl0mnopqrs';
 

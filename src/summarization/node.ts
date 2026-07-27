@@ -13,6 +13,7 @@ import type * as t from '@/types';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
+  isComputerCallOutputMessage,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
@@ -270,7 +271,10 @@ function restoreOriginalToolContent(
   }> = [];
   for (const [index, content] of originalToolContent) {
     const message = messages[index];
-    if (message instanceof ToolMessage) {
+    if (
+      message instanceof ToolMessage &&
+      !isComputerCallOutputMessage(message)
+    ) {
       restorable.push({ index, message, content });
     }
   }

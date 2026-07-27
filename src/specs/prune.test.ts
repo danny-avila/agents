@@ -9,6 +9,7 @@ import {
   isBaseMessage,
   SystemMessage,
   AIMessageChunk,
+  ChatMessage,
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { UsageMetadata } from '@langchain/core/messages';
@@ -508,6 +509,77 @@ describe('Prune Messages Tests', () => {
       expect(result.indexTokenCountMap[2]).toBeGreaterThan(0);
     });
 
+    it('reconciles a stale cached legacy function-call count', () => {
+      const tokenCounter: t.TokenCounter = (message) => {
+        const functionCall = message.additional_kwargs.function_call;
+        return (
+          (typeof message.content === 'string' ? message.content.length : 0) +
+          (functionCall != null ? JSON.stringify(functionCall).length : 0) +
+          1
+        );
+      };
+      const message = new AIMessage({
+        content: '',
+        additional_kwargs: {
+          function_call: {
+            name: 'legacy_lookup',
+            arguments: `{"query":"${'x'.repeat(10_000)}"}`,
+          },
+        },
+      });
+      const messages: BaseMessage[] = [message];
+      const pruneMessages = createPruneMessages({
+        maxTokens: 2_000,
+        startIndex: messages.length,
+        tokenCounter,
+        indexTokenCountMap: { 0: 1 },
+        reserveRatio: 0,
+      });
+
+      const result = pruneMessages({ messages });
+      const projectedFunctionCall = result.context[0].additional_kwargs
+        .function_call as { arguments: string };
+
+      expect(result.context[0]).not.toBe(message);
+      expect(projectedFunctionCall.arguments.length).toBeLessThanOrEqual(
+        calculateMaxToolCallInputChars(2_000)
+      );
+      expect(result.indexTokenCountMap[0]).toBe(
+        tokenCounter(result.context[0])
+      );
+      expect(result.indexTokenCountMap[0]).toBeGreaterThan(1);
+    });
+
+    it('preserves provider output usage for an uncounted current legacy call', () => {
+      const message = new AIMessage({
+        content: '',
+        additional_kwargs: {
+          function_call: {
+            name: 'legacy_lookup',
+            arguments: '{}',
+          },
+        },
+      });
+      const pruneMessages = createPruneMessages({
+        maxTokens: 2_000,
+        startIndex: 0,
+        tokenCounter: () => 123,
+        indexTokenCountMap: {},
+        reserveRatio: 0,
+      });
+
+      const result = pruneMessages({
+        messages: [message],
+        usageMetadata: {
+          input_tokens: 10,
+          output_tokens: 7,
+          total_tokens: 17,
+        },
+      });
+
+      expect(result.indexTokenCountMap[0]).toBe(7);
+    });
+
     it('excludes a corrected tiny new tool count from calibration input', () => {
       const tokenCounter = createTestTokenCounter();
       const history: BaseMessage[] = [
@@ -910,6 +982,179 @@ describe('Prune Messages Tests', () => {
 
       // Token savings from stripping the large tool_use blocks
       expect(repaired.reclaimedTokens).toBeGreaterThan(0);
+    });
+
+    it('strips orphan raw Responses computer calls with parsed tool calls', () => {
+      const tokenCounter = createTestTokenCounter();
+      const computerCall = new AIMessage({
+        content: 'Taking a screenshot.',
+        tool_calls: [
+          {
+            id: 'computer-orphan',
+            name: 'computer_use',
+            args: { action: { type: 'screenshot' } },
+            type: 'tool_call',
+          },
+        ],
+        response_metadata: {
+          output: [
+            {
+              type: 'computer_call',
+              id: 'computer-item',
+              call_id: 'computer-orphan',
+              action: { type: 'screenshot' },
+            },
+          ],
+        },
+      });
+      const context: BaseMessage[] = [
+        new HumanMessage('take a screenshot'),
+        computerCall,
+      ];
+
+      const repaired = repairOrphanedToolMessages({
+        context,
+        allMessages: context,
+        tokenCounter,
+        indexTokenCountMap: {
+          0: tokenCounter(context[0]),
+          1: tokenCounter(context[1]),
+        },
+      });
+      const repairedAI = repaired.context[1] as AIMessage;
+
+      expect(repairedAI.tool_calls ?? []).toHaveLength(0);
+      expect(repairedAI.response_metadata.output).toEqual([]);
+    });
+
+    it('strips orphan computer calls from the LangChain tool_outputs fallback', () => {
+      const tokenCounter = createTestTokenCounter();
+      const computerCall = new AIMessage({
+        content: 'Taking a screenshot.',
+        additional_kwargs: {
+          tool_outputs: [
+            {
+              type: 'computer_call',
+              call_id: 'computer-fallback-orphan',
+              action: { type: 'screenshot' },
+            },
+          ],
+        },
+      });
+      const context: BaseMessage[] = [
+        new HumanMessage('take a screenshot'),
+        computerCall,
+      ];
+
+      const repaired = repairOrphanedToolMessages({
+        context,
+        allMessages: context,
+        tokenCounter,
+        indexTokenCountMap: {
+          0: tokenCounter(context[0]),
+          1: tokenCounter(context[1]),
+        },
+      });
+      const repairedAI = repaired.context[1] as AIMessage;
+
+      expect(repairedAI.additional_kwargs.tool_outputs).toEqual([]);
+    });
+
+    it('retains an empty-content AI parent when one raw call remains paired', () => {
+      const tokenCounter = createTestTokenCounter();
+      const computerCall = new AIMessage({
+        content: [],
+        tool_calls: [
+          {
+            id: 'computer-keep',
+            name: 'computer_use',
+            args: { action: { type: 'screenshot' } },
+            type: 'tool_call',
+          },
+          {
+            id: 'computer-drop',
+            name: 'computer_use',
+            args: { action: { type: 'screenshot' } },
+            type: 'tool_call',
+          },
+        ],
+        response_metadata: {
+          output: [
+            {
+              type: 'computer_call',
+              call_id: 'computer-keep',
+              action: { type: 'screenshot' },
+            },
+            {
+              type: 'computer_call',
+              call_id: 'computer-drop',
+              action: { type: 'screenshot' },
+            },
+          ],
+        },
+      });
+      const computerOutput = new ToolMessage({
+        content: 'data:image/png;base64,AA==',
+        tool_call_id: 'computer-keep',
+        additional_kwargs: { type: 'computer_call_output' },
+      });
+      const context: BaseMessage[] = [computerCall, computerOutput];
+
+      const repaired = repairOrphanedToolMessages({
+        context,
+        allMessages: context,
+        tokenCounter,
+        indexTokenCountMap: {
+          0: tokenCounter(computerCall),
+          1: tokenCounter(computerOutput),
+        },
+      });
+
+      expect(repaired.context).toHaveLength(2);
+      const repairedAI = repaired.context[0] as AIMessage;
+      expect(repairedAI.tool_calls?.map((call) => call.id)).toEqual([
+        'computer-keep',
+      ]);
+      expect(repairedAI.response_metadata.output).toEqual([
+        expect.objectContaining({ call_id: 'computer-keep' }),
+      ]);
+      expect(repaired.context[1]).toBe(computerOutput);
+    });
+
+    it('recognizes raw computer calls on generic assistant messages', () => {
+      const tokenCounter = createTestTokenCounter();
+      const computerCall = new ChatMessage({
+        role: 'assistant',
+        content: '',
+        response_metadata: {
+          output: [
+            {
+              type: 'computer_call',
+              call_id: 'generic-computer',
+              action: { type: 'screenshot' },
+            },
+          ],
+        },
+      });
+      const computerOutput = new ToolMessage({
+        content: 'data:image/png;base64,AA==',
+        tool_call_id: 'generic-computer',
+        additional_kwargs: { type: 'computer_call_output' },
+      });
+      const context: BaseMessage[] = [computerCall, computerOutput];
+
+      const repaired = repairOrphanedToolMessages({
+        context,
+        allMessages: context,
+        tokenCounter,
+        indexTokenCountMap: {
+          0: tokenCounter(computerCall),
+          1: tokenCounter(computerOutput),
+        },
+      });
+
+      expect(repaired.context).toEqual(context);
+      expect(repaired.droppedOrphanCount).toBe(0);
     });
 
     it('should drop AI message entirely when it has only tool_use blocks with no text', () => {
@@ -1317,6 +1562,185 @@ describe('Prune Messages Tests', () => {
       expect(() => JSON.stringify(args)).not.toThrow();
     });
 
+    it('bounds legacy additional_kwargs.function_call arguments', () => {
+      const message = new AIMessage({
+        content: '',
+        additional_kwargs: {
+          marker: 'preserved',
+          function_call: {
+            name: 'legacy_lookup',
+            arguments: `{"query":"${'x'.repeat(2_000)}"}`,
+          },
+        },
+      });
+      const messages: BaseMessage[] = [message];
+
+      const projected = projectToolCallInputs(messages, 200);
+
+      expect(projected).not.toBe(messages);
+      expect(projected[0]).not.toBe(message);
+      expect(projected[0].additional_kwargs.marker).toBe('preserved');
+      const projectedFunctionCall = projected[0].additional_kwargs
+        .function_call as {
+        name: string;
+        arguments: string;
+      };
+      expect(projectedFunctionCall.name).toBe('legacy_lookup');
+      expect(projectedFunctionCall.arguments.length).toBeLessThanOrEqual(200);
+      expect(() => JSON.parse(projectedFunctionCall.arguments)).not.toThrow();
+      expect(
+        (
+          message.additional_kwargs.function_call as {
+            arguments: string;
+          }
+        ).arguments.length
+      ).toBeGreaterThan(2_000);
+    });
+
+    it('normalizes legacy function calls without invoking serialization hooks', () => {
+      const toJSON = jest.fn(() => ({
+        name: 'legacy_lookup',
+        arguments: 'x'.repeat(500_000),
+      }));
+      const originalFunctionCall = {
+        name: 'legacy_lookup',
+        arguments: '{}',
+        toJSON,
+      };
+      const message = new AIMessage({
+        content: '',
+        additional_kwargs: {
+          function_call: originalFunctionCall,
+        },
+      });
+
+      const [projected] = projectToolCallInputs([message], 200);
+      const projectedFunctionCall = projected.additional_kwargs
+        .function_call as {
+        name: string;
+        arguments: string;
+      };
+      const serialized = JSON.stringify(projected.additional_kwargs);
+
+      expect(projected).not.toBe(message);
+      expect(projectedFunctionCall).toEqual({
+        name: 'legacy_lookup',
+        arguments: '{}',
+      });
+      expect(Object.getPrototypeOf(projectedFunctionCall)).toBe(
+        Object.prototype
+      );
+      expect(serialized.length).toBeLessThanOrEqual(300);
+      expect(toJSON).not.toHaveBeenCalled();
+      expect(projectToolCallInputs([projected], 200)[0]).toBe(projected);
+    });
+
+    it('omits a proxied legacy function call without propagating descriptor traps', () => {
+      let descriptorCalls = 0;
+      const legacyProxy = new Proxy(
+        {},
+        {
+          getOwnPropertyDescriptor() {
+            descriptorCalls++;
+            throw new Error('descriptor trap');
+          },
+        }
+      );
+      const message = new AIMessage({
+        content: '',
+        additional_kwargs: {},
+      });
+      (message.additional_kwargs as Record<string, unknown>).function_call =
+        legacyProxy;
+
+      expect(() => projectToolCallInputs([message], 200)).not.toThrow();
+      const [projected] = projectToolCallInputs([message], 200);
+
+      expect(projected.additional_kwargs.function_call).toBeUndefined();
+      expect(descriptorCalls).toBe(0);
+      expect(projectToolCallInputs([projected], 200)[0]).toBe(projected);
+    });
+
+    it('shadows proxy-backed legacy metadata without invoking its get trap', () => {
+      let getCalls = 0;
+      const hugeFunctionCall = {
+        name: 'legacy_lookup',
+        arguments: 'x'.repeat(500_000),
+      };
+      const message = new AIMessage({
+        content: '',
+        additional_kwargs: {},
+      });
+      message.additional_kwargs = new Proxy(
+        {},
+        {
+          get(_target, property) {
+            getCalls++;
+            return property === 'function_call' ? hugeFunctionCall : undefined;
+          },
+          getOwnPropertyDescriptor() {
+            return undefined;
+          },
+          getPrototypeOf() {
+            return null;
+          },
+        }
+      );
+
+      const [projected] = projectToolCallInputs([message], 200);
+
+      expect(getCalls).toBe(0);
+      expect(projected).not.toBe(message);
+      expect(projected.additional_kwargs.function_call).toBeUndefined();
+      expect(projectToolCallInputs([projected], 200)[0]).toBe(projected);
+    });
+
+    it('shadows legacy calls beyond the bounded prototype walk', () => {
+      const inherited = {
+        function_call: {
+          name: 'legacy_lookup',
+          arguments: 'x'.repeat(500_000),
+        },
+      };
+      let additionalKwargs = inherited;
+      for (let i = 0; i < 101; i++) {
+        additionalKwargs = Object.create(additionalKwargs) as typeof inherited;
+      }
+      const message = new AIMessage({
+        content: '',
+        additional_kwargs: {},
+      });
+      message.additional_kwargs = additionalKwargs;
+
+      const [projected] = projectToolCallInputs([message], 200);
+
+      expect(projected).not.toBe(message);
+      expect(
+        Object.prototype.hasOwnProperty.call(
+          projected.additional_kwargs,
+          'function_call'
+        )
+      ).toBe(true);
+      expect(projected.additional_kwargs.function_call).toBeUndefined();
+      expect(projectToolCallInputs([projected], 200)[0]).toBe(projected);
+    });
+
+    it('stabilizes an omitted invalid legacy function call', () => {
+      const message = new AIMessage({
+        content: '',
+        additional_kwargs: {},
+      });
+      (message.additional_kwargs as Record<string, unknown>).function_call =
+        null;
+
+      const [first] = projectToolCallInputs([message], 200);
+      const [second] = projectToolCallInputs([first], 200);
+
+      expect(first).not.toBe(message);
+      expect(first.additional_kwargs.function_call).toBeUndefined();
+      expect(second).toBe(first);
+    });
+
     it('projects every provider-consumed tool-call representation to the same bounded wire args', () => {
       let getterCalls = 0;
       let toJSONCalls = 0;
@@ -1364,6 +1788,16 @@ describe('Prune Messages Tests', () => {
             name: 'evaluate',
             args: adversarialArgs,
           },
+          {
+            id: 'custom-call',
+            name: 'shell',
+            args: { input: 'c'.repeat(2_000) },
+          },
+          {
+            id: 'computer-call',
+            name: 'computer_use',
+            args: { action: { type: 'type', text: 't'.repeat(2_000) } },
+          },
         ],
         additional_kwargs: {
           tool_calls: [
@@ -1400,6 +1834,19 @@ describe('Prune Messages Tests', () => {
               call_id: 'response-only',
               name: 'evaluate',
               arguments: `{"code":"${'q'.repeat(2_000)}"}`,
+            },
+            {
+              type: 'custom_tool_call',
+              id: 'ctc_shared',
+              call_id: 'custom-call',
+              name: 'shell',
+              input: 'c'.repeat(2_000),
+            },
+            {
+              type: 'computer_call',
+              id: 'cc_shared',
+              call_id: 'computer-call',
+              action: { type: 'type', text: 't'.repeat(2_000) },
             },
           ],
         },
@@ -1459,12 +1906,19 @@ describe('Prune Messages Tests', () => {
 
       const responseOutput = projectedMessage.response_metadata
         .output as Array<{
+        type: string;
         call_id: string;
-        arguments: string;
+        arguments?: string;
+        input?: string;
+        action?: unknown;
       }>;
       expect(responseOutput[0].arguments).toBe(canonicalArguments);
-      expect(responseOutput[1].arguments.length).toBeLessThanOrEqual(200);
-      expect(() => JSON.parse(responseOutput[1].arguments)).not.toThrow();
+      expect(responseOutput[1].arguments?.length).toBeLessThanOrEqual(200);
+      expect(() => JSON.parse(responseOutput[1].arguments ?? '')).not.toThrow();
+      expect(responseOutput[2].input?.length).toBeLessThanOrEqual(200);
+      expect(
+        serializeToolCallInput(responseOutput[3].action, 200).length
+      ).toBeLessThanOrEqual(200);
 
       expect(
         (

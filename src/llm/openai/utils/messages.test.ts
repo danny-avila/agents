@@ -200,6 +200,30 @@ describe('_convertMessagesToOpenAIParams', () => {
     expect(Array.isArray(toolMessage.content)).toBe(true);
   });
 
+  it('preserves canonical OpenRouter cache blocks only when requested', () => {
+    const toolMessage = new ToolMessage({
+      content: [
+        {
+          type: 'text',
+          text: 'result body',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ],
+      tool_call_id: 'call_cached',
+    });
+
+    const defaultContent = _convertMessagesToOpenAIParams([toolMessage])[0]
+      .content;
+    const openRouterContent = _convertMessagesToOpenAIParams(
+      [toolMessage],
+      'anthropic/claude-sonnet-4',
+      { preserveToolCacheControl: true }
+    )[0].content;
+
+    expect(typeof defaultContent).toBe('string');
+    expect(openRouterContent).toEqual(toolMessage.content);
+  });
+
   it('bounds direct structured tool-call args without invoking accessors or toJSON', () => {
     const maxInputChars = calculateMaxToolCallInputChars();
     let getterCalls = 0;
@@ -312,6 +336,43 @@ describe('_convertMessagesToOpenAIParams', () => {
     ).toBe(rawArguments);
   });
 
+  it('normalizes legacy function calls before wire serialization', () => {
+    let toJSONCalls = 0;
+    const functionCall = {
+      name: 'legacy_lookup',
+      arguments: '{}',
+    };
+    const message = new AIMessage({
+      content: '',
+      additional_kwargs: {
+        function_call: functionCall,
+      },
+    });
+    Object.defineProperty(functionCall, 'toJSON', {
+      enumerable: true,
+      value: () => {
+        toJSONCalls++;
+        return {
+          name: 'legacy_lookup',
+          arguments: 'x'.repeat(500_000),
+        };
+      },
+    });
+
+    const [chat] = _convertMessagesToOpenAIParams([message]);
+    const serialized = JSON.stringify(chat);
+
+    expect(chat).toMatchObject({
+      role: 'assistant',
+      function_call: {
+        name: 'legacy_lookup',
+        arguments: '{}',
+      },
+    });
+    expect(serialized.length).toBeLessThanOrEqual(300);
+    expect(toJSONCalls).toBe(0);
+  });
+
   it('makes Responses raw reuse match the projected LangChain tool-call args', () => {
     const message = new AIMessage({
       content: '',
@@ -359,25 +420,69 @@ describe('_convertMessagesToOpenAIParams', () => {
     ).toBe('{"query":"stale"}');
   });
 
-  it('preserves native Responses computer-call output handling', () => {
-    const toolMessage = new ToolMessage({
-      content: [
-        {
+  it('normalizes native Responses computer-call output screenshots', () => {
+    const screenshot = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const messages = [
+      new ToolMessage({
+        content: screenshot,
+        tool_call_id: 'call_computer_string',
+        additional_kwargs: { type: 'computer_call_output' },
+      }),
+      new ToolMessage({
+        content: [{ type: 'computer_screenshot', image_url: screenshot }],
+        tool_call_id: 'call_computer_structured',
+        additional_kwargs: { type: 'computer_call_output' },
+      }),
+      new ToolMessage({
+        content: [{ type: 'input_image', file_id: 'file_screenshot123' }],
+        tool_call_id: 'call_computer_file',
+        additional_kwargs: { type: 'computer_call_output' },
+      }),
+    ];
+
+    expect(_convertMessagesToOpenAIResponsesParams(messages)).toEqual([
+      {
+        type: 'computer_call_output',
+        call_id: 'call_computer_string',
+        output: { type: 'computer_screenshot', image_url: screenshot },
+      },
+      {
+        type: 'computer_call_output',
+        call_id: 'call_computer_structured',
+        output: { type: 'computer_screenshot', image_url: screenshot },
+      },
+      {
+        type: 'computer_call_output',
+        call_id: 'call_computer_file',
+        output: {
           type: 'computer_screenshot',
-          image_url: 'data:image/png;base64,AA==',
+          file_id: 'file_screenshot123',
         },
-      ],
-      tool_call_id: 'call_computer',
+      },
+    ]);
+  });
+
+  it('rejects malformed native Responses computer-call output', () => {
+    const message = new ToolMessage({
+      content: 'not a screenshot URL',
+      tool_call_id: 'call_computer_invalid',
       additional_kwargs: { type: 'computer_call_output' },
     });
 
-    expect(_convertMessagesToOpenAIResponsesParams([toolMessage])[0]).toEqual({
-      type: 'computer_call_output',
-      call_id: 'call_computer',
-      output: {
-        type: 'computer_screenshot',
-        image_url: 'data:image/png;base64,AA==',
-      },
+    expect(() => _convertMessagesToOpenAIResponsesParams([message])).toThrow(
+      'Invalid computer call output'
+    );
+  });
+
+  it('rejects a truncated data URI marked as a computer screenshot', () => {
+    const message = new ToolMessage({
+      content: 'data:image/png;base64,AAAA\n\n… [truncated: 1000 chars] …',
+      tool_call_id: 'call_computer_truncated',
+      additional_kwargs: { type: 'computer_call_output' },
     });
+
+    expect(() => _convertMessagesToOpenAIResponsesParams([message])).toThrow(
+      'Invalid computer call output'
+    );
   });
 });

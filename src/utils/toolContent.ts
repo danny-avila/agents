@@ -1,6 +1,9 @@
 import { isProxy } from 'node:util/types';
 import { ToolMessage, type BaseMessage } from '@langchain/core/messages';
-import { truncateToolResultContent } from './truncation';
+import {
+  HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
+  truncateToolResultContent,
+} from './truncation';
 
 type ToolContent = BaseMessage['content'];
 type ToolContentBlock = Exclude<ToolContent, string>[number];
@@ -15,12 +18,16 @@ const ATOMIC_CONTENT_TYPES = new Set([
   'image_file',
   'image_url',
   'input_audio',
+  'input_image',
   'media',
   'resource',
   'resource_link',
   'video',
   'video_url',
 ]);
+const MAX_TOOL_CONTENT_TYPE_CHARS = 256;
+const MAX_PROVIDER_IMAGE_URL_CHARS = 16_384;
+const MAX_PROVIDER_FILE_ID_CHARS = 4_096;
 
 const PROVIDER_NATIVE_TOOL_RESULT_TYPES = new Set([
   'search_result',
@@ -36,82 +43,76 @@ const PROVIDER_NATIVE_TOOL_RESULT_TYPES = new Set([
  * such as bigint or circular diagnostic metadata.
  */
 export function serializeStructuredValue(value: unknown): string {
-  const ancestors: object[] = [];
-  try {
-    const serialized: unknown = JSON.stringify(
-      value,
-      function (_key, nestedValue: unknown) {
-        if (typeof nestedValue === 'bigint') {
-          return nestedValue.toString();
-        }
-        if (
-          nestedValue instanceof ArrayBuffer ||
-          ArrayBuffer.isView(nestedValue)
-        ) {
-          const name =
-            nestedValue instanceof ArrayBuffer
-              ? 'ArrayBuffer'
-              : nestedValue.constructor.name;
-          return `[${name}: ${nestedValue.byteLength} bytes]`;
-        }
-        if (nestedValue != null && typeof nestedValue === 'object') {
-          while (
-            ancestors.length > 0 &&
-            ancestors[ancestors.length - 1] !== this
-          ) {
-            ancestors.pop();
-          }
-          if (ancestors.includes(nestedValue)) {
-            return '[Circular]';
-          }
-          ancestors.push(nestedValue);
-        }
-        return nestedValue;
-      }
-    );
-    return typeof serialized === 'string' ? serialized : String(value);
-  } catch {
-    try {
-      return String(value);
-    } catch {
-      return '[Unserializable structured value]';
-    }
-  }
+  return serializeStructuredValueBounded(value, Number.MAX_SAFE_INTEGER)
+    .content;
 }
 
 const SERIALIZATION_CHUNK_SIZE = 4_096;
 const MAX_STRUCTURED_SERIALIZATION_DEPTH = 200;
 const MAX_STRUCTURED_SERIALIZATION_WORK = 1_000_000;
+const MAX_STRUCTURED_CHARACTER_WORK = 1_000_000;
+const MAX_STRUCTURED_PROPERTY_CACHE_ENTRIES = 10_000;
 const PROXY_VALUE_PLACEHOLDER = '[Proxy value omitted]';
+const CHARACTER_WORK_PLACEHOLDER =
+  '[truncated: character traversal limit exceeded]';
 
 type StructuredWorkState = {
   remaining: number;
+  characterRemaining: number;
   exceeded: boolean;
+  failurePlaceholder?: string;
+  propertyCache: WeakMap<object, Map<string, unknown>>;
+  propertyCacheEntries: number;
 };
 
 function createStructuredWorkState(): StructuredWorkState {
   return {
     remaining: MAX_STRUCTURED_SERIALIZATION_WORK,
+    characterRemaining: MAX_STRUCTURED_CHARACTER_WORK,
     exceeded: false,
+    propertyCache: new WeakMap<object, Map<string, unknown>>(),
+    propertyCacheEntries: 0,
   };
 }
 
 function consumeStructuredWork(state: StructuredWorkState): boolean {
   if (state.remaining <= 0) {
     state.exceeded = true;
+    state.failurePlaceholder ??= '[Traversal limit exceeded]';
     return false;
   }
   state.remaining--;
   return true;
 }
 
+function consumeStructuredCharacterWork(state: StructuredWorkState): boolean {
+  if (state.characterRemaining <= 0) {
+    state.exceeded = true;
+    state.failurePlaceholder ??= CHARACTER_WORK_PLACEHOLDER;
+    return false;
+  }
+  state.characterRemaining--;
+  return true;
+}
+
+function hasExceededStructuredWork(state: StructuredWorkState): boolean {
+  return state.exceeded;
+}
+
 function conservativeStructuredLength(limit: number): number {
   return limit >= Number.MAX_SAFE_INTEGER ? Number.MAX_SAFE_INTEGER : limit + 1;
 }
 
-function jsonStringLength(value: string): number {
+function jsonStringLength(
+  value: string,
+  limit: number,
+  work: StructuredWorkState
+): number {
   let length = 2;
   for (let i = 0; i < value.length; i++) {
+    if (!consumeStructuredCharacterWork(work)) {
+      return conservativeStructuredLength(limit);
+    }
     const code = value.charCodeAt(i);
     if (
       code === 0x08 ||
@@ -126,6 +127,9 @@ function jsonStringLength(value: string): number {
     } else if (code < 0x20) {
       length += 6;
     } else if (code >= 0xd800 && code <= 0xdbff) {
+      if (!consumeStructuredCharacterWork(work)) {
+        return conservativeStructuredLength(limit);
+      }
       const next = value.charCodeAt(i + 1);
       if (next >= 0xdc00 && next <= 0xdfff) {
         length += 2;
@@ -138,8 +142,63 @@ function jsonStringLength(value: string): number {
     } else {
       length++;
     }
+    if (length > limit) {
+      return conservativeStructuredLength(limit);
+    }
   }
   return length;
+}
+
+type NativeDateRead = { matched: true; time: number } | { matched: false };
+
+function readNativeArrayBufferByteLength(value: unknown): number | undefined {
+  if (
+    value == null ||
+    typeof value !== 'object' ||
+    NATIVE_ARRAY_BUFFER_BYTE_LENGTH_GETTER == null
+  ) {
+    return undefined;
+  }
+  try {
+    return NATIVE_ARRAY_BUFFER_BYTE_LENGTH_GETTER.call(value) as number;
+  } catch {
+    return undefined;
+  }
+}
+
+function readNativeDate(value: unknown): NativeDateRead {
+  if (value == null || typeof value !== 'object') {
+    return { matched: false };
+  }
+  try {
+    return { matched: true, time: NATIVE_DATE_GET_TIME.call(value) };
+  } catch {
+    return { matched: false };
+  }
+}
+
+function readNativeBoxedString(value: object): string | undefined {
+  try {
+    return String.prototype.valueOf.call(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function readNativeBoxedNumber(value: object): number | undefined {
+  try {
+    return Number.prototype.valueOf.call(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function readNativeBoxedBoolean(value: object): boolean | undefined {
+  try {
+    return Boolean.prototype.valueOf.call(value);
+  } catch {
+    return undefined;
+  }
 }
 
 function estimateStructuredChars(
@@ -149,52 +208,115 @@ function estimateStructuredChars(
   work = createStructuredWorkState(),
   depth = 0
 ): number {
+  if (hasExceededStructuredWork(work)) {
+    return conservativeStructuredLength(limit);
+  }
   if (typeof value === 'string') {
-    return jsonStringLength(value);
+    return jsonStringLength(value, limit, work);
   }
   if (typeof value === 'bigint') {
-    return jsonStringLength(value.toString());
+    return jsonStringLength(value.toString(), limit, work);
   }
-  if (
-    typeof value === 'number' ||
-    typeof value === 'boolean' ||
-    value == null
-  ) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? String(value === 0 ? 0 : value).length : 4;
+  }
+  if (typeof value === 'boolean' || value == null) {
     return String(value).length;
   }
   if (isProxy(value)) {
     work.exceeded = true;
+    work.failurePlaceholder = PROXY_VALUE_PLACEHOLDER;
     return conservativeStructuredLength(limit);
   }
   if (typeof value === 'undefined' || typeof value === 'function') {
     return 4;
   }
-  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
-    return Math.min(limit + 1, Math.ceil((value.byteLength * 4) / 3) + 32);
-  }
-  if (value instanceof Date) {
-    const time = Date.prototype.getTime.call(value);
-    return Number.isFinite(time)
-      ? jsonStringLength(Date.prototype.toISOString.call(value))
-      : 4;
-  }
-  if (value instanceof String) {
-    return jsonStringLength(String.prototype.valueOf.call(value));
-  }
-  if (value instanceof Number) {
-    const number = Number.prototype.valueOf.call(value);
-    return Number.isFinite(number)
-      ? String(number === 0 ? 0 : number).length
-      : 4;
-  }
-  if (value instanceof Boolean) {
-    return String(Boolean.prototype.valueOf.call(value)).length;
-  }
   if (typeof value !== 'object') {
-    return jsonStringLength(String(value));
+    return jsonStringLength(String(value), limit, work);
+  }
+
+  const valueIsArray = isArray(value);
+  if (!valueIsArray) {
+    const arrayBufferByteLength = readNativeArrayBufferByteLength(value);
+    if (arrayBufferByteLength != null) {
+      if (!isSafeNativeArrayBuffer(value as ArrayBuffer)) {
+        work.exceeded = true;
+        return conservativeStructuredLength(limit);
+      }
+      return Math.min(
+        limit + 1,
+        Math.ceil((arrayBufferByteLength * 4) / 3) + 32
+      );
+    }
+    if (ArrayBuffer.isView(value)) {
+      const view = readSafeNativeArrayBufferView(
+        value,
+        undefined,
+        undefined,
+        false
+      );
+      if (view == null) {
+        work.exceeded = true;
+        return conservativeStructuredLength(limit);
+      }
+      return Math.min(limit + 1, Math.ceil((view.byteLength * 4) / 3) + 32);
+    }
+    const date = readNativeDate(value);
+    if (date.matched) {
+      if (!isSafeNativeDate(value as Date)) {
+        work.exceeded = true;
+        return conservativeStructuredLength(limit);
+      }
+      return Number.isFinite(date.time)
+        ? jsonStringLength(Date.prototype.toISOString.call(value), limit, work)
+        : 4;
+    }
+    const boxedString = readNativeBoxedString(value);
+    if (boxedString != null) {
+      return jsonStringLength(boxedString, limit, work);
+    }
+    const boxedNumber = readNativeBoxedNumber(value);
+    if (boxedNumber != null) {
+      return Number.isFinite(boxedNumber)
+        ? String(boxedNumber === 0 ? 0 : boxedNumber).length
+        : 4;
+    }
+    const boxedBoolean = readNativeBoxedBoolean(value);
+    if (boxedBoolean != null) {
+      return String(boxedBoolean).length;
+    }
+    let prototype: object | null;
+    try {
+      prototype = Object.getPrototypeOf(value) as object | null;
+    } catch {
+      work.exceeded = true;
+      return conservativeStructuredLength(limit);
+    }
+    if (
+      isProxy(prototype) ||
+      (prototype !== Object.prototype && prototype !== null)
+    ) {
+      work.exceeded = true;
+      return conservativeStructuredLength(limit);
+    }
+  } else {
+    let prototype: object | null;
+    try {
+      prototype = Object.getPrototypeOf(value) as object | null;
+    } catch {
+      work.exceeded = true;
+      return conservativeStructuredLength(limit);
+    }
+    if (
+      isProxy(prototype) ||
+      (prototype !== Array.prototype && prototype !== null)
+    ) {
+      work.exceeded = true;
+      return conservativeStructuredLength(limit);
+    }
   }
   if (depth >= MAX_STRUCTURED_SERIALIZATION_DEPTH) {
-    return jsonStringLength('[Max serialization depth]');
+    return jsonStringLength('[Max serialization depth]', limit, work);
   }
   if (ancestors.includes(value)) {
     return 12;
@@ -203,7 +325,7 @@ function estimateStructuredChars(
   ancestors.push(value);
   let length = 2;
   try {
-    if (Array.isArray(value)) {
+    if (valueIsArray) {
       const arrayLength = readStructuredArrayLength(value, work);
       if (arrayLength == null) {
         return conservativeStructuredLength(limit);
@@ -226,11 +348,11 @@ function estimateStructuredChars(
     } else {
       let emitted = 0;
       for (const key in value) {
-        if (!Object.prototype.propertyIsEnumerable.call(value, key)) {
-          continue;
-        }
         if (!consumeStructuredWork(work)) {
           return conservativeStructuredLength(limit);
+        }
+        if (!Object.prototype.propertyIsEnumerable.call(value, key)) {
+          continue;
         }
         if (length > limit) {
           break;
@@ -250,7 +372,7 @@ function estimateStructuredChars(
         if (emitted > 0) {
           length++;
         }
-        length += jsonStringLength(key) + 1;
+        length += jsonStringLength(key, Math.max(0, limit - length), work) + 1;
         length += estimateStructuredChars(
           nested,
           Math.max(0, limit - length),
@@ -267,7 +389,7 @@ function estimateStructuredChars(
   } finally {
     ancestors.pop();
   }
-  if (work.exceeded) {
+  if (hasExceededStructuredWork(work)) {
     return conservativeStructuredLength(limit);
   }
   return Math.min(limit + 1, length);
@@ -442,10 +564,22 @@ function appendJsonString(
   collector: StructuredSerializationCollector,
   value: string
 ): void {
+  if (collector.work.exceeded) {
+    appendSerializedChunk(
+      collector,
+      `"${collector.work.failurePlaceholder ?? CHARACTER_WORK_PLACEHOLDER}"`
+    );
+    return;
+  }
   appendSerializedChunk(collector, '"');
   let safeStart = 0;
 
   for (let i = 0; i < value.length; i++) {
+    if (!consumeStructuredCharacterWork(collector.work)) {
+      appendJsonSafeRange(collector, value, safeStart, i);
+      appendSerializedChunk(collector, `${CHARACTER_WORK_PLACEHOLDER}"`);
+      return;
+    }
     const code = value.charCodeAt(i);
     let escaped: string | undefined;
     switch (code) {
@@ -474,6 +608,11 @@ function appendJsonString(
       if (code < 0x20) {
         escaped = `\\u${code.toString(16).padStart(4, '0')}`;
       } else if (code >= 0xd800 && code <= 0xdbff) {
+        if (!consumeStructuredCharacterWork(collector.work)) {
+          appendJsonSafeRange(collector, value, safeStart, i);
+          appendSerializedChunk(collector, `${CHARACTER_WORK_PLACEHOLDER}"`);
+          return;
+        }
         const next = value.charCodeAt(i + 1);
         if (next >= 0xdc00 && next <= 0xdfff) {
           i++;
@@ -495,32 +634,38 @@ function appendJsonString(
   appendSerializedChunk(collector, '"');
 }
 
-function getArrayBufferViewName(value: ArrayBufferView): string {
-  try {
-    const prototype = Object.getPrototypeOf(value) as {
-      constructor?: { name?: unknown };
-    } | null;
-    const name = prototype?.constructor?.name;
-    return typeof name === 'string' && name !== '' ? name : 'ArrayBufferView';
-  } catch {
-    return 'ArrayBufferView';
-  }
-}
-
 function readStructuredProperty(
   value: Record<string, unknown> | unknown[],
   key: string | number,
   work: StructuredWorkState
 ): unknown {
+  const normalizedKey = String(key);
+  // Callers still consume traversal work for every occurrence. This bounded
+  // cache only avoids re-reading the same descriptor through shared references.
+  const cachedProperties = work.propertyCache.get(value);
+  if (cachedProperties != null && cachedProperties.has(normalizedKey)) {
+    return cachedProperties.get(normalizedKey);
+  }
+
   try {
-    const descriptor = Object.getOwnPropertyDescriptor(value, String(key));
+    const descriptor = Object.getOwnPropertyDescriptor(value, normalizedKey);
+    let propertyValue: unknown;
     if (descriptor == null) {
-      return undefined;
+      propertyValue = undefined;
+    } else if ('value' in descriptor) {
+      propertyValue = descriptor.value;
+    } else {
+      propertyValue = '[Property accessor omitted]';
     }
-    if ('value' in descriptor) {
-      return descriptor.value;
+    if (work.propertyCacheEntries < MAX_STRUCTURED_PROPERTY_CACHE_ENTRIES) {
+      const properties = cachedProperties ?? new Map<string, unknown>();
+      if (cachedProperties == null) {
+        work.propertyCache.set(value, properties);
+      }
+      properties.set(normalizedKey, propertyValue);
+      work.propertyCacheEntries++;
     }
-    return '[Property accessor omitted]';
+    return propertyValue;
   } catch {
     work.exceeded = true;
     work.remaining = 0;
@@ -557,6 +702,13 @@ function appendStructuredValue(
   depth: number,
   position: 'top' | 'array' | 'object'
 ): boolean {
+  if (collector.work.exceeded) {
+    appendSerializedChunk(
+      collector,
+      `"${collector.work.failurePlaceholder ?? CHARACTER_WORK_PLACEHOLDER}"`
+    );
+    return true;
+  }
   if (typeof value === 'string') {
     appendJsonString(collector, value);
     return true;
@@ -577,8 +729,9 @@ function appendStructuredValue(
     return true;
   }
   if (isProxy(value)) {
+    appendSerializedChunk(collector, `"${PROXY_VALUE_PLACEHOLDER}"`);
     collector.work.exceeded = true;
-    appendJsonString(collector, PROXY_VALUE_PLACEHOLDER);
+    collector.work.failurePlaceholder = PROXY_VALUE_PLACEHOLDER;
     return true;
   }
   if (
@@ -596,51 +749,106 @@ function appendStructuredValue(
     } else {
       appendJsonString(
         collector,
-        typeof value === 'function'
-          ? `[Function${value.name ? `: ${value.name}` : ''}]`
-          : String(value)
+        typeof value === 'function' ? '[Function]' : String(value)
       );
     }
     return true;
   }
-  if (value instanceof ArrayBuffer) {
-    appendJsonString(collector, `[ArrayBuffer: ${value.byteLength} bytes]`);
-    return true;
-  }
-  if (ArrayBuffer.isView(value)) {
-    appendJsonString(
-      collector,
-      `[${getArrayBufferViewName(value)}: ${value.byteLength} bytes]`
-    );
-    return true;
-  }
-  if (value instanceof Date) {
-    const time = Date.prototype.getTime.call(value);
-    if (!Number.isFinite(time)) {
-      appendSerializedChunk(collector, 'null');
-    } else {
-      appendJsonString(collector, Date.prototype.toISOString.call(value));
+  const valueIsArray = isArray(value);
+  if (!valueIsArray) {
+    const arrayBufferByteLength = readNativeArrayBufferByteLength(value);
+    if (arrayBufferByteLength != null) {
+      if (!isSafeNativeArrayBuffer(value as ArrayBuffer)) {
+        appendSerializedChunk(collector, '"[Unsafe ArrayBuffer omitted]"');
+        collector.work.exceeded = true;
+        return true;
+      }
+      appendJsonString(
+        collector,
+        `[ArrayBuffer: ${arrayBufferByteLength} bytes]`
+      );
+      return true;
     }
-    return true;
-  }
-  if (value instanceof String) {
-    appendJsonString(collector, String.prototype.valueOf.call(value));
-    return true;
-  }
-  if (value instanceof Number) {
-    const number = Number.prototype.valueOf.call(value);
-    appendSerializedChunk(
-      collector,
-      Number.isFinite(number) ? String(number === 0 ? 0 : number) : 'null'
-    );
-    return true;
-  }
-  if (value instanceof Boolean) {
-    appendSerializedChunk(
-      collector,
-      String(Boolean.prototype.valueOf.call(value))
-    );
-    return true;
+    if (ArrayBuffer.isView(value)) {
+      const view = readSafeNativeArrayBufferView(
+        value,
+        undefined,
+        undefined,
+        false
+      );
+      if (view == null) {
+        appendSerializedChunk(collector, '"[Unsafe ArrayBufferView omitted]"');
+        collector.work.exceeded = true;
+        return true;
+      }
+      appendJsonString(collector, `[${view.name}: ${view.byteLength} bytes]`);
+      return true;
+    }
+    const date = readNativeDate(value);
+    if (date.matched) {
+      if (!isSafeNativeDate(value as Date)) {
+        appendSerializedChunk(collector, '"[Unsafe Date omitted]"');
+        collector.work.exceeded = true;
+      } else if (!Number.isFinite(date.time)) {
+        appendSerializedChunk(collector, 'null');
+      } else {
+        appendJsonString(collector, Date.prototype.toISOString.call(value));
+      }
+      return true;
+    }
+    const boxedString = readNativeBoxedString(value);
+    if (boxedString != null) {
+      appendJsonString(collector, boxedString);
+      return true;
+    }
+    const boxedNumber = readNativeBoxedNumber(value);
+    if (boxedNumber != null) {
+      appendSerializedChunk(
+        collector,
+        Number.isFinite(boxedNumber)
+          ? String(boxedNumber === 0 ? 0 : boxedNumber)
+          : 'null'
+      );
+      return true;
+    }
+    const boxedBoolean = readNativeBoxedBoolean(value);
+    if (boxedBoolean != null) {
+      appendSerializedChunk(collector, String(boxedBoolean));
+      return true;
+    }
+    let prototype: object | null;
+    try {
+      prototype = Object.getPrototypeOf(value) as object | null;
+    } catch {
+      appendSerializedChunk(collector, '"[Unreadable object omitted]"');
+      collector.work.exceeded = true;
+      return true;
+    }
+    if (
+      isProxy(prototype) ||
+      (prototype !== Object.prototype && prototype !== null)
+    ) {
+      appendSerializedChunk(collector, '"[Unsupported object omitted]"');
+      collector.work.exceeded = true;
+      return true;
+    }
+  } else {
+    let prototype: object | null;
+    try {
+      prototype = Object.getPrototypeOf(value) as object | null;
+    } catch {
+      appendSerializedChunk(collector, '"[Unreadable array omitted]"');
+      collector.work.exceeded = true;
+      return true;
+    }
+    if (
+      isProxy(prototype) ||
+      (prototype !== Array.prototype && prototype !== null)
+    ) {
+      appendSerializedChunk(collector, '"[Unsafe array omitted]"');
+      collector.work.exceeded = true;
+      return true;
+    }
   }
   if (depth >= MAX_STRUCTURED_SERIALIZATION_DEPTH) {
     appendJsonString(collector, '[Max serialization depth]');
@@ -653,7 +861,7 @@ function appendStructuredValue(
 
   ancestors.add(value);
   try {
-    if (Array.isArray(value)) {
+    if (valueIsArray) {
       const arrayLength = readStructuredArrayLength(value, collector.work);
       if (arrayLength == null) {
         appendJsonString(collector, '[Unreadable array omitted]');
@@ -692,17 +900,18 @@ function appendStructuredValue(
     // before either output limit applies. Filter a streaming `for…in` walk to
     // retain JSON's own-enumerable-key semantics without that extra array.
     for (const key in value) {
-      if (!Object.prototype.propertyIsEnumerable.call(value, key)) {
-        continue;
-      }
       if (!consumeStructuredWork(collector.work)) {
         if (emitted > 0) {
           appendSerializedChunk(collector, ',');
         }
-        appendJsonString(collector, '_truncated');
-        appendSerializedChunk(collector, ':');
-        appendJsonString(collector, '[Traversal limit exceeded]');
+        appendSerializedChunk(
+          collector,
+          '"_truncated":"[Traversal limit exceeded]"'
+        );
         break;
+      }
+      if (!Object.prototype.propertyIsEnumerable.call(value, key)) {
+        continue;
       }
       const nested = readStructuredProperty(
         value as Record<string, unknown>,
@@ -741,9 +950,10 @@ function formatBoundedStructuredContent(
     return prefix.slice(0, collector.totalChars);
   }
 
-  const indicator =
-    `\n\n… [truncated: ${collector.totalChars} chars exceeded ` +
-    `${maxChars} limit] …\n\n`;
+  const indicator = collector.work.exceeded
+    ? '\n\n… [truncated: safe traversal limit exceeded] …\n\n'
+    : `\n\n… [truncated: ${collector.totalChars} chars exceeded ` +
+      `${maxChars} limit] …\n\n`;
   const available = maxChars - indicator.length;
   if (available <= 0) {
     return prefix.slice(0, maxChars);
@@ -782,7 +992,8 @@ function formatBoundedStructuredContent(
 export function serializeStructuredValueBounded(
   value: unknown,
   maxChars: number,
-  prefixChars = 0
+  prefixChars = 0,
+  work = createStructuredWorkState()
 ): BoundedStructuredSerialization {
   const normalizedMaxChars = normalizeCharLimit(maxChars);
   const normalizedPrefixChars = normalizeCharLimit(prefixChars);
@@ -794,7 +1005,7 @@ export function serializeStructuredValueBounded(
     prefixLimit,
     suffixLimit:
       normalizedMaxChars === Number.MAX_SAFE_INTEGER ? 0 : normalizedMaxChars,
-    work: createStructuredWorkState(),
+    work,
   };
 
   try {
@@ -803,9 +1014,8 @@ export function serializeStructuredValueBounded(
     collector.totalChars = 0;
     collector.prefix = createSegmentedStringBuffer();
     collector.suffix = createSegmentedStringBuffer();
-    collector.work = createStructuredWorkState();
     collector.work.exceeded = true;
-    appendJsonString(collector, '[Unserializable structured value]');
+    appendSerializedChunk(collector, '"[Unserializable structured value]"');
   }
 
   const prefix = materializeSegmentedStringBuffer(collector.prefix);
@@ -829,23 +1039,36 @@ export function serializeStructuredValueBounded(
 
 function serializeStructuredValueWithinLimit(
   value: unknown,
-  maxChars: number
+  maxChars: number,
+  work = createStructuredWorkState()
 ): string {
-  return serializeStructuredValueBounded(value, maxChars).content;
+  return serializeStructuredValueBounded(value, maxChars, 0, work).content;
 }
 
-function isTextBlock(value: unknown): value is TextToolContentBlock {
-  if (!isRecord(value) || hasUnsafeCallableToJSON(value)) {
+function isTextBlockUnchecked(value: unknown): value is TextToolContentBlock {
+  if (!isRecord(value) || isProxy(value)) {
     return false;
   }
-  const type = readOwnEnumerableDataProperty(value, 'type');
-  const text = readOwnEnumerableDataProperty(value, 'text');
-  return (
-    type.found &&
-    type.value === 'text' &&
-    text.found &&
-    typeof text.value === 'string'
-  );
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return false;
+    }
+    const keys = Object.keys(value);
+    if (keys.length !== 2 || !keys.includes('type') || !keys.includes('text')) {
+      return false;
+    }
+    const type = readOwnEnumerableDataProperty(value, 'type');
+    const text = readOwnEnumerableDataProperty(value, 'text');
+    return (
+      type.found &&
+      type.value === 'text' &&
+      text.found &&
+      typeof text.value === 'string'
+    );
+  } catch {
+    return false;
+  }
 }
 
 function isArray(value: unknown): value is unknown[] {
@@ -860,8 +1083,21 @@ function getDenseTextBlockArrayLength(content: unknown[]): number | undefined {
   if (isProxy(content)) {
     return undefined;
   }
+  const validation = createToolBlockClassificationContext();
+  const containerWork = { value: MAX_ATOMIC_VALIDATION_WORK };
   let contentLength: number;
   try {
+    const prototype = Object.getPrototypeOf(content);
+    if (
+      (prototype !== Array.prototype && prototype !== null) ||
+      hasPotentiallyCallableToJSON(
+        content,
+        containerWork,
+        validation.totalRemaining
+      )
+    ) {
+      return undefined;
+    }
     contentLength = content.length;
   } catch {
     return undefined;
@@ -876,14 +1112,19 @@ function getDenseTextBlockArrayLength(content: unknown[]): number | undefined {
   let length = contentLength - 1;
   try {
     for (let i = 0; i < contentLength; i++) {
-      if (!Object.prototype.hasOwnProperty.call(content, i)) {
+      const descriptor = Object.getOwnPropertyDescriptor(content, String(i));
+      if (descriptor == null || !('value' in descriptor)) {
         return undefined;
       }
-      const block = content[i];
-      if (!isTextBlock(block)) {
+      const block = descriptor.value;
+      if (
+        classifyToolContentBlock(block, validation) !== TOOL_BLOCK_TEXT ||
+        validation.totalRemaining.value <= 0
+      ) {
         return undefined;
       }
-      length += block.text.length;
+      const text = readOwnEnumerableDataProperty(block, 'text');
+      length += typeof text.value === 'string' ? text.value.length : 0;
       if (length >= Number.MAX_SAFE_INTEGER) {
         return Number.MAX_SAFE_INTEGER;
       }
@@ -943,8 +1184,18 @@ function isBinaryPayload(value: unknown): boolean {
   if (typeof value === 'string') {
     return value.length > 0;
   }
-  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
-    return value.byteLength > 0;
+  if (isArray(value)) {
+    return false;
+  }
+  const arrayBufferByteLength = readNativeArrayBufferByteLength(value);
+  if (arrayBufferByteLength != null) {
+    return (
+      isSafeNativeArrayBuffer(value as ArrayBuffer) && arrayBufferByteLength > 0
+    );
+  }
+  if (ArrayBuffer.isView(value)) {
+    const view = readSafeNativeArrayBufferView(value);
+    return view != null && view.byteLength > 0;
   }
   return false;
 }
@@ -1023,10 +1274,37 @@ function isProviderNativeToolResultBlock(
 
 const MAX_ATOMIC_VALIDATION_WORK = 10_000;
 const MAX_ATOMIC_VALIDATION_DEPTH = 50;
+type AtomicValidationWork = { value: number };
 const NATIVE_ARRAY_BUFFER_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(
   ArrayBuffer.prototype,
   'byteLength'
 )?.get;
+const NATIVE_TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(
+  Uint8Array.prototype
+) as object;
+const NATIVE_TYPED_ARRAY_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(
+  NATIVE_TYPED_ARRAY_PROTOTYPE,
+  'byteLength'
+)?.get;
+const NATIVE_DATA_VIEW_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(
+  DataView.prototype,
+  'byteLength'
+)?.get;
+const NATIVE_ARRAY_BUFFER_VIEW_NAMES = new Map<object, string>([
+  [Buffer.prototype, 'Buffer'],
+  [DataView.prototype, 'DataView'],
+  [Int8Array.prototype, 'Int8Array'],
+  [Uint8Array.prototype, 'Uint8Array'],
+  [Uint8ClampedArray.prototype, 'Uint8ClampedArray'],
+  [Int16Array.prototype, 'Int16Array'],
+  [Uint16Array.prototype, 'Uint16Array'],
+  [Int32Array.prototype, 'Int32Array'],
+  [Uint32Array.prototype, 'Uint32Array'],
+  [Float32Array.prototype, 'Float32Array'],
+  [Float64Array.prototype, 'Float64Array'],
+  [BigInt64Array.prototype, 'BigInt64Array'],
+  [BigUint64Array.prototype, 'BigUint64Array'],
+]);
 const NATIVE_DATE_GET_TIME = Date.prototype.getTime;
 const NATIVE_DATE_TO_JSON = Date.prototype.toJSON;
 const NATIVE_DATE_TO_ISO_STRING = Date.prototype.toISOString;
@@ -1044,10 +1322,45 @@ const NATIVE_DATE_PROTOTYPE_METHODS: ReadonlyArray<
   [Symbol.toPrimitive, NATIVE_DATE_TO_PRIMITIVE],
 ];
 
-function hasPotentiallyCallableToJSON(value: object): boolean {
+function consumeAtomicValidationWork(
+  remaining: AtomicValidationWork,
+  totalRemaining: AtomicValidationWork | undefined,
+  amount = 1
+): boolean {
+  if (
+    amount > remaining.value ||
+    (totalRemaining != null && amount > totalRemaining.value)
+  ) {
+    remaining.value = 0;
+    if (totalRemaining != null) {
+      totalRemaining.value = 0;
+    }
+    return false;
+  }
+  remaining.value -= amount;
+  if (totalRemaining != null) {
+    totalRemaining.value -= amount;
+  }
+  return true;
+}
+
+function hasPotentiallyCallableToJSON(
+  value: object,
+  remaining?: AtomicValidationWork,
+  totalRemaining?: AtomicValidationWork
+): boolean {
   let current: object | null = value;
   const seen = new Set<object>();
   for (let depth = 0; current != null && depth < 100; depth++) {
+    if (isProxy(current)) {
+      return true;
+    }
+    if (
+      remaining != null &&
+      !consumeAtomicValidationWork(remaining, totalRemaining)
+    ) {
+      return true;
+    }
     if (seen.has(current)) {
       return true;
     }
@@ -1064,19 +1377,72 @@ function hasPotentiallyCallableToJSON(value: object): boolean {
   return current != null;
 }
 
-function isSafeNativeArrayBuffer(value: ArrayBuffer): boolean {
+type NativeArrayBufferViewRead = {
+  byteLength: number;
+  name: string;
+};
+
+function readSafeNativeArrayBufferView(
+  value: ArrayBufferView,
+  remaining?: AtomicValidationWork,
+  totalRemaining?: AtomicValidationWork,
+  rejectCallableToJSON = true
+): NativeArrayBufferViewRead | undefined {
+  try {
+    const prototype = Object.getPrototypeOf(value) as object | null;
+    if (prototype == null || isProxy(prototype)) {
+      return undefined;
+    }
+    const name = NATIVE_ARRAY_BUFFER_VIEW_NAMES.get(prototype);
+    if (
+      name == null ||
+      Object.getOwnPropertyDescriptor(value, 'byteLength') != null ||
+      Object.getOwnPropertyDescriptor(value, 'constructor') != null ||
+      Object.getOwnPropertyDescriptor(value, 'toJSON') != null ||
+      (rejectCallableToJSON &&
+        hasPotentiallyCallableToJSON(value, remaining, totalRemaining))
+    ) {
+      return undefined;
+    }
+    const getter =
+      prototype === DataView.prototype
+        ? NATIVE_DATA_VIEW_BYTE_LENGTH_GETTER
+        : NATIVE_TYPED_ARRAY_BYTE_LENGTH_GETTER;
+    if (getter == null) {
+      return undefined;
+    }
+    const byteLength = getter.call(value) as number;
+    return Number.isSafeInteger(byteLength) && byteLength >= 0
+      ? { byteLength, name }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isSafeNativeArrayBuffer(
+  value: ArrayBuffer,
+  remaining?: AtomicValidationWork,
+  totalRemaining?: AtomicValidationWork
+): boolean {
   try {
     if (
       Object.getPrototypeOf(value) !== ArrayBuffer.prototype ||
       NATIVE_ARRAY_BUFFER_BYTE_LENGTH_GETTER == null ||
       Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')
         ?.get !== NATIVE_ARRAY_BUFFER_BYTE_LENGTH_GETTER ||
-      hasPotentiallyCallableToJSON(value)
+      hasPotentiallyCallableToJSON(value, remaining, totalRemaining)
     ) {
       return false;
     }
     NATIVE_ARRAY_BUFFER_BYTE_LENGTH_GETTER.call(value);
     for (const key in value) {
+      if (
+        remaining != null &&
+        !consumeAtomicValidationWork(remaining, totalRemaining)
+      ) {
+        return false;
+      }
       if (Object.prototype.propertyIsEnumerable.call(value, key)) {
         return false;
       }
@@ -1112,7 +1478,8 @@ function hasUnsafeCallableToJSON(
   value: unknown,
   seen = new Set<object>(),
   remaining = { value: MAX_ATOMIC_VALIDATION_WORK },
-  depth = 0
+  depth = 0,
+  totalRemaining?: AtomicValidationWork
 ): boolean {
   if (isProxy(value)) {
     return true;
@@ -1120,33 +1487,40 @@ function hasUnsafeCallableToJSON(
   if (!isRecord(value)) {
     return false;
   }
-  try {
-    if (value instanceof ArrayBuffer) {
-      return !isSafeNativeArrayBuffer(value);
+  if (
+    seen.has(value) ||
+    depth >= MAX_ATOMIC_VALIDATION_DEPTH ||
+    !consumeAtomicValidationWork(remaining, totalRemaining)
+  ) {
+    return true;
+  }
+  const valueIsArray = isArray(value);
+  if (!valueIsArray) {
+    const arrayBufferByteLength = readNativeArrayBufferByteLength(value);
+    if (arrayBufferByteLength != null) {
+      return !isSafeNativeArrayBuffer(
+        value as unknown as ArrayBuffer,
+        remaining,
+        totalRemaining
+      );
     }
-    if (value instanceof Date) {
-      return !isSafeNativeDate(value);
+    const date = readNativeDate(value);
+    if (date.matched) {
+      return !isSafeNativeDate(value as unknown as Date);
     }
     if (ArrayBuffer.isView(value)) {
-      return hasPotentiallyCallableToJSON(value);
+      return (
+        readSafeNativeArrayBufferView(value, remaining, totalRemaining) == null
+      );
     }
-  } catch {
-    return true;
-  }
-  if (seen.has(value)) {
-    return true;
-  }
-  if (depth >= MAX_ATOMIC_VALIDATION_DEPTH || remaining.value <= 0) {
-    return true;
   }
 
-  remaining.value--;
   seen.add(value);
   try {
-    if (hasPotentiallyCallableToJSON(value)) {
+    if (hasPotentiallyCallableToJSON(value, remaining, totalRemaining)) {
       return true;
     }
-    if (isArray(value)) {
+    if (valueIsArray) {
       const prototype = Object.getPrototypeOf(value);
       if (prototype !== Array.prototype && prototype !== null) {
         return true;
@@ -1157,11 +1531,10 @@ function hasUnsafeCallableToJSON(
         typeof length !== 'number' ||
         !Number.isSafeInteger(length) ||
         length < 0 ||
-        length > remaining.value
+        !consumeAtomicValidationWork(remaining, totalRemaining, length)
       ) {
         return true;
       }
-      remaining.value -= length;
       for (let i = 0; i < length; i++) {
         const descriptor = Object.getOwnPropertyDescriptor(value, String(i));
         if (
@@ -1172,7 +1545,13 @@ function hasUnsafeCallableToJSON(
           return true;
         }
         if (
-          hasUnsafeCallableToJSON(descriptor.value, seen, remaining, depth + 1)
+          hasUnsafeCallableToJSON(
+            descriptor.value,
+            seen,
+            remaining,
+            depth + 1,
+            totalRemaining
+          )
         ) {
           return true;
         }
@@ -1193,15 +1572,20 @@ function hasUnsafeCallableToJSON(
         continue;
       }
       if (
-        remaining.value <= 0 ||
         typeof descriptor.get === 'function' ||
-        typeof descriptor.set === 'function'
+        typeof descriptor.set === 'function' ||
+        !consumeAtomicValidationWork(remaining, totalRemaining)
       ) {
         return true;
       }
-      remaining.value--;
       if (
-        hasUnsafeCallableToJSON(descriptor.value, seen, remaining, depth + 1)
+        hasUnsafeCallableToJSON(
+          descriptor.value,
+          seen,
+          remaining,
+          depth + 1,
+          totalRemaining
+        )
       ) {
         return true;
       }
@@ -1246,10 +1630,18 @@ function isAtomicToolContentBlockUnchecked(value: unknown): boolean {
     return cachePointType.found && cachePointType.value === 'default';
   }
   const type = typeof typeProperty.value === 'string' ? typeProperty.value : '';
+  if (type.length > MAX_TOOL_CONTENT_TYPE_CHARS) {
+    return false;
+  }
+  const slashIndex = type.indexOf('/');
+  const isMimeType =
+    slashIndex > 0 &&
+    slashIndex < type.length - 1 &&
+    slashIndex === type.lastIndexOf('/');
   if (
     !ATOMIC_CONTENT_TYPES.has(type) &&
     !PROVIDER_NATIVE_TOOL_RESULT_TYPES.has(type) &&
-    !(type.includes('/') && type.split('/').length === 2)
+    !isMimeType
   ) {
     return false;
   }
@@ -1259,7 +1651,18 @@ function isAtomicToolContentBlockUnchecked(value: unknown): boolean {
   }
 
   if (type === 'computer_screenshot') {
-    return hasPayloadPath(record, ['image_url'], isStringPayload);
+    return hasAnyPayloadPath(
+      record,
+      [['image_url'], ['file_id']],
+      isStringPayload
+    );
+  }
+  if (type === 'input_image') {
+    return hasAnyPayloadPath(
+      record,
+      [['image_url'], ['file_id']],
+      isStringPayload
+    );
   }
   if (type === 'image_url') {
     return hasAnyPayloadPath(
@@ -1305,7 +1708,7 @@ function isAtomicToolContentBlockUnchecked(value: unknown): boolean {
     );
   }
 
-  if (type.includes('/') && type.split('/').length === 2) {
+  if (isMimeType) {
     return hasPayloadPath(record, ['data'], isStringPayload);
   }
 
@@ -1388,6 +1791,59 @@ function isAtomicToolContentBlockUnchecked(value: unknown): boolean {
   return false;
 }
 
+const TOOL_BLOCK_OPAQUE = 0;
+const TOOL_BLOCK_TEXT = 1;
+const TOOL_BLOCK_ATOMIC = 2;
+
+type ToolBlockClassificationContext = {
+  totalRemaining: AtomicValidationWork;
+  cache: WeakMap<object, number>;
+};
+
+function createToolBlockClassificationContext(): ToolBlockClassificationContext {
+  return {
+    totalRemaining: { value: MAX_STRUCTURED_SERIALIZATION_WORK },
+    cache: new WeakMap<object, number>(),
+  };
+}
+
+function classifyToolContentBlock(
+  value: unknown,
+  context: ToolBlockClassificationContext
+): number {
+  if (isRecord(value)) {
+    const cached = context.cache.get(value);
+    if (cached != null) {
+      return cached;
+    }
+  }
+  const remaining = { value: MAX_ATOMIC_VALIDATION_WORK };
+  let kind = TOOL_BLOCK_OPAQUE;
+  try {
+    if (
+      hasUnsafeCallableToJSON(
+        value,
+        new Set<object>(),
+        remaining,
+        0,
+        context.totalRemaining
+      )
+    ) {
+      kind = TOOL_BLOCK_OPAQUE;
+    } else if (isAtomicToolContentBlockUnchecked(value)) {
+      kind = TOOL_BLOCK_ATOMIC;
+    } else {
+      kind = isTextBlockUnchecked(value) ? TOOL_BLOCK_TEXT : TOOL_BLOCK_OPAQUE;
+    }
+  } catch {
+    kind = TOOL_BLOCK_OPAQUE;
+  }
+  if (isRecord(value) && context.totalRemaining.value > 0) {
+    context.cache.set(value, kind);
+  }
+  return kind;
+}
+
 /**
  * Produces the text representation providers use for structured tool results.
  * Text-only block arrays stay readable; opaque blocks use canonical JSON.
@@ -1443,18 +1899,27 @@ export function serializeToolContentBounded(
   if (originalChars == null) {
     return serializeStructuredValueWithinLimit(content, normalizedMaxChars);
   }
+  return serializeDenseTextBlocksWithinLimit(
+    content as TextToolContentBlock[],
+    originalChars,
+    normalizedMaxChars
+  );
+}
+
+function serializeDenseTextBlocksWithinLimit(
+  textBlocks: readonly TextToolContentBlock[],
+  originalChars: number,
+  normalizedMaxChars: number
+): string {
   if (originalChars <= normalizedMaxChars) {
-    return (content as TextToolContentBlock[])
-      .map((block) => block.text)
-      .join('\n');
+    return textBlocks.map((block) => block.text).join('\n');
   }
   const indicator =
     `\n\n… [truncated: ${originalChars} chars exceeded ` +
     `${normalizedMaxChars} limit] …`;
   const available = Math.max(0, normalizedMaxChars - indicator.length);
   let preview = '';
-  const textBlocks = content as TextToolContentBlock[];
-  for (let i = 0; i < content.length && preview.length < available; i++) {
+  for (let i = 0; i < textBlocks.length && preview.length < available; i++) {
     if (i > 0) {
       preview += '\n';
     }
@@ -1468,6 +1933,395 @@ export type CompactToolContentResult = {
   changed: boolean;
   originalChars: number;
 };
+
+function isProviderImageUrl(value: unknown): value is string {
+  if (typeof value !== 'string' || value === '') {
+    return false;
+  }
+  const isDataImage = value.startsWith('data:image/');
+  if (
+    value.length >
+    (isDataImage
+      ? HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE
+      : MAX_PROVIDER_IMAGE_URL_CHARS)
+  ) {
+    return false;
+  }
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x20 || code === 0x7f) {
+      return false;
+    }
+  }
+  if (isDataImage) {
+    const separator = value.indexOf(',');
+    if (
+      separator < 0 ||
+      !value.slice(0, separator).toLowerCase().endsWith(';base64')
+    ) {
+      return false;
+    }
+    const payload = value.slice(separator + 1);
+    return (
+      payload.length > 0 &&
+      payload.length % 4 === 0 &&
+      /^[a-z0-9+/]+={0,2}$/i.test(payload)
+    );
+  }
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function isProviderFileId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length <= MAX_PROVIDER_FILE_ID_CHARS &&
+    /^file[-_][a-z0-9_-]+$/i.test(value)
+  );
+}
+
+function hasOnlyEnumerableKeys(
+  record: Record<string, unknown>,
+  allowed: ReadonlySet<string>
+): boolean {
+  try {
+    const keys = Object.keys(record);
+    return keys.every((key) => allowed.has(key));
+  } catch {
+    return false;
+  }
+}
+
+export type CacheControlledTextToolContent = [
+  {
+    type: 'text';
+    text: string;
+    cache_control: { type: 'ephemeral'; ttl?: '1h' };
+  },
+];
+
+const SINGLE_TEXT_TOOL_CONTENT_KEYS = new Set(['type', 'text']);
+const CACHE_CONTROLLED_TEXT_TOOL_CONTENT_KEYS = new Set([
+  'type',
+  'text',
+  'cache_control',
+]);
+const CACHE_CONTROL_KEYS = new Set(['type', 'ttl']);
+
+function hasSafePlainPrototype(value: object): boolean {
+  try {
+    const prototype = Object.getPrototypeOf(value) as object | null;
+    return (
+      (prototype === Object.prototype || prototype === null) &&
+      !hasPotentiallyCallableToJSON(value)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function readSafeArrayItem(
+  content: unknown,
+  expectedLength: number,
+  index: number
+): OwnDataProperty {
+  if (!isArray(content) || isProxy(content)) {
+    return { found: false };
+  }
+  try {
+    const length = Object.getOwnPropertyDescriptor(content, 'length');
+    if (length?.value !== expectedLength) {
+      return { found: false };
+    }
+    const prototype = Object.getPrototypeOf(content) as object | null;
+    if (
+      (prototype !== Array.prototype && prototype !== null) ||
+      hasPotentiallyCallableToJSON(content)
+    ) {
+      return { found: false };
+    }
+    const item = Object.getOwnPropertyDescriptor(content, String(index));
+    if (item?.enumerable !== true || !('value' in item)) {
+      return { found: false };
+    }
+    return { found: true, value: item.value };
+  } catch {
+    return { found: false };
+  }
+}
+
+/** Reads one safe text block and returns its bounded text payload. */
+export function getBoundedSingleTextToolContent(
+  content: unknown,
+  maxChars: number
+): string | undefined {
+  const block = readSafeArrayItem(content, 1, 0);
+  if (
+    !block.found ||
+    !isRecord(block.value) ||
+    isProxy(block.value) ||
+    !hasSafePlainPrototype(block.value) ||
+    !hasOnlyEnumerableKeys(block.value, SINGLE_TEXT_TOOL_CONTENT_KEYS)
+  ) {
+    return undefined;
+  }
+  const type = readOwnEnumerableDataProperty(block.value, 'type');
+  const text = readOwnEnumerableDataProperty(block.value, 'text');
+  if (
+    !type.found ||
+    type.value !== 'text' ||
+    !text.found ||
+    typeof text.value !== 'string'
+  ) {
+    return undefined;
+  }
+  const normalizedMaxChars = Number.isFinite(maxChars)
+    ? Math.max(0, Math.floor(maxChars))
+    : Number.MAX_SAFE_INTEGER;
+  return truncateToolResultContent(text.value, normalizedMaxChars);
+}
+
+/**
+ * Canonicalizes the single cache-decorated text block produced by tail prompt
+ * caching without invoking accessors or custom serialization hooks.
+ */
+export function getBoundedCacheControlledTextToolContent(
+  content: unknown,
+  maxChars: number
+): CacheControlledTextToolContent | undefined {
+  const block = readSafeArrayItem(content, 1, 0);
+  if (
+    !block.found ||
+    !isRecord(block.value) ||
+    isProxy(block.value) ||
+    !hasSafePlainPrototype(block.value) ||
+    !hasOnlyEnumerableKeys(block.value, CACHE_CONTROLLED_TEXT_TOOL_CONTENT_KEYS)
+  ) {
+    return undefined;
+  }
+  const type = readOwnEnumerableDataProperty(block.value, 'type');
+  const text = readOwnEnumerableDataProperty(block.value, 'text');
+  const cacheControl = readOwnEnumerableDataProperty(
+    block.value,
+    'cache_control'
+  );
+  if (
+    !type.found ||
+    type.value !== 'text' ||
+    !text.found ||
+    typeof text.value !== 'string' ||
+    !cacheControl.found ||
+    !isRecord(cacheControl.value) ||
+    isProxy(cacheControl.value) ||
+    !hasSafePlainPrototype(cacheControl.value) ||
+    !hasOnlyEnumerableKeys(cacheControl.value, CACHE_CONTROL_KEYS)
+  ) {
+    return undefined;
+  }
+
+  const cacheType = readOwnEnumerableDataProperty(cacheControl.value, 'type');
+  const ttl = readOwnEnumerableDataProperty(cacheControl.value, 'ttl');
+  let hasOwnTtl: boolean;
+  try {
+    hasOwnTtl =
+      Object.getOwnPropertyDescriptor(cacheControl.value, 'ttl') != null;
+  } catch {
+    return undefined;
+  }
+  if (
+    !cacheType.found ||
+    cacheType.value !== 'ephemeral' ||
+    (hasOwnTtl && (!ttl.found || ttl.value !== '1h'))
+  ) {
+    return undefined;
+  }
+
+  const normalizedMaxChars = Number.isFinite(maxChars)
+    ? Math.max(0, Math.floor(maxChars))
+    : Number.MAX_SAFE_INTEGER;
+  return [
+    {
+      type: 'text',
+      text: truncateToolResultContent(text.value, normalizedMaxChars),
+      cache_control: {
+        type: 'ephemeral',
+        ...(ttl.found ? { ttl: '1h' as const } : {}),
+      },
+    },
+  ];
+}
+
+export type ComputerCallOutputScreenshot =
+  | { type: 'input_image'; image_url: string; detail?: InputImageDetail }
+  | { type: 'input_image'; file_id: string; detail?: InputImageDetail }
+  | { type: 'computer_screenshot'; image_url: string }
+  | { type: 'computer_screenshot'; file_id: string };
+
+type InputImageDetail = 'low' | 'high' | 'auto' | 'original';
+
+const INPUT_IMAGE_KEYS = new Set(['type', 'image_url', 'file_id', 'detail']);
+const COMPUTER_SCREENSHOT_KEYS = new Set(['type', 'image_url', 'file_id']);
+const IMAGE_URL_KEYS = new Set(['type', 'image_url', 'detail']);
+const NESTED_IMAGE_URL_KEYS = new Set(['url', 'detail']);
+const INPUT_IMAGE_DETAILS = new Set(['low', 'high', 'auto', 'original']);
+
+/**
+ * Selects the exact screenshot shape accepted by LangChain's Responses
+ * converter without invoking accessors or user-defined serialization hooks.
+ */
+export function getComputerCallOutputScreenshot(
+  content: unknown
+): ComputerCallOutputScreenshot | undefined {
+  if (isProviderImageUrl(content)) {
+    return { type: 'input_image', image_url: content };
+  }
+  if (
+    !isArray(content) ||
+    hasUnsafeCallableToJSON(content) ||
+    content.length !== 1
+  ) {
+    return undefined;
+  }
+
+  const descriptor = Object.getOwnPropertyDescriptor(content, '0');
+  if (descriptor == null || !('value' in descriptor)) {
+    return undefined;
+  }
+  const block = descriptor.value;
+  if (!isRecord(block)) {
+    return undefined;
+  }
+  const type = readOwnEnumerableDataProperty(block, 'type');
+  if (!type.found) {
+    return undefined;
+  }
+  const imageUrl = readOwnEnumerableDataProperty(block, 'image_url');
+  const fileId = readOwnEnumerableDataProperty(block, 'file_id');
+  const validImageUrl =
+    imageUrl.found && isProviderImageUrl(imageUrl.value)
+      ? imageUrl.value
+      : undefined;
+  const validFileId =
+    fileId.found && isProviderFileId(fileId.value) ? fileId.value : undefined;
+  const hasImageUrl = validImageUrl != null;
+  const hasFileId = validFileId != null;
+
+  if (
+    type.value === 'input_image' &&
+    hasOnlyEnumerableKeys(block, INPUT_IMAGE_KEYS)
+  ) {
+    if (
+      (imageUrl.found && !hasImageUrl) ||
+      (fileId.found && !hasFileId) ||
+      hasImageUrl === hasFileId
+    ) {
+      return undefined;
+    }
+    const detail = readOwnEnumerableDataProperty(block, 'detail');
+    if (
+      detail.found &&
+      (typeof detail.value !== 'string' ||
+        !INPUT_IMAGE_DETAILS.has(detail.value))
+    ) {
+      return undefined;
+    }
+    return hasImageUrl
+      ? {
+        type: 'input_image',
+        image_url: validImageUrl,
+        ...(detail.found ? { detail: detail.value as InputImageDetail } : {}),
+      }
+      : {
+        type: 'input_image',
+        file_id: validFileId as string,
+        ...(detail.found ? { detail: detail.value as InputImageDetail } : {}),
+      };
+  }
+  if (
+    type.value === 'computer_screenshot' &&
+    hasOnlyEnumerableKeys(block, COMPUTER_SCREENSHOT_KEYS)
+  ) {
+    if (
+      (imageUrl.found && !hasImageUrl) ||
+      (fileId.found && !hasFileId) ||
+      hasImageUrl === hasFileId
+    ) {
+      return undefined;
+    }
+    return hasImageUrl
+      ? { type: 'computer_screenshot', image_url: validImageUrl }
+      : {
+        type: 'computer_screenshot',
+        file_id: validFileId as string,
+      };
+  }
+  if (
+    type.value === 'image_url' &&
+    !fileId.found &&
+    hasOnlyEnumerableKeys(block, IMAGE_URL_KEYS)
+  ) {
+    if (hasImageUrl) {
+      return { type: 'input_image', image_url: validImageUrl };
+    }
+    if (
+      imageUrl.found &&
+      isRecord(imageUrl.value) &&
+      hasOnlyEnumerableKeys(imageUrl.value, NESTED_IMAGE_URL_KEYS)
+    ) {
+      const url = readOwnEnumerableDataProperty(imageUrl.value, 'url');
+      if (url.found && isProviderImageUrl(url.value)) {
+        return { type: 'input_image', image_url: url.value };
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Returns the provider image URL when a screenshot is URL-backed. */
+export function getComputerCallOutputImageUrl(
+  content: unknown
+): string | undefined {
+  const screenshot = getComputerCallOutputScreenshot(content);
+  return screenshot != null && 'image_url' in screenshot
+    ? screenshot.image_url
+    : undefined;
+}
+
+/** Returns whether content can be sent as a native computer screenshot. */
+export function isComputerCallOutputContent(
+  content: unknown
+): content is ToolContent {
+  return getComputerCallOutputScreenshot(content) != null;
+}
+
+/** Returns whether a ToolMessage carries the native computer-output marker. */
+export function hasComputerCallOutputMarker(message: BaseMessage): boolean {
+  try {
+    if (message.getType() !== 'tool') {
+      return false;
+    }
+    const metadata = message.additional_kwargs as unknown;
+    if (!isRecord(metadata)) {
+      return false;
+    }
+    const type = readOwnEnumerableDataProperty(metadata, 'type');
+    return type.found && type.value === 'computer_call_output';
+  } catch {
+    return false;
+  }
+}
+
+/** Native Responses computer screenshots are indivisible provider payloads. */
+export function isComputerCallOutputMessage(message: BaseMessage): boolean {
+  return (
+    hasComputerCallOutputMarker(message) &&
+    isComputerCallOutputContent(message.content)
+  );
+}
 
 /**
  * Bounds structured tool output without slicing binary/media payloads.
@@ -1540,10 +2394,92 @@ export function compactToolContent(
   }
 
   try {
-    const originalChars = getToolContentCharLength(contentBlocks);
-    const denseTextLength = getDenseTextBlockArrayLength(contentBlocks);
-    const atomicBlocks = contentBlocks.filter(isAtomicToolContentBlock);
-    if (atomicBlocks.length === 0) {
+    const blockKinds = new Uint8Array(contentLength);
+    const validation = createToolBlockClassificationContext();
+    const structuredWork = createStructuredWorkState();
+    const containerValidationWork = {
+      value: MAX_ATOMIC_VALIDATION_WORK,
+    };
+    const containerPrototype = Object.getPrototypeOf(contentBlocks);
+    if (
+      (containerPrototype !== Array.prototype && containerPrototype !== null) ||
+      hasPotentiallyCallableToJSON(
+        contentBlocks,
+        containerValidationWork,
+        validation.totalRemaining
+      )
+    ) {
+      const serialized = serializeStructuredValueBounded(
+        contentBlocks,
+        normalizedMaxChars
+      );
+      return {
+        content: serialized.content,
+        changed: true,
+        originalChars: serialized.originalChars,
+      };
+    }
+    let atomicBlockCount = 0;
+    let denseTextLength = contentLength > 0 ? contentLength - 1 : undefined;
+    for (let i = 0; i < contentLength; i++) {
+      const descriptor = Object.getOwnPropertyDescriptor(
+        contentBlocks,
+        String(i)
+      );
+      if (
+        descriptor == null ||
+        typeof descriptor.get === 'function' ||
+        typeof descriptor.set === 'function'
+      ) {
+        const serialized = serializeStructuredValueBounded(
+          contentBlocks,
+          normalizedMaxChars
+        );
+        return {
+          content: serialized.content,
+          changed: true,
+          originalChars: serialized.originalChars,
+        };
+      }
+      const block = descriptor.value as ToolContentBlock;
+      const kind = classifyToolContentBlock(block, validation);
+      if (validation.totalRemaining.value <= 0) {
+        const serialized = serializeStructuredValueBounded(
+          contentBlocks,
+          normalizedMaxChars
+        );
+        return {
+          content: serialized.content,
+          changed: true,
+          originalChars: serialized.originalChars,
+        };
+      }
+      blockKinds[i] = kind;
+      if (kind === TOOL_BLOCK_ATOMIC) {
+        atomicBlockCount++;
+      }
+      if (denseTextLength == null) {
+        continue;
+      }
+      if (kind !== TOOL_BLOCK_TEXT) {
+        denseTextLength = undefined;
+        continue;
+      }
+      const text = readOwnEnumerableDataProperty(block, 'text').value;
+      denseTextLength += typeof text === 'string' ? text.length : 0;
+      if (denseTextLength >= Number.MAX_SAFE_INTEGER) {
+        denseTextLength = Number.MAX_SAFE_INTEGER;
+      }
+    }
+    const originalChars =
+      denseTextLength ??
+      estimateStructuredChars(
+        contentBlocks,
+        Number.MAX_SAFE_INTEGER,
+        [],
+        structuredWork
+      );
+    if (atomicBlockCount === 0) {
       if (denseTextLength != null && originalChars <= normalizedMaxChars) {
         return {
           content: contentBlocks,
@@ -1551,10 +2487,18 @@ export function compactToolContent(
           originalChars,
         };
       }
-      const serialized = serializeToolContentBounded(
-        contentBlocks,
-        normalizedMaxChars
-      );
+      const serialized =
+        denseTextLength != null
+          ? serializeDenseTextBlocksWithinLimit(
+              contentBlocks as TextToolContentBlock[],
+              denseTextLength,
+              normalizedMaxChars
+          )
+          : serializeStructuredValueWithinLimit(
+            contentBlocks,
+            normalizedMaxChars,
+            structuredWork
+          );
       return {
         content: truncateToolResultContent(serialized, normalizedMaxChars),
         // Opaque arrays are normalized even when they are small so every
@@ -1564,10 +2508,9 @@ export function compactToolContent(
       };
     }
 
-    const hasOpaqueBlocks = contentBlocks.some(
-      (block) => !isAtomicToolContentBlock(block) && !isTextBlock(block)
-    );
+    let hasOpaqueBlocks = false;
     const normalizedBlocks: ToolContentBlock[] = [];
+    const normalizedKinds: number[] = [];
     let opaqueRun: unknown[] = [];
     const flushOpaqueRun = (): void => {
       if (opaqueRun.length === 0) {
@@ -1577,22 +2520,33 @@ export function compactToolContent(
         type: 'text',
         text: serializeStructuredValueWithinLimit(
           opaqueRun,
-          normalizedMaxChars
+          normalizedMaxChars,
+          structuredWork
         ),
       });
+      normalizedKinds.push(TOOL_BLOCK_TEXT);
       opaqueRun = [];
     };
-    for (const block of contentBlocks) {
-      if (isAtomicToolContentBlock(block) || isTextBlock(block)) {
+    for (let i = 0; i < contentLength; i++) {
+      const block = contentBlocks[i];
+      const kind = blockKinds[i];
+      if (kind !== TOOL_BLOCK_OPAQUE) {
         flushOpaqueRun();
         normalizedBlocks.push(block);
+        normalizedKinds.push(kind);
       } else {
+        hasOpaqueBlocks = true;
         opaqueRun.push(block);
       }
     }
     flushOpaqueRun();
 
-    const normalizedLength = getToolContentCharLength(normalizedBlocks);
+    const normalizedLength = estimateStructuredChars(
+      normalizedBlocks,
+      Number.MAX_SAFE_INTEGER,
+      [],
+      structuredWork
+    );
     if (normalizedLength <= normalizedMaxChars) {
       return {
         content: hasOpaqueBlocks ? normalizedBlocks : contentBlocks,
@@ -1606,43 +2560,59 @@ export function compactToolContent(
     // compactable text so the model still receives an explanation.
     const atomicBudget = Math.floor(normalizedMaxChars / 2);
     let atomicChars = 0;
-    const preservedAtomicBlocks = new Set<ToolContentBlock>();
+    let preservedAtomicCount = 0;
+    const preservedAtomicFlags = new Uint8Array(normalizedBlocks.length);
+    let omittedAtomicCount = 0;
     const omittedAtomicTypes: string[] = [];
-    for (const block of normalizedBlocks) {
-      if (!isAtomicToolContentBlock(block)) {
+    const compactableBlocks: ToolContentBlock[] = [];
+    let compactableChars = 0;
+    for (let i = 0; i < normalizedBlocks.length; i++) {
+      const block = normalizedBlocks[i];
+      if (normalizedKinds[i] !== TOOL_BLOCK_ATOMIC) {
+        if (compactableBlocks.length > 0) {
+          compactableChars++;
+        }
+        compactableBlocks.push(block);
+        compactableChars += (block as TextToolContentBlock).text.length;
         continue;
       }
       const blockChars = estimateStructuredChars(
         block,
-        atomicBudget - atomicChars
+        atomicBudget - atomicChars,
+        [],
+        structuredWork
       );
       if (atomicChars + blockChars <= atomicBudget) {
-        preservedAtomicBlocks.add(block);
+        preservedAtomicFlags[i] = 1;
+        preservedAtomicCount++;
         atomicChars += blockChars;
       } else {
+        omittedAtomicCount++;
         const typeProperty = isRecord(block)
           ? readOwnEnumerableDataProperty(block, 'type')
           : { found: false as const };
-        omittedAtomicTypes.push(
-          typeProperty.found && typeof typeProperty.value === 'string'
-            ? typeProperty.value
-            : 'media'
-        );
+        if (omittedAtomicTypes.length < 8) {
+          const rawType =
+            typeProperty.found && typeof typeProperty.value === 'string'
+              ? typeProperty.value
+              : 'media';
+          omittedAtomicTypes.push(truncateToolResultContent(rawType, 80));
+        }
       }
     }
 
-    const compactableBlocks = normalizedBlocks.filter(
-      (block) => !isAtomicToolContentBlock(block)
-    );
-    let previewSource = serializeToolContentBounded(
-      compactableBlocks,
+    let previewSource = serializeDenseTextBlocksWithinLimit(
+      compactableBlocks as TextToolContentBlock[],
+      compactableChars,
       normalizedMaxChars
     );
-    if (omittedAtomicTypes.length > 0) {
+    if (omittedAtomicCount > 0) {
+      const undisplayedCount = omittedAtomicCount - omittedAtomicTypes.length;
       const omittedNotice =
-        `[omitted ${omittedAtomicTypes.length} oversized atomic tool-content ` +
-        `block${omittedAtomicTypes.length === 1 ? '' : 's'}: ` +
-        `${omittedAtomicTypes.join(', ')}]`;
+        `[omitted ${omittedAtomicCount} oversized atomic tool-content ` +
+        `block${omittedAtomicCount === 1 ? '' : 's'}: ` +
+        `${omittedAtomicTypes.join(', ')}` +
+        `${undisplayedCount > 0 ? `, +${undisplayedCount} more` : ''}]`;
       previewSource =
         previewSource.length > 0
           ? `${previewSource}\n${omittedNotice}`
@@ -1650,7 +2620,7 @@ export function compactToolContent(
     }
 
     const structuralAllowance =
-      preservedAtomicBlocks.size * 4 + (previewSource.length > 0 ? 32 : 2);
+      preservedAtomicCount * 4 + (previewSource.length > 0 ? 32 : 2);
     const previewBudget = Math.max(
       0,
       normalizedMaxChars - atomicChars - structuralAllowance
@@ -1658,9 +2628,10 @@ export function compactToolContent(
     const preview = truncateToolResultContent(previewSource, previewBudget);
     const compacted: ToolContentBlock[] = [];
     let previewInserted = false;
-    for (const block of normalizedBlocks) {
-      if (isAtomicToolContentBlock(block)) {
-        if (preservedAtomicBlocks.has(block)) {
+    for (let i = 0; i < normalizedBlocks.length; i++) {
+      const block = normalizedBlocks[i];
+      if (normalizedKinds[i] === TOOL_BLOCK_ATOMIC) {
+        if (preservedAtomicFlags[i] === 1) {
           compacted.push(block);
         }
       } else if (!previewInserted) {
@@ -1677,11 +2648,21 @@ export function compactToolContent(
     // JSON framing can make the block array a few bytes larger than the
     // character budget. Fall back to bounded provider-neutral text rather than
     // leaking an oversized media payload.
-    if (getToolContentCharLength(compacted) > normalizedMaxChars) {
+    const compactedChars =
+      preservedAtomicCount > 0 || compacted.length === 0
+        ? estimateStructuredChars(
+          compacted,
+          Number.MAX_SAFE_INTEGER,
+          [],
+          structuredWork
+        )
+        : preview.length;
+    if (compactedChars > normalizedMaxChars) {
       return {
-        content: serializeToolContentBounded(
+        content: serializeStructuredValueWithinLimit(
           normalizedBlocks,
-          normalizedMaxChars
+          normalizedMaxChars,
+          structuredWork
         ),
         changed: true,
         originalChars,

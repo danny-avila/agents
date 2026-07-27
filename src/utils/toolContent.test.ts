@@ -2,6 +2,10 @@ import { spawnSync } from 'child_process';
 import type { BaseMessage } from '@langchain/core/messages';
 import {
   compactToolContent,
+  getBoundedCacheControlledTextToolContent,
+  getBoundedSingleTextToolContent,
+  getComputerCallOutputScreenshot,
+  getToolContentCharLength,
   isAtomicToolContentBlock,
   serializeStructuredValue,
   serializeStructuredValueBounded,
@@ -121,6 +125,375 @@ describe('toolContent', () => {
 
     expect(result.changed).toBe(false);
     expect(result.content).toBe(content);
+  });
+
+  it('classifies each mixed content block once during compaction', () => {
+    const blocks: Array<Record<string, unknown>> = [];
+    const tracked = new Set<object>();
+    for (let i = 0; i < 100; i++) {
+      const text = { type: 'text', text: `row-${i}-${'x'.repeat(20)}` };
+      const image = {
+        type: 'image_url',
+        image_url: { url: `https://example.com/chart-${i}.png` },
+      };
+      const opaque = { type: 'json', row: { id: i } };
+      blocks.push(text, image, opaque);
+      tracked.add(text);
+      tracked.add(image);
+      tracked.add(opaque);
+    }
+    const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+    let topLevelSafetyWalks = 0;
+    const descriptorSpy = jest
+      .spyOn(Object, 'getOwnPropertyDescriptor')
+      .mockImplementation((target, property) => {
+        if (property === 'toJSON' && tracked.has(target as object)) {
+          topLevelSafetyWalks++;
+        }
+        return getOwnPropertyDescriptor(target, property);
+      });
+
+    const compacted = (() => {
+      try {
+        return compactToolContent(blocks as ToolContent, 1_000);
+      } finally {
+        descriptorSpy.mockRestore();
+      }
+    })();
+
+    expect(topLevelSafetyWalks).toBe(blocks.length);
+    expect(compacted.changed).toBe(true);
+    expect(serializeToolContent(compacted.content).length).toBeLessThanOrEqual(
+      1_000
+    );
+  });
+
+  it('does not reclassify oversized text blocks while serializing', () => {
+    const blocks: Array<Record<string, unknown>> = [];
+    const tracked = new Set<object>();
+    for (let i = 0; i < 300; i++) {
+      const block = {
+        type: 'text',
+        text: `row-${i}-${'x'.repeat(20)}`,
+      };
+      blocks.push(block);
+      tracked.add(block);
+    }
+    const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+    let topLevelSafetyWalks = 0;
+    const descriptorSpy = jest
+      .spyOn(Object, 'getOwnPropertyDescriptor')
+      .mockImplementation((target, property) => {
+        if (property === 'toJSON' && tracked.has(target as object)) {
+          topLevelSafetyWalks++;
+        }
+        return getOwnPropertyDescriptor(target, property);
+      });
+
+    const compacted = (() => {
+      try {
+        return compactToolContent(blocks as ToolContent, 1_000);
+      } finally {
+        descriptorSpy.mockRestore();
+      }
+    })();
+
+    expect(topLevelSafetyWalks).toBe(blocks.length);
+    expect(compacted.changed).toBe(true);
+    expect(typeof compacted.content).toBe('string');
+    expect((compacted.content as string).length).toBeLessThanOrEqual(1_000);
+  });
+
+  it('includes forwarded text-block metadata in the compaction bound', () => {
+    const citations = 'A'.repeat(1_000_000);
+    const content = [
+      {
+        type: 'text',
+        text: 'x',
+        citations,
+      },
+    ] as ToolContent;
+
+    const compacted = compactToolContent(content, 2_000);
+    const serialized = serializeToolContent(compacted.content);
+
+    expect(compacted.changed).toBe(true);
+    expect(compacted.content).not.toBe(content);
+    expect(serialized.length).toBeLessThanOrEqual(2_000);
+    expect(serialized).not.toContain(citations);
+    expect(compacted.originalChars).toBeGreaterThan(1_000_000);
+  });
+
+  it('does not trust callable serialization hooks on the content array', () => {
+    const toJSON = jest.fn(() => ({
+      expanded: 'x'.repeat(100_000),
+    }));
+    const content = [{ type: 'text', text: 'safe' }] as ToolContent;
+    Object.defineProperty(content, 'toJSON', {
+      enumerable: true,
+      value: toJSON,
+    });
+
+    const compacted = compactToolContent(content, 100);
+
+    expect(toJSON).not.toHaveBeenCalled();
+    expect(compacted.changed).toBe(true);
+    expect(typeof compacted.content).toBe('string');
+    expect((compacted.content as string).length).toBeLessThanOrEqual(100);
+  });
+
+  it('uses one bounded fallback when nested opaque validation is exhausted', () => {
+    const opaque = Array.from({ length: 10_001 }, (_, index) => index);
+    const image = {
+      type: 'image_url',
+      image_url: { url: 'https://example.com/chart.png' },
+    };
+    const content: unknown[] = [];
+    for (let i = 0; i < 25; i++) {
+      content.push(image, opaque);
+    }
+    const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+    let descriptorReads = 0;
+    const descriptorSpy = jest
+      .spyOn(Object, 'getOwnPropertyDescriptor')
+      .mockImplementation((target, property) => {
+        if (target === opaque && property !== 'toJSON') {
+          descriptorReads++;
+        }
+        return getOwnPropertyDescriptor(target, property);
+      });
+
+    const compacted = (() => {
+      try {
+        return compactToolContent(content as ToolContent, 1_000);
+      } finally {
+        descriptorSpy.mockRestore();
+      }
+    })();
+
+    expect(descriptorReads).toBeLessThan(400_000);
+    expect(compacted.changed).toBe(true);
+    expect(typeof compacted.content).toBe('string');
+    expect((compacted.content as string).length).toBeLessThanOrEqual(1_000);
+  });
+
+  it('preserves only the atomic occurrence that fits the budget', () => {
+    const image = {
+      type: 'image_url',
+      image_url: { url: 'https://example.com/chart.png' },
+    };
+    const imageChars = JSON.stringify(image).length;
+    const content = [
+      image,
+      image,
+      { type: 'text', text: 'x'.repeat(1_000) },
+    ] as ToolContent;
+
+    const compacted = compactToolContent(content, imageChars * 2 + 20);
+
+    expect(Array.isArray(compacted.content)).toBe(true);
+    expect(
+      (compacted.content as Exclude<ToolContent, string>).filter(
+        (block) => block === image
+      )
+    ).toHaveLength(1);
+    expect(serializeToolContent(compacted.content).length).toBeLessThanOrEqual(
+      imageChars * 2 + 20
+    );
+  });
+
+  it('accounts for non-finite numbers using their JSON null length', () => {
+    const content = [
+      {
+        type: 'image_url',
+        image_url: { url: 'https://example.com/chart.png' },
+        metadata: [NaN, NaN, NaN, NaN, NaN],
+      },
+    ] as ToolContent;
+    const maxChars = JSON.stringify(content).length - 1;
+
+    const compacted = compactToolContent(content, maxChars);
+
+    expect(compacted.changed).toBe(true);
+    expect(serializeToolContent(compacted.content).length).toBeLessThanOrEqual(
+      maxChars
+    );
+  });
+
+  it('fails closed without invoking traps on an array proxy prototype', () => {
+    let trapCalls = 0;
+    const proxyPrototype = new Proxy(Array.prototype, {
+      getOwnPropertyDescriptor() {
+        trapCalls++;
+        return undefined;
+      },
+      getPrototypeOf(target) {
+        trapCalls++;
+        return Reflect.getPrototypeOf(target);
+      },
+    });
+    const nested = ['safe'];
+    Object.setPrototypeOf(nested, proxyPrototype);
+
+    const compacted = compactToolContent(
+      [nested] as unknown as ToolContent,
+      100
+    );
+
+    expect(trapCalls).toBe(0);
+    expect(compacted.changed).toBe(true);
+    expect(typeof compacted.content).toBe('string');
+    expect((compacted.content as string).length).toBeLessThanOrEqual(100);
+  });
+
+  it('does not invoke overridden byteLength accessors on typed views', () => {
+    let byteLengthCalls = 0;
+    const bytes = new Uint8Array([1]);
+    Object.defineProperty(bytes, 'byteLength', {
+      get() {
+        byteLengthCalls++;
+        return 10_000_000;
+      },
+    });
+
+    const compacted = compactToolContent(
+      [{ type: 'video', data: bytes }] as ToolContent,
+      100
+    );
+
+    expect(byteLengthCalls).toBe(0);
+    expect(compacted.changed).toBe(true);
+    expect(typeof compacted.content).toBe('string');
+    expect((compacted.content as string).length).toBeLessThanOrEqual(100);
+  });
+
+  it('uses fixed native view names for exact cap accounting', () => {
+    const bytes = new Uint8Array([1]);
+    Object.defineProperty(bytes, 'constructor', {
+      value: { name: 'X'.repeat(1_000) },
+    });
+    const content = [{ type: 'video', data: bytes }] as ToolContent;
+
+    const compacted = compactToolContent(content, 60);
+    const serialized = serializeToolContent(compacted.content);
+
+    expect(compacted.changed).toBe(true);
+    expect(serialized.length).toBeLessThanOrEqual(60);
+    expect(serialized).not.toContain('X'.repeat(100));
+  });
+
+  it('caps aggregate character traversal across repeated opaque runs', () => {
+    const payload = 'x'.repeat(100_000);
+    const opaque = { type: 'json', payload };
+    const image = {
+      type: 'image_url',
+      image_url: { url: 'https://example.com/chart.png' },
+    };
+    const content = Array.from({ length: 20 }, (_, index) =>
+      index % 2 === 0 ? opaque : image
+    ) as ToolContent;
+    const charCodeAt = String.prototype.charCodeAt;
+    let characterReads = 0;
+    const charSpy = jest
+      .spyOn(String.prototype, 'charCodeAt')
+      .mockImplementation(function (this: string, index: number) {
+        characterReads++;
+        return charCodeAt.call(this, index);
+      });
+
+    const compacted = (() => {
+      try {
+        return compactToolContent(content, 200);
+      } finally {
+        charSpy.mockRestore();
+      }
+    })();
+
+    expect(characterReads).toBeLessThanOrEqual(1_010_000);
+    expect(compacted.changed).toBe(true);
+    expect(serializeToolContent(compacted.content).length).toBeLessThanOrEqual(
+      200
+    );
+    expect(compacted.originalChars).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it('bounds structured traversal across repeated block references', () => {
+    const metadata = Array.from({ length: 1_000 }, (_, index) => index);
+    const block = { type: 'text', text: 'safe', metadata };
+    const content = new Array(100).fill(block) as ToolContent;
+    const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+    let descriptorReads = 0;
+    const descriptorSpy = jest
+      .spyOn(Object, 'getOwnPropertyDescriptor')
+      .mockImplementation((target, property) => {
+        if (target === metadata && property !== 'toJSON') {
+          descriptorReads++;
+        }
+        return getOwnPropertyDescriptor(target, property);
+      });
+
+    try {
+      expect(serializeToolContent(content)).toContain('safe');
+      expect(getToolContentCharLength(content)).toBeGreaterThan(0);
+      expect(
+        serializeToolContentBounded(content, 100).length
+      ).toBeLessThanOrEqual(100);
+    } finally {
+      descriptorSpy.mockRestore();
+    }
+
+    expect(descriptorReads).toBeLessThan(10_000);
+  });
+
+  it('rejects oversized MIME-like types before scanning each distinct block', () => {
+    const hugeType = `${'a'.repeat(100_000)}/b`;
+    const content = Array.from({ length: 50 }, () => ({
+      type: hugeType,
+      data: 'x',
+    })) as ToolContent;
+    const indexOf = String.prototype.indexOf;
+    let hugeTypeScans = 0;
+    const indexOfSpy = jest
+      .spyOn(String.prototype, 'indexOf')
+      .mockImplementation(function (
+        this: string,
+        searchString: string,
+        position?: number
+      ) {
+        if (String(this) === hugeType) {
+          hugeTypeScans++;
+        }
+        return indexOf.call(this, searchString, position);
+      });
+
+    const compacted = (() => {
+      try {
+        return compactToolContent(content, 200);
+      } finally {
+        indexOfSpy.mockRestore();
+      }
+    })();
+    const serialized = serializeToolContent(compacted.content);
+
+    expect(hugeTypeScans).toBe(0);
+    expect(compacted.changed).toBe(true);
+    expect(serialized.length).toBeLessThanOrEqual(200);
+    expect(serialized).not.toContain('a'.repeat(1_000));
+  });
+
+  it('bounds omitted atomic type labels before building the notice', () => {
+    const boundedType = `${'a'.repeat(250)}/b`;
+    const content = Array.from({ length: 50 }, () => ({
+      type: boundedType,
+      data: 'x',
+    })) as ToolContent;
+
+    const compacted = compactToolContent(content, 200);
+    const serialized = serializeToolContent(compacted.content);
+
+    expect(compacted.changed).toBe(true);
+    expect(serialized.length).toBeLessThanOrEqual(200);
+    expect(serialized).not.toContain(boundedType);
   });
 
   it('preserves safe provider-native tool-result blocks atomically', () => {
@@ -596,7 +969,7 @@ describe('toolContent', () => {
     const serialized = serializeStructuredValueBounded(value, 200);
 
     expect(getterCalls).toBe(0);
-    expect(serialized.content).toBe('[null]');
+    expect(serialized.content).toBe('"[Unsafe array omitted]"');
   });
 
   it('fails closed when a proxy blocks own property descriptors', () => {
@@ -835,16 +1208,14 @@ describe('toolContent', () => {
         await import('./src/utils/toolContent.ts');
       const payload = 'A'.repeat(32 * 1024 * 1024);
       const result = serializeStructuredValueBounded({ payload }, 4096);
-      const expectedLength = payload.length + '{"payload":""}'.length;
       if (
         result.content.length !== 4096 ||
-        result.originalChars !== expectedLength ||
+        result.originalChars !== Number.MAX_SAFE_INTEGER ||
         result.truncated !== true
       ) {
         throw new Error(JSON.stringify({
           contentLength: result.content.length,
           originalChars: result.originalChars,
-          expectedLength,
           truncated: result.truncated,
         }));
       }
@@ -930,6 +1301,114 @@ describe('toolContent', () => {
     expect(typeof compacted.content).toBe('string');
     expect((compacted.content as string).length).toBeLessThanOrEqual(200);
     expect(compacted.originalChars).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it('bounds canonical cache-controlled text without enumerating malformed arrays', () => {
+    const canonical = getBoundedCacheControlledTextToolContent(
+      [
+        {
+          type: 'text',
+          text: 'result body',
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      6
+    );
+    const ownKeys = jest.spyOn(Reflect, 'ownKeys');
+    const malformed: unknown[] = [];
+    malformed.length = 100_000;
+
+    expect(canonical).toEqual([
+      {
+        type: 'text',
+        text: 'result',
+        cache_control: { type: 'ephemeral' },
+      },
+    ]);
+    expect(
+      getBoundedCacheControlledTextToolContent(malformed, 100)
+    ).toBeUndefined();
+    expect(ownKeys).not.toHaveBeenCalled();
+    ownKeys.mockRestore();
+  });
+
+  it('rejects an accessor-backed cache ttl without invoking it', () => {
+    let ttlReads = 0;
+    const cacheControl = { type: 'ephemeral' };
+    Object.defineProperty(cacheControl, 'ttl', {
+      enumerable: true,
+      get() {
+        ttlReads++;
+        return '1h';
+      },
+    });
+
+    expect(
+      getBoundedCacheControlledTextToolContent(
+        [{ type: 'text', text: 'result', cache_control: cacheControl }],
+        100
+      )
+    ).toBeUndefined();
+    expect(ttlReads).toBe(0);
+
+    const nonEnumerableTtl = { type: 'ephemeral' };
+    Object.defineProperty(nonEnumerableTtl, 'ttl', { value: '1h' });
+    expect(
+      getBoundedCacheControlledTextToolContent(
+        [{ type: 'text', text: 'result', cache_control: nonEnumerableTtl }],
+        100
+      )
+    ).toBeUndefined();
+  });
+
+  it('only unwraps canonical text cache wrappers', () => {
+    expect(
+      getBoundedSingleTextToolContent(
+        [{ type: 'text', text: 'result', extra: true }],
+        100
+      )
+    ).toBeUndefined();
+    expect(
+      getBoundedCacheControlledTextToolContent(
+        [
+          {
+            type: 'text',
+            text: 'result',
+            cache_control: { type: 'ephemeral', extra: true },
+          },
+        ],
+        100
+      )
+    ).toBeUndefined();
+  });
+
+  it('rejects oversized screenshot URLs and file ids before scanning them', () => {
+    const oversizedUrl = `https://example.com/${'a'.repeat(20_000)}`;
+    const charCodeAt = jest.spyOn(String.prototype, 'charCodeAt');
+
+    const urlResult = getComputerCallOutputScreenshot(oversizedUrl);
+    const urlCharacterReads = charCodeAt.mock.calls.length;
+    charCodeAt.mockRestore();
+
+    expect(urlResult).toBeUndefined();
+    expect(urlCharacterReads).toBe(0);
+    expect(
+      getComputerCallOutputScreenshot([
+        {
+          type: 'input_image',
+          file_id: `file_${'a'.repeat(5_000)}`,
+        },
+      ])
+    ).toBeUndefined();
+  });
+
+  it('preserves bounded native computer screenshots', () => {
+    const screenshot = `data:image/png;base64,${'A'.repeat(100_000)}`;
+
+    expect(getComputerCallOutputScreenshot(screenshot)).toEqual({
+      type: 'input_image',
+      image_url: screenshot,
+    });
   });
 
   it('keeps large bounded head-tail collection linear', () => {

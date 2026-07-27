@@ -130,4 +130,55 @@ describe('applyContextPruning', () => {
     expect(Array.isArray(messages[2].content)).toBe(true);
     expect(messages[2].content).toContain(document);
   });
+
+  it('does not hard-clear native computer screenshots', () => {
+    const screenshot = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const computerOutput = new ToolMessage({
+      content: screenshot,
+      tool_call_id: 'tc-computer',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const messages: BaseMessage[] = [
+      new HumanMessage('take a screenshot'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'tc-computer',
+            name: 'computer',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      computerOutput,
+      new AIMessage('Done.'),
+      new HumanMessage('continue'),
+      new AIMessage('Ready.'),
+      new HumanMessage('next question'),
+    ];
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = charCounter(messages[i]);
+    }
+
+    const result = applyContextPruning({
+      messages,
+      indexTokenCountMap,
+      tokenCounter: charCounter,
+      config: {
+        enabled: true,
+        keepLastAssistants: 1,
+        softTrimRatio: 0,
+        minPrunableToolChars: 1,
+        softTrim: { maxChars: 80, headChars: 20, tailChars: 20 },
+        hardClear: { enabled: true },
+      },
+    });
+
+    expect(result.softTrimmed).toBe(0);
+    expect(result.hardCleared).toBe(0);
+    expect(messages[2]).toBe(computerOutput);
+    expect(messages[2].content).toBe(screenshot);
+  });
 });

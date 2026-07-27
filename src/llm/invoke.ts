@@ -6,6 +6,20 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { ContextOverflowContext } from '@/utils/errors';
 import type * as t from '@/types';
+import {
+  projectCacheControlledToolOutputsToText,
+  projectComputerCallOutputsToText,
+  projectOpenAIChatToolMessageContent,
+  projectOpenAIResponsesToolMessageContent,
+  projectOpenRouterToolMessageContent,
+  projectSingleTextToolOutputsToText,
+  projectStructuredToolOutputsToText,
+  projectToolStreamContentForProvider,
+} from '@/messages/core';
+import {
+  stripAnthropicCacheControl,
+  stripBedrockCacheControl,
+} from '@/messages/cache';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { Constants, GraphEvents, Providers } from '@/common';
@@ -14,6 +28,7 @@ import { getContextOverflowInfo } from '@/utils/errors';
 import { modifyDeltaProperties } from '@/messages';
 import { ChatModelStreamHandler } from '@/stream';
 import { initializeModel } from '@/llm/init';
+import { isOpenAILike } from '@/utils/llm';
 
 /**
  * Context passed to `attemptInvoke`. Matches the subset of Graph that
@@ -53,6 +68,152 @@ export type InvokeContext = NonNullable<
  * When provided, replaces the default `ChatModelStreamHandler`.
  */
 export type OnChunk = (chunk: AIMessageChunk) => void | Promise<void>;
+
+export function usesNativeOpenAIResponses(
+  model: t.ChatModel,
+  provider: Providers,
+  callOptions?: unknown
+): boolean {
+  if (!isOpenAILike(provider)) {
+    return false;
+  }
+  let candidate: unknown = model;
+  let effectiveCallOptions = callOptions;
+  const seen = new Set<object>();
+  for (let depth = 0; depth < 20; depth++) {
+    if (candidate == null || typeof candidate !== 'object') {
+      return false;
+    }
+    if (seen.has(candidate)) {
+      return false;
+    }
+    seen.add(candidate);
+    const runnable = candidate as {
+      _useResponsesApi?: (options?: unknown) => boolean;
+      bound?: unknown;
+      defaultOptions?: unknown;
+      last?: unknown;
+      constructor?: { name?: unknown };
+    };
+    try {
+      if (
+        runnable.defaultOptions != null &&
+        typeof runnable.defaultOptions === 'object' &&
+        !Array.isArray(runnable.defaultOptions) &&
+        effectiveCallOptions != null &&
+        typeof effectiveCallOptions === 'object' &&
+        !Array.isArray(effectiveCallOptions)
+      ) {
+        effectiveCallOptions = {
+          ...(runnable.defaultOptions as Record<string, unknown>),
+          ...(effectiveCallOptions as Record<string, unknown>),
+        };
+      } else if (effectiveCallOptions == null) {
+        effectiveCallOptions = runnable.defaultOptions;
+      }
+      if (
+        runnable._useResponsesApi?.(effectiveCallOptions) === true ||
+        runnable._useResponsesApi?.(undefined) === true
+      ) {
+        return true;
+      }
+    } catch {
+      // Continue through RunnableSequence/RunnableBinding wrappers.
+    }
+    if (
+      typeof runnable.constructor?.name === 'string' &&
+      runnable.constructor.name.includes('Responses')
+    ) {
+      return true;
+    }
+    if (runnable.last != null && typeof runnable.last === 'object') {
+      candidate = runnable.last;
+      continue;
+    }
+    if (runnable.bound != null && typeof runnable.bound === 'object') {
+      candidate = runnable.bound;
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Produces the exact provider-facing message representation before a model
+ * adapter serializes it. This is shared by invocation and Graph's final budget
+ * guard so structured tool output cannot grow after the payload was measured.
+ */
+export function projectMessagesForProvider({
+  model,
+  messages,
+  provider,
+  maxToolResultChars,
+  callOptions,
+}: {
+  model: t.ChatModel;
+  messages: BaseMessage[];
+  provider: Providers;
+  maxToolResultChars?: number;
+  callOptions?: unknown;
+}): BaseMessage[] {
+  const providerInputMessages = projectToolStreamContentForProvider(messages);
+  if (usesNativeOpenAIResponses(model, provider, callOptions)) {
+    return projectOpenAIResponsesToolMessageContent(
+      stripAnthropicCacheControl(
+        stripBedrockCacheControl(providerInputMessages)
+      ),
+      maxToolResultChars
+    );
+  }
+  if (provider === Providers.OPENROUTER) {
+    return projectComputerCallOutputsToText(
+      projectOpenRouterToolMessageContent(
+        stripBedrockCacheControl(providerInputMessages),
+        maxToolResultChars
+      )
+    );
+  }
+  if (isOpenAILike(provider)) {
+    return projectComputerCallOutputsToText(
+      projectOpenAIChatToolMessageContent(
+        stripAnthropicCacheControl(
+          stripBedrockCacheControl(providerInputMessages)
+        ),
+        maxToolResultChars
+      )
+    );
+  }
+  if (provider === Providers.ANTHROPIC) {
+    return projectComputerCallOutputsToText(
+      projectSingleTextToolOutputsToText(
+        stripBedrockCacheControl(providerInputMessages),
+        maxToolResultChars
+      )
+    );
+  }
+  if (provider === Providers.BEDROCK) {
+    return stripAnthropicCacheControl(
+      projectComputerCallOutputsToText(
+        projectCacheControlledToolOutputsToText(
+          providerInputMessages,
+          maxToolResultChars
+        )
+      )
+    );
+  }
+  return projectComputerCallOutputsToText(
+    projectStructuredToolOutputsToText(
+      projectSingleTextToolOutputsToText(
+        stripAnthropicCacheControl(
+          stripBedrockCacheControl(providerInputMessages)
+        ),
+        maxToolResultChars
+      ),
+      maxToolResultChars
+    )
+  );
+}
 
 function getRegisteredDefaultChatStreamHandler(
   context?: InvokeContext
@@ -207,9 +368,19 @@ export async function attemptInvoke(
    * untouched so the graph state never sees `[ref: …]` / `_ref`
    * payload.
    */
+  const invocationMessages = projectMessagesForProvider({
+    model,
+    messages,
+    provider,
+    callOptions: config,
+  });
   const registry = context?.getOrCreateToolOutputRegistry();
   const runId = config?.configurable?.run_id as string | undefined;
-  const messagesForProvider = annotateMessagesForLLM(messages, registry, runId);
+  const messagesForProvider = annotateMessagesForLLM(
+    invocationMessages,
+    registry,
+    runId
+  );
 
   /**
    * Stamp the provider that is ACTUALLY serving this invocation onto the
@@ -404,6 +575,7 @@ export async function tryFallbackProviders({
   context,
   onChunk,
   overflowContext,
+  prepareProviderMessages,
 }: {
   fallbacks: t.FallbackConfig[];
   tools?: t.GraphTools;
@@ -419,6 +591,19 @@ export async function tryFallbackProviders({
    * be dropped in favour of whichever failure came last.
    */
   overflowContext?: ContextOverflowContext;
+  /**
+   * Optional final payload guard used by Graph. It receives the initialized,
+   * tool-bound fallback model so Responses-vs-Chat projection is exact before
+   * the fallback request is measured and sent.
+   */
+  prepareProviderMessages?: (input: {
+    model: t.ChatModel;
+    messages: BaseMessage[];
+    provider: Providers;
+    clientOptions?: t.ClientOptions;
+    maxContextTokens?: number;
+    config?: RunnableConfig;
+  }) => BaseMessage[] | Promise<BaseMessage[]>;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
   const isOverflow = (
     error: unknown,
@@ -460,10 +645,19 @@ export async function tryFallbackProviders({
               [Constants.INVOKED_MODEL]: fbModelName,
             },
           };
+      const fallbackMessages =
+        (await prepareProviderMessages?.({
+          model: fbModel as t.ChatModel,
+          messages,
+          provider: fb.provider,
+          clientOptions: fb.clientOptions,
+          maxContextTokens: fb.maxContextTokens,
+          config: fbConfig,
+        })) ?? messages;
       const result = await attemptInvoke(
         {
           model: fbModel as t.ChatModel,
-          messages,
+          messages: fallbackMessages,
           provider: fb.provider,
           context,
           onChunk,
