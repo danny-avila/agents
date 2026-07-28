@@ -236,8 +236,12 @@ export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
 export type ToolEndEvent = {
   /** The Step Id of the Tool Call */
   id: string;
-  /** The Completed Tool Call */
-  tool_call: ToolCall;
+  /**
+   * The Completed Tool Call. Carries the tool-authored `outcome` label when
+   * present (see `ProcessedToolCall.outcome`) so `ON_RUN_STEP_COMPLETED`
+   * consumers can read it without an unsafe cast.
+   */
+  tool_call: ToolCall & { output?: string; progress?: number; outcome?: string };
   /** The content index of the tool call */
   index: number;
   type?: 'tool_call';

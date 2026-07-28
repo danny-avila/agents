@@ -218,6 +218,44 @@ describe('resolveToolOutcome', () => {
       'Searched for OAuth handling'
     );
   });
+
+  it('keeps $-token replacement text literal', () => {
+    expect(
+      resolveToolOutcome(args, {
+        outcome_patch: { from: 'Searching', to: 'Found $& via $\' and $$' },
+      })
+    ).toBe('Found $& via $\' and $$ for OAuth handling');
+  });
+
+  it('labels failed calls only with tool-authored text', () => {
+    expect(resolveToolOutcome(args, { outcome: 'Search failed for OAuth' }, { isError: true })).toBe(
+      'Search failed for OAuth'
+    );
+    expect(
+      resolveToolOutcome(
+        args,
+        { outcome_patch: { from: 'Searching', to: 'Search failed' } },
+        { isError: true }
+      )
+    ).toBe('Search failed for OAuth handling');
+  });
+
+  it('never falls back to the mechanical transform on a failed call', () => {
+    expect(
+      resolveToolOutcome(
+        args,
+        { outcome_patch: { from: 'searching', to: 'searched' } },
+        { isError: true }
+      )
+    ).toBeUndefined();
+    expect(
+      resolveToolOutcome(
+        { query: 'oauth' },
+        { outcome_patch: { from: 'Searching', to: 'Searched' } },
+        { isError: true }
+      )
+    ).toBeUndefined();
+  });
 });
 
 describe('readOutcomeFields', () => {

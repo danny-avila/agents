@@ -202,6 +202,26 @@ describe('ToolOutputReferenceRegistry', () => {
       });
     });
 
+    it('preserves the intent key inside STRINGIFIED object args too', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('r', 'tool0turn0', 'HUGE-STORED-OUTPUT');
+      const { resolved } = reg.resolve(
+        'r',
+        '{"intent":"Reusing {{tool0turn0}}","command":"cat {{tool0turn0}}"}'
+      );
+      expect(JSON.parse(resolved as string)).toEqual({
+        intent: 'Reusing {{tool0turn0}}',
+        command: 'cat HUGE-STORED-OUTPUT',
+      });
+    });
+
+    it('keeps plain (non-object) string args on the raw substitution path', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('r', 'tool0turn0', 'DATA');
+      const { resolved } = reg.resolve('r', 'echo {{tool0turn0}} intent');
+      expect(resolved).toBe('echo DATA intent');
+    });
+
     it('passes through primitive values untouched', () => {
       const reg = new ToolOutputReferenceRegistry();
       const { resolved } = reg.resolve('r', {

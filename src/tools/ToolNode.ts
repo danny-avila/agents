@@ -2108,7 +2108,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        *  without one, an error call simply stays unlabeled. */
       const outcome = resolveToolOutcome(
         effectiveArgs,
-        readOutcomeFields(toolMessage.artifact)
+        readOutcomeFields(toolMessage.artifact),
+        { isError: toolMessage.status === 'error' }
       );
       const tool_call: t.ProcessedToolCall = {
         args: serializeToolContentBounded(
@@ -3153,7 +3154,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             contentString,
             config,
             request?.turn,
-            resolveToolOutcome(request?.args, result)
+            resolveToolOutcome(request?.args, result, {
+              isError: result.status === 'error',
+            })
           );
         }
 
@@ -3458,7 +3461,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       output,
       config,
       request.turn,
-      resolveToolOutcome(request.args, result)
+      resolveToolOutcome(request.args, result, {
+        isError: result.status === 'error',
+      })
     );
   }
 

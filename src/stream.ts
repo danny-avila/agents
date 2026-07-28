@@ -860,7 +860,9 @@ async function dispatchEagerToolCompletions(args: {
         maxToolResultChars
       ).content;
     }
-    const outcome = resolveToolOutcome(record.request.args, result);
+    const outcome = resolveToolOutcome(record.request.args, result, {
+      isError: result.status === 'error',
+    });
 
     try {
       const dispatched = await safeDispatchCustomEvent(

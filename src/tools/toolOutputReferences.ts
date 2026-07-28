@@ -32,6 +32,24 @@ import {
 import { isComputerCallOutputMessage } from '@/utils/toolContent';
 import { INTENT_ARG } from '@/tools/intentArg';
 
+/** Parses a stringified JSON object arg; undefined for anything else. */
+function parseStringifiedArgsObject(
+  value: string
+): Record<string, unknown> | undefined {
+  if (!value.trim().startsWith('{')) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 /**
  * Non-global matcher for a single `{{tool<i>turn<n>}}` placeholder.
  * Exported for consumers that want to detect references (e.g., syntax
@@ -372,6 +390,23 @@ export class ToolOutputReferenceRegistry {
       return { resolved: args, unresolved: [] };
     }
     const unresolved = new Set<string>();
+    /**
+     * Providers may deliver the args OBJECT as a JSON string. A plain
+     * string-root transform would expand placeholders inside the `intent`
+     * label too, bypassing the top-level exclusion below — parse, transform
+     * key-aware, and re-serialize so the label stays verbatim while every
+     * other field still substitutes. Only taken when an `intent` key is
+     * actually present; other strings keep the fast raw-string path.
+     */
+    if (typeof args === 'string') {
+      const parsedRoot = parseStringifiedArgsObject(args);
+      if (parsedRoot != null && INTENT_ARG in parsedRoot) {
+        const resolved = JSON.stringify(
+          this.transform(entries, parsedRoot, unresolved, true)
+        ) as T;
+        return { resolved, unresolved: Array.from(unresolved) };
+      }
+    }
     const resolved = this.transform(entries, args, unresolved, true) as T;
     return { resolved, unresolved: Array.from(unresolved) };
   }

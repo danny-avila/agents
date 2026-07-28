@@ -46,6 +46,24 @@ export const INTENT_PROPERTY: JsonSchemaType = Object.freeze<JsonSchemaType>({
 });
 
 /**
+ * Discriminates the intent LABEL property from a tool's own business
+ * parameter that merely shares the name: the label contract always opens
+ * with the same instruction. Removal/sanitize passes must never strip a
+ * parameter the tool actually needs.
+ */
+export function isIntentLabelProperty(property: unknown): boolean {
+  if (property == null || typeof property !== 'object') {
+    return false;
+  }
+  const record = property as { type?: unknown; description?: unknown };
+  return (
+    record.type === 'string' &&
+    typeof record.description === 'string' &&
+    record.description.startsWith('ALWAYS write this field FIRST')
+  );
+}
+
+/**
  * Returns a copy of the parameters schema with `intent` prepended as the
  * FIRST property (object key order is insertion order and every provider
  * serializer preserves it — first key in the schema means first key in the
@@ -186,7 +204,10 @@ export function applyOutcome(
   }
   const patch = result?.outcome_patch;
   if (patch != null && patch.from !== '' && intent.includes(patch.from)) {
-    return intent.replace(patch.from, patch.to);
+    /** Replacement callback keeps `to` verbatim — a direct string second
+     *  argument would interpret `$&`/`$'`-style tokens in tool-authored
+     *  text (e.g. labels derived from shell syntax). */
+    return intent.replace(patch.from, () => patch.to);
   }
   return transformLeadingVerb(intent);
 }
@@ -218,15 +239,39 @@ function boundOutcomeLabel(label: string | undefined): string | undefined {
  * otherwise — the mechanical transform of a bare intent is left to the host
  * so the wire never carries a label the host can derive itself. The result
  * is collapsed to a bounded single line before emission.
+ *
+ * For failed calls (`isError`), only tool-AUTHORED text may label the call:
+ * an explicit `outcome`, or a patch whose `from` actually matches the
+ * intent. An unmatched patch must not fall through to the mechanical
+ * past-tense transform — wording drift in a failure patch would otherwise
+ * render a success-looking label for an error.
  */
 export function resolveToolOutcome(
   args: unknown,
   fields?: { outcome?: string; outcome_patch?: OutcomePatch } | null,
+  options?: { isError?: boolean },
 ): string | undefined {
   if (fields == null || (fields.outcome == null && fields.outcome_patch == null)) {
     return undefined;
   }
-  return boundOutcomeLabel(applyOutcome(readIntent(args), fields));
+  if (options?.isError !== true) {
+    return boundOutcomeLabel(applyOutcome(readIntent(args), fields));
+  }
+  const outcome = fields.outcome;
+  if (typeof outcome === 'string' && outcome.trim() !== '') {
+    return boundOutcomeLabel(outcome);
+  }
+  const intent = readIntent(args);
+  const patch = fields.outcome_patch;
+  if (
+    intent != null &&
+    patch != null &&
+    patch.from !== '' &&
+    intent.includes(patch.from)
+  ) {
+    return boundOutcomeLabel(intent.replace(patch.from, () => patch.to));
+  }
+  return undefined;
 }
 
 /**

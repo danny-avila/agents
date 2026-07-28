@@ -1206,6 +1206,77 @@ describe('ChatOpenAICompletions strict tools for structured output', () => {
       toolStrict({ response_format: { type: 'json_object' } })
     ).toBeUndefined();
   });
+
+  describe('optional intent labels under strict mode', () => {
+    const intentTool = {
+      type: 'function' as const,
+      function: {
+        name: 'search_mcp_docs',
+        description: 'Search docs',
+        parameters: {
+          type: 'object',
+          properties: {
+            intent: {
+              type: 'string',
+              description:
+                'ALWAYS write this field FIRST, before any other argument. One short sentence…',
+            },
+            query: { type: 'string' },
+          },
+          required: ['query'],
+        },
+      },
+    };
+
+    function toolProperties(options: Record<string, unknown>): string[] {
+      const model = new ChatOpenAI({ model: 'gpt-4', apiKey: 'test-key' });
+      const completions = completionsOf<InvocationParamsDelegate>(model);
+      const params = completions.invocationParams({
+        tools: [intentTool],
+        ...options,
+      }) as unknown as {
+        tools?: { function: { parameters: { properties: object } } }[];
+      };
+      return Object.keys(params.tools?.[0]?.function.parameters.properties ?? {});
+    }
+
+    it('drops the optional label when strict is auto-enabled (invalid otherwise)', () => {
+      expect(toolProperties({ response_format: jsonSchemaResponseFormat })).toEqual(['query']);
+    });
+
+    it('keeps the label on non-strict requests', () => {
+      expect(toolProperties({})).toEqual(['intent', 'query']);
+    });
+
+    it('spares a business `intent` param even under strict', () => {
+      const businessTool = {
+        type: 'function' as const,
+        function: {
+          name: 'create_record',
+          parameters: {
+            type: 'object',
+            properties: {
+              intent: { type: 'string', description: 'CRM intent category' },
+              title: { type: 'string' },
+            },
+            required: ['intent', 'title'],
+          },
+        },
+      };
+      const model = new ChatOpenAI({ model: 'gpt-4', apiKey: 'test-key' });
+      const completions = completionsOf<InvocationParamsDelegate>(model);
+      const params = completions.invocationParams({
+        tools: [businessTool],
+        response_format: jsonSchemaResponseFormat,
+      }) as unknown as {
+        tools?: { function: { parameters: { properties: object } } }[];
+      };
+      expect(Object.keys(params.tools?.[0]?.function.parameters.properties ?? {})).toEqual([
+        'intent',
+        'title',
+      ]);
+    });
+  });
 });
 
 describe('ChatOpenAI._streamChatModelEvents (native, fork)', () => {
