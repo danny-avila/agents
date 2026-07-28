@@ -24,6 +24,7 @@ import { LOCAL_CODING_BUNDLE_NAMES } from '@/common';
 import { BashProgrammaticToolCallingSchema } from '../BashProgrammaticToolCalling';
 import { ProgrammaticToolCallingSchema } from '../ProgrammaticToolCalling';
 import { WebSearchToolSchema } from '../search/schema';
+import { createSearchTool } from '../search/tool';
 import { ReadFileToolDefinition } from '../ReadFile';
 import { ToolSearchToolSchema } from '../ToolSearch';
 import { SkillToolDefinition } from '../SkillTool';
@@ -118,5 +119,21 @@ describe('intent coverage', () => {
     );
     expectIntentFirst('tool_search', ToolSearchToolSchema);
     expectIntentFirst('web_search', WebSearchToolSchema);
+  });
+
+  it('the createSearchTool FACTORY emits intent first (runtime schema, not the static def)', () => {
+    const serperTool = createSearchTool({
+      searchProvider: 'serper',
+      scraperProvider: 'serper',
+      serperApiKey: 'test-key',
+    });
+    expectIntentFirst('web_search:serper', serperTool.schema as SchemaLike);
+    const searxngTool = createSearchTool({
+      searchProvider: 'searxng',
+      scraperProvider: 'serper',
+      serperApiKey: 'test-key',
+      searxngInstanceUrl: 'http://localhost:8080',
+    });
+    expectIntentFirst('web_search:searxng', searxngTool.schema as SchemaLike);
   });
 });
