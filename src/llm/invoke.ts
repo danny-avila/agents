@@ -1,5 +1,13 @@
 import { concat } from '@langchain/core/utils/stream';
 import { AIMessageChunk } from '@langchain/core/messages';
+import {
+  CallbackManager,
+  CallbackManagerForLLMRun,
+  type Callbacks,
+} from '@langchain/core/callbacks/manager';
+import { getCallbackManagerForConfig } from '@langchain/core/runnables';
+import type { Serialized } from '@langchain/core/load/serializable';
+import type { ChatGeneration } from '@langchain/core/outputs';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
@@ -22,11 +30,18 @@ import {
 } from '@/messages/cache';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
-import { Constants, GraphEvents, Providers } from '@/common';
+import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import { manualToolStreamProviders } from '@/llm/providers';
+import { appendCallbacks } from '@/utils/callbacks';
+import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
-import { modifyDeltaProperties } from '@/messages';
-import { ChatModelStreamHandler } from '@/stream';
+import {
+  modifyDeltaProperties,
+  coalesceAdjacentUserTurns,
+  strictAlternationProviders,
+} from '@/messages';
+import { canSealPreempt } from '@/llm/preempt';
+import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { initializeModel } from '@/llm/init';
 import { isOpenAILike } from '@/utils/llm';
 
@@ -215,13 +230,23 @@ export function projectMessagesForProvider({
   );
 }
 
+/**
+ * The registered handler that owns content-part dispatch, if any.
+ *
+ * Detected by brand rather than by `instanceof`: a host that registers
+ * `new ChatModelStreamHandler()` to opt out of sealing gets wrapped by
+ * `createRunHandlers` on every `AgentSession` run, and by
+ * `composeEventHandlers` on a key collision. Both wrappers forward to the same
+ * dispatcher while failing an identity check, so an identity test would
+ * silently revoke the opt-out documented on `StreamPreemption`.
+ */
 function getRegisteredDefaultChatStreamHandler(
   context?: InvokeContext
-): ChatModelStreamHandler | undefined {
+): t.EventHandler | undefined {
   const handler = context?.handlerRegistry?.getHandler(
     GraphEvents.CHAT_MODEL_STREAM
   );
-  return handler instanceof ChatModelStreamHandler ? handler : undefined;
+  return dispatchesChatModelStream(handler) ? handler : undefined;
 }
 
 function hasReasoningDetails(chunk: AIMessageChunk): boolean {
@@ -318,6 +343,250 @@ function getStreamHandlingChunk({
   );
 }
 
+/**
+ * Best-effort output-token count for a sealed turn, used only when the
+ * provider never got to send its usage chunk.
+ */
+function countSealedTokens(
+  context: InvokeContext | undefined,
+  metadata: Record<string, unknown> | undefined,
+  messages: BaseMessage[]
+): number | undefined {
+  try {
+    const counter = context?.getAgentContext(metadata).tokenCounter;
+    if (counter == null) {
+      return undefined;
+    }
+    let total = 0;
+    for (const message of messages) {
+      total += counter(message);
+    }
+    return total;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Instruction overhead the provider processed but that never appears in the
+ * message array: `createCallModel` pipes the model through
+ * `agentContext.systemRunnable` and binds tool schemas AFTER `messages` is
+ * formed, so the system prompt, dynamic instructions, summary and tool
+ * schemas are all billed yet invisible here.
+ *
+ * Read per-node via `getAgentContext(metadata)` rather than the graph-level
+ * accessor, which is hardcoded to `defaultAgentId` and would report the wrong
+ * agent's overhead in a `MultiAgentGraph`.
+ */
+function sealedInstructionOverhead(
+  context: InvokeContext | undefined,
+  metadata: Record<string, unknown> | undefined
+): number {
+  try {
+    const agentContext = context?.getAgentContext(metadata);
+    return (
+      agentContext?.resolvedInstructionOverhead ??
+      agentContext?.instructionTokens ??
+      0
+    );
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Best-effort usage for a turn the provider never got to bill us for.
+ *
+ * The prompt matters as much as the completion: the provider processed the
+ * ENTIRE prompt — messages plus instruction overhead — before we sealed, and
+ * every resume re-sends it, so under-counting input hides the expensive half
+ * of a preempted run.
+ *
+ * ESTIMATE, NOT MEASUREMENT. Messages are counted with the host's tokenizer
+ * rather than the provider's, and `toolSchemaTokens` applies a heuristic
+ * multiplier. It is also an over-count on the fallback path, where
+ * `tryFallbackProviders` builds a bare model with no `systemRunnable` pipe so
+ * the system prompt genuinely is not sent. Accepted rather than threaded
+ * through a flag: only the fallback-plus-seal combination is affected, and an
+ * over-count is safer than the previous fabricated `input_tokens: 0`.
+ *
+ * Marked `estimated_usage` so calibration can refuse to learn from it — a
+ * ratio derived from the same counter that produced the estimate is
+ * self-consistent by construction and would drag a provider's real
+ * calibration toward 1.0.
+ */
+function synthesizeSealedUsage(
+  context: InvokeContext | undefined,
+  chunk: AIMessageChunk,
+  prompt: BaseMessage[],
+  metadata: Record<string, unknown> | undefined
+): void {
+  if (chunk.usage_metadata != null) {
+    return;
+  }
+  const outputTokens = countSealedTokens(context, metadata, [chunk]);
+  if (outputTokens == null) {
+    return;
+  }
+  const inputTokens =
+    (countSealedTokens(context, metadata, prompt) ?? 0) +
+    sealedInstructionOverhead(context, metadata);
+  chunk.usage_metadata = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: inputTokens + outputTokens,
+  };
+  chunk.response_metadata = {
+    ...chunk.response_metadata,
+    estimated_usage: true,
+  };
+}
+
+function getMessageText(chunk: AIMessageChunk): string {
+  if (typeof chunk.content === 'string') {
+    return chunk.content;
+  }
+  let text = '';
+  for (const block of chunk.content) {
+    if (block.type === ContentTypes.TEXT) {
+      const value = block[ContentTypes.TEXT];
+      if (typeof value === 'string') {
+        text += value;
+      }
+    }
+  }
+  return text;
+}
+
+/**
+ * Ends the real model run for a turn that was sealed mid-stream.
+ *
+ * Mandatory, not cosmetic. `@langchain/core`'s `_streamIterator` calls
+ * `handleLLMEnd` after its try/catch with no `finally`, so breaking out of the
+ * consumer's `for await` produces a *return* completion that fires neither
+ * `handleLLMError` nor `handleLLMEnd`. The run would stay open in every
+ * callback handler: the host records no usage — and since each seal re-sends
+ * the whole prompt, N preemptions cost N unrecorded prompts — while LangSmith
+ * and Langfuse hold a span that never closes.
+ *
+ * `runId` cannot be dictated from here (the bound runnable consumes
+ * `config.runId` for its own run and hands the chat model a fresh one), but it
+ * can be OBSERVED: the capture handler installed at the `model.stream` call
+ * records it from `handleChatModelStart`, which fires before the first chunk.
+ * Rebuilding the manager against that id closes the real run, and the host's
+ * `on_chat_model_end` then arrives through the ordinary `streamEvents` path.
+ *
+ * Falls back to a custom-event dispatch if the id was never observed, so the
+ * host still records usage even when the native close is unavailable.
+ */
+/**
+ * Every callbacks source the real model run would compose beyond the per-call
+ * config. `model` here is whatever `createCallModel` produced — with tools
+ * that is `bindTools(...)`'s `RunnableBinding`, and a system runnable pipes a
+ * `RunnableSequence` on top — while `clientOptions.callbacks` lives on the
+ * chat model at the BOTTOM of that stack. Walks `bound` (bindings) and
+ * `last`/`steps` (sequences), collecting each wrapper's own `callbacks` and
+ * any binding-config callbacks along the way, since the binding merges its
+ * config into the call before the chat model composes.
+ */
+function collectModelCallbackSources(model: unknown): Callbacks[] {
+  const sources: Callbacks[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = model;
+  while (current != null && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const wrapper = current as {
+      callbacks?: Callbacks;
+      config?: { callbacks?: Callbacks };
+      bound?: unknown;
+      last?: unknown;
+      steps?: unknown[];
+    };
+    if (wrapper.callbacks != null) {
+      sources.push(wrapper.callbacks);
+    }
+    if (wrapper.config?.callbacks != null) {
+      sources.push(wrapper.config.callbacks);
+    }
+    current =
+      wrapper.bound ??
+      wrapper.last ??
+      (Array.isArray(wrapper.steps)
+        ? wrapper.steps[wrapper.steps.length - 1]
+        : undefined);
+  }
+  return sources;
+}
+
+async function endSealedModelRun(
+  context: InvokeContext | undefined,
+  chunk: AIMessageChunk,
+  prompt: BaseMessage[],
+  llmRunId: string | undefined,
+  config?: RunnableConfig,
+  model?: t.ChatModel
+): Promise<void> {
+  const metadata = config?.metadata as Record<string, unknown> | undefined;
+  synthesizeSealedUsage(context, chunk, prompt, metadata);
+  if (llmRunId != null) {
+    try {
+      let callbackManager = await getCallbackManagerForConfig(config);
+      /**
+       * The real model run composes the per-call config's callbacks WITH the
+       * model's own (`CallbackManager.configure(config.callbacks,
+       * this.callbacks, …)` in `@langchain/core`'s base chat model), so a
+       * handler supplied via `clientOptions.callbacks` received
+       * `handleChatModelStart` for this run. Rebuilding from the config alone
+       * would close the run for every handler EXCEPT those — leaving their
+       * span open forever. Composed the same way the real run composes:
+       * model callbacks appended non-inheritable, parent run id preserved by
+       * `copy`, tracers deduped by `configure`.
+       */
+      for (const source of collectModelCallbackSources(model)) {
+        callbackManager =
+          CallbackManager.configure(callbackManager ?? undefined, source) ??
+          callbackManager;
+      }
+      if (callbackManager != null) {
+        const runManager = new CallbackManagerForLLMRun(
+          llmRunId,
+          callbackManager.handlers,
+          callbackManager.inheritableHandlers,
+          callbackManager.tags,
+          callbackManager.inheritableTags,
+          callbackManager.metadata,
+          callbackManager.inheritableMetadata,
+          callbackManager.getParentRunId()
+        );
+        const generation: ChatGeneration = {
+          text: getMessageText(chunk),
+          message: chunk,
+        };
+        await runManager.handleLLMEnd({
+          generations: [[generation]],
+          llmOutput: {},
+        });
+        return;
+      }
+    } catch (e) {
+      /**
+       * A sealed answer that reaches the user is worth more than a tidy
+       * trace. Fall through to the custom event rather than failing the run.
+       */
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[attemptInvoke] Native close of the sealed model run failed; falling back to a custom event:',
+        e instanceof Error ? e.message : e
+      );
+    }
+  }
+  await safeDispatchCustomEvent(
+    GraphEvents.CHAT_MODEL_END,
+    { output: chunk },
+    config
+  );
+}
+
 function appendStreamChunk({
   current,
   next,
@@ -376,11 +645,26 @@ export async function attemptInvoke(
   });
   const registry = context?.getOrCreateToolOutputRegistry();
   const runId = config?.configurable?.run_id as string | undefined;
-  const messagesForProvider = annotateMessagesForLLM(
+  const annotated = annotateMessagesForLLM(
     invocationMessages,
     registry,
     runId
   );
+  /**
+   * Keyed on the provider ACTUALLY serving this call, not the agent's primary.
+   * `createCallModel` normalizes for the primary, but `tryFallbackProviders`
+   * re-sends the same array — so an OpenAI primary that fails after a boundary
+   * injected two human turns would hand a Bedrock or Mistral fallback the
+   * consecutive user turns those APIs reject, and the recovery request would
+   * fail for a reason unrelated to the original failure.
+   *
+   * `attemptInvoke` is the single funnel for primary, fallback and
+   * summarization calls, so applying it here covers all three. Idempotent, so
+   * the primary simply re-runs a no-op over already-coalesced messages.
+   */
+  const messagesForProvider = strictAlternationProviders.has(provider)
+    ? coalesceAdjacentUserTurns(annotated)
+    : annotated;
 
   /**
    * Stamp the provider that is ACTUALLY serving this invocation onto the
@@ -400,8 +684,34 @@ export async function attemptInvoke(
   };
 
   if (model.stream) {
-    const stream = await model.stream(messagesForProvider, config);
+    /**
+     * Observed, not dictated. `handleChatModelStart` fires with the chat
+     * model's real run id before the first chunk, which is the only way to
+     * name the run a seal has to close — pinning `config.runId` does not
+     * survive the bound runnable. Installed only when preemption is
+     * configured, so a run that cannot seal carries no extra handler.
+     */
+    let sealedRunId: string | undefined;
+    const streamConfig =
+      context?.preemption == null
+        ? config
+        : {
+          ...config,
+          callbacks: appendCallbacks(config.callbacks, [
+            {
+              handleChatModelStart: (
+                _llm: Serialized,
+                _messages: BaseMessage[][],
+                runId: string
+              ): void => {
+                sealedRunId ??= runId;
+              },
+            },
+          ]),
+        };
+    const stream = await model.stream(messagesForProvider, streamConfig);
     let finalChunk: AIMessageChunk | undefined;
+    let preempted = false;
     const registeredStreamHandler =
       getRegisteredDefaultChatStreamHandler(context);
 
@@ -436,6 +746,26 @@ export async function attemptInvoke(
           next: chunk,
           provider,
         });
+        /**
+         * Only this loop may seal. The registered-handler branch below
+         * dispatches through `run.ts`'s decoupled `streamEvents` consumer,
+         * which can lag the accumulated chunk — sealing there would let the
+         * host index a content part the user has not been shown yet.
+         */
+        /**
+         * Cheap poll first, shape check second, budget claim last. The claim
+         * is what makes this safe under a parallel `MultiAgentGraph`: several
+         * agents share one graph and can each see the poll as true, but only
+         * one can take the slot, and a chunk that cannot seal never spends it.
+         */
+        if (
+          context?.shouldPreemptStream() === true &&
+          canSealPreempt(finalChunk) &&
+          context.claimPreemptSeal()
+        ) {
+          preempted = true;
+          break;
+        }
       }
     } else {
       const metadata = config.metadata as Record<string, unknown> | undefined;
@@ -463,6 +793,21 @@ export async function attemptInvoke(
 
     if (manualToolStreamProviders.has(provider)) {
       finalChunk = modifyDeltaProperties(provider, finalChunk);
+    }
+
+    if (preempted && finalChunk != null) {
+      finalChunk.response_metadata = {
+        ...finalChunk.response_metadata,
+        preempted: true,
+      };
+      await endSealedModelRun(
+        context,
+        finalChunk,
+        messagesForProvider,
+        sealedRunId,
+        config,
+        model
+      );
     }
 
     if ((finalChunk?.tool_calls?.length ?? 0) > 0) {

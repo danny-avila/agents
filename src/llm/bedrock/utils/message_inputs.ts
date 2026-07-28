@@ -1063,7 +1063,19 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
       }
     });
 
-  // Combine consecutive user tool result messages into a single message
+  /**
+   * Combine ALL consecutive user messages into one, not just tool-result
+   * pairs. The Converse API documents strict role alternation; enforcement
+   * varies by model family (Claude on Converse currently tolerates adjacent
+   * user messages — verified live, 2026-07-28 — but the docs promise nothing
+   * for the others), so the converter never emits the shape. The case that
+   * matters: a `PostToolBatch`/`PreemptBoundary` hook injection lands a text
+   * turn directly after tool results, and `ToolMessage` and `HumanMessage`
+   * both convert to `role: 'user'` above. Block order is preserved
+   * (toolResult blocks, then text) — verified live that Converse accepts the
+   * mixed user message and answers both halves — and the toolUse/toolResult
+   * pairing stays intact.
+   */
   const combinedConverseMessages = converseMessages.reduce<BedrockMessage[]>(
     (acc, curr) => {
       if (acc.length === 0) {
@@ -1071,16 +1083,7 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
         return acc;
       }
       const lastMessage = acc[acc.length - 1];
-      const lastHasToolResult =
-        lastMessage.content?.some((c) => 'toolResult' in c) === true;
-      const currHasToolResult =
-        curr.content?.some((c) => 'toolResult' in c) === true;
-      if (
-        lastMessage.role === 'user' &&
-        lastHasToolResult &&
-        curr.role === 'user' &&
-        currHasToolResult
-      ) {
+      if (lastMessage.role === 'user' && curr.role === 'user') {
         lastMessage.content = lastMessage.content?.concat(curr.content ?? []);
       } else {
         acc.push(curr);
