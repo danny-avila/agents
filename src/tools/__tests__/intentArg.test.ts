@@ -25,7 +25,14 @@ describe('withIntent', () => {
   it('prepends intent as the FIRST property key', () => {
     const next = withIntent(base);
     expect(Object.keys(next.properties ?? {})).toEqual(['intent', 'query', 'limit']);
-    expect(next.properties?.[INTENT_ARG]).toBe(INTENT_PROPERTY);
+    expect(next.properties?.[INTENT_ARG]).toEqual(INTENT_PROPERTY);
+    /**
+     * Must be a copy, not the frozen canonical instance: LangChain's
+     * JSON-schema validator stamps `__absolute_uri__` onto subschemas,
+     * which throws on a frozen object.
+     */
+    expect(next.properties?.[INTENT_ARG]).not.toBe(INTENT_PROPERTY);
+    expect(Object.isFrozen(next.properties?.[INTENT_ARG])).toBe(false);
   });
 
   it('never mutates the input schema', () => {

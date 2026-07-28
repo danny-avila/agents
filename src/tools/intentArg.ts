@@ -33,7 +33,13 @@ export const INTENT_DESCRIPTION =
   'When you make several calls to the same tool in one turn, each intent must ' +
   'distinguish that call from its siblings.';
 
-/** Frozen schema property injected as the first key of an intent-enabled tool. */
+/**
+ * Canonical (frozen) shape of the injected property. Always embed a COPY
+ * (`{ ...INTENT_PROPERTY }`): LangChain's JSON-schema validator stamps a
+ * `__absolute_uri__` marker onto every subschema it dereferences, which
+ * throws on a frozen object — and a single shared instance would be stamped
+ * with one schema's URI while embedded in many.
+ */
 export const INTENT_PROPERTY: JsonSchemaType = Object.freeze<JsonSchemaType>({
   type: 'string',
   description: INTENT_DESCRIPTION,
@@ -54,7 +60,7 @@ export function withIntent(parameters?: JsonSchemaType): JsonSchemaType {
   return {
     ...parameters,
     type: 'object',
-    properties: { [INTENT_ARG]: INTENT_PROPERTY, ...existingProps },
+    properties: { [INTENT_ARG]: { ...INTENT_PROPERTY }, ...existingProps },
   };
 }
 
