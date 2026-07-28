@@ -344,6 +344,11 @@ export type ToolCallPart = {
   id?: string;
   /** If provided, the output of the tool call */
   output?: ToolResultContent['content'];
+  /**
+   * Tool-authored settled label for the call (see `ProcessedToolCall.outcome`),
+   * preserved through aggregation so it survives persistence/reload.
+   */
+  outcome?: string;
   /** Auth URL */
   auth?: string;
   /** Expiration time */

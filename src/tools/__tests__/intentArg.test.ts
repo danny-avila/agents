@@ -206,6 +206,18 @@ describe('resolveToolOutcome', () => {
       resolveToolOutcome({ query: 'oauth' }, { outcome_patch: { from: 'a', to: 'b' } })
     ).toBeUndefined();
   });
+
+  it('collapses the label to a bounded single line', () => {
+    expect(
+      resolveToolOutcome(args, { outcome: 'Found 12 results\n  for   "OAuth handling"' })
+    ).toBe('Found 12 results for "OAuth handling"');
+    const oversized = resolveToolOutcome(args, { outcome: `Found ${'x'.repeat(500)}` });
+    expect(oversized?.length).toBe(256);
+    expect(oversized?.endsWith('…')).toBe(true);
+    expect(resolveToolOutcome(args, { outcome: ' \n \t ' })).toBe(
+      'Searched for OAuth handling'
+    );
+  });
 });
 
 describe('readOutcomeFields', () => {

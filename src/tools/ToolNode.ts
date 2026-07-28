@@ -1659,6 +1659,27 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
     }
 
+    /**
+     * A hook (`PreToolUse.updatedInput`) or HITL `edit` decision rewrote the
+     * args: expose the EFFECTIVE args to downstream completion handling
+     * (`handleRunToolCompletions` reads this sink), so the emitted
+     * `tool_call.args` — and any intent/outcome label resolved from them —
+     * reflect what the tool actually ran with. `runTool`'s own placeholder
+     * substitution may overwrite this entry with the post-substitution args,
+     * which is strictly more accurate.
+     */
+    if (
+      effectiveCall !== call &&
+      batchContext.resolvedArgsByCallId != null &&
+      call.id != null &&
+      call.id !== ''
+    ) {
+      batchContext.resolvedArgsByCallId.set(
+        call.id,
+        effectiveCall.args as Record<string, unknown>
+      );
+    }
+
     const output = await this.runTool(effectiveCall, config, {
       ...batchContext,
       usageCount,
@@ -2083,13 +2104,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * the tool actually received rather than leaking the template.
        */
       const effectiveArgs = resolvedArgsByCallId?.get(toolCallId) ?? call.args;
-      const outcome =
-        toolMessage.status === 'error'
-          ? undefined
-          : resolveToolOutcome(
-            effectiveArgs,
-            readOutcomeFields(toolMessage.artifact)
-          );
+      /** Authored outcomes apply to failed calls too (“Search failed for…”);
+       *  without one, an error call simply stays unlabeled. */
+      const outcome = resolveToolOutcome(
+        effectiveArgs,
+        readOutcomeFields(toolMessage.artifact)
+      );
       const tool_call: t.ProcessedToolCall = {
         args: serializeToolContentBounded(
           (effectiveArgs as unknown) ?? {},
@@ -3133,9 +3153,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             contentString,
             config,
             request?.turn,
-            result.status === 'error'
-              ? undefined
-              : resolveToolOutcome(request?.args, result)
+            resolveToolOutcome(request?.args, result)
           );
         }
 
@@ -3440,9 +3458,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       output,
       config,
       request.turn,
-      result.status === 'error'
-        ? undefined
-        : resolveToolOutcome(request.args, result)
+      resolveToolOutcome(request.args, result)
     );
   }
 

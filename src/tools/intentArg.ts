@@ -192,10 +192,32 @@ export function applyOutcome(
 }
 
 /**
+ * Hard cap on an emitted outcome label. The label is a single progress line
+ * in UI chrome; a tool that derives it from data (or a malformed patch)
+ * must not be able to inflate completion events or persisted parts.
+ */
+const MAX_OUTCOME_CHARS = 256;
+
+function boundOutcomeLabel(label: string | undefined): string | undefined {
+  if (label == null) {
+    return undefined;
+  }
+  const singleLine = label.replace(/\s+/g, ' ').trim();
+  if (singleLine === '') {
+    return undefined;
+  }
+  if (singleLine.length <= MAX_OUTCOME_CHARS) {
+    return singleLine;
+  }
+  return `${singleLine.slice(0, MAX_OUTCOME_CHARS - 1)}…`;
+}
+
+/**
  * Resolves the settled label to emit on a completion event: only when the
  * tool actually authored `outcome`/`outcome_patch` fields. Returns undefined
  * otherwise — the mechanical transform of a bare intent is left to the host
- * so the wire never carries a label the host can derive itself.
+ * so the wire never carries a label the host can derive itself. The result
+ * is collapsed to a bounded single line before emission.
  */
 export function resolveToolOutcome(
   args: unknown,
@@ -204,7 +226,7 @@ export function resolveToolOutcome(
   if (fields == null || (fields.outcome == null && fields.outcome_patch == null)) {
     return undefined;
   }
-  return applyOutcome(readIntent(args), fields);
+  return boundOutcomeLabel(applyOutcome(readIntent(args), fields));
 }
 
 /**

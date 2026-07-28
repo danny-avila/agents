@@ -860,10 +860,7 @@ async function dispatchEagerToolCompletions(args: {
         maxToolResultChars
       ).content;
     }
-    const outcome =
-      result.status === 'error'
-        ? undefined
-        : resolveToolOutcome(record.request.args, result);
+    const outcome = resolveToolOutcome(record.request.args, result);
 
     try {
       const dispatched = await safeDispatchCustomEvent(
@@ -2163,7 +2160,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         toolCallContentIndexMap.delete(existingToolCallId);
       }
 
-      const newToolCall: ToolCall & t.PartMetadata = {
+      const newToolCall: ToolCall & t.PartMetadata & { outcome?: string } = {
         id,
         name,
         args,
@@ -2183,6 +2180,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       if (finalUpdate) {
         newToolCall.progress = 1;
         newToolCall.output = contentPart.tool_call.output;
+        const outcome = (contentPart.tool_call as t.ToolCallPart).outcome;
+        if (outcome != null) {
+          newToolCall.outcome = outcome;
+        }
       }
 
       contentParts[index] = {
