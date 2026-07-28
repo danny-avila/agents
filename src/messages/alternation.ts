@@ -78,7 +78,18 @@ export function coalesceAdjacentUserTurns(
 
     result[result.length - 1] = new HumanMessage({
       content: joinContent(previous.content, message.content),
-      additional_kwargs: previous.additional_kwargs,
+      /**
+       * The LATER turn's kwargs, deliberately. The one provider-path consumer
+       * of these flags is the prompt-cache tail anchor, and it reasons
+       * positionally: `isSyntheticMetaMessage` decides whether a breakpoint
+       * may be inserted after the message's LAST text block. Merging keeps
+       * the last block's provenance only if the last part's kwargs survive —
+       * a skill body absorbed into a real user turn must stay anchorable
+       * (the real turn ends it), while a real steer absorbed into a trailing
+       * skill body must not pin the cache to the volatile body. The first
+       * turn's id is kept so origin tracking can re-attach by key.
+       */
+      additional_kwargs: message.additional_kwargs,
       ...(previous.id != null && { id: previous.id }),
     });
   }

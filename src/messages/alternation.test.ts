@@ -111,6 +111,81 @@ describe('coalesceAdjacentUserTurns', () => {
     expect(result).toHaveLength(2);
   });
 
+  /**
+   * The prompt-cache tail anchor reasons positionally — it inserts the
+   * breakpoint after the merged message's LAST text block — so the last
+   * part's provenance flags must survive the merge. A skill body absorbed
+   * into a real user turn stays anchorable; a real turn absorbed into a
+   * trailing skill body must not let the anchor pin the volatile body.
+   */
+  it('keeps the last turn\'s additional_kwargs and the first turn\'s id', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: 'skill body',
+        id: 'first-id',
+        additional_kwargs: { isMeta: true, source: 'skill' },
+      }),
+      new HumanMessage({
+        content: 'real user turn',
+        id: 'second-id',
+        additional_kwargs: { role: 'user' },
+      }),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].additional_kwargs).toEqual({ role: 'user' });
+    expect(result[0].id).toBe('first-id');
+  });
+
+  it('marks the merge meta when the trailing part is the volatile one', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: 'real steer',
+        additional_kwargs: { source: 'steer' },
+      }),
+      new HumanMessage({
+        content: 'skill body',
+        additional_kwargs: { isMeta: true, source: 'skill', skillName: 'x' },
+      }),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].additional_kwargs.source).toBe('skill');
+    expect(result[0].additional_kwargs.isMeta).toBe(true);
+  });
+
+  /**
+   * Only ALL-tool-result turns are excluded. A mixed turn is an ordinary
+   * user turn that happens to carry a result block — merging preserves block
+   * order, so the pairing survives, and excluding it would leave adjacent
+   * user turns on the wire for exactly the shape Bedrock rejects.
+   */
+  it('merges a mixed text plus tool-result turn', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: [
+          { type: 'tool_result', tool_use_id: 't1', content: 'ok' },
+          { type: 'text', text: 'and my comment' },
+        ],
+      }),
+      new HumanMessage({ content: 'next turn' }),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toEqual([
+      { type: 'tool_result', tool_use_id: 't1', content: 'ok' },
+      { type: 'text', text: 'and my comment' },
+      { type: 'text', text: 'next turn' },
+    ]);
+  });
+
+  it('excludes the camelCase toolResult variant too', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: [{ type: 'toolResult', toolResult: { content: 'ok' } }],
+      }),
+      new HumanMessage({ content: 'steer' }),
+    ]);
+    expect(result).toHaveLength(2);
+  });
+
   it('does not mutate the input array or its messages', () => {
     const first = new HumanMessage({ content: 'a' });
     const second = new HumanMessage({ content: 'b' });

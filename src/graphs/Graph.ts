@@ -2685,7 +2685,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * last shaping step before the cache breakpoint is chosen.
        */
       if (strictAlternationProviders.has(agentContext.provider)) {
-        finalMessages = coalesceAdjacentUserTurns(finalMessages);
+        /**
+         * Wrapped like every other provider transform: the merged message is
+         * a NEW object, and without re-attachment the final pre-invoke
+         * measurement would drop both source turns' calibrated shares and
+         * recharge the merge at full raw estimate — enough to flip a
+         * just-fits payload (the synthetic-context compaction above binary
+         * searches to exactly that) into a spurious pre-invoke overflow. The
+         * merge keeps the first source's id, so the keyed branch re-attaches
+         * that origin; the absorbed turn's tokens are charged as new raw
+         * growth, which only ever under-estimates by less than the old
+         * behavior over-estimated.
+         */
+        const beforeCoalesce = finalMessages;
+        finalMessages = trackProviderMessageOrigins(
+          beforeCoalesce,
+          coalesceAdjacentUserTurns(beforeCoalesce)
+        );
       }
 
       // Determine the prompt-cache strategy up front. Two distinct facts:
