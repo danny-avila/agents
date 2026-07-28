@@ -3,8 +3,18 @@ import type { Logger as WinstonLogger } from 'winston';
 import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
 
-export type SearchProvider = 'serper' | 'searxng' | 'tavily' | 'keenable' | 'crw';
-export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily' | 'crw';
+export type SearchProvider =
+  | 'serper'
+  | 'searxng'
+  | 'tavily'
+  | 'keenable'
+  | 'crw';
+export type ScraperProvider =
+  | 'firecrawl'
+  | 'serper'
+  | 'tavily'
+  | 'crw'
+  | 'keenable';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
 export interface Highlight {
@@ -198,6 +208,41 @@ export interface KeenableSearchResponse {
   results?: KeenableSearchResult[];
 }
 
+export interface KeenableScraperConfig {
+  apiKey?: string;
+  /** Override the fetch endpoint base (default: public keyless, keyed when a
+   * key is set). Env fallback: KEENABLE_FETCH_URL. */
+  apiUrl?: string;
+  timeout?: number;
+  logger?: Logger;
+  /** Sent as the X-Keenable-Title attribution header. Defaults to "LibreChat". */
+  attributionTitle?: string;
+}
+
+export type KeenableScrapeOptions = Omit<
+  KeenableScraperConfig,
+  'apiKey' | 'apiUrl' | 'logger'
+>;
+
+/** Raw JSON shape returned by GET /v1/fetch{,/public}?url=... */
+export interface KeenableFetchResult {
+  url?: string;
+  title?: string;
+  content?: string;
+  description?: string;
+}
+
+export interface KeenableScrapeResponse {
+  success: boolean;
+  data?: {
+    content: string;
+    title?: string;
+    description?: string;
+    url?: string;
+  };
+  error?: string;
+}
+
 export type References = {
   links: MediaReference[];
   images: MediaReference[];
@@ -311,6 +356,7 @@ export interface SearchToolConfig
     FirecrawlConfig {
   tavilyScraperOptions?: TavilyScraperConfig;
   crwScraperOptions?: CrwScraperConfig;
+  keenableScraperOptions?: KeenableScraperConfig;
   /** Max chars of highlight content this tool feeds the MODEL per search (the
    * dominant, otherwise-unbounded part of the output). Distinct from
    * `maxContentLength`, which caps scraped/reranked content per source — full
@@ -351,7 +397,8 @@ export type AnyScraperResponse =
   | FirecrawlScrapeResponse
   | SerperScrapeResponse
   | TavilyScrapeResponse
-  | CrwScrapeResponse;
+  | CrwScrapeResponse
+  | KeenableScrapeResponse;
 
 /** Base Scraper Interface */
 export interface BaseScraper {
