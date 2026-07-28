@@ -335,11 +335,22 @@ function createTool({
         maxOutputChars
       );
       const data: t.SearchResultData = { turn, ...searchResult, references };
-      /** Settled label for the call's intent (see `intentArg.ts`). */
-      const referenceCount = references.length;
+      /**
+       * Settled label for the call's intent (see `intentArg.ts`). Counts the
+       * actual result collections — `references` only tracks links embedded
+       * in extracted highlights, so it undercounts ordinary results and can
+       * overcount when one highlight embeds several links.
+       */
+      const resultCount =
+        (data.organic?.length ?? 0) +
+        (data.topStories?.length ?? 0) +
+        (data.news?.length ?? 0) +
+        (data.images?.length ?? 0) +
+        (data.videos?.length ?? 0) +
+        (data.places?.length ?? 0);
       const outcome =
-        referenceCount > 0
-          ? `Found ${referenceCount} result${referenceCount === 1 ? '' : 's'} for "${query}"`
+        resultCount > 0
+          ? `Found ${resultCount} result${resultCount === 1 ? '' : 's'} for "${query}"`
           : undefined;
       return [
         output,
