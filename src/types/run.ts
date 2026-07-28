@@ -125,6 +125,14 @@ export type StandardGraphConfig = Omit<
  * Preconditions the host MUST satisfy:
  *   - `shouldPreempt` is polled once per streamed chunk on the top-level
  *     graph. It must be synchronous, allocation-free and O(1) — never I/O.
+ *     It must also be LEVEL-TRIGGERED (non-consuming): the SDK never clears
+ *     the host's request, and a true result is only honored once the
+ *     accumulated chunk is provider-safe, so the predicate may be polled
+ *     many times before a seal. A one-shot read that clears its own pending
+ *     flag would silently lose the request on an unsafe chunk (leading
+ *     whitespace/reasoning, an in-flight tool call) — keep returning true
+ *     until the `PreemptBoundary` drain hands over the queued injection,
+ *     then disarm there.
  *   - Sealing is only honored on the SDK's own dispatch loop. A run whose
  *     registered `CHAT_MODEL_STREAM` handler IS the SDK dispatcher — or wraps
  *     it, which `composeEventHandlers` and `createRunHandlers` both do —
@@ -147,7 +155,11 @@ export type StandardGraphConfig = Omit<
  *     and reports it either way.
  */
 export interface StreamPreemption {
-  /** Polled once per streamed chunk. Synchronous, allocation-free, O(1). */
+  /**
+   * Polled once per streamed chunk. Synchronous, allocation-free, O(1), and
+   * level-triggered — keep returning true until the `PreemptBoundary` drain
+   * consumes the request; a self-clearing read loses it on an unsafe chunk.
+   */
   shouldPreempt: () => boolean;
   /**
    * Max cooperative seals per run. Each seal costs one extra superstep, so

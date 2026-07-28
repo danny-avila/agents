@@ -1844,6 +1844,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         throw new Error('No config provided');
       }
 
+      /**
+       * A `PreemptBoundary` hook halted this run and the sealed commit is
+       * already in state. Enforced at every model node's ENTRY because that
+       * is the only site that covers all of `MultiAgentGraph`'s onward
+       * routing at once — static direct edges, Command fan-out, fan-in
+       * wrappers, and parallel siblings' subsequent inner-loop turns — none
+       * of which consult the halt (the registry signal was deliberately
+       * cleared to keep the stream-cancel from destroying the sealed turn).
+       * Declining the model call turns every routed-to successor into a
+       * no-op, so the outer workflow drains to END without new turns or tool
+       * side effects. Reset per turn in `resetPreemptTotals`, so the next
+       * `processStream` call starts clean.
+       */
+      if (this.preemptHaltReason != null) {
+        return { messages: [] };
+      }
+
       const { messages } = state;
 
       const discoveredNames = extractToolDiscoveries(messages);

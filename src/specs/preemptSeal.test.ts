@@ -78,6 +78,17 @@ async function createSealRun(options: {
   return run;
 }
 
+class CountingChatModel extends FakeChatModel {
+  invocations = 0;
+
+  override async *_streamResponseChunks(
+    ...args: Parameters<FakeChatModel['_streamResponseChunks']>
+  ): ReturnType<FakeChatModel['_streamResponseChunks']> {
+    this.invocations += 1;
+    yield* super._streamResponseChunks(...args);
+  }
+}
+
 const aiContents = (messages: BaseMessage[]): string[] =>
   messages
     .filter((message) => message.getType() === 'ai')
@@ -191,6 +202,69 @@ describe('cooperative seal (end-to-end via Run)', () => {
     expect(run.Graph?.preemptSealCount).toBe(1);
     expect(starts).toBe(2);
     expect(ends).toBe(2);
+  });
+
+  it('a halting boundary stops multi-agent successors, not just the sealed subgraph', async () => {
+    const registry = new HookRegistry();
+    registry.register('PreemptBoundary', {
+      hooks: [
+        async () => ({
+          preventContinuation: true,
+          stopReason: 'stop_everything',
+        }),
+      ],
+    });
+    const run = await Run.create<t.IState>({
+      runId: 'seal-halt-multiagent',
+      graphConfig: {
+        type: 'multi-agent',
+        agents: [
+          {
+            agentId: 'agent_a',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'You are agent A.',
+          },
+          {
+            agentId: 'agent_b',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'You are agent B.',
+          },
+        ],
+        edges: [{ from: 'agent_a', to: 'agent_b', edgeType: 'direct' }],
+      },
+      hooks: registry,
+      preemption: { shouldPreempt: () => true, maxSeals: 1 },
+      returnContent: true,
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new CountingChatModel({
+      responses: [FULL_RESPONSE, 'agent B should never say this'],
+    });
+    run.Graph.overrideModel = model;
+
+    await run.processStream(
+      { messages: [new HumanMessage('hello there')] },
+      streamConfig
+    );
+
+    /**
+     * The registry halt is cleared to protect the sealed commit, so nothing
+     * in processStream's poll stops the outer workflow — the createCallModel
+     * entry guard is what keeps the direct-edge successor from taking a
+     * model turn after the halting boundary.
+     */
+    expect(model.invocations).toBe(1);
+    expect(run.getHaltReason()).toBe('stop_everything');
+    expect(run.Graph.preemptIncomplete).toBe(true);
+    const contents = aiContents(run.getRunMessages() ?? []);
+    expect(contents.some((c) => c.includes('agent B should never'))).toBe(
+      false
+    );
   });
 
   it('resumes after an injecting boundary and completes without a halt reason', async () => {
