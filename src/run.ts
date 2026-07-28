@@ -744,13 +744,15 @@ export class Run<_T extends t.BaseGraphState> {
      * Cancellation can arrive either at graph construction or per-call through
      * `callerConfig.signal`, and boundary hooks need to observe both — for a
      * multi-agent run the construction signal does not exist at all, since
-     * `MultiAgentGraphConfig` exposes none. The graph keeps whichever it was
-     * given and adopts the caller's when that is the only one, so a drain
-     * cannot keep running against a host queue after the caller aborted.
+     * `MultiAgentGraphConfig` exposes none. Carried on its own field, assigned
+     * unconditionally: writing into `graph.signal` would leak this call's
+     * controller into later calls (model-call config and subagent
+     * parentSignal read that field, and `clearHeavyState()` is skipped on
+     * HITL interrupts), while a conditional write would keep observing a
+     * stale controller the host has since aborted. The boundary dispatch
+     * composes both channels; see `dispatchPreemptBoundary`.
      */
-    if (callerConfig.signal != null && graph.signal == null) {
-      graph.signal = callerConfig.signal;
-    }
+    graph.callerSignal = callerConfig.signal;
 
     /**
      * Skip `resetValues` on resume — we're continuing an in-flight

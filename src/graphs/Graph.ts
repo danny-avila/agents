@@ -146,6 +146,25 @@ const EMPTY_PREEMPT_BOUNDARY: PreemptBoundaryResult = {
   preventContinuation: false,
 };
 
+/**
+ * One signal that fires when either input fires. `AbortSignal.any` is skipped
+ * when the inputs collapse to a single signal — the composite is a fresh
+ * object per call, and the common cases (one channel, or the host reusing the
+ * same controller for both) don't need one.
+ */
+function composeAbortSignals(
+  a: AbortSignal | undefined,
+  b: AbortSignal | undefined
+): AbortSignal | undefined {
+  if (a == null || a === b) {
+    return b;
+  }
+  if (b == null) {
+    return a;
+  }
+  return AbortSignal.any([a, b]);
+}
+
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
 
@@ -673,6 +692,20 @@ export abstract class Graph<
   reasoningStepHasDeltas: Set<string> = new Set();
   protected handlerDispatchedEventCounts: Map<string, number> = new Map();
   signal?: AbortSignal;
+  /**
+   * The abort signal the CALLER handed to the current `processStream` call,
+   * assigned unconditionally — including back to `undefined` — on every call.
+   *
+   * Kept separate from {@link signal} on purpose. That field is construction
+   * state with its own consumers (model-call config, subagent parentSignal),
+   * so adopting a per-call signal into it would leak one call's controller
+   * into the next — `clearHeavyState()` is skipped on HITL interrupts, so a
+   * host that aborts a finished request's controller would poison the resumed
+   * run's model calls and boundary drains with an already-aborted signal.
+   * Boundary dispatch composes the two instead; see
+   * `StandardGraph.dispatchPreemptBoundary`.
+   */
+  callerSignal?: AbortSignal;
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
   handlerRegistry: HandlerRegistry | undefined;
@@ -752,6 +785,7 @@ export abstract class Graph<
   clearHeavyState(): void {
     this.config = undefined;
     this.signal = undefined;
+    this.callerSignal = undefined;
     this.contentData = [];
     this.contentIndexMap = new Map();
     this.stepKeyIds = new Map();
@@ -3468,13 +3502,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       sessionId: runId,
       timeoutMs: PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
       /**
-       * The host's own abort signal, deliberately NOT `config.signal` — inside
-       * a node the latter is LangGraph's composed signal, which also fires
-       * when an unrelated sibling in the same superstep throws. Cancellation
-       * already returns control in milliseconds without this; what it buys is
-       * that a drain does not keep running after the run it belongs to died.
+       * The host's own abort signal(s), deliberately NOT `config.signal` —
+       * inside a node the latter is LangGraph's composed signal, which also
+       * fires when an unrelated sibling in the same superstep throws.
+       * Cancellation already returns control in milliseconds without this;
+       * what it buys is that a drain does not keep running after the run it
+       * belongs to died.
+       *
+       * Composed because the host can cancel through either channel: the
+       * construction signal, or the per-call `callerConfig.signal` — the only
+       * one a multi-agent run has, since `MultiAgentGraphConfig` exposes no
+       * construction signal. When both exist they may be different
+       * controllers, and a drain must stop when EITHER fires.
        */
-      signal: this.signal,
+      signal: composeAbortSignals(this.signal, this.callerSignal),
     }).catch((): undefined => undefined);
     if (result == null) {
       return EMPTY_PREEMPT_BOUNDARY;
