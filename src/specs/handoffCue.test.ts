@@ -4,7 +4,7 @@
  * provider must receive a user-turn handoff cue after the predecessor's
  * trailing assistant output — and tolerant providers must not.
  */
-import { HumanMessage } from '@langchain/core/messages';
+import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
@@ -27,6 +27,32 @@ class CapturingChatModel extends FakeChatModel {
   }
 }
 
+/**
+ * A ChatModel whose streamed chunks never carry ids. Overrides
+ * `_streamIterator` — the seam BELOW LangChain's run-id stamping (which
+ * happens in `_generateUncached`, downstream of `_streamResponseChunks`, so
+ * a subclass override there cannot produce this shape) but still a Runnable,
+ * so `systemRunnable.pipe(model)` works. The public ChatModel contract
+ * requires no ids; custom implementations really do ship this.
+ */
+class IdlessChatModel extends FakeChatModel {
+  readonly invocations: BaseMessage[][] = [];
+  private turn = 0;
+
+  constructor(private texts: string[]) {
+    super({ responses: texts });
+  }
+
+  override async *_streamIterator(
+    input: BaseMessage[]
+  ): AsyncGenerator<AIMessageChunk> {
+    this.invocations.push(input);
+    const text = this.texts[Math.min(this.turn, this.texts.length - 1)];
+    this.turn += 1;
+    yield new AIMessageChunk({ content: text });
+  }
+}
+
 const streamConfig = {
   configurable: { thread_id: 'handoff-cue-e2e' },
   streamMode: 'values' as const,
@@ -35,7 +61,8 @@ const streamConfig = {
 
 async function runTwoAgents(
   provider: Providers,
-  modelId = 'test-model'
+  modelId = 'test-model',
+  idlessModel = false
 ): Promise<{ criticPayload: BaseMessage[]; messages: BaseMessage[] }> {
   const run = await Run.create<t.IState>({
     runId: `handoff-cue-${provider}`,
@@ -63,10 +90,12 @@ async function runTwoAgents(
   if (!run.Graph) {
     throw new Error('Expected graph to be initialized');
   }
-  const model = new CapturingChatModel({
-    responses: ['The essay text.', 'The critique text.'],
-  });
-  run.Graph.overrideModel = model;
+  const model = idlessModel
+    ? new IdlessChatModel(['The essay text.', 'The critique text.'])
+    : new CapturingChatModel({
+      responses: ['The essay text.', 'The critique text.'],
+    });
+  run.Graph.overrideModel = model as never;
 
   await run.processStream(
     { messages: [new HumanMessage('write the essay')] },
@@ -105,6 +134,21 @@ describe('bare direct-edge handoff cue (#345)', () => {
     const { criticPayload } = await runTwoAgents(
       Providers.BEDROCK,
       'us.anthropic.claude-sonnet-4-5-20250929-v1:0'
+    );
+    const last = criticPayload[criticPayload.length - 1];
+    expect(last.content).toBe(PREDECESSOR_HANDOFF_CUE);
+  });
+
+  /**
+   * The public ChatModel contract does not require ids. Provenance must not
+   * depend on the model setting one — the node assigns a reducer-style id
+   * before recording, so the successor still gets the cue.
+   */
+  it('applies the cue even when the model never sets message ids', async () => {
+    const { criticPayload } = await runTwoAgents(
+      Providers.ANTHROPIC,
+      'test-model',
+      true
     );
     const last = criticPayload[criticPayload.length - 1];
     expect(last.content).toBe(PREDECESSOR_HANDOFF_CUE);

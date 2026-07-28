@@ -51,6 +51,7 @@ import {
   coalesceAdjacentUserTurns,
   strictAlternationProviders,
   appendPredecessorHandoffCue,
+  removePredecessorHandoffCue,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -68,7 +69,9 @@ import {
   getFallbackErrorContext,
   getFallbackOverflowCandidates,
   projectMessagesForProvider,
+  resolveServingModelId,
 } from '@/llm/invoke';
+import { v4 } from 'uuid';
 import {
   createLangfuseHandler,
   createLangfuseTraceMetadata,
@@ -3279,11 +3282,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                     calculateMaxToolResultChars(
                       fallbackMaxContextTokens ?? agentContext.maxContextTokens
                     );
-                  const projectedFallbackMessages = trackProviderMessageOrigins(
+                  /**
+                   * Serving-provider cue shaping BEFORE the fallback payload
+                   * is measured: a Claude fallback behind a tolerant primary
+                   * gains the cue inside the guarded projection (a prompt
+                   * within the cue's cost of the fallback budget must take
+                   * the recovery path, not ship oversized), and a tolerant
+                   * fallback behind an Anthropic primary sheds the baked cue
+                   * before it is measured against the tighter budget. The
+                   * attemptInvoke funnel pass then finds nothing to change.
+                   */
+                  const cueShapedFallbackMessages = trackProviderMessageOrigins(
                     fallbackMessages,
+                    isAnthropicLike(fallbackProvider, {
+                      model: resolveServingModelId(fallbackModel),
+                    })
+                      ? appendPredecessorHandoffCue(fallbackMessages, (m) =>
+                        this.isRunProducedMessage(m)
+                      )
+                      : removePredecessorHandoffCue(fallbackMessages)
+                  );
+                  const projectedFallbackMessages = trackProviderMessageOrigins(
+                    cueShapedFallbackMessages,
                     projectMessagesForProvider({
                       model: fallbackModel,
-                      messages: fallbackMessages,
+                      messages: cueShapedFallbackMessages,
                       provider: fallbackProvider,
                       maxToolResultChars: fallbackToolResultChars,
                       callOptions: fallbackConfig,
@@ -3371,15 +3394,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const responseMessage = result.messages?.[0];
       /**
        * Provenance for the handoff-cue gate: recorded at the node, where the
-       * produced turn is unambiguous. A null id (rare; the reducer would
-       * assign one later) simply leaves the cue off for that turn —
-       * fail-safe in the direction of provider-default behavior.
+       * produced turn is unambiguous. The public ChatModel contract does not
+       * require implementations to set message ids — the reducer would
+       * assign one AFTER this node returns, which is too late for the set —
+       * so an id is assigned here first, the same way the reducer does it
+       * (`v4()`, mirrored into `lc_kwargs`), and the reducer's
+       * keep-existing-id rule makes the state message match.
        */
-      if (
-        responseMessage?.getType() === 'ai' &&
-        typeof responseMessage.id === 'string' &&
-        responseMessage.id !== ''
-      ) {
+      if (responseMessage?.getType() === 'ai') {
+        if (
+          typeof responseMessage.id !== 'string' ||
+          responseMessage.id === ''
+        ) {
+          responseMessage.id = v4();
+          responseMessage.lc_kwargs.id = responseMessage.id;
+        }
         this.runProducedAiMessageIds.add(responseMessage.id);
       }
       const toolCalls = (responseMessage as AIMessageChunk | undefined)

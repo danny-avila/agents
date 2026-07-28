@@ -526,7 +526,7 @@ function collectModelCallbackSources(model: unknown): Callbacks[] {
  * `RunnableBinding` and a system runnable pipes a `RunnableSequence`, and
  * neither exposes the chat model's `model` at the top level.
  */
-function resolveServingModelId(model: unknown): string | undefined {
+export function resolveServingModelId(model: unknown): string | undefined {
   const seen = new Set<unknown>();
   let current: unknown = model;
   while (current != null && typeof current === 'object' && !seen.has(current)) {
