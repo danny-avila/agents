@@ -8,6 +8,7 @@
  */
 import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
+import { RunnableBinding } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { Providers } from '@/common';
 import { HookRegistry } from '@/hooks/HookRegistry';
@@ -61,7 +62,19 @@ async function createSealRun(options: {
   if (options.modelCallbacks != null) {
     model.callbacks = options.modelCallbacks;
   }
-  run.Graph.overrideModel = model;
+  /**
+   * Wrapped, not bare, when the test watches model-level callbacks: with
+   * tools bound, production hands `attemptInvoke` a `RunnableBinding` (and a
+   * system runnable pipes a sequence on top), while `clientOptions.callbacks`
+   * lives on the chat model at the bottom. A bare override would let a
+   * naive `model.callbacks` property read pass the detector while missing
+   * every real tool-enabled run.
+   */
+  run.Graph.overrideModel = (
+    options.modelCallbacks != null
+      ? new RunnableBinding({ bound: model, kwargs: {}, config: {} })
+      : model
+  ) as typeof model;
   return run;
 }
 

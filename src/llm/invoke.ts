@@ -479,6 +479,45 @@ function getMessageText(chunk: AIMessageChunk): string {
  * Falls back to a custom-event dispatch if the id was never observed, so the
  * host still records usage even when the native close is unavailable.
  */
+/**
+ * Every callbacks source the real model run would compose beyond the per-call
+ * config. `model` here is whatever `createCallModel` produced — with tools
+ * that is `bindTools(...)`'s `RunnableBinding`, and a system runnable pipes a
+ * `RunnableSequence` on top — while `clientOptions.callbacks` lives on the
+ * chat model at the BOTTOM of that stack. Walks `bound` (bindings) and
+ * `last`/`steps` (sequences), collecting each wrapper's own `callbacks` and
+ * any binding-config callbacks along the way, since the binding merges its
+ * config into the call before the chat model composes.
+ */
+function collectModelCallbackSources(model: unknown): Callbacks[] {
+  const sources: Callbacks[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = model;
+  while (current != null && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const wrapper = current as {
+      callbacks?: Callbacks;
+      config?: { callbacks?: Callbacks };
+      bound?: unknown;
+      last?: unknown;
+      steps?: unknown[];
+    };
+    if (wrapper.callbacks != null) {
+      sources.push(wrapper.callbacks);
+    }
+    if (wrapper.config?.callbacks != null) {
+      sources.push(wrapper.config.callbacks);
+    }
+    current =
+      wrapper.bound ??
+      wrapper.last ??
+      (Array.isArray(wrapper.steps)
+        ? wrapper.steps[wrapper.steps.length - 1]
+        : undefined);
+  }
+  return sources;
+}
+
 async function endSealedModelRun(
   context: InvokeContext | undefined,
   chunk: AIMessageChunk,
@@ -503,14 +542,10 @@ async function endSealedModelRun(
        * model callbacks appended non-inheritable, parent run id preserved by
        * `copy`, tracers deduped by `configure`.
        */
-      const modelCallbacks = (model as { callbacks?: Callbacks } | undefined)
-        ?.callbacks;
-      if (modelCallbacks != null) {
+      for (const source of collectModelCallbackSources(model)) {
         callbackManager =
-          CallbackManager.configure(
-            callbackManager ?? undefined,
-            modelCallbacks
-          ) ?? callbackManager;
+          CallbackManager.configure(callbackManager ?? undefined, source) ??
+          callbackManager;
       }
       if (callbackManager != null) {
         const runManager = new CallbackManagerForLLMRun(
