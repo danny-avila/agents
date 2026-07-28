@@ -115,6 +115,25 @@ const customHandlers = composeEventHandlers(
 );
 ```
 
+## Observability
+
+When Langfuse, LangSmith, or OTel tracing is configured, each run is attributed to the user that triggered it. By default the `userId` field in your trace backend is set to the user's **email address**.
+
+Set `LIBRECHAT_TRACE_USER_ID_FIELD` to change which field is used:
+
+| Value             | What appears as `userId`                                           |
+| ----------------- | ------------------------------------------------------------------ |
+| `email` (default) | `alice@example.com`                                                |
+| `name`            | `Alice Johnson` (OIDC `name` claim or display name)                |
+| `username`        | `alice` — varies by OIDC provider (e.g. Cognito uses the sub UUID) |
+| `id`              | Internal host-assigned user ID                                     |
+
+```bash
+LIBRECHAT_TRACE_USER_ID_FIELD=name   # show display name in Langfuse
+```
+
+The host can also supply a fully resolved `userId` directly via `RunConfig.user.userId`, which takes precedence over this env var.
+
 ## Development
 
 ```bash
