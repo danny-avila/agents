@@ -1,7 +1,7 @@
 import { CallbackHandler } from '@langfuse/langchain';
-import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
 import { context as otelContext } from '@opentelemetry/api';
 import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
+import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
 import {
   getLangfuseTracerProvider,
   propagateAttributes,

@@ -1,6 +1,9 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
+import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
+import { CallbackManager } from '@langchain/core/callbacks/manager';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import {
   Command,
   END,
@@ -14,17 +17,13 @@ import {
   isGraphInterrupt,
   isInterrupted,
 } from '@langchain/langgraph';
-import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
-import { CallbackManager } from '@langchain/core/callbacks/manager';
-import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import type { ToolCall } from '@langchain/core/messages/tool';
-import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { handleConverseStreamMetadata } from '@/llm/bedrock/utils/message_outputs';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
 import { Constants, Providers } from '@/common';
-import { askUserQuestion } from '@/hitl';
 import { ToolNode } from '@/tools/ToolNode';
+import { askUserQuestion } from '@/hitl';
 import { Run } from '@/run';
 
 const mockProcessorStarts: Array<{
@@ -571,7 +570,7 @@ describe('Langfuse callback composition', () => {
         description: 'suspends to collect a human answer',
         schema: z.object({}).passthrough(),
       }
-    ) as unknown as StructuredToolInterface;
+    );
     const toolNode = new ToolNode({
       tools: [askTool],
       eventDrivenMode: true,
