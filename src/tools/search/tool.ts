@@ -452,6 +452,9 @@ export const createSearchTool = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    customRerankerApiUrl,
+    customRerankerApiKey,
+    customRerankerModel,
     onSearchResults: _onSearchResults,
     onGetHighlights,
   } = config;
@@ -557,6 +560,9 @@ export const createSearchTool = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    customRerankerApiUrl,
+    customRerankerApiKey,
+    customRerankerModel,
     rerankerTimeout,
     logger,
   });
