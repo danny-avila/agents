@@ -39,11 +39,12 @@ import {
   modifyDeltaProperties,
   coalesceAdjacentUserTurns,
   strictAlternationProviders,
+  appendPredecessorHandoffCue,
 } from '@/messages';
 import { canSealPreempt } from '@/llm/preempt';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { initializeModel } from '@/llm/init';
-import { isOpenAILike } from '@/utils/llm';
+import { isAnthropicLike, isOpenAILike } from '@/utils/llm';
 
 /**
  * Context passed to `attemptInvoke`. Matches the subset of Graph that
@@ -662,9 +663,24 @@ export async function attemptInvoke(
    * summarization calls, so applying it here covers all three. Idempotent, so
    * the primary simply re-runs a no-op over already-coalesced messages.
    */
-  const messagesForProvider = strictAlternationProviders.has(provider)
-    ? coalesceAdjacentUserTurns(annotated)
+  /**
+   * Same serving-provider rule for the predecessor handoff cue (#345): an
+   * OpenAI primary falling back to a Claude surface needs the cue applied
+   * for the fallback, and an Anthropic primary falling back to OpenAI must
+   * NOT ship the Claude-only synthetic turn. The Bedrock model id is read
+   * off the serving model instance; when absent, `isAnthropicLike` defaults
+   * Bedrock to Claude — the safe direction for a cue that is inert
+   * elsewhere. No-op identity when the payload does not end on a
+   * run-produced assistant turn.
+   */
+  const cued = isAnthropicLike(provider, {
+    model: (model as { model?: string }).model,
+  })
+    ? appendPredecessorHandoffCue(annotated, context?.getLastRunMessage())
     : annotated;
+  const messagesForProvider = strictAlternationProviders.has(provider)
+    ? coalesceAdjacentUserTurns(cued)
+    : cued;
 
   /**
    * Stamp the provider that is ACTUALLY serving this invocation onto the

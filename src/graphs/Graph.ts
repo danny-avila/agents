@@ -50,7 +50,6 @@ import {
   convertInjectedMessages,
   coalesceAdjacentUserTurns,
   strictAlternationProviders,
-  appendPredecessorHandoffCue,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -1465,6 +1464,24 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return this.messages.slice(this.startIndex);
   }
 
+  /**
+   * The run's most recent message without materializing the whole tail —
+   * `getRunMessages()` slices O(n) per call, which is too much for per-model-
+   * invocation reads that only need the last entry (the handoff-cue gate).
+   * Mirrors `getRunMessages`' disposed-graph fallbacks.
+   */
+  getLastRunMessage(): BaseMessage | undefined {
+    /** Typed honestly: disposed-but-cached graphs really do carry null here. */
+    const live = this.messages as BaseMessage[] | null | undefined;
+    if (live == null || live.length === 0) {
+      return this.cachedRunMessages?.at(-1);
+    }
+    if (live.length <= this.startIndex) {
+      return undefined;
+    }
+    return live.at(-1);
+  }
+
   getContentParts(): t.MessageContentComplex[] | undefined {
     // `messages` can be null/undefined on a graph that has been disposed
     // (clearHeavyState) but is still reachable via a cache (e.g. RedisJobStore's
@@ -2517,27 +2534,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               formatContentStrings(beforeLegacyFormat)
             );
           }
-        }
-        /**
-         * Prefill-semantics providers CONTINUE a trailing assistant turn. A
-         * bare direct-edge successor in a multi-agent run receives exactly
-         * that shape — the predecessor's fresh output last — so without a
-         * user-turn cue it answers in the predecessor's voice, or returns
-         * empty content when that turn reads complete (#345). Scoped to
-         * Claude surfaces and to run-produced tails (host-supplied trailing
-         * assistant turns are deliberate prefill and never match by id).
-         */
-        if (
-          isAnthropicLike(
-            agentContext.provider,
-            agentContext.clientOptions as { model?: string }
-          )
-        ) {
-          const before = transformed;
-          transformed = trackProviderMessageOrigins(
-            before,
-            appendPredecessorHandoffCue(before, this.getRunMessages())
-          );
         }
         return transformed;
       };

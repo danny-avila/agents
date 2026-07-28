@@ -28,20 +28,21 @@ export const PREDECESSOR_HANDOFF_CUE =
  * the prefill with a user turn; this closes the same gap for bare edges.
  *
  * Fail-safe OFF by identity: the trailing payload message must carry the same
- * id as the run's last recorded message. Host-supplied trailing assistant
+ * id as the run's last recorded message (`runTail`, from the graph's
+ * non-allocating `getLastRunMessage()`). Host-supplied trailing assistant
  * turns (deliberate prefill flows) never match — the run has not produced
  * them — so single-agent prefill behavior is untouched. Wire-only: the cue is
  * appended to the provider projection, never to graph state or host history.
  */
 export function appendPredecessorHandoffCue(
   messages: BaseMessage[],
-  runMessages: BaseMessage[] | undefined
+  runTail: BaseMessage | undefined
 ): BaseMessage[] {
   const last = messages.at(-1);
   if (last == null || last.getType() !== 'ai') {
     return messages;
   }
-  const lastRun = runMessages?.at(-1);
+  const lastRun = runTail;
   if (lastRun == null || lastRun.getType() !== 'ai') {
     return messages;
   }
