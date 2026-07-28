@@ -7,13 +7,22 @@ import {
   HumanMessage,
   ToolMessage,
 } from '@langchain/core/messages';
+import {
+  convertMessagesToCompletionsMessageParams,
+  convertMessagesToResponsesInput,
+  tools as openAITools,
+} from '@langchain/openai';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
+import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import { convertMessageContentToParts } from '@/llm/google/utils/common';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
+import { toLangChainContent } from '@/messages/langchain';
 import { Constants, Providers } from '@/common';
 import { ToolNode } from '@/tools/ToolNode';
+import { ChatOpenAI } from '@/llm/openai';
 
 /**
  * Minimal stub model shape `attemptInvoke` reads. Either `invoke` or
@@ -21,6 +30,9 @@ import { ToolNode } from '@/tools/ToolNode';
  * extending the real `BaseChatModel` would pull in too much surface.
  */
 type StubModel = {
+  _useResponsesApi?: (options?: unknown) => boolean;
+  defaultOptions?: unknown;
+  last?: unknown;
   invoke?: (messages: BaseMessage[], config?: unknown) => Promise<AIMessage>;
   stream?: (
     messages: BaseMessage[],
@@ -162,6 +174,482 @@ describe('attemptInvoke applies lazy ref annotation', () => {
 
     expect(invokeMessages).toHaveLength(1);
     expect(invokeMessages[0][0].content).toBe('output');
+  });
+
+  it('replaces native computer screenshots for non-Responses providers', async () => {
+    const screenshot = `data:image/png;base64,${'A'.repeat(100_000)}`;
+    const computerOutput = new ToolMessage({
+      content: screenshot,
+      tool_call_id: 'computer-output',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const { invokeMessages, model } = buildCapturingModel();
+
+    await attemptInvoke({
+      model: model as t.ChatModel,
+      messages: [computerOutput],
+      provider: Providers.ANTHROPIC,
+    });
+
+    expect(invokeMessages[0][0].content).toBe(
+      '[Computer screenshot omitted for this provider]'
+    );
+    expect(computerOutput.content).toBe(screenshot);
+  });
+
+  it('scopes cache blocks to providers that support them', async () => {
+    const cachedOutput = new ToolMessage({
+      content: [
+        {
+          type: 'text',
+          text: 'result body',
+          cache_control: { type: 'ephemeral' },
+        },
+      ] as ToolMessage['content'],
+      tool_call_id: 'call_cached_tool',
+    });
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call_cached_tool', name: 'search', args: {} }],
+      }),
+      cachedOutput,
+    ];
+    const openRouter = buildCapturingModel();
+    const openAI = buildCapturingModel();
+    const anthropic = buildCapturingModel();
+    const google = buildCapturingModel();
+
+    await attemptInvoke({
+      model: openRouter.model as t.ChatModel,
+      messages,
+      provider: Providers.OPENROUTER,
+    });
+    await attemptInvoke({
+      model: openAI.model as t.ChatModel,
+      messages,
+      provider: Providers.OPENAI,
+    });
+    await attemptInvoke({
+      model: anthropic.model as t.ChatModel,
+      messages,
+      provider: Providers.ANTHROPIC,
+    });
+    await attemptInvoke({
+      model: google.model as t.ChatModel,
+      messages,
+      provider: Providers.GOOGLE,
+    });
+
+    expect(openRouter.invokeMessages[0][1].content).toEqual(
+      cachedOutput.content
+    );
+    expect(openAI.invokeMessages[0][1].content).toBe('result body');
+    expect(anthropic.invokeMessages[0][1].content).toEqual(
+      cachedOutput.content
+    );
+    expect(google.invokeMessages[0][1].content).toBe('result body');
+    expect(cachedOutput.content).toEqual([
+      {
+        type: 'text',
+        text: 'result body',
+        cache_control: { type: 'ephemeral' },
+      },
+    ]);
+  });
+
+  it('removes foreign cache markers from official OpenAI Chat payloads', async () => {
+    const messages = [
+      new HumanMessage({
+        content: toLangChainContent([
+          {
+            type: 'text',
+            text: 'question',
+            cache_control: { type: 'ephemeral' },
+          },
+        ]),
+      }),
+      new AIMessage({
+        content: toLangChainContent([
+          {
+            type: 'text',
+            text: 'answer',
+            cache_control: { type: 'ephemeral' },
+          },
+        ]),
+      }),
+    ];
+    const { invokeMessages, model } = buildCapturingModel();
+
+    await attemptInvoke({
+      model: model as t.ChatModel,
+      messages,
+      provider: Providers.OPENAI,
+    });
+
+    const payload = convertMessagesToCompletionsMessageParams({
+      messages: invokeMessages[0],
+      model: 'gpt-4o',
+    });
+    expect(JSON.stringify(payload)).not.toContain('cache_control');
+    expect(JSON.stringify(messages)).toContain('cache_control');
+  });
+
+  it('removes Bedrock cache points before an Anthropic fallback', async () => {
+    const messages = [
+      new HumanMessage('search'),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call_bedrock_cache', name: 'search', args: {} }],
+      }),
+      new ToolMessage({
+        content: [
+          { type: 'text', text: 'result body' },
+          { cachePoint: { type: 'default' } },
+        ] as ToolMessage['content'],
+        tool_call_id: 'call_bedrock_cache',
+      }),
+    ];
+    const { invokeMessages, model } = buildCapturingModel();
+
+    await attemptInvoke({
+      model: model as t.ChatModel,
+      messages,
+      provider: Providers.ANTHROPIC,
+    });
+
+    expect((invokeMessages[0][2] as ToolMessage).content).toBe('result body');
+    expect(() =>
+      _convertMessagesToAnthropicPayload(invokeMessages[0])
+    ).not.toThrow();
+    expect(JSON.stringify(invokeMessages[0])).not.toContain('cachePoint');
+    expect(JSON.stringify(messages)).toContain('cachePoint');
+  });
+
+  it('preserves error tool metadata while stripping foreign cache markers', async () => {
+    const cachedError = new ToolMessage({
+      content: toLangChainContent([
+        {
+          type: 'text',
+          text: 'boom',
+          cache_control: { type: 'ephemeral' },
+        },
+      ]),
+      tool_call_id: 'call_error',
+      name: 'search',
+      status: 'error',
+      artifact: { source: 'test' },
+      metadata: { trace: 'trace-1' },
+    });
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call_error', name: 'search', args: {} }],
+      }),
+      cachedError,
+    ];
+    const { invokeMessages, model } = buildCapturingModel();
+
+    await attemptInvoke({
+      model: model as t.ChatModel,
+      messages,
+      provider: Providers.GOOGLE,
+    });
+
+    const sent = invokeMessages[0][1] as ToolMessage;
+    expect(sent).toMatchObject({
+      content: 'boom',
+      status: 'error',
+      artifact: { source: 'test' },
+      metadata: { trace: 'trace-1' },
+    });
+    expect(convertMessageContentToParts(sent, false, messages)).toEqual([
+      expect.objectContaining({
+        functionResponse: expect.objectContaining({
+          response: { error: { details: 'boom' } },
+        }),
+      }),
+    ]);
+    expect(cachedError.content).not.toBe('boom');
+  });
+
+  it('removes per-block cache markers from OpenRouter Responses input', async () => {
+    const messages = [
+      new HumanMessage({
+        content: toLangChainContent([
+          {
+            type: 'text',
+            text: 'question',
+            cache_control: { type: 'ephemeral' },
+          },
+        ]),
+      }),
+    ];
+    const { invokeMessages, model } = buildCapturingModel();
+    model.last = { _useResponsesApi: () => true };
+
+    await attemptInvoke({
+      model: model as t.ChatModel,
+      messages,
+      provider: Providers.OPENROUTER,
+    });
+
+    const input = convertMessagesToResponsesInput({
+      messages: invokeMessages[0],
+      model: 'openai/gpt-5',
+      zdrEnabled: false,
+    });
+    expect(JSON.stringify(input)).not.toContain('cache_control');
+    expect(JSON.stringify(messages)).toContain('cache_control');
+  });
+
+  it.each([
+    [Providers.OPENAI, false],
+    [Providers.OPENAI, true],
+    [Providers.OPENROUTER, false],
+    [Providers.OPENROUTER, true],
+    [Providers.ANTHROPIC, false],
+    [Providers.BEDROCK, false],
+    [Providers.GOOGLE, false],
+  ])(
+    'drops incomplete streamed tool-input fragments for %s (Responses=%s)',
+    async (provider, responses) => {
+      let typeGetterCalls = 0;
+      const accessorBlock = {};
+      Object.defineProperty(accessorBlock, 'type', {
+        enumerable: true,
+        get() {
+          typeGetterCalls++;
+          throw new Error('type getter must not run');
+        },
+      });
+      const proxyBlock = new Proxy(
+        {},
+        {
+          getOwnPropertyDescriptor() {
+            throw new Error('proxy descriptor trap must not run');
+          },
+        }
+      );
+      const streamedToolCall = new AIMessage({
+        content: toLangChainContent([
+          { type: 'text', text: 'calling' },
+          {
+            type: 'tool_use',
+            id: 'call_streamed',
+            name: 'search',
+            input: '',
+            index: 0,
+          },
+          {
+            type: 'text',
+            index: 0,
+            input: '{"query":"records"}',
+          },
+          accessorBlock,
+          proxyBlock,
+        ]),
+        tool_calls: [
+          {
+            id: 'call_streamed',
+            name: 'search',
+            args: { query: 'records' },
+            type: 'tool_call',
+          },
+        ],
+      });
+      const messages = [
+        new HumanMessage('run the search'),
+        streamedToolCall,
+        new ToolMessage({
+          content: 'result',
+          tool_call_id: 'call_streamed',
+          name: 'search',
+        }),
+      ];
+      const { invokeMessages, model } = buildCapturingModel();
+      if (responses) {
+        model.last = { _useResponsesApi: () => true };
+      }
+
+      await attemptInvoke({
+        model: model as t.ChatModel,
+        messages,
+        provider,
+      });
+
+      const sent = invokeMessages[0][1] as AIMessage;
+      expect(sent.content).toEqual([
+        { type: 'text', text: 'calling' },
+        {
+          type: 'tool_use',
+          id: 'call_streamed',
+          name: 'search',
+          input: '',
+          index: 0,
+        },
+      ]);
+      expect(sent.tool_calls).toEqual(streamedToolCall.tool_calls);
+      expect(typeGetterCalls).toBe(0);
+      expect(streamedToolCall.content).toHaveLength(5);
+    }
+  );
+
+  it.each([Providers.OPENAI, Providers.OPENROUTER])(
+    'canonicalizes computer screenshots for an actual %s Responses attempt',
+    async (provider) => {
+      const { invokeMessages, model } = buildCapturingModel();
+      model.last = { _useResponsesApi: () => true };
+      const computerCall = new AIMessage({
+        content: '',
+        response_metadata: {
+          output: [
+            {
+              type: 'computer_call',
+              call_id: 'computer-output',
+              action: { type: 'screenshot' },
+            },
+          ],
+        },
+      });
+      const computerOutput = new ToolMessage({
+        content: 'data:image/png;base64,AA==',
+        tool_call_id: 'computer-output',
+        additional_kwargs: { type: 'computer_call_output' },
+      });
+
+      await attemptInvoke({
+        model: model as t.ChatModel,
+        messages: [computerCall, computerOutput],
+        provider,
+      });
+
+      expect(invokeMessages[0][1].content).toEqual([
+        {
+          type: 'input_image',
+          image_url: 'data:image/png;base64,AA==',
+        },
+      ]);
+    }
+  );
+
+  it('merges per-call options when selecting Chat versus Responses', async () => {
+    const computerCall = new AIMessage({
+      content: '',
+      response_metadata: {
+        output: [
+          {
+            type: 'computer_call',
+            call_id: 'call_per_call_computer',
+            action: { type: 'screenshot' },
+          },
+        ],
+      },
+    });
+    const computerOutput = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_per_call_computer',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const responses = buildCapturingModel();
+    responses.model.defaultOptions = { tools: [] };
+    responses.model._useResponsesApi = (options) =>
+      Array.isArray((options as { tools?: unknown[] } | undefined)?.tools) &&
+      ((options as { tools: unknown[] }).tools.length ?? 0) > 0;
+
+    await attemptInvoke(
+      {
+        model: responses.model as t.ChatModel,
+        messages: [computerCall, computerOutput],
+        provider: Providers.OPENAI,
+      },
+      {
+        tools: [{ type: 'computer_20251124' }],
+      } as unknown as Parameters<typeof attemptInvoke>[1]
+    );
+
+    expect(responses.invokeMessages[0][1].content).toEqual([
+      {
+        type: 'input_image',
+        image_url: 'data:image/png;base64,AA==',
+      },
+    ]);
+
+    const chat = buildCapturingModel();
+    chat.model.defaultOptions = {
+      tools: [{ type: 'computer_20251124' }],
+    };
+    chat.model._useResponsesApi = responses.model._useResponsesApi;
+
+    await attemptInvoke(
+      {
+        model: chat.model as t.ChatModel,
+        messages: [computerCall, computerOutput],
+        provider: Providers.OPENAI,
+      },
+      { tools: [] } as unknown as Parameters<typeof attemptInvoke>[1]
+    );
+
+    expect(chat.invokeMessages[0][1].content).toBe(
+      '[Computer screenshot omitted for this provider]'
+    );
+  });
+
+  it('detects Responses selected by a bound built-in computer tool', async () => {
+    const boundModel = new ChatOpenAI({
+      apiKey: 'test-key',
+      model: 'computer-use-preview',
+      useResponsesApi: false,
+    }).bindTools([
+      openAITools.computerUse({
+        displayWidth: 1024,
+        displayHeight: 768,
+        environment: 'browser',
+        execute: async () => 'data:image/png;base64,AA==',
+      }),
+    ]);
+    const invokeMessages: BaseMessage[][] = [];
+    Object.defineProperty(boundModel, 'stream', {
+      configurable: true,
+      value: undefined,
+    });
+    Object.defineProperty(boundModel, 'invoke', {
+      configurable: true,
+      value: jest.fn(async (messages: BaseMessage[]) => {
+        invokeMessages.push(messages);
+        return new AIMessage({ content: 'ok' });
+      }),
+    });
+    const computerCall = new AIMessage({
+      content: '',
+      response_metadata: {
+        output: [
+          {
+            type: 'computer_call',
+            call_id: 'bound-computer-output',
+            action: { type: 'screenshot' },
+          },
+        ],
+      },
+    });
+    const computerOutput = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'bound-computer-output',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    await attemptInvoke({
+      model: boundModel as t.ChatModel,
+      messages: [computerCall, computerOutput],
+      provider: Providers.OPENAI,
+    });
+
+    expect(invokeMessages[0][1].content).toEqual([
+      {
+        type: 'input_image',
+        image_url: 'data:image/png;base64,AA==',
+      },
+    ]);
   });
 
   it('skips annotation for stale _refKey not present in current run registry (cross-run scenario)', async () => {

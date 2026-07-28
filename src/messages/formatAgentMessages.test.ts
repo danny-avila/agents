@@ -5,13 +5,30 @@ import {
   SystemMessage,
   ToolMessage,
 } from '@langchain/core/messages';
+import {
+  convertMessagesToCompletionsMessageParams,
+  convertResponsesDeltaToChatGenerationChunk,
+  convertMessagesToResponsesInput,
+  convertResponsesMessageToAIMessage,
+} from '@langchain/openai';
 import type { MessageContentComplex, TPayload } from '@/types';
-import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import {
   convertMessagesToContent,
   formatAnthropicArtifactContent,
+  formatArtifactPayload,
+  projectAnthropicArtifactContent,
+  projectArtifactPayload,
+  projectComputerCallOutputsToText,
+  projectOpenAIToolMessageContent,
+  projectOpenAIResponsesToolMessageContent,
 } from './core';
+import {
+  _convertMessagesToOpenAIParams,
+  _convertMessagesToOpenAIResponsesParams,
+} from '@/llm/openai/utils';
+import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { Constants, ContentTypes, Providers } from '@/common';
+import { serializeToolContent } from '@/utils/toolContent';
 import { formatAgentMessages } from './format';
 
 type AnthropicPayloadBlock = {
@@ -1551,7 +1568,7 @@ describe('formatAgentMessages', () => {
       configurable: true,
     });
 
-    formatAnthropicArtifactContent([
+    const originalMessages = [
       new AIMessageChunk({
         content: '',
         tool_calls: [
@@ -1564,12 +1581,575 @@ describe('formatAgentMessages', () => {
         ],
       }),
       toolMessage,
-    ]);
+    ];
+    const formattedMessages = projectAnthropicArtifactContent(originalMessages);
+    const formattedToolMessage = formattedMessages[1] as ToolMessage;
 
-    expect(toolMessage.content).toEqual([
+    expect(formattedToolMessage.content).toEqual([
       { type: ContentTypes.TEXT, text: '' },
       { type: ContentTypes.TEXT, text: 'artifact text' },
     ]);
+    expect(toolMessage.content).toBeUndefined();
+    expect(formattedMessages).not.toBe(originalMessages);
+  });
+
+  it('caps Anthropic artifact expansion after pruning', () => {
+    const toolMessage = new ToolMessage({
+      content: 'short result',
+      tool_call_id: 'call_artifact_capped',
+      artifact: {
+        content: 'artifact'.repeat(1_000),
+      },
+    });
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_artifact_capped',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+
+    const formatted = projectAnthropicArtifactContent(messages, 200);
+    const formattedTool = formatted[1] as ToolMessage;
+
+    expect(
+      serializeToolContent(formattedTool.content).length
+    ).toBeLessThanOrEqual(200);
+    expect(serializeToolContent(formattedTool.content)).toContain('truncated');
+    expect(toolMessage.content).toBe('short result');
+    expect(toolMessage.artifact.content).toContain('artifact');
+    expect(projectAnthropicArtifactContent(formatted, 200)).toBe(formatted);
+  });
+
+  it('caps the aggregate OpenAI/Google artifact payload', () => {
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_artifact_payload',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'short result',
+        tool_call_id: 'call_artifact_payload',
+        artifact: {
+          content: [
+            { type: ContentTypes.TEXT, text: 'artifact'.repeat(1_000) },
+          ],
+        },
+      }),
+    ];
+
+    const formatted = projectArtifactPayload(messages, 200);
+
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+    expect(payload).toBeInstanceOf(HumanMessage);
+    expect(serializeToolContent(payload.content).length).toBeLessThanOrEqual(
+      200
+    );
+    expect(messages).toHaveLength(2);
+    expect((messages[1] as ToolMessage).content).toBe('short result');
+    expect(projectArtifactPayload(formatted, 200)).toBe(formatted);
+  });
+
+  it('bounds artifact block arrays without spreading them into call arguments', () => {
+    const repeatedBlock = {
+      type: ContentTypes.TEXT,
+      text: 'x',
+    } as MessageContentComplex;
+    const artifactContent = new Array<MessageContentComplex>(150_000).fill(
+      repeatedBlock
+    );
+    const toolMessage = new ToolMessage({
+      content: 'short result',
+      tool_call_id: 'call_artifact_many_blocks',
+      artifact: { content: artifactContent },
+    });
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_artifact_many_blocks',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+
+    const formatted = projectArtifactPayload(messages, 200);
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+
+    expect(payload).toBeInstanceOf(HumanMessage);
+    expect(serializeToolContent(payload.content).length).toBeLessThanOrEqual(
+      200
+    );
+    expect(toolMessage.content).toBe('short result');
+    expect(toolMessage.artifact.content).toBe(artifactContent);
+  });
+
+  it('projects structured tool content to the bounded string both OpenAI APIs send', () => {
+    let toJSONCalls = 0;
+    const toolMessage = new ToolMessage({
+      id: 'tool-message-id',
+      name: 'render',
+      status: 'success',
+      tool_call_id: 'call_openai_structured',
+      content: [
+        { type: ContentTypes.TEXT, text: 'rendered chart' },
+        {
+          type: 'image_url',
+          image_url: {
+            url: `data:image/png;base64,${'A'.repeat(2_000)}`,
+          },
+          toJSON() {
+            toJSONCalls++;
+            return { expanded: 'B'.repeat(20_000) };
+          },
+        },
+      ],
+      artifact: { retained: true },
+    });
+
+    const original = [toolMessage];
+    const projected = projectOpenAIToolMessageContent(original, 200);
+    const projectedTool = projected[0] as ToolMessage;
+    const chatPayload = _convertMessagesToOpenAIParams(projected);
+    const responsesPayload = _convertMessagesToOpenAIResponsesParams(projected);
+
+    expect(projected).not.toBe(original);
+    expect(typeof projectedTool.content).toBe('string');
+    expect((projectedTool.content as string).length).toBeLessThanOrEqual(200);
+    expect(projectedTool.tool_call_id).toBe(toolMessage.tool_call_id);
+    expect(projectedTool.status).toBe(toolMessage.status);
+    expect(projectedTool.artifact).toBe(toolMessage.artifact);
+    expect(Array.isArray(toolMessage.content)).toBe(true);
+    expect(toJSONCalls).toBe(0);
+    expect(chatPayload[0]).toMatchObject({
+      role: 'tool',
+      content: projectedTool.content,
+      tool_call_id: toolMessage.tool_call_id,
+    });
+    expect(responsesPayload[0]).toMatchObject({
+      type: 'function_call_output',
+      output: projectedTool.content,
+      call_id: toolMessage.tool_call_id,
+    });
+  });
+
+  it('preserves Responses computer outputs handled as provider-native media', () => {
+    const computerCall = new AIMessage({
+      content: '',
+      response_metadata: {
+        output: [
+          {
+            type: 'computer_call',
+            id: 'computer-item',
+            call_id: 'call_computer',
+            action: { type: 'screenshot' },
+          },
+        ],
+      },
+    });
+    const computerOutput = new ToolMessage({
+      content: [
+        {
+          type: 'computer_screenshot',
+          image_url: 'data:image/png;base64,AA==',
+        },
+      ],
+      tool_call_id: 'call_computer',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const messages = [computerCall, computerOutput];
+    const projected = projectOpenAIToolMessageContent(messages, 10);
+    const responsesInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'computer-use-preview',
+    });
+
+    expect(projected).not.toBe(messages);
+    expect(
+      responsesInput.find((item) => item.type === 'computer_call_output')
+    ).toMatchObject({
+      type: 'computer_call_output',
+      call_id: 'call_computer',
+      output: {
+        type: 'computer_screenshot',
+        image_url: 'data:image/png;base64,AA==',
+      },
+    });
+  });
+
+  it('deduplicates parsed and raw Responses computer calls in ZDR mode', () => {
+    const response = {
+      id: 'resp_computer',
+      object: 'response',
+      created_at: 0,
+      model: 'computer-use-preview',
+      output: [
+        {
+          type: 'computer_call',
+          id: 'computer-item',
+          call_id: 'call_computer',
+          action: { type: 'screenshot' },
+          status: 'completed',
+        },
+      ],
+      status: 'completed',
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        total_tokens: 2,
+        input_tokens_details: { cached_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+      },
+      error: null,
+      incomplete_details: null,
+      metadata: {},
+      user: null,
+      service_tier: 'default',
+    } as unknown as Parameters<typeof convertResponsesMessageToAIMessage>[0];
+    const computerCall = convertResponsesMessageToAIMessage(response);
+    const computerOutput = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_computer',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    const projected = projectOpenAIResponsesToolMessageContent([
+      computerCall,
+      computerOutput,
+    ]);
+    const zdrInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: true,
+      model: 'computer-use-preview',
+    });
+    const retainedInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'computer-use-preview',
+    });
+
+    expect(computerCall.tool_calls).toHaveLength(1);
+    expect((projected[0] as AIMessage).tool_calls).toHaveLength(0);
+    for (const input of [zdrInput, retainedInput]) {
+      expect(
+        input.filter(
+          (item) =>
+            item.type === 'computer_call' && item.call_id === 'call_computer'
+        )
+      ).toHaveLength(1);
+      expect(
+        input.filter(
+          (item) =>
+            item.type === 'computer_call_output' &&
+            item.call_id === 'call_computer'
+        )
+      ).toHaveLength(1);
+    }
+  });
+
+  it('deduplicates streaming Responses computer calls before replay', () => {
+    const event = {
+      type: 'response.output_item.done',
+      sequence_number: 1,
+      output_index: 0,
+      item: {
+        type: 'computer_call',
+        id: 'computer-stream-item',
+        call_id: 'call_computer_stream',
+        action: { type: 'screenshot' },
+        status: 'completed',
+      },
+    } as unknown as Parameters<
+      typeof convertResponsesDeltaToChatGenerationChunk
+    >[0];
+    const generation = convertResponsesDeltaToChatGenerationChunk(event);
+    const computerCall = generation?.message;
+    expect(computerCall).toBeDefined();
+
+    const computerOutput = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_computer_stream',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const projected = projectOpenAIResponsesToolMessageContent([
+      computerCall!,
+      computerOutput,
+    ]);
+
+    expect((computerCall as AIMessage).tool_calls).toHaveLength(1);
+    expect((computerCall as AIMessageChunk).tool_call_chunks).toHaveLength(1);
+    expect((projected[0] as AIMessage).tool_calls).toHaveLength(0);
+    expect((projected[0] as AIMessageChunk).tool_call_chunks).toHaveLength(0);
+    expect(Object.getPrototypeOf(projected[0])).toBe(
+      Object.getPrototypeOf(computerCall)
+    );
+    expect(
+      new AIMessageChunk(projected[0] as AIMessageChunk).tool_calls
+    ).toHaveLength(0);
+    for (const zdrEnabled of [true, false]) {
+      const input = convertMessagesToResponsesInput({
+        messages: projected,
+        zdrEnabled,
+        model: 'computer-use-preview',
+      });
+      expect(
+        input.filter(
+          (item) =>
+            item.type === 'computer_call' &&
+            item.call_id === 'call_computer_stream'
+        )
+      ).toHaveLength(1);
+      expect(
+        input.filter(
+          (item) =>
+            (item.type === 'function_call' || item.type === 'computer_call') &&
+            item.call_id === 'call_computer_stream'
+        )
+      ).toHaveLength(1);
+    }
+
+    const chatProjected = projectComputerCallOutputsToText(
+      projectOpenAIToolMessageContent([computerCall!, computerOutput])
+    );
+    const chatInput = convertMessagesToCompletionsMessageParams({
+      messages: chatProjected,
+      model: 'gpt-4o',
+    });
+
+    expect((chatProjected[0] as AIMessage).tool_calls).toHaveLength(1);
+    expect(chatInput).toEqual([
+      expect.objectContaining({
+        role: 'assistant',
+        tool_calls: [
+          expect.objectContaining({
+            id: 'call_computer_stream',
+            type: 'function',
+          }),
+        ],
+      }),
+      expect.objectContaining({
+        role: 'tool',
+        tool_call_id: 'call_computer_stream',
+        content: '[Computer screenshot omitted for this provider]',
+      }),
+    ]);
+  });
+
+  it('canonicalizes real OpenAI file-backed computer screenshots on the production converter path', () => {
+    const computerCall = new AIMessage({
+      content: '',
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            type: 'computer_call',
+            call_id: 'call_computer_file',
+            action: { type: 'screenshot' },
+          },
+        ],
+      },
+    });
+    const computerOutput = new ToolMessage({
+      content: [
+        {
+          type: 'input_image',
+          file_id: 'file-abc123',
+          detail: 'low',
+        },
+      ],
+      tool_call_id: 'call_computer_file',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    const projected = projectOpenAIToolMessageContent(
+      [computerCall, computerOutput],
+      100
+    );
+    const responsesInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'computer-use-preview',
+    });
+
+    expect(responsesInput).toContainEqual({
+      type: 'computer_call_output',
+      call_id: 'call_computer_file',
+      output: {
+        type: 'input_image',
+        file_id: 'file-abc123',
+        detail: 'low',
+      },
+    });
+  });
+
+  it('rejects extra invalid screenshot fields instead of shipping the original block', () => {
+    const computerCall = new AIMessage({
+      content: '',
+      response_metadata: {
+        output: [
+          {
+            type: 'computer_call',
+            call_id: 'call_computer_extra',
+            action: { type: 'screenshot' },
+          },
+        ],
+      },
+    });
+    const malformed = new ToolMessage({
+      content: [
+        {
+          type: 'input_image',
+          image_url: 'data:image/png;base64,AA==',
+          file_id: 'not-a-file-id',
+        },
+      ],
+      tool_call_id: 'call_computer_extra',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(() =>
+      projectOpenAIToolMessageContent([computerCall, malformed], 100)
+    ).toThrow('Invalid computer call output screenshot');
+  });
+
+  it('rejects computer outputs that precede their call', () => {
+    const computerCall = new AIMessage({
+      content: '',
+      response_metadata: {
+        output: [
+          {
+            type: 'computer_call',
+            call_id: 'call_computer_order',
+            action: { type: 'screenshot' },
+          },
+        ],
+      },
+    });
+    const computerOutput = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_computer_order',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(() =>
+      projectOpenAIToolMessageContent([computerOutput, computerCall], 100)
+    ).toThrow('Invalid computer call output pairing');
+  });
+
+  it('rejects a malformed marked computer output before provider conversion', () => {
+    const malformed = new ToolMessage({
+      content: [{ type: 'text', text: 'A'.repeat(2_000) }],
+      tool_call_id: 'call_computer_malformed',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(() => projectOpenAIToolMessageContent([malformed], 100)).toThrow(
+      'Invalid computer call output screenshot'
+    );
+  });
+
+  it('rejects a marked screenshot paired with a normal function call', () => {
+    const functionCall = new AIMessage({
+      content: '',
+      tool_calls: [
+        {
+          id: 'call_function',
+          name: 'render',
+          args: {},
+          type: 'tool_call',
+        },
+      ],
+    });
+    const malformedPair = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_function',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(() =>
+      projectOpenAIToolMessageContent([functionCall, malformedPair], 100)
+    ).toThrow('Invalid computer call output pairing');
+  });
+
+  it('keeps the mutating artifact formatter API backward compatible', () => {
+    const anthropicToolMessage = new ToolMessage({
+      content: 'result',
+      tool_call_id: 'anthropic_legacy',
+      artifact: {
+        content: [{ type: ContentTypes.TEXT, text: 'anthropic artifact' }],
+      },
+    });
+    const anthropicMessages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'anthropic_legacy',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      anthropicToolMessage,
+    ];
+
+    expect(formatAnthropicArtifactContent(anthropicMessages)).toBeUndefined();
+    expect(anthropicToolMessage.content).toEqual([
+      { type: ContentTypes.TEXT, text: 'result' },
+      { type: ContentTypes.TEXT, text: 'anthropic artifact' },
+    ]);
+    expect(anthropicToolMessage.artifact.content).toHaveLength(1);
+
+    const payloadToolMessage = new ToolMessage({
+      content: 'result',
+      tool_call_id: 'payload_legacy',
+      artifact: {
+        content: [{ type: ContentTypes.TEXT, text: 'payload artifact' }],
+      },
+    });
+    const payloadMessages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'payload_legacy',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      payloadToolMessage,
+    ];
+
+    expect(formatArtifactPayload(payloadMessages)).toBeUndefined();
+    expect(payloadToolMessage.content).toContain(
+      'Tool response is included in the next message'
+    );
+    expect(payloadMessages[payloadMessages.length - 1]).toBeInstanceOf(
+      HumanMessage
+    );
+    expect(payloadToolMessage.artifact.content).toHaveLength(1);
   });
 
   it('should dynamically discover tools from tool_search output and keep their tool calls', () => {
@@ -2216,9 +2796,15 @@ describe('formatAgentMessages', () => {
       },
     ];
 
-    const result = formatAgentMessages(payload, undefined, undefined, undefined, {
-      preserveReasoningContent: true,
-    });
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      {
+        preserveReasoningContent: true,
+      }
+    );
 
     const toolCallMessage = result.messages[0] as AIMessage;
     expect(toolCallMessage.tool_calls).toHaveLength(1);
@@ -2254,15 +2840,19 @@ describe('formatAgentMessages', () => {
       },
     ];
 
-    const result = formatAgentMessages(payload, undefined, undefined, undefined, {
-      provider: Providers.DEEPSEEK,
-      preserveReasoningContent: false,
-    });
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      {
+        provider: Providers.DEEPSEEK,
+        preserveReasoningContent: false,
+      }
+    );
 
     const toolCallMessage = result.messages[0] as AIMessage;
-    expect(
-      toolCallMessage.additional_kwargs.reasoning_content
-    ).toBeUndefined();
+    expect(toolCallMessage.additional_kwargs.reasoning_content).toBeUndefined();
   });
 
   it('should preserve DeepSeek reasoning from supported hidden content blocks', () => {

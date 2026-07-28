@@ -1,7 +1,14 @@
-import { HumanMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  ChatMessage,
+  HumanMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 import {
   encodingForModel,
   createTokenCounter,
+  getTokenCountForMessage,
+  hasUnsafeStructuredSerialization,
   TokenEncoderManager,
   estimateImageBlockTokens,
   estimateDocumentBlockTokens,
@@ -82,15 +89,507 @@ describe('createTokenCounter with different encodings', () => {
   });
 });
 
+describe('getTokenCountForMessage', () => {
+  const messageWithToolArgs = (args: unknown): AIMessage =>
+    ({
+      content: '',
+      tool_calls: [{ id: 'adversarial-call', name: 'stress', args }],
+      getType: () => 'ai',
+    }) as unknown as AIMessage;
+
+  test('bounds direct message strings before tokenization and charges omitted characters', () => {
+    const callbackLengths: number[] = [];
+    const content = 'x'.repeat(300_000);
+
+    const count = getTokenCountForMessage(new HumanMessage(content), (text) => {
+      callbackLengths.push(text.length);
+      return text.length;
+    });
+
+    expect(Math.max(...callbackLengths)).toBe(200_000);
+    expect(count).toBe(600_003);
+  });
+
+  test('bounds direct string tool args before tokenization and charges omitted characters', () => {
+    const callbackLengths: number[] = [];
+    const args = 'x'.repeat(300_000);
+
+    const count = getTokenCountForMessage(messageWithToolArgs(args), (text) => {
+      callbackLengths.push(text.length);
+      return text.length;
+    });
+
+    expect(Math.max(...callbackLengths)).toBe(200_000);
+    expect(count).toBeGreaterThan(args.length);
+  });
+
+  test('counts legacy function_call arguments when parsed tool_calls are absent', () => {
+    const message = new AIMessage({
+      content: '',
+      additional_kwargs: {
+        function_call: {
+          name: 'legacy_lookup',
+          arguments: `{"query":"${'x'.repeat(5_000)}"}`,
+        },
+      },
+    });
+
+    const count = getTokenCountForMessage(message, (text) => text.length);
+
+    expect(message.tool_calls).toHaveLength(0);
+    expect(count).toBeGreaterThan(5_000);
+  });
+
+  test('keeps nested dense strings on the bounded structured path', () => {
+    const callbackLengths: number[] = [];
+    const payload = 'x'.repeat(4 * 1024 * 1024);
+
+    const count = getTokenCountForMessage(
+      messageWithToolArgs({ payload }),
+      (text) => {
+        callbackLengths.push(text.length);
+        return text.length;
+      }
+    );
+
+    expect(Math.max(...callbackLengths)).toBeLessThanOrEqual(200_000);
+    expect(count).toBeGreaterThan(payload.length);
+  });
+
+  test('fails closed when prototype traps throw', () => {
+    let prototypeCalls = 0;
+    const args = new Proxy(
+      { safe: true },
+      {
+        getPrototypeOf() {
+          prototypeCalls++;
+          throw new Error('prototype denied');
+        },
+      }
+    );
+
+    expect(hasUnsafeStructuredSerialization(args)).toBe(true);
+    expect(
+      getTokenCountForMessage(messageWithToolArgs(args), (text) => text.length)
+    ).toBe(Number.MAX_SAFE_INTEGER);
+    expect(prototypeCalls).toBeLessThanOrEqual(2);
+  });
+
+  test('fails closed without recursing through self-referential prototype proxies', () => {
+    let prototypeCalls = 0;
+    const args: Record<string, unknown> = new Proxy<Record<string, unknown>>(
+      {},
+      {
+        getPrototypeOf(): object | null {
+          prototypeCalls++;
+          return args;
+        },
+      }
+    );
+
+    expect(hasUnsafeStructuredSerialization(args)).toBe(true);
+    expect(
+      getTokenCountForMessage(messageWithToolArgs(args), (text) => text.length)
+    ).toBe(Number.MAX_SAFE_INTEGER);
+    expect(prototypeCalls).toBeLessThanOrEqual(2);
+  });
+
+  test('fails closed when descriptor and own-key proxy traps throw', () => {
+    const descriptorProxy = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error('descriptor denied');
+        },
+      }
+    );
+    const ownKeysProxy = new Proxy(
+      {},
+      {
+        ownKeys() {
+          throw new Error('keys denied');
+        },
+      }
+    );
+
+    for (const args of [descriptorProxy, ownKeysProxy]) {
+      expect(hasUnsafeStructuredSerialization(args)).toBe(true);
+      expect(
+        getTokenCountForMessage(
+          messageWithToolArgs(args),
+          (text) => text.length
+        )
+      ).toBe(Number.MAX_SAFE_INTEGER);
+    }
+  });
+
+  test('fails closed on get traps and revoked proxies without invoking them', () => {
+    let getCalls = 0;
+    const getProxy = new Proxy(
+      {},
+      {
+        get() {
+          getCalls++;
+          return { payload: 'x'.repeat(1_000_000) };
+        },
+      }
+    );
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    const inheritedProxy = Object.create(getProxy);
+
+    for (const args of [
+      getProxy,
+      { nested: getProxy },
+      inheritedProxy,
+      revoked.proxy,
+    ]) {
+      expect(hasUnsafeStructuredSerialization(args)).toBe(true);
+      expect(
+        getTokenCountForMessage(
+          messageWithToolArgs(args),
+          (text) => text.length
+        )
+      ).toBe(Number.MAX_SAFE_INTEGER);
+    }
+    expect(getCalls).toBe(0);
+  });
+
+  test('fails closed on proxied content blocks without invoking their traps', () => {
+    let getCalls = 0;
+    const contentBlock = new Proxy(
+      { type: 'text', text: 'safe' },
+      {
+        get() {
+          getCalls++;
+          throw new Error('content read denied');
+        },
+      }
+    );
+    const message = {
+      content: [contentBlock],
+      getType: () => 'tool',
+    } as unknown as ToolMessage;
+
+    expect(getTokenCountForMessage(message, (text) => text.length)).toBe(
+      Number.MAX_SAFE_INTEGER
+    );
+    expect(getCalls).toBe(0);
+  });
+
+  test('detects inherited accessors without invoking them', () => {
+    let accessorCalls = 0;
+    const prototype = {};
+    Object.defineProperty(prototype, 'danger', {
+      enumerable: true,
+      get() {
+        accessorCalls++;
+        return 'x'.repeat(1_000_000);
+      },
+    });
+    const args = Object.assign(Object.create(prototype), { safe: true });
+
+    expect(hasUnsafeStructuredSerialization(args)).toBe(true);
+    expect(
+      getTokenCountForMessage(messageWithToolArgs(args), (text) => text.length)
+    ).toBe(Number.MAX_SAFE_INTEGER);
+    expect(accessorCalls).toBe(0);
+  });
+
+  test('counts tool_calls-only names and arguments', () => {
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [
+        {
+          id: 'tool-call-only',
+          name: 'evaluate_script',
+          args: { code: 'x'.repeat(5_000) },
+        },
+      ],
+    });
+
+    const count = getTokenCountForMessage(message, (text) => text.length);
+
+    expect(count).toBeGreaterThan(5_000);
+  });
+
+  test('counts adversarial structured tool-call args without invoking toJSON', () => {
+    let toJSONCalls = 0;
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [
+        {
+          id: 'adversarial-tool-call',
+          name: 'evaluate_script',
+          args: {
+            query: 'safe',
+            toJSON() {
+              toJSONCalls++;
+              return { code: 'y'.repeat(2_000_000) };
+            },
+          },
+        },
+      ],
+    });
+
+    const count = getTokenCountForMessage(message, (text) => text.length);
+
+    expect(count).toBeGreaterThanOrEqual(Number.MAX_SAFE_INTEGER);
+    expect(toJSONCalls).toBe(0);
+  });
+
+  test('retains conservative pressure when structured args exceed the preview', () => {
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [
+        {
+          id: 'large-structured-tool-call',
+          name: 'evaluate_script',
+          args: { code: 'x'.repeat(300_000) },
+        },
+      ],
+    });
+
+    const count = getTokenCountForMessage(message, (text) => text.length);
+
+    expect(count).toBeGreaterThan(300_000);
+  });
+
+  test('counts opaque structured tool-result blocks as serialized content', () => {
+    const message = new ToolMessage({
+      content: [
+        {
+          type: 'json',
+          rows: Array.from({ length: 20 }, (_, index) => ({
+            id: index,
+            value: `row-${index}-${'x'.repeat(100)}`,
+          })),
+        },
+      ],
+      tool_call_id: 'select-query',
+    });
+
+    const count = getTokenCountForMessage(message, (text) => text.length);
+
+    expect(count).toBeGreaterThan(2_000);
+  });
+
+  test('counts spoofed media types as serialized structured output', () => {
+    const message = new ToolMessage({
+      content: [
+        {
+          type: 'image_url',
+          rows: [{ value: 'x'.repeat(5_000) }],
+        },
+      ],
+      tool_call_id: 'spoofed-image',
+    });
+
+    const count = getTokenCountForMessage(message, (text) => text.length);
+
+    expect(count).toBeGreaterThan(5_000);
+  });
+
+  test('prices Google image media blocks with the image estimator', () => {
+    const message = new ToolMessage({
+      content: [
+        {
+          type: 'media',
+          mimeType: 'image/png',
+          data: pngDataUri(1024, 768),
+        },
+      ],
+      tool_call_id: 'google-image-media',
+    });
+
+    const count = getTokenCountForMessage(
+      message,
+      (text) => text.length,
+      'o200k_base'
+    );
+
+    // 3 message tokens + ceil((85 + 4 * 170) * 1.05)
+    expect(count).toBe(807);
+  });
+
+  test('prices computer screenshots as images instead of base64 text', () => {
+    const screenshot = pngDataUri(1024, 768);
+    const structured = new ToolMessage({
+      content: [{ type: 'computer_screenshot', image_url: screenshot }],
+      tool_call_id: 'computer-structured',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const string = new ToolMessage({
+      content: screenshot,
+      tool_call_id: 'computer-string',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(
+      getTokenCountForMessage(structured, (text) => text.length, 'o200k_base')
+    ).toBe(807);
+    expect(
+      getTokenCountForMessage(string, (text) => text.length, 'o200k_base')
+    ).toBe(807);
+    const file = new ToolMessage({
+      content: [
+        { type: 'input_image', file_id: 'file-screenshot123', detail: 'low' },
+      ],
+      tool_call_id: 'computer-file',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    expect(
+      getTokenCountForMessage(file, (text) => text.length, 'o200k_base')
+    ).toBe(93);
+    const highDetailFile = new ToolMessage({
+      content: [
+        { type: 'input_image', file_id: 'file-screenshot456', detail: 'high' },
+      ],
+      tool_call_id: 'computer-file-high',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    expect(
+      getTokenCountForMessage(
+        highDetailFile,
+        (text) => text.length,
+        'o200k_base'
+      )
+    ).toBe(1079);
+  });
+
+  test('does not image-price malformed marked computer output', () => {
+    const content = 'not a screenshot URL';
+    const message = new ToolMessage({
+      content,
+      tool_call_id: 'computer-invalid',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(
+      getTokenCountForMessage(message, (text) => text.length, 'o200k_base')
+    ).toBe(3 + content.length);
+  });
+
+  test('counts legacy calls on generic assistant messages', () => {
+    const argumentsValue = `{"query":"${'x'.repeat(5_000)}"}`;
+    const message = new ChatMessage({
+      role: 'assistant',
+      content: '',
+      additional_kwargs: {
+        function_call: {
+          name: 'legacy_lookup',
+          arguments: argumentsValue,
+        },
+      },
+    });
+
+    expect(
+      getTokenCountForMessage(message, (text) => text.length, 'o200k_base')
+    ).toBeGreaterThan(argumentsValue.length);
+  });
+
+  test('prices Google PDF media blocks per estimated page', () => {
+    const message = new ToolMessage({
+      content: [
+        {
+          type: 'media',
+          mime_type: 'application/pdf',
+          data: 'A'.repeat(150_000),
+        },
+      ],
+      tool_call_id: 'google-pdf-media',
+    });
+
+    const count = getTokenCountForMessage(
+      message,
+      (text) => text.length,
+      'o200k_base'
+    );
+
+    // 3 message tokens + ceil((2 pages * 1500) * 1.05)
+    expect(count).toBe(3153);
+  });
+
+  test('continues pricing Google audio and video media as timed content', () => {
+    const audio = new ToolMessage({
+      content: [
+        {
+          type: 'media',
+          mime_type: '  Audio/MP3 ; codecs=mp3 ',
+          data: 'A'.repeat(320_000),
+        },
+      ],
+      tool_call_id: 'google-audio-media',
+    });
+    const video = new ToolMessage({
+      content: [
+        {
+          type: 'media',
+          mimeType: 'video/mp4',
+          data: 'A'.repeat(1_000_000),
+        },
+      ],
+      tool_call_id: 'google-video-media',
+    });
+
+    expect(
+      getTokenCountForMessage(audio, (text) => text.length, 'o200k_base')
+    ).toBe(507);
+    expect(
+      getTokenCountForMessage(video, (text) => text.length, 'o200k_base')
+    ).toBe(948);
+  });
+
+  test.each([
+    ['mimeType', 'text/plain'],
+    ['mime_type', 'application/json'],
+  ])(
+    'conservatively prices unknown Google media MIME via %s',
+    (mimeKey, mimeType) => {
+      let toJSONCalls = 0;
+      const data = 'A'.repeat(100_000);
+      const message = new ToolMessage({
+        content: [
+          {
+            type: 'media',
+            [mimeKey]: mimeType,
+            data,
+            toJSON() {
+              toJSONCalls++;
+              return { expanded: 'x'.repeat(1_000_000) };
+            },
+          },
+        ],
+        tool_call_id: 'google-unknown-media',
+      });
+
+      const count = getTokenCountForMessage(
+        message,
+        (text) => text.length,
+        'o200k_base'
+      );
+
+      expect(count).toBeGreaterThan(data.length);
+      expect(toJSONCalls).toBe(0);
+    }
+  );
+});
+
 describe('estimateImageBlockTokens', () => {
   test('claude: tokens = ceil(w*h/750), floored at 1024', () => {
-    const block = { type: 'image_url', image_url: { url: pngDataUri(1024, 768) } };
+    const block = {
+      type: 'image_url',
+      image_url: { url: pngDataUri(1024, 768) },
+    };
     // 1024*768/750 = 1048.58 -> ceil 1049 (> 1024 floor)
     expect(estimateImageBlockTokens(block, 'claude')).toBe(1049);
   });
 
   test('openai: tokens = 85 + tiles*170 (512px tiles)', () => {
-    const block = { type: 'image_url', image_url: { url: pngDataUri(1024, 768) } };
+    const block = {
+      type: 'image_url',
+      image_url: { url: pngDataUri(1024, 768) },
+    };
     // ceil(1024/512)*ceil(768/512) = 2*2 = 4 tiles -> 85 + 680 = 765
     expect(estimateImageBlockTokens(block, 'o200k_base')).toBe(765);
   });
@@ -110,7 +609,9 @@ describe('estimateDocumentBlockTokens', () => {
 
   test('text document is tokenized directly via getTokenCount', () => {
     const block = { type: 'file', source_type: 'text', text: 'hello world' };
-    expect(estimateDocumentBlockTokens(block, 'o200k_base', countChars)).toBe(11);
+    expect(estimateDocumentBlockTokens(block, 'o200k_base', countChars)).toBe(
+      11
+    );
   });
 
   test('base64 PDF is priced per estimated page', () => {
@@ -122,12 +623,16 @@ describe('estimateDocumentBlockTokens', () => {
     };
     // ceil(150000/75000) = 2 pages
     expect(estimateDocumentBlockTokens(block, 'claude', countChars)).toBe(4000); // 2 * 2000
-    expect(estimateDocumentBlockTokens(block, 'o200k_base', countChars)).toBe(3000); // 2 * 1500
+    expect(estimateDocumentBlockTokens(block, 'o200k_base', countChars)).toBe(
+      3000
+    ); // 2 * 1500
   });
 
   test('url-referenced document uses the conservative fallback', () => {
     const block = { type: 'file', source_type: 'url', url: 'https://x/y.pdf' };
-    expect(estimateDocumentBlockTokens(block, 'o200k_base', countChars)).toBe(2000);
+    expect(estimateDocumentBlockTokens(block, 'o200k_base', countChars)).toBe(
+      2000
+    );
   });
 });
 
@@ -137,49 +642,79 @@ describe('estimateTimedMediaBlockTokens', () => {
   test('Google video (type=media, video/*): duration from size at ~300 tok/s', () => {
     // 1,000,000 b64 -> 750,000 bytes / 250,000 Bps = 3s * 300 = 900
     expect(
-      estimateTimedMediaBlockTokens({ type: 'media', mimeType: 'video/mp4', data: B64(1_000_000) }),
+      estimateTimedMediaBlockTokens({
+        type: 'media',
+        mimeType: 'video/mp4',
+        data: B64(1_000_000),
+      })
     ).toBe(900);
   });
 
   test('Google audio (type=media, audio/*): 32 tok/s at ~16KB/s', () => {
     // 320,000 b64 -> 240,000 bytes / 16,000 Bps = 15s * 32 = 480
     expect(
-      estimateTimedMediaBlockTokens({ type: 'media', mimeType: 'audio/mp3', data: B64(320_000) }),
+      estimateTimedMediaBlockTokens({
+        type: 'media',
+        mimeType: 'audio/mp3',
+        data: B64(320_000),
+      })
     ).toBe(480);
   });
 
   test('OpenRouter input_audio: estimates from base64 data', () => {
     expect(
-      estimateTimedMediaBlockTokens({ type: 'input_audio', input_audio: { data: B64(320_000) } }),
+      estimateTimedMediaBlockTokens({
+        type: 'input_audio',
+        input_audio: { data: B64(320_000) },
+      })
     ).toBe(480);
   });
 
   test('OpenRouter video_url with a data: URL estimates from size', () => {
     const url = `data:video/mp4;base64,${B64(1_000_000)}`;
-    expect(estimateTimedMediaBlockTokens({ type: 'video_url', video_url: { url } })).toBe(900);
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'video_url', video_url: { url } })
+    ).toBe(900);
   });
 
   test('bare remote URL falls back to the flat ~30s estimate', () => {
     expect(
-      estimateTimedMediaBlockTokens({ type: 'video_url', video_url: { url: 'https://x/v.mp4' } }),
+      estimateTimedMediaBlockTokens({
+        type: 'video_url',
+        video_url: { url: 'https://x/v.mp4' },
+      })
     ).toBe(9000);
-    expect(estimateTimedMediaBlockTokens({ type: 'input_audio', input_audio: {} })).toBe(960);
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'input_audio', input_audio: {} })
+    ).toBe(960);
   });
 
   test('clamps to at least one second of tokens for tiny payloads', () => {
     expect(
-      estimateTimedMediaBlockTokens({ type: 'media', mimeType: 'audio/wav', data: 'AAAA' }),
+      estimateTimedMediaBlockTokens({
+        type: 'media',
+        mimeType: 'audio/wav',
+        data: 'AAAA',
+      })
     ).toBe(32);
   });
 
   test('standard type=video / type=audio blocks (Bedrock converter shape)', () => {
     // 750,000 bytes video / 250,000 = 3s * 300 = 900
     expect(
-      estimateTimedMediaBlockTokens({ type: 'video', mimeType: 'video/mp4', data: B64(1_000_000) }),
+      estimateTimedMediaBlockTokens({
+        type: 'video',
+        mimeType: 'video/mp4',
+        data: B64(1_000_000),
+      })
     ).toBe(900);
     // 240,000 bytes audio / 16,000 = 15s * 32 = 480
     expect(
-      estimateTimedMediaBlockTokens({ type: 'audio', mimeType: 'audio/mpeg', data: B64(320_000) }),
+      estimateTimedMediaBlockTokens({
+        type: 'audio',
+        mimeType: 'audio/mpeg',
+        data: B64(320_000),
+      })
     ).toBe(480);
   });
 
@@ -190,7 +725,7 @@ describe('estimateTimedMediaBlockTokens', () => {
         type: 'audio',
         mimeType: 'audio/wav',
         data: new Uint8Array(240_000),
-      }),
+      })
     ).toBe(480);
     // base64 data url on a bare video block
     expect(
@@ -198,37 +733,63 @@ describe('estimateTimedMediaBlockTokens', () => {
         type: 'video',
         mimeType: 'video/mp4',
         url: `data:video/mp4;base64,${B64(1_000_000)}`,
-      }),
+      })
     ).toBe(900);
   });
 
   test('non-video/audio media (image/document MIME) is NOT priced as video', () => {
     expect(
-      estimateTimedMediaBlockTokens({ type: 'media', mimeType: 'image/png', fileUri: 's3://x' }),
+      estimateTimedMediaBlockTokens({
+        type: 'media',
+        mimeType: 'image/png',
+        fileUri: 's3://x',
+      })
     ).toBe(0);
     expect(
-      estimateTimedMediaBlockTokens({ type: 'media', mimeType: 'image/png', data: B64(400_000) }),
+      estimateTimedMediaBlockTokens({
+        type: 'media',
+        mimeType: 'image/png',
+        data: B64(400_000),
+      })
     ).toBe(0);
     expect(
-      estimateTimedMediaBlockTokens({ type: 'media', mimeType: 'application/pdf', data: B64(400) }),
+      estimateTimedMediaBlockTokens({
+        type: 'media',
+        mimeType: 'application/pdf',
+        data: B64(400),
+      })
     ).toBe(0);
   });
 
   test('fileId / bare URL with no size falls back to the ~30s estimate', () => {
     expect(
-      estimateTimedMediaBlockTokens({ type: 'video', mimeType: 'video/mp4', fileId: 's3://v' }),
+      estimateTimedMediaBlockTokens({
+        type: 'video',
+        mimeType: 'video/mp4',
+        fileId: 's3://v',
+      })
     ).toBe(9000);
     expect(
-      estimateTimedMediaBlockTokens({ type: 'audio', mimeType: 'audio/mp3', fileId: 's3://a' }),
+      estimateTimedMediaBlockTokens({
+        type: 'audio',
+        mimeType: 'audio/mp3',
+        fileId: 's3://a',
+      })
     ).toBe(960);
   });
 
   test('reads native Bedrock nested source.bytes (video/audio)', () => {
     expect(
-      estimateTimedMediaBlockTokens({ type: 'video', video: { source: { bytes: new Uint8Array(750_000) } } }),
+      estimateTimedMediaBlockTokens({
+        type: 'video',
+        video: { source: { bytes: new Uint8Array(750_000) } },
+      })
     ).toBe(900); // 750,000 / 250,000 = 3s * 300
     expect(
-      estimateTimedMediaBlockTokens({ type: 'audio', audio: { source: { bytes: new Uint8Array(240_000) } } }),
+      estimateTimedMediaBlockTokens({
+        type: 'audio',
+        audio: { source: { bytes: new Uint8Array(240_000) } },
+      })
     ).toBe(480); // 240,000 / 16,000 = 15s * 32
   });
 
@@ -238,41 +799,57 @@ describe('estimateTimedMediaBlockTokens', () => {
       estimateTimedMediaBlockTokens({
         type: 'video',
         video: { url: `data:video/mp4;base64,${B64(1_000_000)}` },
-      }),
+      })
     ).toBe(900);
     // nested base64 data (240,000 -> 15s * 32)
     expect(
-      estimateTimedMediaBlockTokens({ type: 'audio', audio: { data: B64(320_000) } }),
+      estimateTimedMediaBlockTokens({
+        type: 'audio',
+        audio: { data: B64(320_000) },
+      })
     ).toBe(480);
     // nested REMOTE url has no size -> ~30s fallback
     expect(
-      estimateTimedMediaBlockTokens({ type: 'video', video: { url: 'https://x/v.mp4' } }),
+      estimateTimedMediaBlockTokens({
+        type: 'video',
+        video: { url: 'https://x/v.mp4' },
+      })
     ).toBe(9000);
   });
 
   test('non-data URI schemes (gs://, s3://) are treated as remote, not base64', () => {
     // gs:// audio must hit the ~30s remote fallback, not clamp to 32
     expect(
-      estimateTimedMediaBlockTokens({ type: 'audio', mimeType: 'audio/mp3', url: 'gs://bucket/a.mp3' }),
+      estimateTimedMediaBlockTokens({
+        type: 'audio',
+        mimeType: 'audio/mp3',
+        url: 'gs://bucket/a.mp3',
+      })
     ).toBe(960);
     expect(
-      estimateTimedMediaBlockTokens({ type: 'media', mimeType: 'video/mp4', data: 's3://bucket/v.mp4' }),
+      estimateTimedMediaBlockTokens({
+        type: 'media',
+        mimeType: 'video/mp4',
+        data: 's3://bucket/v.mp4',
+      })
     ).toBe(9000);
   });
 
   test('classifies Google MIME-as-type blocks (type is the mime string)', () => {
     // { type: 'audio/wav', data } -> 240,000 bytes / 16,000 = 15s * 32 = 480
     expect(
-      estimateTimedMediaBlockTokens({ type: 'audio/wav', data: B64(320_000) }),
+      estimateTimedMediaBlockTokens({ type: 'audio/wav', data: B64(320_000) })
     ).toBe(480);
     // { type: 'video/mp4', data } -> 750,000 / 250,000 = 3s * 300 = 900
     expect(
-      estimateTimedMediaBlockTokens({ type: 'video/mp4', data: B64(1_000_000) }),
+      estimateTimedMediaBlockTokens({ type: 'video/mp4', data: B64(1_000_000) })
     ).toBe(900);
   });
 
   test('returns 0 for non-timed-media blocks', () => {
     expect(estimateTimedMediaBlockTokens({ type: 'text' })).toBe(0);
-    expect(estimateTimedMediaBlockTokens({ type: 'image/png', data: B64(400) })).toBe(0);
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'image/png', data: B64(400) })
+    ).toBe(0);
   });
 });

@@ -2,9 +2,14 @@
 import { nanoid } from 'nanoid';
 import { tool } from '@langchain/core/tools';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
+import { ContextOverflowError } from '@langchain/core/errors';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
-import { ToolMessage, AIMessageChunk } from '@langchain/core/messages';
 import { START, END, StateGraph, Annotation } from '@langchain/langgraph';
+import {
+  ToolMessage,
+  HumanMessage,
+  AIMessageChunk,
+} from '@langchain/core/messages';
 import type {
   UsageMetadata,
   BaseMessage,
@@ -16,23 +21,27 @@ import type { FallbackErrorContext } from '@/llm/invoke';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import {
-  formatAnthropicArtifactContent,
+  projectAnthropicArtifactContent,
   ensureThinkingBlockInMessages,
   foldToolBlocksForToollessAgent,
   convertMessagesToContent,
   sanitizeOrphanToolBlocks,
   extractToolDiscoveries,
   addBedrockTailCacheControl,
-  formatArtifactPayload,
+  projectArtifactPayload,
   formatContentStrings,
-  isLegacyConvertible,
   CALIBRATION_RATIO_MAX,
+  REPLY_PRIMER_TOKENS,
   createPruneMessages,
+  projectToolCallInputs,
+  calculateMaxToolCallInputChars,
+  projectToolStreamContentForProvider,
   syncBudgetDerivedFields,
   addTailCacheControl,
   resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
   supportsBedrockToolCache,
+  isSyntheticProviderContextMessage,
   getMessageId,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
@@ -40,31 +49,38 @@ import {
   splitAtRecencyBoundary,
 } from '@/messages';
 import {
+  resetIfNotEmpty,
+  isAnthropicLike,
+  isOpenAILike,
+  isGoogleLike,
+  apportionTokenCounts,
+  calculateMaxToolResultChars,
+  joinKeys,
+  sleep,
+} from '@/utils';
+import {
+  attemptInvoke,
+  tryFallbackProviders,
+  getFallbackErrorContext,
+  getFallbackOverflowCandidates,
+  projectMessagesForProvider,
+} from '@/llm/invoke';
+import {
   createLangfuseHandler,
   createLangfuseTraceMetadata,
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
 import {
-  resetIfNotEmpty,
-  isAnthropicLike,
-  isOpenAILike,
-  isGoogleLike,
-  apportionTokenCounts,
-  joinKeys,
-  sleep,
-} from '@/utils';
-import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
   translateRecoveryBudget,
 } from '@/llm/contextOverflowRecovery';
 import {
-  attemptInvoke,
-  tryFallbackProviders,
-  getFallbackErrorContext,
-  getFallbackOverflowCandidates,
-} from '@/llm/invoke';
+  compactToolContent,
+  getToolContentCharLength,
+  serializeToolContentBounded,
+} from '@/utils/toolContent';
 import {
   Constants,
   GraphNodeKeys,
@@ -73,6 +89,10 @@ import {
   Providers,
   StepTypes,
 } from '@/common';
+import {
+  annotateMessagesForLLM,
+  ToolOutputReferenceRegistry,
+} from '@/tools/toolOutputReferences';
 import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
@@ -87,7 +107,6 @@ import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
-import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
@@ -122,26 +141,6 @@ function createToolHandlerRegistry(
   const registry = new HandlerRegistry();
   registry.register(GraphEvents.ON_TOOL_EXECUTE, toolHandler);
   return registry;
-}
-
-/**
- * Start index of the span post-prune formatters can mutate in place: the
- * trailing tool batch plus its owning AI message (artifact formatting touches
- * every tool result after the last AI tool call; Bedrock rewrites the AI
- * message before a trailing tool result). Capped so the usage-snapshot
- * recount stays constant-cost.
- */
-function trailingMutationStart(messages: BaseMessage[]): number {
-  const MAX_SPAN = 16;
-  let index = messages.length - 1;
-  while (
-    index >= 0 &&
-    messages[index]?.getType() === 'tool' &&
-    messages.length - index < MAX_SPAN
-  ) {
-    index--;
-  }
-  return Math.max(0, Math.min(index, messages.length - 2));
 }
 
 type ReasoningKey = 'reasoning_content' | 'reasoning';
@@ -1747,6 +1746,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           provider: agentContext.provider,
           tokenCounter: agentContext.tokenCounter,
           maxTokens: agentContext.maxContextTokens,
+          maxToolResultChars: agentContext.maxToolResultChars,
           thinkingEnabled: isThinkingEnabled(
             agentContext.provider,
             agentContext.clientOptions
@@ -1923,36 +1923,135 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       let finalMessages = messagesToUse;
-      /** Tail snapshot for the dispatch-time usage delta: in-place
-       *  formatters (artifact appends, Bedrock content rewrites, legacy
-       *  string conversion) mutate without changing length or identity —
-       *  capture before they run. Legacy string conversion can also touch
-       *  messages before the tail, so those convertible indices are
-       *  tracked separately (none exist in the common case). */
-      const tailStart = trailingMutationStart(messagesToUse);
-      let preFormatTailTokens: number | null = null;
-      let legacyIndices: number[] | null = null;
-      let preFormatLegacyTokens = 0;
+      /**
+       * Keep the pruner's provider-grounded aggregate as the authoritative
+       * baseline, then attribute it across retained messages. Provider
+       * transforms can shrink one message while expanding or adding another;
+       * per-origin accounting prevents that unrelated shrink from canceling
+       * the expansion. Raw counts are frozen before in-place formatters run.
+       */
+      let providerMessageBaseline:
+        | Array<{ rawTokens: number; accountingWeight: number }>
+        | undefined;
+      const providerMessageOrigins = new WeakMap<BaseMessage, number>();
       if (contextUsage != null && agentContext.tokenCounter != null) {
-        preFormatTailTokens = 0;
-        for (const message of messagesToUse.slice(tailStart)) {
-          preFormatTailTokens += agentContext.tokenCounter(message);
+        const sourceIndices = new WeakMap<BaseMessage, number>();
+        for (let i = 0; i < messages.length; i++) {
+          sourceIndices.set(messages[i], i);
         }
-        if (agentContext.useLegacyContent) {
-          legacyIndices = [];
-          for (let i = 0; i < tailStart; i++) {
-            if (isLegacyConvertible(messagesToUse[i])) {
-              legacyIndices.push(i);
-              preFormatLegacyTokens += agentContext.tokenCounter(
-                messagesToUse[i]
-              );
+        providerMessageBaseline = messagesToUse.map((message, index) => {
+          const rawTokens = agentContext.tokenCounter!(message);
+          const sourceIndex = sourceIndices.get(message);
+          const indexedTokens =
+            sourceIndex != null
+              ? agentContext.indexTokenCountMap[sourceIndex]
+              : undefined;
+          const accountingWeight =
+            indexedTokens != null &&
+            Number.isFinite(indexedTokens) &&
+            indexedTokens >= 0
+              ? indexedTokens
+              : rawTokens;
+          if (!providerMessageOrigins.has(message)) {
+            providerMessageOrigins.set(message, index);
+          }
+          return { rawTokens, accountingWeight };
+        });
+      }
+
+      const getProviderMessageOriginKey = (
+        message: BaseMessage
+      ): string | undefined => {
+        const type = message.getType();
+        if (
+          message instanceof ToolMessage &&
+          typeof message.tool_call_id === 'string' &&
+          message.tool_call_id.length > 0
+        ) {
+          return `tool:call:${message.tool_call_id}`;
+        }
+        if (typeof message.id === 'string' && message.id.length > 0) {
+          return `${type}:id:${message.id}`;
+        }
+        return undefined;
+      };
+
+      /**
+       * Provider projections clone messages. Preserve their baseline origin
+       * without writing tracking metadata onto the wire. Synthetic fold
+       * messages intentionally remain unattributed and are charged in full.
+       */
+      const trackProviderMessageOrigins = (
+        before: BaseMessage[],
+        after: BaseMessage[]
+      ): BaseMessage[] => {
+        if (providerMessageBaseline == null || before === after) {
+          return after;
+        }
+        if (before.length === after.length) {
+          for (let i = 0; i < after.length; i++) {
+            const origin = providerMessageOrigins.get(before[i]);
+            if (
+              origin != null &&
+              !providerMessageOrigins.has(after[i]) &&
+              before[i].getType() === after[i].getType() &&
+              !isSyntheticProviderContextMessage(after[i])
+            ) {
+              providerMessageOrigins.set(after[i], origin);
             }
           }
+          return after;
         }
-      }
+
+        const keyedOrigins = new Map<string, number | null>();
+        for (const message of before) {
+          const origin = providerMessageOrigins.get(message);
+          const key = getProviderMessageOriginKey(message);
+          if (origin == null || key == null) {
+            continue;
+          }
+          keyedOrigins.set(key, keyedOrigins.has(key) ? null : origin);
+        }
+        for (const message of after) {
+          if (
+            providerMessageOrigins.has(message) ||
+            isSyntheticProviderContextMessage(message)
+          ) {
+            continue;
+          }
+          const key = getProviderMessageOriginKey(message);
+          const origin = key != null ? keyedOrigins.get(key) : undefined;
+          if (origin != null) {
+            providerMessageOrigins.set(message, origin);
+          }
+        }
+        return after;
+      };
+
       if (agentContext.useLegacyContent) {
-        finalMessages = formatContentStrings(finalMessages);
+        const before = finalMessages;
+        finalMessages = trackProviderMessageOrigins(
+          before,
+          formatContentStrings(before)
+        );
       }
+
+      const maxProviderToolResultChars =
+        agentContext.maxToolResultChars ??
+        calculateMaxToolResultChars(agentContext.maxContextTokens);
+      const beforeToolStreamProjection = finalMessages;
+      finalMessages = trackProviderMessageOrigins(
+        beforeToolStreamProjection,
+        projectToolStreamContentForProvider(beforeToolStreamProjection)
+      );
+      const beforeToolInputProjection = finalMessages;
+      finalMessages = trackProviderMessageOrigins(
+        beforeToolInputProjection,
+        projectToolCallInputs(
+          beforeToolInputProjection,
+          calculateMaxToolCallInputChars(agentContext.maxContextTokens)
+        )
+      );
 
       const lastMessageX =
         finalMessages.length >= 2
@@ -1979,58 +2078,368 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           trimmed.length > 0 ? [{ type: 'text' as const, text: trimmed }] : '';
       }
 
+      const localProviderOverflowMeasurements = new WeakMap<
+        object,
+        {
+          contextBudget: number;
+          estimatedPromptTokens: number;
+        }
+      >();
+      const measureProviderPayload = (
+        candidate: BaseMessage[],
+        contextBudgetOverride?: number,
+        forceRawRecount = false
+      ): {
+        fits: boolean;
+        projectedMessageTokens?: number;
+        availableMessageTokens?: number;
+        contextBudget?: number;
+        effectiveInstructionTokens?: number;
+      } => {
+        const contextBudget =
+          contextBudgetOverride ?? contextUsage?.contextBudget;
+        const effectiveInstructionTokens =
+          contextUsage?.effectiveInstructionTokens ??
+          (forceRawRecount ? agentContext.instructionTokens : undefined);
+        if (
+          agentContext.tokenCounter == null ||
+          contextBudget == null ||
+          effectiveInstructionTokens == null
+        ) {
+          return { fits: true };
+        }
+        const availableMessageTokens = Math.max(
+          0,
+          contextBudget - effectiveInstructionTokens
+        );
+        let usageRatio =
+          agentContext.calibrationRatio > 0 ? agentContext.calibrationRatio : 1;
+        if (
+          contextUsage?.calibrationRatio != null &&
+          contextUsage.calibrationRatio > 0
+        ) {
+          usageRatio = contextUsage.calibrationRatio;
+        }
+        if (forceRawRecount) {
+          usageRatio = Math.max(1, usageRatio);
+        }
+        const baselineRemaining = contextUsage?.remainingContextTokens;
+        const accountedMessageTokens =
+          !forceRawRecount &&
+          providerMessageBaseline != null &&
+          baselineRemaining != null &&
+          Number.isFinite(baselineRemaining)
+            ? availableMessageTokens -
+              Math.min(availableMessageTokens, Math.max(0, baselineRemaining))
+            : undefined;
+
+        let projectedMessageTokens: number;
+        if (accountedMessageTokens != null && providerMessageBaseline != null) {
+          const replyPrimerTokens = Math.round(
+            REPLY_PRIMER_TOKENS * usageRatio
+          );
+          const rawWeights: Record<string, number> = {};
+          let totalWeight = 0;
+          for (let i = 0; i < providerMessageBaseline.length; i++) {
+            const weight = providerMessageBaseline[i].accountingWeight;
+            rawWeights[i] = weight;
+            totalWeight += weight;
+          }
+          const attributableTokens =
+            totalWeight > 0
+              ? Math.min(
+                Math.max(0, accountedMessageTokens - replyPrimerTokens),
+                Math.round(totalWeight * usageRatio)
+              )
+              : 0;
+          const apportionedTokens =
+            totalWeight > 0
+              ? apportionTokenCounts(
+                rawWeights,
+                attributableTokens / totalWeight,
+                attributableTokens
+              )
+              : {};
+          const attributedByOrigin = providerMessageBaseline.map(
+            (_, origin) => apportionedTokens[origin] || 0
+          );
+          projectedMessageTokens = Math.max(
+            replyPrimerTokens,
+            accountedMessageTokens - attributableTokens
+          );
+          let newRawTokens = 0;
+          const usedOrigins = new Set<number>();
+          for (const message of candidate) {
+            const rawTokens = agentContext.tokenCounter(message);
+            const origin = providerMessageOrigins.get(message);
+            if (origin == null || usedOrigins.has(origin)) {
+              newRawTokens += rawTokens;
+              continue;
+            }
+            usedOrigins.add(origin);
+            projectedMessageTokens += Math.max(
+              0,
+              attributedByOrigin[origin] +
+                Math.round(
+                  (rawTokens - providerMessageBaseline[origin].rawTokens) *
+                    usageRatio
+                )
+            );
+          }
+          projectedMessageTokens += Math.round(newRawTokens * usageRatio);
+        } else {
+          let rawTokens = REPLY_PRIMER_TOKENS;
+          for (const message of candidate) {
+            rawTokens += agentContext.tokenCounter(message);
+          }
+          projectedMessageTokens = Math.round(rawTokens * usageRatio);
+        }
+        return {
+          fits: projectedMessageTokens <= availableMessageTokens,
+          projectedMessageTokens,
+          availableMessageTokens,
+          contextBudget,
+          effectiveInstructionTokens,
+        };
+      };
+
+      const createProviderPayloadOverflowError = ({
+        projection,
+        provider,
+        info,
+      }: {
+        projection: ReturnType<typeof measureProviderPayload>;
+        provider?: Providers;
+        info: string;
+      }): ContextOverflowError => {
+        const error = new ContextOverflowError(
+          JSON.stringify({
+            type: 'final_context_overflow',
+            info,
+            provider,
+            projectedMessageTokens: projection.projectedMessageTokens,
+            availableMessageTokens: projection.availableMessageTokens,
+          })
+        );
+        if (
+          projection.projectedMessageTokens != null &&
+          projection.contextBudget != null &&
+          projection.effectiveInstructionTokens != null
+        ) {
+          localProviderOverflowMeasurements.set(error, {
+            contextBudget: projection.contextBudget,
+            estimatedPromptTokens:
+              projection.projectedMessageTokens +
+              projection.effectiveInstructionTokens,
+          });
+        }
+        return error;
+      };
+
+      const applyProviderMessageTransforms = (
+        candidate: BaseMessage[]
+      ): BaseMessage[] => {
+        let transformed = candidate;
+        if (
+          isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
+        ) {
+          /**
+           * Current-run AI messages may validly omit a thinking block. The
+           * boundary prevents them from being mistaken for foreign history.
+           */
+          const before = transformed;
+          transformed = trackProviderMessageOrigins(
+            before,
+            ensureThinkingBlockInMessages(
+              before,
+              agentContext.provider,
+              config,
+              this.startIndex
+            )
+          );
+        }
+
+        /**
+         * Tool-less destinations cannot send inherited tool blocks without a
+         * tool schema, so fold those interactions into provider-valid content.
+         */
+        if (toolsForBinding == null || toolsForBinding.length === 0) {
+          const before = transformed;
+          transformed = trackProviderMessageOrigins(
+            before,
+            foldToolBlocksForToollessAgent(before, config)
+          );
+          if (agentContext.useLegacyContent) {
+            const beforeLegacyFormat = transformed;
+            transformed = trackProviderMessageOrigins(
+              beforeLegacyFormat,
+              formatContentStrings(beforeLegacyFormat)
+            );
+          }
+        }
+        return transformed;
+      };
+
+      const toolOutputRegistry = this.getOrCreateToolOutputRegistry();
+      const providerRunId = config.configurable?.run_id as string | undefined;
+      const projectProviderReferences = (
+        candidate: BaseMessage[]
+      ): BaseMessage[] =>
+        trackProviderMessageOrigins(
+          candidate,
+          annotateMessagesForLLM(candidate, toolOutputRegistry, providerRunId)
+        );
+
+      const compactSyntheticProviderContext = (
+        candidate: BaseMessage[]
+      ): BaseMessage[] => {
+        const synthetic: Array<{
+          index: number;
+          message: HumanMessage;
+          chars: number;
+        }> = [];
+        for (let i = 0; i < candidate.length; i++) {
+          const message = candidate[i];
+          if (
+            !(message instanceof HumanMessage) ||
+            !isSyntheticProviderContextMessage(message)
+          ) {
+            continue;
+          }
+          const content = message.content;
+          synthetic.push({
+            index: i,
+            message,
+            chars: getToolContentCharLength(content),
+          });
+        }
+        if (synthetic.length === 0) {
+          return candidate;
+        }
+
+        const buildCandidate = (scale: number): BaseMessage[] => {
+          const compacted = [...candidate];
+          for (const { index, message, chars } of synthetic) {
+            const content = compactToolContent(
+              message.content,
+              Math.floor(chars * scale)
+            ).content;
+            compacted[index] = new HumanMessage({
+              content,
+              id: message.id,
+              name: message.name,
+              additional_kwargs: message.additional_kwargs,
+              response_metadata: message.response_metadata,
+            });
+          }
+          return compacted;
+        };
+
+        let best = buildCandidate(0);
+        if (!measureProviderPayload(best).fits) {
+          return candidate;
+        }
+        let low = 0;
+        let high = 1;
+        for (let i = 0; i < 12; i++) {
+          const scale = (low + high) / 2;
+          const attempt = buildCandidate(scale);
+          if (measureProviderPayload(attempt).fits) {
+            best = attempt;
+            low = scale;
+          } else {
+            high = scale;
+          }
+        }
+        return best;
+      };
+
+      let artifactBaseMessages: BaseMessage[] | undefined;
       if (lastMessageY instanceof ToolMessage) {
+        let artifactCandidate = finalMessages;
         if (anthropicLike) {
-          formatAnthropicArtifactContent(finalMessages);
+          artifactCandidate = trackProviderMessageOrigins(
+            finalMessages,
+            projectAnthropicArtifactContent(
+              finalMessages,
+              maxProviderToolResultChars
+            )
+          );
         } else if (
           (isOpenAILike(agentContext.provider) &&
             agentContext.provider !== Providers.DEEPSEEK) ||
           isGoogleLike(agentContext.provider)
         ) {
-          formatArtifactPayload(finalMessages);
+          artifactCandidate = trackProviderMessageOrigins(
+            finalMessages,
+            projectArtifactPayload(finalMessages, maxProviderToolResultChars)
+          );
+        }
+
+        if (artifactCandidate !== finalMessages) {
+          const projection = measureProviderPayload(artifactCandidate);
+          if (projection.fits) {
+            artifactBaseMessages = finalMessages;
+            finalMessages = artifactCandidate;
+          } else {
+            emitAgentLog(
+              config,
+              'warn',
+              'graph',
+              'Artifact payload omitted because it exceeds the remaining context budget',
+              {
+                projectedMessageTokens: projection.projectedMessageTokens,
+                availableMessageTokens: projection.availableMessageTokens,
+              },
+              { runId: this.runId, agentId }
+            );
+          }
         }
       }
 
-      if (
-        isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
-      ) {
-        /**
-         * Pass `this.startIndex` so the function can distinguish CURRENT-run
-         * AI messages (the agent's own iterations — possibly without a
-         * leading thinking block, which Claude is allowed to skip) from
-         * historical context that genuinely needs the
-         * `[Previous agent context]` placeholder. Without this signal the
-         * function would convert the agent's own in-run tool_use messages,
-         * polluting the next iteration's prompt with a placeholder the
-         * model treats as suspicious injected content.
-         */
-        finalMessages = ensureThinkingBlockInMessages(
-          finalMessages,
-          agentContext.provider,
-          config,
-          this.startIndex
-        );
-      }
-
-      /**
-       * A destination that binds no tools is invoked without a tool schema, but
-       * in a multi-agent graph it can still inherit a prior agent's toolUse/
-       * toolResult history. Bedrock's Converse API (and other tool-schema-strict
-       * providers) reject such a request when no top-level toolConfig is sent.
-       * Fold that historical tool content into plain text so the tool-less agent
-       * receives valid, context-preserving messages. Handoff tools count as
-       * bound tools, so a tool-less router mid-handoff is not affected.
-       */
-      if (toolsForBinding == null || toolsForBinding.length === 0) {
-        finalMessages = foldToolBlocksForToollessAgent(finalMessages, config);
-        // The fold emits structured (array) content; re-flatten for agents that
-        // opted into string-only messages (`useLegacyContent`, run earlier at
-        // the top of this block) so the folded turn isn't the lone exception.
-        if (agentContext.useLegacyContent) {
-          finalMessages = formatContentStrings(finalMessages);
+      finalMessages = projectProviderReferences(
+        applyProviderMessageTransforms(finalMessages)
+      );
+      let finalProjection = measureProviderPayload(finalMessages);
+      if (artifactBaseMessages != null) {
+        if (!finalProjection.fits) {
+          finalMessages = projectProviderReferences(
+            applyProviderMessageTransforms(artifactBaseMessages)
+          );
+          finalProjection = measureProviderPayload(finalMessages);
+          emitAgentLog(
+            config,
+            'warn',
+            'graph',
+            'Artifact payload omitted after final provider formatting exceeded the remaining context budget',
+            {
+              projectedMessageTokens: finalProjection.projectedMessageTokens,
+              availableMessageTokens: finalProjection.availableMessageTokens,
+            },
+            { runId: this.runId, agentId }
+          );
         }
       }
-
+      if (!finalProjection.fits) {
+        const compacted = compactSyntheticProviderContext(finalMessages);
+        if (compacted !== finalMessages) {
+          finalMessages = compacted;
+          finalProjection = measureProviderPayload(finalMessages);
+          emitAgentLog(
+            config,
+            finalProjection.fits ? 'warn' : 'error',
+            'graph',
+            finalProjection.fits
+              ? 'Synthetic provider context compacted to fit the final payload budget'
+              : 'Final provider payload still exceeds budget after synthetic context compaction',
+            {
+              projectedMessageTokens: finalProjection.projectedMessageTokens,
+              availableMessageTokens: finalProjection.availableMessageTokens,
+            },
+            { runId: this.runId, agentId }
+          );
+        }
+      }
       // Determine the prompt-cache strategy up front. Two distinct facts:
       //
       //   `providerPromptCacheEnabled` — prompt caching is on for this provider
@@ -2083,7 +2492,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           providerPromptCacheEnabled);
       if (needsOrphanSanitize) {
         const beforeSanitize = finalMessages.length;
-        finalMessages = sanitizeOrphanToolBlocks(finalMessages);
+        const beforeSanitizeMessages = finalMessages;
+        finalMessages = trackProviderMessageOrigins(
+          beforeSanitizeMessages,
+          sanitizeOrphanToolBlocks(beforeSanitizeMessages, (source, clone) => {
+            const origin = providerMessageOrigins.get(source);
+            if (origin != null) {
+              providerMessageOrigins.set(clone, origin);
+            }
+          })
+        );
         if (finalMessages.length !== beforeSanitize) {
           emitAgentLog(
             config,
@@ -2113,20 +2531,24 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         (anthropicPromptCacheEnabled || openRouterPromptCacheEnabled) &&
         !agentContext.systemRunnable
       ) {
-        finalMessages = addTailCacheControl<BaseMessage>(
-          finalMessages,
-          resolvePromptCacheTtl(
-            anthropicPromptCacheEnabled
-              ? (
-                  agentContext.clientOptions as
-                    | t.AnthropicClientOptions
-                    | undefined
-              )?.promptCacheTtl
-              : (
-                  agentContext.clientOptions as
-                    | t.ProviderOptionsMap[Providers.OPENROUTER]
-                    | undefined
-              )?.promptCacheTtl
+        const beforeCacheControl = finalMessages;
+        finalMessages = trackProviderMessageOrigins(
+          beforeCacheControl,
+          addTailCacheControl<BaseMessage>(
+            beforeCacheControl,
+            resolvePromptCacheTtl(
+              anthropicPromptCacheEnabled
+                ? (
+                    agentContext.clientOptions as
+                      | t.AnthropicClientOptions
+                      | undefined
+                )?.promptCacheTtl
+                : (
+                    agentContext.clientOptions as
+                      | t.ProviderOptionsMap[Providers.OPENROUTER]
+                      | undefined
+                )?.promptCacheTtl
+            )
           )
         );
       } else if (bedrockPromptCacheEnabled) {
@@ -2135,14 +2557,45 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           | undefined;
         // Non-Claude models (Nova) reject the extended 1h TTL, so resolve it
         // against the model — message/system caching stays on, clamped to 5m.
-        finalMessages = addBedrockTailCacheControl<BaseMessage>(
-          finalMessages,
-          resolveBedrockPromptCacheTtl(
-            bedrockOptions?.promptCacheTtl,
-            (bedrockOptions as { model?: string } | undefined)?.model
+        const beforeCacheControl = finalMessages;
+        finalMessages = trackProviderMessageOrigins(
+          beforeCacheControl,
+          addBedrockTailCacheControl<BaseMessage>(
+            beforeCacheControl,
+            resolveBedrockPromptCacheTtl(
+              bedrockOptions?.promptCacheTtl,
+              (bedrockOptions as { model?: string } | undefined)?.model
+            )
           )
         );
       }
+
+      const fallbackBaseMessages = finalMessages;
+      const beforeFinalProviderProjection = fallbackBaseMessages;
+      finalMessages = trackProviderMessageOrigins(
+        beforeFinalProviderProjection,
+        projectMessagesForProvider({
+          model: (this.overrideModel ?? model) as t.ChatModel,
+          messages: beforeFinalProviderProjection,
+          provider: agentContext.provider,
+          maxToolResultChars: maxProviderToolResultChars,
+          callOptions: config,
+        })
+      );
+
+      /**
+       * Prompt-cache placement and orphan sanitization are provider-wire
+       * transforms too. Re-measure after both so no content added after the
+       * earlier artifact/synthetic compaction decision can bypass the guard.
+       */
+      finalProjection = measureProviderPayload(finalMessages);
+      const preInvokeContextOverflowError = !finalProjection.fits
+        ? createProviderPayloadOverflowError({
+          projection: finalProjection,
+          provider: agentContext.provider,
+          info: 'Provider message formatting exceeded the context budget and no safe synthetic-context compaction could make it fit.',
+        })
+        : undefined;
 
       if (
         agentContext.lastStreamCall != null &&
@@ -2219,66 +2672,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       /** Past the empty-prompt guard — a model call is now guaranteed */
       if (contextUsage != null) {
-        const usageRatio =
-          contextUsage.calibrationRatio != null &&
-          contextUsage.calibrationRatio > 0
-            ? contextUsage.calibrationRatio
-            : 1;
         if (
-          agentContext.tokenCounter != null &&
-          finalMessages.length !== messagesToUse.length
+          finalProjection.projectedMessageTokens != null &&
+          finalProjection.availableMessageTokens != null
         ) {
-          /** Post-prune formatting restructured the payload (e.g. thinking
-           *  placeholder collapse, orphan drops) — recount so the gauge
-           *  reflects what is actually sent */
-          let rawTokens = 0;
-          for (const message of finalMessages) {
-            rawTokens += agentContext.tokenCounter(message);
-          }
           contextUsage.breakdown.messageCount = finalMessages.length;
-          if (
-            contextUsage.contextBudget != null &&
-            contextUsage.effectiveInstructionTokens != null
-          ) {
-            contextUsage.remainingContextTokens = Math.max(
-              0,
-              contextUsage.contextBudget -
-                contextUsage.effectiveInstructionTokens -
-                Math.round(rawTokens * usageRatio)
-            );
-          }
-        } else if (
-          preFormatTailTokens != null &&
-          agentContext.tokenCounter != null &&
-          contextUsage.remainingContextTokens != null
-        ) {
-          /** Same-length formatting can still mutate in place — the trailing
-           *  tool batch (artifacts, Bedrock rewrites) and any legacy-converted
-           *  messages before it — adjust remaining by the calibrated delta */
-          let postFormatTailTokens = 0;
-          for (const message of finalMessages.slice(tailStart)) {
-            postFormatTailTokens += agentContext.tokenCounter(message);
-          }
-          let formatDelta = postFormatTailTokens - preFormatTailTokens;
-          if (legacyIndices != null && legacyIndices.length > 0) {
-            let postFormatLegacyTokens = 0;
-            for (const index of legacyIndices) {
-              postFormatLegacyTokens += agentContext.tokenCounter(
-                finalMessages[index]
-              );
-            }
-            formatDelta += postFormatLegacyTokens - preFormatLegacyTokens;
-          }
-          if (formatDelta !== 0) {
-            contextUsage.remainingContextTokens = Math.max(
-              0,
-              Math.min(
-                contextUsage.contextBudget ?? Number.MAX_SAFE_INTEGER,
-                contextUsage.remainingContextTokens -
-                  Math.round(formatDelta * usageRatio)
-              )
-            );
-          }
+          contextUsage.remainingContextTokens = Math.max(
+            0,
+            finalProjection.availableMessageTokens -
+              finalProjection.projectedMessageTokens
+          );
         }
         syncBudgetDerivedFields(contextUsage);
         /** Awaited so async host handlers receive the pre-invoke snapshot
@@ -2346,6 +2749,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const metadata = config.metadata as Record<string, unknown>;
 
       try {
+        if (preInvokeContextOverflowError != null) {
+          throw preInvokeContextOverflowError;
+        }
         result = await withLangfuseRuntimeScope(
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,
@@ -2383,15 +2789,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          */
         const estimatedPromptTokens = getEstimatedPromptTokens(contextUsage);
 
-        /**
-         * A previous correction that left the prompt no smaller proves this
-         * state has nothing left to compact — an emptied message list whose
-         * content rides along in an injected summary, for instance. Measuring
-         * that beats trying to predict every such configuration.
-         */
-        const recoveryStalled = agentContext.overflowRecoveryStalled(
-          estimatedPromptTokens
-        );
         const canSummarizeOverflow =
           agentContext.summarizationEnabled === true &&
           splitAtRecencyBoundary(messages, {
@@ -2402,13 +2799,36 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             tokenCounter: agentContext.tokenCounter,
           }).head.length > 0;
 
+        const getLocalProviderOverflowMeasurement = (
+          error: unknown
+        ):
+          | {
+              contextBudget: number;
+              estimatedPromptTokens: number;
+            }
+          | undefined =>
+          typeof error === 'object' && error !== null
+            ? localProviderOverflowMeasurements.get(error)
+            : undefined;
+
+        const getRecoveryPromptEstimate = (
+          error: unknown,
+          fallbackContext?: FallbackErrorContext
+        ): number | undefined => {
+          const resolvedFallbackContext =
+            fallbackContext ?? getFallbackErrorContext(error);
+          return (
+            getLocalProviderOverflowMeasurement(error)?.estimatedPromptTokens ??
+            (resolvedFallbackContext == null
+              ? estimatedPromptTokens
+              : undefined)
+          );
+        };
+
         const planRecovery = (
           error: unknown,
           attributedFallbackContext?: FallbackErrorContext
         ): OverflowRecoveryPlan | null => {
-          if (recoveryStalled) {
-            return null;
-          }
           /**
            * When the rejection came from a fallback, plan against *that*
            * client: its window and output allowance are why it was configured
@@ -2416,13 +2836,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
            */
           const fallbackContext =
             attributedFallbackContext ?? getFallbackErrorContext(error);
+          const localMeasurement = getLocalProviderOverflowMeasurement(error);
+          const recoveryPromptEstimate = getRecoveryPromptEstimate(
+            error,
+            fallbackContext
+          );
+          /**
+           * A previous correction that left the rejected prompt no smaller
+           * proves this state has nothing left to compact. Use the fallback
+           * projection when one exists so unlike provider formats are never
+           * compared through the primary's cheaper pre-projection estimate.
+           */
+          if (agentContext.overflowRecoveryStalled(recoveryPromptEstimate)) {
+            return null;
+          }
           const recovery = planContextOverflowRecovery({
             error,
             provider: fallbackContext?.provider ?? agentContext.provider,
             maxContextTokens:
+              localMeasurement?.contextBudget ??
               fallbackContext?.maxContextTokens ??
               agentContext.maxContextTokens,
-            estimatedPromptTokens,
+            estimatedPromptTokens: recoveryPromptEstimate,
             calibrationRatio: agentContext.calibrationRatio,
             instructionTokens: agentContext.instructionTokens,
             canSummarize: agentContext.summarizationEnabled === true,
@@ -2440,12 +2875,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 ...recovery,
                 budgetTokens: minDefined(
                   getBlindRecoveryBudget(agentContext.maxContextTokens),
-                  translateRecoveryBudget(
-                    recovery.budgetTokens,
-                    recovery.observedCalibrationRatio ??
-                        CALIBRATION_RATIO_MAX,
-                    agentContext.calibrationRatio
-                  )
+                  localMeasurement != null
+                    ? recovery.budgetTokens
+                    : translateRecoveryBudget(
+                      recovery.budgetTokens,
+                      recovery.observedCalibrationRatio ??
+                            CALIBRATION_RATIO_MAX,
+                      agentContext.calibrationRatio
+                    )
                 ),
                 observedCalibrationRatio: undefined,
               }
@@ -2459,16 +2896,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
         const recovery = planRecovery(primaryError);
         if (recovery != null) {
+          const recoveryPromptEstimate =
+            getRecoveryPromptEstimate(primaryError);
           return this.beginOverflowRecovery({
             recovery,
             agentContext,
             agentId,
             config,
             originalToolContent: prunedOriginalToolContent,
-            estimatedPromptTokens,
+            estimatedPromptTokens: recoveryPromptEstimate,
           });
         }
-
         /**
          * A fallback can reject the same prompt as too large even when the
          * primary failed for an unrelated reason — a fallback with a smaller
@@ -2485,7 +2923,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               tryFallbackProviders({
                 fallbacks,
                 tools: agentContext.tools,
-                messages: finalMessages,
+                messages: fallbackBaseMessages,
                 config: invokeConfig,
                 primaryError,
                 context: this,
@@ -2499,20 +2937,71 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
                   maxContextTokens: agentContext.maxContextTokens,
                 },
+                prepareProviderMessages: ({
+                  model: fallbackModel,
+                  messages: fallbackMessages,
+                  provider: fallbackProvider,
+                  maxContextTokens: fallbackMaxContextTokens,
+                  config: fallbackConfig,
+                }) => {
+                  const fallbackToolResultChars =
+                    agentContext.maxToolResultChars ??
+                    calculateMaxToolResultChars(
+                      fallbackMaxContextTokens ?? agentContext.maxContextTokens
+                    );
+                  const projectedFallbackMessages = trackProviderMessageOrigins(
+                    fallbackMessages,
+                    projectMessagesForProvider({
+                      model: fallbackModel,
+                      messages: fallbackMessages,
+                      provider: fallbackProvider,
+                      maxToolResultChars: fallbackToolResultChars,
+                      callOptions: fallbackConfig,
+                    })
+                  );
+                  const primaryContextBudget = contextUsage?.contextBudget;
+                  const fallbackContextBudget =
+                    fallbackMaxContextTokens == null
+                      ? primaryContextBudget
+                      : Math.min(
+                        primaryContextBudget ?? fallbackMaxContextTokens,
+                        fallbackMaxContextTokens
+                      );
+                  const projection = measureProviderPayload(
+                    projectedFallbackMessages,
+                    fallbackContextBudget,
+                    true
+                  );
+                  if (!projection.fits) {
+                    throw createProviderPayloadOverflowError({
+                      projection,
+                      provider: fallbackProvider,
+                      info: 'Fallback provider message formatting exceeded the context budget before invocation.',
+                    });
+                  }
+                  return projectedFallbackMessages;
+                },
               })
           );
         } catch (fallbackError) {
           const overflowCandidates =
             getFallbackOverflowCandidates(fallbackError);
           let fallbackRecovery: OverflowRecoveryPlan | null = null;
+          let fallbackRecoveryPromptEstimate: number | undefined;
           for (const candidate of overflowCandidates) {
             fallbackRecovery = planRecovery(candidate.error, candidate.context);
             if (fallbackRecovery != null) {
+              fallbackRecoveryPromptEstimate = getRecoveryPromptEstimate(
+                candidate.error,
+                candidate.context
+              );
               break;
             }
           }
           if (overflowCandidates.length === 0) {
             fallbackRecovery = planRecovery(fallbackError);
+            fallbackRecoveryPromptEstimate =
+              getRecoveryPromptEstimate(fallbackError);
           }
           if (fallbackRecovery == null) {
             throw fallbackError;
@@ -2523,7 +3012,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentId,
             config,
             originalToolContent: prunedOriginalToolContent,
-            estimatedPromptTokens,
+            estimatedPromptTokens: fallbackRecoveryPromptEstimate,
           });
         }
       } finally {
@@ -3165,6 +3654,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     }
 
     const { name, input: args, error } = data;
+    const eventValueLimit = calculateMaxToolResultChars();
+    const errorOutputPrefix = 'Error processing tool';
+    const errorDetail =
+      error?.message != null
+        ? `: ${serializeToolContentBounded(
+          error.message,
+          Math.max(0, eventValueLimit - errorOutputPrefix.length - 2)
+        )}`
+        : '';
 
     const runStep = graph.getRunStep(stepId);
     if (!runStep) {
@@ -3174,8 +3672,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const tool_call: t.ProcessedToolCall = {
       id: data.id,
       name: name || '',
-      args: typeof args === 'string' ? args : JSON.stringify(args),
-      output: `Error processing tool${error?.message != null ? `: ${error.message}` : ''}`,
+      args: serializeToolContentBounded(args, eventValueLimit),
+      output: `${errorOutputPrefix}${errorDetail}`,
       progress: 1,
     };
 

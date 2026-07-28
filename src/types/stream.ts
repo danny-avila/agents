@@ -336,7 +336,7 @@ export type ToolCallPart = {
   /** If provided, an identifier associated with the tool call */
   id?: string;
   /** If provided, the output of the tool call */
-  output?: string;
+  output?: ToolResultContent['content'];
   /** Auth URL */
   auth?: string;
   /** Expiration time */

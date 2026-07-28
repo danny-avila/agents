@@ -27,6 +27,10 @@ import {
   normalizeError,
 } from '@/tools/eagerEventExecution';
 import {
+  serializeStructuredValueBounded,
+  serializeToolContentBounded,
+} from '@/utils/toolContent';
+import {
   handleServerToolResult,
   handleToolCallChunks,
   handleToolCalls,
@@ -841,15 +845,20 @@ async function dispatchEagerToolCompletions(args: {
     if (stepId === '') {
       continue;
     }
-    const output =
-      result.status === 'error'
-        ? `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`
-        : truncateToolResultContent(
-          typeof result.content === 'string'
-            ? result.content
-            : JSON.stringify(result.content),
-          maxToolResultChars
-        );
+    let output: string;
+    if (result.status === 'error') {
+      output = truncateToolResultContent(
+        `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
+        maxToolResultChars
+      );
+    } else if (typeof result.content === 'string') {
+      output = truncateToolResultContent(result.content, maxToolResultChars);
+    } else {
+      output = serializeStructuredValueBounded(
+        result.content,
+        maxToolResultChars
+      ).content;
+    }
 
     try {
       const dispatched = await safeDispatchCustomEvent(
@@ -861,7 +870,10 @@ async function dispatchEagerToolCompletions(args: {
             type: 'tool_call' as const,
             eager: true,
             tool_call: {
-              args: JSON.stringify(record.request.args),
+              args: serializeToolContentBounded(
+                record.request.args,
+                maxToolResultChars
+              ),
               name: record.toolName,
               id: result.toolCallId,
               output,
@@ -2248,11 +2260,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
             const contentIndex =
               toolCallIndices[toolCallIndex] ?? runStep.index;
             const toolCallId = toolCall.id ?? '';
-            registerToolContentIndex(
-              toolStepContent,
-              contentIndex,
-              toolCallId
-            );
+            registerToolContentIndex(toolStepContent, contentIndex, toolCallId);
             const contentPart: t.MessageContentComplex = {
               type: ContentTypes.TOOL_CALL,
               tool_call: {

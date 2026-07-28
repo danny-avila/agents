@@ -1,6 +1,7 @@
-import { AIMessage, HumanMessage } from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { convertToConverseMessages } from './message_inputs';
+import { toLangChainContent } from '@/messages/langchain';
 
 /**
  * Native-Bedrock reasoning serialization. A `reasoning_content` block whose
@@ -30,6 +31,53 @@ const assistantContent = (result: ConverseResult): ConverseBlock[] => {
   const msg = result.converseMessages.find((m) => m.role === 'assistant');
   return (msg?.content ?? []) as ConverseBlock[];
 };
+
+describe('convertToConverseMessages — Anthropic tool replay', () => {
+  it('deduplicates raw tool_use blocks and unwraps tool_result content', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Search'),
+      new AIMessage({
+        content: toLangChainContent([
+          { type: 'text', text: 'Searching.' },
+          {
+            type: 'tool_use',
+            id: 'call_search',
+            name: 'search',
+            input: '',
+          },
+        ]),
+        tool_calls: [
+          {
+            id: 'call_search',
+            name: 'search',
+            args: { query: 'test' },
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: toLangChainContent([
+          {
+            type: 'tool_result',
+            tool_use_id: 'call_search',
+            is_error: true,
+            content: 'result body',
+          },
+        ]),
+        tool_call_id: 'call_search',
+      }),
+    ];
+
+    const converted = convertToConverseMessages(messages);
+    const serialized = JSON.stringify(converted);
+
+    expect(serialized.match(/"toolUseId":"call_search"/g)).toHaveLength(2);
+    expect(serialized.match(/"toolUse":/g)).toHaveLength(1);
+    expect(serialized.match(/"toolResult":/g)).toHaveLength(1);
+    expect(serialized).toContain('"text":"result body"');
+    expect(serialized).toContain('"status":"error"');
+    expect(serialized).not.toContain('"type":"tool_result"');
+  });
+});
 
 describe('convertToConverseMessages — native Bedrock reasoning serialization', () => {
   it('drops a signature-only reasoning block, keeping text and tool calls', () => {

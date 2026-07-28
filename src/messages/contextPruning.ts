@@ -9,31 +9,23 @@
  * - Hard-clear: Replace entire content with a placeholder.
  *
  * Messages in the "protected zone" (recent assistant turns, system/pre-first-human
- * messages, and messages with image content) are never pruned.
+ * messages) are never pruned. Atomic media/resource blocks are preserved when
+ * they fit; oversized inline payloads are replaced with bounded placeholders.
  */
 
 import { ToolMessage, type BaseMessage } from '@langchain/core/messages';
 import type { ContextPruningSettings } from './contextPruningSettings';
 import type { ContextPruningConfig } from '@/types/graph';
 import type { TokenCounter } from '@/types/run';
+import {
+  cloneToolMessageWithContent,
+  compactToolContent,
+  getToolContentCharLength,
+  isAtomicToolContentBlock,
+  isComputerCallOutputMessage,
+  serializeToolContentBounded,
+} from '@/utils/toolContent';
 import { resolveContextPruningSettings } from './contextPruningSettings';
-
-/**
- * Checks if a message contains image content blocks.
- * Messages with images are skipped by position-based content degradation
- * because images cannot be meaningfully soft-trimmed or replaced with placeholders.
- */
-function hasImageContent(message: BaseMessage): boolean {
-  if (!Array.isArray(message.content)) {
-    return false;
-  }
-  return message.content.some(
-    (block) =>
-      typeof block === 'object' &&
-      'type' in block &&
-      (block.type === 'image_url' || block.type === 'image')
-  );
-}
 
 /**
  * Applies head+tail soft-trim to tool result content.
@@ -138,48 +130,63 @@ export function applyContextPruning(params: {
     if (message.getType() !== 'tool') {
       continue;
     }
+    if (isComputerCallOutputMessage(message)) {
+      continue;
+    }
     if (protectedIndices.has(i)) {
       continue;
     }
-    if (hasImageContent(message)) {
-      continue;
-    }
-
     const content = message.content;
-    if (typeof content !== 'string') {
-      continue;
-    }
-    if (content.length < settings.minPrunableToolChars) {
+    const contentLength = getToolContentCharLength(content);
+    if (contentLength < settings.minPrunableToolChars) {
       continue;
     }
 
     // Compute age ratio: how far back from the end (0 = latest, 1 = oldest)
     const ageRatio = (totalMessages - i) / totalMessages;
 
+    if (
+      Array.isArray(content) &&
+      content.some(isAtomicToolContentBlock) &&
+      ageRatio >= settings.softTrimRatio
+    ) {
+      const compacted = compactToolContent(content, settings.softTrim.maxChars);
+      if (compacted.changed) {
+        const cloned = cloneToolMessageWithContent(
+          message as ToolMessage,
+          compacted.content
+        );
+        messages[i] = cloned;
+        indexTokenCountMap[i] = tokenCounter(cloned);
+        softTrimmed++;
+      }
+      continue;
+    }
+
     if (ageRatio >= settings.hardClearRatio && settings.hardClear.enabled) {
       // Hard-clear: replace with placeholder
-      const cloned = new ToolMessage({
-        content: settings.hardClear.placeholder,
-        tool_call_id: (message as ToolMessage).tool_call_id,
-        name: message.name,
-        id: message.id,
-        additional_kwargs: message.additional_kwargs,
-        response_metadata: message.response_metadata,
-      });
+      const cloned = cloneToolMessageWithContent(
+        message as ToolMessage,
+        settings.hardClear.placeholder
+      );
       messages[i] = cloned;
       indexTokenCountMap[i] = tokenCounter(cloned);
       hardCleared++;
     } else if (ageRatio >= settings.softTrimRatio) {
       // Soft-trim: keep head + tail
-      if (content.length > settings.softTrim.maxChars) {
-        const cloned = new ToolMessage({
-          content: softTrimContent(content, settings.softTrim),
-          tool_call_id: (message as ToolMessage).tool_call_id,
-          name: message.name,
-          id: message.id,
-          additional_kwargs: message.additional_kwargs,
-          response_metadata: message.response_metadata,
-        });
+      if (contentLength > settings.softTrim.maxChars) {
+        const cloned = cloneToolMessageWithContent(
+          message as ToolMessage,
+          softTrimContent(
+            typeof content === 'string'
+              ? content
+              : serializeToolContentBounded(
+                content,
+                settings.softTrim.maxChars
+              ),
+            settings.softTrim
+          )
+        );
         messages[i] = cloned;
         indexTokenCountMap[i] = tokenCounter(cloned);
         softTrimmed++;

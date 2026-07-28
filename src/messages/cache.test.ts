@@ -1029,6 +1029,87 @@ describe('stripAnthropicCacheControl', () => {
     expect(result[0].content).toBe('Hello');
   });
 
+  it('ignores primitive and proxy blocks without invoking proxy traps', () => {
+    const unsafe = new Proxy(
+      {},
+      {
+        ownKeys() {
+          throw new Error('proxy keys must not be inspected');
+        },
+      }
+    );
+    const content = [
+      'primitive',
+      unsafe,
+      {
+        type: ContentTypes.TEXT,
+        text: 'cached',
+        cache_control: { type: 'ephemeral' },
+      },
+    ] as unknown as MessageContentComplex[];
+
+    const result = stripAnthropicCacheControl([{ role: 'user', content }]);
+    const stripped = result[0].content as unknown[];
+
+    expect(stripped[0]).toBe('primitive');
+    expect(stripped[1]).toBe(unsafe);
+    expect(stripped[2]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'cached',
+    });
+  });
+
+  it('removes a non-configurable cache_control from the clone only', () => {
+    const block = { type: ContentTypes.TEXT, text: 'cached' };
+    Object.defineProperty(block, 'cache_control', {
+      configurable: false,
+      enumerable: true,
+      value: { type: 'ephemeral' },
+      writable: false,
+    });
+    const messages = [
+      {
+        role: 'user',
+        content: [block as MessageContentComplex],
+      },
+    ];
+
+    const result = stripAnthropicCacheControl(messages);
+    const stripped = (result[0].content as MessageContentComplex[])[0];
+
+    expect('cache_control' in stripped).toBe(false);
+    expect(
+      (block as typeof block & { cache_control: unknown }).cache_control
+    ).toEqual({ type: 'ephemeral' });
+  });
+
+  it('removes an accessor cache_control without invoking it', () => {
+    let getterCalls = 0;
+    const block = { type: ContentTypes.TEXT, text: 'cached' };
+    Object.defineProperty(block, 'cache_control', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterCalls++;
+        throw new Error('cache getter must not run');
+      },
+    });
+
+    const result = stripAnthropicCacheControl([
+      {
+        role: 'user',
+        content: [block as MessageContentComplex],
+      },
+    ]);
+    const stripped = (result[0].content as MessageContentComplex[])[0];
+
+    expect(getterCalls).toBe(0);
+    expect('cache_control' in stripped).toBe(false);
+    expect(
+      Object.getOwnPropertyDescriptor(block, 'cache_control')
+    ).toBeDefined();
+  });
+
   it('returns non-array input unchanged', () => {
     const notArray = 'not an array';
     /** @ts-expect-error - Testing invalid input */
@@ -1072,6 +1153,38 @@ describe('stripBedrockCacheControl', () => {
       type: ContentTypes.TEXT,
       text: 'Hi there',
     });
+  });
+
+  it('ignores primitive and proxy blocks while removing cache points', () => {
+    let getterCalls = 0;
+    const unsafe = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error('proxy descriptors must not be inspected');
+        },
+      }
+    );
+    const accessorCachePoint = {};
+    Object.defineProperty(accessorCachePoint, 'cachePoint', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterCalls++;
+        throw new Error('cache point getter must not run');
+      },
+    });
+    const content = [
+      42,
+      unsafe,
+      accessorCachePoint,
+      { cachePoint: { type: 'default' } },
+    ] as unknown as MessageContentComplex[];
+
+    const result = stripBedrockCacheControl([{ role: 'user', content }]);
+
+    expect(result[0].content).toEqual([42, unsafe]);
+    expect(getterCalls).toBe(0);
   });
 
   it('handles messages without cachePoint blocks gracefully', () => {

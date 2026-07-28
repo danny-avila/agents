@@ -1,5 +1,10 @@
+import { tools as openAITools } from '@langchain/openai';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { OpenAIChatInput } from '@langchain/openai';
 import type { OpenRouterReasoning, ChatOpenRouterCallOptions } from './index';
+import type { GraphTools } from '@/types';
+import { partitionAndMarkOpenRouterToolCache } from './toolCache';
+import { addTailCacheControl } from '@/messages/cache';
 import { ChatOpenRouter } from './index';
 
 type CreateRouterOptions = Partial<
@@ -243,5 +248,314 @@ describe('ChatOpenRouter reasoning handling', () => {
       const params = router.invocationParams();
       expect(params.reasoning).toEqual({ exclude: true });
     });
+  });
+});
+
+describe('ChatOpenRouter Responses prompt caching', () => {
+  it('maps promptCache to the Responses top-level cache control', () => {
+    const router = new ChatOpenRouter({
+      model: 'anthropic/claude-sonnet-4',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+      promptCache: true,
+      promptCacheTtl: '1h',
+    });
+
+    expect(router.invocationParams().cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+  });
+
+  it('sends cache control on the actual Responses request', async () => {
+    const router = new ChatOpenRouter({
+      model: 'openai/gpt-4.1',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+      promptCache: true,
+      promptCacheTtl: '1h',
+      streaming: false,
+    });
+    const sentinel = new Error('captured request');
+    let capturedRequest: unknown;
+    const responses = (
+      router as unknown as {
+        responses: {
+          completionWithRetry: (request: unknown) => Promise<never>;
+        };
+      }
+    ).responses;
+    responses.completionWithRetry = async (request) => {
+      capturedRequest = request;
+      throw sentinel;
+    };
+
+    await expect(router.invoke([new HumanMessage('hello')])).rejects.toThrow(
+      sentinel
+    );
+    expect(capturedRequest).toMatchObject({
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+      input: [{ type: 'message', role: 'user', content: 'hello' }],
+    });
+  });
+
+  it('honors per-call Responses cache overrides', async () => {
+    const router = new ChatOpenRouter({
+      model: 'openai/gpt-4.1',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+      promptCache: false,
+      streaming: false,
+    });
+    const sentinel = new Error('captured override');
+    let capturedRequest: unknown;
+    const responses = (
+      router as unknown as {
+        responses: {
+          completionWithRetry: (request: unknown) => Promise<never>;
+        };
+      }
+    ).responses;
+    responses.completionWithRetry = async (request) => {
+      capturedRequest = request;
+      throw sentinel;
+    };
+
+    await expect(
+      router.invoke([new HumanMessage('hello')], {
+        promptCache: true,
+        promptCacheTtl: '5m',
+      } as unknown as Parameters<typeof router.invoke>[1])
+    ).rejects.toThrow(sentinel);
+    expect(capturedRequest).toMatchObject({
+      cache_control: { type: 'ephemeral' },
+    });
+    expect(JSON.stringify(capturedRequest)).not.toContain('"ttl"');
+  });
+
+  it('removes tail block markers added after invocation normalization', async () => {
+    const router = new ChatOpenRouter({
+      model: 'openai/gpt-4.1',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+      promptCache: true,
+      streaming: false,
+    });
+    const sentinel = new Error('captured tail cache');
+    let capturedRequest: unknown;
+    const responses = (
+      router as unknown as {
+        responses: {
+          completionWithRetry: (request: unknown) => Promise<never>;
+        };
+      }
+    ).responses;
+    responses.completionWithRetry = async (request) => {
+      capturedRequest = request;
+      throw sentinel;
+    };
+    const messages = addTailCacheControl([
+      new HumanMessage('search'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_cached_result',
+            name: 'search',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'result body',
+        tool_call_id: 'call_cached_result',
+        name: 'search',
+      }),
+    ]);
+
+    await expect(router.invoke(messages)).rejects.toThrow(sentinel);
+
+    const request = capturedRequest as {
+      cache_control?: unknown;
+      input?: Array<{ type?: string; output?: unknown }>;
+    };
+    expect(
+      request.input?.find((item) => item.type === 'function_call_output')
+    ).toMatchObject({ output: 'result body' });
+    expect(request.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+    expect(JSON.stringify(request.input)).not.toContain('cache_control');
+  });
+
+  it('normalizes cache markers for native Responses event streaming', async () => {
+    const router = new ChatOpenRouter({
+      model: 'openai/gpt-4.1',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+      promptCache: true,
+      streaming: true,
+    });
+    let capturedRequest: unknown;
+    const responses = (
+      router as unknown as {
+        responses: {
+          completionWithRetry: (
+            request: unknown
+          ) => Promise<AsyncIterable<never>>;
+          _streamChatModelEvents: (
+            messages: unknown[],
+            options: Record<string, unknown>
+          ) => AsyncIterable<unknown>;
+        };
+      }
+    ).responses;
+    responses.completionWithRetry = async (request) => {
+      capturedRequest = request;
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield* [];
+        },
+      };
+    };
+    const messages = addTailCacheControl([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_stream_cache',
+            name: 'search',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'stream result',
+        tool_call_id: 'call_stream_cache',
+        name: 'search',
+      }),
+    ]);
+
+    for await (const _event of responses._streamChatModelEvents(messages, {})) {
+      // The stubbed provider stream is empty; consuming it triggers request creation.
+    }
+
+    const request = capturedRequest as {
+      input?: Array<{ type?: string; output?: unknown }>;
+      cache_control?: unknown;
+    };
+    expect(
+      request.input?.find((item) => item.type === 'function_call_output')
+    ).toMatchObject({ output: 'stream result' });
+    expect(request.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+    expect(JSON.stringify(request.input)).not.toContain('cache_control');
+  });
+
+  it('removes Chat-style tool cache markers from Responses tools', async () => {
+    const router = new ChatOpenRouter({
+      model: 'openai/gpt-4.1',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+      promptCache: true,
+      streaming: false,
+    });
+    const sentinel = new Error('captured tool cache');
+    let capturedRequest: unknown;
+    const responses = (
+      router as unknown as {
+        responses: {
+          completionWithRetry: (request: unknown) => Promise<never>;
+        };
+      }
+    ).responses;
+    responses.completionWithRetry = async (request) => {
+      capturedRequest = request;
+      throw sentinel;
+    };
+    const markedTools = partitionAndMarkOpenRouterToolCache(
+      [
+        {
+          type: 'function',
+          function: {
+            name: 'search',
+            description: 'Search records',
+            parameters: { type: 'object', properties: {} },
+          },
+        },
+      ] as GraphTools,
+      () => false,
+      '1h'
+    )!;
+    const bound = router.bindTools(markedTools);
+
+    await expect(bound.invoke([new HumanMessage('search')])).rejects.toThrow(
+      sentinel
+    );
+
+    const request = capturedRequest as {
+      cache_control?: unknown;
+      tools?: unknown[];
+    };
+    expect(request.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+    expect(JSON.stringify(request.tools)).not.toContain('cache_control');
+  });
+
+  it('keeps top-level cache control when a computer tool auto-selects Responses', async () => {
+    const router = new ChatOpenRouter({
+      model: 'openai/gpt-4.1',
+      apiKey: 'test-key',
+      useResponsesApi: false,
+      promptCache: true,
+      streaming: false,
+    });
+    const sentinel = new Error('captured computer cache');
+    let capturedRequest: unknown;
+    const responses = (
+      router as unknown as {
+        responses: {
+          completionWithRetry: (request: unknown) => Promise<never>;
+        };
+      }
+    ).responses;
+    responses.completionWithRetry = async (request) => {
+      capturedRequest = request;
+      throw sentinel;
+    };
+    const bound = router.bindTools([
+      openAITools.computerUse({
+        displayWidth: 1024,
+        displayHeight: 768,
+        environment: 'browser',
+        execute: async () => 'data:image/png;base64,AA==',
+      }),
+    ]);
+
+    await expect(bound.invoke([new HumanMessage('inspect')])).rejects.toThrow(
+      sentinel
+    );
+
+    expect(capturedRequest).toMatchObject({
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    });
+  });
+
+  it('keeps Chat prompt caching on content blocks', () => {
+    const router = new ChatOpenRouter({
+      model: 'anthropic/claude-sonnet-4',
+      apiKey: 'test-key',
+      useResponsesApi: false,
+      promptCache: true,
+    });
+
+    expect(router.invocationParams().cache_control).toBeUndefined();
   });
 });

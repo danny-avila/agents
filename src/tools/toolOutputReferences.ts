@@ -29,6 +29,7 @@ import {
   HARD_MAX_TOOL_RESULT_CHARS,
   HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
 } from '@/utils/truncation';
+import { isComputerCallOutputMessage } from '@/utils/toolContent';
 
 /**
  * Non-global matcher for a single `{{tool<i>turn<n>}}` placeholder.
@@ -656,6 +657,11 @@ export function annotateMessagesForLLM(
     const hasRefScope = '_refScope' in meta;
     const hasUnresolvedField = '_unresolvedRefs' in meta;
     if (!hasRefKey && !hasRefScope && !hasUnresolvedField) continue;
+    if (isComputerCallOutputMessage(m)) {
+      out ??= messages.slice();
+      out[i] = cloneToolMessageWithContent(m as ToolMessage, m.content);
+      continue;
+    }
 
     const refKey = readRefKey(meta);
     const unresolved = readUnresolvedRefs(meta);

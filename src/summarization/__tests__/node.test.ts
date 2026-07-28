@@ -1045,6 +1045,83 @@ describe('recency window — first-turn protection', () => {
     expect(tailToolMsg!.content).not.toContain('FULL_ORIGINAL_OUTPUT');
   });
 
+  it('bounds restored tool originals and preserves ToolMessage metadata', async () => {
+    captureEvents();
+
+    let restoredToolMessage: ToolMessage | undefined;
+    const invokeMock = jest.fn().mockImplementation((messages: unknown) => {
+      restoredToolMessage = (messages as Array<unknown>).find(
+        (message) => message instanceof ToolMessage
+      ) as ToolMessage | undefined;
+      return Promise.resolve({ content: 'summary' });
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke: invokeMock };
+        }
+      } as never
+    );
+
+    const artifact = { source: 'clickhouse', rows: 1_000 };
+    const originalToolMessage = new ToolMessage({
+      content: 'masked-stub',
+      tool_call_id: 'bounded',
+      name: 'run_select_query',
+      status: 'success',
+      artifact,
+      metadata: { traceId: 'trace-1' },
+      additional_kwargs: { retained: true },
+      response_metadata: { requestId: 'request-1' },
+    });
+    const agentContext = createAgentContext({
+      maxContextTokens: 2_000,
+      summarizationConfig: { retainRecent: { turns: 0 } },
+      setSummary: jest.fn(),
+    });
+    agentContext.pendingOriginalToolContent = new Map([
+      [2, `[{"rows":"${'x'.repeat(20_000)}"}]`],
+    ]);
+
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+    await summarizeNode(
+      {
+        messages: [
+          new HumanMessage('query the table'),
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'bounded', name: 'run_select_query', args: {} }],
+          }),
+          originalToolMessage,
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(restoredToolMessage).toBeDefined();
+    expect(typeof restoredToolMessage!.content).toBe('string');
+    expect(String(restoredToolMessage!.content).length).toBeLessThanOrEqual(
+      2_400
+    );
+    expect(restoredToolMessage!.content).toContain('[truncated:');
+    expect(restoredToolMessage!.status).toBe('success');
+    expect(restoredToolMessage!.artifact).toBe(artifact);
+    expect(restoredToolMessage!.metadata).toEqual({ traceId: 'trace-1' });
+    expect(restoredToolMessage!.additional_kwargs).toEqual({ retained: true });
+    expect(restoredToolMessage!.response_metadata).toEqual({
+      requestId: 'request-1',
+    });
+    expect(originalToolMessage.content).toBe('masked-stub');
+  });
+
   it('preserves tail-relevant pendingOriginalToolContent entries (reindexed) for future summaries', async () => {
     captureEvents();
 

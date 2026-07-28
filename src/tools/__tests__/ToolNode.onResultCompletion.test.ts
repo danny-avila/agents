@@ -29,7 +29,7 @@ function createAIMessageWithToolCalls(
 type CompletionEvent = {
   result: {
     id: string;
-    tool_call: { id: string; output: string };
+    tool_call: { id: string; output: string; args?: string };
   };
 };
 
@@ -122,6 +122,153 @@ describe('ToolNode per-call onResult completion emission', () => {
 
     expect(result.messages).toHaveLength(2);
     expect(result.messages.map((m) => m.content)).toEqual(['sunny', '42']);
+  });
+
+  it('serializes bigint output before early and batch completion paths', async () => {
+    const completions: CompletionEvent[] = [];
+    const structuredOutput = [{ rowsRead: BigInt(42), status: 'complete' }];
+
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push(data as CompletionEvent);
+          return;
+        }
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        batch.onResult?.({
+          toolCallId: 'call_query',
+          status: 'success',
+          content: structuredOutput,
+        });
+        await flushAsync();
+        batch.resolve([
+          {
+            toolCallId: 'call_query',
+            status: 'success',
+            content: structuredOutput,
+          },
+        ]);
+      });
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('query')],
+      eventDrivenMode: true,
+      toolCallStepIds: new Map([['call_query', 'step_query']]),
+    });
+    const result = (await toolNode.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          { id: 'call_query', name: 'query', args: {} },
+        ]),
+      ],
+    })) as { messages: ToolMessage[] };
+
+    const serialized = '[{"rowsRead":"42","status":"complete"}]';
+    expect(completions).toHaveLength(1);
+    expect(completions[0].result.tool_call.output).toBe(serialized);
+    expect(result.messages[0].content).toBe(serialized);
+  });
+
+  it('omits native computer screenshots from completion events', async () => {
+    const completions: CompletionEvent[] = [];
+    const screenshot = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const computerOutput = new ToolMessage({
+      content: screenshot,
+      tool_call_id: 'call_computer',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const computer = createDummyTool('computer_use');
+    (
+      computer as unknown as {
+        invoke: () => Promise<ToolMessage>;
+      }
+    ).invoke = async () => computerOutput;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push(data as CompletionEvent);
+        }
+      });
+    const toolNode = new ToolNode({
+      tools: [computer],
+      eventDrivenMode: true,
+      directToolNames: new Set(['computer_use']),
+      toolCallStepIds: new Map([['call_computer', 'step_computer']]),
+      maxToolResultChars: 80,
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          { id: 'call_computer', name: 'computer_use', args: {} },
+        ]),
+      ],
+    })) as { messages: ToolMessage[] };
+
+    expect(result.messages[0]).toBe(computerOutput);
+    expect(result.messages[0].content).toBe(screenshot);
+    expect(completions).toHaveLength(1);
+    expect(completions[0].result.tool_call.output).toContain(
+      'Computer screenshot omitted'
+    );
+    expect(completions[0].result.tool_call.output.length).toBeLessThanOrEqual(
+      80
+    );
+  });
+
+  it('bounds cyclic tool args without losing the completion event', async () => {
+    const completions: CompletionEvent[] = [];
+    const cyclicArgs: Record<string, unknown> = { city: 'NYC' };
+    cyclicArgs.self = cyclicArgs;
+
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push(data as CompletionEvent);
+          return;
+        }
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        batch.onResult?.({
+          toolCallId: 'call_weather',
+          status: 'success',
+          content: 'sunny',
+        });
+        await flushAsync();
+        batch.resolve([
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'sunny',
+          },
+        ]);
+      });
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    await toolNode.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          { id: 'call_weather', name: 'weather', args: cyclicArgs },
+        ]),
+      ],
+    });
+
+    expect(completions).toHaveLength(1);
+    expect(completions[0].result.tool_call.args).toContain('[Circular]');
+    expect(completions[0].result.tool_call.output).toBe('sunny');
   });
 
   it('ignores duplicate and unknown onResult reports', async () => {

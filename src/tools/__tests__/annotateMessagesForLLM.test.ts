@@ -90,6 +90,38 @@ describe('annotateMessagesForLLM', () => {
     expect(out[0]).not.toBe(tm);
   });
 
+  it('does not annotate native computer screenshot strings', () => {
+    const registry = new ToolOutputReferenceRegistry();
+    registry.set('r1', 'tool0turn0', 'stored-raw');
+    const screenshot = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const tm = makeToolMessage({
+      content: screenshot,
+      additional_kwargs: {
+        type: 'computer_call_output',
+        _refKey: 'tool0turn0',
+      },
+    });
+
+    const out = annotateMessagesForLLM([tm], registry, 'r1');
+
+    expect(out[0].content).toBe(screenshot);
+    expect((out[0] as ToolMessage).additional_kwargs.type).toBe(
+      'computer_call_output'
+    );
+    expect((out[0] as ToolMessage).additional_kwargs._refKey).toBeUndefined();
+  });
+
+  it('leaves native computer screenshots reference-equal without ref metadata', () => {
+    const registry = new ToolOutputReferenceRegistry();
+    const tm = makeToolMessage({
+      content: 'data:image/png;base64,AAAA',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const messages = [tm];
+
+    expect(annotateMessagesForLLM(messages, registry, 'r1')).toBe(messages);
+  });
+
   it('leaves content untouched but strips framework metadata when _refKey is stale', () => {
     /**
      * Stale `_refKey` (not in registry) doesn't trigger annotation,

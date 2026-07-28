@@ -18,6 +18,8 @@ import type { BaseMessage, AIMessageChunk } from '@langchain/core/messages';
 import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type { ToolRuntime } from '@langchain/core/tools';
 import type * as t from '@/types';
+import { serializeToolContentBounded } from '@/utils/toolContent';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { StandardGraph } from './Graph';
 import { Constants } from '@/common';
 
@@ -723,7 +725,10 @@ export class MultiAgentGraph extends StandardGraph {
     const contentStr =
       typeof toolMessage.content === 'string'
         ? toolMessage.content
-        : JSON.stringify(toolMessage.content);
+        : serializeToolContentBounded(
+          toolMessage.content,
+          HARD_MAX_TOOL_RESULT_CHARS
+        );
 
     const structuredInstructions =
       toolMessage.additional_kwargs[HANDOFF_INSTRUCTIONS_KEY];
