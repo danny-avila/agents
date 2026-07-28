@@ -105,9 +105,11 @@ export class ExaScraper implements t.BaseScraper {
       const data = response.data;
       const resultMap = new Map<string, t.ExaContentsResult>();
       for (const result of data.results ?? []) {
-        const key = result.url ?? result.id;
-        if (key != null) {
-          resultMap.set(key, result);
+        if (result.id != null) {
+          resultMap.set(result.id, result);
+        }
+        if (result.url != null) {
+          resultMap.set(result.url, result);
         }
       }
       const statusMap = new Map<string, t.ExaContentsStatus>();
