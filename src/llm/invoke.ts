@@ -673,10 +673,20 @@ export async function attemptInvoke(
    * elsewhere. No-op identity when the payload does not end on a
    * run-produced assistant turn.
    */
+  /**
+   * Widened deliberately: the type says every context is a full Graph, but
+   * summarization passes none and long-standing tests pass partial stubs —
+   * the accessor genuinely may be absent at runtime.
+   */
+  const getRunTail = (
+    context as
+      | { getLastRunMessage?: () => BaseMessage | undefined }
+      | undefined
+  )?.getLastRunMessage;
   const cued = isAnthropicLike(provider, {
     model: (model as { model?: string }).model,
   })
-    ? appendPredecessorHandoffCue(annotated, context?.getLastRunMessage())
+    ? appendPredecessorHandoffCue(annotated, getRunTail?.call(context))
     : annotated;
   const messagesForProvider = strictAlternationProviders.has(provider)
     ? coalesceAdjacentUserTurns(cued)
