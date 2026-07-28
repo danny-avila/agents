@@ -47,6 +47,10 @@ describe('convertToConverseMessages — tool-result cachePoint hoisting', () => 
 
     const { converseMessages } = convertToConverseMessages([
       new HumanMessage('go'),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 't1', name: 'calc', args: {}, type: 'tool_call' }],
+      }),
       toolMsg,
     ]);
 
@@ -66,6 +70,17 @@ describe('convertToConverseMessages — tool-result cachePoint hoisting', () => 
   it('leaves tool results without a cachePoint untouched', () => {
     const { converseMessages } = convertToConverseMessages([
       new HumanMessage('go'),
+      /**
+       * The calling assistant turn matters: without it the human turn and
+       * the tool result are adjacent user-role messages, which the converter
+       * now merges (Converse rejects consecutive user messages), and this
+       * test would assert against the merged artifact instead of the
+       * tool-result body it is about.
+       */
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 't1', name: 'calc', args: {}, type: 'tool_call' }],
+      }),
       new ToolMessage({ tool_call_id: 't1', content: 'plain result' }),
     ]);
 

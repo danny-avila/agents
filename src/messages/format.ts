@@ -1367,7 +1367,7 @@ export const formatAgentMessages = (
    * pushed. When that message is itself an assistant turn, it already IS the
    * separation the anchor exists to synthesize, so the intent is simply
    * discharged: emitting the placeholder anyway would put two assistant turns
-   * back to back, which Bedrock and Mistral reject and nothing downstream
+   * back to back, which strict-alternation providers can reject and nothing downstream
    * repairs (`coalesceAdjacentUserTurns` merges user turns only).
    */
   const flushSteerAnchor = (next: { role?: LangChainMessageRole }): void => {
@@ -1634,7 +1634,7 @@ export const formatAgentMessages = (
      * A steer that ends an assistant message leaves the replay on a
      * `HumanMessage`. The next payload message is itself a user turn, so the
      * sequence would reach the provider as two adjacent user turns — rejected
-     * outright by Bedrock and Mistral. Anchor it with a placeholder assistant
+     * by strict-alternation providers. Anchor it with a placeholder assistant
      * turn.
      *
      * The placeholder must be NON-EMPTY. A string-content assistant message

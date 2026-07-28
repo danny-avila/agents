@@ -28,9 +28,13 @@ async function createSealRun(options: {
   runId: string;
   hook: HookCallback<'PreemptBoundary'>;
   responses: string[];
+  stopHook?: HookCallback<'Stop'>;
 }): Promise<Run<t.IState>> {
   const registry = new HookRegistry();
   registry.register('PreemptBoundary', { hooks: [options.hook] });
+  if (options.stopHook) {
+    registry.register('Stop', { hooks: [options.stopHook] });
+  }
   const run = await Run.create<t.IState>({
     runId: options.runId,
     graphConfig: {
@@ -96,6 +100,39 @@ describe('cooperative seal (end-to-end via Run)', () => {
     expect(contents[0].length).toBeGreaterThan(0);
     expect(contents[0].length).toBeLessThan(FULL_RESPONSE.length);
     expect(FULL_RESPONSE.startsWith(contents[0])).toBe(true);
+  });
+
+  it('forwards a halting hook\'s own stopReason to Stop hooks and getHaltReason', async () => {
+    let stopReasonSeen: string | undefined;
+    const run = await createSealRun({
+      runId: 'seal-halt-reason',
+      hook: async () => ({
+        preventContinuation: true,
+        stopReason: 'host_policy_stop',
+      }),
+      responses: [FULL_RESPONSE],
+      stopHook: async (input) => {
+        stopReasonSeen = input.stopReason;
+        return {};
+      },
+    });
+
+    await run.processStream(
+      { messages: [new HumanMessage('hello there')] },
+      streamConfig
+    );
+
+    /**
+     * The hook-supplied reason must win end to end: a persistence/audit Stop
+     * hook records the actual cause, not the generic preempt_incomplete
+     * label, and getHaltReason() reports the same string afterward. A
+     * halting boundary that injected nothing also counts as an empty
+     * boundary in the truncated-seal telemetry.
+     */
+    expect(stopReasonSeen).toBe('host_policy_stop');
+    expect(run.getHaltReason()).toBe('host_policy_stop');
+    expect(run.Graph?.preemptIncomplete).toBe(true);
+    expect(run.Graph?.preemptEmptyBoundaries).toBe(1);
   });
 
   it('resumes after an injecting boundary and completes without a halt reason', async () => {

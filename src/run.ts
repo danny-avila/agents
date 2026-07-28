@@ -1012,15 +1012,15 @@ export class Run<_T extends t.BaseGraphState> {
             agentId: graph.defaultAgentId,
             messages: graph.getRunMessages() ?? stateInputs?.messages ?? [],
             /**
-             * A seal whose boundary had nothing to inject ends the turn where
-             * it stands. The run really did stop, so `Stop` must still fire —
-             * but it did not stop because the model was finished, and a host
-             * that persists or notifies on completion needs to tell those
-             * apart.
+             * A seal whose boundary ended the turn early must say so. The
+             * hook-supplied reason wins when a `PreemptBoundary` hook halted
+             * with one — a persistence/audit `Stop` hook should record the
+             * actual cause, not the generic label — and `preempt_incomplete`
+             * is reserved for the boundary that simply had nothing to inject.
              */
-            stopReason: graph.preemptIncomplete
-              ? 'preempt_incomplete'
-              : undefined,
+            stopReason:
+              graph.preemptHaltReason ??
+              (graph.preemptIncomplete ? 'preempt_incomplete' : undefined),
             stopHookActive: false, // will be true when stop is triggered by a hook (Phase 2)
           },
           sessionId: this.id,

@@ -4,9 +4,14 @@ import type { BaseMessage, MessageContent } from '@langchain/core/messages';
 import { Providers } from '@/common';
 
 /**
- * Providers whose APIs require strict user/assistant alternation and reject
- * consecutive user turns. Anthropic's Messages API, OpenAI and Gemini all
- * accept them, so they are deliberately absent.
+ * Providers whose APIs specify strict user/assistant alternation. Mistral
+ * rejects consecutive user turns outright. Bedrock's Converse API documents
+ * the alternation requirement across many model families; enforcement varies
+ * by family — Claude on Converse currently tolerates adjacent user turns
+ * (verified live, 2026-07-28) — so the payload is normalized for all of them
+ * rather than betting on per-family leniency. Anthropic's own Messages API,
+ * OpenAI and Gemini all accept consecutive user turns, so they are
+ * deliberately absent.
  */
 export const strictAlternationProviders: ReadonlySet<Providers> = new Set([
   Providers.BEDROCK,

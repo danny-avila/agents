@@ -450,3 +450,85 @@ describe('convertToConverseMessages — v1 reasoning serialization', () => {
     expect(content.some((b) => b.text === 'answer')).toBe(true);
   });
 });
+
+/**
+ * Converse rejects consecutive same-role messages categorically, and both
+ * `ToolMessage` and `HumanMessage` convert to `role: 'user'` — so a hook
+ * injection landing a text turn directly after tool results (`PostToolBatch`
+ * / `PreemptBoundary` drains) must merge into one user message here, with
+ * block order preserved so the toolUse/toolResult pairing stays intact.
+ */
+describe('convertToConverseMessages — user-role run merging', () => {
+  it('merges a tool result followed by an injected text turn into one user message', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('run the search'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call_1', name: 'search', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'search output',
+        tool_call_id: 'call_1',
+        name: 'search',
+      }),
+      new HumanMessage({
+        content: 'Actually, focus on the second result.',
+        additional_kwargs: { source: 'steer' },
+      }),
+    ];
+
+    const { converseMessages } = convertToConverseMessages(messages);
+
+    expect(converseMessages.map((m) => m.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+    ]);
+    const merged = converseMessages[2];
+    const blockKinds = (merged.content ?? []).map((block) =>
+      'toolResult' in block ? 'toolResult' : 'text'
+    );
+    expect(blockKinds).toEqual(['toolResult', 'text']);
+    expect(
+      (merged.content ?? []).find((block) => 'text' in block)?.text
+    ).toBe('Actually, focus on the second result.');
+  });
+
+  it('still merges adjacent tool-result-only turns', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call_1', name: 'a', args: {}, type: 'tool_call' },
+          { id: 'call_2', name: 'b', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({ content: 'one', tool_call_id: 'call_1', name: 'a' }),
+      new ToolMessage({ content: 'two', tool_call_id: 'call_2', name: 'b' }),
+    ];
+
+    const { converseMessages } = convertToConverseMessages(messages);
+
+    expect(converseMessages.map((m) => m.role)).toEqual(['assistant', 'user']);
+    const toolResultIds = (converseMessages[1].content ?? [])
+      .map((block) => ('toolResult' in block ? block.toolResult?.toolUseId : undefined))
+      .filter(Boolean);
+    expect(toolResultIds).toEqual(['call_1', 'call_2']);
+  });
+
+  it('does not merge across an assistant turn', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('first'),
+      new AIMessage('answer'),
+      new HumanMessage('second'),
+    ];
+    const { converseMessages } = convertToConverseMessages(messages);
+    expect(converseMessages.map((m) => m.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+    ]);
+  });
+});

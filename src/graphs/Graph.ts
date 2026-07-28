@@ -2665,9 +2665,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       /**
-       * Bedrock Converse and Mistral require strict user/assistant
-       * alternation and reject consecutive user turns outright. Four sites
-       * can emit them — the `PostToolBatch` and `PreemptBoundary` hook
+       * Mistral rejects consecutive user turns outright; Bedrock's Converse
+       * API documents strict user/assistant alternation across its model
+       * families, with enforcement varying by family (Claude on Converse
+       * currently tolerates the shape — verified live — but the payload is
+       * normalized for all of them rather than betting on leniency). Four
+       * sites can emit them — the `PostToolBatch` and `PreemptBoundary` hook
        * boundaries (a consolidated context message followed by one
        * `HumanMessage` per injected entry), a queue drain carrying more than
        * one steer, and `run.ts`'s pre-stream context push onto a payload that
@@ -3455,6 +3458,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
            * to END.
            */
           this.preemptIncomplete = true;
+          /**
+           * A halting boundary that ALSO injected nothing is still an empty
+           * boundary by the `getPreemptStats().emptyBoundaries` contract —
+           * hosts use the counter for truncated-seal telemetry, and both
+           * paths end the turn with nothing to resume from.
+           */
+          if (injected.length === 0) {
+            this.preemptEmptyBoundaries += 1;
+          }
           this.cleanupSignalListener();
           return injected.length > 0
             ? { messages: [...(result.messages ?? []), ...injected] }

@@ -520,7 +520,7 @@ describe('formatAgentMessages trailing-steer anchor', () => {
    * A trailing steer followed by another assistant ENTRY needs no anchor —
    * that entry's own assistant turn IS the separation. Emitting the
    * placeholder anyway would put two assistant turns back to back, which
-   * Bedrock and Mistral reject and nothing downstream merges
+   * strict-alternation providers can reject and nothing downstream merges
    * (`coalesceAdjacentUserTurns` merges user turns only).
    */
   it('suppresses the anchor when the next payload entry is an assistant turn', () => {
