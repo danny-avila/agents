@@ -741,6 +741,18 @@ export class Run<_T extends t.BaseGraphState> {
     };
 
     /**
+     * Cancellation can arrive either at graph construction or per-call through
+     * `callerConfig.signal`, and boundary hooks need to observe both — for a
+     * multi-agent run the construction signal does not exist at all, since
+     * `MultiAgentGraphConfig` exposes none. The graph keeps whichever it was
+     * given and adopts the caller's when that is the only one, so a drain
+     * cannot keep running against a host queue after the caller aborted.
+     */
+    if (callerConfig.signal != null && graph.signal == null) {
+      graph.signal = callerConfig.signal;
+    }
+
+    /**
      * Skip `resetValues` on resume — we're continuing an in-flight
      * run, not starting a fresh one. Resetting would wipe the
      * sidecars (`toolCallStepIds`, `stepKeyIds`, accumulated
@@ -1013,6 +1025,19 @@ export class Run<_T extends t.BaseGraphState> {
         }).catch(() => {
           /* Stop hook errors must not masquerade as stream failures */
         });
+      }
+
+      /**
+       * A `PreemptBoundary` hook that returned `preventContinuation` has its
+       * registry halt cleared by the graph — that is what stops the halt from
+       * cancelling the stream before the sealed turn commits — so the reason
+       * is carried across on the graph instead. Surfaced here, AFTER the
+       * `Stop` dispatch above, so the host still receives a completion signal
+       * to persist the partial answer with while `getHaltReason()` correctly
+       * reports that a hook stopped the run rather than the model finishing.
+       */
+      if (this._haltedReason == null && graph.preemptHaltReason != null) {
+        this._haltedReason = graph.preemptHaltReason;
       }
     };
 

@@ -1011,6 +1011,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   preemptIncomplete = false;
   /**
+   * `stopReason` from a `PreemptBoundary` hook that halted the turn.
+   *
+   * Clearing the registry halt is what keeps the sealed turn alive, but the
+   * registry held the only copy of the reason — so it is captured here first.
+   * Without it `getHaltReason()` returns undefined and a host records a
+   * hook-halted turn as an ordinary completion.
+   */
+  preemptHaltReason: string | undefined;
+  /**
    * Agent IDs whose next superstep must return to the agent node. Keyed by
    * agent because `MultiAgentGraph` routes every parallel agent through this
    * same instance, and a single field would let one agent's boundary resume
@@ -1168,6 +1177,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.preemptSealCount = 0;
     this.preemptEmptyBoundaries = 0;
     this.preemptIncomplete = false;
+    this.preemptHaltReason = undefined;
   }
 
   /**
@@ -3488,10 +3498,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * Scoped to a halt this event raised, so a halt from an earlier hook in
      * the same run — `haltRun` is first-write-wins — is left alone.
      */
-    if (
-      result.preventContinuation === true &&
-      this.hookRegistry.getHaltSignal(runId)?.source === 'PreemptBoundary'
-    ) {
+    const halt = this.hookRegistry.getHaltSignal(runId);
+    if (result.preventContinuation === true && halt?.source === 'PreemptBoundary') {
+      this.preemptHaltReason = halt.reason;
       this.hookRegistry.clearHaltSignal(runId);
     }
     const injected: BaseMessage[] = [];
@@ -3503,10 +3512,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * short. Same system-flavored `HumanMessage` convention `ToolNode` uses —
      * Anthropic and Google reject a mid-conversation `SystemMessage`.
      */
-    if (result.additionalContexts.length > 0) {
+    /**
+     * Whitespace-only entries are dropped for the same reason empty
+     * `injectedMessages` are: `executeHooks` keeps them because their raw
+     * length is nonzero, but a blank turn is not something to resume from —
+     * it costs a model call and strict providers reject it outright.
+     */
+    const contexts = result.additionalContexts.filter(
+      (context) => context.trim() !== ''
+    );
+    if (contexts.length > 0) {
       injected.push(
         new HumanMessage({
-          content: result.additionalContexts.join('\n\n'),
+          content: contexts.join('\n\n'),
           additional_kwargs: { role: 'system', isMeta: true, source: 'hook' },
         })
       );

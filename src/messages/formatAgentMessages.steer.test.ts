@@ -446,6 +446,35 @@ describe('formatAgentMessages trailing-steer anchor', () => {
     }
   });
 
+  /**
+   * The old lookahead only proved a later ENTRY existed, not that it emitted.
+   * An entry with empty content is skipped silently, so a trailing steer
+   * followed only by such entries would leave the anchor as the final turn —
+   * an assistant prefill with no request after it.
+   */
+  it('omits the anchor when no later payload entry emits a message', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Partial answer.' },
+          steerPart('Change of plan.'),
+        ],
+      },
+      { role: 'user', content: [] } as unknown as TPayload[number],
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+    const last = messages[messages.length - 1];
+    expect(last.additional_kwargs.source).toBe('steer');
+    expect(
+      messages.some(
+        (m) => m instanceof AIMessage && m.content === '_'
+      )
+    ).toBe(false);
+  });
+
   it('leaves the user turn last when the steer ends the payload', () => {
     const payload: TPayload = [
       { role: 'user', content: 'Original request' },
