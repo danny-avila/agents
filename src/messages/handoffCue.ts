@@ -27,26 +27,23 @@ export const PREDECESSOR_HANDOFF_CUE =
  * Handoff edges with instructions and prompt-instruction edges already break
  * the prefill with a user turn; this closes the same gap for bare edges.
  *
- * Fail-safe OFF by identity: the trailing payload message must carry the same
- * id as the run's last recorded message (`runTail`, from the graph's
- * non-allocating `getLastRunMessage()`). Host-supplied trailing assistant
+ * Fail-safe OFF by provenance: the trailing payload message must be one the
+ * run itself produced (`isRunProduced`, backed by the graph's run-produced id
+ * set — immune to summarization compaction, which rewrites the live array
+ * and stales index-based boundaries). Host-supplied trailing assistant
  * turns (deliberate prefill flows) never match — the run has not produced
  * them — so single-agent prefill behavior is untouched. Wire-only: the cue is
  * appended to the provider projection, never to graph state or host history.
  */
 export function appendPredecessorHandoffCue(
   messages: BaseMessage[],
-  runTail: BaseMessage | undefined
+  isRunProduced: ((message: BaseMessage) => boolean) | undefined
 ): BaseMessage[] {
   const last = messages.at(-1);
   if (last == null || last.getType() !== 'ai') {
     return messages;
   }
-  const lastRun = runTail;
-  if (lastRun == null || lastRun.getType() !== 'ai') {
-    return messages;
-  }
-  if (last.id == null || lastRun.id == null || last.id !== lastRun.id) {
+  if (isRunProduced == null || !isRunProduced(last)) {
     return messages;
   }
   return [
@@ -56,4 +53,26 @@ export function appendPredecessorHandoffCue(
       additional_kwargs: { role: 'user', isMeta: true, source: 'handoff' },
     }),
   ];
+}
+
+/**
+ * Strips a trailing handoff cue. The counterpart for the serving-provider
+ * funnel: an Anthropic-like PRIMARY bakes the cue into its measured payload,
+ * and a tolerant fallback (OpenAI, Mistral, Bedrock-Nova) re-sending that
+ * payload must not ship the Claude-only synthetic turn. Identity on the
+ * no-op path.
+ */
+export function removePredecessorHandoffCue(
+  messages: BaseMessage[]
+): BaseMessage[] {
+  const last = messages.at(-1);
+  if (
+    last == null ||
+    last.getType() !== 'human' ||
+    last.additional_kwargs.source !== 'handoff' ||
+    last.content !== PREDECESSOR_HANDOFF_CUE
+  ) {
+    return messages;
+  }
+  return messages.slice(0, -1);
 }

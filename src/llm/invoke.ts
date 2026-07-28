@@ -40,6 +40,7 @@ import {
   coalesceAdjacentUserTurns,
   strictAlternationProviders,
   appendPredecessorHandoffCue,
+  removePredecessorHandoffCue,
 } from '@/messages';
 import { canSealPreempt } from '@/llm/preempt';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
@@ -519,6 +520,36 @@ function collectModelCallbackSources(model: unknown): Callbacks[] {
   return sources;
 }
 
+/**
+ * The serving model's id, read through the same wrapper stack
+ * `collectModelCallbackSources` walks — `bindTools` returns a
+ * `RunnableBinding` and a system runnable pipes a `RunnableSequence`, and
+ * neither exposes the chat model's `model` at the top level.
+ */
+function resolveServingModelId(model: unknown): string | undefined {
+  const seen = new Set<unknown>();
+  let current: unknown = model;
+  while (current != null && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const wrapper = current as {
+      model?: unknown;
+      bound?: unknown;
+      last?: unknown;
+      steps?: unknown[];
+    };
+    if (typeof wrapper.model === 'string' && wrapper.model !== '') {
+      return wrapper.model;
+    }
+    current =
+      wrapper.bound ??
+      wrapper.last ??
+      (Array.isArray(wrapper.steps)
+        ? wrapper.steps[wrapper.steps.length - 1]
+        : undefined);
+  }
+  return undefined;
+}
+
 async function endSealedModelRun(
   context: InvokeContext | undefined,
   chunk: AIMessageChunk,
@@ -664,30 +695,37 @@ export async function attemptInvoke(
    * the primary simply re-runs a no-op over already-coalesced messages.
    */
   /**
-   * Same serving-provider rule for the predecessor handoff cue (#345): an
-   * OpenAI primary falling back to a Claude surface needs the cue applied
-   * for the fallback, and an Anthropic primary falling back to OpenAI must
-   * NOT ship the Claude-only synthetic turn. The Bedrock model id is read
-   * off the serving model instance; when absent, `isAnthropicLike` defaults
-   * Bedrock to Claude — the safe direction for a cue that is inert
-   * elsewhere. No-op identity when the payload does not end on a
-   * run-produced assistant turn.
+   * Serving-provider re-keying for the predecessor handoff cue (#345). The
+   * PRIMARY's cue is baked in createCallModel's measured transform stage —
+   * appending after measurement could push a just-fits prompt over budget —
+   * so this funnel only corrects for fallbacks crossing provider families:
+   * a tolerant primary falling back to a Claude surface gains the cue here,
+   * and an Anthropic primary falling back to OpenAI/Mistral/Nova has the
+   * Claude-only synthetic turn stripped. Both helpers are identity on their
+   * no-op paths, so the primary's own pass re-runs for free.
+   *
+   * The serving model id is read through the wrapper stack (`bindTools`'
+   * binding, a system runnable's sequence) — a wrapper's top-level `.model`
+   * is undefined, and `isAnthropicLike` would otherwise default a wrapped
+   * Bedrock-Nova model to Claude. The context cast is widened deliberately:
+   * the type says every context is a full Graph, but summarization passes
+   * none and long-standing tests pass partial stubs.
    */
-  /**
-   * Widened deliberately: the type says every context is a full Graph, but
-   * summarization passes none and long-standing tests pass partial stubs —
-   * the accessor genuinely may be absent at runtime.
-   */
-  const getRunTail = (
+  const isRunProduced = (
     context as
-      | { getLastRunMessage?: () => BaseMessage | undefined }
+      | { isRunProducedMessage?: (message: BaseMessage) => boolean }
       | undefined
-  )?.getLastRunMessage;
+  )?.isRunProducedMessage;
   const cued = isAnthropicLike(provider, {
-    model: (model as { model?: string }).model,
+    model: resolveServingModelId(model),
   })
-    ? appendPredecessorHandoffCue(annotated, getRunTail?.call(context))
-    : annotated;
+    ? appendPredecessorHandoffCue(
+      annotated,
+      isRunProduced == null
+        ? undefined
+        : (message): boolean => isRunProduced.call(context, message)
+    )
+    : removePredecessorHandoffCue(annotated);
   const messagesForProvider = strictAlternationProviders.has(provider)
     ? coalesceAdjacentUserTurns(cued)
     : cued;

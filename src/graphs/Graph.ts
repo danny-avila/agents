@@ -50,6 +50,7 @@ import {
   convertInjectedMessages,
   coalesceAdjacentUserTurns,
   strictAlternationProviders,
+  appendPredecessorHandoffCue,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -988,6 +989,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   messages: BaseMessage[] = [];
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
+  /** Ids of AI turns the agent node returned THIS run; see isRunProducedMessage. */
+  protected runProducedAiMessageIds = new Set<string>();
   /** Checkpoint scope whose messages match index-keyed tool snapshots. */
   private originalToolContentCheckpointScope?: string;
   runId: string | undefined;
@@ -1119,6 +1122,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * a stale reference on 2nd+ processStream calls.
      */
     this.toolCallStepIds.clear();
+    this.runProducedAiMessageIds.clear();
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
@@ -1465,21 +1469,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   /**
-   * The run's most recent message without materializing the whole tail —
-   * `getRunMessages()` slices O(n) per call, which is too much for per-model-
-   * invocation reads that only need the last entry (the handoff-cue gate).
-   * Mirrors `getRunMessages`' disposed-graph fallbacks.
+   * True when THIS RUN produced `message` — the provenance the handoff cue
+   * gate needs. Tracked as an id set rather than inferred from `startIndex`
+   * arithmetic: summarization's remove-all compaction rewrites the live
+   * array and leaves `startIndex` stale, so index-based run/host
+   * discrimination silently breaks right after a mid-run summarize. Ids
+   * survive compaction (retained messages keep theirs), host-supplied
+   * prefill messages are never in the set, and membership is O(1) per
+   * model call.
    */
-  getLastRunMessage(): BaseMessage | undefined {
-    /** Typed honestly: disposed-but-cached graphs really do carry null here. */
-    const live = this.messages as BaseMessage[] | null | undefined;
-    if (live == null || live.length === 0) {
-      return this.cachedRunMessages?.at(-1);
-    }
-    if (live.length <= this.startIndex) {
-      return undefined;
-    }
-    return live.at(-1);
+  isRunProducedMessage(message: BaseMessage): boolean {
+    const id = message.id;
+    return (
+      typeof id === 'string' &&
+      id !== '' &&
+      this.runProducedAiMessageIds.has(id)
+    );
   }
 
   getContentParts(): t.MessageContentComplex[] | undefined {
@@ -2535,6 +2540,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             );
           }
         }
+        /**
+         * Applied HERE for the primary so the cue is part of the MEASURED
+         * payload — the pre-invoke projection and overflow guard run on this
+         * stage's output, and a post-measure append could push a just-fits
+         * prompt over budget unreported (#346 round 2). The attemptInvoke
+         * funnel re-keys per SERVING provider: it strips this cue for a
+         * tolerant fallback and adds it for a Claude fallback behind a
+         * tolerant primary.
+         */
+        if (
+          isAnthropicLike(
+            agentContext.provider,
+            agentContext.clientOptions as { model?: string }
+          )
+        ) {
+          const before = transformed;
+          transformed = trackProviderMessageOrigins(
+            before,
+            appendPredecessorHandoffCue(before, (message) =>
+              this.isRunProducedMessage(message)
+            )
+          );
+        }
         return transformed;
       };
 
@@ -3341,6 +3369,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * handled everything — both paths become no-ops.
        */
       const responseMessage = result.messages?.[0];
+      /**
+       * Provenance for the handoff-cue gate: recorded at the node, where the
+       * produced turn is unambiguous. A null id (rare; the reducer would
+       * assign one later) simply leaves the cue off for that turn —
+       * fail-safe in the direction of provider-default behavior.
+       */
+      if (
+        responseMessage?.getType() === 'ai' &&
+        typeof responseMessage.id === 'string' &&
+        responseMessage.id !== ''
+      ) {
+        this.runProducedAiMessageIds.add(responseMessage.id);
+      }
       const toolCalls = (responseMessage as AIMessageChunk | undefined)
         ?.tool_calls;
       const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
