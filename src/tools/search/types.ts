@@ -282,6 +282,7 @@ export interface ExaSearchPayload {
   userLocation?: string;
   includeDomains?: string[];
   excludeDomains?: string[];
+  moderation?: boolean;
 }
 
 export interface ExaSearchResult {

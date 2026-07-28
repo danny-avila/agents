@@ -62,6 +62,7 @@ export const createExaAPI = (
     numResults = 8,
     type,
     news,
+    safeSearch,
   }: t.GetSourcesParams): Promise<t.SearchResult> => {
     if (!query.trim()) {
       return { success: false, error: 'Query cannot be empty' };
@@ -84,6 +85,7 @@ export const createExaAPI = (
         type: options?.searchType ?? 'auto',
         numResults: maxResults,
         contents,
+        moderation: (safeSearch ?? 1) !== 0,
       };
 
       const category = isNews ? 'news' : options?.category;

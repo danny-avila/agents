@@ -68,12 +68,40 @@ describe('Exa search API', () => {
         type: 'auto',
         numResults: 8,
         contents: { highlights: true },
+        moderation: true,
       },
       expect.objectContaining({
         headers: expect.objectContaining({ 'x-api-key': 'test-key' }),
       })
     );
     expect(result.success).toBe(true);
+  });
+
+  it('maps safeSearch levels onto Exa moderation', async () => {
+    mockedAxios.post.mockResolvedValue(sampleResponse);
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'exa',
+      exaApiKey: 'test-key',
+    });
+
+    await searchAPI.getSources({ query: 'typescript', safeSearch: 0 });
+    await searchAPI.getSources({ query: 'typescript', safeSearch: 1 });
+    await searchAPI.getSources({ query: 'typescript', safeSearch: 2 });
+    await searchAPI.getSources({ query: 'typescript' });
+
+    expect(mockedAxios.post.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ moderation: false })
+    );
+    expect(mockedAxios.post.mock.calls[1][1]).toEqual(
+      expect.objectContaining({ moderation: true })
+    );
+    expect(mockedAxios.post.mock.calls[2][1]).toEqual(
+      expect.objectContaining({ moderation: true })
+    );
+    expect(mockedAxios.post.mock.calls[3][1]).toEqual(
+      expect.objectContaining({ moderation: true })
+    );
   });
 
   it('maps results into organic sources (highlights and text fallback)', async () => {
