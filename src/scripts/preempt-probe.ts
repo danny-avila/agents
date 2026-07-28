@@ -2,7 +2,12 @@
 //
 // Live-provider probe for cooperative mid-generation preemption.
 //
-//   npm run probe:preempt -- --provider anthropic
+//   npx tsx --env-file=.env src/scripts/preempt-probe.ts --provider anthropic
+//
+// (tsx rather than the repo's node-loader `script` runner: the import chain
+// reaches @mistralai/mistralai, which ships ESM-only and defeats the loader.
+// Keep live credentials OUT of the worktree's .env — jest loads it — and
+// point --env-file at wherever they actually live.)
 //
 // Asks for a long, tool-free answer, arms `shouldPreempt` once text has
 // started streaming, and asserts the full seal -> PreemptBoundary -> inject ->
@@ -254,18 +259,33 @@ async function probe(): Promise<Verdict> {
   const resumedText = textOf(messages[injectedIndex + 1]);
   const resumeAnswersSteer = /1453/.test(resumedText);
 
-  const ok =
-    stats.seals === 1 &&
-    stats.emptyBoundaries === 0 &&
-    boundaryFired &&
-    injectedIndex > 0 &&
-    isAssistant(messages[injectedIndex - 1]) &&
-    isAssistant(messages[injectedIndex + 1]) &&
-    sealedText.trim().length > 0 &&
-    resumedText.trim().length > 0 &&
-    modelEndEvents >= 2 &&
-    usageEventsWithTokens >= 2 &&
-    chatModelStarts === llmEnds;
+  /**
+   * Control mode is the no-preemption baseline: one uninterrupted model run,
+   * nothing sealed, nothing injected. Its value is the contrast — the same
+   * lifecycle counters must balance WITHOUT the seal machinery — so it gets
+   * its own criteria instead of failing the seal-path ones by construction.
+   */
+  const ok = isControl()
+    ? stats.seals === 0 &&
+      !boundaryFired &&
+      injectedIndex === -1 &&
+      messages.length > 0 &&
+      textOf(messages[messages.length - 1]).trim().length > 0 &&
+      modelEndEvents >= 1 &&
+      usageEventsWithTokens >= 1 &&
+      llmErrors === 0 &&
+      chatModelStarts === llmEnds
+    : stats.seals === 1 &&
+      stats.emptyBoundaries === 0 &&
+      boundaryFired &&
+      injectedIndex > 0 &&
+      isAssistant(messages[injectedIndex - 1]) &&
+      isAssistant(messages[injectedIndex + 1]) &&
+      sealedText.trim().length > 0 &&
+      resumedText.trim().length > 0 &&
+      modelEndEvents >= 2 &&
+      usageEventsWithTokens >= 2 &&
+      chatModelStarts === llmEnds;
 
   return {
     provider: providerKey,

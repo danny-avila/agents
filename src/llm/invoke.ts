@@ -1,6 +1,10 @@
 import { concat } from '@langchain/core/utils/stream';
 import { AIMessageChunk } from '@langchain/core/messages';
-import { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import {
+  CallbackManager,
+  CallbackManagerForLLMRun,
+  type Callbacks,
+} from '@langchain/core/callbacks/manager';
 import { getCallbackManagerForConfig } from '@langchain/core/runnables';
 import type { Serialized } from '@langchain/core/load/serializable';
 import type { ChatGeneration } from '@langchain/core/outputs';
@@ -480,13 +484,34 @@ async function endSealedModelRun(
   chunk: AIMessageChunk,
   prompt: BaseMessage[],
   llmRunId: string | undefined,
-  config?: RunnableConfig
+  config?: RunnableConfig,
+  model?: t.ChatModel
 ): Promise<void> {
   const metadata = config?.metadata as Record<string, unknown> | undefined;
   synthesizeSealedUsage(context, chunk, prompt, metadata);
   if (llmRunId != null) {
     try {
-      const callbackManager = await getCallbackManagerForConfig(config);
+      let callbackManager = await getCallbackManagerForConfig(config);
+      /**
+       * The real model run composes the per-call config's callbacks WITH the
+       * model's own (`CallbackManager.configure(config.callbacks,
+       * this.callbacks, …)` in `@langchain/core`'s base chat model), so a
+       * handler supplied via `clientOptions.callbacks` received
+       * `handleChatModelStart` for this run. Rebuilding from the config alone
+       * would close the run for every handler EXCEPT those — leaving their
+       * span open forever. Composed the same way the real run composes:
+       * model callbacks appended non-inheritable, parent run id preserved by
+       * `copy`, tracers deduped by `configure`.
+       */
+      const modelCallbacks = (model as { callbacks?: Callbacks } | undefined)
+        ?.callbacks;
+      if (modelCallbacks != null) {
+        callbackManager =
+          CallbackManager.configure(
+            callbackManager ?? undefined,
+            modelCallbacks
+          ) ?? callbackManager;
+      }
       if (callbackManager != null) {
         const runManager = new CallbackManagerForLLMRun(
           llmRunId,
@@ -745,7 +770,8 @@ export async function attemptInvoke(
         finalChunk,
         messagesForProvider,
         sealedRunId,
-        config
+        config,
+        model
       );
     }
 

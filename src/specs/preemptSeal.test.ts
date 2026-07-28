@@ -29,6 +29,7 @@ async function createSealRun(options: {
   hook: HookCallback<'PreemptBoundary'>;
   responses: string[];
   stopHook?: HookCallback<'Stop'>;
+  modelCallbacks?: FakeChatModel['callbacks'];
 }): Promise<Run<t.IState>> {
   const registry = new HookRegistry();
   registry.register('PreemptBoundary', { hooks: [options.hook] });
@@ -54,9 +55,13 @@ async function createSealRun(options: {
   if (!run.Graph) {
     throw new Error('Expected graph to be initialized');
   }
-  run.Graph.overrideModel = new FakeChatModel({
+  const model = new FakeChatModel({
     responses: options.responses,
   });
+  if (options.modelCallbacks != null) {
+    model.callbacks = options.modelCallbacks;
+  }
+  run.Graph.overrideModel = model;
   return run;
 }
 
@@ -133,6 +138,46 @@ describe('cooperative seal (end-to-end via Run)', () => {
     expect(run.getHaltReason()).toBe('host_policy_stop');
     expect(run.Graph?.preemptIncomplete).toBe(true);
     expect(run.Graph?.preemptEmptyBoundaries).toBe(1);
+  });
+
+  it('closes model-level callbacks for the sealed run, not just config-level ones', async () => {
+    let starts = 0;
+    let ends = 0;
+    const run = await createSealRun({
+      runId: 'seal-model-callbacks',
+      hook: async () => ({
+        injectedMessages: [
+          { role: 'user' as const, content: 'Shorter.', source: 'steer' },
+        ],
+      }),
+      responses: [FULL_RESPONSE, RESUMED_RESPONSE],
+      /**
+       * A handler supplied on the MODEL (clientOptions.callbacks) gets
+       * handleChatModelStart from the real run, so the sealed turn's
+       * synthetic close must reach it too — otherwise its span for the
+       * sealed run never closes. Two runs (sealed + resumed): both must
+       * balance.
+       */
+      modelCallbacks: [
+        {
+          handleChatModelStart: (): void => {
+            starts += 1;
+          },
+          handleLLMEnd: (): void => {
+            ends += 1;
+          },
+        },
+      ],
+    });
+
+    await run.processStream(
+      { messages: [new HumanMessage('hello there')] },
+      streamConfig
+    );
+
+    expect(run.Graph?.preemptSealCount).toBe(1);
+    expect(starts).toBe(2);
+    expect(ends).toBe(2);
   });
 
   it('resumes after an injecting boundary and completes without a halt reason', async () => {
