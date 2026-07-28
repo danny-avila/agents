@@ -20,15 +20,29 @@ describe('strictAlternationProviders', () => {
 });
 
 describe('coalesceAdjacentUserTurns', () => {
-  it('leaves an already-alternating run untouched', () => {
+  it('leaves an already-alternating run untouched, returning the SAME array', () => {
     const messages = [
       new HumanMessage({ content: 'question' }),
       new AIMessage({ content: 'answer' }),
       new HumanMessage({ content: 'follow-up' }),
     ];
     const result = coalesceAdjacentUserTurns(messages);
-    expect(result.map((m) => m.getType())).toEqual(['human', 'ai', 'human']);
-    expect(result[0]).toBe(messages[0]);
+    /**
+     * Identity, not just equality: the pass runs twice for a primary
+     * Bedrock/Mistral call (createCallModel, then the attemptInvoke funnel),
+     * so the normalized second pass must not reallocate a context-sized
+     * array — and origin tracking early-exits on `before === after`.
+     */
+    expect(result).toBe(messages);
+  });
+
+  it('is idempotent by identity: re-coalescing merged output is a no-op', () => {
+    const once = coalesceAdjacentUserTurns([
+      new HumanMessage({ content: 'steer 1' }),
+      new HumanMessage({ content: 'steer 2' }),
+    ]);
+    expect(once).toHaveLength(1);
+    expect(coalesceAdjacentUserTurns(once)).toBe(once);
   });
 
   /** A boundary that drains two steers, which is the ordinary queue case. */

@@ -67,6 +67,7 @@ export function coalesceAdjacentUserTurns(
   messages: BaseMessage[]
 ): BaseMessage[] {
   const result: BaseMessage[] = [];
+  let mergedAny = false;
   for (const message of messages) {
     const previous = result[result.length - 1];
     const mergeable =
@@ -80,6 +81,7 @@ export function coalesceAdjacentUserTurns(
       result.push(message);
       continue;
     }
+    mergedAny = true;
 
     result[result.length - 1] = new HumanMessage({
       content: joinContent(previous.content, message.content),
@@ -98,5 +100,13 @@ export function coalesceAdjacentUserTurns(
       ...(previous.id != null && { id: previous.id }),
     });
   }
-  return result;
+  /**
+   * Identity on the no-merge path. The pass runs twice for a primary
+   * Bedrock/Mistral call — once in `createCallModel` (must precede the cache
+   * breakpoint) and once in the `attemptInvoke` funnel (must cover fallback
+   * and summarization sends) — so the already-normalized second pass returns
+   * the SAME array rather than reallocating a context-sized copy, and
+   * callers can cheaply detect "nothing changed" by identity.
+   */
+  return mergedAny ? result : messages;
 }
