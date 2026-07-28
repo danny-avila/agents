@@ -8,7 +8,6 @@ import type {
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { LLMResult, Generation } from '@langchain/core/outputs';
 import type { Command } from '@langchain/langgraph';
-import type OpenAITypes from 'openai';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
 import type { ToolEndEvent } from '@/types/tools';
@@ -392,46 +391,6 @@ export interface TMessage {
 }
 
 export type TPayload = Array<Partial<TMessage>>;
-
-export type CustomChunkDelta =
-  | null
-  | undefined
-  | (Partial<OpenAITypes.Chat.Completions.ChatCompletionChunk.Choice.Delta> & {
-      reasoning?: string | null;
-      reasoning_content?: string | null;
-    });
-export type CustomChunkChoice = Partial<
-  Omit<OpenAITypes.Chat.Completions.ChatCompletionChunk.Choice, 'delta'> & {
-    delta?: CustomChunkDelta;
-  }
->;
-export type CustomChunk = Partial<OpenAITypes.ChatCompletionChunk> & {
-  choices?: Partial<Array<CustomChunkChoice>>;
-};
-
-export type SplitStreamHandlers = Partial<{
-  [GraphEvents.ON_RUN_STEP]: ({
-    event,
-    data,
-  }: {
-    event: GraphEvents;
-    data: RunStep;
-  }) => void;
-  [GraphEvents.ON_MESSAGE_DELTA]: ({
-    event,
-    data,
-  }: {
-    event: GraphEvents;
-    data: MessageDeltaEvent;
-  }) => void;
-  [GraphEvents.ON_REASONING_DELTA]: ({
-    event,
-    data,
-  }: {
-    event: GraphEvents;
-    data: ReasoningDeltaEvent;
-  }) => void;
-}>;
 
 export type SummarizeDeltaData = {
   id: string;
