@@ -1,3 +1,4 @@
+import type { JsonSchemaType } from '@/types';
 import { EnvVar } from '@/common';
 
 export const DEFAULT_CODE_API_RUN_TIMEOUT_MS = 15_000;
@@ -15,6 +16,7 @@ type TimeoutSchema = {
 export type ProgrammaticToolCallingJsonSchema = {
   type: 'object';
   properties: {
+    intent: JsonSchemaType;
     code: {
       type: 'string';
       minLength: number;

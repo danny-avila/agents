@@ -335,7 +335,16 @@ function createTool({
         maxOutputChars
       );
       const data: t.SearchResultData = { turn, ...searchResult, references };
-      return [output, { [Constants.WEB_SEARCH]: data }];
+      /** Settled label for the call's intent (see `intentArg.ts`). */
+      const referenceCount = references.length;
+      const outcome =
+        referenceCount > 0
+          ? `Found ${referenceCount} result${referenceCount === 1 ? '' : 's'} for "${query}"`
+          : undefined;
+      return [
+        output,
+        { [Constants.WEB_SEARCH]: data, ...(outcome != null && { outcome }) },
+      ];
     },
     {
       name: WebSearchToolName,

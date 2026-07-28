@@ -41,7 +41,7 @@ import {
 } from '@/utils/truncation';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent } from '@/utils/events';
-import { resolveToolOutcome } from '@/tools/intentArg';
+import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { isGoogleLike } from '@/utils/llm';
 import { getMessageId } from '@/messages';
 
@@ -860,9 +860,11 @@ async function dispatchEagerToolCompletions(args: {
         maxToolResultChars
       ).content;
     }
-    const outcome = resolveToolOutcome(record.request.args, result, {
-      isError: result.status === 'error',
-    });
+    const outcome = resolveToolOutcome(
+      record.request.args,
+      outcomeFieldsFromResult(result),
+      { isError: result.status === 'error' }
+    );
 
     try {
       const dispatched = await safeDispatchCustomEvent(

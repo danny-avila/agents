@@ -36,12 +36,13 @@ import {
   truncateLocalOutput,
   validateBashCommand,
 } from './LocalExecutionEngine';
+import { withIntent } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 /** Back-compat alias; canonical name lives on `Constants.COMPILE_CHECK`. */
 export const CompileCheckToolName = Constants.COMPILE_CHECK;
 
-const CompileCheckSchema: t.JsonSchemaType = {
+const CompileCheckSchema: t.JsonSchemaType = withIntent({
   type: 'object',
   properties: {
     command: {
@@ -55,7 +56,7 @@ const CompileCheckSchema: t.JsonSchemaType = {
         'Optional timeout in milliseconds. Defaults to 120000 (2 min).',
     },
   },
-};
+});
 
 type DetectedKind =
   | 'typescript'

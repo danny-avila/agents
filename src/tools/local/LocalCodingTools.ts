@@ -28,6 +28,7 @@ import { createLocalFileCheckpointer } from './FileCheckpointer';
 import { applyEdit, locateEdit } from './editStrategies';
 import { decodeFile, encodeFile } from './textEncoding';
 import { runPostEditSyntaxCheck } from './syntaxCheck';
+import { withIntent } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 const MAX_READ_CHARS = 256000;
@@ -47,7 +48,7 @@ export const LocalGrepSearchToolName = Constants.GREP_SEARCH;
 export const LocalGlobSearchToolName = Constants.GLOB_SEARCH;
 export const LocalListDirectoryToolName = Constants.LIST_DIRECTORY;
 
-export const LocalReadFileToolSchema: t.JsonSchemaType = {
+export const LocalReadFileToolSchema: t.JsonSchemaType = withIntent({
   type: 'object',
   properties: {
     path: {
@@ -65,9 +66,9 @@ export const LocalReadFileToolSchema: t.JsonSchemaType = {
     },
   },
   required: ['path'],
-};
+});
 
-export const LocalWriteFileToolSchema: t.JsonSchemaType = {
+export const LocalWriteFileToolSchema: t.JsonSchemaType = withIntent({
   type: 'object',
   properties: {
     path: {
@@ -81,9 +82,9 @@ export const LocalWriteFileToolSchema: t.JsonSchemaType = {
     },
   },
   required: ['path', 'content'],
-};
+});
 
-export const LocalEditFileToolSchema: t.JsonSchemaType = {
+export const LocalEditFileToolSchema: t.JsonSchemaType = withIntent({
   type: 'object',
   properties: {
     path: {
@@ -114,9 +115,9 @@ export const LocalEditFileToolSchema: t.JsonSchemaType = {
     },
   },
   required: ['path'],
-};
+});
 
-export const LocalGrepSearchToolSchema: t.JsonSchemaType = {
+export const LocalGrepSearchToolSchema: t.JsonSchemaType = withIntent({
   type: 'object',
   properties: {
     pattern: {
@@ -137,9 +138,9 @@ export const LocalGrepSearchToolSchema: t.JsonSchemaType = {
     },
   },
   required: ['pattern'],
-};
+});
 
-export const LocalGlobSearchToolSchema: t.JsonSchemaType = {
+export const LocalGlobSearchToolSchema: t.JsonSchemaType = withIntent({
   type: 'object',
   properties: {
     pattern: {
@@ -156,9 +157,9 @@ export const LocalGlobSearchToolSchema: t.JsonSchemaType = {
     },
   },
   required: ['pattern'],
-};
+});
 
-export const LocalListDirectoryToolSchema: t.JsonSchemaType = {
+export const LocalListDirectoryToolSchema: t.JsonSchemaType = withIntent({
   type: 'object',
   properties: {
     path: {
@@ -166,7 +167,7 @@ export const LocalListDirectoryToolSchema: t.JsonSchemaType = {
       description: 'Directory to list. Defaults to cwd.',
     },
   },
-};
+});
 
 function lineWindow(
   content: string,
