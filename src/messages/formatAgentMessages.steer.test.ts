@@ -516,6 +516,50 @@ describe('formatAgentMessages trailing-steer anchor', () => {
     expect(emptyAssistants).toHaveLength(0);
   });
 
+  /**
+   * A trailing steer followed by another assistant ENTRY needs no anchor —
+   * that entry's own assistant turn IS the separation. Emitting the
+   * placeholder anyway would put two assistant turns back to back, which
+   * Bedrock and Mistral reject and nothing downstream merges
+   * (`coalesceAdjacentUserTurns` merges user turns only).
+   */
+  it('suppresses the anchor when the next payload entry is an assistant turn', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Working on it.' },
+          steerPart('Actually, do the other thing.'),
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Doing the other thing.' },
+        ],
+      },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    expect(messages.map((message) => message.constructor.name)).toEqual([
+      'HumanMessage',
+      'AIMessage',
+      'HumanMessage',
+      'AIMessage',
+    ]);
+    expect(messages[2].additional_kwargs.source).toBe('steer');
+    expect(messages[3].content).toEqual([
+      { type: 'text', text: 'Doing the other thing.' },
+    ]);
+    expect(
+      messages.some(
+        (message) => message instanceof AIMessage && message.content === '_'
+      )
+    ).toBe(false);
+  });
+
   it('never emits two adjacent user turns around a trailing steer', () => {
     const payload: TPayload = [
       { role: 'user', content: 'Original request' },

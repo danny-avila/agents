@@ -1037,9 +1037,19 @@ export class Run<_T extends t.BaseGraphState> {
        * `Stop` dispatch above, so the host still receives a completion signal
        * to persist the partial answer with while `getHaltReason()` correctly
        * reports that a hook stopped the run rather than the model finishing.
+       *
+       * An empty boundary — sealed, but nothing to inject because the host's
+       * queue was drained or cancelled in the meantime — cut the answer short
+       * just as surely, only without a hook-supplied reason. It surfaces
+       * through the same channel under the same name the `Stop` dispatch
+       * already used for its `stopReason`, so terminal consumers
+       * (`AgentSession` emits `run.halted`, not `run.completed`) cannot
+       * finalize a truncated answer as a natural finish.
        */
       if (this._haltedReason == null && graph.preemptHaltReason != null) {
         this._haltedReason = graph.preemptHaltReason;
+      } else if (this._haltedReason == null && graph.preemptIncomplete) {
+        this._haltedReason = 'preempt_incomplete';
       }
     };
 

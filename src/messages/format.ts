@@ -1362,11 +1362,22 @@ export const formatAgentMessages = (
    * nothing cannot leave the anchor stranded as the final turn.
    */
   let pendingSteerAnchor = false;
-  const flushSteerAnchor = (): void => {
+  /**
+   * Emits the deferred anchor ahead of `next` — the message about to be
+   * pushed. When that message is itself an assistant turn, it already IS the
+   * separation the anchor exists to synthesize, so the intent is simply
+   * discharged: emitting the placeholder anyway would put two assistant turns
+   * back to back, which Bedrock and Mistral reject and nothing downstream
+   * repairs (`coalesceAdjacentUserTurns` merges user turns only).
+   */
+  const flushSteerAnchor = (next: { role?: LangChainMessageRole }): void => {
     if (!pendingSteerAnchor) {
       return;
     }
     pendingSteerAnchor = false;
+    if (next.role === 'assistant') {
+      return;
+    }
     messages.push(
       withMessageRole(
         new AIMessage({ content: STEER_ANCHOR_PLACEHOLDER }),
@@ -1435,7 +1446,7 @@ export const formatAgentMessages = (
       if (sourceMessageId != null && sourceMessageId !== '') {
         formattedMessage.id = sourceMessageId;
       }
-      flushSteerAnchor();
+      flushSteerAnchor(formattedMessage);
       messages.push(formattedMessage);
 
       // Update the index mapping for this message
@@ -1649,7 +1660,14 @@ export const formatAgentMessages = (
      * fresh one. `endsWithSteerMessage` reads only `additional_kwargs.source`,
      * so the deferral cannot change which messages get anchored.
      */
-    flushSteerAnchor();
+    /**
+     * Guarded on emission: an assistant entry whose blocks all filtered away
+     * emits nothing, and flushing for it would strand the anchor as the final
+     * turn — the pending flag stays set for whichever entry emits next.
+     */
+    if (formattedMessages.length > 0) {
+      flushSteerAnchor(formattedMessages[0]);
+    }
     messages.push(...formattedMessages);
     if (endsWithSteerMessage(formattedMessages)) {
       pendingSteerAnchor = true;
