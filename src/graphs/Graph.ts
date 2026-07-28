@@ -50,6 +50,7 @@ import {
   convertInjectedMessages,
   coalesceAdjacentUserTurns,
   strictAlternationProviders,
+  appendPredecessorHandoffCue,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -2516,6 +2517,27 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               formatContentStrings(beforeLegacyFormat)
             );
           }
+        }
+        /**
+         * Prefill-semantics providers CONTINUE a trailing assistant turn. A
+         * bare direct-edge successor in a multi-agent run receives exactly
+         * that shape — the predecessor's fresh output last — so without a
+         * user-turn cue it answers in the predecessor's voice, or returns
+         * empty content when that turn reads complete (#345). Scoped to
+         * Claude surfaces and to run-produced tails (host-supplied trailing
+         * assistant turns are deliberate prefill and never match by id).
+         */
+        if (
+          isAnthropicLike(
+            agentContext.provider,
+            agentContext.clientOptions as { model?: string }
+          )
+        ) {
+          const before = transformed;
+          transformed = trackProviderMessageOrigins(
+            before,
+            appendPredecessorHandoffCue(before, this.getRunMessages())
+          );
         }
         return transformed;
       };
