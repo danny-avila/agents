@@ -41,6 +41,7 @@ import {
 } from '@/utils/truncation';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent } from '@/utils/events';
+import { resolveToolOutcome } from '@/tools/intentArg';
 import { isGoogleLike } from '@/utils/llm';
 import { getMessageId } from '@/messages';
 
@@ -859,6 +860,10 @@ async function dispatchEagerToolCompletions(args: {
         maxToolResultChars
       ).content;
     }
+    const outcome =
+      result.status === 'error'
+        ? undefined
+        : resolveToolOutcome(record.request.args, result);
 
     try {
       const dispatched = await safeDispatchCustomEvent(
@@ -878,6 +883,7 @@ async function dispatchEagerToolCompletions(args: {
               id: result.toolCallId,
               output,
               progress: 1,
+              ...(outcome != null && { outcome }),
             } as t.ProcessedToolCall,
           },
         },

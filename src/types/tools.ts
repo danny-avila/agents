@@ -521,6 +521,17 @@ export type InjectedMessage = {
   skillName?: string;
 };
 
+/**
+ * In-place edit of a call's model-authored `intent` label: the first
+ * occurrence of `from` in the intent is replaced with `to` (case-sensitive).
+ * Lets a tool settle the label while preserving the model's own phrasing,
+ * e.g. `{ from: 'Searching', to: 'Searched' }`.
+ */
+export type OutcomePatch = {
+  from: string;
+  to: string;
+};
+
 /** Result for a single tool call in event-driven execution */
 export type ToolExecuteResult = {
   /** Matches ToolCallRequest.id */
@@ -533,6 +544,13 @@ export type ToolExecuteResult = {
   status: 'success' | 'error';
   /** Error message if status is 'error' */
   errorMessage?: string;
+  /**
+   * Settled human-readable label for this call, replacing the model-authored
+   * `intent` arg in the UI. Full replacement; wins over `outcome_patch`.
+   */
+  outcome?: string;
+  /** In-place edit of the model-authored `intent` label (see {@link OutcomePatch}). */
+  outcome_patch?: OutcomePatch;
   /**
    * Messages to inject into graph state after the ToolMessage for this call.
    * Placed after tool results to respect provider message ordering (tool_call -> tool_result adjacency).

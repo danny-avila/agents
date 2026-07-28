@@ -69,6 +69,10 @@ import {
   resolveLocalExecutionTools,
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
+import {
+  readOutcomeFields,
+  resolveToolOutcome,
+} from '@/tools/intentArg';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import { convertInjectedMessages } from '@/messages/injected';
 import { safeDispatchCustomEvent } from '@/utils/events';
@@ -2079,6 +2083,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * the tool actually received rather than leaking the template.
        */
       const effectiveArgs = resolvedArgsByCallId?.get(toolCallId) ?? call.args;
+      const outcome =
+        toolMessage.status === 'error'
+          ? undefined
+          : resolveToolOutcome(
+            effectiveArgs,
+            readOutcomeFields(toolMessage.artifact)
+          );
       const tool_call: t.ProcessedToolCall = {
         args: serializeToolContentBounded(
           (effectiveArgs as unknown) ?? {},
@@ -2088,6 +2099,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         id: toolCallId,
         output: contentString,
         progress: 1,
+        ...(outcome != null && { outcome }),
       };
 
       await safeDispatchCustomEvent(
@@ -3120,7 +3132,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             request?.args ?? {},
             contentString,
             config,
-            request?.turn
+            request?.turn,
+            result.status === 'error'
+              ? undefined
+              : resolveToolOutcome(request?.args, result)
           );
         }
 
@@ -3361,7 +3376,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     args: Record<string, unknown>,
     output: string,
     config: RunnableConfig,
-    turn?: number
+    turn?: number,
+    outcome?: string
   ): Promise<boolean> {
     const stepId = this.toolCallStepIds?.get(toolCallId) ?? '';
     if (!stepId) {
@@ -3386,6 +3402,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             id: toolCallId,
             output,
             progress: 1,
+            ...(outcome != null && { outcome }),
           } as t.ProcessedToolCall,
         },
       },
@@ -3422,7 +3439,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       request.args,
       output,
       config,
-      request.turn
+      request.turn,
+      result.status === 'error'
+        ? undefined
+        : resolveToolOutcome(request.args, result)
     );
   }
 

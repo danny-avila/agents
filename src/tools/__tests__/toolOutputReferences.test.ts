@@ -187,6 +187,21 @@ describe('ToolOutputReferenceRegistry', () => {
       expect(resolved).toBe('nothing to see here');
     });
 
+    it('leaves the top-level intent arg verbatim (display label, not a data channel)', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('r', 'tool0turn0', 'HUGE-STORED-OUTPUT');
+      const { resolved } = reg.resolve('r', {
+        intent: 'Reusing {{tool0turn0}} for the next step',
+        command: 'cat {{tool0turn0}}',
+        nested: { intent: 'not top-level {{tool0turn0}}' },
+      });
+      expect(resolved).toEqual({
+        intent: 'Reusing {{tool0turn0}} for the next step',
+        command: 'cat HUGE-STORED-OUTPUT',
+        nested: { intent: 'not top-level HUGE-STORED-OUTPUT' },
+      });
+    });
+
     it('passes through primitive values untouched', () => {
       const reg = new ToolOutputReferenceRegistry();
       const { resolved } = reg.resolve('r', {

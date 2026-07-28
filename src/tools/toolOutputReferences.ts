@@ -30,6 +30,7 @@ import {
   HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
 } from '@/utils/truncation';
 import { isComputerCallOutputMessage } from '@/utils/toolContent';
+import { INTENT_ARG } from '@/tools/intentArg';
 
 /**
  * Non-global matcher for a single `{{tool<i>turn<n>}}` placeholder.
@@ -371,14 +372,15 @@ export class ToolOutputReferenceRegistry {
       return { resolved: args, unresolved: [] };
     }
     const unresolved = new Set<string>();
-    const resolved = this.transform(entries, args, unresolved) as T;
+    const resolved = this.transform(entries, args, unresolved, true) as T;
     return { resolved, unresolved: Array.from(unresolved) };
   }
 
   private transform(
     entries: ReadonlyMap<string, string>,
     value: unknown,
-    unresolved: Set<string>
+    unresolved: Set<string>,
+    isRoot = false
   ): unknown {
     if (typeof value === 'string') {
       return this.replaceInString(entries, value, unresolved);
@@ -390,7 +392,16 @@ export class ToolOutputReferenceRegistry {
       const source = value as Record<string, unknown>;
       const next: Record<string, unknown> = {};
       for (const [key, item] of Object.entries(source)) {
-        next[key] = this.transform(entries, item, unresolved);
+        /**
+         * The top-level `intent` arg is a display label, never a data
+         * channel: expanding a `{{tool<i>turn<n>}}` placeholder there would
+         * dump a stored output (up to the registry cap) into a single-line
+         * UI label and persist it with the message. Left verbatim instead.
+         */
+        next[key] =
+          isRoot && key === INTENT_ARG
+            ? item
+            : this.transform(entries, item, unresolved);
       }
       return next;
     }

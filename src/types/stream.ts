@@ -143,6 +143,13 @@ export type ProcessedToolCall = {
   id: string;
   output: string;
   progress: number;
+  /**
+   * Settled label for the call, resolved from the tool-supplied
+   * `outcome`/`outcome_patch` result fields against the model-authored
+   * `intent` arg. Only present when the tool authored one — hosts apply
+   * the mechanical intent transform themselves when absent.
+   */
+  outcome?: string;
 };
 
 export type ProcessedContent = {
