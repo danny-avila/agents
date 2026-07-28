@@ -1,13 +1,30 @@
-import { HumanMessage } from '@langchain/core/messages';
-import { Command, ParentCommand } from '@langchain/langgraph';
+import { z } from 'zod';
+import { tool } from '@langchain/core/tools';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  Command,
+  END,
+  GraphInterrupt,
+  MemorySaver,
+  MessagesAnnotation,
+  NodeInterrupt,
+  ParentCommand,
+  START,
+  StateGraph,
+  isGraphInterrupt,
+  isInterrupted,
+} from '@langchain/langgraph';
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import { CallbackManager } from '@langchain/core/callbacks/manager';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { handleConverseStreamMetadata } from '@/llm/bedrock/utils/message_outputs';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
 import { Constants, Providers } from '@/common';
+import { askUserQuestion } from '@/hitl';
+import { ToolNode } from '@/tools/ToolNode';
 import { Run } from '@/run';
 
 const mockProcessorStarts: Array<{
@@ -15,6 +32,8 @@ const mockProcessorStarts: Array<{
   traceId: string;
 }> = [];
 const mockSpanAttributeSets: Array<Record<string, unknown>> = [];
+let mockSpansStarted = 0;
+let mockSpansEnded = 0;
 let mockProviderInput:
   | {
       spanProcessors?: Array<{
@@ -29,6 +48,7 @@ let mockProviderInput:
   | undefined;
 
 const createMockSpan = (traceIdOverride?: string) => {
+  mockSpansStarted += 1;
   const traceId =
     traceIdOverride ??
     mockProviderInput?.idGenerator?.generateTraceId() ??
@@ -36,6 +56,7 @@ const createMockSpan = (traceIdOverride?: string) => {
   const spanId = mockProviderInput?.idGenerator?.generateSpanId() ?? 'span-id';
   const span = {
     end: jest.fn(() => {
+      mockSpansEnded += 1;
       for (const processor of mockProviderInput?.spanProcessors ?? []) {
         processor.onEnd?.(span);
       }
@@ -104,6 +125,8 @@ describe('Langfuse callback composition', () => {
     jest.clearAllMocks();
     mockProcessorStarts.length = 0;
     mockSpanAttributeSets.length = 0;
+    mockSpansStarted = 0;
+    mockSpansEnded = 0;
     delete process.env.LANGFUSE_PUBLIC_KEY;
     delete process.env.LANGFUSE_SECRET_KEY;
     delete process.env.LANGFUSE_BASE_URL;
@@ -430,6 +453,311 @@ describe('Langfuse callback composition', () => {
     );
   });
 
+  it('ends nested GraphInterrupt control flow without reporting an error', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const langfuse = {
+      publicKey: 'pk-graph-interrupt',
+      secretKey: 'sk-graph-interrupt',
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    const runId = 'test-langfuse-graph-interrupt';
+    const sensitiveQuestion = 'sensitive question payload';
+
+    await handler?.handleChainStart(
+      { lc: 1, type: 'not_implemented', id: ['InterruptedChain'] },
+      { input: 'ask' },
+      runId,
+      'parent-run'
+    );
+    await handler?.handleChainError(
+      new GraphInterrupt([
+        {
+          value: {
+            type: 'ask_user_question',
+            question: sensitiveQuestion,
+          },
+        },
+      ]),
+      runId,
+      'parent-run'
+    );
+
+    expect(mockSpanAttributeSets).not.toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+      })
+    );
+    expect(mockSpanAttributeSets).toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify({
+          controlFlow: 'GraphInterrupt',
+        }),
+      })
+    );
+    expect(JSON.stringify(mockSpanAttributeSets)).not.toContain(
+      sensitiveQuestion
+    );
+  });
+
+  it('ends nested GraphInterrupt tool control flow without reporting an error', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const langfuse = {
+      publicKey: 'pk-tool-graph-interrupt',
+      secretKey: 'sk-tool-graph-interrupt',
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    const runId = 'test-langfuse-tool-graph-interrupt';
+    const sensitiveQuestion = 'sensitive tool question payload';
+
+    await handler?.handleToolStart(
+      { lc: 1, type: 'not_implemented', id: ['AskUserQuestion'] },
+      '{}',
+      runId,
+      'parent-run'
+    );
+    await handler?.handleToolError(
+      new GraphInterrupt([
+        {
+          value: {
+            type: 'ask_user_question',
+            question: sensitiveQuestion,
+          },
+        },
+      ]),
+      runId,
+      'parent-run'
+    );
+
+    expect(mockSpanAttributeSets).not.toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+      })
+    );
+    expect(mockSpanAttributeSets).toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify({
+          controlFlow: 'GraphInterrupt',
+        }),
+      })
+    );
+    expect(JSON.stringify(mockSpanAttributeSets)).not.toContain(
+      sensitiveQuestion
+    );
+  });
+
+  it('normalizes a real ask_user_question pause and preserves resume behavior', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const langfuse = {
+      publicKey: 'pk-ask-user-question',
+      secretKey: 'sk-ask-user-question',
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    expect(handler).toBeDefined();
+
+    const sensitiveQuestion = 'Should the workflow continue?';
+    const askTool = tool(
+      async () => {
+        const { answer } = askUserQuestion({ question: sensitiveQuestion });
+        return `answered: ${answer}`;
+      },
+      {
+        name: 'ask_user_question',
+        description: 'suspends to collect a human answer',
+        schema: z.object({}).passthrough(),
+      }
+    ) as unknown as StructuredToolInterface;
+    const toolNode = new ToolNode({
+      tools: [askTool],
+      eventDrivenMode: true,
+      directToolNames: new Set(['ask_user_question']),
+      interruptingToolNames: new Set(['ask_user_question']),
+    });
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('agent', () => ({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              { id: 'ask-call', name: 'ask_user_question', args: {} },
+            ],
+          }),
+        ],
+      }))
+      .addNode('tools', toolNode)
+      .addEdge(START, 'agent')
+      .addEdge('agent', 'tools')
+      .addEdge('tools', END)
+      .compile({ checkpointer: new MemorySaver() });
+    const chainErrorSpy = jest.spyOn(handler!, 'handleChainError');
+    const toolErrorSpy = jest.spyOn(handler!, 'handleToolError');
+    const config = {
+      callbacks: [handler!],
+      configurable: { thread_id: 'ask-user-question-langfuse' },
+    };
+
+    const first = await graph.invoke({ messages: [] }, config);
+
+    expect(isInterrupted<t.HumanInterruptPayload>(first)).toBe(true);
+    expect(
+      (
+        first as {
+          __interrupt__?: Array<{
+            value?: t.HumanInterruptPayload;
+          }>;
+        }
+      ).__interrupt__?.[0]?.value
+    ).toMatchObject({
+      type: 'ask_user_question',
+      question: { question: sensitiveQuestion },
+    });
+    expect(
+      chainErrorSpy.mock.calls.some(
+        ([error, , parentRunId]) =>
+          isGraphInterrupt(error) && parentRunId != null
+      )
+    ).toBe(true);
+    expect(
+      toolErrorSpy.mock.calls.some(
+        ([error, , parentRunId]) =>
+          isGraphInterrupt(error) && parentRunId != null
+      )
+    ).toBe(true);
+    const controlFlowOutputs = mockSpanAttributeSets.filter(
+      (attributes) =>
+        attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT] ===
+        JSON.stringify({ controlFlow: 'GraphInterrupt' })
+    );
+    expect(controlFlowOutputs.length).toBeGreaterThanOrEqual(2);
+    expect(mockSpanAttributeSets).not.toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+      })
+    );
+    expect(mockSpanAttributeSets).not.toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE]:
+          expect.stringContaining('GraphInterrupt'),
+      })
+    );
+    expect(mockSpansEnded).toBe(mockSpansStarted);
+
+    const second = await graph.invoke(
+      new Command({ resume: { answer: 'yes' } }),
+      config
+    );
+
+    expect(isInterrupted<t.HumanInterruptPayload>(second)).toBe(false);
+    const messages = (second as { messages: ToolMessage[] }).messages;
+    expect(
+      messages.find(
+        (message) =>
+          message instanceof ToolMessage && message.name === 'ask_user_question'
+      )?.content
+    ).toBe('answered: yes');
+    expect(mockSpanAttributeSets).not.toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+      })
+    );
+    expect(mockSpansEnded).toBe(mockSpansStarted);
+  });
+
+  it('defensively reports a synthetic root GraphInterrupt as an error', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const langfuse = {
+      publicKey: 'pk-root-graph-interrupt',
+      secretKey: 'sk-root-graph-interrupt',
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    const runId = 'test-langfuse-root-graph-interrupt';
+
+    await handler?.handleChainStart(
+      { lc: 1, type: 'not_implemented', id: ['RootChain'] },
+      { input: 'root interrupt' },
+      runId
+    );
+    await handler?.handleChainError(new GraphInterrupt(), runId);
+
+    expect(mockSpanAttributeSets).toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+      })
+    );
+  });
+
+  it('normalizes nested NodeInterrupt control flow', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const langfuse = {
+      publicKey: 'pk-node-interrupt',
+      secretKey: 'sk-node-interrupt',
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    const runId = 'test-langfuse-node-interrupt';
+
+    await handler?.handleChainStart(
+      { lc: 1, type: 'not_implemented', id: ['InterruptedChain'] },
+      { input: 'ask' },
+      runId,
+      'parent-run'
+    );
+    await handler?.handleChainError(
+      new NodeInterrupt('pause'),
+      runId,
+      'parent-run'
+    );
+
+    expect(mockSpanAttributeSets).not.toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+      })
+    );
+    expect(mockSpanAttributeSets).toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify({
+          controlFlow: 'GraphInterrupt',
+        }),
+      })
+    );
+  });
+
+  it('continues reporting genuine nested tool failures as errors', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const langfuse = {
+      publicKey: 'pk-genuine-tool-error',
+      secretKey: 'sk-genuine-tool-error',
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    const runId = 'test-langfuse-genuine-tool-error';
+
+    await handler?.handleToolStart(
+      { lc: 1, type: 'not_implemented', id: ['FailingTool'] },
+      '{}',
+      runId,
+      'parent-run'
+    );
+    await handler?.handleToolError(new Error('tool boom'), runId, 'parent-run');
+
+    expect(mockSpanAttributeSets).toContainEqual(
+      expect.objectContaining({
+        [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+        [LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE]:
+          'Error: tool boom',
+      })
+    );
+  });
+
   it('reports a ParentCommand that escapes the root graph as an error', async () => {
     const { createLangfuseHandler } = await import('@/langfuse');
     const { initializeLangfuseTracing } = await import('@/instrumentation');
@@ -509,6 +837,29 @@ describe('Langfuse callback composition', () => {
 
     await expect(
       handler?.handleChainError(null, runId, 'parent-run')
+    ).resolves.toBeUndefined();
+  });
+
+  it('delegates null tool errors without throwing during classification', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const langfuse = {
+      publicKey: 'pk-null-tool-error',
+      secretKey: 'sk-null-tool-error',
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    const runId = 'test-langfuse-null-tool-error';
+
+    await handler?.handleToolStart(
+      { lc: 1, type: 'not_implemented', id: ['NullErrorTool'] },
+      '{}',
+      runId,
+      'parent-run'
+    );
+
+    await expect(
+      handler?.handleToolError(null, runId, 'parent-run')
     ).resolves.toBeUndefined();
   });
 
