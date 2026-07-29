@@ -16,6 +16,7 @@ import {
   normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
 } from './CodeExecutor';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 config();
@@ -26,6 +27,7 @@ const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 export const BashExecutionToolSchema = {
   type: 'object',
   properties: {
+    intent: { ...INTENT_PROPERTY },
     command: {
       type: 'string',
       description: `The bash command or script to execute.
@@ -187,16 +189,20 @@ function createBashExecutionTool(
       /* Drop any model-supplied `runtime_session_hint` from the raw args: the
        * hint must only come from ToolNode's injected `_runtime_session_hint`
        * (below), never from the tool call itself. */
+      /* `intent` is a UI display label — never part of the wire body. */
       const {
         command,
+        intent: _ignoredIntent,
         runtime_session_hint: _ignoredModelHint,
         ...rest
       } = rawInput as {
         command: string;
+        intent?: unknown;
         runtime_session_hint?: unknown;
         args?: string[];
       };
       void _ignoredModelHint;
+      void _ignoredIntent;
       const { session_id, _injected_files, _runtime_session_hint } =
         (config.toolCall ?? {}) as {
           session_id?: string;

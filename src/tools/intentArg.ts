@@ -275,6 +275,23 @@ export function resolveToolOutcome(
 }
 
 /**
+ * Reads the outcome fields off a tool-execution result: the typed
+ * `outcome`/`outcome_patch` fields when present, else the artifact channel
+ * (see {@link readOutcomeFields}) — so a `content_and_artifact` tool authors
+ * its label the same way on the direct and event-driven paths.
+ */
+export function outcomeFieldsFromResult(result: {
+  outcome?: string;
+  outcome_patch?: OutcomePatch;
+  artifact?: unknown;
+}): { outcome?: string; outcome_patch?: OutcomePatch } | undefined {
+  if (result.outcome != null || result.outcome_patch != null) {
+    return result;
+  }
+  return readOutcomeFields(result.artifact);
+}
+
+/**
  * Extracts validated `outcome`/`outcome_patch` fields from an arbitrary
  * value — the artifact channel through which an in-process
  * `content_and_artifact` tool authors its settled label. Returns undefined

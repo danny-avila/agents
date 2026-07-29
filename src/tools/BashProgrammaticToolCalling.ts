@@ -21,6 +21,7 @@ import {
   executeTools,
   formatCompletedResponse,
 } from './ProgrammaticToolCalling';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 config();
@@ -115,6 +116,7 @@ export function createBashProgrammaticToolCallingSchema(
   return {
     type: 'object',
     properties: {
+      intent: { ...INTENT_PROPERTY },
       code: {
         type: 'string',
         minLength: 1,

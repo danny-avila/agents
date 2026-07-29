@@ -49,16 +49,17 @@ import {
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
-  buildToolExecutionRequestPlan,
-  resolveRuntimeSessionHint,
-  recordArgsEqual,
-} from '@/tools/eagerEventExecution';
-import {
   INTENT_ARG,
   readOutcomeFields,
   resolveToolOutcome,
   isIntentLabelProperty,
+  outcomeFieldsFromResult,
 } from '@/tools/intentArg';
+import {
+  buildToolExecutionRequestPlan,
+  resolveRuntimeSessionHint,
+  recordArgsEqual,
+} from '@/tools/eagerEventExecution';
 import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
@@ -3217,7 +3218,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             contentString,
             config,
             request?.turn,
-            resolveToolOutcome(request?.args, result, {
+            resolveToolOutcome(request?.args, outcomeFieldsFromResult(result), {
               isError: result.status === 'error',
             })
           );
@@ -3553,7 +3554,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       output,
       config,
       request.turn,
-      resolveToolOutcome(request.args, result, {
+      resolveToolOutcome(request.args, outcomeFieldsFromResult(result), {
         isError: result.status === 'error',
       })
     );

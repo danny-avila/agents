@@ -1,4 +1,5 @@
 // src/tools/SkillTool.ts
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 export const SkillToolName = Constants.SKILL_TOOL;
@@ -26,6 +27,7 @@ CONSTRAINTS:
 export const SkillToolSchema = {
   type: 'object',
   properties: {
+    intent: { ...INTENT_PROPERTY },
     skillName: {
       type: 'string',
       description:
