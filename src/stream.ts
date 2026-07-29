@@ -41,6 +41,7 @@ import {
 } from '@/utils/truncation';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent } from '@/utils/events';
+import { resolveToolOutcome } from '@/tools/intentArg';
 import { isGoogleLike } from '@/utils/llm';
 import { getMessageId } from '@/messages';
 
@@ -859,6 +860,9 @@ async function dispatchEagerToolCompletions(args: {
         maxToolResultChars
       ).content;
     }
+    const outcome = resolveToolOutcome(record.request.args, result, {
+      isError: result.status === 'error',
+    });
 
     try {
       const dispatched = await safeDispatchCustomEvent(
@@ -878,6 +882,7 @@ async function dispatchEagerToolCompletions(args: {
               id: result.toolCallId,
               output,
               progress: 1,
+              ...(outcome != null && { outcome }),
             } as t.ProcessedToolCall,
           },
         },
@@ -2160,7 +2165,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         toolCallContentIndexMap.delete(existingToolCallId);
       }
 
-      const newToolCall: ToolCall & t.PartMetadata = {
+      const newToolCall: ToolCall & t.PartMetadata & { outcome?: string } = {
         id,
         name,
         args,
@@ -2180,6 +2185,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       if (finalUpdate) {
         newToolCall.progress = 1;
         newToolCall.output = contentPart.tool_call.output;
+        const outcome = (contentPart.tool_call as t.ToolCallPart).outcome;
+        if (outcome != null) {
+          newToolCall.outcome = outcome;
+        }
       }
 
       contentParts[index] = {

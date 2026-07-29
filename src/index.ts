@@ -26,6 +26,7 @@ export * from './tools/ReadFile';
 export * from './tools/skillCatalog';
 export * from './tools/ToolSearch';
 export * from './tools/ToolNode';
+export * from './tools/intentArg';
 export * from './tools/schema';
 export * from './tools/handlers';
 export * from './tools/local';

@@ -560,3 +560,177 @@ describe('ToolNode per-call onResult completion emission', () => {
     );
   });
 });
+
+describe('ToolNode returned-error completions', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  /**
+   * A tool that RETURNS an error ToolMessage never enters the catch path, so
+   * the errorHandler never runs and cannot have dispatched. The output loop
+   * must therefore emit the completion — and with it the tool's authored
+   * failure label — instead of assuming the handler owned it.
+   */
+  it('emits a completion (and authored outcome) for a RETURNED error ToolMessage', async () => {
+    const completions: Array<{
+      result: { tool_call: { id: string; outcome?: string } };
+    }> = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push(
+            data as { result: { tool_call: { id: string; outcome?: string } } }
+          );
+        }
+      });
+
+    const returnsError = tool(
+      async () =>
+        new ToolMessage({
+          content: 'boom',
+          tool_call_id: 'call_fail',
+          status: 'error',
+          artifact: { outcome: 'Search failed for OAuth' },
+        }),
+      {
+        name: 'failing',
+        description: 'returns an error message',
+        schema: z.object({}).passthrough(),
+      }
+    ) as unknown as StructuredToolInterface;
+
+    const errorHandler = jest.fn(async () => true);
+    const toolNode = new ToolNode({
+      tools: [returnsError],
+      toolCallStepIds: new Map([['call_fail', 'step_fail']]),
+      errorHandler: errorHandler as unknown as t.ToolNodeConstructorParams['errorHandler'],
+    });
+
+    await toolNode.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          {
+            id: 'call_fail',
+            name: 'failing',
+            args: { intent: 'Searching for OAuth handling' },
+          },
+        ]),
+      ],
+    });
+    await flushAsync();
+
+    expect(errorHandler).not.toHaveBeenCalled();
+    const completion = completions.find(
+      (c) => c.result.tool_call.id === 'call_fail'
+    );
+    expect(completion).toBeDefined();
+    expect(completion?.result.tool_call.outcome).toBe('Search failed for OAuth');
+  });
+});
+
+describe('ToolNode error-ownership scoping', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  /**
+   * Tool-call ids are provider-scoped and synthetic ids can repeat, so
+   * ownership markers kept on the INSTANCE cross-consume between that
+   * instance's concurrent invocations.
+   *
+   * Interleaving that exposes it: invocation 1 batches a throwing call
+   * (whose handler claims ownership) alongside a slow call that keeps the
+   * batch — and therefore its output loop — pending. While it is parked,
+   * invocation 2 reuses the same id and RETURNS an error message. With
+   * instance-scoped markers, invocation 2's output loop consumes the
+   * marker invocation 1 set and drops its only completion.
+   */
+  it('does not let a pending invocation\'s marker suppress a concurrent call reusing the id', async () => {
+    const completions: string[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push(
+            (data as { result: { tool_call: { id: string } } }).result.tool_call
+              .id
+          );
+        }
+      });
+
+    const shared = 'call_shared';
+    let releaseSlow: (() => void) | undefined;
+    const slowGate = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+
+    const thrower = tool(
+      async () => {
+        throw new Error('boom');
+      },
+      { name: 'thrower', description: 'throws', schema: z.object({}).passthrough() }
+    ) as unknown as StructuredToolInterface;
+    const slow = tool(
+      async () => {
+        await slowGate;
+        return 'done';
+      },
+      { name: 'slow', description: 'parks the batch', schema: z.object({}).passthrough() }
+    ) as unknown as StructuredToolInterface;
+    const returner = tool(
+      async () =>
+        new ToolMessage({
+          content: 'failed',
+          tool_call_id: shared,
+          status: 'error',
+        }),
+      {
+        name: 'returner',
+        description: 'returns an error message',
+        schema: z.object({}).passthrough(),
+      }
+    ) as unknown as StructuredToolInterface;
+
+    /** ONE instance — the shared state the finding is about. */
+    const node = new ToolNode({
+      tools: [thrower, slow, returner],
+      toolCallStepIds: new Map([
+        [shared, 'step_shared'],
+        ['call_slow', 'step_slow'],
+      ]),
+      errorHandler: (async () =>
+        true) as unknown as t.ToolNodeConstructorParams['errorHandler'],
+    });
+
+    // Invocation 1: throws (claiming ownership of `shared`) and parks.
+    const pending = node.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          { id: shared, name: 'thrower', args: {} },
+          { id: 'call_slow', name: 'slow', args: {} },
+        ]),
+      ],
+    }) as Promise<unknown>;
+    await flushAsync();
+
+    // Invocation 2, while invocation 1 is still parked.
+    const before = completions.length;
+    await node.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          { id: shared, name: 'returner', args: {} },
+        ]),
+      ],
+    });
+    await flushAsync();
+    const emittedBySecond = completions.slice(before);
+
+    releaseSlow?.();
+    await pending;
+    await flushAsync();
+
+    expect(emittedBySecond).toContain(shared);
+  });
+});

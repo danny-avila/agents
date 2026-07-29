@@ -115,7 +115,7 @@ type SanitizedStepCompleted =
     };
 
 type SanitizedProcessedToolCall = Partial<
-  Pick<ProcessedToolCall, 'args' | 'id' | 'name' | 'output' | 'progress'>
+  Pick<ProcessedToolCall, 'args' | 'id' | 'name' | 'output' | 'progress' | 'outcome'>
 >;
 
 type SanitizedRunStepCompleted = {
@@ -1195,6 +1195,7 @@ function sanitizeProcessedToolCall(
     sanitized.args = call.args;
   }
   assignString(sanitized, 'output', call.output);
+  assignString(sanitized, 'outcome', call.outcome);
   assignNumber(sanitized, 'progress', call.progress);
   return sanitized;
 }

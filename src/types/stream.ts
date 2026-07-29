@@ -142,6 +142,13 @@ export type ProcessedToolCall = {
   id: string;
   output: string;
   progress: number;
+  /**
+   * Settled label for the call, resolved from the tool-supplied
+   * `outcome`/`outcome_patch` result fields against the model-authored
+   * `intent` arg. Only present when the tool authored one — hosts apply
+   * the mechanical intent transform themselves when absent.
+   */
+  outcome?: string;
 };
 
 export type ProcessedContent = {
@@ -336,6 +343,11 @@ export type ToolCallPart = {
   id?: string;
   /** If provided, the output of the tool call */
   output?: ToolResultContent['content'];
+  /**
+   * Tool-authored settled label for the call (see `ProcessedToolCall.outcome`),
+   * preserved through aggregation so it survives persistence/reload.
+   */
+  outcome?: string;
   /** Auth URL */
   auth?: string;
   /** Expiration time */
