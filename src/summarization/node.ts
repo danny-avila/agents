@@ -386,13 +386,29 @@ function computeSummaryTokenCount(
  * summary can declare what it covers rather than leaving the next run to infer
  * coverage from where the block happens to sit. Messages generated mid-run have
  * no source ID; readers fall back to positional semantics when this is absent.
+ *
+ * One source message can expand into several messages — a steer splits an
+ * assistant entry into pre-steer, steer, and post-steer messages that all carry
+ * its ID — and the recency split lands on any human-type message, including the
+ * steer. An ID still present in the retained tail is therefore only partially
+ * covered, and declaring it would make the next run drop content this run kept.
+ * Such IDs are skipped in favor of the newest fully covered one.
  */
 function resolveSummaryCoverage(
-  messagesToRefine: BaseMessage[]
+  messagesToRefine: BaseMessage[],
+  messagesToRetain: BaseMessage[]
 ): t.SummaryCoverage | undefined {
+  const retainedIds = new Set<string>();
+  for (let i = 0; i < messagesToRetain.length; i++) {
+    const id = messagesToRetain[i].id?.trim();
+    if (id != null && id !== '') {
+      retainedIds.add(id);
+    }
+  }
+
   for (let i = messagesToRefine.length - 1; i >= 0; i--) {
     const id = messagesToRefine[i].id?.trim();
-    if (id != null && id !== '') {
+    if (id != null && id !== '' && !retainedIds.has(id)) {
       return { throughMessageId: id };
     }
   }
@@ -1165,7 +1181,7 @@ export function createSummarizeNode({
     const summaryBlock = buildSummaryBlock({
       summaryText,
       tokenCount,
-      coverage: resolveSummaryCoverage(messagesToRefine),
+      coverage: resolveSummaryCoverage(messagesToRefine, messagesToRetain),
       stepId,
       stepIndex: runStep.index,
       modelName: clientConfig.modelName,

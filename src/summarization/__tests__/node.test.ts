@@ -1019,6 +1019,30 @@ describe('recency window — first-turn protection', () => {
 
       expect(summaryBlock?.coverage).toBeUndefined();
     });
+
+    /** A steer expands one source message into pre-steer, steer, and post-steer
+     *  messages that all carry its ID, and the recency split lands on the steer.
+     *  Declaring `m2` would drop the half the tail kept. */
+    it('skips a source id that straddles the recency boundary', async () => {
+      const summaryBlock = await runCompaction([
+        new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+        new AIMessage({ content: 'pre-steer reply', id: 'm2' }),
+        new HumanMessage({ content: 'steer', id: 'm2' }),
+        new AIMessage({ content: 'post-steer reply', id: 'm2' }),
+      ]);
+
+      expect(summaryBlock?.coverage).toEqual({ throughMessageId: 'm1' });
+    });
+
+    it('omits coverage when every refined id straddles the boundary', async () => {
+      const summaryBlock = await runCompaction([
+        new AIMessage({ content: 'pre-steer reply', id: 'm1' }),
+        new HumanMessage({ content: 'steer', id: 'm1' }),
+        new AIMessage({ content: 'post-steer reply', id: 'm1' }),
+      ]);
+
+      expect(summaryBlock?.coverage).toBeUndefined();
+    });
   });
 
   it('keeps the masked tail content (does not re-inject restored tool payloads into state)', async () => {
