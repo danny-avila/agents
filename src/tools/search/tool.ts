@@ -26,6 +26,46 @@ import { createReranker } from './rerankers';
 import { Constants } from '@/common';
 
 /**
+ * Settled label for a `web_search` call's intent (see `intentArg.ts`).
+ *
+ * Counts the result kinds `formatResultsForLLM` actually renders —
+ * `references` only tracks links embedded in extracted highlights, so it
+ * undercounts ordinary results and can overcount when one highlight embeds
+ * several links.
+ *
+ * A caught provider or processing failure is reported through `data.error`
+ * while the tool still returns NORMALLY, so that case must author its own
+ * label: the `ToolMessage` carries success status, and a bare intent would
+ * otherwise settle mechanically from "Searching…" to "Searched…" and present
+ * a failed search as a successful one.
+ *
+ * Returns undefined for a genuine zero-result search, leaving the host's
+ * mechanical past-tense transform to label it.
+ */
+export function resolveSearchOutcome(
+  data: t.SearchResultData,
+  query: string
+): string | undefined {
+  if (data.error != null && data.error !== '') {
+    return `Search failed for "${query}"`;
+  }
+  const count =
+    (data.organic?.length ?? 0) +
+    (data.topStories?.length ?? 0) +
+    (data.news?.length ?? 0) +
+    (data.images?.length ?? 0) +
+    (data.videos?.length ?? 0) +
+    (data.places?.length ?? 0) +
+    (data.peopleAlsoAsk?.length ?? 0) +
+    (data.knowledgeGraph != null ? 1 : 0) +
+    (data.answerBox != null ? 1 : 0);
+  if (count === 0) {
+    return undefined;
+  }
+  return `Found ${count} result${count === 1 ? '' : 's'} for "${query}"`;
+}
+
+/**
  * Executes parallel searches and merges the results,
  * deduplicating top stories by link
  */
@@ -336,23 +376,7 @@ function createTool({
         maxOutputChars
       );
       const data: t.SearchResultData = { turn, ...searchResult, references };
-      /**
-       * Settled label for the call's intent (see `intentArg.ts`). Counts the
-       * actual result collections — `references` only tracks links embedded
-       * in extracted highlights, so it undercounts ordinary results and can
-       * overcount when one highlight embeds several links.
-       */
-      const resultCount =
-        (data.organic?.length ?? 0) +
-        (data.topStories?.length ?? 0) +
-        (data.news?.length ?? 0) +
-        (data.images?.length ?? 0) +
-        (data.videos?.length ?? 0) +
-        (data.places?.length ?? 0);
-      const outcome =
-        resultCount > 0
-          ? `Found ${resultCount} result${resultCount === 1 ? '' : 's'} for "${query}"`
-          : undefined;
+      const outcome = resolveSearchOutcome(data, query);
       return [
         output,
         { [Constants.WEB_SEARCH]: data, ...(outcome != null && { outcome }) },

@@ -61,13 +61,6 @@ import {
   recordArgsEqual,
 } from '@/tools/eagerEventExecution';
 import {
-  INTENT_ARG,
-  readOutcomeFields,
-  resolveToolOutcome,
-  isIntentLabelProperty,
-  outcomeFieldsFromResult,
-} from '@/tools/intentArg';
-import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
