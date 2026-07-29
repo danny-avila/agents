@@ -1873,13 +1873,16 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     number,
     { agentId?: string; groupId?: number }
   >();
-  const getFirstContentPart = (
+  /** A delta's content may carry several parts (e.g. Google server-side tool
+   *  chunks emit multiple reasoning entries at once); every entry must reach
+   *  the step's slot, in order, or streamed text is silently lost. */
+  const getDeltaContentParts = (
     content?: t.MessageDelta['content'] | t.MessageContentComplex
-  ): t.MessageContentComplex | undefined => {
+  ): t.MessageContentComplex[] => {
     if (content == null) {
-      return undefined;
+      return [];
     }
-    return Array.isArray(content) ? content[0] : content;
+    return Array.isArray(content) ? content : [content];
   };
   const indexContentPart = (
     index: number,
@@ -2311,8 +2314,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
 
-      const contentPart = getFirstContentPart(messageDelta.delta.content);
-      if (contentPart != null) {
+      for (const contentPart of getDeltaContentParts(messageDelta.delta.content)) {
         updateContent(runStep.index, contentPart);
       }
     } else if (
@@ -2341,8 +2343,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
 
-      const contentPart = getFirstContentPart(reasoningDelta.delta.content);
-      if (contentPart != null) {
+      for (const contentPart of getDeltaContentParts(reasoningDelta.delta.content)) {
         updateContent(runStep.index, contentPart);
       }
     } else if (event === GraphEvents.ON_RUN_STEP_DELTA) {
