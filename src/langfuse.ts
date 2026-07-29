@@ -1,7 +1,7 @@
 import { CallbackHandler } from '@langfuse/langchain';
-import { isParentCommand } from '@langchain/langgraph';
 import { context as otelContext } from '@opentelemetry/api';
 import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
+import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
 import {
   getLangfuseTracerProvider,
   propagateAttributes,
@@ -27,6 +27,10 @@ import { isPresent, parseBooleanEnv } from '@/utils/misc';
 
 const TRACE_METADATA_MAX_LENGTH = 200;
 const LANGFUSE_FORCE_FLUSH_ON_DISPOSE = 'LANGFUSE_FORCE_FLUSH_ON_DISPOSE';
+const GRAPH_INTERRUPT_CONTROL_FLOW = { controlFlow: 'GraphInterrupt' } as const;
+const GRAPH_INTERRUPT_TOOL_OUTPUT = JSON.stringify(
+  GRAPH_INTERRUPT_CONTROL_FLOW
+);
 
 export type LangfuseTraceMetadata = Record<string, string>;
 export type LangfuseTraceAttributes = Record<string, string | number | boolean>;
@@ -209,6 +213,13 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     ...args: Parameters<CallbackHandler['handleChainError']>
   ): ReturnType<CallbackHandler['handleChainError']> {
     const [error, runId, parentRunId] = args;
+    if (error != null && parentRunId != null && isGraphInterrupt(error)) {
+      return super.handleChainEnd(
+        GRAPH_INTERRUPT_CONTROL_FLOW,
+        runId,
+        parentRunId
+      );
+    }
     if (error != null && parentRunId != null && isParentCommand(error)) {
       return super.handleChainEnd(
         { controlFlow: 'ParentCommand' },
@@ -259,6 +270,20 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     ...args: Parameters<CallbackHandler['handleToolStart']>
   ): ReturnType<CallbackHandler['handleToolStart']> {
     return this.withRuntimeContext(() => super.handleToolStart(...args));
+  }
+
+  override handleToolError(
+    ...args: Parameters<CallbackHandler['handleToolError']>
+  ): ReturnType<CallbackHandler['handleToolError']> {
+    const [error, runId, parentRunId] = args;
+    if (error != null && parentRunId != null && isGraphInterrupt(error)) {
+      return super.handleToolEnd(
+        GRAPH_INTERRUPT_TOOL_OUTPUT,
+        runId,
+        parentRunId
+      );
+    }
+    return super.handleToolError(...args);
   }
 
   override handleRetrieverStart(
