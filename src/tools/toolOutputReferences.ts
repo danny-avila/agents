@@ -108,8 +108,19 @@ export type ResolveResult<T> = {
  * point in time, ignoring any subsequent registrations.
  */
 export interface ToolOutputResolveView {
-  resolve<T>(args: T): ResolveResult<T>;
+  resolve<T>(args: T, options?: ResolveOptions): ResolveResult<T>;
 }
+
+/**
+ * Per-call resolution options. `substituteIntentKey` opts the top-level
+ * `intent` key back INTO placeholder substitution: the exemption protects
+ * the injected display label, but a tool whose own schema declares a
+ * business parameter named `intent` (the injectors skip such tools) still
+ * needs references piped into it like any other argument.
+ */
+export type ResolveOptions = {
+  substituteIntentKey?: boolean;
+};
 
 /**
  * Pre-resolved arg map keyed by `toolCallId`. Used by the mixed
@@ -352,12 +363,16 @@ export class ToolOutputReferenceRegistry {
    * the serialized args, the original input is returned without
    * walking the tree.
    */
-  resolve<T>(runId: string | undefined, args: T): ResolveResult<T> {
+  resolve<T>(
+    runId: string | undefined,
+    args: T,
+    options?: ResolveOptions
+  ): ResolveResult<T> {
     if (!hasAnyPlaceholder(args)) {
       return { resolved: args, unresolved: [] };
     }
     const bucket = this.runStates.get(this.keyFor(runId));
-    return this.resolveAgainst(bucket?.entries ?? EMPTY_ENTRIES, args);
+    return this.resolveAgainst(bucket?.entries ?? EMPTY_ENTRIES, args, options);
   }
 
   /**
@@ -377,18 +392,20 @@ export class ToolOutputReferenceRegistry {
       ? new Map(bucket.entries)
       : EMPTY_ENTRIES;
     return {
-      resolve: <T>(args: T): ResolveResult<T> =>
-        this.resolveAgainst(entries, args),
+      resolve: <T>(args: T, options?: ResolveOptions): ResolveResult<T> =>
+        this.resolveAgainst(entries, args, options),
     };
   }
 
   private resolveAgainst<T>(
     entries: ReadonlyMap<string, string>,
-    args: T
+    args: T,
+    options?: ResolveOptions
   ): ResolveResult<T> {
     if (!hasAnyPlaceholder(args)) {
       return { resolved: args, unresolved: [] };
     }
+    const exemptIntentKey = options?.substituteIntentKey !== true;
     const unresolved = new Set<string>();
     /**
      * Providers may deliver the args OBJECT as a JSON string. A plain
@@ -398,7 +415,7 @@ export class ToolOutputReferenceRegistry {
      * other field still substitutes. Only taken when an `intent` key is
      * actually present; other strings keep the fast raw-string path.
      */
-    if (typeof args === 'string') {
+    if (exemptIntentKey && typeof args === 'string') {
       const parsedRoot = parseStringifiedArgsObject(args);
       if (parsedRoot != null && INTENT_ARG in parsedRoot) {
         const resolved = JSON.stringify(
@@ -407,7 +424,12 @@ export class ToolOutputReferenceRegistry {
         return { resolved, unresolved: Array.from(unresolved) };
       }
     }
-    const resolved = this.transform(entries, args, unresolved, true) as T;
+    const resolved = this.transform(
+      entries,
+      args,
+      unresolved,
+      exemptIntentKey
+    ) as T;
     return { resolved, unresolved: Array.from(unresolved) };
   }
 
@@ -415,7 +437,7 @@ export class ToolOutputReferenceRegistry {
     entries: ReadonlyMap<string, string>,
     value: unknown,
     unresolved: Set<string>,
-    isRoot = false
+    exemptRootIntent = false
   ): unknown {
     if (typeof value === 'string') {
       return this.replaceInString(entries, value, unresolved);
@@ -434,7 +456,7 @@ export class ToolOutputReferenceRegistry {
          * UI label and persist it with the message. Left verbatim instead.
          */
         next[key] =
-          isRoot && key === INTENT_ARG
+          exemptRootIntent && key === INTENT_ARG
             ? item
             : this.transform(entries, item, unresolved);
       }

@@ -560,3 +560,72 @@ describe('ToolNode per-call onResult completion emission', () => {
     );
   });
 });
+
+describe('ToolNode returned-error completions', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  /**
+   * A tool that RETURNS an error ToolMessage never enters the catch path, so
+   * the errorHandler never runs and cannot have dispatched. The output loop
+   * must therefore emit the completion — and with it the tool's authored
+   * failure label — instead of assuming the handler owned it.
+   */
+  it('emits a completion (and authored outcome) for a RETURNED error ToolMessage', async () => {
+    const completions: Array<{
+      result: { tool_call: { id: string; outcome?: string } };
+    }> = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push(
+            data as { result: { tool_call: { id: string; outcome?: string } } }
+          );
+        }
+      });
+
+    const returnsError = tool(
+      async () =>
+        new ToolMessage({
+          content: 'boom',
+          tool_call_id: 'call_fail',
+          status: 'error',
+          artifact: { outcome: 'Search failed for OAuth' },
+        }),
+      {
+        name: 'failing',
+        description: 'returns an error message',
+        schema: z.object({}).passthrough(),
+      }
+    ) as unknown as StructuredToolInterface;
+
+    const errorHandler = jest.fn(async () => true);
+    const toolNode = new ToolNode({
+      tools: [returnsError],
+      toolCallStepIds: new Map([['call_fail', 'step_fail']]),
+      errorHandler: errorHandler as unknown as t.ToolNodeConstructorParams['errorHandler'],
+    });
+
+    await toolNode.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          {
+            id: 'call_fail',
+            name: 'failing',
+            args: { intent: 'Searching for OAuth handling' },
+          },
+        ]),
+      ],
+    });
+    await flushAsync();
+
+    expect(errorHandler).not.toHaveBeenCalled();
+    const completion = completions.find(
+      (c) => c.result.tool_call.id === 'call_fail'
+    );
+    expect(completion).toBeDefined();
+    expect(completion?.result.tool_call.outcome).toBe('Search failed for OAuth');
+  });
+});

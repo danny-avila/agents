@@ -31,6 +31,7 @@ import type {
   PreResolvedArgsMap,
   ResolvedArgsByCallId,
   ResolveResult,
+  ResolveOptions,
 } from '@/tools/toolOutputReferences';
 import type {
   HookRegistry,
@@ -70,8 +71,10 @@ import {
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import {
+  INTENT_ARG,
   readOutcomeFields,
   resolveToolOutcome,
+  isIntentLabelProperty,
 } from '@/tools/intentArg';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import { convertInjectedMessages } from '@/messages/injected';
@@ -509,6 +512,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * client's tool-call part without a terminal event.
    */
   private undispatchedToolErrors: Set<string> = new Set();
+  /**
+   * Tool call ids whose `errorHandler` OWNS the error completion event —
+   * it ran and either dispatched or threw (a throw is not proof it didn't
+   * dispatch; the built-in session handler emits `tool.completed` before
+   * invoking user callbacks). Only these may be skipped by the output
+   * loop. A tool that RETURNS an error `ToolMessage` never enters the
+   * catch path at all, so it appears in neither set and the output loop
+   * dispatches its completion — and therefore its authored failure label.
+   */
+  private handlerOwnedToolErrors: Set<string> = new Set();
   private toolUsageCount: Map<string, number>;
   /** Maps toolCallId → turn captured in runTool, used by handleRunToolCompletions */
   private toolCallTurns: Map<string, number> = new Map();
@@ -956,14 +969,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       args: T
     ) => ResolveResult<T>;
     let resolveFn: ResolveFn | undefined;
+    const resolveOptions = {
+      substituteIntentKey: this.toolDeclaresBusinessIntent(call.name),
+    };
     if (preBatchSnapshot != null) {
       resolveFn = <T>(_runId: string | undefined, args: T): ResolveResult<T> =>
-        preBatchSnapshot.resolve(args);
+        preBatchSnapshot.resolve(args, resolveOptions);
     } else if (registry != null) {
       resolveFn = <T>(
         runIdArg: string | undefined,
         args: T
-      ): ResolveResult<T> => registry.resolve(runIdArg, args);
+      ): ResolveResult<T> => registry.resolve(runIdArg, args, resolveOptions);
     }
     /**
      * Precompute the reference key once per call — captured locally
@@ -1270,15 +1286,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             },
             config.metadata
           );
-          if (dispatched === false && call.id != null && call.id !== '') {
-            /**
-             * The handler could not dispatch the error completion (typically
-             * a resume pass, where a fast-failing tool errors before the
-             * step replay registers its run step). Remember the call so the
-             * output loop dispatches the completion itself instead of
-             * assuming the handler covered it.
-             */
-            this.undispatchedToolErrors.add(call.id);
+          if (call.id != null && call.id !== '') {
+            if (dispatched === false) {
+              /**
+               * The handler could not dispatch the error completion (typically
+               * a resume pass, where a fast-failing tool errors before the
+               * step replay registers its run step). Remember the call so the
+               * output loop dispatches the completion itself instead of
+               * assuming the handler covered it.
+               */
+              this.undispatchedToolErrors.add(call.id);
+            } else {
+              this.handlerOwnedToolErrors.add(call.id);
+            }
           }
         } catch (handlerError) {
           // A THROWN handler is not proof the completion wasn't dispatched: the
@@ -1288,6 +1308,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           // fallback loop re-emit a duplicate completion — only an explicit
           // `false` return (handled above) means "nothing dispatched"; a throw
           // is just logged.
+          if (call.id != null && call.id !== '') {
+            this.handlerOwnedToolErrors.add(call.id);
+          }
           // eslint-disable-next-line no-console
           console.error('Error in errorHandler:', {
             toolName: call.name,
@@ -1452,13 +1475,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // (later-awaited) `runTool` will actually run with — both are
     // anchored to the pre-batch registry state.
     let resolvedArgs = call.args as Record<string, unknown>;
+    const hookResolveOptions = {
+      substituteIntentKey: this.toolDeclaresBusinessIntent(call.name),
+    };
     if (batchContext.preBatchSnapshot != null) {
-      const { resolved } = batchContext.preBatchSnapshot.resolve(call.args);
+      const { resolved } = batchContext.preBatchSnapshot.resolve(
+        call.args,
+        hookResolveOptions
+      );
       resolvedArgs = resolved as Record<string, unknown>;
     } else if (this.toolOutputRegistry != null) {
       const { resolved } = this.toolOutputRegistry.resolve(
         registryRunId,
-        call.args
+        call.args,
+        hookResolveOptions
       );
       resolvedArgs = resolved as Record<string, unknown>;
     }
@@ -2047,23 +2077,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const toolMessage = output as ToolMessage;
       const toolCallId = call.id ?? '';
 
-      // Skip error ToolMessages when errorHandler already dispatched ON_RUN_STEP_COMPLETED
-      // via handleToolCallErrorStatic — dispatching again here would double-dispatch.
-      // When the handler reported it could NOT dispatch (no run step registered yet at
-      // error time, e.g. a fast-failing tool on a resume pass), fall through: by now the
-      // step replay has usually registered the id, so this loop's dispatch is the only
-      // terminal event the client's tool-call part will ever get.
+      // Skip error ToolMessages only when the errorHandler OWNS the completion —
+      // it ran and dispatched (or threw) via handleToolCallErrorStatic, so
+      // dispatching again here would double-dispatch. Two cases fall through:
+      //  - the handler reported it could NOT dispatch (no run step registered yet
+      //    at error time, e.g. a fast-failing tool on a resume pass); by now the
+      //    step replay has usually registered the id, so this loop's dispatch is
+      //    the only terminal event the client's tool-call part will ever get.
+      //  - the tool RETURNED an error ToolMessage rather than throwing, so the
+      //    catch path (and the handler with it) never ran at all.
+      // Markers are CONSUMED: leaving one set would let a later re-entry (same
+      // ToolNode re-executing the batch) take the wrong branch, and the sets
+      // would grow unbounded across a long-lived graph's failing calls.
       if (toolMessage.status === 'error' && this.errorHandler != null) {
-        if (this.undispatchedToolErrors.has(toolCallId)) {
-          // CONSUME the marker: this loop now owns the dispatch for this id.
-          // Leaving it set would let a later re-entry (same ToolNode instance
-          // re-executing the batch, where the handler CAN dispatch) fall
-          // through here too and double-dispatch — and the set would grow
-          // unbounded across a long-lived graph's fast-failing calls.
-          this.undispatchedToolErrors.delete(toolCallId);
-        } else {
+        if (this.handlerOwnedToolErrors.has(toolCallId)) {
+          this.handlerOwnedToolErrors.delete(toolCallId);
           continue;
         }
+        this.undispatchedToolErrors.delete(toolCallId);
       }
 
       if (this.sessions && this.participatesInCodeSession(call.name)) {
@@ -2198,7 +2229,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       } else if (registry != null) {
         const { resolved, unresolved } = registry.resolve(
           registryRunId,
-          originalArgs
+          originalArgs,
+          { substituteIntentKey: this.toolDeclaresBusinessIntent(call.name) }
         );
         resolvedArgs = resolved as Record<string, unknown>;
         if (unresolved.length > 0 && call.id != null) {
@@ -2419,9 +2451,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       ): void => {
         if (registry != null) {
           const view: ToolOutputResolveView = preBatchSnapshot ?? {
-            resolve: <T>(args: T) => registry.resolve(registryRunId, args),
+            resolve: <T>(args: T, options?: ResolveOptions) =>
+              registry.resolve(registryRunId, args, options),
           };
-          const { resolved, unresolved } = view.resolve(nextArgs);
+          const { resolved, unresolved } = view.resolve(nextArgs, {
+            substituteIntentKey: this.toolDeclaresBusinessIntent(
+              entry.call.name
+            ),
+          });
           entry.args = resolved as Record<string, unknown>;
           if (entry.call.id != null) {
             if (unresolved.length > 0) {
@@ -3389,6 +3426,35 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         );
       }
     }
+  }
+
+  /**
+   * Whether `name`'s own schema declares a BUSINESS parameter called
+   * `intent` (declared, and not the injected label contract — see
+   * `isIntentLabelProperty`). Such a parameter must keep participating in
+   * `{{tool…}}` placeholder substitution; only the display label is exempt.
+   */
+  private toolDeclaresBusinessIntent(name: string): boolean {
+    const instance = this.toolMap.get(name) as
+      | {
+          schema?: {
+            shape?: Record<string, unknown>;
+            properties?: Record<string, unknown>;
+          };
+        }
+      | undefined;
+    const instanceProp =
+      instance?.schema?.properties?.[INTENT_ARG] ??
+      instance?.schema?.shape?.[INTENT_ARG];
+    if (instanceProp != null) {
+      return !isIntentLabelProperty(instanceProp);
+    }
+    const defProp =
+      this.toolRegistry?.get(name)?.parameters?.properties?.[INTENT_ARG];
+    if (defProp != null) {
+      return !isIntentLabelProperty(defProp);
+    }
+    return false;
   }
 
   private async dispatchStepCompleted(

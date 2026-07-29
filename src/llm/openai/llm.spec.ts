@@ -1248,6 +1248,40 @@ describe('ChatOpenAICompletions strict tools for structured output', () => {
       expect(toolProperties({})).toEqual(['intent', 'query']);
     });
 
+    /**
+     * The Responses API flattens tools to `{type, name, parameters, strict}`
+     * and does NOT infer strict from a `json_schema` response_format the way
+     * Completions does — an explicit `strict` (per-call option or on the tool)
+     * is what turns it on there.
+     */
+    function responsesToolProperties(
+      options: Record<string, unknown>
+    ): string[] {
+      const model = new ChatOpenAI({ model: 'gpt-4', apiKey: 'test-key' });
+      const responses = (
+        model as unknown as {
+          responses: {
+            invocationParams: (o: Record<string, unknown>) => {
+              tools?: { parameters?: { properties?: object } }[];
+            };
+          };
+        }
+      ).responses;
+      const params = responses.invocationParams({
+        tools: [intentTool],
+        ...options,
+      });
+      return Object.keys(params.tools?.[0]?.parameters?.properties ?? {});
+    }
+
+    it('drops the label on the RESPONSES delegate under strict too', () => {
+      expect(responsesToolProperties({ strict: true })).toEqual(['query']);
+    });
+
+    it('keeps the label on a non-strict RESPONSES request', () => {
+      expect(responsesToolProperties({})).toEqual(['intent', 'query']);
+    });
+
     it('spares a business `intent` param even under strict', () => {
       const businessTool = {
         type: 'function' as const,

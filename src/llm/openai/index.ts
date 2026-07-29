@@ -1702,7 +1702,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
         ]),
       ];
     }
-    return params;
+    return stripIntentFromStrictTools(params);
   }
 
   async completionWithRetry(
@@ -1952,7 +1952,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
         ]),
       ];
     }
-    return params;
+    return stripIntentFromStrictTools(params);
   }
 
   async completionWithRetry(
