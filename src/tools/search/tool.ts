@@ -17,9 +17,9 @@ import { createKeenableScraper } from './keenable-scraper';
 import { createSerperScraper } from './serper-scraper';
 import { createTavilyScraper } from './tavily-scraper';
 import { createFirecrawlScraper } from './firecrawl';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { createCrwScraper } from './crw-scraper';
 import { expandHighlights } from './highlights';
-import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { formatResultsForLLM } from './format';
 import { createDefaultLogger } from './utils';
 import { createReranker } from './rerankers';
@@ -441,7 +441,6 @@ export const createSearchTool = (
       }
       : tavilySearchOptions;
 
-  /** `intent` FIRST — mirrors `WebSearchToolSchema` (see `intentArg.ts`). */
   const schemaProperties: Record<string, unknown> = {
     intent: { ...INTENT_PROPERTY },
     query: querySchema,

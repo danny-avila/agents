@@ -3,7 +3,6 @@ import { createTwoFilesPatch } from 'diff';
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
-import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import {
   createLocalBashProgrammaticToolCallingTool,
   createLocalProgrammaticToolCallingTool,
@@ -25,6 +24,7 @@ import {
 } from './CompileCheckTool';
 import { classifyAttachment, imageAttachmentContent } from './attachments';
 import { createLocalFileCheckpointer } from './FileCheckpointer';
+import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import { applyEdit, locateEdit } from './editStrategies';
 import { decodeFile, encodeFile } from './textEncoding';
 import { runPostEditSyntaxCheck } from './syntaxCheck';

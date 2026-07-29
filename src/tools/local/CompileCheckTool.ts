@@ -27,7 +27,6 @@ import { resolve } from 'path';
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type { WorkspaceFS } from './workspaceFS';
-import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import type * as t from '@/types';
 import {
   getLocalCwd,
@@ -36,6 +35,7 @@ import {
   truncateLocalOutput,
   validateBashCommand,
 } from './LocalExecutionEngine';
+import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import { withIntent } from '@/tools/intentArg';
 import { Constants } from '@/common';
 

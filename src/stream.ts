@@ -39,9 +39,9 @@ import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
+import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent } from '@/utils/events';
-import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { isGoogleLike } from '@/utils/llm';
 import { getMessageId } from '@/messages';
 

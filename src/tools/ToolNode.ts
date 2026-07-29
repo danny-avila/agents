@@ -49,6 +49,13 @@ import {
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
+  INTENT_ARG,
+  readOutcomeFields,
+  resolveToolOutcome,
+  isIntentLabelProperty,
+  outcomeFieldsFromResult,
+} from '@/tools/intentArg';
+import {
   buildToolExecutionRequestPlan,
   resolveRuntimeSessionHint,
   recordArgsEqual,

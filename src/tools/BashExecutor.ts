@@ -3,7 +3,6 @@ import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
-import { INTENT_PROPERTY } from '@/tools/intentArg';
 import {
   BASH_SHELL_GUIDANCE,
   CODE_ARTIFACT_PATH_GUIDANCE,
@@ -17,6 +16,7 @@ import {
   normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
 } from './CodeExecutor';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 config();
