@@ -7,6 +7,7 @@ import {
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
 } from '@/summarization/node';
+import { convertInjectedMessages } from '@/messages/injected';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { AgentContext } from '@/agents/AgentContext';
 import * as providers from '@/llm/providers';
@@ -1076,6 +1077,38 @@ describe('recency window — first-turn protection', () => {
               skillName: 'demo',
             },
           }),
+          new HumanMessage({ content: 'turn 2 query', id: 'm3' }),
+          new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
+        ],
+        2
+      );
+
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm3' });
+    });
+
+    /** `InjectedMessage` leaves both `isMeta` and `source` optional, so a bare
+     *  injected turn carries no marker of its own — and an injected `steer` is
+     *  otherwise indistinguishable from a replayed one. `convertInjectedMessages`
+     *  records `injected` on everything it builds, which decides both. */
+    it.each([
+      ['a bare injected turn', { role: 'user' as const, content: 'injected' }],
+      [
+        'an injected steer',
+        {
+          role: 'user' as const,
+          content: 'injected steer',
+          source: 'steer' as const,
+        },
+      ],
+    ])('skips %s when anchoring', async (_label, injected) => {
+      const [converted] = convertInjectedMessages([injected]);
+      converted.id = 'reducer-uuid';
+
+      const summaryBlock = await runCompaction(
+        [
+          new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+          new AIMessage({ content: 'turn 1 reply', id: 'm2' }),
+          converted,
           new HumanMessage({ content: 'turn 2 query', id: 'm3' }),
           new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
         ],

@@ -403,22 +403,27 @@ function computeSummaryTokenCount(
  * positional trimming on read, dropping the retained tail. Skipping it reaches
  * the stamped message behind it.
  *
- * `steer` is exempt: a steer is replayed from a payload entry and stamped with
- * its ID, so it is a valid anchor, and skipping it dropped retained steers when
- * this check was once written to reject every marked `source`.
+ * `convertInjectedMessages` records `injected` on everything it builds, which is
+ * what makes this decidable: `isMeta` and `source` are both optional on
+ * `InjectedMessage`, so a bare entry carries no marker of its own, and an
+ * injected `source: 'steer'` is otherwise indistinguishable from a replayed one.
+ * The remaining `isMeta`/`source` checks cover the constructors that build
+ * synthetic entries directly instead of going through that funnel — hook context
+ * in `ToolNode` and `StandardGraph`, handoff cues, reconstructed skill bodies.
  *
- * Known limitation: `InjectedMessage` also permits `source: 'steer'`, and an
- * in-run injected steer is unstamped, so the exemption accepts a UUID for it.
- * Nothing in `additional_kwargs` separates that from a replayed steer. Both
- * directions of the ambiguity bottom out in the reader's positional fallback —
- * what `main` does for every summary today — so the exemption is set to favour
- * replayed steers, which are the common case. A payload entry that omits
- * `messageId` degrades the same way: it is unaddressable in the next payload
- * too, so no anchor could name it.
+ * `steer` is exempt from the `source` check because a replayed steer *is*
+ * stamped from its payload entry; rejecting every marked `source` once dropped
+ * exactly those retained steers. Injected steers are still caught, by `injected`.
+ *
+ * Known limitation: a payload entry that omits `messageId` is never stamped, so
+ * the reducer's UUID is recorded and cannot resolve on the next run. There is no
+ * write-time fix — such an entry has no stable ID to name in the next payload
+ * either — and the reader's positional fallback is what `main` already does, so
+ * the anchor degrades rather than misleads.
  */
 function isSyntheticContext(message: BaseMessage): boolean {
   const { additional_kwargs: kwargs } = message;
-  if (kwargs.isMeta === true) {
+  if (kwargs.injected === true || kwargs.isMeta === true) {
     return true;
   }
   return kwargs.source != null && kwargs.source !== 'steer';
