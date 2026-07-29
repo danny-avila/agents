@@ -5175,6 +5175,36 @@ describe('formatAgentMessages', () => {
       expect(result.boundaryTokenAdjustment).toBeUndefined();
     });
 
+    /** An empty text block is dropped by formatting and costs no tokens, so its
+     *  zero length is accurate — it must not be read as unmeasurable content and
+     *  disable the discount, which would restore the double count. */
+    it('still discounts when a retained part is zero-cost rather than unmeasurable', () => {
+      const payload: TPayload = [
+        { messageId: 'm1', role: 'user', content: 'Covered question' },
+        { messageId: 'm2', role: 'user', content: 'Retained question' },
+        {
+          messageId: 'm3',
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
+              tokenCount: 120,
+              coverage: { retainedFromMessageId: 'm2' },
+            },
+            { type: ContentTypes.TEXT, text: '' },
+            { type: ContentTypes.TEXT, text: 'R'.repeat(500) },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 300 });
+
+      expect(result.boundaryTokenAdjustment?.original).toBe(300);
+      expect(result.indexTokenCountMap?.[1]).toBeLessThan(300);
+      expect(result.indexTokenCountMap?.[1]).toBeGreaterThan(100);
+    });
+
     /** The summary text is returned separately as `summary.tokenCount`, so
      *  leaving it in its own entry's count charges the prompt for it twice. */
     it('discounts the filtered summary text from its own entry', () => {

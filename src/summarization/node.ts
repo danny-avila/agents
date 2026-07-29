@@ -399,12 +399,13 @@ function computeSummaryTokenCount(
  * payload entry carries and anchoring there would degrade to positional
  * trimming on read.
  *
- * The check is deliberately narrow. A steer carries `source: 'steer'` but is
- * replayed by `formatAgentMessages` from a payload entry and stamped with its
- * ID, so it is a valid anchor — treating every non-null `source` as synthetic
- * would skip it and drop the retained steer this coverage exists to protect.
- * Skipping too little only costs an unresolvable anchor, which falls back to
- * positional semantics; skipping too much loses history.
+ * `steer` is the one source label that is *not* synthetic: a steer is replayed
+ * by `formatAgentMessages` from a payload entry and stamped with its ID, so it
+ * is a valid anchor and skipping it would drop the retained steer this coverage
+ * exists to protect. Every other label — `hook`, `skill`, `system` — is created
+ * in-run, and `InjectedMessage` leaves `isMeta` optional for all of them, so the
+ * flag alone cannot be relied on. Hence an allowlist of one rather than a
+ * denylist that has to enumerate the rest.
  *
  * Known limitation: a payload entry that omits `messageId` is never stamped, so
  * the reducer's UUID is recorded and cannot resolve on the next run. There is
@@ -414,7 +415,10 @@ function computeSummaryTokenCount(
  */
 function isInjectedContext(message: BaseMessage): boolean {
   const { additional_kwargs: kwargs } = message;
-  return kwargs.isMeta === true || kwargs.source === 'hook';
+  if (kwargs.isMeta === true) {
+    return true;
+  }
+  return kwargs.source != null && kwargs.source !== 'steer';
 }
 
 function resolveSummaryCoverage(

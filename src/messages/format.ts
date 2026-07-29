@@ -1353,6 +1353,28 @@ function applySummaryBoundary(
   };
 }
 
+/**
+ * Whether `formatAssistantMessage` filters this part out of the emitted message.
+ * Such a part contributes no prompt tokens, so measuring it as zero characters
+ * is accurate rather than a blind spot — it must not be mistaken for content the
+ * char heuristic cannot see.
+ */
+function isDroppedByFormatting(
+  part: MessageContentComplex | undefined
+): boolean {
+  if (part == null) {
+    return true;
+  }
+  if (
+    part.type === ContentTypes.ERROR ||
+    part.type === ContentTypes.AGENT_UPDATE ||
+    part.type === ContentTypes.ACTIVITY_LABEL
+  ) {
+    return true;
+  }
+  return part.type === ContentTypes.TEXT && getTextContent(part).trim() === '';
+}
+
 function measureValueChars(value: unknown): number {
   if (typeof value === 'string') {
     return value.length;
@@ -1871,10 +1893,15 @@ export const formatAgentMessages = (
          *  over-context request. */
         let everyRetainedPartMeasurable = true;
         for (let p = 0; p < content.length; p++) {
-          if (content[p]?.type === ContentTypes.SUMMARY) {
+          const part = content[p];
+          /** Null-guarded first, so the type check below needs no optional chain. */
+          if (
+            isDroppedByFormatting(part) ||
+            part.type === ContentTypes.SUMMARY
+          ) {
             continue;
           }
-          const charLen = contentPartCharLength(content[p]);
+          const charLen = contentPartCharLength(part);
           if (charLen === 0) {
             everyRetainedPartMeasurable = false;
             break;
