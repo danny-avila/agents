@@ -1613,6 +1613,7 @@ export class Run<_T extends t.BaseGraphState> {
     entries,
     thinkingExcerpts,
     lastAssistantText,
+    previousLabels,
     prompt,
     charLimit = 600,
     chainOptions,
@@ -1780,6 +1781,7 @@ export class Run<_T extends t.BaseGraphState> {
       charLimit,
       thinkingExcerpts,
       lastAssistantText,
+      previousLabels,
       redaction,
     });
 

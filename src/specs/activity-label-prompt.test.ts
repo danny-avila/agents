@@ -43,6 +43,55 @@ describe('buildActivityLabelPrompt redaction', () => {
     expect(prompt).toContain('runtime versions');
   });
 
+  it('renders previous headers first, in order, capped at three', () => {
+    const prompt = buildActivityLabelPrompt({
+      entries,
+      charLimit: 600,
+      lastAssistantText: 'Verifying each runtime',
+      previousLabels: [
+        'Confirmed Python 3.14.4 installed',
+        'Wrote marker file to /mnt/data',
+        'Confirmed /mnt/data persists between calls',
+        'Found RLIMIT_AS ceiling at 16GB',
+      ],
+    });
+    expect(prompt.startsWith('Previous headers in this run (most recent last):')).toBe(true);
+    /** Oldest header falls off the cap. */
+    expect(prompt).not.toContain('Confirmed Python 3.14.4 installed');
+    const marker = prompt.indexOf('Wrote marker file to /mnt/data');
+    const persists = prompt.indexOf('Confirmed /mnt/data persists between calls');
+    const rlimit = prompt.indexOf('Found RLIMIT_AS ceiling at 16GB');
+    const intent = prompt.indexOf('Intent');
+    expect(marker).toBeGreaterThan(-1);
+    expect(persists).toBeGreaterThan(marker);
+    expect(rlimit).toBeGreaterThan(persists);
+    expect(intent).toBeGreaterThan(rlimit);
+  });
+
+  it('omits the previous-headers section when the list is empty or absent', () => {
+    for (const previousLabels of [undefined, [] as string[]]) {
+      const prompt = buildActivityLabelPrompt({ entries, charLimit: 600, previousLabels });
+      expect(prompt).not.toContain('Previous headers');
+    }
+  });
+
+  it('drops previous headers under ANY active policy, like the other free-form prose', () => {
+    /** A header for an earlier batch may have been generated under a
+     *  DIFFERENT agent's weaker redaction overlay; an active policy here
+     *  must not inherit that phrasing into this trace. */
+    const redaction = resolveToolOutputTracingConfig({
+      toolOutputTracing: { redactedToolNames: ['unrelated_tool'] },
+    });
+    const prompt = buildActivityLabelPrompt({
+      entries,
+      charLimit: 600,
+      previousLabels: ['Read SECRET_CONNECTION_STRING_LEAK from db'],
+      redaction,
+    });
+    expect(prompt).not.toContain('Previous headers');
+    expect(prompt).not.toContain('SECRET_CONNECTION_STRING_LEAK from db');
+  });
+
   it('drops reasoning excerpts when any batch entry is redacted', () => {
     const redaction = resolveToolOutputTracingConfig({
       toolOutputTracing: { redactedToolNames: ['db_query'] },
