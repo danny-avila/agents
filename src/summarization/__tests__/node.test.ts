@@ -1057,50 +1057,6 @@ describe('recency window — first-turn protection', () => {
       expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm2' });
     });
 
-    /** Hook and skill-body context enters as marked `HumanMessage`s that the
-     *  reducer stamps with a UUID no payload entry carries. Anchoring there
-     *  would degrade to positional trimming on the next run. */
-    it('skips injected context when choosing the anchor', async () => {
-      const summaryBlock = await runCompaction(
-        [
-          new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
-          new AIMessage({ content: 'turn 1 reply', id: 'm2' }),
-          new HumanMessage({
-            content: 'injected skill body',
-            id: 'reducer-uuid',
-            additional_kwargs: { isMeta: true, source: 'skill' },
-          }),
-          new HumanMessage({ content: 'turn 2 query', id: 'm3' }),
-          new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
-        ],
-        2
-      );
-
-      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm3' });
-    });
-
-    /** `InjectedMessage` leaves `isMeta` optional for every source, so a hook
-     *  returning `source: 'skill'` alone is still synthetic and its reducer UUID
-     *  can never resolve in the next payload. */
-    it('skips injected sources that omit isMeta', async () => {
-      const summaryBlock = await runCompaction(
-        [
-          new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
-          new AIMessage({ content: 'turn 1 reply', id: 'm2' }),
-          new HumanMessage({
-            content: 'injected skill body',
-            id: 'reducer-uuid',
-            additional_kwargs: { role: 'user', source: 'skill' },
-          }),
-          new HumanMessage({ content: 'turn 2 query', id: 'm3' }),
-          new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
-        ],
-        2
-      );
-
-      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm3' });
-    });
-
     it('anchors on the straddling id when it is the only source', async () => {
       const summaryBlock = await runCompaction([
         new AIMessage({ content: 'pre-steer reply', id: 'm1' }),

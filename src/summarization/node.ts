@@ -394,42 +394,28 @@ function computeSummaryTokenCount(
  * naming the first *retained* message makes that same message the anchor, so it
  * survives whole and everything before it is unambiguously covered.
  *
- * In-run context is skipped: hook output and anything flagged `isMeta` is
- * created during the run, so `messagesStateReducer` stamps it with a UUID no
- * payload entry carries and anchoring there would degrade to positional
- * trimming on read.
+ * Provenance is deliberately not inferred here. Whether an ID resolves is a
+ * question only the reader can answer — it holds the payload — and
+ * `additional_kwargs` does not record where a message came from: an in-run
+ * injected entry and a replayed payload steer can carry identical markers, and
+ * `messagesStateReducer` gives both a plain `id`. Filtering on those markers
+ * cost a real bug (skipping `source: 'steer'` dropped the retained steers this
+ * coverage exists to protect) without buying anything, because in-run context is
+ * always *appended* — `[...toolMessages, ...injected]` in `ToolNode`, and the
+ * same in `StandardGraph` — so a tail that begins with injected context has no
+ * payload-backed message later to reach instead.
  *
- * `steer` is the one source label that is *not* synthetic: a steer is replayed
- * by `formatAgentMessages` from a payload entry and stamped with its ID, so it
- * is a valid anchor and skipping it would drop the retained steer this coverage
- * exists to protect. Every other label — `hook`, `skill`, `system` — is created
- * in-run, and `InjectedMessage` leaves `isMeta` optional for all of them, so the
- * flag alone cannot be relied on. Hence an allowlist of one rather than a
- * denylist that has to enumerate the rest.
- *
- * Known limitation: a payload entry that omits `messageId` is never stamped, so
- * the reducer's UUID is recorded and cannot resolve on the next run. There is
- * no write-time fix — such an entry has no stable ID to name in the next
- * payload either — and the reader's positional fallback is what `main` already
- * does, so the anchor degrades rather than misleads.
+ * An anchor the reader cannot resolve therefore falls back to positional
+ * trimming, which is what `main` does for every summary today. The same applies
+ * to a payload entry that omits `messageId`: it is unaddressable in the next
+ * payload too, so no anchor could name it. The failure mode is a degraded
+ * anchor, never a misleading one.
  */
-function isInjectedContext(message: BaseMessage): boolean {
-  const { additional_kwargs: kwargs } = message;
-  if (kwargs.isMeta === true) {
-    return true;
-  }
-  return kwargs.source != null && kwargs.source !== 'steer';
-}
-
 function resolveSummaryCoverage(
   messagesToRetain: BaseMessage[]
 ): t.SummaryCoverage | undefined {
   for (let i = 0; i < messagesToRetain.length; i++) {
-    const message = messagesToRetain[i];
-    if (isInjectedContext(message)) {
-      continue;
-    }
-    const id = message.id?.trim();
+    const id = messagesToRetain[i].id?.trim();
     if (id != null && id !== '') {
       return { retainedFromMessageId: id };
     }

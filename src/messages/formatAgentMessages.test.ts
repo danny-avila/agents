@@ -5076,46 +5076,48 @@ describe('formatAgentMessages', () => {
       expect(Object.keys(result.indexTokenCountMap ?? {})).toHaveLength(3);
     });
 
-    /** The tool call and its ToolMessage are still sent, so scaling the entry
-     *  down to the summary's share would hide nearly all of its tokens from
-     *  the pruner and let the request overflow the context window. */
-    it('keeps tool-call tokens when discounting a summary alongside them', () => {
-      const payload: TPayload = [
-        { messageId: 'm1', role: 'user', content: 'Covered question' },
-        { messageId: 'm2', role: 'user', content: 'Retained question' },
+    /** The summary text is returned separately as `summary.tokenCount`, so
+     *  leaving it in its own entry's count charges the prompt for it twice. */
+    it('subtracts the summary tokens from the entry that carries it', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm3' }),
+        { 0: 5, 1: 6, 2: 7, 3: 8, 4: 40 }
+      );
+
+      expect(result.indexTokenCountMap?.[2]).toBe(28);
+      expect(result.boundaryTokenAdjustment).toEqual({
+        original: 40,
+        adjusted: 28,
+        summaryTokens: 12,
+      });
+    });
+
+    /** Subtraction is in token units, so content the character heuristic cannot
+     *  see — media, tool-call payloads, media nested inside a tool output —
+     *  keeps its cost instead of being scaled away by a ratio. */
+    it.each([
+      [
+        'an image',
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,x' } },
+      ],
+      [
+        'a tool call whose output is media',
         {
-          messageId: 'm3',
-          role: 'assistant',
-          content: [
-            {
-              type: ContentTypes.SUMMARY,
-              content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
-              tokenCount: 120,
-              coverage: { retainedFromMessageId: 'm2' },
-            },
-            {
-              type: ContentTypes.TOOL_CALL,
-              tool_call: {
-                id: 'tc1',
-                name: 'search',
-                args: JSON.stringify({ q: 'x'.repeat(4000) }),
-                output: 'y'.repeat(4000),
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'tc1',
+            name: 'render',
+            args: '{}',
+            output: [
+              {
+                type: 'image_url',
+                image_url: { url: 'data:image/png;base64,y' },
               },
-            },
-          ],
+            ],
+          },
         },
-      ];
-
-      const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 3000 });
-
-      const emittedTotal = Object.values(
-        result.indexTokenCountMap ?? {}
-      ).reduce((sum, value) => sum + value, 0);
-      expect(emittedTotal).toBeGreaterThan(2500);
-      expect(result.boundaryTokenAdjustment?.adjusted).toBeGreaterThan(2500);
-    });
-
-    it('leaves the count alone when retained parts cannot be measured', () => {
+      ],
+    ])('preserves non-summary tokens alongside %s', (_label, part) => {
       const payload: TPayload = [
         { messageId: 'm1', role: 'user', content: 'Covered question' },
         { messageId: 'm2', role: 'user', content: 'Retained question' },
@@ -5129,56 +5131,22 @@ describe('formatAgentMessages', () => {
               tokenCount: 120,
               coverage: { retainedFromMessageId: 'm2' },
             },
-            {
-              type: 'image_url',
-              image_url: { url: 'data:image/png;base64,x' },
-            },
-          ],
-        },
-      ];
-
-      const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 900 });
-
-      expect(result.indexTokenCountMap?.[1]).toBe(900);
-      expect(result.boundaryTokenAdjustment).toBeUndefined();
-    });
-
-    /** A measurable caption alongside an unmeasurable image must not license the
-     *  discount: the caption's characters would stand in for the image's real
-     *  token cost and scale roughly a thousand image tokens down to nearly 1. */
-    it('leaves the count alone when only some retained parts are measurable', () => {
-      const payload: TPayload = [
-        { messageId: 'm1', role: 'user', content: 'Covered question' },
-        { messageId: 'm2', role: 'user', content: 'Retained question' },
-        {
-          messageId: 'm3',
-          role: 'assistant',
-          content: [
-            {
-              type: ContentTypes.SUMMARY,
-              content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
-              tokenCount: 120,
-              coverage: { retainedFromMessageId: 'm2' },
-            },
-            { type: ContentTypes.TEXT, text: 'Here it is' },
-            {
-              type: 'image_url',
-              image_url: { url: 'data:image/png;base64,x' },
-            },
+            part as MessageContentComplex,
           ],
         },
       ];
 
       const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 1100 });
 
-      expect(result.indexTokenCountMap?.[1]).toBe(1100);
-      expect(result.boundaryTokenAdjustment).toBeUndefined();
+      const emitted = Object.values(result.indexTokenCountMap ?? {}).reduce(
+        (sum, value) => sum + value,
+        0
+      );
+      expect(emitted).toBe(1100 - 120 + 6);
+      expect(result.boundaryTokenAdjustment?.adjusted).toBe(980);
     });
 
-    /** An empty text block is dropped by formatting and costs no tokens, so its
-     *  zero length is accurate — it must not be read as unmeasurable content and
-     *  disable the discount, which would restore the double count. */
-    it('still discounts when a retained part is zero-cost rather than unmeasurable', () => {
+    it('leaves the count alone when the summary claims the whole entry', () => {
       const payload: TPayload = [
         { messageId: 'm1', role: 'user', content: 'Covered question' },
         { messageId: 'm2', role: 'user', content: 'Retained question' },
@@ -5189,37 +5157,18 @@ describe('formatAgentMessages', () => {
             {
               type: ContentTypes.SUMMARY,
               content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
-              tokenCount: 120,
+              tokenCount: 500,
               coverage: { retainedFromMessageId: 'm2' },
             },
-            { type: ContentTypes.TEXT, text: '' },
-            { type: ContentTypes.TEXT, text: 'R'.repeat(500) },
+            { type: ContentTypes.TEXT, text: 'Short reply' },
           ],
         },
       ];
 
-      const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 300 });
+      const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 400 });
 
-      expect(result.boundaryTokenAdjustment?.original).toBe(300);
-      expect(result.indexTokenCountMap?.[1]).toBeLessThan(300);
-      expect(result.indexTokenCountMap?.[1]).toBeGreaterThan(100);
-    });
-
-    /** The summary text is returned separately as `summary.tokenCount`, so
-     *  leaving it in its own entry's count charges the prompt for it twice. */
-    it('discounts the filtered summary text from its own entry', () => {
-      const withSummary = formatAgentMessages(
-        compactedPayload({ retainedFromMessageId: 'm3' }),
-        { 0: 5, 1: 6, 2: 7, 3: 8, 4: 40 }
-      );
-
-      const blockEntryTokens = withSummary.indexTokenCountMap?.[2];
-      expect(blockEntryTokens).toBeLessThan(40);
-      expect(blockEntryTokens).toBeGreaterThan(0);
-      expect(withSummary.boundaryTokenAdjustment?.original).toBe(40);
-      expect(withSummary.boundaryTokenAdjustment?.adjusted).toBe(
-        blockEntryTokens
-      );
+      expect(result.indexTokenCountMap?.[1]).toBe(400);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
     });
 
     it('leaves entries without summary parts untouched', () => {
