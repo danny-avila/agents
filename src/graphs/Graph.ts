@@ -50,6 +50,8 @@ import {
   convertInjectedMessages,
   coalesceAdjacentUserTurns,
   strictAlternationProviders,
+  appendPredecessorHandoffCue,
+  removePredecessorHandoffCue,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -67,7 +69,9 @@ import {
   getFallbackErrorContext,
   getFallbackOverflowCandidates,
   projectMessagesForProvider,
+  resolveServingModelId,
 } from '@/llm/invoke';
+import { v4 } from 'uuid';
 import {
   createLangfuseHandler,
   createLangfuseTraceMetadata,
@@ -988,6 +992,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   messages: BaseMessage[] = [];
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
+  /** Ids of AI turns the agent node returned THIS run; see isRunProducedMessage. */
+  protected runProducedAiMessageIds = new Set<string>();
   /** Checkpoint scope whose messages match index-keyed tool snapshots. */
   private originalToolContentCheckpointScope?: string;
   runId: string | undefined;
@@ -1119,6 +1125,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * a stale reference on 2nd+ processStream calls.
      */
     this.toolCallStepIds.clear();
+    this.runProducedAiMessageIds.clear();
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
@@ -1462,6 +1469,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return this.cachedRunMessages;
     }
     return this.messages.slice(this.startIndex);
+  }
+
+  /**
+   * True when THIS RUN produced `message` — the provenance the handoff cue
+   * gate needs. Tracked as an id set rather than inferred from `startIndex`
+   * arithmetic: summarization's remove-all compaction rewrites the live
+   * array and leaves `startIndex` stale, so index-based run/host
+   * discrimination silently breaks right after a mid-run summarize. Ids
+   * survive compaction (retained messages keep theirs), host-supplied
+   * prefill messages are never in the set, and membership is O(1) per
+   * model call.
+   */
+  isRunProducedMessage(message: BaseMessage): boolean {
+    const id = message.id;
+    return (
+      typeof id === 'string' &&
+      id !== '' &&
+      this.runProducedAiMessageIds.has(id)
+    );
   }
 
   getContentParts(): t.MessageContentComplex[] | undefined {
@@ -2517,6 +2543,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             );
           }
         }
+        /**
+         * Applied HERE for the primary so the cue is part of the MEASURED
+         * payload — the pre-invoke projection and overflow guard run on this
+         * stage's output, and a post-measure append could push a just-fits
+         * prompt over budget unreported (#346 round 2). The attemptInvoke
+         * funnel re-keys per SERVING provider: it strips this cue for a
+         * tolerant fallback and adds it for a Claude fallback behind a
+         * tolerant primary.
+         */
+        if (
+          isAnthropicLike(
+            agentContext.provider,
+            agentContext.clientOptions as { model?: string }
+          )
+        ) {
+          const before = transformed;
+          transformed = trackProviderMessageOrigins(
+            before,
+            appendPredecessorHandoffCue(before, (message) =>
+              this.isRunProducedMessage(message)
+            )
+          );
+        }
         return transformed;
       };
 
@@ -3233,11 +3282,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                     calculateMaxToolResultChars(
                       fallbackMaxContextTokens ?? agentContext.maxContextTokens
                     );
-                  const projectedFallbackMessages = trackProviderMessageOrigins(
+                  /**
+                   * Serving-provider cue shaping BEFORE the fallback payload
+                   * is measured: a Claude fallback behind a tolerant primary
+                   * gains the cue inside the guarded projection (a prompt
+                   * within the cue's cost of the fallback budget must take
+                   * the recovery path, not ship oversized), and a tolerant
+                   * fallback behind an Anthropic primary sheds the baked cue
+                   * before it is measured against the tighter budget. The
+                   * attemptInvoke funnel pass then finds nothing to change.
+                   */
+                  const cueShapedFallbackMessages = trackProviderMessageOrigins(
                     fallbackMessages,
+                    isAnthropicLike(fallbackProvider, {
+                      model: resolveServingModelId(fallbackModel),
+                    })
+                      ? appendPredecessorHandoffCue(fallbackMessages, (m) =>
+                        this.isRunProducedMessage(m)
+                      )
+                      : removePredecessorHandoffCue(fallbackMessages)
+                  );
+                  const projectedFallbackMessages = trackProviderMessageOrigins(
+                    cueShapedFallbackMessages,
                     projectMessagesForProvider({
                       model: fallbackModel,
-                      messages: fallbackMessages,
+                      messages: cueShapedFallbackMessages,
                       provider: fallbackProvider,
                       maxToolResultChars: fallbackToolResultChars,
                       callOptions: fallbackConfig,
@@ -3323,6 +3392,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * handled everything — both paths become no-ops.
        */
       const responseMessage = result.messages?.[0];
+      /**
+       * Provenance for the handoff-cue gate: recorded at the node, where the
+       * produced turn is unambiguous. The public ChatModel contract does not
+       * require implementations to set message ids — the reducer would
+       * assign one AFTER this node returns, which is too late for the set —
+       * so an id is assigned here first, the same way the reducer does it
+       * (`v4()`, mirrored into `lc_kwargs`), and the reducer's
+       * keep-existing-id rule makes the state message match.
+       */
+      if (responseMessage?.getType() === 'ai') {
+        if (
+          typeof responseMessage.id !== 'string' ||
+          responseMessage.id === ''
+        ) {
+          responseMessage.id = v4();
+          responseMessage.lc_kwargs.id = responseMessage.id;
+        }
+        this.runProducedAiMessageIds.add(responseMessage.id);
+      }
       const toolCalls = (responseMessage as AIMessageChunk | undefined)
         ?.tool_calls;
       const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
