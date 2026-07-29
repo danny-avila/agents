@@ -4,6 +4,8 @@ import {
   INTENT_ARG,
   INTENT_PROPERTY,
   INTENT_DESCRIPTION,
+  INTENT_LABEL_MARKER,
+  withoutIntent,
   withIntent,
   readIntent,
   stripIntent,
@@ -11,6 +13,7 @@ import {
   readOutcomeFields,
   resolveToolOutcome,
 } from '../intentArg';
+import { ReadFileToolSchema } from '../ReadFile';
 
 describe('withIntent', () => {
   const base: JsonSchemaType = {
@@ -72,7 +75,83 @@ describe('withIntent', () => {
   it('carries the model-facing instruction', () => {
     expect(INTENT_PROPERTY.description).toBe(INTENT_DESCRIPTION);
     expect(INTENT_DESCRIPTION).toContain('FIRST');
-    expect(INTENT_DESCRIPTION).toContain('distinguish that call from its siblings');
+    /** Sibling differentiation is the headline case; models emit identical
+     *  labels for parallel calls without it. */
+    expect(INTENT_DESCRIPTION).toContain('Sibling calls to one tool must differ');
+  });
+
+  it('opens with the exported marker so host strip passes can key on it', () => {
+    expect(INTENT_DESCRIPTION.startsWith(INTENT_LABEL_MARKER)).toBe(true);
+  });
+
+  it('stays terse — it is repeated per tool, per request', () => {
+    expect(INTENT_DESCRIPTION.length).toBeLessThanOrEqual(300);
+  });
+});
+
+describe('withoutIntent', () => {
+  it('removes the injected label — the opt-out for embedders that render none', () => {
+    const withLabel = withIntent({
+      type: 'object',
+      properties: { query: { type: 'string' } },
+      required: ['query'],
+    });
+    const stripped = withoutIntent(withLabel);
+    expect(Object.keys(stripped?.properties ?? {})).toEqual(['query']);
+    expect(stripped?.required).toEqual(['query']);
+  });
+
+  it('never removes a tool-owned business `intent` parameter', () => {
+    const business: JsonSchemaType = {
+      type: 'object',
+      properties: { intent: { type: 'string', description: 'CRM intent category' } },
+      required: ['intent'],
+    };
+    expect(withoutIntent(business)).toBe(business);
+  });
+
+  it('is a no-op on schemas without the label', () => {
+    const plain: JsonSchemaType = { type: 'object', properties: { q: { type: 'string' } } };
+    expect(withoutIntent(plain)).toBe(plain);
+    expect(withoutIntent(undefined)).toBeUndefined();
+  });
+
+  it('prunes intent from `required` too, so the schema stays valid', () => {
+    /** Strict-mode normalization lists every property in `required`; leaving
+     *  a dangling entry yields invalid JSON Schema the provider rejects. */
+    const strict: JsonSchemaType = {
+      type: 'object',
+      properties: { intent: { ...INTENT_PROPERTY }, path: { type: 'string' } },
+      required: ['intent', 'path'],
+    };
+    const stripped = withoutIntent(strict);
+    expect(Object.keys(stripped?.properties ?? {})).toEqual(['path']);
+    expect(stripped?.required).toEqual(['path']);
+  });
+
+  it('drops `required` entirely when intent was its only entry', () => {
+    const onlyIntent: JsonSchemaType = {
+      type: 'object',
+      properties: { intent: { ...INTENT_PROPERTY } },
+      required: ['intent'],
+    };
+    const stripped = withoutIntent(onlyIntent);
+    expect(stripped?.required).toBeUndefined();
+    expect(Object.keys(stripped?.properties ?? {})).toEqual([]);
+  });
+
+  it('accepts a readonly `as const` native schema without a cast', () => {
+    /** ReadFileToolSchema is declared `as const`, so `required` is a readonly
+     *  tuple — this call is the compile-time assertion that the advertised
+     *  opt-out is usable on the schemas it exists for. */
+    const stripped = withoutIntent(ReadFileToolSchema);
+    expect(Object.keys(stripped?.properties ?? {})).toEqual(['path']);
+    expect(stripped?.required).toEqual(['path']);
+  });
+
+  it('round-trips with withIntent', () => {
+    const base: JsonSchemaType = { type: 'object', properties: { q: { type: 'string' } } };
+    expect(withoutIntent(withIntent(base))).toEqual(base);
   });
 });
 
@@ -130,7 +209,7 @@ describe('applyOutcome', () => {
   });
 
   it('ignores a blank outcome', () => {
-    expect(applyOutcome(intent, { outcome: '  ' })).toBe('Searched for OAuth handling');
+    expect(applyOutcome(intent, { outcome: '  ' })).toBe(intent);
   });
 
   it('applies outcome_patch to the first occurrence only, case-sensitive', () => {
@@ -141,34 +220,31 @@ describe('applyOutcome', () => {
     ).toBe('Searched for Searching patterns');
     expect(
       applyOutcome(intent, { outcome_patch: { from: 'searching', to: 'searched' } })
-    ).toBe('Searched for OAuth handling');
+    ).toBe(intent);
   });
 
   it('ignores a patch whose from is empty or absent from the intent', () => {
-    expect(applyOutcome(intent, { outcome_patch: { from: '', to: 'x' } })).toBe(
-      'Searched for OAuth handling'
-    );
+    expect(applyOutcome(intent, { outcome_patch: { from: '', to: 'x' } })).toBe(intent);
     expect(applyOutcome(intent, { outcome_patch: { from: 'Grepping', to: 'Grepped' } })).toBe(
-      'Searched for OAuth handling'
+      intent
     );
   });
 
-  it('mechanically transforms the leading verb', () => {
-    expect(applyOutcome('Reading the callback router')).toBe('Read the callback router');
-    expect(applyOutcome('Writing the zod schema')).toBe('Wrote the zod schema');
-    expect(applyOutcome('Delegating the OAuth audit')).toBe('Delegated the OAuth audit');
-  });
-
-  it('preserves a lowercase leading verb', () => {
-    expect(applyOutcome('searching for OAuth handling')).toBe('searched for OAuth handling');
-  });
-
-  it('leaves an unknown leading word unchanged', () => {
-    expect(applyOutcome('Refactoring the zod schema')).toBe('Refactoring the zod schema');
-  });
-
-  it('handles a single-word intent', () => {
-    expect(applyOutcome('Searching')).toBe('Searched');
+  /**
+   * There is no mechanical tense rewrite: a closed English verb list would
+   * never fire for non-English labels, and would fire for some siblings but
+   * not others inside one group. Completion is a UI state, not a tense.
+   */
+  it('returns the intent unchanged when the tool authored no outcome', () => {
+    for (const label of [
+      'Reading the callback router',
+      'Recording the OAuth callback location',
+      'searching for OAuth handling',
+      'Buscando el manejo de OAuth',
+      'Searching',
+    ]) {
+      expect(applyOutcome(label)).toBe(label);
+    }
   });
 
   it('returns undefined with neither intent nor outcome', () => {
@@ -215,7 +291,7 @@ describe('resolveToolOutcome', () => {
     expect(oversized?.length).toBe(256);
     expect(oversized?.endsWith('…')).toBe(true);
     expect(resolveToolOutcome(args, { outcome: ' \n \t ' })).toBe(
-      'Searched for OAuth handling'
+      'Searching for OAuth handling'
     );
   });
 
@@ -240,7 +316,7 @@ describe('resolveToolOutcome', () => {
     ).toBe('Search failed for OAuth handling');
   });
 
-  it('never falls back to the mechanical transform on a failed call', () => {
+  it('never reuses the in-flight intent as a failed call\'s settled label', () => {
     expect(
       resolveToolOutcome(
         args,

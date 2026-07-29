@@ -35,12 +35,12 @@ import { Constants } from '@/common';
  *
  * A caught provider or processing failure is reported through `data.error`
  * while the tool still returns NORMALLY, so that case must author its own
- * label: the `ToolMessage` carries success status, and a bare intent would
- * otherwise settle mechanically from "Searching…" to "Searched…" and present
- * a failed search as a successful one.
+ * label: the `ToolMessage` carries success status, so without an authored
+ * outcome the in-flight intent ("Searching…") would stand as the settled
+ * label and present a failed search as an ordinary one.
  *
- * Returns undefined for a genuine zero-result search, leaving the host's
- * mechanical past-tense transform to label it.
+ * Returns undefined for a genuine zero-result search, leaving the
+ * model-authored intent to stand unchanged as the label.
  */
 export function resolveSearchOutcome(
   data: t.SearchResultData,

@@ -84,7 +84,7 @@ describe('resolveSearchOutcome', () => {
     ).toBe('Found 2 results for "oauth"');
   });
 
-  it('leaves a genuine zero-result search to the mechanical transform', () => {
+  it('leaves a genuine zero-result search unlabeled, so the intent stands', () => {
     expect(resolveSearchOutcome(data({ organic: [] }), 'oauth')).toBeUndefined();
   });
 });
