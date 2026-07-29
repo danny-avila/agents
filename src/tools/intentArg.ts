@@ -238,15 +238,16 @@ function boundOutcomeLabel(label: string | undefined): string | undefined {
 /**
  * Resolves the settled label to emit on a completion event: only when the
  * tool actually authored `outcome`/`outcome_patch` fields. Returns undefined
- * otherwise — the mechanical transform of a bare intent is left to the host
- * so the wire never carries a label the host can derive itself. The result
- * is collapsed to a bounded single line before emission.
+ * otherwise, so the wire never carries a label the host already has — a bare
+ * intent needs no settled form, because it is displayed unchanged and the UI
+ * conveys completion through its own state. Hosts must NOT rewrite it (see
+ * {@link applyOutcome} for why a tense transform is deliberately absent). The
+ * result is collapsed to a bounded single line before emission.
  *
  * For failed calls (`isError`), only tool-AUTHORED text may label the call:
- * an explicit `outcome`, or a patch whose `from` actually matches the
- * intent. An unmatched patch must not fall through to the mechanical
- * past-tense transform — wording drift in a failure patch would otherwise
- * render a success-looking label for an error.
+ * an explicit `outcome`, or a patch whose `from` actually matches the intent.
+ * An unmatched patch resolves to undefined rather than silently reusing the
+ * in-flight intent, so a failure is never labelled as though it succeeded.
  */
 export function resolveToolOutcome(
   args: unknown,
