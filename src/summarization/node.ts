@@ -382,34 +382,29 @@ function computeSummaryTokenCount(
 }
 
 /**
- * Resolves the last refined message that carries a source message ID, so the
- * summary can declare what it covers rather than leaving the next run to infer
- * coverage from where the block happens to sit. Messages generated mid-run have
- * no source ID; readers fall back to positional semantics when this is absent.
+ * Names the first retained message so the summary declares its own extent
+ * rather than leaving the next run to infer coverage from where the block
+ * happens to sit.
  *
- * One source message can expand into several messages — a steer splits an
- * assistant entry into pre-steer, steer, and post-steer messages that all carry
- * its ID — and the recency split lands on any human-type message, including the
- * steer. An ID still present in the retained tail is therefore only partially
- * covered, and declaring it would make the next run drop content this run kept.
- * Such IDs are skipped in favor of the newest fully covered one.
+ * Anchored to the retained side, not the covered side. One source message can
+ * expand into several messages — a steer splits an assistant entry into
+ * pre-steer, steer, and post-steer entries sharing its ID — and the recency
+ * split lands on any human-type message, including the steer. Naming the last
+ * *covered* message would then name a half-covered ID with no correct reading;
+ * naming the first *retained* message makes that same message the anchor, so it
+ * survives whole and everything before it is unambiguously covered.
+ *
+ * Messages generated mid-run carry reducer-assigned IDs matching no payload
+ * entry. Readers cannot resolve those and fall back to positional semantics,
+ * which is also what happens when this returns `undefined`.
  */
 function resolveSummaryCoverage(
-  messagesToRefine: BaseMessage[],
   messagesToRetain: BaseMessage[]
 ): t.SummaryCoverage | undefined {
-  const retainedIds = new Set<string>();
   for (let i = 0; i < messagesToRetain.length; i++) {
     const id = messagesToRetain[i].id?.trim();
     if (id != null && id !== '') {
-      retainedIds.add(id);
-    }
-  }
-
-  for (let i = messagesToRefine.length - 1; i >= 0; i--) {
-    const id = messagesToRefine[i].id?.trim();
-    if (id != null && id !== '' && !retainedIds.has(id)) {
-      return { throughMessageId: id };
+      return { retainedFromMessageId: id };
     }
   }
   return undefined;
@@ -1181,7 +1176,7 @@ export function createSummarizeNode({
     const summaryBlock = buildSummaryBlock({
       summaryText,
       tokenCount,
-      coverage: resolveSummaryCoverage(messagesToRefine, messagesToRetain),
+      coverage: resolveSummaryCoverage(messagesToRetain),
       stepId,
       stepIndex: runStep.index,
       modelName: clientConfig.modelName,

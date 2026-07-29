@@ -4999,7 +4999,9 @@ describe('formatAgentMessages', () => {
   });
 
   describe('summary coverage boundary', () => {
-    const buildSummaryPart = (coverage?: { throughMessageId: string }) => ({
+    const buildSummaryPart = (coverage?: {
+      retainedFromMessageId: string;
+    }) => ({
       type: ContentTypes.SUMMARY,
       content: [
         { type: ContentTypes.TEXT, text: 'Summary of the earliest turns' },
@@ -5012,7 +5014,7 @@ describe('formatAgentMessages', () => {
      *  into the summary, m3/m4 are the retained tail, and the block itself is
      *  persisted on the assistant message that came after all of them. */
     const compactedPayload = (coverage?: {
-      throughMessageId: string;
+      retainedFromMessageId: string;
     }): TPayload => [
       { messageId: 'm1', role: 'user', content: 'Covered question' },
       { messageId: 'm2', role: 'assistant', content: 'Covered answer' },
@@ -5040,7 +5042,7 @@ describe('formatAgentMessages', () => {
 
     it('preserves the retained tail that the summary never covered', () => {
       const result = formatAgentMessages(
-        compactedPayload({ throughMessageId: 'm2' })
+        compactedPayload({ retainedFromMessageId: 'm3' })
       );
 
       expect(result.messages.map(textOf)).toEqual([
@@ -5052,9 +5054,9 @@ describe('formatAgentMessages', () => {
       expect(result.summary!.tokenCount).toBe(12);
     });
 
-    it('drops the covered message itself, not just everything before it', () => {
+    it('retains the anchor message itself, dropping only what precedes it', () => {
       const result = formatAgentMessages(
-        compactedPayload({ throughMessageId: 'm3' })
+        compactedPayload({ retainedFromMessageId: 'm4' })
       );
 
       expect(result.messages.map(textOf)).toEqual([
@@ -5065,11 +5067,40 @@ describe('formatAgentMessages', () => {
 
     it('keeps token counts for the retained tail and drops covered entries', () => {
       const result = formatAgentMessages(
-        compactedPayload({ throughMessageId: 'm2' }),
+        compactedPayload({ retainedFromMessageId: 'm3' }),
         { 0: 5, 1: 6, 2: 7, 3: 8, 4: 40 }
       );
 
-      expect(result.indexTokenCountMap).toEqual({ 0: 7, 1: 8, 2: 40 });
+      expect(result.indexTokenCountMap?.[0]).toBe(7);
+      expect(result.indexTokenCountMap?.[1]).toBe(8);
+      expect(Object.keys(result.indexTokenCountMap ?? {})).toHaveLength(3);
+    });
+
+    /** The summary text is returned separately as `summary.tokenCount`, so
+     *  leaving it in its own entry's count charges the prompt for it twice. */
+    it('discounts the filtered summary text from its own entry', () => {
+      const withSummary = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm3' }),
+        { 0: 5, 1: 6, 2: 7, 3: 8, 4: 40 }
+      );
+
+      const blockEntryTokens = withSummary.indexTokenCountMap?.[2];
+      expect(blockEntryTokens).toBeLessThan(40);
+      expect(blockEntryTokens).toBeGreaterThan(0);
+      expect(withSummary.boundaryTokenAdjustment?.original).toBe(40);
+      expect(withSummary.boundaryTokenAdjustment?.adjusted).toBe(
+        blockEntryTokens
+      );
+    });
+
+    it('leaves entries without summary parts untouched', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm3' }),
+        { 0: 5, 1: 6, 2: 7, 3: 8, 4: 40 }
+      );
+
+      expect(result.indexTokenCountMap?.[0]).toBe(7);
+      expect(result.indexTokenCountMap?.[1]).toBe(8);
     });
 
     it('falls back to positional trimming for legacy blocks without coverage', () => {
@@ -5081,18 +5112,22 @@ describe('formatAgentMessages', () => {
 
     it('falls back to positional trimming when coverage cannot be resolved', () => {
       const result = formatAgentMessages(
-        compactedPayload({ throughMessageId: 'pruned-from-payload' })
+        compactedPayload({ retainedFromMessageId: 'pruned-from-payload' })
       );
 
       expect(result.messages.map(textOf)).toEqual(['Post-compaction reply']);
     });
 
-    it('ignores coverage pointing at or past its own block', () => {
-      const result = formatAgentMessages(
-        compactedPayload({ throughMessageId: 'm5' })
-      );
+    it('ignores an anchor pointing past its own block', () => {
+      const result = formatAgentMessages([
+        ...compactedPayload({ retainedFromMessageId: 'm6' }),
+        { messageId: 'm6', role: 'user', content: 'Later question' },
+      ]);
 
-      expect(result.messages.map(textOf)).toEqual(['Post-compaction reply']);
+      expect(result.messages.map(textOf)).toEqual([
+        'Post-compaction reply',
+        'Later question',
+      ]);
     });
 
     it('applies last-summary-wins across mixed coverage and legacy blocks', () => {
@@ -5115,7 +5150,7 @@ describe('formatAgentMessages', () => {
           messageId: 'm4',
           role: 'assistant',
           content: [
-            buildSummaryPart({ throughMessageId: 'm2' }),
+            buildSummaryPart({ retainedFromMessageId: 'm3' }),
             { type: ContentTypes.TEXT, text: 'Newest reply' },
           ],
         },

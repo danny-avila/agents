@@ -987,7 +987,7 @@ describe('recency window — first-turn protection', () => {
       return summaryBlock;
     };
 
-    it('records the last refined message as the covered boundary', async () => {
+    it('records the first retained message as the coverage anchor', async () => {
       const summaryBlock = await runCompaction([
         new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
         new AIMessage({ content: 'turn 1 reply', id: 'm2' }),
@@ -995,21 +995,21 @@ describe('recency window — first-turn protection', () => {
         new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
       ]);
 
-      expect(summaryBlock?.coverage).toEqual({ throughMessageId: 'm2' });
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm3' });
     });
 
-    it('falls back to the last refined message that carries a source id', async () => {
+    it('skips a retained message that carries no source id', async () => {
       const summaryBlock = await runCompaction([
         new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
-        new AIMessage({ content: 'mid-run step' }),
-        new HumanMessage({ content: 'turn 2 query', id: 'm3' }),
+        new AIMessage({ content: 'turn 1 reply', id: 'm2' }),
+        new HumanMessage({ content: 'turn 2 query' }),
         new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
       ]);
 
-      expect(summaryBlock?.coverage).toEqual({ throughMessageId: 'm1' });
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm4' });
     });
 
-    it('omits coverage when no refined message carries a source id', async () => {
+    it('omits coverage when no retained message carries a source id', async () => {
       const summaryBlock = await runCompaction([
         new HumanMessage('turn 1 query'),
         new AIMessage('turn 1 reply'),
@@ -1021,9 +1021,9 @@ describe('recency window — first-turn protection', () => {
     });
 
     /** A steer expands one source message into pre-steer, steer, and post-steer
-     *  messages that all carry its ID, and the recency split lands on the steer.
-     *  Declaring `m2` would drop the half the tail kept. */
-    it('skips a source id that straddles the recency boundary', async () => {
+     *  messages sharing its ID, and the recency split lands on the steer. The
+     *  straddling message is the anchor, so it survives whole. */
+    it('anchors on a source id that straddles the recency boundary', async () => {
       const summaryBlock = await runCompaction([
         new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
         new AIMessage({ content: 'pre-steer reply', id: 'm2' }),
@@ -1031,17 +1031,17 @@ describe('recency window — first-turn protection', () => {
         new AIMessage({ content: 'post-steer reply', id: 'm2' }),
       ]);
 
-      expect(summaryBlock?.coverage).toEqual({ throughMessageId: 'm1' });
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm2' });
     });
 
-    it('omits coverage when every refined id straddles the boundary', async () => {
+    it('anchors on the straddling id when it is the only source', async () => {
       const summaryBlock = await runCompaction([
         new AIMessage({ content: 'pre-steer reply', id: 'm1' }),
         new HumanMessage({ content: 'steer', id: 'm1' }),
         new AIMessage({ content: 'post-steer reply', id: 'm1' }),
       ]);
 
-      expect(summaryBlock?.coverage).toBeUndefined();
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm1' });
     });
   });
 

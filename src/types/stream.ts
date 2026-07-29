@@ -296,13 +296,19 @@ export type SummaryBoundary = {
 };
 
 /**
- * Semantic extent of a summary: the last source message it actually covers.
- * Distinct from `boundary`, which records where the block was emitted. A
- * recency tail retained at compaction time sits *before* the block's own
- * position, so position alone cannot say what the summary replaced.
+ * Semantic extent of a summary: the first source message compaction retained
+ * verbatim, meaning everything before it is covered. Distinct from `boundary`,
+ * which records where the block was emitted — a retained recency tail sits
+ * *before* the block's own position, so position alone cannot say what the
+ * summary replaced.
+ *
+ * Anchored to the retained side rather than the covered side so that a source
+ * message expanding into several messages (a steer splits an assistant entry
+ * into pre-steer, steer, and post-steer entries sharing one ID) stays whole:
+ * such a message is the retained anchor and survives intact.
  */
 export type SummaryCoverage = {
-  throughMessageId: string;
+  retainedFromMessageId: string;
 };
 
 export type SummaryContentBlock = {

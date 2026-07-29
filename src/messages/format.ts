@@ -1189,12 +1189,12 @@ function extractToolNamesFromSearchOutput(output: string): string[] {
 /**
  * How far back a persisted summary reaches.
  *
- * `coverage` is authoritative: the block declared the last source message it
- * replaced, so a recency tail retained at compaction time survives even though
- * it sits earlier in the payload than the block itself. `positional` is the
- * legacy reading for blocks written before coverage existed (or whose covered
- * message is no longer in the payload) — the block's own location is the
- * boundary, which is why it cannot distinguish a retained tail from history.
+ * `coverage` is authoritative: the block named the first source message that
+ * compaction retained, so `messageIndex` is exclusive — everything before it is
+ * covered and it survives whole. `positional` is the legacy reading for blocks
+ * written before coverage existed (or whose anchor is no longer in the payload)
+ * — the block's own location is the boundary, which is why it cannot
+ * distinguish a retained tail from covered history.
  */
 type SummaryBoundary =
   | {
@@ -1211,29 +1211,36 @@ type SummaryBoundary =
       tokenCount: number;
     };
 
+type SummaryScan = {
+  boundary?: SummaryBoundary;
+  /** Payload index → characters of summary text it carries. Summary blocks nest
+   *  their text under `content[]`, which `contentPartCharLength` does not read,
+   *  so the length is captured here where the text is already extracted. */
+  summaryCharsByIndex: Map<number, number>;
+};
+
 function resolveCoverageIndex(
   coverage: SummaryCoverage | undefined,
   indexBySourceId: Map<string, number>,
   summaryMessageIndex: number
 ): number | undefined {
   /** Persisted JSON, so the declared string type is not a runtime guarantee. */
-  if (typeof coverage?.throughMessageId !== 'string') {
+  if (typeof coverage?.retainedFromMessageId !== 'string') {
     return undefined;
   }
-  const throughMessageId = coverage.throughMessageId.trim();
-  if (throughMessageId === '') {
+  const retainedFromMessageId = coverage.retainedFromMessageId.trim();
+  if (retainedFromMessageId === '') {
     return undefined;
   }
-  const coveredIndex = indexBySourceId.get(throughMessageId);
-  return coveredIndex != null && coveredIndex < summaryMessageIndex
-    ? coveredIndex
+  const retainedIndex = indexBySourceId.get(retainedFromMessageId);
+  return retainedIndex != null && retainedIndex <= summaryMessageIndex
+    ? retainedIndex
     : undefined;
 }
 
-function getLatestSummaryBoundary(
-  payload: TPayload
-): SummaryBoundary | undefined {
-  let summaryBoundary: SummaryBoundary | undefined;
+function scanSummaryBlocks(payload: TPayload): SummaryScan {
+  let boundary: SummaryBoundary | undefined;
+  const summaryCharsByIndex = new Map<number, number>();
   /** Filled as the scan advances, so a coverage lookup only ever resolves to a
    *  message already passed — no second pass over the payload. */
   const indexBySourceId = new Map<string, number>();
@@ -1275,22 +1282,27 @@ function getLatestSummaryBoundary(
         continue;
       }
 
+      summaryCharsByIndex.set(
+        i,
+        (summaryCharsByIndex.get(i) ?? 0) + summaryText.length
+      );
+
       const tokenCount =
         typeof summaryPart.tokenCount === 'number' &&
         Number.isFinite(summaryPart.tokenCount)
           ? summaryPart.tokenCount
           : 0;
-      const coveredIndex = resolveCoverageIndex(
+      const retainedIndex = resolveCoverageIndex(
         summaryPart.coverage,
         indexBySourceId,
         i
       );
 
-      summaryBoundary =
-        coveredIndex != null
+      boundary =
+        retainedIndex != null
           ? {
             mode: 'coverage',
-            messageIndex: coveredIndex,
+            messageIndex: retainedIndex,
             text: summaryText,
             tokenCount,
           }
@@ -1304,7 +1316,7 @@ function getLatestSummaryBoundary(
     }
   }
 
-  return summaryBoundary;
+  return { boundary, summaryCharsByIndex };
 }
 
 function applySummaryBoundary(
@@ -1316,12 +1328,12 @@ function applySummaryBoundary(
     return message;
   }
 
-  /** The covered message is replaced by the summary, so the boundary is
-   *  inclusive; everything after it — including a retained recency tail —
-   *  stays verbatim. The block's own message is untouched: its summary part
-   *  is dropped later by `formatAssistantMessage`. */
+  /** The boundary names the first retained message, so it is exclusive: that
+   *  message and everything after it — the recency tail included — stays
+   *  verbatim, and only genuinely covered history is dropped. Summary parts on
+   *  surviving messages are filtered later by `formatAssistantMessage`. */
   if (summaryBoundary.mode === 'coverage') {
-    return messageIndex <= summaryBoundary.messageIndex ? null : message;
+    return messageIndex < summaryBoundary.messageIndex ? null : message;
   }
 
   if (messageIndex < summaryBoundary.messageIndex) {
@@ -1466,7 +1478,8 @@ export const formatAgentMessages = (
     | undefined;
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
-  const summaryBoundary = getLatestSummaryBoundary(payload);
+  const { boundary: summaryBoundary, summaryCharsByIndex } =
+    scanSummaryBlocks(payload);
 
   // Summary metadata is returned to the caller so it can be forwarded to the
   // agent run and included in the single system message via AgentContext.
@@ -1823,6 +1836,38 @@ export const formatAgentMessages = (
               totalChars: totalCharLen,
             };
           }
+        }
+      } else if (
+        summaryBoundary?.mode === 'coverage' &&
+        summaryCharsByIndex.has(originalIndex) &&
+        Array.isArray(payload[originalIndex].content)
+      ) {
+        /** Coverage keeps the block's own message, but `formatAssistantMessage`
+         *  filters the summary part out of it and the text is accounted
+         *  separately as `summary.tokenCount`. Charging the entry for both
+         *  double-counts, inflating the prompt estimate and pruning early. */
+        const content = payload[originalIndex]
+          .content as MessageContentComplex[];
+        let retainedCharLen = 0;
+        for (let p = 0; p < content.length; p++) {
+          if (content[p]?.type !== ContentTypes.SUMMARY) {
+            retainedCharLen += contentPartCharLength(content[p]);
+          }
+        }
+        const summaryCharLen = summaryCharsByIndex.get(originalIndex) ?? 0;
+        const totalCharLen = retainedCharLen + summaryCharLen;
+        if (summaryCharLen > 0 && totalCharLen > 0) {
+          const original = tokenCount;
+          tokenCount = Math.max(
+            1,
+            Math.round(tokenCount * (retainedCharLen / totalCharLen))
+          );
+          boundaryTokenAdjustment = {
+            original,
+            adjusted: tokenCount,
+            remainingChars: retainedCharLen,
+            totalChars: totalCharLen,
+          };
         }
       }
 
