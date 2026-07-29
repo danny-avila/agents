@@ -1223,9 +1223,10 @@ type SummaryTokenAdjustment = {
 
 type SummaryScan = {
   boundary?: SummaryBoundary;
-  /** Payload index → tokens of summary text it carries, as recorded on the block
-   *  itself. Used to discount the entry that holds a summary, in token units
-   *  rather than by measuring characters. */
+  /** Payload index → the summary text's cost in the consumer's tokenizer, from
+   *  the block's `rawTokenCount`. Used to discount the entry that holds a
+   *  summary: the same units as `indexTokenCountMap`, and no character
+   *  measurement of the retained content. */
   summaryTokensByIndex: Map<number, number>;
 };
 
@@ -1298,10 +1299,20 @@ function scanSummaryBlocks(payload: TPayload): SummaryScan {
           ? summaryPart.tokenCount
           : 0;
 
-      if (tokenCount > 0) {
+      /** Only `rawTokenCount` is comparable with `indexTokenCountMap`.
+       *  `tokenCount` is the injection budget: provider output-token space when
+       *  usage was reported, plus the wrapper added at injection time. Blocks
+       *  written before this field existed simply get no discount. */
+      const rawTokenCount =
+        typeof summaryPart.rawTokenCount === 'number' &&
+        Number.isFinite(summaryPart.rawTokenCount)
+          ? summaryPart.rawTokenCount
+          : 0;
+
+      if (rawTokenCount > 0) {
         summaryTokensByIndex.set(
           i,
-          (summaryTokensByIndex.get(i) ?? 0) + tokenCount
+          (summaryTokensByIndex.get(i) ?? 0) + rawTokenCount
         );
       }
       const retainedIndex = resolveCoverageIndex(

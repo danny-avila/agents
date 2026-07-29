@@ -27,6 +27,20 @@ import { Constants } from '@/common';
 const HANDOFF_INSTRUCTIONS_PATTERN = /(?:Instructions?|Context):\s*(.+)/is;
 const HANDOFF_INSTRUCTIONS_KEY = 'handoff_instructions';
 
+/**
+ * Handoff and fan-in prompts that route work between agents. Built in-run and
+ * never persisted as standalone payload entries, so they are marked synthetic:
+ * `messagesStateReducer` would otherwise give them a plain UUID and downstream
+ * consumers — compaction coverage anchors — could not tell them apart from a
+ * message replayed out of the payload.
+ */
+function buildRoutingPrompt(content: string): HumanMessage {
+  return new HumanMessage({
+    content,
+    additional_kwargs: { role: 'user', isMeta: true, source: 'routing' },
+  });
+}
+
 function getHandoffInstructions(
   input: Record<string, unknown>,
   promptKey: string,
@@ -986,12 +1000,12 @@ export class MultiAgentGraph extends StandardGraph {
                 new AIMessage(
                   `[Processed tool result and transferring to ${agentId}]`
                 ),
-                new HumanMessage(instructions),
+                buildRoutingPrompt(instructions),
               ];
             } else {
               messagesForAgent = [
                 ...filteredMessages,
-                new HumanMessage(instructions),
+                buildRoutingPrompt(instructions),
               ];
             }
           }
@@ -1204,7 +1218,7 @@ export class MultiAgentGraph extends StandardGraph {
               effectiveExcludeResults === false
             ) {
               return {
-                messages: [new HumanMessage(promptText)],
+                messages: [buildRoutingPrompt(promptText)],
               };
             }
 
@@ -1212,7 +1226,7 @@ export class MultiAgentGraph extends StandardGraph {
              * to pass filtered messages + prompt to the destination agent
              */
             const filteredMessages = state.messages.slice(0, this.startIndex);
-            const promptMessage = new HumanMessage(promptText);
+            const promptMessage = buildRoutingPrompt(promptText);
             return {
               messages: [promptMessage],
               agentMessages: messagesStateReducer(filteredMessages, [

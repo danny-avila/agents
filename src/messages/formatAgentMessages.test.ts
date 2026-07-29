@@ -5007,6 +5007,7 @@ describe('formatAgentMessages', () => {
         { type: ContentTypes.TEXT, text: 'Summary of the earliest turns' },
       ],
       tokenCount: 12,
+      rawTokenCount: 12,
       ...(coverage != null ? { coverage } : {}),
     });
 
@@ -5128,7 +5129,8 @@ describe('formatAgentMessages', () => {
             {
               type: ContentTypes.SUMMARY,
               content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
-              tokenCount: 120,
+              tokenCount: 999,
+              rawTokenCount: 120,
               coverage: { retainedFromMessageId: 'm2' },
             },
             part as MessageContentComplex,
@@ -5146,6 +5148,34 @@ describe('formatAgentMessages', () => {
       expect(result.boundaryTokenAdjustment?.adjusted).toBe(980);
     });
 
+    /** `tokenCount` is the injection budget — provider output-token space plus a
+     *  wrapper — so it is not comparable with `indexTokenCountMap`. A block that
+     *  carries only that figure must not be subtracted from the entry. */
+    it('ignores the provider-space token count when no raw count is recorded', () => {
+      const payload: TPayload = [
+        { messageId: 'm1', role: 'user', content: 'Covered question' },
+        { messageId: 'm2', role: 'user', content: 'Retained question' },
+        {
+          messageId: 'm3',
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
+              tokenCount: 900,
+              coverage: { retainedFromMessageId: 'm2' },
+            },
+            { type: ContentTypes.TEXT, text: 'Reply' },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 1000 });
+
+      expect(result.indexTokenCountMap?.[1]).toBe(1000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
+    });
+
     it('leaves the count alone when the summary claims the whole entry', () => {
       const payload: TPayload = [
         { messageId: 'm1', role: 'user', content: 'Covered question' },
@@ -5158,6 +5188,7 @@ describe('formatAgentMessages', () => {
               type: ContentTypes.SUMMARY,
               content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
               tokenCount: 500,
+              rawTokenCount: 500,
               coverage: { retainedFromMessageId: 'm2' },
             },
             { type: ContentTypes.TEXT, text: 'Short reply' },

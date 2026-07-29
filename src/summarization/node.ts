@@ -445,10 +445,29 @@ function resolveSummaryCoverage(
   return undefined;
 }
 
+/**
+ * The summary text's cost in the consumer's own tokenizer, with no injection
+ * wrapper. `tokenCount` cannot serve this purpose: it is the injection budget,
+ * so it sits in provider output-token space whenever usage was reported and it
+ * includes the wrapper added later at injection time. Readers that discount the
+ * entry carrying the block need a figure in the same space as their own
+ * per-message counts, which is what the consumer's `tokenCounter` provides.
+ */
+function computeSummaryRawTokenCount(
+  summaryText: string,
+  tokenCounter?: (message: BaseMessage) => number
+): number {
+  if (tokenCounter == null) {
+    return 0;
+  }
+  return tokenCounter(new SystemMessage(summaryText));
+}
+
 /** Constructs the SummaryContentBlock persisted in the run step and dispatched to events. */
 function buildSummaryBlock(params: {
   summaryText: string;
   tokenCount: number;
+  rawTokenCount: number;
   coverage?: t.SummaryCoverage;
   stepId: string;
   stepIndex: number;
@@ -465,6 +484,9 @@ function buildSummaryBlock(params: {
       } as t.MessageContentComplex,
     ],
     tokenCount: params.tokenCount,
+    ...(params.rawTokenCount > 0
+      ? { rawTokenCount: params.rawTokenCount }
+      : {}),
     ...(params.coverage != null ? { coverage: params.coverage } : {}),
     summaryVersion: params.summaryVersion,
     boundary: {
@@ -1211,6 +1233,10 @@ export function createSummarizeNode({
     const summaryBlock = buildSummaryBlock({
       summaryText,
       tokenCount,
+      rawTokenCount: computeSummaryRawTokenCount(
+        summaryText,
+        agentContext.tokenCounter
+      ),
       coverage: resolveSummaryCoverage(messagesToRetain),
       stepId,
       stepIndex: runStep.index,
