@@ -394,28 +394,45 @@ function computeSummaryTokenCount(
  * naming the first *retained* message makes that same message the anchor, so it
  * survives whole and everything before it is unambiguously covered.
  *
- * Provenance is deliberately not inferred here. Whether an ID resolves is a
- * question only the reader can answer — it holds the payload — and
- * `additional_kwargs` does not record where a message came from: an in-run
- * injected entry and a replayed payload steer can carry identical markers, and
- * `messagesStateReducer` gives both a plain `id`. Filtering on those markers
- * cost a real bug (skipping `source: 'steer'` dropped the retained steers this
- * coverage exists to protect) without buying anything, because in-run context is
- * always *appended* — `[...toolMessages, ...injected]` in `ToolNode`, and the
- * same in `StandardGraph` — so a tail that begins with injected context has no
- * payload-backed message later to reach instead.
+ * Synthetic entries are skipped, because they can sit *before* a resolvable
+ * one. `formatAgentMessages` reconstructs skill bodies inside its payload loop
+ * (see the `pendingSkillNames` block) and keeps processing payload entries
+ * afterwards, so an unstamped skill body — which `messagesStateReducer` then
+ * gives a UUID no payload entry carries — is followed by stamped messages.
+ * Anchoring on the UUID would look resolvable at write time and degrade to
+ * positional trimming on read, dropping the retained tail. Skipping it reaches
+ * the stamped message behind it.
  *
- * An anchor the reader cannot resolve therefore falls back to positional
- * trimming, which is what `main` does for every summary today. The same applies
- * to a payload entry that omits `messageId`: it is unaddressable in the next
- * payload too, so no anchor could name it. The failure mode is a degraded
- * anchor, never a misleading one.
+ * `steer` is exempt: a steer is replayed from a payload entry and stamped with
+ * its ID, so it is a valid anchor, and skipping it dropped retained steers when
+ * this check was once written to reject every marked `source`.
+ *
+ * Known limitation: `InjectedMessage` also permits `source: 'steer'`, and an
+ * in-run injected steer is unstamped, so the exemption accepts a UUID for it.
+ * Nothing in `additional_kwargs` separates that from a replayed steer. Both
+ * directions of the ambiguity bottom out in the reader's positional fallback —
+ * what `main` does for every summary today — so the exemption is set to favour
+ * replayed steers, which are the common case. A payload entry that omits
+ * `messageId` degrades the same way: it is unaddressable in the next payload
+ * too, so no anchor could name it.
  */
+function isSyntheticContext(message: BaseMessage): boolean {
+  const { additional_kwargs: kwargs } = message;
+  if (kwargs.isMeta === true) {
+    return true;
+  }
+  return kwargs.source != null && kwargs.source !== 'steer';
+}
+
 function resolveSummaryCoverage(
   messagesToRetain: BaseMessage[]
 ): t.SummaryCoverage | undefined {
   for (let i = 0; i < messagesToRetain.length; i++) {
-    const id = messagesToRetain[i].id?.trim();
+    const message = messagesToRetain[i];
+    if (isSyntheticContext(message)) {
+      continue;
+    }
+    const id = message.id?.trim();
     if (id != null && id !== '') {
       return { retainedFromMessageId: id };
     }

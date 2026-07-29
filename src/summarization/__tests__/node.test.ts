@@ -1057,6 +1057,34 @@ describe('recency window — first-turn protection', () => {
       expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm2' });
     });
 
+    /** `formatAgentMessages` reconstructs skill bodies inside its payload loop
+     *  and keeps processing payload entries after, so this unstamped entry — a
+     *  reducer UUID by the time compaction sees it — precedes stamped messages.
+     *  Anchoring on it would resolve to nothing on the next run. */
+    it('skips a reconstructed skill body to reach the stamped message behind it', async () => {
+      const summaryBlock = await runCompaction(
+        [
+          new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+          new AIMessage({ content: 'turn 1 reply', id: 'm2' }),
+          new HumanMessage({
+            content: 'skill body',
+            id: 'reducer-uuid',
+            additional_kwargs: {
+              role: 'user',
+              isMeta: true,
+              source: 'skill',
+              skillName: 'demo',
+            },
+          }),
+          new HumanMessage({ content: 'turn 2 query', id: 'm3' }),
+          new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
+        ],
+        2
+      );
+
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm3' });
+    });
+
     it('anchors on the straddling id when it is the only source', async () => {
       const summaryBlock = await runCompaction([
         new AIMessage({ content: 'pre-steer reply', id: 'm1' }),
