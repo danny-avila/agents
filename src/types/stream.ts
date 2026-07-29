@@ -295,10 +295,21 @@ export type SummaryBoundary = {
   contentIndex: number;
 };
 
+/**
+ * Semantic extent of a summary: the last source message it actually covers.
+ * Distinct from `boundary`, which records where the block was emitted. A
+ * recency tail retained at compaction time sits *before* the block's own
+ * position, so position alone cannot say what the summary replaced.
+ */
+export type SummaryCoverage = {
+  throughMessageId: string;
+};
+
 export type SummaryContentBlock = {
   type: ContentTypes.SUMMARY;
   content?: MessageContentComplex[];
   tokenCount?: number;
+  coverage?: SummaryCoverage;
   boundary?: SummaryBoundary;
   summaryVersion?: number;
   model?: string;

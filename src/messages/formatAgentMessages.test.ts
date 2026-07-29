@@ -11,6 +11,7 @@ import {
   convertMessagesToResponsesInput,
   convertResponsesMessageToAIMessage,
 } from '@langchain/openai';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { MessageContentComplex, TPayload } from '@/types';
 import {
   convertMessagesToContent,
@@ -4994,6 +4995,139 @@ describe('formatAgentMessages', () => {
       const adjustedTokens = result.indexTokenCountMap?.[0];
       expect(adjustedTokens).toBeDefined();
       expect(Number.isInteger(adjustedTokens)).toBe(true);
+    });
+  });
+
+  describe('summary coverage boundary', () => {
+    const buildSummaryPart = (coverage?: { throughMessageId: string }) => ({
+      type: ContentTypes.SUMMARY,
+      content: [
+        { type: ContentTypes.TEXT, text: 'Summary of the earliest turns' },
+      ],
+      tokenCount: 12,
+      ...(coverage != null ? { coverage } : {}),
+    });
+
+    /** Mirrors a compaction with `retainRecent.turns: 1`: m1/m2 were refined
+     *  into the summary, m3/m4 are the retained tail, and the block itself is
+     *  persisted on the assistant message that came after all of them. */
+    const compactedPayload = (coverage?: {
+      throughMessageId: string;
+    }): TPayload => [
+      { messageId: 'm1', role: 'user', content: 'Covered question' },
+      { messageId: 'm2', role: 'assistant', content: 'Covered answer' },
+      { messageId: 'm3', role: 'user', content: 'Retained question' },
+      { messageId: 'm4', role: 'assistant', content: 'Retained answer' },
+      {
+        messageId: 'm5',
+        role: 'assistant',
+        content: [
+          buildSummaryPart(coverage),
+          { type: ContentTypes.TEXT, text: 'Post-compaction reply' },
+        ],
+      },
+    ];
+
+    const textOf = (message: BaseMessage): string => {
+      const { content } = message;
+      if (typeof content === 'string') {
+        return content;
+      }
+      return (content as MessageContentComplex[])
+        .map((part) => ('text' in part ? (part as { text: string }).text : ''))
+        .join('');
+    };
+
+    it('preserves the retained tail that the summary never covered', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ throughMessageId: 'm2' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Retained question',
+        'Retained answer',
+        'Post-compaction reply',
+      ]);
+      expect(result.summary!.text).toBe('Summary of the earliest turns');
+      expect(result.summary!.tokenCount).toBe(12);
+    });
+
+    it('drops the covered message itself, not just everything before it', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ throughMessageId: 'm3' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Retained answer',
+        'Post-compaction reply',
+      ]);
+    });
+
+    it('keeps token counts for the retained tail and drops covered entries', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ throughMessageId: 'm2' }),
+        { 0: 5, 1: 6, 2: 7, 3: 8, 4: 40 }
+      );
+
+      expect(result.indexTokenCountMap).toEqual({ 0: 7, 1: 8, 2: 40 });
+    });
+
+    it('falls back to positional trimming for legacy blocks without coverage', () => {
+      const result = formatAgentMessages(compactedPayload());
+
+      expect(result.messages.map(textOf)).toEqual(['Post-compaction reply']);
+      expect(result.summary!.text).toBe('Summary of the earliest turns');
+    });
+
+    it('falls back to positional trimming when coverage cannot be resolved', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ throughMessageId: 'pruned-from-payload' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual(['Post-compaction reply']);
+    });
+
+    it('ignores coverage pointing at or past its own block', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ throughMessageId: 'm5' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual(['Post-compaction reply']);
+    });
+
+    it('applies last-summary-wins across mixed coverage and legacy blocks', () => {
+      const payload: TPayload = [
+        { messageId: 'm1', role: 'user', content: 'Covered question' },
+        {
+          messageId: 'm2',
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Older summary',
+              tokenCount: 3,
+            },
+            { type: ContentTypes.TEXT, text: 'Older tail' },
+          ],
+        },
+        { messageId: 'm3', role: 'user', content: 'Retained question' },
+        {
+          messageId: 'm4',
+          role: 'assistant',
+          content: [
+            buildSummaryPart({ throughMessageId: 'm2' }),
+            { type: ContentTypes.TEXT, text: 'Newest reply' },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload);
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Retained question',
+        'Newest reply',
+      ]);
+      expect(result.summary!.text).toBe('Summary of the earliest turns');
     });
   });
 

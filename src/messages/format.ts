@@ -20,6 +20,7 @@ import type {
   MessageContentComplex,
   ReasoningContentText,
   SummaryContentBlock,
+  SummaryCoverage,
   ThinkingContentText,
   ToolCallContent,
   ToolResultContent,
@@ -1185,20 +1186,64 @@ function extractToolNamesFromSearchOutput(output: string): string[] {
   return [];
 }
 
-type SummaryBoundary = {
-  messageIndex: number;
-  contentIndex: number;
-  text: string;
-  tokenCount: number;
-};
+/**
+ * How far back a persisted summary reaches.
+ *
+ * `coverage` is authoritative: the block declared the last source message it
+ * replaced, so a recency tail retained at compaction time survives even though
+ * it sits earlier in the payload than the block itself. `positional` is the
+ * legacy reading for blocks written before coverage existed (or whose covered
+ * message is no longer in the payload) — the block's own location is the
+ * boundary, which is why it cannot distinguish a retained tail from history.
+ */
+type SummaryBoundary =
+  | {
+      mode: 'coverage';
+      messageIndex: number;
+      text: string;
+      tokenCount: number;
+    }
+  | {
+      mode: 'positional';
+      messageIndex: number;
+      contentIndex: number;
+      text: string;
+      tokenCount: number;
+    };
+
+function resolveCoverageIndex(
+  coverage: SummaryCoverage | undefined,
+  indexBySourceId: Map<string, number>,
+  summaryMessageIndex: number
+): number | undefined {
+  /** Persisted JSON, so the declared string type is not a runtime guarantee. */
+  if (typeof coverage?.throughMessageId !== 'string') {
+    return undefined;
+  }
+  const throughMessageId = coverage.throughMessageId.trim();
+  if (throughMessageId === '') {
+    return undefined;
+  }
+  const coveredIndex = indexBySourceId.get(throughMessageId);
+  return coveredIndex != null && coveredIndex < summaryMessageIndex
+    ? coveredIndex
+    : undefined;
+}
 
 function getLatestSummaryBoundary(
   payload: TPayload
 ): SummaryBoundary | undefined {
   let summaryBoundary: SummaryBoundary | undefined;
+  /** Filled as the scan advances, so a coverage lookup only ever resolves to a
+   *  message already passed — no second pass over the payload. */
+  const indexBySourceId = new Map<string, number>();
 
   for (let i = 0; i < payload.length; i++) {
     const message = payload[i];
+    const sourceMessageId = getSourceMessageId(message);
+    if (sourceMessageId != null) {
+      indexBySourceId.set(sourceMessageId, i);
+    }
     if (!Array.isArray(message.content)) {
       continue;
     }
@@ -1230,16 +1275,32 @@ function getLatestSummaryBoundary(
         continue;
       }
 
-      summaryBoundary = {
-        messageIndex: i,
-        contentIndex: j,
-        text: summaryText,
-        tokenCount:
-          typeof summaryPart.tokenCount === 'number' &&
-          Number.isFinite(summaryPart.tokenCount)
-            ? summaryPart.tokenCount
-            : 0,
-      };
+      const tokenCount =
+        typeof summaryPart.tokenCount === 'number' &&
+        Number.isFinite(summaryPart.tokenCount)
+          ? summaryPart.tokenCount
+          : 0;
+      const coveredIndex = resolveCoverageIndex(
+        summaryPart.coverage,
+        indexBySourceId,
+        i
+      );
+
+      summaryBoundary =
+        coveredIndex != null
+          ? {
+            mode: 'coverage',
+            messageIndex: coveredIndex,
+            text: summaryText,
+            tokenCount,
+          }
+          : {
+            mode: 'positional',
+            messageIndex: i,
+            contentIndex: j,
+            text: summaryText,
+            tokenCount,
+          };
     }
   }
 
@@ -1253,6 +1314,14 @@ function applySummaryBoundary(
 ): Partial<TMessage> | null {
   if (!summaryBoundary) {
     return message;
+  }
+
+  /** The covered message is replaced by the summary, so the boundary is
+   *  inclusive; everything after it — including a retained recency tail —
+   *  stays verbatim. The block's own message is untouched: its summary part
+   *  is dropped later by `formatAssistantMessage`. */
+  if (summaryBoundary.mode === 'coverage') {
+    return messageIndex <= summaryBoundary.messageIndex ? null : message;
   }
 
   if (messageIndex < summaryBoundary.messageIndex) {
@@ -1724,7 +1793,7 @@ export const formatAgentMessages = (
       }
 
       if (
-        summaryBoundary &&
+        summaryBoundary?.mode === 'positional' &&
         originalIndex === summaryBoundary.messageIndex &&
         Array.isArray(payload[originalIndex].content)
       ) {

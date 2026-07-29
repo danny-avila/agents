@@ -381,10 +381,29 @@ function computeSummaryTokenCount(
   return 0;
 }
 
+/**
+ * Resolves the last refined message that carries a source message ID, so the
+ * summary can declare what it covers rather than leaving the next run to infer
+ * coverage from where the block happens to sit. Messages generated mid-run have
+ * no source ID; readers fall back to positional semantics when this is absent.
+ */
+function resolveSummaryCoverage(
+  messagesToRefine: BaseMessage[]
+): t.SummaryCoverage | undefined {
+  for (let i = messagesToRefine.length - 1; i >= 0; i--) {
+    const id = messagesToRefine[i].id?.trim();
+    if (id != null && id !== '') {
+      return { throughMessageId: id };
+    }
+  }
+  return undefined;
+}
+
 /** Constructs the SummaryContentBlock persisted in the run step and dispatched to events. */
 function buildSummaryBlock(params: {
   summaryText: string;
   tokenCount: number;
+  coverage?: t.SummaryCoverage;
   stepId: string;
   stepIndex: number;
   modelName?: string;
@@ -400,6 +419,7 @@ function buildSummaryBlock(params: {
       } as t.MessageContentComplex,
     ],
     tokenCount: params.tokenCount,
+    ...(params.coverage != null ? { coverage: params.coverage } : {}),
     summaryVersion: params.summaryVersion,
     boundary: {
       messageId: params.stepId,
@@ -1145,6 +1165,7 @@ export function createSummarizeNode({
     const summaryBlock = buildSummaryBlock({
       summaryText,
       tokenCount,
+      coverage: resolveSummaryCoverage(messagesToRefine),
       stepId,
       stepIndex: runStep.index,
       modelName: clientConfig.modelName,

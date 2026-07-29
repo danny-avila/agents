@@ -1,5 +1,6 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import {
   createSummarizeNode,
@@ -943,6 +944,81 @@ describe('recency window — first-turn protection', () => {
     expect(result.messages!.slice(1)).toHaveLength(2);
     expect((result.messages![1] as HumanMessage).content).toBe('turn 2 query');
     expect((result.messages![2] as AIMessage).content).toBe('turn 2 reply');
+  });
+
+  describe('summary coverage', () => {
+    const runCompaction = async (
+      messages: BaseMessage[]
+    ): Promise<t.SummaryContentBlock | undefined> => {
+      captureEvents();
+      jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+        class {
+          constructor() {
+            return mockInvokeModel('Summary of older turns');
+          }
+        } as never
+      );
+
+      let summaryBlock: t.SummaryContentBlock | undefined;
+      const graph = mockGraph((_stepId, result) => {
+        if (result.type === 'summary') {
+          summaryBlock = result.summary;
+        }
+      });
+      const summarizeNode = createSummarizeNode({
+        agentContext: createAgentContext({
+          summarizationConfig: { retainRecent: { turns: 1 } },
+        } as never),
+        graph: graph as never,
+        generateStepId,
+      });
+
+      await summarizeNode(
+        {
+          messages,
+          summarizationRequest: {
+            remainingContextTokens: 0,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+
+      return summaryBlock;
+    };
+
+    it('records the last refined message as the covered boundary', async () => {
+      const summaryBlock = await runCompaction([
+        new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+        new AIMessage({ content: 'turn 1 reply', id: 'm2' }),
+        new HumanMessage({ content: 'turn 2 query', id: 'm3' }),
+        new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
+      ]);
+
+      expect(summaryBlock?.coverage).toEqual({ throughMessageId: 'm2' });
+    });
+
+    it('falls back to the last refined message that carries a source id', async () => {
+      const summaryBlock = await runCompaction([
+        new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+        new AIMessage({ content: 'mid-run step' }),
+        new HumanMessage({ content: 'turn 2 query', id: 'm3' }),
+        new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
+      ]);
+
+      expect(summaryBlock?.coverage).toEqual({ throughMessageId: 'm1' });
+    });
+
+    it('omits coverage when no refined message carries a source id', async () => {
+      const summaryBlock = await runCompaction([
+        new HumanMessage('turn 1 query'),
+        new AIMessage('turn 1 reply'),
+        new HumanMessage('turn 2 query'),
+        new AIMessage('turn 2 reply'),
+      ]);
+
+      expect(summaryBlock?.coverage).toBeUndefined();
+    });
   });
 
   it('keeps the masked tail content (does not re-inject restored tool payloads into state)', async () => {
