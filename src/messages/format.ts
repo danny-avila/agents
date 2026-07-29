@@ -1862,21 +1862,32 @@ export const formatAgentMessages = (
         const content = payload[originalIndex]
           .content as MessageContentComplex[];
         let retainedCharLen = 0;
-        let retainedParts = 0;
+        /** Every retained part must be represented, not merely the total. A part
+         *  the char heuristic cannot see — media, and anything else carrying its
+         *  payload outside the fields measured above — still costs real tokens,
+         *  so scaling a mix of measurable text and an unmeasurable image would
+         *  charge the entry for the caption alone and erase the image. Keeping
+         *  the original over-counts, which prunes early rather than sending an
+         *  over-context request. */
+        let everyRetainedPartMeasurable = true;
         for (let p = 0; p < content.length; p++) {
-          if (content[p]?.type !== ContentTypes.SUMMARY) {
-            retainedCharLen += contentPartCharLength(content[p]);
-            retainedParts++;
+          if (content[p]?.type === ContentTypes.SUMMARY) {
+            continue;
           }
+          const charLen = contentPartCharLength(content[p]);
+          if (charLen === 0) {
+            everyRetainedPartMeasurable = false;
+            break;
+          }
+          retainedCharLen += charLen;
         }
         const summaryCharLen = summaryCharsByIndex.get(originalIndex) ?? 0;
         const totalCharLen = retainedCharLen + summaryCharLen;
-        /** Retained parts that measure as nothing mean the content is a shape
-         *  the char heuristic cannot see, not that it is absent — scaling on
-         *  that would erase a real payload's tokens. Keeping the original
-         *  over-counts, which prunes early rather than overflowing. */
-        const retainedIsMeasurable = retainedParts === 0 || retainedCharLen > 0;
-        if (summaryCharLen > 0 && totalCharLen > 0 && retainedIsMeasurable) {
+        if (
+          summaryCharLen > 0 &&
+          totalCharLen > 0 &&
+          everyRetainedPartMeasurable
+        ) {
           const original = tokenCount;
           tokenCount = Math.max(
             1,

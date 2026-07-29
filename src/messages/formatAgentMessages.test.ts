@@ -5143,6 +5143,38 @@ describe('formatAgentMessages', () => {
       expect(result.boundaryTokenAdjustment).toBeUndefined();
     });
 
+    /** A measurable caption alongside an unmeasurable image must not license the
+     *  discount: the caption's characters would stand in for the image's real
+     *  token cost and scale roughly a thousand image tokens down to nearly 1. */
+    it('leaves the count alone when only some retained parts are measurable', () => {
+      const payload: TPayload = [
+        { messageId: 'm1', role: 'user', content: 'Covered question' },
+        { messageId: 'm2', role: 'user', content: 'Retained question' },
+        {
+          messageId: 'm3',
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
+              tokenCount: 120,
+              coverage: { retainedFromMessageId: 'm2' },
+            },
+            { type: ContentTypes.TEXT, text: 'Here it is' },
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,x' },
+            },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 1100 });
+
+      expect(result.indexTokenCountMap?.[1]).toBe(1100);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
+    });
+
     /** The summary text is returned separately as `summary.tokenCount`, so
      *  leaving it in its own entry's count charges the prompt for it twice. */
     it('discounts the filtered summary text from its own entry', () => {
