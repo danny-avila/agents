@@ -8,8 +8,9 @@
  * args, so a host UI can render it as the call's live status label before the
  * rest of the args exist. When the call settles, {@link applyOutcome} edits
  * the sentence in place into its outcome form — a tool-supplied replacement
- * (`outcome`), a tool-supplied span edit (`outcome_patch`), or a mechanical
- * present-progressive→past-tense transform of the leading verb.
+ * (`outcome`) or a tool-supplied span edit (`outcome_patch`). Absent either,
+ * the label is left exactly as the model wrote it: completion is a UI state
+ * (the shimmer stopping, the icon settling), not a tense change.
  *
  * The arg is always optional (never listed in `required`): the same schemas
  * are callable from programmatic tool calling, where no UI renders a label
@@ -23,15 +24,34 @@ import type { JsonSchemaType, OutcomePatch } from '@/types';
 /** Argument carrying the model-authored label for a tool call. */
 export const INTENT_ARG = 'intent';
 
-/** Model-facing instruction for the injected `intent` property. */
+/**
+ * Opening words of {@link INTENT_DESCRIPTION}, and the discriminator that
+ * tells the injected LABEL apart from a tool's own business parameter that
+ * merely shares the name `intent`.
+ *
+ * Exported because host applications reimplement the same strip/sanitize
+ * passes and would otherwise duplicate this as a string literal: if the two
+ * copies drift, the host silently stops recognizing SDK-native labels and
+ * fails OPEN (labels stay in schemas, opt-outs stop working) with no error.
+ * Any edit to the description must preserve this prefix verbatim.
+ */
+export const INTENT_LABEL_MARKER = 'ALWAYS write this field FIRST';
+
+/**
+ * Model-facing instruction for the injected `intent` property.
+ *
+ * Deliberately terse — it is repeated on every opted-in tool schema, on every
+ * request, so each sentence is paid for many times over. What remains is
+ * load-bearing: first-position placement (the entire streaming mechanism),
+ * the one-sentence present-progressive form, who reads it, and the sibling
+ * rule, without which models emit identical labels for parallel calls to one
+ * tool and defeat the feature's headline case.
+ */
 export const INTENT_DESCRIPTION =
-  'ALWAYS write this field FIRST, before any other argument. One short sentence, ' +
-  'present progressive, stating what this specific call is about to do: ' +
-  '"Searching for OAuth handling in the callback router". It is shown to the user ' +
-  'as the live status label for this call while it runs, so write it for a human ' +
-  'reading a progress line. Do not restate the tool name. Do not exceed one sentence. ' +
-  'When you make several calls to the same tool in one turn, each intent must ' +
-  'distinguish that call from its siblings.';
+  `${INTENT_LABEL_MARKER}, before any other argument. One present-progressive ` +
+  'sentence saying what THIS call is about to do: "Searching for OAuth handling ' +
+  'in the callback router". Shown to the user as this call\'s live status. ' +
+  'Never name the tool. Sibling calls to one tool must differ.';
 
 /**
  * Canonical (frozen) shape of the injected property. Always embed a COPY
@@ -59,8 +79,27 @@ export function isIntentLabelProperty(property: unknown): boolean {
   return (
     record.type === 'string' &&
     typeof record.description === 'string' &&
-    record.description.startsWith('ALWAYS write this field FIRST')
+    record.description.startsWith(INTENT_LABEL_MARKER)
   );
+}
+
+/**
+ * Returns a copy of `parameters` without the injected intent LABEL — the
+ * opt-out for consumers that render no status label and should not pay for
+ * the property.
+ *
+ * The SDK's native schemas carry the label unconditionally, so without this
+ * an embedder has no lever at all: `withIntent` is applied at module scope.
+ * Marker-guarded, so a tool's own business parameter named `intent` is never
+ * removed. Returns the input unchanged when there is nothing to strip.
+ */
+export function withoutIntent(parameters?: JsonSchemaType): JsonSchemaType | undefined {
+  const props = parameters?.properties;
+  if (parameters == null || props == null || !isIntentLabelProperty(props[INTENT_ARG])) {
+    return parameters;
+  }
+  const { [INTENT_ARG]: _omit, ...rest } = props;
+  return { ...parameters, properties: rest };
 }
 
 /**
@@ -131,61 +170,24 @@ export function stripIntent(args: unknown): unknown {
 }
 
 /**
- * Leading-verb map for the mechanical outcome transform, keyed by the
- * lowercased first word of the intent. Deliberately small: an unknown leading
- * word leaves the intent unchanged rather than mangling it.
- */
-const OUTCOME_VERB_MAP: ReadonlyMap<string, string> = new Map([
-  ['searching', 'Searched'],
-  ['reading', 'Read'],
-  ['writing', 'Wrote'],
-  ['editing', 'Edited'],
-  ['running', 'Ran'],
-  ['creating', 'Created'],
-  ['checking', 'Checked'],
-  ['fetching', 'Fetched'],
-  ['listing', 'Listed'],
-  ['looking', 'Looked'],
-  ['building', 'Built'],
-  ['deleting', 'Deleted'],
-  ['updating', 'Updated'],
-  ['adding', 'Added'],
-  ['removing', 'Removed'],
-  ['verifying', 'Verified'],
-  ['analyzing', 'Analyzed'],
-  ['generating', 'Generated'],
-  ['delegating', 'Delegated'],
-  ['spawning', 'Spawned'],
-  ['compiling', 'Compiled'],
-  ['grepping', 'Grepped'],
-]);
-
-function matchLeadingCase(replacement: string, original: string): string {
-  if (original.charAt(0) === original.charAt(0).toLowerCase()) {
-    return replacement.charAt(0).toLowerCase() + replacement.slice(1);
-  }
-  return replacement;
-}
-
-function transformLeadingVerb(intent: string): string {
-  const spaceIdx = intent.search(/\s/);
-  const leading = spaceIdx === -1 ? intent : intent.slice(0, spaceIdx);
-  const mapped = OUTCOME_VERB_MAP.get(leading.toLowerCase());
-  if (mapped == null) {
-    return intent;
-  }
-  return matchLeadingCase(mapped, leading) + intent.slice(leading.length);
-}
-
-/**
  * Resolves the settled label for a call from its model-authored `intent` and
  * the tool's result fields, in precedence order:
  *
  *  1. `outcome` — full replacement authored by the tool.
  *  2. `outcome_patch` — first occurrence of `from` in the intent replaced
  *     with `to` (case-sensitive); no-op when `from` is absent or empty.
- *  3. Mechanical transform — the leading word mapped present-progressive →
- *     past tense; an unknown leading word leaves the intent unchanged.
+ *  3. Otherwise the intent is returned UNCHANGED.
+ *
+ * There is deliberately no mechanical present-progressive→past-tense rewrite.
+ * Such a transform can only be a closed list of English verbs, which makes it
+ * wrong in three ways at once: it never fires for the non-English labels this
+ * feature expects (the model answers in the user's language), it fires for
+ * some sibling calls and not others inside one group — "Searched…" beside
+ * "Recording…" — and it quietly enumerates a vocabulary in a feature whose
+ * premise is that the sentence is free-form. Completion is conveyed by UI
+ * state (the shimmer stopping, the icon settling), which is language-neutral
+ * and always consistent; a tool that wants past tense says so explicitly via
+ * `outcome` or `outcome_patch`.
  *
  * Returns undefined when there is neither an intent nor an outcome, so
  * callers fall back to their default label. Pure and dependency-free — host
@@ -209,7 +211,7 @@ export function applyOutcome(
      *  text (e.g. labels derived from shell syntax). */
     return intent.replace(patch.from, () => patch.to);
   }
-  return transformLeadingVerb(intent);
+  return intent;
 }
 
 /**
