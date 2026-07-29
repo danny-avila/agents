@@ -54,6 +54,12 @@ import {
   recordArgsEqual,
 } from '@/tools/eagerEventExecution';
 import {
+  INTENT_ARG,
+  readOutcomeFields,
+  resolveToolOutcome,
+  isIntentLabelProperty,
+} from '@/tools/intentArg';
+import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
@@ -70,12 +76,6 @@ import {
   resolveLocalExecutionTools,
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
-import {
-  INTENT_ARG,
-  readOutcomeFields,
-  resolveToolOutcome,
-  isIntentLabelProperty,
-} from '@/tools/intentArg';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import { convertInjectedMessages } from '@/messages/injected';
 import { safeDispatchCustomEvent } from '@/utils/events';
@@ -133,7 +133,36 @@ type RunToolBatchContext<T = unknown> = {
    * which relies on `node:async_hooks` and is browser-incompatible).
    */
   runInput?: T;
+  /** Batch-local error-completion ownership (see {@link ToolErrorOwnership}). */
+  errorOwnership?: ToolErrorOwnership;
 };
+
+/**
+ * Batch-local record of who owns each failed call's completion event.
+ *
+ * Kept per invocation rather than on the instance: tool-call ids are
+ * provider-scoped (and synthetic ids can repeat), so concurrent `run()`s on
+ * one ToolNode would otherwise share and cross-consume these markers — one
+ * invocation's thrown-error marker suppressing another's only completion,
+ * or leaving a stale marker behind when an interrupt aborts a batch before
+ * the output loop reads it.
+ *
+ * - `handlerOwned`: the errorHandler ran and dispatched (or threw — a throw
+ *   is not proof it didn't dispatch). The output loop must skip these.
+ * - `undispatched`: the handler explicitly reported it could NOT dispatch,
+ *   so the output loop owns the completion instead.
+ *
+ * A call in NEITHER set returned an error `ToolMessage` without ever
+ * entering the catch path, so the output loop owns it too.
+ */
+export type ToolErrorOwnership = {
+  handlerOwned: Set<string>;
+  undispatched: Set<string>;
+};
+
+export function createToolErrorOwnership(): ToolErrorOwnership {
+  return { handlerOwned: new Set(), undispatched: new Set() };
+}
 
 type BoundedToolOutput = {
   content: string;
@@ -506,22 +535,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   toolCallStepIds?: Map<string, string>;
   errorHandler?: t.ToolNodeConstructorParams['errorHandler'];
   /**
-   * Tool call ids whose `errorHandler` did NOT dispatch the error completion
-   * event (it returned `false` or threw). The output loop must dispatch the
-   * completion for these itself — skipping them there would strand the
-   * client's tool-call part without a terminal event.
+   * Fallback error-completion ownership for calls that reach `runTool`
+   * outside a batch context (direct `runTool` use in tests / embedders).
+   * Batch-scoped ownership is threaded via `RunToolBatchContext` instead —
+   * see {@link ToolErrorOwnership} for why per-invocation scoping matters.
    */
-  private undispatchedToolErrors: Set<string> = new Set();
-  /**
-   * Tool call ids whose `errorHandler` OWNS the error completion event —
-   * it ran and either dispatched or threw (a throw is not proof it didn't
-   * dispatch; the built-in session handler emits `tool.completed` before
-   * invoking user callbacks). Only these may be skipped by the output
-   * loop. A tool that RETURNS an error `ToolMessage` never enters the
-   * catch path at all, so it appears in neither set and the output loop
-   * dispatches its completion — and therefore its authored failure label.
-   */
-  private handlerOwnedToolErrors: Set<string> = new Set();
+  private looseErrorOwnership: ToolErrorOwnership =
+    createToolErrorOwnership();
   private toolUsageCount: Map<string, number>;
   /** Maps toolCallId → turn captured in runTool, used by handleRunToolCompletions */
   private toolCallTurns: Map<string, number> = new Map();
@@ -1286,6 +1306,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             },
             config.metadata
           );
+          const ownership =
+            batchContext.errorOwnership ?? this.looseErrorOwnership;
           if (call.id != null && call.id !== '') {
             if (dispatched === false) {
               /**
@@ -1295,9 +1317,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                * output loop dispatches the completion itself instead of
                * assuming the handler covered it.
                */
-              this.undispatchedToolErrors.add(call.id);
+              ownership.undispatched.add(call.id);
             } else {
-              this.handlerOwnedToolErrors.add(call.id);
+              ownership.handlerOwned.add(call.id);
             }
           }
         } catch (handlerError) {
@@ -1309,7 +1331,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           // `false` return (handled above) means "nothing dispatched"; a throw
           // is just logged.
           if (call.id != null && call.id !== '') {
-            this.handlerOwnedToolErrors.add(call.id);
+            (
+              batchContext.errorOwnership ?? this.looseErrorOwnership
+            ).handlerOwned.add(call.id);
           }
           // eslint-disable-next-line no-console
           console.error('Error in errorHandler:', {
@@ -2063,8 +2087,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     calls: ToolCall[],
     outputs: (BaseMessage | Command)[],
     config: RunnableConfig,
-    resolvedArgsByCallId?: ResolvedArgsByCallId
+    resolvedArgsByCallId?: ResolvedArgsByCallId,
+    errorOwnership?: ToolErrorOwnership
   ): Promise<void> {
+    const ownership = errorOwnership ?? this.looseErrorOwnership;
     for (let i = 0; i < calls.length; i++) {
       const call = calls[i];
       const output = outputs[i];
@@ -2090,11 +2116,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       // ToolNode re-executing the batch) take the wrong branch, and the sets
       // would grow unbounded across a long-lived graph's failing calls.
       if (toolMessage.status === 'error' && this.errorHandler != null) {
-        if (this.handlerOwnedToolErrors.has(toolCallId)) {
-          this.handlerOwnedToolErrors.delete(toolCallId);
+        if (ownership.handlerOwned.has(toolCallId)) {
+          ownership.handlerOwned.delete(toolCallId);
           continue;
         }
-        this.undispatchedToolErrors.delete(toolCallId);
+        ownership.undispatched.delete(toolCallId);
       }
 
       if (this.sessions && this.participatesInCodeSession(call.name)) {
@@ -3657,6 +3683,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      * ToolNode cannot read or wipe each other's entries.
      */
     const resolvedArgsByCallId = new Map<string, Record<string, unknown>>();
+    /** Per-invocation error-completion ownership — see `ToolErrorOwnership`. */
+    const errorOwnership = createToolErrorOwnership();
     /**
      * Claim this batch's turn synchronously from the registry (or
      * fall back to 0 when the feature is disabled). The registry is
@@ -3702,6 +3730,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           turn,
           batchScopeId,
           resolvedArgsByCallId,
+          errorOwnership,
           additionalContextsSink: directAdditionalContexts,
           runInput: sendState as T,
         }
@@ -3725,7 +3754,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         // HumanMessage isn't a tool result.
         [sendOutput],
         config,
-        resolvedArgsByCallId
+        resolvedArgsByCallId,
+        errorOwnership
       );
     } else {
       let messages: BaseMessage[];
@@ -3850,7 +3880,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           for (const entry of eventEntries) {
             if (entry.call.id != null) {
               const { resolved, unresolved } = preBatchSnapshot.resolve(
-                entry.call.args as Record<string, unknown>
+                entry.call.args as Record<string, unknown>,
+                {
+                  substituteIntentKey: this.toolDeclaresBusinessIntent(
+                    entry.call.name
+                  ),
+                }
               );
               preResolvedEventArgs.set(entry.call.id, {
                 resolved: resolved as Record<string, unknown>,
@@ -3875,6 +3910,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 turn,
                 batchScopeId,
                 resolvedArgsByCallId,
+                errorOwnership,
                 preBatchSnapshot,
                 additionalContextsSink: directAdditionalContexts,
                 runInput: input as T,
@@ -3887,7 +3923,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             directCalls,
             directOutputs,
             config,
-            resolvedArgsByCallId
+            resolvedArgsByCallId,
+            errorOwnership
           );
         }
 
@@ -3940,6 +3977,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             turn,
             batchScopeId,
             resolvedArgsByCallId,
+            errorOwnership,
             preBatchSnapshot,
             additionalContextsSink: directAdditionalContexts,
             runInput: input as T,
@@ -3949,7 +3987,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           filteredCalls,
           toolOutputs,
           config,
-          resolvedArgsByCallId
+          resolvedArgsByCallId,
+          errorOwnership
         );
         // Append accumulated additionalContexts as a single
         // HumanMessage so the next model turn sees them. Codex P2 #39.
