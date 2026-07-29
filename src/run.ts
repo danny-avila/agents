@@ -49,8 +49,14 @@ import {
   createTitleRunnable,
 } from '@/utils/title';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
+import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeLangfuseTracing } from './instrumentation';
-import { GraphEvents, Callback, TitleMethod } from '@/common';
+import {
+  Callback,
+  GraphEvents,
+  TitleMethod,
+  DEFAULT_RECURSION_LIMIT,
+} from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 import { StandardGraph } from '@/graphs/Graph';
@@ -140,6 +146,7 @@ export class Run<_T extends t.BaseGraphState> {
   private interruptingToolNames?: string[];
   private toolExecution?: t.ToolExecutionConfig;
   private subagentUsageSink?: t.SubagentUsageSink;
+  private preemption?: t.StreamPreemption;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
   graphRunnable?: t.CompiledStateWorkflow;
@@ -201,6 +208,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.interruptingToolNames = config.interruptingToolNames;
     this.toolExecution = config.toolExecution;
     this.subagentUsageSink = config.subagentUsageSink;
+    this.preemption = config.preemption;
 
     if (!config.graphConfig) {
       throw new Error('Graph config not provided');
@@ -275,6 +283,7 @@ export class Run<_T extends t.BaseGraphState> {
       indexTokenCountMap: this.indexTokenCountMap,
       calibrationRatio: this.calibrationRatio,
       subagentUsageSink: this.subagentUsageSink,
+      preemption: this.preemption,
     });
     /** Propagate compile options from graph config */
     standardGraph.compileOptions = this.applyHITLCheckpointerFallback(
@@ -306,6 +315,7 @@ export class Run<_T extends t.BaseGraphState> {
       indexTokenCountMap: this.indexTokenCountMap,
       calibrationRatio: this.calibrationRatio,
       subagentUsageSink: this.subagentUsageSink,
+      preemption: this.preemption,
     });
 
     multiAgentGraph.compileOptions =
@@ -541,6 +551,15 @@ export class Run<_T extends t.BaseGraphState> {
     return this.Graph?.getResolvedInstructionOverhead();
   }
 
+  /**
+   * Cooperative-seal counters for this run. `emptyBoundaries` is the one to
+   * watch: it counts seals whose `PreemptBoundary` produced nothing to
+   * inject, which ends the turn early and leaves the answer unfinished.
+   */
+  getPreemptStats(): t.PreemptStats {
+    return this.Graph?.getPreemptStats() ?? { seals: 0, emptyBoundaries: 0 };
+  }
+
   getToolCount(): number {
     return this.Graph?.getToolCount() ?? 0;
   }
@@ -703,11 +722,37 @@ export class Run<_T extends t.BaseGraphState> {
     const isResume = inputs instanceof Command;
     const stateInputs = isResume ? undefined : (inputs as t.IState);
 
+    /**
+     * Every honored seal costs one extra superstep, so a preemption-enabled
+     * run reserves headroom for its whole seal budget. Without it, a
+     * tool-heavy agent that gets preempted could hit `GraphRecursionError` —
+     * which surfaces as a thrown stream, setting `streamThrew`, firing
+     * `StopFailure`, and wiping via `clearHeavyState()` exactly the partial
+     * content the seal existed to preserve.
+     */
+    const recursionLimit =
+      (callerConfig.recursionLimit ?? DEFAULT_RECURSION_LIMIT) +
+      (this.preemption != null ? resolveMaxSeals(this.preemption.maxSeals) : 0);
+
     const config: t.RunStreamConfig = {
-      recursionLimit: 50,
       ...callerConfig,
+      recursionLimit,
       configurable: { ...callerConfig.configurable },
     };
+
+    /**
+     * Cancellation can arrive either at graph construction or per-call through
+     * `callerConfig.signal`, and boundary hooks need to observe both — for a
+     * multi-agent run the construction signal does not exist at all, since
+     * `MultiAgentGraphConfig` exposes none. Carried on its own field, assigned
+     * unconditionally: writing into `graph.signal` would leak this call's
+     * controller into later calls (model-call config and subagent
+     * parentSignal read that field, and `clearHeavyState()` is skipped on
+     * HITL interrupts), while a conditional write would keep observing a
+     * stale controller the host has since aborted. The boundary dispatch
+     * composes both channels; see `dispatchPreemptBoundary`.
+     */
+    graph.callerSignal = callerConfig.signal;
 
     /**
      * Skip `resetValues` on resume — we're continuing an in-flight
@@ -923,10 +968,17 @@ export class Run<_T extends t.BaseGraphState> {
          * graph doesn't take another model turn after the halting
          * operation completes.
          *
-         * Limitation: the current step (in-flight model call, ongoing
-         * tool batch) is not aborted — only the next step is skipped.
-         * This matches Claude Code's `continue: false` semantic where
-         * the active operation finishes before halting takes effect.
+         * This `break` is NOT graceful, despite what a `continue: false`
+         * reading suggests. Leaving the `for await` calls the iterator's
+         * `return()`, which cancels the reader
+         * (`@langchain/core/utils/stream`), and langgraph's stream wrapper
+         * turns that cancel into `_abortController.abort()`
+         * (`pregel/stream.js`). The in-flight model call or tool batch is
+         * torn down where it stands — it does not finish first.
+         *
+         * A halt is therefore the wrong tool for "stop generating but keep
+         * what you have". That is what `RunConfig.preemption` is for: it
+         * seals the stream at a provider-safe boundary and keeps the run.
          */
         const haltSignal = this.hookRegistry?.getHaltSignal(this.id);
         if (haltSignal != null) {
@@ -959,12 +1011,45 @@ export class Run<_T extends t.BaseGraphState> {
             threadId,
             agentId: graph.defaultAgentId,
             messages: graph.getRunMessages() ?? stateInputs?.messages ?? [],
+            /**
+             * A seal whose boundary ended the turn early must say so. The
+             * hook-supplied reason wins when a `PreemptBoundary` hook halted
+             * with one — a persistence/audit `Stop` hook should record the
+             * actual cause, not the generic label — and `preempt_incomplete`
+             * is reserved for the boundary that simply had nothing to inject.
+             */
+            stopReason:
+              graph.preemptHaltReason ??
+              (graph.preemptIncomplete ? 'preempt_incomplete' : undefined),
             stopHookActive: false, // will be true when stop is triggered by a hook (Phase 2)
           },
           sessionId: this.id,
         }).catch(() => {
           /* Stop hook errors must not masquerade as stream failures */
         });
+      }
+
+      /**
+       * A `PreemptBoundary` hook that returned `preventContinuation` has its
+       * registry halt cleared by the graph — that is what stops the halt from
+       * cancelling the stream before the sealed turn commits — so the reason
+       * is carried across on the graph instead. Surfaced here, AFTER the
+       * `Stop` dispatch above, so the host still receives a completion signal
+       * to persist the partial answer with while `getHaltReason()` correctly
+       * reports that a hook stopped the run rather than the model finishing.
+       *
+       * An empty boundary — sealed, but nothing to inject because the host's
+       * queue was drained or cancelled in the meantime — cut the answer short
+       * just as surely, only without a hook-supplied reason. It surfaces
+       * through the same channel under the same name the `Stop` dispatch
+       * already used for its `stopReason`, so terminal consumers
+       * (`AgentSession` emits `run.halted`, not `run.completed`) cannot
+       * finalize a truncated answer as a natural finish.
+       */
+      if (this._haltedReason == null && graph.preemptHaltReason != null) {
+        this._haltedReason = graph.preemptHaltReason;
+      } else if (this._haltedReason == null && graph.preemptIncomplete) {
+        this._haltedReason = 'preempt_incomplete';
       }
     };
 

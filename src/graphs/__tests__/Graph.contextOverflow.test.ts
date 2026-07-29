@@ -1059,13 +1059,24 @@ describe('context overflow recovery', () => {
     const humanMessages = model.calls[0].filter(
       (message) => message instanceof HumanMessage
     );
-    expect(humanMessages).toHaveLength(2);
-    expect(
-      JSON.stringify(humanMessages[humanMessages.length - 1].content).length
-    ).toBeLessThan(100);
-    expect(
-      JSON.stringify(humanMessages[humanMessages.length - 1].content)
-    ).not.toContain('x'.repeat(1_000));
+    /**
+     * Bedrock is a strict-alternation provider: after compaction shrinks the
+     * synthetic context, `coalesceAdjacentUserTurns` merges it into the
+     * adjacent user query — Converse rejects consecutive user turns, and the
+     * `@langchain/aws` converter only merges toolResult-bearing ones. So one
+     * user turn reaches the provider, carrying both the query and the
+     * compacted note, and it must still be small.
+     */
+    expect(humanMessages).toHaveLength(1);
+    const coalescedContent = JSON.stringify(humanMessages[0].content);
+    expect(coalescedContent).toContain('query the table');
+    /**
+     * No closing bracket: compaction truncates at a character budget, and the
+     * cut can land inside the `[Previous tool interaction]` header itself.
+     */
+    expect(coalescedContent).toContain('[Previous tool interaction');
+    expect(coalescedContent.length).toBeLessThan(150);
+    expect(coalescedContent).not.toContain('x'.repeat(1_000));
   });
 
   it('counts unresolved-reference annotations before invoking the provider', async () => {

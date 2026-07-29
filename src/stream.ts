@@ -39,6 +39,7 @@ import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
+import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { isGoogleLike } from '@/utils/llm';
@@ -859,6 +860,11 @@ async function dispatchEagerToolCompletions(args: {
         maxToolResultChars
       ).content;
     }
+    const outcome = resolveToolOutcome(
+      record.request.args,
+      outcomeFieldsFromResult(result),
+      { isError: result.status === 'error' }
+    );
 
     try {
       const dispatched = await safeDispatchCustomEvent(
@@ -878,6 +884,7 @@ async function dispatchEagerToolCompletions(args: {
               id: result.toolCallId,
               output,
               progress: 1,
+              ...(outcome != null && { outcome }),
             } as t.ProcessedToolCall,
           },
         },
@@ -1400,7 +1407,34 @@ function shouldSkipLateOpenRouterReasoningChunk({
   );
 }
 
+/**
+ * Brands a handler as one that dispatches content parts for the SDK — either
+ * `ChatModelStreamHandler` itself or a wrapper forwarding to one.
+ *
+ * Identity alone is not a usable contract here. Hosts compose and wrap
+ * handlers (`composeEventHandlers`, `createRunHandlers`), and every wrapper
+ * fails `instanceof` while still driving the same dispatch. A brand survives
+ * wrapping, so "does this handler own content-part dispatch" can be answered
+ * about a value the SDK did not construct.
+ */
+export const SDK_STREAM_DISPATCH = Symbol.for(
+  '@librechat/agents:chatModelStreamDispatch'
+);
+
+/** True when `handler` is, or forwards to, the SDK's stream dispatcher. */
+export function dispatchesChatModelStream(handler?: t.EventHandler): boolean {
+  if (handler == null) {
+    return false;
+  }
+  if (handler instanceof ChatModelStreamHandler) {
+    return true;
+  }
+  return Reflect.get(handler, SDK_STREAM_DISPATCH) === true;
+}
+
 export class ChatModelStreamHandler implements t.EventHandler {
+  readonly [SDK_STREAM_DISPATCH] = true;
+
   async handle(
     event: string,
     data: t.StreamEventData,
@@ -1846,13 +1880,16 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     number,
     { agentId?: string; groupId?: number }
   >();
-  const getFirstContentPart = (
+  /** A delta's content may carry several parts (e.g. Google server-side tool
+   *  chunks emit multiple reasoning entries at once); every entry must reach
+   *  the step's slot, in order, or streamed text is silently lost. */
+  const getDeltaContentParts = (
     content?: t.MessageDelta['content'] | t.MessageContentComplex
-  ): t.MessageContentComplex | undefined => {
+  ): t.MessageContentComplex[] => {
     if (content == null) {
-      return undefined;
+      return [];
     }
-    return Array.isArray(content) ? content[0] : content;
+    return Array.isArray(content) ? content : [content];
   };
   const indexContentPart = (
     index: number,
@@ -2130,7 +2167,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         toolCallContentIndexMap.delete(existingToolCallId);
       }
 
-      const newToolCall: ToolCall & t.PartMetadata = {
+      const newToolCall: ToolCall & t.PartMetadata & { outcome?: string } = {
         id,
         name,
         args,
@@ -2150,6 +2187,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       if (finalUpdate) {
         newToolCall.progress = 1;
         newToolCall.output = contentPart.tool_call.output;
+        const outcome = (contentPart.tool_call as t.ToolCallPart).outcome;
+        if (outcome != null) {
+          newToolCall.outcome = outcome;
+        }
       }
 
       contentParts[index] = {
@@ -2284,8 +2325,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
 
-      const contentPart = getFirstContentPart(messageDelta.delta.content);
-      if (contentPart != null) {
+      for (const contentPart of getDeltaContentParts(messageDelta.delta.content)) {
         updateContent(runStep.index, contentPart);
       }
     } else if (
@@ -2314,8 +2354,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
 
-      const contentPart = getFirstContentPart(reasoningDelta.delta.content);
-      if (contentPart != null) {
+      for (const contentPart of getDeltaContentParts(reasoningDelta.delta.content)) {
         updateContent(runStep.index, contentPart);
       }
     } else if (event === GraphEvents.ON_RUN_STEP_DELTA) {

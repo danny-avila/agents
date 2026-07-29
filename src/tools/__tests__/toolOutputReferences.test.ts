@@ -187,6 +187,89 @@ describe('ToolOutputReferenceRegistry', () => {
       expect(resolved).toBe('nothing to see here');
     });
 
+    it('leaves the top-level intent arg verbatim (display label, not a data channel)', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('r', 'tool0turn0', 'HUGE-STORED-OUTPUT');
+      const { resolved } = reg.resolve('r', {
+        intent: 'Reusing {{tool0turn0}} for the next step',
+        command: 'cat {{tool0turn0}}',
+        nested: { intent: 'not top-level {{tool0turn0}}' },
+      });
+      expect(resolved).toEqual({
+        intent: 'Reusing {{tool0turn0}} for the next step',
+        command: 'cat HUGE-STORED-OUTPUT',
+        nested: { intent: 'not top-level HUGE-STORED-OUTPUT' },
+      });
+    });
+
+    it('preserves the intent key inside STRINGIFIED object args too', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('r', 'tool0turn0', 'HUGE-STORED-OUTPUT');
+      const { resolved } = reg.resolve(
+        'r',
+        '{"intent":"Reusing {{tool0turn0}}","command":"cat {{tool0turn0}}"}'
+      );
+      expect(JSON.parse(resolved as string)).toEqual({
+        intent: 'Reusing {{tool0turn0}}',
+        command: 'cat HUGE-STORED-OUTPUT',
+      });
+    });
+
+    it('keeps plain (non-object) string args on the raw substitution path', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('r', 'tool0turn0', 'DATA');
+      const { resolved } = reg.resolve('r', 'echo {{tool0turn0}} intent');
+      expect(resolved).toBe('echo DATA intent');
+    });
+
+    it('substitutes a BUSINESS intent arg when the caller opts in', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('r', 'tool0turn0', 'STORED');
+      const { resolved } = reg.resolve(
+        'r',
+        { intent: 'category {{tool0turn0}}', title: 'x {{tool0turn0}}' },
+        { substituteIntentKey: true }
+      );
+      expect(resolved).toEqual({
+        intent: 'category STORED',
+        title: 'x STORED',
+      });
+    });
+
+    it('substitutes a business intent inside stringified args when opted in', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('r', 'tool0turn0', 'STORED');
+      const { resolved } = reg.resolve(
+        'r',
+        '{"intent":"category {{tool0turn0}}"}',
+        { substituteIntentKey: true }
+      );
+      expect(resolved).toBe('{"intent":"category STORED"}');
+    });
+
+    it('reports unresolved references from a business intent arg', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      const { unresolved } = reg.resolve(
+        'r',
+        { intent: 'category {{tool9turn9}}' },
+        { substituteIntentKey: true }
+      );
+      expect(unresolved).toEqual(['tool9turn9']);
+    });
+
+    it('snapshot views honor the opt-in too', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('r', 'tool0turn0', 'STORED');
+      const view = reg.snapshot('r');
+      expect(view.resolve({ intent: 'x {{tool0turn0}}' }).resolved).toEqual({
+        intent: 'x {{tool0turn0}}',
+      });
+      expect(
+        view.resolve({ intent: 'x {{tool0turn0}}' }, { substituteIntentKey: true })
+          .resolved
+      ).toEqual({ intent: 'x STORED' });
+    });
+
     it('passes through primitive values untouched', () => {
       const reg = new ToolOutputReferenceRegistry();
       const { resolved } = reg.resolve('r', {

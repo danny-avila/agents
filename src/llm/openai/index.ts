@@ -51,6 +51,7 @@ import {
   projectOpenAIResponsesToolMessageContent,
   projectToolStreamContentForProvider,
 } from '@/messages/core';
+import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
 
@@ -1003,6 +1004,65 @@ function createAbortHandler(controller: AbortController): () => void {
  * @param {Object} [fields] Additional fields to add to the OpenAI tool.
  * @returns {ToolDefinition} The inputted tool in OpenAI tool format.
  */
+/**
+ * OpenAI strict function schemas require every property to appear in
+ * `required`. The optional `intent` label (see `tools/intentArg.ts`) is
+ * deliberately NOT required — the same schema is callable from programmatic
+ * tool calling — so a tool auto-marked `strict: true` (the non-streaming
+ * `json_schema` structured-output path) would be rejected as invalid before
+ * execution. That path never streams a live label anyway, so the
+ * marker-identified property is dropped there; every other path keeps it.
+ */
+function stripIntentFromStrictTools<T extends object>(params: T): T {
+  const record = params as { tools?: unknown[] };
+  const tools = record.tools;
+  if (!Array.isArray(tools) || tools.length === 0) {
+    return params;
+  }
+  const nextTools = tools.map((tool) => {
+    const candidate = tool as {
+      strict?: boolean;
+      parameters?: { properties?: Record<string, unknown>; required?: unknown };
+      function?: {
+        strict?: boolean;
+        parameters?: {
+          properties?: Record<string, unknown>;
+          required?: unknown;
+        };
+      };
+    };
+    /** Chat-completions tools nest under `function`; responses-API tools are flat. */
+    const holder = candidate.function ?? candidate;
+    if (holder.strict !== true) {
+      return tool;
+    }
+    const parameters = holder.parameters;
+    const properties = parameters?.properties;
+    if (properties == null || !isIntentLabelProperty(properties[INTENT_ARG])) {
+      return tool;
+    }
+    const required = Array.isArray(parameters?.required)
+      ? (parameters.required as unknown[])
+      : [];
+    if (required.includes(INTENT_ARG)) {
+      return tool;
+    }
+    const { [INTENT_ARG]: _omit, ...restProps } = properties;
+    const nextParams = { ...parameters, properties: restProps };
+    if (candidate.function != null) {
+      return {
+        ...candidate,
+        function: { ...candidate.function, parameters: nextParams },
+      };
+    }
+    return { ...candidate, parameters: nextParams };
+  });
+  if (nextTools.every((tool, index) => tool === tools[index])) {
+    return params;
+  }
+  return { ...params, tools: nextTools } as T;
+}
+
 export function _convertToOpenAITool(
   tool: BindToolsInput,
   fields?: {
@@ -1184,10 +1244,12 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     options?: this['ParsedCallOptions'],
     extra?: { streaming?: boolean }
   ): ReturnType<OriginalChatOpenAICompletions['invocationParams']> {
-    return applyManagedRequestParams(super.invocationParams(options, extra), {
-      promptCacheExplicit: this.promptCacheExplicit,
-      safetyIdentifier: this.safetyIdentifier,
-    });
+    return stripIntentFromStrictTools(
+      applyManagedRequestParams(super.invocationParams(options, extra), {
+        promptCacheExplicit: this.promptCacheExplicit,
+        safetyIdentifier: this.safetyIdentifier,
+      })
+    );
   }
 
   protected _getReasoningParams(
@@ -1640,7 +1702,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
         ]),
       ];
     }
-    return params;
+    return stripIntentFromStrictTools(params);
   }
 
   async completionWithRetry(
@@ -1741,10 +1803,12 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
     options?: this['ParsedCallOptions'],
     extra?: { streaming?: boolean }
   ): ReturnType<OriginalAzureChatOpenAICompletions['invocationParams']> {
-    return applyManagedRequestParams(super.invocationParams(options, extra), {
-      promptCacheExplicit: this.promptCacheExplicit,
-      safetyIdentifier: this.safetyIdentifier,
-    });
+    return stripIntentFromStrictTools(
+      applyManagedRequestParams(super.invocationParams(options, extra), {
+        promptCacheExplicit: this.promptCacheExplicit,
+        safetyIdentifier: this.safetyIdentifier,
+      })
+    );
   }
 
   protected _getReasoningParams(
@@ -1888,7 +1952,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
         ]),
       ];
     }
-    return params;
+    return stripIntentFromStrictTools(params);
   }
 
   async completionWithRetry(

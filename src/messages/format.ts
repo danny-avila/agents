@@ -476,6 +476,25 @@ function formatToolCallOutput(
 }
 
 /**
+ * Content for the synthetic assistant turn that separates a trailing steer
+ * from the next user turn. Non-empty by necessity — see the push site.
+ */
+const STEER_ANCHOR_PLACEHOLDER = '_';
+
+/**
+ * True when an assistant message replayed as a steer and nothing followed it,
+ * so the emitted run ends on the steer's `HumanMessage`.
+ */
+function endsWithSteerMessage(
+  formatted: Array<RoleBearingMessage<BaseMessage>>
+): boolean {
+  if (formatted.length === 0) {
+    return false;
+  }
+  return formatted[formatted.length - 1].additional_kwargs.source === 'steer';
+}
+
+/**
  * Helper function to format an assistant message
  * @param message The message to format
  * @param options Optional formatting options
@@ -1336,6 +1355,36 @@ export const formatAgentMessages = (
     | RoleBearingMessage<SystemMessage>
     | RoleBearingMessage<ToolMessage>
   > = [];
+  /**
+   * A steer ended the previous payload entry, so the next message emitted —
+   * whichever entry finally produces one — must be separated from it by an
+   * assistant turn. Held rather than emitted so an entry that produces
+   * nothing cannot leave the anchor stranded as the final turn.
+   */
+  let pendingSteerAnchor = false;
+  /**
+   * Emits the deferred anchor ahead of `next` — the message about to be
+   * pushed. When that message is itself an assistant turn, it already IS the
+   * separation the anchor exists to synthesize, so the intent is simply
+   * discharged: emitting the placeholder anyway would put two assistant turns
+   * back to back, which strict-alternation providers can reject and nothing downstream
+   * repairs (`coalesceAdjacentUserTurns` merges user turns only).
+   */
+  const flushSteerAnchor = (next: { role?: LangChainMessageRole }): void => {
+    if (!pendingSteerAnchor) {
+      return;
+    }
+    pendingSteerAnchor = false;
+    if (next.role === 'assistant') {
+      return;
+    }
+    messages.push(
+      withMessageRole(
+        new AIMessage({ content: STEER_ANCHOR_PLACEHOLDER }),
+        'assistant'
+      )
+    );
+  };
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
   let boundaryTokenAdjustment:
@@ -1397,6 +1446,7 @@ export const formatAgentMessages = (
       if (sourceMessageId != null && sourceMessageId !== '') {
         formattedMessage.id = sourceMessageId;
       }
+      flushSteerAnchor(formattedMessage);
       messages.push(formattedMessage);
 
       // Update the index mapping for this message
@@ -1580,7 +1630,48 @@ export const formatAgentMessages = (
         formattedMessage.id = sourceMessageId;
       }
     }
+    /**
+     * A steer that ends an assistant message leaves the replay on a
+     * `HumanMessage`. The next payload message is itself a user turn, so the
+     * sequence would reach the provider as two adjacent user turns — rejected
+     * by strict-alternation providers. Anchor it with a placeholder assistant
+     * turn.
+     *
+     * The placeholder must be NON-EMPTY. A string-content assistant message
+     * with no tool calls passes through `_convertMessagesToAnthropicPayload`
+     * verbatim — the empty-text repair there only covers array content and
+     * tool-call turns — so an empty anchor would reach Anthropic as
+     * `{role: 'assistant', content: ''}` and trade one invalid sequence for
+     * another. Same single-underscore convention the Anthropic converter
+     * already uses when it has to synthesize a non-empty block.
+     *
+     * Deferred rather than decided by lookahead. `i < payload.length - 1` only
+     * proves a later ENTRY exists, not that it EMITS: entries with empty
+     * content, and entries dropped by `applySummaryBoundary`, are skipped
+     * silently. A trailing steer followed only by those would get the anchor
+     * as the FINAL turn — an assistant prefill with no request after it, which
+     * the model may simply never answer. So the intent is recorded and flushed
+     * only when a message actually follows.
+     *
+     * Pushed AFTER the id stamping above, deliberately. `messagesStateReducer`
+     * treats a repeated id as replace-in-place, so an anchor carrying the
+     * shared `sourceMessageId` would overwrite the steer it exists to protect.
+     * Left unstamped, it reaches the reducer with a null id and is assigned a
+     * fresh one. `endsWithSteerMessage` reads only `additional_kwargs.source`,
+     * so the deferral cannot change which messages get anchored.
+     */
+    /**
+     * Guarded on emission: an assistant entry whose blocks all filtered away
+     * emits nothing, and flushing for it would strand the anchor as the final
+     * turn — the pending flag stays set for whichever entry emits next.
+     */
+    if (formattedMessages.length > 0) {
+      flushSteerAnchor(formattedMessages[0]);
+    }
     messages.push(...formattedMessages);
+    if (endsWithSteerMessage(formattedMessages)) {
+      pendingSteerAnchor = true;
+    }
 
     // Capture index range BEFORE skill body injection so injected
     // HumanMessages are excluded from the assistant's token distribution.

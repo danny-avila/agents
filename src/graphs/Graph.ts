@@ -47,6 +47,11 @@ import {
   partitionAndMarkAnthropicToolCache,
   DEFAULT_RETAIN_RECENT_TURNS,
   splitAtRecencyBoundary,
+  convertInjectedMessages,
+  coalesceAdjacentUserTurns,
+  strictAlternationProviders,
+  appendPredecessorHandoffCue,
+  removePredecessorHandoffCue,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -64,7 +69,9 @@ import {
   getFallbackErrorContext,
   getFallbackOverflowCandidates,
   projectMessagesForProvider,
+  resolveServingModelId,
 } from '@/llm/invoke';
+import { v4 } from 'uuid';
 import {
   createLangfuseHandler,
   createLangfuseTraceMetadata,
@@ -81,6 +88,7 @@ import {
   getToolContentCharLength,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
+import { resolveMaxSeals } from '@/llm/preempt';
 import {
   Constants,
   GraphNodeKeys,
@@ -88,6 +96,7 @@ import {
   GraphEvents,
   Providers,
   StepTypes,
+  PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
 } from '@/common';
 import {
   annotateMessagesForLLM,
@@ -125,8 +134,40 @@ import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
+import { executeHooks } from '@/hooks';
 
 const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
+
+/** What a `PreemptBoundary` drain resolved to. */
+type PreemptBoundaryResult = {
+  messages: BaseMessage[];
+  /** A hook asked for no further model turn; the seal must not self-loop. */
+  preventContinuation: boolean;
+};
+
+const EMPTY_PREEMPT_BOUNDARY: PreemptBoundaryResult = {
+  messages: [],
+  preventContinuation: false,
+};
+
+/**
+ * One signal that fires when either input fires. `AbortSignal.any` is skipped
+ * when the inputs collapse to a single signal — the composite is a fresh
+ * object per call, and the common cases (one channel, or the host reusing the
+ * same controller for both) don't need one.
+ */
+function composeAbortSignals(
+  a: AbortSignal | undefined,
+  b: AbortSignal | undefined
+): AbortSignal | undefined {
+  if (a == null || a === b) {
+    return b;
+  }
+  if (b == null) {
+    return a;
+  }
+  return AbortSignal.any([a, b]);
+}
 
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
@@ -655,6 +696,20 @@ export abstract class Graph<
   reasoningStepHasDeltas: Set<string> = new Set();
   protected handlerDispatchedEventCounts: Map<string, number> = new Map();
   signal?: AbortSignal;
+  /**
+   * The abort signal the CALLER handed to the current `processStream` call,
+   * assigned unconditionally — including back to `undefined` — on every call.
+   *
+   * Kept separate from {@link signal} on purpose. That field is construction
+   * state with its own consumers (model-call config, subagent parentSignal),
+   * so adopting a per-call signal into it would leak one call's controller
+   * into the next — `clearHeavyState()` is skipped on HITL interrupts, so a
+   * host that aborts a finished request's controller would poison the resumed
+   * run's model calls and boundary drains with an already-aborted signal.
+   * Boundary dispatch composes the two instead; see
+   * `StandardGraph.dispatchPreemptBoundary`.
+   */
+  callerSignal?: AbortSignal;
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
   handlerRegistry: HandlerRegistry | undefined;
@@ -734,6 +789,7 @@ export abstract class Graph<
   clearHeavyState(): void {
     this.config = undefined;
     this.signal = undefined;
+    this.callerSignal = undefined;
     this.contentData = [];
     this.contentIndexMap = new Map();
     this.stepKeyIds = new Map();
@@ -936,6 +992,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   messages: BaseMessage[] = [];
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
+  /** Ids of AI turns the agent node returned THIS run; see isRunProducedMessage. */
+  protected runProducedAiMessageIds = new Set<string>();
   /** Checkpoint scope whose messages match index-keyed tool snapshots. */
   private originalToolContentCheckpointScope?: string;
   runId: string | undefined;
@@ -961,6 +1019,53 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   subagentUsageSink?: t.SubagentUsageSink;
   /** See {@link t.StandardGraphInput.subagentScope}. */
   subagentScope: boolean;
+  /** See {@link t.StandardGraphInput.preemption}. */
+  preemption?: t.StreamPreemption;
+  /**
+   * Seals charged against `preemption.maxSeals`. Per-turn: cleared by both
+   * reset paths so a fresh turn gets a fresh budget, while a HITL resume —
+   * which skips `resetValues` — keeps what it had left.
+   */
+  private preemptSealBudgetUsed = 0;
+  /**
+   * Seals honored over the graph's lifetime. Reported by
+   * {@link getPreemptStats}, so it deliberately SURVIVES `clearHeavyState()`
+   * — a host reads it after `processStream` returns, which is strictly after
+   * cleanup runs.
+   */
+  preemptSealCount = 0;
+  /** Boundaries that produced nothing to inject, so the turn stopped early. */
+  preemptEmptyBoundaries = 0;
+  /**
+   * Set between claiming a seal and resolving its boundary. `MultiAgentGraph`
+   * fans parallel agents through this one instance against a single host
+   * request, so without a one-at-a-time gate several streams would each seal
+   * for the same queued message and every loser would take the
+   * nothing-to-inject path and cut its answer short.
+   */
+  private preemptSealInFlight = false;
+  /**
+   * True when a seal ended the turn without a resume. The assistant turn is
+   * real and kept, but it is not the answer the model intended to finish —
+   * hosts persist it as unfinished rather than complete.
+   */
+  preemptIncomplete = false;
+  /**
+   * `stopReason` from a `PreemptBoundary` hook that halted the turn.
+   *
+   * Clearing the registry halt is what keeps the sealed turn alive, but the
+   * registry held the only copy of the reason — so it is captured here first.
+   * Without it `getHaltReason()` returns undefined and a host records a
+   * hook-halted turn as an ordinary completion.
+   */
+  preemptHaltReason: string | undefined;
+  /**
+   * Agent IDs whose next superstep must return to the agent node. Keyed by
+   * agent because `MultiAgentGraph` routes every parallel agent through this
+   * same instance, and a single field would let one agent's boundary resume
+   * another's turn.
+   */
+  pendingPreemptReturn = new Set<string>();
 
   constructor({
     runId,
@@ -972,6 +1077,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     calibrationRatio,
     subagentUsageSink,
     subagentScope,
+    preemption,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
@@ -979,6 +1085,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.langfuse = langfuse;
     this.subagentUsageSink = subagentUsageSink;
     this.subagentScope = subagentScope === true;
+    this.preemption = preemption;
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -1018,6 +1125,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * a stale reference on 2nd+ processStream calls.
      */
     this.toolCallStepIds.clear();
+    this.runProducedAiMessageIds.clear();
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
@@ -1050,6 +1158,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       new Map()
     );
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
+    this.resetPreemptTurnState();
+    this.resetPreemptTotals();
     const hasScopedCheckpoint =
       this.hasCompiledCheckpointer &&
       checkpointScope != null &&
@@ -1070,12 +1180,132 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
+    /**
+     * Turn state only. The reported totals must outlive cleanup — this runs
+     * in `processStream`'s `finally`, and the host reads `getPreemptStats()`
+     * after that returns.
+     */
+    this.resetPreemptTurnState();
     const preserveOriginalToolContent =
       this.hasCompiledCheckpointer &&
       this.originalToolContentCheckpointScope != null;
     for (const context of this.agentContexts.values()) {
       context.reset({ preserveOriginalToolContent });
     }
+  }
+
+  /**
+   * Per-turn seal budget and routing markers. Cleared by both reset paths so
+   * a new turn starts with a full budget and no stale resume marker.
+   *
+   * The REPORTED counters are deliberately not touched here — see
+   * {@link resetPreemptTotals}.
+   */
+  private resetPreemptTurnState(): void {
+    this.preemptSealBudgetUsed = 0;
+    this.preemptSealInFlight = false;
+    this.pendingPreemptReturn.clear();
+  }
+
+  /**
+   * Lifetime seal totals, cleared only when a genuinely new run starts.
+   * `clearHeavyState()` must NOT call this: it runs in `processStream`'s
+   * `finally`, so zeroing here would make {@link getPreemptStats} and
+   * `preemptIncomplete` unreadable for every caller of the method that just
+   * produced them.
+   */
+  private resetPreemptTotals(): void {
+    this.preemptSealCount = 0;
+    this.preemptEmptyBoundaries = 0;
+    this.preemptIncomplete = false;
+    this.preemptHaltReason = undefined;
+  }
+
+  /**
+   * True when the host has requested a cooperative seal AND this graph may
+   * honor it. Read once per streamed chunk, so it stays property reads plus
+   * one host callback — no I/O, no allocation.
+   *
+   * Non-mutating: a true result only means a seal is worth evaluating. The
+   * budget is taken by {@link claimPreemptSeal} once the accumulated chunk is
+   * known to be safe, so a chunk that cannot seal never spends budget.
+   *
+   * Subagent scopes never seal: a steer targets the top-level conversation,
+   * and a child run must finish so its parent sees a complete result.
+   */
+  /** Internal seal preconditions only — no host callback, no side effects. */
+  private canClaimPreemptSeal(): boolean {
+    /**
+     * Resolved and required here with the same rule `dispatchPreemptBoundary`
+     * uses. Without it a direct `StandardGraph` consumer that supplies no
+     * `runId` could claim a seal on the strength of a global matcher, then hit
+     * the boundary's own null-runId guard and get nothing back — truncating
+     * the answer for a drain that provably could not run.
+     */
+    const runId =
+      (this.config?.configurable?.run_id as string | undefined) ?? this.runId;
+    return (
+      !this.subagentScope &&
+      this.preemption != null &&
+      !this.preemptSealInFlight &&
+      this.preemptSealBudgetUsed < resolveMaxSeals(this.preemption.maxSeals) &&
+      runId != null &&
+      /**
+       * A seal only buys room for an injection. With no `PreemptBoundary`
+       * matcher live — never registered, or a `once` matcher already
+       * consumed — the boundary provably returns nothing and the answer is
+       * cut short for no gain, so refuse the seal instead. Failing closed
+       * lands on the documented no-preemption behavior: the model finishes
+       * and the message waits for the next tool boundary.
+       *
+       * Same session resolution as `dispatchPreemptBoundary`, or a
+       * session-scoped matcher would be visible at one site and not the other.
+       */
+      this.hookRegistry?.hasDispatchableHookFor('PreemptBoundary', runId) ===
+        true
+    );
+  }
+
+  shouldPreemptStream(): boolean {
+    return (
+      this.canClaimPreemptSeal() && this.preemption?.shouldPreempt() === true
+    );
+  }
+
+  /**
+   * Takes the seal slot, or returns false if another stream already holds it.
+   *
+   * Assumes the caller already polled `shouldPreemptStream()` for THIS chunk,
+   * and deliberately does not poll the host again — `StreamPreemption`
+   * documents `shouldPreempt` as once per chunk, and a host that consumes a
+   * pending flag on read would lose the request to a second call.
+   *
+   * The guard and both mutations remain one synchronous body, which is what
+   * makes this safe under a parallel `MultiAgentGraph`: several agents share
+   * one graph and can each see the poll as true, but no `await` can split the
+   * claim, so only one takes the slot. The loser keeps streaming normally
+   * rather than sealing for a message it would never receive.
+   */
+  claimPreemptSeal(): boolean {
+    if (!this.canClaimPreemptSeal()) {
+      return false;
+    }
+    this.preemptSealInFlight = true;
+    this.preemptSealBudgetUsed += 1;
+    this.preemptSealCount += 1;
+    return true;
+  }
+
+  /** Releases the seal slot once its boundary has resolved, win or lose. */
+  releasePreemptSeal(): void {
+    this.preemptSealInFlight = false;
+  }
+
+  getPreemptStats(): t.PreemptStats {
+    return {
+      seals: this.preemptSealCount,
+      emptyBoundaries: this.preemptEmptyBoundaries,
+    };
   }
 
   /* Run Step Processing */
@@ -1239,6 +1469,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return this.cachedRunMessages;
     }
     return this.messages.slice(this.startIndex);
+  }
+
+  /**
+   * True when THIS RUN produced `message` — the provenance the handoff cue
+   * gate needs. Tracked as an id set rather than inferred from `startIndex`
+   * arithmetic: summarization's remove-all compaction rewrites the live
+   * array and leaves `startIndex` stale, so index-based run/host
+   * discrimination silently breaks right after a mid-run summarize. Ids
+   * survive compaction (retained messages keep theirs), host-supplied
+   * prefill messages are never in the set, and membership is O(1) per
+   * model call.
+   */
+  isRunProducedMessage(message: BaseMessage): boolean {
+    const id = message.id;
+    return (
+      typeof id === 'string' &&
+      id !== '' &&
+      this.runProducedAiMessageIds.has(id)
+    );
   }
 
   getContentParts(): t.MessageContentComplex[] | undefined {
@@ -1619,6 +1868,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       if (!config) {
         throw new Error('No config provided');
+      }
+
+      /**
+       * A `PreemptBoundary` hook halted this run and the sealed commit is
+       * already in state. Enforced at every model node's ENTRY because that
+       * is the only site that covers all of `MultiAgentGraph`'s onward
+       * routing at once — static direct edges, Command fan-out, fan-in
+       * wrappers, and parallel siblings' subsequent inner-loop turns — none
+       * of which consult the halt (the registry signal was deliberately
+       * cleared to keep the stream-cancel from destroying the sealed turn).
+       * Declining the model call turns every routed-to successor into a
+       * no-op, so the outer workflow drains to END without new turns or tool
+       * side effects. Reset per turn in `resetPreemptTotals`, so the next
+       * `processStream` call starts clean.
+       */
+      if (this.preemptHaltReason != null) {
+        return { messages: [] };
       }
 
       const { messages } = state;
@@ -2277,6 +2543,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             );
           }
         }
+        /**
+         * Applied HERE for the primary so the cue is part of the MEASURED
+         * payload — the pre-invoke projection and overflow guard run on this
+         * stage's output, and a post-measure append could push a just-fits
+         * prompt over budget unreported (#346 round 2). The attemptInvoke
+         * funnel re-keys per SERVING provider: it strips this cue for a
+         * tolerant fallback and adds it for a Claude fallback behind a
+         * tolerant primary.
+         */
+        if (
+          isAnthropicLike(
+            agentContext.provider,
+            agentContext.clientOptions as { model?: string }
+          )
+        ) {
+          const before = transformed;
+          transformed = trackProviderMessageOrigins(
+            before,
+            appendPredecessorHandoffCue(before, (message) =>
+              this.isRunProducedMessage(message)
+            )
+          );
+        }
         return transformed;
       };
 
@@ -2440,6 +2729,50 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           );
         }
       }
+
+      /**
+       * Mistral rejects consecutive user turns outright; Bedrock's Converse
+       * API documents strict user/assistant alternation across its model
+       * families, with enforcement varying by family (Claude on Converse
+       * currently tolerates the shape — verified live — but the payload is
+       * normalized for all of them rather than betting on leniency). Four
+       * sites can emit them — the `PostToolBatch` and `PreemptBoundary` hook
+       * boundaries (a consolidated context message followed by one
+       * `HumanMessage` per injected entry), a queue drain carrying more than
+       * one steer, and `run.ts`'s pre-stream context push onto a payload that
+       * already ends on a user turn.
+       *
+       * Normalized here, at the last provider-facing hop, rather than at any
+       * one boundary: the boundaries must keep per-message identity, because
+       * `additional_kwargs.source`/`skillName` drive steer rendering and the
+       * trailing-steer anchor downstream. Graph state and the host's
+       * persisted messages are untouched — this shapes only what goes on the
+       * wire, for the providers that actually care.
+       *
+       * Runs AFTER synthetic-context compaction: that pass can rewrite or
+       * drop messages, so coalescing has to see its output, and it is the
+       * last shaping step before the cache breakpoint is chosen.
+       */
+      if (strictAlternationProviders.has(agentContext.provider)) {
+        /**
+         * Wrapped like every other provider transform: the merged message is
+         * a NEW object, and without re-attachment the final pre-invoke
+         * measurement would drop both source turns' calibrated shares and
+         * recharge the merge at full raw estimate — enough to flip a
+         * just-fits payload (the synthetic-context compaction above binary
+         * searches to exactly that) into a spurious pre-invoke overflow. The
+         * merge keeps the first source's id, so the keyed branch re-attaches
+         * that origin; the absorbed turn's tokens are charged as new raw
+         * growth, which only ever under-estimates by less than the old
+         * behavior over-estimated.
+         */
+        const beforeCoalesce = finalMessages;
+        finalMessages = trackProviderMessageOrigins(
+          beforeCoalesce,
+          coalesceAdjacentUserTurns(beforeCoalesce)
+        );
+      }
+
       // Determine the prompt-cache strategy up front. Two distinct facts:
       //
       //   `providerPromptCacheEnabled` — prompt caching is on for this provider
@@ -2949,11 +3282,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                     calculateMaxToolResultChars(
                       fallbackMaxContextTokens ?? agentContext.maxContextTokens
                     );
-                  const projectedFallbackMessages = trackProviderMessageOrigins(
+                  /**
+                   * Serving-provider cue shaping BEFORE the fallback payload
+                   * is measured: a Claude fallback behind a tolerant primary
+                   * gains the cue inside the guarded projection (a prompt
+                   * within the cue's cost of the fallback budget must take
+                   * the recovery path, not ship oversized), and a tolerant
+                   * fallback behind an Anthropic primary sheds the baked cue
+                   * before it is measured against the tighter budget. The
+                   * attemptInvoke funnel pass then finds nothing to change.
+                   */
+                  const cueShapedFallbackMessages = trackProviderMessageOrigins(
                     fallbackMessages,
+                    isAnthropicLike(fallbackProvider, {
+                      model: resolveServingModelId(fallbackModel),
+                    })
+                      ? appendPredecessorHandoffCue(fallbackMessages, (m) =>
+                        this.isRunProducedMessage(m)
+                      )
+                      : removePredecessorHandoffCue(fallbackMessages)
+                  );
+                  const projectedFallbackMessages = trackProviderMessageOrigins(
+                    cueShapedFallbackMessages,
                     projectMessagesForProvider({
                       model: fallbackModel,
-                      messages: fallbackMessages,
+                      messages: cueShapedFallbackMessages,
                       provider: fallbackProvider,
                       maxToolResultChars: fallbackToolResultChars,
                       callOptions: fallbackConfig,
@@ -3039,6 +3392,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * handled everything — both paths become no-ops.
        */
       const responseMessage = result.messages?.[0];
+      /**
+       * Provenance for the handoff-cue gate: recorded at the node, where the
+       * produced turn is unambiguous. The public ChatModel contract does not
+       * require implementations to set message ids — the reducer would
+       * assign one AFTER this node returns, which is too late for the set —
+       * so an id is assigned here first, the same way the reducer does it
+       * (`v4()`, mirrored into `lc_kwargs`), and the reducer's
+       * keep-existing-id rule makes the state message match.
+       */
+      if (responseMessage?.getType() === 'ai') {
+        if (
+          typeof responseMessage.id !== 'string' ||
+          responseMessage.id === ''
+        ) {
+          responseMessage.id = v4();
+          responseMessage.lc_kwargs.id = responseMessage.id;
+        }
+        this.runProducedAiMessageIds.add(responseMessage.id);
+      }
       const toolCalls = (responseMessage as AIMessageChunk | undefined)
         ?.tool_calls;
       const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
@@ -3126,8 +3498,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       const invokeElapsed = ((Date.now() - invokeStart) / 1000).toFixed(2);
       agentContext.currentUsage = this.getUsageMetadata(result.messages?.[0]);
+      /**
+       * Synthetic usage from a sealed turn is an estimate derived from the
+       * host's own counter, so feeding it to calibration would teach a ratio
+       * of exactly 1.0 — self-consistent by construction, and wrong for any
+       * provider whose real ratio differs. It still flows to `currentUsage`
+       * for host billing; it just does not get to move the EMA.
+       */
+      const estimatedUsage =
+        (result.messages?.[0] as AIMessageChunk | undefined)?.response_metadata
+          .estimated_usage === true;
       if (agentContext.currentUsage) {
-        agentContext.updateLastCallUsage(agentContext.currentUsage);
+        if (!estimatedUsage) {
+          agentContext.updateLastCallUsage(agentContext.currentUsage);
+        }
         emitAgentLog(
           config,
           'debug',
@@ -3157,8 +3541,181 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           { force: true }
         );
       }
+      if (
+        (responseMessage as AIMessageChunk | undefined)?.response_metadata
+          .preempted === true
+      ) {
+        const { messages: injected, preventContinuation } =
+          await this.dispatchPreemptBoundary(agentId, config);
+        /**
+         * Release before branching: the slot is held only for the duration of
+         * the drain, and an early return below must not strand it.
+         */
+        this.releasePreemptSeal();
+        if (preventContinuation) {
+          /**
+           * A hook halted at the boundary. Commit the sealed turn and anything
+           * it injected, but do NOT self-loop: `preventContinuation` promises
+           * no further model turn, and the run-loop poll in `processStream`
+           * only sees the halt AFTER the next call would already have started
+           * — direct graph consumers never poll it at all. A trailing injected
+           * HumanMessage carries no tool calls, so `toolsCondition` routes it
+           * to END.
+           */
+          this.preemptIncomplete = true;
+          /**
+           * A halting boundary that ALSO injected nothing is still an empty
+           * boundary by the `getPreemptStats().emptyBoundaries` contract —
+           * hosts use the counter for truncated-seal telemetry, and both
+           * paths end the turn with nothing to resume from.
+           */
+          if (injected.length === 0) {
+            this.preemptEmptyBoundaries += 1;
+          }
+          this.cleanupSignalListener();
+          return injected.length > 0
+            ? { messages: [...(result.messages ?? []), ...injected] }
+            : result;
+        }
+        if (injected.length > 0) {
+          this.pendingPreemptReturn.add(agentId);
+          this.cleanupSignalListener();
+          return { messages: [...(result.messages ?? []), ...injected] };
+        }
+        /**
+         * Nothing to inject — the host cancelled or already drained. Do NOT
+         * self-loop: a trailing model turn with no new input is dropped by
+         * some Gemini models and read as prefill by Anthropic. Do NOT pretend
+         * the turn completed either; the answer really was cut short.
+         */
+        this.preemptEmptyBoundaries += 1;
+        this.preemptIncomplete = true;
+      }
+
       this.cleanupSignalListener();
       return result;
+    };
+  }
+
+  /**
+   * Fires `PreemptBoundary` after a sealed turn and returns whatever the
+   * hooks asked to inject, converted through the same `convertInjectedMessages`
+   * the tool boundary uses so the two sites cannot emit different shapes.
+   *
+   * Never throws: a drain that fails or times out costs the injection, not the
+   * run. The caller treats an empty result as "nothing to resume with".
+   *
+   * `preventContinuation` is surfaced alongside the messages rather than left
+   * to the registry halt signal, which `processStream` only polls between
+   * stream events — by then the self-loop it was meant to prevent has already
+   * issued another model call, and a direct graph consumer never polls it.
+   */
+  private async dispatchPreemptBoundary(
+    agentId: string,
+    config: RunnableConfig | undefined
+  ): Promise<PreemptBoundaryResult> {
+    if (this.hookRegistry == null) {
+      return EMPTY_PREEMPT_BOUNDARY;
+    }
+    const configurable = config?.configurable;
+    const runId = (configurable?.run_id as string | undefined) ?? this.runId;
+    if (runId == null) {
+      return EMPTY_PREEMPT_BOUNDARY;
+    }
+    const result = await executeHooks({
+      registry: this.hookRegistry,
+      input: {
+        hook_event_name: 'PreemptBoundary',
+        runId,
+        threadId: configurable?.thread_id as string | undefined,
+        agentId: this.subagentScope ? agentId : undefined,
+        executingAgentId: agentId,
+        sealCount: this.preemptSealCount,
+      },
+      sessionId: runId,
+      timeoutMs: PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
+      /**
+       * The host's own abort signal(s), deliberately NOT `config.signal` —
+       * inside a node the latter is LangGraph's composed signal, which also
+       * fires when an unrelated sibling in the same superstep throws.
+       * Cancellation already returns control in milliseconds without this;
+       * what it buys is that a drain does not keep running after the run it
+       * belongs to died.
+       *
+       * Composed because the host can cancel through either channel: the
+       * construction signal, or the per-call `callerConfig.signal` — the only
+       * one a multi-agent run has, since `MultiAgentGraphConfig` exposes no
+       * construction signal. When both exist they may be different
+       * controllers, and a drain must stop when EITHER fires.
+       */
+      signal: composeAbortSignals(this.signal, this.callerSignal),
+    }).catch((): undefined => undefined);
+    if (result == null) {
+      return EMPTY_PREEMPT_BOUNDARY;
+    }
+    /**
+     * `executeHooks` raises a registry halt whenever a hook returns
+     * `preventContinuation`. That halt has exactly one consumer — the poll in
+     * `Run.processStream` — and its `break` cancels the stream iterator, which
+     * aborts Pregel. The abort lands BEFORE the outer reducer commits
+     * `StandardGraph.messages`, so honoring the halt here would destroy the
+     * sealed assistant turn: the run returns empty content and the host
+     * persists nothing. Measured deterministically — the commit is several
+     * stream events downstream of the point the halt becomes observable.
+     *
+     * The `preventContinuation` branch in `createCallModel` already enforces
+     * the contract locally by declining to self-loop, and a sealed chunk
+     * provably carries no tool calls, so the turn routes to END after exactly
+     * one model call either way. Clearing the halt therefore costs nothing it
+     * was buying and saves the content the seal exists to preserve.
+     *
+     * Scoped to a halt this event raised, so a halt from an earlier hook in
+     * the same run — `haltRun` is first-write-wins — is left alone.
+     */
+    const halt = this.hookRegistry.getHaltSignal(runId);
+    if (result.preventContinuation === true && halt?.source === 'PreemptBoundary') {
+      this.preemptHaltReason = halt.reason;
+      this.hookRegistry.clearHaltSignal(runId);
+    }
+    const injected: BaseMessage[] = [];
+    /**
+     * `PreemptBoundaryHookOutput` is `BaseHookOutput`, so `additionalContext`
+     * is part of the contract here just as it is at the tool boundary. It has
+     * to be materialized BEFORE the emptiness test, or a hook that returns
+     * context alone would read as "nothing to resume with" and cut the answer
+     * short. Same system-flavored `HumanMessage` convention `ToolNode` uses —
+     * Anthropic and Google reject a mid-conversation `SystemMessage`.
+     */
+    /**
+     * Whitespace-only entries are dropped for the same reason empty
+     * `injectedMessages` are: `executeHooks` keeps them because their raw
+     * length is nonzero, but a blank turn is not something to resume from —
+     * it costs a model call and strict providers reject it outright.
+     */
+    const contexts = result.additionalContexts.filter(
+      (context) => context.trim() !== ''
+    );
+    if (contexts.length > 0) {
+      injected.push(
+        new HumanMessage({
+          content: contexts.join('\n\n'),
+          additional_kwargs: { role: 'system', isMeta: true, source: 'hook' },
+        })
+      );
+    }
+    if (result.injectedMessages.length > 0) {
+      try {
+        injected.push(...convertInjectedMessages(result.injectedMessages));
+      } catch (e) {
+        console.warn(
+          '[StandardGraph] Failed to convert PreemptBoundary injectedMessages:',
+          e instanceof Error ? e.message : e
+        );
+      }
+    }
+    return {
+      messages: injected,
+      preventContinuation: result.preventContinuation === true,
     };
   }
 
@@ -3325,6 +3882,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       config?: RunnableConfig
     ): string => {
       this.config = config;
+      /**
+       * A sealed turn that injected messages resumes in the SAME pregel run:
+       * back to the agent node as a new superstep, so the model continues in
+       * one assistant message instead of restarting the graph.
+       */
+      if (this.pendingPreemptReturn.delete(agentId)) {
+        return agentNode;
+      }
       if (state.summarizationRequest != null) {
         return summarizeNode;
       }

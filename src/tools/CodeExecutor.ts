@@ -5,6 +5,7 @@ import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { EnvVar, Constants } from '@/common';
 
 export {
@@ -75,6 +76,7 @@ const SUPPORTED_LANGUAGES = [
 export const CodeExecutionToolSchema = {
   type: 'object',
   properties: {
+    intent: { ...INTENT_PROPERTY },
     lang: {
       type: 'string',
       enum: SUPPORTED_LANGUAGES,
@@ -346,18 +348,22 @@ function createCodeExecutionTool(
        * injected `_runtime_session_hint` (below). Spreading `...rest` into
        * postData would otherwise let a tool call opt itself into / pick a
        * stateful runtime even when statefulSessions is off. */
+      /* `intent` is a UI display label — never part of the wire body. */
       const {
         lang,
         code,
+        intent: _ignoredIntent,
         runtime_session_hint: _ignoredModelHint,
         ...rest
       } = rawInput as {
         lang: SupportedLanguage;
         code: string;
+        intent?: unknown;
         runtime_session_hint?: unknown;
         args?: string[];
       };
       void _ignoredModelHint;
+      void _ignoredIntent;
       /**
        * Extract session context from config.toolCall (injected by ToolNode).
        * - session_id: associates with the previous run.

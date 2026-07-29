@@ -7,6 +7,7 @@ import type {
 import type { Logger } from 'winston';
 import type { MultiAgentGraph, StandardGraph } from '@/graphs';
 import type * as t from '@/types';
+import { dispatchesChatModelStream, SDK_STREAM_DISPATCH } from '@/stream';
 import { Constants } from '@/common';
 
 export class HandlerRegistry {
@@ -36,7 +37,7 @@ export function composeEventHandlers(
         composed[eventType] = handler;
         continue;
       }
-      composed[eventType] = {
+      const wrapper: t.EventHandler = {
         handle: async (
           ...args: Parameters<t.EventHandler['handle']>
         ): Promise<void> => {
@@ -44,6 +45,19 @@ export function composeEventHandlers(
           await handler.handle(...args);
         },
       };
+      /**
+       * Carry the stream-dispatch brand across the wrapper. Without this a
+       * composed handler fails every capability check made about it — notably
+       * the one deciding whether a run may seal — even though it still drives
+       * the SDK's content-part dispatch.
+       */
+      if (
+        dispatchesChatModelStream(previous) ||
+        dispatchesChatModelStream(handler)
+      ) {
+        Object.defineProperty(wrapper, SDK_STREAM_DISPATCH, { value: true });
+      }
+      composed[eventType] = wrapper;
     }
   }
 

@@ -24,6 +24,7 @@ import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { getCodeBaseURL } from './CodeExecutor';
 import { Constants } from '@/common';
 
@@ -51,6 +52,7 @@ const MCP_SERVER_DESCRIPTION =
 export const ToolSearchToolSchema = {
   type: 'object',
   properties: {
+    intent: { ...INTENT_PROPERTY },
     query: {
       type: 'string',
       maxLength: MAX_PATTERN_LENGTH,
@@ -117,6 +119,7 @@ function createToolSearchSchema(mode: t.ToolSearchMode): ToolSearchSchema {
   return {
     type: 'object',
     properties: {
+      intent: { ...INTENT_PROPERTY },
       query: {
         type: 'string',
         maxLength: MAX_PATTERN_LENGTH,

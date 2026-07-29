@@ -1,3 +1,5 @@
+import { INTENT_PROPERTY } from '@/tools/intentArg';
+
 export enum DATE_RANGE {
   PAST_HOUR = 'h',
   PAST_24_HOURS = 'd',
@@ -71,6 +73,7 @@ export const newsSchema = {
 export const WebSearchToolSchema = {
   type: 'object',
   properties: {
+    intent: { ...INTENT_PROPERTY },
     query: querySchema,
     date: dateSchema,
     country: countrySchema,
