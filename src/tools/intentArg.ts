@@ -84,6 +84,18 @@ export function isIntentLabelProperty(property: unknown): boolean {
 }
 
 /**
+ * Schema shape accepted by {@link withoutIntent}.
+ *
+ * `required` is widened to `readonly string[]` because the SDK's own native
+ * schemas are declared `as const` — their `required` is a readonly tuple, and
+ * a mutable `string[]` parameter would reject the very schemas this helper
+ * exists for (TS2345), forcing embedders to cast to use the advertised API.
+ */
+export type IntentStrippableSchema = Omit<JsonSchemaType, 'required'> & {
+  required?: readonly string[];
+};
+
+/**
  * Returns a copy of `parameters` without the injected intent LABEL — the
  * opt-out for consumers that render no status label and should not pay for
  * the property.
@@ -92,14 +104,33 @@ export function isIntentLabelProperty(property: unknown): boolean {
  * an embedder has no lever at all: `withIntent` is applied at module scope.
  * Marker-guarded, so a tool's own business parameter named `intent` is never
  * removed. Returns the input unchanged when there is nothing to strip.
+ *
+ * `required` is pruned alongside the property: a schema that lists `intent`
+ * as required (strict-mode normalization does exactly that, since OpenAI
+ * strict function schemas require every property to appear in `required`)
+ * would otherwise be left naming a property it no longer declares, which is
+ * invalid JSON Schema and gets rejected by the provider instead of quietly
+ * opting out.
  */
-export function withoutIntent(parameters?: JsonSchemaType): JsonSchemaType | undefined {
+export function withoutIntent(parameters?: IntentStrippableSchema): JsonSchemaType | undefined {
   const props = parameters?.properties;
   if (parameters == null || props == null || !isIntentLabelProperty(props[INTENT_ARG])) {
-    return parameters;
+    return parameters as JsonSchemaType | undefined;
   }
   const { [INTENT_ARG]: _omit, ...rest } = props;
-  return { ...parameters, properties: rest };
+  const next: JsonSchemaType = {
+    ...(parameters as JsonSchemaType),
+    properties: rest,
+  };
+  if (parameters.required != null) {
+    const required = parameters.required.filter((key) => key !== INTENT_ARG);
+    if (required.length > 0) {
+      next.required = required;
+    } else {
+      delete next.required;
+    }
+  }
+  return next;
 }
 
 /**

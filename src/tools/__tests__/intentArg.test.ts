@@ -13,6 +13,7 @@ import {
   readOutcomeFields,
   resolveToolOutcome,
 } from '../intentArg';
+import { ReadFileToolSchema } from '../ReadFile';
 
 describe('withIntent', () => {
   const base: JsonSchemaType = {
@@ -113,6 +114,39 @@ describe('withoutIntent', () => {
     const plain: JsonSchemaType = { type: 'object', properties: { q: { type: 'string' } } };
     expect(withoutIntent(plain)).toBe(plain);
     expect(withoutIntent(undefined)).toBeUndefined();
+  });
+
+  it('prunes intent from `required` too, so the schema stays valid', () => {
+    /** Strict-mode normalization lists every property in `required`; leaving
+     *  a dangling entry yields invalid JSON Schema the provider rejects. */
+    const strict: JsonSchemaType = {
+      type: 'object',
+      properties: { intent: { ...INTENT_PROPERTY }, path: { type: 'string' } },
+      required: ['intent', 'path'],
+    };
+    const stripped = withoutIntent(strict);
+    expect(Object.keys(stripped?.properties ?? {})).toEqual(['path']);
+    expect(stripped?.required).toEqual(['path']);
+  });
+
+  it('drops `required` entirely when intent was its only entry', () => {
+    const onlyIntent: JsonSchemaType = {
+      type: 'object',
+      properties: { intent: { ...INTENT_PROPERTY } },
+      required: ['intent'],
+    };
+    const stripped = withoutIntent(onlyIntent);
+    expect(stripped?.required).toBeUndefined();
+    expect(Object.keys(stripped?.properties ?? {})).toEqual([]);
+  });
+
+  it('accepts a readonly `as const` native schema without a cast', () => {
+    /** ReadFileToolSchema is declared `as const`, so `required` is a readonly
+     *  tuple — this call is the compile-time assertion that the advertised
+     *  opt-out is usable on the schemas it exists for. */
+    const stripped = withoutIntent(ReadFileToolSchema);
+    expect(Object.keys(stripped?.properties ?? {})).toEqual(['path']);
+    expect(stripped?.required).toEqual(['path']);
   });
 
   it('round-trips with withIntent', () => {
