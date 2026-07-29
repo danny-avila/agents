@@ -394,15 +394,30 @@ function computeSummaryTokenCount(
  * naming the first *retained* message makes that same message the anchor, so it
  * survives whole and everything before it is unambiguously covered.
  *
- * Messages generated mid-run carry reducer-assigned IDs matching no payload
- * entry. Readers cannot resolve those and fall back to positional semantics,
- * which is also what happens when this returns `undefined`.
+ * Injected and meta entries are skipped. `convertInjectedMessages` builds hook
+ * and skill-body context as `HumanMessage`s marked via `additional_kwargs`, and
+ * `messagesStateReducer` stamps them with a UUID that matches no payload entry
+ * — anchoring there would look resolvable at write time and silently degrade to
+ * positional trimming on read. Passing over them reaches a source-backed
+ * message when one follows.
+ *
+ * Anything still unresolvable on read — a mid-run tail with no payload-backed
+ * message at all — falls back to positional semantics, as does `undefined`.
  */
+function isInjectedContext(message: BaseMessage): boolean {
+  const { additional_kwargs: kwargs } = message;
+  return kwargs.isMeta === true || kwargs.source != null;
+}
+
 function resolveSummaryCoverage(
   messagesToRetain: BaseMessage[]
 ): t.SummaryCoverage | undefined {
   for (let i = 0; i < messagesToRetain.length; i++) {
-    const id = messagesToRetain[i].id?.trim();
+    const message = messagesToRetain[i];
+    if (isInjectedContext(message)) {
+      continue;
+    }
+    const id = message.id?.trim();
     if (id != null && id !== '') {
       return { retainedFromMessageId: id };
     }

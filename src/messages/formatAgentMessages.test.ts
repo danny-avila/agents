@@ -5076,6 +5076,73 @@ describe('formatAgentMessages', () => {
       expect(Object.keys(result.indexTokenCountMap ?? {})).toHaveLength(3);
     });
 
+    /** The tool call and its ToolMessage are still sent, so scaling the entry
+     *  down to the summary's share would hide nearly all of its tokens from
+     *  the pruner and let the request overflow the context window. */
+    it('keeps tool-call tokens when discounting a summary alongside them', () => {
+      const payload: TPayload = [
+        { messageId: 'm1', role: 'user', content: 'Covered question' },
+        { messageId: 'm2', role: 'user', content: 'Retained question' },
+        {
+          messageId: 'm3',
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
+              tokenCount: 120,
+              coverage: { retainedFromMessageId: 'm2' },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tc1',
+                name: 'search',
+                args: JSON.stringify({ q: 'x'.repeat(4000) }),
+                output: 'y'.repeat(4000),
+              },
+            },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 3000 });
+
+      const emittedTotal = Object.values(
+        result.indexTokenCountMap ?? {}
+      ).reduce((sum, value) => sum + value, 0);
+      expect(emittedTotal).toBeGreaterThan(2500);
+      expect(result.boundaryTokenAdjustment?.adjusted).toBeGreaterThan(2500);
+    });
+
+    it('leaves the count alone when retained parts cannot be measured', () => {
+      const payload: TPayload = [
+        { messageId: 'm1', role: 'user', content: 'Covered question' },
+        { messageId: 'm2', role: 'user', content: 'Retained question' },
+        {
+          messageId: 'm3',
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
+              tokenCount: 120,
+              coverage: { retainedFromMessageId: 'm2' },
+            },
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,x' },
+            },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 900 });
+
+      expect(result.indexTokenCountMap?.[1]).toBe(900);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
+    });
+
     /** The summary text is returned separately as `summary.tokenCount`, so
      *  leaving it in its own entry's count charges the prompt for it twice. */
     it('discounts the filtered summary text from its own entry', () => {

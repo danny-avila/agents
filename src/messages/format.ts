@@ -1353,6 +1353,19 @@ function applySummaryBoundary(
   };
 }
 
+function measureValueChars(value: unknown): number {
+  if (typeof value === 'string') {
+    return value.length;
+  }
+  if (value == null || typeof value !== 'object') {
+    return 0;
+  }
+  const measured = serializeStructuredValueBounded(value, 0).originalChars;
+  return measured === Number.MAX_SAFE_INTEGER
+    ? HARD_MAX_TOOL_RESULT_CHARS
+    : Math.min(measured, HARD_MAX_TOOL_RESULT_CHARS);
+}
+
 function contentPartCharLength(part: MessageContentComplex): number {
   const record = part as Record<string, unknown>;
   let len = 0;
@@ -1362,15 +1375,15 @@ function contentPartCharLength(part: MessageContentComplex): number {
   if (typeof record.thinking === 'string') {
     len += record.thinking.length;
   }
-  const { input } = record;
-  if (typeof input === 'string') {
-    len += input.length;
-  } else if (input != null && typeof input === 'object') {
-    const measured = serializeStructuredValueBounded(input, 0).originalChars;
-    len +=
-      measured === Number.MAX_SAFE_INTEGER
-        ? HARD_MAX_TOOL_RESULT_CHARS
-        : Math.min(measured, HARD_MAX_TOOL_RESULT_CHARS);
+  len += measureValueChars(record.input);
+  /** Tool calls nest their payload a level down, so measuring only the
+   *  top-level fields scores an entire tool turn as zero characters. */
+  const { tool_call: toolCall } = record;
+  if (toolCall != null && typeof toolCall === 'object') {
+    const call = toolCall as Record<string, unknown>;
+    len += measureValueChars(call.name);
+    len += measureValueChars(call.args);
+    len += measureValueChars(call.output);
   }
   return len;
 }
@@ -1849,14 +1862,21 @@ export const formatAgentMessages = (
         const content = payload[originalIndex]
           .content as MessageContentComplex[];
         let retainedCharLen = 0;
+        let retainedParts = 0;
         for (let p = 0; p < content.length; p++) {
           if (content[p]?.type !== ContentTypes.SUMMARY) {
             retainedCharLen += contentPartCharLength(content[p]);
+            retainedParts++;
           }
         }
         const summaryCharLen = summaryCharsByIndex.get(originalIndex) ?? 0;
         const totalCharLen = retainedCharLen + summaryCharLen;
-        if (summaryCharLen > 0 && totalCharLen > 0) {
+        /** Retained parts that measure as nothing mean the content is a shape
+         *  the char heuristic cannot see, not that it is absent — scaling on
+         *  that would erase a real payload's tokens. Keeping the original
+         *  over-counts, which prunes early rather than overflowing. */
+        const retainedIsMeasurable = retainedParts === 0 || retainedCharLen > 0;
+        if (summaryCharLen > 0 && totalCharLen > 0 && retainedIsMeasurable) {
           const original = tokenCount;
           tokenCount = Math.max(
             1,
