@@ -282,7 +282,7 @@ describe('resolveToolOutcome', () => {
     ).toBe('Search failed for OAuth handling');
   });
 
-  it('never falls back to the mechanical transform on a failed call', () => {
+  it('never reuses the in-flight intent as a failed call\'s settled label', () => {
     expect(
       resolveToolOutcome(
         args,

@@ -145,8 +145,14 @@ export type ProcessedToolCall = {
   /**
    * Settled label for the call, resolved from the tool-supplied
    * `outcome`/`outcome_patch` result fields against the model-authored
-   * `intent` arg. Only present when the tool authored one — hosts apply
-   * the mechanical intent transform themselves when absent.
+   * `intent` arg. Present ONLY when the tool authored one.
+   *
+   * When absent, display the `intent` arg unchanged — do NOT rewrite its
+   * tense. A gerund→past-tense rewrite can only be a closed list of English
+   * verbs, so it never fires for the non-English labels this feature expects
+   * and fires for some sibling calls but not others within one group.
+   * Completion belongs to UI state (the shimmer stopping, the icon settling),
+   * which is language-neutral and always consistent.
    */
   outcome?: string;
 };
