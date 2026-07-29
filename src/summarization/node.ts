@@ -394,19 +394,21 @@ function computeSummaryTokenCount(
  * naming the first *retained* message makes that same message the anchor, so it
  * survives whole and everything before it is unambiguously covered.
  *
- * Injected and meta entries are skipped. `convertInjectedMessages` builds hook
- * and skill-body context as `HumanMessage`s marked via `additional_kwargs`, and
- * `messagesStateReducer` stamps them with a UUID that matches no payload entry
- * — anchoring there would look resolvable at write time and silently degrade to
- * positional trimming on read. Passing over them reaches a source-backed
- * message when one follows.
+ * In-run context is skipped: hook output and anything flagged `isMeta` is
+ * created during the run, so `messagesStateReducer` stamps it with a UUID no
+ * payload entry carries and anchoring there would degrade to positional
+ * trimming on read.
  *
- * Anything still unresolvable on read — a mid-run tail with no payload-backed
- * message at all — falls back to positional semantics, as does `undefined`.
+ * The check is deliberately narrow. A steer carries `source: 'steer'` but is
+ * replayed by `formatAgentMessages` from a payload entry and stamped with its
+ * ID, so it is a valid anchor — treating every non-null `source` as synthetic
+ * would skip it and drop the retained steer this coverage exists to protect.
+ * Skipping too little only costs an unresolvable anchor, which falls back to
+ * positional semantics; skipping too much loses history.
  */
 function isInjectedContext(message: BaseMessage): boolean {
   const { additional_kwargs: kwargs } = message;
-  return kwargs.isMeta === true || kwargs.source != null;
+  return kwargs.isMeta === true || kwargs.source === 'hook';
 }
 
 function resolveSummaryCoverage(

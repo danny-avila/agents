@@ -1028,8 +1028,30 @@ describe('recency window — first-turn protection', () => {
       const summaryBlock = await runCompaction([
         new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
         new AIMessage({ content: 'pre-steer reply', id: 'm2' }),
-        new HumanMessage({ content: 'steer', id: 'm2' }),
+        new HumanMessage({
+          content: 'steer',
+          id: 'm2',
+          additional_kwargs: { role: 'user', source: 'steer' },
+        }),
         new AIMessage({ content: 'post-steer reply', id: 'm2' }),
+      ]);
+
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm2' });
+    });
+
+    /** A steer carries `source: 'steer'` but is replayed from a payload entry
+     *  and stamped with its ID, so it is a valid anchor. When compaction lands
+     *  before any post-steer message exists it is the *only* retained entry —
+     *  treating every marked message as synthetic drops it. */
+    it('anchors on a retained steer with no post-steer message', async () => {
+      const summaryBlock = await runCompaction([
+        new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+        new AIMessage({ content: 'pre-steer reply', id: 'm2' }),
+        new HumanMessage({
+          content: 'steer',
+          id: 'm2',
+          additional_kwargs: { role: 'user', source: 'steer' },
+        }),
       ]);
 
       expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm2' });
@@ -1060,7 +1082,11 @@ describe('recency window — first-turn protection', () => {
     it('anchors on the straddling id when it is the only source', async () => {
       const summaryBlock = await runCompaction([
         new AIMessage({ content: 'pre-steer reply', id: 'm1' }),
-        new HumanMessage({ content: 'steer', id: 'm1' }),
+        new HumanMessage({
+          content: 'steer',
+          id: 'm1',
+          additional_kwargs: { role: 'user', source: 'steer' },
+        }),
         new AIMessage({ content: 'post-steer reply', id: 'm1' }),
       ]);
 
