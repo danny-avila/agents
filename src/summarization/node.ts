@@ -405,6 +405,12 @@ function computeSummaryTokenCount(
  * would skip it and drop the retained steer this coverage exists to protect.
  * Skipping too little only costs an unresolvable anchor, which falls back to
  * positional semantics; skipping too much loses history.
+ *
+ * Known limitation: a payload entry that omits `messageId` is never stamped, so
+ * the reducer's UUID is recorded and cannot resolve on the next run. There is
+ * no write-time fix — such an entry has no stable ID to name in the next
+ * payload either — and the reader's positional fallback is what `main` already
+ * does, so the anchor degrades rather than misleads.
  */
 function isInjectedContext(message: BaseMessage): boolean {
   const { additional_kwargs: kwargs } = message;
