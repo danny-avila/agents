@@ -37,8 +37,8 @@ export function truncateForLabel(value: string, maxLength: number): string {
  * Reduces a committed label to bounded single-line data.
  *
  * Sections in this prompt are delimited by blank lines, so a label carrying
- * embedded newlines could otherwise forge an apparent `Tool calls:` or
- * `Label:` section. Unlike every other input here, previous labels re-enter
+ * embedded newlines could otherwise forge an apparent entries section or
+ * `Header:` cue. Unlike every other input here, previous labels re-enter
  * the prompt on EVERY later batch, so one malformed result — plain model
  * noncompliance, or injection surfacing through a tool result — would
  * persistently steer unrelated later labels rather than affecting one. The
@@ -47,7 +47,10 @@ export function truncateForLabel(value: string, maxLength: number): string {
  * model's window and starve the run of labels entirely.
  */
 function sanitizePreviousLabel(label: string): string {
-  return truncateForLabel(label.replace(/\s+/g, ' ').trim(), PREVIOUS_LABEL_LIMIT);
+  return truncateForLabel(
+    label.replace(/\s+/g, ' ').trim(),
+    PREVIOUS_LABEL_LIMIT
+  );
 }
 
 const ABORT_SERIALIZATION = Symbol('abort-label-serialization');
@@ -150,7 +153,11 @@ export function buildActivityLabelPrompt({
    *  mean an earlier header may have been generated under ANOTHER agent's
    *  weaker policy — so they share the excerpts' wholesale drop rather than
    *  letting a handoff leak a looser agent's phrasing into this trace. */
-  if (!excerptsRedacted && previousLabels != null && previousLabels.length > 0) {
+  if (
+    !excerptsRedacted &&
+    previousLabels != null &&
+    previousLabels.length > 0
+  ) {
     const recent = previousLabels
       .slice(-MAX_PREVIOUS_LABELS)
       .map(sanitizePreviousLabel)
@@ -192,7 +199,14 @@ export function buildActivityLabelPrompt({
     const shown = entries.slice(0, MAX_PROMPT_ENTRIES);
     const omitted = entries.length - shown.length;
     sections.push(
-      'Tool calls:\n' +
+      /** Frames the list as reference material, not the thing to
+       *  transcribe. Ported from LibreChat's fallback builder (its
+       *  runtime.ts documents that without this the model "hands back a
+       *  transcription" of the list) after the eval harness measured it
+       *  across three independent sweeps: fewer template-redundancy and
+       *  length violations than a bare `Tool calls:` heading, with no
+       *  per-case regressions (agents #360). */
+      'What it called, and what came back (do not restate these):\n' +
         shown
           .map((entry) => {
             const input = clip(
@@ -220,6 +234,9 @@ export function buildActivityLabelPrompt({
           : '')
     );
   }
-  sections.push('Label:');
+  /** The fallback builder's terminal cue, measured alongside the heading
+   *  (same sweeps). The default system prompt already describes the
+   *  output as "the header of a collapsed activity group". */
+  sections.push('Header:');
   return sections.join('\n\n');
 }
