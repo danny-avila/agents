@@ -8,7 +8,6 @@ import type {
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { LLMResult, Generation } from '@langchain/core/outputs';
 import type { Command } from '@langchain/langgraph';
-import type OpenAITypes from 'openai';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
 import type { ToolEndEvent } from '@/types/tools';
@@ -68,13 +67,14 @@ export type RunStep = {
   runId?: string; // #new
   agentId?: string; // #new - tracks which agent this step belongs to
   /**
-   * Group ID - incrementing number (1, 2, 3...) reflecting execution order.
-   * Agents with the same groupId run in parallel and should be rendered together.
-   * undefined means the agent runs sequentially (not part of any parallel group).
+   * Opaque positive safe-integer identifier for parallel execution.
+   * Agents with the same groupId should be rendered together.
+   * Consumers must use content indexes, not groupId ordering, for execution order.
+   * undefined means the agent runs sequentially (not part of a parallel group).
    *
    * Example for: researcher -> [analyst1, analyst2, analyst3] -> summarizer
    * - researcher: undefined (sequential)
-   * - analyst1, analyst2, analyst3: 1 (first parallel group)
+   * - analyst1, analyst2, analyst3: the same groupId (parallel group)
    * - summarizer: undefined (sequential)
    */
   groupId?: number; // #new
@@ -142,6 +142,19 @@ export type ProcessedToolCall = {
   id: string;
   output: string;
   progress: number;
+  /**
+   * Settled label for the call, resolved from the tool-supplied
+   * `outcome`/`outcome_patch` result fields against the model-authored
+   * `intent` arg. Present ONLY when the tool authored one.
+   *
+   * When absent, display the `intent` arg unchanged — do NOT rewrite its
+   * tense. A gerund→past-tense rewrite can only be a closed list of English
+   * verbs, so it never fires for the non-English labels this feature expects
+   * and fires for some sibling calls but not others within one group.
+   * Completion belongs to UI state (the shimmer stopping, the icon settling),
+   * which is language-neutral and always consistent.
+   */
+  outcome?: string;
 };
 
 export type ProcessedContent = {
@@ -191,6 +204,8 @@ export interface ExtendedMessageContent {
   type?: string;
   text?: string;
   input?: string;
+  /** Tool-call arguments on a v1 standard-content `tool_call` block. */
+  args?: ToolCallPart['args'];
   index?: string | number;
   id?: string;
   name?: string;
@@ -286,15 +301,29 @@ export type SummaryBoundary = {
   contentIndex: number;
 };
 
+/**
+ * Semantic extent of a summary: the first source message compaction retained
+ * verbatim, meaning everything before it is covered. Distinct from `boundary`,
+ * which records where the block was emitted — a retained recency tail sits
+ * *before* the block's own position, so position alone cannot say what the
+ * summary replaced.
+ *
+ * Anchored to the retained side rather than the covered side so that a source
+ * message expanding into several messages (a steer splits an assistant entry
+ * into pre-steer, steer, and post-steer entries sharing one ID) stays whole:
+ * such a message is the retained anchor and survives intact.
+ */
 export type SummaryCoverage = {
-  throughMessageId: string;
+  retainedFromMessageId: string;
 };
 
 export type SummaryContentBlock = {
   type: ContentTypes.SUMMARY;
   content?: MessageContentComplex[];
+  /** Injection budget: provider output-token space when usage was reported, plus
+   *  the wrapper added at injection time. Not comparable with per-message counts
+   *  such as `indexTokenCountMap`, which are in the consumer's own tokenizer. */
   tokenCount?: number;
-  /** Last source content covered by the summary. Separate from the block's UI location. */
   coverage?: SummaryCoverage;
   boundary?: SummaryBoundary;
   summaryVersion?: number;
@@ -339,7 +368,12 @@ export type ToolCallPart = {
   /** If provided, an identifier associated with the tool call */
   id?: string;
   /** If provided, the output of the tool call */
-  output?: string;
+  output?: ToolResultContent['content'];
+  /**
+   * Tool-authored settled label for the call (see `ProcessedToolCall.outcome`),
+   * preserved through aggregation so it survives persistence/reload.
+   */
+  outcome?: string;
   /** Auth URL */
   auth?: string;
   /** Expiration time */
@@ -395,46 +429,6 @@ export interface TMessage {
 }
 
 export type TPayload = Array<Partial<TMessage>>;
-
-export type CustomChunkDelta =
-  | null
-  | undefined
-  | (Partial<OpenAITypes.Chat.Completions.ChatCompletionChunk.Choice.Delta> & {
-      reasoning?: string | null;
-      reasoning_content?: string | null;
-    });
-export type CustomChunkChoice = Partial<
-  Omit<OpenAITypes.Chat.Completions.ChatCompletionChunk.Choice, 'delta'> & {
-    delta?: CustomChunkDelta;
-  }
->;
-export type CustomChunk = Partial<OpenAITypes.ChatCompletionChunk> & {
-  choices?: Partial<Array<CustomChunkChoice>>;
-};
-
-export type SplitStreamHandlers = Partial<{
-  [GraphEvents.ON_RUN_STEP]: ({
-    event,
-    data,
-  }: {
-    event: GraphEvents;
-    data: RunStep;
-  }) => void;
-  [GraphEvents.ON_MESSAGE_DELTA]: ({
-    event,
-    data,
-  }: {
-    event: GraphEvents;
-    data: MessageDeltaEvent;
-  }) => void;
-  [GraphEvents.ON_REASONING_DELTA]: ({
-    event,
-    data,
-  }: {
-    event: GraphEvents;
-    data: ReasoningDeltaEvent;
-  }) => void;
-}>;
 
 export type SummarizeDeltaData = {
   id: string;

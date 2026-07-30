@@ -5,6 +5,7 @@ import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { EnvVar, Constants } from '@/common';
 
 export {
@@ -75,6 +76,7 @@ const SUPPORTED_LANGUAGES = [
 export const CodeExecutionToolSchema = {
   type: 'object',
   properties: {
+    intent: { ...INTENT_PROPERTY },
     lang: {
       type: 'string',
       enum: SUPPORTED_LANGUAGES,
@@ -111,6 +113,102 @@ const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 
 type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
+const MAX_RETRY_AFTER_SECONDS = 3600;
+
+export const CODE_API_UNAVAILABLE_ERROR_MESSAGE =
+  'Code execution is temporarily unavailable. Please retry.';
+export const CODE_API_AUTHORIZATION_ERROR_MESSAGE =
+  'Code execution is not authorized. Verify access before trying again.';
+export const CODE_API_EXECUTION_FAILED_ERROR_MESSAGE = 'Code execution failed.';
+export const CODE_API_INVALID_REQUEST_ERROR_MESSAGE =
+  'The code execution request was rejected. Please check the tool input and try again.';
+export const CODE_API_RATE_LIMITED_ERROR_MESSAGE =
+  'Code execution is temporarily rate-limited. Please retry shortly.';
+
+const SAFE_CODE_API_EXECUTION_ERROR_DETAILS: Readonly<
+  Partial<Record<string, string>>
+> = {
+  'Execution failed or timed out': 'Execution failed or timed out.',
+  'Out of memory': 'Execution exceeded the memory limit.',
+  'Time limit exceeded': 'Execution exceeded the time limit.',
+  'sandbox emitted an empty pending tool call block; aborting to avoid a tight retry loop':
+    'Generated code emitted an invalid empty tool request.',
+  'stderr length exceeded': 'Execution error output exceeded the size limit.',
+  'stdout length exceeded': 'Execution output exceeded the size limit.',
+};
+
+export class CodeApiRequestError extends Error {
+  constructor(message = CODE_API_UNAVAILABLE_ERROR_MESSAGE) {
+    super(message);
+    this.name = 'CodeApiRequestError';
+  }
+}
+
+function getRetryAfterSeconds(responseBody: string): number | undefined {
+  try {
+    const parsed = JSON.parse(responseBody) as {
+      error?: unknown;
+      retry_after_seconds?: unknown;
+    };
+    if (
+      parsed.error !== 'rate_limited' ||
+      typeof parsed.retry_after_seconds !== 'number' ||
+      !Number.isFinite(parsed.retry_after_seconds) ||
+      parsed.retry_after_seconds <= 0
+    ) {
+      return undefined;
+    }
+    return Math.min(
+      Math.ceil(parsed.retry_after_seconds),
+      MAX_RETRY_AFTER_SECONDS
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+export function normalizeCodeApiRequestError(
+  error: unknown
+): CodeApiRequestError {
+  return error instanceof CodeApiRequestError
+    ? error
+    : new CodeApiRequestError();
+}
+
+function getSafeCodeApiExecutionErrorDetail(
+  error: unknown
+): string | undefined {
+  if (typeof error !== 'string') {
+    return undefined;
+  }
+  const exactMatch = SAFE_CODE_API_EXECUTION_ERROR_DETAILS[error];
+  if (exactMatch != null) {
+    return exactMatch;
+  }
+  if (/^Sandbox exited with code (?:-?\d{1,4}|unknown)$/.test(error)) {
+    return error.replace(/^Sandbox/, 'Execution');
+  }
+  if (/^Sandbox requested an unregistered tool: .+$/.test(error)) {
+    return 'Generated code requested a tool that is not available.';
+  }
+  return undefined;
+}
+
+export function buildCodeApiExecutionErrorMessage(response: {
+  error?: unknown;
+  stderr?: unknown;
+}): string {
+  const safeDetail = getSafeCodeApiExecutionErrorDetail(response.error);
+  const message =
+    safeDetail != null
+      ? `${CODE_API_EXECUTION_FAILED_ERROR_MESSAGE} ${safeDetail}`
+      : CODE_API_EXECUTION_FAILED_ERROR_MESSAGE;
+  if (typeof response.stderr === 'string' && response.stderr !== '') {
+    return `${message}\n\nStderr:\n${response.stderr}`;
+  }
+  return message;
+}
+
 export async function resolveCodeApiAuthHeaders(
   authHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.CodeApiAuthHeaderMap> {
@@ -118,14 +216,19 @@ export async function resolveCodeApiAuthHeaders(
     return {};
   }
   if (typeof authHeaders === 'function') {
-    return authHeaders();
+    try {
+      const resolvedHeaders = await authHeaders();
+      return resolvedHeaders;
+    } catch {
+      throw new CodeApiRequestError(CODE_API_AUTHORIZATION_ERROR_MESSAGE);
+    }
   }
   return authHeaders;
 }
 
 export async function buildCodeApiHttpErrorMessage(
-  method: string,
-  endpoint: string,
+  _method: string,
+  _endpoint: string,
   response: { status: number; text: () => Promise<string> }
 ): Promise<string> {
   let responseBody = '';
@@ -134,9 +237,19 @@ export async function buildCodeApiHttpErrorMessage(
   } catch {
     responseBody = '';
   }
-  const body = responseBody.trim();
-  const bodySuffix = body === '' ? '' : `, body: ${body.slice(0, 1000)}`;
-  return `CodeAPI request failed: ${method} ${endpoint} returned ${response.status}${bodySuffix}`;
+  if (response.status === 429) {
+    const retryAfterSeconds = getRetryAfterSeconds(responseBody);
+    return retryAfterSeconds != null
+      ? `Code execution is temporarily rate-limited. Retry after ${retryAfterSeconds} seconds.`
+      : CODE_API_RATE_LIMITED_ERROR_MESSAGE;
+  }
+  if (response.status === 401 || response.status === 403) {
+    return CODE_API_AUTHORIZATION_ERROR_MESSAGE;
+  }
+  if (response.status === 400 || response.status === 422) {
+    return CODE_API_INVALID_REQUEST_ERROR_MESSAGE;
+  }
+  return CODE_API_UNAVAILABLE_ERROR_MESSAGE;
 }
 
 export const CodeExecutionToolDescription = `
@@ -150,16 +263,18 @@ Usage:
 `.trim();
 
 /**
- * Best-effort statefulness note. Deliberately hedged: warm reuse is an
- * optimization, not a guarantee (the runtime may be reset on idle timeout,
- * eviction, or the 8h VM lifetime), so the model must never depend on carried
- * state for correctness and must persist anything durable to /mnt/data.
+ * Statefulness here is FILESYSTEM-tier, not runtime-tier. Executions in a
+ * session reuse one warm machine, so `/mnt/data` carries across calls — but
+ * every execution is a brand-new interpreter process in a fresh sandbox, so
+ * variables and imports never survive. The note must not imply otherwise: a
+ * model told its in-memory state persists writes `df = ...` in one call and
+ * `df.head()` in the next, then hits a NameError it was told to treat as rare.
  */
 export const STATEFUL_ENV_NOTE =
-  'Session state (best-effort): consecutive executions in this conversation usually share one runtime, so variables, imports, and in-memory data from earlier successful calls are typically still available. The runtime may be reset at any time, so treat carried-over state as an optimization, never a guarantee. Anything that must survive MUST be written to /mnt/data. If a NameError/ImportError signals lost state, re-run the needed setup and continue.';
+  'Session state: executions in this conversation run on the same warm machine, so files persist between calls — but each execution is a NEW process. Variables, imports, and in-memory data NEVER carry over: every call must re-import and rebuild the state it needs. Only /mnt/data is durable (the machine itself may also be reset at any time), so write anything that must survive there and read it back next call.';
 
 export const StatefulCodeExecutionToolDescription = `
-Runs code and returns stdout/stderr output from a session-based execution environment, similar to a long-running command-line session.
+Runs code and returns stdout/stderr output. Executions in this conversation share one warm machine with a persistent /mnt/data, but each execution runs as a separate process (not a notebook-style kernel).
 
 ${STATEFUL_ENV_NOTE}
 
@@ -181,7 +296,7 @@ export function buildCodeExecutionToolDescription(opts?: {
 const STATELESS_CODE_PARAM_NOTE =
   'The environment is stateless; variables and imports don\'t persist between executions.';
 const STATEFUL_CODE_PARAM_NOTE =
-  'Executions in this conversation usually share one runtime: variables and imports from prior successful calls are typically still defined, but the runtime may reset between calls. Rebuild state on NameError/ImportError; persist anything important to /mnt/data.';
+  'Executions in this conversation share one warm machine, so files written to /mnt/data persist between calls. Each execution is a new process: variables and imports do NOT carry over — re-import and reload from /mnt/data every call.';
 
 export function buildCodeExecutionToolSchema(opts?: {
   statefulSessions?: boolean;
@@ -233,18 +348,22 @@ function createCodeExecutionTool(
        * injected `_runtime_session_hint` (below). Spreading `...rest` into
        * postData would otherwise let a tool call opt itself into / pick a
        * stateful runtime even when statefulSessions is off. */
+      /* `intent` is a UI display label — never part of the wire body. */
       const {
         lang,
         code,
+        intent: _ignoredIntent,
         runtime_session_hint: _ignoredModelHint,
         ...rest
       } = rawInput as {
         lang: SupportedLanguage;
         code: string;
+        intent?: unknown;
         runtime_session_hint?: unknown;
         args?: string[];
       };
       void _ignoredModelHint;
+      void _ignoredIntent;
       /**
        * Extract session context from config.toolCall (injected by ToolNode).
        * - session_id: associates with the previous run.
@@ -312,7 +431,7 @@ function createCodeExecutionTool(
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {
-          throw new Error(
+          throw new CodeApiRequestError(
             await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
           );
         }
@@ -356,7 +475,7 @@ function createCodeExecutionTool(
         ];
       } catch (error) {
         const messageWithReminder = appendFailedExecutionFileReminder(
-          (error as Error | undefined)?.message ?? '',
+          normalizeCodeApiRequestError(error).message,
           code
         );
         throw new Error(`Execution error:\n\n${messageWithReminder}`);

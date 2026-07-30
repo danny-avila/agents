@@ -19,6 +19,7 @@ import type { GoogleClientOptions, GoogleThinkingConfig } from '@/types';
 import {
   convertResponseContentToChatGenerationChunk,
   convertBaseMessagesToContent,
+  dropUnsupportedModelTurnPrefill,
   mapGenerateContentResultToChatResult,
 } from './utils/common';
 
@@ -254,6 +255,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       this.client.systemInstruction = systemInstruction;
       actualPrompt = prompt.slice(1);
     }
+    actualPrompt = dropUnsupportedModelTurnPrefill(actualPrompt, this.model);
     const parameters = this.invocationParams(options);
     const request = {
       ...parameters,
@@ -308,6 +310,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       this.client.systemInstruction = systemInstruction;
       actualPrompt = prompt.slice(1);
     }
+    actualPrompt = dropUnsupportedModelTurnPrefill(actualPrompt, this.model);
     const parameters = this.invocationParams(options);
     const request = {
       ...parameters,

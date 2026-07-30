@@ -65,13 +65,24 @@ describe('buildBashExecutionToolDescription', () => {
       ).toBe(StatefulBashExecutionToolDescription);
     });
 
-    it('hedges: usually-persists but may-reset, and only /mnt/data is durable', () => {
+    /* Filesystem-tier only: each call runs in a fresh sandbox (new process
+     * tree + private /tmp), so background processes are reaped and non-
+     * /mnt/data writes are discarded. The description must not promise
+     * otherwise. */
+    it('promises /mnt/data persistence WITHOUT promising surviving processes or /tmp', () => {
       const d = StatefulBashExecutionToolDescription;
-      expect(d).toContain('usually');
-      expect(d).toContain('may be reset');
+      expect(d).toContain('same warm machine');
       expect(d).toContain('Only /mnt/data is durable');
-      /* filesystem-tier, not shell-variable-tier */
-      expect(d).toContain('do not rely on shell variables');
+      expect(d).toContain('background processes do NOT survive');
+      expect(d).toContain('/tmp');
+    });
+
+    it('never claims /tmp or background processes persist between calls', () => {
+      const d = StatefulBashExecutionToolDescription;
+      expect(d).not.toContain('files (including /tmp)');
+      expect(d).not.toContain(
+        'background processes from earlier calls typically persist'
+      );
     });
 
     it('keeps the artifact-path guidance in both variants', () => {

@@ -30,7 +30,11 @@ import type {
   MessageDeltaEvent,
   ReasoningDeltaEvent,
 } from '@/types/stream';
-import type { TokenCounter, TokenBudgetBreakdown } from '@/types/run';
+import type {
+  TokenCounter,
+  StreamPreemption,
+  TokenBudgetBreakdown,
+} from '@/types/run';
 import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
@@ -346,6 +350,13 @@ export type StandardGraphInput = {
    * hook inputs carry only `executingAgentId`.
    */
   subagentScope?: boolean;
+  /**
+   * Cooperative preemption, forwarded from `RunConfig.preemption`. Only ever
+   * set on the top-level graph: a steer targets the conversation, so subagent
+   * children must run to completion and `buildChildInputs` does not propagate
+   * this field.
+   */
+  preemption?: StreamPreemption;
 };
 
 export type GraphEdge = {
@@ -534,9 +545,9 @@ export type LangfuseToolOutputTracingConfig = {
 
 export type LangfuseToolNodeTracingConfig = {
   /**
-   * Overrides ToolNode callback tracing. ToolNode spans are exported by the
-   * env-backed Langfuse callback, so this only enables tracing when that
-   * callback is configured.
+   * Opts into the internal ToolNode batch observation. Graph tool-dispatch
+   * and individual tool observations are exported without this wrapper, so
+   * the default is false to avoid a redundant hierarchy level.
    */
   enabled?: boolean;
 };
@@ -546,6 +557,13 @@ export interface LangfuseConfig {
   publicKey?: string;
   secretKey?: string;
   baseUrl?: string;
+  /**
+   * Environment identifier attached to exported traces (Langfuse
+   * `environment`). When unset, falls back to `LANGFUSE_TRACING_ENVIRONMENT`
+   * then `NODE_ENV`, so production traces are not collapsed under the
+   * `default` environment.
+   */
+  environment?: string;
   metadata?: Record<string, string | number | boolean | null | undefined>;
   /**
    * Internal OTLP span attributes to attach to Langfuse observations before

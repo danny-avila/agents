@@ -20,14 +20,23 @@ import type {
   MessageContentComplex,
   ReasoningContentText,
   SummaryContentBlock,
+  SummaryCoverage,
   ThinkingContentText,
   ToolCallContent,
+  ToolResultContent,
   ToolCallPart,
   TPayload,
   TMessage,
 } from '@/types';
+import {
+  compactToolContent,
+  getToolContentCharLength,
+  isAtomicToolContentBlock,
+  serializeStructuredValueBounded,
+} from '@/utils/toolContent';
 import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { Providers, ContentTypes, Constants } from '@/common';
 import { emitAgentLog } from '@/utils/events';
 
@@ -400,7 +409,8 @@ function hasMeaningfulAssistantContent(part: MessageContentComplex): boolean {
     part.type === ContentTypes.TOOL_CALL ||
     part.type === ContentTypes.ERROR ||
     part.type === ContentTypes.AGENT_UPDATE ||
-    part.type === ContentTypes.SUMMARY
+    part.type === ContentTypes.SUMMARY ||
+    part.type === ContentTypes.ACTIVITY_LABEL
   ) {
     return false;
   }
@@ -455,6 +465,34 @@ function hasToolCallOutput(part: MessageContentComplex): boolean {
   }
   const output = part.tool_call?.output;
   return output != null && output !== '';
+}
+
+function formatToolCallOutput(
+  output: ToolCallPart['output'] | undefined
+): MessageContent {
+  if (output == null) {
+    return '';
+  }
+  return compactToolContent(output, HARD_MAX_TOOL_RESULT_CHARS).content;
+}
+
+/**
+ * Content for the synthetic assistant turn that separates a trailing steer
+ * from the next user turn. Non-empty by necessity — see the push site.
+ */
+const STEER_ANCHOR_PLACEHOLDER = '_';
+
+/**
+ * True when an assistant message replayed as a steer and nothing followed it,
+ * so the emitted run ends on the steer's `HumanMessage`.
+ */
+function endsWithSteerMessage(
+  formatted: Array<RoleBearingMessage<BaseMessage>>
+): boolean {
+  if (formatted.length === 0) {
+    return false;
+  }
+  return formatted[formatted.length - 1].additional_kwargs.source === 'steer';
 }
 
 /**
@@ -716,7 +754,7 @@ function formatAssistantMessage(
             new ToolMessage({
               tool_call_id: tool_call.id ?? '',
               name: tool_call.name,
-              content: output != null ? output : '',
+              content: formatToolCallOutput(output),
             }),
             'tool'
           )
@@ -798,7 +836,8 @@ function formatAssistantMessage(
       } else if (
         part.type === ContentTypes.ERROR ||
         part.type === ContentTypes.AGENT_UPDATE ||
-        part.type === ContentTypes.SUMMARY
+        part.type === ContentTypes.SUMMARY ||
+        part.type === ContentTypes.ACTIVITY_LABEL
       ) {
         continue;
       } else {
@@ -914,6 +953,14 @@ function labelAllAgentContent(
 
   for (let i = 0; i < contentParts.length; i++) {
     const part = contentParts[i];
+    /** UI-only progress headers are not agent content and must not disturb
+     *  agent state: a label with no `agentIdMap` entry would otherwise read
+     *  as an agent change and flush the buffer mid-agent, splitting one
+     *  agent's contiguous content into two labeled blocks. Skipped before
+     *  any state transition below (mirrors the transfer path). */
+    if (part.type === ContentTypes.ACTIVITY_LABEL) {
+      continue;
+    }
     const agentId = agentIdMap[i];
 
     // If agent changed, flush previous buffer
@@ -1037,6 +1084,14 @@ export const labelContentByAgent = (
 
   for (let i = 0; i < contentParts.length; i++) {
     const part = contentParts[i];
+    /** UI-only progress headers are not agent content and must not disturb
+     *  agent state: a label with no `agentIdMap` entry would otherwise look
+     *  like an agent change, flushing the buffer and resetting an open
+     *  transfer capture so the transferred agent's following chunks lose
+     *  their frame. Skipped before any state transition below. */
+    if (part.type === ContentTypes.ACTIVITY_LABEL) {
+      continue;
+    }
     const agentId = agentIdMap[i];
 
     // Check if this is a transfer tool call
@@ -1131,23 +1186,73 @@ function extractToolNamesFromSearchOutput(output: string): string[] {
   return [];
 }
 
-type ResolvedSummaryCoverage = {
-  messageIndex: number;
-  text: string;
-  tokenCount: number;
+/**
+ * How far back a persisted summary reaches.
+ *
+ * `coverage` is authoritative: the block named the first source message that
+ * compaction retained, so `messageIndex` is exclusive — everything before it is
+ * covered and it survives whole. `positional` is the legacy reading for blocks
+ * written before coverage existed (or whose anchor is no longer in the payload)
+ * — the block's own location is the boundary, which is why it cannot
+ * distinguish a retained tail from covered history.
+ */
+type SummaryBoundary =
+  | {
+      mode: 'coverage';
+      messageIndex: number;
+      text: string;
+      tokenCount: number;
+    }
+  | {
+      mode: 'positional';
+      messageIndex: number;
+      contentIndex: number;
+      text: string;
+      tokenCount: number;
+    };
+
+type SummaryTokenAdjustment = {
+  original: number;
+  adjusted: number;
+  remainingChars: number;
+  totalChars: number;
 };
 
-type SummaryValue = Pick<ResolvedSummaryCoverage, 'text' | 'tokenCount'>;
+type SummaryScan = {
+  boundary?: SummaryBoundary;
+};
 
-function scanLatestSummary(payload: TPayload): {
-  coverage?: ResolvedSummaryCoverage;
-  legacy?: SummaryValue;
-} {
-  let summaryCoverage: ResolvedSummaryCoverage | undefined;
-  let legacySummary: SummaryValue | undefined;
+function resolveCoverageIndex(
+  coverage: SummaryCoverage | undefined,
+  indexBySourceId: Map<string, number>,
+  summaryMessageIndex: number
+): number | undefined {
+  /** Persisted JSON, so the declared string type is not a runtime guarantee. */
+  if (typeof coverage?.retainedFromMessageId !== 'string') {
+    return undefined;
+  }
+  const retainedFromMessageId = coverage.retainedFromMessageId.trim();
+  if (retainedFromMessageId === '') {
+    return undefined;
+  }
+  const retainedIndex = indexBySourceId.get(retainedFromMessageId);
+  return retainedIndex != null && retainedIndex <= summaryMessageIndex
+    ? retainedIndex
+    : undefined;
+}
+
+function scanSummaryBlocks(payload: TPayload): SummaryScan {
+  let boundary: SummaryBoundary | undefined;
+  /** Filled as the scan advances, so a coverage lookup only ever resolves to a
+   *  message already passed — no second pass over the payload. */
+  const indexBySourceId = new Map<string, number>();
 
   for (let i = 0; i < payload.length; i++) {
     const message = payload[i];
+    const sourceMessageId = getSourceMessageId(message);
+    if (sourceMessageId != null) {
+      indexBySourceId.set(sourceMessageId, i);
+    }
     if (!Array.isArray(message.content)) {
       continue;
     }
@@ -1179,58 +1284,148 @@ function scanLatestSummary(payload: TPayload): {
         continue;
       }
 
-      // A newer malformed summary must not fall back to an older checkpoint;
-      // preserve raw history unless the latest summary resolves safely.
-      summaryCoverage = undefined;
-      legacySummary = undefined;
-      const summaryValue = {
-        text: summaryText,
-        tokenCount:
-          typeof summaryPart.tokenCount === 'number' &&
-          Number.isFinite(summaryPart.tokenCount)
-            ? summaryPart.tokenCount
-            : 0,
-      };
-      const coverage = summaryPart.coverage;
-      if (coverage == null) {
-        legacySummary = summaryValue;
-        continue;
-      }
-      if (typeof coverage.throughMessageId !== 'string') {
-        continue;
-      }
+      const tokenCount =
+        typeof summaryPart.tokenCount === 'number' &&
+        Number.isFinite(summaryPart.tokenCount)
+          ? summaryPart.tokenCount
+          : 0;
 
-      const boundaryMessageIndex = payload.findIndex(
-        (candidate) =>
-          getSourceMessageId(candidate) === coverage.throughMessageId
+      const retainedIndex = resolveCoverageIndex(
+        summaryPart.coverage,
+        indexBySourceId,
+        i
       );
-      if (boundaryMessageIndex < 0 || boundaryMessageIndex >= i) {
-        continue;
-      }
 
-      summaryCoverage = {
-        messageIndex: boundaryMessageIndex,
-        ...summaryValue,
-      };
+      boundary =
+        retainedIndex != null
+          ? {
+            mode: 'coverage',
+            messageIndex: retainedIndex,
+            text: summaryText,
+            tokenCount,
+          }
+          : {
+            mode: 'positional',
+            messageIndex: i,
+            contentIndex: j,
+            text: summaryText,
+            tokenCount,
+          };
     }
   }
 
-  return { coverage: summaryCoverage, legacy: legacySummary };
+  return { boundary };
 }
 
-function applySummaryCoverage(
+function applySummaryBoundary(
   message: Partial<TMessage>,
   messageIndex: number,
-  summaryCoverage?: ResolvedSummaryCoverage
+  summaryBoundary?: SummaryBoundary
 ): Partial<TMessage> | null {
-  if (!summaryCoverage) {
+  if (!summaryBoundary) {
     return message;
   }
 
-  if (messageIndex <= summaryCoverage.messageIndex) {
+  /** The boundary names the first retained message, so it is exclusive: that
+   *  message and everything after it — the recency tail included — stays
+   *  verbatim, and only genuinely covered history is dropped. Summary parts on
+   *  surviving messages are filtered later by `formatAssistantMessage`. */
+  if (summaryBoundary.mode === 'coverage') {
+    return messageIndex < summaryBoundary.messageIndex ? null : message;
+  }
+
+  if (messageIndex < summaryBoundary.messageIndex) {
     return null;
   }
-  return message;
+
+  if (
+    messageIndex !== summaryBoundary.messageIndex ||
+    !Array.isArray(message.content)
+  ) {
+    return message;
+  }
+
+  return {
+    ...message,
+    content: message.content.slice(summaryBoundary.contentIndex + 1),
+  };
+}
+
+/**
+ * Whether `formatAssistantMessage` filters this part out of the emitted message.
+ * Such a part contributes no prompt tokens, so measuring it as zero characters
+ * is accurate — it must not be mistaken for content the heuristic cannot see.
+ */
+function isDroppedByFormatting(
+  part: MessageContentComplex | undefined
+): boolean {
+  if (part == null) {
+    return true;
+  }
+  if (
+    part.type === ContentTypes.SUMMARY ||
+    part.type === ContentTypes.ERROR ||
+    part.type === ContentTypes.AGENT_UPDATE ||
+    part.type === ContentTypes.ACTIVITY_LABEL
+  ) {
+    return true;
+  }
+  return part.type === ContentTypes.TEXT && getTextContent(part).trim() === '';
+}
+
+function measureValueChars(value: unknown): number {
+  if (typeof value === 'string') {
+    return value.length;
+  }
+  if (value == null || typeof value !== 'object') {
+    return 0;
+  }
+  const measured = serializeStructuredValueBounded(value, 0).originalChars;
+  return measured === Number.MAX_SAFE_INTEGER
+    ? HARD_MAX_TOOL_RESULT_CHARS
+    : Math.min(measured, HARD_MAX_TOOL_RESULT_CHARS);
+}
+
+/**
+ * Whether a retained part's whole prompt cost is the text the char heuristic
+ * reads, making it safe to represent in a character ratio.
+ *
+ * An allowlist, not a denylist. Media, resources, and tool calls carry cost that
+ * is unrelated to their serialized length — a short image URL nested in
+ * `tool_call.output` stands in for a fixed four-figure media charge — and
+ * rejecting those case by case has repeatedly missed a nesting level. Listing
+ * the two shapes whose characters `contentPartCharLength` actually reads makes
+ * every other shape, present or future, ineligible by default: the ratio is
+ * skipped and the entry keeps its original count, which prunes early rather than
+ * exceeding the window.
+ */
+function isCharRatioEligible(part: MessageContentComplex | undefined): boolean {
+  if (part == null) {
+    return false;
+  }
+  return part.type === ContentTypes.TEXT || part.type === ContentTypes.THINKING;
+}
+
+function contentPartCharLength(part: MessageContentComplex): number {
+  const record = part as Record<string, unknown>;
+  let len = 0;
+  if (typeof record.text === 'string') {
+    len += record.text.length;
+  }
+  if (typeof record.thinking === 'string') {
+    len += record.thinking.length;
+  }
+  len += measureValueChars(record.input);
+  /** Tool calls nest their payload a level down, so measuring only the
+   *  top-level fields scores an entire tool turn as zero characters. */
+  const { tool_call: toolCall } = record;
+  if (toolCall != null && typeof toolCall === 'object') {
+    const call = toolCall as Record<string, unknown>;
+    len += measureValueChars(call.name);
+    len += measureValueChars(call.args);
+    len += measureValueChars(call.output);
+  }
+  return len;
 }
 
 /** Extracts the skillName from a skill tool_call's args (string or object). */
@@ -1279,6 +1474,9 @@ export const formatAgentMessages = (
   /** Cross-run summary extracted from the payload. Should be forwarded to the
    *  agent run so it can be included in the system message via AgentContext. */
   summary?: { text: string; tokenCount: number };
+  /** When a positional summary boundary sliced content from a message, the token
+   *  count was proportionally reduced. Returned so the caller can log it. */
+  boundaryTokenAdjustment?: SummaryTokenAdjustment;
 } => {
   const messages: Array<
     | RoleBearingMessage<HumanMessage>
@@ -1286,12 +1484,42 @@ export const formatAgentMessages = (
     | RoleBearingMessage<SystemMessage>
     | RoleBearingMessage<ToolMessage>
   > = [];
+  /**
+   * A steer ended the previous payload entry, so the next message emitted —
+   * whichever entry finally produces one — must be separated from it by an
+   * assistant turn. Held rather than emitted so an entry that produces
+   * nothing cannot leave the anchor stranded as the final turn.
+   */
+  let pendingSteerAnchor = false;
+  /**
+   * Emits the deferred anchor ahead of `next` — the message about to be
+   * pushed. When that message is itself an assistant turn, it already IS the
+   * separation the anchor exists to synthesize, so the intent is simply
+   * discharged: emitting the placeholder anyway would put two assistant turns
+   * back to back, which strict-alternation providers can reject and nothing downstream
+   * repairs (`coalesceAdjacentUserTurns` merges user turns only).
+   */
+  const flushSteerAnchor = (next: { role?: LangChainMessageRole }): void => {
+    if (!pendingSteerAnchor) {
+      return;
+    }
+    pendingSteerAnchor = false;
+    if (next.role === 'assistant') {
+      return;
+    }
+    messages.push(
+      withMessageRole(
+        new AIMessage({ content: STEER_ANCHOR_PLACEHOLDER }),
+        'assistant'
+      )
+    );
+  };
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
+  let boundaryTokenAdjustment: SummaryTokenAdjustment | undefined;
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
-  const { coverage: summaryCoverage, legacy: legacySummary } =
-    scanLatestSummary(payload);
+  const { boundary: summaryBoundary } = scanSummaryBlocks(payload);
 
   // Summary metadata is returned to the caller so it can be forwarded to the
   // agent run and included in the single system message via AgentContext.
@@ -1309,7 +1537,7 @@ export const formatAgentMessages = (
   for (let i = 0; i < payload.length; i++) {
     const rawMessage = payload[i];
     const sourceMessageId = getSourceMessageId(rawMessage);
-    let message = applySummaryCoverage(rawMessage, i, summaryCoverage);
+    let message = applySummaryBoundary(rawMessage, i, summaryBoundary);
     if (!message) {
       indexMapping[i] = [];
       continue;
@@ -1340,6 +1568,7 @@ export const formatAgentMessages = (
       if (sourceMessageId != null && sourceMessageId !== '') {
         formattedMessage.id = sourceMessageId;
       }
+      flushSteerAnchor(formattedMessage);
       messages.push(formattedMessage);
 
       // Update the index mapping for this message
@@ -1523,7 +1752,48 @@ export const formatAgentMessages = (
         formattedMessage.id = sourceMessageId;
       }
     }
+    /**
+     * A steer that ends an assistant message leaves the replay on a
+     * `HumanMessage`. The next payload message is itself a user turn, so the
+     * sequence would reach the provider as two adjacent user turns — rejected
+     * by strict-alternation providers. Anchor it with a placeholder assistant
+     * turn.
+     *
+     * The placeholder must be NON-EMPTY. A string-content assistant message
+     * with no tool calls passes through `_convertMessagesToAnthropicPayload`
+     * verbatim — the empty-text repair there only covers array content and
+     * tool-call turns — so an empty anchor would reach Anthropic as
+     * `{role: 'assistant', content: ''}` and trade one invalid sequence for
+     * another. Same single-underscore convention the Anthropic converter
+     * already uses when it has to synthesize a non-empty block.
+     *
+     * Deferred rather than decided by lookahead. `i < payload.length - 1` only
+     * proves a later ENTRY exists, not that it EMITS: entries with empty
+     * content, and entries dropped by `applySummaryBoundary`, are skipped
+     * silently. A trailing steer followed only by those would get the anchor
+     * as the FINAL turn — an assistant prefill with no request after it, which
+     * the model may simply never answer. So the intent is recorded and flushed
+     * only when a message actually follows.
+     *
+     * Pushed AFTER the id stamping above, deliberately. `messagesStateReducer`
+     * treats a repeated id as replace-in-place, so an anchor carrying the
+     * shared `sourceMessageId` would overwrite the steer it exists to protect.
+     * Left unstamped, it reaches the reducer with a null id and is assigned a
+     * fresh one. `endsWithSteerMessage` reads only `additional_kwargs.source`,
+     * so the deferral cannot change which messages get anchored.
+     */
+    /**
+     * Guarded on emission: an assistant entry whose blocks all filtered away
+     * emits nothing, and flushing for it would strand the anchor as the final
+     * turn — the pending flag stays set for whichever entry emits next.
+     */
+    if (formattedMessages.length > 0) {
+      flushSteerAnchor(formattedMessages[0]);
+    }
     messages.push(...formattedMessages);
+    if (endsWithSteerMessage(formattedMessages)) {
+      pendingSteerAnchor = true;
+    }
 
     // Capture index range BEFORE skill body injection so injected
     // HumanMessages are excluded from the assistant's token distribution.
@@ -1575,22 +1845,91 @@ export const formatAgentMessages = (
         continue;
       }
 
-      const msgCount = resultIndices.length;
-      if (msgCount > 0 && Array.isArray(payload[originalIndex].content)) {
-        for (const part of payload[originalIndex]
-          .content as Array<MessageContentComplex | null>) {
-          if (part == null || part.type !== ContentTypes.SUMMARY) {
-            continue;
+      /**
+       * Coverage mode deliberately leaves the count alone, even though the entry
+       * holding the block is charged for summary text that `formatAssistantMessage`
+       * filters out and `summary.tokenCount` accounts separately.
+       *
+       * Discounting it needs the summary's cost in the same units as
+       * `indexTokenCountMap`, and that figure is not obtainable here: this
+       * function receives no tokenizer, and a count recorded at write time is in
+       * the writing run's units — `Run.create` derives its counter from the model
+       * in play, and a consumer may supply its own — so a conversation continued
+       * on a different model would subtract across encodings. Attempts to proxy
+       * it (character ratios, provider identity) all under-count some shape,
+       * which risks an over-context request; over-counting merely prunes early.
+       * Fixing it properly means passing the reader a tokenizer, which is a
+       * consumer-facing change and out of scope here.
+       */
+      if (
+        summaryBoundary?.mode === 'positional' &&
+        originalIndex === summaryBoundary.messageIndex &&
+        Array.isArray(payload[originalIndex].content)
+      ) {
+        const content = payload[originalIndex]
+          .content as MessageContentComplex[];
+        const { contentIndex } = summaryBoundary;
+        if (contentIndex >= 0 && contentIndex < content.length - 1) {
+          let totalCharLen = 0;
+          let remainingCharLen = 0;
+          /**
+           * The ratio applies only when *every* part of the entry is one whose
+           * token cost tracks its character length. A single ineligible part
+           * cancels the discount, whichever side of the boundary it sits on.
+           *
+           * Both sides can break it, in opposite directions. A retained image has
+           * its fixed cost scaled away, collapsing the entry. A removed base64
+           * payload inflates the denominator — serializing to a huge length while
+           * the counter charges a fixed estimate — dragging retained text below
+           * its real cost. Either way the request can exceed the window.
+           *
+           * Telling a text-bearing tool payload from a media-bearing one means
+           * recursing into arbitrary nested output, which has already missed a
+           * level twice here. Cancelling instead keeps the original count: an
+           * over-count that prunes early rather than overflowing. Entries of
+           * plain text and reasoning — the common shape — still proportion.
+           */
+          let everyRetainedPartMeasurable = true;
+          for (let p = 0; p < content.length; p++) {
+            const part = content[p];
+            const retained = p > contentIndex;
+
+            if (isDroppedByFormatting(part)) {
+              /** Removed summary text is real removed content: it is read as
+               *  plain text and belongs in the denominator. */
+              if (!retained && part.type === ContentTypes.SUMMARY) {
+                totalCharLen += contentPartCharLength(part);
+              }
+              continue;
+            }
+
+            const charLen = contentPartCharLength(part);
+            if (!isCharRatioEligible(part) || (retained && charLen === 0)) {
+              everyRetainedPartMeasurable = false;
+              break;
+            }
+            totalCharLen += charLen;
+            if (retained) {
+              remainingCharLen += charLen;
+            }
           }
-          const summaryTokenCount = (part as SummaryContentBlock).tokenCount;
-          if (
-            typeof summaryTokenCount === 'number' &&
-            Number.isFinite(summaryTokenCount)
-          ) {
-            tokenCount = Math.max(0, tokenCount - summaryTokenCount);
+          if (totalCharLen > 0 && everyRetainedPartMeasurable) {
+            const original = tokenCount;
+            tokenCount = Math.max(
+              1,
+              Math.round(tokenCount * (remainingCharLen / totalCharLen))
+            );
+            boundaryTokenAdjustment = {
+              original,
+              adjusted: tokenCount,
+              remainingChars: remainingCharLen,
+              totalChars: totalCharLen,
+            };
           }
         }
       }
+
+      const msgCount = resultIndices.length;
       if (msgCount === 1) {
         updatedIndexTokenCountMap[resultIndices[0]] = tokenCount;
         continue;
@@ -1633,7 +1972,14 @@ export const formatAgentMessages = (
             if (typeof args === 'string') {
               len += args.length;
             } else if (args != null) {
-              len += JSON.stringify(args).length;
+              const measured = serializeStructuredValueBounded(
+                args,
+                0
+              ).originalChars;
+              len +=
+                measured === Number.MAX_SAFE_INTEGER
+                  ? HARD_MAX_TOOL_RESULT_CHARS
+                  : Math.min(measured, HARD_MAX_TOOL_RESULT_CHARS);
             }
           }
         }
@@ -1661,19 +2007,15 @@ export const formatAgentMessages = (
     }
   }
 
-  let summary = summaryCoverage
-    ? { text: summaryCoverage.text, tokenCount: summaryCoverage.tokenCount }
-    : undefined;
-  if (summary == null && messages.length === 0) {
-    summary = legacySummary;
-  }
-
   return {
     messages,
     indexTokenCountMap: indexTokenCountMap
       ? updatedIndexTokenCountMap
       : undefined,
-    summary,
+    summary: summaryBoundary
+      ? { text: summaryBoundary.text, tokenCount: summaryBoundary.tokenCount }
+      : undefined,
+    boundaryTokenAdjustment,
   };
 };
 
@@ -1702,12 +2044,155 @@ export function shiftIndexTokenCountMap(
   return shiftedMap;
 }
 
-/** Block types that contain binary image data and must be preserved structurally. */
-const IMAGE_BLOCK_TYPES = new Set(['image_url', 'image']);
-
 /** Checks whether a BaseMessage is a tool-role message. */
 const isToolMessage = (m: BaseMessage): boolean =>
   m instanceof ToolMessage || ('role' in m && (m as any).role === 'tool');
+
+const PORTABLE_FOLDED_MEDIA_TYPES = new Set(['image', 'image_url']);
+const MAX_FOLDED_BLOCK_CHARS = 8_000;
+const MAX_FOLDED_CONTEXT_CHARS = HARD_MAX_TOOL_RESULT_CHARS;
+const MAX_FOLDED_CONTEXT_WORK = 100_000;
+const FOLDED_CONTEXT_TRUNCATION_NOTICE =
+  '… [additional folded context omitted]';
+const syntheticProviderContextMessages = new WeakSet<BaseMessage>();
+
+type FoldContextBudget = {
+  remainingChars: number;
+  remainingWork: number;
+  truncated: boolean;
+};
+
+function createFoldContextBudget(): FoldContextBudget {
+  return {
+    remainingChars: MAX_FOLDED_CONTEXT_CHARS,
+    remainingWork: MAX_FOLDED_CONTEXT_WORK,
+    truncated: false,
+  };
+}
+
+function readFoldedDataProperty(value: unknown, key: string): unknown {
+  if (value == null || typeof value !== 'object') {
+    return undefined;
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor != null && 'value' in descriptor
+      ? descriptor.value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Adds one logical line without first concatenating caller-controlled strings.
+ * The shared budget covers every synthetic message emitted by one transform,
+ * so many individually bounded blocks cannot build an unbounded aggregate.
+ */
+function appendFoldedLine(
+  textChunks: string[],
+  budget: FoldContextBudget,
+  pieces: readonly string[]
+): boolean {
+  if (budget.remainingChars <= 0) {
+    budget.truncated = true;
+    return false;
+  }
+
+  const separatorChars = textChunks.length > 0 ? 1 : 0;
+  const available = budget.remainingChars - separatorChars;
+  if (available <= 0) {
+    budget.remainingChars = 0;
+    budget.truncated = true;
+    return false;
+  }
+
+  let totalChars = 0;
+  for (const piece of pieces) {
+    totalChars = Math.min(Number.MAX_SAFE_INTEGER, totalChars + piece.length);
+  }
+  if (totalChars <= available) {
+    const line = pieces.join('');
+    textChunks.push(line);
+    budget.remainingChars -= separatorChars + line.length;
+    return true;
+  }
+
+  const notice = FOLDED_CONTEXT_TRUNCATION_NOTICE.slice(0, available);
+  let remainingHeadChars = Math.max(0, available - notice.length);
+  const boundedPieces: string[] = [];
+  for (const piece of pieces) {
+    if (remainingHeadChars <= 0) {
+      break;
+    }
+    const retained = piece.slice(0, remainingHeadChars);
+    boundedPieces.push(retained);
+    remainingHeadChars -= retained.length;
+  }
+  boundedPieces.push(notice);
+  textChunks.push(boundedPieces.join(''));
+  budget.remainingChars = 0;
+  budget.truncated = true;
+  return false;
+}
+
+function consumeFoldedWork(
+  textChunks: string[],
+  budget: FoldContextBudget
+): boolean {
+  if (budget.remainingChars <= 0) {
+    return false;
+  }
+  if (budget.remainingWork-- > 0) {
+    return true;
+  }
+  appendFoldedLine(textChunks, budget, [FOLDED_CONTEXT_TRUNCATION_NOTICE]);
+  budget.remainingChars = 0;
+  budget.truncated = true;
+  return false;
+}
+
+function serializeFoldedValue(value: unknown): string {
+  const compacted = compactToolContent(value, MAX_FOLDED_BLOCK_CHARS).content;
+  return typeof compacted === 'string'
+    ? compacted
+    : serializeStructuredValueBounded(compacted, MAX_FOLDED_BLOCK_CHARS)
+      .content;
+}
+
+function markSyntheticProviderContext<T extends BaseMessage>(message: T): T {
+  syntheticProviderContextMessages.add(message);
+  return message;
+}
+
+function appendSyntheticProviderContextMessage(
+  result: BaseMessage[],
+  parts: MessageContentComplex[]
+): boolean {
+  if (parts.length === 0) {
+    return false;
+  }
+  result.push(
+    markSyntheticProviderContext(
+      withMessageRole(
+        new HumanMessage({ content: toLangChainContent(parts) }),
+        'user'
+      )
+    )
+  );
+  return true;
+}
+
+/**
+ * Identifies provider-context placeholders created by this module without
+ * trusting user-controlled content prefixes or leaking marker metadata onto
+ * the provider wire.
+ */
+export function isSyntheticProviderContextMessage(
+  message: BaseMessage
+): boolean {
+  return syntheticProviderContextMessages.has(message);
+}
 
 /** Flushes accumulated text chunks into `parts` as a single text block. */
 function flushTextChunks(
@@ -1726,10 +2211,10 @@ function flushTextChunks(
 
 /**
  * Appends a single message's content to the running `textChunks` / `parts`
- * accumulators.  Image blocks are shallow-copied into `parts` as-is so that
- * binary data (base64 images) never becomes text tokens.  All other block
- * types are serialized to text — unrecognized types are JSON-serialized
- * rather than silently dropped.
+ * accumulators. Portable image blocks are shallow-copied into `parts` so
+ * binary data never becomes text tokens. Provider-specific media/resource
+ * blocks are retained as bounded text so a folded cross-provider history
+ * cannot contain an unsupported native block or JSON-expand without limit.
  *
  * When `content` is an array containing tool_use blocks, `tool_calls` is NOT
  * additionally serialized (avoiding double output).  `tool_calls` is used as
@@ -1739,73 +2224,245 @@ function appendMessageContent(
   msg: BaseMessage,
   role: string,
   textChunks: string[],
-  parts: MessageContentComplex[]
+  parts: MessageContentComplex[],
+  budget: FoldContextBudget
 ): void {
   const { content } = msg;
 
   if (typeof content === 'string') {
-    if (content) {
-      textChunks.push(`${role}: ${content}`);
+    if (content && consumeFoldedWork(textChunks, budget)) {
+      appendFoldedLine(textChunks, budget, [`${role}: `, content]);
     }
-    appendToolCalls(msg, role, textChunks);
+    appendToolCalls(msg, role, textChunks, budget);
     return;
   }
 
   if (!Array.isArray(content)) {
-    appendToolCalls(msg, role, textChunks);
+    appendToolCalls(msg, role, textChunks, budget);
     return;
   }
 
   let hasToolUseBlock = false;
 
   for (const block of content as ExtendedMessageContent[]) {
-    if (IMAGE_BLOCK_TYPES.has(block.type ?? '')) {
-      flushTextChunks(textChunks, parts);
-      parts.push({ ...block } as MessageContentComplex);
-      continue;
-    }
-
-    if (block.type === 'tool_use') {
+    if (!consumeFoldedWork(textChunks, budget)) {
       hasToolUseBlock = true;
-      textChunks.push(
-        `${role}: [tool_use] ${String(block.name ?? '')} ${JSON.stringify(block.input ?? {})}`
-      );
+      break;
+    }
+    const blockTypeValue = readFoldedDataProperty(block, 'type');
+    const blockType =
+      typeof blockTypeValue === 'string' ? blockTypeValue : undefined;
+
+    if (
+      blockType !== 'tool_use' &&
+      blockType !== 'tool_call' &&
+      blockType !== 'tool_result' &&
+      isAtomicToolContentBlock(block)
+    ) {
+      if (PORTABLE_FOLDED_MEDIA_TYPES.has(blockType ?? '')) {
+        const blockChars = getToolContentCharLength([block]);
+        if (blockChars > budget.remainingChars) {
+          appendFoldedLine(textChunks, budget, [
+            `${role}: [${blockType ?? 'media'} omitted: folded context limit]`,
+          ]);
+          continue;
+        }
+        flushTextChunks(textChunks, parts);
+        parts.push({ ...block } as MessageContentComplex);
+        budget.remainingChars -= blockChars;
+      } else {
+        appendFoldedLine(textChunks, budget, [
+          `${role}: [${blockType ?? 'media'}] `,
+          serializeFoldedValue(block),
+        ]);
+      }
       continue;
     }
 
-    const text = block.text ?? block.input;
+    if (blockType === 'tool_use') {
+      hasToolUseBlock = true;
+      const name = readFoldedDataProperty(block, 'name');
+      const input = readFoldedDataProperty(block, 'input');
+      appendFoldedLine(textChunks, budget, [
+        `${role}: [tool_use] ${typeof name === 'string' ? name : ''} `,
+        serializeFoldedValue(input ?? {}),
+      ]);
+      continue;
+    }
+
+    // A `tool_call` content block appears either as the v1 standard shape
+    // (`{ name, args }` at top level, which `@langchain/aws` maps to a Converse
+    // toolUse) or this repo's `ToolCallContent` (`{ tool_call: { name, args,
+    // output } }`, from `convertMessagesToContent` / persisted history). Handle
+    // both, and emit any embedded output, so the name/args/result survive.
+    if (blockType === 'tool_call') {
+      hasToolUseBlock = true;
+      const nested = readFoldedDataProperty(block, 'tool_call');
+      const nestedName = readFoldedDataProperty(nested, 'name');
+      const topLevelName = readFoldedDataProperty(block, 'name');
+      let name = '';
+      if (typeof nestedName === 'string') {
+        name = nestedName;
+      } else if (typeof topLevelName === 'string') {
+        name = topLevelName;
+      }
+      const nestedArgs = readFoldedDataProperty(nested, 'args');
+      const topLevelArgs = readFoldedDataProperty(block, 'args');
+      const rawArgs = nestedArgs ?? topLevelArgs ?? {};
+      const argsText =
+        typeof rawArgs === 'string' ? rawArgs : serializeFoldedValue(rawArgs);
+      appendFoldedLine(textChunks, budget, [
+        `${role}: [tool_use] ${name}${argsText ? ' ' : ''}`,
+        argsText,
+      ]);
+      const output = readFoldedDataProperty(nested, 'output');
+      if (output != null && output !== '') {
+        appendFoldedLine(textChunks, budget, [
+          'Tool: ',
+          typeof output === 'string' ? output : serializeFoldedValue(output),
+        ]);
+      }
+      continue;
+    }
+
+    // A `tool_result` content block (e.g. an AIMessage(tool_call) followed by a
+    // user message carrying the result). Preserve nested image blocks as-is
+    // instead of JSON-stringifying them through the generic fallback.
+    if (blockType === 'tool_result') {
+      hasToolUseBlock = true;
+      const inner = readFoldedDataProperty(block, 'content') as
+        | ToolResultContent['content']
+        | undefined;
+      if (typeof inner === 'string') {
+        if (inner) {
+          appendFoldedLine(textChunks, budget, [
+            `${role}: [tool_result] `,
+            inner,
+          ]);
+        }
+      } else if (Array.isArray(inner)) {
+        for (const innerBlock of inner as Array<
+          string | ExtendedMessageContent
+        >) {
+          if (!consumeFoldedWork(textChunks, budget)) {
+            break;
+          }
+          if (typeof innerBlock === 'string') {
+            if (innerBlock) {
+              appendFoldedLine(textChunks, budget, [
+                `${role}: [tool_result] `,
+                innerBlock,
+              ]);
+            }
+          } else {
+            const innerTypeValue = readFoldedDataProperty(innerBlock, 'type');
+            const innerType =
+              typeof innerTypeValue === 'string' ? innerTypeValue : undefined;
+            if (
+              isAtomicToolContentBlock(innerBlock) &&
+              PORTABLE_FOLDED_MEDIA_TYPES.has(innerType ?? '')
+            ) {
+              const blockChars = getToolContentCharLength([innerBlock]);
+              if (blockChars <= budget.remainingChars) {
+                flushTextChunks(textChunks, parts);
+                parts.push({ ...innerBlock } as MessageContentComplex);
+                budget.remainingChars -= blockChars;
+              } else {
+                appendFoldedLine(textChunks, budget, [
+                  `${role}: [${innerType ?? 'media'} omitted: folded context limit]`,
+                ]);
+              }
+            } else {
+              const textValue = readFoldedDataProperty(innerBlock, 'text');
+              const inputValue = readFoldedDataProperty(innerBlock, 'input');
+              const innerText = textValue ?? inputValue;
+              appendFoldedLine(textChunks, budget, [
+                `${role}: [tool_result] `,
+                typeof innerText === 'string' && innerText
+                  ? innerText
+                  : serializeFoldedValue(innerBlock),
+              ]);
+            }
+          }
+        }
+      } else if (inner != null) {
+        appendFoldedLine(textChunks, budget, [
+          `${role}: [tool_result] `,
+          serializeFoldedValue(inner),
+        ]);
+      }
+      continue;
+    }
+
+    const text =
+      readFoldedDataProperty(block, 'text') ??
+      readFoldedDataProperty(block, 'input');
     if (typeof text === 'string' && text) {
-      textChunks.push(`${role}: ${text}`);
+      appendFoldedLine(textChunks, budget, [`${role}: `, text]);
       continue;
     }
 
     // Fallback: serialize unrecognized block types to preserve context
-    if (block.type != null && block.type !== '') {
-      textChunks.push(`${role}: [${block.type}] ${JSON.stringify(block)}`);
+    if (blockType != null && blockType !== '') {
+      appendFoldedLine(textChunks, budget, [
+        `${role}: [${blockType}] `,
+        serializeFoldedValue(block),
+      ]);
     }
   }
 
   // If content array had no tool_use blocks, fall back to tool_calls metadata
   // (handles edge case: empty content array with tool_calls populated)
   if (!hasToolUseBlock) {
-    appendToolCalls(msg, role, textChunks);
+    appendToolCalls(msg, role, textChunks, budget);
   }
 }
 
 function appendToolCalls(
   msg: BaseMessage,
   role: string,
-  textChunks: string[]
+  textChunks: string[],
+  budget: FoldContextBudget
 ): void {
   if (role !== 'AI') {
     return;
   }
   const aiMsg = msg as AIMessage;
-  if (!aiMsg.tool_calls || aiMsg.tool_calls.length === 0) {
+  if (aiMsg.tool_calls && aiMsg.tool_calls.length > 0) {
+    for (const tc of aiMsg.tool_calls) {
+      if (!consumeFoldedWork(textChunks, budget)) {
+        break;
+      }
+      const name = readFoldedDataProperty(tc, 'name');
+      const args = readFoldedDataProperty(tc, 'args');
+      appendFoldedLine(textChunks, budget, [
+        `AI: [tool_call] ${typeof name === 'string' ? name : ''}(`,
+        serializeFoldedValue(args),
+        ')',
+      ]);
+    }
     return;
   }
-  for (const tc of aiMsg.tool_calls) {
-    textChunks.push(`AI: [tool_call] ${tc.name}(${JSON.stringify(tc.args)})`);
+  // Fall back to raw provider tool calls kept only in additional_kwargs.
+  const rawToolCalls = aiMsg.additional_kwargs.tool_calls;
+  if (!Array.isArray(rawToolCalls)) {
+    return;
+  }
+  for (const tc of rawToolCalls) {
+    if (!consumeFoldedWork(textChunks, budget)) {
+      break;
+    }
+    const fn = readFoldedDataProperty(tc, 'function');
+    if (fn == null) {
+      continue;
+    }
+    const name = readFoldedDataProperty(fn, 'name');
+    const args = readFoldedDataProperty(fn, 'arguments');
+    appendFoldedLine(textChunks, budget, [
+      `AI: [tool_call] ${typeof name === 'string' ? name : ''}(`,
+      typeof args === 'string' ? args : '',
+      ')',
+    ]);
   }
 }
 
@@ -1865,6 +2522,7 @@ export function ensureThinkingBlockInMessages(
 
   const result: BaseMessage[] =
     lastHumanIndex >= 0 ? messages.slice(0, lastHumanIndex + 1) : [];
+  const foldBudget = createFoldContextBudget();
   let i = lastHumanIndex + 1;
 
   while (i < messages.length) {
@@ -1895,13 +2553,14 @@ export function ensureThinkingBlockInMessages(
         if (typeof c !== 'object') {
           continue;
         }
-        if (c.type === 'tool_use') {
+        const type = readFoldedDataProperty(c, 'type');
+        if (type === 'tool_use') {
           hasToolUse = true;
         } else if (
-          c.type === ContentTypes.THINKING ||
-          c.type === ContentTypes.REASONING_CONTENT ||
-          c.type === ContentTypes.REASONING ||
-          c.type === 'redacted_thinking'
+          type === ContentTypes.THINKING ||
+          type === ContentTypes.REASONING_CONTENT ||
+          type === ContentTypes.REASONING ||
+          type === 'redacted_thinking'
         ) {
           hasThinkingBlock = true;
         }
@@ -1956,30 +2615,33 @@ export function ensureThinkingBlockInMessages(
       // ToolMessages — preserves image blocks as-is to avoid serializing
       // binary data as text (which caused 174× token amplification).
       const parts: MessageContentComplex[] = [];
-      const textChunks: string[] = ['[Previous agent context]'];
+      const textChunks: string[] = [];
+      appendFoldedLine(textChunks, foldBudget, ['[Previous agent context]']);
 
-      appendMessageContent(msg, 'AI', textChunks, parts);
+      appendMessageContent(msg, 'AI', textChunks, parts, foldBudget);
 
       let j = i + 1;
       while (j < messages.length && isToolMessage(messages[j])) {
-        appendMessageContent(messages[j], 'Tool', textChunks, parts);
+        appendMessageContent(
+          messages[j],
+          'Tool',
+          textChunks,
+          parts,
+          foldBudget
+        );
         j++;
       }
 
       flushTextChunks(textChunks, parts);
-      emitAgentLog(
-        config,
-        'warn',
-        'format',
-        'ensureThinkingBlockInMessages: injecting [Previous agent context] HumanMessage' +
-          ` (${parts.length} msgs at index ${i}, no thinking block in chain)`
-      );
-      result.push(
-        withMessageRole(
-          new HumanMessage({ content: toLangChainContent(parts) }),
-          'user'
-        )
-      );
+      if (appendSyntheticProviderContextMessage(result, parts)) {
+        emitAgentLog(
+          config,
+          'warn',
+          'format',
+          'ensureThinkingBlockInMessages: injecting [Previous agent context] HumanMessage' +
+            ` (${parts.length} msgs at index ${i}, no thinking block in chain)`
+        );
+      }
       i = j;
     } else {
       // Keep the message as is
@@ -1987,6 +2649,140 @@ export function ensureThinkingBlockInMessages(
       i++;
     }
   }
+
+  return result;
+}
+
+/** Whether a message carries tool content a tool-less agent cannot legally
+ *  send. Covers every representation a provider converter will serialize back
+ *  into a request: a ToolMessage, parsed `AIMessage.tool_calls`, raw
+ *  `additional_kwargs.tool_calls` (OpenAI keeps calls here when the parsed
+ *  array is empty), and `tool_use` / `tool_call` / `tool_result` content
+ *  blocks (`@langchain/aws` and the Anthropic converter map these to Converse
+ *  `toolUse` / `toolResult`). Missing the parent AI message is not just a
+ *  passthrough: folding its ToolMessage alone would leave an orphan
+ *  `assistant(tool_calls) -> user(...)` sequence. */
+function messageHasToolContent(msg: BaseMessage): boolean {
+  if (isToolMessage(msg)) {
+    return true;
+  }
+  const aiMsg = msg as AIMessage;
+  if (aiMsg.tool_calls != null && aiMsg.tool_calls.length > 0) {
+    return true;
+  }
+  const rawToolCalls = aiMsg.additional_kwargs.tool_calls;
+  if (Array.isArray(rawToolCalls) && rawToolCalls.length > 0) {
+    return true;
+  }
+  if (Array.isArray(msg.content)) {
+    for (const block of msg.content as ExtendedMessageContent[]) {
+      const type = readFoldedDataProperty(block, 'type');
+      if (
+        typeof block === 'object' &&
+        (type === 'tool_use' || type === 'tool_call' || type === 'tool_result')
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Whether a message carries a tool RESULT: a ToolMessage, or a message whose
+ *  content includes a `tool_result` block (the shape when a call/result pair is
+ *  split as `AIMessage(tool_call)` + `HumanMessage(tool_result)`). Such a result
+ *  belongs with the preceding tool call, so it is absorbed into the same fold
+ *  and labelled as tool output. */
+function isToolResultMessage(msg: BaseMessage): boolean {
+  if (isToolMessage(msg)) {
+    return true;
+  }
+  if (Array.isArray(msg.content)) {
+    return (msg.content as ExtendedMessageContent[]).some(
+      (block) =>
+        typeof block === 'object' &&
+        readFoldedDataProperty(block, 'type') === 'tool_result'
+    );
+  }
+  return false;
+}
+
+/**
+ * Folds tool_use / tool_result content into plain text for an agent that binds
+ * no tools.
+ *
+ * In a multi-agent graph, a tool-less destination still inherits the prior
+ * agent's conversation history, which can contain toolUse/toolResult blocks.
+ * Because it binds no tools, the model is invoked with no tool schema — and
+ * Bedrock's Converse API rejects any request that carries toolUse/toolResult
+ * blocks without a top-level toolConfig ("The toolConfig field must be defined
+ * when using toolUse and toolResult content blocks"). Adding a dummy toolConfig
+ * is not an option: AWS requires at least one tool, and it would expose a
+ * capability the destination was intentionally denied.
+ *
+ * Each tool-call turn plus its trailing tool results (ToolMessages or
+ * `tool_result` content blocks) is collapsed into a single `[Previous tool
+ * interaction]` HumanMessage that preserves the tool name, arguments and result
+ * as text (image blocks are kept as-is). Runs in a single pass: non-tool
+ * messages pass through, `result` is allocated lazily on the first fold, and the
+ * original array is returned unchanged when it holds no tool content (the common
+ * fresh-tool-less-agent case).
+ */
+export function foldToolBlocksForToollessAgent(
+  messages: BaseMessage[],
+  config?: RunnableConfig
+): BaseMessage[] {
+  let result: BaseMessage[] | null = null;
+  let foldedCount = 0;
+  const foldBudget = createFoldContextBudget();
+  let i = 0;
+  while (i < messages.length) {
+    const msg = messages[i];
+    if (!messageHasToolContent(msg)) {
+      result?.push(msg);
+      i++;
+      continue;
+    }
+
+    /** First fold — copy the untouched prefix once, then append from here. */
+    if (result === null) {
+      result = messages.slice(0, i);
+    }
+
+    const parts: MessageContentComplex[] = [];
+    const textChunks: string[] = [];
+    appendFoldedLine(textChunks, foldBudget, ['[Previous tool interaction]']);
+    appendMessageContent(
+      msg,
+      isToolResultMessage(msg) ? 'Tool' : 'AI',
+      textChunks,
+      parts,
+      foldBudget
+    );
+    foldedCount++;
+
+    let j = i + 1;
+    while (j < messages.length && isToolResultMessage(messages[j])) {
+      appendMessageContent(messages[j], 'Tool', textChunks, parts, foldBudget);
+      foldedCount++;
+      j++;
+    }
+
+    flushTextChunks(textChunks, parts);
+    appendSyntheticProviderContextMessage(result, parts);
+    i = j;
+  }
+
+  if (result === null) {
+    return messages;
+  }
+
+  emitAgentLog(
+    config,
+    'warn',
+    'format',
+    `foldToolBlocksForToollessAgent: folded ${foldedCount} tool message(s) into text for a tool-less agent`
+  );
 
   return result;
 }

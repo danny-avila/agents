@@ -236,8 +236,12 @@ export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
 export type ToolEndEvent = {
   /** The Step Id of the Tool Call */
   id: string;
-  /** The Completed Tool Call */
-  tool_call: ToolCall;
+  /**
+   * The Completed Tool Call. Carries the tool-authored `outcome` label when
+   * present (see `ProcessedToolCall.outcome`) so `ON_RUN_STEP_COMPLETED`
+   * consumers can read it without an unsafe cast.
+   */
+  tool_call: ToolCall & { output?: string; progress?: number; outcome?: string };
   /** The content index of the tool call */
   index: number;
   type?: 'tool_call';
@@ -521,6 +525,17 @@ export type InjectedMessage = {
   skillName?: string;
 };
 
+/**
+ * In-place edit of a call's model-authored `intent` label: the first
+ * occurrence of `from` in the intent is replaced with `to` (case-sensitive).
+ * Lets a tool settle the label while preserving the model's own phrasing,
+ * e.g. `{ from: 'Searching', to: 'Searched' }`.
+ */
+export type OutcomePatch = {
+  from: string;
+  to: string;
+};
+
 /** Result for a single tool call in event-driven execution */
 export type ToolExecuteResult = {
   /** Matches ToolCallRequest.id */
@@ -533,6 +548,13 @@ export type ToolExecuteResult = {
   status: 'success' | 'error';
   /** Error message if status is 'error' */
   errorMessage?: string;
+  /**
+   * Settled human-readable label for this call, replacing the model-authored
+   * `intent` arg in the UI. Full replacement; wins over `outcome_patch`.
+   */
+  outcome?: string;
+  /** In-place edit of the model-authored `intent` label (see {@link OutcomePatch}). */
+  outcome_patch?: OutcomePatch;
   /**
    * Messages to inject into graph state after the ToolMessage for this call.
    * Placed after tool results to respect provider message ordering (tool_call -> tool_result adjacency).

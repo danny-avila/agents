@@ -1,4 +1,5 @@
 // src/tools/ReadFile.ts
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 export const ReadFileToolName = Constants.READ_FILE;
@@ -22,6 +23,7 @@ CONSTRAINTS:
 export const ReadFileToolSchema = {
   type: 'object',
   properties: {
+    intent: { ...INTENT_PROPERTY },
     path: {
       type: 'string',
       description:

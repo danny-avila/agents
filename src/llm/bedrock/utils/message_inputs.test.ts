@@ -1,6 +1,7 @@
-import { AIMessage, HumanMessage } from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { convertToConverseMessages } from './message_inputs';
+import { toLangChainContent } from '@/messages/langchain';
 
 /**
  * Native-Bedrock reasoning serialization. A `reasoning_content` block whose
@@ -30,6 +31,53 @@ const assistantContent = (result: ConverseResult): ConverseBlock[] => {
   const msg = result.converseMessages.find((m) => m.role === 'assistant');
   return (msg?.content ?? []) as ConverseBlock[];
 };
+
+describe('convertToConverseMessages — Anthropic tool replay', () => {
+  it('deduplicates raw tool_use blocks and unwraps tool_result content', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Search'),
+      new AIMessage({
+        content: toLangChainContent([
+          { type: 'text', text: 'Searching.' },
+          {
+            type: 'tool_use',
+            id: 'call_search',
+            name: 'search',
+            input: '',
+          },
+        ]),
+        tool_calls: [
+          {
+            id: 'call_search',
+            name: 'search',
+            args: { query: 'test' },
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: toLangChainContent([
+          {
+            type: 'tool_result',
+            tool_use_id: 'call_search',
+            is_error: true,
+            content: 'result body',
+          },
+        ]),
+        tool_call_id: 'call_search',
+      }),
+    ];
+
+    const converted = convertToConverseMessages(messages);
+    const serialized = JSON.stringify(converted);
+
+    expect(serialized.match(/"toolUseId":"call_search"/g)).toHaveLength(2);
+    expect(serialized.match(/"toolUse":/g)).toHaveLength(1);
+    expect(serialized.match(/"toolResult":/g)).toHaveLength(1);
+    expect(serialized).toContain('"text":"result body"');
+    expect(serialized).toContain('"status":"error"');
+    expect(serialized).not.toContain('"type":"tool_result"');
+  });
+});
 
 describe('convertToConverseMessages — native Bedrock reasoning serialization', () => {
   it('drops a signature-only reasoning block, keeping text and tool calls', () => {
@@ -400,5 +448,87 @@ describe('convertToConverseMessages — v1 reasoning serialization', () => {
       'native reasoning',
     ]);
     expect(content.some((b) => b.text === 'answer')).toBe(true);
+  });
+});
+
+/**
+ * Converse rejects consecutive same-role messages categorically, and both
+ * `ToolMessage` and `HumanMessage` convert to `role: 'user'` — so a hook
+ * injection landing a text turn directly after tool results (`PostToolBatch`
+ * / `PreemptBoundary` drains) must merge into one user message here, with
+ * block order preserved so the toolUse/toolResult pairing stays intact.
+ */
+describe('convertToConverseMessages — user-role run merging', () => {
+  it('merges a tool result followed by an injected text turn into one user message', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('run the search'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call_1', name: 'search', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'search output',
+        tool_call_id: 'call_1',
+        name: 'search',
+      }),
+      new HumanMessage({
+        content: 'Actually, focus on the second result.',
+        additional_kwargs: { source: 'steer' },
+      }),
+    ];
+
+    const { converseMessages } = convertToConverseMessages(messages);
+
+    expect(converseMessages.map((m) => m.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+    ]);
+    const merged = converseMessages[2];
+    const blockKinds = (merged.content ?? []).map((block) =>
+      'toolResult' in block ? 'toolResult' : 'text'
+    );
+    expect(blockKinds).toEqual(['toolResult', 'text']);
+    expect(
+      (merged.content ?? []).find((block) => 'text' in block)?.text
+    ).toBe('Actually, focus on the second result.');
+  });
+
+  it('still merges adjacent tool-result-only turns', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call_1', name: 'a', args: {}, type: 'tool_call' },
+          { id: 'call_2', name: 'b', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({ content: 'one', tool_call_id: 'call_1', name: 'a' }),
+      new ToolMessage({ content: 'two', tool_call_id: 'call_2', name: 'b' }),
+    ];
+
+    const { converseMessages } = convertToConverseMessages(messages);
+
+    expect(converseMessages.map((m) => m.role)).toEqual(['assistant', 'user']);
+    const toolResultIds = (converseMessages[1].content ?? [])
+      .map((block) => ('toolResult' in block ? block.toolResult?.toolUseId : undefined))
+      .filter(Boolean);
+    expect(toolResultIds).toEqual(['call_1', 'call_2']);
+  });
+
+  it('does not merge across an assistant turn', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('first'),
+      new AIMessage('answer'),
+      new HumanMessage('second'),
+    ];
+    const { converseMessages } = convertToConverseMessages(messages);
+    expect(converseMessages.map((m) => m.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+    ]);
   });
 });

@@ -142,6 +142,8 @@ export enum ContentTypes {
   REASONING_CONTENT = 'reasoning_content',
   /** Mid-run user steer persisted inline in an assistant message; replayed as a user turn */
   STEER = 'steer',
+  /** Fast-model activity label for a tool/reasoning block; UI-only, never model input */
+  ACTIVITY_LABEL = 'activity_label',
 }
 
 export enum ToolCallTypes {
@@ -184,6 +186,8 @@ export enum Constants {
   WEB_SEARCH = 'web_search',
   CONTENT_AND_ARTIFACT = 'content_and_artifact',
   LC_TRANSFER_TO_ = 'lc_transfer_to_',
+  HANDOFF_PARALLEL_BATCH = '__handoff_parallel_batch',
+  HANDOFF_GROUP_ID = '__handoff_group_id',
   /** Delimiter for MCP tools: toolName_mcp_serverName */
   MCP_DELIMITER = '_mcp_',
   /** Anthropic server tool ID prefix (web_search, code_execution, etc.) */

@@ -118,7 +118,7 @@ describe('Langfuse tool output tracing redaction', () => {
     process.env = originalEnv;
   });
 
-  it('enables ToolNode tracing only when Langfuse is active by default', () => {
+  it('keeps internal ToolNode batch tracing opt-in', () => {
     delete process.env.LANGFUSE_SECRET_KEY;
     delete process.env.LANGFUSE_PUBLIC_KEY;
     delete process.env.LANGFUSE_BASE_URL;
@@ -132,7 +132,7 @@ describe('Langfuse tool output tracing redaction', () => {
           secretKey: 'sk-run',
         },
       })
-    ).toBe(true);
+    ).toBe(false);
     expect(
       shouldTraceToolNodeForLangfuse({
         agentLangfuse: {
@@ -149,7 +149,7 @@ describe('Langfuse tool output tracing redaction', () => {
     process.env.LANGFUSE_PUBLIC_KEY = 'pk-test';
     process.env.LANGFUSE_BASE_URL = 'https://langfuse.test';
 
-    expect(shouldTraceToolNodeForLangfuse({})).toBe(true);
+    expect(shouldTraceToolNodeForLangfuse({})).toBe(false);
     expect(
       shouldTraceToolNodeForLangfuse({
         runLangfuse: { toolNodeTracing: { enabled: true } },
@@ -162,7 +162,7 @@ describe('Langfuse tool output tracing redaction', () => {
     ).toBe(false);
   });
 
-  it('lets agent Langfuse enablement override disabled run defaults for ToolNode tracing', () => {
+  it('lets an agent explicitly opt into ToolNode batch tracing', () => {
     delete process.env.LANGFUSE_SECRET_KEY;
     delete process.env.LANGFUSE_PUBLIC_KEY;
     delete process.env.LANGFUSE_BASE_URL;
@@ -177,6 +177,7 @@ describe('Langfuse tool output tracing redaction', () => {
           publicKey: 'pk-agent',
           secretKey: 'sk-agent',
           baseUrl: 'https://langfuse.test',
+          toolNodeTracing: { enabled: true },
         },
       })
     ).toBe(true);

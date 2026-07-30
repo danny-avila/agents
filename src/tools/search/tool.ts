@@ -13,15 +13,57 @@ import {
   DATE_RANGE,
 } from './schema';
 import { createSearchAPI, createSourceProcessor } from './search';
+import { createKeenableScraper } from './keenable-scraper';
 import { createSerperScraper } from './serper-scraper';
 import { createTavilyScraper } from './tavily-scraper';
 import { createFirecrawlScraper } from './firecrawl';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { createCrwScraper } from './crw-scraper';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
 import { createDefaultLogger } from './utils';
 import { createReranker } from './rerankers';
 import { Constants } from '@/common';
+
+/**
+ * Settled label for a `web_search` call's intent (see `intentArg.ts`).
+ *
+ * Counts the result kinds `formatResultsForLLM` actually renders —
+ * `references` only tracks links embedded in extracted highlights, so it
+ * undercounts ordinary results and can overcount when one highlight embeds
+ * several links.
+ *
+ * A caught provider or processing failure is reported through `data.error`
+ * while the tool still returns NORMALLY, so that case must author its own
+ * label: the `ToolMessage` carries success status, so without an authored
+ * outcome the in-flight intent ("Searching…") would stand as the settled
+ * label and present a failed search as an ordinary one.
+ *
+ * Returns undefined for a genuine zero-result search, leaving the
+ * model-authored intent to stand unchanged as the label.
+ */
+export function resolveSearchOutcome(
+  data: t.SearchResultData,
+  query: string
+): string | undefined {
+  if (data.error != null && data.error !== '') {
+    return `Search failed for "${query}"`;
+  }
+  const count =
+    (data.organic?.length ?? 0) +
+    (data.topStories?.length ?? 0) +
+    (data.news?.length ?? 0) +
+    (data.images?.length ?? 0) +
+    (data.videos?.length ?? 0) +
+    (data.places?.length ?? 0) +
+    (data.peopleAlsoAsk?.length ?? 0) +
+    (data.knowledgeGraph != null ? 1 : 0) +
+    (data.answerBox != null ? 1 : 0);
+  if (count === 0) {
+    return undefined;
+  }
+  return `Found ${count} result${count === 1 ? '' : 's'} for "${query}"`;
+}
 
 /**
  * Executes parallel searches and merges the results,
@@ -203,6 +245,8 @@ function createSearchProcessor({
   supportsNews,
   sourceProcessor,
   onGetHighlights,
+  mainExpandBy,
+  separatorExpandBy,
   logger,
 }: {
   safeSearch: t.SearchToolConfig['safeSearch'];
@@ -212,6 +256,8 @@ function createSearchProcessor({
   searchAPI: ReturnType<typeof createSearchAPI>;
   sourceProcessor: ReturnType<typeof createSourceProcessor>;
   onGetHighlights: t.SearchToolConfig['onGetHighlights'];
+  mainExpandBy: t.SearchToolConfig['mainExpandBy'];
+  separatorExpandBy: t.SearchToolConfig['separatorExpandBy'];
   logger: t.Logger;
 }) {
   return async function ({
@@ -260,7 +306,11 @@ function createSearchProcessor({
         numElements: maxSources,
       });
 
-      return expandHighlights(processedSources);
+      return expandHighlights(
+        processedSources,
+        mainExpandBy,
+        separatorExpandBy
+      );
     } catch (error) {
       logger.error('Error in search:', error);
       return {
@@ -326,7 +376,11 @@ function createTool({
         maxOutputChars
       );
       const data: t.SearchResultData = { turn, ...searchResult, references };
-      return [output, { [Constants.WEB_SEARCH]: data }];
+      const outcome = resolveSearchOutcome(data, query);
+      return [
+        output,
+        { [Constants.WEB_SEARCH]: data, ...(outcome != null && { outcome }) },
+      ];
     },
     {
       name: WebSearchToolName,
@@ -370,12 +424,15 @@ export const createSearchTool = (
     keenableApiKey,
     keenableApiUrl,
     keenableSearchOptions,
+    keenableScraperOptions,
     rerankerType = 'cohere',
     rerankerTimeout,
     topResults = 5,
     maxContentLength,
     chunkSize,
     chunkOverlap,
+    mainExpandBy,
+    separatorExpandBy,
     maxOutputChars,
     strategies = ['no_extraction'],
     filterContent = true,
@@ -409,6 +466,7 @@ export const createSearchTool = (
       : tavilySearchOptions;
 
   const schemaProperties: Record<string, unknown> = {
+    intent: { ...INTENT_PROPERTY },
     query: querySchema,
     date: dateSchema,
     images: imagesSchema,
@@ -466,11 +524,20 @@ export const createSearchTool = (
   } else if (scraperProvider === 'crw') {
     scraperInstance = createCrwScraper({
       ...crwScraperOptions,
-      apiKey:
-        crwScraperOptions?.apiKey ?? crwApiKey ?? process.env.CRW_API_KEY,
+      apiKey: crwScraperOptions?.apiKey ?? crwApiKey ?? process.env.CRW_API_KEY,
       apiUrl: crwScraperOptions?.apiUrl ?? crwApiUrl,
       timeout: scraperTimeout ?? crwScraperOptions?.timeout,
       formats: crwScraperOptions?.formats ?? ['markdown', 'rawHtml'],
+      logger,
+    });
+  } else if (scraperProvider === 'keenable') {
+    scraperInstance = createKeenableScraper({
+      ...keenableScraperOptions,
+      apiKey: keenableScraperOptions?.apiKey ?? keenableApiKey,
+      timeout: scraperTimeout ?? keenableScraperOptions?.timeout,
+      attributionTitle:
+        keenableScraperOptions?.attributionTitle ??
+        keenableSearchOptions?.attributionTitle,
       logger,
     });
   } else {
@@ -525,6 +592,8 @@ export const createSearchTool = (
     supportsNews: searchProvider !== 'keenable',
     sourceProcessor,
     onGetHighlights,
+    mainExpandBy,
+    separatorExpandBy,
     logger,
   });
 

@@ -5,13 +5,31 @@ import {
   SystemMessage,
   ToolMessage,
 } from '@langchain/core/messages';
+import {
+  convertMessagesToCompletionsMessageParams,
+  convertResponsesDeltaToChatGenerationChunk,
+  convertMessagesToResponsesInput,
+  convertResponsesMessageToAIMessage,
+} from '@langchain/openai';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { MessageContentComplex, TPayload } from '@/types';
-import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import {
   convertMessagesToContent,
   formatAnthropicArtifactContent,
+  formatArtifactPayload,
+  projectAnthropicArtifactContent,
+  projectArtifactPayload,
+  projectComputerCallOutputsToText,
+  projectOpenAIToolMessageContent,
+  projectOpenAIResponsesToolMessageContent,
 } from './core';
+import {
+  _convertMessagesToOpenAIParams,
+  _convertMessagesToOpenAIResponsesParams,
+} from '@/llm/openai/utils';
+import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { Constants, ContentTypes, Providers } from '@/common';
+import { serializeToolContent } from '@/utils/toolContent';
 import { formatAgentMessages } from './format';
 
 type AnthropicPayloadBlock = {
@@ -30,30 +48,6 @@ const getAnthropicPayloadBlocks = (
   expect(Array.isArray(content)).toBe(true);
   return content as AnthropicPayloadBlock[];
 };
-
-function summaryBlock(
-  coverageMessageId: string,
-  text: string,
-  tokenCount: number
-): MessageContentComplex {
-  return {
-    type: ContentTypes.SUMMARY,
-    content: [{ type: ContentTypes.TEXT, text }],
-    tokenCount,
-    coverage: { throughMessageId: coverageMessageId },
-  };
-}
-
-function legacySummaryBlock(
-  text: string,
-  tokenCount: number
-): MessageContentComplex {
-  return {
-    type: ContentTypes.SUMMARY,
-    content: [{ type: ContentTypes.TEXT, text }],
-    tokenCount,
-  };
-}
 
 describe('formatAgentMessages', () => {
   it('should format simple user and AI messages', () => {
@@ -124,20 +118,42 @@ describe('formatAgentMessages', () => {
     expect(Object.keys(result.messages[0])).not.toContain('role');
   });
 
-  it('should use the latest summary and trim only its covered context', () => {
-    const payload: TPayload = [
-      { role: 'user', messageId: 'old-user', content: 'Old user message' },
+  it('preserves a legacy summary-only compacted history', () => {
+    const result = formatAgentMessages([
       {
         role: 'assistant',
-        messageId: 'old-assistant',
-        content: 'Old assistant message',
-      },
-      {
-        role: 'assistant',
-        messageId: 'summary-message',
         content: [
-          { type: ContentTypes.TEXT, text: 'Retained recent response' },
-          summaryBlock('old-assistant', 'Conversation summary', 12),
+          {
+            type: ContentTypes.SUMMARY,
+            content: [
+              { type: ContentTypes.TEXT, text: 'Legacy compacted context' },
+            ],
+            tokenCount: 11,
+          },
+        ],
+      },
+    ]);
+
+    expect(result.messages).toHaveLength(0);
+    expect(result.summary).toEqual({
+      text: 'Legacy compacted context',
+      tokenCount: 11,
+    });
+  });
+
+  it('should prepend the latest summary and trim context before its boundary', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Old user message' },
+      { role: 'assistant', content: 'Old assistant message' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Covered by summary' },
+          {
+            type: ContentTypes.SUMMARY,
+            text: 'Conversation summary',
+            tokenCount: 12,
+          },
           { type: ContentTypes.TEXT, text: 'Preserved tail' },
         ],
       },
@@ -161,143 +177,27 @@ describe('formatAgentMessages', () => {
       (result.messages[0].content as MessageContentComplex[])[0]
     ).toMatchObject({
       type: ContentTypes.TEXT,
-      text: 'Retained recent response',
+      text: 'Preserved tail',
     });
-    expect(result.indexTokenCountMap?.[0]).toBe(6);
+    expect(result.indexTokenCountMap?.[0]).toBeLessThan(18);
+    expect(result.indexTokenCountMap?.[0]).toBeGreaterThan(0);
     expect(result.indexTokenCountMap?.[1]).toBe(4);
-  });
-
-  it('should ignore unresolved summary coverage and preserve raw history', () => {
-    const payload: TPayload = [
-      { role: 'user', messageId: 'raw-user', content: 'Raw request' },
-      {
-        role: 'assistant',
-        messageId: 'summary-message',
-        content: [
-          summaryBlock('raw-user', 'Older resolvable summary', 8),
-          { type: ContentTypes.TEXT, text: 'Raw response before summary' },
-          summaryBlock('missing-message', 'Unresolvable summary', 12),
-          { type: ContentTypes.TEXT, text: 'Raw response after summary' },
-        ],
-      },
-    ];
-
-    const result = formatAgentMessages(payload);
-
-    expect(result.summary).toBeUndefined();
-    expect(result.messages).toHaveLength(2);
-    expect(result.messages[0].content).toEqual([
-      { type: ContentTypes.TEXT, text: 'Raw request' },
-    ]);
-    expect(result.messages[1].content).toEqual([
-      { type: ContentTypes.TEXT, text: 'Raw response before summary' },
-      { type: ContentTypes.TEXT, text: 'Raw response after summary' },
-    ]);
-  });
-
-  it('should preserve a legacy summary-only compacted history', () => {
-    const result = formatAgentMessages([
-      {
-        role: 'assistant',
-        messageId: 'legacy-summary',
-        content: [legacySummaryBlock('Legacy compacted context', 11)],
-      },
-    ]);
-
-    expect(result.messages).toHaveLength(0);
-    expect(result.summary).toEqual({
-      text: 'Legacy compacted context',
-      tokenCount: 11,
-    });
-  });
-
-  it('should not trust a legacy summary while raw history remains', () => {
-    const result = formatAgentMessages([
-      { role: 'user', content: 'Raw request' },
-      {
-        role: 'assistant',
-        content: [legacySummaryBlock('Ambiguous legacy context', 9)],
-      },
-    ]);
-
-    expect(result.messages).toHaveLength(1);
-    expect(result.messages[0].content).toEqual([
-      { type: ContentTypes.TEXT, text: 'Raw request' },
-    ]);
-    expect(result.summary).toBeUndefined();
-  });
-
-  it('should preserve both retained turns across a request, including five image-only parts', () => {
-    const fiveImages: MessageContentComplex[] = Array.from(
-      { length: 5 },
-      (_, index) => ({
-        type: 'image_url',
-        image_url: { url: `https://example.com/image-${index + 1}.png` },
-      })
-    );
-    const payload: TPayload = [
-      { role: 'user', messageId: 'old-user', content: 'Old request' },
-      {
-        role: 'assistant',
-        messageId: 'old-assistant',
-        content: 'Old response',
-      },
-      {
-        role: 'user',
-        messageId: 'retained-user-1',
-        content: 'Describe the uploaded set',
-      },
-      {
-        role: 'assistant',
-        messageId: 'retained-assistant-1',
-        content: 'I will compare the set.',
-      },
-      {
-        role: 'user',
-        messageId: 'retained-user-2',
-        content: fiveImages,
-      },
-      {
-        role: 'assistant',
-        messageId: 'summary-step',
-        content: [summaryBlock('old-assistant', 'Covered old turn', 10)],
-      },
-    ];
-
-    const result = formatAgentMessages(payload);
-
-    expect(result.summary?.text).toBe('Covered old turn');
-    expect(result.messages).toHaveLength(3);
-    expect(result.messages.map((message) => message.id)).toEqual([
-      'retained-user-1',
-      'retained-assistant-1',
-      'retained-user-2',
-    ]);
-    expect(result.messages[2]).toBeInstanceOf(HumanMessage);
-    expect(result.messages[2].content).toEqual(fiveImages);
   });
 
   it('should apply last-summary-wins when multiple summary blocks exist', () => {
     const payload: TPayload = [
-      { role: 'user', messageId: 'covered-old', content: 'Old request' },
       {
         role: 'assistant',
-        messageId: 'old-summary-message',
         content: [
-          summaryBlock('covered-old', 'Old summary', 3),
+          { type: ContentTypes.SUMMARY, text: 'Old summary', tokenCount: 3 },
           { type: ContentTypes.TEXT, text: 'Old tail' },
         ],
       },
       {
         role: 'assistant',
-        messageId: 'covered-new',
-        content: 'Drop this message',
-      },
-      {
-        role: 'assistant',
-        messageId: 'new-summary-message',
         content: [
-          summaryBlock('covered-new', 'Newest summary', 9),
+          { type: ContentTypes.TEXT, text: 'Drop this part' },
+          { type: ContentTypes.SUMMARY, text: 'Newest summary', tokenCount: 9 },
           { type: ContentTypes.TEXT, text: 'Keep this part' },
         ],
       },
@@ -1692,7 +1592,7 @@ describe('formatAgentMessages', () => {
       configurable: true,
     });
 
-    formatAnthropicArtifactContent([
+    const originalMessages = [
       new AIMessageChunk({
         content: '',
         tool_calls: [
@@ -1705,12 +1605,575 @@ describe('formatAgentMessages', () => {
         ],
       }),
       toolMessage,
-    ]);
+    ];
+    const formattedMessages = projectAnthropicArtifactContent(originalMessages);
+    const formattedToolMessage = formattedMessages[1] as ToolMessage;
 
-    expect(toolMessage.content).toEqual([
+    expect(formattedToolMessage.content).toEqual([
       { type: ContentTypes.TEXT, text: '' },
       { type: ContentTypes.TEXT, text: 'artifact text' },
     ]);
+    expect(toolMessage.content).toBeUndefined();
+    expect(formattedMessages).not.toBe(originalMessages);
+  });
+
+  it('caps Anthropic artifact expansion after pruning', () => {
+    const toolMessage = new ToolMessage({
+      content: 'short result',
+      tool_call_id: 'call_artifact_capped',
+      artifact: {
+        content: 'artifact'.repeat(1_000),
+      },
+    });
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_artifact_capped',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+
+    const formatted = projectAnthropicArtifactContent(messages, 200);
+    const formattedTool = formatted[1] as ToolMessage;
+
+    expect(
+      serializeToolContent(formattedTool.content).length
+    ).toBeLessThanOrEqual(200);
+    expect(serializeToolContent(formattedTool.content)).toContain('truncated');
+    expect(toolMessage.content).toBe('short result');
+    expect(toolMessage.artifact.content).toContain('artifact');
+    expect(projectAnthropicArtifactContent(formatted, 200)).toBe(formatted);
+  });
+
+  it('caps the aggregate OpenAI/Google artifact payload', () => {
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_artifact_payload',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'short result',
+        tool_call_id: 'call_artifact_payload',
+        artifact: {
+          content: [
+            { type: ContentTypes.TEXT, text: 'artifact'.repeat(1_000) },
+          ],
+        },
+      }),
+    ];
+
+    const formatted = projectArtifactPayload(messages, 200);
+
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+    expect(payload).toBeInstanceOf(HumanMessage);
+    expect(serializeToolContent(payload.content).length).toBeLessThanOrEqual(
+      200
+    );
+    expect(messages).toHaveLength(2);
+    expect((messages[1] as ToolMessage).content).toBe('short result');
+    expect(projectArtifactPayload(formatted, 200)).toBe(formatted);
+  });
+
+  it('bounds artifact block arrays without spreading them into call arguments', () => {
+    const repeatedBlock = {
+      type: ContentTypes.TEXT,
+      text: 'x',
+    } as MessageContentComplex;
+    const artifactContent = new Array<MessageContentComplex>(150_000).fill(
+      repeatedBlock
+    );
+    const toolMessage = new ToolMessage({
+      content: 'short result',
+      tool_call_id: 'call_artifact_many_blocks',
+      artifact: { content: artifactContent },
+    });
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_artifact_many_blocks',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+
+    const formatted = projectArtifactPayload(messages, 200);
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+
+    expect(payload).toBeInstanceOf(HumanMessage);
+    expect(serializeToolContent(payload.content).length).toBeLessThanOrEqual(
+      200
+    );
+    expect(toolMessage.content).toBe('short result');
+    expect(toolMessage.artifact.content).toBe(artifactContent);
+  });
+
+  it('projects structured tool content to the bounded string both OpenAI APIs send', () => {
+    let toJSONCalls = 0;
+    const toolMessage = new ToolMessage({
+      id: 'tool-message-id',
+      name: 'render',
+      status: 'success',
+      tool_call_id: 'call_openai_structured',
+      content: [
+        { type: ContentTypes.TEXT, text: 'rendered chart' },
+        {
+          type: 'image_url',
+          image_url: {
+            url: `data:image/png;base64,${'A'.repeat(2_000)}`,
+          },
+          toJSON() {
+            toJSONCalls++;
+            return { expanded: 'B'.repeat(20_000) };
+          },
+        },
+      ],
+      artifact: { retained: true },
+    });
+
+    const original = [toolMessage];
+    const projected = projectOpenAIToolMessageContent(original, 200);
+    const projectedTool = projected[0] as ToolMessage;
+    const chatPayload = _convertMessagesToOpenAIParams(projected);
+    const responsesPayload = _convertMessagesToOpenAIResponsesParams(projected);
+
+    expect(projected).not.toBe(original);
+    expect(typeof projectedTool.content).toBe('string');
+    expect((projectedTool.content as string).length).toBeLessThanOrEqual(200);
+    expect(projectedTool.tool_call_id).toBe(toolMessage.tool_call_id);
+    expect(projectedTool.status).toBe(toolMessage.status);
+    expect(projectedTool.artifact).toBe(toolMessage.artifact);
+    expect(Array.isArray(toolMessage.content)).toBe(true);
+    expect(toJSONCalls).toBe(0);
+    expect(chatPayload[0]).toMatchObject({
+      role: 'tool',
+      content: projectedTool.content,
+      tool_call_id: toolMessage.tool_call_id,
+    });
+    expect(responsesPayload[0]).toMatchObject({
+      type: 'function_call_output',
+      output: projectedTool.content,
+      call_id: toolMessage.tool_call_id,
+    });
+  });
+
+  it('preserves Responses computer outputs handled as provider-native media', () => {
+    const computerCall = new AIMessage({
+      content: '',
+      response_metadata: {
+        output: [
+          {
+            type: 'computer_call',
+            id: 'computer-item',
+            call_id: 'call_computer',
+            action: { type: 'screenshot' },
+          },
+        ],
+      },
+    });
+    const computerOutput = new ToolMessage({
+      content: [
+        {
+          type: 'computer_screenshot',
+          image_url: 'data:image/png;base64,AA==',
+        },
+      ],
+      tool_call_id: 'call_computer',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const messages = [computerCall, computerOutput];
+    const projected = projectOpenAIToolMessageContent(messages, 10);
+    const responsesInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'computer-use-preview',
+    });
+
+    expect(projected).not.toBe(messages);
+    expect(
+      responsesInput.find((item) => item.type === 'computer_call_output')
+    ).toMatchObject({
+      type: 'computer_call_output',
+      call_id: 'call_computer',
+      output: {
+        type: 'computer_screenshot',
+        image_url: 'data:image/png;base64,AA==',
+      },
+    });
+  });
+
+  it('deduplicates parsed and raw Responses computer calls in ZDR mode', () => {
+    const response = {
+      id: 'resp_computer',
+      object: 'response',
+      created_at: 0,
+      model: 'computer-use-preview',
+      output: [
+        {
+          type: 'computer_call',
+          id: 'computer-item',
+          call_id: 'call_computer',
+          action: { type: 'screenshot' },
+          status: 'completed',
+        },
+      ],
+      status: 'completed',
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        total_tokens: 2,
+        input_tokens_details: { cached_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+      },
+      error: null,
+      incomplete_details: null,
+      metadata: {},
+      user: null,
+      service_tier: 'default',
+    } as unknown as Parameters<typeof convertResponsesMessageToAIMessage>[0];
+    const computerCall = convertResponsesMessageToAIMessage(response);
+    const computerOutput = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_computer',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    const projected = projectOpenAIResponsesToolMessageContent([
+      computerCall,
+      computerOutput,
+    ]);
+    const zdrInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: true,
+      model: 'computer-use-preview',
+    });
+    const retainedInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'computer-use-preview',
+    });
+
+    expect(computerCall.tool_calls).toHaveLength(1);
+    expect((projected[0] as AIMessage).tool_calls).toHaveLength(0);
+    for (const input of [zdrInput, retainedInput]) {
+      expect(
+        input.filter(
+          (item) =>
+            item.type === 'computer_call' && item.call_id === 'call_computer'
+        )
+      ).toHaveLength(1);
+      expect(
+        input.filter(
+          (item) =>
+            item.type === 'computer_call_output' &&
+            item.call_id === 'call_computer'
+        )
+      ).toHaveLength(1);
+    }
+  });
+
+  it('deduplicates streaming Responses computer calls before replay', () => {
+    const event = {
+      type: 'response.output_item.done',
+      sequence_number: 1,
+      output_index: 0,
+      item: {
+        type: 'computer_call',
+        id: 'computer-stream-item',
+        call_id: 'call_computer_stream',
+        action: { type: 'screenshot' },
+        status: 'completed',
+      },
+    } as unknown as Parameters<
+      typeof convertResponsesDeltaToChatGenerationChunk
+    >[0];
+    const generation = convertResponsesDeltaToChatGenerationChunk(event);
+    const computerCall = generation?.message;
+    expect(computerCall).toBeDefined();
+
+    const computerOutput = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_computer_stream',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const projected = projectOpenAIResponsesToolMessageContent([
+      computerCall!,
+      computerOutput,
+    ]);
+
+    expect((computerCall as AIMessage).tool_calls).toHaveLength(1);
+    expect((computerCall as AIMessageChunk).tool_call_chunks).toHaveLength(1);
+    expect((projected[0] as AIMessage).tool_calls).toHaveLength(0);
+    expect((projected[0] as AIMessageChunk).tool_call_chunks).toHaveLength(0);
+    expect(Object.getPrototypeOf(projected[0])).toBe(
+      Object.getPrototypeOf(computerCall)
+    );
+    expect(
+      new AIMessageChunk(projected[0] as AIMessageChunk).tool_calls
+    ).toHaveLength(0);
+    for (const zdrEnabled of [true, false]) {
+      const input = convertMessagesToResponsesInput({
+        messages: projected,
+        zdrEnabled,
+        model: 'computer-use-preview',
+      });
+      expect(
+        input.filter(
+          (item) =>
+            item.type === 'computer_call' &&
+            item.call_id === 'call_computer_stream'
+        )
+      ).toHaveLength(1);
+      expect(
+        input.filter(
+          (item) =>
+            (item.type === 'function_call' || item.type === 'computer_call') &&
+            item.call_id === 'call_computer_stream'
+        )
+      ).toHaveLength(1);
+    }
+
+    const chatProjected = projectComputerCallOutputsToText(
+      projectOpenAIToolMessageContent([computerCall!, computerOutput])
+    );
+    const chatInput = convertMessagesToCompletionsMessageParams({
+      messages: chatProjected,
+      model: 'gpt-4o',
+    });
+
+    expect((chatProjected[0] as AIMessage).tool_calls).toHaveLength(1);
+    expect(chatInput).toEqual([
+      expect.objectContaining({
+        role: 'assistant',
+        tool_calls: [
+          expect.objectContaining({
+            id: 'call_computer_stream',
+            type: 'function',
+          }),
+        ],
+      }),
+      expect.objectContaining({
+        role: 'tool',
+        tool_call_id: 'call_computer_stream',
+        content: '[Computer screenshot omitted for this provider]',
+      }),
+    ]);
+  });
+
+  it('canonicalizes real OpenAI file-backed computer screenshots on the production converter path', () => {
+    const computerCall = new AIMessage({
+      content: '',
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            type: 'computer_call',
+            call_id: 'call_computer_file',
+            action: { type: 'screenshot' },
+          },
+        ],
+      },
+    });
+    const computerOutput = new ToolMessage({
+      content: [
+        {
+          type: 'input_image',
+          file_id: 'file-abc123',
+          detail: 'low',
+        },
+      ],
+      tool_call_id: 'call_computer_file',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    const projected = projectOpenAIToolMessageContent(
+      [computerCall, computerOutput],
+      100
+    );
+    const responsesInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'computer-use-preview',
+    });
+
+    expect(responsesInput).toContainEqual({
+      type: 'computer_call_output',
+      call_id: 'call_computer_file',
+      output: {
+        type: 'input_image',
+        file_id: 'file-abc123',
+        detail: 'low',
+      },
+    });
+  });
+
+  it('rejects extra invalid screenshot fields instead of shipping the original block', () => {
+    const computerCall = new AIMessage({
+      content: '',
+      response_metadata: {
+        output: [
+          {
+            type: 'computer_call',
+            call_id: 'call_computer_extra',
+            action: { type: 'screenshot' },
+          },
+        ],
+      },
+    });
+    const malformed = new ToolMessage({
+      content: [
+        {
+          type: 'input_image',
+          image_url: 'data:image/png;base64,AA==',
+          file_id: 'not-a-file-id',
+        },
+      ],
+      tool_call_id: 'call_computer_extra',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(() =>
+      projectOpenAIToolMessageContent([computerCall, malformed], 100)
+    ).toThrow('Invalid computer call output screenshot');
+  });
+
+  it('rejects computer outputs that precede their call', () => {
+    const computerCall = new AIMessage({
+      content: '',
+      response_metadata: {
+        output: [
+          {
+            type: 'computer_call',
+            call_id: 'call_computer_order',
+            action: { type: 'screenshot' },
+          },
+        ],
+      },
+    });
+    const computerOutput = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_computer_order',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(() =>
+      projectOpenAIToolMessageContent([computerOutput, computerCall], 100)
+    ).toThrow('Invalid computer call output pairing');
+  });
+
+  it('rejects a malformed marked computer output before provider conversion', () => {
+    const malformed = new ToolMessage({
+      content: [{ type: 'text', text: 'A'.repeat(2_000) }],
+      tool_call_id: 'call_computer_malformed',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(() => projectOpenAIToolMessageContent([malformed], 100)).toThrow(
+      'Invalid computer call output screenshot'
+    );
+  });
+
+  it('rejects a marked screenshot paired with a normal function call', () => {
+    const functionCall = new AIMessage({
+      content: '',
+      tool_calls: [
+        {
+          id: 'call_function',
+          name: 'render',
+          args: {},
+          type: 'tool_call',
+        },
+      ],
+    });
+    const malformedPair = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_function',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(() =>
+      projectOpenAIToolMessageContent([functionCall, malformedPair], 100)
+    ).toThrow('Invalid computer call output pairing');
+  });
+
+  it('keeps the mutating artifact formatter API backward compatible', () => {
+    const anthropicToolMessage = new ToolMessage({
+      content: 'result',
+      tool_call_id: 'anthropic_legacy',
+      artifact: {
+        content: [{ type: ContentTypes.TEXT, text: 'anthropic artifact' }],
+      },
+    });
+    const anthropicMessages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'anthropic_legacy',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      anthropicToolMessage,
+    ];
+
+    expect(formatAnthropicArtifactContent(anthropicMessages)).toBeUndefined();
+    expect(anthropicToolMessage.content).toEqual([
+      { type: ContentTypes.TEXT, text: 'result' },
+      { type: ContentTypes.TEXT, text: 'anthropic artifact' },
+    ]);
+    expect(anthropicToolMessage.artifact.content).toHaveLength(1);
+
+    const payloadToolMessage = new ToolMessage({
+      content: 'result',
+      tool_call_id: 'payload_legacy',
+      artifact: {
+        content: [{ type: ContentTypes.TEXT, text: 'payload artifact' }],
+      },
+    });
+    const payloadMessages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'payload_legacy',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      payloadToolMessage,
+    ];
+
+    expect(formatArtifactPayload(payloadMessages)).toBeUndefined();
+    expect(payloadToolMessage.content).toContain(
+      'Tool response is included in the next message'
+    );
+    expect(payloadMessages[payloadMessages.length - 1]).toBeInstanceOf(
+      HumanMessage
+    );
+    expect(payloadToolMessage.artifact.content).toHaveLength(1);
   });
 
   it('should dynamically discover tools from tool_search output and keep their tool calls', () => {
@@ -4342,25 +4805,537 @@ describe('formatAgentMessages', () => {
     });
   });
 
-  describe('cross-run summary token accounting', () => {
-    it('should exclude only covered messages from the map', () => {
-      const payload: TPayload = [
-        { role: 'user', messageId: 'old-user', content: 'Old question' },
+  describe('summary boundary token count adjustment', () => {
+    /** Atomic media costs a fixed provider price the character heuristic cannot
+     *  see, so scaling by the measurable siblings alone erases it. Both shapes
+     *  collapsed a four-figure count to 1 before this guard. */
+    it.each([
+      [
+        'text before the summary',
+        { type: ContentTypes.TEXT, text: 'hello there' },
+      ],
+      [
+        'a tool call before the summary',
         {
-          role: 'assistant',
-          messageId: 'old-assistant',
-          content: 'Old answer',
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'tc1',
+            name: 'search',
+            args: '{"q":"x"}',
+            output: 'result text',
+          },
         },
+      ],
+    ])(
+      'skips the positional discount when retained media is unmeasurable, with %s',
+      (_label, leading) => {
+        const payload: TPayload = [
+          {
+            role: 'assistant',
+            content: [
+              leading as MessageContentComplex,
+              {
+                type: ContentTypes.SUMMARY,
+                text: 'S'.repeat(400),
+                tokenCount: 100,
+              },
+              {
+                type: 'image_url',
+                image_url: { url: 'data:image/png;base64,x' },
+              },
+            ],
+          },
+        ];
+
+        const result = formatAgentMessages(payload, { 0: 1200 });
+
+        expect(result.indexTokenCountMap?.[0]).toBe(1200);
+        expect(result.boundaryTokenAdjustment).toBeUndefined();
+      }
+    );
+
+    /** The media sits a level down, inside `tool_call.output`, where serializing
+     *  gives it a nonzero length while the token counter charges its fixed media
+     *  cost. Eligibility is decided by part type, so nesting depth is irrelevant. */
+    it('skips the positional discount when retained tool output carries media', () => {
+      const payload: TPayload = [
         {
           role: 'assistant',
-          messageId: 'summary-step',
+          content: [
+            { type: ContentTypes.TEXT, text: 'a'.repeat(4000) },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'S'.repeat(400),
+              tokenCount: 100,
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tc1',
+                name: 'render',
+                args: '{}',
+                output: [
+                  {
+                    type: 'image_url',
+                    image_url: { url: 'data:image/png;base64,y' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 4000 });
+
+      const emitted = Object.values(result.indexTokenCountMap ?? {}).reduce(
+        (sum, value) => sum + value,
+        0
+      );
+      expect(emitted).toBe(4000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
+    });
+
+    it('still proportions when every retained part is measurable', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'a'.repeat(400) },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'S'.repeat(100),
+              tokenCount: 20,
+            },
+            { type: ContentTypes.TEXT, text: 'b'.repeat(100) },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 600 });
+
+      expect(result.boundaryTokenAdjustment?.original).toBe(600);
+      expect(result.indexTokenCountMap?.[0]).toBeLessThan(600);
+      expect(result.indexTokenCountMap?.[0]).toBeGreaterThan(0);
+    });
+
+    it('should proportion token count when thinking block is sliced off by boundary', () => {
+      const thinkingText = 'x'.repeat(1000);
+      const payload: TPayload = [
+        { role: 'user', content: 'Old question' },
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.THINKING, thinking: thinkingText },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Summary of conversation',
+              tokenCount: 15,
+            },
+            { type: ContentTypes.TEXT, text: 'Brief response after summary' },
+          ],
+        },
+        { role: 'user', content: 'Follow-up question' },
+      ];
+
+      const indexTokenCountMap = { 0: 5, 1: 1590, 2: 8 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.summary).toBeDefined();
+      expect(result.summary!.text).toBe('Summary of conversation');
+
+      const boundaryMsgTokens = result.indexTokenCountMap?.[0];
+      expect(boundaryMsgTokens).toBeDefined();
+      expect(boundaryMsgTokens!).toBeLessThan(200);
+      expect(boundaryMsgTokens!).toBeGreaterThan(0);
+
+      expect(result.indexTokenCountMap?.[1]).toBe(8);
+    });
+
+    /** Reframed: a tool call anywhere in the entry now cancels the ratio, since
+     *  telling a text-bearing tool payload from a media-bearing one requires
+     *  recursing into arbitrary nested output. The entry keeps its count. */
+    it('should not proportion when a tool_use part is present', () => {
+      const thinkingText = 'a'.repeat(800);
+      const toolInput = JSON.stringify({ data: 'b'.repeat(400) });
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.THINKING, thinking: thinkingText },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tc1',
+                name: 'search',
+                args: toolInput,
+                output: 'result',
+              },
+            },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Conversation summary after tool use',
+              tokenCount: 20,
+            },
+            { type: ContentTypes.TEXT, text: 'Short tail' },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 2000 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.summary).toBeDefined();
+
+      const totalOutputTokens = Object.values(
+        result.indexTokenCountMap || {}
+      ).reduce((sum, v) => sum + v, 0);
+
+      expect(totalOutputTokens).toBe(2000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
+    });
+
+    it('should roughly halve token count when content is evenly split around boundary', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'a'.repeat(100) },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Mid-conversation summary',
+              tokenCount: 10,
+            },
+            { type: ContentTypes.TEXT, text: 'b'.repeat(100) },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 500 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.summary).toBeDefined();
+
+      const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
+      expect(adjustedTokens).toBeGreaterThan(150);
+      expect(adjustedTokens).toBeLessThan(350);
+    });
+
+    it('should still adjust when summary is the first content part (its own text is sliced off)', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Summary at start',
+              tokenCount: 10,
+            },
+            { type: ContentTypes.TEXT, text: 'Everything after the summary' },
+          ],
+        },
+        { role: 'user', content: 'Next question' },
+      ];
+
+      const indexTokenCountMap = { 0: 300, 1: 10 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.summary).toBeDefined();
+
+      const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
+      expect(adjustedTokens).toBeLessThan(300);
+      expect(adjustedTokens).toBeGreaterThan(100);
+      expect(result.indexTokenCountMap?.[1]).toBe(10);
+    });
+
+    /** Previously the removed `tool_use` input was counted into the denominator.
+     *  A base64 payload there serializes to a huge length while the counter
+     *  charges a fixed estimate, so the ratio dragged retained text below its
+     *  real cost. The discount is cancelled instead. */
+    it('should not use tool_use input size in the char-length ratio', () => {
+      const hugeInput = JSON.stringify({ payload: 'z'.repeat(5000) });
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use' as ContentTypes,
+              input: hugeInput,
+            } as unknown as MessageContentComplex,
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'After heavy tool use',
+              tokenCount: 12,
+            },
+            { type: ContentTypes.TEXT, text: 'Tiny tail' },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 3000 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.summary).toBeDefined();
+
+      const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
+      expect(adjustedTokens).toBe(3000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
+    });
+
+    it('should handle multiple content parts after the boundary', () => {
+      const thinkingText = 'x'.repeat(2000);
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.THINKING, thinking: thinkingText },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Conversation checkpoint',
+              tokenCount: 14,
+            },
+            { type: ContentTypes.TEXT, text: 'Part A of the tail' },
+            {
+              type: ContentTypes.TEXT,
+              text: 'Part B of the tail with more text',
+            },
+          ],
+        },
+        { role: 'user', content: 'Next message' },
+      ];
+
+      const indexTokenCountMap = { 0: 4000, 1: 6 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.summary).toBeDefined();
+
+      const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
+      expect(adjustedTokens).toBeLessThan(200);
+      expect(adjustedTokens).toBeGreaterThan(0);
+
+      expect(result.indexTokenCountMap?.[1]).toBe(6);
+    });
+
+    it('should produce integer token counts after proportional adjustment', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.THINKING, thinking: 'x'.repeat(333) },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Summary',
+              tokenCount: 5,
+            },
+            { type: ContentTypes.TEXT, text: 'y'.repeat(77) },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 997 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      const adjustedTokens = result.indexTokenCountMap?.[0];
+      expect(adjustedTokens).toBeDefined();
+      expect(Number.isInteger(adjustedTokens)).toBe(true);
+    });
+  });
+
+  describe('summary coverage boundary', () => {
+    const buildSummaryPart = (coverage?: {
+      retainedFromMessageId: string;
+    }) => ({
+      type: ContentTypes.SUMMARY,
+      content: [
+        { type: ContentTypes.TEXT, text: 'Summary of the earliest turns' },
+      ],
+      tokenCount: 12,
+      ...(coverage != null ? { coverage } : {}),
+    });
+
+    /** Mirrors a compaction with `retainRecent.turns: 1`: m1/m2 were refined
+     *  into the summary, m3/m4 are the retained tail, and the block itself is
+     *  persisted on the assistant message that came after all of them. */
+    const compactedPayload = (coverage?: {
+      retainedFromMessageId: string;
+    }): TPayload => [
+      { messageId: 'm1', role: 'user', content: 'Covered question' },
+      { messageId: 'm2', role: 'assistant', content: 'Covered answer' },
+      { messageId: 'm3', role: 'user', content: 'Retained question' },
+      { messageId: 'm4', role: 'assistant', content: 'Retained answer' },
+      {
+        messageId: 'm5',
+        role: 'assistant',
+        content: [
+          buildSummaryPart(coverage),
+          { type: ContentTypes.TEXT, text: 'Post-compaction reply' },
+        ],
+      },
+    ];
+
+    const textOf = (message: BaseMessage): string => {
+      const { content } = message;
+      if (typeof content === 'string') {
+        return content;
+      }
+      return (content as MessageContentComplex[])
+        .map((part) => ('text' in part ? (part as { text: string }).text : ''))
+        .join('');
+    };
+
+    it('preserves the retained tail that the summary never covered', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm3' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Retained question',
+        'Retained answer',
+        'Post-compaction reply',
+      ]);
+      expect(result.summary!.text).toBe('Summary of the earliest turns');
+      expect(result.summary!.tokenCount).toBe(12);
+    });
+
+    it('retains the anchor message itself, dropping only what precedes it', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm4' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Retained answer',
+        'Post-compaction reply',
+      ]);
+    });
+
+    /** Coverage mode leaves the block's entry at its full count on purpose. The
+     *  summary's cost in the reader's token units is not obtainable here — no
+     *  tokenizer reaches this function, and a figure recorded at write time is
+     *  in the writing run's units. Over-counting prunes early; under-counting
+     *  would risk an over-context request. */
+    it('does not discount the entry carrying the summary block', () => {
+      const payload: TPayload = [
+        { messageId: 'm1', role: 'user', content: 'Covered question' },
+        { messageId: 'm2', role: 'user', content: 'Retained question' },
+        {
+          messageId: 'm3',
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
+              tokenCount: 120,
+              coverage: { retainedFromMessageId: 'm2' },
+            },
+            { type: ContentTypes.TEXT, text: 'Reply' },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 1000 });
+
+      expect(result.indexTokenCountMap?.[1]).toBe(1000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
+    });
+
+    it('keeps token counts for the retained tail and drops covered entries', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm3' }),
+        { 0: 5, 1: 6, 2: 7, 3: 8, 4: 40 }
+      );
+
+      expect(result.indexTokenCountMap?.[0]).toBe(7);
+      expect(result.indexTokenCountMap?.[1]).toBe(8);
+      expect(Object.keys(result.indexTokenCountMap ?? {})).toHaveLength(3);
+    });
+
+    it('leaves entries without summary parts untouched', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm3' }),
+        { 0: 5, 1: 6, 2: 7, 3: 8, 4: 40 }
+      );
+
+      expect(result.indexTokenCountMap?.[0]).toBe(7);
+      expect(result.indexTokenCountMap?.[1]).toBe(8);
+    });
+
+    it('falls back to positional trimming for legacy blocks without coverage', () => {
+      const result = formatAgentMessages(compactedPayload());
+
+      expect(result.messages.map(textOf)).toEqual(['Post-compaction reply']);
+      expect(result.summary!.text).toBe('Summary of the earliest turns');
+    });
+
+    it('falls back to positional trimming when coverage cannot be resolved', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'pruned-from-payload' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual(['Post-compaction reply']);
+    });
+
+    it('ignores an anchor pointing past its own block', () => {
+      const result = formatAgentMessages([
+        ...compactedPayload({ retainedFromMessageId: 'm6' }),
+        { messageId: 'm6', role: 'user', content: 'Later question' },
+      ]);
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Post-compaction reply',
+        'Later question',
+      ]);
+    });
+
+    it('applies last-summary-wins across mixed coverage and legacy blocks', () => {
+      const payload: TPayload = [
+        { messageId: 'm1', role: 'user', content: 'Covered question' },
+        {
+          messageId: 'm2',
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Older summary',
+              tokenCount: 3,
+            },
+            { type: ContentTypes.TEXT, text: 'Older tail' },
+          ],
+        },
+        { messageId: 'm3', role: 'user', content: 'Retained question' },
+        {
+          messageId: 'm4',
+          role: 'assistant',
+          content: [
+            buildSummaryPart({ retainedFromMessageId: 'm3' }),
+            { type: ContentTypes.TEXT, text: 'Newest reply' },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload);
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Retained question',
+        'Newest reply',
+      ]);
+      expect(result.summary!.text).toBe('Summary of the earliest turns');
+    });
+  });
+
+  describe('cross-run summary token accounting', () => {
+    it('should conserve tokens: summary boundary excludes pre-boundary messages from the map', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'Old question' },
+        { role: 'assistant', content: 'Old answer' },
+        {
+          role: 'assistant',
           content: [
             { type: ContentTypes.TEXT, text: 'Text before summary' },
-            summaryBlock(
-              'old-assistant',
-              'This is a conversation summary capturing prior context.',
-              25
-            ),
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'This is a conversation summary capturing prior context.',
+              tokenCount: 25,
+            },
             { type: ContentTypes.TEXT, text: 'Text after summary' },
           ],
         },
@@ -4390,27 +5365,23 @@ describe('formatAgentMessages', () => {
       expect(outputKeys).toHaveLength(3);
 
       const boundaryMsgTokens = result.indexTokenCountMap?.[0] ?? 0;
-      expect(boundaryMsgTokens).toBe(35);
+      expect(boundaryMsgTokens).toBeLessThan(60);
+      expect(boundaryMsgTokens).toBeGreaterThan(0);
       expect(result.indexTokenCountMap?.[1]).toBe(10);
       expect(result.indexTokenCountMap?.[2]).toBe(15);
     });
 
     it('should preserve summary token at index 0 when tool calls expand post-boundary messages', () => {
       const payload: TPayload = [
-        {
-          role: 'user',
-          messageId: 'covered-user',
-          content: 'Summarized away',
-        },
+        { role: 'user', content: 'Summarized away' },
         {
           role: 'assistant',
-          messageId: 'summary-step',
           content: [
-            summaryBlock(
-              'covered-user',
-              'Summary of the conversation so far.',
-              20
-            ),
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Summary of the conversation so far.',
+              tokenCount: 20,
+            },
           ],
         },
         {
@@ -4461,12 +5432,8 @@ describe('formatAgentMessages', () => {
 
     it('should produce correct maps across a simulated multi-run lifecycle', () => {
       const run1Payload: TPayload = [
-        { role: 'user', messageId: 'run1-user', content: 'What is 2+2?' },
-        {
-          role: 'assistant',
-          messageId: 'run1-assistant',
-          content: 'The answer is 4.',
-        },
+        { role: 'user', content: 'What is 2+2?' },
+        { role: 'assistant', content: 'The answer is 4.' },
       ];
       const run1Map = { 0: 10, 1: 12 };
 
@@ -4477,21 +5444,16 @@ describe('formatAgentMessages', () => {
 
       const run2Payload: TPayload = [
         ...run1Payload,
-        {
-          role: 'user',
-          messageId: 'run2-user',
-          content: 'Now multiply 4 by 10.',
-        },
+        { role: 'user', content: 'Now multiply 4 by 10.' },
         {
           role: 'assistant',
-          messageId: 'run2-summary-step',
           content: [
             { type: ContentTypes.TEXT, text: 'Sure, the answer is 40.' },
-            summaryBlock(
-              'run2-user',
-              'User asked basic arithmetic: 2+2=4, then 4*10=40.',
-              18
-            ),
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'User asked basic arithmetic: 2+2=4, then 4*10=40.',
+              tokenCount: 18,
+            },
           ],
         },
       ];
@@ -4507,17 +5469,26 @@ describe('formatAgentMessages', () => {
       const run2TotalPostBoundary = Object.values(
         run2Result.indexTokenCountMap || {}
       ).reduce((sum, v) => sum + v, 0);
-      expect(run2TotalPostBoundary).toBe(32);
+      expect(run2TotalPostBoundary).toBe(0);
 
       const run3Payload: TPayload = [
-        ...run2Payload,
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'User asked basic arithmetic: 2+2=4, then 4*10=40.',
+              tokenCount: 18,
+            },
+          ],
+        },
         { role: 'user', content: 'What is the square root of 40?' },
         {
           role: 'assistant',
           content: 'The square root of 40 is approximately 6.32.',
         },
       ];
-      const run3Map = { 0: 10, 1: 12, 2: 14, 3: 50, 4: 15, 5: 20 };
+      const run3Map = { 0: 18, 1: 15, 2: 20 };
 
       const run3Result = formatAgentMessages(run3Payload, run3Map);
       expect(run3Result.summary).toBeDefined();
@@ -4529,7 +5500,7 @@ describe('formatAgentMessages', () => {
       const run3Total = Object.values(
         run3Result.indexTokenCountMap || {}
       ).reduce((sum, count) => sum + count, 0);
-      expect(run3Total).toBe(32 + 15 + 20);
+      expect(run3Total).toBe(15 + 20);
     });
   });
 });

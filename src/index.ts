@@ -1,7 +1,6 @@
 /* Main Operations */
 export * from './run';
 export * from './stream';
-export * from './splitStream';
 export * from './events';
 export * from './messages';
 
@@ -27,6 +26,7 @@ export * from './tools/ReadFile';
 export * from './tools/skillCatalog';
 export * from './tools/ToolSearch';
 export * from './tools/ToolNode';
+export * from './tools/intentArg';
 export * from './tools/schema';
 export * from './tools/handlers';
 export * from './tools/local';
@@ -80,4 +80,5 @@ export { getChatModelClass } from './llm/providers';
 export { FakeChatModel, createFakeStreamingLLM } from './llm/fake';
 export { initializeModel } from './llm/init';
 export { attemptInvoke, tryFallbackProviders } from './llm/invoke';
+export { canSealPreempt } from './llm/preempt';
 export { isThinkingEnabled, getMaxOutputTokensKey } from './llm/request';

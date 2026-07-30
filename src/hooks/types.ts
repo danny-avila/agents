@@ -17,6 +17,7 @@ export const HOOK_EVENTS = [
   'PostToolUse',
   'PostToolUseFailure',
   'PostToolBatch',
+  'PreemptBoundary',
   'PermissionDenied',
   'SubagentStart',
   'SubagentStop',
@@ -145,6 +146,39 @@ export interface PostToolBatchHookInput extends BaseHookInput {
   entries: PostToolBatchEntry[];
 }
 
+/**
+ * Fires when a cooperative preemption seals the model stream mid-generation
+ * — the second injection boundary, and the only one that exists during a
+ * long text answer with no tool calls in it.
+ *
+ * Order: fires after the model stream is sealed and BEFORE the next model
+ * call. The `injectedMessages` a hook returns here are appended verbatim and
+ * the agent node self-loops. Returning nothing is a valid outcome (the host's
+ * queue was cancelled or already drained): the run stops honestly rather than
+ * self-looping into an empty turn.
+ *
+ * The sealed turn is NOT yet observable from graph state when this fires.
+ * Dispatch happens inside the agent node, and only the outer graph's reducer
+ * writes `StandardGraph.messages` — which cannot run until the node returns.
+ * A hook calling `Run.getRunMessages()` here sees the state as of the last
+ * completed superstep, so the sealed text is absent. `PostToolBatch` behaves
+ * the same way: a tool-boundary hook cannot see the assistant turn that
+ * requested the tool. This is a property of the single-node outer graph, not
+ * of preemption, and committing first would mean returning from the node and
+ * re-entering — precisely what the self-loop exists to avoid.
+ *
+ * A hook that needs the sealed text should therefore not go looking for it in
+ * graph state. Decide from the host's own queue, or read it after the run.
+ *
+ * Requires `RunConfig.preemption`. This event is deliberately NOT
+ * result-altering, so registering it never disables eager tool execution.
+ */
+export interface PreemptBoundaryHookInput extends BaseHookInput {
+  hook_event_name: 'PreemptBoundary';
+  /** 1-based index of this seal within the run. */
+  sealCount: number;
+}
+
 export interface PermissionDeniedHookInput extends BaseHookInput {
   hook_event_name: 'PermissionDenied';
   toolName: string;
@@ -217,6 +251,7 @@ export type HookInput =
   | PostToolUseHookInput
   | PostToolUseFailureHookInput
   | PostToolBatchHookInput
+  | PreemptBoundaryHookInput
   | PermissionDeniedHookInput
   | SubagentStartHookInput
   | SubagentStopHookInput
@@ -233,6 +268,7 @@ export type HookInputByEvent = {
   PostToolUse: PostToolUseHookInput;
   PostToolUseFailure: PostToolUseFailureHookInput;
   PostToolBatch: PostToolBatchHookInput;
+  PreemptBoundary: PreemptBoundaryHookInput;
   PermissionDenied: PermissionDeniedHookInput;
   SubagentStart: SubagentStartHookInput;
   SubagentStop: SubagentStopHookInput;
@@ -251,14 +287,18 @@ export interface BaseHookOutput {
   additionalContext?: string;
   /**
    * Messages to inject into graph state, one `HumanMessage` per entry
-   * (converted via `ToolNode.convertInjectedMessages`, which preserves
+   * (converted via `convertInjectedMessages`, which preserves
    * `role`/`source`/`isMeta` in `additional_kwargs`). Unlike
    * `additionalContext` — which is consolidated across hooks into a single
    * system-flavored message — each entry keeps its own identity and role,
    * making this the channel for injecting verbatim user speech (e.g. a
    * mid-run steering message). Accumulated across hooks in registration
-   * order. Currently consumed only at the `PostToolBatch` dispatch site;
-   * other events ignore the field.
+   * order.
+   *
+   * Consumed at exactly two dispatch sites, both of which run the same
+   * converter so the emitted shapes cannot drift: `PostToolBatch` (the tool
+   * boundary) and `PreemptBoundary` (a cooperative mid-generation seal).
+   * Every other event ignores the field.
    */
   injectedMessages?: InjectedMessage[];
   /** True to prevent the next model turn. Any hook can set this. */
@@ -367,6 +407,8 @@ export type PostToolUseFailureHookOutput = BaseHookOutput;
 
 export type PostToolBatchHookOutput = BaseHookOutput;
 
+export type PreemptBoundaryHookOutput = BaseHookOutput;
+
 export type PermissionDeniedHookOutput = BaseHookOutput;
 
 export interface SubagentStartHookOutput extends BaseHookOutput {
@@ -395,6 +437,7 @@ export type HookOutputByEvent = {
   PostToolUse: PostToolUseHookOutput;
   PostToolUseFailure: PostToolUseFailureHookOutput;
   PostToolBatch: PostToolBatchHookOutput;
+  PreemptBoundary: PreemptBoundaryHookOutput;
   PermissionDenied: PermissionDeniedHookOutput;
   SubagentStart: SubagentStartHookOutput;
   SubagentStop: SubagentStopHookOutput;
@@ -412,6 +455,7 @@ export type HookOutput =
   | PostToolUseHookOutput
   | PostToolUseFailureHookOutput
   | PostToolBatchHookOutput
+  | PreemptBoundaryHookOutput
   | PermissionDeniedHookOutput
   | SubagentStartHookOutput
   | SubagentStopHookOutput

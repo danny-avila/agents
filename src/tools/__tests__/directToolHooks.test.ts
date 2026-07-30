@@ -20,7 +20,7 @@ import { ToolNode } from '../ToolNode';
  */
 function createDirectTool(
   name: string,
-  impl: (args: Record<string, unknown>) => string | Promise<string>
+  impl: (args: Record<string, unknown>) => unknown | Promise<unknown>
 ): StructuredToolInterface {
   return tool(async (args: Record<string, unknown>) => impl(args), {
     name,
@@ -147,6 +147,217 @@ describe('Direct-path lifecycle hooks (in-process tools)', () => {
     expect(String(message.content)).toBe('ran:ls');
   });
 
+  it('serializes bigint values in direct structured tool output', async () => {
+    const query = createDirectTool('query', () => 'unused');
+    (
+      query as unknown as {
+        invoke: () => Promise<Array<Record<string, unknown>>>;
+      }
+    ).invoke = async () => [{ rowsRead: BigInt(42), status: 'complete' }];
+    const node = new ToolNode({
+      tools: [query],
+      eventDrivenMode: true,
+      directToolNames: new Set(['query']),
+    });
+
+    const result = await node.invoke({
+      messages: [aiCall('call_bigint', 'query', {})],
+    });
+    const [message] = toolMessages(result);
+
+    expect(message.status).toBe('success');
+    expect(message.content).toBe('[{"rowsRead":"42","status":"complete"}]');
+  });
+
+  it('bounds a large structured result without invoking toJSON', async () => {
+    let toJSONCalls = 0;
+    const structuredOutput = {
+      rows: [{ value: 'x'.repeat(20_000) }],
+      toJSON() {
+        toJSONCalls++;
+        return 'y'.repeat(100_000);
+      },
+    };
+    const query = createDirectTool('large_query', () => 'unused');
+    (
+      query as unknown as {
+        invoke: () => Promise<typeof structuredOutput>;
+      }
+    ).invoke = async () => structuredOutput;
+    const node = new ToolNode({
+      tools: [query],
+      eventDrivenMode: true,
+      directToolNames: new Set(['large_query']),
+      maxToolResultChars: 200,
+    });
+
+    const result = await node.invoke({
+      messages: [aiCall('call_large', 'large_query', {})],
+    });
+    const [message] = toolMessages(result);
+
+    expect(toJSONCalls).toBe(0);
+    expect(typeof message.content).toBe('string');
+    expect((message.content as string).length).toBeLessThanOrEqual(200);
+    expect(message.content).toContain('truncated');
+  });
+
+  it('keeps native computer screenshots intact despite the generic result cap', async () => {
+    const screenshot = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const contents: ToolMessage['content'][] = [
+      screenshot,
+      [{ type: 'computer_screenshot', image_url: screenshot }],
+    ];
+
+    for (let i = 0; i < contents.length; i++) {
+      const name = `computer_output_${i}`;
+      const computerOutput = new ToolMessage({
+        content: contents[i],
+        tool_call_id: `computer-call-${i}`,
+        additional_kwargs: { type: 'computer_call_output' },
+      });
+      const computer = createDirectTool(name, () => 'unused');
+      (
+        computer as unknown as {
+          invoke: () => Promise<ToolMessage>;
+        }
+      ).invoke = async () => computerOutput;
+      const node = new ToolNode({
+        tools: [computer],
+        eventDrivenMode: true,
+        directToolNames: new Set([name]),
+        maxToolResultChars: 80,
+      });
+
+      const result = await node.invoke({
+        messages: [aiCall(`computer-call-${i}`, name, {})],
+      });
+      const [message] = toolMessages(result);
+
+      expect(message).toBe(computerOutput);
+      expect(message.content).toBe(contents[i]);
+      expect(message.additional_kwargs.type).toBe('computer_call_output');
+    }
+  });
+
+  it('preserves a valid PostToolUse computer screenshot replacement', async () => {
+    const original = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const replacement = `data:image/png;base64,${'B'.repeat(2_000)}`;
+    const computerOutput = new ToolMessage({
+      content: original,
+      tool_call_id: 'computer-hook-valid',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const computer = createDirectTool('computer_hook_valid', () => 'unused');
+    (
+      computer as unknown as {
+        invoke: () => Promise<ToolMessage>;
+      }
+    ).invoke = async () => computerOutput;
+    const registry = new HookRegistry();
+    registry.register('PostToolUse', {
+      hooks: [
+        async (): Promise<PostToolUseHookOutput> => ({
+          updatedOutput: replacement,
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [computer],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['computer_hook_valid']),
+      maxToolResultChars: 80,
+    });
+
+    const result = await node.invoke({
+      messages: [aiCall('computer-hook-valid', 'computer_hook_valid', {})],
+    });
+    const [message] = toolMessages(result);
+
+    expect(message.content).toBe(replacement);
+    expect(message.additional_kwargs.type).toBe('computer_call_output');
+  });
+
+  it('rejects an invalid PostToolUse computer output replacement', async () => {
+    const screenshot = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const computerOutput = new ToolMessage({
+      content: screenshot,
+      tool_call_id: 'computer-hook-invalid',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const computer = createDirectTool('computer_hook_invalid', () => 'unused');
+    (
+      computer as unknown as {
+        invoke: () => Promise<ToolMessage>;
+      }
+    ).invoke = async () => computerOutput;
+    const registry = new HookRegistry();
+    registry.register('PostToolUse', {
+      hooks: [
+        async (): Promise<PostToolUseHookOutput> => ({
+          updatedOutput: 'redacted screenshot',
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [computer],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['computer_hook_invalid']),
+      maxToolResultChars: 80,
+    });
+
+    await expect(
+      node.invoke({
+        messages: [
+          aiCall('computer-hook-invalid', 'computer_hook_invalid', {}),
+        ],
+      })
+    ).rejects.toThrow(
+      'PostToolUse updatedOutput for a computer call must be a valid screenshot'
+    );
+  });
+
+  it('caps returned and thrown direct-tool errors before storing them', async () => {
+    const returnedError = createDirectTool(
+      'returned_error',
+      () =>
+        new ToolMessage({
+          status: 'error',
+          content: `returned:${'x'.repeat(2_000)}`,
+          tool_call_id: 'returned',
+        })
+    );
+    const thrownError = createDirectTool('thrown_error', () => {
+      throw new Error(`thrown:${'y'.repeat(2_000)}`);
+    });
+    const node = new ToolNode({
+      tools: [returnedError, thrownError],
+      eventDrivenMode: true,
+      directToolNames: new Set(['returned_error', 'thrown_error']),
+      maxToolResultChars: 200,
+    });
+
+    const returned = toolMessages(
+      await node.invoke({
+        messages: [aiCall('returned', 'returned_error', {})],
+      })
+    )[0];
+    const thrown = toolMessages(
+      await node.invoke({
+        messages: [aiCall('thrown', 'thrown_error', {})],
+      })
+    )[0];
+
+    expect(returned.status).toBe('error');
+    expect(String(returned.content).length).toBeLessThanOrEqual(200);
+    expect(returned.content).toContain('[truncated:');
+    expect(thrown.status).toBe('error');
+    expect(String(thrown.content).length).toBeLessThanOrEqual(200);
+    expect(thrown.content).toContain('[truncated:');
+  });
+
   it('executingAgentId defaults to agentId for direct callers, and an explicit value wins', async () => {
     const echo = createDirectTool('echo', (args) => `ran:${args.command}`);
     const captured: Array<string | undefined> = [];
@@ -245,6 +456,37 @@ describe('Direct-path lifecycle hooks (in-process tools)', () => {
     const [message] = toolMessages(result);
     expect(String(message.content)).toBe('REPLACED');
     expect(message.status).toBe('success');
+  });
+
+  it('caps PostToolUse updatedOutput after the hook rewrite', async () => {
+    const echo = createDirectTool('echo', () => 'ORIGINAL');
+    const replacement = 'R'.repeat(500);
+
+    const registry = new HookRegistry();
+    registry.register('PostToolUse', {
+      hooks: [
+        async (): Promise<PostToolUseHookOutput> => ({
+          updatedOutput: replacement,
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [echo],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+      maxToolResultChars: 50,
+    });
+
+    const result = await node.invoke({
+      messages: [aiCall('call_5_capped', 'echo', { command: 'x' })],
+    });
+    const [message] = toolMessages(result);
+
+    expect(typeof message.content).toBe('string');
+    expect((message.content as string).length).toBeLessThanOrEqual(50);
+    expect(message.content).not.toBe(replacement);
   });
 
   it('PostToolUseFailure observes errors thrown by the tool', async () => {
@@ -376,11 +618,16 @@ describe('Direct-path lifecycle hooks (in-process tools)', () => {
 
     // Patch the tool's `func` to record the turn the body sees via the
     // standard LangChain config.toolCall.turn channel.
-    const originalFunc = (echo as unknown as { func: (input: unknown, config: unknown) => Promise<string> }).func;
-    (echo as unknown as { func: (input: unknown, config: unknown) => Promise<string> }).func = async (
-      input,
-      config
-    ): Promise<string> => {
+    const originalFunc = (
+      echo as unknown as {
+        func: (input: unknown, config: unknown) => Promise<string>;
+      }
+    ).func;
+    (
+      echo as unknown as {
+        func: (input: unknown, config: unknown) => Promise<string>;
+      }
+    ).func = async (input, config): Promise<string> => {
       const t = (config as { toolCall?: { turn?: number } } | undefined)
         ?.toolCall?.turn;
       if (typeof t === 'number') bodyTurns.push(t);
@@ -424,7 +671,8 @@ describe('Direct-path lifecycle hooks (in-process tools)', () => {
       hooks: [
         async (): Promise<PreToolUseHookOutput> => ({
           decision: 'allow',
-          additionalContext: 'POLICY-NOTE: writes here require approval next time',
+          additionalContext:
+            'POLICY-NOTE: writes here require approval next time',
         }),
       ],
     });

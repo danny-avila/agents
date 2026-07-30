@@ -5,6 +5,8 @@ on:
     branches:
       - dev
       - main
+    paths-ignore:
+      - '**.md'
 
 concurrency:
   group: ci-${{ github.head_ref || github.ref }}

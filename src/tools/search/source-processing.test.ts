@@ -141,6 +141,63 @@ describe('expandHighlights content stripping', () => {
     expect(result.organic?.[0].content).toBeUndefined();
     expect(result.organic?.[0].references).toBeUndefined();
   });
+
+  test('honors a custom mainExpandBy when expanding highlights', () => {
+    const highlightText = 'KEYFACT';
+    // Boundary-free filler so expansion is governed purely by mainExpandBy,
+    // not by where natural separators happen to fall.
+    const content = `${'x'.repeat(1000)}${highlightText}${'y'.repeat(1000)}`;
+    const makeData = (): t.SearchResultData => ({
+      organic: [
+        {
+          ...makeOrganic('https://a.com'),
+          content,
+          highlights: [{ text: highlightText, score: 0.9 }],
+        },
+      ],
+    });
+
+    // separatorExpandBy 0 isolates the mainExpandBy effect.
+    const narrow = expandHighlights(makeData(), 50, 0).organic?.[0]
+      .highlights?.[0];
+    const wide = expandHighlights(makeData(), 500, 0).organic?.[0]
+      .highlights?.[0];
+
+    expect(narrow?.text).toContain(highlightText);
+    expect(wide?.text).toContain(highlightText);
+    // 50 chars of context each side vs. 500 → wide must be markedly longer.
+    expect(wide!.text.length).toBeGreaterThan(narrow!.text.length);
+    expect(narrow!.text.length).toBe(highlightText.length + 100);
+    expect(wide!.text.length).toBe(highlightText.length + 1000);
+  });
+
+  test('honors a custom separatorExpandBy when seeking boundaries', () => {
+    const highlightText = 'KEYFACT';
+    // The main window lands inside a boundary-free 'y' run; the only natural
+    // boundary ('. ') sits 250 chars past the main window's end. A small
+    // separator range can't reach it; a large one can.
+    const content = `${'x'.repeat(100)}${highlightText}${'y'.repeat(300)}. ${'z'.repeat(300)}`;
+    const makeData = (): t.SearchResultData => ({
+      organic: [
+        {
+          ...makeOrganic('https://a.com'),
+          content,
+          highlights: [{ text: highlightText, score: 0.9 }],
+        },
+      ],
+    });
+
+    // Same mainExpandBy; only the separator search range differs.
+    const narrow = expandHighlights(makeData(), 50, 100).organic?.[0]
+      .highlights?.[0];
+    const wide = expandHighlights(makeData(), 50, 400).organic?.[0]
+      .highlights?.[0];
+
+    expect(narrow?.text).toContain(highlightText);
+    expect(wide?.text).toContain(highlightText);
+    // Only the wider separator range reaches the trailing sentence boundary.
+    expect(wide!.text.length).toBeGreaterThan(narrow!.text.length);
+  });
 });
 
 describe('createSourceProcessor content capping', () => {

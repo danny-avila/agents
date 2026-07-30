@@ -4,13 +4,14 @@
  * This util file contains functions for converting LangChain messages to Anthropic messages.
  */
 import { createHash } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 import { ToolCall } from '@langchain/core/messages/tool';
 import {
   type BaseMessage,
   type SystemMessage,
   HumanMessage,
   type AIMessage,
-  type ToolMessage,
+  ToolMessage,
   isAIMessage,
   type Data,
   type StandardContentBlockConverter,
@@ -33,6 +34,11 @@ import {
   AnthropicCompactionBlockParam,
   AnthropicToolResponse,
 } from '../types';
+import {
+  cloneToolMessageWithContent,
+  serializeStructuredValueBounded,
+} from '@/utils/toolContent';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { Constants } from '@/common';
 
 type StandardTextBlock = Data.StandardTextBlock;
@@ -157,16 +163,139 @@ function hoistToolResultCacheControl(
   }
   let cacheControl: unknown;
   const stripped = content.map((block) => {
-    if ('cache_control' in block) {
-      cacheControl ??= (block as Record<string, unknown>).cache_control;
-      const clone = { ...(block as Record<string, unknown>) };
-      delete clone.cache_control;
-      return clone as MessageContentComplex;
+    if (typeof block !== 'object' || block == null || isProxy(block)) {
+      return block;
+    }
+    try {
+      const descriptors = Object.getOwnPropertyDescriptors(block);
+      const cacheControlDescriptor = descriptors.cache_control;
+      if (
+        cacheControlDescriptor.enumerable === true &&
+        'value' in cacheControlDescriptor
+      ) {
+        cacheControl ??= cacheControlDescriptor.value;
+        delete descriptors.cache_control;
+        return Object.create(
+          Object.getPrototypeOf(block),
+          descriptors
+        ) as MessageContentComplex;
+      }
+    } catch {
+      return block;
     }
     return block;
   });
   // `stripped` is element-equal to `content` when no marker was present.
   return { content: stripped, cacheControl };
+}
+
+/**
+ * A ToolMessage can already contain an Anthropic-native `tool_result` block
+ * (for example, when a tool returns provider-native structured content). The
+ * outer ToolMessage conversion supplies the one required result envelope, so
+ * unwrap an exact single nested envelope rather than sending an invalid
+ * `tool_result.content: [{ type: "tool_result", ... }]` payload.
+ */
+function unwrapToolMessageResultContent(content: ToolMessage['content']): {
+  content: string | MessageContentComplex[] | undefined;
+  cacheControl: unknown;
+  isError: boolean | undefined;
+} {
+  if (!Array.isArray(content) || content.length !== 1) {
+    return { content, cacheControl: undefined, isError: undefined };
+  }
+
+  const block = content[0];
+  if (typeof block !== 'object' || block == null || isProxy(block)) {
+    return { content, cacheControl: undefined, isError: undefined };
+  }
+
+  try {
+    const type = Object.getOwnPropertyDescriptor(block, 'type');
+    const nestedContent = Object.getOwnPropertyDescriptor(block, 'content');
+    if (
+      type?.enumerable !== true ||
+      !('value' in type) ||
+      type.value !== 'tool_result' ||
+      (nestedContent != null &&
+        (nestedContent.enumerable !== true || !('value' in nestedContent)))
+    ) {
+      return { content, cacheControl: undefined, isError: undefined };
+    }
+
+    const cacheControl = Object.getOwnPropertyDescriptor(
+      block,
+      'cache_control'
+    );
+    const isError = Object.getOwnPropertyDescriptor(block, 'is_error');
+    const nested =
+      nestedContent != null && 'value' in nestedContent
+        ? nestedContent.value
+        : undefined;
+    if (typeof nested === 'string') {
+      return {
+        content: nested,
+        cacheControl:
+          cacheControl?.enumerable === true && 'value' in cacheControl
+            ? cacheControl.value
+            : undefined,
+        isError:
+          isError?.enumerable === true &&
+          'value' in isError &&
+          typeof isError.value === 'boolean'
+            ? isError.value
+            : undefined,
+      };
+    }
+    if (Array.isArray(nested)) {
+      return {
+        content: nested as MessageContentComplex[],
+        cacheControl:
+          cacheControl?.enumerable === true && 'value' in cacheControl
+            ? cacheControl.value
+            : undefined,
+        isError:
+          isError?.enumerable === true &&
+          'value' in isError &&
+          typeof isError.value === 'boolean'
+            ? isError.value
+            : undefined,
+      };
+    }
+    if (nested == null) {
+      return {
+        content: undefined,
+        cacheControl:
+          cacheControl?.enumerable === true && 'value' in cacheControl
+            ? cacheControl.value
+            : undefined,
+        isError:
+          isError?.enumerable === true &&
+          'value' in isError &&
+          typeof isError.value === 'boolean'
+            ? isError.value
+            : undefined,
+      };
+    }
+    return {
+      content: serializeStructuredValueBounded(
+        nested,
+        HARD_MAX_TOOL_RESULT_CHARS
+      ).content,
+      cacheControl:
+        cacheControl?.enumerable === true && 'value' in cacheControl
+          ? cacheControl.value
+          : undefined,
+      isError:
+        isError?.enumerable === true &&
+        'value' in isError &&
+        typeof isError.value === 'boolean'
+          ? isError.value
+          : undefined,
+    };
+  } catch {
+    return { content, cacheControl: undefined, isError: undefined };
+  }
 }
 
 function _ensureMessageContents(
@@ -209,21 +338,38 @@ function _ensureMessageContents(
           );
         }
       } else {
-        const toolMessageContent = (
-          message as { content?: BaseMessage['content'] | null }
-        ).content;
+        const toolMessage = message as ToolMessage;
+        const toolMessageContent = toolMessage.content;
+        const unwrapped = unwrapToolMessageResultContent(toolMessageContent);
+        const formattedContent =
+          unwrapped.content == null
+            ? undefined
+            : _formatContent(
+              unwrapped.content === toolMessageContent
+                ? toolMessage
+                : cloneToolMessageWithContent(
+                  toolMessage,
+                      unwrapped.content as Parameters<
+                        typeof cloneToolMessageWithContent
+                      >[1]
+                )
+            );
         // Hoist a tail cache_control off the inner content onto the
         // tool_result block itself (the documented cacheable position).
-        const { content: hoistedContent, cacheControl } =
-          toolMessageContent != null
-            ? hoistToolResultCacheControl(_formatContent(message))
+        const { content: hoistedContent, cacheControl: innerCacheControl } =
+          formattedContent != null
+            ? hoistToolResultCacheControl(formattedContent)
             : { content: undefined, cacheControl: undefined };
+        const cacheControl = unwrapped.cacheControl ?? innerCacheControl;
         updatedMsgs.push(
           new HumanMessage({
             content: [
               {
                 type: 'tool_result',
                 ...(hoistedContent != null ? { content: hoistedContent } : {}),
+                ...(unwrapped.isError != null
+                  ? { is_error: unwrapped.isError }
+                  : {}),
                 ...(cacheControl != null
                   ? { cache_control: cacheControl as { type: 'ephemeral' } }
                   : {}),
@@ -473,6 +619,13 @@ function _formatContent(message: BaseMessage) {
    * forwarding an unusable block. The receiving model produces its own thinking.
    */
   const foreignReasoningTypes = ['reasoning_content', 'reasoning', 'think'];
+  /**
+   * Google server-side tool blocks (`toolCall`/`toolResponse` parts from e.g.
+   * URL context or Google Search). Only Google can execute these and validate
+   * their thought signatures, so they are dropped on a cross-provider handoff
+   * (e.g. Google → Anthropic); the assistant's answer text is kept.
+   */
+  const foreignServerToolTypes = ['toolCall', 'toolResponse'];
   const { content } = message;
 
   if (typeof content === 'string') {
@@ -854,6 +1007,14 @@ function _formatContent(message: BaseMessage) {
         // input and fall through to the throw below rather than being silently
         // dropped — as does any other unknown block (user media, Google
         // code-execution), which must be surfaced, not discarded.
+        return null;
+      } else if (
+        isAIMessage(message) &&
+        foreignServerToolTypes.some((t) => t === contentPart.type)
+      ) {
+        // Google server-side tool call/response (e.g. URL context) — only
+        // Google can execute it or validate its thought signature; drop it
+        // on a cross-provider handoff rather than crash.
         return null;
       } else {
         console.error(

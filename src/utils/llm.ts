@@ -32,7 +32,10 @@ export function isAnthropicLike(
 ): boolean {
   if (provider === Providers.ANTHROPIC) return true;
   if (provider === Providers.BEDROCK) {
-    return /claude/i.test(String(clientOptions?.model ?? ''));
+    return (
+      clientOptions?.model == null ||
+      /claude/i.test(String(clientOptions.model))
+    );
   }
   return false;
 }

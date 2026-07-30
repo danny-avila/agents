@@ -26,6 +26,8 @@ const INPUT = LangfuseOtelSpanAttributes.OBSERVATION_INPUT;
 const OUTPUT = LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT;
 const TRACE_INPUT = LangfuseOtelSpanAttributes.TRACE_INPUT;
 const TRACE_OUTPUT = LangfuseOtelSpanAttributes.TRACE_OUTPUT;
+const OBSERVATION_TYPE = LangfuseOtelSpanAttributes.OBSERVATION_TYPE;
+const TRACE_TAGS = LangfuseOtelSpanAttributes.TRACE_TAGS;
 
 describe('shouldDropLangfuseSpan', () => {
   it('drops langgraph __start__ seed spans', () => {
@@ -40,6 +42,7 @@ describe('shouldDropLangfuseSpan', () => {
     expect(shouldDropLangfuseSpan('GenerateTitle')).toBe(false);
     expect(shouldDropLangfuseSpan('agent=openAI__gpt-5.4')).toBe(false);
     expect(shouldDropLangfuseSpan('ChatOpenAI')).toBe(false);
+    expect(shouldDropLangfuseSpan('tool_batch')).toBe(false);
   });
 });
 
@@ -48,9 +51,10 @@ describe('shapeLangfuseSpan', () => {
     const span = createSpan('agent=openAI__gpt-5.4', {}, 'parent-1');
     shapeLangfuseSpan(span);
     expect(span.name).toBe('agent');
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('agent');
   });
 
-  it('renames tool node spans to the pending tool names and scopes input to args', () => {
+  it('shapes tool nodes as stable dispatch chains with scoped call inputs', () => {
     const messages = [
       { type: 'human', content: 'hello' },
       {
@@ -71,13 +75,14 @@ describe('shapeLangfuseSpan', () => {
       'parent-1'
     );
     shapeLangfuseSpan(span);
-    expect(span.name).toBe('get_service_details');
+    expect(span.name).toBe('tool-dispatch');
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
     expect(JSON.parse(span.attributes[INPUT] as string)).toEqual([
       { name: 'get_service_details', args: { path: 'organizations/1' } },
     ]);
   });
 
-  it('joins multiple pending tool names and dedupes repeats', () => {
+  it('preserves every pending call in a multi-tool dispatch input', () => {
     const messages = [
       {
         type: 'ai',
@@ -89,12 +94,16 @@ describe('shapeLangfuseSpan', () => {
       },
     ];
     const span = createSpan(
-      'tool_batch',
+      'tools=openAI__gpt-5.4',
       { [INPUT]: JSON.stringify({ messages }) },
       'parent-1'
     );
     shapeLangfuseSpan(span);
-    expect(span.name).toBe('web_search, execute_code');
+    expect(JSON.parse(span.attributes[INPUT] as string)).toEqual([
+      { name: 'web_search', args: { q: 'a' } },
+      { name: 'web_search', args: { q: 'b' } },
+      { name: 'execute_code', args: { code: '1+1' } },
+    ]);
   });
 
   it('reads tool calls from serialized langchain message kwargs', () => {
@@ -115,10 +124,10 @@ describe('shapeLangfuseSpan', () => {
       'parent-1'
     );
     shapeLangfuseSpan(span);
-    expect(span.name).toBe('lookup');
+    expect(span.name).toBe('tool-dispatch');
   });
 
-  it('leaves tool node spans untouched when no tool calls are found', () => {
+  it('keeps a stable tool-dispatch shape when no tool calls are found', () => {
     const original = JSON.stringify({
       messages: [{ type: 'human', content: 'hi' }],
     });
@@ -128,12 +137,14 @@ describe('shapeLangfuseSpan', () => {
       'parent-1'
     );
     shapeLangfuseSpan(span);
-    expect(span.name).toBe('tools=agent_abc');
+    expect(span.name).toBe('tool-dispatch');
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
     expect(span.attributes[INPUT]).toBe(original);
   });
 
   it('sets root span and trace input/output to the question and answer', () => {
     const span = createSpan('LibreChat Agent', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
       [INPUT]: JSON.stringify({
         messages: [
           { type: 'system', content: 'You are helpful.' },
@@ -156,6 +167,7 @@ describe('shapeLangfuseSpan', () => {
 
   it('extracts answer text from content part arrays', () => {
     const span = createSpan('LibreChat Agent', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
       [INPUT]: JSON.stringify([{ type: 'human', content: 'hi' }]),
       [OUTPUT]: JSON.stringify({
         messages: [
@@ -189,6 +201,65 @@ describe('shapeLangfuseSpan', () => {
     const span = createSpan('LibreChat Agent', { [INPUT]: 'plain text' });
     shapeLangfuseSpan(span);
     expect(span.attributes[INPUT]).toBe('plain text');
-    expect(span.attributes[TRACE_INPUT]).toBeUndefined();
+    expect(span.attributes[TRACE_INPUT]).toBe('plain text');
+  });
+
+  it('renames generation spans to a provider-agnostic name', () => {
+    const span = createSpan(
+      'ChatOpenAI',
+      { [OBSERVATION_TYPE]: 'generation' },
+      'parent-1'
+    );
+    shapeLangfuseSpan(span);
+    expect(span.name).toBe('llm');
+  });
+
+  it('marks only agent-tagged root spans as agent observations', () => {
+    const span = createSpan('LibreChat Agent', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+      [INPUT]: JSON.stringify({
+        messages: [{ type: 'human', content: 'hi' }],
+      }),
+    });
+    shapeLangfuseSpan(span);
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('agent');
+  });
+
+  it('marks title-tagged root spans as chain observations', () => {
+    const span = createSpan('LibreChat Title', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'title']),
+      [INPUT]: 'Conversation text',
+      [OUTPUT]: 'Conversation title',
+    });
+
+    shapeLangfuseSpan(span);
+
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
+    expect(span.attributes[TRACE_INPUT]).toBe('Conversation text');
+    expect(span.attributes[TRACE_OUTPUT]).toBe('Conversation title');
+  });
+
+  it('does not classify untagged root spans as agents', () => {
+    const span = createSpan('Custom root', { [INPUT]: 'input' });
+
+    shapeLangfuseSpan(span);
+
+    expect(span.attributes[OBSERVATION_TYPE]).toBeUndefined();
+  });
+
+  it('shapes standalone generation roots without replacing their type', () => {
+    const span = createSpan('ChatOpenAI', {
+      [OBSERVATION_TYPE]: 'generation',
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'title']),
+      [INPUT]: 'Generate a title',
+      [OUTPUT]: 'A useful title',
+    });
+
+    shapeLangfuseSpan(span);
+
+    expect(span.name).toBe('llm');
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('generation');
+    expect(span.attributes[TRACE_INPUT]).toBe('Generate a title');
+    expect(span.attributes[TRACE_OUTPUT]).toBe('A useful title');
   });
 });

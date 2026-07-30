@@ -188,6 +188,111 @@ describe('preFlightTruncateToolResults', () => {
     expect(indexTokenCountMap[2]).toBeLessThan(originalTokenCount);
   });
 
+  it('truncates structured tool results and preserves message metadata', () => {
+    const toolMsg = new ToolMessage({
+      content: [
+        {
+          type: 'json',
+          rows: Array.from({ length: 20 }, (_, index) => ({
+            id: index,
+            value: `${'x'.repeat(100)}-${index}`,
+          })),
+        },
+      ],
+      tool_call_id: 'tc-structured',
+      name: 'run_select_query',
+      status: 'success',
+      artifact: { source: 'clickhouse' },
+      metadata: { requestId: 'request-1' },
+      additional_kwargs: { traceId: 'trace-1' },
+    });
+    const messages: BaseMessage[] = [toolMsg];
+    const indexTokenCountMap: Record<string, number | undefined> = { 0: 0 };
+
+    const count = preFlightTruncateToolResults({
+      messages,
+      maxContextTokens: 200,
+      indexTokenCountMap,
+      tokenCounter,
+    });
+
+    expect(count).toBe(1);
+    expect(typeof messages[0].content).toBe('string');
+    expect(messages[0].content).toContain('truncated');
+    expect(messages[0].content).toContain('"id":0');
+    const truncated = messages[0] as ToolMessage;
+    expect(truncated.tool_call_id).toBe('tc-structured');
+    expect(truncated.name).toBe('run_select_query');
+    expect(truncated.status).toBe('success');
+    expect(truncated.artifact).toEqual({ source: 'clickhouse' });
+    expect(truncated.metadata).toEqual({ requestId: 'request-1' });
+    expect(truncated.additional_kwargs).toEqual({ traceId: 'trace-1' });
+    expect(indexTokenCountMap[0]).toBe(tokenCounter(truncated));
+  });
+
+  it('does not truncate indivisible native computer screenshots', () => {
+    const screenshot = `data:image/png;base64,${'A'.repeat(2_000)}`;
+    const stringOutput = new ToolMessage({
+      content: screenshot,
+      tool_call_id: 'computer-string',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const structuredOutput = new ToolMessage({
+      content: [{ type: 'computer_screenshot', image_url: screenshot }],
+      tool_call_id: 'computer-structured',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    const messages: BaseMessage[] = [stringOutput, structuredOutput];
+    const indexTokenCountMap: Record<string, number | undefined> = {
+      0: tokenCounter(stringOutput),
+      1: tokenCounter(structuredOutput),
+    };
+
+    const count = preFlightTruncateToolResults({
+      messages,
+      maxContextTokens: 50,
+      indexTokenCountMap,
+      tokenCounter,
+    });
+
+    expect(count).toBe(0);
+    expect(messages[0]).toBe(stringOutput);
+    expect(messages[0].content).toBe(screenshot);
+    expect(messages[1]).toBe(structuredOutput);
+    expect(messages[1].content).toBe(structuredOutput.content);
+  });
+
+  it('compacts text in multipart results without slicing media blocks', () => {
+    const imageBlock = {
+      type: 'image_url',
+      image_url: { url: 'data:image/png;base64,AAAA' },
+    };
+    const toolMsg = new ToolMessage({
+      content: [{ type: 'text', text: 'x'.repeat(1_000) }, imageBlock],
+      tool_call_id: 'tc-multipart',
+      name: 'screenshot',
+    });
+    const messages: BaseMessage[] = [toolMsg];
+    const indexTokenCountMap: Record<string, number | undefined> = {
+      0: tokenCounter(toolMsg),
+    };
+
+    const count = preFlightTruncateToolResults({
+      messages,
+      maxContextTokens: 200,
+      indexTokenCountMap,
+      tokenCounter,
+    });
+
+    expect(count).toBe(1);
+    expect(Array.isArray(messages[0].content)).toBe(true);
+    const content = messages[0].content as Array<Record<string, unknown>>;
+    expect(content).toHaveLength(2);
+    expect(content[0].type).toBe('text');
+    expect(content[0].text).toContain('truncated');
+    expect(content[1]).toBe(imageBlock);
+  });
+
   it('does not truncate results that fit within budget', () => {
     const toolMsg = new ToolMessage({
       content: 'OK',

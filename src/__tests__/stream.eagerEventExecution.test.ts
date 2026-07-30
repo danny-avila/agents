@@ -2498,6 +2498,80 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     ).toBe(true);
   });
 
+  it('serializes bigint output before eager completion dispatch', async () => {
+    const graph = createGraph();
+    const completedEvents: Array<{ result: t.ToolEndEvent }> = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completedEvents.push(data as { result: t.ToolEndEvent });
+          return;
+        }
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        batch.resolve([
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: [{ rowsRead: BigInt(42) }],
+          },
+        ]);
+      });
+
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: '{"city":"NYC"}',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_stock',
+              name: 'stock',
+              args: '{"ticker":"C',
+              index: 1,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    await graph.eagerEventToolExecutions.get('call_weather')?.promise;
+
+    expect(completedEvents).toHaveLength(1);
+    expect(
+      (
+        completedEvents[0].result as {
+          tool_call?: { output?: string };
+        }
+      ).tool_call?.output
+    ).toBe('[{"rowsRead":"42"}]');
+  });
+
   it('does not emit a stale eager completion after the active execution is invalidated', async () => {
     const graph = createGraph({
       getAgentContext: jest.fn(

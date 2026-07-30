@@ -1,5 +1,6 @@
 import { HumanMessage, AIMessage, ToolMessage } from '@langchain/core/messages';
 import type { TPayload } from '@/types';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { formatAgentMessages } from './format';
 import { ContentTypes } from '@/common';
 
@@ -36,6 +37,108 @@ describe('formatAgentMessages with tools parameter', () => {
     expect(result.messages[2]).toBeInstanceOf(ToolMessage);
     expect((result.messages[1] as AIMessage).tool_calls).toHaveLength(1);
     expect((result.messages[2] as ToolMessage).tool_call_id).toBe('123');
+  });
+
+  it('restores persisted structured tool output for harness accounting', () => {
+    const output = [
+      {
+        type: ContentTypes.TEXT,
+        text: JSON.stringify([
+          { id: 1, value: 'first' },
+          { id: 2, value: 'second' },
+        ]),
+      },
+    ];
+    const payload: TPayload = [
+      { role: 'user', content: 'Query the table' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'query-1',
+              name: 'run_select_query',
+              args: '{}',
+              output,
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload, { 0: 5, 1: 0 });
+
+    const toolMessage = result.messages[2] as ToolMessage;
+    expect(toolMessage).toBeInstanceOf(ToolMessage);
+    expect(toolMessage.content).toEqual(output);
+    expect(toolMessage.tool_call_id).toBe('query-1');
+  });
+
+  it('normalizes opaque persisted tool output before provider dispatch', () => {
+    const output = [{ type: 'json', rows: [{ id: 1, value: 'first' }] }];
+    const payload: TPayload = [
+      { role: 'user', content: 'Query the table' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'query-opaque',
+              name: 'run_select_query',
+              args: '{}',
+              output,
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+    const toolMessage = result.messages[2] as ToolMessage;
+
+    expect(typeof toolMessage.content).toBe('string');
+    expect(toolMessage.content).toBe(JSON.stringify(output));
+  });
+
+  it('hard-caps persisted structured output without invoking toJSON', () => {
+    let toJSONCalls = 0;
+    const output = {
+      rows: [{ value: 'x'.repeat(HARD_MAX_TOOL_RESULT_CHARS + 1_000) }],
+      toJSON() {
+        toJSONCalls++;
+        return 'y'.repeat(HARD_MAX_TOOL_RESULT_CHARS * 2);
+      },
+    };
+    const payload: TPayload = [
+      { role: 'user', content: 'Query the table' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'query-bounded',
+              name: 'run_select_query',
+              args: '{}',
+              output,
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+    const content = (result.messages[2] as ToolMessage).content;
+
+    expect(toJSONCalls).toBe(0);
+    expect(typeof content).toBe('string');
+    expect((content as string).length).toBeLessThanOrEqual(
+      HARD_MAX_TOOL_RESULT_CHARS
+    );
+    expect(content).toContain('truncated');
+    expect(content).not.toContain('y'.repeat(1_000));
   });
 
   it('should filter out all tool calls when tools set is empty', () => {

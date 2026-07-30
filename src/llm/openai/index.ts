@@ -29,16 +29,29 @@ import type {
   BaseMessageChunk,
   UsageMetadata,
 } from '@langchain/core/messages';
+import type { ChatModelStreamEvent } from '@langchain/core/language_models/event';
 import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
 import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
 import type { SeenScalarMetadata } from './streamMetadata';
 import type { HeaderValue, HeadersLike } from './types';
+import type { PromptCacheTtl } from '@/messages/cache';
+import {
+  buildAnthropicCacheControl,
+  resolvePromptCacheTtl,
+  stripAnthropicCacheControl,
+  stripBedrockCacheControl,
+} from '@/messages/cache';
 import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
+import {
+  projectOpenAIResponsesToolMessageContent,
+  projectToolStreamContentForProvider,
+} from '@/messages/core';
+import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
 
@@ -102,6 +115,9 @@ type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   includeReasoningContent?: boolean;
   includeReasoningDetails?: boolean;
   convertReasoningDetailsToContent?: boolean;
+  preserveToolCacheControl?: boolean;
+  responsesPromptCache?: boolean;
+  responsesPromptCacheTtl?: PromptCacheTtl;
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
 };
@@ -168,6 +184,40 @@ type OpenAIManagedRequestParams = {
   };
   safety_identifier?: string;
 };
+
+function stripResponsesToolCacheControl<T>(tools: T): T {
+  if (!Array.isArray(tools)) {
+    return tools;
+  }
+
+  return tools.map((tool) => {
+    if (tool == null || typeof tool !== 'object') {
+      return tool;
+    }
+    const clone = { ...(tool as Record<string, unknown>) };
+    delete clone.cache_control;
+    if (
+      clone.extras != null &&
+      typeof clone.extras === 'object' &&
+      !Array.isArray(clone.extras)
+    ) {
+      clone.extras = { ...(clone.extras as Record<string, unknown>) };
+      delete (clone.extras as Record<string, unknown>).cache_control;
+    }
+    return clone;
+  }) as T;
+}
+
+function projectOpenAIResponsesProviderMessages(
+  messages: BaseMessage[]
+): BaseMessage[] {
+  return projectOpenAIResponsesToolMessageContent(
+    stripAnthropicCacheControl(
+      stripBedrockCacheControl(projectToolStreamContentForProvider(messages))
+    )
+  );
+}
+
 type ResponsesRequest =
   | OpenAIClient.Responses.ResponseCreateParamsStreaming
   | OpenAIClient.Responses.ResponseCreateParamsNonStreaming;
@@ -954,6 +1004,65 @@ function createAbortHandler(controller: AbortController): () => void {
  * @param {Object} [fields] Additional fields to add to the OpenAI tool.
  * @returns {ToolDefinition} The inputted tool in OpenAI tool format.
  */
+/**
+ * OpenAI strict function schemas require every property to appear in
+ * `required`. The optional `intent` label (see `tools/intentArg.ts`) is
+ * deliberately NOT required — the same schema is callable from programmatic
+ * tool calling — so a tool auto-marked `strict: true` (the non-streaming
+ * `json_schema` structured-output path) would be rejected as invalid before
+ * execution. That path never streams a live label anyway, so the
+ * marker-identified property is dropped there; every other path keeps it.
+ */
+function stripIntentFromStrictTools<T extends object>(params: T): T {
+  const record = params as { tools?: unknown[] };
+  const tools = record.tools;
+  if (!Array.isArray(tools) || tools.length === 0) {
+    return params;
+  }
+  const nextTools = tools.map((tool) => {
+    const candidate = tool as {
+      strict?: boolean;
+      parameters?: { properties?: Record<string, unknown>; required?: unknown };
+      function?: {
+        strict?: boolean;
+        parameters?: {
+          properties?: Record<string, unknown>;
+          required?: unknown;
+        };
+      };
+    };
+    /** Chat-completions tools nest under `function`; responses-API tools are flat. */
+    const holder = candidate.function ?? candidate;
+    if (holder.strict !== true) {
+      return tool;
+    }
+    const parameters = holder.parameters;
+    const properties = parameters?.properties;
+    if (properties == null || !isIntentLabelProperty(properties[INTENT_ARG])) {
+      return tool;
+    }
+    const required = Array.isArray(parameters?.required)
+      ? (parameters.required as unknown[])
+      : [];
+    if (required.includes(INTENT_ARG)) {
+      return tool;
+    }
+    const { [INTENT_ARG]: _omit, ...restProps } = properties;
+    const nextParams = { ...parameters, properties: restProps };
+    if (candidate.function != null) {
+      return {
+        ...candidate,
+        function: { ...candidate.function, parameters: nextParams },
+      };
+    }
+    return { ...candidate, parameters: nextParams };
+  });
+  if (nextTools.every((tool, index) => tool === tools[index])) {
+    return params;
+  }
+  return { ...params, tools: nextTools } as T;
+}
+
 export function _convertToOpenAITool(
   tool: BindToolsInput,
   fields?: {
@@ -1116,6 +1225,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   private includeReasoningContent?: boolean;
   private includeReasoningDetails?: boolean;
   private convertReasoningDetailsToContent?: boolean;
+  private preserveToolCacheControl?: boolean;
   private promptCacheExplicit?: boolean;
   private safetyIdentifier?: string;
 
@@ -1125,6 +1235,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     this.includeReasoningDetails = fields?.includeReasoningDetails;
     this.convertReasoningDetailsToContent =
       fields?.convertReasoningDetailsToContent;
+    this.preserveToolCacheControl = fields?.preserveToolCacheControl;
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.safetyIdentifier = fields?.safety_identifier;
   }
@@ -1133,10 +1244,12 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     options?: this['ParsedCallOptions'],
     extra?: { streaming?: boolean }
   ): ReturnType<OriginalChatOpenAICompletions['invocationParams']> {
-    return applyManagedRequestParams(super.invocationParams(options, extra), {
-      promptCacheExplicit: this.promptCacheExplicit,
-      safetyIdentifier: this.safetyIdentifier,
-    });
+    return stripIntentFromStrictTools(
+      applyManagedRequestParams(super.invocationParams(options, extra), {
+        promptCacheExplicit: this.promptCacheExplicit,
+        safetyIdentifier: this.safetyIdentifier,
+      })
+    );
   }
 
   protected _getReasoningParams(
@@ -1225,6 +1338,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
         includeReasoningContent: this.includeReasoningContent,
         includeReasoningDetails: this.includeReasoningDetails,
         convertReasoningDetailsToContent: this.convertReasoningDetailsToContent,
+        preserveToolCacheControl: this.preserveToolCacheControl,
       }
     );
 
@@ -1393,6 +1507,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
         includeReasoningContent: this.includeReasoningContent,
         includeReasoningDetails: this.includeReasoningDetails,
         convertReasoningDetailsToContent: this.convertReasoningDetailsToContent,
+        preserveToolCacheControl: this.preserveToolCacheControl,
       });
 
     const params = {
@@ -1533,21 +1648,52 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   private promptCacheExplicit?: boolean;
+  private responsesPromptCache?: boolean;
+  private responsesPromptCacheTtl?: PromptCacheTtl;
   private safetyIdentifier?: string;
 
   constructor(fields?: LibreChatOpenAIFields) {
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.responsesPromptCache = fields?.responsesPromptCache;
+    this.responsesPromptCacheTtl = fields?.responsesPromptCacheTtl;
     this.safetyIdentifier = fields?.safety_identifier;
   }
 
   invocationParams(
     options?: this['ParsedCallOptions']
   ): ReturnType<OriginalChatOpenAIResponses['invocationParams']> {
-    const params = applyManagedRequestParams(super.invocationParams(options), {
-      promptCacheExplicit: this.promptCacheExplicit,
-      safetyIdentifier: this.safetyIdentifier,
-    });
+    const cacheOptions = options as
+      | {
+          promptCache?: boolean;
+          promptCacheTtl?: PromptCacheTtl;
+        }
+      | undefined;
+    const promptCache = cacheOptions?.promptCache ?? this.responsesPromptCache;
+    const cacheControl =
+      promptCache === true
+        ? buildAnthropicCacheControl(
+          resolvePromptCacheTtl(
+            cacheOptions?.promptCacheTtl ?? this.responsesPromptCacheTtl
+          )
+        )
+        : undefined;
+    const baseParams = applyManagedRequestParams(
+      super.invocationParams(options),
+      {
+        promptCacheExplicit: this.promptCacheExplicit,
+        safetyIdentifier: this.safetyIdentifier,
+      }
+    );
+    const params = {
+      ...baseParams,
+      ...(baseParams.tools != null && {
+        tools: stripResponsesToolCacheControl(baseParams.tools),
+      }),
+      ...(cacheControl != null && {
+        cache_control: cacheControl,
+      }),
+    };
     if (shouldIncludeEncryptedReasoning(this.model, params)) {
       params.include = [
         ...new Set([
@@ -1556,7 +1702,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
         ]),
       ];
     }
-    return params;
+    return stripIntentFromStrictTools(params);
   }
 
   async completionWithRetry(
@@ -1592,7 +1738,11 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    const result = await super._generate(messages, options, runManager);
+    const result = await super._generate(
+      projectOpenAIResponsesProviderMessages(messages),
+      options,
+      runManager
+    );
     for (const generation of result.generations) {
       attachCacheWriteUsage(generation.message);
     }
@@ -1605,13 +1755,25 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     for await (const chunk of super._streamResponseChunks(
-      messages,
+      projectOpenAIResponsesProviderMessages(messages),
       options,
       runManager
     )) {
       attachCacheWriteUsage(chunk.message);
       yield chunk;
     }
+  }
+
+  async *_streamChatModelEvents(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatModelStreamEvent> {
+    yield* super._streamChatModelEvents(
+      projectOpenAIResponsesProviderMessages(messages),
+      options,
+      runManager
+    );
   }
 
   protected _getReasoningParams(
@@ -1641,10 +1803,12 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
     options?: this['ParsedCallOptions'],
     extra?: { streaming?: boolean }
   ): ReturnType<OriginalAzureChatOpenAICompletions['invocationParams']> {
-    return applyManagedRequestParams(super.invocationParams(options, extra), {
-      promptCacheExplicit: this.promptCacheExplicit,
-      safetyIdentifier: this.safetyIdentifier,
-    });
+    return stripIntentFromStrictTools(
+      applyManagedRequestParams(super.invocationParams(options, extra), {
+        promptCacheExplicit: this.promptCacheExplicit,
+        safetyIdentifier: this.safetyIdentifier,
+      })
+    );
   }
 
   protected _getReasoningParams(
@@ -1788,7 +1952,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
         ]),
       ];
     }
-    return params;
+    return stripIntentFromStrictTools(params);
   }
 
   async completionWithRetry(

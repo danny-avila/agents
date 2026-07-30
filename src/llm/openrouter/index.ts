@@ -32,6 +32,7 @@ export interface ChatOpenRouterCallOptions
   include_reasoning?: boolean;
   reasoning?: OpenRouterReasoning;
   modelKwargs?: OpenAIChatInput['modelKwargs'];
+  useResponsesApi?: boolean;
   promptCache?: boolean;
   /**
    * Prompt-cache breakpoint TTL. Defaults to `'1h'` (extended cache) when
@@ -52,6 +53,7 @@ export type OpenRouterInvocationParams = Omit<
   'messages'
 > & {
   reasoning?: OpenRouterReasoning;
+  cache_control?: { type: 'ephemeral'; ttl?: '1h' };
 };
 
 type InvocationParamsExtra = {
@@ -150,6 +152,9 @@ export class ChatOpenRouter extends ChatOpenAI {
       modelKwargs: parentModelKwargs,
       includeReasoningDetails: true,
       convertReasoningDetailsToContent: true,
+      preserveToolCacheControl: true,
+      responsesPromptCache: _fields.promptCache,
+      responsesPromptCacheTtl: _fields.promptCacheTtl,
     });
 
     // Merge reasoning config: modelKwargs.reasoning < constructor reasoning
@@ -171,11 +176,16 @@ export class ChatOpenRouter extends ChatOpenAI {
     type MutableParams = Omit<
       OpenAIClient.Chat.ChatCompletionCreateParams,
       'messages'
-    > & { reasoning_effort?: string; reasoning?: OpenRouterReasoning };
+    > & {
+      reasoning_effort?: string;
+      reasoning?: OpenRouterReasoning;
+      cache_control?: { type: 'ephemeral'; ttl?: '1h' };
+    };
 
     const optionsWithDefaults = this._combineCallOptions(options);
+    const useResponsesApi = this._useResponsesApi(options);
     const params = (
-      this._useResponsesApi(options)
+      useResponsesApi
         ? this.responses.invocationParams(optionsWithDefaults)
         : this.completions.invocationParams(optionsWithDefaults, extra)
     ) as MutableParams;

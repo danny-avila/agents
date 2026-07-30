@@ -11,9 +11,12 @@ import {
   appendCodeSessionFileSummary,
   emptyOutputMessage,
   buildCodeApiHttpErrorMessage,
+  CodeApiRequestError,
   getCodeBaseURL,
+  normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
 } from './CodeExecutor';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 config();
@@ -24,6 +27,7 @@ const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 export const BashExecutionToolSchema = {
   type: 'object',
   properties: {
+    intent: { ...INTENT_PROPERTY },
     command: {
       type: 'string',
       description: `The bash command or script to execute.
@@ -58,17 +62,18 @@ Usage:
 `.trim();
 
 /**
- * Bash statefulness is filesystem-tier: on a warm session the machine (files
- * including /tmp, installed packages, background processes) persists between
- * calls, but each call may start a fresh shell — so shell variables and cwd
- * are NOT reliable, and the machine can be reset at any time. Only /mnt/data
- * is durable.
+ * Bash statefulness is filesystem-tier and scoped to `/mnt/data`. The machine
+ * is warm across calls, but each call runs in a fresh sandbox (new process
+ * tree + private /tmp), so background processes are reaped when the call ends
+ * and anything written outside /mnt/data is discarded. The note must not
+ * promise otherwise: a model told background processes survive will start a
+ * server in one call and assume it is listening in the next.
  */
 export const STATEFUL_BASH_NOTE =
-  'Session state (best-effort): commands in this conversation usually run on the same machine, so files (including /tmp), installed packages, and running background processes from earlier calls typically persist. Each call may still start a fresh shell — do not rely on shell variables or the working directory carrying over — and the machine may be reset at any time. Only /mnt/data is durable.';
+  'Session state: commands in this conversation run on the same warm machine, so files written to /mnt/data persist between calls. Each call runs in a fresh, isolated sandbox: shell variables, the working directory, /tmp, and background processes do NOT survive after the call returns — a process started in one call is terminated when that call ends. Only /mnt/data is durable (the machine itself may also be reset at any time).';
 
 export const StatefulBashExecutionToolDescription = `
-Runs bash commands and returns stdout/stderr output from a session-based execution environment, similar to a long-running machine.
+Runs bash commands and returns stdout/stderr output. Commands in this conversation share one warm machine with a persistent /mnt/data, but each command runs in its own isolated sandbox (not a persistent shell session).
 
 ${STATEFUL_BASH_NOTE}
 
@@ -125,7 +130,7 @@ export function buildBashExecutionToolDescription(options?: {
 const STATELESS_BASH_PARAM_NOTE =
   'The environment is stateless; variables and state don\'t persist between executions.';
 const STATEFUL_BASH_PARAM_NOTE =
-  'Files, installed packages, and background processes usually persist between calls, but each call may start a fresh shell (do not rely on shell variables or cwd) and the machine may reset. Only /mnt/data is durable.';
+  'Files written to /mnt/data persist between calls on the same warm machine. Each call runs in a fresh sandbox: shell variables, cwd, /tmp, and background processes do NOT survive the call. Only /mnt/data is durable.';
 
 export function buildBashExecutionToolSchema(opts?: {
   statefulSessions?: boolean;
@@ -184,16 +189,20 @@ function createBashExecutionTool(
       /* Drop any model-supplied `runtime_session_hint` from the raw args: the
        * hint must only come from ToolNode's injected `_runtime_session_hint`
        * (below), never from the tool call itself. */
+      /* `intent` is a UI display label — never part of the wire body. */
       const {
         command,
+        intent: _ignoredIntent,
         runtime_session_hint: _ignoredModelHint,
         ...rest
       } = rawInput as {
         command: string;
+        intent?: unknown;
         runtime_session_hint?: unknown;
         args?: string[];
       };
       void _ignoredModelHint;
+      void _ignoredIntent;
       const { session_id, _injected_files, _runtime_session_hint } =
         (config.toolCall ?? {}) as {
           session_id?: string;
@@ -249,7 +258,7 @@ function createBashExecutionTool(
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {
-          throw new Error(
+          throw new CodeApiRequestError(
             await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
           );
         }
@@ -290,7 +299,7 @@ function createBashExecutionTool(
         ];
       } catch (error) {
         const messageWithReminder = appendFailedExecutionFileReminder(
-          (error as Error | undefined)?.message ?? '',
+          normalizeCodeApiRequestError(error).message,
           command
         );
         throw new Error(`Execution error:\n\n${messageWithReminder}`);

@@ -1,5 +1,6 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { TPayload } from '@/types';
+import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { ContentTypes, Constants, Providers } from '@/common';
 import { formatAgentMessages } from './format';
 
@@ -322,5 +323,271 @@ describe('formatAgentMessages steer replay', () => {
       'Steer text.',
       [{ type: 'text', text: 'After.' }],
     ]);
+  });
+});
+
+describe('formatAgentMessages trailing-steer anchor', () => {
+  const steerPart = (text: string): Record<string, unknown> =>
+    ({
+      type: ContentTypes.STEER,
+      [ContentTypes.STEER]: text,
+    }) as unknown as Record<string, unknown>;
+
+  /**
+   * A steer that ends an assistant message leaves the replay on a
+   * HumanMessage. Followed by the next turn's user message, that reaches the
+   * provider as two adjacent user turns — a hard error on Bedrock and
+   * Mistral. Reachable today through abort, not only through preemption.
+   */
+  it('anchors a trailing steer when another turn follows', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Working on it.' },
+          steerPart('Actually, stop and do the other thing.'),
+        ],
+      },
+      { role: 'user', content: 'Next turn' },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    const steerIndex = messages.findIndex(
+      (message) =>
+        message instanceof HumanMessage &&
+        message.additional_kwargs.source === 'steer'
+    );
+    expect(steerIndex).toBeGreaterThan(0);
+
+    const anchor = messages[steerIndex + 1];
+    expect(anchor).toBeInstanceOf(AIMessage);
+    expect(anchor.content).not.toBe('');
+
+    const following = messages[steerIndex + 2];
+    expect(following).toBeInstanceOf(HumanMessage);
+    expect(following.content).toEqual([{ type: 'text', text: 'Next turn' }]);
+  });
+
+  /**
+   * `messagesStateReducer` treats a repeated id as replace-in-place, so an
+   * anchor stamped with the shared `sourceMessageId` would overwrite the very
+   * steer it exists to protect. It must reach the reducer unstamped.
+   */
+  it('does not stamp the anchor with the shared source message id', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        messageId: 'assistant_1',
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Partial answer.' },
+          steerPart('Change of plan.'),
+        ],
+      } as unknown as TPayload[number],
+      { role: 'user', content: 'Next turn' },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    const steerIndex = messages.findIndex(
+      (message) => message.additional_kwargs.source === 'steer'
+    );
+    expect(steerIndex).toBeGreaterThan(0);
+    expect(messages[steerIndex].id).toBe('assistant_1');
+    expect(messages[steerIndex - 1].id).toBe('assistant_1');
+
+    const anchor = messages[steerIndex + 1];
+    expect(anchor).toBeInstanceOf(AIMessage);
+    expect(anchor.content).not.toBe('');
+    expect(anchor.id).not.toBe('assistant_1');
+  });
+
+  /**
+   * The anchor exists to keep the sequence provider-valid, so the assertion
+   * that matters is what a provider actually receives. An empty-string
+   * assistant turn with no tool calls survives the Anthropic converter
+   * verbatim — the empty-text repair covers only array content and tool-call
+   * turns — so an empty anchor would trade adjacent user turns for an
+   * empty-content 400.
+   */
+  it('survives the Anthropic converter with non-empty assistant content', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Partial answer.' },
+          steerPart('Change of plan.'),
+        ],
+      },
+      { role: 'user', content: 'Next turn' },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+    const { messages: anthropicMessages } =
+      _convertMessagesToAnthropicPayload(messages);
+
+    for (const message of anthropicMessages) {
+      if (message.role !== 'assistant') {
+        continue;
+      }
+      if (typeof message.content === 'string') {
+        expect(message.content.trim()).not.toBe('');
+        continue;
+      }
+      expect(message.content.length).toBeGreaterThan(0);
+    }
+
+    const roles = anthropicMessages.map((message) => message.role);
+    for (let i = 1; i < roles.length; i++) {
+      expect(roles[i] === 'user' && roles[i - 1] === 'user').toBe(false);
+    }
+  });
+
+  /**
+   * The old lookahead only proved a later ENTRY existed, not that it emitted.
+   * An entry with empty content is skipped silently, so a trailing steer
+   * followed only by such entries would leave the anchor as the final turn —
+   * an assistant prefill with no request after it.
+   */
+  it('omits the anchor when no later payload entry emits a message', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Partial answer.' },
+          steerPart('Change of plan.'),
+        ],
+      },
+      { role: 'user', content: [] } as unknown as TPayload[number],
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+    const last = messages[messages.length - 1];
+    expect(last.additional_kwargs.source).toBe('steer');
+    expect(
+      messages.some(
+        (m) => m instanceof AIMessage && m.content === '_'
+      )
+    ).toBe(false);
+  });
+
+  it('leaves the user turn last when the steer ends the payload', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Working on it.' },
+          steerPart('Actually, stop and do the other thing.'),
+        ],
+      },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    const last = messages[messages.length - 1];
+    expect(last).toBeInstanceOf(HumanMessage);
+    expect(last.additional_kwargs.source).toBe('steer');
+  });
+
+  it('does not anchor when assistant content follows the steer', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Working on it.' },
+          steerPart('Focus on item two.'),
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Focusing.' },
+        ],
+      },
+      { role: 'user', content: 'Next turn' },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    const emptyAssistants = messages.filter(
+      (message) => message instanceof AIMessage && message.content === ''
+    );
+    expect(emptyAssistants).toHaveLength(0);
+  });
+
+  /**
+   * A trailing steer followed by another assistant ENTRY needs no anchor —
+   * that entry's own assistant turn IS the separation. Emitting the
+   * placeholder anyway would put two assistant turns back to back, which
+   * strict-alternation providers can reject and nothing downstream merges
+   * (`coalesceAdjacentUserTurns` merges user turns only).
+   */
+  it('suppresses the anchor when the next payload entry is an assistant turn', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Working on it.' },
+          steerPart('Actually, do the other thing.'),
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Doing the other thing.' },
+        ],
+      },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    expect(messages.map((message) => message.constructor.name)).toEqual([
+      'HumanMessage',
+      'AIMessage',
+      'HumanMessage',
+      'AIMessage',
+    ]);
+    expect(messages[2].additional_kwargs.source).toBe('steer');
+    expect(messages[3].content).toEqual([
+      { type: 'text', text: 'Doing the other thing.' },
+    ]);
+    expect(
+      messages.some(
+        (message) => message instanceof AIMessage && message.content === '_'
+      )
+    ).toBe(false);
+  });
+
+  it('never emits two adjacent user turns around a trailing steer', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Original request' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Partial answer.' },
+          steerPart('Change of plan.'),
+        ],
+      },
+      { role: 'user', content: 'Next turn' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Second answer.' },
+          steerPart('Change again.'),
+        ],
+      },
+      { role: 'user', content: 'Third turn' },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    for (let i = 1; i < messages.length; i++) {
+      const adjacentHumans =
+        messages[i] instanceof HumanMessage &&
+        messages[i - 1] instanceof HumanMessage;
+      expect(adjacentHumans).toBe(false);
+    }
   });
 });

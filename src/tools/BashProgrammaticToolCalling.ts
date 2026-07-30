@@ -7,6 +7,8 @@ import {
   BASH_SHELL_GUIDANCE,
   CODE_ARTIFACT_PATH_GUIDANCE,
   appendFailedExecutionFileReminder,
+  buildCodeApiExecutionErrorMessage,
+  CodeApiRequestError,
   getCodeBaseURL,
 } from './CodeExecutor';
 import {
@@ -19,6 +21,7 @@ import {
   executeTools,
   formatCompletedResponse,
 } from './ProgrammaticToolCalling';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 config();
@@ -113,6 +116,7 @@ export function createBashProgrammaticToolCallingSchema(
   return {
     type: 'object',
     properties: {
+      intent: { ...INTENT_PROPERTY },
       code: {
         type: 'string',
         minLength: 1,
@@ -434,15 +438,10 @@ export function createBashProgrammaticToolCallingTool(
         }
 
         if (response.status === 'error') {
-          throw new Error(
-            `Execution error: ${response.error}` +
-              (response.stderr != null && response.stderr !== ''
-                ? `\n\nStderr:\n${response.stderr}`
-                : '')
-          );
+          throw new Error(buildCodeApiExecutionErrorMessage(response));
         }
 
-        throw new Error(`Unexpected response status: ${response.status}`);
+        throw new CodeApiRequestError();
       } catch (error) {
         const messageWithReminder = appendFailedExecutionFileReminder(
           (error as Error).message,

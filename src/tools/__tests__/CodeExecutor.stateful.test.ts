@@ -41,12 +41,22 @@ describe('CodeExecutor stateful description', () => {
     );
   });
 
-  it('hedges the stateful wording and keeps /mnt/data as the durable store', () => {
+  /* Statefulness is filesystem-tier only: the machine is warm across calls,
+   * but every execution is a new interpreter process, so in-memory state never
+   * carries over. The description must not imply a notebook-style kernel. */
+  it('promises filesystem persistence WITHOUT promising a shared runtime', () => {
     const d = StatefulCodeExecutionToolDescription;
-    expect(d).toContain('usually share one runtime');
-    expect(d).toContain('may be reset at any time');
-    expect(d).toContain('MUST be written to /mnt/data');
+    expect(d).toContain('same warm machine');
+    expect(d).toContain('/mnt/data');
+    expect(d).toContain('NEW process');
+    expect(d).toContain('NEVER carry over');
     expect(d).toContain(CODE_ARTIFACT_PATH_GUIDANCE);
+  });
+
+  it('never claims variables/imports survive between executions', () => {
+    const d = StatefulCodeExecutionToolDescription;
+    expect(d).not.toContain('share one runtime');
+    expect(d).not.toContain('typically still available');
   });
 
   it('adjusts the code-param note per mode', () => {
@@ -55,8 +65,9 @@ describe('CodeExecutor stateful description', () => {
     const stateful = buildCodeExecutionToolSchema({ statefulSessions: true })
       .properties.code.description;
     expect(stateless).toContain('variables and imports don\'t persist');
-    expect(stateful).toContain('typically still defined');
-    expect(stateful).toContain('may reset between calls');
+    expect(stateful).toContain('do NOT carry over');
+    expect(stateful).toContain('/mnt/data');
+    expect(stateful).not.toContain('typically still defined');
   });
 });
 

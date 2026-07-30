@@ -1,5 +1,6 @@
 import type { JsonSchemaType, LCTool } from '@/types/tools';
 import type { SubagentConfig } from '@/types';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 export const SubagentToolName = Constants.SUBAGENT;
@@ -29,6 +30,7 @@ const SUBAGENT_TYPE_PROP_DESCRIPTION =
 export const SubagentToolSchema = {
   type: 'object',
   properties: {
+    intent: { ...INTENT_PROPERTY },
     description: {
       type: 'string',
       description: DESCRIPTION_PROP_DESCRIPTION,
@@ -67,6 +69,7 @@ export function buildSubagentToolParams(configs: SubagentConfig[]): {
     schema: {
       type: 'object',
       properties: {
+        intent: { ...INTENT_PROPERTY },
         description: {
           type: 'string',
           description: DESCRIPTION_PROP_DESCRIPTION,

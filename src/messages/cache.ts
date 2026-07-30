@@ -1,16 +1,10 @@
-import {
-  AIMessage,
-  BaseMessage,
-  ToolMessage,
-  HumanMessage,
-  SystemMessage,
-  MessageContentComplex,
-} from '@langchain/core/messages';
+import { isProxy } from 'node:util/types';
+import { BaseMessage, MessageContentComplex } from '@langchain/core/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessage } from '@/types/messages';
+import { hasComputerCallOutputMarker } from '@/utils/toolContent';
 import { toLangChainContent } from './langchain';
 import { ContentTypes } from '@/common/enum';
-import { withMessageRole } from './format';
 
 type MessageWithContent = {
   content?: string | MessageContentComplex[];
@@ -134,13 +128,30 @@ export function resolveBedrockPromptCacheTtl(
  * Deep clones a message's content to prevent mutation of the original.
  */
 function deepCloneContent<T extends string | MessageContentComplex[]>(
-  content: T
+  content: T,
+  omittedProperty?: string
 ): T {
   if (typeof content === 'string') {
     return content;
   }
   if (Array.isArray(content)) {
-    return content.map((block) => ({ ...block })) as T;
+    return content.map((block) => {
+      if (typeof block !== 'object' || block == null || isProxy(block)) {
+        return block;
+      }
+      try {
+        const descriptors = Object.getOwnPropertyDescriptors(block);
+        if (omittedProperty != null) {
+          delete descriptors[omittedProperty];
+        }
+        return Object.create(
+          Object.getPrototypeOf(block),
+          descriptors
+        ) as MessageContentComplex;
+      } catch {
+        return block;
+      }
+    }) as T;
   }
   return content;
 }
@@ -156,45 +167,36 @@ export function cloneMessage<T extends MessageWithContent>(
   content: string | MessageContentComplex[]
 ): T {
   if (message instanceof BaseMessage) {
-    const baseParams = {
-      content: toLangChainContent(content),
-      additional_kwargs: { ...message.additional_kwargs },
-      response_metadata: { ...message.response_metadata },
-      id: message.id,
-      name: message.name,
+    const descriptors = Object.getOwnPropertyDescriptors(message) as Record<
+      PropertyKey,
+      PropertyDescriptor | undefined
+    >;
+    const contentDescriptor = descriptors.content;
+    descriptors.content = {
+      configurable: contentDescriptor?.configurable ?? true,
+      enumerable: contentDescriptor?.enumerable ?? true,
+      value: toLangChainContent(content),
+      writable: contentDescriptor?.writable ?? true,
     };
-
-    const msgType = message.getType();
-    switch (msgType) {
-    case 'ai':
-      return withMessageRole(
-        new AIMessage({
-          ...baseParams,
-          tool_calls: (message as unknown as AIMessage).tool_calls,
-        }),
-        'assistant'
-      ) as unknown as T;
-    case 'human':
-      return withMessageRole(
-        new HumanMessage(baseParams),
-        'user'
-      ) as unknown as T;
-    case 'system':
-      return withMessageRole(
-        new SystemMessage(baseParams),
-        'system'
-      ) as unknown as T;
-    case 'tool':
-      return withMessageRole(
-        new ToolMessage({
-          ...baseParams,
-          tool_call_id: (message as unknown as ToolMessage).tool_call_id,
-        }),
-        'tool'
-      ) as unknown as T;
-    default:
-      break;
+    const lcKwargs = descriptors.lc_kwargs;
+    if (
+      lcKwargs != null &&
+      'value' in lcKwargs &&
+      typeof lcKwargs.value === 'object' &&
+      lcKwargs.value != null
+    ) {
+      descriptors.lc_kwargs = {
+        ...lcKwargs,
+        value: {
+          ...(lcKwargs.value as Record<string, unknown>),
+          content: toLangChainContent(content),
+        },
+      };
     }
+    return Object.create(
+      Object.getPrototypeOf(message),
+      descriptors as PropertyDescriptorMap
+    ) as T;
   }
 
   const {
@@ -251,7 +253,11 @@ function sanitizeBedrockSystemMessage<T extends MessageWithContent>(
   let modified = false;
   for (const block of content) {
     if (isCachePoint(block)) {
-      const existing = (block as { cachePoint?: { ttl?: unknown } }).cachePoint;
+      const descriptor = Object.getOwnPropertyDescriptor(block, 'cachePoint');
+      const existing =
+        descriptor != null && 'value' in descriptor
+          ? (descriptor.value as { ttl?: unknown } | undefined)
+          : undefined;
       const desired = buildBedrockCachePoint(ttl);
       if (existing?.ttl !== desired.ttl) {
         modified = true;
@@ -378,8 +384,17 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
 /**
  * Checks if a content block is a cache point
  */
-function isCachePoint(block: MessageContentComplex): boolean {
-  return 'cachePoint' in block && !('type' in block);
+function isCachePoint(block: unknown): boolean {
+  if (typeof block !== 'object' || block == null || isProxy(block)) {
+    return false;
+  }
+  try {
+    const cachePoint = Object.getOwnPropertyDescriptor(block, 'cachePoint');
+    const type = Object.getOwnPropertyDescriptor(block, 'type');
+    return cachePoint?.enumerable === true && type == null;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -460,8 +475,13 @@ export function addTailCacheControl<T extends AnthropicMessage | BaseMessage>(
     const originalMessage = updatedMessages[i];
     const content = originalMessage.content;
     const hasArrayContent = Array.isArray(content);
+    const isComputerOutput =
+      originalMessage instanceof BaseMessage &&
+      hasComputerCallOutputMarker(originalMessage);
     const canPlaceMarker =
-      !markerPlaced && !isSyntheticMetaMessage(originalMessage);
+      !markerPlaced &&
+      !isSyntheticMetaMessage(originalMessage) &&
+      !isComputerOutput;
 
     // Earlier string-content messages carry no markers to strip.
     if (!canPlaceMarker && !hasArrayContent) {
@@ -706,7 +726,21 @@ export function addCacheControlToStablePrefixMessages<
  */
 function hasAnthropicCacheControl(content: MessageContentComplex[]): boolean {
   for (let i = 0; i < content.length; i++) {
-    if ('cache_control' in content[i]) return true;
+    const block = content[i];
+    if (typeof block !== 'object' || block == null || isProxy(block)) {
+      continue;
+    }
+    try {
+      const cacheControl = Object.getOwnPropertyDescriptor(
+        block,
+        'cache_control'
+      );
+      if (cacheControl?.enumerable === true) {
+        return true;
+      }
+    } catch {
+      continue;
+    }
   }
   return false;
 }
@@ -733,13 +767,7 @@ export function stripAnthropicCacheControl<T extends MessageWithContent>(
       continue;
     }
 
-    const clonedContent = deepCloneContent(content);
-    for (let j = 0; j < clonedContent.length; j++) {
-      const block = clonedContent[j] as Record<string, unknown>;
-      if ('cache_control' in block) {
-        delete block.cache_control;
-      }
-    }
+    const clonedContent = deepCloneContent(content, 'cache_control');
     updatedMessages[i] = cloneMessage(originalMessage, clonedContent);
   }
 
@@ -961,10 +989,14 @@ export function addBedrockTailCacheControl<
       'lc_namespace' in originalMessage;
     const hasArrayContent = Array.isArray(content);
     const isEmptyString = typeof content === 'string' && content === '';
+    const isComputerOutput =
+      originalMessage instanceof BaseMessage &&
+      hasComputerCallOutputMarker(originalMessage);
     const canPlaceCachePoint =
       !cachePointPlaced &&
       !isEmptyString &&
       !isSyntheticMetaMessage(originalMessage) &&
+      !isComputerOutput &&
       (typeof content === 'string' || hasArrayContent);
 
     if (!canPlaceCachePoint && !hasArrayContent && !hasSerializationProps) {

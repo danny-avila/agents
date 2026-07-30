@@ -3,11 +3,11 @@
  * permission policies (allow / deny / ask lists + a global mode) without
  * hand-rolling matching, precedence, and decision logic per-host.
  *
- * Maps directly to the Claude Code Agent SDK permission vocabulary
- * (`allowed_tools` / `disallowed_tools` / `permissionMode`) so users of
- * either SDK can think in the same terms. See the README's HITL section
- * for the cross-walk and `docs/hooks-design-report.md` for the broader
- * hook system context.
+ * Uses the Claude Code Agent SDK permission vocabulary (`allowed_tools` /
+ * `disallowed_tools` / `permissionMode`) while treating modes as fallbacks
+ * for calls that match no explicit rule. See the README's HITL section for
+ * the cross-walk and `docs/hooks-design-report.md` for the broader hook
+ * system context.
  */
 
 import type { HookCallback, PreToolUseHookOutput, ToolDecision } from './types';
@@ -20,10 +20,8 @@ import type { HookCallback, PreToolUseHookOutput, ToolDecision } from './types';
  *   - `dontAsk`  — unmatched tools are denied; the human is never
  *                  prompted. Useful for headless / API agents where a
  *                  silent denial is preferable to a hung interrupt.
- *   - `bypass`   — every tool is approved, except those matching `deny`
- *                  patterns. The kill switch you flip when you trust
- *                  the agent and want to stop being asked. Equivalent to
- *                  Claude Code's `bypassPermissions`.
+ *   - `bypass`   — unmatched tools are approved. Explicit `deny` and `ask`
+ *                  rules still apply.
  */
 export type ToolPolicyMode = 'default' | 'dontAsk' | 'bypass';
 
@@ -46,9 +44,8 @@ export interface ToolPolicyConfig {
    */
   deny?: readonly string[];
   /**
-   * Tool name patterns that always trigger human approval, regardless
-   * of `mode: 'default'` vs `'dontAsk'`. In `mode: 'bypass'` these are
-   * still bypassed (because that's what bypass means).
+   * Tool name patterns that always trigger human approval. Wins over
+   * `allow` and every mode, but not `deny`.
    */
   ask?: readonly string[];
   /**
@@ -115,12 +112,12 @@ function formatReason(
  * registry.register('PreToolUse', { hooks: [policyHook] });
  * ```
  *
- * Evaluation order matches Claude Code's permission flow:
+ * Explicit rules take precedence over fallback modes:
  *
  *   1. `deny` rule match → `'deny'` (always wins, even in `bypass`).
- *   2. `mode === 'bypass'` → `'allow'`.
+ *   2. `ask` rule match → `'ask'`.
  *   3. `allow` rule match → `'allow'`.
- *   4. `ask` rule match → `'ask'`.
+ *   4. `mode === 'bypass'` → `'allow'`.
  *   5. `mode === 'dontAsk'` → `'deny'`.
  *   6. fallthrough → `'ask'`.
  *
@@ -168,14 +165,14 @@ function decide(
   if (denyMatch(toolName)) {
     return 'deny';
   }
-  if (mode === 'bypass') {
-    return 'allow';
+  if (askMatch(toolName)) {
+    return 'ask';
   }
   if (allowMatch(toolName)) {
     return 'allow';
   }
-  if (askMatch(toolName)) {
-    return 'ask';
+  if (mode === 'bypass') {
+    return 'allow';
   }
   if (mode === 'dontAsk') {
     return 'deny';

@@ -4,6 +4,7 @@
  */
 import {
   type BaseMessage,
+  type ToolMessage,
   isAIMessage,
   type Data,
   parseBase64DataUrl,
@@ -27,6 +28,8 @@ import type {
   BedrockContentBlock,
   MessageContentReasoningBlock,
 } from '../types';
+import { serializeStructuredValueBounded } from '@/utils/toolContent';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 
 /**
  * Reasoning blocks from other providers, relative to Bedrock. Bedrock's native
@@ -40,6 +43,14 @@ const FOREIGN_REASONING_TYPES = [
   'reasoning',
   'think',
 ];
+
+/**
+ * Google server-side tool blocks (`toolCall`/`toolResponse` parts from e.g.
+ * URL context or Google Search). Only Google can execute these and validate
+ * their thought signatures, so they are dropped on a cross-provider handoff
+ * (e.g. Google → Bedrock); the assistant's answer text is kept.
+ */
+const FOREIGN_SERVER_TOOL_TYPES = ['toolCall', 'toolResponse'];
 
 /**
  * Bedrock Converse rejects assistant messages with no content blocks. When
@@ -690,6 +701,13 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   if (typeof msg.content === 'string' && msg.content !== '') {
     assistantMsg.content?.push({ text: msg.content });
   } else if (Array.isArray(msg.content)) {
+    const parsedToolCallIds = new Set(
+      isAIMessage(msg)
+        ? (msg.tool_calls ?? []).flatMap((toolCall) =>
+          toolCall.id != null ? [toolCall.id] : []
+        )
+        : []
+    );
     const concatenatedBlocks = concatenateLangchainReasoningBlocks(
       msg.content as Array<MessageContentComplex | MessageContentReasoningBlock>
     );
@@ -699,6 +717,33 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
       if (block.type === 'text') {
         const text = (block as { text?: string }).text ?? '';
         appendSerializableBedrockTextBlock(contentBlocks, text);
+      } else if (block.type === 'tool_use') {
+        const toolUse = block as {
+          id?: unknown;
+          name?: unknown;
+          input?: unknown;
+        };
+        if (
+          typeof toolUse.id === 'string' &&
+          parsedToolCallIds.has(toolUse.id)
+        ) {
+          return;
+        }
+        if (
+          typeof toolUse.id !== 'string' ||
+          typeof toolUse.name !== 'string' ||
+          toolUse.input == null ||
+          typeof toolUse.input !== 'object'
+        ) {
+          throw new Error('Invalid Anthropic tool_use content block');
+        }
+        contentBlocks.push({
+          toolUse: {
+            toolUseId: toolUse.id,
+            name: toolUse.name,
+            input: toolUse.input as Record<string, unknown>,
+          },
+        } as BedrockContentBlock);
       } else if (block.type === 'reasoning_content') {
         const reasoningBlock = block as MessageContentReasoningBlock;
         // Bedrock Converse rejects reasoningContent whose reasoningText.text is
@@ -727,6 +772,11 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
           // than crash. The Bedrock model produces its own reasoning. Anything
           // else unknown still throws below — real content must be surfaced.
           return;
+        } else if (FOREIGN_SERVER_TOOL_TYPES.some((t) => t === block.type)) {
+          // Google server-side tool call/response (e.g. URL context) — only
+          // Google can execute it or validate its thought signature; drop it
+          // on a cross-provider handoff rather than crash.
+          return;
         } else {
           const blockValues = Object.fromEntries(
             Object.entries(block).filter(([key]) => key !== 'type')
@@ -743,13 +793,20 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
 
   // Important: this must be placed after any reasoning content blocks
   if (isAIMessage(msg) && msg.tool_calls != null && msg.tool_calls.length > 0) {
-    const toolUseBlocks = msg.tool_calls.map((tc) => ({
-      toolUse: {
-        toolUseId: tc.id,
-        name: tc.name,
-        input: tc.args as Record<string, unknown>,
-      },
-    }));
+    const existingToolUseIds = new Set(
+      (assistantMsg.content ?? [])
+        .filter((content) => 'toolUse' in content)
+        .map((content) => content.toolUse?.toolUseId)
+    );
+    const toolUseBlocks = msg.tool_calls
+      .filter((toolCall) => !existingToolUseIds.has(toolCall.id))
+      .map((toolCall) => ({
+        toolUse: {
+          toolUseId: toolCall.id,
+          name: toolCall.name,
+          input: toolCall.args as Record<string, unknown>,
+        },
+      }));
     assistantMsg.content = [
       ...(assistantMsg.content ?? []),
       ...toolUseBlocks,
@@ -904,17 +961,45 @@ function convertHumanMessageToConverseMessage(
  */
 function convertToolMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   const toolCallId = (msg as { tool_call_id?: string }).tool_call_id;
+  let isError = (msg as ToolMessage).status === 'error';
 
   let content: BedrockContentBlock[];
   if (typeof msg.content === 'string') {
     content = [{ text: msg.content }];
   } else if (Array.isArray(msg.content)) {
-    content = msg.content.map((block) =>
-      convertLangChainContentBlockToConverseContentBlock({
-        block,
-        onUnknown: 'passthrough',
-      })
-    );
+    content = msg.content.flatMap((block) => {
+      if (typeof block === 'object' && block.type === 'tool_result') {
+        if ((block as { is_error?: unknown }).is_error === true) {
+          isError = true;
+        }
+        const toolResultContent = (block as { content?: unknown }).content;
+        if (typeof toolResultContent === 'string') {
+          return [{ text: toolResultContent }];
+        }
+        if (Array.isArray(toolResultContent)) {
+          return toolResultContent.map((nestedBlock) =>
+            convertLangChainContentBlockToConverseContentBlock({
+              block: nestedBlock,
+              onUnknown: 'passthrough',
+            })
+          );
+        }
+        return [
+          {
+            text: serializeStructuredValueBounded(
+              toolResultContent,
+              HARD_MAX_TOOL_RESULT_CHARS
+            ).content,
+          },
+        ];
+      }
+      return [
+        convertLangChainContentBlockToConverseContentBlock({
+          block,
+          onUnknown: 'passthrough',
+        }),
+      ];
+    });
   } else {
     content = [{ text: String(msg.content) }];
   }
@@ -945,6 +1030,7 @@ function convertToolMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
         toolResult: {
           toolUseId: toolCallId,
           content: toolResultContent as { text: string }[],
+          ...(isError ? { status: 'error' as const } : {}),
         },
       },
       ...trailingCachePoints,
@@ -977,7 +1063,19 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
       }
     });
 
-  // Combine consecutive user tool result messages into a single message
+  /**
+   * Combine ALL consecutive user messages into one, not just tool-result
+   * pairs. The Converse API documents strict role alternation; enforcement
+   * varies by model family (Claude on Converse currently tolerates adjacent
+   * user messages — verified live, 2026-07-28 — but the docs promise nothing
+   * for the others), so the converter never emits the shape. The case that
+   * matters: a `PostToolBatch`/`PreemptBoundary` hook injection lands a text
+   * turn directly after tool results, and `ToolMessage` and `HumanMessage`
+   * both convert to `role: 'user'` above. Block order is preserved
+   * (toolResult blocks, then text) — verified live that Converse accepts the
+   * mixed user message and answers both halves — and the toolUse/toolResult
+   * pairing stays intact.
+   */
   const combinedConverseMessages = converseMessages.reduce<BedrockMessage[]>(
     (acc, curr) => {
       if (acc.length === 0) {
@@ -985,16 +1083,7 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
         return acc;
       }
       const lastMessage = acc[acc.length - 1];
-      const lastHasToolResult =
-        lastMessage.content?.some((c) => 'toolResult' in c) === true;
-      const currHasToolResult =
-        curr.content?.some((c) => 'toolResult' in c) === true;
-      if (
-        lastMessage.role === 'user' &&
-        lastHasToolResult &&
-        curr.role === 'user' &&
-        currHasToolResult
-      ) {
+      if (lastMessage.role === 'user' && curr.role === 'user') {
         lastMessage.content = lastMessage.content?.concat(curr.content ?? []);
       } else {
         acc.push(curr);

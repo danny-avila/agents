@@ -11,10 +11,20 @@ import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
 import {
+  cloneToolMessageWithContent,
+  compactToolContent,
+  isComputerCallOutputMessage,
+  serializeToolContentBounded,
+} from '@/utils/toolContent';
+import {
   addTailCacheControl,
   resolvePromptCacheTtl,
   type PromptCacheTtl,
 } from '@/messages/cache';
+import {
+  DEFAULT_RETAIN_RECENT_TURNS,
+  splitAtRecencyBoundary,
+} from '@/messages/recency';
 import {
   Constants,
   ContentTypes,
@@ -24,8 +34,8 @@ import {
 } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
+import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { createRemoveAllMessage } from '@/messages/reducer';
-import { splitAtRecencyBoundary } from '@/messages/recency';
 import { getMaxOutputTokensKey } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
@@ -43,8 +53,6 @@ const SUMMARIZATION_PARAM_KEYS = new Set(['maxSummaryTokens']);
  * `retainRecent.turns` to `0` reverts to the legacy "summarize every
  * message" behavior.
  */
-const DEFAULT_RETAIN_RECENT_TURNS = 2;
-
 /**
  * Token overhead of the XML wrapper added around the
  * summary at injection time in AgentContext.buildSystemRunnable:
@@ -197,10 +205,10 @@ function extractToolFailuresSection(messages: BaseMessage[]): string {
     }
 
     const toolName = toolMsg.name ?? 'tool';
-    const content =
-      typeof toolMsg.content === 'string'
-        ? toolMsg.content
-        : JSON.stringify(toolMsg.content);
+    const content = serializeToolContentBounded(
+      toolMsg.content,
+      MAX_TOOL_FAILURE_CHARS * 4
+    );
     const normalized = content.replace(/\s+/g, ' ').trim();
     const summary =
       normalized.length > MAX_TOOL_FAILURE_CHARS
@@ -241,24 +249,44 @@ function enrichSummary(summaryText: string, messages: BaseMessage[]): string {
  */
 function restoreOriginalToolContent(
   messages: BaseMessage[],
-  originalToolContent: Map<number, string> | undefined
+  originalToolContent: Map<number, string> | undefined,
+  maxContextTokens?: number
 ): BaseMessage[] {
   if (originalToolContent == null || originalToolContent.size === 0) {
     return messages;
   }
-  const restored = [...messages];
-  for (const [idx, content] of originalToolContent) {
-    const msg = restored[idx];
-    if (msg instanceof ToolMessage) {
-      restored[idx] = new ToolMessage({
-        content,
-        tool_call_id: msg.tool_call_id,
-        name: msg.name,
-        id: msg.id,
-        additional_kwargs: msg.additional_kwargs,
-        response_metadata: msg.response_metadata,
-      });
+
+  const restorable: Array<{
+    index: number;
+    message: ToolMessage;
+    content: string;
+  }> = [];
+  for (const [index, content] of originalToolContent) {
+    const message = messages[index];
+    if (
+      message instanceof ToolMessage &&
+      !isComputerCallOutputMessage(message)
+    ) {
+      restorable.push({ index, message, content });
     }
+  }
+  if (restorable.length === 0) {
+    return messages;
+  }
+
+  /**
+   * Restored originals improve checkpoint quality, but they still feed a
+   * provider call. Share one tool-result budget across every restoration so
+   * several previously masked results cannot overflow the summarizer.
+   */
+  let remainingChars = calculateMaxToolResultChars(maxContextTokens);
+  const restored = [...messages];
+  for (let i = 0; i < restorable.length; i++) {
+    const { index, message, content } = restorable[i];
+    const maxChars = Math.floor(remainingChars / (restorable.length - i));
+    const compacted = compactToolContent(content, maxChars).content;
+    restored[index] = cloneToolMessageWithContent(message, compacted);
+    remainingChars -= serializeToolContentBounded(compacted, maxChars).length;
   }
   return restored;
 }
@@ -343,6 +371,70 @@ function computeSummaryTokenCount(
     );
   }
   return 0;
+}
+
+/**
+ * Names the first retained message so the summary declares its own extent
+ * rather than leaving the next run to infer coverage from where the block
+ * happens to sit.
+ *
+ * Anchored to the retained side, not the covered side. One source message can
+ * expand into several messages — a steer splits an assistant entry into
+ * pre-steer, steer, and post-steer entries sharing its ID — and the recency
+ * split lands on any human-type message, including the steer. Naming the last
+ * *covered* message would then name a half-covered ID with no correct reading;
+ * naming the first *retained* message makes that same message the anchor, so it
+ * survives whole and everything before it is unambiguously covered.
+ *
+ * Synthetic entries are skipped, because they can sit *before* a resolvable
+ * one. `formatAgentMessages` reconstructs skill bodies inside its payload loop
+ * (see the `pendingSkillNames` block) and keeps processing payload entries
+ * afterwards, so an unstamped skill body — which `messagesStateReducer` then
+ * gives a UUID no payload entry carries — is followed by stamped messages.
+ * Anchoring on the UUID would look resolvable at write time and degrade to
+ * positional trimming on read, dropping the retained tail. Skipping it reaches
+ * the stamped message behind it.
+ *
+ * `convertInjectedMessages` records `injected` on everything it builds, which is
+ * what makes this decidable: `isMeta` and `source` are both optional on
+ * `InjectedMessage`, so a bare entry carries no marker of its own, and an
+ * injected `source: 'steer'` is otherwise indistinguishable from a replayed one.
+ * The remaining `isMeta`/`source` checks cover the constructors that build
+ * synthetic entries directly instead of going through that funnel — hook context
+ * in `ToolNode` and `StandardGraph`, handoff cues, reconstructed skill bodies.
+ *
+ * `steer` is exempt from the `source` check because a replayed steer *is*
+ * stamped from its payload entry; rejecting every marked `source` once dropped
+ * exactly those retained steers. Injected steers are still caught, by `injected`.
+ *
+ * Known limitation: a payload entry that omits `messageId` is never stamped, so
+ * the reducer's UUID is recorded and cannot resolve on the next run. There is no
+ * write-time fix — such an entry has no stable ID to name in the next payload
+ * either — and the reader's positional fallback is what `main` already does, so
+ * the anchor degrades rather than misleads.
+ */
+function isSyntheticContext(message: BaseMessage): boolean {
+  const { additional_kwargs: kwargs } = message;
+  if (kwargs.injected === true || kwargs.isMeta === true) {
+    return true;
+  }
+  return kwargs.source != null && kwargs.source !== 'steer';
+}
+
+function resolveSummaryCoverage(
+  messagesToRetain: BaseMessage[]
+): t.SummaryCoverage | undefined {
+  for (let i = 0; i < messagesToRetain.length; i++) {
+    const message = messagesToRetain[i];
+    if (isSyntheticContext(message)) {
+      continue;
+    }
+    const id = message.id?.trim();
+    if (id != null && id !== '') {
+      return { retainedFromMessageId: id };
+    }
+  }
+  return undefined;
 }
 
 /** Constructs the SummaryContentBlock persisted in the run step and dispatched to events. */
@@ -511,7 +603,16 @@ async function executeSummarizationWithFallback(params: {
   stepId: string;
   usePromptCache: boolean;
   log: LogFn;
-}): Promise<{ text: string; usage?: Partial<UsageMetadata> }> {
+}): Promise<{
+  text: string;
+  usage?: Partial<UsageMetadata>;
+  /**
+   * True when every model call failed and `text` is the generated metadata
+   * stub rather than a real summary. Callers that would replace history with
+   * this need to know it carries none of the original content.
+   */
+  usedMetadataStub?: boolean;
+}> {
   const {
     agentContext,
     messages,
@@ -526,6 +627,7 @@ async function executeSummarizationWithFallback(params: {
 
   let summaryText = '';
   let summaryUsage: Partial<UsageMetadata> | undefined;
+  let usedMetadataStub = false;
 
   try {
     /**
@@ -628,10 +730,11 @@ async function executeSummarizationWithFallback(params: {
         }
       );
       summaryText = generateMetadataStub(messages);
+      usedMetadataStub = true;
     }
   }
 
-  return { text: summaryText, usage: summaryUsage };
+  return { text: summaryText, usage: summaryUsage, usedMetadataStub };
 }
 
 /** Dispatches run step completion, ON_SUMMARIZE_COMPLETE, and rebuilds token map. */
@@ -768,6 +871,34 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
+    /**
+     * Overflow recovery routes through this node purely to get back to the
+     * agent node with a corrected budget, and deliberately spends no model
+     * call on its first attempt: re-pruning under the raised context pressure
+     * drives the pruner's tool-output compression and masking, which is
+     * cheaper than a summary and cannot lose message content. Summarization
+     * is also skipped outright when the caller never enabled it.
+     */
+    if (
+      request.reason === 'overflow' &&
+      (request.allowSummarization !== true ||
+        agentContext.summarizationEnabled !== true)
+    ) {
+      emitAgentLog(
+        config,
+        'debug',
+        'summarize',
+        'Overflow recovery re-prune — compressing tool output without a summarization call',
+        {
+          maxContextTokens: agentContext.maxContextTokens,
+          summarizationEnabled: agentContext.summarizationEnabled === true,
+          allowSummarization: request.allowSummarization === true,
+        },
+        { runId: graph.runId, agentId: request.agentId }
+      );
+      return { summarizationRequest: undefined };
+    }
+
     const maxCtx = agentContext.maxContextTokens ?? 0;
     if (maxCtx > 0 && agentContext.instructionTokens >= maxCtx) {
       emitAgentLog(
@@ -799,7 +930,8 @@ export function createSummarizeNode({
 
     const restoredMessages = restoreOriginalToolContent(
       state.messages,
-      originalPending
+      originalPending,
+      agentContext.maxContextTokens
     );
 
     const runnableConfig = config ?? graph.config;
@@ -970,16 +1102,61 @@ export function createSummarizeNode({
       }
       : undefined;
 
-    const { text: rawText, usage: summaryUsage } =
-      await executeSummarizationWithFallback({
-        agentContext,
-        messages: messagesToRefine,
-        clientConfig,
-        summarizeConfig,
+    const {
+      text: rawText,
+      usage: summaryUsage,
+      usedMetadataStub,
+    } = await executeSummarizationWithFallback({
+      agentContext,
+      messages: messagesToRefine,
+      clientConfig,
+      summarizeConfig,
+      stepId,
+      usePromptCache: isSelfSummarizeModel && hasPromptCache,
+      log,
+    });
+
+    /**
+     * The metadata stub describes the history rather than summarizing it, so
+     * committing it means removing the head and keeping nothing of what it
+     * said. That trade is never worth making to paper over an overflow: the
+     * recovery would "succeed" only by destroying the conversation it was
+     * supposed to preserve. Leave state untouched and let the provider error
+     * surface instead.
+     */
+    if (usedMetadataStub === true && request.reason === 'overflow') {
+      log(
+        'warn',
+        'Overflow summarization failed; keeping history rather than replacing it with a metadata stub'
+      );
+      agentContext.markSummarizationTriggered(state.messages.length);
+      /**
+       * The run step was already dispatched, so it has to be resolved here or
+       * consumers tracking step lifecycle keep an unfinished placeholder for
+       * the rest of the run.
+       */
+      await graph.dispatchRunStepCompleted(
         stepId,
-        usePromptCache: isSelfSummarizeModel && hasPromptCache,
-        log,
-      });
+        {
+          type: 'summary',
+          summary: placeholderSummary,
+        } satisfies t.SummaryCompleted,
+        runnableConfig
+      );
+      if (runnableConfig) {
+        await safeDispatchCustomEvent(
+          GraphEvents.ON_SUMMARIZE_COMPLETE,
+          {
+            id: stepId,
+            agentId: request.agentId,
+            error:
+              'Summarization failed during overflow recovery; conversation history was preserved',
+          } satisfies t.SummarizeCompleteEvent,
+          runnableConfig
+        );
+      }
+      return { summarizationRequest: undefined };
+    }
 
     if (!rawText) {
       agentContext.markSummarizationTriggered(0);
@@ -1023,15 +1200,10 @@ export function createSummarizeNode({
         : {}),
     });
 
-    const coveredThroughMessageId = messagesToRefine.at(-1)?.id?.trim();
-    const summaryCoverage: t.SummaryCoverage | undefined =
-      coveredThroughMessageId != null && coveredThroughMessageId !== ''
-        ? { throughMessageId: coveredThroughMessageId }
-        : undefined;
     const summaryBlock = buildSummaryBlock({
       summaryText,
       tokenCount,
-      coverage: summaryCoverage,
+      coverage: resolveSummaryCoverage(messagesToRetain),
       stepId,
       stepIndex: runStep.index,
       modelName: clientConfig.modelName,
