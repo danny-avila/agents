@@ -93,6 +93,11 @@ import {
   translateRecoveryBudget,
 } from '@/llm/contextOverflowRecovery';
 import {
+  hasToolOutputTracingConfig,
+  resolveLangfuseConfig,
+  resolveToolOutputTracingConfig,
+} from '@/langfuseConfig';
+import {
   compactToolContent,
   getToolContentCharLength,
   serializeToolContentBounded,
@@ -124,7 +129,6 @@ import { shouldTriggerSummarization } from '@/summarization';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
-import { resolveLangfuseConfig } from '@/langfuseConfig';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
@@ -3078,6 +3082,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           traceIdSeed:
             langfuse?.deterministicTraceId === true ? this.runId : undefined,
           runId: this.langfuseScopeRunId,
+          toolOutputTracing: hasToolOutputTracingConfig(
+            this.langfuse,
+            agentContext.langfuse
+          )
+            ? resolveToolOutputTracingConfig(
+              this.langfuse,
+              agentContext.langfuse
+            )
+            : undefined,
         });
         if (langfuseHandler != null) {
           invokeConfig = {

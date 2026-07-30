@@ -567,6 +567,35 @@ describe('Langfuse callback composition', () => {
       })
     );
 
+    // Explicit `agentId` metadata (stamped by the graph's model path and
+    // ToolNode) beats node-name parsing: agent `research`'s inner node is
+    // named `agent=research`, indistinguishable by name from a sibling
+    // literally named `agent=research` — the explicit identity disambiguates.
+    await withLangfuseRuntimeScope(
+      {
+        langfuse: agentBLangfuse,
+        traceIdSeed: 'prefixed-sibling-seed',
+        runId: 'run-1',
+        agentId: 'agent=research',
+      },
+      () =>
+        streamHandler?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['AmbiguousNodeChain'] },
+          { input: 'ambiguous node' },
+          'lc-ambiguous-node-run',
+          undefined,
+          undefined,
+          { langgraph_node: 'agent=research', agentId: 'research' }
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({ publicKey: 'pk-run' }),
+        traceId: traceIdFromSeed('run-seed'),
+      })
+    );
+
     // An agent id that itself begins with an internal node prefix is carried
     // VERBATIM by its outer workflow node — still recognized as its own scope.
     await withLangfuseRuntimeScope(

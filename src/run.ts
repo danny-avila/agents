@@ -1,4 +1,5 @@
 // src/run.ts
+import { nanoid } from 'nanoid';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
@@ -828,6 +829,15 @@ export class Run<_T extends t.BaseGraphState> {
     const traceName = config.runName ?? getLangfuseTraceName(traceMetadata);
     const streamLangfuseConfig = this.getStreamLangfuseConfig(graph);
     initializeLangfuseTracing(streamLangfuseConfig);
+    const streamRuntimeScope = resolveLangfuseRuntimeScope({
+      runLangfuse: streamLangfuseConfig,
+      langfuseOverlay: this.getStreamToolOutputTracingLangfuseConfig(graph),
+      traceIdSeed:
+        streamLangfuseConfig?.deterministicTraceId === true
+          ? this.id
+          : undefined,
+      runId: this.id,
+    });
     const langfuseHandler = createLangfuseHandler({
       langfuse: streamLangfuseConfig,
       userId,
@@ -839,6 +849,11 @@ export class Run<_T extends t.BaseGraphState> {
           ? this.id
           : undefined,
       runId: this.id,
+      // The aggregate multi-agent policy from the runtime scope — the
+      // handler must restore THIS (not the primary agent's config-derived
+      // policy) when rejecting a foreign scope.
+      toolOutputTracing: streamRuntimeScope.toolOutputTracing,
+      traceName,
     });
     if (langfuseHandler != null) {
       config.runName = traceName;
@@ -1058,28 +1073,18 @@ export class Run<_T extends t.BaseGraphState> {
       // When opted in, seed the root trace id from this run's id so feedback /
       // other external signals can be attached to the trace later without a
       // lookup (see SeededTraceIdGenerator in ./instrumentation).
-      await withLangfuseRuntimeScope(
-        resolveLangfuseRuntimeScope({
-          runLangfuse: streamLangfuseConfig,
-          langfuseOverlay: this.getStreamToolOutputTracingLangfuseConfig(graph),
-          traceIdSeed:
-            streamLangfuseConfig?.deterministicTraceId === true
-              ? this.id
-              : undefined,
-          runId: this.id,
-        }),
-        () =>
-          withLangfuseAttributes(
-            {
-              langfuse: streamLangfuseConfig,
-              userId,
-              sessionId,
-              traceName,
-              traceMetadata,
-              tags: ['librechat', 'agent'],
-            },
-            consumeStream
-          )
+      await withLangfuseRuntimeScope(streamRuntimeScope, () =>
+        withLangfuseAttributes(
+          {
+            langfuse: streamLangfuseConfig,
+            userId,
+            sessionId,
+            traceName,
+            traceMetadata,
+            tags: ['librechat', 'agent'],
+          },
+          consumeStream
+        )
       );
     } catch (err) {
       streamThrew = true;
@@ -1455,6 +1460,27 @@ export class Run<_T extends t.BaseGraphState> {
       agentName: titleContext?.name,
     });
     const titleRunName = getLangfuseTraceName(traceMetadata, 'LibreChat Title');
+    /** Scope identity carries an opaque per-execution component: public run
+     *  ids are unrestricted, so a purely derived id (`title-<runId>`) could
+     *  collide with an ordinary concurrent run literally named that way and
+     *  defeat foreign-scope rejection. */
+    const titleScopeRunId = `title:${this.id}:${nanoid()}`;
+    /** Seed policy mirrors `generateActivityLabel`:
+     *  `runWithLangfuseRuntimeContext` SPREADS the surrounding context, so an
+     *  absent seed INHERITS an active parent run's and collapses the title
+     *  into that run's trace. Seeded when determinism is opted into OR a
+     *  parent seed is live; otherwise unseeded, matching the other paths. */
+    const inheritedTraceSeed = getTraceIdSeed();
+    const titleRuntimeScope = resolveLangfuseRuntimeScope({
+      runLangfuse: this.langfuse,
+      langfuseOverlay: titleContext?.langfuse,
+      traceIdSeed:
+        titleLangfuseConfig?.deterministicTraceId === true ||
+        inheritedTraceSeed != null
+          ? 'title-' + this.id
+          : undefined,
+      runId: titleScopeRunId,
+    });
 
     if (chainOptions != null) {
       titleUserId =
@@ -1476,7 +1502,9 @@ export class Run<_T extends t.BaseGraphState> {
           titleLangfuseConfig?.deterministicTraceId === true
             ? 'title-' + this.id
             : undefined,
-        runId: 'title-' + this.id,
+        runId: titleScopeRunId,
+        toolOutputTracing: titleRuntimeScope.toolOutputTracing,
+        traceName: chainOptions.runName ?? titleRunName,
       });
 
       if (titleLangfuseHandler != null) {
@@ -1566,23 +1594,6 @@ export class Run<_T extends t.BaseGraphState> {
             runtimeConfig
           )
       );
-
-    /** Seed policy mirrors `generateActivityLabel`:
-     *  `runWithLangfuseRuntimeContext` SPREADS the surrounding context, so an
-     *  absent seed INHERITS an active parent run's and collapses the title
-     *  into that run's trace. Seeded when determinism is opted into OR a
-     *  parent seed is live; otherwise unseeded, matching the other paths. */
-    const inheritedTraceSeed = getTraceIdSeed();
-    const titleRuntimeScope = resolveLangfuseRuntimeScope({
-      runLangfuse: this.langfuse,
-      langfuseOverlay: titleContext?.langfuse,
-      traceIdSeed:
-        titleLangfuseConfig?.deterministicTraceId === true ||
-        inheritedTraceSeed != null
-          ? 'title-' + this.id
-          : undefined,
-      runId: 'title-' + this.id,
-    });
 
     try {
       try {
@@ -1703,7 +1714,8 @@ export class Run<_T extends t.BaseGraphState> {
       inheritedTraceSeed != null
         ? (traceSeed ?? `activity-label-${this.id}-${labelSeq}`)
         : undefined;
-    const labelScopeRunId = `activity-label-${this.id}-${labelSeq}`;
+    /** Opaque per-execution component: see `titleScopeRunId`. */
+    const labelScopeRunId = `activity-label:${this.id}:${labelSeq}:${nanoid()}`;
     const labelRuntimeScope = resolveLangfuseRuntimeScope({
       runLangfuse: this.langfuse,
       langfuseOverlay: labelContext?.langfuse,
@@ -1730,6 +1742,8 @@ export class Run<_T extends t.BaseGraphState> {
             ? labelTraceSeed
             : undefined,
         runId: labelScopeRunId,
+        toolOutputTracing: labelRuntimeScope.toolOutputTracing,
+        traceName: labelChainOptions.runName ?? labelRunName,
       });
     }
     if (labelLangfuseHandler != null) {

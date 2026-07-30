@@ -19,6 +19,7 @@ import type {
 } from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type { Context } from '@opentelemetry/api';
+import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
 import {
   resolveLangfuseConfigForSpan,
@@ -69,6 +70,14 @@ type LangfuseHandlerParams = {
    *  only adopted when stamped with the same run (see
    *  `LangfuseRuntimeContext.runId`). */
   runId?: string;
+  /** The run's resolved tool-output policy — for multi-agent streams the
+   *  conservative aggregate across agents, which `this.langfuse` (the
+   *  primary agent's config) cannot reproduce. Applied when a foreign
+   *  scope's policy is rejected. */
+  toolOutputTracing?: ResolvedLangfuseToolOutputTracingConfig;
+  /** The run's propagated trace name, re-propagated when a foreign scope's
+   *  attributes are cleared. */
+  traceName?: string;
 };
 
 type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
@@ -80,6 +89,7 @@ type HandlerIdentity = {
   sessionId?: string;
   tags?: string[];
   metadata?: LangfuseTraceMetadata;
+  traceName?: string;
 };
 
 type LangfuseAttributeParams = AgentLangfuseHandlerParams & {
@@ -201,6 +211,7 @@ function normalizeBedrockUsageForLangfuse(output: LLMResult): LLMResult {
 }
 
 const LANGGRAPH_NODE_METADATA_KEY = 'langgraph_node';
+const AGENT_ID_METADATA_KEY = 'agentId';
 const LANGGRAPH_NODE_AGENT_PREFIXES = ['agent=', 'tools=', 'summarize='];
 
 /** The LangGraph node a callback executes under, from its inherited
@@ -265,19 +276,29 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private readonly traceIdSeed?: string;
   private readonly runId?: string;
   private readonly identity: HandlerIdentity;
+  private readonly toolOutputTracing?: ResolvedLangfuseToolOutputTracingConfig;
   private readonly trackedRunIds = new Set<string>();
 
   constructor(params?: AgentLangfuseHandlerParams) {
-    const { langfuse, traceIdSeed, runId, ...handlerParams } = params ?? {};
+    const {
+      langfuse,
+      traceIdSeed,
+      runId,
+      toolOutputTracing,
+      traceName,
+      ...handlerParams
+    } = params ?? {};
     super(handlerParams);
     this.langfuse = langfuse;
     this.traceIdSeed = traceIdSeed;
     this.runId = runId;
+    this.toolOutputTracing = toolOutputTracing;
     this.identity = {
       userId: handlerParams.userId,
       sessionId: handlerParams.sessionId,
       tags: handlerParams.tags,
       metadata: handlerParams.traceMetadata,
+      traceName,
     };
   }
 
@@ -323,6 +344,14 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     }
     if (scopeAgentId == null) {
       return false;
+    }
+    // Explicit agent identity (stamped into invoke metadata by the graph's
+    // model path and ToolNode) is unambiguous; node names are a fallback —
+    // an agent literally named `agent=research` makes its outer node
+    // indistinguishable from agent `research`'s inner model node.
+    const explicitAgentId = callbackMetadata?.[AGENT_ID_METADATA_KEY];
+    if (typeof explicitAgentId === 'string' && explicitAgentId !== '') {
+      return explicitAgentId !== scopeAgentId;
     }
     const callbackNode = getCallbackNode(callbackMetadata);
     return (
@@ -407,20 +436,26 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
           langfuse: this.langfuse,
           traceIdSeed: this.getDeterministicTraceSeed(),
           runId: this.runId,
-          toolOutputTracing: resolveToolOutputTracingConfig(this.langfuse),
+          toolOutputTracing:
+            this.toolOutputTracing ??
+            resolveToolOutputTracingConfig(this.langfuse),
         },
         action,
         { replace: true }
       );
-    const { userId, sessionId, tags, metadata } = this.identity;
+    const { userId, sessionId, tags, metadata, traceName } = this.identity;
     const hasIdentity =
       userId != null ||
       sessionId != null ||
       metadata != null ||
+      traceName != null ||
       (tags?.length ?? 0) > 0;
     return otelContext.with(cleanContext, () =>
       hasIdentity
-        ? propagateAttributes({ userId, sessionId, tags, metadata }, scoped)
+        ? propagateAttributes(
+          { userId, sessionId, tags, metadata, traceName },
+          scoped
+        )
         : scoped()
     );
   }
@@ -691,6 +726,8 @@ export function createLangfuseHandler({
   tags,
   traceIdSeed,
   runId,
+  toolOutputTracing,
+  traceName,
 }: AgentLangfuseHandlerParams): CallbackHandler | undefined {
   if (!shouldCreateLangfuseHandler(langfuse)) {
     return undefined;
@@ -706,6 +743,8 @@ export function createLangfuseHandler({
     langfuse,
     traceIdSeed,
     runId,
+    toolOutputTracing,
+    traceName,
   });
 }
 

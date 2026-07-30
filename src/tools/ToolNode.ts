@@ -745,6 +745,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     options?: Partial<RunnableConfig>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ): Promise<any> {
+    // Explicit agent identity for tool callbacks: node-name parsing is
+    // ambiguous when agent ids themselves embed node prefixes, so the
+    // handler prefers this metadata (see `isForeignScope`).
+    const scopedOptions =
+      this.executingAgentId == null
+        ? options
+        : {
+          ...options,
+          metadata: {
+            ...options?.metadata,
+            agentId: this.executingAgentId,
+          },
+        };
     return withLangfuseRuntimeScope(
       resolveLangfuseRuntimeScope({
         runLangfuse: this.runLangfuse,
@@ -756,7 +769,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         // `LangfuseRuntimeContext.agentId`).
         agentId: this.executingAgentId,
       }),
-      () => super.invoke(input, options)
+      () => super.invoke(input, scopedOptions)
     );
   }
 
