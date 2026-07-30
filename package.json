@@ -199,7 +199,9 @@
     "re": "bun run clean && bun install && rm -rf ./dist && turbo build",
     "lint": "eslint \"{,!(node_modules|venv)/**/}*.{js,jsx,ts,tsx}\" --fix",
     "format": "prettier --write .",
-    "audit": "npm audit --omit=dev"
+    "audit": "npm audit --omit=dev",
+    "label:eval": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/activity-labels/run.ts",
+    "label:rescore": "node ./src/scripts/activity-labels/rescore.cjs"
   },
   "overrides": {
     "@langchain/openai": "1.5.5",
