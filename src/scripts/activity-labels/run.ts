@@ -188,9 +188,11 @@ function continuitySection(previousLabels: string[]): string | null {
 
 /**
  * Applies a framing hypothesis as marker-exact substitutions on a built (or
- * captured) prompt. Strict: the heading is rewritten only when its marker
- * occurs exactly once, the terminal only when it is the final line — a
- * prompt failing either check is returned unchanged, so a framing variant
+ * captured) prompt. Strict: the heading is rewritten when the prompt STARTS
+ * with the section (a bare batch with no previous labels, intent, or
+ * excerpts puts `Tool calls:` first) or when the section-boundary marker
+ * occurs exactly once; the terminal only when it is the final line. A
+ * prompt failing every check is returned unchanged, so a framing variant
  * degrades to the control rather than corrupting the sample.
  */
 function applyFraming(
@@ -199,9 +201,12 @@ function applyFraming(
 ): string {
   let text = prompt;
   if (entriesHeading != null && entriesHeading !== 'Tool calls:') {
+    const lead = 'Tool calls:\n';
     const marker = '\n\nTool calls:\n';
     const first = text.indexOf(marker);
-    if (first !== -1 && text.indexOf(marker, first + 1) === -1) {
+    if (text.startsWith(lead)) {
+      text = `${entriesHeading}\n` + text.slice(lead.length);
+    } else if (first !== -1 && text.indexOf(marker, first + 1) === -1) {
       text =
         text.slice(0, first) +
         `\n\n${entriesHeading}\n` +
@@ -252,11 +257,13 @@ type LabelFailure = { error: string; latencyMs: number };
 type LabelResult = LabelSuccess | LabelFailure;
 
 /**
- * One label request with three attempts. Transport rejections (DNS,
- * connection reset) are retried like 429/500/529 responses instead of
- * escaping to the top level, where a single flake would discard every
- * completed record of an otherwise finished run. `latencyMs` spans the
- * whole sequence including backoff — the cost a variant actually paid.
+ * One label request with three attempts. The whole attempt — fetch AND the
+ * body reads, which reject on a connection reset after headers arrive —
+ * sits inside one try, so any transport rejection is retried like a
+ * 429/500/529 instead of escaping to the top level, where a single flake
+ * would discard every completed record of an otherwise finished run.
+ * `latencyMs` spans the whole sequence including backoff — the cost a
+ * variant actually paid.
  */
 async function requestLabel({
   apiKey,
@@ -272,9 +279,8 @@ async function requestLabel({
   const started = Date.now();
   let lastError = 'exhausted retries';
   for (let attempt = 1; attempt <= 3; attempt++) {
-    let response: Response;
     try {
-      response = await fetch('https://api.anthropic.com/v1/messages', {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -288,50 +294,50 @@ async function requestLabel({
           messages: [{ role: 'user', content: prompt }],
         }),
       });
+      if (response.ok) {
+        const json = (await response.json()) as {
+          content?: Array<{ text?: string }>;
+          usage?: { input_tokens?: number; output_tokens?: number };
+        };
+        /** Same normalization as the production extractor (src/run.ts): a
+         *  label renders as a single row and re-enters later prompts as
+         *  continuity context, so newlines must not survive here either —
+         *  and a raw newline would break the per-case Markdown tables. */
+        const label = (json.content ?? [])
+          .map((block) => block.text ?? '')
+          .join('')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .replace(/^["']|["']$/g, '');
+        return {
+          label,
+          latencyMs: Date.now() - started,
+          inputTokens: json.usage?.input_tokens ?? 0,
+          outputTokens: json.usage?.output_tokens ?? 0,
+        };
+      }
+      const body = await response.text();
+      lastError = `HTTP ${response.status}: ${body.slice(0, 160)}`;
+      if (attempt < 3 && [429, 500, 529].includes(response.status)) {
+        const retryAfter = Number(response.headers.get('retry-after'));
+        const waitMs =
+          Number.isFinite(retryAfter) && retryAfter > 0
+            ? retryAfter * 1000
+            : attempt * 2000;
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(waitMs, 15000))
+        );
+        continue;
+      }
+      break;
     } catch (error) {
-      lastError = `fetch failed: ${error instanceof Error ? error.message : String(error)}`;
+      lastError = `request failed: ${error instanceof Error ? error.message : String(error)}`;
       if (attempt < 3) {
         await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
         continue;
       }
       break;
     }
-    if (response.ok) {
-      const json = (await response.json()) as {
-        content?: Array<{ text?: string }>;
-        usage?: { input_tokens?: number; output_tokens?: number };
-      };
-      /** Same normalization as the production extractor (src/run.ts): a
-       *  label renders as a single row and re-enters later prompts as
-       *  continuity context, so newlines must not survive here either —
-       *  and a raw newline would break the per-case Markdown tables. */
-      const label = (json.content ?? [])
-        .map((block) => block.text ?? '')
-        .join('')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .replace(/^["']|["']$/g, '');
-      return {
-        label,
-        latencyMs: Date.now() - started,
-        inputTokens: json.usage?.input_tokens ?? 0,
-        outputTokens: json.usage?.output_tokens ?? 0,
-      };
-    }
-    const body = await response.text();
-    lastError = `HTTP ${response.status}: ${body.slice(0, 160)}`;
-    if (attempt < 3 && [429, 500, 529].includes(response.status)) {
-      const retryAfter = Number(response.headers.get('retry-after'));
-      const waitMs =
-        Number.isFinite(retryAfter) && retryAfter > 0
-          ? retryAfter * 1000
-          : attempt * 2000;
-      await new Promise((resolve) =>
-        setTimeout(resolve, Math.min(waitMs, 15000))
-      );
-      continue;
-    }
-    break;
   }
   return { error: lastError, latencyMs: Date.now() - started };
 }
@@ -450,14 +456,36 @@ async function pool(
   await Promise.all(workers);
 }
 
+/** A typo in a selection must fail up front, not silently drop the
+ *  requested column and complete a billed run without its control. */
+function resolveSelection<T>(
+  requested: string[] | undefined,
+  available: T[],
+  nameOf: (item: T) => string,
+  flag: string
+): T[] {
+  if (requested == null) {
+    return available;
+  }
+  const byName = new Map(available.map((item) => [nameOf(item), item]));
+  const unknown = requested.filter((name) => !byName.has(name));
+  if (unknown.length > 0) {
+    throw new Error(
+      `unknown ${flag}: ${unknown.join(', ')} (available: ${[...byName.keys()].join(', ')})`
+    );
+  }
+  return requested.map((name) => byName.get(name)!);
+}
+
 (async () => {
   const args = parseArgs(process.argv.slice(2));
-  const runVariants = args.variants
-    ? variants.filter((variant) => args.variants!.includes(variant.name))
-    : variants;
-  const runCases: CorpusCase[] = args.cases
-    ? cases.filter((c: CorpusCase) => args.cases!.includes(c.id))
-    : cases;
+  const runVariants = resolveSelection(
+    args.variants,
+    variants,
+    (variant) => variant.name,
+    '--variants'
+  );
+  const runCases = resolveSelection(args.cases, cases, (c) => c.id, '--cases');
   if (runVariants.length === 0 || runCases.length === 0) {
     throw new Error('nothing selected — check --variants / --cases names');
   }
