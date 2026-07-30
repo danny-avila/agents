@@ -1001,8 +1001,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * Identity used to stamp Langfuse runtime scopes and handlers (see
    * `LangfuseRuntimeContext.runId`). Falls back to a generated id when no
    * public `runId` was supplied, so directly-constructed graphs still get
-   * foreign-scope protection when running concurrently. `#` is reserved as
-   * the per-agent sub-scope separator.
+   * foreign-scope protection when running concurrently.
    */
   protected readonly langfuseScopeRunId: string;
   /**
@@ -3099,7 +3098,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,
             langfuseOverlay: agentContext.langfuse,
-            runId: `${this.langfuseScopeRunId}#${agentId}`,
+            runId: this.langfuseScopeRunId,
+            agentId,
           }),
           () =>
             attemptInvoke(
@@ -3262,7 +3262,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             resolveLangfuseRuntimeScope({
               runLangfuse: this.langfuse,
               langfuseOverlay: agentContext.langfuse,
-              runId: `${this.langfuseScopeRunId}#${agentId}`,
+              runId: this.langfuseScopeRunId,
+              agentId,
             }),
             () =>
               tryFallbackProviders({

@@ -21,6 +21,7 @@ import type { Context } from '@opentelemetry/api';
 import type * as t from '@/types';
 import {
   resolveLangfuseConfigForSpan,
+  resolveLangfuseScopeAgentId,
   resolveLangfuseScopeRunId,
   resolveTraceIdSeedForSpan,
   withLangfuseRuntimeScope,
@@ -191,25 +192,8 @@ function normalizeBedrockUsageForLangfuse(output: LLMResult): LLMResult {
   return { ...output, generations };
 }
 
-const SCOPE_AGENT_SEPARATOR = '#';
 const LANGGRAPH_NODE_METADATA_KEY = 'langgraph_node';
 const LANGGRAPH_NODE_AGENT_PREFIXES = ['agent=', 'tools=', 'summarize='];
-
-/** Scope stamps are `<runId>` or `<runId>#<agentId>` for per-agent overlay
- *  scopes inside a run (`#` is reserved in run ids). */
-function splitScopeStamp(stamp: string): {
-  runPart: string;
-  agentPart?: string;
-} {
-  const separatorIndex = stamp.indexOf(SCOPE_AGENT_SEPARATOR);
-  if (separatorIndex === -1) {
-    return { runPart: stamp };
-  }
-  return {
-    runPart: stamp.slice(0, separatorIndex),
-    agentPart: stamp.slice(separatorIndex + SCOPE_AGENT_SEPARATOR.length),
-  };
-}
 
 /** The agent a callback executes under, from LangGraph's inherited
  *  `langgraph_node` run metadata (`agent=<id>` / `tools=<id>` /
@@ -298,27 +282,27 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
 
   /**
    * Whether the ambient runtime scope belongs to a different run — or, for
-   * per-agent sub-scopes (`<run>#<agentId>`), to a different concurrently
-   * executing agent of the same run than the one this callback reports via
-   * its inherited `langgraph_node` metadata. Unstamped scopes on unstamped
-   * handlers are never foreign (host-managed handler semantics).
+   * per-agent overlay scopes, to a different concurrently executing agent of
+   * the same run than the one this callback reports via its inherited
+   * `langgraph_node` metadata. Unstamped scopes on unstamped handlers are
+   * never foreign (host-managed handler semantics).
    */
   private isForeignScope(
-    scopeStamp: string | undefined,
+    scopeRunId: string | undefined,
+    scopeAgentId: string | undefined,
     callbackMetadata?: Record<string, unknown>
   ): boolean {
-    if (this.runId == null || scopeStamp == null) {
+    if (this.runId == null || scopeRunId == null) {
       return false;
     }
-    const { runPart, agentPart } = splitScopeStamp(scopeStamp);
-    if (runPart !== this.runId) {
+    if (scopeRunId !== this.runId) {
       return true;
     }
-    if (agentPart == null) {
+    if (scopeAgentId == null) {
       return false;
     }
     const callbackAgentId = extractCallbackAgentId(callbackMetadata);
-    return callbackAgentId != null && callbackAgentId !== agentPart;
+    return callbackAgentId != null && callbackAgentId !== scopeAgentId;
   }
 
   /**
@@ -347,8 +331,13 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     callbackMetadata?: Record<string, unknown>
   ): T {
     const currentContext = otelContext.active();
-    const scopeStamp = resolveLangfuseScopeRunId(currentContext);
-    const isForeignScope = this.isForeignScope(scopeStamp, callbackMetadata);
+    const scopeRunId = resolveLangfuseScopeRunId(currentContext);
+    const scopeAgentId = resolveLangfuseScopeAgentId(currentContext);
+    const isForeignScope = this.isForeignScope(
+      scopeRunId,
+      scopeAgentId,
+      callbackMetadata
+    );
     const langfuse = isForeignScope
       ? this.langfuse
       : (resolveLangfuseConfigForSpan(currentContext) ?? this.langfuse);
@@ -359,21 +348,29 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
       )
       : currentContext;
     const seed = this.getDeterministicTraceSeed();
-    const contextSeed = isForeignScope
-      ? undefined
-      : resolveTraceIdSeedForSpan(activeContext);
     const scoped = (): T =>
-      withLangfuseRuntimeScope(
-        {
-          langfuse,
-          traceIdSeed: contextSeed ?? seed,
-          runId: isForeignScope ? this.runId : (scopeStamp ?? this.runId),
-          toolOutputTracing: isForeignScope
-            ? resolveToolOutputTracingConfig(this.langfuse)
-            : undefined,
-        },
-        action
-      );
+      isForeignScope
+        ? withLangfuseRuntimeScope(
+          {
+            langfuse,
+            traceIdSeed: seed,
+            runId: this.runId,
+            toolOutputTracing: resolveToolOutputTracingConfig(this.langfuse),
+          },
+          action,
+          // Replace, don't merge: the foreign run's explicit destination or
+          // seed must not survive inheritance when this run has none of its
+          // own (env-credential runs, non-deterministic runs).
+          { replace: true }
+        )
+        : withLangfuseRuntimeScope(
+          {
+            langfuse,
+            traceIdSeed: resolveTraceIdSeedForSpan(activeContext) ?? seed,
+            runId: scopeRunId ?? this.runId,
+          },
+          action
+        );
     return activeContext === currentContext
       ? scoped()
       : otelContext.with(activeContext, scoped);

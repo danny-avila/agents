@@ -520,7 +520,8 @@ describe('Langfuse callback composition', () => {
       {
         langfuse: agentBLangfuse,
         traceIdSeed: 'agent-b-seed',
-        runId: 'run-1#agent-b',
+        runId: 'run-1',
+        agentId: 'agent-b',
       },
       () =>
         streamHandler?.handleChainStart(
@@ -545,7 +546,8 @@ describe('Langfuse callback composition', () => {
       {
         langfuse: agentBLangfuse,
         traceIdSeed: 'agent-b-seed',
-        runId: 'run-1#agent-b',
+        runId: 'run-1',
+        agentId: 'agent-b',
       },
       () =>
         streamHandler?.handleChainStart(
@@ -564,6 +566,52 @@ describe('Langfuse callback composition', () => {
         traceId: traceIdFromSeed('agent-b-seed'),
       })
     );
+  });
+
+  it('clears a foreign scope for env-credential runs instead of inheriting it', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+    const tenantA = {
+      publicKey: 'pk-tenant-a',
+      secretKey: 'sk-tenant-a',
+      baseUrl: 'https://langfuse.tenant-a',
+      deterministicTraceId: true,
+    };
+    initializeLangfuseTracing(tenantA);
+    initializeLangfuseTracing();
+    // Run B has no explicit config or seed of its own — it relies on env
+    // credentials. Rejecting a foreign scope must CLEAR the foreign values
+    // rather than let merge inheritance re-adopt them through `undefined`.
+    const handlerB = createLangfuseHandler({ runId: 'run-b' });
+
+    await withLangfuseRuntimeScope(
+      { langfuse: tenantA, traceIdSeed: 'run-a', runId: 'run-a' },
+      () =>
+        handlerB?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['EnvCredentialChain'] },
+          { input: 'env credentials' },
+          'lc-env-run'
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({
+          publicKey: 'pk-env',
+          secretKey: 'sk-env',
+        }),
+      })
+    );
+    expect(
+      mockProcessorStarts.filter(
+        (record) =>
+          (record.params as { publicKey?: string }).publicKey ===
+            'pk-tenant-a' || record.traceId === traceIdFromSeed('run-a')
+      )
+    ).toHaveLength(0);
   });
 
   it('applies its own tool-output policy inside a foreign run scope', async () => {
