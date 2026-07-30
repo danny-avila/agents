@@ -26,6 +26,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import type { ActivityLabelToolEntry } from '@/types/activityLabel';
@@ -120,6 +121,10 @@ function parseArgs(argv: string[]): RunArgs {
       args.model = argv[++i];
     } else if (key === '--concurrency') {
       args.concurrency = Number(argv[++i]);
+    } else {
+      /** A mistyped `--dryy` must not fall through to a fully billed
+       *  default sweep. */
+      throw new Error(`unknown option: ${key}`);
     }
   }
   if (!Number.isInteger(args.samples) || args.samples < 1) {
@@ -492,9 +497,13 @@ function resolveSelection<T>(
   const apiKey = args.dry ? '' : loadKey();
   const records: RunRecord[] = [];
   const tasks: Array<() => Promise<void>> = [];
-  for (const variant of runVariants) {
-    for (let sample = 1; sample <= args.samples; sample++) {
-      for (const testCase of runCases) {
+  /** Variants innermost, so adjacent queue slots cycle through the arms:
+   *  a variant-major queue would correlate variant identity with elapsed
+   *  run time, letting later arms inherit rate-limit or provider-load
+   *  conditions the first arm never saw. */
+  for (let sample = 1; sample <= args.samples; sample++) {
+    for (const testCase of runCases) {
+      for (const variant of runVariants) {
         tasks.push(() =>
           runCase({
             apiKey,
@@ -541,9 +550,15 @@ function resolveSelection<T>(
   });
   fs.mkdirSync(RESULTS_DIR, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  /** Lets the rescorer refuse a stored run whose corpus has since
+   *  drifted (renamed steps, changed tool names). */
+  const corpusFingerprint = crypto
+    .createHash('sha256')
+    .update(JSON.stringify(cases))
+    .digest('hex');
   fs.writeFileSync(
     path.join(RESULTS_DIR, `${stamp}.json`),
-    JSON.stringify({ args, records }, null, 2)
+    JSON.stringify({ args, corpusFingerprint, records }, null, 2)
   );
   fs.writeFileSync(path.join(RESULTS_DIR, 'latest.md'), report);
 

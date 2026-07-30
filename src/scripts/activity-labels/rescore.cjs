@@ -7,6 +7,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const { cases, stepEntries } = require('./corpus.cjs');
 const { checkLabel } = require('./checks.cjs');
@@ -28,7 +29,27 @@ function newestResults() {
 const sourcePath = process.argv[2]
   ? path.resolve(process.argv[2])
   : newestResults();
-const { args, records } = JSON.parse(fs.readFileSync(sourcePath, 'utf8'));
+const { args, corpusFingerprint, records } = JSON.parse(
+  fs.readFileSync(sourcePath, 'utf8')
+);
+
+/** Rescoring replays stored labels against the CURRENT corpus. If the
+ *  corpus drifted since the run (renamed steps, changed tool names), the
+ *  recomputed flags would grade against the wrong entries — refuse rather
+ *  than silently produce a plausible-looking report. */
+const currentFingerprint = crypto
+  .createHash('sha256')
+  .update(JSON.stringify(cases))
+  .digest('hex');
+if (corpusFingerprint == null) {
+  console.warn(
+    'WARN: stored results predate corpus fingerprinting — rescoring against the current corpus, which may have drifted'
+  );
+} else if (corpusFingerprint !== currentFingerprint) {
+  throw new Error(
+    'stored results came from a different corpus revision — re-run the sweep instead of rescoring'
+  );
+}
 
 const stepsByCase = new Map(
   cases.map((testCase) => [

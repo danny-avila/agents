@@ -1,5 +1,8 @@
 /** Aggregation + markdown rendering, shared by the live runner and the
- *  offline rescorer so metric fixes never require re-spending on the API. */
+ *  offline rescorer so metric fixes never require re-spending on the API.
+ *
+ *  Ported from LibreChat #14527 with two fixes pending backport: numeric
+ *  sample ordering and a keyed record index for the per-case cells. */
 const FLAG_TYPES = [
   'len',
   'punct',
@@ -113,13 +116,25 @@ function markdownReport({
   }
   lines.push('');
   lines.push('## Per-case');
+  /** Sorted numerically — the default lexicographic sort orders samples
+   *  1, 10, 11, …, 2 once a sweep reaches ten samples. */
+  const sampleList = [...new Set(records.map((r) => r.sample))].sort(
+    (a, b) => a - b
+  );
+  /** One keyed pass instead of a records.find per table cell, which is
+   *  quadratic in paid results on large sweeps. */
+  const recordIndex = new Map(
+    records.map((record) => [
+      `${record.variant}\0${record.sample}\0${record.caseId}\0${record.stepId}`,
+      record,
+    ])
+  );
   for (const testCase of runCases) {
     lines.push('');
     lines.push(`### ${testCase.id}`);
     lines.push('');
     lines.push(`*${testCase.notes}*`);
     lines.push('');
-    const sampleList = [...new Set(records.map((r) => r.sample))].sort();
     const header = ['step'];
     if (samples > 1) {
       header.push('s');
@@ -141,12 +156,8 @@ function markdownReport({
           row.push(step.productionLabel ?? '');
         }
         for (const variantName of variantNames) {
-          const record = records.find(
-            (r) =>
-              r.variant === variantName &&
-              r.sample === sample &&
-              r.caseId === testCase.id &&
-              r.stepId === stepId
+          const record = recordIndex.get(
+            `${variantName}\0${sample}\0${testCase.id}\0${stepId}`
           );
           if (!record) {
             row.push('');
