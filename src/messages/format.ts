@@ -1214,20 +1214,12 @@ type SummaryBoundary =
 type SummaryTokenAdjustment = {
   original: number;
   adjusted: number;
-  /** Positional path: characters retained after the slice, and the entry total. */
-  remainingChars?: number;
-  totalChars?: number;
-  /** Coverage path: the summary's own recorded token count, subtracted. */
-  summaryTokens?: number;
+  remainingChars: number;
+  totalChars: number;
 };
 
 type SummaryScan = {
   boundary?: SummaryBoundary;
-  /** Payload index → the summary text's cost in the consumer's tokenizer, from
-   *  the block's `rawTokenCount`. Used to discount the entry that holds a
-   *  summary: the same units as `indexTokenCountMap`, and no character
-   *  measurement of the retained content. */
-  summaryTokensByIndex: Map<number, number>;
 };
 
 function resolveCoverageIndex(
@@ -1251,7 +1243,6 @@ function resolveCoverageIndex(
 
 function scanSummaryBlocks(payload: TPayload): SummaryScan {
   let boundary: SummaryBoundary | undefined;
-  const summaryTokensByIndex = new Map<number, number>();
   /** Filled as the scan advances, so a coverage lookup only ever resolves to a
    *  message already passed — no second pass over the payload. */
   const indexBySourceId = new Map<string, number>();
@@ -1299,22 +1290,6 @@ function scanSummaryBlocks(payload: TPayload): SummaryScan {
           ? summaryPart.tokenCount
           : 0;
 
-      /** Only `rawTokenCount` is comparable with `indexTokenCountMap`.
-       *  `tokenCount` is the injection budget: provider output-token space when
-       *  usage was reported, plus the wrapper added at injection time. Blocks
-       *  written before this field existed simply get no discount. */
-      const rawTokenCount =
-        typeof summaryPart.rawTokenCount === 'number' &&
-        Number.isFinite(summaryPart.rawTokenCount)
-          ? summaryPart.rawTokenCount
-          : 0;
-
-      if (rawTokenCount > 0) {
-        summaryTokensByIndex.set(
-          i,
-          (summaryTokensByIndex.get(i) ?? 0) + rawTokenCount
-        );
-      }
       const retainedIndex = resolveCoverageIndex(
         summaryPart.coverage,
         indexBySourceId,
@@ -1339,7 +1314,7 @@ function scanSummaryBlocks(payload: TPayload): SummaryScan {
     }
   }
 
-  return { boundary, summaryTokensByIndex };
+  return { boundary };
 }
 
 function applySummaryBoundary(
@@ -1457,9 +1432,8 @@ export const formatAgentMessages = (
   /** Cross-run summary extracted from the payload. Should be forwarded to the
    *  agent run so it can be included in the system message via AgentContext. */
   summary?: { text: string; tokenCount: number };
-  /** When a summary reduced a message's token count, returned so the caller can
-   *  log it. The positional path scales by the share of characters that survive
-   *  the slice; the coverage path subtracts the summary's own token count. */
+  /** When a positional summary boundary sliced content from a message, the token
+   *  count was proportionally reduced. Returned so the caller can log it. */
   boundaryTokenAdjustment?: SummaryTokenAdjustment;
 } => {
   const messages: Array<
@@ -1503,8 +1477,7 @@ export const formatAgentMessages = (
   let boundaryTokenAdjustment: SummaryTokenAdjustment | undefined;
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
-  const { boundary: summaryBoundary, summaryTokensByIndex } =
-    scanSummaryBlocks(payload);
+  const { boundary: summaryBoundary } = scanSummaryBlocks(payload);
 
   // Summary metadata is returned to the caller so it can be forwarded to the
   // agent run and included in the single system message via AgentContext.
@@ -1830,6 +1803,22 @@ export const formatAgentMessages = (
         continue;
       }
 
+      /**
+       * Coverage mode deliberately leaves the count alone, even though the entry
+       * holding the block is charged for summary text that `formatAssistantMessage`
+       * filters out and `summary.tokenCount` accounts separately.
+       *
+       * Discounting it needs the summary's cost in the same units as
+       * `indexTokenCountMap`, and that figure is not obtainable here: this
+       * function receives no tokenizer, and a count recorded at write time is in
+       * the writing run's units — `Run.create` derives its counter from the model
+       * in play, and a consumer may supply its own — so a conversation continued
+       * on a different model would subtract across encodings. Attempts to proxy
+       * it (character ratios, provider identity) all under-count some shape,
+       * which risks an over-context request; over-counting merely prunes early.
+       * Fixing it properly means passing the reader a tokenizer, which is a
+       * consumer-facing change and out of scope here.
+       */
       if (
         summaryBoundary?.mode === 'positional' &&
         originalIndex === summaryBoundary.messageIndex &&
@@ -1861,34 +1850,6 @@ export const formatAgentMessages = (
               totalChars: totalCharLen,
             };
           }
-        }
-      } else if (summaryBoundary?.mode === 'coverage') {
-        /**
-         * Coverage keeps the message holding the block, but
-         * `formatAssistantMessage` filters the summary part out of it while the
-         * text is accounted separately as `summary.tokenCount`. Charging the
-         * entry for both double-counts, inflating the prompt estimate and
-         * pruning early.
-         *
-         * Subtracts the summary's own recorded token count rather than scaling
-         * by a share of characters. Character length is the wrong proxy here:
-         * media, tool-call payloads, and nested media inside a tool output all
-         * cost tokens out of proportion to the characters a heuristic can see,
-         * so any ratio built from characters erases whatever it cannot measure.
-         * Subtraction needs no measurement of the retained content at all.
-         */
-        const summaryTokens = summaryTokensByIndex.get(originalIndex) ?? 0;
-        /** A summary claiming the whole entry means the two counts do not share
-         *  a basis; leaving the original over-counts, which prunes early rather
-         *  than sending an over-context request. */
-        if (summaryTokens > 0 && summaryTokens < tokenCount) {
-          const original = tokenCount;
-          tokenCount -= summaryTokens;
-          boundaryTokenAdjustment = {
-            original,
-            adjusted: tokenCount,
-            summaryTokens,
-          };
         }
       }
 

@@ -315,12 +315,9 @@ export type SummaryContentBlock = {
   type: ContentTypes.SUMMARY;
   content?: MessageContentComplex[];
   /** Injection budget: provider output-token space when usage was reported, plus
-   *  the wrapper added at injection time. Not comparable with per-message counts. */
+   *  the wrapper added at injection time. Not comparable with per-message counts
+   *  such as `indexTokenCountMap`, which are in the consumer's own tokenizer. */
   tokenCount?: number;
-  /** The summary text's cost in the consumer's own tokenizer, with no injection
-   *  wrapper — the units `indexTokenCountMap` is kept in. Recorded separately so
-   *  a reader can discount the entry carrying this block without mixing spaces. */
-  rawTokenCount?: number;
   coverage?: SummaryCoverage;
   boundary?: SummaryBoundary;
   summaryVersion?: number;
