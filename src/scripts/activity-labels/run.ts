@@ -402,7 +402,13 @@ async function requestLabel({
       }
       const body = await response.text();
       lastError = `HTTP ${response.status}: ${singleLine(body).slice(0, 160)}`;
-      if (attempt < 3 && [429, 500, 529].includes(response.status)) {
+      /** Transient statuses: rate limit (429), Anthropic 500/529
+       *  (overloaded), and completed gateway failures (408/502/503/504)
+       *  — a brief proxy outage must not bias an arm as an error. */
+      if (
+        attempt < 3 &&
+        [408, 429, 500, 502, 503, 504, 529].includes(response.status)
+      ) {
         const retryAfter = Number(response.headers.get('retry-after'));
         const waitMs =
           Number.isFinite(retryAfter) && retryAfter > 0
