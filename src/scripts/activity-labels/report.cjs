@@ -45,9 +45,13 @@ function aggregate(records, model) {
       agg.errors += 1;
       /** Some failures still billed (a 200 whose label normalized to
        *  empty) — dropping their usage would make an all-empty variant
-       *  report $0. */
+       *  report $0, and dropping latency would show mean ms 0. Old
+       *  stored runs predate error latency; skip when absent. */
       agg.inputTokens += record.inputTokens ?? 0;
       agg.outputTokens += record.outputTokens ?? 0;
+      if (record.latencyMs != null) {
+        agg.latencies.push(record.latencyMs);
+      }
       continue;
     }
     agg.steps += 1;
@@ -126,7 +130,10 @@ function markdownReport({
     lines.push(
       `| ${agg.variant} | ${agg.steps}${agg.errors ? ` (+${agg.errors} err)` : ''} | ` +
         FLAG_TYPES.map((type) => agg.flagCounts[type] ?? 0).join(' | ') +
-        ` | ${agg.distinctOpeners} | ${agg.topOpener} | ${agg.avgWords} | ${agg.meanLatencyMs} | $${agg.costUsd} |`
+        /** topOpener carries a model-derived token — escape pipes like
+         *  the per-case renderer does, or a label opening with `a|b`
+         *  shifts every following aggregate column. */
+        ` | ${agg.distinctOpeners} | ${String(agg.topOpener).replace(/\|/g, '\\|')} | ${agg.avgWords} | ${agg.meanLatencyMs} | $${agg.costUsd} |`
     );
   }
   lines.push('');

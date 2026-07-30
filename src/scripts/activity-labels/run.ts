@@ -91,6 +91,11 @@ const ROOT = path.resolve(HARNESS_DIR, '..', '..', '..');
 const RESULTS_DIR = path.join(HARNESS_DIR, 'results');
 const CHAR_LIMIT = 600;
 const MAX_TOKENS = 256;
+/** Per-attempt deadline: a connection an intermediary leaves open would
+ *  otherwise pin its worker forever — pool() awaits every worker, so one
+ *  hung request would keep the whole run from writing its report. Labels
+ *  take ~1s; 60s is generous headroom before the retry path takes over. */
+const ATTEMPT_TIMEOUT_MS = 60_000;
 
 type CorpusStep = {
   id?: string;
@@ -338,6 +343,7 @@ async function requestLabel({
     try {
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
+        signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS),
         headers: {
           'content-type': 'application/json',
           'x-api-key': apiKey,
@@ -434,6 +440,7 @@ type DryRunRecord = RecordBase & { prompt: string };
 
 type ErrorRecord = RecordBase & {
   error: string;
+  latencyMs?: number;
   inputTokens?: number;
   outputTokens?: number;
 };
@@ -505,6 +512,7 @@ async function runCase({
         caseId: testCase.id,
         stepId,
         error: result.error,
+        latencyMs: result.latencyMs,
         ...(result.inputTokens != null && {
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
