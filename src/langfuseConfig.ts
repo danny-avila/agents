@@ -12,6 +12,30 @@ export function normalizeToolName(name: string): string {
   return name.trim().toLowerCase();
 }
 
+export function hasLangfuseConfigCredentials(
+  langfuse?: t.LangfuseConfig
+): langfuse is t.LangfuseConfig & {
+  publicKey: string;
+  secretKey: string;
+} {
+  return (
+    langfuse != null &&
+    isPresent(langfuse.publicKey) &&
+    isPresent(langfuse.secretKey)
+  );
+}
+
+export function hasLangfuseEnvCredentials(): boolean {
+  return (
+    isPresent(process.env.LANGFUSE_SECRET_KEY) &&
+    isPresent(process.env.LANGFUSE_PUBLIC_KEY)
+  );
+}
+
+export function hasLangfuseEnvConfig(): boolean {
+  return hasLangfuseEnvCredentials();
+}
+
 function normalizeToolNames(names: string[] | undefined): Set<string> {
   const normalized = new Set<string>();
   for (const name of names ?? []) {

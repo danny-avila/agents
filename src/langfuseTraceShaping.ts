@@ -299,7 +299,10 @@ function isToolSpan(span: MutableSpan): boolean {
  * `endpoint__model___sender[____index]` (`__` encodes `:`; see LibreChat's
  * `encodeEphemeralAgentId`), and the outer workflow node carries that id as
  * its span name — so switching models renames the span (item 1). Returns the
- * stable human `sender` segment when the name matches that encoding.
+ * stable human `sender` segment only when the name matches that encoding:
+ * the `endpoint__model` prefix must contain both segments and — unlike
+ * display names such as `LibreChat Agent: Ops___EU` — never contains
+ * whitespace, so legitimate names that merely embed `___` are left alone.
  */
 function extractEphemeralAgentSender(name: string): string | undefined {
   let workingId = name;
@@ -316,14 +319,25 @@ function extractEphemeralAgentSender(name: string): string | undefined {
   if (senderSeparator <= 0) {
     return undefined;
   }
+  const encodedPrefix = workingId.slice(0, senderSeparator);
+  if (/\s/.test(encodedPrefix)) {
+    return undefined;
+  }
+  const prefixParts = encodedPrefix.split('__');
+  if (prefixParts.length < 2 || prefixParts.some((part) => part === '')) {
+    return undefined;
+  }
   const sender = workingId
     .slice(senderSeparator + EPHEMERAL_AGENT_SENDER_SEPARATOR.length)
     .replace(/__/g, ':');
   return sender === '' ? undefined : sender;
 }
 
+/** Workflow-agent node spans are always children of the run's root chain, so
+ *  root observations (host-named run roots like `LibreChat Agent: <name>`)
+ *  are never rename candidates. */
 function shapeEphemeralAgentNodeSpan(span: MutableSpan): void {
-  if (isToolSpan(span)) {
+  if (isToolSpan(span) || isRootSpan(span)) {
     return;
   }
   const sender = extractEphemeralAgentSender(span.name);

@@ -633,6 +633,38 @@ describe('Langfuse per-run routing integration', () => {
     expect(agentRoot?.parentSpanId).toBe(hostSpanContext.spanId);
   });
 
+  it('detaches root observations from managed ambient spans of another destination', async () => {
+    const hostTenantId = 'tenant-managed-a';
+    const runTenantId = 'tenant-managed-b';
+    const hostLangfuse = tenantLangfuse(hostTenantId);
+    initializeLangfuseTracing(hostLangfuse);
+    initializeLangfuseTracing(tenantLangfuse(runTenantId));
+
+    let hostSpan: MockSpan | undefined;
+    await withLangfuseRuntimeScope({ langfuse: hostLangfuse }, async () => {
+      hostSpan = createMockSpan('host-group');
+    });
+
+    // A managed span is only a safe parent for runs exporting to the SAME
+    // destination; nesting tenant-B under tenant-A's span would leave B's
+    // trace dangling in B's project with A's trace id.
+    await otelContext.with(
+      otelTrace.setSpan(otelContext.active(), hostSpan as never),
+      () => runTenantFlow(runTenantId)
+    );
+
+    const hostSpanContext = hostSpan?.spanContext() as {
+      traceId: string;
+      spanId: string;
+    };
+    const agentRoot = startsForTenant(runTenantId).find(
+      (record) => record.name === `LibreChat Agent: Parent ${runTenantId}`
+    );
+    expect(agentRoot?.traceId).toBe(traceIdFromSeed(`routing-${runTenantId}`));
+    expect(agentRoot?.traceId).not.toBe(hostSpanContext.traceId);
+    expect(agentRoot?.parentSpanId).toBeUndefined();
+  });
+
   it('routes spans from captured OTel context after ALS scope exits', () => {
     const langfuse = tenantLangfuse('tenant-otel');
     initializeLangfuseTracing(langfuse);

@@ -24,8 +24,22 @@ import {
   resolveTraceIdSeedForSpan,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
-import { isLangfuseManagedSpan } from '@/langfuseSpanRegistry';
+import {
+  hasLangfuseConfigCredentials,
+  hasLangfuseEnvCredentials,
+  hasLangfuseEnvConfig,
+} from '@/langfuseConfig';
+import {
+  getLangfuseManagedSpanDestination,
+  resolveLangfuseDestinationKey,
+} from '@/langfuseSpanRegistry';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
+
+export {
+  hasLangfuseConfigCredentials,
+  hasLangfuseEnvCredentials,
+  hasLangfuseEnvConfig,
+};
 
 const TRACE_METADATA_MAX_LENGTH = 200;
 const LANGFUSE_FORCE_FLUSH_ON_DISPOSE = 'LANGFUSE_FORCE_FLUSH_ON_DISPOSE';
@@ -179,13 +193,23 @@ function normalizeBedrockUsageForLangfuse(output: LLMResult): LLMResult {
  * skipped because the span no longer looks like a root), collapses concurrent
  * runs inside one request context — an agent run and the previous turn's
  * title run — into a single merged trace with racing names and unioned tags,
- * and bypasses the seeded deterministic trace id generator. Spans created
- * through the Langfuse tracer provider are kept, so hosts can still group
- * runs under their own Langfuse observations deliberately.
+ * and bypasses the seeded deterministic trace id generator. Only a
+ * Langfuse-managed span bound to the same export destination as the starting
+ * run is a safe parent — that is the sanctioned way for hosts to group runs
+ * under their own Langfuse observations; a managed span from a different
+ * destination (another tenant's project) would leave this run's trace
+ * dangling in its own destination while inheriting the other trace's id.
  */
-function detachForeignAmbientSpan(activeContext: Context): Context {
+function detachForeignAmbientSpan(
+  activeContext: Context,
+  destinationKey?: string
+): Context {
   const activeSpan = otelTrace.getSpan(activeContext);
-  if (activeSpan == null || isLangfuseManagedSpan(activeSpan)) {
+  if (activeSpan == null) {
+    return activeContext;
+  }
+  const parentDestination = getLangfuseManagedSpanDestination(activeSpan);
+  if (parentDestination != null && parentDestination === destinationKey) {
     return activeContext;
   }
   return otelTrace.deleteSpan(activeContext);
@@ -236,11 +260,14 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
    */
   private withRuntimeContext<T>(action: () => T, isDetachedRun = false): T {
     const currentContext = otelContext.active();
-    const activeContext = isDetachedRun
-      ? detachForeignAmbientSpan(currentContext)
-      : currentContext;
     const langfuse =
-      resolveLangfuseConfigForSpan(activeContext) ?? this.langfuse;
+      resolveLangfuseConfigForSpan(currentContext) ?? this.langfuse;
+    const activeContext = isDetachedRun
+      ? detachForeignAmbientSpan(
+        currentContext,
+        resolveLangfuseDestinationKey(langfuse)
+      )
+      : currentContext;
     const seed = this.getDeterministicTraceSeed();
     const scoped = (): T =>
       withLangfuseRuntimeScope(
@@ -385,19 +412,6 @@ function hasLangfuseTraceAttributes(langfuse?: t.LangfuseConfig): boolean {
   );
 }
 
-export function hasLangfuseConfigCredentials(
-  langfuse?: t.LangfuseConfig
-): langfuse is t.LangfuseConfig & {
-  publicKey: string;
-  secretKey: string;
-} {
-  return (
-    langfuse != null &&
-    isPresent(langfuse.publicKey) &&
-    isPresent(langfuse.secretKey)
-  );
-}
-
 function hasLangfuseConfigBaseUrl(langfuse?: t.LangfuseConfig): boolean {
   return isPresent(langfuse?.baseUrl);
 }
@@ -499,17 +513,6 @@ export function getLangfuseTraceName(
 ): string {
   const agentName = traceMetadata?.agentName;
   return isPresent(agentName) ? `${fallback}: ${agentName}` : fallback;
-}
-
-export function hasLangfuseEnvConfig(): boolean {
-  return hasLangfuseEnvCredentials();
-}
-
-export function hasLangfuseEnvCredentials(): boolean {
-  return (
-    isPresent(process.env.LANGFUSE_SECRET_KEY) &&
-    isPresent(process.env.LANGFUSE_PUBLIC_KEY)
-  );
 }
 
 export function shouldCreateLangfuseHandler(

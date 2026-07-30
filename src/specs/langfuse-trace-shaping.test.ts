@@ -184,6 +184,24 @@ describe('shapeLangfuseSpan', () => {
     expect(span.name).toBe('server__toolkit___lookup');
   });
 
+  it('keeps display names that merely embed triple underscores', () => {
+    const runName = createSpan('LibreChat Agent: Ops___EU', {}, 'parent-1');
+    shapeLangfuseSpan(runName);
+    expect(runName.name).toBe('LibreChat Agent: Ops___EU');
+
+    const noEncodedPrefix = createSpan('Ops___EU', {}, 'parent-1');
+    shapeLangfuseSpan(noEncodedPrefix);
+    expect(noEncodedPrefix.name).toBe('Ops___EU');
+  });
+
+  it('never renames root observations, even with an encoded-id shape', () => {
+    const span = createSpan('bedrock__claude-sonnet-5___ClickHouse Agent', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+    });
+    shapeLangfuseSpan(span);
+    expect(span.name).toBe('bedrock__claude-sonnet-5___ClickHouse Agent');
+  });
+
   it('sets root span and trace input/output to the question and answer', () => {
     const span = createSpan('LibreChat Agent', {
       [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),

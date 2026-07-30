@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { setLangfuseTracerProvider } from '@langfuse/tracing';
 import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
 import { context, ROOT_CONTEXT, createContextKey } from '@opentelemetry/api';
@@ -13,17 +13,16 @@ import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
 import type { Context } from '@opentelemetry/api';
 import type * as t from '@/types';
 import {
-  createLibreChatTraceAttributes,
-  hasLangfuseConfigCredentials,
-  hasLangfuseEnvCredentials,
-  hasLangfuseEnvConfig,
-} from '@/langfuse';
+  getLangfuseDestinationKey,
+  getLangfuseSpanProcessorParams,
+  registerLangfuseManagedSpan,
+} from '@/langfuseSpanRegistry';
 import {
   resolveLangfuseConfigForSpan,
   resolveTraceIdSeedForSpan,
 } from '@/langfuseRuntimeScope';
 import { createLangfuseSpanProcessor } from '@/langfuseToolOutputTracing';
-import { registerLangfuseManagedSpan } from '@/langfuseSpanRegistry';
+import { createLibreChatTraceAttributes } from '@/langfuse';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
 import { isPresent } from '@/utils/misc';
 
@@ -76,79 +75,6 @@ export function ensureOpenTelemetryContextManager(): void {
   }
 }
 
-function resolveLangfuseEnvironment(
-  langfuse?: t.LangfuseConfig
-): string | undefined {
-  const candidates = [
-    langfuse?.environment,
-    process.env.LANGFUSE_TRACING_ENVIRONMENT,
-    process.env.NODE_ENV,
-  ];
-  for (const candidate of candidates) {
-    if (candidate != null && candidate.trim() !== '') {
-      return candidate.trim();
-    }
-  }
-  return undefined;
-}
-
-function getLangfuseSpanProcessorParams(
-  langfuse?: t.LangfuseConfig
-): LangfuseSpanProcessorParams | undefined {
-  if (langfuse?.enabled === false) {
-    return undefined;
-  }
-  const environment = resolveLangfuseEnvironment(langfuse);
-  if (hasLangfuseConfigCredentials(langfuse)) {
-    return {
-      publicKey: langfuse.publicKey,
-      secretKey: langfuse.secretKey,
-      ...(isPresent(langfuse.baseUrl) ? { baseUrl: langfuse.baseUrl } : {}),
-      ...(isPresent(environment) ? { environment } : {}),
-    };
-  }
-  if (hasLangfuseEnvConfig()) {
-    const baseUrl =
-      langfuse?.baseUrl ??
-      process.env.LANGFUSE_BASE_URL ??
-      process.env.LANGFUSE_BASEURL;
-    return {
-      publicKey: process.env.LANGFUSE_PUBLIC_KEY as string,
-      secretKey: process.env.LANGFUSE_SECRET_KEY as string,
-      ...(isPresent(baseUrl) ? { baseUrl } : {}),
-      ...(isPresent(environment) ? { environment } : {}),
-    };
-  }
-  if (isPresent(langfuse?.baseUrl) && hasLangfuseEnvCredentials()) {
-    return {
-      publicKey: process.env.LANGFUSE_PUBLIC_KEY as string,
-      secretKey: process.env.LANGFUSE_SECRET_KEY as string,
-      baseUrl: langfuse.baseUrl,
-      ...(isPresent(environment) ? { environment } : {}),
-    };
-  }
-  return undefined;
-}
-
-function hashCacheKeyValue(value: string | undefined): string | undefined {
-  return isPresent(value)
-    ? createHash('sha256').update(value, 'utf8').digest('hex')
-    : undefined;
-}
-
-function getLangfuseTracerProviderKey(
-  params: LangfuseSpanProcessorParams,
-  langfuse?: t.LangfuseConfig
-): string {
-  return JSON.stringify({
-    publicKey: params.publicKey,
-    secretKeyHash: hashCacheKeyValue(params.secretKey),
-    baseUrl: params.baseUrl,
-    environment: params.environment,
-    toolOutputTracing: langfuse?.toolOutputTracing,
-  });
-}
-
 class RoutingLangfuseSpanProcessor implements SpanProcessor {
   // Processors live for the process lifetime. LibreChat tenant Langfuse
   // destinations are expected to be a bounded admin-managed set, and shutdown
@@ -161,26 +87,42 @@ class RoutingLangfuseSpanProcessor implements SpanProcessor {
     if (params == null) {
       return undefined;
     }
+    return this.ensureProcessorForKey(
+      getLangfuseDestinationKey(params, langfuse),
+      params,
+      langfuse
+    );
+  }
 
-    const processorKey = getLangfuseTracerProviderKey(params, langfuse);
-    const existing = this.processors.get(processorKey);
+  private ensureProcessorForKey(
+    destinationKey: string,
+    params: LangfuseSpanProcessorParams,
+    langfuse?: t.LangfuseConfig
+  ): SpanProcessor {
+    const existing = this.processors.get(destinationKey);
     if (existing != null) {
       return existing;
     }
 
     const processor = createLangfuseSpanProcessor(params, langfuse);
-    this.processors.set(processorKey, processor);
+    this.processors.set(destinationKey, processor);
     return processor;
   }
 
   onStart(span: Span, parentContext: Context): void {
     const langfuse = resolveLangfuseConfigForSpan(parentContext);
-    const processor = this.ensureProcessor(langfuse);
-    if (processor == null) {
+    const params = getLangfuseSpanProcessorParams(langfuse);
+    if (params == null) {
       return;
     }
 
-    registerLangfuseManagedSpan(span);
+    const destinationKey = getLangfuseDestinationKey(params, langfuse);
+    const processor = this.ensureProcessorForKey(
+      destinationKey,
+      params,
+      langfuse
+    );
+    registerLangfuseManagedSpan(span, destinationKey);
 
     const librechatTraceAttributes = createLibreChatTraceAttributes(
       langfuse?.librechatTraceAttributes ?? {}
