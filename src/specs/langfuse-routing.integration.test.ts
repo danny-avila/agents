@@ -675,10 +675,26 @@ describe('Langfuse per-run routing integration', () => {
 
     const graphA = buildGraph();
     const graphB = buildGraph();
-    expect(graphA.langfuseScopeRunId).toEqual(expect.stringMatching(/^graph-/));
-    expect(graphB.langfuseScopeRunId).toEqual(expect.stringMatching(/^graph-/));
+    expect(graphA.langfuseScopeRunId).toEqual(expect.stringMatching(/^graph:/));
+    expect(graphB.langfuseScopeRunId).toEqual(expect.stringMatching(/^graph:/));
     expect(graphA.langfuseScopeRunId).not.toBe(graphB.langfuseScopeRunId);
-    expect(graphA.langfuseScopeRunId).not.toContain('#');
+  });
+
+  it('stamps concurrent executions of the same public run id distinctly', async () => {
+    const { StandardGraph } = await import('@/graphs/Graph');
+    const buildGraph = (): { langfuseScopeRunId: string } =>
+      new StandardGraph({
+        runId: 'duplicate-run',
+        agents: [createAgent('duplicate')],
+        langfuse: tenantLangfuse('duplicate'),
+      }) as unknown as { langfuseScopeRunId: string };
+
+    const first = buildGraph();
+    const second = buildGraph();
+    expect(first.langfuseScopeRunId).toEqual(
+      expect.stringMatching(/^duplicate-run:/)
+    );
+    expect(first.langfuseScopeRunId).not.toBe(second.langfuseScopeRunId);
   });
 
   it('routes spans from captured OTel context after ALS scope exits', () => {

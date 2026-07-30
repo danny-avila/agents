@@ -836,7 +836,10 @@ export class Run<_T extends t.BaseGraphState> {
         streamLangfuseConfig?.deterministicTraceId === true
           ? this.id
           : undefined,
-      runId: this.id,
+      // The graph's per-execution stamp, NOT the public run id: public ids
+      // may repeat across concurrent executions (retries, tenant-local
+      // message ids), and equal stamps defeat foreign-scope rejection.
+      runId: graph.langfuseScopeRunId,
     });
     const langfuseHandler = createLangfuseHandler({
       langfuse: streamLangfuseConfig,
@@ -848,7 +851,7 @@ export class Run<_T extends t.BaseGraphState> {
         streamLangfuseConfig?.deterministicTraceId === true
           ? this.id
           : undefined,
-      runId: this.id,
+      runId: graph.langfuseScopeRunId,
       // The aggregate multi-agent policy from the runtime scope — the
       // handler must restore THIS (not the primary agent's config-derived
       // policy) when rejecting a foreign scope.

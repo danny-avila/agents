@@ -1003,11 +1003,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   runId: string | undefined;
   /**
    * Identity used to stamp Langfuse runtime scopes and handlers (see
-   * `LangfuseRuntimeContext.runId`). Falls back to a generated id when no
-   * public `runId` was supplied, so directly-constructed graphs still get
-   * foreign-scope protection when running concurrently.
+   * `LangfuseRuntimeContext.runId`). Carries an opaque per-instance
+   * component: public run ids are unrestricted and may repeat across
+   * concurrently executing runs (retries, duplicate submissions,
+   * tenant-local message ids), and equal stamps would let those runs adopt
+   * each other's scopes. One graph instance = one execution's stamp, shared
+   * by the stream handler and every graph-level scope of that execution.
    */
-  protected readonly langfuseScopeRunId: string;
+  readonly langfuseScopeRunId: string;
   /**
    * Boundary between historical messages (loaded from conversation state)
    * and messages produced during the current run.  Set once in the state
@@ -1092,7 +1095,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
-    this.langfuseScopeRunId = runId ?? `graph-${nanoid()}`;
+    this.langfuseScopeRunId = `${runId ?? 'graph'}:${nanoid()}`;
     this.signal = signal;
     this.langfuse = langfuse;
     this.subagentUsageSink = subagentUsageSink;

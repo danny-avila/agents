@@ -211,7 +211,9 @@ function normalizeBedrockUsageForLangfuse(output: LLMResult): LLMResult {
 }
 
 const LANGGRAPH_NODE_METADATA_KEY = 'langgraph_node';
-const AGENT_ID_METADATA_KEY = 'agentId';
+/** Explicit agent identity in invoke metadata: the graph's model path and
+ *  ToolNode stamp `agentId`; the summarization node stamps `agent_id`. */
+const AGENT_ID_METADATA_KEYS = ['agentId', 'agent_id'];
 const LANGGRAPH_NODE_AGENT_PREFIXES = ['agent=', 'tools=', 'summarize='];
 
 /** The LangGraph node a callback executes under, from its inherited
@@ -349,9 +351,11 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     // model path and ToolNode) is unambiguous; node names are a fallback —
     // an agent literally named `agent=research` makes its outer node
     // indistinguishable from agent `research`'s inner model node.
-    const explicitAgentId = callbackMetadata?.[AGENT_ID_METADATA_KEY];
-    if (typeof explicitAgentId === 'string' && explicitAgentId !== '') {
-      return explicitAgentId !== scopeAgentId;
+    for (const key of AGENT_ID_METADATA_KEYS) {
+      const explicitAgentId = callbackMetadata?.[key];
+      if (typeof explicitAgentId === 'string' && explicitAgentId !== '') {
+        return explicitAgentId !== scopeAgentId;
+      }
     }
     const callbackNode = getCallbackNode(callbackMetadata);
     return (
