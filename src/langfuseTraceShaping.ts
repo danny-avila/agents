@@ -254,11 +254,20 @@ function shapeRootSpan(span: MutableSpan): void {
     parseAttributeValue(span.attributes[outputKey]),
     'assistant'
   );
-  if (question != null) {
-    span.attributes[inputKey] = question;
-  }
-  if (answer != null) {
-    span.attributes[outputKey] = answer;
+  /** A generation that IS the trace root — a bare `model.invoke` with no
+   *  wrapping chain, i.e. the activity-label path — is also the only
+   *  observation carrying its own prompt: reducing its observation input
+   *  would discard the SystemMessage from the one place it is traced.
+   *  Chain/agent roots keep the full reduction; their child generations
+   *  still record the complete prompt. Trace-level input/output reduce
+   *  either way, so the trace list keeps showing question and answer. */
+  if (!isGenerationSpan(span)) {
+    if (question != null) {
+      span.attributes[inputKey] = question;
+    }
+    if (answer != null) {
+      span.attributes[outputKey] = answer;
+    }
   }
   const traceInput = question ?? span.attributes[inputKey];
   const traceOutput = answer ?? span.attributes[outputKey];

@@ -262,4 +262,51 @@ describe('shapeLangfuseSpan', () => {
     expect(span.attributes[TRACE_INPUT]).toBe('Generate a title');
     expect(span.attributes[TRACE_OUTPUT]).toBe('A useful title');
   });
+
+  it('keeps a generation root\'s full observation input while reducing trace input', () => {
+    /** The activity-label path: a bare model.invoke traces the generation
+     *  as its own root, so the observation input is the ONLY record of
+     *  the system prompt. The exact shape @langfuse/langchain exports. */
+    const originalInput = JSON.stringify([
+      { role: 'system', content: 'Write a short label describing…' },
+      { role: 'user', content: 'Tool calls:\n- bash(ls) → ok\n\nLabel:' },
+    ]);
+    const originalOutput = JSON.stringify({
+      role: 'assistant',
+      content: 'Confirmed /mnt/data persists',
+    });
+    const span = createSpan('LibreChat Activity Label', {
+      [OBSERVATION_TYPE]: 'generation',
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'activity-label']),
+      [INPUT]: originalInput,
+      [OUTPUT]: originalOutput,
+    });
+
+    shapeLangfuseSpan(span);
+
+    expect(span.name).toBe('llm');
+    expect(span.attributes[INPUT]).toBe(originalInput);
+    expect(span.attributes[OUTPUT]).toBe(originalOutput);
+    expect(span.attributes[TRACE_INPUT]).toBe(
+      'Tool calls:\n- bash(ls) → ok\n\nLabel:'
+    );
+    expect(span.attributes[TRACE_OUTPUT]).toBe(originalOutput);
+  });
+
+  it('still reduces observation input on non-generation roots', () => {
+    const span = createSpan('LibreChat Agent', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+      [INPUT]: JSON.stringify({
+        messages: [
+          { type: 'system', content: 'You are helpful.' },
+          { type: 'human', content: 'What is ClickHouse?' },
+        ],
+      }),
+    });
+
+    shapeLangfuseSpan(span);
+
+    expect(span.attributes[INPUT]).toBe('What is ClickHouse?');
+    expect(span.attributes[TRACE_INPUT]).toBe('What is ClickHouse?');
+  });
 });
