@@ -33,6 +33,23 @@ export function truncateForLabel(value: string, maxLength: number): string {
   return value.slice(0, Math.max(0, maxLength - 1)) + '…';
 }
 
+/**
+ * Reduces a committed label to bounded single-line data.
+ *
+ * Sections in this prompt are delimited by blank lines, so a label carrying
+ * embedded newlines could otherwise forge an apparent `Tool calls:` or
+ * `Label:` section. Unlike every other input here, previous labels re-enter
+ * the prompt on EVERY later batch, so one malformed result — plain model
+ * noncompliance, or injection surfacing through a tool result — would
+ * persistently steer unrelated later labels rather than affecting one. The
+ * clip bounds the same way `lastAssistantText` and reasoning excerpts are
+ * bounded: oversized headers must not inflate later requests past the fast
+ * model's window and starve the run of labels entirely.
+ */
+function sanitizePreviousLabel(label: string): string {
+  return truncateForLabel(label.replace(/\s+/g, ' ').trim(), PREVIOUS_LABEL_LIMIT);
+}
+
 const ABORT_SERIALIZATION = Symbol('abort-label-serialization');
 
 /**
@@ -76,6 +93,11 @@ function serializeForLabel(value: unknown, limit: number): string {
 
 const INPUT_CONTEXT_LIMIT = 200;
 const MAX_THINKING_EXCERPTS = 4;
+const MAX_PREVIOUS_LABELS = 3;
+/** Per-label bound. A header is 5-9 words; anything past this is
+ *  noncompliance or payload, and previous labels are the one input that
+ *  RE-ENTERS the prompt on every later batch of the run. */
+const PREVIOUS_LABEL_LIMIT = 200;
 /** A label is 5-9 words; no batch needs more than this many entries to
  *  produce one, and the cap keeps a 200-call programmatic batch from
  *  building an enormous prompt out of per-field-bounded pieces. */
@@ -86,6 +108,13 @@ export type BuildActivityLabelPromptParams = {
   charLimit: number;
   thinkingExcerpts?: string[];
   lastAssistantText?: string;
+  /**
+   * Headers already committed for earlier batches in this run, in run order
+   * with the most recent last. Rendered ahead of the block context so the
+   * label continues the run's story instead of restating a line the user is
+   * already reading. Capped at {@link MAX_PREVIOUS_LABELS}.
+   */
+  previousLabels?: string[];
   /**
    * Resolved tool-output tracing policy. The label prompt becomes Langfuse
    * generation input, so outputs/errors excluded from tracing (global
@@ -104,6 +133,7 @@ export function buildActivityLabelPrompt({
   charLimit,
   thinkingExcerpts,
   lastAssistantText,
+  previousLabels,
   redaction,
 }: BuildActivityLabelPromptParams): string {
   const clip = truncateForLabel;
@@ -116,6 +146,24 @@ export function buildActivityLabelPrompt({
     redaction != null &&
     (redaction.enabled === false || redaction.redactedToolNames.size > 0);
   const sections: string[] = [];
+  /** Previous labels are free-form model prose too, and per-agent overlays
+   *  mean an earlier header may have been generated under ANOTHER agent's
+   *  weaker policy — so they share the excerpts' wholesale drop rather than
+   *  letting a handoff leak a looser agent's phrasing into this trace. */
+  if (!excerptsRedacted && previousLabels != null && previousLabels.length > 0) {
+    const recent = previousLabels
+      .slice(-MAX_PREVIOUS_LABELS)
+      .map(sanitizePreviousLabel)
+      /** A label that sanitizes to nothing carries no story to continue;
+       *  rendering it would leave a bare bullet implying a missing header. */
+      .filter((label) => label.length > 0);
+    if (recent.length > 0) {
+      sections.push(
+        'Previous headers in this run (most recent last):\n' +
+          recent.map((label) => `- ${label}`).join('\n')
+      );
+    }
+  }
   /** Intent text is free-form assistant prose that can quote a redacted
    *  tool result just as reasoning can, so it shares the excerpts' fate. */
   if (

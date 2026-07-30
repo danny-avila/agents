@@ -1613,6 +1613,7 @@ export class Run<_T extends t.BaseGraphState> {
     entries,
     thinkingExcerpts,
     lastAssistantText,
+    previousLabels,
     prompt,
     charLimit = 600,
     chainOptions,
@@ -1780,6 +1781,7 @@ export class Run<_T extends t.BaseGraphState> {
       charLimit,
       thinkingExcerpts,
       lastAssistantText,
+      previousLabels,
       redaction,
     });
 
@@ -1837,7 +1839,14 @@ export class Run<_T extends t.BaseGraphState> {
           )
           .join('');
       }
-      return text.trim().replace(/^["']|["']$/g, '');
+      /** Collapsed to one line at the source: a header renders as a single
+       *  row, and hosts feed committed labels back as continuity context —
+       *  so a multi-line result would carry its line breaks into every later
+       *  prompt in the run. */
+      return text
+        .replace(/\s+/g, ' ')
+        .trim()
+        .replace(/^["']|["']$/g, '');
     };
 
     try {
