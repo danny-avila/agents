@@ -3072,6 +3072,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         metadata: {
           ...(config.metadata ?? {}),
           ...traceMetadata,
+          /** Canonical agent identity, stamped OUTSIDE trace-metadata
+           *  filtering: `createLangfuseTraceMetadata` drops values over its
+           *  length cap, but scope trust (`isForeignScope`) needs the id
+           *  verbatim regardless of length. */
+          agentId,
         },
       };
       initializeLangfuseTracing(langfuse);
