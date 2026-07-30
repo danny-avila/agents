@@ -34,7 +34,7 @@ import {
   createPruneMessages,
   syncBudgetDerivedFields,
 } from '@/messages';
-import { createSchemaOnlyTools } from '@/tools/schema';
+import { createSchemaOnlyTools, getToolBindingName } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
 import { toJsonSchema } from '@/utils/schema';
@@ -218,6 +218,9 @@ export class AgentContext {
   /** Per-tool schema token counts (post-multiplier), keyed by tool name.
    *  `undefined` when not calculated (e.g. cached aggregate schema tokens). */
   toolTokenCounts?: Record<string, number>;
+  /** Current-turn tool budget after explicit tool suppression. */
+  currentTurnToolSchemaTokens?: number;
+  currentTurnToolCount?: number;
   /** Names of counted tools that are deferred (`defer_loading`) and discovered. */
   deferredToolNames: string[] = [];
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
@@ -234,7 +237,7 @@ export class AgentContext {
     return (
       this.systemMessageTokens +
       this.dynamicInstructionTokens +
-      this.toolSchemaTokens +
+      (this.currentTurnToolSchemaTokens ?? this.toolSchemaTokens) +
       summaryOverhead
     );
   }
@@ -758,10 +761,14 @@ export class AgentContext {
       return messages;
     }
 
-    const tailIndex = this.getPromptCacheDynamicTailIndex(
-      messages,
-      promptCacheProvider
-    );
+    const summaryBeforeLoneOpenRouterUser =
+      promptCacheProvider === Providers.OPENROUTER &&
+      messages.length === 1 &&
+      messages[0].getType() === 'human' &&
+      tail.some((message) => message.getType() === 'ai');
+    const tailIndex = summaryBeforeLoneOpenRouterUser
+      ? 0
+      : this.getPromptCacheDynamicTailIndex(messages, promptCacheProvider);
     const stablePrefix = messages.slice(0, tailIndex);
     const trailingMessages = messages.slice(tailIndex);
     const cacheablePrefix = this.addStablePromptCacheMarkers(
@@ -954,6 +961,8 @@ export class AgentContext {
     this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;
     this.toolTokenCounts = undefined;
+    this.currentTurnToolSchemaTokens = undefined;
+    this.currentTurnToolCount = undefined;
     this.deferredToolNames = [];
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
@@ -1095,25 +1104,33 @@ export class AgentContext {
     if (instanceTools.length > 0) {
       for (const tool of instanceTools) {
         const genericTool = tool as Record<string, unknown>;
+        let schemaForCounting: unknown;
         if (
           genericTool.schema != null &&
           typeof genericTool.schema === 'object'
         ) {
-          const toolName = (genericTool.name as string | undefined) ?? '';
-          const jsonSchema = toJsonSchema(
+          schemaForCounting = toJsonSchema(
             genericTool.schema,
-            toolName,
+            getToolBindingName(tool) ?? '',
             (genericTool.description as string | undefined) ?? ''
           );
-          const schemaTokens = tokenCounter(
-            new SystemMessage(JSON.stringify(jsonSchema))
-          );
-          toolTokens += schemaTokens;
-          if (toolName) {
-            countedToolNames.add(toolName);
-            rawToolTokenCounts[toolName] =
-              (rawToolTokenCounts[toolName] ?? 0) + schemaTokens;
-          }
+        } else if (
+          genericTool.function != null ||
+          genericTool.toolSpec != null
+        ) {
+          schemaForCounting = genericTool;
+        } else {
+          continue;
+        }
+        const toolName = getToolBindingName(tool) ?? '';
+        const schemaTokens = tokenCounter(
+          new SystemMessage(JSON.stringify(schemaForCounting))
+        );
+        toolTokens += schemaTokens;
+        if (toolName) {
+          countedToolNames.add(toolName);
+          rawToolTokenCounts[toolName] =
+            (rawToolTokenCounts[toolName] ?? 0) + schemaTokens;
         }
       }
     }
@@ -1259,6 +1276,11 @@ export class AgentContext {
     return this.summaryText != null && this.summaryText !== '';
   }
 
+  /** True when full compaction left only a summary for the next model call. */
+  hasPendingCompactionSummary(): boolean {
+    return this._summaryLocation === 'history_message' && this.hasSummary();
+  }
+
   getSummaryText(): string | undefined {
     return this.summaryText;
   }
@@ -1317,7 +1339,10 @@ export class AgentContext {
      * producing the same misleading "N tools" diagnostic this fix is meant
      * to eliminate.
      */
-    const toolCount = this.getToolsForBinding()?.length ?? 0;
+    const toolCount =
+      this.currentTurnToolCount ?? this.getToolsForBinding()?.length ?? 0;
+    const toolSchemaTokens =
+      this.currentTurnToolSchemaTokens ?? this.toolSchemaTokens;
     const messageCount = messages?.length ?? 0;
 
     let messageTokens = 0;
@@ -1346,7 +1371,7 @@ export class AgentContext {
       instructionTokens: this.instructionTokens,
       systemMessageTokens: this.systemMessageTokens,
       dynamicInstructionTokens: this.dynamicInstructionTokens,
-      toolSchemaTokens: this.toolSchemaTokens,
+      toolSchemaTokens,
       summaryTokens: this.summaryTokenCount,
       toolCount,
       messageCount,

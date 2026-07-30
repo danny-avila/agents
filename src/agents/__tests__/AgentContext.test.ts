@@ -773,6 +773,29 @@ describe('AgentContext', () => {
       expect(result[3].content).toBe('Second');
     });
 
+    it('places an OpenRouter summary before a lone retained user turn', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'google/gemini-3.1-pro-preview',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+        },
+      });
+      ctx.setSummary('Rotating summary', 7);
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Current request'),
+      ]);
+
+      expect(result[1]).toBeInstanceOf(AIMessage);
+      expect(result[1].content).toBe('<summary>\nRotating summary\n</summary>');
+      expect(result[2]).toBeInstanceOf(HumanMessage);
+      expect(result[2].content).toBe('Current request');
+    });
+
     it('preserves the Bedrock system cache point through message cache-control pass', async () => {
       const ctx = createBasicContext({
         agentConfig: {

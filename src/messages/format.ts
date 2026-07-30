@@ -1137,10 +1137,14 @@ type ResolvedSummaryCoverage = {
   tokenCount: number;
 };
 
-function getLatestSummaryCoverage(
-  payload: TPayload
-): ResolvedSummaryCoverage | undefined {
+type SummaryValue = Pick<ResolvedSummaryCoverage, 'text' | 'tokenCount'>;
+
+function scanLatestSummary(payload: TPayload): {
+  coverage?: ResolvedSummaryCoverage;
+  legacy?: SummaryValue;
+} {
   let summaryCoverage: ResolvedSummaryCoverage | undefined;
+  let legacySummary: SummaryValue | undefined;
 
   for (let i = 0; i < payload.length; i++) {
     const message = payload[i];
@@ -1178,8 +1182,21 @@ function getLatestSummaryCoverage(
       // A newer malformed summary must not fall back to an older checkpoint;
       // preserve raw history unless the latest summary resolves safely.
       summaryCoverage = undefined;
+      legacySummary = undefined;
+      const summaryValue = {
+        text: summaryText,
+        tokenCount:
+          typeof summaryPart.tokenCount === 'number' &&
+          Number.isFinite(summaryPart.tokenCount)
+            ? summaryPart.tokenCount
+            : 0,
+      };
       const coverage = summaryPart.coverage;
-      if (coverage == null || typeof coverage.throughMessageId !== 'string') {
+      if (coverage == null) {
+        legacySummary = summaryValue;
+        continue;
+      }
+      if (typeof coverage.throughMessageId !== 'string') {
         continue;
       }
 
@@ -1193,17 +1210,12 @@ function getLatestSummaryCoverage(
 
       summaryCoverage = {
         messageIndex: boundaryMessageIndex,
-        text: summaryText,
-        tokenCount:
-          typeof summaryPart.tokenCount === 'number' &&
-          Number.isFinite(summaryPart.tokenCount)
-            ? summaryPart.tokenCount
-            : 0,
+        ...summaryValue,
       };
     }
   }
 
-  return summaryCoverage;
+  return { coverage: summaryCoverage, legacy: legacySummary };
 }
 
 function applySummaryCoverage(
@@ -1278,7 +1290,8 @@ export const formatAgentMessages = (
   const updatedIndexTokenCountMap: Record<number, number> = {};
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
-  const summaryCoverage = getLatestSummaryCoverage(payload);
+  const { coverage: summaryCoverage, legacy: legacySummary } =
+    scanLatestSummary(payload);
 
   // Summary metadata is returned to the caller so it can be forwarded to the
   // agent run and included in the single system message via AgentContext.
@@ -1556,13 +1569,28 @@ export const formatAgentMessages = (
       originalIndex++
     ) {
       const resultIndices = indexMapping[originalIndex] || [];
-      const tokenCount = indexTokenCountMap[originalIndex];
+      let tokenCount = indexTokenCountMap[originalIndex];
 
       if (tokenCount === undefined) {
         continue;
       }
 
       const msgCount = resultIndices.length;
+      if (msgCount > 0 && Array.isArray(payload[originalIndex].content)) {
+        for (const part of payload[originalIndex]
+          .content as Array<MessageContentComplex | null>) {
+          if (part == null || part.type !== ContentTypes.SUMMARY) {
+            continue;
+          }
+          const summaryTokenCount = (part as SummaryContentBlock).tokenCount;
+          if (
+            typeof summaryTokenCount === 'number' &&
+            Number.isFinite(summaryTokenCount)
+          ) {
+            tokenCount = Math.max(0, tokenCount - summaryTokenCount);
+          }
+        }
+      }
       if (msgCount === 1) {
         updatedIndexTokenCountMap[resultIndices[0]] = tokenCount;
         continue;
@@ -1633,14 +1661,19 @@ export const formatAgentMessages = (
     }
   }
 
+  let summary = summaryCoverage
+    ? { text: summaryCoverage.text, tokenCount: summaryCoverage.tokenCount }
+    : undefined;
+  if (summary == null && messages.length === 0) {
+    summary = legacySummary;
+  }
+
   return {
     messages,
     indexTokenCountMap: indexTokenCountMap
       ? updatedIndexTokenCountMap
       : undefined,
-    summary: summaryCoverage
-      ? { text: summaryCoverage.text, tokenCount: summaryCoverage.tokenCount }
-      : undefined,
+    summary,
   };
 };
 

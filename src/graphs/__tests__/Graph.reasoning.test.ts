@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
+import { RunnableLambda } from '@langchain/core/runnables';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import {
@@ -30,6 +31,7 @@ import { toLangChainContent } from '@/messages/langchain';
 import { filterToolsForCurrentTurn } from '../Graph';
 import { ChatOpenRouter } from '@/llm/openrouter';
 import { ToolNode } from '@/tools/ToolNode';
+import * as invoke from '@/llm/invoke';
 import { Run } from '@/run';
 
 type ReasoningKey = 'reasoning_content' | 'reasoning';
@@ -79,6 +81,12 @@ class CapturingMessageModel implements t.ChatModel {
   async invoke(messages: BaseMessage[]): Promise<AIMessageChunk> {
     this.invocations.push(messages);
     return new AIMessageChunk('ok');
+  }
+}
+
+class FailingMessageModel implements t.ChatModel {
+  async invoke(): Promise<AIMessageChunk> {
+    throw new Error('primary failed');
   }
 }
 
@@ -1799,6 +1807,106 @@ describe('StandardGraph final response reasoning fallback', () => {
     expect(model.invocations).toHaveLength(0);
   });
 
+  it('protects the real user turn when injected human context follows it', async () => {
+    const latest = new HumanMessage({
+      content: [
+        {
+          type: 'image_url',
+          image_url: { url: 'https://example.com/latest.png' },
+        },
+      ],
+    });
+    const injected = new HumanMessage({
+      content: 'Hook context',
+      additional_kwargs: { role: 'system', source: 'hook' },
+    });
+    const run = await Run.create<t.IState>({
+      runId: 'real-user-turn-lost-before-injected-context',
+      graphConfig: { type: 'standard', llmConfig },
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const graph = run.Graph;
+    const agentContext = graph.agentContexts.get('default');
+    if (!agentContext) {
+      throw new Error('Expected default agent context');
+    }
+    agentContext.pruneMessages = () => ({
+      context: [injected],
+      indexTokenCountMap: { 1: 5 },
+      messagesToRefine: [latest],
+      prePruneContextTokens: 20,
+      remainingContextTokens: 5,
+      contextPressure: 0.8,
+      calibrationRatio: 1,
+      contextBudget: 25,
+      effectiveInstructionTokens: 0,
+    });
+    const model = new CapturingMessageModel();
+    graph.overrideModel = model;
+
+    await expect(
+      graph.createCallModel('default')(
+        { messages: [latest, injected] },
+        {
+          ...config,
+          metadata: {
+            thread_id: 'real-user-turn-lost-before-injected-context',
+            langgraph_node: 'agent=default',
+            langgraph_step: 0,
+            checkpoint_ns: '',
+          },
+        }
+      )
+    ).rejects.toThrow('current_turn_exceeds_context');
+    expect(model.invocations).toHaveLength(0);
+  });
+
+  it('allows an empty message tail when full compaction left a summary', async () => {
+    const run = await Run.create<t.IState>({
+      runId: 'summary-only-continuation',
+      graphConfig: { type: 'standard', llmConfig },
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const graph = run.Graph;
+    const agentContext = graph.agentContexts.get('default');
+    if (!agentContext) {
+      throw new Error('Expected default agent context');
+    }
+    agentContext.setSummary('Compacted history', 8);
+    const summaryPrompt = await agentContext.systemRunnable!.invoke([]);
+    expect(summaryPrompt.at(-1)?.content).toBe(
+      '<summary>\nCompacted history\n</summary>'
+    );
+    const invocations: BaseMessage[][] = [];
+    graph.overrideModel = RunnableLambda.from((messages: BaseMessage[]) => {
+      invocations.push(messages);
+      return new AIMessageChunk('ok');
+    }) as unknown as t.ChatModel;
+
+    await graph.createCallModel('default')(
+      { messages: [] },
+      {
+        ...config,
+        metadata: {
+          thread_id: 'summary-only-continuation',
+          langgraph_node: 'agent=default',
+          langgraph_step: 0,
+          checkpoint_ns: '',
+        },
+      }
+    );
+
+    expect(invocations).toHaveLength(1);
+  });
+
   it('removes only explicitly disabled tools from the next current-turn binding', () => {
     const tools = [
       { name: 'file_search' },
@@ -1822,6 +1930,177 @@ describe('StandardGraph final response reasoning fallback', () => {
     expect(
       (result as Array<{ name?: string }>).map((tool) => tool.name)
     ).toEqual(['calculator']);
+  });
+
+  it('ignores injected human context when finding same-turn tool controls', () => {
+    const tools = [
+      { name: 'file_search' },
+      { name: 'calculator' },
+    ] as t.GraphTools;
+    const result = filterToolsForCurrentTurn(
+      [
+        new HumanMessage('search these files'),
+        new ToolMessage({
+          content: 'search budget exhausted',
+          tool_call_id: 'file-search-1',
+          name: 'file_search',
+          artifact: {
+            toolControl: { disableTools: ['file_search'] },
+          },
+        }),
+        new HumanMessage({
+          content: 'Skill context',
+          additional_kwargs: { isMeta: true, source: 'skill' },
+        }),
+      ],
+      tools
+    );
+
+    expect(
+      (result as Array<{ name?: string }>).map((entry) => entry.name)
+    ).toEqual(['calculator']);
+  });
+
+  it('resolves names from OpenAI and Bedrock tool schemas', () => {
+    const tools = [
+      { name: 'direct_tool' },
+      { type: 'function', function: { name: 'openai_tool' } },
+      { toolSpec: { name: 'bedrock_tool' } },
+    ] as unknown as t.GraphTools;
+    const result = filterToolsForCurrentTurn(
+      [
+        new HumanMessage('use tools'),
+        new ToolMessage({
+          content: 'tool limits reached',
+          tool_call_id: 'control-1',
+          artifact: {
+            toolControl: {
+              disableTools: ['openai_tool', 'bedrock_tool'],
+            },
+          },
+        }),
+      ],
+      tools
+    );
+
+    expect(result).toEqual([{ name: 'direct_tool' }]);
+  });
+
+  it('uses the filtered tool budget during pruning', async () => {
+    const tools = [
+      { name: 'file_search' },
+      { name: 'calculator' },
+    ] as t.GraphTools;
+    const user = new HumanMessage('search these files');
+    const control = new ToolMessage({
+      content: 'search budget exhausted',
+      tool_call_id: 'file-search-1',
+      name: 'file_search',
+      artifact: { toolControl: { disableTools: ['file_search'] } },
+    });
+    const run = await Run.create<t.IState>({
+      runId: 'filtered-tool-budget',
+      graphConfig: { type: 'standard', llmConfig },
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const graph = run.Graph;
+    const agentContext = graph.agentContexts.get('default');
+    if (!agentContext) {
+      throw new Error('Expected default agent context');
+    }
+    agentContext.tools = tools;
+    agentContext.toolSchemaTokens = 1000;
+    agentContext.toolTokenCounts = { file_search: 900, calculator: 100 };
+    let pruningInstructionTokens = -1;
+    agentContext.pruneMessages = () => {
+      pruningInstructionTokens = agentContext.instructionTokens;
+      return {
+        context: [user, control],
+        indexTokenCountMap: { 0: 5, 1: 5 },
+        messagesToRefine: [],
+        prePruneContextTokens: 10,
+        remainingContextTokens: 10,
+        contextPressure: 0,
+        calibrationRatio: 1,
+        contextBudget: 20,
+        effectiveInstructionTokens: agentContext.instructionTokens,
+      };
+    };
+    graph.overrideModel = new CapturingMessageModel();
+
+    await graph.createCallModel('default')(
+      { messages: [user, control] },
+      {
+        ...config,
+        metadata: {
+          thread_id: 'filtered-tool-budget',
+          langgraph_node: 'agent=default',
+          langgraph_step: 0,
+          checkpoint_ns: '',
+        },
+      }
+    );
+
+    expect(pruningInstructionTokens).toBe(100);
+    expect(agentContext.getTokenBudgetBreakdown().toolSchemaTokens).toBe(100);
+  });
+
+  it('keeps disabled tools out of fallback provider bindings', async () => {
+    const tools = [
+      { name: 'file_search' },
+      { name: 'calculator' },
+    ] as t.GraphTools;
+    const user = new HumanMessage('search these files');
+    const control = new ToolMessage({
+      content: 'search budget exhausted',
+      tool_call_id: 'file-search-1',
+      name: 'file_search',
+      artifact: { toolControl: { disableTools: ['file_search'] } },
+    });
+    const run = await Run.create<t.IState>({
+      runId: 'filtered-fallback-tools',
+      graphConfig: { type: 'standard', llmConfig },
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const graph = run.Graph;
+    const agentContext = graph.agentContexts.get('default');
+    if (!agentContext) {
+      throw new Error('Expected default agent context');
+    }
+    agentContext.tools = tools;
+    agentContext.clientOptions = {
+      fallbacks: [{ provider: Providers.ANTHROPIC }],
+    } as unknown as t.ClientOptions;
+    graph.overrideModel = new FailingMessageModel();
+    const fallbackSpy = jest
+      .spyOn(invoke, 'tryFallbackProviders')
+      .mockResolvedValue({ messages: [new AIMessageChunk('fallback')] });
+
+    await graph.createCallModel('default')(
+      { messages: [user, control] },
+      {
+        ...config,
+        metadata: {
+          thread_id: 'filtered-fallback-tools',
+          langgraph_node: 'agent=default',
+          langgraph_step: 0,
+          checkpoint_ns: '',
+        },
+      }
+    );
+
+    expect(fallbackSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ tools: [{ name: 'calculator' }] })
+    );
+    fallbackSpy.mockRestore();
   });
 
   it('retains tool controls from a content_and_artifact ToolNode result', async () => {

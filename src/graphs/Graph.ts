@@ -72,6 +72,7 @@ import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
+import { createSchemaOnlyTools, getToolBindingName } from '@/tools/schema';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
@@ -82,7 +83,6 @@ import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
 import { resolveLangfuseConfig } from '@/langfuseConfig';
-import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
@@ -104,15 +104,18 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
-function getToolBindingName(toolBinding: unknown): string | undefined {
-  if (
-    toolBinding == null ||
-    (typeof toolBinding !== 'object' && typeof toolBinding !== 'function') ||
-    !('name' in toolBinding)
-  ) {
-    return undefined;
+function isRealUserMessage(message: BaseMessage): boolean {
+  if (message.getType() !== 'human') {
+    return false;
   }
-  return typeof toolBinding.name === 'string' ? toolBinding.name : undefined;
+  const { isMeta, role, source } = message.additional_kwargs;
+  return (
+    isMeta !== true &&
+    role !== 'system' &&
+    source !== 'skill' &&
+    source !== 'hook' &&
+    source !== 'system'
+  );
 }
 
 /** Applies explicit tool controls emitted after the latest real user turn. */
@@ -126,7 +129,7 @@ export function filterToolsForCurrentTurn(
 
   let latestHumanIndex = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].getType() === 'human') {
+    if (isRealUserMessage(messages[i])) {
       latestHumanIndex = i;
       break;
     }
@@ -1615,6 +1618,44 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (agentContext.tokenCalculationPromise) {
         await agentContext.tokenCalculationPromise;
       }
+      agentContext.currentTurnToolSchemaTokens = undefined;
+      agentContext.currentTurnToolCount = undefined;
+      const toolsWereSuppressed =
+        (rawToolsForBinding?.length ?? 0) <
+        (resolvedToolsForBinding?.length ?? 0);
+      if (toolsWereSuppressed) {
+        if (
+          agentContext.toolTokenCounts == null &&
+          agentContext.tokenCounter != null
+        ) {
+          await agentContext.calculateInstructionTokens(
+            agentContext.tokenCounter
+          );
+        }
+        const disabledToolNames = new Set<string>();
+        for (const toolBinding of resolvedToolsForBinding ?? []) {
+          if (
+            (rawToolsForBinding as readonly unknown[] | undefined)?.includes(
+              toolBinding
+            ) === true
+          ) {
+            continue;
+          }
+          const toolName = getToolBindingName(toolBinding);
+          if (toolName != null) {
+            disabledToolNames.add(toolName);
+          }
+        }
+        let disabledToolTokens = 0;
+        for (const toolName of disabledToolNames) {
+          disabledToolTokens += agentContext.toolTokenCounts?.[toolName] ?? 0;
+        }
+        agentContext.currentTurnToolSchemaTokens = Math.max(
+          0,
+          agentContext.toolSchemaTokens - disabledToolTokens
+        );
+        agentContext.currentTurnToolCount = rawToolsForBinding?.length ?? 0;
+      }
       if (!config.signal) {
         config.signal = this.signal;
       }
@@ -1676,28 +1717,37 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (resolvedInstructionOverhead != null) {
           agentContext.resolvedInstructionOverhead =
             resolvedInstructionOverhead;
+          const currentToolTokens =
+            agentContext.currentTurnToolSchemaTokens ??
+            agentContext.toolSchemaTokens;
           const nonToolOverhead =
-            agentContext.instructionTokens - agentContext.toolSchemaTokens;
+            agentContext.instructionTokens - currentToolTokens;
           const calibratedToolTokens = Math.max(
             0,
             resolvedInstructionOverhead - nonToolOverhead
           );
-          const currentToolTokens = agentContext.toolSchemaTokens;
           const variance =
             currentToolTokens > 0
               ? Math.abs(calibratedToolTokens - currentToolTokens) /
                 currentToolTokens
               : 1;
           if (variance > CALIBRATION_VARIANCE_THRESHOLD) {
-            agentContext.toolSchemaTokens = calibratedToolTokens;
-            /** Largest-remainder apportionment keeps the per-tool breakdown
-             *  summing exactly to the calibrated aggregate */
-            if (agentContext.toolTokenCounts != null && currentToolTokens > 0) {
-              agentContext.toolTokenCounts = apportionTokenCounts(
-                agentContext.toolTokenCounts,
-                calibratedToolTokens / currentToolTokens,
-                calibratedToolTokens
-              );
+            if (agentContext.currentTurnToolSchemaTokens != null) {
+              agentContext.currentTurnToolSchemaTokens = calibratedToolTokens;
+            } else {
+              agentContext.toolSchemaTokens = calibratedToolTokens;
+              /** Largest-remainder apportionment keeps the per-tool breakdown
+               *  summing exactly to the calibrated aggregate */
+              if (
+                agentContext.toolTokenCounts != null &&
+                currentToolTokens > 0
+              ) {
+                agentContext.toolTokenCounts = apportionTokenCounts(
+                  agentContext.toolTokenCounts,
+                  calibratedToolTokens / currentToolTokens,
+                  calibratedToolTokens
+                );
+              }
             }
           }
         }
@@ -1830,8 +1880,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
-      const latestHumanMessage = messages.findLast(
-        (message) => message.getType() === 'human'
+      const latestHumanMessage = messages.findLast((message) =>
+        isRealUserMessage(message)
       );
       if (
         latestHumanMessage != null &&
@@ -2069,7 +2119,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         (agentContext.clientOptions as t.LLMConfig | undefined)?.fallbacks ??
         [];
 
-      if (finalMessages.length === 0) {
+      if (
+        finalMessages.length === 0 &&
+        !agentContext.hasPendingCompactionSummary()
+      ) {
         const budgetBreakdown = agentContext.getTokenBudgetBreakdown(messages);
         const breakdown = agentContext.formatTokenBudgetBreakdown(messages);
         const instructionsExceedBudget =
@@ -2276,7 +2329,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           () =>
             tryFallbackProviders({
               fallbacks,
-              tools: agentContext.tools,
+              tools: rawToolsForBinding,
               messages: finalMessages,
               config: invokeConfig,
               primaryError,

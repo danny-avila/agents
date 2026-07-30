@@ -44,6 +44,17 @@ function summaryBlock(
   };
 }
 
+function legacySummaryBlock(
+  text: string,
+  tokenCount: number
+): MessageContentComplex {
+  return {
+    type: ContentTypes.SUMMARY,
+    content: [{ type: ContentTypes.TEXT, text }],
+    tokenCount,
+  };
+}
+
 describe('formatAgentMessages', () => {
   it('should format simple user and AI messages', () => {
     const payload: TPayload = [
@@ -152,7 +163,7 @@ describe('formatAgentMessages', () => {
       type: ContentTypes.TEXT,
       text: 'Retained recent response',
     });
-    expect(result.indexTokenCountMap?.[0]).toBe(18);
+    expect(result.indexTokenCountMap?.[0]).toBe(6);
     expect(result.indexTokenCountMap?.[1]).toBe(4);
   });
 
@@ -182,6 +193,38 @@ describe('formatAgentMessages', () => {
       { type: ContentTypes.TEXT, text: 'Raw response before summary' },
       { type: ContentTypes.TEXT, text: 'Raw response after summary' },
     ]);
+  });
+
+  it('should preserve a legacy summary-only compacted history', () => {
+    const result = formatAgentMessages([
+      {
+        role: 'assistant',
+        messageId: 'legacy-summary',
+        content: [legacySummaryBlock('Legacy compacted context', 11)],
+      },
+    ]);
+
+    expect(result.messages).toHaveLength(0);
+    expect(result.summary).toEqual({
+      text: 'Legacy compacted context',
+      tokenCount: 11,
+    });
+  });
+
+  it('should not trust a legacy summary while raw history remains', () => {
+    const result = formatAgentMessages([
+      { role: 'user', content: 'Raw request' },
+      {
+        role: 'assistant',
+        content: [legacySummaryBlock('Ambiguous legacy context', 9)],
+      },
+    ]);
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'Raw request' },
+    ]);
+    expect(result.summary).toBeUndefined();
   });
 
   it('should preserve both retained turns across a request, including five image-only parts', () => {
@@ -4347,7 +4390,7 @@ describe('formatAgentMessages', () => {
       expect(outputKeys).toHaveLength(3);
 
       const boundaryMsgTokens = result.indexTokenCountMap?.[0] ?? 0;
-      expect(boundaryMsgTokens).toBe(60);
+      expect(boundaryMsgTokens).toBe(35);
       expect(result.indexTokenCountMap?.[1]).toBe(10);
       expect(result.indexTokenCountMap?.[2]).toBe(15);
     });
@@ -4464,7 +4507,7 @@ describe('formatAgentMessages', () => {
       const run2TotalPostBoundary = Object.values(
         run2Result.indexTokenCountMap || {}
       ).reduce((sum, v) => sum + v, 0);
-      expect(run2TotalPostBoundary).toBe(50);
+      expect(run2TotalPostBoundary).toBe(32);
 
       const run3Payload: TPayload = [
         ...run2Payload,
@@ -4486,7 +4529,7 @@ describe('formatAgentMessages', () => {
       const run3Total = Object.values(
         run3Result.indexTokenCountMap || {}
       ).reduce((sum, count) => sum + count, 0);
-      expect(run3Total).toBe(50 + 15 + 20);
+      expect(run3Total).toBe(32 + 15 + 20);
     });
   });
 });
