@@ -4831,6 +4831,48 @@ describe('formatAgentMessages', () => {
       }
     );
 
+    /** The media sits a level down, inside `tool_call.output`, where serializing
+     *  gives it a nonzero length while the token counter charges its fixed media
+     *  cost. Eligibility is decided by part type, so nesting depth is irrelevant. */
+    it('skips the positional discount when retained tool output carries media', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'a'.repeat(4000) },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'S'.repeat(400),
+              tokenCount: 100,
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tc1',
+                name: 'render',
+                args: '{}',
+                output: [
+                  {
+                    type: 'image_url',
+                    image_url: { url: 'data:image/png;base64,y' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 4000 });
+
+      const emitted = Object.values(result.indexTokenCountMap ?? {}).reduce(
+        (sum, value) => sum + value,
+        0
+      );
+      expect(emitted).toBe(4000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
+    });
+
     it('still proportions when every retained part is measurable', () => {
       const payload: TPayload = [
         {

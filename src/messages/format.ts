@@ -1386,6 +1386,26 @@ function measureValueChars(value: unknown): number {
     : Math.min(measured, HARD_MAX_TOOL_RESULT_CHARS);
 }
 
+/**
+ * Whether a retained part's whole prompt cost is the text the char heuristic
+ * reads, making it safe to represent in a character ratio.
+ *
+ * An allowlist, not a denylist. Media, resources, and tool calls carry cost that
+ * is unrelated to their serialized length — a short image URL nested in
+ * `tool_call.output` stands in for a fixed four-figure media charge — and
+ * rejecting those case by case has repeatedly missed a nesting level. Listing
+ * the two shapes whose characters `contentPartCharLength` actually reads makes
+ * every other shape, present or future, ineligible by default: the ratio is
+ * skipped and the entry keeps its original count, which prunes early rather than
+ * exceeding the window.
+ */
+function isCharRatioEligible(part: MessageContentComplex | undefined): boolean {
+  if (part == null) {
+    return false;
+  }
+  return part.type === ContentTypes.TEXT || part.type === ContentTypes.THINKING;
+}
+
 function contentPartCharLength(part: MessageContentComplex): number {
   const record = part as Record<string, unknown>;
   let len = 0;
@@ -1852,19 +1872,22 @@ export const formatAgentMessages = (
         if (contentIndex >= 0 && contentIndex < content.length - 1) {
           let totalCharLen = 0;
           let remainingCharLen = 0;
-          /** Every *retained* part must be represented before scaling. A part the
-           *  heuristic cannot see — atomic media above all — still costs its
-           *  fixed provider price, so a ratio that counts only the measurable
-           *  siblings scales that cost away: an entry keeping just an image after
-           *  the summary collapses to 1. Keeping the original over-counts, which
-           *  prunes early rather than exceeding the window. */
+          /** Every *retained* part must be one the ratio can represent. A part
+           *  carrying cost unrelated to its length — atomic media above all,
+           *  including media nested inside a tool output — would have that cost
+           *  scaled away: an entry keeping just an image after the summary
+           *  collapses to 1. Parts formatting drops are exempt, contributing
+           *  nothing to either side. */
           let everyRetainedPartMeasurable = true;
           for (let p = 0; p < content.length; p++) {
             const part = content[p];
             const charLen = contentPartCharLength(part);
             totalCharLen += charLen;
             if (p > contentIndex) {
-              if (charLen === 0 && !isDroppedByFormatting(part)) {
+              if (isDroppedByFormatting(part)) {
+                continue;
+              }
+              if (!isCharRatioEligible(part) || charLen === 0) {
                 everyRetainedPartMeasurable = false;
                 break;
               }
