@@ -43,6 +43,11 @@ function aggregate(records, model) {
     const agg = byVariant.get(record.variant);
     if (record.error) {
       agg.errors += 1;
+      /** Some failures still billed (a 200 whose label normalized to
+       *  empty) — dropping their usage would make an all-empty variant
+       *  report $0. */
+      agg.inputTokens += record.inputTokens ?? 0;
+      agg.outputTokens += record.outputTokens ?? 0;
       continue;
     }
     agg.steps += 1;

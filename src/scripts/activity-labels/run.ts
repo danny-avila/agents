@@ -290,7 +290,21 @@ type LabelSuccess = {
   outputTokens: number;
 };
 
-type LabelFailure = { error: string; latencyMs: number };
+type LabelFailure = {
+  error: string;
+  latencyMs: number;
+  /** Present when the failure still billed tokens (e.g. a 200 whose
+   *  label normalized to empty) — without them an all-empty variant
+   *  would report $0. */
+  inputTokens?: number;
+  outputTokens?: number;
+};
+
+/** Error diagnostics land in Markdown table cells that escape only
+ *  pipes — a multiline gateway body would split the row. */
+function singleLine(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
 
 type LabelResult = LabelSuccess | LabelFailure;
 
@@ -358,6 +372,8 @@ async function requestLabel({
           return {
             error: 'empty label — production would commit no header',
             latencyMs: Date.now() - started,
+            inputTokens: json.usage?.input_tokens ?? 0,
+            outputTokens: json.usage?.output_tokens ?? 0,
           };
         }
         return {
@@ -375,11 +391,11 @@ async function requestLabel({
       if ([401, 403, 404].includes(response.status)) {
         const detail = await response.text().catch(() => '');
         throw new FatalRunError(
-          `run-fatal HTTP ${response.status} (bad credentials or unknown model): ${detail.slice(0, 160)}`
+          `run-fatal HTTP ${response.status} (bad credentials or unknown model): ${singleLine(detail).slice(0, 160)}`
         );
       }
       const body = await response.text();
-      lastError = `HTTP ${response.status}: ${body.slice(0, 160)}`;
+      lastError = `HTTP ${response.status}: ${singleLine(body).slice(0, 160)}`;
       if (attempt < 3 && [429, 500, 529].includes(response.status)) {
         const retryAfter = Number(response.headers.get('retry-after'));
         const waitMs =
@@ -396,7 +412,7 @@ async function requestLabel({
       if (error instanceof FatalRunError) {
         throw error;
       }
-      lastError = `request failed: ${error instanceof Error ? error.message : String(error)}`;
+      lastError = `request failed: ${singleLine(error instanceof Error ? error.message : String(error))}`;
       if (attempt < 3) {
         await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
         continue;
@@ -416,7 +432,11 @@ type RecordBase = {
 
 type DryRunRecord = RecordBase & { prompt: string };
 
-type ErrorRecord = RecordBase & { error: string };
+type ErrorRecord = RecordBase & {
+  error: string;
+  inputTokens?: number;
+  outputTokens?: number;
+};
 
 type LabelRecord = RecordBase & {
   label: string;
@@ -485,6 +505,10 @@ async function runCase({
         caseId: testCase.id,
         stepId,
         error: result.error,
+        ...(result.inputTokens != null && {
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+        }),
       });
       continue;
     }
@@ -606,6 +630,20 @@ function resolveSelection<T>(
   console.log(`done in ${((Date.now() - started) / 1000).toFixed(1)}s\n`);
 
   if (args.dry) {
+    /** Every rendered prompt is inspectable, not just the first three —
+     *  a multi-step case's later prompts (the ones that demonstrate the
+     *  three-label continuity cap) live past the console preview. */
+    fs.mkdirSync(RESULTS_DIR, { recursive: true });
+    const dryPath = path.join(RESULTS_DIR, 'dry-latest.md');
+    fs.writeFileSync(
+      dryPath,
+      (records as DryRunRecord[])
+        .map(
+          (record) =>
+            `## ${record.variant} / ${record.caseId} / ${record.stepId}\n\n\`\`\`\n${record.prompt}\n\`\`\`\n`
+        )
+        .join('\n')
+    );
     for (const record of records.slice(0, 3) as DryRunRecord[]) {
       console.log(
         `--- ${record.variant} / ${record.caseId} / ${record.stepId} ---`
@@ -613,7 +651,9 @@ function resolveSelection<T>(
       console.log(record.prompt);
       console.log('');
     }
-    console.log(`rendered ${records.length} prompts (showing 3)`);
+    console.log(
+      `rendered ${records.length} prompts (showing 3; all in ${path.relative(process.cwd(), dryPath)})`
+    );
     return;
   }
 
