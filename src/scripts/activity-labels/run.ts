@@ -189,7 +189,13 @@ function loadKey(): string {
     .replace(/^["']|["']$/g, '');
 }
 
-const BUILDER_TERMINAL = '\n\nLabel:';
+/** The CURRENT builder framing (shipped in #363). Framing-hypothesis
+ *  variants substitute against these markers; when a hypothesis ships,
+ *  update them and the variant becomes the baseline. */
+const BUILDER_ENTRIES_HEADING =
+  'What it called, and what came back (do not restate these):';
+const BUILDER_TERMINAL_LINE = 'Header:';
+const BUILDER_TERMINAL = `\n\n${BUILDER_TERMINAL_LINE}`;
 
 /**
  * Renders the continuity section through the REAL builder (empty batch +
@@ -218,22 +224,23 @@ function continuitySection(previousLabels: string[]): string | null {
 }
 
 /**
- * Applies a framing hypothesis as marker-exact substitutions on a built (or
- * captured) prompt. Strict: the heading is rewritten when the prompt STARTS
- * with the section (a bare batch with no previous labels, intent, or
- * excerpts puts `Tool calls:` first) or when the section-boundary marker
- * occurs exactly once; the terminal only when it is the final line. A
- * prompt failing every check is returned unchanged, so a framing variant
- * degrades to the control rather than corrupting the sample.
+ * Applies a framing hypothesis as marker-exact substitutions on a built
+ * prompt. Strict: the heading is rewritten when the prompt STARTS with the
+ * entries section (a bare batch with no previous labels, intent, or
+ * excerpts puts it first) or when the section-boundary marker occurs
+ * exactly once; the terminal only when it is the final line. A prompt
+ * failing every check is returned unchanged, so a framing variant degrades
+ * to the control rather than corrupting the sample — note the captured
+ * verbatim prompts predate #363's framing and take exactly that path.
  */
 function applyFraming(
   prompt: string,
   { entriesHeading, terminal }: Pick<Variant, 'entriesHeading' | 'terminal'>
 ): string {
   let text = prompt;
-  if (entriesHeading != null && entriesHeading !== 'Tool calls:') {
-    const lead = 'Tool calls:\n';
-    const marker = '\n\nTool calls:\n';
+  if (entriesHeading != null && entriesHeading !== BUILDER_ENTRIES_HEADING) {
+    const lead = `${BUILDER_ENTRIES_HEADING}\n`;
+    const marker = `\n\n${BUILDER_ENTRIES_HEADING}\n`;
     const first = text.indexOf(marker);
     if (text.startsWith(lead)) {
       text = `${entriesHeading}\n` + text.slice(lead.length);
@@ -246,10 +253,10 @@ function applyFraming(
   }
   if (
     terminal != null &&
-    terminal !== 'Label:' &&
+    terminal !== BUILDER_TERMINAL_LINE &&
     text.endsWith(BUILDER_TERMINAL)
   ) {
-    text = text.slice(0, -'Label:'.length) + terminal;
+    text = text.slice(0, -BUILDER_TERMINAL_LINE.length) + terminal;
   }
   return text;
 }

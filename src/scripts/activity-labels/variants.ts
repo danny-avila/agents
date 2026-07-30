@@ -51,14 +51,12 @@ export const HOST_SHIPPED_INSTRUCTION: string = [
   'Output only the line.',
 ].join(' ');
 
-/** The host fallback builder's entries heading (LibreChat runtime.ts
- *  `buildPrompt`): frames the list as reference material because "without
- *  this the model tends to read the list as the thing to summarize and
- *  hands back a transcription of it". Never shipped on the SDK path;
- *  measured here before any port. */
-const GUARD_HEADING =
-  'What it called, and what came back (do not restate these):';
-
+/** The guard-framing variants that once lived here ("What it called, and
+ *  what came back (do not restate these):" + `Header:`) SHIPPED into the
+ *  builder in #363 after three measured sweeps — they are the baseline
+ *  now, so both instruction variants render them via the real builder.
+ *  Future framing hypotheses use the same `entriesHeading` / `terminal`
+ *  fields against the current builder markers (see run.ts). */
 export const variants: Variant[] = [
   {
     name: 'sdk-default',
@@ -69,18 +67,5 @@ export const variants: Variant[] = [
     name: 'host-shipped',
     usePreviousLabels: true,
     instruction: HOST_SHIPPED_INSTRUCTION,
-  },
-  {
-    name: 'guard-heading',
-    usePreviousLabels: true,
-    instruction: HOST_SHIPPED_INSTRUCTION,
-    entriesHeading: GUARD_HEADING,
-  },
-  {
-    name: 'guard-full',
-    usePreviousLabels: true,
-    instruction: HOST_SHIPPED_INSTRUCTION,
-    entriesHeading: GUARD_HEADING,
-    terminal: 'Header:',
   },
 ];
