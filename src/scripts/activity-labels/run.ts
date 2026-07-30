@@ -325,15 +325,18 @@ async function requestLabel({
           outputTokens: json.usage?.output_tokens ?? 0,
         };
       }
-      const body = await response.text();
-      if (response.status === 401 || response.status === 403) {
-        /** Every remaining task would send the same doomed request —
-         *  with the default corpus, hundreds of them — and produce an
-         *  all-error report. Kill the run instead. */
+      /** Statuses where every remaining task would send the same doomed
+       *  request — bad credentials (401/403) or a nonexistent --model
+       *  (404). Classified BEFORE the body read, and with the read
+       *  guarded, so a dropped error-body stream cannot demote a
+       *  definitive failure to a retryable transport error. */
+      if ([401, 403, 404].includes(response.status)) {
+        const detail = await response.text().catch(() => '');
         throw new FatalRunError(
-          `authentication failed (HTTP ${response.status}): ${body.slice(0, 160)}`
+          `run-fatal HTTP ${response.status} (bad credentials or unknown model): ${detail.slice(0, 160)}`
         );
       }
+      const body = await response.text();
       lastError = `HTTP ${response.status}: ${body.slice(0, 160)}`;
       if (attempt < 3 && [429, 500, 529].includes(response.status)) {
         const retryAfter = Number(response.headers.get('retry-after'));
