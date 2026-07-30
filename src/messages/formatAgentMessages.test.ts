@@ -11,6 +11,7 @@ import {
   convertMessagesToResponsesInput,
   convertResponsesMessageToAIMessage,
 } from '@langchain/openai';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { MessageContentComplex, TPayload } from '@/types';
 import {
   convertMessagesToContent,
@@ -4782,6 +4783,119 @@ describe('formatAgentMessages', () => {
   });
 
   describe('summary boundary token count adjustment', () => {
+    /** Atomic media costs a fixed provider price the character heuristic cannot
+     *  see, so scaling by the measurable siblings alone erases it. Both shapes
+     *  collapsed a four-figure count to 1 before this guard. */
+    it.each([
+      [
+        'text before the summary',
+        { type: ContentTypes.TEXT, text: 'hello there' },
+      ],
+      [
+        'a tool call before the summary',
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'tc1',
+            name: 'search',
+            args: '{"q":"x"}',
+            output: 'result text',
+          },
+        },
+      ],
+    ])(
+      'skips the positional discount when retained media is unmeasurable, with %s',
+      (_label, leading) => {
+        const payload: TPayload = [
+          {
+            role: 'assistant',
+            content: [
+              leading as MessageContentComplex,
+              {
+                type: ContentTypes.SUMMARY,
+                text: 'S'.repeat(400),
+                tokenCount: 100,
+              },
+              {
+                type: 'image_url',
+                image_url: { url: 'data:image/png;base64,x' },
+              },
+            ],
+          },
+        ];
+
+        const result = formatAgentMessages(payload, { 0: 1200 });
+
+        expect(result.indexTokenCountMap?.[0]).toBe(1200);
+        expect(result.boundaryTokenAdjustment).toBeUndefined();
+      }
+    );
+
+    /** The media sits a level down, inside `tool_call.output`, where serializing
+     *  gives it a nonzero length while the token counter charges its fixed media
+     *  cost. Eligibility is decided by part type, so nesting depth is irrelevant. */
+    it('skips the positional discount when retained tool output carries media', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'a'.repeat(4000) },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'S'.repeat(400),
+              tokenCount: 100,
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tc1',
+                name: 'render',
+                args: '{}',
+                output: [
+                  {
+                    type: 'image_url',
+                    image_url: { url: 'data:image/png;base64,y' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 4000 });
+
+      const emitted = Object.values(result.indexTokenCountMap ?? {}).reduce(
+        (sum, value) => sum + value,
+        0
+      );
+      expect(emitted).toBe(4000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
+    });
+
+    it('still proportions when every retained part is measurable', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'a'.repeat(400) },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'S'.repeat(100),
+              tokenCount: 20,
+            },
+            { type: ContentTypes.TEXT, text: 'b'.repeat(100) },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 600 });
+
+      expect(result.boundaryTokenAdjustment?.original).toBe(600);
+      expect(result.indexTokenCountMap?.[0]).toBeLessThan(600);
+      expect(result.indexTokenCountMap?.[0]).toBeGreaterThan(0);
+    });
+
     it('should proportion token count when thinking block is sliced off by boundary', () => {
       const thinkingText = 'x'.repeat(1000);
       const payload: TPayload = [
@@ -4815,7 +4929,10 @@ describe('formatAgentMessages', () => {
       expect(result.indexTokenCountMap?.[1]).toBe(8);
     });
 
-    it('should proportion token count when thinking + tool_use are sliced off', () => {
+    /** Reframed: a tool call anywhere in the entry now cancels the ratio, since
+     *  telling a text-bearing tool payload from a media-bearing one requires
+     *  recursing into arbitrary nested output. The entry keeps its count. */
+    it('should not proportion when a tool_use part is present', () => {
       const thinkingText = 'a'.repeat(800);
       const toolInput = JSON.stringify({ data: 'b'.repeat(400) });
       const payload: TPayload = [
@@ -4851,8 +4968,8 @@ describe('formatAgentMessages', () => {
         result.indexTokenCountMap || {}
       ).reduce((sum, v) => sum + v, 0);
 
-      expect(totalOutputTokens).toBeLessThan(200);
-      expect(totalOutputTokens).toBeGreaterThan(0);
+      expect(totalOutputTokens).toBe(2000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
     });
 
     it('should roughly halve token count when content is evenly split around boundary', () => {
@@ -4908,7 +5025,11 @@ describe('formatAgentMessages', () => {
       expect(result.indexTokenCountMap?.[1]).toBe(10);
     });
 
-    it('should account for tool_use input size in the char-length ratio', () => {
+    /** Previously the removed `tool_use` input was counted into the denominator.
+     *  A base64 payload there serializes to a huge length while the counter
+     *  charges a fixed estimate, so the ratio dragged retained text below its
+     *  real cost. The discount is cancelled instead. */
+    it('should not use tool_use input size in the char-length ratio', () => {
       const hugeInput = JSON.stringify({ payload: 'z'.repeat(5000) });
       const payload: TPayload = [
         {
@@ -4934,8 +5055,8 @@ describe('formatAgentMessages', () => {
       expect(result.summary).toBeDefined();
 
       const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
-      expect(adjustedTokens).toBeLessThan(100);
-      expect(adjustedTokens).toBeGreaterThan(0);
+      expect(adjustedTokens).toBe(3000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
     });
 
     it('should handle multiple content parts after the boundary', () => {
@@ -4994,6 +5115,187 @@ describe('formatAgentMessages', () => {
       const adjustedTokens = result.indexTokenCountMap?.[0];
       expect(adjustedTokens).toBeDefined();
       expect(Number.isInteger(adjustedTokens)).toBe(true);
+    });
+  });
+
+  describe('summary coverage boundary', () => {
+    const buildSummaryPart = (coverage?: {
+      retainedFromMessageId: string;
+    }) => ({
+      type: ContentTypes.SUMMARY,
+      content: [
+        { type: ContentTypes.TEXT, text: 'Summary of the earliest turns' },
+      ],
+      tokenCount: 12,
+      ...(coverage != null ? { coverage } : {}),
+    });
+
+    /** Mirrors a compaction with `retainRecent.turns: 1`: m1/m2 were refined
+     *  into the summary, m3/m4 are the retained tail, and the block itself is
+     *  persisted on the assistant message that came after all of them. */
+    const compactedPayload = (coverage?: {
+      retainedFromMessageId: string;
+    }): TPayload => [
+      { messageId: 'm1', role: 'user', content: 'Covered question' },
+      { messageId: 'm2', role: 'assistant', content: 'Covered answer' },
+      { messageId: 'm3', role: 'user', content: 'Retained question' },
+      { messageId: 'm4', role: 'assistant', content: 'Retained answer' },
+      {
+        messageId: 'm5',
+        role: 'assistant',
+        content: [
+          buildSummaryPart(coverage),
+          { type: ContentTypes.TEXT, text: 'Post-compaction reply' },
+        ],
+      },
+    ];
+
+    const textOf = (message: BaseMessage): string => {
+      const { content } = message;
+      if (typeof content === 'string') {
+        return content;
+      }
+      return (content as MessageContentComplex[])
+        .map((part) => ('text' in part ? (part as { text: string }).text : ''))
+        .join('');
+    };
+
+    it('preserves the retained tail that the summary never covered', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm3' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Retained question',
+        'Retained answer',
+        'Post-compaction reply',
+      ]);
+      expect(result.summary!.text).toBe('Summary of the earliest turns');
+      expect(result.summary!.tokenCount).toBe(12);
+    });
+
+    it('retains the anchor message itself, dropping only what precedes it', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm4' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Retained answer',
+        'Post-compaction reply',
+      ]);
+    });
+
+    /** Coverage mode leaves the block's entry at its full count on purpose. The
+     *  summary's cost in the reader's token units is not obtainable here — no
+     *  tokenizer reaches this function, and a figure recorded at write time is
+     *  in the writing run's units. Over-counting prunes early; under-counting
+     *  would risk an over-context request. */
+    it('does not discount the entry carrying the summary block', () => {
+      const payload: TPayload = [
+        { messageId: 'm1', role: 'user', content: 'Covered question' },
+        { messageId: 'm2', role: 'user', content: 'Retained question' },
+        {
+          messageId: 'm3',
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
+              tokenCount: 120,
+              coverage: { retainedFromMessageId: 'm2' },
+            },
+            { type: ContentTypes.TEXT, text: 'Reply' },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 1000 });
+
+      expect(result.indexTokenCountMap?.[1]).toBe(1000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
+    });
+
+    it('keeps token counts for the retained tail and drops covered entries', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm3' }),
+        { 0: 5, 1: 6, 2: 7, 3: 8, 4: 40 }
+      );
+
+      expect(result.indexTokenCountMap?.[0]).toBe(7);
+      expect(result.indexTokenCountMap?.[1]).toBe(8);
+      expect(Object.keys(result.indexTokenCountMap ?? {})).toHaveLength(3);
+    });
+
+    it('leaves entries without summary parts untouched', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm3' }),
+        { 0: 5, 1: 6, 2: 7, 3: 8, 4: 40 }
+      );
+
+      expect(result.indexTokenCountMap?.[0]).toBe(7);
+      expect(result.indexTokenCountMap?.[1]).toBe(8);
+    });
+
+    it('falls back to positional trimming for legacy blocks without coverage', () => {
+      const result = formatAgentMessages(compactedPayload());
+
+      expect(result.messages.map(textOf)).toEqual(['Post-compaction reply']);
+      expect(result.summary!.text).toBe('Summary of the earliest turns');
+    });
+
+    it('falls back to positional trimming when coverage cannot be resolved', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'pruned-from-payload' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual(['Post-compaction reply']);
+    });
+
+    it('ignores an anchor pointing past its own block', () => {
+      const result = formatAgentMessages([
+        ...compactedPayload({ retainedFromMessageId: 'm6' }),
+        { messageId: 'm6', role: 'user', content: 'Later question' },
+      ]);
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Post-compaction reply',
+        'Later question',
+      ]);
+    });
+
+    it('applies last-summary-wins across mixed coverage and legacy blocks', () => {
+      const payload: TPayload = [
+        { messageId: 'm1', role: 'user', content: 'Covered question' },
+        {
+          messageId: 'm2',
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Older summary',
+              tokenCount: 3,
+            },
+            { type: ContentTypes.TEXT, text: 'Older tail' },
+          ],
+        },
+        { messageId: 'm3', role: 'user', content: 'Retained question' },
+        {
+          messageId: 'm4',
+          role: 'assistant',
+          content: [
+            buildSummaryPart({ retainedFromMessageId: 'm3' }),
+            { type: ContentTypes.TEXT, text: 'Newest reply' },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload);
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Retained question',
+        'Newest reply',
+      ]);
+      expect(result.summary!.text).toBe('Summary of the earliest turns');
     });
   });
 

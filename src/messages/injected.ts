@@ -2,8 +2,8 @@
 import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { InjectedMessage } from '@/types/tools';
-import { ContentTypes } from '@/common';
 import { toLangChainContent } from './langchain';
+import { ContentTypes } from '@/common';
 
 /**
  * Converts `InjectedMessage` instances to LangChain `HumanMessage` objects.
@@ -56,8 +56,15 @@ export function convertInjectedMessages(
     if (isEmptyInjectedContent(msg.content)) {
       continue;
     }
+    /** Provenance, recorded here because this is the only place that knows it.
+     *  `isMeta` and `source` are both optional on `InjectedMessage`, so a bare
+     *  entry is otherwise indistinguishable from a message replayed out of the
+     *  payload — and downstream consumers such as compaction coverage need to
+     *  know that this message has no persisted source ID to name. Kept separate
+     *  from `isMeta`, which carries UI and cache meaning of its own. */
     const additional_kwargs: Record<string, unknown> = {
       role: msg.role,
+      injected: true,
     };
     if (msg.isMeta != null) additional_kwargs.isMeta = msg.isMeta;
     if (msg.source != null) additional_kwargs.source = msg.source;

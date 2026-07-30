@@ -381,10 +381,75 @@ function computeSummaryTokenCount(
   return 0;
 }
 
+/**
+ * Names the first retained message so the summary declares its own extent
+ * rather than leaving the next run to infer coverage from where the block
+ * happens to sit.
+ *
+ * Anchored to the retained side, not the covered side. One source message can
+ * expand into several messages — a steer splits an assistant entry into
+ * pre-steer, steer, and post-steer entries sharing its ID — and the recency
+ * split lands on any human-type message, including the steer. Naming the last
+ * *covered* message would then name a half-covered ID with no correct reading;
+ * naming the first *retained* message makes that same message the anchor, so it
+ * survives whole and everything before it is unambiguously covered.
+ *
+ * Synthetic entries are skipped, because they can sit *before* a resolvable
+ * one. `formatAgentMessages` reconstructs skill bodies inside its payload loop
+ * (see the `pendingSkillNames` block) and keeps processing payload entries
+ * afterwards, so an unstamped skill body — which `messagesStateReducer` then
+ * gives a UUID no payload entry carries — is followed by stamped messages.
+ * Anchoring on the UUID would look resolvable at write time and degrade to
+ * positional trimming on read, dropping the retained tail. Skipping it reaches
+ * the stamped message behind it.
+ *
+ * `convertInjectedMessages` records `injected` on everything it builds, which is
+ * what makes this decidable: `isMeta` and `source` are both optional on
+ * `InjectedMessage`, so a bare entry carries no marker of its own, and an
+ * injected `source: 'steer'` is otherwise indistinguishable from a replayed one.
+ * The remaining `isMeta`/`source` checks cover the constructors that build
+ * synthetic entries directly instead of going through that funnel — hook context
+ * in `ToolNode` and `StandardGraph`, handoff cues, reconstructed skill bodies.
+ *
+ * `steer` is exempt from the `source` check because a replayed steer *is*
+ * stamped from its payload entry; rejecting every marked `source` once dropped
+ * exactly those retained steers. Injected steers are still caught, by `injected`.
+ *
+ * Known limitation: a payload entry that omits `messageId` is never stamped, so
+ * the reducer's UUID is recorded and cannot resolve on the next run. There is no
+ * write-time fix — such an entry has no stable ID to name in the next payload
+ * either — and the reader's positional fallback is what `main` already does, so
+ * the anchor degrades rather than misleads.
+ */
+function isSyntheticContext(message: BaseMessage): boolean {
+  const { additional_kwargs: kwargs } = message;
+  if (kwargs.injected === true || kwargs.isMeta === true) {
+    return true;
+  }
+  return kwargs.source != null && kwargs.source !== 'steer';
+}
+
+function resolveSummaryCoverage(
+  messagesToRetain: BaseMessage[]
+): t.SummaryCoverage | undefined {
+  for (let i = 0; i < messagesToRetain.length; i++) {
+    const message = messagesToRetain[i];
+    if (isSyntheticContext(message)) {
+      continue;
+    }
+    const id = message.id?.trim();
+    if (id != null && id !== '') {
+      return { retainedFromMessageId: id };
+    }
+  }
+  return undefined;
+}
+
 /** Constructs the SummaryContentBlock persisted in the run step and dispatched to events. */
 function buildSummaryBlock(params: {
   summaryText: string;
   tokenCount: number;
+  coverage?: t.SummaryCoverage;
   stepId: string;
   stepIndex: number;
   modelName?: string;
@@ -400,6 +465,7 @@ function buildSummaryBlock(params: {
       } as t.MessageContentComplex,
     ],
     tokenCount: params.tokenCount,
+    ...(params.coverage != null ? { coverage: params.coverage } : {}),
     summaryVersion: params.summaryVersion,
     boundary: {
       messageId: params.stepId,
@@ -1145,6 +1211,7 @@ export function createSummarizeNode({
     const summaryBlock = buildSummaryBlock({
       summaryText,
       tokenCount,
+      coverage: resolveSummaryCoverage(messagesToRetain),
       stepId,
       stepIndex: runStep.index,
       modelName: clientConfig.modelName,

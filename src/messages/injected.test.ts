@@ -34,7 +34,7 @@ describe('convertInjectedMessages', () => {
 
   it('carries isMeta, source and skillName only when set', () => {
     const [bare] = convertInjectedMessages([{ role: 'user', content: 'x' }]);
-    expect(bare.additional_kwargs).toEqual({ role: 'user' });
+    expect(bare.additional_kwargs).toEqual({ role: 'user', injected: true });
 
     const [full] = convertInjectedMessages([
       {
@@ -47,10 +47,27 @@ describe('convertInjectedMessages', () => {
     ]);
     expect(full.additional_kwargs).toEqual({
       role: 'user',
+      injected: true,
       isMeta: true,
       source: 'steer',
       skillName: 'writing',
     });
+  });
+
+  /** Both marker fields are optional on `InjectedMessage`, so consumers that
+   *  must tell in-run context from payload-replayed messages — compaction
+   *  coverage anchors — cannot rely on them. `injected` is unconditional. */
+  it('always records injected provenance, whatever the caller supplied', () => {
+    const converted = convertInjectedMessages([
+      { role: 'user', content: 'bare' },
+      { role: 'system', content: 'hook output', source: 'hook' },
+      { role: 'user', content: 'injected steer', source: 'steer' },
+    ]);
+
+    expect(converted).toHaveLength(3);
+    for (const message of converted) {
+      expect(message.additional_kwargs.injected).toBe(true);
+    }
   });
 
   it('passes multimodal content through as a content array', () => {
