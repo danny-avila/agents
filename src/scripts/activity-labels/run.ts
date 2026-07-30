@@ -45,9 +45,23 @@ type LabelCheck = {
   maxOverlap?: number;
 };
 
-/** Aggregate rows are produced and consumed by the ported CJS modules;
- *  run.ts only pipes them from aggregate() into markdownReport(). */
-type AggregateRow = Readonly<Record<string, string | number>>;
+/** The row shape aggregate() actually returns (report.cjs) — typed
+ *  explicitly so the reporting boundary is validated even though the
+ *  producer is CJS. avgWords and costUsd are pre-formatted strings
+ *  ('7.2' / '—', '0.0428' / 'n/a'). */
+type AggregateRow = {
+  variant: string;
+  steps: number;
+  errors: number;
+  flagCounts: Readonly<Record<string, number>>;
+  distinctOpeners: number;
+  topOpener: string;
+  avgWords: string;
+  meanLatencyMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: string;
+};
 
 const require = createRequire(import.meta.url);
 const HARNESS_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -100,6 +114,18 @@ type RunArgs = {
   cases?: string[];
 };
 
+/** A value-taking option must not consume a following flag (`--model
+ *  --dry` would silently disable dry-run mode) or run off the end of
+ *  argv (an undefined model is omitted from the request body and the
+ *  whole sweep 400s per task). */
+function optionValue(argv: string[], index: number, flag: string): string {
+  const value = argv[index];
+  if (value == null || value === '' || value.startsWith('--')) {
+    throw new Error(`${flag} requires a value`);
+  }
+  return value;
+}
+
 function parseArgs(argv: string[]): RunArgs {
   const args: RunArgs = {
     samples: 1,
@@ -112,15 +138,15 @@ function parseArgs(argv: string[]): RunArgs {
     if (key === '--dry') {
       args.dry = true;
     } else if (key === '--variants') {
-      args.variants = argv[++i].split(',');
+      args.variants = optionValue(argv, ++i, key).split(',');
     } else if (key === '--cases') {
-      args.cases = argv[++i].split(',');
+      args.cases = optionValue(argv, ++i, key).split(',');
     } else if (key === '--samples') {
-      args.samples = Number(argv[++i]);
+      args.samples = Number(optionValue(argv, ++i, key));
     } else if (key === '--model') {
-      args.model = argv[++i];
+      args.model = optionValue(argv, ++i, key);
     } else if (key === '--concurrency') {
-      args.concurrency = Number(argv[++i]);
+      args.concurrency = Number(optionValue(argv, ++i, key));
     } else {
       /** A mistyped `--dryy` must not fall through to a fully billed
        *  default sweep. */
