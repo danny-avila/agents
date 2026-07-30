@@ -1,4 +1,5 @@
 import { CallbackHandler } from '@langfuse/langchain';
+import { LangfuseOtelContextKeys } from '@langfuse/core';
 import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
@@ -18,15 +19,19 @@ import type {
 } from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type { Context } from '@opentelemetry/api';
+import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
 import {
   resolveLangfuseConfigForSpan,
+  resolveLangfuseScopeAgentId,
+  resolveLangfuseScopeRunId,
   resolveTraceIdSeedForSpan,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
 import {
   hasLangfuseConfigCredentials,
   hasLangfuseEnvCredentials,
+  resolveToolOutputTracingConfig,
   hasLangfuseEnvConfig,
 } from '@/langfuseConfig';
 import {
@@ -61,10 +66,30 @@ type LangfuseHandlerParams = {
   traceMetadata?: LangfuseTraceMetadata;
   tags?: string[];
   traceIdSeed?: string;
+  /** Identity of the run this handler traces; ambient runtime scopes are
+   *  only adopted when stamped with the same run (see
+   *  `LangfuseRuntimeContext.runId`). */
+  runId?: string;
+  /** The run's resolved tool-output policy — for multi-agent streams the
+   *  conservative aggregate across agents, which `this.langfuse` (the
+   *  primary agent's config) cannot reproduce. Applied when a foreign
+   *  scope's policy is rejected. */
+  toolOutputTracing?: ResolvedLangfuseToolOutputTracingConfig;
+  /** The run's propagated trace name, re-propagated when a foreign scope's
+   *  attributes are cleared. */
+  traceName?: string;
 };
 
 type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
   langfuse?: t.LangfuseConfig;
+};
+
+type HandlerIdentity = {
+  userId?: string;
+  sessionId?: string;
+  tags?: string[];
+  metadata?: LangfuseTraceMetadata;
+  traceName?: string;
 };
 
 type LangfuseAttributeParams = AgentLangfuseHandlerParams & {
@@ -185,6 +210,43 @@ function normalizeBedrockUsageForLangfuse(output: LLMResult): LLMResult {
   return { ...output, generations };
 }
 
+const LANGGRAPH_NODE_METADATA_KEY = 'langgraph_node';
+/** Explicit agent identity in invoke metadata. Every identity-stamping
+ *  component (graph model path, ToolNode, summarization node) overwrites the
+ *  canonical `agentId` at its own invoke, so spread order guarantees the
+ *  closest stamper wins — key priority alone could not (an inherited key of
+ *  either casing can name the wrong agent). `agent_id` remains a fallback
+ *  for third-party graphs that only stamp the snake-case form. */
+const AGENT_ID_METADATA_KEYS = ['agentId', 'agent_id'];
+const LANGGRAPH_NODE_AGENT_PREFIXES = ['agent=', 'tools=', 'summarize='];
+
+/** The LangGraph node a callback executes under, from its inherited
+ *  `langgraph_node` run metadata. `undefined` when the callback carries no
+ *  node identity. */
+function getCallbackNode(
+  metadata?: Record<string, unknown>
+): string | undefined {
+  const node = metadata?.[LANGGRAPH_NODE_METADATA_KEY];
+  return typeof node === 'string' && node !== '' ? node : undefined;
+}
+
+/** Whether a callback's node identifies the given agent. The outer workflow
+ *  node carries the agent id VERBATIM — including ids that themselves begin
+ *  with an internal prefix (an agent literally named `agent=research`) — so
+ *  an exact match is checked before decoding the inner subgraph prefixes
+ *  (`agent=` / `tools=` / `summarize=`). */
+function callbackNodeMatchesAgent(node: string, agentId: string): boolean {
+  if (node === agentId) {
+    return true;
+  }
+  for (const prefix of LANGGRAPH_NODE_AGENT_PREFIXES) {
+    if (node.startsWith(prefix) && node.slice(prefix.length) === agentId) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Hosts often execute agent code inside their own OpenTelemetry spans (HTTP
  * server auto-instrumentation on the global provider). Root observations must
@@ -218,13 +280,32 @@ function detachForeignAmbientSpan(
 class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private readonly langfuse?: t.LangfuseConfig;
   private readonly traceIdSeed?: string;
+  private readonly runId?: string;
+  private readonly identity: HandlerIdentity;
+  private readonly toolOutputTracing?: ResolvedLangfuseToolOutputTracingConfig;
   private readonly trackedRunIds = new Set<string>();
 
   constructor(params?: AgentLangfuseHandlerParams) {
-    const { langfuse, traceIdSeed, ...handlerParams } = params ?? {};
+    const {
+      langfuse,
+      traceIdSeed,
+      runId,
+      toolOutputTracing,
+      traceName,
+      ...handlerParams
+    } = params ?? {};
     super(handlerParams);
     this.langfuse = langfuse;
     this.traceIdSeed = traceIdSeed;
+    this.runId = runId;
+    this.toolOutputTracing = toolOutputTracing;
+    this.identity = {
+      userId: handlerParams.userId,
+      sessionId: handlerParams.sessionId,
+      tags: handlerParams.tags,
+      metadata: handlerParams.traceMetadata,
+      traceName,
+    };
   }
 
   private getDeterministicTraceSeed(): string | undefined {
@@ -250,16 +331,74 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   }
 
   /**
-   * Detached runs (roots, or starts whose parent this handler never tracked)
-   * take their span parent from the ambient OTEL context, so drop any foreign
-   * ambient span first — a run launched from a host's instrumented request
-   * context must start its own trace, not join an unexported foreign one.
-   * Trace identity otherwise stays scope-first: an active runtime scope
-   * (agent overlay, or a per-path seed like the title/label scopes) wins over
-   * this handler's own configuration.
+   * Whether the ambient runtime scope belongs to a different run — or, for
+   * per-agent overlay scopes, to a different concurrently executing agent of
+   * the same run than the one this callback reports via its inherited
+   * `langgraph_node` metadata. Unstamped scopes on unstamped handlers are
+   * never foreign (host-managed handler semantics).
    */
-  private withRuntimeContext<T>(action: () => T, isDetachedRun = false): T {
+  private isForeignScope(
+    scopeRunId: string | undefined,
+    scopeAgentId: string | undefined,
+    callbackMetadata?: Record<string, unknown>
+  ): boolean {
+    if (this.runId == null || scopeRunId == null) {
+      return false;
+    }
+    if (scopeRunId !== this.runId) {
+      return true;
+    }
+    if (scopeAgentId == null) {
+      return false;
+    }
+    // Explicit agent identity (stamped into invoke metadata by the graph's
+    // model path and ToolNode) is unambiguous; node names are a fallback —
+    // an agent literally named `agent=research` makes its outer node
+    // indistinguishable from agent `research`'s inner model node.
+    for (const key of AGENT_ID_METADATA_KEYS) {
+      const explicitAgentId = callbackMetadata?.[key];
+      if (typeof explicitAgentId === 'string' && explicitAgentId !== '') {
+        return explicitAgentId !== scopeAgentId;
+      }
+    }
+    const callbackNode = getCallbackNode(callbackMetadata);
+    return (
+      callbackNode != null &&
+      !callbackNodeMatchesAgent(callbackNode, scopeAgentId)
+    );
+  }
+
+  /**
+   * LangChain executes non-awaited callbacks on a process-wide background
+   * queue (`consumeCallback`), so this callback may be running inside a
+   * DIFFERENT concurrent run's async context. The ambient runtime scope is
+   * therefore only adopted when it belongs to this handler's run (and, for
+   * agent sub-scopes, to this callback's agent): scopes are stamped at their
+   * call sites, and a foreign stamp means the scope's config would route
+   * spans to the wrong destination, its seed would collapse this run's spans
+   * into the foreign trace, and its tool-output policy could leak output the
+   * foreign run permits but this run redacts — so config, seed, AND redaction
+   * policy all fall back to this handler's own run. Unstamped scopes on
+   * unstamped handlers keep scope-first semantics (agent overlays and
+   * per-path seeds like the title/label scopes, host-managed handlers).
+   *
+   * Detached runs (roots, or starts whose parent this handler never tracked)
+   * take their span parent from the ambient OTEL context, so drop any
+   * foreign ambient span first — a run launched from a host's instrumented
+   * request context must start its own trace, not join an unexported
+   * foreign one.
+   */
+  private withRuntimeContext<T>(
+    action: () => T,
+    isDetachedRun = false,
+    callbackMetadata?: Record<string, unknown>
+  ): T {
     const currentContext = otelContext.active();
+    const scopeRunId = resolveLangfuseScopeRunId(currentContext);
+    const scopeAgentId = resolveLangfuseScopeAgentId(currentContext);
+    if (this.isForeignScope(scopeRunId, scopeAgentId, callbackMetadata)) {
+      return this.withForeignScopeRejected(action);
+    }
     const langfuse =
       resolveLangfuseConfigForSpan(currentContext) ?? this.langfuse;
     const activeContext = isDetachedRun
@@ -268,18 +407,65 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
         resolveLangfuseDestinationKey(langfuse)
       )
       : currentContext;
-    const seed = this.getDeterministicTraceSeed();
     const scoped = (): T =>
       withLangfuseRuntimeScope(
         {
           langfuse,
-          traceIdSeed: resolveTraceIdSeedForSpan(activeContext) ?? seed,
+          traceIdSeed:
+            resolveTraceIdSeedForSpan(activeContext) ??
+            this.getDeterministicTraceSeed(),
+          runId: scopeRunId ?? this.runId,
         },
         action
       );
     return activeContext === currentContext
       ? scoped()
       : otelContext.with(activeContext, scoped);
+  }
+
+  /**
+   * A foreign concurrent run's context must be replaced wholesale, not
+   * merged: this library's scope keys (config, seed, tool-output policy,
+   * identity stamps) via the replace-mode runtime scope, `@langfuse/tracing`'s
+   * propagated trace attributes (userId, sessionId, tags, metadata, …) by
+   * deleting their context keys and re-propagating this handler's own
+   * identity, and the foreign active span — removed both so detached runs
+   * root their own trace and so `propagateAttributes` cannot stamp this
+   * run's identity onto the foreign run's still-recording span.
+   */
+  private withForeignScopeRejected<T>(action: () => T): T {
+    let cleanContext = otelTrace.deleteSpan(otelContext.active());
+    for (const key of Object.values(LangfuseOtelContextKeys)) {
+      cleanContext = cleanContext.deleteValue(key);
+    }
+    const scoped = (): T =>
+      withLangfuseRuntimeScope(
+        {
+          langfuse: this.langfuse,
+          traceIdSeed: this.getDeterministicTraceSeed(),
+          runId: this.runId,
+          toolOutputTracing:
+            this.toolOutputTracing ??
+            resolveToolOutputTracingConfig(this.langfuse),
+        },
+        action,
+        { replace: true }
+      );
+    const { userId, sessionId, tags, metadata, traceName } = this.identity;
+    const hasIdentity =
+      userId != null ||
+      sessionId != null ||
+      metadata != null ||
+      traceName != null ||
+      (tags?.length ?? 0) > 0;
+    return otelContext.with(cleanContext, () =>
+      hasIdentity
+        ? propagateAttributes(
+          { userId, sessionId, tags, metadata, traceName },
+          scoped
+        )
+        : scoped()
+    );
   }
 
   // LangChain may invoke callback handlers outside the caller's OTEL context.
@@ -290,7 +476,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleChainStart']> {
     return this.withRuntimeContext(
       () => super.handleChainStart(...args),
-      this.startsDetachedRun(args[2], args[3])
+      this.startsDetachedRun(args[2], args[3]),
+      args[5]
     );
   }
 
@@ -329,7 +516,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleGenerationStart']> {
     return this.withRuntimeContext(
       () => super.handleGenerationStart(...args),
-      this.startsDetachedRun(args[2], args[3])
+      this.startsDetachedRun(args[2], args[3]),
+      args[6]
     );
   }
 
@@ -338,7 +526,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleChatModelStart']> {
     return this.withRuntimeContext(
       () => super.handleChatModelStart(...args),
-      this.startsDetachedRun(args[2], args[3])
+      this.startsDetachedRun(args[2], args[3]),
+      args[6]
     );
   }
 
@@ -347,7 +536,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleLLMStart']> {
     return this.withRuntimeContext(
       () => super.handleLLMStart(...args),
-      this.startsDetachedRun(args[2], args[3])
+      this.startsDetachedRun(args[2], args[3]),
+      args[6]
     );
   }
 
@@ -368,7 +558,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleToolStart']> {
     return this.withRuntimeContext(
       () => super.handleToolStart(...args),
-      this.startsDetachedRun(args[2], args[3])
+      this.startsDetachedRun(args[2], args[3]),
+      args[5]
     );
   }
 
@@ -391,7 +582,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleRetrieverStart']> {
     return this.withRuntimeContext(
       () => super.handleRetrieverStart(...args),
-      this.startsDetachedRun(args[2], args[3])
+      this.startsDetachedRun(args[2], args[3]),
+      args[5]
     );
   }
 }
@@ -541,6 +733,9 @@ export function createLangfuseHandler({
   traceMetadata,
   tags,
   traceIdSeed,
+  runId,
+  toolOutputTracing,
+  traceName,
 }: AgentLangfuseHandlerParams): CallbackHandler | undefined {
   if (!shouldCreateLangfuseHandler(langfuse)) {
     return undefined;
@@ -555,6 +750,9 @@ export function createLangfuseHandler({
     tags: mergeLangfuseTags(tags, langfuse?.tags),
     langfuse,
     traceIdSeed,
+    runId,
+    toolOutputTracing,
+    traceName,
   });
 }
 

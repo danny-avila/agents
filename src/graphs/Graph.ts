@@ -1,4 +1,5 @@
 /* eslint-disable no-console */
+import { v4 } from 'uuid';
 import { nanoid } from 'nanoid';
 import { tool } from '@langchain/core/tools';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
@@ -54,6 +55,14 @@ import {
   removePredecessorHandoffCue,
 } from '@/messages';
 import {
+  attemptInvoke,
+  tryFallbackProviders,
+  getFallbackErrorContext,
+  getFallbackOverflowCandidates,
+  projectMessagesForProvider,
+  resolveServingModelId,
+} from '@/llm/invoke';
+import {
   resetIfNotEmpty,
   isAnthropicLike,
   isOpenAILike,
@@ -64,14 +73,14 @@ import {
   sleep,
 } from '@/utils';
 import {
-  attemptInvoke,
-  tryFallbackProviders,
-  getFallbackErrorContext,
-  getFallbackOverflowCandidates,
-  projectMessagesForProvider,
-  resolveServingModelId,
-} from '@/llm/invoke';
-import { v4 } from 'uuid';
+  Constants,
+  GraphNodeKeys,
+  ContentTypes,
+  GraphEvents,
+  Providers,
+  StepTypes,
+  PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
+} from '@/common';
 import {
   createLangfuseHandler,
   createLangfuseTraceMetadata,
@@ -84,20 +93,15 @@ import {
   translateRecoveryBudget,
 } from '@/llm/contextOverflowRecovery';
 import {
+  hasToolOutputTracingConfig,
+  resolveLangfuseConfig,
+  resolveToolOutputTracingConfig,
+} from '@/langfuseConfig';
+import {
   compactToolContent,
   getToolContentCharLength,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
-import { resolveMaxSeals } from '@/llm/preempt';
-import {
-  Constants,
-  GraphNodeKeys,
-  ContentTypes,
-  GraphEvents,
-  Providers,
-  StepTypes,
-  PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
-} from '@/common';
 import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
@@ -125,12 +129,12 @@ import { shouldTriggerSummarization } from '@/summarization';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
-import { resolveLangfuseConfig } from '@/langfuseConfig';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
 import { isThinkingEnabled } from '@/llm/request';
+import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
@@ -998,6 +1002,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   private originalToolContentCheckpointScope?: string;
   runId: string | undefined;
   /**
+   * Identity used to stamp Langfuse runtime scopes and handlers (see
+   * `LangfuseRuntimeContext.runId`). Carries an opaque per-instance
+   * component: public run ids are unrestricted and may repeat across
+   * concurrently executing runs (retries, duplicate submissions,
+   * tenant-local message ids), and equal stamps would let those runs adopt
+   * each other's scopes. One graph instance = one execution's stamp, shared
+   * by the stream handler and every graph-level scope of that execution.
+   */
+  readonly langfuseScopeRunId: string;
+  /**
    * Boundary between historical messages (loaded from conversation state)
    * and messages produced during the current run.  Set once in the state
    * reducer when messages first arrive.  Used by `getRunMessages()` and
@@ -1081,6 +1095,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
+    this.langfuseScopeRunId = `${runId ?? 'graph'}:${nanoid()}`;
     this.signal = signal;
     this.langfuse = langfuse;
     this.subagentUsageSink = subagentUsageSink;
@@ -3057,6 +3072,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         metadata: {
           ...(config.metadata ?? {}),
           ...traceMetadata,
+          /** Canonical agent identity, stamped OUTSIDE trace-metadata
+           *  filtering: `createLangfuseTraceMetadata` drops values over its
+           *  length cap, but scope trust (`isForeignScope`) needs the id
+           *  verbatim regardless of length. */
+          agentId,
         },
       };
       initializeLangfuseTracing(langfuse);
@@ -3069,6 +3089,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           tags: ['librechat', 'agent'],
           traceIdSeed:
             langfuse?.deterministicTraceId === true ? this.runId : undefined,
+          runId: this.langfuseScopeRunId,
+          toolOutputTracing: hasToolOutputTracingConfig(
+            this.langfuse,
+            agentContext.langfuse
+          )
+            ? resolveToolOutputTracingConfig(
+              this.langfuse,
+              agentContext.langfuse
+            )
+            : undefined,
         });
         if (langfuseHandler != null) {
           invokeConfig = {
@@ -3089,6 +3119,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,
             langfuseOverlay: agentContext.langfuse,
+            runId: this.langfuseScopeRunId,
+            agentId,
           }),
           () =>
             attemptInvoke(
@@ -3251,6 +3283,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             resolveLangfuseRuntimeScope({
               runLangfuse: this.langfuse,
               langfuseOverlay: agentContext.langfuse,
+              runId: this.langfuseScopeRunId,
+              agentId,
             }),
             () =>
               tryFallbackProviders({
@@ -3673,7 +3707,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * the same run — `haltRun` is first-write-wins — is left alone.
      */
     const halt = this.hookRegistry.getHaltSignal(runId);
-    if (result.preventContinuation === true && halt?.source === 'PreemptBoundary') {
+    if (
+      result.preventContinuation === true &&
+      halt?.source === 'PreemptBoundary'
+    ) {
       this.preemptHaltReason = halt.reason;
       this.hookRegistry.clearHaltSignal(runId);
     }

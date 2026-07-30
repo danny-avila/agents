@@ -385,6 +385,462 @@ describe('Langfuse callback composition', () => {
     );
   });
 
+  it('keeps callback spans on their own run when a foreign run scope is active', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const tenantA = {
+      publicKey: 'pk-tenant-a',
+      secretKey: 'sk-tenant-a',
+      baseUrl: 'https://langfuse.tenant-a',
+      deterministicTraceId: true,
+    };
+    const tenantB = {
+      publicKey: 'pk-tenant-b',
+      secretKey: 'sk-tenant-b',
+      baseUrl: 'https://langfuse.tenant-b',
+      deterministicTraceId: true,
+    };
+    initializeLangfuseTracing(tenantA);
+    initializeLangfuseTracing(tenantB);
+    const handlerB = createLangfuseHandler({
+      langfuse: tenantB,
+      traceIdSeed: 'run-b',
+      runId: 'run-b',
+    });
+
+    // LangChain's background callback queue (`consumeCallback`) executes
+    // non-awaited callbacks inside whichever concurrent run's async context
+    // the queue drain happens to be on — here, tenant-A's. A scope stamped
+    // with a different run must never reroute tenant-B's spans.
+    await withLangfuseRuntimeScope(
+      { langfuse: tenantA, traceIdSeed: 'run-a', runId: 'run-a' },
+      () =>
+        handlerB?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['ForeignScopedChain'] },
+          { input: 'foreign scoped' },
+          'lc-foreign-run'
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({
+          publicKey: 'pk-tenant-b',
+          secretKey: 'sk-tenant-b',
+          baseUrl: 'https://langfuse.tenant-b',
+        }),
+        traceId: traceIdFromSeed('run-b'),
+      })
+    );
+    expect(
+      mockProcessorStarts.filter(
+        (record) =>
+          (record.params as { publicKey?: string }).publicKey ===
+            'pk-tenant-a' || record.traceId === traceIdFromSeed('run-a')
+      )
+    ).toHaveLength(0);
+  });
+
+  it('adopts an agent overlay scope stamped with the handler run', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const runLangfuse = {
+      publicKey: 'pk-run',
+      secretKey: 'sk-run',
+      baseUrl: 'https://langfuse.run',
+      deterministicTraceId: true,
+    };
+    const agentLangfuse = {
+      publicKey: 'pk-agent',
+      secretKey: 'sk-agent',
+      baseUrl: 'https://langfuse.agent',
+      deterministicTraceId: true,
+    };
+    initializeLangfuseTracing(runLangfuse);
+    initializeLangfuseTracing(agentLangfuse);
+    const streamHandler = createLangfuseHandler({
+      langfuse: runLangfuse,
+      traceIdSeed: 'run-seed',
+      runId: 'run-1',
+    });
+
+    await withLangfuseRuntimeScope(
+      { langfuse: agentLangfuse, traceIdSeed: 'agent-seed', runId: 'run-1' },
+      () =>
+        streamHandler?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['SameRunOverlayChain'] },
+          { input: 'same run overlay' },
+          'lc-overlay-run'
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({
+          publicKey: 'pk-agent',
+          secretKey: 'sk-agent',
+          baseUrl: 'https://langfuse.agent',
+        }),
+        traceId: traceIdFromSeed('agent-seed'),
+      })
+    );
+  });
+
+  it('scopes agent overlays to the callback agent in parallel fan-out', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const runLangfuse = {
+      publicKey: 'pk-run',
+      secretKey: 'sk-run',
+      baseUrl: 'https://langfuse.run',
+      deterministicTraceId: true,
+    };
+    const agentBLangfuse = {
+      publicKey: 'pk-agent-b',
+      secretKey: 'sk-agent-b',
+      baseUrl: 'https://langfuse.agent-b',
+      deterministicTraceId: true,
+    };
+    initializeLangfuseTracing(runLangfuse);
+    initializeLangfuseTracing(agentBLangfuse);
+    const streamHandler = createLangfuseHandler({
+      langfuse: runLangfuse,
+      traceIdSeed: 'run-seed',
+      runId: 'run-1',
+    });
+
+    // Agent B's overlay scope is ambient (the background callback queue can
+    // interleave concurrent fan-out agents), but this callback reports agent
+    // A via inherited langgraph metadata — a sibling's overlay must not
+    // capture it.
+    await withLangfuseRuntimeScope(
+      {
+        langfuse: agentBLangfuse,
+        traceIdSeed: 'agent-b-seed',
+        runId: 'run-1',
+        agentId: 'agent-b',
+      },
+      () =>
+        streamHandler?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['SiblingAgentChain'] },
+          { input: 'sibling agent' },
+          'lc-sibling-run',
+          undefined,
+          undefined,
+          { langgraph_node: 'agent=agent-a' }
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({ publicKey: 'pk-run' }),
+        traceId: traceIdFromSeed('run-seed'),
+      })
+    );
+
+    // The SAME agent's overlay scope is still adopted.
+    await withLangfuseRuntimeScope(
+      {
+        langfuse: agentBLangfuse,
+        traceIdSeed: 'agent-b-seed',
+        runId: 'run-1',
+        agentId: 'agent-b',
+      },
+      () =>
+        streamHandler?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['OwnAgentChain'] },
+          { input: 'own agent' },
+          'lc-own-agent-run',
+          undefined,
+          undefined,
+          { langgraph_node: 'agent=agent-b' }
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({ publicKey: 'pk-agent-b' }),
+        traceId: traceIdFromSeed('agent-b-seed'),
+      })
+    );
+
+    // Explicit `agentId` metadata (stamped by the graph's model path and
+    // ToolNode) beats node-name parsing: agent `research`'s inner node is
+    // named `agent=research`, indistinguishable by name from a sibling
+    // literally named `agent=research` — the explicit identity disambiguates.
+    await withLangfuseRuntimeScope(
+      {
+        langfuse: agentBLangfuse,
+        traceIdSeed: 'prefixed-sibling-seed',
+        runId: 'run-1',
+        agentId: 'agent=research',
+      },
+      () =>
+        streamHandler?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['AmbiguousNodeChain'] },
+          { input: 'ambiguous node' },
+          'lc-ambiguous-node-run',
+          undefined,
+          undefined,
+          { langgraph_node: 'agent=research', agentId: 'research' }
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({ publicKey: 'pk-run' }),
+        traceId: traceIdFromSeed('run-seed'),
+      })
+    );
+
+    // An agent id that itself begins with an internal node prefix is carried
+    // VERBATIM by its outer workflow node — still recognized as its own scope.
+    await withLangfuseRuntimeScope(
+      {
+        langfuse: agentBLangfuse,
+        traceIdSeed: 'prefixed-agent-seed',
+        runId: 'run-1',
+        agentId: 'agent=research',
+      },
+      () =>
+        streamHandler?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['PrefixedAgentChain'] },
+          { input: 'prefixed agent' },
+          'lc-prefixed-agent-run',
+          undefined,
+          undefined,
+          { langgraph_node: 'agent=research' }
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({ publicKey: 'pk-agent-b' }),
+        traceId: traceIdFromSeed('prefixed-agent-seed'),
+      })
+    );
+  });
+
+  it('rejects a sibling agent overlay for tool callbacks', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const runLangfuse = {
+      publicKey: 'pk-run',
+      secretKey: 'sk-run',
+      baseUrl: 'https://langfuse.run',
+      deterministicTraceId: true,
+    };
+    const agentBLangfuse = {
+      publicKey: 'pk-agent-b',
+      secretKey: 'sk-agent-b',
+      baseUrl: 'https://langfuse.agent-b',
+      deterministicTraceId: true,
+    };
+    initializeLangfuseTracing(runLangfuse);
+    initializeLangfuseTracing(agentBLangfuse);
+    const streamHandler = createLangfuseHandler({
+      langfuse: runLangfuse,
+      traceIdSeed: 'run-seed',
+      runId: 'run-1',
+    });
+
+    // Tool supersteps stamp their scope with the executing agent; a tool
+    // callback reporting a different agent via `tools=<id>` metadata must
+    // not adopt the sibling's overlay.
+    await withLangfuseRuntimeScope(
+      {
+        langfuse: agentBLangfuse,
+        traceIdSeed: 'agent-b-seed',
+        runId: 'run-1',
+        agentId: 'agent-b',
+      },
+      () =>
+        streamHandler?.handleToolStart(
+          { lc: 1, type: 'not_implemented', id: ['SiblingTool'] },
+          'sibling tool input',
+          'lc-sibling-tool-run',
+          undefined,
+          undefined,
+          { langgraph_node: 'tools=agent-a' }
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({ publicKey: 'pk-run' }),
+        traceId: traceIdFromSeed('run-seed'),
+      })
+    );
+    expect(
+      mockProcessorStarts.filter(
+        (record) =>
+          (record.params as { publicKey?: string }).publicKey === 'pk-agent-b'
+      )
+    ).toHaveLength(0);
+  });
+
+  it('replaces foreign propagated identity attributes with its own', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const { propagateAttributes } = await import('@langfuse/tracing');
+    const { getPropagatedAttributesFromContext } = await import(
+      '@langfuse/core'
+    );
+    const tenantA = {
+      publicKey: 'pk-tenant-a',
+      secretKey: 'sk-tenant-a',
+      baseUrl: 'https://langfuse.tenant-a',
+    };
+    const tenantB = {
+      publicKey: 'pk-tenant-b',
+      secretKey: 'sk-tenant-b',
+      baseUrl: 'https://langfuse.tenant-b',
+    };
+    initializeLangfuseTracing(tenantA);
+    initializeLangfuseTracing(tenantB);
+    const handlerB = createLangfuseHandler({
+      langfuse: tenantB,
+      userId: 'user-b',
+      runId: 'run-b',
+    });
+
+    let observedAttributes: Record<string, unknown> | undefined;
+    mockStartActiveSpan.mockImplementationOnce(
+      (_name, _options, activeContext, callback) => {
+        observedAttributes = getPropagatedAttributesFromContext(
+          otelContext.active()
+        ) as Record<string, unknown>;
+        return callback(
+          createMockSpan(otelTrace.getSpanContext(activeContext)?.traceId)
+        );
+      }
+    );
+
+    // Run A's propagated identity (user, session) is ambient; B's spans must
+    // carry B's identity — and NOT retain A's session where B has none.
+    await propagateAttributes(
+      { userId: 'user-a', sessionId: 'session-a' },
+      async () =>
+        withLangfuseRuntimeScope({ langfuse: tenantA, runId: 'run-a' }, () =>
+          handlerB?.handleChainStart(
+            { lc: 1, type: 'not_implemented', id: ['IdentityChain'] },
+            { input: 'identity' },
+            'lc-identity-run'
+          )
+        )
+    );
+
+    expect(observedAttributes?.['user.id']).toBe('user-b');
+    expect(observedAttributes?.['session.id']).toBeUndefined();
+  });
+
+  it('clears a foreign scope for env-credential runs instead of inheriting it', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+    const tenantA = {
+      publicKey: 'pk-tenant-a',
+      secretKey: 'sk-tenant-a',
+      baseUrl: 'https://langfuse.tenant-a',
+      deterministicTraceId: true,
+    };
+    initializeLangfuseTracing(tenantA);
+    initializeLangfuseTracing();
+    // Run B has no explicit config or seed of its own — it relies on env
+    // credentials. Rejecting a foreign scope must CLEAR the foreign values
+    // rather than let merge inheritance re-adopt them through `undefined`.
+    const handlerB = createLangfuseHandler({ runId: 'run-b' });
+
+    await withLangfuseRuntimeScope(
+      { langfuse: tenantA, traceIdSeed: 'run-a', runId: 'run-a' },
+      () =>
+        handlerB?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['EnvCredentialChain'] },
+          { input: 'env credentials' },
+          'lc-env-run'
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({
+          publicKey: 'pk-env',
+          secretKey: 'sk-env',
+        }),
+      })
+    );
+    expect(
+      mockProcessorStarts.filter(
+        (record) =>
+          (record.params as { publicKey?: string }).publicKey ===
+            'pk-tenant-a' || record.traceId === traceIdFromSeed('run-a')
+      )
+    ).toHaveLength(0);
+  });
+
+  it('applies its own tool-output policy inside a foreign run scope', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const { resolveToolOutputTracingConfig } = await import('@/langfuseConfig');
+    const { getLangfuseRuntimeToolOutputTracingConfig } = await import(
+      '@/langfuseRuntimeContext'
+    );
+    const tenantA = {
+      publicKey: 'pk-tenant-a',
+      secretKey: 'sk-tenant-a',
+      baseUrl: 'https://langfuse.tenant-a',
+      toolOutputTracing: { enabled: true },
+    };
+    const tenantB = {
+      publicKey: 'pk-tenant-b',
+      secretKey: 'sk-tenant-b',
+      baseUrl: 'https://langfuse.tenant-b',
+      toolOutputTracing: { enabled: false },
+    };
+    initializeLangfuseTracing(tenantA);
+    initializeLangfuseTracing(tenantB);
+    const handlerB = createLangfuseHandler({
+      langfuse: tenantB,
+      runId: 'run-b',
+    });
+
+    let observedPolicy: { enabled: boolean } | undefined;
+    mockStartActiveSpan.mockImplementationOnce(
+      (_name, _options, activeContext, callback) => {
+        observedPolicy = getLangfuseRuntimeToolOutputTracingConfig();
+        return callback(
+          createMockSpan(otelTrace.getSpanContext(activeContext)?.traceId)
+        );
+      }
+    );
+
+    // Tenant A permits tool output; tenant B redacts. B's callback running
+    // inside A's scope must not inherit A's permissive policy.
+    await withLangfuseRuntimeScope(
+      {
+        langfuse: tenantA,
+        runId: 'run-a',
+        toolOutputTracing: resolveToolOutputTracingConfig(tenantA),
+      },
+      () =>
+        handlerB?.handleToolStart(
+          { lc: 1, type: 'not_implemented', id: ['SensitiveTool'] },
+          'sensitive input',
+          'lc-tool-run'
+        )
+    );
+
+    expect(observedPolicy?.enabled).toBe(false);
+  });
+
   it('attaches configured trace attributes to Langfuse callback spans', async () => {
     const { createLangfuseHandler } = await import('@/langfuse');
     const { initializeLangfuseTracing } = await import('@/instrumentation');

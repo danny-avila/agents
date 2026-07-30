@@ -8,8 +8,11 @@ import type * as t from '@/types';
 import {
   getLangfuseRuntimeConfig,
   getLangfuseRuntimeToolOutputTracingConfig,
+  getLangfuseScopeAgentId,
+  getLangfuseScopeRunId,
   getTraceIdSeed,
   hasLangfuseRuntimeContextValue,
+  replaceLangfuseRuntimeContext,
   runWithLangfuseRuntimeContext,
 } from '@/langfuseRuntimeContext';
 import {
@@ -24,6 +27,16 @@ export type ResolveLangfuseRuntimeScopeParams = {
   runLangfuse?: t.LangfuseConfig;
   langfuseOverlay?: t.LangfuseConfig;
   traceIdSeed?: string;
+  runId?: string;
+  agentId?: string;
+};
+
+export type LangfuseRuntimeScopeOptions = {
+  /** Replace the surrounding scope entirely instead of merging with it:
+   *  fields absent from `scope` are CLEARED rather than inherited. Required
+   *  when rejecting a foreign concurrent run's scope, whose explicit values
+   *  must not survive merge inheritance. */
+  replace?: boolean;
 };
 
 const langfuseToolOutputTracingConfigKey = createContextKey(
@@ -33,6 +46,8 @@ const langfuseConfigKey = createContextKey('librechat.langfuse.config');
 const langfuseTraceIdSeedKey = createContextKey(
   'librechat.langfuse.trace-id-seed'
 );
+const langfuseScopeRunIdKey = createContextKey('librechat.langfuse.run-id');
+const langfuseScopeAgentIdKey = createContextKey('librechat.langfuse.agent-id');
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value);
@@ -75,6 +90,32 @@ export function resolveTraceIdSeedForSpan(
   return getTraceIdSeed() ?? getOtelTraceIdSeed(activeContext);
 }
 
+function getOtelScopeRunId(activeContext: Context): string | undefined {
+  const value = activeContext.getValue(langfuseScopeRunIdKey);
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+function getOtelScopeAgentId(activeContext: Context): string | undefined {
+  const value = activeContext.getValue(langfuseScopeAgentIdKey);
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+/** The run identity the active scope belongs to (see
+ *  `LangfuseRuntimeContext.runId`), or `undefined` for unstamped scopes. */
+export function resolveLangfuseScopeRunId(
+  activeContext: Context
+): string | undefined {
+  return getLangfuseScopeRunId() ?? getOtelScopeRunId(activeContext);
+}
+
+/** The agent identity of a per-agent overlay scope (see
+ *  `LangfuseRuntimeContext.agentId`), or `undefined` for run-level scopes. */
+export function resolveLangfuseScopeAgentId(
+  activeContext: Context
+): string | undefined {
+  return getLangfuseScopeAgentId() ?? getOtelScopeAgentId(activeContext);
+}
+
 export function resolveToolOutputTracingConfigForSpan(
   activeContext: Context
 ): ResolvedLangfuseToolOutputTracingConfig | undefined {
@@ -84,45 +125,77 @@ export function resolveToolOutputTracingConfigForSpan(
   );
 }
 
+function setOrClearContextValue(
+  activeContext: Context,
+  key: Parameters<Context['setValue']>[0],
+  value: unknown,
+  replace: boolean
+): Context {
+  if (value != null) {
+    return activeContext.setValue(key, value);
+  }
+  return replace ? activeContext.deleteValue(key) : activeContext;
+}
+
 export function withLangfuseRuntimeScope<T>(
   scope: LangfuseRuntimeScope,
-  action: () => T
+  action: () => T,
+  options?: LangfuseRuntimeScopeOptions
 ): T {
-  if (!hasLangfuseRuntimeContextValue(scope)) {
+  const replace = options?.replace === true;
+  if (!replace && !hasLangfuseRuntimeContextValue(scope)) {
     return action();
   }
 
   let activeContext = context.active();
-  if (scope.langfuse != null) {
-    activeContext = activeContext.setValue(langfuseConfigKey, scope.langfuse);
-  }
-  if (scope.toolOutputTracing != null) {
-    activeContext = activeContext.setValue(
-      langfuseToolOutputTracingConfigKey,
-      scope.toolOutputTracing
-    );
-  }
-  if (hasText(scope.traceIdSeed)) {
-    activeContext = activeContext.setValue(
-      langfuseTraceIdSeedKey,
-      scope.traceIdSeed
-    );
-  }
+  activeContext = setOrClearContextValue(
+    activeContext,
+    langfuseConfigKey,
+    scope.langfuse,
+    replace
+  );
+  activeContext = setOrClearContextValue(
+    activeContext,
+    langfuseToolOutputTracingConfigKey,
+    scope.toolOutputTracing,
+    replace
+  );
+  activeContext = setOrClearContextValue(
+    activeContext,
+    langfuseTraceIdSeedKey,
+    hasText(scope.traceIdSeed) ? scope.traceIdSeed : undefined,
+    replace
+  );
+  activeContext = setOrClearContextValue(
+    activeContext,
+    langfuseScopeRunIdKey,
+    hasText(scope.runId) ? scope.runId : undefined,
+    replace
+  );
+  activeContext = setOrClearContextValue(
+    activeContext,
+    langfuseScopeAgentIdKey,
+    hasText(scope.agentId) ? scope.agentId : undefined,
+    replace
+  );
 
   // Span processors receive the OTel parent context in `onStart`, while
   // LangChain callback handlers may run outside that context and need ALS.
   // The trace id generator reads the seed from ALS or OTel context so SDK
   // callbacks that preserve only one of those contexts still keep trace/score
   // cohesion.
-  return runWithLangfuseRuntimeContext(scope, () =>
-    context.with(activeContext, action)
-  );
+  const runScoped = replace
+    ? replaceLangfuseRuntimeContext
+    : runWithLangfuseRuntimeContext;
+  return runScoped(scope, () => context.with(activeContext, action));
 }
 
 export function resolveLangfuseRuntimeScope({
   runLangfuse,
   langfuseOverlay,
   traceIdSeed,
+  runId,
+  agentId,
 }: ResolveLangfuseRuntimeScopeParams): LangfuseRuntimeScope {
   const langfuse = resolveLangfuseConfig(runLangfuse, langfuseOverlay);
   const toolOutputTracing = !hasToolOutputTracingConfig(
@@ -131,5 +204,5 @@ export function resolveLangfuseRuntimeScope({
   )
     ? undefined
     : resolveToolOutputTracingConfig(runLangfuse, langfuseOverlay);
-  return { langfuse, traceIdSeed, toolOutputTracing };
+  return { langfuse, traceIdSeed, toolOutputTracing, runId, agentId };
 }

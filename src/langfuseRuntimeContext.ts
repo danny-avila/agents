@@ -13,6 +13,22 @@ export type LangfuseRuntimeContext = {
   langfuse?: t.LangfuseConfig;
   traceIdSeed?: string;
   toolOutputTracing?: ResolvedLangfuseToolOutputTracingConfig;
+  /**
+   * Identity of the run this scope belongs to. LangChain executes
+   * non-awaited callbacks on a shared background queue
+   * (`@langchain/core` `consumeCallback`, a process-wide `p-queue` with
+   * concurrency 1), so a callback can run inside a DIFFERENT concurrent
+   * run's async context. Handlers compare this id against their own run to
+   * decide whether an ambient scope is theirs to adopt.
+   */
+  runId?: string;
+  /**
+   * Identity of the agent whose overlay this scope carries, for per-agent
+   * scopes inside a run. Fan-out agents execute concurrently with distinct
+   * Langfuse overlays, so handlers additionally compare this against the
+   * agent a callback reports via its inherited `langgraph_node` metadata.
+   */
+  agentId?: string;
 };
 
 const langfuseRuntimeContextStore =
@@ -28,6 +44,8 @@ export function hasLangfuseRuntimeContextValue(
   return (
     context.langfuse != null ||
     hasText(context.traceIdSeed) ||
+    hasText(context.runId) ||
+    hasText(context.agentId) ||
     context.toolOutputTracing != null
   );
 }
@@ -51,6 +69,14 @@ export function getTraceIdSeed(): string | undefined {
   return getLangfuseRuntimeContext()?.traceIdSeed;
 }
 
+export function getLangfuseScopeRunId(): string | undefined {
+  return getLangfuseRuntimeContext()?.runId;
+}
+
+export function getLangfuseScopeAgentId(): string | undefined {
+  return getLangfuseRuntimeContext()?.agentId;
+}
+
 export function getLangfuseRuntimeToolOutputTracingConfig():
   | ResolvedLangfuseToolOutputTracingConfig
   | undefined {
@@ -60,7 +86,8 @@ export function getLangfuseRuntimeToolOutputTracingConfig():
 /**
  * Runs `fn` with a merged Langfuse runtime context. Undefined fields inherit
  * from the parent scope; callers intentionally cannot clear parent values by
- * passing `undefined`.
+ * passing `undefined` — use `replaceLangfuseRuntimeContext` when the parent
+ * scope must NOT leak through (a foreign concurrent run's scope).
  */
 export function runWithLangfuseRuntimeContext<T>(
   context: LangfuseRuntimeContext,
@@ -73,6 +100,8 @@ export function runWithLangfuseRuntimeContext<T>(
     ...(hasText(context.traceIdSeed)
       ? { traceIdSeed: context.traceIdSeed }
       : {}),
+    ...(hasText(context.runId) ? { runId: context.runId } : {}),
+    ...(hasText(context.agentId) ? { agentId: context.agentId } : {}),
     ...(context.toolOutputTracing !== undefined
       ? { toolOutputTracing: context.toolOutputTracing }
       : {}),
@@ -81,6 +110,19 @@ export function runWithLangfuseRuntimeContext<T>(
   return hasLangfuseRuntimeContextValue(next)
     ? langfuseRuntimeContextStore.run(next, fn)
     : fn();
+}
+
+/**
+ * Runs `fn` with EXACTLY the provided context — the surrounding scope's
+ * fields do not leak through. A rejected foreign run's explicit destination
+ * or seed must not survive via merge inheritance when this run has none of
+ * its own (env-credential runs, non-deterministic runs).
+ */
+export function replaceLangfuseRuntimeContext<T>(
+  context: LangfuseRuntimeContext,
+  fn: () => T
+): T {
+  return langfuseRuntimeContextStore.run({ ...context }, fn);
 }
 
 export function runWithTraceIdSeed<T>(
