@@ -211,12 +211,13 @@ function normalizeBedrockUsageForLangfuse(output: LLMResult): LLMResult {
 }
 
 const LANGGRAPH_NODE_METADATA_KEY = 'langgraph_node';
-/** Explicit agent identity in invoke metadata. The summarization node's
- *  `agent_id` is checked first: it is stamped at the invoke closest to the
- *  summarizer's own work, while `agentId` (the graph's model path, ToolNode)
- *  can be inherited from an enclosing scope and name the wrong agent for a
- *  summarization callback carrying both. */
-const AGENT_ID_METADATA_KEYS = ['agent_id', 'agentId'];
+/** Explicit agent identity in invoke metadata. Every identity-stamping
+ *  component (graph model path, ToolNode, summarization node) overwrites the
+ *  canonical `agentId` at its own invoke, so spread order guarantees the
+ *  closest stamper wins — key priority alone could not (an inherited key of
+ *  either casing can name the wrong agent). `agent_id` remains a fallback
+ *  for third-party graphs that only stamp the snake-case form. */
+const AGENT_ID_METADATA_KEYS = ['agentId', 'agent_id'];
 const LANGGRAPH_NODE_AGENT_PREFIXES = ['agent=', 'tools=', 'summarize='];
 
 /** The LangGraph node a callback executes under, from its inherited

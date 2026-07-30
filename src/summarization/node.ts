@@ -1091,6 +1091,11 @@ export function createSummarizeNode({
         metadata: {
           ...config.metadata,
           agent_id: request.agentId,
+          /** Canonical agent-identity key, overwritten by every component
+             *  that stamps identity (graph model path, ToolNode, here) so the
+             *  closest stamper always wins via spread order — Langfuse scope
+             *  trust relies on it (see `isForeignScope`). */
+          agentId: request.agentId,
           summarization_provider: clientConfig.provider,
           summarization_model: clientConfig.modelName,
           /**
