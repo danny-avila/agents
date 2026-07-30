@@ -488,6 +488,140 @@ describe('Langfuse callback composition', () => {
     );
   });
 
+  it('scopes agent overlays to the callback agent in parallel fan-out', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const runLangfuse = {
+      publicKey: 'pk-run',
+      secretKey: 'sk-run',
+      baseUrl: 'https://langfuse.run',
+      deterministicTraceId: true,
+    };
+    const agentBLangfuse = {
+      publicKey: 'pk-agent-b',
+      secretKey: 'sk-agent-b',
+      baseUrl: 'https://langfuse.agent-b',
+      deterministicTraceId: true,
+    };
+    initializeLangfuseTracing(runLangfuse);
+    initializeLangfuseTracing(agentBLangfuse);
+    const streamHandler = createLangfuseHandler({
+      langfuse: runLangfuse,
+      traceIdSeed: 'run-seed',
+      runId: 'run-1',
+    });
+
+    // Agent B's overlay scope is ambient (the background callback queue can
+    // interleave concurrent fan-out agents), but this callback reports agent
+    // A via inherited langgraph metadata — a sibling's overlay must not
+    // capture it.
+    await withLangfuseRuntimeScope(
+      {
+        langfuse: agentBLangfuse,
+        traceIdSeed: 'agent-b-seed',
+        runId: 'run-1#agent-b',
+      },
+      () =>
+        streamHandler?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['SiblingAgentChain'] },
+          { input: 'sibling agent' },
+          'lc-sibling-run',
+          undefined,
+          undefined,
+          { langgraph_node: 'agent=agent-a' }
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({ publicKey: 'pk-run' }),
+        traceId: traceIdFromSeed('run-seed'),
+      })
+    );
+
+    // The SAME agent's overlay scope is still adopted.
+    await withLangfuseRuntimeScope(
+      {
+        langfuse: agentBLangfuse,
+        traceIdSeed: 'agent-b-seed',
+        runId: 'run-1#agent-b',
+      },
+      () =>
+        streamHandler?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['OwnAgentChain'] },
+          { input: 'own agent' },
+          'lc-own-agent-run',
+          undefined,
+          undefined,
+          { langgraph_node: 'agent=agent-b' }
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({ publicKey: 'pk-agent-b' }),
+        traceId: traceIdFromSeed('agent-b-seed'),
+      })
+    );
+  });
+
+  it('applies its own tool-output policy inside a foreign run scope', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const { resolveToolOutputTracingConfig } = await import('@/langfuseConfig');
+    const { getLangfuseRuntimeToolOutputTracingConfig } = await import(
+      '@/langfuseRuntimeContext'
+    );
+    const tenantA = {
+      publicKey: 'pk-tenant-a',
+      secretKey: 'sk-tenant-a',
+      baseUrl: 'https://langfuse.tenant-a',
+      toolOutputTracing: { enabled: true },
+    };
+    const tenantB = {
+      publicKey: 'pk-tenant-b',
+      secretKey: 'sk-tenant-b',
+      baseUrl: 'https://langfuse.tenant-b',
+      toolOutputTracing: { enabled: false },
+    };
+    initializeLangfuseTracing(tenantA);
+    initializeLangfuseTracing(tenantB);
+    const handlerB = createLangfuseHandler({
+      langfuse: tenantB,
+      runId: 'run-b',
+    });
+
+    let observedPolicy: { enabled: boolean } | undefined;
+    mockStartActiveSpan.mockImplementationOnce(
+      (_name, _options, activeContext, callback) => {
+        observedPolicy = getLangfuseRuntimeToolOutputTracingConfig();
+        return callback(
+          createMockSpan(otelTrace.getSpanContext(activeContext)?.traceId)
+        );
+      }
+    );
+
+    // Tenant A permits tool output; tenant B redacts. B's callback running
+    // inside A's scope must not inherit A's permissive policy.
+    await withLangfuseRuntimeScope(
+      {
+        langfuse: tenantA,
+        runId: 'run-a',
+        toolOutputTracing: resolveToolOutputTracingConfig(tenantA),
+      },
+      () =>
+        handlerB?.handleToolStart(
+          { lc: 1, type: 'not_implemented', id: ['SensitiveTool'] },
+          'sensitive input',
+          'lc-tool-run'
+        )
+    );
+
+    expect(observedPolicy?.enabled).toBe(false);
+  });
+
   it('attaches configured trace attributes to Langfuse callback spans', async () => {
     const { createLangfuseHandler } = await import('@/langfuse');
     const { initializeLangfuseTracing } = await import('@/instrumentation');

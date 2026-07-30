@@ -665,6 +665,22 @@ describe('Langfuse per-run routing integration', () => {
     expect(agentRoot?.parentSpanId).toBeUndefined();
   });
 
+  it('generates a scope stamp for directly-constructed graphs without a run id', async () => {
+    const { StandardGraph } = await import('@/graphs/Graph');
+    const buildGraph = (): { langfuseScopeRunId: string } =>
+      new StandardGraph({
+        agents: [createAgent('stampless')],
+        langfuse: tenantLangfuse('stampless'),
+      }) as unknown as { langfuseScopeRunId: string };
+
+    const graphA = buildGraph();
+    const graphB = buildGraph();
+    expect(graphA.langfuseScopeRunId).toEqual(expect.stringMatching(/^graph-/));
+    expect(graphB.langfuseScopeRunId).toEqual(expect.stringMatching(/^graph-/));
+    expect(graphA.langfuseScopeRunId).not.toBe(graphB.langfuseScopeRunId);
+    expect(graphA.langfuseScopeRunId).not.toContain('#');
+  });
+
   it('routes spans from captured OTel context after ALS scope exits', () => {
     const langfuse = tenantLangfuse('tenant-otel');
     initializeLangfuseTracing(langfuse);

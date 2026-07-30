@@ -28,6 +28,7 @@ import {
 import {
   hasLangfuseConfigCredentials,
   hasLangfuseEnvCredentials,
+  resolveToolOutputTracingConfig,
   hasLangfuseEnvConfig,
 } from '@/langfuseConfig';
 import {
@@ -190,6 +191,45 @@ function normalizeBedrockUsageForLangfuse(output: LLMResult): LLMResult {
   return { ...output, generations };
 }
 
+const SCOPE_AGENT_SEPARATOR = '#';
+const LANGGRAPH_NODE_METADATA_KEY = 'langgraph_node';
+const LANGGRAPH_NODE_AGENT_PREFIXES = ['agent=', 'tools=', 'summarize='];
+
+/** Scope stamps are `<runId>` or `<runId>#<agentId>` for per-agent overlay
+ *  scopes inside a run (`#` is reserved in run ids). */
+function splitScopeStamp(stamp: string): {
+  runPart: string;
+  agentPart?: string;
+} {
+  const separatorIndex = stamp.indexOf(SCOPE_AGENT_SEPARATOR);
+  if (separatorIndex === -1) {
+    return { runPart: stamp };
+  }
+  return {
+    runPart: stamp.slice(0, separatorIndex),
+    agentPart: stamp.slice(separatorIndex + SCOPE_AGENT_SEPARATOR.length),
+  };
+}
+
+/** The agent a callback executes under, from LangGraph's inherited
+ *  `langgraph_node` run metadata (`agent=<id>` / `tools=<id>` /
+ *  `summarize=<id>` node names, or the bare agent id on the outer workflow
+ *  node). `undefined` when the callback carries no node identity. */
+function extractCallbackAgentId(
+  metadata?: Record<string, unknown>
+): string | undefined {
+  const node = metadata?.[LANGGRAPH_NODE_METADATA_KEY];
+  if (typeof node !== 'string' || node === '') {
+    return undefined;
+  }
+  for (const prefix of LANGGRAPH_NODE_AGENT_PREFIXES) {
+    if (node.startsWith(prefix)) {
+      return node.slice(prefix.length);
+    }
+  }
+  return node;
+}
+
 /**
  * Hosts often execute agent code inside their own OpenTelemetry spans (HTTP
  * server auto-instrumentation on the global provider). Root observations must
@@ -257,15 +297,42 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   }
 
   /**
+   * Whether the ambient runtime scope belongs to a different run — or, for
+   * per-agent sub-scopes (`<run>#<agentId>`), to a different concurrently
+   * executing agent of the same run than the one this callback reports via
+   * its inherited `langgraph_node` metadata. Unstamped scopes on unstamped
+   * handlers are never foreign (host-managed handler semantics).
+   */
+  private isForeignScope(
+    scopeStamp: string | undefined,
+    callbackMetadata?: Record<string, unknown>
+  ): boolean {
+    if (this.runId == null || scopeStamp == null) {
+      return false;
+    }
+    const { runPart, agentPart } = splitScopeStamp(scopeStamp);
+    if (runPart !== this.runId) {
+      return true;
+    }
+    if (agentPart == null) {
+      return false;
+    }
+    const callbackAgentId = extractCallbackAgentId(callbackMetadata);
+    return callbackAgentId != null && callbackAgentId !== agentPart;
+  }
+
+  /**
    * LangChain executes non-awaited callbacks on a process-wide background
    * queue (`consumeCallback`), so this callback may be running inside a
    * DIFFERENT concurrent run's async context. The ambient runtime scope is
-   * therefore only adopted when it belongs to this handler's run: scopes are
-   * stamped with a `runId` at their call sites, and a mismatch against this
-   * handler's own run means the scope is a foreign concurrent run's — its
-   * config would route spans to the wrong tenant's processor and its seed
-   * would collapse this run's spans into the foreign trace. Unstamped scopes
-   * on unstamped handlers keep scope-first semantics (agent overlays and
+   * therefore only adopted when it belongs to this handler's run (and, for
+   * agent sub-scopes, to this callback's agent): scopes are stamped at their
+   * call sites, and a foreign stamp means the scope's config would route
+   * spans to the wrong destination, its seed would collapse this run's spans
+   * into the foreign trace, and its tool-output policy could leak output the
+   * foreign run permits but this run redacts — so config, seed, AND redaction
+   * policy all fall back to this handler's own run. Unstamped scopes on
+   * unstamped handlers keep scope-first semantics (agent overlays and
    * per-path seeds like the title/label scopes, host-managed handlers).
    *
    * Detached runs (roots, or starts whose parent this handler never tracked)
@@ -274,11 +341,14 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
    * request context must start its own trace, not join an unexported
    * foreign one.
    */
-  private withRuntimeContext<T>(action: () => T, isDetachedRun = false): T {
+  private withRuntimeContext<T>(
+    action: () => T,
+    isDetachedRun = false,
+    callbackMetadata?: Record<string, unknown>
+  ): T {
     const currentContext = otelContext.active();
-    const scopeRunId = resolveLangfuseScopeRunId(currentContext);
-    const isForeignScope =
-      this.runId != null && scopeRunId != null && scopeRunId !== this.runId;
+    const scopeStamp = resolveLangfuseScopeRunId(currentContext);
+    const isForeignScope = this.isForeignScope(scopeStamp, callbackMetadata);
     const langfuse = isForeignScope
       ? this.langfuse
       : (resolveLangfuseConfigForSpan(currentContext) ?? this.langfuse);
@@ -297,7 +367,10 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
         {
           langfuse,
           traceIdSeed: contextSeed ?? seed,
-          runId: this.runId ?? (isForeignScope ? undefined : scopeRunId),
+          runId: isForeignScope ? this.runId : (scopeStamp ?? this.runId),
+          toolOutputTracing: isForeignScope
+            ? resolveToolOutputTracingConfig(this.langfuse)
+            : undefined,
         },
         action
       );
@@ -314,7 +387,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleChainStart']> {
     return this.withRuntimeContext(
       () => super.handleChainStart(...args),
-      this.startsDetachedRun(args[2], args[3])
+      this.startsDetachedRun(args[2], args[3]),
+      args[5]
     );
   }
 
@@ -353,7 +427,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleGenerationStart']> {
     return this.withRuntimeContext(
       () => super.handleGenerationStart(...args),
-      this.startsDetachedRun(args[2], args[3])
+      this.startsDetachedRun(args[2], args[3]),
+      args[6]
     );
   }
 
@@ -362,7 +437,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleChatModelStart']> {
     return this.withRuntimeContext(
       () => super.handleChatModelStart(...args),
-      this.startsDetachedRun(args[2], args[3])
+      this.startsDetachedRun(args[2], args[3]),
+      args[6]
     );
   }
 
@@ -371,7 +447,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleLLMStart']> {
     return this.withRuntimeContext(
       () => super.handleLLMStart(...args),
-      this.startsDetachedRun(args[2], args[3])
+      this.startsDetachedRun(args[2], args[3]),
+      args[6]
     );
   }
 
@@ -392,7 +469,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleToolStart']> {
     return this.withRuntimeContext(
       () => super.handleToolStart(...args),
-      this.startsDetachedRun(args[2], args[3])
+      this.startsDetachedRun(args[2], args[3]),
+      args[5]
     );
   }
 
@@ -415,7 +493,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleRetrieverStart']> {
     return this.withRuntimeContext(
       () => super.handleRetrieverStart(...args),
-      this.startsDetachedRun(args[2], args[3])
+      this.startsDetachedRun(args[2], args[3]),
+      args[5]
     );
   }
 }

@@ -998,6 +998,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   private originalToolContentCheckpointScope?: string;
   runId: string | undefined;
   /**
+   * Identity used to stamp Langfuse runtime scopes and handlers (see
+   * `LangfuseRuntimeContext.runId`). Falls back to a generated id when no
+   * public `runId` was supplied, so directly-constructed graphs still get
+   * foreign-scope protection when running concurrently. `#` is reserved as
+   * the per-agent sub-scope separator.
+   */
+  protected readonly langfuseScopeRunId: string;
+  /**
    * Boundary between historical messages (loaded from conversation state)
    * and messages produced during the current run.  Set once in the state
    * reducer when messages first arrive.  Used by `getRunMessages()` and
@@ -1081,6 +1089,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
+    this.langfuseScopeRunId = runId ?? `graph-${nanoid()}`;
     this.signal = signal;
     this.langfuse = langfuse;
     this.subagentUsageSink = subagentUsageSink;
@@ -3069,7 +3078,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           tags: ['librechat', 'agent'],
           traceIdSeed:
             langfuse?.deterministicTraceId === true ? this.runId : undefined,
-          runId: this.runId,
+          runId: this.langfuseScopeRunId,
         });
         if (langfuseHandler != null) {
           invokeConfig = {
@@ -3090,7 +3099,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,
             langfuseOverlay: agentContext.langfuse,
-            runId: this.runId,
+            runId: `${this.langfuseScopeRunId}#${agentId}`,
           }),
           () =>
             attemptInvoke(
@@ -3253,7 +3262,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             resolveLangfuseRuntimeScope({
               runLangfuse: this.langfuse,
               langfuseOverlay: agentContext.langfuse,
-              runId: this.runId,
+              runId: `${this.langfuseScopeRunId}#${agentId}`,
             }),
             () =>
               tryFallbackProviders({
