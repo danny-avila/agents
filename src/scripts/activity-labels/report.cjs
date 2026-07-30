@@ -1,8 +1,9 @@
 /** Aggregation + markdown rendering, shared by the live runner and the
  *  offline rescorer so metric fixes never require re-spending on the API.
  *
- *  Ported from LibreChat #14527 with two fixes pending backport: numeric
- *  sample ordering and a keyed record index for the per-case cells. */
+ *  Ported from LibreChat #14527 with three fixes pending backport: numeric
+ *  sample ordering, a keyed record index for the per-case cells, and
+ *  case-folded opener tallies. */
 const FLAG_TYPES = [
   'len',
   'punct',
@@ -46,8 +47,14 @@ function aggregate(records, model) {
     agg.latencies.push(record.latencyMs);
     agg.inputTokens += record.inputTokens;
     agg.outputTokens += record.outputTokens;
-    agg.firstWords[record.firstWord] =
-      (agg.firstWords[record.firstWord] ?? 0) + 1;
+    /** Case-folded: 'Found' and 'found' are one opener — counting them
+     *  separately would make a sentence-case violation read as MORE
+     *  register diversity, the opposite of what the tally detects. */
+    const opener =
+      typeof record.firstWord === 'string'
+        ? record.firstWord.toLowerCase()
+        : record.firstWord;
+    agg.firstWords[opener] = (agg.firstWords[opener] ?? 0) + 1;
     for (const flag of record.flags) {
       const type = flagType(flag);
       agg.flagCounts[type] = (agg.flagCounts[type] ?? 0) + 1;

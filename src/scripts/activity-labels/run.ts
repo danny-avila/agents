@@ -261,6 +261,10 @@ type LabelFailure = { error: string; latencyMs: number };
 
 type LabelResult = LabelSuccess | LabelFailure;
 
+/** An error no retry or later task can recover from — thrown through the
+ *  pool so the run stops instead of recording it per task. */
+class FatalRunError extends Error {}
+
 /**
  * One label request with three attempts. The whole attempt — fetch AND the
  * body reads, which reject on a connection reset after headers arrive —
@@ -322,6 +326,14 @@ async function requestLabel({
         };
       }
       const body = await response.text();
+      if (response.status === 401 || response.status === 403) {
+        /** Every remaining task would send the same doomed request —
+         *  with the default corpus, hundreds of them — and produce an
+         *  all-error report. Kill the run instead. */
+        throw new FatalRunError(
+          `authentication failed (HTTP ${response.status}): ${body.slice(0, 160)}`
+        );
+      }
       lastError = `HTTP ${response.status}: ${body.slice(0, 160)}`;
       if (attempt < 3 && [429, 500, 529].includes(response.status)) {
         const retryAfter = Number(response.headers.get('retry-after'));
@@ -336,6 +348,9 @@ async function requestLabel({
       }
       break;
     } catch (error) {
+      if (error instanceof FatalRunError) {
+        throw error;
+      }
       lastError = `request failed: ${error instanceof Error ? error.message : String(error)}`;
       if (attempt < 3) {
         await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
