@@ -1,7 +1,7 @@
 import { CallbackHandler } from '@langfuse/langchain';
-import { context as otelContext } from '@opentelemetry/api';
 import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
+import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import {
   getLangfuseTracerProvider,
   propagateAttributes,
@@ -17,12 +17,14 @@ import type {
   LLMResult,
 } from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
+import type { Context } from '@opentelemetry/api';
 import type * as t from '@/types';
 import {
   resolveLangfuseConfigForSpan,
   resolveTraceIdSeedForSpan,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
+import { isLangfuseManagedSpan } from '@/langfuseSpanRegistry';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
 
 const TRACE_METADATA_MAX_LENGTH = 200;
@@ -169,9 +171,30 @@ function normalizeBedrockUsageForLangfuse(output: LLMResult): LLMResult {
   return { ...output, generations };
 }
 
+/**
+ * Hosts often execute agent code inside their own OpenTelemetry spans (HTTP
+ * server auto-instrumentation on the global provider). Root observations must
+ * not inherit that ambient identity: the foreign parent is never exported to
+ * Langfuse, which orphans the trace root (root/trace input-output shaping is
+ * skipped because the span no longer looks like a root), collapses concurrent
+ * runs inside one request context — an agent run and the previous turn's
+ * title run — into a single merged trace with racing names and unioned tags,
+ * and bypasses the seeded deterministic trace id generator. Spans created
+ * through the Langfuse tracer provider are kept, so hosts can still group
+ * runs under their own Langfuse observations deliberately.
+ */
+function detachForeignAmbientSpan(activeContext: Context): Context {
+  const activeSpan = otelTrace.getSpan(activeContext);
+  if (activeSpan == null || isLangfuseManagedSpan(activeSpan)) {
+    return activeContext;
+  }
+  return otelTrace.deleteSpan(activeContext);
+}
+
 class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private readonly langfuse?: t.LangfuseConfig;
   private readonly traceIdSeed?: string;
+  private readonly trackedRunIds = new Set<string>();
 
   constructor(params?: AgentLangfuseHandlerParams) {
     const { langfuse, traceIdSeed, ...handlerParams } = params ?? {};
@@ -186,18 +209,50 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
       : undefined;
   }
 
-  private withRuntimeContext<T>(action: () => T): T {
-    const activeContext = otelContext.active();
+  /**
+   * Mirrors the base handler's `runMap`: a start callback whose `parentRunId`
+   * this handler never observed gets no explicit parent span and falls back
+   * to the ambient OTEL context (`startAndRegisterOtelSpan`), so it needs the
+   * same foreign-span detachment as a true root. This happens whenever a
+   * handler is attached mid-graph — e.g. the per-agent handler created for a
+   * detached subagent's model invocations, whose surrounding graph runs were
+   * never traced.
+   */
+  private startsDetachedRun(runId: string, parentRunId?: string): boolean {
+    const detached =
+      parentRunId == null || !this.trackedRunIds.has(parentRunId);
+    this.trackedRunIds.add(runId);
+    return detached;
+  }
+
+  /**
+   * Detached runs (roots, or starts whose parent this handler never tracked)
+   * take their span parent from the ambient OTEL context, so drop any foreign
+   * ambient span first — a run launched from a host's instrumented request
+   * context must start its own trace, not join an unexported foreign one.
+   * Trace identity otherwise stays scope-first: an active runtime scope
+   * (agent overlay, or a per-path seed like the title/label scopes) wins over
+   * this handler's own configuration.
+   */
+  private withRuntimeContext<T>(action: () => T, isDetachedRun = false): T {
+    const currentContext = otelContext.active();
+    const activeContext = isDetachedRun
+      ? detachForeignAmbientSpan(currentContext)
+      : currentContext;
     const langfuse =
       resolveLangfuseConfigForSpan(activeContext) ?? this.langfuse;
     const seed = this.getDeterministicTraceSeed();
-    return withLangfuseRuntimeScope(
-      {
-        langfuse,
-        traceIdSeed: resolveTraceIdSeedForSpan(activeContext) ?? seed,
-      },
-      action
-    );
+    const scoped = (): T =>
+      withLangfuseRuntimeScope(
+        {
+          langfuse,
+          traceIdSeed: resolveTraceIdSeedForSpan(activeContext) ?? seed,
+        },
+        action
+      );
+    return activeContext === currentContext
+      ? scoped()
+      : otelContext.with(activeContext, scoped);
   }
 
   // LangChain may invoke callback handlers outside the caller's OTEL context.
@@ -206,7 +261,10 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleChainStart(
     ...args: Parameters<CallbackHandler['handleChainStart']>
   ): ReturnType<CallbackHandler['handleChainStart']> {
-    return this.withRuntimeContext(() => super.handleChainStart(...args));
+    return this.withRuntimeContext(
+      () => super.handleChainStart(...args),
+      this.startsDetachedRun(args[2], args[3])
+    );
   }
 
   override handleChainError(
@@ -233,25 +291,37 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleAgentAction(
     ...args: Parameters<CallbackHandler['handleAgentAction']>
   ): ReturnType<CallbackHandler['handleAgentAction']> {
-    return this.withRuntimeContext(() => super.handleAgentAction(...args));
+    return this.withRuntimeContext(
+      () => super.handleAgentAction(...args),
+      this.startsDetachedRun(args[1], args[2])
+    );
   }
 
   override handleGenerationStart(
     ...args: Parameters<CallbackHandler['handleGenerationStart']>
   ): ReturnType<CallbackHandler['handleGenerationStart']> {
-    return this.withRuntimeContext(() => super.handleGenerationStart(...args));
+    return this.withRuntimeContext(
+      () => super.handleGenerationStart(...args),
+      this.startsDetachedRun(args[2], args[3])
+    );
   }
 
   override handleChatModelStart(
     ...args: Parameters<CallbackHandler['handleChatModelStart']>
   ): ReturnType<CallbackHandler['handleChatModelStart']> {
-    return this.withRuntimeContext(() => super.handleChatModelStart(...args));
+    return this.withRuntimeContext(
+      () => super.handleChatModelStart(...args),
+      this.startsDetachedRun(args[2], args[3])
+    );
   }
 
   override handleLLMStart(
     ...args: Parameters<CallbackHandler['handleLLMStart']>
   ): ReturnType<CallbackHandler['handleLLMStart']> {
-    return this.withRuntimeContext(() => super.handleLLMStart(...args));
+    return this.withRuntimeContext(
+      () => super.handleLLMStart(...args),
+      this.startsDetachedRun(args[2], args[3])
+    );
   }
 
   override handleLLMEnd(
@@ -269,7 +339,10 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleToolStart(
     ...args: Parameters<CallbackHandler['handleToolStart']>
   ): ReturnType<CallbackHandler['handleToolStart']> {
-    return this.withRuntimeContext(() => super.handleToolStart(...args));
+    return this.withRuntimeContext(
+      () => super.handleToolStart(...args),
+      this.startsDetachedRun(args[2], args[3])
+    );
   }
 
   override handleToolError(
@@ -289,7 +362,10 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleRetrieverStart(
     ...args: Parameters<CallbackHandler['handleRetrieverStart']>
   ): ReturnType<CallbackHandler['handleRetrieverStart']> {
-    return this.withRuntimeContext(() => super.handleRetrieverStart(...args));
+    return this.withRuntimeContext(
+      () => super.handleRetrieverStart(...args),
+      this.startsDetachedRun(args[2], args[3])
+    );
   }
 }
 

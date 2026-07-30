@@ -10,8 +10,11 @@ const TOOL_DISPATCH_SPAN_NAME = 'tool-dispatch';
 const GENERATION_SPAN_NAME = 'llm';
 const ROOT_OBSERVATION_TYPE = 'agent';
 const CHAIN_OBSERVATION_TYPE = 'chain';
+const TOOL_OBSERVATION_TYPE = 'tool';
 const AGENT_TRACE_TAG = 'agent';
 const TITLE_TRACE_TAG = 'title';
+const EPHEMERAL_AGENT_SENDER_SEPARATOR = '___';
+const EPHEMERAL_AGENT_INDEX_SEPARATOR = '____';
 
 type MutableSpan = ReadableSpan & {
   name: string;
@@ -284,6 +287,51 @@ function isGenerationSpan(span: MutableSpan): boolean {
   return typeof type === 'string' && type.toLowerCase() === 'generation';
 }
 
+function isToolSpan(span: MutableSpan): boolean {
+  const type = span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE];
+  return (
+    typeof type === 'string' && type.toLowerCase() === TOOL_OBSERVATION_TYPE
+  );
+}
+
+/**
+ * LibreChat ephemeral agents are identified as
+ * `endpoint__model___sender[____index]` (`__` encodes `:`; see LibreChat's
+ * `encodeEphemeralAgentId`), and the outer workflow node carries that id as
+ * its span name — so switching models renames the span (item 1). Returns the
+ * stable human `sender` segment when the name matches that encoding.
+ */
+function extractEphemeralAgentSender(name: string): string | undefined {
+  let workingId = name;
+  const indexSeparator = workingId.lastIndexOf(EPHEMERAL_AGENT_INDEX_SEPARATOR);
+  if (
+    indexSeparator !== -1 &&
+    /^\d+$/.test(
+      workingId.slice(indexSeparator + EPHEMERAL_AGENT_INDEX_SEPARATOR.length)
+    )
+  ) {
+    workingId = workingId.slice(0, indexSeparator);
+  }
+  const senderSeparator = workingId.indexOf(EPHEMERAL_AGENT_SENDER_SEPARATOR);
+  if (senderSeparator <= 0) {
+    return undefined;
+  }
+  const sender = workingId
+    .slice(senderSeparator + EPHEMERAL_AGENT_SENDER_SEPARATOR.length)
+    .replace(/__/g, ':');
+  return sender === '' ? undefined : sender;
+}
+
+function shapeEphemeralAgentNodeSpan(span: MutableSpan): void {
+  if (isToolSpan(span)) {
+    return;
+  }
+  const sender = extractEphemeralAgentSender(span.name);
+  if (sender != null) {
+    span.name = sender;
+  }
+}
+
 function hasTraceTag(span: MutableSpan, expectedTag: string): boolean {
   const tags = parseAttributeValue(
     span.attributes[LangfuseOtelSpanAttributes.TRACE_TAGS]
@@ -313,7 +361,8 @@ function shapeRootObservationType(span: MutableSpan): void {
  * Reshapes spans per Langfuse-team feedback before export:
  * - `agent=<id>` / `tools=<id>` node names carry the ephemeral agent id
  *   (`provider__model`) — strip it so switching models doesn't break
- *   name-based logic (item 1).
+ *   name-based logic (item 1). The outer workflow node is named with the
+ *   bare agent id; ephemeral ids reduce to their stable sender name.
  * - LLM generation spans keep the provider client class name (`ChatOpenAI`,
  *   `AzureChatOpenAI`, …); rename them to a provider-agnostic `llm` so the
  *   name reflects the operation, not the model (the model stays on the
@@ -333,6 +382,8 @@ export function shapeLangfuseSpan(span: ReadableSpan): void {
     shapeToolNodeSpan(mutable);
   } else if (isGenerationSpan(mutable)) {
     mutable.name = GENERATION_SPAN_NAME;
+  } else {
+    shapeEphemeralAgentNodeSpan(mutable);
   }
   if (!isRootSpan(span)) {
     return;

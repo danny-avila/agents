@@ -40,6 +40,12 @@ import {
   buildActivityLabelPrompt,
 } from '@/prompts/activityLabel';
 import {
+  Callback,
+  GraphEvents,
+  TitleMethod,
+  DEFAULT_RECURSION_LIMIT,
+} from '@/common';
+import {
   appendCallbacks,
   findCallback,
   type CallbackEntry,
@@ -49,16 +55,10 @@ import {
   createTitleRunnable,
 } from '@/utils/title';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
-import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeLangfuseTracing } from './instrumentation';
-import {
-  Callback,
-  GraphEvents,
-  TitleMethod,
-  DEFAULT_RECURSION_LIMIT,
-} from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
+import { resolveMaxSeals } from '@/llm/preempt';
 import { StandardGraph } from '@/graphs/Graph';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -1438,13 +1438,16 @@ export class Run<_T extends t.BaseGraphState> {
     titlePromptTemplate,
   }: t.RunTitleOptions): Promise<{ language?: string; title?: string }> {
     let titleLangfuseHandler: CallbackEntry | undefined;
-    let titleLangfuseConfig: t.LangfuseConfig | undefined;
     let titleUserId: string | undefined;
     let titleSessionId: string | undefined;
     const titleContext =
       this.Graph == null
         ? undefined
         : this.Graph.agentContexts.get(this.Graph.defaultAgentId);
+    const titleLangfuseConfig = resolveLangfuseConfig(
+      this.langfuse,
+      titleContext?.langfuse
+    );
     const traceMetadata = createLangfuseTraceMetadata({
       messageId: 'title-' + this.id,
       agentName: titleContext?.name,
@@ -1460,10 +1463,6 @@ export class Run<_T extends t.BaseGraphState> {
         typeof chainOptions.configurable?.thread_id === 'string'
           ? chainOptions.configurable.thread_id
           : undefined;
-      titleLangfuseConfig = resolveLangfuseConfig(
-        this.langfuse,
-        titleContext?.langfuse
-      );
       initializeLangfuseTracing(titleLangfuseConfig);
       titleLangfuseHandler = createLangfuseHandler({
         langfuse: titleLangfuseConfig,
@@ -1565,14 +1564,26 @@ export class Run<_T extends t.BaseGraphState> {
           )
       );
 
+    /** Seed policy mirrors `generateActivityLabel`:
+     *  `runWithLangfuseRuntimeContext` SPREADS the surrounding context, so an
+     *  absent seed INHERITS an active parent run's and collapses the title
+     *  into that run's trace. Seeded when determinism is opted into OR a
+     *  parent seed is live; otherwise unseeded, matching the other paths. */
+    const inheritedTraceSeed = getTraceIdSeed();
+    const titleRuntimeScope = resolveLangfuseRuntimeScope({
+      runLangfuse: this.langfuse,
+      langfuseOverlay: titleContext?.langfuse,
+      traceIdSeed:
+        titleLangfuseConfig?.deterministicTraceId === true ||
+        inheritedTraceSeed != null
+          ? 'title-' + this.id
+          : undefined,
+    });
+
     try {
       try {
-        return await withLangfuseRuntimeScope(
-          resolveLangfuseRuntimeScope({
-            runLangfuse: this.langfuse,
-            langfuseOverlay: titleContext?.langfuse,
-          }),
-          () => invokeTitleChain(invokeConfig)
+        return await withLangfuseRuntimeScope(titleRuntimeScope, () =>
+          invokeTitleChain(invokeConfig)
         );
       } catch (_e) {
         // Fallback: strip callbacks to avoid EventStream tracer errors in certain environments
@@ -1585,12 +1596,8 @@ export class Run<_T extends t.BaseGraphState> {
         const safeConfig = Object.assign({}, rest, {
           callbacks: langfuseHandler ? [langfuseHandler] : [],
         });
-        return await withLangfuseRuntimeScope(
-          resolveLangfuseRuntimeScope({
-            runLangfuse: this.langfuse,
-            langfuseOverlay: titleContext?.langfuse,
-          }),
-          () => invokeTitleChain(safeConfig as Partial<RunnableConfig>)
+        return await withLangfuseRuntimeScope(titleRuntimeScope, () =>
+          invokeTitleChain(safeConfig as Partial<RunnableConfig>)
         );
       }
     } finally {

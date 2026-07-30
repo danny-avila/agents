@@ -23,6 +23,7 @@ import {
   resolveTraceIdSeedForSpan,
 } from '@/langfuseRuntimeScope';
 import { createLangfuseSpanProcessor } from '@/langfuseToolOutputTracing';
+import { registerLangfuseManagedSpan } from '@/langfuseSpanRegistry';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
 import { isPresent } from '@/utils/misc';
 
@@ -178,6 +179,8 @@ class RoutingLangfuseSpanProcessor implements SpanProcessor {
     if (processor == null) {
       return;
     }
+
+    registerLangfuseManagedSpan(span);
 
     const librechatTraceAttributes = createLibreChatTraceAttributes(
       langfuse?.librechatTraceAttributes ?? {}

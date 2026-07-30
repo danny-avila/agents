@@ -142,6 +142,48 @@ describe('shapeLangfuseSpan', () => {
     expect(span.attributes[INPUT]).toBe(original);
   });
 
+  it('reduces ephemeral agent ids on workflow node spans to the sender name', () => {
+    const span = createSpan(
+      'bedrock__claude-sonnet-5___ClickHouse Agent',
+      {},
+      'parent-1'
+    );
+    shapeLangfuseSpan(span);
+    expect(span.name).toBe('ClickHouse Agent');
+  });
+
+  it('strips parallel-instance index suffixes from ephemeral agent ids', () => {
+    const span = createSpan('openAI__gpt-4o___GPT-4o____1', {}, 'parent-1');
+    shapeLangfuseSpan(span);
+    expect(span.name).toBe('GPT-4o');
+  });
+
+  it('restores encoded colons in ephemeral agent sender names', () => {
+    const span = createSpan('openAI__gpt-4o___alias__variant', {}, 'parent-1');
+    shapeLangfuseSpan(span);
+    expect(span.name).toBe('alias:variant');
+  });
+
+  it('keeps persisted agent ids and senderless ephemeral ids unchanged', () => {
+    const persisted = createSpan('agent_okvkCroi6wXM4-7BY4ud1', {}, 'parent-1');
+    shapeLangfuseSpan(persisted);
+    expect(persisted.name).toBe('agent_okvkCroi6wXM4-7BY4ud1');
+
+    const senderless = createSpan('openAI__gpt-4o', {}, 'parent-1');
+    shapeLangfuseSpan(senderless);
+    expect(senderless.name).toBe('openAI__gpt-4o');
+  });
+
+  it('does not rename tool observations whose names embed triple underscores', () => {
+    const span = createSpan(
+      'server__toolkit___lookup',
+      { [OBSERVATION_TYPE]: 'tool' },
+      'parent-1'
+    );
+    shapeLangfuseSpan(span);
+    expect(span.name).toBe('server__toolkit___lookup');
+  });
+
   it('sets root span and trace input/output to the question and answer', () => {
     const span = createSpan('LibreChat Agent', {
       [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
