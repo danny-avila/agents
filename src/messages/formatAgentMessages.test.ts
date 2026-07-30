@@ -4783,6 +4783,77 @@ describe('formatAgentMessages', () => {
   });
 
   describe('summary boundary token count adjustment', () => {
+    /** Atomic media costs a fixed provider price the character heuristic cannot
+     *  see, so scaling by the measurable siblings alone erases it. Both shapes
+     *  collapsed a four-figure count to 1 before this guard. */
+    it.each([
+      [
+        'text before the summary',
+        { type: ContentTypes.TEXT, text: 'hello there' },
+      ],
+      [
+        'a tool call before the summary',
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'tc1',
+            name: 'search',
+            args: '{"q":"x"}',
+            output: 'result text',
+          },
+        },
+      ],
+    ])(
+      'skips the positional discount when retained media is unmeasurable, with %s',
+      (_label, leading) => {
+        const payload: TPayload = [
+          {
+            role: 'assistant',
+            content: [
+              leading as MessageContentComplex,
+              {
+                type: ContentTypes.SUMMARY,
+                text: 'S'.repeat(400),
+                tokenCount: 100,
+              },
+              {
+                type: 'image_url',
+                image_url: { url: 'data:image/png;base64,x' },
+              },
+            ],
+          },
+        ];
+
+        const result = formatAgentMessages(payload, { 0: 1200 });
+
+        expect(result.indexTokenCountMap?.[0]).toBe(1200);
+        expect(result.boundaryTokenAdjustment).toBeUndefined();
+      }
+    );
+
+    it('still proportions when every retained part is measurable', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'a'.repeat(400) },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'S'.repeat(100),
+              tokenCount: 20,
+            },
+            { type: ContentTypes.TEXT, text: 'b'.repeat(100) },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 600 });
+
+      expect(result.boundaryTokenAdjustment?.original).toBe(600);
+      expect(result.indexTokenCountMap?.[0]).toBeLessThan(600);
+      expect(result.indexTokenCountMap?.[0]).toBeGreaterThan(0);
+    });
+
     it('should proportion token count when thinking block is sliced off by boundary', () => {
       const thinkingText = 'x'.repeat(1000);
       const payload: TPayload = [

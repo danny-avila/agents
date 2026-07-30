@@ -1351,6 +1351,28 @@ function applySummaryBoundary(
   };
 }
 
+/**
+ * Whether `formatAssistantMessage` filters this part out of the emitted message.
+ * Such a part contributes no prompt tokens, so measuring it as zero characters
+ * is accurate — it must not be mistaken for content the heuristic cannot see.
+ */
+function isDroppedByFormatting(
+  part: MessageContentComplex | undefined
+): boolean {
+  if (part == null) {
+    return true;
+  }
+  if (
+    part.type === ContentTypes.SUMMARY ||
+    part.type === ContentTypes.ERROR ||
+    part.type === ContentTypes.AGENT_UPDATE ||
+    part.type === ContentTypes.ACTIVITY_LABEL
+  ) {
+    return true;
+  }
+  return part.type === ContentTypes.TEXT && getTextContent(part).trim() === '';
+}
+
 function measureValueChars(value: unknown): number {
   if (typeof value === 'string') {
     return value.length;
@@ -1830,14 +1852,26 @@ export const formatAgentMessages = (
         if (contentIndex >= 0 && contentIndex < content.length - 1) {
           let totalCharLen = 0;
           let remainingCharLen = 0;
+          /** Every *retained* part must be represented before scaling. A part the
+           *  heuristic cannot see — atomic media above all — still costs its
+           *  fixed provider price, so a ratio that counts only the measurable
+           *  siblings scales that cost away: an entry keeping just an image after
+           *  the summary collapses to 1. Keeping the original over-counts, which
+           *  prunes early rather than exceeding the window. */
+          let everyRetainedPartMeasurable = true;
           for (let p = 0; p < content.length; p++) {
-            const charLen = contentPartCharLength(content[p]);
+            const part = content[p];
+            const charLen = contentPartCharLength(part);
             totalCharLen += charLen;
             if (p > contentIndex) {
+              if (charLen === 0 && !isDroppedByFormatting(part)) {
+                everyRetainedPartMeasurable = false;
+                break;
+              }
               remainingCharLen += charLen;
             }
           }
-          if (totalCharLen > 0) {
+          if (totalCharLen > 0 && everyRetainedPartMeasurable) {
             const original = tokenCount;
             tokenCount = Math.max(
               1,
