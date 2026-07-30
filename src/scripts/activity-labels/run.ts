@@ -1,12 +1,13 @@
 /* eslint-disable no-console */
 /**
  * SDK-side activity-label eval runner, ported from LibreChat #14527
- * (scripts/activity-labels/). Same corpus, checks, and report — those three
- * modules are byte-identical to the LibreChat originals so results compare
- * across repos — but the user prompt is rendered by the REAL
- * `buildActivityLabelPrompt` from `src/prompts/activityLabel.ts` instead of
- * a hand-port. That is the point of the SDK version: a change to the
- * builder (sections, truncation, framing) is measured as it will ship.
+ * (scripts/activity-labels/). corpus and report are byte-identical to the
+ * LibreChat originals so results compare across repos; checks carries one
+ * tool-echo normalization fix pending backport (see checks.cjs header).
+ * The user prompt is rendered by the REAL `buildActivityLabelPrompt` from
+ * `src/prompts/activityLabel.ts` instead of a hand-port. That is the point
+ * of the SDK version: a change to the builder (sections, truncation,
+ * framing) is measured as it will ship.
  *
  * Replays each case against the production wire shape (system = variant
  * instruction, user = built prompt, max_tokens 256). Multi-step cases run
@@ -27,16 +28,49 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
+import type { ActivityLabelToolEntry } from '@/types/activityLabel';
+import type { Variant } from './variants';
 import { buildActivityLabelPrompt } from '@/prompts/activityLabel';
 import { variants } from './variants';
-import type { Variant } from './variants';
-import type { ActivityLabelToolEntry } from '@/types/activityLabel';
+
+/** The subset of an entry the echo checker reads; verbatim captured steps
+ *  only recover tool names, not full entries. */
+type EchoEntry = Pick<ActivityLabelToolEntry, 'toolName'>;
+
+type LabelCheck = {
+  flags: string[];
+  wordCount: number;
+  firstWord?: string;
+  maxOverlap?: number;
+};
+
+/** Aggregate rows are produced and consumed by the ported CJS modules;
+ *  run.ts only pipes them from aggregate() into markdownReport(). */
+type AggregateRow = Readonly<Record<string, string | number>>;
 
 const require = createRequire(import.meta.url);
 const HARNESS_DIR = path.dirname(fileURLToPath(import.meta.url));
-const { cases, stepEntries } = require('./corpus.cjs');
-const { checkLabel } = require('./checks.cjs');
-const { aggregate, markdownReport } = require('./report.cjs');
+const { cases, stepEntries } = require('./corpus.cjs') as {
+  cases: CorpusCase[];
+  stepEntries: (step: CorpusStep) => EchoEntry[];
+};
+const { checkLabel } = require('./checks.cjs') as {
+  checkLabel: (
+    label: string,
+    context: { entries: EchoEntry[]; previousLabels: string[] }
+  ) => LabelCheck;
+};
+const { aggregate, markdownReport } = require('./report.cjs') as {
+  aggregate: (records: RunRecord[], model: string) => AggregateRow[];
+  markdownReport: (input: {
+    records: RunRecord[];
+    aggregates: AggregateRow[];
+    runCases: CorpusCase[];
+    variantNames: string[];
+    model: string;
+    samples: number;
+  }) => string;
+};
 
 const ROOT = path.resolve(HARNESS_DIR, '..', '..', '..');
 const RESULTS_DIR = path.join(HARNESS_DIR, 'results');
@@ -88,6 +122,16 @@ function parseArgs(argv: string[]): RunArgs {
       args.concurrency = Number(argv[++i]);
     }
   }
+  if (!Number.isInteger(args.samples) || args.samples < 1) {
+    throw new Error(
+      `--samples must be a positive integer, got ${args.samples}`
+    );
+  }
+  if (!Number.isInteger(args.concurrency) || args.concurrency < 1) {
+    throw new Error(
+      `--concurrency must be a positive integer, got ${args.concurrency}`
+    );
+  }
   return args;
 }
 
@@ -118,22 +162,28 @@ const BUILDER_TERMINAL = '\n\nLabel:';
 
 /**
  * Renders the continuity section through the REAL builder (empty batch +
- * previousLabels yields `<section>\n\nLabel:`) so verbatim captured steps
- * get exactly the sanitation and 3-label cap production applies — not a
- * reimplementation of it.
+ * previousLabels yields `<section>\n\n<terminal>`) so verbatim captured
+ * steps get exactly the sanitation and 3-label cap production applies —
+ * not a reimplementation of it. The terminal is derived from an empty
+ * render rather than assumed, so this keeps working if the builder ever
+ * renames `Label:` — the exact change the framing variants evaluate.
  */
 function continuitySection(previousLabels: string[]): string | null {
   if (previousLabels.length === 0) {
     return null;
   }
+  const terminal = buildActivityLabelPrompt({
+    entries: [],
+    charLimit: CHAR_LIMIT,
+  });
   const rendered = buildActivityLabelPrompt({
     entries: [],
     charLimit: CHAR_LIMIT,
     previousLabels,
   });
-  return rendered === 'Label:'
+  return rendered === terminal
     ? null
-    : rendered.slice(0, -BUILDER_TERMINAL.length);
+    : rendered.slice(0, -(terminal.length + '\n\n'.length));
 }
 
 /**
@@ -190,14 +240,24 @@ function renderStepPrompt(
   return applyFraming(prompt, variant);
 }
 
-type LabelResult = {
-  label?: string;
-  error?: string;
+type LabelSuccess = {
+  label: string;
   latencyMs: number;
-  inputTokens?: number;
-  outputTokens?: number;
+  inputTokens: number;
+  outputTokens: number;
 };
 
+type LabelFailure = { error: string; latencyMs: number };
+
+type LabelResult = LabelSuccess | LabelFailure;
+
+/**
+ * One label request with three attempts. Transport rejections (DNS,
+ * connection reset) are retried like 429/500/529 responses instead of
+ * escaping to the top level, where a single flake would discard every
+ * completed record of an otherwise finished run. `latencyMs` spans the
+ * whole sequence including backoff — the cost a variant actually paid.
+ */
 async function requestLabel({
   apiKey,
   model,
@@ -209,42 +269,57 @@ async function requestLabel({
   instruction: string;
   prompt: string;
 }): Promise<LabelResult> {
-  let latencyMs = 0;
+  const started = Date.now();
+  let lastError = 'exhausted retries';
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const started = Date.now();
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: MAX_TOKENS,
-        system: instruction,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-    latencyMs = Date.now() - started;
+    let response: Response;
+    try {
+      response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: MAX_TOKENS,
+          system: instruction,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      });
+    } catch (error) {
+      lastError = `fetch failed: ${error instanceof Error ? error.message : String(error)}`;
+      if (attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+        continue;
+      }
+      break;
+    }
     if (response.ok) {
       const json = (await response.json()) as {
         content?: Array<{ text?: string }>;
         usage?: { input_tokens?: number; output_tokens?: number };
       };
+      /** Same normalization as the production extractor (src/run.ts): a
+       *  label renders as a single row and re-enters later prompts as
+       *  continuity context, so newlines must not survive here either —
+       *  and a raw newline would break the per-case Markdown tables. */
       const label = (json.content ?? [])
         .map((block) => block.text ?? '')
         .join('')
+        .replace(/\s+/g, ' ')
         .trim()
         .replace(/^["']|["']$/g, '');
       return {
         label,
-        latencyMs,
+        latencyMs: Date.now() - started,
         inputTokens: json.usage?.input_tokens ?? 0,
         outputTokens: json.usage?.output_tokens ?? 0,
       };
     }
     const body = await response.text();
+    lastError = `HTTP ${response.status}: ${body.slice(0, 160)}`;
     if (attempt < 3 && [429, 500, 529].includes(response.status)) {
       const retryAfter = Number(response.headers.get('retry-after'));
       const waitMs =
@@ -256,15 +331,34 @@ async function requestLabel({
       );
       continue;
     }
-    return {
-      error: `HTTP ${response.status}: ${body.slice(0, 160)}`,
-      latencyMs,
-    };
+    break;
   }
-  return { error: 'exhausted retries', latencyMs };
+  return { error: lastError, latencyMs: Date.now() - started };
 }
 
-type RunRecord = Record<string, unknown>;
+type RecordBase = {
+  variant: string;
+  sample: number;
+  caseId: string;
+  stepId: string;
+};
+
+type DryRunRecord = RecordBase & { prompt: string };
+
+type ErrorRecord = RecordBase & { error: string };
+
+type LabelRecord = RecordBase & {
+  label: string;
+  production?: string;
+  flags: string[];
+  wordCount: number;
+  firstWord?: string;
+  latencyMs: number;
+  inputTokens: number;
+  outputTokens: number;
+};
+
+type RunRecord = DryRunRecord | ErrorRecord | LabelRecord;
 
 /** One case chain: steps serial, labels feeding forward. */
 async function runCase({
@@ -308,7 +402,7 @@ async function runCase({
       instruction: variant.instruction,
       prompt,
     });
-    if (result.error) {
+    if ('error' in result) {
       records.push({
         variant: variant.name,
         sample,
@@ -322,7 +416,7 @@ async function runCase({
       entries: stepEntries(step),
       previousLabels: chain,
     });
-    chain.push(result.label as string);
+    chain.push(result.label);
     records.push({
       variant: variant.name,
       sample,
@@ -396,7 +490,7 @@ async function pool(
   console.log(`done in ${((Date.now() - started) / 1000).toFixed(1)}s\n`);
 
   if (args.dry) {
-    for (const record of records.slice(0, 3)) {
+    for (const record of records.slice(0, 3) as DryRunRecord[]) {
       console.log(
         `--- ${record.variant} / ${record.caseId} / ${record.stepId} ---`
       );

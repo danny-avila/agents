@@ -3,6 +3,10 @@
  * measurable prose failures (register collapse via first-word tallies,
  * cross-batch redundancy via content-word overlap); commit-log READABILITY
  * still needs the human pass over results/latest.md.
+ *
+ * Ported from LibreChat #14527 with ONE divergence: tool-echo matching
+ * normalizes namespaced MCP names (see the candidate-set comment below).
+ * Backport candidate for LibreChat's scripts/activity-labels/checks.js.
  */
 const STOPWORDS = new Set([
   'the',
@@ -126,10 +130,31 @@ function checkLabel(label, { entries = [], previousLabels = [] } = {}) {
   const lower = label.toLowerCase();
   for (const entry of entries) {
     const name = String(entry.toolName ?? '').toLowerCase();
-    if (
-      name.length > 3 &&
-      (lower.includes(name) || lower.includes(name.replace(/_/g, ' ')))
-    ) {
+    if (name.length <= 3) {
+      continue;
+    }
+    /** Namespaced MCP names (`mcp__github__search_repositories`) would
+     *  otherwise normalize their double underscores to double spaces and
+     *  never match a natural echo; collapse separator runs and also try
+     *  the post-namespace tail ("search repositories"). Only multi-char
+     *  candidates derived from the full name — never single middle
+     *  segments like "github", which are legitimate label subjects. */
+    const segments = name.split('__');
+    const tail = segments[segments.length - 1];
+    const candidates = new Set([
+      name,
+      name.replace(/_+/g, ' '),
+      tail,
+      tail.replace(/_/g, ' '),
+    ]);
+    let echoed = false;
+    for (const candidate of candidates) {
+      if (candidate.length > 3 && lower.includes(candidate)) {
+        echoed = true;
+        break;
+      }
+    }
+    if (echoed) {
       flags.push(`tool-echo:${entry.toolName}`);
       break;
     }
