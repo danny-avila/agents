@@ -351,6 +351,15 @@ async function requestLabel({
           .replace(/\s+/g, ' ')
           .trim()
           .replace(/^["']|["']$/g, '');
+        if (label.length === 0) {
+          /** Production's extractLabel returns {} for an empty normalized
+           *  label and commits no header — grading it as a len:0 step
+           *  would count an outcome users never see. */
+          return {
+            error: 'empty label — production would commit no header',
+            latencyMs: Date.now() - started,
+          };
+        }
         return {
           label,
           latencyMs: Date.now() - started,
@@ -456,6 +465,11 @@ async function runCase({
         stepId,
         prompt,
       });
+      /** Seed the chain so later dry prompts render the Previous-headers
+       *  section a live continuity run would — the captured production
+       *  label when the step has one, a marked placeholder otherwise.
+       *  Rendering inspection only; nothing is graded in dry mode. */
+      chain.push(step.productionLabel ?? `[dry placeholder] ${stepId}`);
       continue;
     }
     const result = await requestLabel({

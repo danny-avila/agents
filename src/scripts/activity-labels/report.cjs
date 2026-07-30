@@ -30,7 +30,10 @@ function aggregate(records, model) {
         steps: 0,
         errors: 0,
         flagCounts: {},
-        firstWords: {},
+        /** Null prototype: labels are model prose, and an opener like
+         *  'Constructor' would otherwise hit Object.prototype.constructor
+         *  and render a garbage tally ('__proto__' would vanish). */
+        firstWords: Object.create(null),
         totalWords: 0,
         latencies: [],
         inputTokens: 0,
