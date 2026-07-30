@@ -28,6 +28,13 @@ const TRACE_INPUT = LangfuseOtelSpanAttributes.TRACE_INPUT;
 const TRACE_OUTPUT = LangfuseOtelSpanAttributes.TRACE_OUTPUT;
 const OBSERVATION_TYPE = LangfuseOtelSpanAttributes.OBSERVATION_TYPE;
 const TRACE_TAGS = LangfuseOtelSpanAttributes.TRACE_TAGS;
+const METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
+
+/** The outer workflow node: a non-root LangGraph node span whose
+ *  `langgraph_node` metadata equals its name. */
+function createWorkflowNodeSpan(name: string): TestSpan {
+  return createSpan(name, { [METADATA_LANGGRAPH_NODE]: name }, 'parent-1');
+}
 
 describe('shouldDropLangfuseSpan', () => {
   it('drops langgraph __start__ seed spans', () => {
@@ -142,34 +149,33 @@ describe('shapeLangfuseSpan', () => {
     expect(span.attributes[INPUT]).toBe(original);
   });
 
-  it('reduces ephemeral agent ids on workflow node spans to the sender name', () => {
-    const span = createSpan(
-      'bedrock__claude-sonnet-5___ClickHouse Agent',
-      {},
-      'parent-1'
+  it('reduces ephemeral workflow-agent node ids to agent observations named by sender', () => {
+    const span = createWorkflowNodeSpan(
+      'bedrock__claude-sonnet-5___ClickHouse Agent'
     );
     shapeLangfuseSpan(span);
     expect(span.name).toBe('ClickHouse Agent');
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('agent');
   });
 
   it('strips parallel-instance index suffixes from ephemeral agent ids', () => {
-    const span = createSpan('openAI__gpt-4o___GPT-4o____1', {}, 'parent-1');
+    const span = createWorkflowNodeSpan('openAI__gpt-4o___GPT-4o____1');
     shapeLangfuseSpan(span);
     expect(span.name).toBe('GPT-4o');
   });
 
   it('restores encoded colons in ephemeral agent sender names', () => {
-    const span = createSpan('openAI__gpt-4o___alias__variant', {}, 'parent-1');
+    const span = createWorkflowNodeSpan('openAI__gpt-4o___alias__variant');
     shapeLangfuseSpan(span);
     expect(span.name).toBe('alias:variant');
   });
 
   it('keeps persisted agent ids and senderless ephemeral ids unchanged', () => {
-    const persisted = createSpan('agent_okvkCroi6wXM4-7BY4ud1', {}, 'parent-1');
+    const persisted = createWorkflowNodeSpan('agent_okvkCroi6wXM4-7BY4ud1');
     shapeLangfuseSpan(persisted);
     expect(persisted.name).toBe('agent_okvkCroi6wXM4-7BY4ud1');
 
-    const senderless = createSpan('openAI__gpt-4o', {}, 'parent-1');
+    const senderless = createWorkflowNodeSpan('openAI__gpt-4o');
     shapeLangfuseSpan(senderless);
     expect(senderless.name).toBe('openAI__gpt-4o');
   });
@@ -184,19 +190,29 @@ describe('shapeLangfuseSpan', () => {
     expect(span.name).toBe('server__toolkit___lookup');
   });
 
-  it('keeps display names that merely embed triple underscores', () => {
+  it('only renames spans carrying matching langgraph node metadata', () => {
     const runName = createSpan('LibreChat Agent: Ops___EU', {}, 'parent-1');
     shapeLangfuseSpan(runName);
     expect(runName.name).toBe('LibreChat Agent: Ops___EU');
 
-    const noEncodedPrefix = createSpan('Ops___EU', {}, 'parent-1');
-    shapeLangfuseSpan(noEncodedPrefix);
-    expect(noEncodedPrefix.name).toBe('Ops___EU');
+    const ordinaryChain = createSpan('pipeline__stage___EU', {}, 'parent-1');
+    shapeLangfuseSpan(ordinaryChain);
+    expect(ordinaryChain.name).toBe('pipeline__stage___EU');
+    expect(ordinaryChain.attributes[OBSERVATION_TYPE]).toBeUndefined();
+
+    const mismatchedNode = createSpan(
+      'pipeline__stage___EU',
+      { [METADATA_LANGGRAPH_NODE]: 'some-other-node' },
+      'parent-1'
+    );
+    shapeLangfuseSpan(mismatchedNode);
+    expect(mismatchedNode.name).toBe('pipeline__stage___EU');
   });
 
   it('never renames root observations, even with an encoded-id shape', () => {
     const span = createSpan('bedrock__claude-sonnet-5___ClickHouse Agent', {
       [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+      [METADATA_LANGGRAPH_NODE]: 'bedrock__claude-sonnet-5___ClickHouse Agent',
     });
     shapeLangfuseSpan(span);
     expect(span.name).toBe('bedrock__claude-sonnet-5___ClickHouse Agent');

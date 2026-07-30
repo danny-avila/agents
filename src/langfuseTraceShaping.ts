@@ -15,6 +15,7 @@ const AGENT_TRACE_TAG = 'agent';
 const TITLE_TRACE_TAG = 'title';
 const EPHEMERAL_AGENT_SENDER_SEPARATOR = '___';
 const EPHEMERAL_AGENT_INDEX_SEPARATOR = '____';
+const OBSERVATION_METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
 
 type MutableSpan = ReadableSpan & {
   name: string;
@@ -295,6 +296,16 @@ function isToolSpan(span: MutableSpan): boolean {
 }
 
 /**
+ * Whether the span is a LangGraph node execution whose node id is the span
+ * name — the shape of the outer workflow-agent node. `@langfuse/tracing`
+ * flattens object metadata to per-key attributes with string values stored
+ * raw, so LangGraph's `langgraph_node` arrives directly comparable.
+ */
+function isWorkflowNodeSpan(span: MutableSpan): boolean {
+  return span.attributes[OBSERVATION_METADATA_LANGGRAPH_NODE] === span.name;
+}
+
+/**
  * LibreChat ephemeral agents are identified as
  * `endpoint__model___sender[____index]` (`__` encodes `:`; see LibreChat's
  * `encodeEphemeralAgentId`), and the outer workflow node carries that id as
@@ -333,17 +344,23 @@ function extractEphemeralAgentSender(name: string): string | undefined {
   return sender === '' ? undefined : sender;
 }
 
-/** Workflow-agent node spans are always children of the run's root chain, so
- *  root observations (host-named run roots like `LibreChat Agent: <name>`)
- *  are never rename candidates. */
+/** Workflow-agent node spans are always children of the run's root chain and
+ *  always carry `langgraph_node` metadata equal to their name, so host-named
+ *  run roots (`LibreChat Agent: <name>`) and ordinary chains that merely look
+ *  like encoded ids (`pipeline__stage___EU`) are never rename candidates.
+ *  Successful decodes become `agent` observations, matching the inner
+ *  `agent=<id>` node shaping. */
 function shapeEphemeralAgentNodeSpan(span: MutableSpan): void {
-  if (isToolSpan(span) || isRootSpan(span)) {
+  if (isToolSpan(span) || isRootSpan(span) || !isWorkflowNodeSpan(span)) {
     return;
   }
   const sender = extractEphemeralAgentSender(span.name);
-  if (sender != null) {
-    span.name = sender;
+  if (sender == null) {
+    return;
   }
+  span.name = sender;
+  span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] =
+    ROOT_OBSERVATION_TYPE;
 }
 
 function hasTraceTag(span: MutableSpan, expectedTag: string): boolean {

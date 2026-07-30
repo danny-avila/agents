@@ -103,16 +103,21 @@ function hashCacheKeyValue(value: string | undefined): string | undefined {
     : undefined;
 }
 
+/**
+ * Identity of an export destination (project credentials + endpoint +
+ * environment) only. Processor-level policies like `toolOutputTracing` are
+ * deliberately excluded: two spans exporting to the same project under
+ * different redaction settings still share a destination and may parent one
+ * another.
+ */
 export function getLangfuseDestinationKey(
-  params: LangfuseSpanProcessorParams,
-  langfuse?: t.LangfuseConfig
+  params: LangfuseSpanProcessorParams
 ): string {
   return JSON.stringify({
     publicKey: params.publicKey,
     secretKeyHash: hashCacheKeyValue(params.secretKey),
     baseUrl: params.baseUrl,
     environment: params.environment,
-    toolOutputTracing: langfuse?.toolOutputTracing,
   });
 }
 
@@ -122,7 +127,5 @@ export function resolveLangfuseDestinationKey(
   langfuse?: t.LangfuseConfig
 ): string | undefined {
   const params = getLangfuseSpanProcessorParams(langfuse);
-  return params == null
-    ? undefined
-    : getLangfuseDestinationKey(params, langfuse);
+  return params == null ? undefined : getLangfuseDestinationKey(params);
 }

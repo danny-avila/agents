@@ -75,6 +75,19 @@ export function ensureOpenTelemetryContextManager(): void {
   }
 }
 
+/** Cache key for processor instances: the destination plus processor-level
+ *  policy (`toolOutputTracing` is baked into each processor's redaction
+ *  behavior), unlike the pure destination identity used for span parenting. */
+function getLangfuseProcessorCacheKey(
+  destinationKey: string,
+  langfuse?: t.LangfuseConfig
+): string {
+  return JSON.stringify({
+    destinationKey,
+    toolOutputTracing: langfuse?.toolOutputTracing,
+  });
+}
+
 class RoutingLangfuseSpanProcessor implements SpanProcessor {
   // Processors live for the process lifetime. LibreChat tenant Langfuse
   // destinations are expected to be a bounded admin-managed set, and shutdown
@@ -88,24 +101,24 @@ class RoutingLangfuseSpanProcessor implements SpanProcessor {
       return undefined;
     }
     return this.ensureProcessorForKey(
-      getLangfuseDestinationKey(params, langfuse),
+      getLangfuseProcessorCacheKey(getLangfuseDestinationKey(params), langfuse),
       params,
       langfuse
     );
   }
 
   private ensureProcessorForKey(
-    destinationKey: string,
+    processorCacheKey: string,
     params: LangfuseSpanProcessorParams,
     langfuse?: t.LangfuseConfig
   ): SpanProcessor {
-    const existing = this.processors.get(destinationKey);
+    const existing = this.processors.get(processorCacheKey);
     if (existing != null) {
       return existing;
     }
 
     const processor = createLangfuseSpanProcessor(params, langfuse);
-    this.processors.set(destinationKey, processor);
+    this.processors.set(processorCacheKey, processor);
     return processor;
   }
 
@@ -116,9 +129,9 @@ class RoutingLangfuseSpanProcessor implements SpanProcessor {
       return;
     }
 
-    const destinationKey = getLangfuseDestinationKey(params, langfuse);
+    const destinationKey = getLangfuseDestinationKey(params);
     const processor = this.ensureProcessorForKey(
-      destinationKey,
+      getLangfuseProcessorCacheKey(destinationKey, langfuse),
       params,
       langfuse
     );
