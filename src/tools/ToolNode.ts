@@ -541,8 +541,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * Batch-scoped ownership is threaded via `RunToolBatchContext` instead —
    * see {@link ToolErrorOwnership} for why per-invocation scoping matters.
    */
-  private looseErrorOwnership: ToolErrorOwnership =
-    createToolErrorOwnership();
+  private looseErrorOwnership: ToolErrorOwnership = createToolErrorOwnership();
   private toolUsageCount: Map<string, number>;
   /** Maps toolCallId → turn captured in runTool, used by handleRunToolCompletions */
   private toolCallTurns: Map<string, number> = new Map();
@@ -750,6 +749,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       resolveLangfuseRuntimeScope({
         runLangfuse: this.runLangfuse,
         langfuseOverlay: this.agentLangfuse,
+        // Run identity is inherited from the ambient stream scope (tool
+        // supersteps execute on the owning run's chain); the agent identity
+        // must be stamped here so a concurrent sibling agent's queued
+        // callback cannot adopt this agent's overlay (see
+        // `LangfuseRuntimeContext.agentId`).
+        agentId: this.executingAgentId,
       }),
       () => super.invoke(input, options)
     );
@@ -3030,9 +3035,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       for (const result of results) {
         if (result.injectedMessages && result.injectedMessages.length > 0) {
           try {
-            injected.push(
-              ...convertInjectedMessages(result.injectedMessages)
-            );
+            injected.push(...convertInjectedMessages(result.injectedMessages));
           } catch (e) {
             // eslint-disable-next-line no-console
             console.warn(

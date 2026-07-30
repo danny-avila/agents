@@ -568,6 +568,121 @@ describe('Langfuse callback composition', () => {
     );
   });
 
+  it('rejects a sibling agent overlay for tool callbacks', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const runLangfuse = {
+      publicKey: 'pk-run',
+      secretKey: 'sk-run',
+      baseUrl: 'https://langfuse.run',
+      deterministicTraceId: true,
+    };
+    const agentBLangfuse = {
+      publicKey: 'pk-agent-b',
+      secretKey: 'sk-agent-b',
+      baseUrl: 'https://langfuse.agent-b',
+      deterministicTraceId: true,
+    };
+    initializeLangfuseTracing(runLangfuse);
+    initializeLangfuseTracing(agentBLangfuse);
+    const streamHandler = createLangfuseHandler({
+      langfuse: runLangfuse,
+      traceIdSeed: 'run-seed',
+      runId: 'run-1',
+    });
+
+    // Tool supersteps stamp their scope with the executing agent; a tool
+    // callback reporting a different agent via `tools=<id>` metadata must
+    // not adopt the sibling's overlay.
+    await withLangfuseRuntimeScope(
+      {
+        langfuse: agentBLangfuse,
+        traceIdSeed: 'agent-b-seed',
+        runId: 'run-1',
+        agentId: 'agent-b',
+      },
+      () =>
+        streamHandler?.handleToolStart(
+          { lc: 1, type: 'not_implemented', id: ['SiblingTool'] },
+          'sibling tool input',
+          'lc-sibling-tool-run',
+          undefined,
+          undefined,
+          { langgraph_node: 'tools=agent-a' }
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({ publicKey: 'pk-run' }),
+        traceId: traceIdFromSeed('run-seed'),
+      })
+    );
+    expect(
+      mockProcessorStarts.filter(
+        (record) =>
+          (record.params as { publicKey?: string }).publicKey === 'pk-agent-b'
+      )
+    ).toHaveLength(0);
+  });
+
+  it('replaces foreign propagated identity attributes with its own', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const { propagateAttributes } = await import('@langfuse/tracing');
+    const { getPropagatedAttributesFromContext } = await import(
+      '@langfuse/core'
+    );
+    const tenantA = {
+      publicKey: 'pk-tenant-a',
+      secretKey: 'sk-tenant-a',
+      baseUrl: 'https://langfuse.tenant-a',
+    };
+    const tenantB = {
+      publicKey: 'pk-tenant-b',
+      secretKey: 'sk-tenant-b',
+      baseUrl: 'https://langfuse.tenant-b',
+    };
+    initializeLangfuseTracing(tenantA);
+    initializeLangfuseTracing(tenantB);
+    const handlerB = createLangfuseHandler({
+      langfuse: tenantB,
+      userId: 'user-b',
+      runId: 'run-b',
+    });
+
+    let observedAttributes: Record<string, unknown> | undefined;
+    mockStartActiveSpan.mockImplementationOnce(
+      (_name, _options, activeContext, callback) => {
+        observedAttributes = getPropagatedAttributesFromContext(
+          otelContext.active()
+        ) as Record<string, unknown>;
+        return callback(
+          createMockSpan(otelTrace.getSpanContext(activeContext)?.traceId)
+        );
+      }
+    );
+
+    // Run A's propagated identity (user, session) is ambient; B's spans must
+    // carry B's identity — and NOT retain A's session where B has none.
+    await propagateAttributes(
+      { userId: 'user-a', sessionId: 'session-a' },
+      async () =>
+        withLangfuseRuntimeScope({ langfuse: tenantA, runId: 'run-a' }, () =>
+          handlerB?.handleChainStart(
+            { lc: 1, type: 'not_implemented', id: ['IdentityChain'] },
+            { input: 'identity' },
+            'lc-identity-run'
+          )
+        )
+    );
+
+    expect(observedAttributes?.['user.id']).toBe('user-b');
+    expect(observedAttributes?.['session.id']).toBeUndefined();
+  });
+
   it('clears a foreign scope for env-credential runs instead of inheriting it', async () => {
     const { createLangfuseHandler } = await import('@/langfuse');
     const { initializeLangfuseTracing } = await import('@/instrumentation');

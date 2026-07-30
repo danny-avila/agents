@@ -1,4 +1,5 @@
 import { CallbackHandler } from '@langfuse/langchain';
+import { LangfuseOtelContextKeys } from '@langfuse/core';
 import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
@@ -72,6 +73,13 @@ type LangfuseHandlerParams = {
 
 type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
   langfuse?: t.LangfuseConfig;
+};
+
+type HandlerIdentity = {
+  userId?: string;
+  sessionId?: string;
+  tags?: string[];
+  metadata?: LangfuseTraceMetadata;
 };
 
 type LangfuseAttributeParams = AgentLangfuseHandlerParams & {
@@ -248,6 +256,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private readonly langfuse?: t.LangfuseConfig;
   private readonly traceIdSeed?: string;
   private readonly runId?: string;
+  private readonly identity: HandlerIdentity;
   private readonly trackedRunIds = new Set<string>();
 
   constructor(params?: AgentLangfuseHandlerParams) {
@@ -256,6 +265,12 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     this.langfuse = langfuse;
     this.traceIdSeed = traceIdSeed;
     this.runId = runId;
+    this.identity = {
+      userId: handlerParams.userId,
+      sessionId: handlerParams.sessionId,
+      tags: handlerParams.tags,
+      metadata: handlerParams.traceMetadata,
+    };
   }
 
   private getDeterministicTraceSeed(): string | undefined {
@@ -333,47 +348,70 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     const currentContext = otelContext.active();
     const scopeRunId = resolveLangfuseScopeRunId(currentContext);
     const scopeAgentId = resolveLangfuseScopeAgentId(currentContext);
-    const isForeignScope = this.isForeignScope(
-      scopeRunId,
-      scopeAgentId,
-      callbackMetadata
-    );
-    const langfuse = isForeignScope
-      ? this.langfuse
-      : (resolveLangfuseConfigForSpan(currentContext) ?? this.langfuse);
+    if (this.isForeignScope(scopeRunId, scopeAgentId, callbackMetadata)) {
+      return this.withForeignScopeRejected(action);
+    }
+    const langfuse =
+      resolveLangfuseConfigForSpan(currentContext) ?? this.langfuse;
     const activeContext = isDetachedRun
       ? detachForeignAmbientSpan(
         currentContext,
         resolveLangfuseDestinationKey(langfuse)
       )
       : currentContext;
-    const seed = this.getDeterministicTraceSeed();
     const scoped = (): T =>
-      isForeignScope
-        ? withLangfuseRuntimeScope(
-          {
-            langfuse,
-            traceIdSeed: seed,
-            runId: this.runId,
-            toolOutputTracing: resolveToolOutputTracingConfig(this.langfuse),
-          },
-          action,
-          // Replace, don't merge: the foreign run's explicit destination or
-          // seed must not survive inheritance when this run has none of its
-          // own (env-credential runs, non-deterministic runs).
-          { replace: true }
-        )
-        : withLangfuseRuntimeScope(
-          {
-            langfuse,
-            traceIdSeed: resolveTraceIdSeedForSpan(activeContext) ?? seed,
-            runId: scopeRunId ?? this.runId,
-          },
-          action
-        );
+      withLangfuseRuntimeScope(
+        {
+          langfuse,
+          traceIdSeed:
+            resolveTraceIdSeedForSpan(activeContext) ??
+            this.getDeterministicTraceSeed(),
+          runId: scopeRunId ?? this.runId,
+        },
+        action
+      );
     return activeContext === currentContext
       ? scoped()
       : otelContext.with(activeContext, scoped);
+  }
+
+  /**
+   * A foreign concurrent run's context must be replaced wholesale, not
+   * merged: this library's scope keys (config, seed, tool-output policy,
+   * identity stamps) via the replace-mode runtime scope, `@langfuse/tracing`'s
+   * propagated trace attributes (userId, sessionId, tags, metadata, …) by
+   * deleting their context keys and re-propagating this handler's own
+   * identity, and the foreign active span — removed both so detached runs
+   * root their own trace and so `propagateAttributes` cannot stamp this
+   * run's identity onto the foreign run's still-recording span.
+   */
+  private withForeignScopeRejected<T>(action: () => T): T {
+    let cleanContext = otelTrace.deleteSpan(otelContext.active());
+    for (const key of Object.values(LangfuseOtelContextKeys)) {
+      cleanContext = cleanContext.deleteValue(key);
+    }
+    const scoped = (): T =>
+      withLangfuseRuntimeScope(
+        {
+          langfuse: this.langfuse,
+          traceIdSeed: this.getDeterministicTraceSeed(),
+          runId: this.runId,
+          toolOutputTracing: resolveToolOutputTracingConfig(this.langfuse),
+        },
+        action,
+        { replace: true }
+      );
+    const { userId, sessionId, tags, metadata } = this.identity;
+    const hasIdentity =
+      userId != null ||
+      sessionId != null ||
+      metadata != null ||
+      (tags?.length ?? 0) > 0;
+    return otelContext.with(cleanContext, () =>
+      hasIdentity
+        ? propagateAttributes({ userId, sessionId, tags, metadata }, scoped)
+        : scoped()
+    );
   }
 
   // LangChain may invoke callback handlers outside the caller's OTEL context.

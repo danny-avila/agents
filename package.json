@@ -231,6 +231,7 @@
     "@langchain/openai": "1.5.5",
     "@langchain/textsplitters": "^1.0.1",
     "@langchain/xai": "^1.4.3",
+    "@langfuse/core": "^5.4.1",
     "@langfuse/langchain": "^5.4.1",
     "@langfuse/otel": "^5.4.1",
     "@langfuse/tracing": "^5.4.1",
