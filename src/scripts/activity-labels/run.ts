@@ -449,12 +449,16 @@ async function pool(
   tasks: Array<() => Promise<void>>,
   size: number
 ): Promise<void> {
-  const queue = [...tasks];
+  /** Shared index instead of queue.shift(): shifting reindexes the whole
+   *  remaining array per task, quadratic over a large sweep. */
+  let next = 0;
   const workers = Array.from(
-    { length: Math.min(size, queue.length) },
+    { length: Math.min(size, tasks.length) },
     async () => {
-      while (queue.length > 0) {
-        await queue.shift()!();
+      while (next < tasks.length) {
+        const task = tasks[next];
+        next += 1;
+        await task();
       }
     }
   );
@@ -462,7 +466,9 @@ async function pool(
 }
 
 /** A typo in a selection must fail up front, not silently drop the
- *  requested column and complete a billed run without its control. */
+ *  requested column and complete a billed run without its control; a
+ *  duplicate would schedule the same paid arm twice and merge both runs
+ *  under one aggregate row. */
 function resolveSelection<T>(
   requested: string[] | undefined,
   available: T[],
@@ -477,6 +483,14 @@ function resolveSelection<T>(
   if (unknown.length > 0) {
     throw new Error(
       `unknown ${flag}: ${unknown.join(', ')} (available: ${[...byName.keys()].join(', ')})`
+    );
+  }
+  const duplicates = requested.filter(
+    (name, index) => requested.indexOf(name) !== index
+  );
+  if (duplicates.length > 0) {
+    throw new Error(
+      `duplicate ${flag} selection: ${[...new Set(duplicates)].join(', ')}`
     );
   }
   return requested.map((name) => byName.get(name)!);

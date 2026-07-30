@@ -91,6 +91,9 @@ const report = markdownReport({
   model: args.model,
   samples: args.samples,
 });
+/** An archived JSON can be rescored by explicit path in a fresh checkout
+ *  where the gitignored results/ directory does not exist yet. */
+fs.mkdirSync(RESULTS_DIR, { recursive: true });
 fs.writeFileSync(path.join(RESULTS_DIR, 'latest.md'), report);
 console.log(`rescored ${path.basename(sourcePath)}`);
 console.log(report.split('## Per-case')[0]);

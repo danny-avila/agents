@@ -4,9 +4,10 @@
  * cross-batch redundancy via content-word overlap); commit-log READABILITY
  * still needs the human pass over results/latest.md.
  *
- * Ported from LibreChat #14527 with ONE divergence: tool-echo matching
- * normalizes namespaced MCP names (see the candidate-set comment below).
- * Backport candidate for LibreChat's scripts/activity-labels/checks.js.
+ * Ported from LibreChat #14527 with two divergences, both backport
+ * candidates for LibreChat's scripts/activity-labels/checks.js: tool-echo
+ * matching normalizes namespaced MCP names (see the candidate-set comment
+ * below), and COUNT_ECHO also catches spelled-out counts.
  */
 const STOPWORDS = new Set([
   'the',
@@ -99,7 +100,10 @@ function jaccard(a, b) {
 }
 
 const GENERIC_OPENER = /^(ran|used|executed|called|invoked|performed)\b/i;
-const COUNT_ECHO = /\b\d+\s+(tools?|commands?|calls?)\b/i;
+/** Digits or the spelled-out counts a label-length line can fit — the
+ *  instruction forbids counting calls either way. */
+const COUNT_ECHO =
+  /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(tools?|commands?|calls?)\b/i;
 const DUP_THRESHOLD = 0.5;
 
 /**
