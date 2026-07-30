@@ -203,23 +203,31 @@ function normalizeBedrockUsageForLangfuse(output: LLMResult): LLMResult {
 const LANGGRAPH_NODE_METADATA_KEY = 'langgraph_node';
 const LANGGRAPH_NODE_AGENT_PREFIXES = ['agent=', 'tools=', 'summarize='];
 
-/** The agent a callback executes under, from LangGraph's inherited
- *  `langgraph_node` run metadata (`agent=<id>` / `tools=<id>` /
- *  `summarize=<id>` node names, or the bare agent id on the outer workflow
- *  node). `undefined` when the callback carries no node identity. */
-function extractCallbackAgentId(
+/** The LangGraph node a callback executes under, from its inherited
+ *  `langgraph_node` run metadata. `undefined` when the callback carries no
+ *  node identity. */
+function getCallbackNode(
   metadata?: Record<string, unknown>
 ): string | undefined {
   const node = metadata?.[LANGGRAPH_NODE_METADATA_KEY];
-  if (typeof node !== 'string' || node === '') {
-    return undefined;
+  return typeof node === 'string' && node !== '' ? node : undefined;
+}
+
+/** Whether a callback's node identifies the given agent. The outer workflow
+ *  node carries the agent id VERBATIM — including ids that themselves begin
+ *  with an internal prefix (an agent literally named `agent=research`) — so
+ *  an exact match is checked before decoding the inner subgraph prefixes
+ *  (`agent=` / `tools=` / `summarize=`). */
+function callbackNodeMatchesAgent(node: string, agentId: string): boolean {
+  if (node === agentId) {
+    return true;
   }
   for (const prefix of LANGGRAPH_NODE_AGENT_PREFIXES) {
-    if (node.startsWith(prefix)) {
-      return node.slice(prefix.length);
+    if (node.startsWith(prefix) && node.slice(prefix.length) === agentId) {
+      return true;
     }
   }
-  return node;
+  return false;
 }
 
 /**
@@ -316,8 +324,11 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     if (scopeAgentId == null) {
       return false;
     }
-    const callbackAgentId = extractCallbackAgentId(callbackMetadata);
-    return callbackAgentId != null && callbackAgentId !== scopeAgentId;
+    const callbackNode = getCallbackNode(callbackMetadata);
+    return (
+      callbackNode != null &&
+      !callbackNodeMatchesAgent(callbackNode, scopeAgentId)
+    );
   }
 
   /**

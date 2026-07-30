@@ -566,6 +566,33 @@ describe('Langfuse callback composition', () => {
         traceId: traceIdFromSeed('agent-b-seed'),
       })
     );
+
+    // An agent id that itself begins with an internal node prefix is carried
+    // VERBATIM by its outer workflow node — still recognized as its own scope.
+    await withLangfuseRuntimeScope(
+      {
+        langfuse: agentBLangfuse,
+        traceIdSeed: 'prefixed-agent-seed',
+        runId: 'run-1',
+        agentId: 'agent=research',
+      },
+      () =>
+        streamHandler?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['PrefixedAgentChain'] },
+          { input: 'prefixed agent' },
+          'lc-prefixed-agent-run',
+          undefined,
+          undefined,
+          { langgraph_node: 'agent=research' }
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({ publicKey: 'pk-agent-b' }),
+        traceId: traceIdFromSeed('prefixed-agent-seed'),
+      })
+    );
   });
 
   it('rejects a sibling agent overlay for tool callbacks', async () => {
