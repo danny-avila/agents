@@ -1872,25 +1872,44 @@ export const formatAgentMessages = (
         if (contentIndex >= 0 && contentIndex < content.length - 1) {
           let totalCharLen = 0;
           let remainingCharLen = 0;
-          /** Every *retained* part must be one the ratio can represent. A part
-           *  carrying cost unrelated to its length — atomic media above all,
-           *  including media nested inside a tool output — would have that cost
-           *  scaled away: an entry keeping just an image after the summary
-           *  collapses to 1. Parts formatting drops are exempt, contributing
-           *  nothing to either side. */
+          /**
+           * The ratio applies only when *every* part of the entry is one whose
+           * token cost tracks its character length. A single ineligible part
+           * cancels the discount, whichever side of the boundary it sits on.
+           *
+           * Both sides can break it, in opposite directions. A retained image has
+           * its fixed cost scaled away, collapsing the entry. A removed base64
+           * payload inflates the denominator — serializing to a huge length while
+           * the counter charges a fixed estimate — dragging retained text below
+           * its real cost. Either way the request can exceed the window.
+           *
+           * Telling a text-bearing tool payload from a media-bearing one means
+           * recursing into arbitrary nested output, which has already missed a
+           * level twice here. Cancelling instead keeps the original count: an
+           * over-count that prunes early rather than overflowing. Entries of
+           * plain text and reasoning — the common shape — still proportion.
+           */
           let everyRetainedPartMeasurable = true;
           for (let p = 0; p < content.length; p++) {
             const part = content[p];
+            const retained = p > contentIndex;
+
+            if (isDroppedByFormatting(part)) {
+              /** Removed summary text is real removed content: it is read as
+               *  plain text and belongs in the denominator. */
+              if (!retained && part.type === ContentTypes.SUMMARY) {
+                totalCharLen += contentPartCharLength(part);
+              }
+              continue;
+            }
+
             const charLen = contentPartCharLength(part);
+            if (!isCharRatioEligible(part) || (retained && charLen === 0)) {
+              everyRetainedPartMeasurable = false;
+              break;
+            }
             totalCharLen += charLen;
-            if (p > contentIndex) {
-              if (isDroppedByFormatting(part)) {
-                continue;
-              }
-              if (!isCharRatioEligible(part) || charLen === 0) {
-                everyRetainedPartMeasurable = false;
-                break;
-              }
+            if (retained) {
               remainingCharLen += charLen;
             }
           }

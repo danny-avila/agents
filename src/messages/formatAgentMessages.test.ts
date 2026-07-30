@@ -4929,7 +4929,10 @@ describe('formatAgentMessages', () => {
       expect(result.indexTokenCountMap?.[1]).toBe(8);
     });
 
-    it('should proportion token count when thinking + tool_use are sliced off', () => {
+    /** Reframed: a tool call anywhere in the entry now cancels the ratio, since
+     *  telling a text-bearing tool payload from a media-bearing one requires
+     *  recursing into arbitrary nested output. The entry keeps its count. */
+    it('should not proportion when a tool_use part is present', () => {
       const thinkingText = 'a'.repeat(800);
       const toolInput = JSON.stringify({ data: 'b'.repeat(400) });
       const payload: TPayload = [
@@ -4965,8 +4968,8 @@ describe('formatAgentMessages', () => {
         result.indexTokenCountMap || {}
       ).reduce((sum, v) => sum + v, 0);
 
-      expect(totalOutputTokens).toBeLessThan(200);
-      expect(totalOutputTokens).toBeGreaterThan(0);
+      expect(totalOutputTokens).toBe(2000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
     });
 
     it('should roughly halve token count when content is evenly split around boundary', () => {
@@ -5022,7 +5025,11 @@ describe('formatAgentMessages', () => {
       expect(result.indexTokenCountMap?.[1]).toBe(10);
     });
 
-    it('should account for tool_use input size in the char-length ratio', () => {
+    /** Previously the removed `tool_use` input was counted into the denominator.
+     *  A base64 payload there serializes to a huge length while the counter
+     *  charges a fixed estimate, so the ratio dragged retained text below its
+     *  real cost. The discount is cancelled instead. */
+    it('should not use tool_use input size in the char-length ratio', () => {
       const hugeInput = JSON.stringify({ payload: 'z'.repeat(5000) });
       const payload: TPayload = [
         {
@@ -5048,8 +5055,8 @@ describe('formatAgentMessages', () => {
       expect(result.summary).toBeDefined();
 
       const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
-      expect(adjustedTokens).toBeLessThan(100);
-      expect(adjustedTokens).toBeGreaterThan(0);
+      expect(adjustedTokens).toBe(3000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
     });
 
     it('should handle multiple content parts after the boundary', () => {
