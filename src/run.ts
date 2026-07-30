@@ -838,6 +838,7 @@ export class Run<_T extends t.BaseGraphState> {
         streamLangfuseConfig?.deterministicTraceId === true
           ? this.id
           : undefined,
+      runId: this.id,
     });
     if (langfuseHandler != null) {
       config.runName = traceName;
@@ -1065,6 +1066,7 @@ export class Run<_T extends t.BaseGraphState> {
             streamLangfuseConfig?.deterministicTraceId === true
               ? this.id
               : undefined,
+          runId: this.id,
         }),
         () =>
           withLangfuseAttributes(
@@ -1474,6 +1476,7 @@ export class Run<_T extends t.BaseGraphState> {
           titleLangfuseConfig?.deterministicTraceId === true
             ? 'title-' + this.id
             : undefined,
+        runId: 'title-' + this.id,
       });
 
       if (titleLangfuseHandler != null) {
@@ -1578,6 +1581,7 @@ export class Run<_T extends t.BaseGraphState> {
         inheritedTraceSeed != null
           ? 'title-' + this.id
           : undefined,
+      runId: 'title-' + this.id,
     });
 
     try {
@@ -1699,10 +1703,12 @@ export class Run<_T extends t.BaseGraphState> {
       inheritedTraceSeed != null
         ? (traceSeed ?? `activity-label-${this.id}-${labelSeq}`)
         : undefined;
+    const labelScopeRunId = `activity-label-${this.id}-${labelSeq}`;
     const labelRuntimeScope = resolveLangfuseRuntimeScope({
       runLangfuse: this.langfuse,
       langfuseOverlay: labelContext?.langfuse,
       traceIdSeed: labelTraceSeed,
+      runId: labelScopeRunId,
     });
     /** Handler only when a session id resolved from
      *  `chainOptions.configurable.thread_id`: without it the label call has
@@ -1723,6 +1729,7 @@ export class Run<_T extends t.BaseGraphState> {
           labelLangfuseConfig?.deterministicTraceId === true
             ? labelTraceSeed
             : undefined,
+        runId: labelScopeRunId,
       });
     }
     if (labelLangfuseHandler != null) {

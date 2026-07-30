@@ -8,6 +8,7 @@ import type * as t from '@/types';
 import {
   getLangfuseRuntimeConfig,
   getLangfuseRuntimeToolOutputTracingConfig,
+  getLangfuseScopeRunId,
   getTraceIdSeed,
   hasLangfuseRuntimeContextValue,
   runWithLangfuseRuntimeContext,
@@ -24,6 +25,7 @@ export type ResolveLangfuseRuntimeScopeParams = {
   runLangfuse?: t.LangfuseConfig;
   langfuseOverlay?: t.LangfuseConfig;
   traceIdSeed?: string;
+  runId?: string;
 };
 
 const langfuseToolOutputTracingConfigKey = createContextKey(
@@ -33,6 +35,7 @@ const langfuseConfigKey = createContextKey('librechat.langfuse.config');
 const langfuseTraceIdSeedKey = createContextKey(
   'librechat.langfuse.trace-id-seed'
 );
+const langfuseScopeRunIdKey = createContextKey('librechat.langfuse.run-id');
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value);
@@ -75,6 +78,19 @@ export function resolveTraceIdSeedForSpan(
   return getTraceIdSeed() ?? getOtelTraceIdSeed(activeContext);
 }
 
+function getOtelScopeRunId(activeContext: Context): string | undefined {
+  const value = activeContext.getValue(langfuseScopeRunIdKey);
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+/** The run identity the active scope belongs to (see
+ *  `LangfuseRuntimeContext.runId`), or `undefined` for unstamped scopes. */
+export function resolveLangfuseScopeRunId(
+  activeContext: Context
+): string | undefined {
+  return getLangfuseScopeRunId() ?? getOtelScopeRunId(activeContext);
+}
+
 export function resolveToolOutputTracingConfigForSpan(
   activeContext: Context
 ): ResolvedLangfuseToolOutputTracingConfig | undefined {
@@ -108,6 +124,9 @@ export function withLangfuseRuntimeScope<T>(
       scope.traceIdSeed
     );
   }
+  if (hasText(scope.runId)) {
+    activeContext = activeContext.setValue(langfuseScopeRunIdKey, scope.runId);
+  }
 
   // Span processors receive the OTel parent context in `onStart`, while
   // LangChain callback handlers may run outside that context and need ALS.
@@ -123,6 +142,7 @@ export function resolveLangfuseRuntimeScope({
   runLangfuse,
   langfuseOverlay,
   traceIdSeed,
+  runId,
 }: ResolveLangfuseRuntimeScopeParams): LangfuseRuntimeScope {
   const langfuse = resolveLangfuseConfig(runLangfuse, langfuseOverlay);
   const toolOutputTracing = !hasToolOutputTracingConfig(
@@ -131,5 +151,5 @@ export function resolveLangfuseRuntimeScope({
   )
     ? undefined
     : resolveToolOutputTracingConfig(runLangfuse, langfuseOverlay);
-  return { langfuse, traceIdSeed, toolOutputTracing };
+  return { langfuse, traceIdSeed, toolOutputTracing, runId };
 }

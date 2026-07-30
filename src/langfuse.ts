@@ -21,6 +21,7 @@ import type { Context } from '@opentelemetry/api';
 import type * as t from '@/types';
 import {
   resolveLangfuseConfigForSpan,
+  resolveLangfuseScopeRunId,
   resolveTraceIdSeedForSpan,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
@@ -61,6 +62,10 @@ type LangfuseHandlerParams = {
   traceMetadata?: LangfuseTraceMetadata;
   tags?: string[];
   traceIdSeed?: string;
+  /** Identity of the run this handler traces; ambient runtime scopes are
+   *  only adopted when stamped with the same run (see
+   *  `LangfuseRuntimeContext.runId`). */
+  runId?: string;
 };
 
 type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
@@ -218,13 +223,15 @@ function detachForeignAmbientSpan(
 class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private readonly langfuse?: t.LangfuseConfig;
   private readonly traceIdSeed?: string;
+  private readonly runId?: string;
   private readonly trackedRunIds = new Set<string>();
 
   constructor(params?: AgentLangfuseHandlerParams) {
-    const { langfuse, traceIdSeed, ...handlerParams } = params ?? {};
+    const { langfuse, traceIdSeed, runId, ...handlerParams } = params ?? {};
     super(handlerParams);
     this.langfuse = langfuse;
     this.traceIdSeed = traceIdSeed;
+    this.runId = runId;
   }
 
   private getDeterministicTraceSeed(): string | undefined {
@@ -250,18 +257,31 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   }
 
   /**
+   * LangChain executes non-awaited callbacks on a process-wide background
+   * queue (`consumeCallback`), so this callback may be running inside a
+   * DIFFERENT concurrent run's async context. The ambient runtime scope is
+   * therefore only adopted when it belongs to this handler's run: scopes are
+   * stamped with a `runId` at their call sites, and a mismatch against this
+   * handler's own run means the scope is a foreign concurrent run's — its
+   * config would route spans to the wrong tenant's processor and its seed
+   * would collapse this run's spans into the foreign trace. Unstamped scopes
+   * on unstamped handlers keep scope-first semantics (agent overlays and
+   * per-path seeds like the title/label scopes, host-managed handlers).
+   *
    * Detached runs (roots, or starts whose parent this handler never tracked)
-   * take their span parent from the ambient OTEL context, so drop any foreign
-   * ambient span first — a run launched from a host's instrumented request
-   * context must start its own trace, not join an unexported foreign one.
-   * Trace identity otherwise stays scope-first: an active runtime scope
-   * (agent overlay, or a per-path seed like the title/label scopes) wins over
-   * this handler's own configuration.
+   * take their span parent from the ambient OTEL context, so drop any
+   * foreign ambient span first — a run launched from a host's instrumented
+   * request context must start its own trace, not join an unexported
+   * foreign one.
    */
   private withRuntimeContext<T>(action: () => T, isDetachedRun = false): T {
     const currentContext = otelContext.active();
-    const langfuse =
-      resolveLangfuseConfigForSpan(currentContext) ?? this.langfuse;
+    const scopeRunId = resolveLangfuseScopeRunId(currentContext);
+    const isForeignScope =
+      this.runId != null && scopeRunId != null && scopeRunId !== this.runId;
+    const langfuse = isForeignScope
+      ? this.langfuse
+      : (resolveLangfuseConfigForSpan(currentContext) ?? this.langfuse);
     const activeContext = isDetachedRun
       ? detachForeignAmbientSpan(
         currentContext,
@@ -269,11 +289,15 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
       )
       : currentContext;
     const seed = this.getDeterministicTraceSeed();
+    const contextSeed = isForeignScope
+      ? undefined
+      : resolveTraceIdSeedForSpan(activeContext);
     const scoped = (): T =>
       withLangfuseRuntimeScope(
         {
           langfuse,
-          traceIdSeed: resolveTraceIdSeedForSpan(activeContext) ?? seed,
+          traceIdSeed: contextSeed ?? seed,
+          runId: this.runId ?? (isForeignScope ? undefined : scopeRunId),
         },
         action
       );
@@ -541,6 +565,7 @@ export function createLangfuseHandler({
   traceMetadata,
   tags,
   traceIdSeed,
+  runId,
 }: AgentLangfuseHandlerParams): CallbackHandler | undefined {
   if (!shouldCreateLangfuseHandler(langfuse)) {
     return undefined;
@@ -555,6 +580,7 @@ export function createLangfuseHandler({
     tags: mergeLangfuseTags(tags, langfuse?.tags),
     langfuse,
     traceIdSeed,
+    runId,
   });
 }
 

@@ -1,4 +1,5 @@
 /* eslint-disable no-console */
+import { v4 } from 'uuid';
 import { nanoid } from 'nanoid';
 import { tool } from '@langchain/core/tools';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
@@ -54,6 +55,14 @@ import {
   removePredecessorHandoffCue,
 } from '@/messages';
 import {
+  attemptInvoke,
+  tryFallbackProviders,
+  getFallbackErrorContext,
+  getFallbackOverflowCandidates,
+  projectMessagesForProvider,
+  resolveServingModelId,
+} from '@/llm/invoke';
+import {
   resetIfNotEmpty,
   isAnthropicLike,
   isOpenAILike,
@@ -64,14 +73,14 @@ import {
   sleep,
 } from '@/utils';
 import {
-  attemptInvoke,
-  tryFallbackProviders,
-  getFallbackErrorContext,
-  getFallbackOverflowCandidates,
-  projectMessagesForProvider,
-  resolveServingModelId,
-} from '@/llm/invoke';
-import { v4 } from 'uuid';
+  Constants,
+  GraphNodeKeys,
+  ContentTypes,
+  GraphEvents,
+  Providers,
+  StepTypes,
+  PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
+} from '@/common';
 import {
   createLangfuseHandler,
   createLangfuseTraceMetadata,
@@ -88,16 +97,6 @@ import {
   getToolContentCharLength,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
-import { resolveMaxSeals } from '@/llm/preempt';
-import {
-  Constants,
-  GraphNodeKeys,
-  ContentTypes,
-  GraphEvents,
-  Providers,
-  StepTypes,
-  PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
-} from '@/common';
 import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
@@ -131,6 +130,7 @@ import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
 import { isThinkingEnabled } from '@/llm/request';
+import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
@@ -3069,6 +3069,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           tags: ['librechat', 'agent'],
           traceIdSeed:
             langfuse?.deterministicTraceId === true ? this.runId : undefined,
+          runId: this.runId,
         });
         if (langfuseHandler != null) {
           invokeConfig = {
@@ -3089,6 +3090,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,
             langfuseOverlay: agentContext.langfuse,
+            runId: this.runId,
           }),
           () =>
             attemptInvoke(
@@ -3251,6 +3253,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             resolveLangfuseRuntimeScope({
               runLangfuse: this.langfuse,
               langfuseOverlay: agentContext.langfuse,
+              runId: this.runId,
             }),
             () =>
               tryFallbackProviders({
@@ -3673,7 +3676,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * the same run — `haltRun` is first-write-wins — is left alone.
      */
     const halt = this.hookRegistry.getHaltSignal(runId);
-    if (result.preventContinuation === true && halt?.source === 'PreemptBoundary') {
+    if (
+      result.preventContinuation === true &&
+      halt?.source === 'PreemptBoundary'
+    ) {
       this.preemptHaltReason = halt.reason;
       this.hookRegistry.clearHaltSignal(runId);
     }

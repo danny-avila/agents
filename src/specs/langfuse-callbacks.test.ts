@@ -385,6 +385,109 @@ describe('Langfuse callback composition', () => {
     );
   });
 
+  it('keeps callback spans on their own run when a foreign run scope is active', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const tenantA = {
+      publicKey: 'pk-tenant-a',
+      secretKey: 'sk-tenant-a',
+      baseUrl: 'https://langfuse.tenant-a',
+      deterministicTraceId: true,
+    };
+    const tenantB = {
+      publicKey: 'pk-tenant-b',
+      secretKey: 'sk-tenant-b',
+      baseUrl: 'https://langfuse.tenant-b',
+      deterministicTraceId: true,
+    };
+    initializeLangfuseTracing(tenantA);
+    initializeLangfuseTracing(tenantB);
+    const handlerB = createLangfuseHandler({
+      langfuse: tenantB,
+      traceIdSeed: 'run-b',
+      runId: 'run-b',
+    });
+
+    // LangChain's background callback queue (`consumeCallback`) executes
+    // non-awaited callbacks inside whichever concurrent run's async context
+    // the queue drain happens to be on — here, tenant-A's. A scope stamped
+    // with a different run must never reroute tenant-B's spans.
+    await withLangfuseRuntimeScope(
+      { langfuse: tenantA, traceIdSeed: 'run-a', runId: 'run-a' },
+      () =>
+        handlerB?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['ForeignScopedChain'] },
+          { input: 'foreign scoped' },
+          'lc-foreign-run'
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({
+          publicKey: 'pk-tenant-b',
+          secretKey: 'sk-tenant-b',
+          baseUrl: 'https://langfuse.tenant-b',
+        }),
+        traceId: traceIdFromSeed('run-b'),
+      })
+    );
+    expect(
+      mockProcessorStarts.filter(
+        (record) =>
+          (record.params as { publicKey?: string }).publicKey ===
+            'pk-tenant-a' || record.traceId === traceIdFromSeed('run-a')
+      )
+    ).toHaveLength(0);
+  });
+
+  it('adopts an agent overlay scope stamped with the handler run', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const runLangfuse = {
+      publicKey: 'pk-run',
+      secretKey: 'sk-run',
+      baseUrl: 'https://langfuse.run',
+      deterministicTraceId: true,
+    };
+    const agentLangfuse = {
+      publicKey: 'pk-agent',
+      secretKey: 'sk-agent',
+      baseUrl: 'https://langfuse.agent',
+      deterministicTraceId: true,
+    };
+    initializeLangfuseTracing(runLangfuse);
+    initializeLangfuseTracing(agentLangfuse);
+    const streamHandler = createLangfuseHandler({
+      langfuse: runLangfuse,
+      traceIdSeed: 'run-seed',
+      runId: 'run-1',
+    });
+
+    await withLangfuseRuntimeScope(
+      { langfuse: agentLangfuse, traceIdSeed: 'agent-seed', runId: 'run-1' },
+      () =>
+        streamHandler?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['SameRunOverlayChain'] },
+          { input: 'same run overlay' },
+          'lc-overlay-run'
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({
+          publicKey: 'pk-agent',
+          secretKey: 'sk-agent',
+          baseUrl: 'https://langfuse.agent',
+        }),
+        traceId: traceIdFromSeed('agent-seed'),
+      })
+    );
+  });
+
   it('attaches configured trace attributes to Langfuse callback spans', async () => {
     const { createLangfuseHandler } = await import('@/langfuse');
     const { initializeLangfuseTracing } = await import('@/instrumentation');

@@ -13,6 +13,15 @@ export type LangfuseRuntimeContext = {
   langfuse?: t.LangfuseConfig;
   traceIdSeed?: string;
   toolOutputTracing?: ResolvedLangfuseToolOutputTracingConfig;
+  /**
+   * Identity of the run this scope belongs to. LangChain executes
+   * non-awaited callbacks on a shared background queue
+   * (`@langchain/core` `consumeCallback`, a process-wide `p-queue` with
+   * concurrency 1), so a callback can run inside a DIFFERENT concurrent
+   * run's async context. Handlers compare this id against their own run to
+   * decide whether an ambient scope is theirs to adopt.
+   */
+  runId?: string;
 };
 
 const langfuseRuntimeContextStore =
@@ -28,6 +37,7 @@ export function hasLangfuseRuntimeContextValue(
   return (
     context.langfuse != null ||
     hasText(context.traceIdSeed) ||
+    hasText(context.runId) ||
     context.toolOutputTracing != null
   );
 }
@@ -49,6 +59,10 @@ export function getLangfuseRuntimeConfig(): t.LangfuseConfig | undefined {
 
 export function getTraceIdSeed(): string | undefined {
   return getLangfuseRuntimeContext()?.traceIdSeed;
+}
+
+export function getLangfuseScopeRunId(): string | undefined {
+  return getLangfuseRuntimeContext()?.runId;
 }
 
 export function getLangfuseRuntimeToolOutputTracingConfig():
@@ -73,6 +87,7 @@ export function runWithLangfuseRuntimeContext<T>(
     ...(hasText(context.traceIdSeed)
       ? { traceIdSeed: context.traceIdSeed }
       : {}),
+    ...(hasText(context.runId) ? { runId: context.runId } : {}),
     ...(context.toolOutputTracing !== undefined
       ? { toolOutputTracing: context.toolOutputTracing }
       : {}),
