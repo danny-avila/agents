@@ -51,9 +51,10 @@ import {
   projectOpenAIResponsesToolMessageContent,
   projectToolStreamContentForProvider,
 } from '@/messages/core';
-import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
+import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
+import { createOpenAIRetryCaller } from './retry';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 const iife = <T>(fn: () => T) => fn();
@@ -123,6 +124,8 @@ type LibreChatOpenAIFields = t.ChatOpenAIFields & {
 };
 type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & {
   _lc_stream_delay?: number;
+  maxConcurrency?: number;
+  maxRetries?: number;
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
 };
@@ -1231,6 +1234,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 
   constructor(fields?: LibreChatOpenAIFields) {
     super(fields);
+    this.caller = createOpenAIRetryCaller(fields);
     this.includeReasoningContent = fields?.includeReasoningContent;
     this.includeReasoningDetails = fields?.includeReasoningDetails;
     this.convertReasoningDetailsToContent =
@@ -1654,6 +1658,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
 
   constructor(fields?: LibreChatOpenAIFields) {
     super(fields);
+    this.caller = createOpenAIRetryCaller(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.responsesPromptCache = fields?.responsesPromptCache;
     this.responsesPromptCacheTtl = fields?.responsesPromptCacheTtl;
@@ -1795,6 +1800,7 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
     super(fields);
+    this.caller = createOpenAIRetryCaller(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.safetyIdentifier = fields?.safety_identifier;
   }
@@ -1933,6 +1939,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
     super(fields);
+    this.caller = createOpenAIRetryCaller(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.safetyIdentifier = fields?.safety_identifier;
   }

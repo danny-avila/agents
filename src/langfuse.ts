@@ -10,6 +10,8 @@ import {
 import type {
   AIMessageChunkFields,
   AIMessageFields,
+  BaseMessage,
+  MessageContent,
   UsageMetadata,
 } from '@langchain/core/messages';
 import type {
@@ -138,12 +140,113 @@ function getLangfuseBedrockUsage(
   };
 }
 
-function cloneMessageWithUsage(
+const OMITTED_IMAGE_URL = '[image URL omitted]';
+
+function summarizeImageUrl(url: unknown): string {
+  if (typeof url !== 'string') {
+    return OMITTED_IMAGE_URL;
+  }
+  const match =
+    /^data:(image\/[a-zA-Z0-9.+-]+);base64,([a-zA-Z0-9+/]*={0,2})$/i.exec(url);
+  if (match == null) {
+    return OMITTED_IMAGE_URL;
+  }
+  const padding = match[2].length - match[2].replace(/=+$/, '').length;
+  const bytes = Math.max(0, Math.floor((match[2].length * 3) / 4) - padding);
+  return `[image omitted; type=${match[1].toLowerCase()}; bytes=${bytes}]`;
+}
+
+function sanitizeImageValue(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return summarizeImageUrl(value);
+  }
+  if (value == null || typeof value !== 'object') {
+    return OMITTED_IMAGE_URL;
+  }
+  const record = value as Record<string, unknown>;
+  return {
+    ...(record.detail != null && { detail: record.detail }),
+    url: summarizeImageUrl(record.url),
+  };
+}
+
+function sanitizeMessageContent(content: MessageContent): MessageContent {
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  const sanitized = content.map((block) => {
+    const record = block as unknown as Record<string, unknown>;
+    if ('image_url' in record) {
+      return {
+        ...record,
+        image_url: sanitizeImageValue(record.image_url),
+      } as unknown as typeof block;
+    }
+    if (
+      record.type === 'image' &&
+      record.source != null &&
+      typeof record.source === 'object'
+    ) {
+      const source = record.source as Record<string, unknown>;
+      return {
+        ...record,
+        source: {
+          ...(source.type != null && { type: source.type }),
+          ...(source.media_type != null && { media_type: source.media_type }),
+          data: summarizeImageUrl(
+            typeof source.data === 'string' && source.media_type != null
+              ? `data:${String(source.media_type)};base64,${source.data}`
+              : source.data
+          ),
+        },
+      } as unknown as typeof block;
+    }
+    if (record.inlineData != null && typeof record.inlineData === 'object') {
+      const inlineData = record.inlineData as Record<string, unknown>;
+      return {
+        ...record,
+        inlineData: {
+          ...(inlineData.mimeType != null && { mimeType: inlineData.mimeType }),
+          data: summarizeImageUrl(
+            typeof inlineData.data === 'string' && inlineData.mimeType != null
+              ? `data:${String(inlineData.mimeType)};base64,${inlineData.data}`
+              : inlineData.data
+          ),
+        },
+      } as unknown as typeof block;
+    }
+    return block;
+  });
+  return sanitized.some((block, index) => block !== content[index])
+    ? sanitized
+    : content;
+}
+
+function cloneMessageWithContent(message: BaseMessage): BaseMessage {
+  const content = sanitizeMessageContent(message.content);
+  if (content === message.content) {
+    return message;
+  }
+  const clone = Object.create(
+    Object.getPrototypeOf(message),
+    Object.getOwnPropertyDescriptors(message)
+  ) as BaseMessage;
+  clone.content = content;
+  return clone;
+}
+
+function sanitizeChatMessagesForLangfuse(
+  messages: BaseMessage[][]
+): BaseMessage[][] {
+  return messages.map((batch) => batch.map(cloneMessageWithContent));
+}
+
+function cloneMessageForLangfuse(
   message: AIMessage | AIMessageChunk,
-  usageMetadata: UsageMetadata
+  usageMetadata: UsageMetadata | undefined
 ): AIMessage | AIMessageChunk {
   const fields: AIMessageFields = {
-    content: message.content,
+    content: sanitizeMessageContent(message.content),
     additional_kwargs: message.additional_kwargs,
     response_metadata: message.response_metadata,
     id: message.id,
@@ -175,13 +278,17 @@ function normalizeGenerationForLangfuse(generation: Generation): Generation {
   }
 
   const usageMetadata = getLangfuseBedrockUsage(message);
-  if (usageMetadata == null || usageMetadata === message.usage_metadata) {
+  const content = sanitizeMessageContent(message.content);
+  if (
+    (usageMetadata == null || usageMetadata === message.usage_metadata) &&
+    content === message.content
+  ) {
     return generation;
   }
 
   const chatGeneration: ChatGeneration = {
     ...(generation as ChatGeneration),
-    message: cloneMessageWithUsage(message, usageMetadata),
+    message: cloneMessageForLangfuse(message, usageMetadata),
   };
   return chatGeneration;
 }
@@ -524,8 +631,12 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleChatModelStart(
     ...args: Parameters<CallbackHandler['handleChatModelStart']>
   ): ReturnType<CallbackHandler['handleChatModelStart']> {
+    const sanitizedArgs = [...args] as Parameters<
+      CallbackHandler['handleChatModelStart']
+    >;
+    sanitizedArgs[1] = sanitizeChatMessagesForLangfuse(args[1]);
     return this.withRuntimeContext(
-      () => super.handleChatModelStart(...args),
+      () => super.handleChatModelStart(...sanitizedArgs),
       this.startsDetachedRun(args[2], args[3]),
       args[6]
     );

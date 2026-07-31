@@ -18,6 +18,7 @@ import {
   isInterrupted,
 } from '@langchain/langgraph';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { ChatGeneration } from '@langchain/core/outputs';
 import type * as t from '@/types';
 import { handleConverseStreamMetadata } from '@/llm/bedrock/utils/message_outputs';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
@@ -1454,6 +1455,68 @@ describe('Langfuse callback composition', () => {
         input_cache_creation: 10000,
       })
     );
+  });
+
+  it('bounds image inputs and outputs without mutating provider messages', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-test',
+      secretKey: 'sk-test',
+    });
+    const handler = createLangfuseHandler({
+      langfuse: {
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+      },
+    });
+    const inputBase64 = Buffer.alloc(20_000, 'a').toString('base64');
+    const outputBase64 = Buffer.alloc(18_000, 'b').toString('base64');
+    const inputUrl = `data:image/png;base64,${inputBase64}`;
+    const outputUrl = `data:image/jpeg;base64,${outputBase64}`;
+    const signedUrl =
+      'https://storage.example.test/image.png?sp=r&sig=private-signature';
+    const input = new HumanMessage({
+      content: [
+        { type: 'text', text: 'Describe this image' },
+        { type: 'image_url', image_url: { url: inputUrl } },
+        { type: 'image_url', image_url: { url: signedUrl } },
+      ],
+    });
+    const output = new AIMessage({
+      content: [{ type: 'image_url', image_url: { url: outputUrl } }],
+    });
+    const generation: ChatGeneration = { text: '', message: output };
+    const runId = 'bounded-media-run';
+
+    await handler?.handleChatModelStart(
+      { lc: 1, type: 'constructor', id: ['AzureChatOpenAI'], kwargs: {} },
+      [[input]],
+      runId
+    );
+    await handler?.handleLLMEnd({ generations: [[generation]] }, runId);
+
+    const serializedAttributes = JSON.stringify(mockSpanAttributeSets);
+    expect(serializedAttributes).toContain('image omitted');
+    expect(serializedAttributes).toContain('type=image/png');
+    expect(serializedAttributes).toContain('bytes=20000');
+    expect(serializedAttributes).toContain('type=image/jpeg');
+    expect(serializedAttributes).toContain('bytes=18000');
+    expect(serializedAttributes).not.toContain(inputBase64.slice(0, 64));
+    expect(serializedAttributes).not.toContain(outputBase64.slice(0, 64));
+    expect(serializedAttributes).not.toContain('private-signature');
+    expect(
+      (input.content[1] as unknown as { image_url: { url: string } }).image_url
+        .url
+    ).toBe(inputUrl);
+    expect(
+      (input.content[2] as unknown as { image_url: { url: string } }).image_url
+        .url
+    ).toBe(signedUrl);
+    expect(
+      (output.content[0] as unknown as { image_url: { url: string } }).image_url
+        .url
+    ).toBe(outputUrl);
   });
 
   it('uses deterministic trace ids when tracing is configured from env only', async () => {
