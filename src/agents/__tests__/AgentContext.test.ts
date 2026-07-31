@@ -1490,7 +1490,15 @@ describe('AgentContext', () => {
       ctx.systemMessageTokens = 100;
       ctx.indexTokenCountMap = { '0': 50 };
       ctx.currentUsage = { input_tokens: 100 };
-      ctx.openAIResponsesReasoningReplayIds.add('rs_123');
+      ctx.openAIResponsesReasoningReplaySnapshotsById.set(
+        'rs_123',
+        'in_progress'
+      );
+      ctx.reasoningReplaySource = {
+        provider: Providers.OPENAI,
+        model: 'gpt-5.4',
+        useResponsesApi: true,
+      };
 
       ctx.reset();
 
@@ -1498,7 +1506,8 @@ describe('AgentContext', () => {
       expect(ctx.instructionTokens).toBe(0);
       expect(ctx.indexTokenCountMap).toEqual({});
       expect(ctx.currentUsage).toBeUndefined();
-      expect(ctx.openAIResponsesReasoningReplayIds.size).toBe(0);
+      expect(ctx.openAIResponsesReasoningReplaySnapshotsById.size).toBe(0);
+      expect(ctx.reasoningReplaySource).toBeUndefined();
     });
 
     it('preserves summarization settings across resets', () => {

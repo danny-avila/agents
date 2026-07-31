@@ -1904,6 +1904,87 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(messageDeltas[0]?.delta).toEqual({ content: [toolCallPart] });
   });
 
+  it('dispatches later revisions of an OpenAI reasoning item once', async () => {
+    const dispatchReasoningDelta = jest.fn<
+      StandardGraph['dispatchReasoningDelta']
+    >(async () => undefined);
+    const snapshotsById = new Map<string, string>();
+    const graph = createGraph({
+      dispatchReasoningDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.OPENAI,
+          clientOptions: { model: 'gpt-5.4' },
+          reasoningKey: 'reasoning_content',
+          currentTokenType: ContentTypes.THINK,
+          openAIResponsesReasoningReplaySnapshotsById: snapshotsById,
+          toolDefinitions: [],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const inProgress = {
+      type: 'reasoning',
+      id: 'rs_123',
+      status: 'in_progress',
+      summary: [],
+      encrypted_content: 'encrypted-reasoning',
+    };
+    const completed = {
+      ...inProgress,
+      status: 'completed',
+      summary: [
+        {
+          type: 'summary_text',
+          text: 'Checked the final constraint.',
+        },
+      ],
+    };
+
+    for (const item of [inProgress, completed, structuredClone(completed)]) {
+      await handler.handle(
+        GraphEvents.CHAT_MODEL_STREAM,
+        {
+          chunk: {
+            content: '',
+            additional_kwargs: {
+              openai_responses_reasoning_replay: [item],
+            },
+          } as unknown as t.StreamChunk,
+        },
+        metadata,
+        graph
+      );
+    }
+
+    expect(dispatchReasoningDelta).toHaveBeenCalledTimes(2);
+    expect(dispatchReasoningDelta).toHaveBeenNthCalledWith(
+      2,
+      expect.stringMatching(/^step_/),
+      {
+        content: [
+          {
+            type: ContentTypes.THINK,
+            think: '',
+            provider_replay: {
+              openai_responses: {
+                provider: Providers.OPENAI,
+                model: 'gpt-5.4',
+                items: [completed],
+              },
+            },
+          },
+        ],
+      },
+      metadata
+    );
+    expect(snapshotsById.size).toBe(1);
+    expect(JSON.parse(snapshotsById.get('rs_123') ?? '{}')).toEqual(completed);
+  });
+
   it('captures raw Anthropic thinking text and signatures for replay', async () => {
     const dispatchReasoningDelta = jest.fn<
       StandardGraph['dispatchReasoningDelta']

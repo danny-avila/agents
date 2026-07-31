@@ -1339,6 +1339,15 @@ export function getChunkContent({
   }
 
   if (
+    provider === Providers.BEDROCK &&
+    Array.isArray(chunk?.content) &&
+    chunk.content.length > 0 &&
+    chunk.content.every((contentPart) => isReasoningContentPart(contentPart))
+  ) {
+    return chunk.content;
+  }
+
+  if (
     (provider === Providers.OPENAI || provider === Providers.AZURE) &&
     (
       chunk?.additional_kwargs?.reasoning as
@@ -1621,12 +1630,20 @@ function getOpenAIResponsesReasoningReplay(
   if (items.length === 0) {
     return undefined;
   }
-  const unseenItems = items.filter(
-    (item) => !agentContext.openAIResponsesReasoningReplayIds.has(item.id)
-  );
-  for (const item of unseenItems) {
-    agentContext.openAIResponsesReasoningReplayIds.add(item.id);
-  }
+  const unseenItems = items.filter((item) => {
+    const snapshot = JSON.stringify(item);
+    if (
+      agentContext.openAIResponsesReasoningReplaySnapshotsById.get(item.id) ===
+      snapshot
+    ) {
+      return false;
+    }
+    agentContext.openAIResponsesReasoningReplaySnapshotsById.set(
+      item.id,
+      snapshot
+    );
+    return true;
+  });
   return unseenItems.length === 0
     ? undefined
     : { provider: agentContext.provider, model, items: unseenItems };

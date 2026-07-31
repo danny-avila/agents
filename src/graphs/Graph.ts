@@ -61,6 +61,7 @@ import {
   getFallbackOverflowCandidates,
   projectMessagesForProvider,
   resolveServingModelId,
+  resolveReasoningReplaySource,
 } from '@/llm/invoke';
 import {
   resetIfNotEmpty,
@@ -2000,6 +2001,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         model = agentContext.systemRunnable.pipe(model as Runnable);
       }
 
+      agentContext.reasoningReplaySource = resolveReasoningReplaySource({
+        model: (this.overrideModel ?? model) as t.ChatModel,
+        provider: agentContext.provider,
+        clientOptions: agentContext.clientOptions,
+        callOptions: config,
+      });
+
       if (agentContext.tokenCalculationPromise) {
         await agentContext.tokenCalculationPromise;
       }
@@ -3304,6 +3312,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
                   maxContextTokens: agentContext.maxContextTokens,
                 },
+                reasoningReplaySource: agentContext.reasoningReplaySource,
                 prepareProviderMessages: ({
                   model: fallbackModel,
                   messages: fallbackMessages,
@@ -3311,6 +3320,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   maxContextTokens: fallbackMaxContextTokens,
                   config: fallbackConfig,
                 }) => {
+                  const replayValidatedFallbackMessages =
+                    trackProviderMessageOrigins(
+                      fallbackBaseMessages,
+                      fallbackMessages
+                    );
                   const fallbackToolResultChars =
                     agentContext.maxToolResultChars ??
                     calculateMaxToolResultChars(
@@ -3327,14 +3341,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                    * attemptInvoke funnel pass then finds nothing to change.
                    */
                   const cueShapedFallbackMessages = trackProviderMessageOrigins(
-                    fallbackMessages,
+                    replayValidatedFallbackMessages,
                     isAnthropicLike(fallbackProvider, {
                       model: resolveServingModelId(fallbackModel),
                     })
-                      ? appendPredecessorHandoffCue(fallbackMessages, (m) =>
-                        this.isRunProducedMessage(m)
+                      ? appendPredecessorHandoffCue(
+                        replayValidatedFallbackMessages,
+                        (m) => this.isRunProducedMessage(m)
                       )
-                      : removePredecessorHandoffCue(fallbackMessages)
+                      : removePredecessorHandoffCue(
+                        replayValidatedFallbackMessages
+                      )
                   );
                   const projectedFallbackMessages = trackProviderMessageOrigins(
                     cueShapedFallbackMessages,
