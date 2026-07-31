@@ -398,6 +398,16 @@ function _ensureMessageContents(
  * shape degrades to `{}` — the call already executed, so the replayed input
  * is informational and an empty object is the safe representation.
  */
+/** True for `{}` — no own enumerable keys on a non-array, non-null object. */
+function isEmptyPlainObject(value: unknown): boolean {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 0
+  );
+}
+
 export function coerceAnthropicToolUseInput(
   input: unknown
 ): Record<string, unknown> {
@@ -677,19 +687,11 @@ function _formatContent(message: BaseMessage) {
         'name' in contentPart
       ) {
         const rawPart = contentPart as Record<string, unknown>;
-        let input = rawPart.input ?? rawPart.args;
-        if (typeof input === 'string') {
-          try {
-            input = JSON.parse(input);
-          } catch {
-            input = {};
-          }
-        }
         const corrected: AnthropicServerToolUseBlockParam = {
           type: 'server_tool_use',
           id: rawPart.id as string,
           name: (rawPart.name ?? 'web_search') as 'web_search',
-          input: (input ?? {}) as Record<string, unknown>,
+          input: coerceAnthropicToolUseInput(rawPart.input ?? rawPart.args),
         };
         return corrected;
       }
@@ -944,10 +946,16 @@ function _formatContent(message: BaseMessage) {
         // Core's streaming aggregation can leave the inline tool_use input empty
         // (the assembled arguments live in `message.tool_calls` or, for persisted
         // messages, in sibling input_json_delta blocks). Restore it when missing.
+        // An empty plain object counts as missing too: context-pressure
+        // truncation degrades an inline input to `{}` while a small `args`
+        // mirror survives intact, and a genuinely empty call's mirror is also
+        // `{}`, so preferring the mirror never loses information.
         if (
           contentPartCopy.type === 'tool_use' &&
           typeof contentPartCopy.id === 'string' &&
-          (contentPartCopy.input === '' || contentPartCopy.input == null)
+          (contentPartCopy.input === '' ||
+            contentPartCopy.input == null ||
+            isEmptyPlainObject(contentPartCopy.input))
         ) {
           const matchingToolCall = isAIMessage(message)
             ? message.tool_calls?.find(

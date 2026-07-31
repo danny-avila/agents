@@ -188,6 +188,52 @@ describe('_convertMessagesToAnthropicPayload — non-object tool_use input repla
     expect(toolUse.input).toEqual({ input: '9 * 9' });
   });
 
+  it('restores intact args when the inline input degraded to an empty object', () => {
+    // Asymmetric truncation: the raw string input serializes longer than the
+    // args object, so a near-envelope cap can degrade the inline input to {}
+    // while the tool_calls mirror survives. Replay must prefer the mirror.
+    const toolUse = getToolUse(
+      buildHistory({}, { input: '670592745 / 99991' })
+    );
+    expect(toolUse.input).toEqual({ input: '670592745 / 99991' });
+  });
+
+  it('ships an empty object when the inline input is {} and args were nulled too', () => {
+    const toolUse = getToolUse(buildHistory({}, null));
+    expect(toolUse.input).toEqual({});
+  });
+
+  it('coerces non-object inputs on the srvtoolu_ server-tool normalization branch', () => {
+    for (const [raw, expected] of [
+      ['123', {}],
+      ['[1,2]', {}],
+      ['{"query": "x"}', { query: 'x' }],
+      [null, {}],
+    ] as Array<[unknown, Record<string, unknown>]>) {
+      const history: BaseMessage[] = [
+        new HumanMessage('search'),
+        new AIMessage({
+          content: [
+            {
+              type: 'server_tool_use',
+              id: 'srvtoolu_abc',
+              name: 'web_search',
+              input: raw,
+            } as any,
+          ],
+        }),
+      ];
+      const payload = _convertMessagesToAnthropicPayload(history);
+      const assistant = payload.messages.find(
+        (m: any) => m.role === 'assistant'
+      );
+      const block = (assistant!.content as any[]).find(
+        (b) => b.type === 'server_tool_use'
+      );
+      expect(block.input).toEqual(expected);
+    }
+  });
+
   it('coerces a string input that parses to a non-object', () => {
     for (const raw of ['123', '[1,2]', '"text"', 'null']) {
       const toolUse = getToolUse(buildHistory(raw, undefined));
