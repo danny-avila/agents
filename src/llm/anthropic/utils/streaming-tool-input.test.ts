@@ -1,6 +1,12 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
+import type {
+  AnthropicMessageCreateParams,
+  AnthropicServerToolUseBlockParam,
+  AnthropicToolUseBlockParam,
+} from '@/llm/anthropic/types';
 import { _makeMessageChunkFromAnthropicEvent } from './message_outputs';
 import { _convertMessagesToAnthropicPayload } from './message_inputs';
 
@@ -155,28 +161,45 @@ describe('_convertMessagesToAnthropicPayload — aggregated streaming tool input
  * conversion must never emit a non-object input, whatever shape history is in.
  */
 describe('_convertMessagesToAnthropicPayload — non-object tool_use input replay', () => {
-  const buildHistory = (input: unknown, args: unknown): BaseMessage[] => [
+  /** History shapes context-pressure truncation can leave behind in state. */
+  type DegradedToolInput = string | Record<string, unknown> | null | undefined;
+
+  const buildHistory = (
+    input: DegradedToolInput,
+    args: DegradedToolInput
+  ): BaseMessage[] => [
     new HumanMessage('What is 9 * 9?'),
     new AIMessage({
-      content: [
-        { type: 'tool_use', id: 'toolu_x', name: 'calculator', input } as any,
-      ],
+      content: [{ type: 'tool_use', id: 'toolu_x', name: 'calculator', input }],
       tool_calls: [
         {
           id: 'toolu_x',
           name: 'calculator',
-          args: args as any,
+          args: args as ToolCall['args'],
           type: 'tool_call',
         },
       ],
     }),
   ];
 
-  const getToolUse = (history: BaseMessage[]): any => {
-    const payload = _convertMessagesToAnthropicPayload(history);
-    const assistant = payload.messages.find((m: any) => m.role === 'assistant');
-    return (assistant!.content as any[]).find((b) => b.type === 'tool_use');
+  const findAssistantBlock = (
+    payload: AnthropicMessageCreateParams,
+    type: 'tool_use' | 'server_tool_use'
+  ): AnthropicToolUseBlockParam | AnthropicServerToolUseBlockParam => {
+    const assistant = payload.messages.find((m) => m.role === 'assistant');
+    const content = assistant?.content;
+    const block = (Array.isArray(content) ? content : []).find(
+      (b): b is AnthropicToolUseBlockParam | AnthropicServerToolUseBlockParam =>
+        b.type === type
+    );
+    expect(block).toBeDefined();
+    return block!;
   };
+
+  const getToolUse = (
+    history: BaseMessage[]
+  ): AnthropicToolUseBlockParam | AnthropicServerToolUseBlockParam =>
+    findAssistantBlock(_convertMessagesToAnthropicPayload(history), 'tool_use');
 
   it('ships an empty object when input and args were both truncated to null', () => {
     const toolUse = getToolUse(buildHistory(null, null));
@@ -204,12 +227,13 @@ describe('_convertMessagesToAnthropicPayload — non-object tool_use input repla
   });
 
   it('coerces non-object inputs on the srvtoolu_ server-tool normalization branch', () => {
-    for (const [raw, expected] of [
+    const cases: Array<[DegradedToolInput, Record<string, unknown>]> = [
       ['123', {}],
       ['[1,2]', {}],
       ['{"query": "x"}', { query: 'x' }],
       [null, {}],
-    ] as Array<[unknown, Record<string, unknown>]>) {
+    ];
+    for (const [raw, expected] of cases) {
       const history: BaseMessage[] = [
         new HumanMessage('search'),
         new AIMessage({
@@ -219,16 +243,13 @@ describe('_convertMessagesToAnthropicPayload — non-object tool_use input repla
               id: 'srvtoolu_abc',
               name: 'web_search',
               input: raw,
-            } as any,
+            },
           ],
         }),
       ];
-      const payload = _convertMessagesToAnthropicPayload(history);
-      const assistant = payload.messages.find(
-        (m: any) => m.role === 'assistant'
-      );
-      const block = (assistant!.content as any[]).find(
-        (b) => b.type === 'server_tool_use'
+      const block = findAssistantBlock(
+        _convertMessagesToAnthropicPayload(history),
+        'server_tool_use'
       );
       expect(block.input).toEqual(expected);
     }
@@ -255,7 +276,7 @@ describe('_convertMessagesToAnthropicPayload — non-object tool_use input repla
           {
             id: 'toolu_x',
             name: 'calculator',
-            args: null as any,
+            args: null as unknown as ToolCall['args'],
             type: 'tool_call',
           },
         ],
