@@ -643,6 +643,10 @@ export abstract class Graph<
     currentToolMap?: t.ToolMap;
   }): CustomToolNode<T> | ToolNode<T>;
   abstract getRunMessages(): BaseMessage[] | undefined;
+  /** Returns a snapshot of deferred tools discovered by this graph. */
+  getDiscoveredTools(_agentId?: string): string[] {
+    return [];
+  }
   abstract getContentParts(): t.MessageContentComplex[] | undefined;
   abstract generateStepId(stepKey: string): [string, number];
   abstract getKeyList(
@@ -1006,6 +1010,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   messages: BaseMessage[] = [];
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
+  /** Per-agent discovery snapshots preserved before contexts are reset on cleanup. */
+  private cachedDiscoveredTools?: Map<string, string[]>;
   /** Ids of AI turns the agent node returned THIS run; see isRunProducedMessage. */
   protected runProducedAiMessageIds = new Set<string>();
   /** Checkpoint scope whose messages match index-keyed tool snapshots. */
@@ -1137,6 +1143,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   resetValues(keepContent?: boolean, checkpointScope?: string): void {
     this.messages = [];
     this.cachedRunMessages = undefined;
+    this.cachedDiscoveredTools = undefined;
     this.config = resetIfNotEmpty(this.config, undefined);
     if (keepContent !== true) {
       this.contentData = resetIfNotEmpty(this.contentData, []);
@@ -1203,6 +1210,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   override clearHeavyState(): void {
     this.cachedRunMessages = this.messages.slice(this.startIndex);
+    this.cachedDiscoveredTools = new Map(
+      Array.from(this.agentContexts, ([agentId, context]) => [
+        agentId,
+        context.getDiscoveredTools(),
+      ])
+    );
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
@@ -1495,6 +1508,32 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return this.cachedRunMessages;
     }
     return this.messages.slice(this.startIndex);
+  }
+
+  override getDiscoveredTools(agentId?: string): string[] {
+    if (agentId != null) {
+      const current =
+        this.agentContexts.get(agentId)?.getDiscoveredTools() ?? [];
+      if (current.length > 0 || this.cachedDiscoveredTools == null) {
+        return current;
+      }
+      return [...(this.cachedDiscoveredTools.get(agentId) ?? [])];
+    }
+
+    const discoveredTools = new Set<string>();
+    for (const context of this.agentContexts.values()) {
+      for (const toolName of context.getDiscoveredTools()) {
+        discoveredTools.add(toolName);
+      }
+    }
+    if (discoveredTools.size === 0 && this.cachedDiscoveredTools != null) {
+      for (const snapshot of this.cachedDiscoveredTools.values()) {
+        for (const toolName of snapshot) {
+          discoveredTools.add(toolName);
+        }
+      }
+    }
+    return Array.from(discoveredTools);
   }
 
   /**

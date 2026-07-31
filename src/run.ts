@@ -539,6 +539,21 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   /**
+   * Returns a defensive snapshot of tools discovered by the current run.
+   * Pass an agent id for that context, or omit it for the ordered union across
+   * contexts. Interrupted state is available immediately for host persistence;
+   * completed runs retain their final snapshot through graph cleanup.
+   */
+  getDiscoveredTools(agentId?: string): string[] {
+    if (!this.Graph) {
+      throw new Error(
+        'Graph not initialized. Make sure to use Run.create() to instantiate the Run.'
+      );
+    }
+    return this.Graph.getDiscoveredTools(agentId);
+  }
+
+  /**
    * Returns the current calibration ratio (EMA of provider-vs-estimate token ratios).
    * Hosts should persist this value and pass it back as `RunConfig.calibrationRatio`
    * on the next run for the same conversation so the pruner starts with an accurate
