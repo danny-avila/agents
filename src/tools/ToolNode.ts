@@ -3718,6 +3718,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const batchScopeId = incomingRunId ?? `\0anon-${this.anonBatchCounter++}`;
     const turn = this.toolOutputRegistry?.nextTurn(batchScopeId) ?? 0;
     let outputs: (BaseMessage | Command)[];
+    /** Hoisted from the messages-state branch so the Command tail can carry
+     *  the promotion into handoff updates (same-id state copies there would
+     *  otherwise overwrite the replacement message). */
+    let promotedAiMessage: AIMessage | undefined;
+    let invalidCallResults: ToolMessage[] = [];
 
     if (this.isSendInput(input)) {
       const isLocalTool =
@@ -3871,7 +3876,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             !toolMessageIds.has(call.id) &&
             !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
         );
-      const invalidCallResults = attributableInvalidCalls.map(
+      invalidCallResults = attributableInvalidCalls.map(
         (call) =>
           new ToolMessage({
             status: 'error',
@@ -3899,7 +3904,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * Skipped when the message has no id: the reducer would append a
        * duplicate instead of replacing, which is worse than the dangle.
        */
-      const promotedAiMessage =
+      promotedAiMessage =
         attributableInvalidCalls.length > 0
           ? new AIMessage({
             id: aiMessage.id,
@@ -4154,6 +4159,28 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
     }
 
+    /**
+     * Carry the invalid-call promotion into handoff commands. A handoff
+     * tool's Command snapshots `update.messages` from the PRE-promotion
+     * state (MultiAgentGraph builds a filtered same-id copy of the original
+     * AI message), and commands apply after the sibling reducer updates —
+     * so the stale copy would overwrite the replacement message, and a
+     * Send handoff's child state could omit the synthesized results
+     * entirely. Patch each command's same-id AI message with the promotion
+     * and append any missing synthesized results.
+     */
+    if (promotedAiMessage != null) {
+      outputs = outputs.map((output) =>
+        isCommand(output)
+          ? patchCommandUpdateForPromotedInvalidCalls(
+            output,
+            promotedAiMessage!,
+            invalidCallResults
+          )
+          : output
+      );
+    }
+
     const combinedOutputs: (
       | { messages: BaseMessage[] }
       | BaseMessage[]
@@ -4316,13 +4343,15 @@ function areToolCallsInvoked(
  */
 function sanitizeInvalidToolUseBlocks(
   content: AIMessage['content'],
-  promotedCalls: ReadonlyArray<{ id?: string }>
+  promotedCalls: ReadonlyArray<{ id?: string; name?: string }>
 ): AIMessage['content'] {
   if (!Array.isArray(content)) {
     return content;
   }
-  const promotedIds = new Set(
-    promotedCalls.map((call) => call.id).filter((id) => id != null)
+  const promotedNamesById = new Map(
+    promotedCalls
+      .filter((call) => call.id != null)
+      .map((call) => [call.id!, call.name ?? 'unknown'])
   );
   return content.map((block) => {
     if (
@@ -4331,17 +4360,99 @@ function sanitizeInvalidToolUseBlocks(
     ) {
       return block;
     }
-    const toolUse = block as { id?: string; input?: unknown };
-    if (
-      toolUse.id == null ||
-      !promotedIds.has(toolUse.id) ||
-      (typeof toolUse.input === 'object' &&
-        toolUse.input != null &&
-        !Array.isArray(toolUse.input))
-    ) {
+    const toolUse = block as { id?: string; name?: string; input?: unknown };
+    if (toolUse.id == null || !promotedNamesById.has(toolUse.id)) {
       return block;
     }
-    return { ...block, input: {} };
+    const inputIsObject =
+      typeof toolUse.input === 'object' &&
+      toolUse.input != null &&
+      !Array.isArray(toolUse.input);
+    /** `name` normalizes with the SAME fallback the promoted `tool_calls`
+     *  entry uses — a nameless block would fail provider validation on its
+     *  own even with a valid input. */
+    const nameIsValid =
+      typeof toolUse.name === 'string' && toolUse.name !== '';
+    if (inputIsObject && nameIsValid) {
+      return block;
+    }
+    return {
+      ...block,
+      ...(inputIsObject ? {} : { input: {} }),
+      ...(nameIsValid ? {} : { name: promotedNamesById.get(toolUse.id) }),
+    };
+  });
+}
+
+/**
+ * Rewrite a handoff Command's `update.messages` so the invalid-call promotion
+ * survives into the child state: the same-id AI message copy (snapshotted
+ * pre-promotion by the handoff tool) gets the sanitized content, the promoted
+ * `tool_calls` entries for the answered invalid calls, and the leftover
+ * `invalid_tool_calls`; synthesized results missing from the update are
+ * appended so the child's history keeps every call/result pair. The update
+ * copy's own `tool_calls` narrowing (parallel handoffs filter to a single
+ * call) is preserved. Commands without a same-id AI message pass through.
+ */
+function patchCommandUpdateForPromotedInvalidCalls(
+  command: Command,
+  promoted: AIMessage,
+  invalidResults: ToolMessage[]
+): Command {
+  const update = command.update as { messages?: BaseMessage[] } | undefined;
+  const messages = update?.messages;
+  if (
+    !Array.isArray(messages) ||
+    promoted.id == null ||
+    invalidResults.length === 0
+  ) {
+    return command;
+  }
+  const hasSameIdAiMessage = messages.some(
+    (msg) => isAIMessage(msg) && msg.id === promoted.id
+  );
+  if (!hasSameIdAiMessage) {
+    return command;
+  }
+  const next: BaseMessage[] = messages.map((msg) => {
+    if (!isAIMessage(msg) || msg.id !== promoted.id) {
+      return msg;
+    }
+    const existingIds = new Set(
+      (msg.tool_calls ?? []).map((call) => call.id)
+    );
+    const promotedEntries = invalidResults
+      .filter((result) => !existingIds.has(result.tool_call_id))
+      .map((result) => ({
+        id: result.tool_call_id,
+        name: result.name ?? 'unknown',
+        args: {},
+        type: 'tool_call' as const,
+      }));
+    return new AIMessage({
+      id: msg.id,
+      content: promoted.content,
+      name: msg.name,
+      additional_kwargs: msg.additional_kwargs,
+      response_metadata: msg.response_metadata,
+      usage_metadata: msg.usage_metadata,
+      tool_calls: [...(msg.tool_calls ?? []), ...promotedEntries],
+      invalid_tool_calls: promoted.invalid_tool_calls,
+    });
+  });
+  const presentResultIds = new Set(
+    next
+      .filter((msg): msg is ToolMessage => msg._getType() === 'tool')
+      .map((msg) => msg.tool_call_id)
+  );
+  const missingResults = invalidResults.filter(
+    (result) => !presentResultIds.has(result.tool_call_id)
+  );
+  return new Command({
+    graph: command.graph,
+    goto: command.goto,
+    resume: command.resume,
+    update: { ...update, messages: [...next, ...missingResults] },
   });
 }
 

@@ -222,19 +222,41 @@ function getMessageInvalidToolCalls(
   return calls;
 }
 
+/** The serialized message's own id (uuid), NOT the LC-serialization type id
+ *  array that `message.id` carries in constructor dumps. */
+function getSerializedMessageId(
+  message: Record<string, unknown>
+): string | undefined {
+  const kwargsId = isRecord(message.kwargs) ? message.kwargs.id : undefined;
+  const dataId = isRecord(message.data) ? message.data.id : undefined;
+  const rawId = message.id;
+  const id = kwargsId ?? dataId ?? rawId;
+  return typeof id === 'string' && id !== '' ? id : undefined;
+}
+
 /** Latest assistant turn's tool calls — the calls this tool node is executing. */
 function findPendingToolCalls(value: unknown): SerializedToolCall[] {
   const messages = getMessageArray(value);
   if (messages == null) {
     return [];
   }
+  /**
+   * Invalid calls count only where ToolNode's own gate lets them execute:
+   * the messages-state form (a bare-array state means the node returns a
+   * plain output list and skips invalid handling) with an id-bearing
+   * assistant message (no id, no reducer upsert). Mirrors
+   * `canPromoteInvalidCalls` so the span never reports skipped calls.
+   */
+  const invalidCallsApply = !Array.isArray(value);
   for (let i = messages.length - 1; i >= 0; i--) {
     if (getMessageRole(messages[i]) !== 'assistant') {
       continue;
     }
     const calls = [
       ...getMessageToolCalls(messages[i]),
-      ...getMessageInvalidToolCalls(messages[i]),
+      ...(invalidCallsApply && getSerializedMessageId(messages[i]) != null
+        ? getMessageInvalidToolCalls(messages[i])
+        : []),
     ];
     if (calls.length > 0) {
       return calls;

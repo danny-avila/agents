@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { MemorySaver } from '@langchain/langgraph';
+import { Command, MemorySaver } from '@langchain/langgraph';
 import { describe, it, expect } from '@jest/globals';
 import {
   AIMessage,
@@ -144,6 +144,132 @@ describe('ToolNode invalid_tool_calls handling', () => {
     expect(blocks.find((b) => b.id === 'tc_bad')?.input).toEqual({});
     expect(blocks.find((b) => b.id === 'tc_ok')?.input).toEqual({ command: 'hi' });
     expect(blocks[0]).toEqual({ type: 'text', text: 'Two calls.' });
+  });
+
+  it('normalizes a nameless promoted call\'s tool_use block name (provider validation)', async () => {
+    const node = new ToolNode({ tools: [createEchoTool()] });
+    const aiMsg = new AIMessage({
+      id: 'ai_nameless_block',
+      content: [
+        { type: 'tool_use', id: 'tc_noname', input: '"raw unparsed' },
+      ],
+      tool_calls: [],
+      invalid_tool_calls: [
+        {
+          id: 'tc_noname',
+          args: '"raw unparsed',
+          error: 'Malformed args.',
+          type: 'invalid_tool_call',
+        },
+      ],
+    });
+
+    const result = await node.invoke(
+      { messages: [aiMsg] },
+      { configurable: { run_id: 'invalid-nameless-block' } }
+    );
+    const promoted = toPromotedAiMessage(result)!;
+    const block = (promoted.content as Array<{ id?: string }>).find(
+      (b) => b.id === 'tc_noname'
+    ) as { name?: string; input?: unknown };
+    /** Same fallback the promoted tool_calls entry uses — a nameless block
+     *  fails provider validation on its own even with a valid input. */
+    expect(block.name).toBe('unknown');
+    expect(block.input).toEqual({});
+    expect(promoted.tool_calls?.[0]).toMatchObject({
+      id: 'tc_noname',
+      name: 'unknown',
+    });
+  });
+
+  it('carries the promotion into a handoff Command update (same-id state copy + missing result)', async () => {
+    /**
+     * A handoff tool snapshots `update.messages` from the PRE-promotion
+     * state with a filtered SAME-ID copy of the AI message, and commands
+     * apply after sibling reducer updates — un-patched, that stale copy
+     * overwrites the promotion and the child state omits the synthesized
+     * result, recreating the dangling pair inside the child graph.
+     */
+    const prePromotionCopy = () =>
+      new AIMessage({
+        id: 'ai_handoff',
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_handoff',
+            name: 'transfer_to_agent_b',
+            input: {},
+          },
+          { type: 'tool_use', id: 'tc_bad', name: 'echo', input: '"raw unparsed' },
+        ],
+        tool_calls: [
+          { id: 'tc_handoff', name: 'transfer_to_agent_b', args: {} },
+        ],
+      });
+    const handoffTool = tool(
+      async () =>
+        new Command({
+          graph: Command.PARENT,
+          goto: 'agent_b',
+          update: {
+            messages: [
+              prePromotionCopy(),
+              new ToolMessage({
+                content: 'transferred',
+                tool_call_id: 'tc_handoff',
+                name: 'transfer_to_agent_b',
+              }),
+            ],
+          },
+        }),
+      {
+        name: 'transfer_to_agent_b',
+        description: 'handoff',
+        schema: z.object({}),
+      }
+    ) as unknown as StructuredToolInterface;
+
+    const node = new ToolNode({ tools: [handoffTool] });
+    const aiMsg = new AIMessage({
+      id: 'ai_handoff',
+      content: prePromotionCopy().content,
+      tool_calls: [{ id: 'tc_handoff', name: 'transfer_to_agent_b', args: {} }],
+      invalid_tool_calls: [
+        {
+          id: 'tc_bad',
+          name: 'echo',
+          args: '"raw unparsed',
+          error: 'Malformed args.',
+          type: 'invalid_tool_call',
+        },
+      ],
+    });
+
+    const result = (await node.invoke(
+      { messages: [aiMsg] },
+      { configurable: { run_id: 'invalid-handoff' } }
+    )) as Array<Command | { messages: BaseMessage[] }>;
+
+    const command = result.find((entry) => entry instanceof Command) as Command;
+    expect(command).toBeDefined();
+    const update = command.update as { messages: BaseMessage[] };
+    const patchedAi = update.messages.find(
+      (msg): msg is AIMessage => msg._getType() === 'ai'
+    )!;
+    expect(patchedAi.tool_calls?.map((c) => c.id).sort()).toEqual([
+      'tc_bad',
+      'tc_handoff',
+    ]);
+    expect(patchedAi.invalid_tool_calls).toHaveLength(0);
+    const patchedBlock = (patchedAi.content as Array<{ id?: string }>).find(
+      (b) => b.id === 'tc_bad'
+    ) as { input?: unknown };
+    expect(patchedBlock.input).toEqual({});
+    const resultIds = update.messages
+      .filter((msg): msg is ToolMessage => msg._getType() === 'tool')
+      .map((msg) => msg.tool_call_id)
+      .sort();
+    expect(resultIds).toEqual(['tc_bad', 'tc_handoff']);
   });
 
   it('leaves BaseMessage[] (array-input) callers at the status quo — no synthesized results, no replacement', async () => {

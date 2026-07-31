@@ -142,6 +142,7 @@ describe('shapeLangfuseSpan', () => {
     const mixed = [
       {
         type: 'ai',
+        id: 'ai_mixed_span',
         tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
         invalid_tool_calls: [
           {
@@ -187,6 +188,7 @@ describe('shapeLangfuseSpan', () => {
     const invalidOnly = [
       {
         type: 'ai',
+        id: 'ai_invalid_only_span',
         tool_calls: [],
         invalid_tool_calls: [
           {
@@ -207,6 +209,58 @@ describe('shapeLangfuseSpan', () => {
     shapeLangfuseSpan(invalidOnlySpan);
     expect(JSON.parse(invalidOnlySpan.attributes[INPUT] as string)).toEqual([
       { name: 'echo', args: 'garbage' },
+    ]);
+  });
+
+  it('excludes invalid calls when ToolNode would skip them (array state / id-less message)', () => {
+    /** Mirrors ToolNode's canPromoteInvalidCalls gate: a bare-array state
+     *  returns a plain output list (invalid handling skipped) and an id-less
+     *  message cannot take the reducer upsert — the span must not report
+     *  those calls as pending work. Valid calls still count. */
+    const invalidCall = {
+      name: 'echo',
+      args: 'garbage',
+      id: 'tc_gated',
+      error: 'Malformed args.',
+      type: 'invalid_tool_call',
+    };
+    const arrayStateSpan = createSpan(
+      'tools=agent_abc',
+      {
+        [INPUT]: JSON.stringify([
+          {
+            type: 'ai',
+            id: 'ai_array_span',
+            tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+            invalid_tool_calls: [invalidCall],
+          },
+        ]),
+      },
+      'parent-1'
+    );
+    shapeLangfuseSpan(arrayStateSpan);
+    expect(JSON.parse(arrayStateSpan.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: { command: 'hi' } },
+    ]);
+
+    const idlessSpan = createSpan(
+      'tools=agent_abc',
+      {
+        [INPUT]: JSON.stringify({
+          messages: [
+            {
+              type: 'ai',
+              tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+              invalid_tool_calls: [invalidCall],
+            },
+          ],
+        }),
+      },
+      'parent-1'
+    );
+    shapeLangfuseSpan(idlessSpan);
+    expect(JSON.parse(idlessSpan.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: { command: 'hi' } },
     ]);
   });
 
