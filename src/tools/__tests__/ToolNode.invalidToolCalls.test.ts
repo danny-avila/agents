@@ -37,12 +37,21 @@ function createEchoTool(name = 'echo'): StructuredToolInterface {
   }) as unknown as StructuredToolInterface;
 }
 
-function toToolMessages(result: unknown): ToolMessage[] {
-  const messages = Array.isArray(result)
+function resultMessages(result: unknown): BaseMessage[] {
+  return Array.isArray(result)
     ? result
     : (result as { messages: BaseMessage[] }).messages;
-  return messages.filter(
+}
+
+function toToolMessages(result: unknown): ToolMessage[] {
+  return resultMessages(result).filter(
     (msg): msg is ToolMessage => msg._getType() === 'tool'
+  );
+}
+
+function toPromotedAiMessage(result: unknown): AIMessage | undefined {
+  return resultMessages(result).find(
+    (msg): msg is AIMessage => msg._getType() === 'ai'
   );
 }
 
@@ -50,6 +59,7 @@ describe('ToolNode invalid_tool_calls handling', () => {
   it('synthesizes an error ToolMessage for an invalid call alongside real results (direct batch)', async () => {
     const node = new ToolNode({ tools: [createEchoTool()] });
     const aiMsg = new AIMessage({
+      id: 'ai_mixed',
       content: '',
       tool_calls: [{ id: 'tc_valid', name: 'echo', args: { command: 'hi' } }],
       invalid_tool_calls: [
@@ -78,6 +88,43 @@ describe('ToolNode invalid_tool_calls handling', () => {
     )!;
     expect(String(invalidResult.content)).toContain('Malformed args.');
     expect(invalidResult.name).toBe('echo');
+
+    /** Replacement AI message (reducer upsert-by-id): the answered invalid
+     *  call is promoted into tool_calls so provider converters that rebuild
+     *  the call side from tool_calls emit it alongside its synthesized
+     *  result. */
+    const promoted = toPromotedAiMessage(result);
+    expect(promoted?.id).toBe('ai_mixed');
+    expect(promoted?.tool_calls?.map((c) => c.id).sort()).toEqual([
+      'tc_invalid',
+      'tc_valid',
+    ]);
+    expect(promoted?.invalid_tool_calls).toHaveLength(0);
+  });
+
+  it('does NOT emit a replacement AI message when the original has no id (reducer would append, not replace)', async () => {
+    const node = new ToolNode({ tools: [createEchoTool()] });
+    const aiMsg = new AIMessage({
+      content: '',
+      tool_calls: [],
+      invalid_tool_calls: [
+        {
+          id: 'tc_no_promote',
+          name: 'echo',
+          args: 'garbage',
+          error: 'Malformed args.',
+          type: 'invalid_tool_call',
+        },
+      ],
+    });
+
+    const result = await node.invoke(
+      { messages: [aiMsg] },
+      { configurable: { run_id: 'invalid-no-id' } }
+    );
+
+    expect(toToolMessages(result).map((m) => m.tool_call_id)).toEqual(['tc_no_promote']);
+    expect(toPromotedAiMessage(result)).toBeUndefined();
   });
 
   it('synthesizes error ToolMessages when EVERY call in the batch is invalid', async () => {
@@ -259,5 +306,144 @@ describe('ToolNode invalid_tool_calls handling', () => {
      *  replays; each must have a paired result or the call 400s. */
     expect(resultIds.has('tc_ask_valid')).toBe(true);
     expect(resultIds.has('tc_ask_invalid')).toBe(true);
+  });
+
+  it('routes an INVALID-ONLY turn through ToolNode at the graph level (toolsCondition)', async () => {
+    /**
+     * Codex P1: `toolsCondition` used to return END when `tool_calls` was
+     * empty, so a turn whose only call was malformed never entered ToolNode —
+     * the dangling `tool_use` was committed with no result and no promotion.
+     * This drives the REAL graph routing (agent → toolsCondition → toolNode →
+     * agent) via a scripted model, not a direct node.invoke.
+     */
+    const modelInvocations: BaseMessage[][] = [];
+    const buildModel = (responses: string[], emitCalls: boolean) => {
+      const model = new FakeChatModel({
+        responses,
+        toolCalls: emitCalls
+          ? [{ name: 'echo', args: {}, id: 'tc_solo_invalid', type: 'tool_call' }]
+          : [],
+      });
+      const orig = model._streamResponseChunks.bind(model);
+      model._streamResponseChunks = async function* (
+        messages,
+        options,
+        runManager
+      ): AsyncGenerator<ChatGenerationChunk> {
+        modelInvocations.push(messages);
+        for await (const chunk of orig(messages, options, runManager)) {
+          const chunkMessage = chunk.message as unknown as {
+            tool_call_chunks?: Array<{ id?: string; args?: string }>;
+          };
+          for (const tc of chunkMessage.tool_call_chunks ?? []) {
+            if (tc.id === 'tc_solo_invalid') {
+              tc.args = '"malformed"';
+            }
+          }
+          yield chunk;
+        }
+      };
+      return model;
+    };
+
+    const run = await Run.create<t.IState>({
+      runId: 'invalid-only-graph',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'agent-invalid-only',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4o-mini', streaming: true },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+            graphTools: [createEchoTool()],
+          },
+        ],
+      },
+      returnContent: true,
+      customHandlers: {},
+      tokenCounter: ((text: string) =>
+        String(text).length) as unknown as t.RunConfig['tokenCounter'],
+      indexTokenCountMap: {},
+    });
+    run.Graph!.overrideModel = buildModel(['Calling.', 'Recovered.'], true);
+
+    const invalidOnlyConfig = {
+      configurable: { thread_id: 'invalid-only-thread' },
+      streamMode: 'values' as const,
+      version: 'v2' as const,
+    };
+    await run.processStream(
+      { messages: [new HumanMessage('go')] },
+      invalidOnlyConfig
+    );
+
+    /** A second model call happened at all (END would have stopped after one),
+     *  and it sees the promoted call paired with its synthesized result. */
+    expect(modelInvocations.length).toBeGreaterThan(1);
+    const followUp = modelInvocations[1];
+    const aiMsg = followUp.find(
+      (msg): msg is AIMessage => msg._getType() === 'ai'
+    )!;
+    expect(aiMsg.tool_calls?.map((c) => c.id)).toEqual(['tc_solo_invalid']);
+    expect(aiMsg.invalid_tool_calls).toHaveLength(0);
+    const toolMsg = followUp.find(
+      (msg): msg is ToolMessage => msg._getType() === 'tool'
+    )!;
+    expect(toolMsg.tool_call_id).toBe('tc_solo_invalid');
+    expect(String(toolMsg.content)).toContain('Malformed');
+  });
+
+  it('round-trips through the REAL OpenAI Responses outbound converter with call/output pairing intact', async () => {
+    /**
+     * Codex P1: `_convertMessagesToOpenAIResponsesParams` rebuilds
+     * `function_call` items from `tool_calls` only, so an un-promoted invalid
+     * call would vanish while its synthesized `function_call_output` remained
+     * — an output whose call_id has no matching call. The promotion keeps the
+     * two sides agreeing; this exercises the real outbound converter over the
+     * exact message shapes ToolNode emits for a mixed valid/invalid batch.
+     */
+    const { _convertMessagesToOpenAIResponsesParams } = await import(
+      '@/llm/openai/utils'
+    );
+
+    const node = new ToolNode({ tools: [createEchoTool()] });
+    const aiMsg = new AIMessage({
+      id: 'ai_responses',
+      content: 'Two calls.',
+      tool_calls: [{ id: 'tc_ok', name: 'echo', args: { command: 'hi' } }],
+      invalid_tool_calls: [
+        {
+          id: 'tc_bad',
+          name: 'echo',
+          args: '"malformed"',
+          error: 'Malformed args.',
+          type: 'invalid_tool_call',
+        },
+      ],
+    });
+    const result = await node.invoke(
+      { messages: [aiMsg] },
+      { configurable: { run_id: 'invalid-responses' } }
+    );
+    const promoted = toPromotedAiMessage(result)!;
+    const toolMessages = toToolMessages(result);
+
+    const items = _convertMessagesToOpenAIResponsesParams(
+      [new HumanMessage('go'), promoted, ...toolMessages],
+      'gpt-4o-mini'
+    ) as Array<{ type?: string; call_id?: string }>;
+
+    const callIds = items
+      .filter((item) => item.type === 'function_call')
+      .map((item) => item.call_id)
+      .sort();
+    const outputIds = items
+      .filter((item) => item.type === 'function_call_output')
+      .map((item) => item.call_id)
+      .sort();
+    expect(callIds).toEqual(['tc_bad', 'tc_ok']);
+    expect(outputIds).toEqual(['tc_bad', 'tc_ok']);
   });
 });

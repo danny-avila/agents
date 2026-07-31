@@ -2,6 +2,7 @@ import { nanoid } from 'nanoid';
 import { ToolCall } from '@langchain/core/messages/tool';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
+  AIMessage,
   ToolMessage,
   HumanMessage,
   isAIMessage,
@@ -24,7 +25,7 @@ import type {
   ToolRuntime,
   StructuredToolInterface,
 } from '@langchain/core/tools';
-import type { BaseMessage, AIMessage } from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type {
   ToolOutputResolveView,
@@ -3844,27 +3845,66 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * with an id can be paired (and only those produce the 400); the
        * already-processed / server-tool filters mirror `filteredCalls`.
        */
-      const invalidCallResults = (aiMessage.invalid_tool_calls ?? [])
-        .filter(
-          (call) =>
-            call.id != null &&
-            call.id !== '' &&
-            !toolMessageIds.has(call.id) &&
-            !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
-        )
-        .map(
-          (call) =>
-            new ToolMessage({
-              status: 'error',
-              content: truncateToolResultContent(
-                `Error: ${call.error ?? 'Malformed tool call arguments.'} ` +
-                  'The tool call input could not be parsed as a JSON object; the tool was not run.\n Please fix your mistakes.',
-                this.maxToolResultChars
-              ),
-              name: call.name ?? 'unknown',
-              tool_call_id: call.id!,
-            })
-        );
+      const attributableInvalidCalls = (aiMessage.invalid_tool_calls ?? []).filter(
+        (call) =>
+          call.id != null &&
+          call.id !== '' &&
+          !toolMessageIds.has(call.id) &&
+          !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+      );
+      const invalidCallResults = attributableInvalidCalls.map(
+        (call) =>
+          new ToolMessage({
+            status: 'error',
+            content: truncateToolResultContent(
+              `Error: ${call.error ?? 'Malformed tool call arguments.'} ` +
+                'The tool call input could not be parsed as a JSON object; the tool was not run.\n Please fix your mistakes.',
+              this.maxToolResultChars
+            ),
+            name: call.name ?? 'unknown',
+            tool_call_id: call.id!,
+          })
+      );
+
+      /**
+       * Promote the answered invalid calls into well-formed `tool_calls` on a
+       * REPLACEMENT copy of the AI message (`messagesStateReducer` upserts by
+       * id). Without this, provider converters that rebuild the call side of
+       * the wire from `tool_calls` — OpenAI Completions `tool_calls`, OpenAI
+       * Responses `function_call` items, Gemini/Bedrock function-call parts —
+       * drop the invalid call while the synthesized result above still
+       * references it, inverting the dangling-pair rejection (an output whose
+       * call is missing). Promoting at this single seam keeps the call and
+       * result sides agreeing for EVERY provider; args become `{}` (the raw
+       * string never parsed — the paired error result tells the model why).
+       * Skipped when the message has no id: the reducer would append a
+       * duplicate instead of replacing, which is worse than the dangle.
+       */
+      const promotedAiMessage =
+        attributableInvalidCalls.length > 0 &&
+        typeof aiMessage.id === 'string' &&
+        aiMessage.id.length > 0
+          ? new AIMessage({
+            id: aiMessage.id,
+            content: aiMessage.content,
+            name: aiMessage.name,
+            additional_kwargs: aiMessage.additional_kwargs,
+            response_metadata: aiMessage.response_metadata,
+            usage_metadata: aiMessage.usage_metadata,
+            tool_calls: [
+              ...(aiMessage.tool_calls ?? []),
+              ...attributableInvalidCalls.map((call) => ({
+                id: call.id!,
+                name: call.name ?? 'unknown',
+                args: {},
+                type: 'tool_call' as const,
+              })),
+            ],
+            invalid_tool_calls: (aiMessage.invalid_tool_calls ?? []).filter(
+              (call) => !attributableInvalidCalls.includes(call)
+            ),
+          })
+          : undefined;
 
       if (this.eventDrivenMode && filteredCalls.length > 0) {
         const directToolNames = this.directToolNames;
@@ -4007,6 +4047,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             ]
             : [];
         outputs = [
+          // Replacement AI message first (reducer upsert-by-id), then results.
+          ...(promotedAiMessage != null ? [promotedAiMessage] : []),
           ...directOutputs,
           ...eventResult.toolMessages,
           // Synthesized invalid-call errors sit with the real tool results,
@@ -4046,9 +4088,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         );
         // Append accumulated additionalContexts as a single
         // HumanMessage so the next model turn sees them. Codex P2 #39.
+        const promotedPrefix = promotedAiMessage != null ? [promotedAiMessage] : [];
         outputs =
           directAdditionalContexts.length > 0
             ? [
+              ...promotedPrefix,
               ...toolOutputs,
               ...invalidCallResults,
               new HumanMessage({
@@ -4059,7 +4103,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 additional_kwargs: { role: 'system', source: 'hook' },
               }),
             ]
-            : [...toolOutputs, ...invalidCallResults];
+            : [...promotedPrefix, ...toolOutputs, ...invalidCallResults];
       }
 
       /**
@@ -4239,6 +4283,24 @@ function areToolCallsInvoked(
   );
 }
 
+/**
+ * Whether the message carries an `invalid_tool_calls` entry ToolNode can pair a
+ * synthesized error result with (id-bearing, non-server). Shared by the routing
+ * condition below so an invalid-only turn still enters ToolNode — otherwise the
+ * malformed `tool_use` block is committed with no `tool_result` and the next
+ * model call is rejected by pairing-strict providers.
+ */
+function hasAttributableInvalidToolCalls(message: AIMessage): boolean {
+  return (
+    message.invalid_tool_calls?.some(
+      (call) =>
+        call.id != null &&
+        call.id !== '' &&
+        !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+    ) ?? false
+  );
+}
+
 export function toolsCondition<T extends string>(
   state: BaseMessage[] | typeof MessagesAnnotation.State,
   toolNode: T,
@@ -4252,6 +4314,20 @@ export function toolsCondition<T extends string>(
     'tool_calls' in message &&
     (message.tool_calls?.length ?? 0) > 0 &&
     !areToolCallsInvoked(message, invokedToolIds)
+  ) {
+    return toolNode;
+  }
+  /**
+   * Invalid-only turn: no valid calls to route on, but ToolNode still owes the
+   * malformed calls their synthesized error results. Restricted to the
+   * zero-valid-calls case on purpose — when valid calls exist they either
+   * routed above, or were ALL invoked externally (`invokedToolIds`), where
+   * entering ToolNode would re-execute them.
+   */
+  if (
+    message &&
+    (message.tool_calls?.length ?? 0) === 0 &&
+    hasAttributableInvalidToolCalls(message)
   ) {
     return toolNode;
   }
