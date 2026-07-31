@@ -573,6 +573,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private eagerEventToolExecutions?: Map<string, t.EagerEventToolExecution>;
   /** Shared per-run per-tool turn counter used by eager and normal event dispatch. */
   private eagerEventToolUsageCount?: Map<string, number>;
+  /**
+   * Shared per-run eager prestart circuit breaker. Tool names added here
+   * (when a prestarted execution's args mismatch the final request) are no
+   * longer prestarted by the stream handler for the rest of the run.
+   */
+  private eagerEventToolSuppressions?: Set<string>;
   /** Agent ID for event-driven mode */
   private agentId?: string;
   /**
@@ -657,6 +663,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     eagerEventToolExecution,
     eagerEventToolExecutions,
     eagerEventToolUsageCount,
+    eagerEventToolSuppressions,
     agentId,
     executingAgentId,
     directToolNames,
@@ -694,6 +701,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.eagerEventToolExecution = eagerEventToolExecution;
     this.eagerEventToolExecutions = eagerEventToolExecutions;
     this.eagerEventToolUsageCount = eagerEventToolUsageCount;
+    this.eagerEventToolSuppressions = eagerEventToolSuppressions;
     this.agentId = agentId;
     // Default to agentId so callers constructing ToolNode directly (who pass the
     // existing agentId option) still get attribution without knowing the new option.
@@ -3314,6 +3322,22 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       execution.toolName !== request.name ||
       !recordArgsEqual(execution.args, request.args)
     ) {
+      // Circuit breaker: a prestart/final mismatch means the streamed eager
+      // snapshot cannot be trusted for this tool in this run. Without this,
+      // the model retries the call, the retry prestarts and diverges the
+      // same way, and the run loops to the recursion limit (LibreChat#14371).
+      // On an identity mismatch, suppress the eagerly executed name too —
+      // otherwise a retry that deterministically streams name A but
+      // materializes name B keeps prestarting A (and repeating its side
+      // effects) every round.
+      this.eagerEventToolSuppressions?.add(request.name);
+      this.eagerEventToolSuppressions?.add(execution.toolName);
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[ToolNode] eager prestart args diverged from the final request for ' +
+          `tool "${request.name}" (toolCallId=${request.id}); suppressing ` +
+          'eager prestart for this tool for the rest of the run'
+      );
       return {
         toolCallId: request.id,
         toolName: request.name,

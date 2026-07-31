@@ -767,6 +767,15 @@ export abstract class Graph<
   eagerEventToolCallChunks: Map<string, t.EagerEventToolCallChunkState> =
     new Map();
   /**
+   * Per-run eager prestart circuit breaker, shared by reference with every
+   * ToolNode this graph compiles. When a prestarted execution's args turn
+   * out to differ from the final request, ToolNode records the tool name
+   * here and the stream handler stops prestarting that tool for the rest of
+   * the run — the retry then executes normally instead of re-diverging in a
+   * loop (LibreChat#14371).
+   */
+  eagerEventToolSuppressions: Set<string> = new Set();
+  /**
    * Run-scoped execution backend for built-in code tools. Defaults to the
    * remote Code API sandbox when unset.
    */
@@ -815,6 +824,7 @@ export abstract class Graph<
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
+    this.eagerEventToolSuppressions.clear();
     this.toolExecution = undefined;
     this.handlerDispatchedEventCounts.clear();
     /**
@@ -1144,6 +1154,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
+    this.eagerEventToolSuppressions.clear();
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
@@ -1672,6 +1683,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         eagerEventToolUsageCount: this.getEagerEventToolUsageCount(
           agentContext?.agentId
         ),
+        eagerEventToolSuppressions: this.eagerEventToolSuppressions,
         toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         interruptingToolNames:
