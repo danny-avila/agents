@@ -164,6 +164,11 @@ describe('shapeLangfuseSpan', () => {
             id: 'srvtoolu_xyz',
             error: 'Malformed args.',
           },
+          {
+            args: 'nameless — included with the unknown fallback',
+            id: 'tc_nameless',
+            error: 'Malformed args.',
+          },
         ],
       },
     ];
@@ -176,6 +181,7 @@ describe('shapeLangfuseSpan', () => {
     expect(JSON.parse(mixedSpan.attributes[INPUT] as string)).toEqual([
       { name: 'echo', args: { command: 'hi' } },
       { name: 'echo', args: '"raw unparsed' },
+      { name: 'unknown', args: 'nameless — included with the unknown fallback' },
     ]);
 
     const invalidOnly = [

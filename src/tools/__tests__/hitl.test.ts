@@ -35,6 +35,7 @@ import type * as t from '@/types';
 import { Providers as providers, GraphEvents } from '@/common';
 import * as events from '@/utils/events';
 import { HookRegistry, createToolPolicyHook } from '@/hooks';
+import { askUserQuestion } from '@/hitl';
 import { ToolNode } from '../ToolNode';
 
 async function flushAsyncWork(): Promise<void> {
@@ -4362,8 +4363,6 @@ describe('AskUserQuestion — interrupt + resume', () => {
      * onto the right content part when a model emits several ask calls in
      * one turn — positional guessing mislabels the cards.
      */
-    const { askUserQuestion } = await import('@/hitl');
-
     const askTool = tool(
       async (input: { question: string }, config) => {
         const resolution = askUserQuestion(input, {
