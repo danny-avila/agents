@@ -188,8 +188,30 @@ function getMessageToolCalls(
  * keeps the full serialized graph state as its input, and a mixed dispatch
  * silently omits the malformed call. `args` stays the raw unparsed string.
  */
+/** Tool-result ids present in the serialized state — ToolNode's
+ *  `!toolMessageIds.has(id)` execution filter, mirrored for the span. */
+function getToolResultIds(
+  messages: Record<string, unknown>[]
+): Set<string> {
+  const ids = new Set<string>();
+  for (const message of messages) {
+    if (getMessageRole(message) !== 'tool') {
+      continue;
+    }
+    const rawId =
+      message.tool_call_id ??
+      (isRecord(message.kwargs) ? message.kwargs.tool_call_id : undefined) ??
+      (isRecord(message.data) ? message.data.tool_call_id : undefined);
+    if (typeof rawId === 'string' && rawId !== '') {
+      ids.add(rawId);
+    }
+  }
+  return ids;
+}
+
 function getMessageInvalidToolCalls(
-  message: Record<string, unknown>
+  message: Record<string, unknown>,
+  answeredIds: ReadonlySet<string>
 ): SerializedToolCall[] {
   const rawCalls =
     message.invalid_tool_calls ??
@@ -206,6 +228,7 @@ function getMessageInvalidToolCalls(
       !isRecord(rawCall) ||
       typeof rawCall.id !== 'string' ||
       rawCall.id === '' ||
+      answeredIds.has(rawCall.id) ||
       rawCall.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
     ) {
       continue;
@@ -250,6 +273,9 @@ function findPendingToolCalls(value: unknown): SerializedToolCall[] {
    * `canPromoteInvalidCalls` so the span never reports skipped calls.
    */
   const invalidCallsApply = !Array.isArray(value);
+  const answeredIds = invalidCallsApply
+    ? getToolResultIds(messages)
+    : undefined;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (getMessageRole(messages[i]) !== 'assistant') {
       continue;
@@ -257,7 +283,7 @@ function findPendingToolCalls(value: unknown): SerializedToolCall[] {
     const calls = [
       ...getMessageToolCalls(messages[i]),
       ...(invalidCallsApply && getSerializedMessageId(messages[i]) != null
-        ? getMessageInvalidToolCalls(messages[i])
+        ? getMessageInvalidToolCalls(messages[i], answeredIds!)
         : []),
     ];
     if (calls.length > 0) {

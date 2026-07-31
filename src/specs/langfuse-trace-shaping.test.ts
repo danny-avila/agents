@@ -264,6 +264,47 @@ describe('shapeLangfuseSpan', () => {
     ]);
   });
 
+  it('excludes invalid calls already answered by a ToolMessage in the state', () => {
+    /** Mirrors ToolNode's !toolMessageIds.has(id) execution filter: an
+     *  answered invalid call is not pending work, even when the same turn
+     *  still has a pending valid call. */
+    const span = createSpan(
+      'tools=agent_abc',
+      {
+        [INPUT]: JSON.stringify({
+          messages: [
+            {
+              type: 'ai',
+              id: 'ai_answered_invalid',
+              tool_calls: [
+                { name: 'echo', args: { command: 'hi' }, id: 'tc_pending' },
+              ],
+              invalid_tool_calls: [
+                {
+                  name: 'echo',
+                  args: 'garbage',
+                  id: 'tc_answered_invalid',
+                  error: 'Malformed args.',
+                  type: 'invalid_tool_call',
+                },
+              ],
+            },
+            {
+              type: 'tool',
+              tool_call_id: 'tc_answered_invalid',
+              content: 'Error: Malformed args.',
+            },
+          ],
+        }),
+      },
+      'parent-1'
+    );
+    shapeLangfuseSpan(span);
+    expect(JSON.parse(span.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: { command: 'hi' } },
+    ]);
+  });
+
   it('keeps a stable tool-dispatch shape when no tool calls are found', () => {
     const original = JSON.stringify({
       messages: [{ type: 'human', content: 'hi' }],

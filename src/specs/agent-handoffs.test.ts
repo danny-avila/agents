@@ -125,6 +125,7 @@ type HandoffReceptionProbe = {
   ): {
     instructions: string | null;
     parallelGroupId?: number;
+    filteredMessages?: t.BaseGraphState['messages'];
   } | null;
 };
 
@@ -2373,6 +2374,92 @@ describe('Agent Handoffs Tests', () => {
       expect(leftReply).toBeDefined();
       expect(rightReply).toBeDefined();
       expectPromotedPairing(finalMessages!);
+    });
+
+    it('reception strips transfer tool_use content blocks alongside the calls (array-content providers)', async () => {
+      /**
+       * The retained filtered AI message used to keep `content` verbatim:
+       * with the promoted sibling holding the message in state, an
+       * Anthropic child would replay the stripped transfer's `tool_use`
+       * block (and a parallel sibling's block, whose result never reaches
+       * this recipient) as unmatched calls. Both must be filtered with the
+       * tool-call filtering; non-transfer blocks stay.
+       */
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'You are a router'),
+        createBasicAgent('left', 'You are the left specialist'),
+        createBasicAgent('right', 'You are the right specialist'),
+      ];
+      const edges: t.GraphEdge[] = [
+        { from: 'router', to: 'left', edgeType: 'handoff' },
+        { from: 'router', to: 'right', edgeType: 'handoff' },
+      ];
+      const run = await Run.create(createTestConfig(agents, edges));
+      const graph = run.Graph as unknown as HandoffReceptionProbe;
+
+      const transferLeft = {
+        id: 'tc_transfer_left',
+        name: `${Constants.LC_TRANSFER_TO_}left`,
+        args: {},
+      };
+      const context = graph.processHandoffReception(
+        [
+          new AIMessage({
+            id: 'ai_reception_blocks',
+            content: [
+              { type: 'text', text: 'Routing.' },
+              {
+                type: 'tool_use',
+                id: 'tc_transfer_left',
+                name: `${Constants.LC_TRANSFER_TO_}left`,
+                input: {},
+              },
+              {
+                type: 'tool_use',
+                id: 'tc_transfer_right_sibling',
+                name: `${Constants.LC_TRANSFER_TO_}right`,
+                input: {},
+              },
+              {
+                type: 'tool_use',
+                id: 'tc_promoted_sibling',
+                name: 'unknown',
+                input: {},
+              },
+            ],
+            tool_calls: [
+              transferLeft,
+              { id: 'tc_promoted_sibling', name: 'unknown', args: {} },
+            ],
+          }),
+          new ToolMessage({
+            content: 'Successfully transferred to left',
+            name: transferLeft.name,
+            tool_call_id: transferLeft.id,
+          }),
+          new ToolMessage({
+            content: 'Error: Malformed args.',
+            name: 'unknown',
+            tool_call_id: 'tc_promoted_sibling',
+          }),
+        ],
+        'left'
+      );
+
+      const retained = context?.filteredMessages?.find(
+        (msg): msg is AIMessage => msg.getType() === 'ai'
+      );
+      expect(retained).toBeDefined();
+      expect(retained!.tool_calls?.map((call) => call.id)).toEqual([
+        'tc_promoted_sibling',
+      ]);
+      const blocks = retained!.content as Array<{ type?: string; id?: string }>;
+      /** Both this recipient's transfer block AND the parallel sibling's
+       *  are gone; the text and the promoted sibling's block remain. */
+      expect(blocks.map((block) => block.id ?? block.type)).toEqual([
+        'text',
+        'tc_promoted_sibling',
+      ]);
     });
   });
 });
