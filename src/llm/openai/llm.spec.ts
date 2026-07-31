@@ -540,6 +540,29 @@ describe('convertCompletionsMessageToBaseMessage (fork delegate)', () => {
     );
   });
 
+  it('preserves the reported service tier for non-streaming completions', () => {
+    const mockMessage = {
+      role: 'assistant' as const,
+      content: 'Done',
+    };
+    const mockRawResponse = {
+      id: 'chatcmpl-priority',
+      model: 'gpt-5.6-sol',
+      service_tier: 'priority' as const,
+      choices: [{ index: 0, message: mockMessage }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    };
+
+    const result = completionsDelegateOf(
+      newOpenAI()
+    )._convertCompletionsMessageToBaseMessage(
+      mockMessage,
+      mockRawResponse
+    ) as AIMessage;
+
+    expect(result.response_metadata.service_tier).toBe('priority');
+  });
+
   it('preserves delta reasoning_content in streaming chunks', () => {
     const delta = {
       role: 'assistant' as const,
