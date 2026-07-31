@@ -1014,8 +1014,9 @@ function recordEagerToolCallChunks(args: {
   graph: StandardGraph;
   stepKey: string;
   toolCallChunks?: ToolCallChunk[];
+  seal?: StreamedToolCallSeal;
 }): void {
-  const { graph, stepKey, toolCallChunks } = args;
+  const { graph, stepKey, toolCallChunks, seal } = args;
   if (toolCallChunks == null || toolCallChunks.length === 0) {
     return;
   }
@@ -1062,6 +1063,16 @@ function recordEagerToolCallChunks(args: {
     const argsText = isRepeatedObservedFragment
       ? existing.argsText
       : mergeToolCallArgsText(existing.argsText, incomingArgs);
+    const index = getEagerToolChunkIndex(toolCallChunk) ?? existing.index;
+    // Only a chunk whose explicit adapter seal covers THIS call may supply a
+    // full-args restatement (OpenAI Responses `arguments.done`). Pure-signal
+    // seals carry empty args and never set this.
+    const sealCoversChunk =
+      seal != null &&
+      (seal.kind === 'all' ||
+        (seal.kind === 'single' &&
+          ((seal.id != null && seal.id === id) ||
+            (seal.index != null && seal.index === index))));
     const next = {
       id,
       name,
@@ -1070,9 +1081,13 @@ function recordEagerToolCallChunks(args: {
       // final request's args always come from this text — never from the
       // heuristic `argsText` above, which may reconcile away real payload.
       rawArgsText: `${existing.rawArgsText ?? ''}${incomingArgs}`,
-      index: getEagerToolChunkIndex(toolCallChunk) ?? existing.index,
+      index,
       lastArgsFragment:
         incomingArgs !== '' ? incomingArgs : existing.lastArgsFragment,
+      sealedArgsFragment:
+        sealCoversChunk && incomingArgs !== ''
+          ? incomingArgs
+          : existing.sealedArgsFragment,
     };
     graph.eagerEventToolCallChunks.set(key, next);
   }
@@ -1166,13 +1181,15 @@ function getStreamedReadyToolCalls(args: {
         return [];
       }
       // Adapter seals may restate the finished call's full args on the seal
-      // chunk itself (OpenAI Responses `function_call_arguments.done`). When
-      // the accumulated text IS that final restatement, the adapter has
-      // vouched for it — plain concatenation intentionally differs there.
+      // chunk itself (OpenAI Responses `function_call_arguments.done`). Only
+      // when the seal-carrying chunk supplied that fragment AND the
+      // accumulated text IS that restatement has the adapter vouched for it —
+      // plain concatenation intentionally differs there. Pure-signal seals
+      // (Bedrock contentBlockStop, `args: ''`) never qualify.
       const isAuthoritativeRestatement =
         sealedByAdapter &&
-        state.lastArgsFragment != null &&
-        state.lastArgsFragment === state.argsText;
+        state.sealedArgsFragment != null &&
+        state.sealedArgsFragment === state.argsText;
       // Otherwise the final request's args come from LangChain's canonical
       // verbatim concatenation (`rawArgsText`), while `argsText` reconciles
       // provider quirks with lossy heuristics that can also swallow
@@ -1625,6 +1642,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
           graph,
           stepKey,
           toolCallChunks: chunk.tool_call_chunks,
+          seal: streamedToolCallSeal,
         });
       }
       await handleToolCallChunks({

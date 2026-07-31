@@ -85,6 +85,15 @@ export type EagerEventToolCallChunkState = {
    * canonical accumulation.
    */
   rawArgsText?: string;
+  /**
+   * The non-empty args fragment carried by a chunk whose explicit adapter
+   * seal covered this call. Some adapters restate the finished call's full
+   * args on the seal chunk (OpenAI Responses `function_call_arguments.done`);
+   * only such a restatement may override the `rawArgsText` comparison at
+   * seal time. Pure-signal seals (Bedrock `contentBlockStop`, `args: ''`)
+   * never set this.
+   */
+  sealedArgsFragment?: string;
 };
 
 export type ToolNodeOptions = {

@@ -32,6 +32,12 @@ import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
+import {
+  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
+  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
+  BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
+  OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
+} from '@/tools/streamedToolCallSeals';
 import { GraphEvents, Providers, StepTypes } from '@/common';
 import { ChatModelStreamHandler } from '@/stream';
 import { ToolNode } from '@/tools/ToolNode';
@@ -327,6 +333,137 @@ describe('eager args divergence (LibreChat#14371)', () => {
 
     expect(toolExecuteCalls).toHaveLength(0);
     expect(graph.eagerEventToolExecutions.has('call_1')).toBe(false);
+  });
+
+  it('does not treat a pure-signal adapter seal as an args restatement (Bedrock)', async () => {
+    // Bedrock's contentBlockStop seal chunk carries `args: ''` — a pure
+    // signal, not a restatement. A repeated complete-JSON fragment leaves
+    // the heuristic accumulator with lastArgsFragment === argsText while the
+    // canonical concatenation differs; the seal must NOT bless that state as
+    // authoritative (Codex P1 on #368).
+    const bedrockMetadata = {
+      [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+        BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
+    };
+    const graph = createGraph({
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.BEDROCK,
+          reasoningKey: 'reasoning_content',
+          toolDefinitions: [{ name: 'db_query' }],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    const fragment = '{"sql":"SELECT 1;"}';
+    for (const toolCallChunk of [
+      { id: 'call_1', name: 'db_query', args: fragment, index: 0 },
+      { args: fragment, index: 0 },
+    ]) {
+      await handler.handle(
+        GraphEvents.CHAT_MODEL_STREAM,
+        {
+          chunk: {
+            content: '',
+            tool_call_chunks: [toolCallChunk],
+            response_metadata: bedrockMetadata,
+          } as unknown as t.StreamChunk,
+        },
+        metadata,
+        graph
+      );
+    }
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [{ args: '', index: 0 }],
+          response_metadata: {
+            ...bedrockMetadata,
+            [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: {
+              kind: 'single',
+              index: 0,
+            },
+          },
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.has('call_1')).toBe(false);
+  });
+
+  it('still prestarts adapter-sealed calls whose seal chunk restates the args (OpenAI Responses contract)', async () => {
+    const graph = createGraph({
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.OPENAI,
+          reasoningKey: 'reasoning_content',
+          toolDefinitions: [{ name: 'db_query' }],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const adapterMetadata = {
+      [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+        OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
+    };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            { id: 'call_1', name: 'db_query', args: '{"sql":"SELE', index: 0 },
+          ],
+          response_metadata: adapterMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+    // The `arguments.done` seal chunk restates the complete args.
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            { id: 'call_1', args: '{"sql":"SELECT 1;"}', index: 0 },
+          ],
+          response_metadata: {
+            ...adapterMetadata,
+            [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: {
+              kind: 'single',
+              id: 'call_1',
+              index: 0,
+            },
+          },
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls[0]).toMatchObject({
+      id: 'call_1',
+      name: 'db_query',
+      args: { sql: 'SELECT 1;' },
+    });
   });
 
   it('still prestarts sealed calls whose fragments accumulate cleanly', async () => {
