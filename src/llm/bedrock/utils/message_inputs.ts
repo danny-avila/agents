@@ -762,8 +762,6 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
         ) {
           throw new Error('Invalid Anthropic tool_use content block');
         }
-        // A non-object input (raw streamed string, truncation-persisted null)
-        // is recoverable — coerce it rather than fail the whole request.
         contentBlocks.push({
           toolUse: {
             toolUseId: toolUse.id,
