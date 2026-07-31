@@ -102,6 +102,49 @@ describe('ToolNode invalid_tool_calls handling', () => {
     expect(promoted?.invalid_tool_calls).toHaveLength(0);
   });
 
+  it('sanitizes the promoted call\'s Anthropic tool_use content block (raw string input → {})', async () => {
+    /**
+     * Anthropic formats array-content AI messages from the blocks verbatim; a
+     * call whose streamed input never parsed leaves `input` as the raw
+     * accumulated string, which the API rejects with "Input should be an
+     * object" on replay. The replacement message must normalize the block to
+     * match the promoted args; valid siblings' blocks stay untouched.
+     */
+    const node = new ToolNode({ tools: [createEchoTool()] });
+    const aiMsg = new AIMessage({
+      id: 'ai_blocks',
+      content: [
+        { type: 'text', text: 'Two calls.' },
+        { type: 'tool_use', id: 'tc_ok', name: 'echo', input: { command: 'hi' } },
+        { type: 'tool_use', id: 'tc_bad', name: 'echo', input: '"raw unparsed' },
+      ],
+      tool_calls: [{ id: 'tc_ok', name: 'echo', args: { command: 'hi' } }],
+      invalid_tool_calls: [
+        {
+          id: 'tc_bad',
+          name: 'echo',
+          args: '"raw unparsed',
+          error: 'Malformed args.',
+          type: 'invalid_tool_call',
+        },
+      ],
+    });
+
+    const result = await node.invoke(
+      { messages: [aiMsg] },
+      { configurable: { run_id: 'invalid-blocks' } }
+    );
+    const promoted = toPromotedAiMessage(result)!;
+    const blocks = promoted.content as Array<{
+      type?: string;
+      id?: string;
+      input?: unknown;
+    }>;
+    expect(blocks.find((b) => b.id === 'tc_bad')?.input).toEqual({});
+    expect(blocks.find((b) => b.id === 'tc_ok')?.input).toEqual({ command: 'hi' });
+    expect(blocks[0]).toEqual({ type: 'text', text: 'Two calls.' });
+  });
+
   it('does NOT emit a replacement AI message when the original has no id (reducer would append, not replace)', async () => {
     const node = new ToolNode({ tools: [createEchoTool()] });
     const aiMsg = new AIMessage({

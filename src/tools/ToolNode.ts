@@ -3886,7 +3886,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         aiMessage.id.length > 0
           ? new AIMessage({
             id: aiMessage.id,
-            content: aiMessage.content,
+            content: sanitizeInvalidToolUseBlocks(
+              aiMessage.content,
+              attributableInvalidCalls
+            ),
             name: aiMessage.name,
             additional_kwargs: aiMessage.additional_kwargs,
             response_metadata: aiMessage.response_metadata,
@@ -4281,6 +4284,48 @@ function areToolCallsInvoked(
       (toolCall) => toolCall.id != null && invokedToolIds.has(toolCall.id)
     ) ?? false
   );
+}
+
+/**
+ * Normalize the `tool_use` content blocks of promoted invalid calls so the
+ * replacement AI message is valid on EVERY provider surface, not just
+ * `tool_calls`. Anthropic formats an array-content AI message from its blocks
+ * verbatim, and a call whose streamed `input_json` never parsed leaves the
+ * block's `input` as the raw accumulated STRING — replayed as-is, the API
+ * rejects it with `tool_use.input: Input should be an object` before pairing
+ * is even checked. Blocks matching a promoted call id get `input: {}`
+ * (mirroring the promoted args); everything else passes through untouched.
+ * String content (OpenAI-style) is returned as-is.
+ */
+function sanitizeInvalidToolUseBlocks(
+  content: AIMessage['content'],
+  promotedCalls: ReadonlyArray<{ id?: string }>
+): AIMessage['content'] {
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  const promotedIds = new Set(
+    promotedCalls.map((call) => call.id).filter((id) => id != null)
+  );
+  return content.map((block) => {
+    if (
+      typeof block !== 'object' ||
+      (block as { type?: string } | null)?.type !== 'tool_use'
+    ) {
+      return block;
+    }
+    const toolUse = block as { id?: string; input?: unknown };
+    if (
+      toolUse.id == null ||
+      !promotedIds.has(toolUse.id) ||
+      (typeof toolUse.input === 'object' &&
+        toolUse.input != null &&
+        !Array.isArray(toolUse.input))
+    ) {
+      return block;
+    }
+    return { ...block, input: {} };
+  });
 }
 
 /**
