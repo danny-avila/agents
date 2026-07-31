@@ -4389,6 +4389,22 @@ function sanitizeInvalidToolUseBlocks(
  * materializes them (synthesized result, promoted tool_calls entry, sanitized
  * block, handoff patch): `''` is normalized like `undefined` — providers
  * reject nameless calls, so an empty string would defeat the promotion.
+ *
+ * INVARIANT MAP — a tool call lives in several parallel representations, and
+ * any surface that materializes, copies, filters, routes on, or reports one
+ * must keep ALL of them agreeing (`tool_calls`, `invalid_tool_calls`,
+ * provider content blocks, paired results). The attribution predicate is:
+ * id-bearing (non-empty), non-server (`srvtoolu_`), unanswered
+ * (`toolMessageIds`), messages-state input, id-bearing AI message. Surfaces
+ * that apply it today — extend this list when adding another:
+ *   - `run()`'s `canPromoteInvalidCalls` gate + attributable filter
+ *   - `toolsCondition`'s invalid-only / server-mix routing branch
+ *   - `sanitizeInvalidToolUseBlocks` (block input AND name)
+ *   - `patchCommandUpdateForPromotedInvalidCalls` (handoff snapshots)
+ *   - `processHandoffReception`'s transfer-block filtering (MultiAgentGraph)
+ *   - `findPendingToolCalls` in langfuseTraceShaping (span claims)
+ *   - `serializeMessage`/`deserializeMessage` (session round-trip keeps
+ *     `invalid_tool_calls` with the content blocks they repair)
  */
 function normalizeInvalidCallName(name: string | undefined | null): string {
   return name != null && name !== '' ? name : 'unknown';

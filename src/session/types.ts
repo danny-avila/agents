@@ -52,6 +52,7 @@ export interface SerializedSessionMessage {
   name?: string;
   toolCallId?: string;
   toolCalls?: JsonValue;
+  invalidToolCalls?: JsonValue;
   usageMetadata?: JsonObject;
 }
 

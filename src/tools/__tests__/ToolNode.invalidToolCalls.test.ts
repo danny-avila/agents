@@ -12,6 +12,10 @@ import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type * as t from '@/types';
 import { _convertMessagesToOpenAIResponsesParams } from '@/llm/openai/utils';
+import {
+  serializeMessage,
+  deserializeMessage,
+} from '@/session/messageSerialization';
 import { askUserQuestion } from '@/hitl/askUserQuestion';
 import { FakeChatModel } from '@/llm/fake';
 import { Providers } from '@/common';
@@ -282,6 +286,46 @@ describe('ToolNode invalid_tool_calls handling', () => {
       .map((msg) => msg.tool_call_id)
       .sort();
     expect(resultIds).toEqual(['tc_bad', 'tc_handoff']);
+  });
+
+  it('session serialization round-trips invalid_tool_calls with the content blocks they repair', async () => {
+    /**
+     * The durable-session layer keeps the serialized content (including any
+     * raw malformed tool_use blocks) — dropping `invalid_tool_calls` there
+     * would strand those blocks without the entries ToolNode synthesizes
+     * results and promotions from on restore.
+     */
+    const original = new AIMessage({
+      id: 'ai_session_roundtrip',
+      content: [
+        { type: 'tool_use', id: 'tc_rt_bad', name: 'echo', input: '"raw unparsed' },
+      ],
+      tool_calls: [{ id: 'tc_rt_ok', name: 'echo', args: { command: 'hi' } }],
+      invalid_tool_calls: [
+        {
+          id: 'tc_rt_bad',
+          name: 'echo',
+          args: '"raw unparsed',
+          error: 'Malformed args.',
+          type: 'invalid_tool_call',
+        },
+      ],
+    });
+
+    const restored = deserializeMessage(serializeMessage(original)) as AIMessage;
+    expect(restored.tool_calls).toEqual(original.tool_calls);
+    expect(restored.invalid_tool_calls).toEqual(original.invalid_tool_calls);
+
+    const node = new ToolNode({ tools: [createEchoTool()] });
+    const result = await node.invoke(
+      { messages: [restored] },
+      { configurable: { run_id: 'invalid-session-roundtrip' } }
+    );
+    expect(toToolMessages(result).map((m) => m.tool_call_id).sort()).toEqual([
+      'tc_rt_bad',
+      'tc_rt_ok',
+    ]);
+    expect(toPromotedAiMessage(result)?.invalid_tool_calls).toHaveLength(0);
   });
 
   it('leaves BaseMessage[] (array-input) callers at the status quo — no synthesized results, no replacement', async () => {
