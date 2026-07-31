@@ -11,6 +11,7 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type * as t from '@/types';
+import { _convertMessagesToOpenAIResponsesParams } from '@/llm/openai/utils';
 import { askUserQuestion } from '@/hitl/askUserQuestion';
 import { FakeChatModel } from '@/llm/fake';
 import { Providers } from '@/common';
@@ -186,6 +187,7 @@ describe('ToolNode invalid_tool_calls handling', () => {
      * NON-server call stays conservative: no routing, even when invoked.
      */
     const serverMix = new AIMessage({
+      id: 'ai_server_mix',
       content: '',
       tool_calls: [{ id: 'srvtoolu_abc', name: 'web_search', args: { q: 'x' } }],
       invalid_tool_calls: [
@@ -199,20 +201,34 @@ describe('ToolNode invalid_tool_calls handling', () => {
       ],
     });
     expect(
-      toolsCondition([serverMix], 'tools', new Set(['srvtoolu_abc']))
+      toolsCondition({ messages: [serverMix] }, 'tools', new Set(['srvtoolu_abc']))
     ).toBe('tools');
 
     const clientMix = new AIMessage({
+      id: 'ai_client_mix',
       content: '',
       tool_calls: [{ id: 'tc_regular', name: 'echo', args: { command: 'hi' } }],
       invalid_tool_calls: serverMix.invalid_tool_calls,
     });
-    expect(toolsCondition([clientMix], 'tools', new Set(['tc_regular']))).toBe(
+    expect(
+      toolsCondition({ messages: [clientMix] }, 'tools', new Set(['tc_regular']))
+    ).toBe('__end__');
+
+    /** Mirrors ToolNode's own gating: array-state graphs get a plain output
+     *  list (invalid handling is skipped there), and an id-less message
+     *  cannot take the replacement upsert — routing either would no-op. */
+    expect(toolsCondition([serverMix], 'tools', new Set(['srvtoolu_abc']))).toBe(
       '__end__'
     );
+    const noIdMix = new AIMessage({
+      content: '',
+      tool_calls: [],
+      invalid_tool_calls: serverMix.invalid_tool_calls,
+    });
+    expect(toolsCondition({ messages: [noIdMix] }, 'tools')).toBe('__end__');
   });
 
-  it('does NOT emit a replacement AI message when the original has no id (reducer would append, not replace)', async () => {
+  it('keeps the full status quo when the AI message has no id (results and replacement are all-or-nothing)', async () => {
     const node = new ToolNode({ tools: [createEchoTool()] });
     const aiMsg = new AIMessage({
       content: '',
@@ -233,13 +249,17 @@ describe('ToolNode invalid_tool_calls handling', () => {
       { configurable: { run_id: 'invalid-no-id' } }
     );
 
-    expect(toToolMessages(result).map((m) => m.tool_call_id)).toEqual(['tc_no_promote']);
+    /** No replacement can upsert without an id, so the synthesized result is
+     *  suppressed too — emitting it alone would strand an output whose call
+     *  the provider converters never reconstruct. */
+    expect(toToolMessages(result)).toHaveLength(0);
     expect(toPromotedAiMessage(result)).toBeUndefined();
   });
 
   it('synthesizes error ToolMessages when EVERY call in the batch is invalid', async () => {
     const node = new ToolNode({ tools: [createEchoTool()] });
     const aiMsg = new AIMessage({
+      id: 'ai_only_invalid',
       content: '',
       tool_calls: [],
       invalid_tool_calls: [
@@ -514,10 +534,6 @@ describe('ToolNode invalid_tool_calls handling', () => {
      * two sides agreeing; this exercises the real outbound converter over the
      * exact message shapes ToolNode emits for a mixed valid/invalid batch.
      */
-    const { _convertMessagesToOpenAIResponsesParams } = await import(
-      '@/llm/openai/utils'
-    );
-
     const node = new ToolNode({ tools: [createEchoTool()] });
     const aiMsg = new AIMessage({
       id: 'ai_responses',

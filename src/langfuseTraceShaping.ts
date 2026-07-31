@@ -1,5 +1,6 @@
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
+import { Constants } from '@/common';
 
 const LANGGRAPH_START_NODE = '__start__';
 const ANONYMOUS_LAMBDA_NAME = 'RunnableLambda';
@@ -199,7 +200,14 @@ function getMessageInvalidToolCalls(
   }
   const calls: SerializedToolCall[] = [];
   for (const rawCall of rawCalls) {
-    if (!isRecord(rawCall) || typeof rawCall.id !== 'string') {
+    // Same attribution predicate ToolNode executes with (id-bearing,
+    // non-server) so the span never claims calls the node deliberately skips.
+    if (
+      !isRecord(rawCall) ||
+      typeof rawCall.id !== 'string' ||
+      rawCall.id === '' ||
+      rawCall.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+    ) {
       continue;
     }
     const call = normalizeToolCall(rawCall);

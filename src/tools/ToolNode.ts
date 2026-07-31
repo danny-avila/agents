@@ -3846,15 +3846,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * already-processed / server-tool filters mirror `filteredCalls`.
        */
       /**
-       * Invalid-call handling only applies to the MESSAGES-STATE input form,
-       * where the returned messages flow through `messagesStateReducer` and
-       * the replacement AI message below upserts by id. A `BaseMessage[]`
+       * Invalid-call handling only applies when the replacement AI message
+       * can actually land: the MESSAGES-STATE input form (the returned
+       * messages flow through `messagesStateReducer` and the replacement
+       * upserts by id) with an id-bearing AI message. A `BaseMessage[]`
        * caller receives a plain output LIST it appends to its own history —
-       * the replacement would duplicate the assistant turn and the
-       * synthesized results would reference calls its history formatting
-       * never emits. Array callers keep the untouched status quo.
+       * the replacement would duplicate the assistant turn — and an id-less
+       * message cannot be upserted. In both cases the synthesized results
+       * are skipped TOO: results and promotion are all-or-nothing, or the
+       * next provider request would carry an output whose call the
+       * converters never emit (the inverted rejection). Such callers keep
+       * the untouched status quo.
        */
-      const attributableInvalidCalls = Array.isArray(input)
+      const canPromoteInvalidCalls =
+        !Array.isArray(input) &&
+        typeof aiMessage.id === 'string' &&
+        aiMessage.id.length > 0;
+      const attributableInvalidCalls = !canPromoteInvalidCalls
         ? []
         : (aiMessage.invalid_tool_calls ?? []).filter(
           (call) =>
@@ -3892,9 +3900,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * duplicate instead of replacing, which is worse than the dangle.
        */
       const promotedAiMessage =
-        attributableInvalidCalls.length > 0 &&
-        typeof aiMessage.id === 'string' &&
-        aiMessage.id.length > 0
+        attributableInvalidCalls.length > 0
           ? new AIMessage({
             id: aiMessage.id,
             content: sanitizeInvalidToolUseBlocks(
@@ -4383,9 +4389,17 @@ export function toolsCondition<T extends string>(
    * and the first branch declines. A valid NON-server call that was invoked
    * externally stays conservative (no routing) — ToolNode does not filter on
    * `invokedToolIds`, so entering it would re-execute that call.
+   *
+   * Mirrors ToolNode's own gating exactly, or the routed turn would no-op and
+   * bounce back to the model with the dangle intact: array-state graphs get a
+   * plain output list (no reducer upsert — ToolNode skips invalid handling
+   * there), and an id-less message cannot take the replacement upsert either.
    */
   if (
+    !Array.isArray(state) &&
     message &&
+    typeof message.id === 'string' &&
+    message.id.length > 0 &&
     hasAttributableInvalidToolCalls(message) &&
     (message.tool_calls ?? []).every(
       (call) =>

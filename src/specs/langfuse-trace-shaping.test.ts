@@ -152,6 +152,18 @@ describe('shapeLangfuseSpan', () => {
             type: 'invalid_tool_call',
           },
           { name: 'echo', args: 'no-id — excluded', error: 'Malformed args.' },
+          {
+            name: 'echo',
+            args: 'empty-id — excluded',
+            id: '',
+            error: 'Malformed args.',
+          },
+          {
+            name: 'web_search',
+            args: 'server-tool — excluded',
+            id: 'srvtoolu_xyz',
+            error: 'Malformed args.',
+          },
         ],
       },
     ];
