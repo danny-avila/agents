@@ -3885,7 +3885,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 'The tool call input could not be parsed as a JSON object; the tool was not run.\n Please fix your mistakes.',
               this.maxToolResultChars
             ),
-            name: call.name ?? 'unknown',
+            name: normalizeInvalidCallName(call.name),
             tool_call_id: call.id!,
           })
       );
@@ -3920,7 +3920,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               ...(aiMessage.tool_calls ?? []),
               ...attributableInvalidCalls.map((call) => ({
                 id: call.id!,
-                name: call.name ?? 'unknown',
+                name: normalizeInvalidCallName(call.name),
                 args: {},
                 type: 'tool_call' as const,
               })),
@@ -4351,7 +4351,7 @@ function sanitizeInvalidToolUseBlocks(
   const promotedNamesById = new Map(
     promotedCalls
       .filter((call) => call.id != null)
-      .map((call) => [call.id!, call.name ?? 'unknown'])
+      .map((call) => [call.id!, normalizeInvalidCallName(call.name)])
   );
   return content.map((block) => {
     if (
@@ -4382,6 +4382,16 @@ function sanitizeInvalidToolUseBlocks(
       ...(nameIsValid ? {} : { name: promotedNamesById.get(toolUse.id) }),
     };
   });
+}
+
+/**
+ * Name fallback for attributable invalid calls, shared by every surface that
+ * materializes them (synthesized result, promoted tool_calls entry, sanitized
+ * block, handoff patch): `''` is normalized like `undefined` — providers
+ * reject nameless calls, so an empty string would defeat the promotion.
+ */
+function normalizeInvalidCallName(name: string | undefined | null): string {
+  return name != null && name !== '' ? name : 'unknown';
 }
 
 /**
@@ -4425,7 +4435,7 @@ function patchCommandUpdateForPromotedInvalidCalls(
       .filter((result) => !existingIds.has(result.tool_call_id))
       .map((result) => ({
         id: result.tool_call_id,
-        name: result.name ?? 'unknown',
+        name: normalizeInvalidCallName(result.name),
         args: {},
         type: 'tool_call' as const,
       }));

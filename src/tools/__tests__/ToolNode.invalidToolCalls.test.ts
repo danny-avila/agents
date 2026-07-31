@@ -152,11 +152,19 @@ describe('ToolNode invalid_tool_calls handling', () => {
       id: 'ai_nameless_block',
       content: [
         { type: 'tool_use', id: 'tc_noname', input: '"raw unparsed' },
+        { type: 'tool_use', id: 'tc_emptyname', name: '', input: '"raw unparsed' },
       ],
       tool_calls: [],
       invalid_tool_calls: [
         {
           id: 'tc_noname',
+          args: '"raw unparsed',
+          error: 'Malformed args.',
+          type: 'invalid_tool_call',
+        },
+        {
+          id: 'tc_emptyname',
+          name: '',
           args: '"raw unparsed',
           error: 'Malformed args.',
           type: 'invalid_tool_call',
@@ -169,17 +177,21 @@ describe('ToolNode invalid_tool_calls handling', () => {
       { configurable: { run_id: 'invalid-nameless-block' } }
     );
     const promoted = toPromotedAiMessage(result)!;
-    const block = (promoted.content as Array<{ id?: string }>).find(
-      (b) => b.id === 'tc_noname'
-    ) as { name?: string; input?: unknown };
-    /** Same fallback the promoted tool_calls entry uses — a nameless block
-     *  fails provider validation on its own even with a valid input. */
-    expect(block.name).toBe('unknown');
-    expect(block.input).toEqual({});
-    expect(promoted.tool_calls?.[0]).toMatchObject({
-      id: 'tc_noname',
-      name: 'unknown',
-    });
+    const blocks = promoted.content as Array<{ id?: string; name?: string; input?: unknown }>;
+    /** Same fallback the promoted tool_calls entries use — missing AND
+     *  empty-string names both fail provider validation on their own. */
+    for (const id of ['tc_noname', 'tc_emptyname']) {
+      const block = blocks.find((b) => b.id === id)!;
+      expect(block.name).toBe('unknown');
+      expect(block.input).toEqual({});
+      expect(promoted.tool_calls?.find((c) => c.id === id)).toMatchObject({
+        name: 'unknown',
+      });
+      const synthesized = toToolMessages(result).find(
+        (m) => m.tool_call_id === id
+      )!;
+      expect(synthesized.name).toBe('unknown');
+    }
   });
 
   it('carries the promotion into a handoff Command update (same-id state copy + missing result)', async () => {

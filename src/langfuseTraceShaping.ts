@@ -213,7 +213,9 @@ function getMessageInvalidToolCalls(
     // Same name fallback ToolNode synthesizes with — a nameless attributable
     // call still gets a result, so it must still count in the span input.
     const call = normalizeToolCall(
-      typeof rawCall.name === 'string' ? rawCall : { ...rawCall, name: 'unknown' }
+      typeof rawCall.name === 'string' && rawCall.name !== ''
+        ? rawCall
+        : { ...rawCall, name: 'unknown' }
     );
     if (call != null) {
       calls.push(call);
