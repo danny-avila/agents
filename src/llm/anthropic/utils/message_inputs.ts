@@ -388,6 +388,34 @@ function _ensureMessageContents(
   return updatedMsgs as (SystemMessage | HumanMessage | AIMessage)[];
 }
 
+/**
+ * Anthropic requires `tool_use.input` to be a JSON object; anything else is
+ * rejected with a 400 (`tool_use.input: Input should be an object`).
+ * History can carry non-object inputs: streaming leaves the raw partial-JSON
+ * string on the content block, and upstream context projections can leave
+ * `null` (observed live on a summarization-retained tool call replayed after
+ * compaction). A string is parsed when it forms complete JSON; every other
+ * shape degrades to `{}` — the call already executed, so the replayed input
+ * is informational and an empty object is the safe representation.
+ */
+export function coerceAnthropicToolUseInput(
+  input: unknown
+): Record<string, unknown> {
+  let candidate: unknown = input;
+  if (typeof candidate === 'string') {
+    try {
+      candidate = JSON.parse(candidate);
+    } catch {
+      return {};
+    }
+  }
+  return typeof candidate === 'object' &&
+    candidate !== null &&
+    !Array.isArray(candidate)
+    ? (candidate as Record<string, unknown>)
+    : {};
+}
+
 export function _convertLangChainToolCallToAnthropic(
   toolCall: ToolCall
 ): AnthropicToolResponse {
@@ -401,7 +429,7 @@ export function _convertLangChainToolCallToAnthropic(
     type: isServerTool ? 'server_tool_use' : 'tool_use',
     id: isServerTool ? toolCall.id : normalizeAnthropicToolCallId(toolCall.id),
     name: toolCall.name,
-    input: toolCall.args,
+    input: coerceAnthropicToolUseInput(toolCall.args),
   };
 }
 
@@ -949,14 +977,29 @@ function _formatContent(message: BaseMessage) {
           }
         }
 
-        if ('input' in contentPartCopy) {
-          // Anthropic tool use inputs should be valid objects, when applicable.
-          if (typeof contentPartCopy.input === 'string') {
-            try {
-              contentPartCopy.input = JSON.parse(contentPartCopy.input);
-            } catch {
-              contentPartCopy.input = {};
-            }
+        if (
+          contentPartCopy.type === 'tool_use' ||
+          contentPartCopy.type === 'server_tool_use'
+        ) {
+          /**
+           * The API requires `input` to be a JSON object. Streaming leaves the
+           * raw partial-JSON string here, and context-pressure truncation can
+           * leave `null` on BOTH the block and its `tool_calls` mirror — so
+           * the restore above may itself restore a non-object. Coerce last,
+           * after every restore path has run.
+           */
+          contentPartCopy.input = coerceAnthropicToolUseInput(
+            'input' in contentPartCopy ? contentPartCopy.input : undefined
+          );
+        } else if (
+          'input' in contentPartCopy &&
+          typeof contentPartCopy.input === 'string'
+        ) {
+          // Non-tool_use tool blocks keep their legacy string handling.
+          try {
+            contentPartCopy.input = JSON.parse(contentPartCopy.input);
+          } catch {
+            contentPartCopy.input = {};
           }
         }
 

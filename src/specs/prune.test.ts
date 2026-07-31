@@ -1444,7 +1444,44 @@ describe('Prune Messages Tests', () => {
       expect(calculateMaxToolCallInputChars(0)).toBe(200_000);
       expect(calculateMaxToolCallInputChars(1_000)).toBe(600);
       expect(calculateMaxToolCallInputChars(1_000_000)).toBe(200_000);
-      expect(serializeToolCallInput(undefined, 4)).toBe('null');
+      // Even below the envelope floor, serialized args stay a JSON object —
+      // 'null' here poisoned replayed tool calls (Anthropic 400s a non-object
+      // tool_use.input).
+      expect(serializeToolCallInput(undefined, 4)).toBe('{}');
+    });
+
+    it('never nulls an input when the cap is below the truncation envelope', () => {
+      // Regression: a tight summarization budget can shrink the per-input cap
+      // below the `{_truncated, _originalChars}` envelope size (~38 chars).
+      // The projection used to return `null` for BOTH the inline block input
+      // and the tool_calls args; the nulls were written back into graph state
+      // by preFlightTruncateToolCallInputs and later replayed to Anthropic as
+      // `tool_use.input: null` → 400 "Input should be an object".
+      const chunk = new AIMessageChunk({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tiny-cap-call',
+            name: 'calculator',
+            // Streaming leaves the raw JSON string on the block.
+            input: '{"input": "670592745 / 99991"}',
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tiny-cap-call',
+            name: 'calculator',
+            args: { input: '670592745 / 99991' },
+          },
+        ],
+      });
+
+      const [projected] = projectToolCallInputs([chunk], 20);
+      const block = (
+        (projected as AIMessageChunk).content as Array<Record<string, unknown>>
+      )[0];
+      expect(block.input).toEqual({});
+      expect((projected as AIMessageChunk).tool_calls?.[0].args).toEqual({});
     });
 
     it('returns the original array when every input is already safe and bounded', () => {

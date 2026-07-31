@@ -1,8 +1,8 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
-import { _convertMessagesToAnthropicPayload } from './message_inputs';
 import { _makeMessageChunkFromAnthropicEvent } from './message_outputs';
+import { _convertMessagesToAnthropicPayload } from './message_inputs';
 
 /**
  * Regression for @langchain/core >= 1.1.46 streaming aggregation: a tool call's
@@ -40,7 +40,9 @@ describe('_convertMessagesToAnthropicPayload — aggregated streaming tool input
   ];
 
   it('does not throw on the orphaned text-with-input block', () => {
-    expect(() => _convertMessagesToAnthropicPayload(buildHistory())).not.toThrow();
+    expect(() =>
+      _convertMessagesToAnthropicPayload(buildHistory())
+    ).not.toThrow();
   });
 
   it('restores tool_use input from message.tool_calls and drops the orphan block', () => {
@@ -60,13 +62,16 @@ describe('_convertMessagesToAnthropicPayload — aggregated streaming tool input
     // No leftover delta: no text block carrying `input`, no input_json_delta.
     expect(
       blocks.find(
-        (b) => (b.type === 'text' && 'input' in b) || b.type === 'input_json_delta'
+        (b) =>
+          (b.type === 'text' && 'input' in b) || b.type === 'input_json_delta'
       )
     ).toBeUndefined();
 
     // The real assistant text is preserved.
     expect(
-      blocks.some((b) => b.type === 'text' && b.text === 'Let me calculate that.')
+      blocks.some(
+        (b) => b.type === 'text' && b.text === 'Let me calculate that.'
+      )
     ).toBe(true);
   });
 
@@ -94,7 +99,9 @@ describe('_convertMessagesToAnthropicPayload — aggregated streaming tool input
     ];
     const payload = _convertMessagesToAnthropicPayload(history);
     const assistant = payload.messages.find((m: any) => m.role === 'assistant');
-    const toolUse = (assistant!.content as any[]).find((b) => b.type === 'tool_use');
+    const toolUse = (assistant!.content as any[]).find(
+      (b) => b.type === 'tool_use'
+    );
     expect(toolUse.input).toEqual({ input: '2 + 2' });
   });
 
@@ -105,8 +112,18 @@ describe('_convertMessagesToAnthropicPayload — aggregated streaming tool input
       new HumanMessage('What\'s the weather in Seattle tomorrow?'),
       new AIMessage({
         content: [
-          { type: 'text', index: 1, text: 'I need to call the get_weather tool' },
-          { type: 'tool_use', index: 2, name: 'get_weather', id: 'tool_call_id', input: '' },
+          {
+            type: 'text',
+            index: 1,
+            text: 'I need to call the get_weather tool',
+          },
+          {
+            type: 'tool_use',
+            index: 2,
+            name: 'get_weather',
+            id: 'tool_call_id',
+            input: '',
+          },
           { type: 'input_json_delta', index: 2, input: '{"city": "' },
           { type: 'input_json_delta', index: 2, input: 'Seattle", "da' },
           { type: 'input_json_delta', index: 2, input: 'te": "to' },
@@ -129,6 +146,84 @@ describe('_convertMessagesToAnthropicPayload — aggregated streaming tool input
   });
 });
 
+/**
+ * Regression for the summarization-CI flake: context-pressure truncation
+ * (`preFlightTruncateToolCallInputs` under a tight budget) used to null BOTH a
+ * tool_use block's inline `input` and its `tool_calls` args in graph state.
+ * Replaying that message shipped `"input": null` and Anthropic rejected the
+ * request with 400 `tool_use.input: Input should be an object`. The payload
+ * conversion must never emit a non-object input, whatever shape history is in.
+ */
+describe('_convertMessagesToAnthropicPayload — non-object tool_use input replay', () => {
+  const buildHistory = (input: unknown, args: unknown): BaseMessage[] => [
+    new HumanMessage('What is 9 * 9?'),
+    new AIMessage({
+      content: [
+        { type: 'tool_use', id: 'toolu_x', name: 'calculator', input } as any,
+      ],
+      tool_calls: [
+        {
+          id: 'toolu_x',
+          name: 'calculator',
+          args: args as any,
+          type: 'tool_call',
+        },
+      ],
+    }),
+  ];
+
+  const getToolUse = (history: BaseMessage[]): any => {
+    const payload = _convertMessagesToAnthropicPayload(history);
+    const assistant = payload.messages.find((m: any) => m.role === 'assistant');
+    return (assistant!.content as any[]).find((b) => b.type === 'tool_use');
+  };
+
+  it('ships an empty object when input and args were both truncated to null', () => {
+    const toolUse = getToolUse(buildHistory(null, null));
+    expect(toolUse.input).toEqual({});
+  });
+
+  it('restores object args when only the inline input was nulled', () => {
+    const toolUse = getToolUse(buildHistory(null, { input: '9 * 9' }));
+    expect(toolUse.input).toEqual({ input: '9 * 9' });
+  });
+
+  it('coerces a string input that parses to a non-object', () => {
+    for (const raw of ['123', '[1,2]', '"text"', 'null']) {
+      const toolUse = getToolUse(buildHistory(raw, undefined));
+      expect(toolUse.input).toEqual({});
+    }
+  });
+
+  it('still parses a complete JSON-object string input', () => {
+    const toolUse = getToolUse(buildHistory('{"input": "9 * 9"}', undefined));
+    expect(toolUse.input).toEqual({ input: '9 * 9' });
+  });
+
+  it('coerces non-object args on the string-content tool_calls path', () => {
+    const history: BaseMessage[] = [
+      new HumanMessage('What is 9 * 9?'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'toolu_x',
+            name: 'calculator',
+            args: null as any,
+            type: 'tool_call',
+          },
+        ],
+      }),
+    ];
+    const payload = _convertMessagesToAnthropicPayload(history);
+    const assistant = payload.messages.find((m: any) => m.role === 'assistant');
+    const toolUse = (assistant!.content as any[]).find(
+      (b) => b.type === 'tool_use'
+    );
+    expect(toolUse.input).toEqual({});
+  });
+});
+
 describe('_makeMessageChunkFromAnthropicEvent — streamed tool input merges into content', () => {
   const fields = { streamUsage: true, coerceContentToString: false };
 
@@ -137,7 +232,12 @@ describe('_makeMessageChunkFromAnthropicEvent — streamed tool input merges int
       {
         type: 'content_block_start',
         index: 0,
-        content_block: { type: 'tool_use', id: 'toolu_1', name: 'calculator', input: {} },
+        content_block: {
+          type: 'tool_use',
+          id: 'toolu_1',
+          name: 'calculator',
+          input: {},
+        },
       },
       {
         type: 'content_block_delta',
@@ -168,13 +268,21 @@ describe('_makeMessageChunkFromAnthropicEvent — streamed tool input merges int
     const blocks = merged.content as any[];
 
     const toolUse = blocks.find((b) => b.type === 'tool_use');
-    expect(toolUse).toMatchObject({ type: 'tool_use', id: 'toolu_1', name: 'calculator' });
+    expect(toolUse).toMatchObject({
+      type: 'tool_use',
+      id: 'toolu_1',
+      name: 'calculator',
+    });
     const parsed =
-      typeof toolUse.input === 'string' ? JSON.parse(toolUse.input) : toolUse.input;
+      typeof toolUse.input === 'string'
+        ? JSON.parse(toolUse.input)
+        : toolUse.input;
     expect(parsed).toEqual({ input: '2 + 2' });
 
     // no orphaned delta block survives aggregation
-    expect(blocks.filter((b) => b.type !== 'tool_use' && 'input' in b)).toHaveLength(0);
+    expect(
+      blocks.filter((b) => b.type !== 'tool_use' && 'input' in b)
+    ).toHaveLength(0);
 
     // tool_calls remain correctly aggregated
     expect(merged.tool_calls?.[0]).toMatchObject({
