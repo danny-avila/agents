@@ -684,6 +684,33 @@ function convertSystemMessageToConverseMessage(
 /**
  * Convert an AI message to a Bedrock message.
  */
+/**
+ * Bedrock Converse requires `toolUse.input` to be a JSON object document.
+ * History can carry non-object values: streaming leaves the raw partial-JSON
+ * string on Anthropic-shaped inline blocks, and context-pressure truncation
+ * (pre-3.x `createBoundedTruncationValue`) could persist `null` onto BOTH a
+ * block's inline input and its `tool_calls` args. A string is parsed when it
+ * forms a complete JSON object; every other shape degrades to `{}` — the call
+ * already executed, so the replayed input is informational. Twin of
+ * `coerceAnthropicToolUseInput` in the Anthropic fork; duplicated so each
+ * fork stays self-contained against its upstream.
+ */
+function coerceBedrockToolUseInput(input: unknown): Record<string, unknown> {
+  let candidate: unknown = input;
+  if (typeof candidate === 'string') {
+    try {
+      candidate = JSON.parse(candidate);
+    } catch {
+      return {};
+    }
+  }
+  return typeof candidate === 'object' &&
+    candidate !== null &&
+    !Array.isArray(candidate)
+    ? (candidate as Record<string, unknown>)
+    : {};
+}
+
 function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   // Check for v1 format from other providers (PR #9766 fix)
   const responseMetadata = msg.response_metadata as
@@ -731,17 +758,17 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
         }
         if (
           typeof toolUse.id !== 'string' ||
-          typeof toolUse.name !== 'string' ||
-          toolUse.input == null ||
-          typeof toolUse.input !== 'object'
+          typeof toolUse.name !== 'string'
         ) {
           throw new Error('Invalid Anthropic tool_use content block');
         }
+        // A non-object input (raw streamed string, truncation-persisted null)
+        // is recoverable — coerce it rather than fail the whole request.
         contentBlocks.push({
           toolUse: {
             toolUseId: toolUse.id,
             name: toolUse.name,
-            input: toolUse.input as Record<string, unknown>,
+            input: coerceBedrockToolUseInput(toolUse.input),
           },
         } as BedrockContentBlock);
       } else if (block.type === 'reasoning_content') {
@@ -804,7 +831,7 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
         toolUse: {
           toolUseId: toolCall.id,
           name: toolCall.name,
-          input: toolCall.args as Record<string, unknown>,
+          input: coerceBedrockToolUseInput(toolCall.args),
         },
       }));
     assistantMsg.content = [
@@ -862,7 +889,7 @@ function convertFromV1ToChatBedrockConverseMessage(
           toolUse: {
             toolUseId: toolCall.id,
             name: toolCall.name,
-            input: toolCall.args as Record<string, unknown>,
+            input: coerceBedrockToolUseInput(toolCall.args),
           },
         } as BedrockContentBlock);
       } else if (block.type === 'reasoning') {
@@ -914,7 +941,7 @@ function convertFromV1ToChatBedrockConverseMessage(
           toolUse: {
             toolUseId: tc.id,
             name: tc.name,
-            input: tc.args as Record<string, unknown>,
+            input: coerceBedrockToolUseInput(tc.args),
           },
         } as BedrockContentBlock);
       }
