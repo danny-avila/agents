@@ -3845,13 +3845,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * with an id can be paired (and only those produce the 400); the
        * already-processed / server-tool filters mirror `filteredCalls`.
        */
-      const attributableInvalidCalls = (aiMessage.invalid_tool_calls ?? []).filter(
-        (call) =>
-          call.id != null &&
-          call.id !== '' &&
-          !toolMessageIds.has(call.id) &&
-          !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
-      );
+      /**
+       * Invalid-call handling only applies to the MESSAGES-STATE input form,
+       * where the returned messages flow through `messagesStateReducer` and
+       * the replacement AI message below upserts by id. A `BaseMessage[]`
+       * caller receives a plain output LIST it appends to its own history —
+       * the replacement would duplicate the assistant turn and the
+       * synthesized results would reference calls its history formatting
+       * never emits. Array callers keep the untouched status quo.
+       */
+      const attributableInvalidCalls = Array.isArray(input)
+        ? []
+        : (aiMessage.invalid_tool_calls ?? []).filter(
+          (call) =>
+            call.id != null &&
+            call.id !== '' &&
+            !toolMessageIds.has(call.id) &&
+            !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+        );
       const invalidCallResults = attributableInvalidCalls.map(
         (call) =>
           new ToolMessage({
@@ -4363,16 +4374,23 @@ export function toolsCondition<T extends string>(
     return toolNode;
   }
   /**
-   * Invalid-only turn: no valid calls to route on, but ToolNode still owes the
-   * malformed calls their synthesized error results. Restricted to the
-   * zero-valid-calls case on purpose — when valid calls exist they either
-   * routed above, or were ALL invoked externally (`invokedToolIds`), where
-   * entering ToolNode would re-execute them.
+   * The valid calls (if any) did not route above, but ToolNode still owes any
+   * malformed calls their synthesized error results. Route when EVERY valid
+   * call is provider-server-executed (`srvtoolu_` — ToolNode's batch filter
+   * excludes those before execution, so nothing re-runs): that covers both the
+   * invalid-only turn and the Anthropic server-call + malformed-client-call
+   * mix, where `handleAnthropicSearchResults` marks the server call invoked
+   * and the first branch declines. A valid NON-server call that was invoked
+   * externally stays conservative (no routing) — ToolNode does not filter on
+   * `invokedToolIds`, so entering it would re-execute that call.
    */
   if (
     message &&
-    (message.tool_calls?.length ?? 0) === 0 &&
-    hasAttributableInvalidToolCalls(message)
+    hasAttributableInvalidToolCalls(message) &&
+    (message.tool_calls ?? []).every(
+      (call) =>
+        call.id?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) === true
+    )
   ) {
     return toolNode;
   }

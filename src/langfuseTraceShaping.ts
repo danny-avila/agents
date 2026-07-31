@@ -179,6 +179,37 @@ function getMessageToolCalls(
   return calls;
 }
 
+/**
+ * Id-bearing `invalid_tool_calls` on the assistant turn. ToolNode pairs these
+ * with synthesized error results (and an invalid-only turn is routed on them
+ * alone), so the tool-dispatch span must count them as part of the executing
+ * batch — otherwise an invalid-only dispatch finds zero calls and the span
+ * keeps the full serialized graph state as its input, and a mixed dispatch
+ * silently omits the malformed call. `args` stays the raw unparsed string.
+ */
+function getMessageInvalidToolCalls(
+  message: Record<string, unknown>
+): SerializedToolCall[] {
+  const rawCalls =
+    message.invalid_tool_calls ??
+    (isRecord(message.kwargs) ? message.kwargs.invalid_tool_calls : undefined) ??
+    (isRecord(message.data) ? message.data.invalid_tool_calls : undefined);
+  if (!Array.isArray(rawCalls)) {
+    return [];
+  }
+  const calls: SerializedToolCall[] = [];
+  for (const rawCall of rawCalls) {
+    if (!isRecord(rawCall) || typeof rawCall.id !== 'string') {
+      continue;
+    }
+    const call = normalizeToolCall(rawCall);
+    if (call != null) {
+      calls.push(call);
+    }
+  }
+  return calls;
+}
+
 /** Latest assistant turn's tool calls — the calls this tool node is executing. */
 function findPendingToolCalls(value: unknown): SerializedToolCall[] {
   const messages = getMessageArray(value);
@@ -189,7 +220,10 @@ function findPendingToolCalls(value: unknown): SerializedToolCall[] {
     if (getMessageRole(messages[i]) !== 'assistant') {
       continue;
     }
-    const calls = getMessageToolCalls(messages[i]);
+    const calls = [
+      ...getMessageToolCalls(messages[i]),
+      ...getMessageInvalidToolCalls(messages[i]),
+    ];
     if (calls.length > 0) {
       return calls;
     }

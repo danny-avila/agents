@@ -14,7 +14,7 @@ import type * as t from '@/types';
 import { askUserQuestion } from '@/hitl/askUserQuestion';
 import { FakeChatModel } from '@/llm/fake';
 import { Providers } from '@/common';
-import { ToolNode } from '../ToolNode';
+import { ToolNode, toolsCondition } from '../ToolNode';
 import { Run } from '@/run';
 
 /**
@@ -143,6 +143,73 @@ describe('ToolNode invalid_tool_calls handling', () => {
     expect(blocks.find((b) => b.id === 'tc_bad')?.input).toEqual({});
     expect(blocks.find((b) => b.id === 'tc_ok')?.input).toEqual({ command: 'hi' });
     expect(blocks[0]).toEqual({ type: 'text', text: 'Two calls.' });
+  });
+
+  it('leaves BaseMessage[] (array-input) callers at the status quo — no synthesized results, no replacement', async () => {
+    /**
+     * The array input form returns a plain output LIST the caller appends to
+     * its own history: a replacement AI message would duplicate the assistant
+     * turn, and synthesized results would reference calls the caller's
+     * history formatting never emits. Both are reducer-shaped writes, so
+     * they only apply to the messages-state form.
+     */
+    const node = new ToolNode({ tools: [createEchoTool()] });
+    const aiMsg = new AIMessage({
+      id: 'ai_array_input',
+      content: '',
+      tool_calls: [{ id: 'tc_ok', name: 'echo', args: { command: 'hi' } }],
+      invalid_tool_calls: [
+        {
+          id: 'tc_bad',
+          name: 'echo',
+          args: 'garbage',
+          error: 'Malformed args.',
+          type: 'invalid_tool_call',
+        },
+      ],
+    });
+
+    const result = await node.invoke([aiMsg], {
+      configurable: { run_id: 'invalid-array-input' },
+    });
+
+    expect(toToolMessages(result).map((m) => m.tool_call_id)).toEqual(['tc_ok']);
+    expect(toPromotedAiMessage(result)).toBeUndefined();
+  });
+
+  it('toolsCondition routes a server-call + malformed-client-call mix to the tool node', () => {
+    /**
+     * `handleAnthropicSearchResults` marks completed server calls invoked, so
+     * the valid-calls branch declines; every valid call is `srvtoolu_`-
+     * prefixed (ToolNode's batch filter excludes those), so routing cannot
+     * re-execute anything and the malformed call gets its result. A valid
+     * NON-server call stays conservative: no routing, even when invoked.
+     */
+    const serverMix = new AIMessage({
+      content: '',
+      tool_calls: [{ id: 'srvtoolu_abc', name: 'web_search', args: { q: 'x' } }],
+      invalid_tool_calls: [
+        {
+          id: 'tc_bad',
+          name: 'echo',
+          args: 'garbage',
+          error: 'Malformed args.',
+          type: 'invalid_tool_call',
+        },
+      ],
+    });
+    expect(
+      toolsCondition([serverMix], 'tools', new Set(['srvtoolu_abc']))
+    ).toBe('tools');
+
+    const clientMix = new AIMessage({
+      content: '',
+      tool_calls: [{ id: 'tc_regular', name: 'echo', args: { command: 'hi' } }],
+      invalid_tool_calls: serverMix.invalid_tool_calls,
+    });
+    expect(toolsCondition([clientMix], 'tools', new Set(['tc_regular']))).toBe(
+      '__end__'
+    );
   });
 
   it('does NOT emit a replacement AI message when the original has no id (reducer would append, not replace)', async () => {

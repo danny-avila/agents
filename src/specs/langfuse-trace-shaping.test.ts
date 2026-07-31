@@ -134,6 +134,64 @@ describe('shapeLangfuseSpan', () => {
     expect(span.name).toBe('tool-dispatch');
   });
 
+  it('counts id-bearing invalid_tool_calls in the dispatch input (mixed and invalid-only)', () => {
+    /** ToolNode pairs attributable invalid calls with synthesized error
+     *  results (and routes invalid-only turns on them alone), so the span
+     *  input must include them — invalid-only used to find zero calls and
+     *  keep the full serialized graph state as the input. */
+    const mixed = [
+      {
+        type: 'ai',
+        tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+        invalid_tool_calls: [
+          {
+            name: 'echo',
+            args: '"raw unparsed',
+            id: 'tc_bad',
+            error: 'Malformed args.',
+            type: 'invalid_tool_call',
+          },
+          { name: 'echo', args: 'no-id — excluded', error: 'Malformed args.' },
+        ],
+      },
+    ];
+    const mixedSpan = createSpan(
+      'tools=agent_abc',
+      { [INPUT]: JSON.stringify({ messages: mixed }) },
+      'parent-1'
+    );
+    shapeLangfuseSpan(mixedSpan);
+    expect(JSON.parse(mixedSpan.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: { command: 'hi' } },
+      { name: 'echo', args: '"raw unparsed' },
+    ]);
+
+    const invalidOnly = [
+      {
+        type: 'ai',
+        tool_calls: [],
+        invalid_tool_calls: [
+          {
+            name: 'echo',
+            args: 'garbage',
+            id: 'tc_solo',
+            error: 'Malformed args.',
+            type: 'invalid_tool_call',
+          },
+        ],
+      },
+    ];
+    const invalidOnlySpan = createSpan(
+      'tools=agent_abc',
+      { [INPUT]: JSON.stringify({ messages: invalidOnly }) },
+      'parent-1'
+    );
+    shapeLangfuseSpan(invalidOnlySpan);
+    expect(JSON.parse(invalidOnlySpan.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: 'garbage' },
+    ]);
+  });
+
   it('keeps a stable tool-dispatch shape when no tool calls are found', () => {
     const original = JSON.stringify({
       messages: [{ type: 'human', content: 'hi' }],
