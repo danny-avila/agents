@@ -60,11 +60,24 @@ import type {
  * ```
  */
 export function askUserQuestion(
-  question: AskUserQuestionRequest
+  question: AskUserQuestionRequest,
+  options?: {
+    /**
+     * The calling tool's `tool_call_id`, surfaced on the interrupt payload
+     * as `tool_call_id` so hosts can attribute the question (and answer) to
+     * the exact tool-call content part. Tool bodies created with
+     * `tool(fn, …)` receive it as `config.toolCall.id` — LangChain stamps
+     * the full ToolCall onto the config when a tool is invoked with one.
+     * Optional: positional hosts and custom nodes can omit it.
+     */
+    toolCallId?: string;
+  }
 ): AskUserQuestionResolution {
   const payload: AskUserQuestionInterruptPayload = {
     type: 'ask_user_question',
     question,
+    ...(options?.toolCallId != null &&
+      options.toolCallId !== '' && { tool_call_id: options.toolCallId }),
   };
   return interrupt<AskUserQuestionInterruptPayload, AskUserQuestionResolution>(
     payload

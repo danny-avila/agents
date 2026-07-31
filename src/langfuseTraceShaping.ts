@@ -1,5 +1,6 @@
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
+import { Constants } from '@/common';
 
 const LANGGRAPH_START_NODE = '__start__';
 const ANONYMOUS_LAMBDA_NAME = 'RunnableLambda';
@@ -179,17 +180,112 @@ function getMessageToolCalls(
   return calls;
 }
 
+/**
+ * Id-bearing `invalid_tool_calls` on the assistant turn. ToolNode pairs these
+ * with synthesized error results (and an invalid-only turn is routed on them
+ * alone), so the tool-dispatch span must count them as part of the executing
+ * batch — otherwise an invalid-only dispatch finds zero calls and the span
+ * keeps the full serialized graph state as its input, and a mixed dispatch
+ * silently omits the malformed call. `args` stays the raw unparsed string.
+ */
+/** Tool-result ids present in the serialized state — ToolNode's
+ *  `!toolMessageIds.has(id)` execution filter, mirrored for the span. */
+function getToolResultIds(
+  messages: Record<string, unknown>[]
+): Set<string> {
+  const ids = new Set<string>();
+  for (const message of messages) {
+    if (getMessageRole(message) !== 'tool') {
+      continue;
+    }
+    const rawId =
+      message.tool_call_id ??
+      (isRecord(message.kwargs) ? message.kwargs.tool_call_id : undefined) ??
+      (isRecord(message.data) ? message.data.tool_call_id : undefined);
+    if (typeof rawId === 'string' && rawId !== '') {
+      ids.add(rawId);
+    }
+  }
+  return ids;
+}
+
+function getMessageInvalidToolCalls(
+  message: Record<string, unknown>,
+  answeredIds: ReadonlySet<string>
+): SerializedToolCall[] {
+  const rawCalls =
+    message.invalid_tool_calls ??
+    (isRecord(message.kwargs) ? message.kwargs.invalid_tool_calls : undefined) ??
+    (isRecord(message.data) ? message.data.invalid_tool_calls : undefined);
+  if (!Array.isArray(rawCalls)) {
+    return [];
+  }
+  const calls: SerializedToolCall[] = [];
+  for (const rawCall of rawCalls) {
+    // Same attribution predicate ToolNode executes with (id-bearing,
+    // non-server) so the span never claims calls the node deliberately skips.
+    if (
+      !isRecord(rawCall) ||
+      typeof rawCall.id !== 'string' ||
+      rawCall.id === '' ||
+      answeredIds.has(rawCall.id) ||
+      rawCall.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+    ) {
+      continue;
+    }
+    // Same name fallback ToolNode synthesizes with — a nameless attributable
+    // call still gets a result, so it must still count in the span input.
+    const call = normalizeToolCall(
+      typeof rawCall.name === 'string' && rawCall.name !== ''
+        ? rawCall
+        : { ...rawCall, name: 'unknown' }
+    );
+    if (call != null) {
+      calls.push(call);
+    }
+  }
+  return calls;
+}
+
+/** The serialized message's own id (uuid), NOT the LC-serialization type id
+ *  array that `message.id` carries in constructor dumps. */
+function getSerializedMessageId(
+  message: Record<string, unknown>
+): string | undefined {
+  const kwargsId = isRecord(message.kwargs) ? message.kwargs.id : undefined;
+  const dataId = isRecord(message.data) ? message.data.id : undefined;
+  const rawId = message.id;
+  const id = kwargsId ?? dataId ?? rawId;
+  return typeof id === 'string' && id !== '' ? id : undefined;
+}
+
 /** Latest assistant turn's tool calls — the calls this tool node is executing. */
 function findPendingToolCalls(value: unknown): SerializedToolCall[] {
   const messages = getMessageArray(value);
   if (messages == null) {
     return [];
   }
+  /**
+   * Invalid calls count only where ToolNode's own gate lets them execute:
+   * the messages-state form (a bare-array state means the node returns a
+   * plain output list and skips invalid handling) with an id-bearing
+   * assistant message (no id, no reducer upsert). Mirrors
+   * `canPromoteInvalidCalls` so the span never reports skipped calls.
+   */
+  const invalidCallsApply = !Array.isArray(value);
+  const answeredIds = invalidCallsApply
+    ? getToolResultIds(messages)
+    : undefined;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (getMessageRole(messages[i]) !== 'assistant') {
       continue;
     }
-    const calls = getMessageToolCalls(messages[i]);
+    const calls = [
+      ...getMessageToolCalls(messages[i]),
+      ...(invalidCallsApply && getSerializedMessageId(messages[i]) != null
+        ? getMessageInvalidToolCalls(messages[i], answeredIds!)
+        : []),
+    ];
     if (calls.length > 0) {
       return calls;
     }

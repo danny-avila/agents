@@ -2,6 +2,7 @@ import { nanoid } from 'nanoid';
 import { ToolCall } from '@langchain/core/messages/tool';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
+  AIMessage,
   ToolMessage,
   HumanMessage,
   isAIMessage,
@@ -24,7 +25,7 @@ import type {
   ToolRuntime,
   StructuredToolInterface,
 } from '@langchain/core/tools';
-import type { BaseMessage, AIMessage } from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type {
   ToolOutputResolveView,
@@ -3717,6 +3718,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const batchScopeId = incomingRunId ?? `\0anon-${this.anonBatchCounter++}`;
     const turn = this.toolOutputRegistry?.nextTurn(batchScopeId) ?? 0;
     let outputs: (BaseMessage | Command)[];
+    /** Hoisted from the messages-state branch so the Command tail can carry
+     *  the promotion into handoff updates (same-id state copies there would
+     *  otherwise overwrite the replacement message). */
+    let promotedAiMessage: AIMessage | undefined;
+    let invalidCallResults: ToolMessage[] = [];
 
     if (this.isSendInput(input)) {
       const isLocalTool =
@@ -3832,6 +3838,99 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
         }) ?? [];
 
+      /**
+       * Synthesize error results for `invalid_tool_calls` — calls whose
+       * streamed args never collapsed into a JSON object (`@langchain/core`
+       * files them separately with `error: "Malformed args."`, and they never
+       * enter `tool_calls`). Their `tool_use` blocks still ride the AI
+       * message content the provider receives, so skipping them leaves a
+       * `tool_use` with no `tool_result` and the NEXT model call is rejected
+       * (Anthropic 400 INVALID_TOOL_RESULTS) — fatal on HITL resume, where
+       * the paused AI message is replayed from the checkpoint. Only calls
+       * with an id can be paired (and only those produce the 400); the
+       * already-processed / server-tool filters mirror `filteredCalls`.
+       */
+      /**
+       * Invalid-call handling only applies when the replacement AI message
+       * can actually land: the MESSAGES-STATE input form (the returned
+       * messages flow through `messagesStateReducer` and the replacement
+       * upserts by id) with an id-bearing AI message. A `BaseMessage[]`
+       * caller receives a plain output LIST it appends to its own history —
+       * the replacement would duplicate the assistant turn — and an id-less
+       * message cannot be upserted. In both cases the synthesized results
+       * are skipped TOO: results and promotion are all-or-nothing, or the
+       * next provider request would carry an output whose call the
+       * converters never emit (the inverted rejection). Such callers keep
+       * the untouched status quo.
+       */
+      const canPromoteInvalidCalls =
+        !Array.isArray(input) &&
+        typeof aiMessage.id === 'string' &&
+        aiMessage.id.length > 0;
+      const attributableInvalidCalls = !canPromoteInvalidCalls
+        ? []
+        : (aiMessage.invalid_tool_calls ?? []).filter(
+          (call) =>
+            call.id != null &&
+            call.id !== '' &&
+            !toolMessageIds.has(call.id) &&
+            !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+        );
+      invalidCallResults = attributableInvalidCalls.map(
+        (call) =>
+          new ToolMessage({
+            status: 'error',
+            content: truncateToolResultContent(
+              `Error: ${call.error ?? 'Malformed tool call arguments.'} ` +
+                'The tool call input could not be parsed as a JSON object; the tool was not run.\n Please fix your mistakes.',
+              this.maxToolResultChars
+            ),
+            name: normalizeInvalidCallName(call.name),
+            tool_call_id: call.id!,
+          })
+      );
+
+      /**
+       * Promote the answered invalid calls into well-formed `tool_calls` on a
+       * REPLACEMENT copy of the AI message (`messagesStateReducer` upserts by
+       * id). Without this, provider converters that rebuild the call side of
+       * the wire from `tool_calls` — OpenAI Completions `tool_calls`, OpenAI
+       * Responses `function_call` items, Gemini/Bedrock function-call parts —
+       * drop the invalid call while the synthesized result above still
+       * references it, inverting the dangling-pair rejection (an output whose
+       * call is missing). Promoting at this single seam keeps the call and
+       * result sides agreeing for EVERY provider; args become `{}` (the raw
+       * string never parsed — the paired error result tells the model why).
+       * Skipped when the message has no id: the reducer would append a
+       * duplicate instead of replacing, which is worse than the dangle.
+       */
+      promotedAiMessage =
+        attributableInvalidCalls.length > 0
+          ? new AIMessage({
+            id: aiMessage.id,
+            content: sanitizeInvalidToolUseBlocks(
+              aiMessage.content,
+              attributableInvalidCalls
+            ),
+            name: aiMessage.name,
+            additional_kwargs: aiMessage.additional_kwargs,
+            response_metadata: aiMessage.response_metadata,
+            usage_metadata: aiMessage.usage_metadata,
+            tool_calls: [
+              ...(aiMessage.tool_calls ?? []),
+              ...attributableInvalidCalls.map((call) => ({
+                id: call.id!,
+                name: normalizeInvalidCallName(call.name),
+                args: {},
+                type: 'tool_call' as const,
+              })),
+            ],
+            invalid_tool_calls: (aiMessage.invalid_tool_calls ?? []).filter(
+              (call) => !attributableInvalidCalls.includes(call)
+            ),
+          })
+          : undefined;
+
       if (this.eventDrivenMode && filteredCalls.length > 0) {
         const directToolNames = this.directToolNames;
         const hasRegisteredHandoffTool = this.hasRegisteredHandoffTool();
@@ -3854,7 +3953,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           }
         }
 
-        if (directEntries.length === 0) {
+        if (directEntries.length === 0 && invalidCallResults.length === 0) {
           return this.executeViaEvent(filteredCalls, config, input, {
             batchIndices: eventEntries.map((entry) => entry.batchIndex),
             turn,
@@ -3973,8 +4072,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             ]
             : [];
         outputs = [
+          // Replacement AI message first (reducer upsert-by-id), then results.
+          ...(promotedAiMessage != null ? [promotedAiMessage] : []),
           ...directOutputs,
           ...eventResult.toolMessages,
+          // Synthesized invalid-call errors sit with the real tool results,
+          // before injected context, to keep provider tool-result adjacency.
+          ...invalidCallResults,
           ...directInjected,
           ...eventResult.injected,
         ];
@@ -4009,10 +4113,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         );
         // Append accumulated additionalContexts as a single
         // HumanMessage so the next model turn sees them. Codex P2 #39.
+        const promotedPrefix = promotedAiMessage != null ? [promotedAiMessage] : [];
         outputs =
           directAdditionalContexts.length > 0
             ? [
+              ...promotedPrefix,
               ...toolOutputs,
+              ...invalidCallResults,
               new HumanMessage({
                 content: directAdditionalContexts.join('\n\n'),
                 // Same system-role marker the event-driven path
@@ -4021,12 +4128,57 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 additional_kwargs: { role: 'system', source: 'hook' },
               }),
             ]
-            : toolOutputs;
+            : [...promotedPrefix, ...toolOutputs, ...invalidCallResults];
+      }
+
+      /**
+       * Resolve the streamed tool-call cards for invalid calls, best-effort.
+       * Runs AFTER the direct batch settled: on an interrupting first pass
+       * this line is unreachable (the node unwound), so interrupt/resume
+       * flows emit the completion exactly once — same reasoning as the
+       * deferred blocked-call side effects. Skipped when the stream never
+       * registered a step for the call (non-streaming providers), where a
+       * completion could not be routed to a card anyway.
+       */
+      for (const result of invalidCallResults) {
+        const invalidStepId = this.toolCallStepIds?.get(result.tool_call_id);
+        if (invalidStepId == null || invalidStepId === '') {
+          continue;
+        }
+        await this.dispatchStepCompleted(
+          result.tool_call_id,
+          result.name ?? 'unknown',
+          {},
+          typeof result.content === 'string' ? result.content : '',
+          config
+        );
       }
     }
 
     if (!outputs.some(isCommand)) {
       return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
+    }
+
+    /**
+     * Carry the invalid-call promotion into handoff commands. A handoff
+     * tool's Command snapshots `update.messages` from the PRE-promotion
+     * state (MultiAgentGraph builds a filtered same-id copy of the original
+     * AI message), and commands apply after the sibling reducer updates —
+     * so the stale copy would overwrite the replacement message, and a
+     * Send handoff's child state could omit the synthesized results
+     * entirely. Patch each command's same-id AI message with the promotion
+     * and append any missing synthesized results.
+     */
+    if (promotedAiMessage != null) {
+      outputs = outputs.map((output) =>
+        isCommand(output)
+          ? patchCommandUpdateForPromotedInvalidCalls(
+            output,
+            promotedAiMessage!,
+            invalidCallResults
+          )
+          : output
+      );
     }
 
     const combinedOutputs: (
@@ -4178,6 +4330,176 @@ function areToolCallsInvoked(
   );
 }
 
+/**
+ * Normalize the `tool_use` content blocks of promoted invalid calls so the
+ * replacement AI message is valid on EVERY provider surface, not just
+ * `tool_calls`. Anthropic formats an array-content AI message from its blocks
+ * verbatim, and a call whose streamed `input_json` never parsed leaves the
+ * block's `input` as the raw accumulated STRING — replayed as-is, the API
+ * rejects it with `tool_use.input: Input should be an object` before pairing
+ * is even checked. Blocks matching a promoted call id get `input: {}`
+ * (mirroring the promoted args); everything else passes through untouched.
+ * String content (OpenAI-style) is returned as-is.
+ */
+function sanitizeInvalidToolUseBlocks(
+  content: AIMessage['content'],
+  promotedCalls: ReadonlyArray<{ id?: string; name?: string }>
+): AIMessage['content'] {
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  const promotedNamesById = new Map(
+    promotedCalls
+      .filter((call) => call.id != null)
+      .map((call) => [call.id!, normalizeInvalidCallName(call.name)])
+  );
+  return content.map((block) => {
+    if (
+      typeof block !== 'object' ||
+      (block as { type?: string } | null)?.type !== 'tool_use'
+    ) {
+      return block;
+    }
+    const toolUse = block as { id?: string; name?: string; input?: unknown };
+    if (toolUse.id == null || !promotedNamesById.has(toolUse.id)) {
+      return block;
+    }
+    const inputIsObject =
+      typeof toolUse.input === 'object' &&
+      toolUse.input != null &&
+      !Array.isArray(toolUse.input);
+    /** `name` normalizes with the SAME fallback the promoted `tool_calls`
+     *  entry uses — a nameless block would fail provider validation on its
+     *  own even with a valid input. */
+    const nameIsValid =
+      typeof toolUse.name === 'string' && toolUse.name !== '';
+    if (inputIsObject && nameIsValid) {
+      return block;
+    }
+    return {
+      ...block,
+      ...(inputIsObject ? {} : { input: {} }),
+      ...(nameIsValid ? {} : { name: promotedNamesById.get(toolUse.id) }),
+    };
+  });
+}
+
+/**
+ * Name fallback for attributable invalid calls, shared by every surface that
+ * materializes them (synthesized result, promoted tool_calls entry, sanitized
+ * block, handoff patch): `''` is normalized like `undefined` — providers
+ * reject nameless calls, so an empty string would defeat the promotion.
+ *
+ * INVARIANT MAP — a tool call lives in several parallel representations, and
+ * any surface that materializes, copies, filters, routes on, or reports one
+ * must keep ALL of them agreeing (`tool_calls`, `invalid_tool_calls`,
+ * provider content blocks, paired results). The attribution predicate is:
+ * id-bearing (non-empty), non-server (`srvtoolu_`), unanswered
+ * (`toolMessageIds`), messages-state input, id-bearing AI message. Surfaces
+ * that apply it today — extend this list when adding another:
+ *   - `run()`'s `canPromoteInvalidCalls` gate + attributable filter
+ *   - `toolsCondition`'s invalid-only / server-mix routing branch
+ *   - `sanitizeInvalidToolUseBlocks` (block input AND name)
+ *   - `patchCommandUpdateForPromotedInvalidCalls` (handoff snapshots)
+ *   - `processHandoffReception`'s transfer-block filtering (MultiAgentGraph)
+ *   - `findPendingToolCalls` in langfuseTraceShaping (span claims)
+ *   - `serializeMessage`/`deserializeMessage` (session round-trip keeps
+ *     `invalid_tool_calls` with the content blocks they repair)
+ */
+function normalizeInvalidCallName(name: string | undefined | null): string {
+  return name != null && name !== '' ? name : 'unknown';
+}
+
+/**
+ * Rewrite a handoff Command's `update.messages` so the invalid-call promotion
+ * survives into the child state: the same-id AI message copy (snapshotted
+ * pre-promotion by the handoff tool) gets the sanitized content, the promoted
+ * `tool_calls` entries for the answered invalid calls, and the leftover
+ * `invalid_tool_calls`; synthesized results missing from the update are
+ * appended so the child's history keeps every call/result pair. The update
+ * copy's own `tool_calls` narrowing (parallel handoffs filter to a single
+ * call) is preserved. Commands without a same-id AI message pass through.
+ */
+function patchCommandUpdateForPromotedInvalidCalls(
+  command: Command,
+  promoted: AIMessage,
+  invalidResults: ToolMessage[]
+): Command {
+  const update = command.update as { messages?: BaseMessage[] } | undefined;
+  const messages = update?.messages;
+  if (
+    !Array.isArray(messages) ||
+    promoted.id == null ||
+    invalidResults.length === 0
+  ) {
+    return command;
+  }
+  const hasSameIdAiMessage = messages.some(
+    (msg) => isAIMessage(msg) && msg.id === promoted.id
+  );
+  if (!hasSameIdAiMessage) {
+    return command;
+  }
+  const next: BaseMessage[] = messages.map((msg) => {
+    if (!isAIMessage(msg) || msg.id !== promoted.id) {
+      return msg;
+    }
+    const existingIds = new Set(
+      (msg.tool_calls ?? []).map((call) => call.id)
+    );
+    const promotedEntries = invalidResults
+      .filter((result) => !existingIds.has(result.tool_call_id))
+      .map((result) => ({
+        id: result.tool_call_id,
+        name: normalizeInvalidCallName(result.name),
+        args: {},
+        type: 'tool_call' as const,
+      }));
+    return new AIMessage({
+      id: msg.id,
+      content: promoted.content,
+      name: msg.name,
+      additional_kwargs: msg.additional_kwargs,
+      response_metadata: msg.response_metadata,
+      usage_metadata: msg.usage_metadata,
+      tool_calls: [...(msg.tool_calls ?? []), ...promotedEntries],
+      invalid_tool_calls: promoted.invalid_tool_calls,
+    });
+  });
+  const presentResultIds = new Set(
+    next
+      .filter((msg): msg is ToolMessage => msg._getType() === 'tool')
+      .map((msg) => msg.tool_call_id)
+  );
+  const missingResults = invalidResults.filter(
+    (result) => !presentResultIds.has(result.tool_call_id)
+  );
+  return new Command({
+    graph: command.graph,
+    goto: command.goto,
+    resume: command.resume,
+    update: { ...update, messages: [...next, ...missingResults] },
+  });
+}
+
+/**
+ * Whether the message carries an `invalid_tool_calls` entry ToolNode can pair a
+ * synthesized error result with (id-bearing, non-server). Shared by the routing
+ * condition below so an invalid-only turn still enters ToolNode — otherwise the
+ * malformed `tool_use` block is committed with no `tool_result` and the next
+ * model call is rejected by pairing-strict providers.
+ */
+function hasAttributableInvalidToolCalls(message: AIMessage): boolean {
+  return (
+    message.invalid_tool_calls?.some(
+      (call) =>
+        call.id != null &&
+        call.id !== '' &&
+        !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+    ) ?? false
+  );
+}
+
 export function toolsCondition<T extends string>(
   state: BaseMessage[] | typeof MessagesAnnotation.State,
   toolNode: T,
@@ -4191,6 +4513,35 @@ export function toolsCondition<T extends string>(
     'tool_calls' in message &&
     (message.tool_calls?.length ?? 0) > 0 &&
     !areToolCallsInvoked(message, invokedToolIds)
+  ) {
+    return toolNode;
+  }
+  /**
+   * The valid calls (if any) did not route above, but ToolNode still owes any
+   * malformed calls their synthesized error results. Route when EVERY valid
+   * call is provider-server-executed (`srvtoolu_` — ToolNode's batch filter
+   * excludes those before execution, so nothing re-runs): that covers both the
+   * invalid-only turn and the Anthropic server-call + malformed-client-call
+   * mix, where `handleAnthropicSearchResults` marks the server call invoked
+   * and the first branch declines. A valid NON-server call that was invoked
+   * externally stays conservative (no routing) — ToolNode does not filter on
+   * `invokedToolIds`, so entering it would re-execute that call.
+   *
+   * Mirrors ToolNode's own gating exactly, or the routed turn would no-op and
+   * bounce back to the model with the dangle intact: array-state graphs get a
+   * plain output list (no reducer upsert — ToolNode skips invalid handling
+   * there), and an id-less message cannot take the replacement upsert either.
+   */
+  if (
+    !Array.isArray(state) &&
+    message &&
+    typeof message.id === 'string' &&
+    message.id.length > 0 &&
+    hasAttributableInvalidToolCalls(message) &&
+    (message.tool_calls ?? []).every(
+      (call) =>
+        call.id?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) === true
+    )
   ) {
     return toolNode;
   }

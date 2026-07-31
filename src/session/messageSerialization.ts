@@ -6,7 +6,7 @@ import {
   ToolMessage,
   BaseMessage,
 } from '@langchain/core/messages';
-import type { ToolCall } from '@langchain/core/messages/tool';
+import type { ToolCall, InvalidToolCall } from '@langchain/core/messages/tool';
 import type { UsageMetadata } from '@langchain/core/messages';
 import type { JsonObject, JsonValue, SerializedSessionMessage } from './types';
 
@@ -15,6 +15,7 @@ type MessageExtras = {
   name?: string;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
+  invalid_tool_calls?: InvalidToolCall[];
   usage_metadata?: UsageMetadata;
   additional_kwargs?: unknown;
   response_metadata?: unknown;
@@ -133,6 +134,13 @@ export function serializeMessage(
   if (extras.tool_calls) {
     serialized.toolCalls = toJsonValue(extras.tool_calls);
   }
+  /** Malformed-call metadata must round-trip with the calls: the content
+   *  (with any raw `tool_use` blocks) survives serialization, so dropping
+   *  `invalid_tool_calls` would strand those blocks without the entries
+   *  ToolNode repairs the pairing from on restore. */
+  if (extras.invalid_tool_calls && extras.invalid_tool_calls.length > 0) {
+    serialized.invalidToolCalls = toJsonValue(extras.invalid_tool_calls);
+  }
   return serialized;
 }
 
@@ -153,6 +161,9 @@ export function deserializeMessage(
     return new AIMessage({
       ...common,
       tool_calls: serialized.toolCalls as ToolCall[] | undefined,
+      invalid_tool_calls: serialized.invalidToolCalls as
+        | InvalidToolCall[]
+        | undefined,
       usage_metadata: serialized.usageMetadata as UsageMetadata | undefined,
     });
   }

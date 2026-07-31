@@ -134,6 +134,177 @@ describe('shapeLangfuseSpan', () => {
     expect(span.name).toBe('tool-dispatch');
   });
 
+  it('counts id-bearing invalid_tool_calls in the dispatch input (mixed and invalid-only)', () => {
+    /** ToolNode pairs attributable invalid calls with synthesized error
+     *  results (and routes invalid-only turns on them alone), so the span
+     *  input must include them — invalid-only used to find zero calls and
+     *  keep the full serialized graph state as the input. */
+    const mixed = [
+      {
+        type: 'ai',
+        id: 'ai_mixed_span',
+        tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+        invalid_tool_calls: [
+          {
+            name: 'echo',
+            args: '"raw unparsed',
+            id: 'tc_bad',
+            error: 'Malformed args.',
+            type: 'invalid_tool_call',
+          },
+          { name: 'echo', args: 'no-id — excluded', error: 'Malformed args.' },
+          {
+            name: 'echo',
+            args: 'empty-id — excluded',
+            id: '',
+            error: 'Malformed args.',
+          },
+          {
+            name: 'web_search',
+            args: 'server-tool — excluded',
+            id: 'srvtoolu_xyz',
+            error: 'Malformed args.',
+          },
+          {
+            args: 'nameless — included with the unknown fallback',
+            id: 'tc_nameless',
+            error: 'Malformed args.',
+          },
+        ],
+      },
+    ];
+    const mixedSpan = createSpan(
+      'tools=agent_abc',
+      { [INPUT]: JSON.stringify({ messages: mixed }) },
+      'parent-1'
+    );
+    shapeLangfuseSpan(mixedSpan);
+    expect(JSON.parse(mixedSpan.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: { command: 'hi' } },
+      { name: 'echo', args: '"raw unparsed' },
+      { name: 'unknown', args: 'nameless — included with the unknown fallback' },
+    ]);
+
+    const invalidOnly = [
+      {
+        type: 'ai',
+        id: 'ai_invalid_only_span',
+        tool_calls: [],
+        invalid_tool_calls: [
+          {
+            name: 'echo',
+            args: 'garbage',
+            id: 'tc_solo',
+            error: 'Malformed args.',
+            type: 'invalid_tool_call',
+          },
+        ],
+      },
+    ];
+    const invalidOnlySpan = createSpan(
+      'tools=agent_abc',
+      { [INPUT]: JSON.stringify({ messages: invalidOnly }) },
+      'parent-1'
+    );
+    shapeLangfuseSpan(invalidOnlySpan);
+    expect(JSON.parse(invalidOnlySpan.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: 'garbage' },
+    ]);
+  });
+
+  it('excludes invalid calls when ToolNode would skip them (array state / id-less message)', () => {
+    /** Mirrors ToolNode's canPromoteInvalidCalls gate: a bare-array state
+     *  returns a plain output list (invalid handling skipped) and an id-less
+     *  message cannot take the reducer upsert — the span must not report
+     *  those calls as pending work. Valid calls still count. */
+    const invalidCall = {
+      name: 'echo',
+      args: 'garbage',
+      id: 'tc_gated',
+      error: 'Malformed args.',
+      type: 'invalid_tool_call',
+    };
+    const arrayStateSpan = createSpan(
+      'tools=agent_abc',
+      {
+        [INPUT]: JSON.stringify([
+          {
+            type: 'ai',
+            id: 'ai_array_span',
+            tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+            invalid_tool_calls: [invalidCall],
+          },
+        ]),
+      },
+      'parent-1'
+    );
+    shapeLangfuseSpan(arrayStateSpan);
+    expect(JSON.parse(arrayStateSpan.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: { command: 'hi' } },
+    ]);
+
+    const idlessSpan = createSpan(
+      'tools=agent_abc',
+      {
+        [INPUT]: JSON.stringify({
+          messages: [
+            {
+              type: 'ai',
+              tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+              invalid_tool_calls: [invalidCall],
+            },
+          ],
+        }),
+      },
+      'parent-1'
+    );
+    shapeLangfuseSpan(idlessSpan);
+    expect(JSON.parse(idlessSpan.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: { command: 'hi' } },
+    ]);
+  });
+
+  it('excludes invalid calls already answered by a ToolMessage in the state', () => {
+    /** Mirrors ToolNode's !toolMessageIds.has(id) execution filter: an
+     *  answered invalid call is not pending work, even when the same turn
+     *  still has a pending valid call. */
+    const span = createSpan(
+      'tools=agent_abc',
+      {
+        [INPUT]: JSON.stringify({
+          messages: [
+            {
+              type: 'ai',
+              id: 'ai_answered_invalid',
+              tool_calls: [
+                { name: 'echo', args: { command: 'hi' }, id: 'tc_pending' },
+              ],
+              invalid_tool_calls: [
+                {
+                  name: 'echo',
+                  args: 'garbage',
+                  id: 'tc_answered_invalid',
+                  error: 'Malformed args.',
+                  type: 'invalid_tool_call',
+                },
+              ],
+            },
+            {
+              type: 'tool',
+              tool_call_id: 'tc_answered_invalid',
+              content: 'Error: Malformed args.',
+            },
+          ],
+        }),
+      },
+      'parent-1'
+    );
+    shapeLangfuseSpan(span);
+    expect(JSON.parse(span.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: { command: 'hi' } },
+    ]);
+  });
+
   it('keeps a stable tool-dispatch shape when no tool calls are found', () => {
     const original = JSON.stringify({
       messages: [{ type: 'human', content: 'hi' }],
