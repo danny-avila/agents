@@ -51,8 +51,8 @@ import {
   projectOpenAIResponsesToolMessageContent,
   projectToolStreamContentForProvider,
 } from '@/messages/core';
-import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
+import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
@@ -495,7 +495,7 @@ export function shouldIncludeEncryptedReasoning(
       | undefined
   )?.context;
   return (
-    /^gpt-5\.6(?:-|$)/i.test(model) &&
+    /(?:^|[./:])gpt-5\.6(?:-|$)/i.test(model) &&
     (params.store === false || reasoningContext !== 'current_turn')
   );
 }
@@ -1646,6 +1646,89 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   }
 }
 
+function attachOpenAIResponsesReasoningReplayToMessage<
+  T extends BaseMessage | BaseMessageChunk,
+>(message: T): T {
+  const output = (message.response_metadata as { output?: unknown } | undefined)
+    ?.output;
+  if (!Array.isArray(output)) {
+    return message;
+  }
+  const reasoning = output.filter(
+    (item) =>
+      item != null &&
+      typeof item === 'object' &&
+      (item as { type?: unknown }).type === 'reasoning' &&
+      typeof (item as { encrypted_content?: unknown }).encrypted_content ===
+        'string' &&
+      (item as { encrypted_content: string }).encrypted_content !== ''
+  );
+  if (reasoning.length > 0) {
+    message.additional_kwargs.openai_responses_reasoning_replay = reasoning;
+  }
+  return message;
+}
+
+export function attachOpenAIResponsesReasoningReplay(
+  chunk: ChatGenerationChunk
+): ChatGenerationChunk {
+  attachOpenAIResponsesReasoningReplayToMessage(chunk.message);
+  return chunk;
+}
+
+export function expandOpenAIResponsesReasoningReplay(
+  messages: BaseMessage[]
+): BaseMessage[] {
+  return messages.flatMap((message) => {
+    if (!isAIMessage(message)) {
+      return [message];
+    }
+    const candidates =
+      message.additional_kwargs.openai_responses_reasoning_replay;
+    if (!Array.isArray(candidates)) {
+      return [message];
+    }
+    const reasoning = candidates.filter(
+      (item): item is OpenAIClient.Responses.ResponseReasoningItem =>
+        item != null &&
+        typeof item === 'object' &&
+        (item as { type?: unknown }).type === 'reasoning' &&
+        typeof (item as { encrypted_content?: unknown }).encrypted_content ===
+          'string' &&
+        (item as { encrypted_content: string }).encrypted_content !== ''
+    );
+    if (reasoning.length === 0) {
+      return [message];
+    }
+
+    const additionalKwargs = { ...message.additional_kwargs };
+    delete additionalKwargs.openai_responses_reasoning_replay;
+    const finalReasoning = reasoning[reasoning.length - 1];
+    return [
+      ...reasoning.slice(0, -1).map(
+        (item) =>
+          new AIMessage({
+            content: [],
+            additional_kwargs: { reasoning: item },
+          })
+      ),
+      new AIMessage({
+        id: message.id,
+        name: message.name,
+        content: message.content,
+        tool_calls: message.tool_calls,
+        invalid_tool_calls: message.invalid_tool_calls,
+        usage_metadata: message.usage_metadata,
+        response_metadata: message.response_metadata,
+        additional_kwargs: {
+          ...additionalKwargs,
+          reasoning: finalReasoning,
+        },
+      }),
+    ];
+  });
+}
+
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   private promptCacheExplicit?: boolean;
   private responsesPromptCache?: boolean;
@@ -1739,12 +1822,15 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
     const result = await super._generate(
-      projectOpenAIResponsesProviderMessages(messages),
+      expandOpenAIResponsesReasoningReplay(
+        projectOpenAIResponsesProviderMessages(messages)
+      ),
       options,
       runManager
     );
     for (const generation of result.generations) {
       attachCacheWriteUsage(generation.message);
+      attachOpenAIResponsesReasoningReplayToMessage(generation.message);
     }
     return result;
   }
@@ -1755,12 +1841,14 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     for await (const chunk of super._streamResponseChunks(
-      projectOpenAIResponsesProviderMessages(messages),
+      expandOpenAIResponsesReasoningReplay(
+        projectOpenAIResponsesProviderMessages(messages)
+      ),
       options,
       runManager
     )) {
       attachCacheWriteUsage(chunk.message);
-      yield chunk;
+      yield attachOpenAIResponsesReasoningReplay(chunk);
     }
   }
 
@@ -1770,7 +1858,9 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatModelStreamEvent> {
     yield* super._streamChatModelEvents(
-      projectOpenAIResponsesProviderMessages(messages),
+      expandOpenAIResponsesReasoningReplay(
+        projectOpenAIResponsesProviderMessages(messages)
+      ),
       options,
       runManager
     );
@@ -1988,9 +2078,14 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    const result = await super._generate(messages, options, runManager);
+    const result = await super._generate(
+      expandOpenAIResponsesReasoningReplay(messages),
+      options,
+      runManager
+    );
     for (const generation of result.generations) {
       attachCacheWriteUsage(generation.message);
+      attachOpenAIResponsesReasoningReplayToMessage(generation.message);
     }
     return result;
   }
@@ -2001,12 +2096,12 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     for await (const chunk of super._streamResponseChunks(
-      messages,
+      expandOpenAIResponsesReasoningReplay(messages),
       options,
       runManager
     )) {
       attachCacheWriteUsage(chunk.message);
-      yield chunk;
+      yield attachOpenAIResponsesReasoningReplay(chunk);
     }
   }
 

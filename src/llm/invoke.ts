@@ -1,14 +1,14 @@
 import { concat } from '@langchain/core/utils/stream';
-import { AIMessageChunk } from '@langchain/core/messages';
+import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
+import { getCallbackManagerForConfig } from '@langchain/core/runnables';
 import {
   CallbackManager,
   CallbackManagerForLLMRun,
   type Callbacks,
 } from '@langchain/core/callbacks/manager';
-import { getCallbackManagerForConfig } from '@langchain/core/runnables';
 import type { Serialized } from '@langchain/core/load/serializable';
-import type { ChatGeneration } from '@langchain/core/outputs';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { ChatGeneration } from '@langchain/core/outputs';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
@@ -25,27 +25,27 @@ import {
   projectToolStreamContentForProvider,
 } from '@/messages/core';
 import {
-  stripAnthropicCacheControl,
-  stripBedrockCacheControl,
-} from '@/messages/cache';
-import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
-import { assertNotTruncatedToolCall } from '@/llm/truncation';
-import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
-import { manualToolStreamProviders } from '@/llm/providers';
-import { appendCallbacks } from '@/utils/callbacks';
-import { safeDispatchCustomEvent } from '@/utils/events';
-import { getContextOverflowInfo } from '@/utils/errors';
-import {
   modifyDeltaProperties,
   coalesceAdjacentUserTurns,
   strictAlternationProviders,
   appendPredecessorHandoffCue,
   removePredecessorHandoffCue,
 } from '@/messages';
-import { canSealPreempt } from '@/llm/preempt';
+import {
+  stripAnthropicCacheControl,
+  stripBedrockCacheControl,
+} from '@/messages/cache';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
-import { initializeModel } from '@/llm/init';
+import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
+import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
+import { assertNotTruncatedToolCall } from '@/llm/truncation';
+import { manualToolStreamProviders } from '@/llm/providers';
 import { isAnthropicLike, isOpenAILike } from '@/utils/llm';
+import { safeDispatchCustomEvent } from '@/utils/events';
+import { getContextOverflowInfo } from '@/utils/errors';
+import { appendCallbacks } from '@/utils/callbacks';
+import { canSealPreempt } from '@/llm/preempt';
+import { initializeModel } from '@/llm/init';
 
 /**
  * Context passed to `attemptInvoke`. Matches the subset of Graph that
@@ -550,6 +550,147 @@ export function resolveServingModelId(model: unknown): string | undefined {
   return undefined;
 }
 
+export interface ReasoningReplaySource {
+  provider: Providers;
+  model?: string;
+  useResponsesApi?: boolean;
+}
+
+/** Resolves the replay identity of the model that will serve an invocation. */
+export function resolveReasoningReplaySource({
+  model,
+  provider,
+  clientOptions,
+  callOptions,
+}: {
+  model: t.ChatModel;
+  provider: Providers;
+  clientOptions?: t.ClientOptions;
+  callOptions?: unknown;
+}): ReasoningReplaySource {
+  return {
+    provider,
+    model:
+      resolveServingModelId(model) ?? extractClientOptionsModel(clientOptions),
+    useResponsesApi: usesNativeOpenAIResponses(model, provider, callOptions),
+  };
+}
+
+/**
+ * Removes provider-native reasoning that is not valid for the model serving
+ * this invocation. Fallbacks start from messages formatted for the primary,
+ * so compatibility must be checked again after the fallback model is known.
+ */
+export function filterReasoningReplayForInvocation({
+  messages,
+  source,
+  target,
+}: {
+  messages: BaseMessage[];
+  source: ReasoningReplaySource;
+  target: ReasoningReplaySource;
+}): BaseMessage[] {
+  const isOpenAIResponsesReplay =
+    source.provider === Providers.OPENAI || source.provider === Providers.AZURE;
+  const compatible =
+    source.provider === target.provider &&
+    source.model != null &&
+    source.model === target.model &&
+    (!isOpenAIResponsesReplay ||
+      (source.useResponsesApi === true && target.useResponsesApi === true));
+  if (compatible) {
+    return messages;
+  }
+
+  return messages.flatMap((message) => {
+    if (message.getType() !== 'ai') {
+      return [message];
+    }
+    const aiMessage = message as AIMessage;
+    let content = aiMessage.content;
+    if (Array.isArray(content)) {
+      if (source.provider === Providers.ANTHROPIC) {
+        const filtered = content.filter(
+          (part) =>
+            part.type !== ContentTypes.THINKING &&
+            part.type !== 'redacted_thinking' &&
+            !(
+              part.type === ContentTypes.REASONING &&
+              typeof (part as { signature?: unknown }).signature === 'string'
+            )
+        );
+        if (filtered.length !== content.length) {
+          content = filtered;
+        }
+      } else if (source.provider === Providers.BEDROCK) {
+        const filtered = content.filter(
+          (part) => part.type !== ContentTypes.REASONING_CONTENT
+        );
+        if (filtered.length !== content.length) {
+          content = filtered;
+        }
+      }
+    }
+
+    let additionalKwargs = aiMessage.additional_kwargs;
+    let responseMetadata = aiMessage.response_metadata;
+    if (isOpenAIResponsesReplay) {
+      const {
+        openai_responses_reasoning_replay: _,
+        reasoning: __,
+        ...rest
+      } = additionalKwargs;
+      if (
+        'openai_responses_reasoning_replay' in additionalKwargs ||
+        'reasoning' in additionalKwargs
+      ) {
+        additionalKwargs = rest;
+      }
+      if (Array.isArray(responseMetadata.output)) {
+        const filteredOutput = responseMetadata.output.filter(
+          (item) =>
+            item == null ||
+            typeof item !== 'object' ||
+            !('type' in item) ||
+            item.type !== 'reasoning'
+        );
+        if (filteredOutput.length !== responseMetadata.output.length) {
+          responseMetadata = {
+            ...responseMetadata,
+            output: filteredOutput,
+          };
+        }
+      }
+    }
+    if (
+      content === aiMessage.content &&
+      additionalKwargs === aiMessage.additional_kwargs &&
+      responseMetadata === aiMessage.response_metadata
+    ) {
+      return [message];
+    }
+    if (
+      (content === '' || (Array.isArray(content) && content.length === 0)) &&
+      (aiMessage.tool_calls?.length ?? 0) === 0 &&
+      (aiMessage.invalid_tool_calls?.length ?? 0) === 0
+    ) {
+      return [];
+    }
+    return [
+      new AIMessage({
+        id: aiMessage.id,
+        name: aiMessage.name,
+        content,
+        additional_kwargs: additionalKwargs,
+        response_metadata: responseMetadata,
+        tool_calls: aiMessage.tool_calls,
+        invalid_tool_calls: aiMessage.invalid_tool_calls,
+        usage_metadata: aiMessage.usage_metadata,
+      }),
+    ];
+  });
+}
+
 async function endSealedModelRun(
   context: InvokeContext | undefined,
   chunk: AIMessageChunk,
@@ -677,11 +818,7 @@ export async function attemptInvoke(
   });
   const registry = context?.getOrCreateToolOutputRegistry();
   const runId = config?.configurable?.run_id as string | undefined;
-  const annotated = annotateMessagesForLLM(
-    invocationMessages,
-    registry,
-    runId
-  );
+  const annotated = annotateMessagesForLLM(invocationMessages, registry, runId);
   /**
    * Keyed on the provider ACTUALLY serving this call, not the agent's primary.
    * `createCallModel` normalizes for the primary, but `tryFallbackProviders`
@@ -951,7 +1088,7 @@ export function getFallbackOverflowCandidates(
  * Best-effort read of the configured model name from client options.
  * Providers disagree on the key (`model` vs `modelName`).
  */
-function extractClientOptionsModel(
+export function extractClientOptionsModel(
   clientOptions: t.ClientOptions | undefined
 ): string | undefined {
   const options = clientOptions as
@@ -985,6 +1122,7 @@ export async function tryFallbackProviders({
   onChunk,
   overflowContext,
   prepareProviderMessages,
+  reasoningReplaySource,
 }: {
   fallbacks: t.FallbackConfig[];
   tools?: t.GraphTools;
@@ -1013,6 +1151,8 @@ export async function tryFallbackProviders({
     maxContextTokens?: number;
     config?: RunnableConfig;
   }) => BaseMessage[] | Promise<BaseMessage[]>;
+  /** Provider/model identity used when native reasoning entered `messages`. */
+  reasoningReplaySource?: ReasoningReplaySource;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
   const isOverflow = (
     error: unknown,
@@ -1054,15 +1194,28 @@ export async function tryFallbackProviders({
               [Constants.INVOKED_MODEL]: fbModelName,
             },
           };
+      const replayValidatedMessages =
+        reasoningReplaySource == null
+          ? messages
+          : filterReasoningReplayForInvocation({
+            messages,
+            source: reasoningReplaySource,
+            target: resolveReasoningReplaySource({
+              model: fbModel as t.ChatModel,
+              provider: fb.provider,
+              clientOptions: fb.clientOptions,
+              callOptions: fbConfig,
+            }),
+          });
       const fallbackMessages =
         (await prepareProviderMessages?.({
           model: fbModel as t.ChatModel,
-          messages,
+          messages: replayValidatedMessages,
           provider: fb.provider,
           clientOptions: fb.clientOptions,
           maxContextTokens: fb.maxContextTokens,
           config: fbConfig,
-        })) ?? messages;
+        })) ?? replayValidatedMessages;
       const result = await attemptInvoke(
         {
           model: fbModel as t.ChatModel,

@@ -11,7 +11,7 @@ import type { Command } from '@langchain/langgraph';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
 import type { ToolEndEvent } from '@/types/tools';
-import { StepTypes, ContentTypes, GraphEvents } from '@/common/enum';
+import { StepTypes, ContentTypes, GraphEvents, Providers } from '@/common/enum';
 
 export type HandleLLMEnd = (
   output: LLMResult,
@@ -281,7 +281,59 @@ export type MessageDeltaUpdate = {
   text: string;
   tool_call_ids?: string[];
 };
-export type ReasoningDeltaUpdate = { type: ContentTypes.THINK; think: string };
+export type BedrockReasoningReplayBlock = {
+  type: ContentTypes.REASONING_CONTENT;
+  reasoningText?: { text?: string; signature?: string };
+  redactedContent?: string;
+};
+
+export type AnthropicReasoningReplayBlock =
+  | {
+      type: ContentTypes.THINKING;
+      thinking?: string;
+      signature?: string;
+    }
+  | {
+      type: 'redacted_thinking';
+      data: string;
+    };
+
+export type OpenAIResponsesReasoningReplayItem = {
+  type: 'reasoning';
+  id: string;
+  summary: Array<{ type: 'summary_text'; text: string }>;
+  content?: Array<{ type: 'reasoning_text'; text: string }>;
+  encrypted_content: string;
+  status?: 'in_progress' | 'completed' | 'incomplete';
+};
+
+export type OpenAIResponsesReasoningReplay = {
+  provider: Providers.OPENAI | Providers.AZURE;
+  model: string;
+  items: OpenAIResponsesReasoningReplayItem[];
+};
+
+export type AnthropicReasoningReplay = {
+  model: string;
+  blocks: AnthropicReasoningReplayBlock[];
+};
+
+export type BedrockReasoningReplay = {
+  model: string;
+  blocks: BedrockReasoningReplayBlock[];
+};
+
+export type ProviderReasoningReplay = {
+  anthropic?: AnthropicReasoningReplay;
+  bedrock?: BedrockReasoningReplay;
+  openai_responses?: OpenAIResponsesReasoningReplay;
+};
+
+export type ReasoningDeltaUpdate = {
+  type: ContentTypes.THINK;
+  think: string;
+  provider_replay?: ProviderReasoningReplay;
+};
 
 export type ContentType =
   | 'text'
@@ -294,6 +346,7 @@ export type ContentType =
 export type ReasoningContentText = {
   type: ContentTypes.THINK;
   think: string;
+  provider_replay?: ProviderReasoningReplay;
 };
 
 export type SummaryBoundary = {
