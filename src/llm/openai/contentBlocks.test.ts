@@ -1,4 +1,6 @@
 import { describe, expect, test } from '@jest/globals';
+import { ChatGenerationChunk } from '@langchain/core/outputs';
+import { convertMessagesToResponsesInput } from '@langchain/openai';
 import {
   AIMessage,
   AIMessageChunk,
@@ -9,6 +11,10 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
+import {
+  attachOpenAIResponsesReasoningReplay,
+  expandOpenAIResponsesReasoningReplay,
+} from './index';
 import { _convertOpenAIResponsesDeltaToBaseMessageChunk } from './utils';
 
 describe('OpenAI content block translator compatibility', () => {
@@ -113,6 +119,85 @@ describe('OpenAI content block translator compatibility', () => {
   });
 
   describe('Responses', () => {
+    test('copies all final encrypted reasoning items onto the streamed chunk', () => {
+      const reasoning = [
+        {
+          type: 'reasoning',
+          id: 'rs_first',
+          summary: [],
+          encrypted_content: 'encrypted-first-reasoning',
+        },
+        {
+          type: 'reasoning',
+          id: 'rs_second',
+          summary: [],
+          encrypted_content: 'encrypted-second-reasoning',
+        },
+      ];
+      const chunk = new ChatGenerationChunk({
+        text: '',
+        message: new AIMessageChunk({
+          content: '',
+          response_metadata: {
+            output: [
+              reasoning[0],
+              { type: 'message', content: [] },
+              reasoning[1],
+            ],
+          },
+        }),
+      });
+
+      expect(
+        attachOpenAIResponsesReasoningReplay(chunk).message.additional_kwargs
+          .openai_responses_reasoning_replay
+      ).toEqual(reasoning);
+    });
+
+    test('replays every encrypted reasoning item before the assistant message', () => {
+      const reasoning = [
+        {
+          type: 'reasoning' as const,
+          id: 'rs_first',
+          status: 'completed' as const,
+          summary: [],
+          encrypted_content: 'encrypted-first-reasoning',
+        },
+        {
+          type: 'reasoning' as const,
+          id: 'rs_second',
+          status: 'completed' as const,
+          summary: [],
+          encrypted_content: 'encrypted-second-reasoning',
+        },
+      ];
+      const messages = expandOpenAIResponsesReasoningReplay([
+        new AIMessage({
+          content: 'Final answer',
+          additional_kwargs: {
+            openai_responses_reasoning_replay: reasoning,
+          },
+        }),
+      ]);
+
+      expect(
+        convertMessagesToResponsesInput({
+          messages,
+          zdrEnabled: true,
+          model: 'gpt-5.6-terra',
+        })
+      ).toEqual([
+        reasoning[0],
+        reasoning[1],
+        {
+          type: 'message',
+          role: 'assistant',
+          content: 'Final answer',
+          phase: undefined,
+        },
+      ]);
+    });
+
     test('marks Responses function call arguments done as an explicit tool-call seal', () => {
       const chunk = _convertOpenAIResponsesDeltaToBaseMessageChunk({
         type: 'response.function_call_arguments.done',
@@ -121,7 +206,9 @@ describe('OpenAI content block translator compatibility', () => {
         output_index: 1,
         name: 'search',
         arguments: '{"query":"weather"}',
-      } as Parameters<typeof _convertOpenAIResponsesDeltaToBaseMessageChunk>[0]);
+      } as Parameters<
+        typeof _convertOpenAIResponsesDeltaToBaseMessageChunk
+      >[0]);
       const message = chunk?.message as AIMessageChunk | undefined;
 
       expect(message?.tool_call_chunks).toEqual([

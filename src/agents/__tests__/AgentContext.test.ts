@@ -1490,6 +1490,7 @@ describe('AgentContext', () => {
       ctx.systemMessageTokens = 100;
       ctx.indexTokenCountMap = { '0': 50 };
       ctx.currentUsage = { input_tokens: 100 };
+      ctx.openAIResponsesReasoningReplayIds.add('rs_123');
 
       ctx.reset();
 
@@ -1497,6 +1498,7 @@ describe('AgentContext', () => {
       expect(ctx.instructionTokens).toBe(0);
       expect(ctx.indexTokenCountMap).toEqual({});
       expect(ctx.currentUsage).toBeUndefined();
+      expect(ctx.openAIResponsesReasoningReplayIds.size).toBe(0);
     });
 
     it('preserves summarization settings across resets', () => {

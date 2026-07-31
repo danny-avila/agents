@@ -435,6 +435,121 @@ function getReasoningTextFromContentPart(
   );
 }
 
+function getBedrockReasoningReplay(
+  contentPart: t.MessageContentComplex,
+  agentContext: AgentContext
+): t.ProviderReasoningReplay | undefined {
+  const model = (agentContext.clientOptions as { model?: unknown } | undefined)
+    ?.model;
+  if (
+    typeof model !== 'string' ||
+    model === '' ||
+    contentPart.type !== ContentTypes.REASONING_CONTENT
+  ) {
+    return undefined;
+  }
+  const block = contentPart as Partial<t.BedrockReasoningReplayBlock>;
+  const reasoningText = block.reasoningText;
+  if (
+    reasoningText != null &&
+    (typeof reasoningText.text === 'string' ||
+      typeof reasoningText.signature === 'string')
+  ) {
+    return {
+      bedrock: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: {
+              ...(typeof reasoningText.text === 'string' && {
+                text: reasoningText.text,
+              }),
+              ...(typeof reasoningText.signature === 'string' && {
+                signature: reasoningText.signature,
+              }),
+            },
+          },
+        ],
+      },
+    };
+  }
+  if (
+    typeof block.redactedContent === 'string' &&
+    block.redactedContent !== ''
+  ) {
+    return {
+      bedrock: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            redactedContent: block.redactedContent,
+          },
+        ],
+      },
+    };
+  }
+  return undefined;
+}
+
+function getAnthropicReasoningReplay(
+  contentPart: t.MessageContentComplex,
+  agentContext: AgentContext
+): t.ProviderReasoningReplay | undefined {
+  const model = (agentContext.clientOptions as { model?: unknown } | undefined)
+    ?.model;
+  if (typeof model !== 'string' || model === '') {
+    return undefined;
+  }
+  if (
+    contentPart.type === ContentTypes.THINKING ||
+    contentPart.type === ContentTypes.REASONING
+  ) {
+    const block = contentPart as Partial<t.AnthropicReasoningReplayBlock> & {
+      thinking?: string;
+      reasoning?: string;
+      signature?: string;
+    };
+    const thinking =
+      contentPart.type === ContentTypes.THINKING
+        ? block.thinking
+        : block.reasoning;
+    if (typeof thinking !== 'string' && typeof block.signature !== 'string') {
+      return undefined;
+    }
+    return {
+      anthropic: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.THINKING,
+            ...(typeof thinking === 'string' && {
+              thinking,
+            }),
+            ...(typeof block.signature === 'string' && {
+              signature: block.signature,
+            }),
+          },
+        ],
+      },
+    };
+  }
+  if (contentPart.type === 'redacted_thinking') {
+    const data = (contentPart as { data?: unknown }).data;
+    if (typeof data !== 'string' || data === '') {
+      return undefined;
+    }
+    return {
+      anthropic: {
+        model,
+        blocks: [{ type: 'redacted_thinking', data }],
+      },
+    };
+  }
+  return undefined;
+}
+
 function getReasoningTextFromChunk(
   chunk: Partial<AIMessageChunk>,
   agentContext: AgentContext
@@ -1407,6 +1522,154 @@ function shouldSkipLateOpenRouterReasoningChunk({
   );
 }
 
+function normalizeOpenAIResponsesReasoningReplayItem(
+  candidate: unknown
+): t.OpenAIResponsesReasoningReplayItem | undefined {
+  if (candidate == null || typeof candidate !== 'object') {
+    return undefined;
+  }
+  const item = candidate as Record<string, unknown>;
+  if (
+    item.type !== 'reasoning' ||
+    typeof item.id !== 'string' ||
+    item.id === '' ||
+    typeof item.encrypted_content !== 'string' ||
+    item.encrypted_content === '' ||
+    !Array.isArray(item.summary)
+  ) {
+    return undefined;
+  }
+  const summary = item.summary.flatMap(
+    (part): t.OpenAIResponsesReasoningReplayItem['summary'] => {
+      if (
+        part == null ||
+        typeof part !== 'object' ||
+        (part as { type?: unknown }).type !== 'summary_text' ||
+        typeof (part as { text?: unknown }).text !== 'string'
+      ) {
+        return [];
+      }
+      return [
+        {
+          type: 'summary_text',
+          text: (part as { text: string }).text,
+        },
+      ];
+    }
+  );
+  const rawContent = item.content;
+  const content = Array.isArray(rawContent)
+    ? rawContent.flatMap(
+      (
+        part
+      ): NonNullable<t.OpenAIResponsesReasoningReplayItem['content']> => {
+        if (
+          part == null ||
+            typeof part !== 'object' ||
+            (part as { type?: unknown }).type !== 'reasoning_text' ||
+            typeof (part as { text?: unknown }).text !== 'string'
+        ) {
+          return [];
+        }
+        return [
+          {
+            type: 'reasoning_text',
+            text: (part as { text: string }).text,
+          },
+        ];
+      }
+    )
+    : undefined;
+  const status =
+    item.status === 'in_progress' ||
+    item.status === 'completed' ||
+    item.status === 'incomplete'
+      ? item.status
+      : undefined;
+  return {
+    type: 'reasoning',
+    id: item.id,
+    summary,
+    ...(content != null && { content }),
+    encrypted_content: item.encrypted_content,
+    ...(status != null && { status }),
+  };
+}
+
+function getOpenAIResponsesReasoningReplay(
+  chunk: Partial<AIMessageChunk>,
+  agentContext: AgentContext
+): t.OpenAIResponsesReasoningReplay | undefined {
+  if (
+    agentContext.provider !== Providers.OPENAI &&
+    agentContext.provider !== Providers.AZURE
+  ) {
+    return undefined;
+  }
+  const model = (agentContext.clientOptions as { model?: unknown } | undefined)
+    ?.model;
+  const candidates = chunk.additional_kwargs?.openai_responses_reasoning_replay;
+  if (typeof model !== 'string' || model === '' || !Array.isArray(candidates)) {
+    return undefined;
+  }
+  const items = candidates.flatMap(
+    (candidate): t.OpenAIResponsesReasoningReplayItem[] => {
+      const item = normalizeOpenAIResponsesReasoningReplayItem(candidate);
+      return item == null ? [] : [item];
+    }
+  );
+  if (items.length === 0) {
+    return undefined;
+  }
+  const unseenItems = items.filter(
+    (item) => !agentContext.openAIResponsesReasoningReplayIds.has(item.id)
+  );
+  for (const item of unseenItems) {
+    agentContext.openAIResponsesReasoningReplayIds.add(item.id);
+  }
+  return unseenItems.length === 0
+    ? undefined
+    : { provider: agentContext.provider, model, items: unseenItems };
+}
+
+async function dispatchOpenAIResponsesReasoningReplay({
+  graph,
+  agentContext,
+  replay,
+  metadata,
+}: {
+  graph: StandardGraph;
+  agentContext: AgentContext;
+  replay: t.OpenAIResponsesReasoningReplay;
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  agentContext.currentTokenType = ContentTypes.THINK;
+  agentContext.tokenTypeSwitch = 'reasoning';
+  const stepKey = graph.getStepKey(metadata);
+  const messageId = getMessageId(stepKey, graph) ?? '';
+  await graph.dispatchRunStep(
+    stepKey,
+    {
+      type: StepTypes.MESSAGE_CREATION,
+      message_creation: { message_id: messageId },
+    },
+    metadata
+  );
+  await graph.dispatchReasoningDelta(
+    graph.getStepIdByKey(stepKey),
+    {
+      content: [
+        {
+          type: ContentTypes.THINK,
+          think: '',
+          provider_replay: { openai_responses: replay },
+        },
+      ],
+    },
+    metadata
+  );
+}
+
 /**
  * Brands a handler as one that dispatches content parts for the SDK — either
  * `ChatModelStreamHandler` itself or a wrapper forwarding to one.
@@ -1456,6 +1719,19 @@ export class ChatModelStreamHandler implements t.EventHandler {
     const agentContext = graph.getAgentContext(metadata);
 
     const chunk = data.chunk as Partial<AIMessageChunk>;
+    const openAIResponsesReplay = getOpenAIResponsesReasoningReplay(
+      chunk,
+      agentContext
+    );
+    if (openAIResponsesReplay != null) {
+      await dispatchOpenAIResponsesReasoningReplay({
+        graph,
+        agentContext,
+        replay: openAIResponsesReplay,
+        metadata,
+      });
+      return;
+    }
 
     const content = getChunkContent({
       chunk,
@@ -1756,15 +2032,28 @@ hasToolCallChunks: ${hasToolCallChunks}
       await graph.dispatchReasoningDelta(
         stepId,
         {
-          content: content.map((c) => ({
-            type: ContentTypes.THINK,
-            think:
-              (c as t.ThinkingContentText).thinking ??
-              (c as Partial<t.GoogleReasoningContentText>).reasoning ??
-              (c as Partial<t.BedrockReasoningContentText>).reasoningText
-                ?.text ??
-              '',
-          })),
+          content: content.map((c) => {
+            const isAnthropicReplayShape =
+              c.type === ContentTypes.THINKING ||
+              c.type === 'redacted_thinking' ||
+              (c.type === ContentTypes.REASONING &&
+                typeof (c as { signature?: unknown }).signature === 'string');
+            const providerReplay = isAnthropicReplayShape
+              ? getAnthropicReasoningReplay(c, agentContext)
+              : getBedrockReasoningReplay(c, agentContext);
+            return {
+              type: ContentTypes.THINK,
+              think:
+                (c as t.ThinkingContentText).thinking ??
+                (c as Partial<t.GoogleReasoningContentText>).reasoning ??
+                (c as Partial<t.BedrockReasoningContentText>).reasoningText
+                  ?.text ??
+                '',
+              ...(providerReplay != null && {
+                provider_replay: providerReplay,
+              }),
+            };
+          }),
         },
         metadata
       );
@@ -1856,6 +2145,127 @@ hasToolCallChunks: ${hasToolCallChunks}
     }
     agentContext.lastToken = chunk.content;
   }
+}
+
+function mergeOpenAIResponsesReasoningReplay(
+  existing: t.OpenAIResponsesReasoningReplay | undefined,
+  incoming: t.OpenAIResponsesReasoningReplay | undefined
+): t.OpenAIResponsesReasoningReplay | undefined {
+  if (incoming == null) {
+    return existing;
+  }
+  if (
+    existing == null ||
+    existing.provider !== incoming.provider ||
+    existing.model !== incoming.model
+  ) {
+    return structuredClone(incoming);
+  }
+  const items = structuredClone(existing.items);
+  const indexes = new Map(items.map((item, index) => [item.id, index]));
+  for (const item of incoming.items) {
+    const index = indexes.get(item.id);
+    if (index == null) {
+      indexes.set(item.id, items.length);
+      items.push(structuredClone(item));
+      continue;
+    }
+    items[index] = structuredClone(item);
+  }
+  return { provider: incoming.provider, model: incoming.model, items };
+}
+
+function mergeProviderReasoningReplay(
+  existing: t.ProviderReasoningReplay | undefined,
+  incoming: t.ProviderReasoningReplay | undefined
+): t.ProviderReasoningReplay | undefined {
+  if (incoming == null) {
+    return existing;
+  }
+  const anthropicModelChanged =
+    incoming.anthropic != null &&
+    existing?.anthropic?.model !== incoming.anthropic.model;
+  const anthropic = anthropicModelChanged
+    ? structuredClone(incoming.anthropic)
+    : structuredClone(existing?.anthropic);
+  if (
+    !anthropicModelChanged &&
+    anthropic != null &&
+    incoming.anthropic != null
+  ) {
+    for (const incomingBlock of incoming.anthropic.blocks) {
+      const lastBlock = anthropic.blocks[anthropic.blocks.length - 1];
+      const startsNewSignedBlock =
+        incomingBlock.type === ContentTypes.THINKING &&
+        typeof incomingBlock.thinking === 'string' &&
+        anthropic.blocks.length > 0 &&
+        lastBlock.type === ContentTypes.THINKING &&
+        typeof lastBlock.signature === 'string' &&
+        lastBlock.signature !== '';
+      if (
+        incomingBlock.type === ContentTypes.THINKING &&
+        anthropic.blocks.length > 0 &&
+        lastBlock.type === ContentTypes.THINKING &&
+        !startsNewSignedBlock
+      ) {
+        if (typeof incomingBlock.thinking === 'string') {
+          lastBlock.thinking =
+            (lastBlock.thinking ?? '') + incomingBlock.thinking;
+        }
+        if (typeof incomingBlock.signature === 'string') {
+          lastBlock.signature =
+            (lastBlock.signature ?? '') + incomingBlock.signature;
+        }
+        continue;
+      }
+      anthropic.blocks.push(structuredClone(incomingBlock));
+    }
+  }
+  const bedrockModelChanged =
+    incoming.bedrock != null &&
+    existing?.bedrock?.model !== incoming.bedrock.model;
+  const bedrock = bedrockModelChanged
+    ? structuredClone(incoming.bedrock)
+    : structuredClone(existing?.bedrock);
+  if (!bedrockModelChanged && bedrock != null && incoming.bedrock != null) {
+    for (const incomingBlock of incoming.bedrock.blocks) {
+      const incomingReasoningText = incomingBlock.reasoningText;
+      const lastBlock = bedrock.blocks[bedrock.blocks.length - 1];
+      const lastReasoningText =
+        bedrock.blocks.length > 0 ? lastBlock.reasoningText : undefined;
+      const startsNewSignedBlock =
+        typeof incomingReasoningText?.text === 'string' &&
+        lastReasoningText?.signature != null;
+      if (
+        incomingReasoningText != null &&
+        lastReasoningText != null &&
+        !startsNewSignedBlock
+      ) {
+        if (typeof incomingReasoningText.text === 'string') {
+          lastReasoningText.text =
+            (lastReasoningText.text ?? '') + incomingReasoningText.text;
+        }
+        if (typeof incomingReasoningText.signature === 'string') {
+          lastReasoningText.signature =
+            (lastReasoningText.signature ?? '') +
+            incomingReasoningText.signature;
+        }
+        continue;
+      }
+      bedrock.blocks.push(structuredClone(incomingBlock));
+    }
+  }
+  const openaiResponses = mergeOpenAIResponsesReasoningReplay(
+    existing?.openai_responses,
+    incoming.openai_responses
+  );
+  return {
+    ...(anthropic != null && anthropic.blocks.length > 0 && { anthropic }),
+    ...(bedrock != null && bedrock.blocks.length > 0 && { bedrock }),
+    ...(openaiResponses != null && {
+      openai_responses: structuredClone(openaiResponses),
+    }),
+  };
 }
 
 export function createContentAggregator(): t.ContentAggregatorResult {
@@ -2072,6 +2482,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       const update: t.ReasoningDeltaUpdate = {
         type: ContentTypes.THINK,
         think: (currentContent.think || '') + contentPart.think,
+        provider_replay: mergeProviderReasoningReplay(
+          currentContent.provider_replay,
+          (contentPart as t.ReasoningContentText).provider_replay
+        ),
       };
       contentParts[index] = update;
     } else if (
@@ -2325,7 +2739,9 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
 
-      for (const contentPart of getDeltaContentParts(messageDelta.delta.content)) {
+      for (const contentPart of getDeltaContentParts(
+        messageDelta.delta.content
+      )) {
         updateContent(runStep.index, contentPart);
       }
     } else if (
@@ -2354,7 +2770,9 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
 
-      for (const contentPart of getDeltaContentParts(reasoningDelta.delta.content)) {
+      for (const contentPart of getDeltaContentParts(
+        reasoningDelta.delta.content
+      )) {
         updateContent(runStep.index, contentPart);
       }
     } else if (event === GraphEvents.ON_RUN_STEP_DELTA) {

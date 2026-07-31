@@ -14,10 +14,15 @@ import type {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
+  AnthropicReasoningReplay,
+  AnthropicReasoningReplayBlock,
+  BedrockReasoningReplay,
+  BedrockReasoningReplayBlock,
   BedrockReasoningContentText,
   ExtendedMessageContent,
   GoogleReasoningContentText,
   MessageContentComplex,
+  OpenAIResponsesReasoningReplay,
   ReasoningContentText,
   SummaryContentBlock,
   SummaryCoverage,
@@ -336,13 +341,17 @@ export const formatFromLangChain = (
 };
 
 interface FormatAssistantMessageOptions {
+  model?: string;
   preserveUnpairedServerToolUses?: boolean;
   preserveReasoningContent?: boolean;
   provider?: Providers;
+  useResponsesApi?: boolean;
 }
 
 interface FormatAgentMessagesOptions {
+  model?: string;
   provider?: Providers;
+  useResponsesApi?: boolean;
   /** Reconstruct hidden `reasoning_content` from `THINK` parts onto prior
    *  tool-call messages. Explicit opt-in for OpenAI-compatible endpoints that
    *  replay reasoning across turns; defaults to on for DeepSeek thinking-mode. */
@@ -376,6 +385,173 @@ function extractReasoningContent(
     return typeof reasoningText.text === 'string' ? reasoningText.text : '';
   }
   return '';
+}
+
+function extractBedrockReasoningReplay(
+  part: MessageContentComplex | undefined | null
+): BedrockReasoningReplay | undefined {
+  if (part?.type !== ContentTypes.THINK) {
+    return undefined;
+  }
+  const replay = (part as ReasoningContentText).provider_replay?.bedrock;
+  if (
+    replay == null ||
+    typeof replay.model !== 'string' ||
+    replay.model === '' ||
+    !Array.isArray(replay.blocks)
+  ) {
+    return undefined;
+  }
+  const blocks = replay.blocks.flatMap(
+    (block): BedrockReasoningReplayBlock[] => {
+      const { reasoningText, redactedContent } = block;
+      if (
+        typeof reasoningText?.text === 'string' &&
+        reasoningText.text !== '' &&
+        typeof reasoningText.signature === 'string' &&
+        reasoningText.signature !== ''
+      ) {
+        return [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: {
+              text: reasoningText.text,
+              signature: reasoningText.signature,
+            },
+          },
+        ];
+      }
+      if (typeof redactedContent === 'string' && redactedContent !== '') {
+        return [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            redactedContent,
+          },
+        ];
+      }
+      return [];
+    }
+  );
+  return blocks.length > 0 ? { model: replay.model, blocks } : undefined;
+}
+
+function extractAnthropicReasoningReplay(
+  part: MessageContentComplex | undefined | null
+): AnthropicReasoningReplay | undefined {
+  if (part?.type !== ContentTypes.THINK) {
+    return undefined;
+  }
+  const replay = (part as ReasoningContentText).provider_replay?.anthropic;
+  if (
+    replay == null ||
+    typeof replay.model !== 'string' ||
+    replay.model === '' ||
+    !Array.isArray(replay.blocks)
+  ) {
+    return undefined;
+  }
+  const blocks = replay.blocks.flatMap(
+    (block): AnthropicReasoningReplayBlock[] => {
+      if (
+        block.type === ContentTypes.THINKING &&
+        typeof block.signature === 'string' &&
+        block.signature !== ''
+      ) {
+        return [
+          {
+            type: ContentTypes.THINKING,
+            thinking: block.thinking ?? '',
+            signature: block.signature,
+          },
+        ];
+      }
+      if (
+        block.type === 'redacted_thinking' &&
+        typeof block.data === 'string' &&
+        block.data !== ''
+      ) {
+        return [{ type: 'redacted_thinking', data: block.data }];
+      }
+      return [];
+    }
+  );
+  return blocks.length > 0 ? { model: replay.model, blocks } : undefined;
+}
+
+function extractOpenAIResponsesReasoningReplay(
+  part: MessageContentComplex | undefined | null
+): OpenAIResponsesReasoningReplay | undefined {
+  if (part?.type !== ContentTypes.THINK) {
+    return undefined;
+  }
+  const replay = (part as ReasoningContentText).provider_replay
+    ?.openai_responses;
+  if (
+    replay == null ||
+    (replay.provider !== Providers.OPENAI &&
+      replay.provider !== Providers.AZURE) ||
+    !Array.isArray(replay.items) ||
+    replay.items.length === 0 ||
+    replay.items.some(
+      (item) =>
+        typeof item.id !== 'string' ||
+        item.id === '' ||
+        typeof item.encrypted_content !== 'string' ||
+        item.encrypted_content === '' ||
+        !Array.isArray(item.summary)
+    )
+  ) {
+    return undefined;
+  }
+  return structuredClone(replay);
+}
+
+function shouldInvalidateReplayTokenCount(
+  message: Partial<TMessage>,
+  options?: FormatAssistantMessageOptions
+): boolean {
+  if (!Array.isArray(message.content)) {
+    return false;
+  }
+  let hasReplay = false;
+  let hasCompatibleReplay = false;
+  for (const part of message.content as Array<
+    MessageContentComplex | undefined | null
+  >) {
+    if (part?.type !== ContentTypes.THINK) {
+      continue;
+    }
+    const replay = (part as ReasoningContentText).provider_replay;
+    if (replay == null) {
+      continue;
+    }
+    if (replay.anthropic != null) {
+      hasReplay = true;
+      const anthropic = extractAnthropicReasoningReplay(part);
+      hasCompatibleReplay ||=
+        options?.provider === Providers.ANTHROPIC &&
+        options.model != null &&
+        anthropic?.model === options.model;
+    }
+    if (replay.bedrock != null) {
+      hasReplay = true;
+      const bedrock = extractBedrockReasoningReplay(part);
+      hasCompatibleReplay ||=
+        options?.provider === Providers.BEDROCK &&
+        options.model != null &&
+        bedrock?.model === options.model;
+    }
+    if (replay.openai_responses != null) {
+      hasReplay = true;
+      const openAI = extractOpenAIResponsesReasoningReplay(part);
+      hasCompatibleReplay ||=
+        openAI?.provider === options?.provider &&
+        options?.useResponsesApi === true &&
+        options?.model != null &&
+        openAI?.model === options.model;
+    }
+  }
+  return hasReplay && !hasCompatibleReplay;
 }
 
 type ServerToolInput = Exclude<NonNullable<ToolCallPart['args']>, string>;
@@ -518,6 +694,9 @@ function formatAssistantMessage(
   let lastAIMessage: RoleBearingMessage<AIMessage> | null = null;
   let hasReasoning = false;
   let pendingReasoningContent = '';
+  let pendingAnthropicReasoning: AnthropicReasoningReplay | undefined;
+  let pendingBedrockReasoning: BedrockReasoningReplay | undefined;
+  let pendingOpenAIReasoning: OpenAIResponsesReasoningReplay | undefined;
   const emittedServerToolUseIds = new Set<string>();
   const pendingServerToolUses = new Map<string, MessageContentComplex>();
   const shouldPreserveReasoningContent =
@@ -534,15 +713,98 @@ function formatAssistantMessage(
     return reasoningContent;
   };
 
+  const takePendingBedrockReasoning = (): BedrockReasoningReplayBlock[] => {
+    if (
+      options?.provider !== Providers.BEDROCK ||
+      options.model == null ||
+      pendingBedrockReasoning?.model !== options.model
+    ) {
+      pendingBedrockReasoning = undefined;
+      return [];
+    }
+    const blocks = pendingBedrockReasoning.blocks;
+    pendingBedrockReasoning = undefined;
+    return blocks;
+  };
+
+  const takePendingAnthropicReasoning = (): AnthropicReasoningReplayBlock[] => {
+    if (
+      options?.provider !== Providers.ANTHROPIC ||
+      options.model == null ||
+      pendingAnthropicReasoning?.model !== options.model
+    ) {
+      pendingAnthropicReasoning = undefined;
+      return [];
+    }
+    const blocks = pendingAnthropicReasoning.blocks;
+    pendingAnthropicReasoning = undefined;
+    return blocks;
+  };
+
+  const takePendingOpenAIReasoning = ():
+    | OpenAIResponsesReasoningReplay
+    | undefined => {
+    const isOpenAIResponses =
+      (options?.provider === Providers.OPENAI ||
+        options?.provider === Providers.AZURE) &&
+      options.useResponsesApi === true;
+    if (
+      !isOpenAIResponses ||
+      options.model == null ||
+      pendingOpenAIReasoning?.provider !== options.provider ||
+      pendingOpenAIReasoning?.model !== options.model
+    ) {
+      pendingOpenAIReasoning = undefined;
+      return undefined;
+    }
+    const replay = pendingOpenAIReasoning;
+    pendingOpenAIReasoning = undefined;
+    return replay;
+  };
+
+  const normalizeReplayContent = (
+    content: MessageContent
+  ): MessageContentComplex[] => {
+    if (typeof content !== 'string') {
+      return content as MessageContentComplex[];
+    }
+    if (content === '') {
+      return [];
+    }
+    return [{ type: ContentTypes.TEXT, text: content }];
+  };
+
   const createAIMessage = (
     content: MessageContent
   ): RoleBearingMessage<AIMessage> => {
     const reasoningContent = takePendingReasoningContent();
+    const anthropicReasoning = takePendingAnthropicReasoning();
+    const bedrockReasoning = takePendingBedrockReasoning();
+    const openAIReasoning = takePendingOpenAIReasoning();
+    let replayContent = content;
+    if (anthropicReasoning.length > 0 || bedrockReasoning.length > 0) {
+      replayContent = [
+        ...anthropicReasoning,
+        ...bedrockReasoning,
+        ...normalizeReplayContent(content),
+      ] as MessageContent;
+    }
     return withMessageRole(
       new AIMessage({
-        content,
+        content: replayContent,
         ...(reasoningContent != null && {
-          additional_kwargs: { reasoning_content: reasoningContent },
+          additional_kwargs: {
+            reasoning_content: reasoningContent,
+            ...(openAIReasoning != null && {
+              openai_responses_reasoning_replay: openAIReasoning.items,
+            }),
+          },
+        }),
+        ...(reasoningContent == null &&
+          openAIReasoning != null && {
+          additional_kwargs: {
+            openai_responses_reasoning_replay: openAIReasoning.items,
+          },
         }),
       }),
       'assistant'
@@ -558,6 +820,37 @@ function formatAssistantMessage(
       typeof aiMessage.additional_kwargs.reasoning_content === 'string'
         ? `${aiMessage.additional_kwargs.reasoning_content}${reasoningContent}`
         : reasoningContent;
+  };
+
+  const attachPendingBedrockReasoning = (aiMessage: AIMessage): void => {
+    const bedrockReasoning = takePendingBedrockReasoning();
+    if (bedrockReasoning.length === 0) {
+      return;
+    }
+    aiMessage.content = [
+      ...normalizeReplayContent(aiMessage.content),
+      ...bedrockReasoning,
+    ] as MessageContent;
+  };
+
+  const attachPendingAnthropicReasoning = (aiMessage: AIMessage): void => {
+    const anthropicReasoning = takePendingAnthropicReasoning();
+    if (anthropicReasoning.length === 0) {
+      return;
+    }
+    aiMessage.content = [
+      ...normalizeReplayContent(aiMessage.content),
+      ...anthropicReasoning,
+    ] as MessageContent;
+  };
+
+  const attachPendingOpenAIReasoning = (aiMessage: AIMessage): void => {
+    const replay = takePendingOpenAIReasoning();
+    if (replay == null) {
+      return;
+    }
+    aiMessage.additional_kwargs.openai_responses_reasoning_replay =
+      replay.items;
   };
 
   const flushPendingServerToolUse = (toolUseId: string): void => {
@@ -714,6 +1007,9 @@ function formatAssistantMessage(
           formattedMessages.push(lastAIMessage);
         } else {
           attachPendingReasoningContent(lastAIMessage);
+          attachPendingAnthropicReasoning(lastAIMessage);
+          attachPendingBedrockReasoning(lastAIMessage);
+          attachPendingOpenAIReasoning(lastAIMessage);
         }
 
         const tool_call: ToolCallPart = _tool_call;
@@ -768,6 +1064,12 @@ function formatAssistantMessage(
       ) {
         hasReasoning = true;
         pendingReasoningContent += extractReasoningContent(part);
+        pendingAnthropicReasoning =
+          extractAnthropicReasoningReplay(part) ?? pendingAnthropicReasoning;
+        pendingBedrockReasoning =
+          extractBedrockReasoningReplay(part) ?? pendingBedrockReasoning;
+        pendingOpenAIReasoning =
+          extractOpenAIResponsesReasoningReplay(part) ?? pendingOpenAIReasoning;
         continue;
       } else if (part.type === ContentTypes.STEER) {
         /*
@@ -833,6 +1135,9 @@ function formatAssistantMessage(
          *  flushed above or intentionally dropped when not preserving). */
         hasReasoning = false;
         pendingReasoningContent = '';
+        pendingAnthropicReasoning = undefined;
+        pendingBedrockReasoning = undefined;
+        pendingOpenAIReasoning = undefined;
       } else if (
         part.type === ContentTypes.ERROR ||
         part.type === ContentTypes.AGENT_UPDATE ||
@@ -870,6 +1175,12 @@ function formatAssistantMessage(
     }
   } else if (currentContent.length > 0) {
     formattedMessages.push(createAIMessage(toLangChainContent(currentContent)));
+  } else if (pendingOpenAIReasoning != null) {
+    if (lastAIMessage != null) {
+      attachPendingOpenAIReasoning(lastAIMessage);
+    } else {
+      formattedMessages.push(createAIMessage(''));
+    }
   }
 
   return formattedMessages;
@@ -1519,6 +1830,7 @@ export const formatAgentMessages = (
   let boundaryTokenAdjustment: SummaryTokenAdjustment | undefined;
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
+  const invalidatedReplayTokenCounts = new Set<number>();
   const { boundary: summaryBoundary } = scanSummaryBlocks(payload);
 
   // Summary metadata is returned to the caller so it can be forwarded to the
@@ -1740,13 +2052,24 @@ export const formatAgentMessages = (
       }
     }
 
-    const formattedMessages = formatAssistantMessage(processedMessage, {
+    const assistantFormatOptions: FormatAssistantMessageOptions = {
       preserveUnpairedServerToolUses: i === payload.length - 1,
       preserveReasoningContent:
         options?.preserveReasoningContent ??
         options?.provider === Providers.DEEPSEEK,
       provider: options?.provider,
-    });
+      model: options?.model,
+      useResponsesApi: options?.useResponsesApi,
+    };
+    if (
+      shouldInvalidateReplayTokenCount(processedMessage, assistantFormatOptions)
+    ) {
+      invalidatedReplayTokenCounts.add(i);
+    }
+    const formattedMessages = formatAssistantMessage(
+      processedMessage,
+      assistantFormatOptions
+    );
     if (sourceMessageId != null && sourceMessageId !== '') {
       for (const formattedMessage of formattedMessages) {
         formattedMessage.id = sourceMessageId;
@@ -1841,7 +2164,10 @@ export const formatAgentMessages = (
       const resultIndices = indexMapping[originalIndex] || [];
       let tokenCount = indexTokenCountMap[originalIndex];
 
-      if (tokenCount === undefined) {
+      if (
+        tokenCount === undefined ||
+        invalidatedReplayTokenCounts.has(originalIndex)
+      ) {
         continue;
       }
 

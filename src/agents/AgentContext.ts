@@ -290,6 +290,8 @@ export class AgentContext {
   tokenTypeSwitch?: 'reasoning' | 'content';
   /** Tracks how many reasoning→text transitions have occurred (ensures unique post-reasoning step keys) */
   reasoningTransitionCount = 0;
+  /** OpenAI Responses reasoning items already emitted during this run */
+  openAIResponsesReasoningReplayIds: Set<string> = new Set();
   /** Current token type being processed */
   currentTokenType: ContentTypes.TEXT | ContentTypes.THINK | 'think_and_text' =
     ContentTypes.TEXT;
@@ -1014,6 +1016,7 @@ export class AgentContext {
     this.lastStreamCall = undefined;
     this.tokenTypeSwitch = undefined;
     this.reasoningTransitionCount = 0;
+    this.openAIResponsesReasoningReplayIds.clear();
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;

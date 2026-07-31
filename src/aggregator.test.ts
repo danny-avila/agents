@@ -1,6 +1,9 @@
 import type * as t from '@/types';
-import { GraphEvents, StepTypes, ContentTypes } from '@/common';
+import { GraphEvents, StepTypes, ContentTypes, Providers } from '@/common';
 import { createContentAggregator } from './stream';
+
+const bedrockModel = 'anthropic.claude-sonnet-5-v1:0';
+const anthropicModel = 'claude-sonnet-5';
 
 const createRunStep = (id: string): t.RunStep => ({
   id,
@@ -63,6 +66,305 @@ describe('ContentAggregator empty deltas', () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+describe('ContentAggregator Bedrock reasoning replay', () => {
+  it('merges streamed reasoning text and signature into one persisted replay block', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_bedrock_reasoning'),
+    });
+
+    for (const content of [
+      {
+        type: ContentTypes.THINK,
+        think: 'first ',
+        provider_replay: {
+          bedrock: {
+            model: bedrockModel,
+            blocks: [
+              {
+                type: ContentTypes.REASONING_CONTENT,
+                reasoningText: { text: 'first ' },
+              },
+            ],
+          },
+        },
+      },
+      {
+        type: ContentTypes.THINK,
+        think: 'second',
+        provider_replay: {
+          bedrock: {
+            model: bedrockModel,
+            blocks: [
+              {
+                type: ContentTypes.REASONING_CONTENT,
+                reasoningText: { text: 'second' },
+              },
+            ],
+          },
+        },
+      },
+      {
+        type: ContentTypes.THINK,
+        think: '',
+        provider_replay: {
+          bedrock: {
+            model: bedrockModel,
+            blocks: [
+              {
+                type: ContentTypes.REASONING_CONTENT,
+                reasoningText: { signature: 'sig-abc' },
+              },
+            ],
+          },
+        },
+      },
+    ] satisfies t.ReasoningContentText[]) {
+      aggregateContent({
+        event: GraphEvents.ON_REASONING_DELTA,
+        data: {
+          id: 'step_bedrock_reasoning',
+          delta: { content: [content] },
+        },
+      });
+    }
+
+    expect(contentParts).toEqual([
+      {
+        type: ContentTypes.THINK,
+        think: 'first second',
+        provider_replay: {
+          bedrock: {
+            model: bedrockModel,
+            blocks: [
+              {
+                type: ContentTypes.REASONING_CONTENT,
+                reasoningText: {
+                  text: 'first second',
+                  signature: 'sig-abc',
+                },
+              },
+            ],
+          },
+        },
+      },
+    ]);
+  });
+});
+
+describe('ContentAggregator Anthropic reasoning replay', () => {
+  it('merges streamed thinking and signature while preserving redacted blocks', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_anthropic_reasoning'),
+    });
+
+    for (const content of [
+      {
+        type: ContentTypes.THINK,
+        think: 'first ',
+        provider_replay: {
+          anthropic: {
+            model: anthropicModel,
+            blocks: [{ type: ContentTypes.THINKING, thinking: 'first ' }],
+          },
+        },
+      },
+      {
+        type: ContentTypes.THINK,
+        think: 'second',
+        provider_replay: {
+          anthropic: {
+            model: anthropicModel,
+            blocks: [{ type: ContentTypes.THINKING, thinking: 'second' }],
+          },
+        },
+      },
+      {
+        type: ContentTypes.THINK,
+        think: '',
+        provider_replay: {
+          anthropic: {
+            model: anthropicModel,
+            blocks: [{ type: ContentTypes.THINKING, signature: 'sig-abc' }],
+          },
+        },
+      },
+      {
+        type: ContentTypes.THINK,
+        think: '',
+        provider_replay: {
+          anthropic: {
+            model: anthropicModel,
+            blocks: [{ type: 'redacted_thinking', data: 'encrypted-thinking' }],
+          },
+        },
+      },
+    ] satisfies t.ReasoningContentText[]) {
+      aggregateContent({
+        event: GraphEvents.ON_REASONING_DELTA,
+        data: {
+          id: 'step_anthropic_reasoning',
+          delta: { content: [content] },
+        },
+      });
+    }
+
+    expect(contentParts).toEqual([
+      {
+        type: ContentTypes.THINK,
+        think: 'first second',
+        provider_replay: {
+          anthropic: {
+            model: anthropicModel,
+            blocks: [
+              {
+                type: ContentTypes.THINKING,
+                thinking: 'first second',
+                signature: 'sig-abc',
+              },
+              {
+                type: 'redacted_thinking',
+                data: 'encrypted-thinking',
+              },
+            ],
+          },
+        },
+      },
+    ]);
+  });
+});
+
+describe('ContentAggregator OpenAI Responses reasoning replay', () => {
+  it('persists ordered encrypted reasoning items without duplicating final metadata', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_openai_reasoning'),
+    });
+    aggregateContent({
+      event: GraphEvents.ON_REASONING_DELTA,
+      data: {
+        id: 'step_openai_reasoning',
+        delta: {
+          content: [
+            {
+              type: ContentTypes.THINK,
+              think: 'Checked the constraint.',
+            },
+          ],
+        },
+      },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_REASONING_DELTA,
+      data: {
+        id: 'step_openai_reasoning',
+        delta: {
+          content: [
+            {
+              type: ContentTypes.THINK,
+              think: '',
+              provider_replay: {
+                openai_responses: {
+                  provider: Providers.OPENAI,
+                  model: 'gpt-5.4',
+                  items: [
+                    {
+                      type: 'reasoning',
+                      id: 'rs_123',
+                      status: 'in_progress',
+                      summary: [],
+                      encrypted_content: 'encrypted-reasoning',
+                    },
+                  ],
+                },
+              },
+            },
+          ],
+        },
+      },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_REASONING_DELTA,
+      data: {
+        id: 'step_openai_reasoning',
+        delta: {
+          content: [
+            {
+              type: ContentTypes.THINK,
+              think: '',
+              provider_replay: {
+                openai_responses: {
+                  provider: Providers.OPENAI,
+                  model: 'gpt-5.4',
+                  items: [
+                    {
+                      type: 'reasoning',
+                      id: 'rs_123',
+                      status: 'completed',
+                      summary: [
+                        {
+                          type: 'summary_text',
+                          text: 'Checked the constraint.',
+                        },
+                      ],
+                      encrypted_content: 'encrypted-reasoning',
+                    },
+                    {
+                      type: 'reasoning',
+                      id: 'rs_456',
+                      status: 'completed',
+                      summary: [],
+                      encrypted_content: 'encrypted-follow-up',
+                    },
+                  ],
+                },
+              },
+            },
+          ],
+        },
+      },
+    });
+
+    expect(contentParts).toEqual([
+      {
+        type: ContentTypes.THINK,
+        think: 'Checked the constraint.',
+        provider_replay: {
+          openai_responses: {
+            provider: Providers.OPENAI,
+            model: 'gpt-5.4',
+            items: [
+              {
+                type: 'reasoning',
+                id: 'rs_123',
+                status: 'completed',
+                summary: [
+                  {
+                    type: 'summary_text',
+                    text: 'Checked the constraint.',
+                  },
+                ],
+                encrypted_content: 'encrypted-reasoning',
+              },
+              {
+                type: 'reasoning',
+                id: 'rs_456',
+                status: 'completed',
+                summary: [],
+                encrypted_content: 'encrypted-follow-up',
+              },
+            ],
+          },
+        },
+      },
+    ]);
   });
 });
 
