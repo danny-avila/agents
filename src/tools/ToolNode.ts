@@ -3832,6 +3832,40 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
         }) ?? [];
 
+      /**
+       * Synthesize error results for `invalid_tool_calls` — calls whose
+       * streamed args never collapsed into a JSON object (`@langchain/core`
+       * files them separately with `error: "Malformed args."`, and they never
+       * enter `tool_calls`). Their `tool_use` blocks still ride the AI
+       * message content the provider receives, so skipping them leaves a
+       * `tool_use` with no `tool_result` and the NEXT model call is rejected
+       * (Anthropic 400 INVALID_TOOL_RESULTS) — fatal on HITL resume, where
+       * the paused AI message is replayed from the checkpoint. Only calls
+       * with an id can be paired (and only those produce the 400); the
+       * already-processed / server-tool filters mirror `filteredCalls`.
+       */
+      const invalidCallResults = (aiMessage.invalid_tool_calls ?? [])
+        .filter(
+          (call) =>
+            call.id != null &&
+            call.id !== '' &&
+            !toolMessageIds.has(call.id) &&
+            !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+        )
+        .map(
+          (call) =>
+            new ToolMessage({
+              status: 'error',
+              content: truncateToolResultContent(
+                `Error: ${call.error ?? 'Malformed tool call arguments.'} ` +
+                  'The tool call input could not be parsed as a JSON object; the tool was not run.\n Please fix your mistakes.',
+                this.maxToolResultChars
+              ),
+              name: call.name ?? 'unknown',
+              tool_call_id: call.id!,
+            })
+        );
+
       if (this.eventDrivenMode && filteredCalls.length > 0) {
         const directToolNames = this.directToolNames;
         const hasRegisteredHandoffTool = this.hasRegisteredHandoffTool();
@@ -3854,7 +3888,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           }
         }
 
-        if (directEntries.length === 0) {
+        if (directEntries.length === 0 && invalidCallResults.length === 0) {
           return this.executeViaEvent(filteredCalls, config, input, {
             batchIndices: eventEntries.map((entry) => entry.batchIndex),
             turn,
@@ -3975,6 +4009,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         outputs = [
           ...directOutputs,
           ...eventResult.toolMessages,
+          // Synthesized invalid-call errors sit with the real tool results,
+          // before injected context, to keep provider tool-result adjacency.
+          ...invalidCallResults,
           ...directInjected,
           ...eventResult.injected,
         ];
@@ -4013,6 +4050,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           directAdditionalContexts.length > 0
             ? [
               ...toolOutputs,
+              ...invalidCallResults,
               new HumanMessage({
                 content: directAdditionalContexts.join('\n\n'),
                 // Same system-role marker the event-driven path
@@ -4021,7 +4059,30 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 additional_kwargs: { role: 'system', source: 'hook' },
               }),
             ]
-            : toolOutputs;
+            : [...toolOutputs, ...invalidCallResults];
+      }
+
+      /**
+       * Resolve the streamed tool-call cards for invalid calls, best-effort.
+       * Runs AFTER the direct batch settled: on an interrupting first pass
+       * this line is unreachable (the node unwound), so interrupt/resume
+       * flows emit the completion exactly once — same reasoning as the
+       * deferred blocked-call side effects. Skipped when the stream never
+       * registered a step for the call (non-streaming providers), where a
+       * completion could not be routed to a card anyway.
+       */
+      for (const result of invalidCallResults) {
+        const invalidStepId = this.toolCallStepIds?.get(result.tool_call_id);
+        if (invalidStepId == null || invalidStepId === '') {
+          continue;
+        }
+        await this.dispatchStepCompleted(
+          result.tool_call_id,
+          result.name ?? 'unknown',
+          {},
+          typeof result.content === 'string' ? result.content : '',
+          config
+        );
       }
     }
 
