@@ -25,7 +25,6 @@ import {
   buildToolExecutionRequestPlan,
   coerceRecordArgs,
   normalizeError,
-  recordArgsEqual,
 } from '@/tools/eagerEventExecution';
 import {
   serializeStructuredValueBounded,
@@ -1077,10 +1076,12 @@ function recordEagerToolCallChunks(args: {
       id,
       name,
       argsText,
-      // Canonical accumulation: LangChain concats fragments verbatim, so the
-      // final request's args always come from this text — never from the
-      // heuristic `argsText` above, which may reconcile away real payload.
-      rawArgsText: `${existing.rawArgsText ?? ''}${incomingArgs}`,
+      // Canonical accumulation length: LangChain concats fragments verbatim
+      // to build the final request, and every reconciliation branch above
+      // yields text no longer than that concat — equal exactly when every
+      // merge was a pure append. Tracking the length (not the text) keeps
+      // cumulative/restating streams from retaining every prefix.
+      rawArgsLength: (existing.rawArgsLength ?? 0) + incomingArgs.length,
       index,
       lastArgsFragment:
         incomingArgs !== '' ? incomingArgs : existing.lastArgsFragment,
@@ -1180,29 +1181,31 @@ function getStreamedReadyToolCalls(args: {
       if (args == null) {
         return [];
       }
-      // Adapter seals may restate the finished call's full args on the seal
-      // chunk itself (OpenAI Responses `function_call_arguments.done`). Only
-      // when the seal-carrying chunk supplied that fragment AND the
-      // accumulated text IS that restatement has the adapter vouched for it —
-      // plain concatenation intentionally differs there. Pure-signal seals
-      // (Bedrock contentBlockStop, `args: ''`) never qualify.
+      // The final request's args come from LangChain's canonical verbatim
+      // concatenation of fragments, while `argsText` reconciles provider
+      // quirks with lossy heuristics that can also swallow legitimately
+      // repetitive payload fragments (LibreChat#14371). `argsText` can never
+      // be LONGER than the plain concat, so length equality proves it IS the
+      // canonical accumulation.
+      const isCanonicalAccumulation =
+        state.rawArgsLength != null &&
+        state.argsText.length === state.rawArgsLength;
+      // Adapter seals may instead restate the finished call's full args on
+      // the seal chunk itself (OpenAI Responses
+      // `function_call_arguments.done`). Only when the seal-carrying chunk
+      // supplied that fragment AND the accumulated text IS that restatement
+      // has the adapter vouched for it — plain concatenation intentionally
+      // differs there. Pure-signal seals (Bedrock contentBlockStop,
+      // `args: ''`) never qualify.
       const isAuthoritativeRestatement =
         sealedByAdapter &&
         state.sealedArgsFragment != null &&
         state.sealedArgsFragment === state.argsText;
-      // Otherwise the final request's args come from LangChain's canonical
-      // verbatim concatenation (`rawArgsText`), while `argsText` reconciles
-      // provider quirks with lossy heuristics that can also swallow
-      // legitimately repetitive payload fragments (LibreChat#14371).
       // Prestarting an unconfirmed snapshot trips the "changed after eager
-      // execution started" guard and burns a retry loop, so only prestart
-      // when both views agree — otherwise leave the call to normal ToolNode
-      // execution with final args.
-      if (!isAuthoritativeRestatement && state.rawArgsText !== state.argsText) {
-        const rawArgs = coerceRecordArgs(state.rawArgsText ?? '');
-        if (rawArgs == null || !recordArgsEqual(args, rawArgs)) {
-          return [];
-        }
+      // execution started" guard and burns a retry loop — leave unconfirmed
+      // calls to normal ToolNode execution with final args.
+      if (!isCanonicalAccumulation && !isAuthoritativeRestatement) {
+        return [];
       }
       return [
         {

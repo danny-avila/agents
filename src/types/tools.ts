@@ -76,20 +76,23 @@ export type EagerEventToolCallChunkState = {
   index?: number;
   lastArgsFragment?: string;
   /**
-   * Plain in-order concatenation of every observed args fragment — the same
-   * accumulation LangChain's `AIMessageChunk.concat` performs to build the
-   * final tool call. `argsText` applies lossy reconciliation heuristics
-   * (repeat dedupe, overlap merge) that can drop legitimately repetitive
-   * payload fragments; prestart must only trust `argsText` when it matches
-   * this canonical text, since the final request's args come from the
-   * canonical accumulation.
+   * Cumulative length of every observed args fragment — the length of the
+   * plain in-order concatenation that LangChain's `AIMessageChunk.concat`
+   * performs to build the final tool call. Every reconciliation branch in
+   * `mergeToolCallArgsText` (and the repeat-fragment dedupe) produces text no
+   * longer than plain concatenation, with equality exactly when every merge
+   * was a pure append — so `argsText.length === rawArgsLength` proves
+   * `argsText` IS the canonical accumulation the final request will carry.
+   * Tracking only the length keeps cumulative/restating streams from
+   * retaining every prefix (quadratic growth) while still letting seal-time
+   * prestart verify the snapshot.
    */
-  rawArgsText?: string;
+  rawArgsLength?: number;
   /**
    * The non-empty args fragment carried by a chunk whose explicit adapter
    * seal covered this call. Some adapters restate the finished call's full
    * args on the seal chunk (OpenAI Responses `function_call_arguments.done`);
-   * only such a restatement may override the `rawArgsText` comparison at
+   * only such a restatement may override the canonical-accumulation check at
    * seal time. Pure-signal seals (Bedrock `contentBlockStop`, `args: ''`)
    * never set this.
    */

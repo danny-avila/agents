@@ -3325,7 +3325,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       // snapshot cannot be trusted for this tool in this run. Without this,
       // the model retries the call, the retry prestarts and diverges the
       // same way, and the run loops to the recursion limit (LibreChat#14371).
+      // On an identity mismatch, suppress the eagerly executed name too —
+      // otherwise a retry that deterministically streams name A but
+      // materializes name B keeps prestarting A (and repeating its side
+      // effects) every round.
       this.eagerEventToolSuppressions?.add(request.name);
+      this.eagerEventToolSuppressions?.add(execution.toolName);
       // eslint-disable-next-line no-console
       console.warn(
         '[ToolNode] eager prestart args diverged from the final request for ' +

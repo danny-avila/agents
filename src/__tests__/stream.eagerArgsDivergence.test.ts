@@ -615,6 +615,60 @@ describe('eager args divergence (LibreChat#14371)', () => {
       expect(toolExecuteCalls).toHaveLength(0);
     });
 
+    it('suppresses the eagerly executed name too when the identity mismatches', async () => {
+      // If the stream prestarts name A but the final request materializes as
+      // name B for the same call id, suppressing only B would let every
+      // retry prestart A again — repeating A's side effects while the run
+      // loops (Codex P2 on #368).
+      jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      installToolExecuteResponder();
+      const suppressions = new Set<string>();
+      const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+      const request: t.ToolCallRequest = {
+        id: 'call_1',
+        name: 'tool_a',
+        args: { sql: 'SELECT 1;' },
+        stepId: 'step_1',
+        turn: 0,
+      };
+      eagerExecutions.set('call_1', {
+        toolCallId: 'call_1',
+        toolName: 'tool_a',
+        args: { sql: 'SELECT 1;' },
+        request,
+        promise: Promise.resolve({
+          results: [
+            { toolCallId: 'call_1', status: 'success', content: 'eager' },
+          ],
+        }),
+      });
+
+      const toolNode = new ToolNode({
+        tools: [createDummyTool('tool_a'), createDummyTool('tool_b')],
+        eventDrivenMode: true,
+        eagerEventToolExecution: { enabled: true },
+        eagerEventToolExecutions: eagerExecutions,
+        eagerEventToolSuppressions: suppressions,
+        toolCallStepIds: new Map([['call_1', 'step_1']]),
+      });
+      const result = (await toolNode.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              { id: 'call_1', name: 'tool_b', args: { sql: 'SELECT 1;' } },
+            ],
+          }),
+        ],
+      })) as { messages: ToolMessage[] };
+
+      expect(result.messages[0].content).toContain(
+        'changed after eager execution'
+      );
+      expect(suppressions.has('tool_b')).toBe(true);
+      expect(suppressions.has('tool_a')).toBe(true);
+    });
+
     it('stops prestarting a suppressed tool while siblings still prestart', async () => {
       const graph = createGraph();
       (graph.eagerEventToolSuppressions as Set<string>).add('db_query');
