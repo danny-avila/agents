@@ -25,6 +25,7 @@ import {
   buildToolExecutionRequestPlan,
   coerceRecordArgs,
   normalizeError,
+  recordArgsEqual,
 } from '@/tools/eagerEventExecution';
 import {
   serializeStructuredValueBounded,
@@ -160,6 +161,13 @@ function isEagerExecutionExcludedTool(
   }
   const excluded = graph.eagerEventToolExecution?.excludeToolNames;
   if (excluded != null && excluded.includes(name)) {
+    return true;
+  }
+  // Run-scoped circuit breaker: once a prestart for this tool diverged from
+  // the final request ("changed after eager execution started"), stop
+  // prestarting it so the model's retry executes normally instead of
+  // re-diverging in a loop (LibreChat#14371).
+  if (graph.eagerEventToolSuppressions?.has(name) === true) {
     return true;
   }
   // A code-session participant writes to the shared sandbox, so it is
@@ -1058,6 +1066,10 @@ function recordEagerToolCallChunks(args: {
       id,
       name,
       argsText,
+      // Canonical accumulation: LangChain concats fragments verbatim, so the
+      // final request's args always come from this text — never from the
+      // heuristic `argsText` above, which may reconcile away real payload.
+      rawArgsText: `${existing.rawArgsText ?? ''}${incomingArgs}`,
       index: getEagerToolChunkIndex(toolCallChunk) ?? existing.index,
       lastArgsFragment:
         incomingArgs !== '' ? incomingArgs : existing.lastArgsFragment,
@@ -1095,6 +1107,7 @@ function getStreamedReadyToolCalls(args: {
   const readyEntries: Array<{
     key: string;
     state: t.EagerEventToolCallChunkState;
+    sealedByAdapter: boolean;
   }> = [];
 
   for (const [key, state] of graph.eagerEventToolCallChunks) {
@@ -1124,7 +1137,11 @@ function getStreamedReadyToolCalls(args: {
       isSealedByLaterChunk ||
       isSealedExplicitly
     ) {
-      readyEntries.push({ key, state });
+      readyEntries.push({
+        key,
+        state,
+        sealedByAdapter: isSealedExplicitly || seal?.kind === 'all',
+      });
     }
   }
 
@@ -1143,10 +1160,32 @@ function getStreamedReadyToolCalls(args: {
 
   return readyEntries
     .sort((left, right) => (left.state.index ?? 0) - (right.state.index ?? 0))
-    .flatMap(({ state }) => {
+    .flatMap(({ state, sealedByAdapter }) => {
       const args = coerceRecordArgs(state.argsText);
       if (args == null) {
         return [];
+      }
+      // Adapter seals may restate the finished call's full args on the seal
+      // chunk itself (OpenAI Responses `function_call_arguments.done`). When
+      // the accumulated text IS that final restatement, the adapter has
+      // vouched for it — plain concatenation intentionally differs there.
+      const isAuthoritativeRestatement =
+        sealedByAdapter &&
+        state.lastArgsFragment != null &&
+        state.lastArgsFragment === state.argsText;
+      // Otherwise the final request's args come from LangChain's canonical
+      // verbatim concatenation (`rawArgsText`), while `argsText` reconciles
+      // provider quirks with lossy heuristics that can also swallow
+      // legitimately repetitive payload fragments (LibreChat#14371).
+      // Prestarting an unconfirmed snapshot trips the "changed after eager
+      // execution started" guard and burns a retry loop, so only prestart
+      // when both views agree — otherwise leave the call to normal ToolNode
+      // execution with final args.
+      if (!isAuthoritativeRestatement && state.rawArgsText !== state.argsText) {
+        const rawArgs = coerceRecordArgs(state.rawArgsText ?? '');
+        if (rawArgs == null || !recordArgsEqual(args, rawArgs)) {
+          return [];
+        }
       }
       return [
         {
@@ -2325,7 +2364,9 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
 
-      for (const contentPart of getDeltaContentParts(messageDelta.delta.content)) {
+      for (const contentPart of getDeltaContentParts(
+        messageDelta.delta.content
+      )) {
         updateContent(runStep.index, contentPart);
       }
     } else if (
@@ -2354,7 +2395,9 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
 
-      for (const contentPart of getDeltaContentParts(reasoningDelta.delta.content)) {
+      for (const contentPart of getDeltaContentParts(
+        reasoningDelta.delta.content
+      )) {
         updateContent(runStep.index, contentPart);
       }
     } else if (event === GraphEvents.ON_RUN_STEP_DELTA) {

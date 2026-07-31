@@ -75,6 +75,16 @@ export type EagerEventToolCallChunkState = {
   argsText: string;
   index?: number;
   lastArgsFragment?: string;
+  /**
+   * Plain in-order concatenation of every observed args fragment — the same
+   * accumulation LangChain's `AIMessageChunk.concat` performs to build the
+   * final tool call. `argsText` applies lossy reconciliation heuristics
+   * (repeat dedupe, overlap merge) that can drop legitimately repetitive
+   * payload fragments; prestart must only trust `argsText` when it matches
+   * this canonical text, since the final request's args come from the
+   * canonical accumulation.
+   */
+  rawArgsText?: string;
 };
 
 export type ToolNodeOptions = {
@@ -156,6 +166,14 @@ export type ToolNodeOptions = {
   eagerEventToolExecutions?: Map<string, EagerEventToolExecution>;
   /** Shared per-run per-tool turn counter used by eager and normal event dispatch. */
   eagerEventToolUsageCount?: Map<string, number>;
+  /**
+   * Shared per-run circuit breaker for eager prestart. When a prestarted
+   * execution's args turn out to differ from the final request ("changed
+   * after eager execution started"), the ToolNode adds the tool name here
+   * and the stream handler stops prestarting that tool for the remainder of
+   * the run, so the model's retry executes normally instead of looping.
+   */
+  eagerEventToolSuppressions?: Set<string>;
   /**
    * Hook registry for PreToolUse/PostToolUse/PostToolUseFailure/
    * PermissionDenied lifecycle hooks. Fires for **every** tool the
@@ -241,7 +259,11 @@ export type ToolEndEvent = {
    * present (see `ProcessedToolCall.outcome`) so `ON_RUN_STEP_COMPLETED`
    * consumers can read it without an unsafe cast.
    */
-  tool_call: ToolCall & { output?: string; progress?: number; outcome?: string };
+  tool_call: ToolCall & {
+    output?: string;
+    progress?: number;
+    outcome?: string;
+  };
   /** The content index of the tool call */
   index: number;
   type?: 'tool_call';
