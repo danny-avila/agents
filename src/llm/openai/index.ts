@@ -2275,7 +2275,11 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    const result = await super._generate(messages, options, runManager);
+    const result = await super._generate(
+      projectOpenAIResponsesProviderMessages(messages),
+      options,
+      runManager
+    );
     for (const generation of result.generations) {
       attachCacheWriteUsage(generation.message);
     }
@@ -2287,11 +2291,12 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
+    const projectedMessages = projectOpenAIResponsesProviderMessages(messages);
     const stream = await this.completionWithRetry(
       {
         ...this.invocationParams(options),
         input: convertMessagesToResponsesInput({
-          messages,
+          messages: projectedMessages,
           zdrEnabled: this.zdrEnabled ?? false,
           model: this.model,
         }),
@@ -2300,6 +2305,18 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       options
     );
     yield* convertLibreChatResponsesStream(stream, options, runManager);
+  }
+
+  async *_streamChatModelEvents(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatModelStreamEvent> {
+    yield* super._streamChatModelEvents(
+      projectOpenAIResponsesProviderMessages(messages),
+      options,
+      runManager
+    );
   }
 
   protected _getReasoningParams(

@@ -47,6 +47,24 @@ type StreamingOpenAIResponsesDelegate = OpenAIResponsesDelegate & {
     request: OpenAIClient.Responses.ResponseCreateParamsStreaming
   ) => Promise<AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>>;
 };
+type MockableResponsesDelegate = OpenAIResponsesDelegate & {
+  completionWithRetry: (request: {
+    input?: unknown;
+    stream?: boolean;
+  }) => Promise<unknown>;
+  _generate: (
+    messages: AIMessage[],
+    options: Record<string, unknown>
+  ) => Promise<unknown>;
+  _streamChatModelEvents: (
+    messages: AIMessage[],
+    options: Record<string, unknown>
+  ) => AsyncGenerator<unknown>;
+  _streamResponseChunks: (
+    messages: AIMessage[],
+    options: Record<string, unknown>
+  ) => AsyncGenerator<ChatGenerationChunk>;
+};
 type AnthropicCallOptions = Parameters<
   CustomAnthropic['invocationParams']
 >[0] & {
@@ -192,6 +210,107 @@ const baseAzureFields = {
   azureOpenAIApiInstanceName: 'test-instance',
   azureOpenAIApiDeploymentName: 'test-deployment',
 };
+
+function createPersistedPreemptedAzureMessage(): AIMessage {
+  return new AIMessage({
+    id: 'msg_persisted_azure',
+    content: [{ type: 'text', text: 'Partial Azure answer.' }],
+    additional_kwargs: {
+      reasoning: {
+        id: 'rs_persisted_azure',
+        type: 'reasoning',
+        status: 'in_progress',
+        summary: [],
+      },
+      tool_outputs: [
+        {
+          id: 'local_persisted_azure',
+          type: 'local_shell_call_output',
+          status: 'completed',
+          output: 'AZURE_SERVER_RESULT',
+        },
+      ],
+      [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+        {
+          itemId: 'local_persisted_azure',
+          kind: 'output',
+          outputIndex: 0,
+        },
+        {
+          itemId: 'rs_persisted_azure',
+          kind: 'reasoning',
+          outputIndex: 1,
+        },
+        {
+          itemId: 'msg_persisted_azure',
+          kind: 'text',
+          outputIndex: 2,
+          contentIndex: 0,
+        },
+      ],
+    },
+    response_metadata: {
+      id: 'resp_persisted_azure',
+      model_provider: 'openai',
+      preempted: true,
+    },
+  });
+}
+
+function expectNeutralizedAzureResponsesRequest(request: unknown): void {
+  const serialized = JSON.stringify(request);
+  expect(serialized).toContain('AZURE_SERVER_RESULT');
+  expect(serialized.match(/AZURE_SERVER_RESULT/g)).toHaveLength(1);
+  expect(serialized).toContain('serverToolResult');
+  expect(serialized).not.toContain('msg_persisted_azure');
+  expect(serialized).not.toContain('rs_persisted_azure');
+  expect(serialized).not.toContain('local_persisted_azure');
+  expect(serialized).not.toContain('resp_persisted_azure');
+  expect(serialized).not.toContain(OPENAI_RESPONSES_REPLAY_POSITIONS_KEY);
+  expect(serialized).not.toContain('local_shell_call_output');
+}
+
+function createCompletedAzureResponse(): OpenAIClient.Responses.Response {
+  return {
+    id: 'resp_fresh_azure',
+    created_at: 0,
+    error: null,
+    incomplete_details: null,
+    instructions: null,
+    metadata: {},
+    model: 'gpt-5',
+    object: 'response',
+    output: [
+      {
+        id: 'msg_fresh_azure',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [
+          {
+            type: 'output_text',
+            text: 'Fresh Azure answer.',
+            annotations: [],
+          },
+        ],
+      },
+    ],
+    output_text: 'Fresh Azure answer.',
+    parallel_tool_calls: true,
+    status: 'completed',
+    temperature: null,
+    tool_choice: 'auto',
+    tools: [],
+    top_p: null,
+    usage: {
+      input_tokens: 1,
+      input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+      output_tokens: 1,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 2,
+    },
+  } as OpenAIClient.Responses.Response;
+}
 
 const waitForFetchOutcome = (
   promise: Promise<Response>,
@@ -1015,6 +1134,61 @@ describe('custom chat model class smoke tests', () => {
     nonReasoningModel.model = 'gpt-4o';
     nonReasoningModel.reasoning = { effort: 'low' };
     expect(nonReasoningModel.getReasoningParams()).toBeUndefined();
+  });
+
+  it('sanitizes persisted preempted history on direct Azure Responses streams', async () => {
+    const model = new AzureChatOpenAI({
+      ...baseAzureFields,
+    });
+    model.model = 'gpt-5';
+    const responses = (
+      model as unknown as { responses: MockableResponsesDelegate }
+    ).responses;
+    const requests: unknown[] = [];
+    responses.completionWithRetry = async (request) => {
+      requests.push(request);
+      return (async function* () {})();
+    };
+    const message = createPersistedPreemptedAzureMessage();
+    const originalSerialized = JSON.stringify(message.toJSON());
+
+    for await (const _chunk of responses._streamResponseChunks([message], {})) {
+      // The empty mock stream intentionally yields no chunks.
+    }
+    for await (const _event of responses._streamChatModelEvents(
+      [message],
+      {}
+    )) {
+      // The empty mock stream intentionally yields no events.
+    }
+
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      expectNeutralizedAzureResponsesRequest(request);
+    }
+    expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+  });
+
+  it('sanitizes persisted preempted history on direct Azure Responses generation', async () => {
+    const model = new AzureChatOpenAI({
+      ...baseAzureFields,
+    });
+    model.model = 'gpt-5';
+    const responses = (
+      model as unknown as { responses: MockableResponsesDelegate }
+    ).responses;
+    let request: unknown;
+    responses.completionWithRetry = async (nextRequest) => {
+      request = nextRequest;
+      return createCompletedAzureResponse();
+    };
+    const message = createPersistedPreemptedAzureMessage();
+    const originalSerialized = JSON.stringify(message.toJSON());
+
+    await responses._generate([message], {});
+
+    expectNeutralizedAzureResponsesRequest(request);
+    expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
   });
 
   it('keeps DeepSeek, Moonshot, and xAI on LibreChat wrapper semantics', () => {
