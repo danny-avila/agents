@@ -26,6 +26,7 @@ import {
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import { ensureOpenTelemetryContextManager } from '@/instrumentation';
+import { projectToolStreamContentForProvider } from '@/messages/core';
 import { formatAgentMessages } from '@/messages/format';
 import { ContentTypes } from '@/common';
 
@@ -277,6 +278,173 @@ describe('Langfuse tool output tracing redaction', () => {
     ) as Array<{ role: string; content: string }>;
     expect(redacted[0].content).toBe('show tables');
     expect(redacted[1].content).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
+  it('redacts captured Responses server-tool outputs wherever they are serialized', () => {
+    const outputs = [
+      {
+        id: 'local_output',
+        type: 'local_shell_call_output',
+        status: 'completed',
+        output: 'local shell secret',
+      },
+      {
+        id: 'shell_output',
+        call_id: 'shell_call',
+        type: 'shell_call_output',
+        status: 'completed',
+        output: 'shell secret',
+      },
+      {
+        id: 'patch_output',
+        call_id: 'patch_call',
+        type: 'apply_patch_call_output',
+        status: 'completed',
+        output: 'patch secret',
+      },
+      {
+        id: 'program_output',
+        call_id: 'program_call',
+        type: 'program_output',
+        status: 'completed',
+        result: 'program secret',
+      },
+    ];
+    const serializedMessage = {
+      role: 'assistant',
+      content: outputs.map((value) => ({ type: 'non_standard', value })),
+      content_blocks: outputs.map((value) => ({
+        type: 'non_standard',
+        value,
+      })),
+      additional_kwargs: { tool_outputs: outputs },
+    };
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'generation',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify([
+        serializedMessage,
+      ]),
+    });
+
+    redactLangfuseSpanToolOutputs(span, createConfig({ enabled: false }));
+
+    const redacted = span.attributes[
+      LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT
+    ] as string;
+    expect(redacted).not.toMatch(
+      /local shell secret|shell secret|patch secret|program secret/
+    );
+    expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+    expect(redacted).toContain('local_output');
+    expect(redacted).toContain('shell_call');
+    expect(redacted).toContain('patch_call');
+    expect(redacted).toContain('program_call');
+  });
+
+  it('selectively redacts captured Responses outputs by canonical tool name', () => {
+    const outputs = [
+      {
+        type: 'local_shell_call_output',
+        output: 'public local output',
+      },
+      { type: 'shell_call_output', output: 'private shell output' },
+      { type: 'apply_patch_call_output', output: 'public patch output' },
+      { type: 'program_output', result: 'private program output' },
+    ];
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify(outputs),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({ redactedToolNames: new Set(['shell', 'program']) })
+    );
+
+    const redacted = readJsonAttribute<Array<Record<string, unknown>>>(
+      span,
+      LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+    );
+    expect(redacted[0].output).toBe('public local output');
+    expect(redacted[1].output).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+    expect(redacted[2].output).toBe('public patch output');
+    expect(redacted[3].result).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
+  it('redacts marked bounded replay text without parsing its payload', () => {
+    const truncatedSecret =
+      '{"serverToolResult":{"status":"success","output":"secret head…secret tail"';
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'text',
+              text: truncatedSecret,
+            },
+          ],
+        },
+      ]),
+    });
+
+    redactLangfuseSpanToolOutputs(span, createConfig({ enabled: false }));
+
+    const redacted = span.attributes[
+      LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+    ] as string;
+    expect(redacted).not.toContain('secret head');
+    expect(redacted).not.toContain('secret tail');
+    expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
+  it('redacts neutralized replay results from resumed generation input', () => {
+    const message = new AIMessage({
+      content: [{ type: 'text', text: 'Partial answer.' }],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: 'shell_output_item',
+            call_id: 'shell_call',
+            type: 'shell_call_output',
+            status: 'completed',
+            output: 'resumed generation secret',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+    const [projected] = projectToolStreamContentForProvider(
+      [message],
+      'fallback'
+    );
+    expect(projected.content).toEqual([
+      { type: 'text', text: 'Partial answer.' },
+      expect.objectContaining({
+        type: 'text',
+        text: expect.stringContaining('resumed generation secret'),
+      }),
+    ]);
+    expect(JSON.stringify(projected.content)).not.toContain('extras');
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        projected.toJSON(),
+      ]),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({ redactedToolNames: new Set(['shell']) })
+    );
+
+    const redacted = span.attributes[
+      LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+    ] as string;
+    expect(redacted).toContain('Partial answer.');
+    expect(redacted).not.toContain('resumed generation secret');
+    expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   });
 
   it('redacts only configured tool names when output tracing stays enabled', () => {

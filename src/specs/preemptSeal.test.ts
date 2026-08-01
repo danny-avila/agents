@@ -629,6 +629,9 @@ describe('cooperative seal (end-to-end via Run)', () => {
     expect(resumedInput).toContain('Partial answer.');
     expect(resumedInput).toContain('local shell result');
     expect(resumedInput).toContain('serverToolResult');
+    expect(resumedInput.indexOf('local shell result')).toBeLessThan(
+      resumedInput.indexOf('Partial answer.')
+    );
     expect(resumedInput).not.toContain('local_output_item');
     expect(resumedInput).not.toContain('local_shell_call_output');
     expect(resumedInput).not.toContain('rs_interrupted');

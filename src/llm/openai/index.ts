@@ -41,6 +41,11 @@ import type { SeenScalarMetadata } from './streamMetadata';
 import type { HeaderValue, HeadersLike } from './types';
 import type { PromptCacheTtl } from '@/messages/cache';
 import {
+  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
+  projectOpenAIResponsesToolMessageContent,
+  projectToolStreamContentForProvider,
+} from '@/messages/core';
+import {
   buildAnthropicCacheControl,
   resolvePromptCacheTtl,
   stripAnthropicCacheControl,
@@ -50,10 +55,6 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
-import {
-  projectOpenAIResponsesToolMessageContent,
-  projectToolStreamContentForProvider,
-} from '@/messages/core';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
@@ -393,6 +394,10 @@ function isResponseMessage(
   return item.type === 'message';
 }
 
+function isResponseInputRole(role: string): boolean {
+  return role === 'system' || role === 'developer' || role === 'user';
+}
+
 /** Only `input_text`/`input_image`/`input_file` accept a Responses breakpoint;
  *  `output_text`/`refusal` (replayed assistant blocks) are rejected with a 400. */
 function isCacheableResponsePart(part: unknown): part is CacheableResponsePart {
@@ -466,11 +471,7 @@ export function addResponseCacheBreakpoints(
         /** Only input roles take a Responses breakpoint. Assistant/tool turns
          *  carry output content (string or output_text) that the API rejects
          *  under an input marker, so they're never eligible. */
-        if (
-          item.role !== 'system' &&
-          item.role !== 'developer' &&
-          item.role !== 'user'
-        ) {
+        if (!isResponseInputRole(item.role)) {
           return false;
         }
         const content = item.content as
@@ -582,6 +583,52 @@ const RESPONSES_REPLAY_OUTPUT_ITEM_TYPES = new Set([
   'program_output',
 ]);
 
+type ResponsesReplayPosition = {
+  contentIndex?: number;
+  itemId: string;
+  kind: 'output' | 'text';
+  outputIndex: number;
+};
+
+function remapResponsesTextBlockIndex(
+  chunk: ChatGenerationChunk,
+  event: OpenAIClient.Responses.ResponseStreamEvent,
+  textBlockIndices: Map<string, number>
+): void {
+  const position = iife(() => {
+    if (
+      event.type === 'response.output_text.delta' ||
+      event.type === 'response.output_text.annotation.added'
+    ) {
+      return {
+        contentIndex: event.content_index,
+        outputIndex: event.output_index,
+      };
+    }
+    if (
+      event.type === 'response.output_item.added' &&
+      event.item.type === 'message'
+    ) {
+      return { contentIndex: 0, outputIndex: event.output_index };
+    }
+    return undefined;
+  });
+  if (position == null || !Array.isArray(chunk.message.content)) {
+    return;
+  }
+  const key = `${position.outputIndex}:${position.contentIndex}`;
+  let blockIndex = textBlockIndices.get(key);
+  if (blockIndex == null) {
+    blockIndex = textBlockIndices.size;
+    textBlockIndices.set(key, blockIndex);
+  }
+  chunk.message.content = chunk.message.content.map((block) =>
+    typeof block === 'object' && block.type === 'text'
+      ? { ...block, index: blockIndex }
+      : block
+  );
+}
+
 function convertDroppedResponsesReplayOutput(
   event: OpenAIClient.Responses.ResponseStreamEvent
 ): ChatGenerationChunk | null {
@@ -601,11 +648,69 @@ function convertDroppedResponsesReplayOutput(
   });
 }
 
+function attachResponsesReplayPosition(
+  chunk: ChatGenerationChunk,
+  event: OpenAIClient.Responses.ResponseStreamEvent,
+  seenPositions: Set<string>
+): void {
+  let position: ResponsesReplayPosition | undefined;
+  if (event.type === 'response.output_text.delta' && event.delta.length > 0) {
+    position = {
+      contentIndex: event.content_index,
+      itemId: event.item_id,
+      kind: 'text',
+      outputIndex: event.output_index,
+    };
+  } else if (
+    event.type === 'response.output_item.done' &&
+    (RESPONSES_REPLAY_OUTPUT_ITEM_TYPES.has(event.item.type) ||
+      Array.isArray(chunk.message.additional_kwargs.tool_outputs))
+  ) {
+    let itemId: string | undefined;
+    if (typeof event.item.id === 'string' && event.item.id.length > 0) {
+      itemId = event.item.id;
+    } else if (
+      'call_id' in event.item &&
+      typeof event.item.call_id === 'string' &&
+      event.item.call_id.length > 0
+    ) {
+      itemId = event.item.call_id;
+    }
+    if (itemId != null) {
+      position = {
+        itemId,
+        kind: 'output',
+        outputIndex: event.output_index,
+      };
+    }
+  }
+  if (position == null) {
+    return;
+  }
+  const positionKey = `${position.kind}:${position.itemId}:${position.outputIndex}:${position.contentIndex ?? ''}`;
+  if (seenPositions.has(positionKey)) {
+    return;
+  }
+  seenPositions.add(positionKey);
+  const existing = chunk.message.additional_kwargs[
+    OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+  ] as unknown;
+  chunk.message.additional_kwargs = {
+    ...chunk.message.additional_kwargs,
+    [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+      ...(Array.isArray(existing) ? existing : []),
+      position,
+    ],
+  };
+}
+
 async function* convertLibreChatResponsesStream(
   stream: AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>,
   options: ResponsesStreamChunkOptions,
   runManager?: CallbackManagerForLLMRun
 ): AsyncGenerator<ChatGenerationChunk> {
+  const seenReplayPositions = new Set<string>();
+  const responsesTextBlockIndices = new Map<string, number>();
   try {
     for await (const event of stream) {
       if (options.signal?.aborted === true) {
@@ -617,6 +722,8 @@ async function* convertLibreChatResponsesStream(
       if (chunk == null) {
         continue;
       }
+      remapResponsesTextBlockIndex(chunk, event, responsesTextBlockIndices);
+      attachResponsesReplayPosition(chunk, event, seenReplayPositions);
       attachCacheWriteUsage(chunk.message);
       yield chunk;
       await runManager?.handleLLMNewToken(

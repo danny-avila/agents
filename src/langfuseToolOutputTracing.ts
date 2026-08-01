@@ -25,6 +25,7 @@ import { resolveToolOutputTracingConfigForSpan } from '@/langfuseRuntimeScope';
 export { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, resolveLangfuseConfig };
 
 const LANGGRAPH_TOOL_NODE_PREFIX = 'tools=';
+const SERVER_TOOL_RESULT_PREFIX = '{"serverToolResult":';
 
 const CHAT_ROLES = new Set([
   'assistant',
@@ -48,6 +49,13 @@ type RedactionContext = {
 };
 
 const TOOL_OUTPUT_FIELD_KEYS = ['content', 'artifact'];
+
+const RESPONSES_REPLAY_OUTPUT_DESCRIPTORS = {
+  local_shell_call_output: { outputField: 'output', toolName: 'local_shell' },
+  shell_call_output: { outputField: 'output', toolName: 'shell' },
+  apply_patch_call_output: { outputField: 'output', toolName: 'apply_patch' },
+  program_output: { outputField: 'result', toolName: 'program' },
+} as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value);
@@ -213,6 +221,73 @@ function redactToolContentFields(
   return next;
 }
 
+function redactResponsesReplayOutput(
+  value: Record<string, unknown>,
+  config: ResolvedLangfuseToolOutputTracingConfig
+): RedactionResult | undefined {
+  const type = getStringField(value, 'type');
+  if (type == null || !(type in RESPONSES_REPLAY_OUTPUT_DESCRIPTORS)) {
+    return undefined;
+  }
+  const descriptor =
+    RESPONSES_REPLAY_OUTPUT_DESCRIPTORS[
+      type as keyof typeof RESPONSES_REPLAY_OUTPUT_DESCRIPTORS
+    ];
+  if (
+    !(descriptor.outputField in value) ||
+    !shouldRedactTool(descriptor.toolName, config)
+  ) {
+    return undefined;
+  }
+  return {
+    value: {
+      ...value,
+      [descriptor.outputField]: config.redactionText,
+    },
+    changed: true,
+  };
+}
+
+function redactNeutralServerToolResult(
+  value: Record<string, unknown>,
+  config: ResolvedLangfuseToolOutputTracingConfig
+): RedactionResult | undefined {
+  if (getStringField(value, 'type') !== 'text') {
+    return undefined;
+  }
+  const text = getStringField(value, 'text');
+  const extras = value.extras;
+  const marker = isRecord(extras)
+    ? extras.librechatServerToolResult
+    : undefined;
+  const hasSerializedMarker =
+    text?.startsWith(SERVER_TOOL_RESULT_PREFIX) === true;
+  if (!isRecord(marker) && !hasSerializedMarker) {
+    return undefined;
+  }
+  let toolName = isRecord(marker)
+    ? getStringField(marker, 'toolName')
+    : undefined;
+  if (toolName == null && hasSerializedMarker) {
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      if (isRecord(parsed) && isRecord(parsed.serverToolResult)) {
+        toolName = getStringField(parsed.serverToolResult, 'toolName');
+      }
+    } catch {
+      const match = /"toolName":"([^"\\]+)"/.exec(text.slice(0, 256));
+      toolName = match?.[1];
+    }
+  }
+  if (!shouldRedactTool(toolName, config)) {
+    return undefined;
+  }
+  return {
+    value: { ...value, text: config.redactionText },
+    changed: true,
+  };
+}
+
 function collectToolCallNames(
   value: unknown,
   redactionContext: RedactionContext
@@ -259,6 +334,15 @@ function redactValue(
 
   if (!isRecord(value)) {
     return { value, changed: false };
+  }
+
+  const replayOutput = redactResponsesReplayOutput(value, config);
+  if (replayOutput != null) {
+    return replayOutput;
+  }
+  const neutralServerToolResult = redactNeutralServerToolResult(value, config);
+  if (neutralServerToolResult != null) {
+    return neutralServerToolResult;
   }
 
   const toolName = getSerializedToolName(value, redactionContext);

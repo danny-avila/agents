@@ -14,6 +14,7 @@ import {
 import type { BaseMessage } from '@langchain/core/messages';
 import type { MessageContentComplex, TPayload } from '@/types';
 import {
+  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
   convertMessagesToContent,
   formatAnthropicArtifactContent,
   formatArtifactPayload,
@@ -1901,6 +1902,54 @@ describe('formatAgentMessages', () => {
     }
   );
 
+  it('normalizes Responses text metadata before OpenAI Chat fallback replay', () => {
+    const annotatedText = {
+      type: 'text' as const,
+      text: 'Cited answer.',
+      annotations: [
+        {
+          type: 'citation' as const,
+          url: 'https://example.com/source',
+          title: 'Source',
+        },
+      ],
+      extras: { phase: 'final_answer' },
+      index: 0,
+    };
+    const message = new AIMessage({
+      content: [annotatedText],
+      response_metadata: {
+        model_provider: 'openai',
+        output: [],
+        output_version: 'v1',
+        preempted: true,
+      },
+    });
+
+    const native = projectToolStreamContentForProvider([message], 'native');
+    const fallback = projectToolStreamContentForProvider([message], 'fallback');
+    const fallbackMessage = fallback[0] as AIMessage;
+
+    expect((native[0] as AIMessage).content).toEqual([annotatedText]);
+    expect(fallbackMessage.content).toEqual([
+      { type: 'text', text: 'Cited answer.' },
+    ]);
+    expect(_convertMessagesToOpenAIParams(fallback)).toEqual([
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Cited answer.' }],
+      },
+    ]);
+    expect(message.content).toEqual([annotatedText]);
+
+    const fallbackAgain = projectToolStreamContentForProvider(
+      fallback,
+      'fallback'
+    );
+    expect(fallbackAgain).toBe(fallback);
+    expect(fallbackAgain[0]).toBe(fallbackMessage);
+  });
+
   it.each([
     [
       'Responses projector',
@@ -2213,6 +2262,65 @@ describe('formatAgentMessages', () => {
         );
         expect(JSON.stringify(providerInput)).not.toContain('ig_interrupted');
       }
+
+      const projectedAgain =
+        projectOpenAIResponsesToolMessageContent(projected);
+      expect(projectedAgain).toBe(projected);
+      expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
+
+  it.each([
+    ['v0', 'jpeg', '/9j/4AAQSkZJRg==', 'image/jpeg'],
+    ['v1', 'jpeg', '/9j/4AAQSkZJRg==', 'image/jpeg'],
+    ['v0', 'webp', 'UklGRgAAAABXRUJQ', 'image/webp'],
+    ['v1', 'webp', 'UklGRgAAAABXRUJQ', 'image/webp'],
+  ] as const)(
+    'preserves %s generated %s media type during replay',
+    (outputVersion, _format, data, mimeType) => {
+      const generatedImage = {
+        id: `ig_${outputVersion}_${_format}`,
+        type: 'image_generation_call',
+        status: 'completed',
+        result: data,
+      };
+      const v0Message = new AIMessage({
+        content: [{ type: 'text', text: 'Generated image.' }],
+        additional_kwargs: { tool_outputs: [generatedImage] },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+      const message =
+        outputVersion === 'v0'
+          ? v0Message
+          : new AIMessage({
+            contentBlocks: v0Message.contentBlocks,
+            additional_kwargs: v0Message.additional_kwargs,
+            response_metadata: {
+              model_provider: 'openai',
+              output_version: 'v1',
+              preempted: true,
+            },
+          });
+
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+      const providerInput = convertMessagesToResponsesInput({
+        messages: projected,
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+
+      expect(projectedMessage.content).toEqual(
+        expect.arrayContaining([{ type: 'image', mimeType, data }])
+      );
+      expect(JSON.stringify(providerInput)).toContain(
+        `data:${mimeType};base64,${data}`
+      );
+      expect(JSON.stringify(providerInput)).not.toContain(generatedImage.id);
+      expect(JSON.stringify(message.toJSON())).toContain(generatedImage.id);
 
       const projectedAgain =
         projectOpenAIResponsesToolMessageContent(projected);
@@ -2639,12 +2747,18 @@ describe('formatAgentMessages', () => {
         {
           type: 'text',
           text: expect.stringContaining('computed'),
+          extras: {
+            librechatServerToolResult: { toolName: 'code_interpreter' },
+          },
         },
         {
           type: 'text',
           text: expect.stringContaining(
             'https://example.com/ephemeral-chart.png'
           ),
+          extras: {
+            librechatServerToolResult: { toolName: 'code_interpreter' },
+          },
         },
       ]);
       expect(
@@ -2856,6 +2970,121 @@ describe('formatAgentMessages', () => {
     }
   );
 
+  it('replays captured server-tool results at their output positions', () => {
+    const makeResult = (id: string, output: string) => ({
+      id,
+      type: 'local_shell_call_output',
+      status: 'completed',
+      output,
+    });
+    const results = [
+      makeResult('result_after', 'after result'),
+      {
+        call_id: 'patch_without_item_id',
+        type: 'apply_patch_call_output',
+        status: 'completed',
+        output: 'no-id patch result',
+      },
+      makeResult('result_before', 'before result'),
+      makeResult('result_middle', 'middle result'),
+    ];
+    const message = new AIMessage({
+      content: [
+        { type: 'text', text: 'First narration.' },
+        { type: 'text', text: 'Second narration.' },
+      ],
+      additional_kwargs: {
+        tool_outputs: results,
+        [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+          {
+            itemId: 'result_after',
+            kind: 'output',
+            outputIndex: 5,
+          },
+          {
+            itemId: 'msg_first',
+            kind: 'text',
+            outputIndex: 1,
+            contentIndex: 0,
+          },
+          {
+            itemId: 'result_before',
+            kind: 'output',
+            outputIndex: 0,
+          },
+          {
+            itemId: 'msg_first',
+            kind: 'text',
+            outputIndex: 1,
+            contentIndex: 0,
+          },
+          {
+            itemId: 'result_middle',
+            kind: 'output',
+            outputIndex: 3,
+          },
+          {
+            itemId: 'patch_without_item_id',
+            kind: 'output',
+            outputIndex: 2,
+          },
+          {
+            itemId: 'msg_second',
+            kind: 'text',
+            outputIndex: 4,
+            contentIndex: 0,
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const orderedText = (
+      projectedMessage.content as Array<{
+        extras?: { librechatServerToolResult?: unknown };
+        text?: string;
+        type: string;
+      }>
+    ).map((block) => {
+      if (block.extras?.librechatServerToolResult != null) {
+        return (
+          JSON.parse(block.text!) as {
+            serverToolResult: { output: string };
+          }
+        ).serverToolResult.output;
+      }
+      return block.text;
+    });
+
+    expect(orderedText).toEqual([
+      'before result',
+      'First narration.',
+      'no-id patch result',
+      'middle result',
+      'Second narration.',
+      'after result',
+    ]);
+    expect(projectedMessage.additional_kwargs).not.toHaveProperty(
+      OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+    );
+    expect(JSON.stringify(projectedMessage.toJSON())).not.toMatch(/result_/);
+    expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+      'patch_without_item_id'
+    );
+    expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+      OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+    );
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
   it('neutralizes provider references duplicated into v1 content blocks', () => {
     const reasoning = {
       id: 'rs_interrupted',
@@ -2963,6 +3192,7 @@ describe('formatAgentMessages', () => {
         type: 'text',
         text: JSON.stringify({
           serverToolResult: {
+            toolName: 'code_interpreter',
             status: 'success',
             output: {
               type: 'code_interpreter_output',
@@ -2971,6 +3201,9 @@ describe('formatAgentMessages', () => {
             },
           },
         }),
+        extras: {
+          librechatServerToolResult: { toolName: 'code_interpreter' },
+        },
       },
       { type: 'image', mimeType: 'image/png', data: 'AA==' },
     ]);
@@ -2983,6 +3216,36 @@ describe('formatAgentMessages', () => {
     expect(serialized).not.toContain('image_generation_call');
     expect(JSON.stringify(message.toJSON())).toContain('rs_interrupted');
     expect(JSON.stringify(message.toJSON())).toContain('ci_interrupted');
+
+    const fallback = projectToolStreamContentForProvider([message], 'fallback');
+    const fallbackMessage = fallback[0] as AIMessage;
+    expect(fallbackMessage.content).toEqual([
+      { type: 'text', text: 'Partial answer.' },
+      {
+        type: 'text',
+        text: JSON.stringify({
+          serverToolResult: {
+            toolName: 'code_interpreter',
+            status: 'success',
+            output: {
+              type: 'code_interpreter_output',
+              returnCode: 0,
+              stdout: '1',
+            },
+          },
+        }),
+      },
+    ]);
+    expect(_convertMessagesToOpenAIParams(fallback)).toEqual([
+      {
+        role: 'assistant',
+        content: fallbackMessage.content,
+      },
+    ]);
+    expect(JSON.stringify(fallbackMessage.toJSON())).not.toContain('extras');
+    expect(JSON.stringify(fallbackMessage.toJSON())).not.toContain(
+      'librechatServerToolResult'
+    );
 
     const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
     expect(projectedAgain).toBe(projected);

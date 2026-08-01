@@ -1,3 +1,4 @@
+import { convertMessagesToResponsesInput } from '@langchain/openai';
 import {
   AIMessage,
   AIMessageChunk,
@@ -21,6 +22,10 @@ import {
   CustomOpenAIClient,
   CustomAzureOpenAIClient,
 } from '@/llm/openai';
+import {
+  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
+  projectOpenAIResponsesToolMessageContent,
+} from '@/messages/core';
 import { CustomChatGoogleGenerativeAI } from '@/llm/google';
 import { CustomChatBedrockConverse } from '@/llm/bedrock';
 import { ChatOpenRouter } from '@/llm/openrouter';
@@ -467,7 +472,16 @@ describe('custom chat model class smoke tests', () => {
           output_index: items.length,
           content_index: 0,
           item_id: 'msg_partial',
-          delta: 'Partial answer.',
+          delta: 'Partial ',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: items.length + 1,
+          output_index: items.length,
+          content_index: 0,
+          item_id: 'msg_partial',
+          delta: 'answer.',
           logprobs: [],
         } as OpenAIClient.Responses.ResponseStreamEvent;
       })();
@@ -483,9 +497,93 @@ describe('custom chat model class smoke tests', () => {
       undefined
     );
 
-    expect(chunks).toHaveLength(items.length + 1);
+    expect(chunks).toHaveLength(items.length + 2);
     expect(combined?.text).toBe('Partial answer.');
     expect(combined?.additional_kwargs.tool_outputs).toEqual(items);
+    expect(
+      combined?.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]
+    ).toEqual([
+      ...items.map((item, outputIndex) => ({
+        itemId: item.id,
+        kind: 'output',
+        outputIndex,
+      })),
+      {
+        contentIndex: 0,
+        itemId: 'msg_partial',
+        kind: 'text',
+        outputIndex: items.length,
+      },
+    ]);
+  });
+
+  it('keeps a raw server result between distinct Responses output messages', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingOpenAIResponsesDelegate }
+    ).responses;
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 0,
+          content_index: 0,
+          item_id: 'msg_first',
+          delta: 'First narration.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_item.done',
+          sequence_number: 1,
+          output_index: 1,
+          item: {
+            id: 'local_output_item',
+            type: 'local_shell_call_output',
+            status: 'completed',
+            output: 'middle server result',
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 2,
+          output_index: 2,
+          content_index: 0,
+          item_id: 'msg_second',
+          delta: 'Second narration.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    let combined: AIMessageChunk | undefined;
+    const stream = await model.stream([new HumanMessage('run a server tool')]);
+    for await (const chunk of stream) {
+      combined =
+        combined == null
+          ? (chunk as AIMessageChunk)
+          : (combined.concat(chunk as AIMessageChunk) as AIMessageChunk);
+    }
+    expect(combined).toBeDefined();
+    combined!.response_metadata.preempted = true;
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([combined!]);
+    const providerInput = convertMessagesToResponsesInput({
+      messages: [projected],
+      model: 'gpt-5',
+      zdrEnabled: false,
+    });
+    const serialized = JSON.stringify(providerInput);
+    const firstIndex = serialized.indexOf('First narration.');
+    const resultIndex = serialized.indexOf('middle server result');
+    const secondIndex = serialized.indexOf('Second narration.');
+
+    expect(firstIndex).toBeGreaterThanOrEqual(0);
+    expect(firstIndex).toBeLessThan(resultIndex);
+    expect(resultIndex).toBeLessThan(secondIndex);
   });
 
   it('keeps Azure client customization and gates reasoning to reasoning models', () => {

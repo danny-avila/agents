@@ -668,6 +668,16 @@ function hasReplayableEncryptedReasoning(reasoning: unknown): boolean {
 
 type ResponsesReplayProjection = 'fallback' | 'native';
 
+export const OPENAI_RESPONSES_REPLAY_POSITIONS_KEY =
+  '__openai_responses_replay_positions__';
+
+type ResponsesReplayPosition = {
+  contentIndex?: number;
+  itemId: string;
+  kind: 'output' | 'text';
+  outputIndex: number;
+};
+
 type CompletedGeneratedImages = {
   blocks: LangChainContentBlock.Multimodal.Image[];
   data: Set<string>;
@@ -676,7 +686,13 @@ type CompletedGeneratedImages = {
 
 type ResponsesReplayArtifacts = {
   generatedImages: CompletedGeneratedImages;
-  serverToolResults: LangChainContentBlock.Standard[];
+  serverToolResults: PositionedResponsesReplayBlock[];
+};
+
+type PositionedResponsesReplayBlock = {
+  block: LangChainContentBlock.Standard;
+  outputIndex: number;
+  textIndex?: number;
 };
 
 type PositionedResponsesImage = {
@@ -727,7 +743,8 @@ function hasMeaningfulServerToolOutput(output: unknown): boolean {
 function createNeutralServerToolResult(
   output: unknown,
   status: 'error' | 'success',
-  maxChars: number
+  maxChars: number,
+  toolName?: string
 ): LangChainContentBlock.Text | undefined {
   if (!hasMeaningfulServerToolOutput(output)) {
     return undefined;
@@ -735,9 +752,20 @@ function createNeutralServerToolResult(
   return {
     type: 'text',
     text: serializeToolContentBounded(
-      { serverToolResult: { status, output } },
+      {
+        serverToolResult: {
+          ...(toolName != null ? { toolName } : {}),
+          status,
+          output,
+        },
+      },
       maxChars
     ),
+    extras: {
+      librechatServerToolResult: {
+        ...(toolName != null ? { toolName } : {}),
+      },
+    },
   };
 }
 
@@ -778,7 +806,7 @@ function projectPreemptedResponsesV1Content(
   replayProjection: ResponsesReplayProjection,
   generatedImages?: CompletedGeneratedImages,
   originalImages?: PositionedResponsesImages,
-  serverToolResults?: LangChainContentBlock.Standard[]
+  serverToolResults?: PositionedResponsesReplayBlock[]
 ): {
   content: AIMessage['content'];
   preservedServerToolResult: boolean;
@@ -798,7 +826,9 @@ function projectPreemptedResponsesV1Content(
   let preservedServerToolResult = false;
   let reasoningInsertionIndex: number | undefined;
   let originalImageIndex = 0;
+  let serverToolResultIndex = 0;
   let sourceTextIndex = 0;
+  const serverToolNamesByCallId = new Map<string, string>();
 
   const appendOriginalImages = (throughTextIndex?: number): void => {
     if (replayProjection !== 'native' || originalImages == null) {
@@ -828,6 +858,36 @@ function projectPreemptedResponsesV1Content(
     }
   };
 
+  const appendServerToolResults = (throughTextIndex?: number): void => {
+    if (serverToolResults == null) {
+      return;
+    }
+    while (serverToolResultIndex < serverToolResults.length) {
+      const positionedResult = serverToolResults[serverToolResultIndex];
+      if (
+        throughTextIndex != null &&
+        (positionedResult.textIndex == null ||
+          positionedResult.textIndex > throughTextIndex)
+      ) {
+        return;
+      }
+      serverToolResultIndex++;
+      if (
+        replayProjection === 'fallback' &&
+        positionedResult.block.type === 'text'
+      ) {
+        projected.push({
+          type: 'text',
+          text: positionedResult.block.text,
+        });
+      } else {
+        projected.push(positionedResult.block);
+      }
+      changed = true;
+      preservedServerToolResult = true;
+    }
+  };
+
   for (let i = 0; i < contentBlocks.length; i++) {
     const block = contentBlocks[i];
     if (!isCompleteToolStreamContentBlock(block)) {
@@ -854,7 +914,13 @@ function projectPreemptedResponsesV1Content(
     }
     if (block.type === 'text') {
       appendOriginalImages(sourceTextIndex);
-      projected.push(block);
+      appendServerToolResults(sourceTextIndex);
+      if (replayProjection === 'fallback') {
+        projected.push({ type: 'text', text: block.text });
+        changed = true;
+      } else {
+        projected.push(block);
+      }
       sourceTextIndex++;
       continue;
     }
@@ -865,6 +931,14 @@ function projectPreemptedResponsesV1Content(
       block.type === 'server_tool_call' ||
       block.type === 'server_tool_call_chunk'
     ) {
+      if (
+        typeof block.id === 'string' &&
+        block.id.length > 0 &&
+        typeof block.name === 'string' &&
+        block.name.length > 0
+      ) {
+        serverToolNamesByCallId.set(block.id, block.name);
+      }
       changed = true;
       continue;
     }
@@ -872,11 +946,16 @@ function projectPreemptedResponsesV1Content(
       const result = createNeutralServerToolResult(
         block.output,
         block.status,
-        maxChars
+        maxChars,
+        serverToolNamesByCallId.get(block.toolCallId)
       );
       changed = true;
       if (result != null) {
-        projected.push(result);
+        projected.push(
+          replayProjection === 'fallback'
+            ? { type: 'text', text: result.text }
+            : result
+        );
         preservedServerToolResult = true;
       }
       continue;
@@ -903,13 +982,7 @@ function projectPreemptedResponsesV1Content(
     changed = true;
   }
   appendOriginalImages();
-  if (serverToolResults != null) {
-    projected.push(...serverToolResults);
-    if (serverToolResults.length > 0) {
-      changed = true;
-      preservedServerToolResult = true;
-    }
-  }
+  appendServerToolResults();
   if (replayProjection === 'native' && generatedImages != null) {
     projected.push(...generatedImages.blocks);
     changed ||= generatedImages.blocks.length > 0;
@@ -929,17 +1002,178 @@ function getAuthoritativeResponsesOutput(message: AIMessage): unknown[] {
   return Array.isArray(toolOutputs) ? toolOutputs : [];
 }
 
+function isResponsesReplayPosition(
+  value: unknown
+): value is ResponsesReplayPosition {
+  if (value == null || typeof value !== 'object') {
+    return false;
+  }
+  const position = value as Partial<ResponsesReplayPosition>;
+  return (
+    (position.kind === 'output' || position.kind === 'text') &&
+    typeof position.itemId === 'string' &&
+    position.itemId.length > 0 &&
+    typeof position.outputIndex === 'number' &&
+    Number.isSafeInteger(position.outputIndex) &&
+    position.outputIndex >= 0 &&
+    (position.contentIndex == null ||
+      (typeof position.contentIndex === 'number' &&
+        Number.isSafeInteger(position.contentIndex) &&
+        position.contentIndex >= 0))
+  );
+}
+
+function getGeneratedImageMimeType(data: string): string {
+  const bytes = Buffer.from(data.slice(0, 16), 'base64');
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return 'image/webp';
+  }
+  return 'image/png';
+}
+
+function getResponsesReplayItemKey(
+  item: Record<string, unknown>
+): string | undefined {
+  if (typeof item.id === 'string' && item.id.length > 0) {
+    return item.id;
+  }
+  return typeof item.call_id === 'string' && item.call_id.length > 0
+    ? item.call_id
+    : undefined;
+}
+
+const RESPONSES_REPLAY_OUTPUT_TOOL_NAMES = {
+  apply_patch_call_output: 'apply_patch',
+  local_shell_call_output: 'local_shell',
+  shell_call_output: 'shell',
+} as const;
+
 function getResponsesReplayArtifacts(
   output: readonly unknown[],
   maxChars: number,
-  replayProjection: ResponsesReplayProjection
+  replayProjection: ResponsesReplayProjection,
+  replayPositionValue?: unknown
 ): ResponsesReplayArtifacts {
   const blocks: LangChainContentBlock.Multimodal.Image[] = [];
   const data = new Set<string>();
   const ids = new Set<string>();
   const emittedData = new Set<string>();
   const emittedIds = new Set<string>();
-  const serverToolResults: LangChainContentBlock.Standard[] = [];
+  const serverToolResults: PositionedResponsesReplayBlock[] = [];
+  const replayPositions = Array.isArray(replayPositionValue)
+    ? replayPositionValue.filter(isResponsesReplayPosition)
+    : [];
+  const outputPositionsByItemId = new Map<string, ResponsesReplayPosition>();
+  const textPositionsByKey = new Map<string, ResponsesReplayPosition>();
+  for (const position of replayPositions) {
+    if (position.kind === 'output') {
+      outputPositionsByItemId.set(position.itemId, position);
+      continue;
+    }
+    textPositionsByKey.set(
+      `${position.itemId}:${position.outputIndex}:${position.contentIndex ?? 0}`,
+      position
+    );
+  }
+  const hasAuthoritativeMessage = output.some(
+    (item) =>
+      item != null &&
+      typeof item === 'object' &&
+      'type' in item &&
+      item.type === 'message'
+  );
+  if (hasAuthoritativeMessage) {
+    for (let outputIndex = 0; outputIndex < output.length; outputIndex++) {
+      const item = output[outputIndex];
+      if (item == null || typeof item !== 'object') {
+        continue;
+      }
+      const itemRecord = item as Record<string, unknown>;
+      const itemKey = getResponsesReplayItemKey(itemRecord);
+      if (itemKey != null) {
+        outputPositionsByItemId.set(itemKey, {
+          itemId: itemKey,
+          kind: 'output',
+          outputIndex,
+        });
+      }
+      if (
+        !('type' in item) ||
+        item.type !== 'message' ||
+        !('content' in item) ||
+        !Array.isArray(item.content)
+      ) {
+        continue;
+      }
+      for (
+        let contentIndex = 0;
+        contentIndex < item.content.length;
+        contentIndex++
+      ) {
+        const content = item.content[contentIndex];
+        if (
+          content == null ||
+          typeof content !== 'object' ||
+          !('type' in content) ||
+          content.type !== 'output_text'
+        ) {
+          continue;
+        }
+        const itemId =
+          'id' in item && typeof item.id === 'string'
+            ? item.id
+            : `message-${outputIndex}`;
+        textPositionsByKey.set(`${itemId}:${outputIndex}:${contentIndex}`, {
+          contentIndex,
+          itemId,
+          kind: 'text',
+          outputIndex,
+        });
+      }
+    }
+  }
+  const textPositions = [...textPositionsByKey.values()].sort(
+    (a, b) =>
+      a.outputIndex - b.outputIndex ||
+      (a.contentIndex ?? 0) - (b.contentIndex ?? 0)
+  );
+  const getPosition = (
+    item: Record<string, unknown>
+  ): Pick<PositionedResponsesReplayBlock, 'outputIndex' | 'textIndex'> => {
+    const itemId = getResponsesReplayItemKey(item);
+    const position =
+      itemId != null ? outputPositionsByItemId.get(itemId) : undefined;
+    if (position == null) {
+      return { outputIndex: Number.MAX_SAFE_INTEGER };
+    }
+    return {
+      outputIndex: position.outputIndex,
+      textIndex: textPositions.filter(
+        (textPosition) => textPosition.outputIndex < position.outputIndex
+      ).length,
+    };
+  };
+  const pushServerToolResult = (
+    block: LangChainContentBlock.Standard | undefined,
+    item: Record<string, unknown>
+  ): void => {
+    if (block == null) {
+      return;
+    }
+    serverToolResults.push({ block, ...getPosition(item) });
+  };
   for (const item of output) {
     if (item == null || typeof item !== 'object' || !('type' in item)) {
       continue;
@@ -970,17 +1204,16 @@ function getResponsesReplayArtifacts(
           replayProjection === 'native' &&
           resultUrl.startsWith('data:image/')
         ) {
-          serverToolResults.push({ type: 'image', url: resultUrl });
+          pushServerToolResult({ type: 'image', url: resultUrl }, item);
           continue;
         }
         const mediaResult = createNeutralServerToolResult(
           { type: 'code_interpreter_image', url: resultUrl },
           item.status === 'failed' ? 'error' : 'success',
-          maxChars
+          maxChars,
+          'code_interpreter'
         );
-        if (mediaResult != null) {
-          serverToolResults.push(mediaResult);
-        }
+        pushServerToolResult(mediaResult, item);
       }
       continue;
     }
@@ -1000,11 +1233,10 @@ function getResponsesReplayArtifacts(
           ...(hasError ? { error: item.error } : {}),
         },
         hasError ? 'error' : 'success',
-        maxChars
+        maxChars,
+        'mcp_list_tools'
       );
-      if (listToolsResult != null) {
-        serverToolResults.push(listToolsResult);
-      }
+      pushServerToolResult(listToolsResult, item);
       continue;
     }
     if (item.type === 'mcp_call') {
@@ -1040,11 +1272,12 @@ function getResponsesReplayArtifacts(
             (item.status === 'failed' || item.status === 'incomplete'))
           ? 'error'
           : 'success',
-        maxChars
+        maxChars,
+        'name' in item && typeof item.name === 'string' && item.name.length > 0
+          ? item.name
+          : 'mcp'
       );
-      if (mcpResult != null) {
-        serverToolResults.push(mcpResult);
-      }
+      pushServerToolResult(mcpResult, item);
       continue;
     }
     if (
@@ -1061,11 +1294,10 @@ function getResponsesReplayArtifacts(
           (item.status === 'failed' || item.status === 'incomplete')
           ? 'error'
           : 'success',
-        maxChars
+        maxChars,
+        RESPONSES_REPLAY_OUTPUT_TOOL_NAMES[item.type]
       );
-      if (result != null) {
-        serverToolResults.push(result);
-      }
+      pushServerToolResult(result, item);
       continue;
     }
     if (item.type === 'program_output') {
@@ -1075,11 +1307,10 @@ function getResponsesReplayArtifacts(
       const result = createNeutralServerToolResult(
         item.result,
         'status' in item && item.status === 'incomplete' ? 'error' : 'success',
-        maxChars
+        maxChars,
+        'program'
       );
-      if (result != null) {
-        serverToolResults.push(result);
-      }
+      pushServerToolResult(result, item);
       continue;
     }
     if (item.type !== 'image_generation_call') {
@@ -1114,14 +1345,19 @@ function getResponsesReplayArtifacts(
       }
       blocks.push({
         type: 'image',
-        mimeType: 'image/png',
+        mimeType: getGeneratedImageMimeType(item.result),
         data: item.result,
       });
     }
   }
   return {
     generatedImages: { blocks, data, ids },
-    serverToolResults,
+    serverToolResults: serverToolResults.sort(
+      (a, b) =>
+        (a.textIndex ?? Number.MAX_SAFE_INTEGER) -
+          (b.textIndex ?? Number.MAX_SAFE_INTEGER) ||
+        a.outputIndex - b.outputIndex
+    ),
   };
 }
 
@@ -1188,6 +1424,7 @@ function isPreemptedOpenAIResponsesMessage(message: AIMessage): boolean {
     Array.isArray(metadata.output) ||
     metadata.tool_outputs != null ||
     Array.isArray(message.additional_kwargs.tool_outputs) ||
+    message.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY] != null ||
     message.additional_kwargs.__openai_function_call_ids__ != null ||
     message.additional_kwargs.__openai_custom_tool_call_ids__ != null ||
     (message.additional_kwargs.reasoning != null &&
@@ -1222,7 +1459,8 @@ function projectPreemptedOpenAIResponsesMessage(
   const { generatedImages, serverToolResults } = getResponsesReplayArtifacts(
     authoritativeOutput,
     maxChars,
-    replayProjection
+    replayProjection,
+    additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]
   );
   const isV1 = metadata.output_version === 'v1';
   const translatesV0 =
@@ -1269,6 +1507,7 @@ function projectPreemptedOpenAIResponsesMessage(
     message.id?.startsWith('msg_') === true ||
     (!retainsEncryptedReasoning && additionalKwargs.reasoning != null) ||
     additionalKwargs.tool_outputs != null ||
+    additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY] != null ||
     additionalKwargs.__openai_function_call_ids__ != null ||
     additionalKwargs.__openai_custom_tool_call_ids__ != null ||
     metadata.id != null ||
@@ -1281,6 +1520,7 @@ function projectPreemptedOpenAIResponsesMessage(
     delete additionalKwargs.reasoning;
   }
   delete additionalKwargs.tool_outputs;
+  delete additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY];
   delete additionalKwargs.__openai_function_call_ids__;
   delete additionalKwargs.__openai_custom_tool_call_ids__;
 
