@@ -1154,6 +1154,7 @@ function getResponsesReplayArtifacts(
   const replayPositions = Array.isArray(replayPositionValue)
     ? replayPositionValue.filter(isResponsesReplayPosition)
     : [];
+  const authoritativeOutputIndicesByItemId = new Map<string, number>();
   const outputPositionsByItemId = new Map<string, ResponsesReplayPosition>();
   const textPositionsByKey = new Map<string, ResponsesReplayPosition>();
   for (const position of replayPositions) {
@@ -1166,70 +1167,61 @@ function getResponsesReplayArtifacts(
       position
     );
   }
-  const hasAuthoritativeMessage = output.some(
-    (item) =>
-      item != null &&
-      typeof item === 'object' &&
-      'type' in item &&
-      item.type === 'message'
-  );
+  let hasAuthoritativeMessage = false;
   for (let outputIndex = 0; outputIndex < output.length; outputIndex++) {
     const item = output[outputIndex];
-    if (item != null && typeof item === 'object') {
-      rawOutputIndices.set(item as Record<string, unknown>, outputIndex);
+    if (item == null || typeof item !== 'object') {
+      continue;
+    }
+    const itemRecord = item as Record<string, unknown>;
+    rawOutputIndices.set(itemRecord, outputIndex);
+    const itemKey = getResponsesReplayItemKey(itemRecord);
+    if (itemKey != null) {
+      authoritativeOutputIndicesByItemId.set(itemKey, outputIndex);
+    }
+    if (!('type' in item) || item.type !== 'message') {
+      continue;
+    }
+    hasAuthoritativeMessage = true;
+    if (!('content' in item) || !Array.isArray(item.content)) {
+      continue;
+    }
+    for (
+      let contentIndex = 0;
+      contentIndex < item.content.length;
+      contentIndex++
+    ) {
+      const content = item.content[contentIndex];
+      if (
+        content == null ||
+        typeof content !== 'object' ||
+        !('type' in content) ||
+        content.type !== 'output_text' ||
+        !('text' in content) ||
+        typeof content.text !== 'string' ||
+        content.text.length === 0
+      ) {
+        continue;
+      }
+      const itemId =
+        'id' in item && typeof item.id === 'string'
+          ? item.id
+          : `message-${outputIndex}`;
+      textPositionsByKey.set(`${itemId}:${outputIndex}:${contentIndex}`, {
+        contentIndex,
+        itemId,
+        kind: 'text',
+        outputIndex,
+      });
     }
   }
   if (hasAuthoritativeMessage) {
-    for (let outputIndex = 0; outputIndex < output.length; outputIndex++) {
-      const item = output[outputIndex];
-      if (item == null || typeof item !== 'object') {
-        continue;
-      }
-      const itemRecord = item as Record<string, unknown>;
-      const itemKey = getResponsesReplayItemKey(itemRecord);
-      if (itemKey != null) {
-        outputPositionsByItemId.set(itemKey, {
-          itemId: itemKey,
-          kind: 'output',
-          outputIndex,
-        });
-      }
-      if (
-        !('type' in item) ||
-        item.type !== 'message' ||
-        !('content' in item) ||
-        !Array.isArray(item.content)
-      ) {
-        continue;
-      }
-      for (
-        let contentIndex = 0;
-        contentIndex < item.content.length;
-        contentIndex++
-      ) {
-        const content = item.content[contentIndex];
-        if (
-          content == null ||
-          typeof content !== 'object' ||
-          !('type' in content) ||
-          content.type !== 'output_text' ||
-          !('text' in content) ||
-          typeof content.text !== 'string' ||
-          content.text.length === 0
-        ) {
-          continue;
-        }
-        const itemId =
-          'id' in item && typeof item.id === 'string'
-            ? item.id
-            : `message-${outputIndex}`;
-        textPositionsByKey.set(`${itemId}:${outputIndex}:${contentIndex}`, {
-          contentIndex,
-          itemId,
-          kind: 'text',
-          outputIndex,
-        });
-      }
+    for (const [itemId, outputIndex] of authoritativeOutputIndicesByItemId) {
+      outputPositionsByItemId.set(itemId, {
+        itemId,
+        kind: 'output',
+        outputIndex,
+      });
     }
   }
   const textPositions = [...textPositionsByKey.values()].sort(
@@ -1238,18 +1230,18 @@ function getResponsesReplayArtifacts(
       (a.contentIndex ?? 0) - (b.contentIndex ?? 0)
   );
   const textCountBeforeOutputIndex = new Map<number, number>();
-  const positionedOutputIndices = [
-    ...new Set(
-      [
-        ...outputPositionsByItemId.values(),
-        ...(hasAuthoritativeMessage
-          ? [...rawOutputIndices.values()].map((outputIndex) => ({
-            outputIndex,
-          }))
-          : []),
-      ].map((position) => position.outputIndex)
-    ),
-  ].sort((a, b) => a - b);
+  const positionedOutputIndexSet = new Set<number>();
+  for (const position of outputPositionsByItemId.values()) {
+    positionedOutputIndexSet.add(position.outputIndex);
+  }
+  if (hasAuthoritativeMessage) {
+    for (const outputIndex of rawOutputIndices.values()) {
+      positionedOutputIndexSet.add(outputIndex);
+    }
+  }
+  const positionedOutputIndices = [...positionedOutputIndexSet].sort(
+    (a, b) => a - b
+  );
   let textPositionIndex = 0;
   for (const outputIndex of positionedOutputIndices) {
     while (
@@ -1587,9 +1579,12 @@ function getSelfContainedResponsesV0Images(
     }
     if (
       block.type === 'image' &&
-      'data' in block &&
-      ((typeof block.data === 'string' && block.data.length > 0) ||
-        (block.data instanceof Uint8Array && block.data.length > 0))
+      (('url' in block &&
+        typeof block.url === 'string' &&
+        block.url.length > 0) ||
+        ('data' in block &&
+          ((typeof block.data === 'string' && block.data.length > 0) ||
+            (block.data instanceof Uint8Array && block.data.length > 0))))
     ) {
       images.push({ block, textIndex: textCount });
     }

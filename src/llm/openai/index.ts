@@ -597,9 +597,9 @@ function isResponsesReplayOutputItem(item: unknown): boolean {
 /**
  * LangChain's Responses converter places the authoritative terminal output in
  * response_metadata.output. Its chunk merge has no way to delete provisional
- * tool_outputs, so remove only our preemption-only captures once that terminal
- * output arrives. A stream that is interrupted has no terminal chunk and keeps
- * the captures for replay.
+ * tool_outputs or replay-position sidecars, so remove those preemption-only
+ * captures once that terminal output arrives. An interrupted stream has no
+ * terminal chunk and keeps the captures for replay.
  */
 class ResponsesReplayAIMessageChunk extends AIMessageChunk {
   override get lc_id(): string[] {
@@ -608,9 +608,10 @@ class ResponsesReplayAIMessageChunk extends AIMessageChunk {
 
   override concat(chunk: AIMessageChunk): this {
     const combined = super.concat(chunk);
-    if (!Array.isArray(combined.response_metadata.output)) {
+    if (!Array.isArray(chunk.response_metadata.output)) {
       return combined;
     }
+    delete combined.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY];
     const toolOutputs = combined.additional_kwargs.tool_outputs;
     if (!Array.isArray(toolOutputs)) {
       return combined;

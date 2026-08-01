@@ -617,14 +617,89 @@ describe('custom chat model class smoke tests', () => {
       expect(combined?.lc_kwargs.additional_kwargs).toEqual(
         expect.objectContaining({ tool_outputs: [streamedToolOutput] })
       );
+      expect(combined?.additional_kwargs).not.toHaveProperty(
+        OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+      );
+      expect(combined?.lc_kwargs.additional_kwargs).not.toHaveProperty(
+        OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+      );
       expect(
         JSON.stringify(tracedResult).match(/unique authoritative local output/g)
       ).toHaveLength(1);
       expect(JSON.stringify(tracedResult)).not.toContain(
         'stale provisional local output'
       );
+      expect(JSON.stringify(tracedResult)).not.toContain(
+        OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+      );
     }
   );
+
+  it('removes replay positions on a text-only terminal response', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingOpenAIResponsesDelegate }
+    ).responses;
+    const messageItem = {
+      id: 'msg_terminal',
+      type: 'message',
+      role: 'assistant',
+      status: 'completed',
+      content: [
+        {
+          type: 'output_text',
+          text: 'Complete answer.',
+          annotations: [],
+          logprobs: [],
+        },
+      ],
+    } as const;
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 0,
+          content_index: 0,
+          item_id: messageItem.id,
+          delta: messageItem.content[0].text,
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.completed',
+          sequence_number: 1,
+          response: {
+            id: 'resp_text_terminal',
+            model: 'gpt-5',
+            output: [messageItem],
+            status: 'completed',
+            usage: null,
+          },
+        } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    let combined: AIMessageChunk | undefined;
+    const stream = await model.stream([new HumanMessage('answer')]);
+    for await (const chunk of stream) {
+      combined =
+        combined == null
+          ? (chunk as AIMessageChunk)
+          : (combined.concat(chunk as AIMessageChunk) as AIMessageChunk);
+    }
+
+    expect(combined?.text).toBe('Complete answer.');
+    expect(combined?.response_metadata.output).toEqual([messageItem]);
+    expect(combined?.additional_kwargs).not.toHaveProperty(
+      OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+    );
+    expect(combined?.lc_kwargs.additional_kwargs).not.toHaveProperty(
+      OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+    );
+  });
 
   it('keeps a raw server result between distinct Responses output messages', async () => {
     const model = new ChatOpenAI({

@@ -2637,6 +2637,63 @@ describe('formatAgentMessages', () => {
     );
   });
 
+  it.each([
+    ['data URL', 'data:image/png;base64,AQ=='],
+    ['HTTPS URL', 'https://example.com/application-image.png'],
+  ])(
+    'preserves an unrelated v0 application image backed by a %s',
+    (_label, url) => {
+      const applicationImage = {
+        type: 'image' as const,
+        url,
+        metadata: { source: 'application' },
+      };
+      const providerImage = {
+        type: 'image' as const,
+        id: 'ig_url_provider',
+        url: 'data:image/png;base64,AA==',
+        metadata: { status: 'completed' },
+      };
+      const message = new AIMessage({
+        content: [
+          applicationImage,
+          { type: 'text', text: 'Partial answer.' },
+          providerImage,
+        ],
+        additional_kwargs: {
+          tool_outputs: [
+            {
+              id: providerImage.id,
+              type: 'image_generation_call',
+              status: 'completed',
+              result: 'AA==',
+            },
+          ],
+        },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+
+      const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+
+      expect(projected.content).toEqual([
+        applicationImage,
+        { type: 'text', text: 'Partial answer.' },
+        {
+          type: 'image',
+          mimeType: 'image/png',
+          data: 'AA==',
+          extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+        },
+      ]);
+      expect(JSON.stringify(projected.toJSON())).not.toContain(
+        providerImage.id
+      );
+    }
+  );
+
   it('restores v0 image positions before appending a generated image', () => {
     const imageA = {
       type: 'image' as const,
