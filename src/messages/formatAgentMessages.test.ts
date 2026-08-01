@@ -1912,6 +1912,259 @@ describe('formatAgentMessages', () => {
     expect(message.response_metadata).toHaveProperty('output');
   });
 
+  it.each(['additional_kwargs', 'response_metadata'] as const)(
+    'preserves completed v0 generated images from %s without provider ids',
+    (imageSource) => {
+      const events: Parameters<
+        typeof convertResponsesDeltaToChatGenerationChunk
+      >[0][] = [
+        {
+          type: 'response.output_item.done',
+          sequence_number: 0,
+          output_index: 0,
+          item: {
+            id: 'ig_interrupted',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'AA==',
+          },
+        },
+        {
+          type: 'response.output_item.added',
+          sequence_number: 1,
+          output_index: 1,
+          item: {
+            id: 'msg_interrupted',
+            type: 'message',
+            role: 'assistant',
+            status: 'in_progress',
+            content: [],
+          },
+        },
+        {
+          type: 'response.output_text.delta',
+          sequence_number: 2,
+          output_index: 1,
+          content_index: 0,
+          item_id: 'msg_interrupted',
+          delta: 'Partial answer.',
+          logprobs: [],
+        },
+      ];
+      let streamedMessage: AIMessageChunk | undefined;
+      for (const event of events) {
+        const generation = convertResponsesDeltaToChatGenerationChunk(event);
+        if (generation == null) {
+          continue;
+        }
+        streamedMessage =
+          streamedMessage == null
+            ? (generation.message as AIMessageChunk)
+            : (streamedMessage.concat(
+                generation.message as AIMessageChunk
+            ) as AIMessageChunk);
+      }
+      expect(streamedMessage).toBeDefined();
+      const toolOutputs = streamedMessage!.additional_kwargs.tool_outputs;
+      const message =
+        imageSource === 'additional_kwargs'
+          ? streamedMessage!
+          : new AIMessage({
+            content: 'Partial answer.',
+            response_metadata: {
+              model_provider: 'openai',
+              output: toolOutputs,
+            },
+          });
+      message.response_metadata.preempted = true;
+
+      const unsafeProviderInput = convertMessagesToResponsesInput({
+        messages: [message],
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+
+      expect(JSON.stringify(unsafeProviderInput)).toContain('ig_interrupted');
+      expect(projectedMessage.response_metadata).toMatchObject({
+        model_provider: 'openai',
+        output_version: 'v1',
+        preempted: true,
+      });
+      expect(projectedMessage.content).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: 'text', text: 'Partial answer.' }),
+          { type: 'image', mimeType: 'image/png', data: 'AA==' },
+        ])
+      );
+      expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+        'ig_interrupted'
+      );
+      expect(JSON.stringify(message.toJSON())).toContain('ig_interrupted');
+
+      for (const zdrEnabled of [false, true]) {
+        const providerInput = convertMessagesToResponsesInput({
+          messages: projected,
+          zdrEnabled,
+          model: 'gpt-5.6',
+        });
+        expect(providerInput).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: 'message',
+              role: 'assistant',
+              content: expect.arrayContaining([
+                expect.objectContaining({
+                  type: 'output_text',
+                  text: 'Partial answer.',
+                }),
+                {
+                  type: 'input_image',
+                  detail: 'auto',
+                  image_url: 'data:image/png;base64,AA==',
+                },
+              ]),
+            }),
+          ])
+        );
+        expect(JSON.stringify(providerInput)).not.toContain(
+          'image_generation_call'
+        );
+        expect(JSON.stringify(providerInput)).not.toContain('ig_interrupted');
+      }
+
+      const projectedAgain =
+        projectOpenAIResponsesToolMessageContent(projected);
+      expect(projectedAgain).toBe(projected);
+      expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
+
+  it.each([
+    ['in_progress', 'AA=='],
+    ['completed', ''],
+  ] as const)(
+    'does not promote %s v0 generated image data %j',
+    (status, result) => {
+      const message = new AIMessage({
+        content: 'Partial answer.',
+        additional_kwargs: {
+          tool_outputs: [
+            {
+              id: 'ig_unusable',
+              type: 'image_generation_call',
+              status,
+              result,
+            },
+          ],
+        },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+
+      const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected as AIMessage;
+      const providerInput = convertMessagesToResponsesInput({
+        messages: [projected],
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+
+      expect(projectedMessage.response_metadata.output_version).toBeUndefined();
+      expect(JSON.stringify(providerInput)).toContain('Partial answer.');
+      expect(JSON.stringify(providerInput)).not.toContain('input_image');
+      expect(JSON.stringify(providerInput)).not.toContain('ig_unusable');
+    }
+  );
+
+  it('uses response output over stale v0 generated-image tool outputs', () => {
+    const message = new AIMessage({
+      content: [{ type: 'text', text: 'Partial answer.' }],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: 'ig_stale',
+            type: 'image_generation_call',
+            status: 'in_progress',
+            result: 'AQ==',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        output: [
+          {
+            id: 'ig_authoritative',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'AA==',
+          },
+        ],
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: [projected],
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projectedMessage.content).toEqual([
+      { type: 'text', text: 'Partial answer.' },
+      { type: 'image', mimeType: 'image/png', data: 'AA==' },
+    ]);
+    expect(JSON.stringify(providerInput)).toContain(
+      'data:image/png;base64,AA=='
+    );
+    expect(JSON.stringify(providerInput)).not.toContain('AQ==');
+    expect(JSON.stringify(providerInput)).not.toContain('ig_stale');
+    expect(JSON.stringify(providerInput)).not.toContain('ig_authoritative');
+  });
+
+  it('preserves unrelated self-contained image blocks during v0 promotion', () => {
+    const applicationImage = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'AQ==',
+      metadata: { status: 'ready' },
+    };
+    const message = new AIMessage({
+      content: [{ type: 'text', text: 'Partial answer.' }, applicationImage],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: 'ig_interrupted',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'AA==',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected as AIMessage;
+
+    expect(projectedMessage.content).toEqual([
+      { type: 'text', text: 'Partial answer.' },
+      applicationImage,
+      { type: 'image', mimeType: 'image/png', data: 'AA==' },
+    ]);
+    expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+      'ig_interrupted'
+    );
+  });
+
   it('neutralizes provider references duplicated into v1 content blocks', () => {
     const reasoning = {
       id: 'rs_interrupted',

@@ -590,14 +590,6 @@ function cloneAIMessageWithContent(
   ) as AIMessage;
 }
 
-type ResponsesReplayMetadata = {
-  [key: string]: unknown;
-  id?: unknown;
-  output?: unknown;
-  preempted?: unknown;
-  tool_outputs?: unknown;
-};
-
 function cloneAIMessageWithResponsesReplayState(
   message: AIMessage,
   content: AIMessage['content'],
@@ -688,41 +680,56 @@ function isUnsafePreemptedResponsesV1Block(
   }
 }
 
+function isProviderGeneratedImageBlock(
+  block: LangChainContentBlock.Multimodal.Image,
+  generatedImages: ReturnType<typeof getCompletedGeneratedImages>
+): boolean {
+  if (typeof block.id === 'string' && block.id.length > 0) {
+    return generatedImages.ids.has(block.id);
+  }
+  return (
+    typeof block.data === 'string' &&
+    generatedImages.data.has(block.data) &&
+    block.metadata != null &&
+    typeof block.metadata === 'object' &&
+    'status' in block.metadata
+  );
+}
+
 function projectPreemptedResponsesV1Content(
-  message: AIMessage,
-  reasoning: unknown
+  content: AIMessage['content'],
+  reasoning: unknown,
+  generatedImages?: ReturnType<typeof getCompletedGeneratedImages>,
+  originalImages?: LangChainContentBlock.Multimodal.Image[]
 ): AIMessage['content'] {
-  if (
-    message.response_metadata.output_version !== 'v1' ||
-    !Array.isArray(message.content)
-  ) {
-    return message.content;
+  if (!Array.isArray(content)) {
+    return content;
   }
 
-  const content = message.content as LangChainContentBlock.Standard[];
+  const contentBlocks = content as LangChainContentBlock.Standard[];
   const encryptedReasoning = hasReplayableEncryptedReasoning(reasoning)
     ? reasoning
     : undefined;
   let projected: LangChainContentBlock.Standard[] | undefined;
-  let hasEncryptedReasoning = content.some(
-    (block) =>
+  let hasEncryptedReasoning = false;
+  let reasoningInsertionIndex: number | undefined;
+  for (let i = 0; i < contentBlocks.length; i++) {
+    const block = contentBlocks[i];
+    if (
       block.type === 'non_standard' &&
       hasReplayableEncryptedReasoning(block.value)
-  );
-  for (let i = 0; i < content.length; i++) {
-    const block = content[i];
-    if (isUnsafePreemptedResponsesV1Block(block)) {
-      projected ??= content.slice(0, i);
-      if (
-        block.type === 'reasoning' &&
-        encryptedReasoning != null &&
-        !hasEncryptedReasoning
-      ) {
-        projected.push({
-          type: 'non_standard',
-          value: encryptedReasoning,
-        });
-        hasEncryptedReasoning = true;
+    ) {
+      hasEncryptedReasoning = true;
+    }
+    if (
+      isUnsafePreemptedResponsesV1Block(block) ||
+      (generatedImages != null &&
+        block.type === 'image' &&
+        isProviderGeneratedImageBlock(block, generatedImages))
+    ) {
+      projected ??= contentBlocks.slice(0, i);
+      if (block.type === 'reasoning') {
+        reasoningInsertionIndex ??= projected.length;
       }
       continue;
     }
@@ -730,12 +737,101 @@ function projectPreemptedResponsesV1Content(
   }
 
   if (encryptedReasoning != null && !hasEncryptedReasoning) {
-    projected = [
-      { type: 'non_standard', value: encryptedReasoning },
-      ...(projected ?? content),
-    ];
+    const reasoningBlock: LangChainContentBlock.Standard = {
+      type: 'non_standard',
+      value: encryptedReasoning,
+    };
+    if (projected != null) {
+      projected.splice(reasoningInsertionIndex ?? 0, 0, reasoningBlock);
+    } else {
+      projected = [reasoningBlock, ...contentBlocks];
+    }
   }
-  return projected ?? message.content;
+  if (originalImages != null) {
+    projected ??= [...contentBlocks];
+    for (const block of originalImages) {
+      const isGeneratedImage =
+        generatedImages != null &&
+        isProviderGeneratedImageBlock(block, generatedImages);
+      if (!isGeneratedImage) {
+        projected.push(block);
+      }
+    }
+  }
+  if (generatedImages != null) {
+    projected ??= [...contentBlocks];
+    projected.push(...generatedImages.blocks);
+  }
+  return projected ?? content;
+}
+
+function getCompletedGeneratedImages(message: AIMessage): {
+  blocks: LangChainContentBlock.Multimodal.Image[];
+  data: Set<string>;
+  ids: Set<string>;
+} {
+  const responseOutput = message.response_metadata.output;
+  const toolOutputs = message.additional_kwargs.tool_outputs;
+  const responseOutputIsAuthoritative =
+    Array.isArray(responseOutput) && responseOutput.length > 0;
+  const blocks: LangChainContentBlock.Multimodal.Image[] = [];
+  const data = new Set<string>();
+  const ids = new Set<string>();
+  const sources = [
+    [responseOutput, responseOutputIsAuthoritative],
+    [toolOutputs, !responseOutputIsAuthoritative],
+  ] as const;
+  for (const [output, isAuthoritative] of sources) {
+    for (const item of Array.isArray(output) ? output : []) {
+      if (
+        item == null ||
+        typeof item !== 'object' ||
+        !('type' in item) ||
+        item.type !== 'image_generation_call'
+      ) {
+        continue;
+      }
+      if ('id' in item && typeof item.id === 'string' && item.id.length > 0) {
+        ids.add(item.id);
+      }
+      if (
+        !('result' in item) ||
+        typeof item.result !== 'string' ||
+        item.result.length === 0
+      ) {
+        continue;
+      }
+      data.add(item.result);
+      if (isAuthoritative && 'status' in item && item.status === 'completed') {
+        blocks.push({
+          type: 'image',
+          mimeType: 'image/png',
+          data: item.result,
+        });
+      }
+    }
+  }
+  return { blocks, data, ids };
+}
+
+function getSelfContainedResponsesV0Images(
+  message: AIMessage
+): LangChainContentBlock.Multimodal.Image[] {
+  if (!Array.isArray(message.content)) {
+    return [];
+  }
+  const images: LangChainContentBlock.Multimodal.Image[] = [];
+  for (const block of message.content as LangChainContentBlock.Standard[]) {
+    if (
+      block.type === 'image' &&
+      'data' in block &&
+      ((typeof block.data === 'string' && block.data.length > 0) ||
+        (block.data instanceof Uint8Array && block.data.length > 0))
+    ) {
+      images.push(block);
+    }
+  }
+  return images;
 }
 
 /**
@@ -745,7 +841,7 @@ function projectPreemptedResponsesV1Content(
  * reasoning and the original graph/checkpoint message.
  */
 function projectPreemptedOpenAIResponsesMessage(message: AIMessage): AIMessage {
-  const metadata = message.response_metadata as ResponsesReplayMetadata;
+  const metadata = message.response_metadata;
   if (metadata.preempted !== true) {
     return message;
   }
@@ -754,9 +850,22 @@ function projectPreemptedOpenAIResponsesMessage(message: AIMessage): AIMessage {
   const hasEncryptedReasoning = hasReplayableEncryptedReasoning(
     additionalKwargs.reasoning
   );
+  const generatedImages =
+    metadata.output_version === 'v1'
+      ? undefined
+      : getCompletedGeneratedImages(message);
+  const promotesGeneratedImages = (generatedImages?.blocks.length ?? 0) > 0;
+  const originalImages =
+    promotesGeneratedImages && metadata.model_provider === 'openai'
+      ? getSelfContainedResponsesV0Images(message)
+      : undefined;
   const content = projectPreemptedResponsesV1Content(
-    message,
-    additionalKwargs.reasoning
+    metadata.output_version === 'v1' || promotesGeneratedImages
+      ? message.contentBlocks
+      : message.content,
+    additionalKwargs.reasoning,
+    promotesGeneratedImages ? generatedImages : undefined,
+    originalImages
   );
   const hasUnsafeProviderReferences =
     content !== message.content ||
@@ -778,10 +887,14 @@ function projectPreemptedOpenAIResponsesMessage(message: AIMessage): AIMessage {
   delete additionalKwargs.__openai_function_call_ids__;
   delete additionalKwargs.__openai_custom_tool_call_ids__;
 
-  const responseMetadata: ResponsesReplayMetadata = { ...metadata };
+  const responseMetadata: AIMessage['response_metadata'] = { ...metadata };
   delete responseMetadata.id;
   delete responseMetadata.output;
   delete responseMetadata.tool_outputs;
+  if (promotesGeneratedImages) {
+    responseMetadata.model_provider = 'openai';
+    responseMetadata.output_version = 'v1';
+  }
 
   return cloneAIMessageWithResponsesReplayState(
     message,
