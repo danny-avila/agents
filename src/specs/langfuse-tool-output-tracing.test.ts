@@ -510,6 +510,7 @@ describe('Langfuse tool output tracing redaction', () => {
       },
       {
         type: 'web_search_call',
+        results: [{ title: 'private web result' }],
         action: {
           type: 'search',
           queries: ['public web query'],
@@ -584,6 +585,7 @@ describe('Langfuse tool output tracing redaction', () => {
       results: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
     });
     expect(redacted[11]).toMatchObject({
+      results: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
       action: {
         type: 'search',
         queries: ['public web query'],
@@ -858,6 +860,12 @@ describe('Langfuse tool output tracing redaction', () => {
       const span = createSpan('gpt-5.6', {
         [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify([
           message.toJSON(),
+          {
+            type: 'image',
+            id: generatedById.id,
+            url: 'private-generated-image-url',
+            fileId: 'private-generated-image-file-id',
+          },
         ]),
       });
 
@@ -868,6 +876,8 @@ describe('Langfuse tool output tracing redaction', () => {
       ] as string;
       expect(redacted).not.toContain(generatedById.result);
       expect(redacted).not.toContain(generatedByDataFallback.result);
+      expect(redacted).not.toContain('private-generated-image-url');
+      expect(redacted).not.toContain('private-generated-image-file-id');
       expect(redacted).toContain('public-user-image-data');
       expect(redacted).toContain(generatedById.id);
       expect(redacted).toContain(generatedByDataFallback.id);
@@ -900,6 +910,28 @@ describe('Langfuse tool output tracing redaction', () => {
     expect(redacted).not.toContain('secret head');
     expect(redacted).not.toContain('secret tail');
     expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
+  it('preserves ordinary text that only resembles a server-tool result', () => {
+    const ordinaryText =
+      '{"serverToolResult":{"status":"draft","output":"public literal text"}}';
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: ordinaryText }],
+        },
+      ]),
+    });
+
+    redactLangfuseSpanToolOutputs(span, createConfig({ enabled: false }));
+
+    expect(
+      span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
+    ).toContain('public literal text');
+    expect(
+      span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
+    ).not.toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   });
 
   it('redacts neutralized replay results from resumed generation input', () => {

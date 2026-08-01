@@ -91,7 +91,7 @@ const RESPONSES_REPLAY_OUTPUT_DESCRIPTORS: Readonly<
   },
   web_search_call: {
     nestedOutputFields: { action: ['sources'] },
-    outputFields: [],
+    outputFields: ['results'],
     toolName: 'web_search',
   },
   tool_search_output: {
@@ -371,6 +371,48 @@ function redactStandardServerToolResult(
   };
 }
 
+function parseSerializedServerToolResultMarker(
+  text: string
+): { toolName?: string } | undefined {
+  if (!text.startsWith(SERVER_TOOL_RESULT_PREFIX)) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!isRecord(parsed) || !isRecord(parsed.serverToolResult)) {
+      return undefined;
+    }
+    const result = parsed.serverToolResult;
+    const status = getStringField(result, 'status');
+    if (
+      (status !== 'error' && status !== 'success') ||
+      !Object.prototype.hasOwnProperty.call(result, 'output')
+    ) {
+      return undefined;
+    }
+    const toolName = getStringField(result, 'toolName');
+    return toolName != null ? { toolName } : {};
+  } catch {
+    const match =
+      /^\{"serverToolResult":\{(?:"toolName":("(?:\\.|[^"\\])*"),)?"status":"(?:error|success)","output":/.exec(
+        text.slice(0, 512)
+      );
+    if (match == null) {
+      return undefined;
+    }
+    const encodedToolName = match.at(1);
+    if (encodedToolName == null) {
+      return {};
+    }
+    try {
+      const toolName = JSON.parse(encodedToolName) as unknown;
+      return typeof toolName === 'string' ? { toolName } : {};
+    } catch {
+      return {};
+    }
+  }
+}
+
 function redactMarkedServerToolResult(
   value: Record<string, unknown>,
   config: ResolvedLangfuseToolOutputTracingConfig
@@ -384,25 +426,14 @@ function redactMarkedServerToolResult(
   const marker = isRecord(extras)
     ? extras.librechatServerToolResult
     : undefined;
-  const hasSerializedMarker =
-    text?.startsWith(SERVER_TOOL_RESULT_PREFIX) === true;
-  if (!isRecord(marker) && !hasSerializedMarker) {
+  const serializedMarker =
+    text != null ? parseSerializedServerToolResultMarker(text) : undefined;
+  if (!isRecord(marker) && serializedMarker == null) {
     return undefined;
   }
-  let toolName = isRecord(marker)
+  const toolName = isRecord(marker)
     ? getStringField(marker, 'toolName')
-    : undefined;
-  if (toolName == null && hasSerializedMarker) {
-    try {
-      const parsed = JSON.parse(text) as unknown;
-      if (isRecord(parsed) && isRecord(parsed.serverToolResult)) {
-        toolName = getStringField(parsed.serverToolResult, 'toolName');
-      }
-    } catch {
-      const match = /"toolName":"([^"\\]+)"/.exec(text.slice(0, 256));
-      toolName = match?.[1];
-    }
-  }
+    : serializedMarker?.toolName;
   if (!shouldRedactTool(toolName, config)) {
     return undefined;
   }
@@ -443,10 +474,15 @@ function redactGeneratedImageBlock(
   if (!isGeneratedImage) {
     return undefined;
   }
-  return {
-    value: { ...value, data: config.redactionText },
-    changed: true,
-  };
+  const redacted = { ...value };
+  let changed = false;
+  for (const outputField of ['data', 'url', 'fileId']) {
+    if (outputField in redacted) {
+      redacted[outputField] = config.redactionText;
+      changed = true;
+    }
+  }
+  return changed ? { value: redacted, changed: true } : undefined;
 }
 
 function collectRedactionContext(
