@@ -584,6 +584,75 @@ const RESPONSES_REPLAY_OUTPUT_ITEM_TYPES = new Set([
   'program_output',
 ]);
 
+function isResponsesReplayOutputItem(item: unknown): boolean {
+  return (
+    typeof item === 'object' &&
+    item != null &&
+    'type' in item &&
+    typeof item.type === 'string' &&
+    RESPONSES_REPLAY_OUTPUT_ITEM_TYPES.has(item.type)
+  );
+}
+
+/**
+ * LangChain's Responses converter places the authoritative terminal output in
+ * response_metadata.output. Its chunk merge has no way to delete provisional
+ * tool_outputs, so remove only our preemption-only captures once that terminal
+ * output arrives. A stream that is interrupted has no terminal chunk and keeps
+ * the captures for replay.
+ */
+class ResponsesReplayAIMessageChunk extends AIMessageChunk {
+  override get lc_id(): string[] {
+    return [...this.lc_namespace, AIMessageChunk.lc_name()];
+  }
+
+  override concat(chunk: AIMessageChunk): this {
+    const combined = super.concat(chunk);
+    if (!Array.isArray(combined.response_metadata.output)) {
+      return combined;
+    }
+    const toolOutputs = combined.additional_kwargs.tool_outputs;
+    if (!Array.isArray(toolOutputs)) {
+      return combined;
+    }
+    const retainedToolOutputs = toolOutputs.filter(
+      (item) => !isResponsesReplayOutputItem(item)
+    );
+    if (retainedToolOutputs.length === toolOutputs.length) {
+      return combined;
+    }
+    const additionalKwargs = { ...combined.additional_kwargs };
+    if (retainedToolOutputs.length > 0) {
+      additionalKwargs.tool_outputs = retainedToolOutputs;
+    } else {
+      delete additionalKwargs.tool_outputs;
+    }
+    combined.additional_kwargs = additionalKwargs;
+    return combined;
+  }
+}
+
+function makeResponsesReplayAggregationSafe(
+  chunk: ChatGenerationChunk
+): ChatGenerationChunk {
+  if (!AIMessageChunk.isInstance(chunk.message)) {
+    return chunk;
+  }
+  const message = chunk.message;
+  chunk.message = new ResponsesReplayAIMessageChunk({
+    id: message.id,
+    name: message.name,
+    content: message.content,
+    additional_kwargs: message.additional_kwargs,
+    response_metadata: message.response_metadata,
+    tool_calls: message.tool_calls,
+    invalid_tool_calls: message.invalid_tool_calls,
+    tool_call_chunks: message.tool_call_chunks,
+    usage_metadata: message.usage_metadata,
+  });
+  return chunk;
+}
+
 function remapResponsesTextBlockIndex(
   chunk: ChatGenerationChunk,
   event: OpenAIClient.Responses.ResponseStreamEvent,
@@ -740,16 +809,16 @@ async function* convertLibreChatResponsesStream(
       if (options.signal?.aborted === true) {
         return;
       }
-      const chunk =
+      const convertedChunk =
         convertResponsesDeltaToChatGenerationChunk(event) ??
         convertDroppedResponsesReplayOutput(event);
-      if (chunk == null) {
+      if (convertedChunk == null) {
         continue;
       }
+      const chunk = makeResponsesReplayAggregationSafe(convertedChunk);
       remapResponsesTextBlockIndex(chunk, event, responsesTextBlockIndices);
       attachResponsesReplayPosition(chunk, event, seenReplayPositions);
       attachCacheWriteUsage(chunk.message);
-      yield chunk;
       await runManager?.handleLLMNewToken(
         chunk.text || '',
         {
@@ -761,6 +830,7 @@ async function* convertLibreChatResponsesStream(
         undefined,
         { chunk }
       );
+      yield chunk;
     }
   } catch (e) {
     throw wrapOpenAIClientError(e);
