@@ -1133,6 +1133,49 @@ describe('ChatOpenAIResponses streaming callback dispatch', () => {
 
     expect(events).toEqual(['callback:visible chunk', 'yield:visible chunk']);
   });
+
+  it('propagates an abort received with the next buffered event', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = responsesOf<ResponsesStreamDelegate>(model);
+    const controller = new AbortController();
+    const abortReason = new Error('buffered Responses stream aborted');
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 0,
+          content_index: 0,
+          item_id: 'msg_abort',
+          delta: 'partial',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        controller.abort(abortReason);
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 1,
+          output_index: 0,
+          content_index: 0,
+          item_id: 'msg_abort',
+          delta: ' must not complete normally',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    const stream = responses._streamResponseChunks([new HumanMessage('test')], {
+      signal: controller.signal,
+    });
+
+    await expect(stream.next()).resolves.toMatchObject({
+      done: false,
+      value: { text: 'partial' },
+    });
+    await expect(stream.next()).rejects.toBe(abortReason);
+  });
 });
 
 describe('ChatOpenAICompletions reasoning_content compatibility', () => {

@@ -442,15 +442,19 @@ function synthesizeSealedUsage(
   const inputTokens =
     (countSealedTokens(context, metadata, prompt) ?? 0) +
     sealedInstructionOverhead(context, metadata);
-  chunk.usage_metadata = {
+  const usageMetadata = {
     input_tokens: inputTokens,
     output_tokens: outputTokens,
     total_tokens: inputTokens + outputTokens,
   };
-  chunk.response_metadata = {
+  chunk.usage_metadata = usageMetadata;
+  chunk.lc_kwargs.usage_metadata = usageMetadata;
+  const responseMetadata = {
     ...chunk.response_metadata,
     estimated_usage: true,
   };
+  chunk.response_metadata = responseMetadata;
+  chunk.lc_kwargs.response_metadata = responseMetadata;
 }
 
 function getMessageText(chunk: AIMessageChunk): string {
@@ -865,10 +869,12 @@ export async function attemptInvoke(
     }
 
     if (preempted && finalChunk != null) {
-      finalChunk.response_metadata = {
+      const responseMetadata = {
         ...finalChunk.response_metadata,
         preempted: true,
       };
+      finalChunk.response_metadata = responseMetadata;
+      finalChunk.lc_kwargs.response_metadata = responseMetadata;
       await endSealedModelRun(
         context,
         finalChunk,

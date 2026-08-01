@@ -684,11 +684,13 @@ function remapResponsesTextBlockIndex(
     blockIndex = textBlockIndices.size;
     textBlockIndices.set(key, blockIndex);
   }
-  chunk.message.content = chunk.message.content.map((block) =>
+  const content = chunk.message.content.map((block) =>
     typeof block === 'object' && block.type === 'text'
       ? { ...block, index: blockIndex }
       : block
   );
+  chunk.message.content = content;
+  chunk.message.lc_kwargs.content = content;
 }
 
 function convertDroppedResponsesReplayOutput(
@@ -744,6 +746,17 @@ function attachResponsesReplayPosition(
     };
   } else if (
     event.type === 'response.output_item.added' &&
+    event.item.type === 'message' &&
+    typeof event.item.id === 'string' &&
+    event.item.id.length > 0
+  ) {
+    position = {
+      itemId: event.item.id,
+      kind: 'message',
+      outputIndex: event.output_index,
+    };
+  } else if (
+    event.type === 'response.output_item.added' &&
     event.item.type === 'reasoning' &&
     typeof event.item.id === 'string' &&
     event.item.id.length > 0
@@ -787,13 +800,15 @@ function attachResponsesReplayPosition(
   const existing = chunk.message.additional_kwargs[
     OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
   ] as unknown;
-  chunk.message.additional_kwargs = {
+  const additionalKwargs = {
     ...chunk.message.additional_kwargs,
     [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
       ...(Array.isArray(existing) ? existing : []),
       position,
     ],
   };
+  chunk.message.additional_kwargs = additionalKwargs;
+  chunk.message.lc_kwargs.additional_kwargs = additionalKwargs;
 }
 
 async function* convertLibreChatResponsesStream(
@@ -805,9 +820,7 @@ async function* convertLibreChatResponsesStream(
   const responsesTextBlockIndices = new Map<string, number>();
   try {
     for await (const event of stream) {
-      if (options.signal?.aborted === true) {
-        return;
-      }
+      options.signal?.throwIfAborted();
       const convertedChunk =
         convertResponsesDeltaToChatGenerationChunk(event) ??
         convertDroppedResponsesReplayOutput(event);

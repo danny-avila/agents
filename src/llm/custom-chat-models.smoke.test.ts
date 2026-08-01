@@ -467,8 +467,20 @@ describe('custom chat model class smoke tests', () => {
           } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
         }
         yield {
-          type: 'response.output_text.delta',
+          type: 'response.output_item.added',
           sequence_number: items.length,
+          output_index: items.length,
+          item: {
+            id: 'msg_partial',
+            type: 'message',
+            role: 'assistant',
+            status: 'in_progress',
+            content: [],
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: items.length + 1,
           output_index: items.length,
           content_index: 0,
           item_id: 'msg_partial',
@@ -477,7 +489,7 @@ describe('custom chat model class smoke tests', () => {
         } as OpenAIClient.Responses.ResponseStreamEvent;
         yield {
           type: 'response.output_text.delta',
-          sequence_number: items.length + 1,
+          sequence_number: items.length + 2,
           output_index: items.length,
           content_index: 0,
           item_id: 'msg_partial',
@@ -497,7 +509,7 @@ describe('custom chat model class smoke tests', () => {
       undefined
     );
 
-    expect(chunks).toHaveLength(items.length + 2);
+    expect(chunks).toHaveLength(items.length + 3);
     expect(combined?.text).toBe('Partial answer.');
     expect(combined?.additional_kwargs.tool_outputs).toEqual(items);
     expect(
@@ -509,10 +521,64 @@ describe('custom chat model class smoke tests', () => {
         outputIndex,
       })),
       {
+        itemId: 'msg_partial',
+        kind: 'message',
+        outputIndex: items.length,
+      },
+      {
         contentIndex: 0,
         itemId: 'msg_partial',
         kind: 'text',
         outputIndex: items.length,
+      },
+    ]);
+  });
+
+  it('rehydrates one-chunk Responses replay ordering from constructor kwargs', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingOpenAIResponsesDelegate }
+    ).responses;
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 3,
+          content_index: 2,
+          item_id: 'msg_one_chunk',
+          delta: 'Partial answer.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    const stream = await model.stream([new HumanMessage('answer')]);
+    const result = await stream.next();
+    expect(result.done).toBe(false);
+    const chunk = result.value as AIMessageChunk;
+    const serializedFields = JSON.parse(
+      JSON.stringify(chunk.lc_kwargs)
+    ) as ConstructorParameters<typeof AIMessageChunk>[0];
+    const rehydrated = new AIMessageChunk(serializedFields);
+
+    expect(chunk.content).toEqual([
+      { type: 'text', text: 'Partial answer.', index: 0 },
+    ]);
+    expect(rehydrated.content).toEqual([
+      { type: 'text', text: 'Partial answer.', index: 0 },
+    ]);
+    expect(
+      rehydrated.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]
+    ).toEqual([
+      {
+        contentIndex: 2,
+        itemId: 'msg_one_chunk',
+        kind: 'text',
+        outputIndex: 3,
       },
     ]);
   });

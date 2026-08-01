@@ -6,13 +6,14 @@
  * the dispatch-synchronous loop in `attemptInvoke` (no registered
  * CHAT_MODEL_STREAM handler), which is the only loop allowed to seal.
  */
-import { HumanMessage } from '@langchain/core/messages';
 import { RunnableBinding } from '@langchain/core/runnables';
+import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
 import {
   type OpenAIClient,
   convertMessagesToResponsesInput,
   convertResponsesDeltaToChatGenerationChunk,
 } from '@langchain/openai';
+import type { ChatGeneration, LLMResult } from '@langchain/core/outputs';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { HookCallback } from '@/hooks/types';
 import type * as t from '@/types';
@@ -335,6 +336,43 @@ describe('cooperative seal (end-to-end via Run)', () => {
     expect(run.Graph?.preemptSealCount).toBe(1);
     expect(starts).toBe(2);
     expect(ends).toBe(2);
+  });
+
+  it('preserves the preempted marker through constructor-kwargs rehydration', async () => {
+    let sealedChunk: AIMessageChunk | undefined;
+    const run = await createSealRun({
+      runId: 'seal-serialized-preempted-marker',
+      hook: async () => ({ preventContinuation: true }),
+      responses: [FULL_RESPONSE],
+      modelCallbacks: [
+        {
+          handleLLMEnd(output: LLMResult): void {
+            const generation = output.generations[0]?.[0] as
+              | ChatGeneration
+              | undefined;
+            const message = generation?.message;
+            if (
+              AIMessageChunk.isInstance(message) &&
+              message.response_metadata.preempted === true
+            ) {
+              sealedChunk = message;
+            }
+          },
+        },
+      ],
+    });
+
+    await run.processStream(
+      { messages: [new HumanMessage('hello there')] },
+      streamConfig
+    );
+
+    expect(sealedChunk).toBeDefined();
+    const serializedFields = JSON.parse(
+      JSON.stringify(sealedChunk!.lc_kwargs)
+    ) as ConstructorParameters<typeof AIMessageChunk>[0];
+    const rehydrated = new AIMessageChunk(serializedFields);
+    expect(rehydrated.response_metadata.preempted).toBe(true);
   });
 
   it('a halting boundary stops multi-agent successors, not just the sealed subgraph', async () => {

@@ -2638,14 +2638,27 @@ describe('formatAgentMessages', () => {
   });
 
   it.each([
-    ['data URL', 'data:image/png;base64,AQ=='],
-    ['HTTPS URL', 'https://example.com/application-image.png'],
+    [
+      'data URL',
+      { url: 'data:image/png;base64,AQ==' },
+      'data:image/png;base64,AQ==',
+    ],
+    [
+      'HTTPS URL',
+      { url: 'https://example.com/application-image.png' },
+      'https://example.com/application-image.png',
+    ],
+    [
+      'file ID',
+      { fileId: 'file_application_image' },
+      '"file_id":"file_application_image"',
+    ],
   ])(
     'preserves an unrelated v0 application image backed by a %s',
-    (_label, url) => {
+    (_label, source, providerFragment) => {
       const applicationImage = {
         type: 'image' as const,
-        url,
+        ...source,
         metadata: { source: 'application' },
       };
       const providerImage = {
@@ -2677,6 +2690,11 @@ describe('formatAgentMessages', () => {
       });
 
       const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+      const providerInput = convertMessagesToResponsesInput({
+        messages: [projected],
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
 
       expect(projected.content).toEqual([
         applicationImage,
@@ -2691,6 +2709,7 @@ describe('formatAgentMessages', () => {
       expect(JSON.stringify(projected.toJSON())).not.toContain(
         providerImage.id
       );
+      expect(JSON.stringify(providerInput)).toContain(providerFragment);
     }
   );
 
@@ -2734,6 +2753,79 @@ describe('formatAgentMessages', () => {
         extras: IMAGE_GENERATION_REPLAY_EXTRAS,
       },
     ]);
+  });
+
+  it.each([
+    ['an earlier replay item before a leading image', true],
+    ['a trailing image before a later replay item', false],
+  ] as const)('keeps %s during v0 promotion', (_label, imageFirst) => {
+    const applicationImage = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'AQ==',
+    };
+    const narration = { type: 'text' as const, text: 'Narration.' };
+    const generatedImage = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'Ag==',
+      extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+    };
+    const generatedImageId = `ig_${imageFirst ? 'before' : 'after'}_image`;
+    const message = new AIMessage({
+      content: imageFirst
+        ? [applicationImage, narration]
+        : [narration, applicationImage],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: generatedImageId,
+            type: 'image_generation_call',
+            status: 'completed',
+            result: generatedImage.data,
+          },
+        ],
+        [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: imageFirst
+          ? [
+            {
+              itemId: generatedImageId,
+              kind: 'output',
+              outputIndex: 0,
+            },
+            {
+              itemId: 'msg_after_image',
+              kind: 'text',
+              outputIndex: 1,
+              contentIndex: 0,
+            },
+          ]
+          : [
+            {
+              itemId: 'msg_before_image',
+              kind: 'text',
+              outputIndex: 0,
+              contentIndex: 0,
+            },
+            {
+              itemId: generatedImageId,
+              kind: 'output',
+              outputIndex: 1,
+            },
+          ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+
+    expect(projected.content).toEqual(
+      imageFirst
+        ? [generatedImage, applicationImage, narration]
+        : [narration, applicationImage, generatedImage]
+    );
   });
 
   it('restores v0 image positions before appending a generated image', () => {
@@ -2860,6 +2952,23 @@ describe('formatAgentMessages', () => {
       content: [applicationImage],
       additional_kwargs: {
         reasoning,
+        [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+          {
+            itemId: reasoning.id,
+            kind: 'reasoning',
+            outputIndex: 0,
+          },
+          {
+            itemId: 'msg_image_only',
+            kind: 'message',
+            outputIndex: 1,
+          },
+          {
+            itemId: 'ig_image_only',
+            kind: 'output',
+            outputIndex: 2,
+          },
+        ],
         tool_outputs: [
           {
             id: 'ig_image_only',

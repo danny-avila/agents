@@ -674,7 +674,7 @@ export const OPENAI_RESPONSES_REPLAY_POSITIONS_KEY =
 export type ResponsesReplayPosition = {
   contentIndex?: number;
   itemId: string;
-  kind: 'output' | 'reasoning' | 'text';
+  kind: 'message' | 'output' | 'reasoning' | 'text';
   outputIndex: number;
 };
 
@@ -686,9 +686,11 @@ type CompletedGeneratedImages = {
 
 type ResponsesReplayArtifacts = {
   generatedImages: CompletedGeneratedImages;
+  messagePositions: ResponsesReplayPosition[];
   positionsByItemId: Map<string, ResponsesReplayItemPosition>;
   positionedServerToolResultIds: Set<string>;
   serverToolResults: PositionedResponsesReplayBlock[];
+  textPositions: ResponsesReplayPosition[];
 };
 
 type ResponsesReplayItemPosition = Pick<
@@ -823,7 +825,9 @@ function projectPreemptedResponsesV1Content(
   originalImages?: PositionedResponsesImages,
   serverToolResults?: PositionedResponsesReplayBlock[],
   positionedServerToolResultIds?: ReadonlySet<string>,
-  reasoningPosition?: ResponsesReplayItemPosition
+  reasoningPosition?: ResponsesReplayItemPosition,
+  textPositions?: readonly ResponsesReplayPosition[],
+  messagePositions?: readonly ResponsesReplayPosition[]
 ): {
   content: AIMessage['content'];
   preservedServerToolResult: boolean;
@@ -888,7 +892,10 @@ function projectPreemptedResponsesV1Content(
     }
   };
 
-  const appendReplayBlocks = (throughTextIndex?: number): void => {
+  const appendReplayBlocks = (
+    throughTextIndex?: number,
+    beforeOutputIndex?: number
+  ): void => {
     for (;;) {
       const generatedImage = generatedImages?.blocks[generatedImageIndex];
       const serverToolResult = serverToolResults?.[serverToolResultIndex];
@@ -920,6 +927,12 @@ function projectPreemptedResponsesV1Content(
       ) {
         return;
       }
+      if (
+        beforeOutputIndex != null &&
+        positionedResult.outputIndex >= beforeOutputIndex
+      ) {
+        return;
+      }
       if (selected.kind === 'generatedImage') {
         generatedImageIndex++;
       } else if (selected.kind === 'serverToolResult') {
@@ -941,6 +954,28 @@ function projectPreemptedResponsesV1Content(
       changed = true;
       preservedServerToolResult ||= selected.kind === 'serverToolResult';
     }
+  };
+
+  const appendPositionedOriginalImages = (throughTextIndex?: number): void => {
+    const nextOriginalImage = originalImages?.blocks[originalImageIndex];
+    if (
+      nextOriginalImage == null ||
+      (throughTextIndex != null &&
+        nextOriginalImage.textIndex > throughTextIndex)
+    ) {
+      return;
+    }
+    const followingTextPosition = textPositions?.[nextOriginalImage.textIndex];
+    const imageOnlyMessagePosition =
+      originalImages?.textCount === 0 ? messagePositions?.[0] : undefined;
+    const outputBoundary = followingTextPosition ?? imageOnlyMessagePosition;
+    if (outputBoundary != null) {
+      appendReplayBlocks(
+        nextOriginalImage.textIndex,
+        outputBoundary.outputIndex
+      );
+    }
+    appendOriginalImages(throughTextIndex);
   };
 
   for (let i = 0; i < contentBlocks.length; i++) {
@@ -972,7 +1007,7 @@ function projectPreemptedResponsesV1Content(
       continue;
     }
     if (block.type === 'text') {
-      appendOriginalImages(sourceTextIndex);
+      appendPositionedOriginalImages(sourceTextIndex);
       appendReplayBlocks(sourceTextIndex);
       if (replayProjection === 'fallback') {
         projected.push({ type: 'text', text: block.text });
@@ -984,7 +1019,7 @@ function projectPreemptedResponsesV1Content(
       continue;
     }
     if (originalImages != null && sourceTextIndex >= originalImages.textCount) {
-      appendOriginalImages();
+      appendPositionedOriginalImages();
     }
     if (
       block.type === 'server_tool_call' ||
@@ -1048,7 +1083,7 @@ function projectPreemptedResponsesV1Content(
     projected.splice(reasoningInsertionIndex ?? 0, 0, reasoningBlock);
     changed = true;
   }
-  appendOriginalImages();
+  appendPositionedOriginalImages();
   appendReplayBlocks();
   return {
     content: changed ? toLangChainContent(projected) : content,
@@ -1073,7 +1108,8 @@ function isResponsesReplayPosition(
   }
   const position = value as Partial<ResponsesReplayPosition>;
   return (
-    (position.kind === 'output' ||
+    (position.kind === 'message' ||
+      position.kind === 'output' ||
       position.kind === 'reasoning' ||
       position.kind === 'text') &&
     typeof position.itemId === 'string' &&
@@ -1155,11 +1191,19 @@ function getResponsesReplayArtifacts(
     ? replayPositionValue.filter(isResponsesReplayPosition)
     : [];
   const authoritativeOutputIndicesByItemId = new Map<string, number>();
+  const messagePositionsByKey = new Map<string, ResponsesReplayPosition>();
   const outputPositionsByItemId = new Map<string, ResponsesReplayPosition>();
   const textPositionsByKey = new Map<string, ResponsesReplayPosition>();
   for (const position of replayPositions) {
     if (position.kind === 'output' || position.kind === 'reasoning') {
       outputPositionsByItemId.set(position.itemId, position);
+      continue;
+    }
+    if (position.kind === 'message') {
+      messagePositionsByKey.set(
+        `${position.itemId}:${position.outputIndex}`,
+        position
+      );
       continue;
     }
     textPositionsByKey.set(
@@ -1183,6 +1227,15 @@ function getResponsesReplayArtifacts(
       continue;
     }
     hasAuthoritativeMessage = true;
+    const messageItemId =
+      'id' in item && typeof item.id === 'string'
+        ? item.id
+        : `message-${outputIndex}`;
+    messagePositionsByKey.set(`${messageItemId}:${outputIndex}`, {
+      itemId: messageItemId,
+      kind: 'message',
+      outputIndex,
+    });
     if (!('content' in item) || !Array.isArray(item.content)) {
       continue;
     }
@@ -1228,6 +1281,9 @@ function getResponsesReplayArtifacts(
     (a, b) =>
       a.outputIndex - b.outputIndex ||
       (a.contentIndex ?? 0) - (b.contentIndex ?? 0)
+  );
+  const messagePositions = [...messagePositionsByKey.values()].sort(
+    (a, b) => a.outputIndex - b.outputIndex
   );
   const textCountBeforeOutputIndex = new Map<number, number>();
   const positionedOutputIndexSet = new Set<number>();
@@ -1556,11 +1612,13 @@ function getResponsesReplayArtifacts(
       data,
       ids,
     },
+    messagePositions,
     positionedServerToolResultIds,
     positionsByItemId,
     serverToolResults: serverToolResults.sort(
       comparePositionedResponsesReplayBlocks
     ),
+    textPositions,
   };
 }
 
@@ -1581,9 +1639,12 @@ function getSelfContainedResponsesV0Images(
     }
     if (
       block.type === 'image' &&
-      (('url' in block &&
-        typeof block.url === 'string' &&
-        block.url.length > 0) ||
+      (('fileId' in block &&
+        typeof block.fileId === 'string' &&
+        block.fileId.length > 0) ||
+        ('url' in block &&
+          typeof block.url === 'string' &&
+          block.url.length > 0) ||
         ('data' in block &&
           ((typeof block.data === 'string' && block.data.length > 0) ||
             (block.data instanceof Uint8Array && block.data.length > 0))))
@@ -1666,9 +1727,11 @@ function projectPreemptedOpenAIResponsesMessage(
   const authoritativeOutput = getAuthoritativeResponsesOutput(message);
   const {
     generatedImages,
+    messagePositions,
     positionedServerToolResultIds,
     positionsByItemId,
     serverToolResults,
+    textPositions,
   } = getResponsesReplayArtifacts(
     authoritativeOutput,
     maxChars,
@@ -1711,7 +1774,9 @@ function projectPreemptedOpenAIResponsesMessage(
     originalImages,
     serverToolResults,
     positionedServerToolResultIds,
-    reasoningPosition
+    reasoningPosition,
+    textPositions,
+    messagePositions
   );
   const promotesV0 =
     !isV1 &&
