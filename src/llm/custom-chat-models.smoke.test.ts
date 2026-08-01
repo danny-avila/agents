@@ -537,6 +537,10 @@ describe('custom chat model class smoke tests', () => {
         id: 'local_output_item',
         type: 'local_shell_call_output',
         status: 'completed',
+        output: 'stale provisional local output',
+      } as const;
+      const authoritativeReplayOutput = {
+        ...provisionalReplayOutput,
         output: 'unique authoritative local output',
       } as const;
       responses.completionWithRetry = async () =>
@@ -559,7 +563,7 @@ describe('custom chat model class smoke tests', () => {
             response: {
               id: 'resp_terminal',
               model: 'gpt-5',
-              output: [streamedToolOutput, provisionalReplayOutput],
+              output: [streamedToolOutput, authoritativeReplayOutput],
               status:
                 terminalType === 'response.completed'
                   ? 'completed'
@@ -594,7 +598,7 @@ describe('custom chat model class smoke tests', () => {
       ]);
       expect(combined?.response_metadata.output).toEqual([
         streamedToolOutput,
-        provisionalReplayOutput,
+        authoritativeReplayOutput,
       ]);
       expect(combined?.toJSON()).toEqual(
         expect.objectContaining({
@@ -604,9 +608,21 @@ describe('custom chat model class smoke tests', () => {
       expect(
         JSON.stringify(combined).match(/unique authoritative local output/g)
       ).toHaveLength(1);
+      expect(JSON.stringify(combined)).not.toContain(
+        'stale provisional local output'
+      );
+      expect(JSON.stringify(combined?.lc_kwargs)).not.toContain(
+        'stale provisional local output'
+      );
+      expect(combined?.lc_kwargs.additional_kwargs).toEqual(
+        expect.objectContaining({ tool_outputs: [streamedToolOutput] })
+      );
       expect(
         JSON.stringify(tracedResult).match(/unique authoritative local output/g)
       ).toHaveLength(1);
+      expect(JSON.stringify(tracedResult)).not.toContain(
+        'stale provisional local output'
+      );
     }
   );
 

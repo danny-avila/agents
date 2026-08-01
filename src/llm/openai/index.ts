@@ -621,13 +621,11 @@ class ResponsesReplayAIMessageChunk extends AIMessageChunk {
     if (retainedToolOutputs.length === toolOutputs.length) {
       return combined;
     }
-    const additionalKwargs = { ...combined.additional_kwargs };
     if (retainedToolOutputs.length > 0) {
-      additionalKwargs.tool_outputs = retainedToolOutputs;
+      combined.additional_kwargs.tool_outputs = retainedToolOutputs;
     } else {
-      delete additionalKwargs.tool_outputs;
+      delete combined.additional_kwargs.tool_outputs;
     }
-    combined.additional_kwargs = additionalKwargs;
     return combined;
   }
 }
