@@ -586,6 +586,111 @@ describe('custom chat model class smoke tests', () => {
     expect(resultIndex).toBeLessThan(secondIndex);
   });
 
+  it('keeps streamed generated images and server results in cross-item order', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingOpenAIResponsesDelegate }
+    ).responses;
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 0,
+          content_index: 0,
+          item_id: 'msg_first',
+          delta: 'First narration.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_item.done',
+          sequence_number: 1,
+          output_index: 1,
+          item: {
+            id: 'ig_middle',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'AA==',
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_item.done',
+          sequence_number: 2,
+          output_index: 2,
+          item: {
+            id: 'local_middle',
+            type: 'local_shell_call_output',
+            status: 'completed',
+            output: 'middle server result',
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 3,
+          output_index: 3,
+          content_index: 0,
+          item_id: 'msg_second',
+          delta: 'Second narration.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    let combined: AIMessageChunk | undefined;
+    const stream = await model.stream([new HumanMessage('generate and run')]);
+    for await (const chunk of stream) {
+      combined =
+        combined == null
+          ? (chunk as AIMessageChunk)
+          : (combined.concat(chunk as AIMessageChunk) as AIMessageChunk);
+    }
+    expect(combined).toBeDefined();
+    expect(
+      combined!.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]
+    ).toEqual([
+      {
+        contentIndex: 0,
+        itemId: 'msg_first',
+        kind: 'text',
+        outputIndex: 0,
+      },
+      { itemId: 'ig_middle', kind: 'output', outputIndex: 1 },
+      { itemId: 'local_middle', kind: 'output', outputIndex: 2 },
+      {
+        contentIndex: 0,
+        itemId: 'msg_second',
+        kind: 'text',
+        outputIndex: 3,
+      },
+    ]);
+    combined!.response_metadata.preempted = true;
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([combined!]);
+    const providerInput = convertMessagesToResponsesInput({
+      messages: [projected],
+      model: 'gpt-5',
+      zdrEnabled: false,
+    });
+    const serialized = JSON.stringify(providerInput);
+    const firstIndex = serialized.indexOf('First narration.');
+    const imageIndex = serialized.indexOf('data:image/png;base64,AA==');
+    const resultIndex = serialized.indexOf('middle server result');
+    const secondIndex = serialized.indexOf('Second narration.');
+
+    expect(firstIndex).toBeGreaterThanOrEqual(0);
+    expect(firstIndex).toBeLessThan(imageIndex);
+    expect(imageIndex).toBeLessThan(resultIndex);
+    expect(resultIndex).toBeLessThan(secondIndex);
+    expect(serialized).not.toContain('ig_middle');
+    expect(serialized).not.toContain('local_middle');
+    expect(projected.additional_kwargs).not.toHaveProperty(
+      OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+    );
+  });
+
   it('keeps Azure client customization and gates reasoning to reasoning models', () => {
     const model = new AzureChatOpenAI({
       ...baseAzureFields,

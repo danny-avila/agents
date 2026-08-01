@@ -37,6 +37,7 @@ import type { BindToolsInput } from '@langchain/core/language_models/chat_models
 import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
+import type { ResponsesReplayPosition } from '@/messages/core';
 import type { SeenScalarMetadata } from './streamMetadata';
 import type { HeaderValue, HeadersLike } from './types';
 import type { PromptCacheTtl } from '@/messages/cache';
@@ -582,13 +583,6 @@ const RESPONSES_REPLAY_OUTPUT_ITEM_TYPES = new Set([
   'apply_patch_call_output',
   'program_output',
 ]);
-
-type ResponsesReplayPosition = {
-  contentIndex?: number;
-  itemId: string;
-  kind: 'output' | 'text';
-  outputIndex: number;
-};
 
 function remapResponsesTextBlockIndex(
   chunk: ChatGenerationChunk,

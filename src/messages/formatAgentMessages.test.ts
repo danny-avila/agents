@@ -44,6 +44,13 @@ type AnthropicPayloadBlock = {
   type: string;
 };
 
+const CODE_INTERPRETER_REPLAY_EXTRAS = {
+  librechatServerToolResult: { toolName: 'code_interpreter' },
+} as const;
+const IMAGE_GENERATION_REPLAY_EXTRAS = {
+  librechatServerToolResult: { toolName: 'image_generation' },
+} as const;
+
 const getAnthropicPayloadBlocks = (
   content: unknown
 ): AnthropicPayloadBlock[] => {
@@ -2224,7 +2231,12 @@ describe('formatAgentMessages', () => {
       expect(projectedMessage.content).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ type: 'text', text: 'Partial answer.' }),
-          { type: 'image', mimeType: 'image/png', data: 'AA==' },
+          {
+            type: 'image',
+            mimeType: 'image/png',
+            data: 'AA==',
+            extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+          },
         ])
       );
       expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
@@ -2270,6 +2282,137 @@ describe('formatAgentMessages', () => {
     }
   );
 
+  it('keeps completed v1 generated images in their Responses output positions', () => {
+    const firstGeneratedImage = {
+      id: 'ig_before_text',
+      type: 'image_generation_call',
+      status: 'completed',
+      result: 'AA==',
+    };
+    const secondGeneratedImage = {
+      id: 'ig_between_text',
+      type: 'image_generation_call',
+      status: 'completed',
+      result: 'AQ==',
+    };
+    const message = new AIMessage({
+      content: [
+        {
+          type: 'image',
+          mimeType: 'image/png',
+          data: firstGeneratedImage.result,
+          id: firstGeneratedImage.id,
+          metadata: { status: 'completed' },
+        },
+        { type: 'text', text: 'The image above is the first result.' },
+        {
+          type: 'image',
+          mimeType: 'image/png',
+          data: secondGeneratedImage.result,
+          id: secondGeneratedImage.id,
+          metadata: { status: 'completed' },
+        },
+        { type: 'text', text: 'The second image is directly above.' },
+      ],
+      response_metadata: {
+        model_provider: 'openai',
+        output_version: 'v1',
+        preempted: true,
+        output: [
+          firstGeneratedImage,
+          {
+            id: 'msg_first_narration',
+            type: 'message',
+            role: 'assistant',
+            status: 'completed',
+            content: [
+              {
+                type: 'output_text',
+                text: 'The image above is the first result.',
+                annotations: [],
+              },
+            ],
+          },
+          secondGeneratedImage,
+          {
+            id: 'msg_second_narration',
+            type: 'message',
+            role: 'assistant',
+            status: 'in_progress',
+            content: [
+              {
+                type: 'output_text',
+                text: 'The second image is directly above.',
+                annotations: [],
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projectedMessage.content).toEqual([
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+      { type: 'text', text: 'The image above is the first result.' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AQ==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+      { type: 'text', text: 'The second image is directly above.' },
+    ]);
+    expect(providerInput).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [
+          {
+            type: 'input_image',
+            detail: 'auto',
+            image_url: 'data:image/png;base64,AA==',
+          },
+          {
+            type: 'output_text',
+            text: 'The image above is the first result.',
+            annotations: [],
+          },
+          {
+            type: 'input_image',
+            detail: 'auto',
+            image_url: 'data:image/png;base64,AQ==',
+          },
+          {
+            type: 'output_text',
+            text: 'The second image is directly above.',
+            annotations: [],
+          },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(projectedMessage.toJSON())).not.toMatch(
+      /ig_(before|between)_text/
+    );
+    expect(message.response_metadata).toHaveProperty('output');
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
   it.each([
     ['v0', 'jpeg', '/9j/4AAQSkZJRg==', 'image/jpeg'],
     ['v1', 'jpeg', '/9j/4AAQSkZJRg==', 'image/jpeg'],
@@ -2304,6 +2447,7 @@ describe('formatAgentMessages', () => {
               preempted: true,
             },
           });
+      const originalSerialized = JSON.stringify(message.toJSON());
 
       const projected = projectOpenAIResponsesToolMessageContent([message]);
       const projectedMessage = projected[0] as AIMessage;
@@ -2314,13 +2458,43 @@ describe('formatAgentMessages', () => {
       });
 
       expect(projectedMessage.content).toEqual(
-        expect.arrayContaining([{ type: 'image', mimeType, data }])
+        expect.arrayContaining([
+          {
+            type: 'image',
+            mimeType,
+            data,
+            extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+          },
+        ])
       );
       expect(JSON.stringify(providerInput)).toContain(
         `data:${mimeType};base64,${data}`
       );
       expect(JSON.stringify(providerInput)).not.toContain(generatedImage.id);
-      expect(JSON.stringify(message.toJSON())).toContain(generatedImage.id);
+      expect(JSON.stringify(providerInput)).not.toContain(
+        'librechatServerToolResult'
+      );
+      expect(JSON.stringify(providerInput)).not.toContain('extras');
+
+      const fallback = projectToolStreamContentForProvider(
+        [message],
+        'fallback'
+      );
+      expect((fallback[0] as AIMessage).content).toEqual([
+        { type: 'text', text: 'Generated image.' },
+      ]);
+      expect(_convertMessagesToOpenAIParams(fallback)).toEqual([
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Generated image.' }],
+        },
+      ]);
+      expect(JSON.stringify(fallback[0].toJSON())).not.toContain(
+        'librechatServerToolResult'
+      );
+      expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+      expect(originalSerialized).toContain(generatedImage.id);
+      expect(originalSerialized).not.toContain('librechatServerToolResult');
 
       const projectedAgain =
         projectOpenAIResponsesToolMessageContent(projected);
@@ -2405,7 +2579,12 @@ describe('formatAgentMessages', () => {
 
     expect(projectedMessage.content).toEqual([
       { type: 'text', text: 'Partial answer.' },
-      { type: 'image', mimeType: 'image/png', data: 'AA==' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
     ]);
     expect(JSON.stringify(providerInput)).toContain(
       'data:image/png;base64,AA=='
@@ -2446,7 +2625,12 @@ describe('formatAgentMessages', () => {
     expect(projectedMessage.content).toEqual([
       { type: 'text', text: 'Partial answer.' },
       applicationImage,
-      { type: 'image', mimeType: 'image/png', data: 'AA==' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
     ]);
     expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
       'ig_interrupted'
@@ -2507,7 +2691,12 @@ describe('formatAgentMessages', () => {
       imageB,
       { type: 'text', text: 'Second.' },
       imageC,
-      { type: 'image', mimeType: 'image/png', data: 'BA==' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'BA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
     ]);
     expect(providerInput).toEqual([
       {
@@ -2592,7 +2781,12 @@ describe('formatAgentMessages', () => {
     expect(projected.content).toEqual([
       { type: 'non_standard', value: reasoning },
       applicationImage,
-      { type: 'image', mimeType: 'image/png', data: 'Ag==' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'Ag==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
     ]);
   });
 
@@ -2630,7 +2824,12 @@ describe('formatAgentMessages', () => {
     expect(projected.content).toEqual([
       applicationImage,
       applicationImage,
-      { type: 'image', mimeType: 'image/png', data: 'AA==' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
     ]);
   });
 
@@ -2663,7 +2862,12 @@ describe('formatAgentMessages', () => {
 
     expect(projected.content).toEqual([
       applicationImage,
-      { type: 'image', mimeType: 'image/png', data: 'AA==' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
     ]);
   });
 
@@ -2689,9 +2893,128 @@ describe('formatAgentMessages', () => {
 
     expect(projected.content).toEqual([
       { type: 'text', text: 'Partial answer.' },
-      { type: 'image', mimeType: 'image/png', data: 'AA==' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
     ]);
   });
+
+  it.each(['v0', 'v1'] as const)(
+    'marks native %s code-interpreter data-url image replay without changing provider payload',
+    (outputVersion) => {
+      const dataUrl = 'data:image/png;base64,AA==';
+      const toolOutput = {
+        id: `ci_inline_${outputVersion}`,
+        type: 'code_interpreter_call',
+        status: 'completed',
+        code: 'display(chart)',
+        outputs: [{ type: 'image', url: dataUrl }],
+      };
+      const v0Message = new AIMessage({
+        content: [{ type: 'text', text: 'Partial answer.' }],
+        additional_kwargs: { tool_outputs: [toolOutput] },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+      const message =
+        outputVersion === 'v0'
+          ? v0Message
+          : new AIMessage({
+            contentBlocks: v0Message.contentBlocks,
+            additional_kwargs: v0Message.additional_kwargs,
+            response_metadata: {
+              model_provider: 'openai',
+              output_version: 'v1',
+              preempted: true,
+            },
+          });
+      const originalSerialized = JSON.stringify(message.toJSON());
+
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+      const providerInput = convertMessagesToResponsesInput({
+        messages: projected,
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+
+      expect(projectedMessage.content).toEqual([
+        { type: 'text', text: 'Partial answer.' },
+        {
+          type: 'image',
+          url: dataUrl,
+          extras: CODE_INTERPRETER_REPLAY_EXTRAS,
+        },
+      ]);
+      expect(providerInput).toEqual([
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'output_text',
+              text: 'Partial answer.',
+              annotations: [],
+            },
+            {
+              type: 'input_image',
+              detail: 'auto',
+              image_url: dataUrl,
+            },
+          ],
+        },
+      ]);
+      expect(JSON.stringify(providerInput)).not.toContain(
+        'librechatServerToolResult'
+      );
+      expect(JSON.stringify(providerInput)).not.toContain('extras');
+
+      const fallback = projectToolStreamContentForProvider(
+        [message],
+        'fallback'
+      );
+      const fallbackMessage = fallback[0] as AIMessage;
+      expect(fallbackMessage.content).toEqual([
+        { type: 'text', text: 'Partial answer.' },
+        {
+          type: 'text',
+          text: JSON.stringify({
+            serverToolResult: {
+              toolName: 'code_interpreter',
+              status: 'success',
+              output: {
+                type: 'code_interpreter_image',
+                url: dataUrl,
+              },
+            },
+          }),
+        },
+      ]);
+      expect(_convertMessagesToOpenAIParams(fallback)).toEqual([
+        {
+          role: 'assistant',
+          content: fallbackMessage.content,
+        },
+      ]);
+      expect(JSON.stringify(fallbackMessage.toJSON())).not.toContain('extras');
+      expect(JSON.stringify(fallbackMessage.toJSON())).not.toContain(
+        'librechatServerToolResult'
+      );
+      expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+      expect(originalSerialized).toContain(toolOutput.id);
+      expect(originalSerialized).not.toContain('librechatServerToolResult');
+
+      const projectedAgain =
+        projectOpenAIResponsesToolMessageContent(projected);
+      expect(projectedAgain).toBe(projected);
+      expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
 
   it.each(['v0', 'v1'] as const)(
     'preserves completed %s server-tool results without replay ids',
@@ -3205,7 +3528,12 @@ describe('formatAgentMessages', () => {
           librechatServerToolResult: { toolName: 'code_interpreter' },
         },
       },
-      { type: 'image', mimeType: 'image/png', data: 'AA==' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
     ]);
     expect(projectedMessage.additional_kwargs).toEqual({});
     const serialized = JSON.stringify(projectedMessage.toJSON());

@@ -45,17 +45,72 @@ type RedactionResult = {
 };
 
 type RedactionContext = {
+  generatedImageData: Set<string>;
+  generatedImageIds: Set<string>;
   toolNamesByCallId: Map<string, string>;
 };
 
 const TOOL_OUTPUT_FIELD_KEYS = ['content', 'artifact'];
 
-const RESPONSES_REPLAY_OUTPUT_DESCRIPTORS = {
-  local_shell_call_output: { outputField: 'output', toolName: 'local_shell' },
-  shell_call_output: { outputField: 'output', toolName: 'shell' },
-  apply_patch_call_output: { outputField: 'output', toolName: 'apply_patch' },
-  program_output: { outputField: 'result', toolName: 'program' },
-} as const;
+type ResponsesReplayOutputDescriptor = {
+  nestedOutputFields?: Readonly<Record<string, readonly string[]>>;
+  outputFields: readonly string[];
+  resolveToolNameFromCallId?: boolean;
+  toolName?: string;
+};
+
+const RESPONSES_REPLAY_OUTPUT_DESCRIPTORS: Readonly<
+  Record<string, ResponsesReplayOutputDescriptor>
+> = {
+  local_shell_call_output: {
+    outputFields: ['output'],
+    toolName: 'local_shell',
+  },
+  shell_call_output: { outputFields: ['output'], toolName: 'shell' },
+  apply_patch_call_output: {
+    outputFields: ['output'],
+    toolName: 'apply_patch',
+  },
+  program_output: { outputFields: ['result'], toolName: 'program' },
+  code_interpreter_call: {
+    outputFields: ['outputs'],
+    toolName: 'code_interpreter',
+  },
+  mcp_call: { outputFields: ['output', 'error'], toolName: 'mcp' },
+  mcp_list_tools: {
+    outputFields: ['tools', 'error'],
+    toolName: 'mcp_list_tools',
+  },
+  image_generation_call: {
+    outputFields: ['result'],
+    toolName: 'image_generation',
+  },
+  file_search_call: {
+    outputFields: ['results'],
+    toolName: 'file_search',
+  },
+  web_search_call: {
+    nestedOutputFields: { action: ['sources'] },
+    outputFields: [],
+    toolName: 'web_search',
+  },
+  tool_search_output: {
+    outputFields: ['tools'],
+    toolName: 'tool_search',
+  },
+  function_call_output: {
+    outputFields: ['output'],
+    resolveToolNameFromCallId: true,
+  },
+  custom_tool_call_output: {
+    outputFields: ['output'],
+    resolveToolNameFromCallId: true,
+  },
+  computer_call_output: {
+    outputFields: ['output'],
+    toolName: 'computer_use',
+  },
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value);
@@ -127,6 +182,8 @@ function getSerializedToolCallId(
 ): string | undefined {
   return (
     getStringField(value, 'tool_call_id') ??
+    getStringField(value, 'toolCallId') ??
+    getStringField(value, 'call_id') ??
     getNestedStringField(value, 'kwargs', 'tool_call_id') ??
     getNestedStringField(value, 'additional_kwargs', 'tool_call_id') ??
     getNestedStringField(value, 'data', 'tool_call_id') ??
@@ -223,39 +280,106 @@ function redactToolContentFields(
 
 function redactResponsesReplayOutput(
   value: Record<string, unknown>,
-  config: ResolvedLangfuseToolOutputTracingConfig
+  config: ResolvedLangfuseToolOutputTracingConfig,
+  redactionContext: RedactionContext
 ): RedactionResult | undefined {
   const type = getStringField(value, 'type');
-  if (type == null || !(type in RESPONSES_REPLAY_OUTPUT_DESCRIPTORS)) {
+  if (
+    type == null ||
+    !Object.prototype.hasOwnProperty.call(
+      RESPONSES_REPLAY_OUTPUT_DESCRIPTORS,
+      type
+    )
+  ) {
     return undefined;
   }
   const descriptor =
     RESPONSES_REPLAY_OUTPUT_DESCRIPTORS[
       type as keyof typeof RESPONSES_REPLAY_OUTPUT_DESCRIPTORS
     ];
-  if (
-    !(descriptor.outputField in value) ||
-    !shouldRedactTool(descriptor.toolName, config)
-  ) {
+  const hasDirectOutput = descriptor.outputFields.some(
+    (outputField) => outputField in value
+  );
+  const hasNestedOutput = Object.entries(
+    descriptor.nestedOutputFields ?? {}
+  ).some(([objectField, outputFields]) => {
+    const nested = value[objectField];
+    return (
+      isRecord(nested) &&
+      outputFields.some((outputField) => outputField in nested)
+    );
+  });
+  if (!hasDirectOutput && !hasNestedOutput) {
     return undefined;
   }
+  let toolName = descriptor.toolName;
+  if (descriptor.resolveToolNameFromCallId === true) {
+    toolName = getSerializedToolName(value, redactionContext);
+  } else if (type === 'mcp_call') {
+    toolName = getStringField(value, 'name') ?? descriptor.toolName;
+  }
+  if (!shouldRedactTool(toolName, config)) {
+    return undefined;
+  }
+  const redacted = { ...value };
+  for (const outputField of descriptor.outputFields) {
+    if (outputField in redacted) {
+      redacted[outputField] = config.redactionText;
+    }
+  }
+  for (const [objectField, outputFields] of Object.entries(
+    descriptor.nestedOutputFields ?? {}
+  )) {
+    const nested = redacted[objectField];
+    if (!isRecord(nested)) {
+      continue;
+    }
+    const redactedNested = { ...nested };
+    for (const outputField of outputFields) {
+      if (outputField in redactedNested) {
+        redactedNested[outputField] = config.redactionText;
+      }
+    }
+    redacted[objectField] = redactedNested;
+  }
   return {
-    value: {
-      ...value,
-      [descriptor.outputField]: config.redactionText,
-    },
+    value: redacted,
     changed: true,
   };
 }
 
-function redactNeutralServerToolResult(
+function redactStandardServerToolResult(
+  value: Record<string, unknown>,
+  config: ResolvedLangfuseToolOutputTracingConfig,
+  redactionContext: RedactionContext
+): RedactionResult | undefined {
+  if (
+    getStringField(value, 'type') !== 'server_tool_call_result' ||
+    !('output' in value)
+  ) {
+    return undefined;
+  }
+  const toolName =
+    getNestedStringField(value, 'extras', 'name') ??
+    getSerializedToolName(value, redactionContext);
+  if (!shouldRedactTool(toolName, config)) {
+    return undefined;
+  }
+  return {
+    value: { ...value, output: config.redactionText },
+    changed: true,
+  };
+}
+
+function redactMarkedServerToolResult(
   value: Record<string, unknown>,
   config: ResolvedLangfuseToolOutputTracingConfig
 ): RedactionResult | undefined {
-  if (getStringField(value, 'type') !== 'text') {
+  const type = getStringField(value, 'type');
+  if (type !== 'text' && type !== 'image') {
     return undefined;
   }
-  const text = getStringField(value, 'text');
+  const text = type === 'text' ? getStringField(value, 'text') : undefined;
   const extras = value.extras;
   const marker = isRecord(extras)
     ? extras.librechatServerToolResult
@@ -282,19 +406,56 @@ function redactNeutralServerToolResult(
   if (!shouldRedactTool(toolName, config)) {
     return undefined;
   }
+  if (type === 'image') {
+    const redacted = { ...value };
+    let changed = false;
+    for (const outputField of ['data', 'url', 'fileId']) {
+      if (outputField in redacted) {
+        redacted[outputField] = config.redactionText;
+        changed = true;
+      }
+    }
+    return changed ? { value: redacted, changed: true } : undefined;
+  }
   return {
     value: { ...value, text: config.redactionText },
     changed: true,
   };
 }
 
-function collectToolCallNames(
+function redactGeneratedImageBlock(
+  value: Record<string, unknown>,
+  config: ResolvedLangfuseToolOutputTracingConfig,
+  redactionContext: RedactionContext
+): RedactionResult | undefined {
+  if (
+    getStringField(value, 'type') !== 'image' ||
+    !shouldRedactTool('image_generation', config)
+  ) {
+    return undefined;
+  }
+  const id = getStringField(value, 'id');
+  const data = getStringField(value, 'data');
+  const isGeneratedImage =
+    id != null
+      ? redactionContext.generatedImageIds.has(id)
+      : data != null && redactionContext.generatedImageData.has(data);
+  if (!isGeneratedImage) {
+    return undefined;
+  }
+  return {
+    value: { ...value, data: config.redactionText },
+    changed: true,
+  };
+}
+
+function collectRedactionContext(
   value: unknown,
   redactionContext: RedactionContext
 ): void {
   if (Array.isArray(value)) {
     for (const item of value) {
-      collectToolCallNames(item, redactionContext);
+      collectRedactionContext(item, redactionContext);
     }
     return;
   }
@@ -309,8 +470,19 @@ function collectToolCallNames(
     redactionContext.toolNamesByCallId.set(toolCallId, toolName);
   }
 
+  if (getStringField(value, 'type') === 'image_generation_call') {
+    const id = getStringField(value, 'id');
+    const result = getStringField(value, 'result');
+    if (id != null) {
+      redactionContext.generatedImageIds.add(id);
+    }
+    if (result != null) {
+      redactionContext.generatedImageData.add(result);
+    }
+  }
+
   for (const child of Object.values(value)) {
-    collectToolCallNames(child, redactionContext);
+    collectRedactionContext(child, redactionContext);
   }
 }
 
@@ -336,13 +508,33 @@ function redactValue(
     return { value, changed: false };
   }
 
-  const replayOutput = redactResponsesReplayOutput(value, config);
+  const replayOutput = redactResponsesReplayOutput(
+    value,
+    config,
+    redactionContext
+  );
   if (replayOutput != null) {
     return replayOutput;
   }
-  const neutralServerToolResult = redactNeutralServerToolResult(value, config);
-  if (neutralServerToolResult != null) {
-    return neutralServerToolResult;
+  const standardServerToolResult = redactStandardServerToolResult(
+    value,
+    config,
+    redactionContext
+  );
+  if (standardServerToolResult != null) {
+    return standardServerToolResult;
+  }
+  const markedServerToolResult = redactMarkedServerToolResult(value, config);
+  if (markedServerToolResult != null) {
+    return markedServerToolResult;
+  }
+  const generatedImageBlock = redactGeneratedImageBlock(
+    value,
+    config,
+    redactionContext
+  );
+  if (generatedImageBlock != null) {
+    return generatedImageBlock;
   }
 
   const toolName = getSerializedToolName(value, redactionContext);
@@ -371,10 +563,12 @@ function redactSerializedValue(
   config: ResolvedLangfuseToolOutputTracingConfig
 ): RedactionResult {
   const redactionContext: RedactionContext = {
+    generatedImageData: new Set(),
+    generatedImageIds: new Set(),
     toolNamesByCallId: new Map(),
   };
   if (typeof value !== 'string') {
-    collectToolCallNames(value, redactionContext);
+    collectRedactionContext(value, redactionContext);
     return redactValue(value, config, redactionContext);
   }
 
@@ -385,7 +579,7 @@ function redactSerializedValue(
 
   try {
     const parsed = JSON.parse(value) as unknown;
-    collectToolCallNames(parsed, redactionContext);
+    collectRedactionContext(parsed, redactionContext);
     const result = redactValue(parsed, config, redactionContext);
     return result.changed
       ? { value: JSON.stringify(result.value), changed: true }

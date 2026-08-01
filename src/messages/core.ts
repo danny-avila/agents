@@ -671,7 +671,7 @@ type ResponsesReplayProjection = 'fallback' | 'native';
 export const OPENAI_RESPONSES_REPLAY_POSITIONS_KEY =
   '__openai_responses_replay_positions__';
 
-type ResponsesReplayPosition = {
+export type ResponsesReplayPosition = {
   contentIndex?: number;
   itemId: string;
   kind: 'output' | 'text';
@@ -679,7 +679,7 @@ type ResponsesReplayPosition = {
 };
 
 type CompletedGeneratedImages = {
-  blocks: LangChainContentBlock.Multimodal.Image[];
+  blocks: PositionedResponsesReplayBlock[];
   data: Set<string>;
   ids: Set<string>;
 };
@@ -740,6 +740,16 @@ function hasMeaningfulServerToolOutput(output: unknown): boolean {
   }
 }
 
+function createServerToolResultExtras(toolName?: string): {
+  librechatServerToolResult: { toolName?: string };
+} {
+  return {
+    librechatServerToolResult: {
+      ...(toolName != null ? { toolName } : {}),
+    },
+  };
+}
+
 function createNeutralServerToolResult(
   output: unknown,
   status: 'error' | 'success',
@@ -761,11 +771,7 @@ function createNeutralServerToolResult(
       },
       maxChars
     ),
-    extras: {
-      librechatServerToolResult: {
-        ...(toolName != null ? { toolName } : {}),
-      },
-    },
+    extras: createServerToolResultExtras(toolName),
   };
 }
 
@@ -825,6 +831,7 @@ function projectPreemptedResponsesV1Content(
   let hasEncryptedReasoning = false;
   let preservedServerToolResult = false;
   let reasoningInsertionIndex: number | undefined;
+  let generatedImageIndex = 0;
   let originalImageIndex = 0;
   let serverToolResultIndex = 0;
   let sourceTextIndex = 0;
@@ -858,12 +865,23 @@ function projectPreemptedResponsesV1Content(
     }
   };
 
-  const appendServerToolResults = (throughTextIndex?: number): void => {
-    if (serverToolResults == null) {
-      return;
-    }
-    while (serverToolResultIndex < serverToolResults.length) {
-      const positionedResult = serverToolResults[serverToolResultIndex];
+  const appendReplayBlocks = (throughTextIndex?: number): void => {
+    for (;;) {
+      const generatedImage = generatedImages?.blocks[generatedImageIndex];
+      const serverToolResult = serverToolResults?.[serverToolResultIndex];
+      const useGeneratedImage =
+        generatedImage != null &&
+        (serverToolResult == null ||
+          comparePositionedResponsesReplayBlocks(
+            generatedImage,
+            serverToolResult
+          ) <= 0);
+      const positionedResult = useGeneratedImage
+        ? generatedImage
+        : serverToolResult;
+      if (positionedResult == null) {
+        return;
+      }
       if (
         throughTextIndex != null &&
         (positionedResult.textIndex == null ||
@@ -871,7 +889,11 @@ function projectPreemptedResponsesV1Content(
       ) {
         return;
       }
-      serverToolResultIndex++;
+      if (useGeneratedImage) {
+        generatedImageIndex++;
+      } else {
+        serverToolResultIndex++;
+      }
       if (
         replayProjection === 'fallback' &&
         positionedResult.block.type === 'text'
@@ -884,7 +906,7 @@ function projectPreemptedResponsesV1Content(
         projected.push(positionedResult.block);
       }
       changed = true;
-      preservedServerToolResult = true;
+      preservedServerToolResult ||= !useGeneratedImage;
     }
   };
 
@@ -914,7 +936,7 @@ function projectPreemptedResponsesV1Content(
     }
     if (block.type === 'text') {
       appendOriginalImages(sourceTextIndex);
-      appendServerToolResults(sourceTextIndex);
+      appendReplayBlocks(sourceTextIndex);
       if (replayProjection === 'fallback') {
         projected.push({ type: 'text', text: block.text });
         changed = true;
@@ -982,11 +1004,7 @@ function projectPreemptedResponsesV1Content(
     changed = true;
   }
   appendOriginalImages();
-  appendServerToolResults();
-  if (replayProjection === 'native' && generatedImages != null) {
-    projected.push(...generatedImages.blocks);
-    changed ||= generatedImages.blocks.length > 0;
-  }
+  appendReplayBlocks();
   return {
     content: changed ? toLangChainContent(projected) : content,
     preservedServerToolResult,
@@ -1054,6 +1072,16 @@ function getResponsesReplayItemKey(
     : undefined;
 }
 
+function comparePositionedResponsesReplayBlocks(
+  a: PositionedResponsesReplayBlock,
+  b: PositionedResponsesReplayBlock
+): number {
+  return (
+    (a.textIndex ?? Number.MAX_SAFE_INTEGER) -
+      (b.textIndex ?? Number.MAX_SAFE_INTEGER) || a.outputIndex - b.outputIndex
+  );
+}
+
 const RESPONSES_REPLAY_OUTPUT_TOOL_NAMES = {
   apply_patch_call_output: 'apply_patch',
   local_shell_call_output: 'local_shell',
@@ -1066,7 +1094,7 @@ function getResponsesReplayArtifacts(
   replayProjection: ResponsesReplayProjection,
   replayPositionValue?: unknown
 ): ResponsesReplayArtifacts {
-  const blocks: LangChainContentBlock.Multimodal.Image[] = [];
+  const blocks: PositionedResponsesReplayBlock[] = [];
   const data = new Set<string>();
   const ids = new Set<string>();
   const emittedData = new Set<string>();
@@ -1149,6 +1177,24 @@ function getResponsesReplayArtifacts(
       a.outputIndex - b.outputIndex ||
       (a.contentIndex ?? 0) - (b.contentIndex ?? 0)
   );
+  const textCountBeforeOutputIndex = new Map<number, number>();
+  const positionedOutputIndices = [
+    ...new Set(
+      [...outputPositionsByItemId.values()].map(
+        (position) => position.outputIndex
+      )
+    ),
+  ].sort((a, b) => a - b);
+  let textPositionIndex = 0;
+  for (const outputIndex of positionedOutputIndices) {
+    while (
+      textPositionIndex < textPositions.length &&
+      textPositions[textPositionIndex].outputIndex < outputIndex
+    ) {
+      textPositionIndex++;
+    }
+    textCountBeforeOutputIndex.set(outputIndex, textPositionIndex);
+  }
   const getPosition = (
     item: Record<string, unknown>
   ): Pick<PositionedResponsesReplayBlock, 'outputIndex' | 'textIndex'> => {
@@ -1160,9 +1206,7 @@ function getResponsesReplayArtifacts(
     }
     return {
       outputIndex: position.outputIndex,
-      textIndex: textPositions.filter(
-        (textPosition) => textPosition.outputIndex < position.outputIndex
-      ).length,
+      textIndex: textCountBeforeOutputIndex.get(position.outputIndex) ?? 0,
     };
   };
   const pushServerToolResult = (
@@ -1204,7 +1248,14 @@ function getResponsesReplayArtifacts(
           replayProjection === 'native' &&
           resultUrl.startsWith('data:image/')
         ) {
-          pushServerToolResult({ type: 'image', url: resultUrl }, item);
+          pushServerToolResult(
+            {
+              type: 'image',
+              url: resultUrl,
+              extras: createServerToolResultExtras('code_interpreter'),
+            },
+            item
+          );
           continue;
         }
         const mediaResult = createNeutralServerToolResult(
@@ -1344,19 +1395,24 @@ function getResponsesReplayArtifacts(
         emittedData.add(item.result);
       }
       blocks.push({
-        type: 'image',
-        mimeType: getGeneratedImageMimeType(item.result),
-        data: item.result,
+        block: {
+          type: 'image',
+          mimeType: getGeneratedImageMimeType(item.result),
+          data: item.result,
+          extras: createServerToolResultExtras('image_generation'),
+        },
+        ...getPosition(item),
       });
     }
   }
   return {
-    generatedImages: { blocks, data, ids },
+    generatedImages: {
+      blocks: blocks.sort(comparePositionedResponsesReplayBlocks),
+      data,
+      ids,
+    },
     serverToolResults: serverToolResults.sort(
-      (a, b) =>
-        (a.textIndex ?? Number.MAX_SAFE_INTEGER) -
-          (b.textIndex ?? Number.MAX_SAFE_INTEGER) ||
-        a.outputIndex - b.outputIndex
+      comparePositionedResponsesReplayBlocks
     ),
   };
 }
