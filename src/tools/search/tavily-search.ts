@@ -359,6 +359,8 @@ export const createTavilyAPI = (
             'Content-Type': 'application/json',
           },
           timeout: config.timeout,
+          httpAgent: options?.httpAgent,
+          httpsAgent: options?.httpsAgent,
         }
       );
 

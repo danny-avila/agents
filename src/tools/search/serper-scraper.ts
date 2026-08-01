@@ -33,6 +33,8 @@ export class SerperScraper implements t.BaseScraper {
   private timeout: number;
   private logger: t.Logger;
   private includeMarkdown: boolean;
+  private httpAgent?: t.HttpAgent;
+  private httpsAgent?: t.HttpsAgent;
 
   constructor(config: t.SerperScraperConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.SERPER_API_KEY ?? '';
@@ -44,6 +46,8 @@ export class SerperScraper implements t.BaseScraper {
 
     this.timeout = config.timeout ?? 7500;
     this.includeMarkdown = config.includeMarkdown ?? true;
+    this.httpAgent = config.httpAgent;
+    this.httpsAgent = config.httpsAgent;
 
     this.logger = config.logger || createDefaultLogger();
 
@@ -88,6 +92,8 @@ export class SerperScraper implements t.BaseScraper {
           'Content-Type': 'application/json',
         },
         timeout: options.timeout ?? this.timeout,
+        httpAgent: this.httpAgent,
+        httpsAgent: this.httpsAgent,
       });
 
       return [url, { success: true, data: response.data }];

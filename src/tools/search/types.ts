@@ -1,7 +1,16 @@
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { Logger as WinstonLogger } from 'winston';
+import type { Agent as HttpsAgent } from 'https';
+import type { Agent as HttpAgent } from 'http';
 import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
+
+export type { HttpAgent, HttpsAgent };
+
+export interface HttpAgentConfig {
+  httpAgent?: HttpAgent;
+  httpsAgent?: HttpsAgent;
+}
 
 export type SearchProvider =
   | 'serper'
@@ -81,7 +90,7 @@ export type TavilyTimeRangeInput =
   | 'm'
   | 'y';
 
-export interface TavilySearchOptions {
+export interface TavilySearchOptions extends HttpAgentConfig {
   searchDepth?: 'basic' | 'advanced' | 'fast' | 'ultra-fast';
   maxResults?: number;
   includeImages?: boolean;
@@ -116,7 +125,7 @@ export interface TavilySearchPayload {
   chunks_per_source?: number;
 }
 
-export interface CrwSearchOptions {
+export interface CrwSearchOptions extends HttpAgentConfig {
   /** Max results to request (maps to `limit`; clamped 1..20). */
   maxResults?: number;
   /** Add 'images' to the sources array. */
@@ -164,7 +173,7 @@ export interface CrwSearchResponse {
   error_code?: string;
 }
 
-export interface SearchConfig {
+export interface SearchConfig extends HttpAgentConfig {
   searchProvider?: SearchProvider;
   serperApiKey?: string;
   searxngInstanceUrl?: string;
@@ -181,7 +190,7 @@ export interface SearchConfig {
   crwSearchOptions?: CrwSearchOptions;
 }
 
-export interface KeenableSearchOptions {
+export interface KeenableSearchOptions extends HttpAgentConfig {
   maxResults?: number;
   /** Restrict results to a single domain, e.g. "github.com". */
   site?: string;
@@ -208,7 +217,7 @@ export interface KeenableSearchResponse {
   results?: KeenableSearchResult[];
 }
 
-export interface KeenableScraperConfig {
+export interface KeenableScraperConfig extends HttpAgentConfig {
   apiKey?: string;
   /** Override the fetch endpoint base (default: public keyless, keyed when a
    * key is set). Env fallback: KEENABLE_FETCH_URL. */
@@ -221,7 +230,7 @@ export interface KeenableScraperConfig {
 
 export type KeenableScrapeOptions = Omit<
   KeenableScraperConfig,
-  'apiKey' | 'apiUrl' | 'logger'
+  'apiKey' | 'apiUrl' | 'logger' | 'httpAgent' | 'httpsAgent'
 >;
 
 /** Raw JSON shape returned by GET /v1/fetch{,/public}?url=... */
@@ -287,7 +296,7 @@ export interface FirecrawlConfig {
   firecrawlOptions?: FirecrawlScraperConfig;
 }
 
-export interface SerperScraperConfig {
+export interface SerperScraperConfig extends HttpAgentConfig {
   apiKey?: string;
   apiUrl?: string;
   timeout?: number;
@@ -295,7 +304,7 @@ export interface SerperScraperConfig {
   includeMarkdown?: boolean;
 }
 
-export interface TavilyScraperConfig {
+export interface TavilyScraperConfig extends HttpAgentConfig {
   apiKey?: string;
   apiUrl?: string;
   timeout?: number;
@@ -421,10 +430,10 @@ export interface BaseScraper {
 /** Firecrawl */
 export type FirecrawlScrapeOptions = Omit<
   FirecrawlScraperConfig,
-  'apiKey' | 'apiUrl' | 'version' | 'logger'
+  'apiKey' | 'apiUrl' | 'version' | 'logger' | 'httpAgent' | 'httpsAgent'
 >;
 
-export interface CrwScraperConfig {
+export interface CrwScraperConfig extends HttpAgentConfig {
   apiKey?: string;
   apiUrl?: string;
   formats?: string[];
@@ -444,17 +453,17 @@ export interface CrwScraperConfig {
 
 export type CrwScrapeOptions = Omit<
   CrwScraperConfig,
-  'apiKey' | 'apiUrl' | 'logger'
+  'apiKey' | 'apiUrl' | 'logger' | 'httpAgent' | 'httpsAgent'
 >;
 
 export type SerperScrapeOptions = Omit<
   SerperScraperConfig,
-  'apiKey' | 'apiUrl' | 'logger'
+  'apiKey' | 'apiUrl' | 'logger' | 'httpAgent' | 'httpsAgent'
 >;
 
 export type TavilyScrapeOptions = Omit<
   TavilyScraperConfig,
-  'apiKey' | 'apiUrl' | 'logger'
+  'apiKey' | 'apiUrl' | 'logger' | 'httpAgent' | 'httpsAgent'
 >;
 
 export interface TavilyExtractPayload {
@@ -620,7 +629,7 @@ export interface TavilyExtractResult {
   error?: string;
 }
 
-export interface FirecrawlScraperConfig {
+export interface FirecrawlScraperConfig extends HttpAgentConfig {
   apiKey?: string;
   apiUrl?: string;
   version?: string;

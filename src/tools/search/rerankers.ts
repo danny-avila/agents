@@ -42,22 +42,28 @@ export abstract class BaseReranker {
 export class JinaReranker extends BaseReranker {
   private apiUrl: string;
   private timeout: number;
+  private httpAgent?: t.HttpAgent;
+  private httpsAgent?: t.HttpsAgent;
 
   constructor({
     apiKey = process.env.JINA_API_KEY,
     apiUrl = getDefaultJinaApiUrl(),
     timeout = DEFAULT_RERANKER_TIMEOUT,
     logger,
+    httpAgent,
+    httpsAgent,
   }: {
     apiKey?: string;
     apiUrl?: string;
     timeout?: number;
     logger?: t.Logger;
-  }) {
+  } & t.HttpAgentConfig) {
     super(logger);
     this.apiKey = apiKey;
     this.apiUrl = apiUrl;
     this.timeout = timeout;
+    this.httpAgent = httpAgent;
+    this.httpsAgent = httpsAgent;
   }
 
   async rerank(
@@ -92,6 +98,8 @@ export class JinaReranker extends BaseReranker {
             Authorization: `Bearer ${this.apiKey}`,
           },
           timeout: this.timeout,
+          httpAgent: this.httpAgent,
+          httpsAgent: this.httpsAgent,
         }
       );
 
@@ -135,19 +143,25 @@ export class JinaReranker extends BaseReranker {
 
 export class CohereReranker extends BaseReranker {
   private timeout: number;
+  private httpAgent?: t.HttpAgent;
+  private httpsAgent?: t.HttpsAgent;
 
   constructor({
     apiKey = process.env.COHERE_API_KEY,
     timeout = DEFAULT_RERANKER_TIMEOUT,
     logger,
+    httpAgent,
+    httpsAgent,
   }: {
     apiKey?: string;
     timeout?: number;
     logger?: t.Logger;
-  }) {
+  } & t.HttpAgentConfig) {
     super(logger);
     this.apiKey = apiKey;
     this.timeout = timeout;
+    this.httpAgent = httpAgent;
+    this.httpsAgent = httpsAgent;
   }
 
   async rerank(
@@ -179,6 +193,8 @@ export class CohereReranker extends BaseReranker {
             Authorization: `Bearer ${this.apiKey}`,
           },
           timeout: this.timeout,
+          httpAgent: this.httpAgent,
+          httpsAgent: this.httpsAgent,
         }
       );
 
@@ -231,14 +247,16 @@ export class InfinityReranker extends BaseReranker {
 /**
  * Creates the appropriate reranker based on type and configuration
  */
-export const createReranker = (config: {
-  rerankerType: t.RerankerType;
-  jinaApiKey?: string;
-  jinaApiUrl?: string;
-  cohereApiKey?: string;
-  rerankerTimeout?: number;
-  logger?: t.Logger;
-}): BaseReranker | undefined => {
+export const createReranker = (
+  config: {
+    rerankerType: t.RerankerType;
+    jinaApiKey?: string;
+    jinaApiUrl?: string;
+    cohereApiKey?: string;
+    rerankerTimeout?: number;
+    logger?: t.Logger;
+  } & t.HttpAgentConfig
+): BaseReranker | undefined => {
   const {
     rerankerType,
     jinaApiKey,
@@ -246,6 +264,8 @@ export const createReranker = (config: {
     cohereApiKey,
     rerankerTimeout,
     logger,
+    httpAgent,
+    httpsAgent,
   } = config;
 
   // Create a default logger if none is provided
@@ -258,12 +278,16 @@ export const createReranker = (config: {
       apiUrl: jinaApiUrl,
       timeout: rerankerTimeout,
       logger: defaultLogger,
+      httpAgent,
+      httpsAgent,
     });
   case 'cohere':
     return new CohereReranker({
       apiKey: cohereApiKey,
       timeout: rerankerTimeout,
       logger: defaultLogger,
+      httpAgent,
+      httpsAgent,
     });
   case 'infinity':
     return new InfinityReranker(defaultLogger);
@@ -279,6 +303,8 @@ export const createReranker = (config: {
       apiUrl: jinaApiUrl,
       timeout: rerankerTimeout,
       logger: defaultLogger,
+      httpAgent,
+      httpsAgent,
     });
   }
 };
