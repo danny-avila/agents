@@ -26,6 +26,7 @@ export { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, resolveLangfuseConfig };
 
 const LANGGRAPH_TOOL_NODE_PREFIX = 'tools=';
 const SERVER_TOOL_RESULT_PREFIX = '{"serverToolResult":';
+const SERVER_TOOL_RESULT_REPLAY_MARKER_KEY = 'librechatResponsesReplay';
 
 const CHAT_ROLES = new Set([
   'assistant',
@@ -403,6 +404,9 @@ function parseSerializedServerToolResultMarker(
       return undefined;
     }
     const result = parsed.serverToolResult;
+    if (result[SERVER_TOOL_RESULT_REPLAY_MARKER_KEY] !== true) {
+      return undefined;
+    }
     const status = getStringField(result, 'status');
     if (
       (status !== 'error' && status !== 'success') ||
@@ -414,7 +418,7 @@ function parseSerializedServerToolResultMarker(
     return toolName != null ? { toolName } : {};
   } catch {
     const match =
-      /^\{"serverToolResult":\{(?:"toolName":("(?:\\.|[^"\\])*"),)?"status":"(?:error|success)","output":/.exec(
+      /^\{"serverToolResult":\{"librechatResponsesReplay":true,(?:"toolName":("(?:\\.|[^"\\])*"),)?"status":"(?:error|success)","output":/.exec(
         text.slice(0, 512)
       );
     if (match == null) {
@@ -480,7 +484,8 @@ function redactMarkedServerToolResult(
 function redactGeneratedImageBlock(
   value: Record<string, unknown>,
   config: ResolvedLangfuseToolOutputTracingConfig,
-  redactionContext: RedactionContext
+  redactionContext: RedactionContext,
+  isAssistantContent: boolean
 ): RedactionResult | undefined {
   if (
     getStringField(value, 'type') !== 'image' ||
@@ -488,12 +493,27 @@ function redactGeneratedImageBlock(
   ) {
     return undefined;
   }
+  const extras = value.extras;
+  const explicitMarker = isRecord(extras)
+    ? extras.librechatServerToolResult
+    : undefined;
+  const explicitToolName = isRecord(explicitMarker)
+    ? getStringField(explicitMarker, 'toolName')
+    : undefined;
+  if (
+    explicitToolName != null &&
+    normalizeToolName(explicitToolName) !== 'image_generation'
+  ) {
+    return undefined;
+  }
   const id = getStringField(value, 'id');
   const data = getStringField(value, 'data');
   const isGeneratedImage =
-    id != null
+    explicitToolName != null ||
+    isAssistantContent ||
+    (id != null
       ? redactionContext.generatedImageIds.has(id)
-      : data != null && redactionContext.generatedImageData.has(data);
+      : data != null && redactionContext.generatedImageData.has(data));
   if (!isGeneratedImage) {
     return undefined;
   }
@@ -603,7 +623,8 @@ function redactValue(
   const generatedImageBlock = redactGeneratedImageBlock(
     value,
     config,
-    redactionContext
+    redactionContext,
+    allowSerializedMarker
   );
   if (generatedImageBlock != null) {
     return generatedImageBlock;
@@ -662,7 +683,12 @@ function redactSerializedValue(
       ? { value: JSON.stringify(result.value), changed: true }
       : { value, changed: false };
   } catch {
-    return { value, changed: false };
+    // OpenTelemetry truncates string attributes before span processors run.
+    // Langfuse serializes structured message values to JSON first, so a
+    // truncated attribute can still contain tool output even though it is no
+    // longer parseable. Fail closed for JSON-shaped attributes whenever tool
+    // output redaction is active instead of exporting a partial secret.
+    return { value: config.redactionText, changed: true };
   }
 }
 
@@ -752,6 +778,17 @@ export function redactLangfuseSpanToolOutputs(
   }
 }
 
+export function prepareLangfuseSpanForExport(
+  span: ReadableSpan,
+  config?: ResolvedLangfuseToolOutputTracingConfig
+): void {
+  classifyLangfuseToolNodeSpan(span);
+  if (config != null) {
+    redactLangfuseSpanToolOutputs(span, config);
+  }
+  shapeLangfuseSpan(span);
+}
+
 class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
   private readonly processor: LangfuseSpanProcessor;
   private readonly fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig;
@@ -785,12 +822,8 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
     if (shouldDropLangfuseSpan(span.name)) {
       return;
     }
-    classifyLangfuseToolNodeSpan(span);
-    shapeLangfuseSpan(span);
     const config = this.spanConfigs.get(span) ?? this.fallbackConfig;
-    if (config != null) {
-      redactLangfuseSpanToolOutputs(span, config);
-    }
+    prepareLangfuseSpanForExport(span, config);
     this.processor.onEnd(span);
   }
 

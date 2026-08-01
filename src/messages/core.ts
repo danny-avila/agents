@@ -674,7 +674,7 @@ export const OPENAI_RESPONSES_REPLAY_POSITIONS_KEY =
 export type ResponsesReplayPosition = {
   contentIndex?: number;
   itemId: string;
-  kind: 'output' | 'text';
+  kind: 'output' | 'reasoning' | 'text';
   outputIndex: number;
 };
 
@@ -686,12 +686,20 @@ type CompletedGeneratedImages = {
 
 type ResponsesReplayArtifacts = {
   generatedImages: CompletedGeneratedImages;
+  positionsByItemId: Map<string, ResponsesReplayItemPosition>;
+  positionedServerToolResultIds: Set<string>;
   serverToolResults: PositionedResponsesReplayBlock[];
 };
+
+type ResponsesReplayItemPosition = Pick<
+  PositionedResponsesReplayBlock,
+  'outputIndex' | 'textIndex'
+>;
 
 type PositionedResponsesReplayBlock = {
   block: LangChainContentBlock.Standard;
   outputIndex: number;
+  subIndex: number;
   textIndex?: number;
 };
 
@@ -764,6 +772,7 @@ function createNeutralServerToolResult(
     text: serializeToolContentBounded(
       {
         serverToolResult: {
+          librechatResponsesReplay: true,
           ...(toolName != null ? { toolName } : {}),
           status,
           output,
@@ -812,7 +821,9 @@ function projectPreemptedResponsesV1Content(
   replayProjection: ResponsesReplayProjection,
   generatedImages?: CompletedGeneratedImages,
   originalImages?: PositionedResponsesImages,
-  serverToolResults?: PositionedResponsesReplayBlock[]
+  serverToolResults?: PositionedResponsesReplayBlock[],
+  positionedServerToolResultIds?: ReadonlySet<string>,
+  reasoningPosition?: ResponsesReplayItemPosition
 ): {
   content: AIMessage['content'];
   preservedServerToolResult: boolean;
@@ -826,6 +837,17 @@ function projectPreemptedResponsesV1Content(
     replayProjection === 'native' && hasReplayableEncryptedReasoning(reasoning)
       ? reasoning
       : undefined;
+  const positionedReasoning: PositionedResponsesReplayBlock | undefined =
+    encryptedReasoning != null && reasoningPosition != null
+      ? {
+        block: {
+          type: 'non_standard' as const,
+          value: encryptedReasoning,
+        },
+        ...reasoningPosition,
+        subIndex: 0,
+      }
+      : undefined;
   const projected: LangChainContentBlock.Standard[] = [];
   let changed = false;
   let hasEncryptedReasoning = false;
@@ -833,6 +855,7 @@ function projectPreemptedResponsesV1Content(
   let reasoningInsertionIndex: number | undefined;
   let generatedImageIndex = 0;
   let originalImageIndex = 0;
+  let reasoningPending = positionedReasoning;
   let serverToolResultIndex = 0;
   let sourceTextIndex = 0;
   const serverToolNamesByCallId = new Map<string, string>();
@@ -869,19 +892,27 @@ function projectPreemptedResponsesV1Content(
     for (;;) {
       const generatedImage = generatedImages?.blocks[generatedImageIndex];
       const serverToolResult = serverToolResults?.[serverToolResultIndex];
-      const useGeneratedImage =
-        generatedImage != null &&
-        (serverToolResult == null ||
-          comparePositionedResponsesReplayBlocks(
-            generatedImage,
-            serverToolResult
-          ) <= 0);
-      const positionedResult = useGeneratedImage
-        ? generatedImage
-        : serverToolResult;
-      if (positionedResult == null) {
+      const candidates: Array<{
+        kind: 'generatedImage' | 'reasoning' | 'serverToolResult';
+        value: PositionedResponsesReplayBlock;
+      }> = [];
+      if (generatedImage != null) {
+        candidates.push({ kind: 'generatedImage', value: generatedImage });
+      }
+      if (serverToolResult != null) {
+        candidates.push({ kind: 'serverToolResult', value: serverToolResult });
+      }
+      if (reasoningPending != null) {
+        candidates.push({ kind: 'reasoning', value: reasoningPending });
+      }
+      if (candidates.length === 0) {
         return;
       }
+      candidates.sort((a, b) =>
+        comparePositionedResponsesReplayBlocks(a.value, b.value)
+      );
+      const selected = candidates[0];
+      const positionedResult = selected.value;
       if (
         throughTextIndex != null &&
         (positionedResult.textIndex == null ||
@@ -889,10 +920,12 @@ function projectPreemptedResponsesV1Content(
       ) {
         return;
       }
-      if (useGeneratedImage) {
+      if (selected.kind === 'generatedImage') {
         generatedImageIndex++;
-      } else {
+      } else if (selected.kind === 'serverToolResult') {
         serverToolResultIndex++;
+      } else {
+        reasoningPending = undefined;
       }
       if (
         replayProjection === 'fallback' &&
@@ -906,7 +939,7 @@ function projectPreemptedResponsesV1Content(
         projected.push(positionedResult.block);
       }
       changed = true;
-      preservedServerToolResult ||= !useGeneratedImage;
+      preservedServerToolResult ||= selected.kind === 'serverToolResult';
     }
   };
 
@@ -928,7 +961,11 @@ function projectPreemptedResponsesV1Content(
         hasReplayableEncryptedReasoning(block.value)
       ) {
         hasEncryptedReasoning = true;
-        projected.push(block);
+        if (positionedReasoning == null) {
+          projected.push(block);
+        } else {
+          changed = true;
+        }
       } else {
         changed = true;
       }
@@ -965,6 +1002,10 @@ function projectPreemptedResponsesV1Content(
       continue;
     }
     if (block.type === 'server_tool_call_result') {
+      if (positionedServerToolResultIds?.has(block.toolCallId) === true) {
+        changed = true;
+        continue;
+      }
       const result = createNeutralServerToolResult(
         block.output,
         block.status,
@@ -995,7 +1036,11 @@ function projectPreemptedResponsesV1Content(
     projected.push(block);
   }
 
-  if (encryptedReasoning != null && !hasEncryptedReasoning) {
+  if (
+    encryptedReasoning != null &&
+    !hasEncryptedReasoning &&
+    positionedReasoning == null
+  ) {
     const reasoningBlock: LangChainContentBlock.Standard = {
       type: 'non_standard',
       value: encryptedReasoning,
@@ -1028,7 +1073,9 @@ function isResponsesReplayPosition(
   }
   const position = value as Partial<ResponsesReplayPosition>;
   return (
-    (position.kind === 'output' || position.kind === 'text') &&
+    (position.kind === 'output' ||
+      position.kind === 'reasoning' ||
+      position.kind === 'text') &&
     typeof position.itemId === 'string' &&
     position.itemId.length > 0 &&
     typeof position.outputIndex === 'number' &&
@@ -1078,7 +1125,9 @@ function comparePositionedResponsesReplayBlocks(
 ): number {
   return (
     (a.textIndex ?? Number.MAX_SAFE_INTEGER) -
-      (b.textIndex ?? Number.MAX_SAFE_INTEGER) || a.outputIndex - b.outputIndex
+      (b.textIndex ?? Number.MAX_SAFE_INTEGER) ||
+    a.outputIndex - b.outputIndex ||
+    a.subIndex - b.subIndex
   );
 }
 
@@ -1099,6 +1148,8 @@ function getResponsesReplayArtifacts(
   const ids = new Set<string>();
   const emittedData = new Set<string>();
   const emittedIds = new Set<string>();
+  const positionedServerToolResultIds = new Set<string>();
+  const rawOutputIndices = new Map<Record<string, unknown>, number>();
   const serverToolResults: PositionedResponsesReplayBlock[] = [];
   const replayPositions = Array.isArray(replayPositionValue)
     ? replayPositionValue.filter(isResponsesReplayPosition)
@@ -1106,7 +1157,7 @@ function getResponsesReplayArtifacts(
   const outputPositionsByItemId = new Map<string, ResponsesReplayPosition>();
   const textPositionsByKey = new Map<string, ResponsesReplayPosition>();
   for (const position of replayPositions) {
-    if (position.kind === 'output') {
+    if (position.kind === 'output' || position.kind === 'reasoning') {
       outputPositionsByItemId.set(position.itemId, position);
       continue;
     }
@@ -1122,6 +1173,12 @@ function getResponsesReplayArtifacts(
       'type' in item &&
       item.type === 'message'
   );
+  for (let outputIndex = 0; outputIndex < output.length; outputIndex++) {
+    const item = output[outputIndex];
+    if (item != null && typeof item === 'object') {
+      rawOutputIndices.set(item as Record<string, unknown>, outputIndex);
+    }
+  }
   if (hasAuthoritativeMessage) {
     for (let outputIndex = 0; outputIndex < output.length; outputIndex++) {
       const item = output[outputIndex];
@@ -1155,7 +1212,10 @@ function getResponsesReplayArtifacts(
           content == null ||
           typeof content !== 'object' ||
           !('type' in content) ||
-          content.type !== 'output_text'
+          content.type !== 'output_text' ||
+          !('text' in content) ||
+          typeof content.text !== 'string' ||
+          content.text.length === 0
         ) {
           continue;
         }
@@ -1180,9 +1240,14 @@ function getResponsesReplayArtifacts(
   const textCountBeforeOutputIndex = new Map<number, number>();
   const positionedOutputIndices = [
     ...new Set(
-      [...outputPositionsByItemId.values()].map(
-        (position) => position.outputIndex
-      )
+      [
+        ...outputPositionsByItemId.values(),
+        ...(hasAuthoritativeMessage
+          ? [...rawOutputIndices.values()].map((outputIndex) => ({
+            outputIndex,
+          }))
+          : []),
+      ].map((position) => position.outputIndex)
     ),
   ].sort((a, b) => a - b);
   let textPositionIndex = 0;
@@ -1195,28 +1260,44 @@ function getResponsesReplayArtifacts(
     }
     textCountBeforeOutputIndex.set(outputIndex, textPositionIndex);
   }
-  const getPosition = (
-    item: Record<string, unknown>
-  ): Pick<PositionedResponsesReplayBlock, 'outputIndex' | 'textIndex'> => {
-    const itemId = getResponsesReplayItemKey(item);
-    const position =
-      itemId != null ? outputPositionsByItemId.get(itemId) : undefined;
-    if (position == null) {
-      return { outputIndex: Number.MAX_SAFE_INTEGER };
-    }
-    return {
+  const positionsByItemId = new Map<string, ResponsesReplayItemPosition>();
+  for (const [itemId, position] of outputPositionsByItemId) {
+    positionsByItemId.set(itemId, {
       outputIndex: position.outputIndex,
       textIndex: textCountBeforeOutputIndex.get(position.outputIndex) ?? 0,
-    };
+    });
+  }
+  const getPosition = (
+    item: Record<string, unknown>
+  ): ResponsesReplayItemPosition => {
+    const itemId = getResponsesReplayItemKey(item);
+    const position = itemId != null ? positionsByItemId.get(itemId) : undefined;
+    if (position == null) {
+      const rawOutputIndex = rawOutputIndices.get(item);
+      return {
+        outputIndex: rawOutputIndex ?? Number.MAX_SAFE_INTEGER,
+        ...(hasAuthoritativeMessage && rawOutputIndex != null
+          ? {
+            textIndex: textCountBeforeOutputIndex.get(rawOutputIndex) ?? 0,
+          }
+          : {}),
+      };
+    }
+    return position;
   };
   const pushServerToolResult = (
     block: LangChainContentBlock.Standard | undefined,
-    item: Record<string, unknown>
+    item: Record<string, unknown>,
+    subIndex = 0
   ): void => {
     if (block == null) {
       return;
     }
-    serverToolResults.push({ block, ...getPosition(item) });
+    const itemId = getResponsesReplayItemKey(item);
+    if (itemId != null) {
+      positionedServerToolResultIds.add(itemId);
+    }
+    serverToolResults.push({ block, ...getPosition(item), subIndex });
   };
   for (const item of output) {
     if (item == null || typeof item !== 'object' || !('type' in item)) {
@@ -1226,16 +1307,47 @@ function getResponsesReplayArtifacts(
       if (
         !('outputs' in item) ||
         !Array.isArray(item.outputs) ||
-        !('status' in item) ||
-        (item.status !== 'completed' && item.status !== 'failed')
+        !('status' in item)
       ) {
         continue;
       }
-      for (const result of item.outputs) {
+      const resultStatus = item.status === 'completed' ? 'success' : 'error';
+      const returnCode = item.status === 'completed' ? 0 : 1;
+      for (
+        let resultIndex = 0;
+        resultIndex < item.outputs.length;
+        resultIndex++
+      ) {
+        const result = item.outputs[resultIndex];
         if (
           result == null ||
           typeof result !== 'object' ||
-          !('type' in result) ||
+          !('type' in result)
+        ) {
+          continue;
+        }
+        if (
+          result.type === 'logs' &&
+          'logs' in result &&
+          typeof result.logs === 'string'
+        ) {
+          pushServerToolResult(
+            createNeutralServerToolResult(
+              {
+                type: 'code_interpreter_output',
+                returnCode,
+                stdout: result.logs,
+              },
+              resultStatus,
+              maxChars,
+              'code_interpreter'
+            ),
+            item,
+            resultIndex
+          );
+          continue;
+        }
+        if (
           result.type !== 'image' ||
           !('url' in result) ||
           typeof result.url !== 'string' ||
@@ -1254,18 +1366,58 @@ function getResponsesReplayArtifacts(
               url: resultUrl,
               extras: createServerToolResultExtras('code_interpreter'),
             },
-            item
+            item,
+            resultIndex
           );
           continue;
         }
         const mediaResult = createNeutralServerToolResult(
           { type: 'code_interpreter_image', url: resultUrl },
-          item.status === 'failed' ? 'error' : 'success',
+          resultStatus,
           maxChars,
           'code_interpreter'
         );
-        pushServerToolResult(mediaResult, item);
+        pushServerToolResult(mediaResult, item, resultIndex);
       }
+      continue;
+    }
+    if (item.type === 'file_search_call') {
+      const result = createNeutralServerToolResult(
+        'results' in item && Array.isArray(item.results)
+          ? { results: item.results }
+          : undefined,
+        'status' in item && item.status === 'completed' ? 'success' : 'error',
+        maxChars,
+        'file_search'
+      );
+      pushServerToolResult(result, item);
+      continue;
+    }
+    if (item.type === 'web_search_call') {
+      const result = createNeutralServerToolResult(
+        {
+          ...('action' in item ? { action: item.action } : {}),
+          ...('results' in item && Array.isArray(item.results)
+            ? { results: item.results }
+            : {}),
+        },
+        'status' in item && item.status === 'completed' ? 'success' : 'error',
+        maxChars,
+        'web_search'
+      );
+      pushServerToolResult(result, item);
+      continue;
+    }
+    if (item.type === 'tool_search_output') {
+      const result = createNeutralServerToolResult(
+        'tools' in item && Array.isArray(item.tools)
+          ? { tools: item.tools }
+          : undefined,
+        'status' in item && item.status === 'completed' ? 'success' : 'error',
+        maxChars,
+        'tool_search'
+      );
+      pushServerToolResult(result, item);
       continue;
     }
     if (item.type === 'mcp_list_tools') {
@@ -1402,6 +1554,7 @@ function getResponsesReplayArtifacts(
           extras: createServerToolResultExtras('image_generation'),
         },
         ...getPosition(item),
+        subIndex: 0,
       });
     }
   }
@@ -1411,6 +1564,8 @@ function getResponsesReplayArtifacts(
       data,
       ids,
     },
+    positionedServerToolResultIds,
+    positionsByItemId,
     serverToolResults: serverToolResults.sort(
       comparePositionedResponsesReplayBlocks
     ),
@@ -1512,12 +1667,29 @@ function projectPreemptedOpenAIResponsesMessage(
     replayProjection === 'native' &&
     hasReplayableEncryptedReasoning(additionalKwargs.reasoning);
   const authoritativeOutput = getAuthoritativeResponsesOutput(message);
-  const { generatedImages, serverToolResults } = getResponsesReplayArtifacts(
+  const {
+    generatedImages,
+    positionedServerToolResultIds,
+    positionsByItemId,
+    serverToolResults,
+  } = getResponsesReplayArtifacts(
     authoritativeOutput,
     maxChars,
     replayProjection,
     additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]
   );
+  const reasoningItemId =
+    retainsEncryptedReasoning &&
+    additionalKwargs.reasoning != null &&
+    typeof additionalKwargs.reasoning === 'object' &&
+    'id' in additionalKwargs.reasoning &&
+    typeof additionalKwargs.reasoning.id === 'string'
+      ? additionalKwargs.reasoning.id
+      : undefined;
+  const reasoningPosition =
+    reasoningItemId != null
+      ? positionsByItemId.get(reasoningItemId)
+      : undefined;
   const isV1 = metadata.output_version === 'v1';
   const translatesV0 =
     !isV1 &&
@@ -1540,7 +1712,9 @@ function projectPreemptedOpenAIResponsesMessage(
     replayProjection,
     replayProjection === 'native' ? generatedImages : undefined,
     originalImages,
-    serverToolResults
+    serverToolResults,
+    positionedServerToolResultIds,
+    reasoningPosition
   );
   const promotesV0 =
     !isV1 &&

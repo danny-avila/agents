@@ -8,6 +8,7 @@ import type { TPayload } from '@/types';
 import {
   LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
   classifyLangfuseToolNodeSpan,
+  prepareLangfuseSpanForExport,
   redactLangfuseSpanToolOutputs,
   shouldTraceToolNodeForLangfuse,
 } from '@/langfuseToolOutputTracing';
@@ -816,7 +817,7 @@ describe('Langfuse tool output tracing redaction', () => {
       createConfig({ redactedToolNames: new Set(['image_generation']) }),
     ],
   ] as const)(
-    'redacts normalized generated images %s without touching user images',
+    'redacts serialized normalized generated images %s without touching user images',
     (_scope, config) => {
       const generatedById = {
         id: 'ig_normal_response',
@@ -846,7 +847,9 @@ describe('Langfuse tool output tracing redaction', () => {
           {
             type: 'image',
             mimeType: 'image/png',
-            data: 'public-user-image-data',
+            id: generatedById.id,
+            url: 'private-generated-image-url',
+            fileId: 'private-generated-image-file-id',
           },
         ],
         additional_kwargs: {
@@ -857,15 +860,25 @@ describe('Langfuse tool output tracing redaction', () => {
           output: [generatedById, generatedByDataFallback],
         },
       });
+      const serializedMessage = serializeMessageForLangfuse(message);
+      const serializedUserMessage = serializeMessageForLangfuse(
+        new HumanMessage({
+          content: [
+            {
+              type: 'image',
+              mimeType: 'image/png',
+              data: 'public-user-image-data',
+            },
+          ],
+        })
+      );
+      expect(JSON.stringify(serializedMessage)).not.toContain(
+        'image_generation_call'
+      );
       const span = createSpan('gpt-5.6', {
         [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify([
-          message.toJSON(),
-          {
-            type: 'image',
-            id: generatedById.id,
-            url: 'private-generated-image-url',
-            fileId: 'private-generated-image-file-id',
-          },
+          serializedMessage,
+          serializedUserMessage,
         ]),
       });
 
@@ -880,14 +893,83 @@ describe('Langfuse tool output tracing redaction', () => {
       expect(redacted).not.toContain('private-generated-image-file-id');
       expect(redacted).toContain('public-user-image-data');
       expect(redacted).toContain(generatedById.id);
-      expect(redacted).toContain(generatedByDataFallback.id);
       expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
     }
   );
 
+  it('does not reclassify a marked code-interpreter image as image generation', () => {
+    const codeImage = 'data:image/png;base64,public-code-image';
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify([
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'image',
+              url: codeImage,
+              extras: {
+                librechatServerToolResult: {
+                  toolName: 'code_interpreter',
+                },
+              },
+            },
+          ],
+        },
+      ]),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({
+        redactedToolNames: new Set(['image_generation']),
+      })
+    );
+
+    expect(
+      span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]
+    ).toContain(codeImage);
+    expect(
+      span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]
+    ).not.toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
+  it('fails closed when OpenTelemetry truncates a JSON-shaped attribute', () => {
+    const secret = 'private truncated tool output';
+    const serialized = JSON.stringify([
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              serverToolResult: {
+                toolName: 'shell',
+                status: 'success',
+                output: secret,
+              },
+            }),
+          },
+        ],
+      },
+    ]);
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: serialized.slice(0, -1),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({ redactedToolNames: new Set(['shell']) })
+    );
+
+    expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]).toBe(
+      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
+    );
+    expect(JSON.stringify(span.attributes)).not.toContain(secret);
+  });
+
   it('redacts marked bounded replay text without parsing its payload', () => {
     const truncatedSecret =
-      '{"serverToolResult":{"status":"success","output":"secret head…secret tail"';
+      '{"serverToolResult":{"librechatResponsesReplay":true,"status":"success","output":"secret head…secret tail"';
     const span = createSpan('gpt-5.6', {
       [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
         {
@@ -912,9 +994,69 @@ describe('Langfuse tool output tracing redaction', () => {
     expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   });
 
+  it('redacts replay output before root-span answer shaping', () => {
+    const rootSecret = 'private root replay result';
+    const span = createSpan('LangGraph', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        { role: 'user', content: 'Continue.' },
+      ]),
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify([
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'Partial answer. ' },
+            {
+              type: 'text',
+              text: JSON.stringify({
+                serverToolResult: {
+                  toolName: 'shell',
+                  status: 'success',
+                  output: rootSecret,
+                },
+              }),
+              extras: {
+                librechatServerToolResult: { toolName: 'shell' },
+              },
+            },
+          ],
+        },
+      ]),
+    });
+
+    prepareLangfuseSpanForExport(span, createConfig({ enabled: false }));
+
+    for (const key of [
+      LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT,
+      LangfuseOtelSpanAttributes.TRACE_OUTPUT,
+    ]) {
+      const output = span.attributes[key] as string;
+      expect(output).toContain('Partial answer.');
+      expect(output).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+      expect(output).not.toContain(rootSecret);
+    }
+  });
+
+  it('redacts a root tool output before deriving trace output', () => {
+    const rootSecret = 'private root tool result';
+    const span = createSpan('shell', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: rootSecret,
+    });
+
+    prepareLangfuseSpanForExport(span, createConfig({ enabled: false }));
+
+    expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]).toBe(
+      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
+    );
+    expect(span.attributes[LangfuseOtelSpanAttributes.TRACE_OUTPUT]).toBe(
+      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
+    );
+    expect(JSON.stringify(span.attributes)).not.toContain(rootSecret);
+  });
+
   it('preserves ordinary text that only resembles a server-tool result', () => {
     const ordinaryText =
-      '{"serverToolResult":{"status":"draft","output":"public literal text"}}';
+      '{"serverToolResult":{"status":"success","output":"public literal text"}}';
     const span = createSpan('gpt-5.6', {
       [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
         {
@@ -938,7 +1080,7 @@ describe('Langfuse tool output tracing redaction', () => {
     const userLiteral =
       '{"serverToolResult":{"status":"success","output":"public user literal"}}';
     const assistantResult =
-      '{"serverToolResult":{"status":"success","output":"private replay result"}}';
+      '{"serverToolResult":{"librechatResponsesReplay":true,"status":"success","output":"private replay result"}}';
     const span = createSpan('gpt-5.6', {
       [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
         {

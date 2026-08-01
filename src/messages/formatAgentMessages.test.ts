@@ -2985,6 +2985,7 @@ describe('formatAgentMessages', () => {
           type: 'text',
           text: JSON.stringify({
             serverToolResult: {
+              librechatResponsesReplay: true,
               toolName: 'code_interpreter',
               status: 'success',
               output: {
@@ -3055,7 +3056,7 @@ describe('formatAgentMessages', () => {
 
       const projected = projectOpenAIResponsesToolMessageContent(
         [message],
-        200
+        400
       );
       const projectedMessage = projected[0] as AIMessage;
       const providerInput = convertMessagesToResponsesInput({
@@ -3086,7 +3087,7 @@ describe('formatAgentMessages', () => {
       ]);
       expect(
         (projectedMessage.content[1] as { text: string }).text.length
-      ).toBeLessThanOrEqual(200);
+      ).toBeLessThanOrEqual(400);
       const serializedProviderInput = JSON.stringify(providerInput);
       expect(serializedProviderInput).toContain('computed');
       expect(serializedProviderInput).toContain('ephemeral-chart.png');
@@ -3099,6 +3100,332 @@ describe('formatAgentMessages', () => {
         projectOpenAIResponsesToolMessageContent(projected);
       expect(projectedAgain).toBe(projected);
       expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
+
+  it('uses captured output positions for translated v0 server-tool results', () => {
+    const toolOutputs = [
+      {
+        id: 'ci_position_item',
+        type: 'code_interpreter_call',
+        status: 'completed',
+        code: 'print("CODE_BEFORE_TEXT")',
+        outputs: [{ type: 'logs', logs: 'CODE_BEFORE_TEXT' }],
+      },
+      {
+        id: 'fs_position_item',
+        type: 'file_search_call',
+        status: 'completed',
+        queries: ['positioned file result'],
+        results: [
+          {
+            file_id: 'file_without_provider_replay',
+            filename: 'position.txt',
+            score: 1,
+            text: 'FILE_BETWEEN_TEXT',
+          },
+        ],
+      },
+      {
+        id: 'ws_position_item',
+        type: 'web_search_call',
+        status: 'completed',
+        action: { type: 'search', query: 'positioned web result' },
+        results: [{ title: 'WEB_BETWEEN_TEXT' }],
+      },
+      {
+        id: 'ts_position_item',
+        type: 'tool_search_output',
+        status: 'completed',
+        tools: [
+          {
+            type: 'function',
+            name: 'TOOL_BETWEEN_TEXT',
+            description: 'positioned tool-search result',
+            parameters: { type: 'object', properties: {} },
+          },
+        ],
+      },
+    ];
+    const message = new AIMessage({
+      content: [
+        { type: 'text', text: 'First narration.' },
+        { type: 'text', text: 'Second narration.' },
+      ],
+      additional_kwargs: {
+        tool_outputs: toolOutputs,
+        [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+          { itemId: 'ci_position_item', kind: 'output', outputIndex: 0 },
+          {
+            itemId: 'msg_first_position',
+            kind: 'text',
+            outputIndex: 1,
+            contentIndex: 0,
+          },
+          { itemId: 'fs_position_item', kind: 'output', outputIndex: 2 },
+          { itemId: 'ws_position_item', kind: 'output', outputIndex: 3 },
+          { itemId: 'ts_position_item', kind: 'output', outputIndex: 4 },
+          {
+            itemId: 'msg_second_position',
+            kind: 'text',
+            outputIndex: 5,
+            contentIndex: 0,
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+    const originalSerialized = JSON.stringify(message.toJSON());
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const markers = [
+      'CODE_BEFORE_TEXT',
+      'FILE_BETWEEN_TEXT',
+      'WEB_BETWEEN_TEXT',
+      'TOOL_BETWEEN_TEXT',
+    ];
+    const orderedContent = (
+      projectedMessage.content as Array<{ text?: string; type: string }>
+    ).map((block) => {
+      if (
+        block.text === 'First narration.' ||
+        block.text === 'Second narration.'
+      ) {
+        return block.text;
+      }
+      return markers.find((marker) => block.text?.includes(marker) === true);
+    });
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+    const serializedProviderInput = JSON.stringify(providerInput);
+
+    expect(orderedContent).toEqual([
+      'CODE_BEFORE_TEXT',
+      'First narration.',
+      'FILE_BETWEEN_TEXT',
+      'WEB_BETWEEN_TEXT',
+      'TOOL_BETWEEN_TEXT',
+      'Second narration.',
+    ]);
+    expect(serializedProviderInput).toContain('WEB_BETWEEN_TEXT');
+    for (const toolOutput of toolOutputs) {
+      expect(serializedProviderInput).not.toContain(toolOutput.id);
+    }
+    expect(projectedMessage.additional_kwargs).not.toHaveProperty(
+      OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+    );
+    expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
+  it.each(['v0', 'v1'] as const)(
+    'preserves terminal incomplete %s file-search and code-interpreter outputs',
+    (outputVersion) => {
+      const dataUrl = 'data:image/png;base64,AA==';
+      const toolOutputs = [
+        {
+          id: `fs_incomplete_${outputVersion}`,
+          type: 'file_search_call',
+          status: 'incomplete',
+          queries: ['partial result'],
+          results: [
+            {
+              file_id: 'partial_file',
+              filename: 'partial.txt',
+              score: 0.5,
+              text: 'PARTIAL_FILE_RESULT',
+            },
+          ],
+        },
+        {
+          id: `ci_incomplete_${outputVersion}`,
+          type: 'code_interpreter_call',
+          status: 'incomplete',
+          code: 'display(partial_chart)',
+          outputs: [
+            { type: 'logs', logs: 'PARTIAL_CODE_LOG' },
+            { type: 'image', url: dataUrl },
+          ],
+        },
+      ];
+      const message = new AIMessage({
+        content: [{ type: 'text', text: 'Partial narration.' }],
+        additional_kwargs: {
+          tool_outputs: toolOutputs,
+          [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+            {
+              itemId: toolOutputs[0].id,
+              kind: 'output',
+              outputIndex: 0,
+            },
+            {
+              itemId: toolOutputs[1].id,
+              kind: 'output',
+              outputIndex: 1,
+            },
+            {
+              itemId: 'msg_incomplete',
+              kind: 'text',
+              outputIndex: 2,
+              contentIndex: 0,
+            },
+          ],
+        },
+        response_metadata: {
+          model_provider: 'openai',
+          ...(outputVersion === 'v1' ? { output_version: 'v1' } : {}),
+          preempted: true,
+        },
+      });
+      const originalSerialized = JSON.stringify(message.toJSON());
+
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+      const providerInput = convertMessagesToResponsesInput({
+        messages: projected,
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+      const serialized = JSON.stringify(projectedMessage.content);
+      const serializedProviderInput = JSON.stringify(providerInput);
+      const serverResults = (
+        projectedMessage.content as Array<{ text?: string; type: string }>
+      )
+        .filter(
+          (block) =>
+            block.type === 'text' &&
+            block.text?.startsWith('{"serverToolResult":') === true
+        )
+        .map(
+          (block) =>
+            (
+              JSON.parse(block.text!) as {
+                serverToolResult: { output: unknown; status: string };
+              }
+            ).serverToolResult
+        );
+
+      expect(serverResults).toEqual([
+        expect.objectContaining({ status: 'error' }),
+        expect.objectContaining({ status: 'error' }),
+      ]);
+      expect(serialized).toContain('PARTIAL_FILE_RESULT');
+      expect(serialized).toContain('PARTIAL_CODE_LOG');
+      expect(projectedMessage.content).toEqual(
+        expect.arrayContaining([
+          {
+            type: 'image',
+            url: dataUrl,
+            extras: CODE_INTERPRETER_REPLAY_EXTRAS,
+          },
+        ])
+      );
+      expect(serializedProviderInput).toContain(dataUrl);
+      expect(serializedProviderInput).not.toContain(toolOutputs[0].id);
+      expect(serializedProviderInput).not.toContain(toolOutputs[1].id);
+      expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+
+      const projectedAgain =
+        projectOpenAIResponsesToolMessageContent(projected);
+      expect(projectedAgain).toBe(projected);
+      expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
+
+  it.each([
+    ['logs then image', ['logs', 'image']],
+    ['image then logs', ['image', 'logs']],
+  ] as const)(
+    'preserves code-interpreter %s order at its cross-item position',
+    (_label, outputOrder) => {
+      const dataUrl = 'data:image/png;base64,AQ==';
+      const outputs = outputOrder.map((type) =>
+        type === 'logs'
+          ? { type: 'logs', logs: 'ORDERED_CODE_LOG' }
+          : { type: 'image', url: dataUrl }
+      );
+      const message = new AIMessage({
+        content: [
+          { type: 'text', text: 'First narration.' },
+          { type: 'text', text: 'Second narration.' },
+        ],
+        additional_kwargs: {
+          tool_outputs: [
+            {
+              id: 'ci_ordered_outputs',
+              type: 'code_interpreter_call',
+              status: 'completed',
+              code: 'display(result)',
+              outputs,
+            },
+          ],
+          [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+            {
+              itemId: 'msg_order_first',
+              kind: 'text',
+              outputIndex: 0,
+              contentIndex: 0,
+            },
+            {
+              itemId: 'ci_ordered_outputs',
+              kind: 'output',
+              outputIndex: 1,
+            },
+            {
+              itemId: 'msg_order_second',
+              kind: 'text',
+              outputIndex: 2,
+              contentIndex: 0,
+            },
+          ],
+        },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+      const orderedContent = (
+        projectedMessage.content as Array<{
+          text?: string;
+          type: string;
+          url?: string;
+        }>
+      ).map((block) => {
+        if (
+          block.text === 'First narration.' ||
+          block.text === 'Second narration.'
+        ) {
+          return block.text;
+        }
+        if (block.type === 'image' && block.url === dataUrl) {
+          return 'image';
+        }
+        return block.text?.includes('ORDERED_CODE_LOG') === true
+          ? 'logs'
+          : undefined;
+      });
+
+      expect(orderedContent).toEqual([
+        'First narration.',
+        ...outputOrder,
+        'Second narration.',
+      ]);
+      expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+        'ci_ordered_outputs'
+      );
     }
   );
 
@@ -3408,6 +3735,215 @@ describe('formatAgentMessages', () => {
     expect(projectedAgain[0]).toBe(projectedMessage);
   });
 
+  it('derives id-less server-result positions from authoritative output', () => {
+    const output = [
+      {
+        type: 'local_shell_call_output',
+        status: 'completed',
+        output: 'IDLESS_BEFORE_TEXT',
+      },
+      {
+        id: 'msg_authoritative_first',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [
+          {
+            type: 'output_text',
+            text: 'First narration.',
+            annotations: [],
+          },
+        ],
+      },
+      {
+        id: 'msg_authoritative_empty',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [
+          {
+            type: 'output_text',
+            text: '',
+            annotations: [],
+          },
+        ],
+      },
+      {
+        type: 'program_output',
+        status: 'completed',
+        result: 'IDLESS_BETWEEN_TEXT',
+      },
+      {
+        id: 'msg_authoritative_second',
+        type: 'message',
+        role: 'assistant',
+        status: 'in_progress',
+        content: [
+          {
+            type: 'output_text',
+            text: 'Second narration.',
+            annotations: [],
+          },
+        ],
+      },
+    ];
+    const message = new AIMessage({
+      content: [
+        { type: 'text', text: 'First narration.' },
+        { type: 'text', text: 'Second narration.' },
+      ],
+      response_metadata: {
+        model_provider: 'openai',
+        output,
+        output_version: 'v1',
+        preempted: true,
+      },
+    });
+    const originalSerialized = JSON.stringify(message.toJSON());
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const orderedContent = (
+      projectedMessage.content as Array<{ text?: string; type: string }>
+    ).map((block) => {
+      if (
+        block.text === 'First narration.' ||
+        block.text === 'Second narration.'
+      ) {
+        return block.text;
+      }
+      if (block.text?.includes('IDLESS_BEFORE_TEXT') === true) {
+        return 'IDLESS_BEFORE_TEXT';
+      }
+      return block.text?.includes('IDLESS_BETWEEN_TEXT') === true
+        ? 'IDLESS_BETWEEN_TEXT'
+        : undefined;
+    });
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(orderedContent).toEqual([
+      'IDLESS_BEFORE_TEXT',
+      'First narration.',
+      'IDLESS_BETWEEN_TEXT',
+      'Second narration.',
+    ]);
+    expect(JSON.stringify(providerInput)).not.toContain(
+      'local_shell_call_output'
+    );
+    expect(JSON.stringify(providerInput)).not.toContain('program_output');
+    expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
+  it.each(['v0', 'v1'] as const)(
+    'replays encrypted %s reasoning at its captured output position',
+    (outputVersion) => {
+      const reasoning = {
+        id: `rs_positioned_${outputVersion}`,
+        type: 'reasoning',
+        status: 'completed',
+        summary: [],
+        encrypted_content: `opaque-positioned-${outputVersion}`,
+      };
+      const serverResult = {
+        id: `local_before_reasoning_${outputVersion}`,
+        type: 'local_shell_call_output',
+        status: 'completed',
+        output: 'RESULT_BEFORE_REASONING',
+      };
+      const message = new AIMessage({
+        content: [
+          { type: 'reasoning', reasoning: 'unfinished summary' },
+          { type: 'text', text: 'Narration after reasoning.' },
+        ],
+        additional_kwargs: {
+          reasoning,
+          tool_outputs: [serverResult],
+          [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+            {
+              itemId: serverResult.id,
+              kind: 'output',
+              outputIndex: 0,
+            },
+            {
+              itemId: reasoning.id,
+              kind: 'reasoning',
+              outputIndex: 1,
+            },
+            {
+              itemId: 'msg_after_reasoning',
+              kind: 'text',
+              outputIndex: 2,
+              contentIndex: 0,
+            },
+          ],
+        },
+        response_metadata: {
+          model_provider: 'openai',
+          ...(outputVersion === 'v1' ? { output_version: 'v1' } : {}),
+          preempted: true,
+        },
+      });
+      const originalSerialized = JSON.stringify(message.toJSON());
+
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+      const replayOrder = (
+        projectedMessage.content as Array<{
+          text?: string;
+          type: string;
+          value?: unknown;
+        }>
+      ).map((block) => {
+        if (block.type === 'non_standard' && block.value === reasoning) {
+          return 'reasoning';
+        }
+        if (block.text === 'Narration after reasoning.') {
+          return 'narration';
+        }
+        return block.text?.includes('RESULT_BEFORE_REASONING') === true
+          ? 'result'
+          : undefined;
+      });
+      const providerInput = convertMessagesToResponsesInput({
+        messages: projected,
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+      const serializedProviderInput = JSON.stringify(providerInput);
+      const resultIndex = serializedProviderInput.indexOf(
+        'RESULT_BEFORE_REASONING'
+      );
+      const reasoningIndex = serializedProviderInput.indexOf(reasoning.id);
+      const narrationIndex = serializedProviderInput.indexOf(
+        'Narration after reasoning.'
+      );
+
+      expect(replayOrder).toEqual(['result', 'reasoning', 'narration']);
+      expect(resultIndex).toBeGreaterThanOrEqual(0);
+      expect(resultIndex).toBeLessThan(reasoningIndex);
+      expect(reasoningIndex).toBeLessThan(narrationIndex);
+      expect(serializedProviderInput).not.toContain(serverResult.id);
+      expect(projectedMessage.additional_kwargs.reasoning).toBe(reasoning);
+      expect(projectedMessage.additional_kwargs).not.toHaveProperty(
+        OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+      );
+      expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+
+      const projectedAgain =
+        projectOpenAIResponsesToolMessageContent(projected);
+      expect(projectedAgain).toBe(projected);
+      expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
+
   it('neutralizes provider references duplicated into v1 content blocks', () => {
     const reasoning = {
       id: 'rs_interrupted',
@@ -3515,6 +4051,7 @@ describe('formatAgentMessages', () => {
         type: 'text',
         text: JSON.stringify({
           serverToolResult: {
+            librechatResponsesReplay: true,
             toolName: 'code_interpreter',
             status: 'success',
             output: {
@@ -3553,6 +4090,7 @@ describe('formatAgentMessages', () => {
         type: 'text',
         text: JSON.stringify({
           serverToolResult: {
+            librechatResponsesReplay: true,
             toolName: 'code_interpreter',
             status: 'success',
             output: {

@@ -626,10 +626,29 @@ function remapResponsesTextBlockIndex(
 function convertDroppedResponsesReplayOutput(
   event: OpenAIClient.Responses.ResponseStreamEvent
 ): ChatGenerationChunk | null {
-  if (
-    event.type !== 'response.output_item.done' ||
-    !RESPONSES_REPLAY_OUTPUT_ITEM_TYPES.has(event.item.type)
-  ) {
+  if (event.type !== 'response.output_item.done') {
+    return null;
+  }
+  if (event.item.type === 'reasoning') {
+    // Added/summary events already stream id, type, and summary. Only merge
+    // terminal fields here so chunk concatenation does not duplicate summary.
+    return new ChatGenerationChunk({
+      text: '',
+      message: new AIMessageChunk({
+        content: [],
+        additional_kwargs: {
+          reasoning: {
+            status: event.item.status,
+            ...(typeof event.item.encrypted_content === 'string'
+              ? { encrypted_content: event.item.encrypted_content }
+              : {}),
+          },
+        },
+        response_metadata: { model_provider: 'openai' },
+      }),
+    });
+  }
+  if (!RESPONSES_REPLAY_OUTPUT_ITEM_TYPES.has(event.item.type)) {
     return null;
   }
   return new ChatGenerationChunk({
@@ -653,6 +672,17 @@ function attachResponsesReplayPosition(
       contentIndex: event.content_index,
       itemId: event.item_id,
       kind: 'text',
+      outputIndex: event.output_index,
+    };
+  } else if (
+    event.type === 'response.output_item.added' &&
+    event.item.type === 'reasoning' &&
+    typeof event.item.id === 'string' &&
+    event.item.id.length > 0
+  ) {
+    position = {
+      itemId: event.item.id,
+      kind: 'reasoning',
       outputIndex: event.output_index,
     };
   } else if (

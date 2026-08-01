@@ -629,9 +629,32 @@ describe('custom chat model class smoke tests', () => {
           },
         } as OpenAIClient.Responses.ResponseStreamEvent;
         yield {
-          type: 'response.output_text.delta',
+          type: 'response.output_item.added',
           sequence_number: 3,
           output_index: 3,
+          item: {
+            id: 'rs_middle',
+            type: 'reasoning',
+            status: 'in_progress',
+            summary: [],
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_item.done',
+          sequence_number: 4,
+          output_index: 3,
+          item: {
+            id: 'rs_middle',
+            type: 'reasoning',
+            status: 'incomplete',
+            summary: [],
+            encrypted_content: 'opaque-middle-reasoning',
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 5,
+          output_index: 4,
           content_index: 0,
           item_id: 'msg_second',
           delta: 'Second narration.',
@@ -648,6 +671,13 @@ describe('custom chat model class smoke tests', () => {
           : (combined.concat(chunk as AIMessageChunk) as AIMessageChunk);
     }
     expect(combined).toBeDefined();
+    expect(combined!.additional_kwargs.reasoning).toEqual({
+      id: 'rs_middle',
+      type: 'reasoning',
+      status: 'incomplete',
+      summary: [],
+      encrypted_content: 'opaque-middle-reasoning',
+    });
     expect(
       combined!.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]
     ).toEqual([
@@ -659,11 +689,12 @@ describe('custom chat model class smoke tests', () => {
       },
       { itemId: 'ig_middle', kind: 'output', outputIndex: 1 },
       { itemId: 'local_middle', kind: 'output', outputIndex: 2 },
+      { itemId: 'rs_middle', kind: 'reasoning', outputIndex: 3 },
       {
         contentIndex: 0,
         itemId: 'msg_second',
         kind: 'text',
-        outputIndex: 3,
+        outputIndex: 4,
       },
     ]);
     combined!.response_metadata.preempted = true;
@@ -678,12 +709,14 @@ describe('custom chat model class smoke tests', () => {
     const firstIndex = serialized.indexOf('First narration.');
     const imageIndex = serialized.indexOf('data:image/png;base64,AA==');
     const resultIndex = serialized.indexOf('middle server result');
+    const reasoningIndex = serialized.indexOf('opaque-middle-reasoning');
     const secondIndex = serialized.indexOf('Second narration.');
 
     expect(firstIndex).toBeGreaterThanOrEqual(0);
     expect(firstIndex).toBeLessThan(imageIndex);
     expect(imageIndex).toBeLessThan(resultIndex);
-    expect(resultIndex).toBeLessThan(secondIndex);
+    expect(resultIndex).toBeLessThan(reasoningIndex);
+    expect(reasoningIndex).toBeLessThan(secondIndex);
     expect(serialized).not.toContain('ig_middle');
     expect(serialized).not.toContain('local_middle');
     expect(projected.additional_kwargs).not.toHaveProperty(
