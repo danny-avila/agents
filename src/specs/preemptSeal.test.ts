@@ -6,14 +6,21 @@
  * the dispatch-synchronous loop in `attemptInvoke` (no registered
  * CHAT_MODEL_STREAM handler), which is the only loop allowed to seal.
  */
-import { HumanMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
 import { RunnableBinding } from '@langchain/core/runnables';
-import type * as t from '@/types';
-import { Providers } from '@/common';
-import { HookRegistry } from '@/hooks/HookRegistry';
+import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
+import {
+  type OpenAIClient,
+  convertMessagesToResponsesInput,
+  convertResponsesDeltaToChatGenerationChunk,
+} from '@langchain/openai';
+import type { ChatGeneration, LLMResult } from '@langchain/core/outputs';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { HookCallback } from '@/hooks/types';
+import type * as t from '@/types';
+import { HookRegistry } from '@/hooks/HookRegistry';
 import { FakeChatModel } from '@/llm/fake';
+import { ChatOpenAI } from '@/llm/openai';
+import { Providers } from '@/common';
 import { Run } from '@/run';
 
 const FULL_RESPONSE = 'Alpha beta gamma delta epsilon zeta';
@@ -88,6 +95,133 @@ class CountingChatModel extends FakeChatModel {
     yield* super._streamResponseChunks(...args);
   }
 }
+
+class ResponsesReasoningChatModel extends FakeChatModel {
+  invocations: BaseMessage[][] = [];
+  includeServerToolResult = false;
+
+  _useResponsesApi(): boolean {
+    return true;
+  }
+
+  override async *_streamResponseChunks(
+    ...args: Parameters<FakeChatModel['_streamResponseChunks']>
+  ): ReturnType<FakeChatModel['_streamResponseChunks']> {
+    const [messages] = args;
+    this.invocations.push(messages);
+    if (this.invocations.length !== 1) {
+      yield* super._streamResponseChunks(...args);
+      return;
+    }
+
+    const outputOffset = this.includeServerToolResult ? 1 : 0;
+    const events: Parameters<
+      typeof convertResponsesDeltaToChatGenerationChunk
+    >[0][] = [
+      {
+        type: 'response.created',
+        sequence_number: 0,
+        response: {
+          id: 'resp_interrupted',
+          created_at: 0,
+          output_text: '',
+          error: null,
+          incomplete_details: null,
+          instructions: null,
+          metadata: null,
+          model: 'gpt-5.6',
+          object: 'response',
+          output: [],
+          parallel_tool_calls: true,
+          temperature: null,
+          tool_choice: 'auto',
+          tools: [],
+          top_p: null,
+          status: 'in_progress',
+        },
+      },
+      ...(this.includeServerToolResult
+        ? [
+          {
+            type: 'response.output_item.done' as const,
+            sequence_number: 1,
+            output_index: 0,
+            item: {
+              id: 'ci_interrupted',
+              type: 'code_interpreter_call' as const,
+              status: 'completed' as const,
+              code: 'print("server result")',
+              container_id: 'container_interrupted',
+              outputs: [
+                { type: 'logs' as const, logs: 'server result' },
+                {
+                  type: 'image' as const,
+                  url: 'https://example.com/ephemeral-chart.png',
+                },
+              ],
+            },
+          },
+        ]
+        : []),
+      {
+        type: 'response.output_item.added',
+        sequence_number: 1 + outputOffset,
+        output_index: outputOffset,
+        item: {
+          id: 'rs_interrupted',
+          type: 'reasoning',
+          status: 'in_progress',
+          summary: [],
+        },
+      },
+      {
+        type: 'response.output_item.done',
+        sequence_number: 2 + outputOffset,
+        output_index: outputOffset,
+        item: {
+          id: 'rs_interrupted',
+          type: 'reasoning',
+          status: 'completed',
+          summary: [],
+          encrypted_content: 'encrypted-reasoning',
+        },
+      },
+      {
+        type: 'response.output_item.added',
+        sequence_number: 3 + outputOffset,
+        output_index: 1 + outputOffset,
+        item: {
+          id: 'msg_interrupted',
+          type: 'message',
+          role: 'assistant',
+          status: 'in_progress',
+          content: [],
+        },
+      },
+      {
+        type: 'response.output_text.delta',
+        sequence_number: 4 + outputOffset,
+        output_index: 1 + outputOffset,
+        content_index: 0,
+        item_id: 'msg_interrupted',
+        delta: 'Partial answer.',
+        logprobs: [],
+      },
+    ];
+    for (const event of events) {
+      const chunk = convertResponsesDeltaToChatGenerationChunk(event);
+      if (chunk != null) {
+        yield chunk;
+      }
+    }
+  }
+}
+
+type StreamingResponsesDelegate = {
+  completionWithRetry: (
+    request: OpenAIClient.Responses.ResponseCreateParamsStreaming
+  ) => Promise<AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>>;
+};
 
 const aiContents = (messages: BaseMessage[]): string[] =>
   messages
@@ -204,6 +338,43 @@ describe('cooperative seal (end-to-end via Run)', () => {
     expect(ends).toBe(2);
   });
 
+  it('preserves the preempted marker through constructor-kwargs rehydration', async () => {
+    let sealedChunk: AIMessageChunk | undefined;
+    const run = await createSealRun({
+      runId: 'seal-serialized-preempted-marker',
+      hook: async () => ({ preventContinuation: true }),
+      responses: [FULL_RESPONSE],
+      modelCallbacks: [
+        {
+          handleLLMEnd(output: LLMResult): void {
+            const generation = output.generations[0]?.[0] as
+              | ChatGeneration
+              | undefined;
+            const message = generation?.message;
+            if (
+              AIMessageChunk.isInstance(message) &&
+              message.response_metadata.preempted === true
+            ) {
+              sealedChunk = message;
+            }
+          },
+        },
+      ],
+    });
+
+    await run.processStream(
+      { messages: [new HumanMessage('hello there')] },
+      streamConfig
+    );
+
+    expect(sealedChunk).toBeDefined();
+    const serializedFields = JSON.parse(
+      JSON.stringify(sealedChunk!.lc_kwargs)
+    ) as ConstructorParameters<typeof AIMessageChunk>[0];
+    const rehydrated = new AIMessageChunk(serializedFields);
+    expect(rehydrated.response_metadata.preempted).toBe(true);
+  });
+
   it('a halting boundary stops multi-agent successors, not just the sealed subgraph', async () => {
     const registry = new HookRegistry();
     registry.register('PreemptBoundary', {
@@ -272,7 +443,11 @@ describe('cooperative seal (end-to-end via Run)', () => {
       runId: 'seal-inject-resume',
       hook: async () => ({
         injectedMessages: [
-          { role: 'user' as const, content: 'Make it shorter.', source: 'steer' },
+          {
+            role: 'user' as const,
+            content: 'Make it shorter.',
+            source: 'steer',
+          },
         ],
       }),
       responses: [FULL_RESPONSE, RESUMED_RESPONSE],
@@ -305,5 +480,199 @@ describe('cooperative seal (end-to-end via Run)', () => {
     expect(FULL_RESPONSE.startsWith(contents[0])).toBe(true);
     expect(contents[0].length).toBeLessThan(FULL_RESPONSE.length);
     expect(contents[1]).toBe(RESUMED_RESPONSE);
+  });
+
+  it.each(['v0', 'v1'] as const)(
+    'does not replay interrupted OpenAI Responses item ids on %s resume',
+    async (outputVersion) => {
+      const run = await createSealRun({
+        runId: `seal-openai-responses-reasoning-${outputVersion}`,
+        hook: async () => ({
+          injectedMessages: [
+            { role: 'user' as const, content: 'Go on.', source: 'steer' },
+          ],
+        }),
+        responses: [],
+      });
+      const model = new ResponsesReasoningChatModel({
+        responses: [RESUMED_RESPONSE],
+      });
+      model.outputVersion = outputVersion;
+      run.Graph!.overrideModel = model;
+
+      await run.processStream(
+        { messages: [new HumanMessage('hello there')] },
+        streamConfig
+      );
+
+      expect(model.invocations).toHaveLength(2);
+      const sealedMessage = model.invocations[1].find(
+        (message) => message.getType() === 'ai'
+      );
+      expect(sealedMessage).toBeDefined();
+      expect(sealedMessage?.text).toBe('Partial answer.');
+      expect(sealedMessage?.response_metadata).not.toHaveProperty('id');
+      const actualOutputVersion = (
+        sealedMessage?.response_metadata as { output_version?: unknown }
+      ).output_version;
+      expect(actualOutputVersion).toBe(
+        outputVersion === 'v1' ? 'v1' : undefined
+      );
+
+      const providerInput = convertMessagesToResponsesInput({
+        messages: model.invocations[1],
+        model: 'gpt-5.6',
+        zdrEnabled: false,
+      });
+      const unsafeReasoning = providerInput.find(
+        (item) =>
+          item.type === 'reasoning' &&
+          item.id === 'rs_interrupted' &&
+          (typeof item.encrypted_content !== 'string' ||
+            item.encrypted_content.length === 0)
+      );
+      expect(unsafeReasoning).toBeUndefined();
+      expect(JSON.stringify(providerInput)).toContain('Partial answer.');
+    }
+  );
+
+  it.each(['v0', 'v1'] as const)(
+    'preserves completed Responses server results on %s resume without ids',
+    async (outputVersion) => {
+      const run = await createSealRun({
+        runId: `seal-openai-responses-server-result-${outputVersion}`,
+        hook: async () => ({
+          injectedMessages: [
+            { role: 'user' as const, content: 'Go on.', source: 'steer' },
+          ],
+        }),
+        responses: [],
+      });
+      const model = new ResponsesReasoningChatModel({
+        responses: [RESUMED_RESPONSE],
+      });
+      model.outputVersion = outputVersion;
+      model.includeServerToolResult = true;
+      run.Graph!.overrideModel = model;
+
+      await run.processStream(
+        { messages: [new HumanMessage('hello there')] },
+        streamConfig
+      );
+
+      expect(model.invocations).toHaveLength(2);
+      const sealedMessage = model.invocations[1].find(
+        (message) => message.getType() === 'ai'
+      );
+      expect(sealedMessage).toBeDefined();
+      expect(sealedMessage?.text).toContain('Partial answer.');
+      expect(sealedMessage?.text).toContain('server result');
+      expect(sealedMessage?.text).toContain('ephemeral-chart.png');
+      expect(
+        (sealedMessage?.response_metadata as { output_version?: unknown })
+          .output_version
+      ).toBe('v1');
+
+      const providerInput = convertMessagesToResponsesInput({
+        messages: model.invocations[1],
+        model: 'gpt-5.6',
+        zdrEnabled: false,
+      });
+      const serializedProviderInput = JSON.stringify(providerInput);
+      expect(serializedProviderInput).toContain('server result');
+      expect(serializedProviderInput).toContain('ephemeral-chart.png');
+      expect(serializedProviderInput).not.toContain('ci_interrupted');
+      expect(serializedProviderInput).not.toContain('code_interpreter_call');
+      expect(serializedProviderInput).not.toContain('function_call_output');
+    }
+  );
+
+  it('preserves dropped raw Responses results through a real model resume', async () => {
+    const run = await createSealRun({
+      runId: 'seal-openai-responses-raw-result',
+      hook: async () => ({
+        injectedMessages: [
+          { role: 'user' as const, content: 'Go on.', source: 'steer' },
+        ],
+      }),
+      responses: [],
+    });
+    const model = new ChatOpenAI({
+      model: 'gpt-5.6',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingResponsesDelegate }
+    ).responses;
+    const requests: OpenAIClient.Responses.ResponseCreateParamsStreaming[] = [];
+    responses.completionWithRetry = async (request) => {
+      requests.push(request);
+      const invocation = requests.length;
+      return (async function* () {
+        if (invocation === 1) {
+          yield {
+            type: 'response.output_item.done',
+            sequence_number: 0,
+            output_index: 0,
+            item: {
+              id: 'local_output_item',
+              type: 'local_shell_call_output',
+              status: 'completed',
+              output: 'local shell result',
+            },
+          } as OpenAIClient.Responses.ResponseStreamEvent;
+          yield {
+            type: 'response.output_item.added',
+            sequence_number: 1,
+            output_index: 1,
+            item: {
+              id: 'rs_interrupted',
+              type: 'reasoning',
+              status: 'in_progress',
+              summary: [],
+            },
+          } as OpenAIClient.Responses.ResponseStreamEvent;
+          yield {
+            type: 'response.output_text.delta',
+            sequence_number: 2,
+            output_index: 2,
+            content_index: 0,
+            item_id: 'msg_interrupted',
+            delta: 'Partial answer.',
+            logprobs: [],
+          } as OpenAIClient.Responses.ResponseStreamEvent;
+          return;
+        }
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 0,
+          content_index: 0,
+          item_id: 'msg_resumed',
+          delta: RESUMED_RESPONSE,
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+    };
+    run.Graph!.overrideModel = model;
+
+    await run.processStream(
+      { messages: [new HumanMessage('hello there')] },
+      streamConfig
+    );
+
+    expect(requests).toHaveLength(2);
+    const resumedInput = JSON.stringify(requests[1].input);
+    expect(resumedInput).toContain('Partial answer.');
+    expect(resumedInput).toContain('local shell result');
+    expect(resumedInput).toContain('serverToolResult');
+    expect(resumedInput.indexOf('local shell result')).toBeLessThan(
+      resumedInput.indexOf('Partial answer.')
+    );
+    expect(resumedInput).not.toContain('local_output_item');
+    expect(resumedInput).not.toContain('local_shell_call_output');
+    expect(resumedInput).not.toContain('rs_interrupted');
+    expect(run.getHaltReason()).toBeUndefined();
   });
 });

@@ -1,3 +1,4 @@
+import { convertMessagesToResponsesInput } from '@langchain/openai';
 import {
   AIMessage,
   AIMessageChunk,
@@ -21,6 +22,10 @@ import {
   CustomOpenAIClient,
   CustomAzureOpenAIClient,
 } from '@/llm/openai';
+import {
+  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
+  projectOpenAIResponsesToolMessageContent,
+} from '@/messages/core';
 import { CustomChatGoogleGenerativeAI } from '@/llm/google';
 import { CustomChatBedrockConverse } from '@/llm/bedrock';
 import { ChatOpenRouter } from '@/llm/openrouter';
@@ -36,6 +41,29 @@ type OpenAIRequestOptionsWithBaseURL = ReturnType<
 type OpenAIResponsesDelegate = {
   client?: unknown;
   _getClientOptions: (options?: OpenAIRequestOptions) => OpenAIRequestOptions;
+};
+type StreamingOpenAIResponsesDelegate = OpenAIResponsesDelegate & {
+  completionWithRetry: (
+    request: OpenAIClient.Responses.ResponseCreateParamsStreaming
+  ) => Promise<AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>>;
+};
+type MockableResponsesDelegate = OpenAIResponsesDelegate & {
+  completionWithRetry: (request: {
+    input?: unknown;
+    stream?: boolean;
+  }) => Promise<unknown>;
+  _generate: (
+    messages: AIMessage[],
+    options: Record<string, unknown>
+  ) => Promise<unknown>;
+  _streamChatModelEvents: (
+    messages: AIMessage[],
+    options: Record<string, unknown>
+  ) => AsyncGenerator<unknown>;
+  _streamResponseChunks: (
+    messages: AIMessage[],
+    options: Record<string, unknown>
+  ) => AsyncGenerator<ChatGenerationChunk>;
 };
 type AnthropicCallOptions = Parameters<
   CustomAnthropic['invocationParams']
@@ -182,6 +210,107 @@ const baseAzureFields = {
   azureOpenAIApiInstanceName: 'test-instance',
   azureOpenAIApiDeploymentName: 'test-deployment',
 };
+
+function createPersistedPreemptedAzureMessage(): AIMessage {
+  return new AIMessage({
+    id: 'msg_persisted_azure',
+    content: [{ type: 'text', text: 'Partial Azure answer.' }],
+    additional_kwargs: {
+      reasoning: {
+        id: 'rs_persisted_azure',
+        type: 'reasoning',
+        status: 'in_progress',
+        summary: [],
+      },
+      tool_outputs: [
+        {
+          id: 'local_persisted_azure',
+          type: 'local_shell_call_output',
+          status: 'completed',
+          output: 'AZURE_SERVER_RESULT',
+        },
+      ],
+      [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+        {
+          itemId: 'local_persisted_azure',
+          kind: 'output',
+          outputIndex: 0,
+        },
+        {
+          itemId: 'rs_persisted_azure',
+          kind: 'reasoning',
+          outputIndex: 1,
+        },
+        {
+          itemId: 'msg_persisted_azure',
+          kind: 'text',
+          outputIndex: 2,
+          contentIndex: 0,
+        },
+      ],
+    },
+    response_metadata: {
+      id: 'resp_persisted_azure',
+      model_provider: 'openai',
+      preempted: true,
+    },
+  });
+}
+
+function expectNeutralizedAzureResponsesRequest(request: unknown): void {
+  const serialized = JSON.stringify(request);
+  expect(serialized).toContain('AZURE_SERVER_RESULT');
+  expect(serialized.match(/AZURE_SERVER_RESULT/g)).toHaveLength(1);
+  expect(serialized).toContain('serverToolResult');
+  expect(serialized).not.toContain('msg_persisted_azure');
+  expect(serialized).not.toContain('rs_persisted_azure');
+  expect(serialized).not.toContain('local_persisted_azure');
+  expect(serialized).not.toContain('resp_persisted_azure');
+  expect(serialized).not.toContain(OPENAI_RESPONSES_REPLAY_POSITIONS_KEY);
+  expect(serialized).not.toContain('local_shell_call_output');
+}
+
+function createCompletedAzureResponse(): OpenAIClient.Responses.Response {
+  return {
+    id: 'resp_fresh_azure',
+    created_at: 0,
+    error: null,
+    incomplete_details: null,
+    instructions: null,
+    metadata: {},
+    model: 'gpt-5',
+    object: 'response',
+    output: [
+      {
+        id: 'msg_fresh_azure',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [
+          {
+            type: 'output_text',
+            text: 'Fresh Azure answer.',
+            annotations: [],
+          },
+        ],
+      },
+    ],
+    output_text: 'Fresh Azure answer.',
+    parallel_tool_calls: true,
+    status: 'completed',
+    temperature: null,
+    tool_choice: 'auto',
+    tools: [],
+    top_p: null,
+    usage: {
+      input_tokens: 1,
+      input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+      output_tokens: 1,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 2,
+    },
+  } as OpenAIClient.Responses.Response;
+}
 
 const waitForFetchOutcome = (
   promise: Promise<Response>,
@@ -401,6 +530,569 @@ describe('custom chat model class smoke tests', () => {
     );
   });
 
+  it('retains replayable Responses output items before a terminal event', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingOpenAIResponsesDelegate }
+    ).responses;
+    const items = [
+      {
+        id: 'local_output_item',
+        type: 'local_shell_call_output',
+        status: 'completed',
+        output: 'local output',
+      },
+      {
+        id: 'shell_output_item',
+        call_id: 'shell_call_id',
+        type: 'shell_call_output',
+        status: 'completed',
+        max_output_length: 1_000,
+        output: [
+          {
+            stdout: 'shell output',
+            stderr: '',
+            outcome: { type: 'exit', exit_code: 0 },
+          },
+        ],
+      },
+      {
+        id: 'patch_output_item',
+        call_id: 'patch_call_id',
+        type: 'apply_patch_call_output',
+        status: 'completed',
+        output: 'patch output',
+      },
+      {
+        id: 'program_output_item',
+        call_id: 'program_call_id',
+        type: 'program_output',
+        status: 'completed',
+        result: 'program output',
+      },
+    ] as const;
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        for (let i = 0; i < items.length; i++) {
+          yield {
+            type: 'response.output_item.done',
+            sequence_number: i,
+            output_index: i,
+            item: items[i],
+          } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
+        }
+        yield {
+          type: 'response.output_item.added',
+          sequence_number: items.length,
+          output_index: items.length,
+          item: {
+            id: 'msg_partial',
+            type: 'message',
+            role: 'assistant',
+            status: 'in_progress',
+            content: [],
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: items.length + 1,
+          output_index: items.length,
+          content_index: 0,
+          item_id: 'msg_partial',
+          delta: 'Partial ',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: items.length + 2,
+          output_index: items.length,
+          content_index: 0,
+          item_id: 'msg_partial',
+          delta: 'answer.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    const chunks: AIMessageChunk[] = [];
+    const stream = await model.stream([new HumanMessage('run tools')]);
+    for await (const chunk of stream) {
+      chunks.push(chunk as AIMessageChunk);
+    }
+    const combined = chunks.reduce<AIMessageChunk | undefined>(
+      (current, chunk) =>
+        current == null ? chunk : (current.concat(chunk) as AIMessageChunk),
+      undefined
+    );
+
+    expect(chunks).toHaveLength(items.length + 3);
+    expect(combined?.text).toBe('Partial answer.');
+    expect(combined?.additional_kwargs.tool_outputs).toEqual(items);
+    expect(
+      combined?.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]
+    ).toEqual([
+      ...items.map((item, outputIndex) => ({
+        itemId: item.id,
+        kind: 'output',
+        outputIndex,
+      })),
+      {
+        itemId: 'msg_partial',
+        kind: 'message',
+        outputIndex: items.length,
+      },
+      {
+        contentIndex: 0,
+        itemId: 'msg_partial',
+        kind: 'text',
+        outputIndex: items.length,
+      },
+    ]);
+  });
+
+  it('rehydrates one-chunk Responses replay ordering from constructor kwargs', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingOpenAIResponsesDelegate }
+    ).responses;
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 3,
+          content_index: 2,
+          item_id: 'msg_one_chunk',
+          delta: 'Partial answer.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    const stream = await model.stream([new HumanMessage('answer')]);
+    const result = await stream.next();
+    expect(result.done).toBe(false);
+    const chunk = result.value as AIMessageChunk;
+    const serializedFields = JSON.parse(
+      JSON.stringify(chunk.lc_kwargs)
+    ) as ConstructorParameters<typeof AIMessageChunk>[0];
+    const rehydrated = new AIMessageChunk(serializedFields);
+
+    expect(chunk.content).toEqual([
+      { type: 'text', text: 'Partial answer.', index: 0 },
+    ]);
+    expect(rehydrated.content).toEqual([
+      { type: 'text', text: 'Partial answer.', index: 0 },
+    ]);
+    expect(
+      rehydrated.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]
+    ).toEqual([
+      {
+        contentIndex: 2,
+        itemId: 'msg_one_chunk',
+        kind: 'text',
+        outputIndex: 3,
+      },
+    ]);
+  });
+
+  it.each(['response.completed', 'response.incomplete'] as const)(
+    'removes provisional replay outputs after %s supplies the authoritative output',
+    async (terminalType) => {
+      const model = new ChatOpenAI({
+        model: 'gpt-5',
+        apiKey: 'test-key',
+        useResponsesApi: true,
+      });
+      const responses = (
+        model as unknown as { responses: StreamingOpenAIResponsesDelegate }
+      ).responses;
+      const streamedToolOutput = {
+        id: 'web_search_item',
+        type: 'web_search_call',
+        status: 'completed',
+      } as const;
+      const provisionalReplayOutput = {
+        id: 'local_output_item',
+        type: 'local_shell_call_output',
+        status: 'completed',
+        output: 'stale provisional local output',
+      } as const;
+      const authoritativeReplayOutput = {
+        ...provisionalReplayOutput,
+        output: 'unique authoritative local output',
+      } as const;
+      responses.completionWithRetry = async () =>
+        (async function* () {
+          yield {
+            type: 'response.output_item.done',
+            sequence_number: 0,
+            output_index: 0,
+            item: streamedToolOutput,
+          } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
+          yield {
+            type: 'response.output_item.done',
+            sequence_number: 1,
+            output_index: 1,
+            item: provisionalReplayOutput,
+          } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
+          yield {
+            type: terminalType,
+            sequence_number: 2,
+            response: {
+              id: 'resp_terminal',
+              model: 'gpt-5',
+              output: [streamedToolOutput, authoritativeReplayOutput],
+              status:
+                terminalType === 'response.completed'
+                  ? 'completed'
+                  : 'incomplete',
+              usage: null,
+            },
+          } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
+        })();
+
+      let tracedResult: unknown;
+      const chunks: AIMessageChunk[] = [];
+      const stream = await model.stream([new HumanMessage('run tools')], {
+        callbacks: [
+          {
+            handleLLMEnd(result: unknown): void {
+              tracedResult = result;
+            },
+          },
+        ],
+      });
+      for await (const chunk of stream) {
+        chunks.push(chunk as AIMessageChunk);
+      }
+      const combined = chunks.reduce<AIMessageChunk | undefined>(
+        (current, chunk) =>
+          current == null ? chunk : (current.concat(chunk) as AIMessageChunk),
+        undefined
+      );
+
+      expect(combined?.additional_kwargs.tool_outputs).toEqual([
+        streamedToolOutput,
+      ]);
+      expect(combined?.response_metadata.output).toEqual([
+        streamedToolOutput,
+        authoritativeReplayOutput,
+      ]);
+      expect(combined?.toJSON()).toEqual(
+        expect.objectContaining({
+          id: ['langchain_core', 'messages', 'AIMessageChunk'],
+        })
+      );
+      expect(
+        JSON.stringify(combined).match(/unique authoritative local output/g)
+      ).toHaveLength(1);
+      expect(JSON.stringify(combined)).not.toContain(
+        'stale provisional local output'
+      );
+      expect(JSON.stringify(combined?.lc_kwargs)).not.toContain(
+        'stale provisional local output'
+      );
+      expect(combined?.lc_kwargs.additional_kwargs).toEqual(
+        expect.objectContaining({ tool_outputs: [streamedToolOutput] })
+      );
+      expect(combined?.additional_kwargs).not.toHaveProperty(
+        OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+      );
+      expect(combined?.lc_kwargs.additional_kwargs).not.toHaveProperty(
+        OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+      );
+      expect(
+        JSON.stringify(tracedResult).match(/unique authoritative local output/g)
+      ).toHaveLength(1);
+      expect(JSON.stringify(tracedResult)).not.toContain(
+        'stale provisional local output'
+      );
+      expect(JSON.stringify(tracedResult)).not.toContain(
+        OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+      );
+    }
+  );
+
+  it('removes replay positions on a text-only terminal response', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingOpenAIResponsesDelegate }
+    ).responses;
+    const messageItem = {
+      id: 'msg_terminal',
+      type: 'message',
+      role: 'assistant',
+      status: 'completed',
+      content: [
+        {
+          type: 'output_text',
+          text: 'Complete answer.',
+          annotations: [],
+          logprobs: [],
+        },
+      ],
+    } as const;
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 0,
+          content_index: 0,
+          item_id: messageItem.id,
+          delta: messageItem.content[0].text,
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.completed',
+          sequence_number: 1,
+          response: {
+            id: 'resp_text_terminal',
+            model: 'gpt-5',
+            output: [messageItem],
+            status: 'completed',
+            usage: null,
+          },
+        } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    let combined: AIMessageChunk | undefined;
+    const stream = await model.stream([new HumanMessage('answer')]);
+    for await (const chunk of stream) {
+      combined =
+        combined == null
+          ? (chunk as AIMessageChunk)
+          : (combined.concat(chunk as AIMessageChunk) as AIMessageChunk);
+    }
+
+    expect(combined?.text).toBe('Complete answer.');
+    expect(combined?.response_metadata.output).toEqual([messageItem]);
+    expect(combined?.additional_kwargs).not.toHaveProperty(
+      OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+    );
+    expect(combined?.lc_kwargs.additional_kwargs).not.toHaveProperty(
+      OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+    );
+  });
+
+  it('keeps a raw server result between distinct Responses output messages', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingOpenAIResponsesDelegate }
+    ).responses;
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 0,
+          content_index: 0,
+          item_id: 'msg_first',
+          delta: 'First narration.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_item.done',
+          sequence_number: 1,
+          output_index: 1,
+          item: {
+            id: 'local_output_item',
+            type: 'local_shell_call_output',
+            status: 'completed',
+            output: 'middle server result',
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 2,
+          output_index: 2,
+          content_index: 0,
+          item_id: 'msg_second',
+          delta: 'Second narration.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    let combined: AIMessageChunk | undefined;
+    const stream = await model.stream([new HumanMessage('run a server tool')]);
+    for await (const chunk of stream) {
+      combined =
+        combined == null
+          ? (chunk as AIMessageChunk)
+          : (combined.concat(chunk as AIMessageChunk) as AIMessageChunk);
+    }
+    expect(combined).toBeDefined();
+    combined!.response_metadata.preempted = true;
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([combined!]);
+    const providerInput = convertMessagesToResponsesInput({
+      messages: [projected],
+      model: 'gpt-5',
+      zdrEnabled: false,
+    });
+    const serialized = JSON.stringify(providerInput);
+    const firstIndex = serialized.indexOf('First narration.');
+    const resultIndex = serialized.indexOf('middle server result');
+    const secondIndex = serialized.indexOf('Second narration.');
+
+    expect(firstIndex).toBeGreaterThanOrEqual(0);
+    expect(firstIndex).toBeLessThan(resultIndex);
+    expect(resultIndex).toBeLessThan(secondIndex);
+  });
+
+  it('keeps streamed generated images and server results in cross-item order', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingOpenAIResponsesDelegate }
+    ).responses;
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 0,
+          content_index: 0,
+          item_id: 'msg_first',
+          delta: 'First narration.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_item.done',
+          sequence_number: 1,
+          output_index: 1,
+          item: {
+            id: 'ig_middle',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'AA==',
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_item.done',
+          sequence_number: 2,
+          output_index: 2,
+          item: {
+            id: 'local_middle',
+            type: 'local_shell_call_output',
+            status: 'completed',
+            output: 'middle server result',
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_item.added',
+          sequence_number: 3,
+          output_index: 3,
+          item: {
+            id: 'rs_middle',
+            type: 'reasoning',
+            status: 'in_progress',
+            summary: [],
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_item.done',
+          sequence_number: 4,
+          output_index: 3,
+          item: {
+            id: 'rs_middle',
+            type: 'reasoning',
+            status: 'incomplete',
+            summary: [],
+            encrypted_content: 'opaque-middle-reasoning',
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 5,
+          output_index: 4,
+          content_index: 0,
+          item_id: 'msg_second',
+          delta: 'Second narration.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    let combined: AIMessageChunk | undefined;
+    const stream = await model.stream([new HumanMessage('generate and run')]);
+    for await (const chunk of stream) {
+      combined =
+        combined == null
+          ? (chunk as AIMessageChunk)
+          : (combined.concat(chunk as AIMessageChunk) as AIMessageChunk);
+    }
+    expect(combined).toBeDefined();
+    expect(combined!.additional_kwargs.reasoning).toEqual({
+      id: 'rs_middle',
+      type: 'reasoning',
+      status: 'incomplete',
+      summary: [],
+      encrypted_content: 'opaque-middle-reasoning',
+    });
+    expect(
+      combined!.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]
+    ).toEqual([
+      {
+        contentIndex: 0,
+        itemId: 'msg_first',
+        kind: 'text',
+        outputIndex: 0,
+      },
+      { itemId: 'ig_middle', kind: 'output', outputIndex: 1 },
+      { itemId: 'local_middle', kind: 'output', outputIndex: 2 },
+      { itemId: 'rs_middle', kind: 'reasoning', outputIndex: 3 },
+      {
+        contentIndex: 0,
+        itemId: 'msg_second',
+        kind: 'text',
+        outputIndex: 4,
+      },
+    ]);
+    combined!.response_metadata.preempted = true;
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([combined!]);
+    const providerInput = convertMessagesToResponsesInput({
+      messages: [projected],
+      model: 'gpt-5',
+      zdrEnabled: false,
+    });
+    const serialized = JSON.stringify(providerInput);
+    const firstIndex = serialized.indexOf('First narration.');
+    const imageIndex = serialized.indexOf('data:image/png;base64,AA==');
+    const resultIndex = serialized.indexOf('middle server result');
+    const reasoningIndex = serialized.indexOf('opaque-middle-reasoning');
+    const secondIndex = serialized.indexOf('Second narration.');
+
+    expect(firstIndex).toBeGreaterThanOrEqual(0);
+    expect(firstIndex).toBeLessThan(imageIndex);
+    expect(imageIndex).toBeLessThan(resultIndex);
+    expect(resultIndex).toBeLessThan(reasoningIndex);
+    expect(reasoningIndex).toBeLessThan(secondIndex);
+    expect(serialized).not.toContain('ig_middle');
+    expect(serialized).not.toContain('local_middle');
+    expect(projected.additional_kwargs).not.toHaveProperty(
+      OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+    );
+  });
+
   it('keeps Azure client customization and gates reasoning to reasoning models', () => {
     const model = new AzureChatOpenAI({
       ...baseAzureFields,
@@ -442,6 +1134,61 @@ describe('custom chat model class smoke tests', () => {
     nonReasoningModel.model = 'gpt-4o';
     nonReasoningModel.reasoning = { effort: 'low' };
     expect(nonReasoningModel.getReasoningParams()).toBeUndefined();
+  });
+
+  it('sanitizes persisted preempted history on direct Azure Responses streams', async () => {
+    const model = new AzureChatOpenAI({
+      ...baseAzureFields,
+    });
+    model.model = 'gpt-5';
+    const responses = (
+      model as unknown as { responses: MockableResponsesDelegate }
+    ).responses;
+    const requests: unknown[] = [];
+    responses.completionWithRetry = async (request) => {
+      requests.push(request);
+      return (async function* () {})();
+    };
+    const message = createPersistedPreemptedAzureMessage();
+    const originalSerialized = JSON.stringify(message.toJSON());
+
+    for await (const _chunk of responses._streamResponseChunks([message], {})) {
+      // The empty mock stream intentionally yields no chunks.
+    }
+    for await (const _event of responses._streamChatModelEvents(
+      [message],
+      {}
+    )) {
+      // The empty mock stream intentionally yields no events.
+    }
+
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      expectNeutralizedAzureResponsesRequest(request);
+    }
+    expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+  });
+
+  it('sanitizes persisted preempted history on direct Azure Responses generation', async () => {
+    const model = new AzureChatOpenAI({
+      ...baseAzureFields,
+    });
+    model.model = 'gpt-5';
+    const responses = (
+      model as unknown as { responses: MockableResponsesDelegate }
+    ).responses;
+    let request: unknown;
+    responses.completionWithRetry = async (nextRequest) => {
+      request = nextRequest;
+      return createCompletedAzureResponse();
+    };
+    const message = createPersistedPreemptedAzureMessage();
+    const originalSerialized = JSON.stringify(message.toJSON());
+
+    await responses._generate([message], {});
+
+    expectNeutralizedAzureResponsesRequest(request);
+    expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
   });
 
   it('keeps DeepSeek, Moonshot, and xAI on LibreChat wrapper semantics', () => {
