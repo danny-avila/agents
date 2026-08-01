@@ -1753,6 +1753,341 @@ describe('formatAgentMessages', () => {
     });
   });
 
+  it('neutralizes nonterminal Responses references on preempted provider input', () => {
+    const message = new AIMessage({
+      id: 'msg_interrupted',
+      content: 'Partial answer.',
+      additional_kwargs: {
+        reasoning: {
+          id: 'rs_interrupted',
+          type: 'reasoning',
+          summary: [],
+        },
+        tool_outputs: [
+          {
+            id: 'ci_interrupted',
+            type: 'code_interpreter_call',
+            status: 'completed',
+          },
+        ],
+        __openai_function_call_ids__: { call_1: 'fc_interrupted' },
+        __openai_custom_tool_call_ids__: { call_2: 'ctc_interrupted' },
+        retained: 'application metadata',
+      },
+      response_metadata: {
+        id: 'resp_interrupted',
+        output: [],
+        tool_outputs: [{ id: 'ci_interrupted' }],
+        model_name: 'gpt-5.6',
+        preempted: true,
+      },
+    });
+
+    const messages = [message];
+    const unsafeProviderInput = convertMessagesToResponsesInput({
+      messages,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+    const projected = projectOpenAIResponsesToolMessageContent(messages);
+    const projectedMessage = projected[0] as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projected).not.toBe(messages);
+    expect(projectedMessage).not.toBe(message);
+    expect(Object.getPrototypeOf(projectedMessage)).toBe(
+      Object.getPrototypeOf(message)
+    );
+    expect(projectedMessage.id).toBeUndefined();
+    expect(projectedMessage.content).toBe('Partial answer.');
+    expect(projectedMessage.additional_kwargs).toEqual({
+      retained: 'application metadata',
+    });
+    expect(projectedMessage.response_metadata).toEqual({
+      model_name: 'gpt-5.6',
+      preempted: true,
+    });
+    const unsafeSerializedInput = JSON.stringify(unsafeProviderInput);
+    const serializedInput = JSON.stringify(providerInput);
+    expect(unsafeSerializedInput).toContain('rs_interrupted');
+    expect(unsafeSerializedInput).toContain('ci_interrupted');
+    expect(serializedInput).toContain('Partial answer.');
+    expect(serializedInput).not.toContain('interrupted');
+    expect(message.id).toBe('msg_interrupted');
+    expect(message.additional_kwargs.reasoning).toBeDefined();
+    expect(message.response_metadata).toHaveProperty('output');
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
+  it('retains self-contained encrypted reasoning on preempted Responses input', () => {
+    const reasoning = {
+      id: 'rs_encrypted',
+      type: 'reasoning',
+      status: 'completed',
+      summary: [],
+      encrypted_content: 'opaque-reasoning',
+    };
+    const message = new AIMessage({
+      id: 'msg_interrupted',
+      content: 'Partial answer.',
+      additional_kwargs: { reasoning },
+      response_metadata: { preempted: true },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: [projected],
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projectedMessage.additional_kwargs.reasoning).toBe(reasoning);
+    expect(providerInput).toContainEqual(
+      expect.objectContaining({
+        id: 'rs_encrypted',
+        type: 'reasoning',
+        encrypted_content: 'opaque-reasoning',
+      })
+    );
+  });
+
+  it('neutralizes terminal Responses ids when request retention is unknown', () => {
+    const message = new AIMessage({
+      id: 'msg_completed',
+      content: 'Complete answer.',
+      additional_kwargs: {
+        reasoning: {
+          id: 'rs_completed',
+          type: 'reasoning',
+          summary: [],
+        },
+      },
+      response_metadata: {
+        preempted: true,
+        status: 'completed',
+        output: [
+          {
+            id: 'msg_completed',
+            type: 'message',
+            role: 'assistant',
+            status: 'completed',
+            content: [
+              {
+                type: 'output_text',
+                text: 'Complete answer.',
+                annotations: [],
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projectedMessage).not.toBe(message);
+    expect(projectedMessage.id).toBeUndefined();
+    expect(projectedMessage.additional_kwargs.reasoning).toBeUndefined();
+    expect(projectedMessage.response_metadata).toEqual({
+      preempted: true,
+      status: 'completed',
+    });
+    expect(JSON.stringify(providerInput)).toContain('Complete answer.');
+    expect(JSON.stringify(providerInput)).not.toContain('msg_completed');
+    expect(JSON.stringify(providerInput)).not.toContain('rs_completed');
+    expect(message.response_metadata).toHaveProperty('output');
+  });
+
+  it('neutralizes provider references duplicated into v1 content blocks', () => {
+    const reasoning = {
+      id: 'rs_interrupted',
+      type: 'reasoning',
+      status: 'in_progress',
+      summary: [],
+    };
+    const toolOutputs = [
+      {
+        id: 'ci_interrupted',
+        type: 'code_interpreter_call',
+        status: 'completed',
+        code: 'print(1)',
+        outputs: [{ type: 'logs', logs: '1' }],
+      },
+      {
+        type: 'image_generation_call',
+        id: 'ig_interrupted',
+        status: 'completed',
+        result: 'AA==',
+      },
+    ];
+    const providerMessage = new AIMessage({
+      content: [{ type: 'text', text: 'Partial answer.' }],
+      additional_kwargs: { reasoning, tool_outputs: toolOutputs },
+      response_metadata: { model_provider: 'openai' },
+    });
+    const message = new AIMessage({
+      contentBlocks: providerMessage.contentBlocks,
+      additional_kwargs: providerMessage.additional_kwargs,
+      response_metadata: {
+        id: 'resp_interrupted',
+        model_provider: 'openai',
+        output_version: 'v1',
+        preempted: true,
+      },
+    });
+
+    expect(message.content).toEqual([
+      { type: 'reasoning', reasoning: '' },
+      { type: 'text', text: 'Partial answer.' },
+      {
+        type: 'server_tool_call',
+        id: 'ci_interrupted',
+        name: 'code_interpreter',
+        args: { code: 'print(1)' },
+      },
+      {
+        type: 'server_tool_call_result',
+        toolCallId: 'ci_interrupted',
+        status: 'success',
+        output: {
+          type: 'code_interpreter_output',
+          returnCode: 0,
+          stderr: undefined,
+          stdout: '1',
+        },
+      },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        id: 'ig_interrupted',
+        metadata: { status: 'completed' },
+      },
+      {
+        type: 'non_standard',
+        value: toolOutputs[1],
+      },
+    ]);
+    expect(message.additional_kwargs.tool_outputs).toBe(toolOutputs);
+
+    const unsafeProviderInput = convertMessagesToResponsesInput({
+      messages: [message],
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(unsafeProviderInput).toContainEqual(
+      expect.objectContaining({ type: 'reasoning' })
+    );
+    expect(JSON.stringify(unsafeProviderInput)).toContain('ci_interrupted');
+    expect(JSON.stringify(unsafeProviderInput)).toContain(
+      'image_generation_call'
+    );
+    expect(JSON.stringify(providerInput)).toContain('Partial answer.');
+    expect(JSON.stringify(providerInput)).toContain(
+      'data:image/png;base64,AA=='
+    );
+    expect(JSON.stringify(providerInput)).not.toContain('rs_interrupted');
+    expect(JSON.stringify(providerInput)).not.toContain('ci_interrupted');
+    expect(JSON.stringify(providerInput)).not.toContain(
+      'image_generation_call'
+    );
+    expect(projectedMessage.content).toEqual([
+      { type: 'text', text: 'Partial answer.' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        id: 'ig_interrupted',
+        metadata: { status: 'completed' },
+      },
+    ]);
+    expect(projectedMessage.additional_kwargs).toEqual({});
+    const serialized = JSON.stringify(projectedMessage.toJSON());
+    expect(serialized).toContain('Partial answer.');
+    expect(serialized).toContain('AA==');
+    expect(serialized).not.toContain('rs_interrupted');
+    expect(serialized).not.toContain('ci_interrupted');
+    expect(serialized).not.toContain('image_generation_call');
+    expect(JSON.stringify(message.toJSON())).toContain('rs_interrupted');
+    expect(JSON.stringify(message.toJSON())).toContain('ci_interrupted');
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
+  it('retains exactly one self-contained encrypted reasoning item in v1', () => {
+    const reasoning = {
+      id: 'rs_encrypted',
+      type: 'reasoning',
+      status: 'completed',
+      summary: [],
+      encrypted_content: 'opaque-reasoning',
+    };
+    const message = new AIMessage({
+      content: [
+        {
+          type: 'reasoning',
+          reasoning: 'summary',
+        },
+        { type: 'text', text: 'Partial answer.' },
+      ],
+      additional_kwargs: { reasoning },
+      response_metadata: {
+        model_provider: 'openai',
+        output_version: 'v1',
+        preempted: true,
+      },
+    });
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projectedMessage.content).toEqual([
+      { type: 'non_standard', value: reasoning },
+      { type: 'text', text: 'Partial answer.' },
+    ]);
+    expect(
+      providerInput.filter(
+        (item) => item.type === 'reasoning' && item.id === 'rs_encrypted'
+      )
+    ).toEqual([
+      expect.objectContaining({
+        id: 'rs_encrypted',
+        type: 'reasoning',
+        encrypted_content: 'opaque-reasoning',
+      }),
+    ]);
+    expect(JSON.stringify(providerInput)).toContain('Partial answer.');
+  });
+
   it('preserves Responses computer outputs handled as provider-native media', () => {
     const computerCall = new AIMessage({
       content: '',

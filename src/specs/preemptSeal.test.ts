@@ -7,13 +7,17 @@
  * CHAT_MODEL_STREAM handler), which is the only loop allowed to seal.
  */
 import { HumanMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
 import { RunnableBinding } from '@langchain/core/runnables';
-import type * as t from '@/types';
-import { Providers } from '@/common';
-import { HookRegistry } from '@/hooks/HookRegistry';
+import {
+  convertMessagesToResponsesInput,
+  convertResponsesDeltaToChatGenerationChunk,
+} from '@langchain/openai';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { HookCallback } from '@/hooks/types';
+import type * as t from '@/types';
+import { HookRegistry } from '@/hooks/HookRegistry';
 import { FakeChatModel } from '@/llm/fake';
+import { Providers } from '@/common';
 import { Run } from '@/run';
 
 const FULL_RESPONSE = 'Alpha beta gamma delta epsilon zeta';
@@ -86,6 +90,102 @@ class CountingChatModel extends FakeChatModel {
   ): ReturnType<FakeChatModel['_streamResponseChunks']> {
     this.invocations += 1;
     yield* super._streamResponseChunks(...args);
+  }
+}
+
+class ResponsesReasoningChatModel extends FakeChatModel {
+  invocations: BaseMessage[][] = [];
+
+  _useResponsesApi(): boolean {
+    return true;
+  }
+
+  override async *_streamResponseChunks(
+    ...args: Parameters<FakeChatModel['_streamResponseChunks']>
+  ): ReturnType<FakeChatModel['_streamResponseChunks']> {
+    const [messages] = args;
+    this.invocations.push(messages);
+    if (this.invocations.length !== 1) {
+      yield* super._streamResponseChunks(...args);
+      return;
+    }
+
+    const events: Parameters<
+      typeof convertResponsesDeltaToChatGenerationChunk
+    >[0][] = [
+      {
+        type: 'response.created',
+        sequence_number: 0,
+        response: {
+          id: 'resp_interrupted',
+          created_at: 0,
+          output_text: '',
+          error: null,
+          incomplete_details: null,
+          instructions: null,
+          metadata: null,
+          model: 'gpt-5.6',
+          object: 'response',
+          output: [],
+          parallel_tool_calls: true,
+          temperature: null,
+          tool_choice: 'auto',
+          tools: [],
+          top_p: null,
+          status: 'in_progress',
+        },
+      },
+      {
+        type: 'response.output_item.added',
+        sequence_number: 1,
+        output_index: 0,
+        item: {
+          id: 'rs_interrupted',
+          type: 'reasoning',
+          status: 'in_progress',
+          summary: [],
+        },
+      },
+      {
+        type: 'response.output_item.done',
+        sequence_number: 2,
+        output_index: 0,
+        item: {
+          id: 'rs_interrupted',
+          type: 'reasoning',
+          status: 'completed',
+          summary: [],
+          encrypted_content: 'encrypted-reasoning',
+        },
+      },
+      {
+        type: 'response.output_item.added',
+        sequence_number: 3,
+        output_index: 1,
+        item: {
+          id: 'msg_interrupted',
+          type: 'message',
+          role: 'assistant',
+          status: 'in_progress',
+          content: [],
+        },
+      },
+      {
+        type: 'response.output_text.delta',
+        sequence_number: 4,
+        output_index: 1,
+        content_index: 0,
+        item_id: 'msg_interrupted',
+        delta: 'Partial answer.',
+        logprobs: [],
+      },
+    ];
+    for (const event of events) {
+      const chunk = convertResponsesDeltaToChatGenerationChunk(event);
+      if (chunk != null) {
+        yield chunk;
+      }
+    }
   }
 }
 
@@ -272,7 +372,11 @@ describe('cooperative seal (end-to-end via Run)', () => {
       runId: 'seal-inject-resume',
       hook: async () => ({
         injectedMessages: [
-          { role: 'user' as const, content: 'Make it shorter.', source: 'steer' },
+          {
+            role: 'user' as const,
+            content: 'Make it shorter.',
+            source: 'steer',
+          },
         ],
       }),
       responses: [FULL_RESPONSE, RESUMED_RESPONSE],
@@ -306,4 +410,58 @@ describe('cooperative seal (end-to-end via Run)', () => {
     expect(contents[0].length).toBeLessThan(FULL_RESPONSE.length);
     expect(contents[1]).toBe(RESUMED_RESPONSE);
   });
+
+  it.each(['v0', 'v1'] as const)(
+    'does not replay interrupted OpenAI Responses item ids on %s resume',
+    async (outputVersion) => {
+      const run = await createSealRun({
+        runId: `seal-openai-responses-reasoning-${outputVersion}`,
+        hook: async () => ({
+          injectedMessages: [
+            { role: 'user' as const, content: 'Go on.', source: 'steer' },
+          ],
+        }),
+        responses: [],
+      });
+      const model = new ResponsesReasoningChatModel({
+        responses: [RESUMED_RESPONSE],
+      });
+      model.outputVersion = outputVersion;
+      run.Graph!.overrideModel = model;
+
+      await run.processStream(
+        { messages: [new HumanMessage('hello there')] },
+        streamConfig
+      );
+
+      expect(model.invocations).toHaveLength(2);
+      const sealedMessage = model.invocations[1].find(
+        (message) => message.getType() === 'ai'
+      );
+      expect(sealedMessage).toBeDefined();
+      expect(sealedMessage?.text).toBe('Partial answer.');
+      expect(sealedMessage?.response_metadata).not.toHaveProperty('id');
+      const actualOutputVersion = (
+        sealedMessage?.response_metadata as { output_version?: unknown }
+      ).output_version;
+      expect(actualOutputVersion).toBe(
+        outputVersion === 'v1' ? 'v1' : undefined
+      );
+
+      const providerInput = convertMessagesToResponsesInput({
+        messages: model.invocations[1],
+        model: 'gpt-5.6',
+        zdrEnabled: false,
+      });
+      const unsafeReasoning = providerInput.find(
+        (item) =>
+          item.type === 'reasoning' &&
+          item.id === 'rs_interrupted' &&
+          (typeof item.encrypted_content !== 'string' ||
+            item.encrypted_content.length === 0)
+      );
+      expect(unsafeReasoning).toBeUndefined();
+      expect(JSON.stringify(providerInput)).toContain('Partial answer.');
+    }
+  );
 });

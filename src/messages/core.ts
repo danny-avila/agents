@@ -7,6 +7,7 @@ import {
   HumanMessage,
   AIMessageChunk,
 } from '@langchain/core/messages';
+import type { ContentBlock as LangChainContentBlock } from '@langchain/core/messages';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
@@ -589,6 +590,208 @@ function cloneAIMessageWithContent(
   ) as AIMessage;
 }
 
+type ResponsesReplayMetadata = {
+  [key: string]: unknown;
+  id?: unknown;
+  output?: unknown;
+  preempted?: unknown;
+  tool_outputs?: unknown;
+};
+
+function cloneAIMessageWithResponsesReplayState(
+  message: AIMessage,
+  content: AIMessage['content'],
+  id: string | undefined,
+  additionalKwargs: AIMessage['additional_kwargs'],
+  responseMetadata: AIMessage['response_metadata']
+): AIMessage {
+  const descriptors = Object.getOwnPropertyDescriptors(message) as Record<
+    string,
+    PropertyDescriptor | undefined
+  >;
+  const replacements = {
+    content,
+    id,
+    additional_kwargs: additionalKwargs,
+    response_metadata: responseMetadata,
+  };
+  for (const [key, value] of Object.entries(replacements)) {
+    const descriptor = descriptors[key];
+    descriptors[key] = {
+      configurable: descriptor?.configurable ?? true,
+      enumerable: descriptor?.enumerable ?? true,
+      value,
+      writable: descriptor?.writable ?? true,
+    };
+  }
+  const lcKwargs = descriptors.lc_kwargs;
+  if (
+    lcKwargs != null &&
+    'value' in lcKwargs &&
+    typeof lcKwargs.value === 'object' &&
+    lcKwargs.value != null
+  ) {
+    descriptors.lc_kwargs = {
+      ...lcKwargs,
+      value: {
+        ...(lcKwargs.value as Record<string, unknown>),
+        ...replacements,
+        ...(responseMetadata.output_version === 'v1'
+          ? { content: undefined, contentBlocks: content }
+          : {}),
+      },
+    };
+  }
+  return Object.create(
+    Object.getPrototypeOf(message),
+    descriptors as PropertyDescriptorMap
+  ) as AIMessage;
+}
+
+function hasReplayableEncryptedReasoning(reasoning: unknown): boolean {
+  if (reasoning == null || typeof reasoning !== 'object') {
+    return false;
+  }
+  const item = reasoning as {
+    encrypted_content?: unknown;
+    id?: unknown;
+    status?: unknown;
+    summary?: unknown;
+    type?: unknown;
+  };
+  return (
+    item.type === 'reasoning' &&
+    typeof item.id === 'string' &&
+    item.id.length > 0 &&
+    Array.isArray(item.summary) &&
+    typeof item.encrypted_content === 'string' &&
+    item.encrypted_content.length > 0 &&
+    (item.status === undefined ||
+      item.status === 'completed' ||
+      item.status === 'incomplete')
+  );
+}
+
+function isUnsafePreemptedResponsesV1Block(
+  block: LangChainContentBlock.Standard
+): boolean {
+  switch (block.type) {
+  case 'reasoning':
+  case 'server_tool_call':
+  case 'server_tool_call_chunk':
+  case 'server_tool_call_result':
+    return true;
+  case 'non_standard':
+    return !hasReplayableEncryptedReasoning(block.value);
+  default:
+    return false;
+  }
+}
+
+function projectPreemptedResponsesV1Content(
+  message: AIMessage,
+  reasoning: unknown
+): AIMessage['content'] {
+  if (
+    message.response_metadata.output_version !== 'v1' ||
+    !Array.isArray(message.content)
+  ) {
+    return message.content;
+  }
+
+  const content = message.content as LangChainContentBlock.Standard[];
+  const encryptedReasoning = hasReplayableEncryptedReasoning(reasoning)
+    ? reasoning
+    : undefined;
+  let projected: LangChainContentBlock.Standard[] | undefined;
+  let hasEncryptedReasoning = content.some(
+    (block) =>
+      block.type === 'non_standard' &&
+      hasReplayableEncryptedReasoning(block.value)
+  );
+  for (let i = 0; i < content.length; i++) {
+    const block = content[i];
+    if (isUnsafePreemptedResponsesV1Block(block)) {
+      projected ??= content.slice(0, i);
+      if (
+        block.type === 'reasoning' &&
+        encryptedReasoning != null &&
+        !hasEncryptedReasoning
+      ) {
+        projected.push({
+          type: 'non_standard',
+          value: encryptedReasoning,
+        });
+        hasEncryptedReasoning = true;
+      }
+      continue;
+    }
+    projected?.push(block);
+  }
+
+  if (encryptedReasoning != null && !hasEncryptedReasoning) {
+    projected = [
+      { type: 'non_standard', value: encryptedReasoning },
+      ...(projected ?? content),
+    ];
+  }
+  return projected ?? message.content;
+}
+
+/**
+ * A sealed Responses turn cannot prove that provider-side item ids were
+ * retained: the response object does not echo the request's `store` flag.
+ * Project a provider-neutral clone while preserving self-contained encrypted
+ * reasoning and the original graph/checkpoint message.
+ */
+function projectPreemptedOpenAIResponsesMessage(message: AIMessage): AIMessage {
+  const metadata = message.response_metadata as ResponsesReplayMetadata;
+  if (metadata.preempted !== true) {
+    return message;
+  }
+
+  const additionalKwargs = { ...message.additional_kwargs };
+  const hasEncryptedReasoning = hasReplayableEncryptedReasoning(
+    additionalKwargs.reasoning
+  );
+  const content = projectPreemptedResponsesV1Content(
+    message,
+    additionalKwargs.reasoning
+  );
+  const hasUnsafeProviderReferences =
+    content !== message.content ||
+    message.id?.startsWith('msg_') === true ||
+    (!hasEncryptedReasoning && additionalKwargs.reasoning != null) ||
+    additionalKwargs.tool_outputs != null ||
+    additionalKwargs.__openai_function_call_ids__ != null ||
+    additionalKwargs.__openai_custom_tool_call_ids__ != null ||
+    metadata.id != null ||
+    metadata.output != null ||
+    metadata.tool_outputs != null;
+  if (!hasUnsafeProviderReferences) {
+    return message;
+  }
+  if (!hasEncryptedReasoning) {
+    delete additionalKwargs.reasoning;
+  }
+  delete additionalKwargs.tool_outputs;
+  delete additionalKwargs.__openai_function_call_ids__;
+  delete additionalKwargs.__openai_custom_tool_call_ids__;
+
+  const responseMetadata: ResponsesReplayMetadata = { ...metadata };
+  delete responseMetadata.id;
+  delete responseMetadata.output;
+  delete responseMetadata.tool_outputs;
+
+  return cloneAIMessageWithResponsesReplayState(
+    message,
+    content,
+    message.id?.startsWith('msg_') === true ? undefined : message.id,
+    additionalKwargs,
+    responseMetadata
+  );
+}
+
 /**
  * Drops incomplete streamed text-input fragments that some providers retain
  * beside the assembled parsed tool call. They are neither user-visible text
@@ -687,7 +890,7 @@ function projectStructuredOpenAIToolContent(
 function projectOpenAIToolMessageContentInternal(
   messages: BaseMessage[],
   maxChars: number,
-  deduplicateResponsesComputerCalls: boolean,
+  nativeResponsesProjection: boolean,
   cacheControlledTextProjection: CacheControlledTextProjection
 ): BaseMessage[] {
   const pendingComputerCallIds: string[] = [];
@@ -699,8 +902,18 @@ function projectOpenAIToolMessageContentInternal(
     const isAssistant =
       message.getType() === 'ai' || messageRole === 'assistant';
     if (isAssistant) {
+      let assistantMessage = message as AIMessage;
+      if (nativeResponsesProjection) {
+        const replaySafeMessage =
+          projectPreemptedOpenAIResponsesMessage(assistantMessage);
+        if (replaySafeMessage !== assistantMessage) {
+          projected ??= [...messages];
+          projected[i] = replaySafeMessage;
+          assistantMessage = replaySafeMessage;
+        }
+      }
       const parsedComputerCallIds = new Set<string>();
-      const toolCalls = (message as AIMessage).tool_calls;
+      const toolCalls = assistantMessage.tool_calls;
       if (Array.isArray(toolCalls)) {
         for (const toolCall of toolCalls) {
           const record = toolCall as ToolCall & {
@@ -727,12 +940,12 @@ function projectOpenAIToolMessageContentInternal(
       }
 
       const rawOutput = (
-        message.response_metadata as {
+        assistantMessage.response_metadata as {
           output?: unknown;
         }
       ).output;
       const fallbackOutput = (
-        message.additional_kwargs as {
+        assistantMessage.additional_kwargs as {
           tool_outputs?: unknown;
         }
       ).tool_outputs;
@@ -775,7 +988,7 @@ function projectOpenAIToolMessageContentInternal(
       }
 
       if (
-        deduplicateResponsesComputerCalls &&
+        nativeResponsesProjection &&
         Array.isArray(toolCalls) &&
         rawComputerCallIds.size > 0
       ) {
@@ -794,7 +1007,7 @@ function projectOpenAIToolMessageContentInternal(
         if (projectedToolCalls.length !== toolCalls.length) {
           projected ??= [...messages];
           projected[i] = cloneAIMessageWithToolCalls(
-            message as AIMessage,
+            assistantMessage,
             projectedToolCalls,
             rawComputerCallIds
           );
