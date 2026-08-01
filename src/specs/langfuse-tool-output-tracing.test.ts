@@ -934,6 +934,34 @@ describe('Langfuse tool output tracing redaction', () => {
     ).not.toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   });
 
+  it('recognizes serialized fallback results only inside assistant messages', () => {
+    const userLiteral =
+      '{"serverToolResult":{"status":"success","output":"public user literal"}}';
+    const assistantResult =
+      '{"serverToolResult":{"status":"success","output":"private replay result"}}';
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        {
+          role: 'user',
+          content: [{ type: 'text', text: userLiteral }],
+        },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: assistantResult }],
+        },
+      ]),
+    });
+
+    redactLangfuseSpanToolOutputs(span, createConfig({ enabled: false }));
+
+    const redacted = span.attributes[
+      LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+    ] as string;
+    expect(redacted).toContain('public user literal');
+    expect(redacted).not.toContain('private replay result');
+    expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
   it('redacts neutralized replay results from resumed generation input', () => {
     const message = new AIMessage({
       content: [{ type: 'text', text: 'Partial answer.' }],

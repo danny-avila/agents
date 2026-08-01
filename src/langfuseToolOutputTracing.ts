@@ -245,6 +245,26 @@ function hasToolMessageIdentity(value: Record<string, unknown>): boolean {
   );
 }
 
+function hasAssistantMessageIdentity(value: Record<string, unknown>): boolean {
+  const role = getStringField(value, 'role');
+  if (role?.toLowerCase() === 'assistant') {
+    return true;
+  }
+  const type = getStringField(value, 'type') ?? getStringField(value, '_type');
+  if (type === 'ai' || type === 'assistant') {
+    return true;
+  }
+  const id = value.id;
+  return (
+    Array.isArray(id) &&
+    id.some(
+      (part) =>
+        typeof part === 'string' &&
+        (part === 'AIMessage' || part === 'AIMessageChunk')
+    )
+  );
+}
+
 function redactToolContentFields(
   value: Record<string, unknown>,
   config: ResolvedLangfuseToolOutputTracingConfig
@@ -415,7 +435,8 @@ function parseSerializedServerToolResultMarker(
 
 function redactMarkedServerToolResult(
   value: Record<string, unknown>,
-  config: ResolvedLangfuseToolOutputTracingConfig
+  config: ResolvedLangfuseToolOutputTracingConfig,
+  allowSerializedMarker: boolean
 ): RedactionResult | undefined {
   const type = getStringField(value, 'type');
   if (type !== 'text' && type !== 'image') {
@@ -427,7 +448,9 @@ function redactMarkedServerToolResult(
     ? extras.librechatServerToolResult
     : undefined;
   const serializedMarker =
-    text != null ? parseSerializedServerToolResultMarker(text) : undefined;
+    allowSerializedMarker && text != null
+      ? parseSerializedServerToolResultMarker(text)
+      : undefined;
   if (!isRecord(marker) && serializedMarker == null) {
     return undefined;
   }
@@ -525,13 +548,19 @@ function collectRedactionContext(
 function redactValue(
   value: unknown,
   config: ResolvedLangfuseToolOutputTracingConfig,
-  redactionContext: RedactionContext
+  redactionContext: RedactionContext,
+  allowSerializedServerToolResult = false
 ): RedactionResult {
   if (Array.isArray(value)) {
     let changed = false;
     const next: unknown[] = [];
     for (const item of value) {
-      const result = redactValue(item, config, redactionContext);
+      const result = redactValue(
+        item,
+        config,
+        redactionContext,
+        allowSerializedServerToolResult
+      );
       if (result.changed) {
         changed = true;
       }
@@ -543,6 +572,9 @@ function redactValue(
   if (!isRecord(value)) {
     return { value, changed: false };
   }
+
+  const allowSerializedMarker =
+    allowSerializedServerToolResult || hasAssistantMessageIdentity(value);
 
   const replayOutput = redactResponsesReplayOutput(
     value,
@@ -560,7 +592,11 @@ function redactValue(
   if (standardServerToolResult != null) {
     return standardServerToolResult;
   }
-  const markedServerToolResult = redactMarkedServerToolResult(value, config);
+  const markedServerToolResult = redactMarkedServerToolResult(
+    value,
+    config,
+    allowSerializedMarker
+  );
   if (markedServerToolResult != null) {
     return markedServerToolResult;
   }
@@ -584,7 +620,12 @@ function redactValue(
   let changed = false;
   const next: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
-    const result = redactValue(child, config, redactionContext);
+    const result = redactValue(
+      child,
+      config,
+      redactionContext,
+      allowSerializedMarker
+    );
     if (result.changed) {
       changed = true;
     }
