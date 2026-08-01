@@ -1,10 +1,10 @@
 import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
-import { HttpsProxyAgent } from 'https-proxy-agent';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
+import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { EnvVar, Constants } from '@/common';
 
@@ -426,8 +426,9 @@ function createCodeExecutionTool(
           body: JSON.stringify(postData),
         };
 
-        if (process.env.PROXY != null && process.env.PROXY !== '') {
-          fetchOptions.agent = new HttpsProxyAgent(process.env.PROXY);
+        const proxyAgent = resolveFetchProxyAgent(EXEC_ENDPOINT);
+        if (proxyAgent) {
+          fetchOptions.agent = proxyAgent;
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {
