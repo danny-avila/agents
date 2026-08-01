@@ -508,9 +508,17 @@ function redactGeneratedImageBlock(
   }
   const id = getStringField(value, 'id');
   const data = getStringField(value, 'data');
+  const metadata = value.metadata;
+  const normalizedStatus = isRecord(metadata)
+    ? getStringField(metadata, 'status')
+    : undefined;
+  const hasNormalizedGeneratedImageIdentity =
+    isAssistantContent &&
+    id?.startsWith('ig_') === true &&
+    isPresent(normalizedStatus);
   const isGeneratedImage =
     explicitToolName != null ||
-    isAssistantContent ||
+    hasNormalizedGeneratedImageIdentity ||
     (id != null
       ? redactionContext.generatedImageIds.has(id)
       : data != null && redactionContext.generatedImageData.has(data));

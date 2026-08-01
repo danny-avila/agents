@@ -825,8 +825,8 @@ describe('Langfuse tool output tracing redaction', () => {
         status: 'completed',
         result: 'private-generated-image-by-id',
       };
-      const generatedByDataFallback = {
-        id: 'ig_normal_response_without_content_id',
+      const generatedSecond = {
+        id: 'ig_normal_response_second',
         type: 'image_generation_call',
         status: 'completed',
         result: 'private-generated-image-by-data',
@@ -838,11 +838,14 @@ describe('Langfuse tool output tracing redaction', () => {
             mimeType: 'image/png',
             data: generatedById.result,
             id: generatedById.id,
+            metadata: { status: generatedById.status },
           },
           {
             type: 'image',
             mimeType: 'image/png',
-            data: generatedByDataFallback.result,
+            data: generatedSecond.result,
+            id: generatedSecond.id,
+            metadata: { status: generatedSecond.status },
           },
           {
             type: 'image',
@@ -850,14 +853,22 @@ describe('Langfuse tool output tracing redaction', () => {
             id: generatedById.id,
             url: 'private-generated-image-url',
             fileId: 'private-generated-image-file-id',
+            metadata: { status: generatedById.status },
+          },
+          {
+            type: 'image',
+            mimeType: 'image/png',
+            data: 'public-assistant-application-image',
+            id: 'application-image',
+            metadata: { status: 'completed' },
           },
         ],
         additional_kwargs: {
-          tool_outputs: [generatedById, generatedByDataFallback],
+          tool_outputs: [generatedById, generatedSecond],
         },
         response_metadata: {
           model_provider: 'openai',
-          output: [generatedById, generatedByDataFallback],
+          output: [generatedById, generatedSecond],
         },
       });
       const serializedMessage = serializeMessageForLangfuse(message);
@@ -888,9 +899,10 @@ describe('Langfuse tool output tracing redaction', () => {
         LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT
       ] as string;
       expect(redacted).not.toContain(generatedById.result);
-      expect(redacted).not.toContain(generatedByDataFallback.result);
+      expect(redacted).not.toContain(generatedSecond.result);
       expect(redacted).not.toContain('private-generated-image-url');
       expect(redacted).not.toContain('private-generated-image-file-id');
+      expect(redacted).toContain('public-assistant-application-image');
       expect(redacted).toContain('public-user-image-data');
       expect(redacted).toContain(generatedById.id);
       expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
