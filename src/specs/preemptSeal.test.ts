@@ -9,6 +9,7 @@
 import { HumanMessage } from '@langchain/core/messages';
 import { RunnableBinding } from '@langchain/core/runnables';
 import {
+  type OpenAIClient,
   convertMessagesToResponsesInput,
   convertResponsesDeltaToChatGenerationChunk,
 } from '@langchain/openai';
@@ -17,6 +18,7 @@ import type { HookCallback } from '@/hooks/types';
 import type * as t from '@/types';
 import { HookRegistry } from '@/hooks/HookRegistry';
 import { FakeChatModel } from '@/llm/fake';
+import { ChatOpenAI } from '@/llm/openai';
 import { Providers } from '@/common';
 import { Run } from '@/run';
 
@@ -95,6 +97,7 @@ class CountingChatModel extends FakeChatModel {
 
 class ResponsesReasoningChatModel extends FakeChatModel {
   invocations: BaseMessage[][] = [];
+  includeServerToolResult = false;
 
   _useResponsesApi(): boolean {
     return true;
@@ -110,6 +113,7 @@ class ResponsesReasoningChatModel extends FakeChatModel {
       return;
     }
 
+    const outputOffset = this.includeServerToolResult ? 1 : 0;
     const events: Parameters<
       typeof convertResponsesDeltaToChatGenerationChunk
     >[0][] = [
@@ -135,10 +139,33 @@ class ResponsesReasoningChatModel extends FakeChatModel {
           status: 'in_progress',
         },
       },
+      ...(this.includeServerToolResult
+        ? [
+          {
+            type: 'response.output_item.done' as const,
+            sequence_number: 1,
+            output_index: 0,
+            item: {
+              id: 'ci_interrupted',
+              type: 'code_interpreter_call' as const,
+              status: 'completed' as const,
+              code: 'print("server result")',
+              container_id: 'container_interrupted',
+              outputs: [
+                { type: 'logs' as const, logs: 'server result' },
+                {
+                  type: 'image' as const,
+                  url: 'https://example.com/ephemeral-chart.png',
+                },
+              ],
+            },
+          },
+        ]
+        : []),
       {
         type: 'response.output_item.added',
-        sequence_number: 1,
-        output_index: 0,
+        sequence_number: 1 + outputOffset,
+        output_index: outputOffset,
         item: {
           id: 'rs_interrupted',
           type: 'reasoning',
@@ -148,8 +175,8 @@ class ResponsesReasoningChatModel extends FakeChatModel {
       },
       {
         type: 'response.output_item.done',
-        sequence_number: 2,
-        output_index: 0,
+        sequence_number: 2 + outputOffset,
+        output_index: outputOffset,
         item: {
           id: 'rs_interrupted',
           type: 'reasoning',
@@ -160,8 +187,8 @@ class ResponsesReasoningChatModel extends FakeChatModel {
       },
       {
         type: 'response.output_item.added',
-        sequence_number: 3,
-        output_index: 1,
+        sequence_number: 3 + outputOffset,
+        output_index: 1 + outputOffset,
         item: {
           id: 'msg_interrupted',
           type: 'message',
@@ -172,8 +199,8 @@ class ResponsesReasoningChatModel extends FakeChatModel {
       },
       {
         type: 'response.output_text.delta',
-        sequence_number: 4,
-        output_index: 1,
+        sequence_number: 4 + outputOffset,
+        output_index: 1 + outputOffset,
         content_index: 0,
         item_id: 'msg_interrupted',
         delta: 'Partial answer.',
@@ -188,6 +215,12 @@ class ResponsesReasoningChatModel extends FakeChatModel {
     }
   }
 }
+
+type StreamingResponsesDelegate = {
+  completionWithRetry: (
+    request: OpenAIClient.Responses.ResponseCreateParamsStreaming
+  ) => Promise<AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>>;
+};
 
 const aiContents = (messages: BaseMessage[]): string[] =>
   messages
@@ -464,4 +497,141 @@ describe('cooperative seal (end-to-end via Run)', () => {
       expect(JSON.stringify(providerInput)).toContain('Partial answer.');
     }
   );
+
+  it.each(['v0', 'v1'] as const)(
+    'preserves completed Responses server results on %s resume without ids',
+    async (outputVersion) => {
+      const run = await createSealRun({
+        runId: `seal-openai-responses-server-result-${outputVersion}`,
+        hook: async () => ({
+          injectedMessages: [
+            { role: 'user' as const, content: 'Go on.', source: 'steer' },
+          ],
+        }),
+        responses: [],
+      });
+      const model = new ResponsesReasoningChatModel({
+        responses: [RESUMED_RESPONSE],
+      });
+      model.outputVersion = outputVersion;
+      model.includeServerToolResult = true;
+      run.Graph!.overrideModel = model;
+
+      await run.processStream(
+        { messages: [new HumanMessage('hello there')] },
+        streamConfig
+      );
+
+      expect(model.invocations).toHaveLength(2);
+      const sealedMessage = model.invocations[1].find(
+        (message) => message.getType() === 'ai'
+      );
+      expect(sealedMessage).toBeDefined();
+      expect(sealedMessage?.text).toContain('Partial answer.');
+      expect(sealedMessage?.text).toContain('server result');
+      expect(sealedMessage?.text).toContain('ephemeral-chart.png');
+      expect(
+        (sealedMessage?.response_metadata as { output_version?: unknown })
+          .output_version
+      ).toBe('v1');
+
+      const providerInput = convertMessagesToResponsesInput({
+        messages: model.invocations[1],
+        model: 'gpt-5.6',
+        zdrEnabled: false,
+      });
+      const serializedProviderInput = JSON.stringify(providerInput);
+      expect(serializedProviderInput).toContain('server result');
+      expect(serializedProviderInput).toContain('ephemeral-chart.png');
+      expect(serializedProviderInput).not.toContain('ci_interrupted');
+      expect(serializedProviderInput).not.toContain('code_interpreter_call');
+      expect(serializedProviderInput).not.toContain('function_call_output');
+    }
+  );
+
+  it('preserves dropped raw Responses results through a real model resume', async () => {
+    const run = await createSealRun({
+      runId: 'seal-openai-responses-raw-result',
+      hook: async () => ({
+        injectedMessages: [
+          { role: 'user' as const, content: 'Go on.', source: 'steer' },
+        ],
+      }),
+      responses: [],
+    });
+    const model = new ChatOpenAI({
+      model: 'gpt-5.6',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingResponsesDelegate }
+    ).responses;
+    const requests: OpenAIClient.Responses.ResponseCreateParamsStreaming[] = [];
+    responses.completionWithRetry = async (request) => {
+      requests.push(request);
+      const invocation = requests.length;
+      return (async function* () {
+        if (invocation === 1) {
+          yield {
+            type: 'response.output_item.done',
+            sequence_number: 0,
+            output_index: 0,
+            item: {
+              id: 'local_output_item',
+              type: 'local_shell_call_output',
+              status: 'completed',
+              output: 'local shell result',
+            },
+          } as OpenAIClient.Responses.ResponseStreamEvent;
+          yield {
+            type: 'response.output_item.added',
+            sequence_number: 1,
+            output_index: 1,
+            item: {
+              id: 'rs_interrupted',
+              type: 'reasoning',
+              status: 'in_progress',
+              summary: [],
+            },
+          } as OpenAIClient.Responses.ResponseStreamEvent;
+          yield {
+            type: 'response.output_text.delta',
+            sequence_number: 2,
+            output_index: 2,
+            content_index: 0,
+            item_id: 'msg_interrupted',
+            delta: 'Partial answer.',
+            logprobs: [],
+          } as OpenAIClient.Responses.ResponseStreamEvent;
+          return;
+        }
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 0,
+          content_index: 0,
+          item_id: 'msg_resumed',
+          delta: RESUMED_RESPONSE,
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+    };
+    run.Graph!.overrideModel = model;
+
+    await run.processStream(
+      { messages: [new HumanMessage('hello there')] },
+      streamConfig
+    );
+
+    expect(requests).toHaveLength(2);
+    const resumedInput = JSON.stringify(requests[1].input);
+    expect(resumedInput).toContain('Partial answer.');
+    expect(resumedInput).toContain('local shell result');
+    expect(resumedInput).toContain('serverToolResult');
+    expect(resumedInput).not.toContain('local_output_item');
+    expect(resumedInput).not.toContain('local_shell_call_output');
+    expect(resumedInput).not.toContain('rs_interrupted');
+    expect(run.getHaltReason()).toBeUndefined();
+  });
 });

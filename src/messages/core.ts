@@ -580,7 +580,9 @@ function cloneAIMessageWithContent(
       ...lcKwargs,
       value: {
         ...(lcKwargs.value as Record<string, unknown>),
-        content,
+        ...(message.response_metadata.output_version === 'v1'
+          ? { content: undefined, contentBlocks: content }
+          : { content }),
       },
     };
   }
@@ -664,76 +666,232 @@ function hasReplayableEncryptedReasoning(reasoning: unknown): boolean {
   );
 }
 
-function isUnsafePreemptedResponsesV1Block(
-  block: LangChainContentBlock.Standard
-): boolean {
-  switch (block.type) {
-  case 'reasoning':
-  case 'server_tool_call':
-  case 'server_tool_call_chunk':
-  case 'server_tool_call_result':
-    return true;
-  case 'non_standard':
-    return !hasReplayableEncryptedReasoning(block.value);
-  default:
-    return false;
-  }
-}
+type ResponsesReplayProjection = 'fallback' | 'native';
+
+type CompletedGeneratedImages = {
+  blocks: LangChainContentBlock.Multimodal.Image[];
+  data: Set<string>;
+  ids: Set<string>;
+};
+
+type ResponsesReplayArtifacts = {
+  generatedImages: CompletedGeneratedImages;
+  serverToolResults: LangChainContentBlock.Standard[];
+};
+
+type PositionedResponsesImage = {
+  block: LangChainContentBlock.Multimodal.Image;
+  textIndex: number;
+};
+
+type PositionedResponsesImages = {
+  blocks: PositionedResponsesImage[];
+  textCount: number;
+};
 
 function isProviderGeneratedImageBlock(
   block: LangChainContentBlock.Multimodal.Image,
-  generatedImages: ReturnType<typeof getCompletedGeneratedImages>
+  generatedImages: CompletedGeneratedImages,
+  allowDataFallback = true
 ): boolean {
   if (typeof block.id === 'string' && block.id.length > 0) {
     return generatedImages.ids.has(block.id);
   }
   return (
+    allowDataFallback &&
     typeof block.data === 'string' &&
     generatedImages.data.has(block.data) &&
     block.metadata != null &&
     typeof block.metadata === 'object' &&
-    'status' in block.metadata
+    block.metadata.status === 'completed'
   );
+}
+
+function hasMeaningfulServerToolOutput(output: unknown): boolean {
+  if (output == null || output === '') {
+    return false;
+  }
+  if (Array.isArray(output)) {
+    return output.length > 0;
+  }
+  if (typeof output !== 'object') {
+    return true;
+  }
+  try {
+    return Object.keys(output).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function createNeutralServerToolResult(
+  output: unknown,
+  status: 'error' | 'success',
+  maxChars: number
+): LangChainContentBlock.Text | undefined {
+  if (!hasMeaningfulServerToolOutput(output)) {
+    return undefined;
+  }
+  return {
+    type: 'text',
+    text: serializeToolContentBounded(
+      { serverToolResult: { status, output } },
+      maxChars
+    ),
+  };
+}
+
+function isCompleteToolStreamContentBlock(block: unknown): boolean {
+  if (block == null || typeof block !== 'object') {
+    return true;
+  }
+  try {
+    if (isProxy(block)) {
+      return false;
+    }
+    const type = Object.getOwnPropertyDescriptor(block, 'type');
+    if (type == null) {
+      return true;
+    }
+    if (type.enumerable !== true || !('value' in type)) {
+      return false;
+    }
+    if (type.value !== 'text') {
+      return true;
+    }
+    const text = Object.getOwnPropertyDescriptor(block, 'text');
+    return (
+      text?.enumerable === true &&
+      'value' in text &&
+      typeof text.value === 'string' &&
+      text.value !== ''
+    );
+  } catch {
+    return false;
+  }
 }
 
 function projectPreemptedResponsesV1Content(
   content: AIMessage['content'],
   reasoning: unknown,
-  generatedImages?: ReturnType<typeof getCompletedGeneratedImages>,
-  originalImages?: LangChainContentBlock.Multimodal.Image[]
-): AIMessage['content'] {
+  maxChars: number,
+  replayProjection: ResponsesReplayProjection,
+  generatedImages?: CompletedGeneratedImages,
+  originalImages?: PositionedResponsesImages,
+  serverToolResults?: LangChainContentBlock.Standard[]
+): {
+  content: AIMessage['content'];
+  preservedServerToolResult: boolean;
+} {
   if (!Array.isArray(content)) {
-    return content;
+    return { content, preservedServerToolResult: false };
   }
 
   const contentBlocks = content as LangChainContentBlock.Standard[];
-  const encryptedReasoning = hasReplayableEncryptedReasoning(reasoning)
-    ? reasoning
-    : undefined;
-  let projected: LangChainContentBlock.Standard[] | undefined;
+  const encryptedReasoning =
+    replayProjection === 'native' && hasReplayableEncryptedReasoning(reasoning)
+      ? reasoning
+      : undefined;
+  const projected: LangChainContentBlock.Standard[] = [];
+  let changed = false;
   let hasEncryptedReasoning = false;
+  let preservedServerToolResult = false;
   let reasoningInsertionIndex: number | undefined;
+  let originalImageIndex = 0;
+  let sourceTextIndex = 0;
+
+  const appendOriginalImages = (throughTextIndex?: number): void => {
+    if (replayProjection !== 'native' || originalImages == null) {
+      return;
+    }
+    while (originalImageIndex < originalImages.blocks.length) {
+      const positionedImage = originalImages.blocks[originalImageIndex];
+      if (
+        throughTextIndex != null &&
+        positionedImage.textIndex > throughTextIndex
+      ) {
+        return;
+      }
+      originalImageIndex++;
+      if (
+        generatedImages != null &&
+        isProviderGeneratedImageBlock(
+          positionedImage.block,
+          generatedImages,
+          false
+        )
+      ) {
+        continue;
+      }
+      projected.push(positionedImage.block);
+      changed = true;
+    }
+  };
+
   for (let i = 0; i < contentBlocks.length; i++) {
     const block = contentBlocks[i];
-    if (
-      block.type === 'non_standard' &&
-      hasReplayableEncryptedReasoning(block.value)
-    ) {
-      hasEncryptedReasoning = true;
+    if (!isCompleteToolStreamContentBlock(block)) {
+      changed = true;
+      continue;
     }
-    if (
-      isUnsafePreemptedResponsesV1Block(block) ||
-      (generatedImages != null &&
-        block.type === 'image' &&
-        isProviderGeneratedImageBlock(block, generatedImages))
-    ) {
-      projected ??= contentBlocks.slice(0, i);
-      if (block.type === 'reasoning') {
-        reasoningInsertionIndex ??= projected.length;
+    if (block.type === 'reasoning') {
+      reasoningInsertionIndex ??= projected.length;
+      changed = true;
+      continue;
+    }
+    if (block.type === 'non_standard') {
+      if (
+        replayProjection === 'native' &&
+        !hasEncryptedReasoning &&
+        hasReplayableEncryptedReasoning(block.value)
+      ) {
+        hasEncryptedReasoning = true;
+        projected.push(block);
+      } else {
+        changed = true;
       }
       continue;
     }
-    projected?.push(block);
+    if (block.type === 'text') {
+      appendOriginalImages(sourceTextIndex);
+      projected.push(block);
+      sourceTextIndex++;
+      continue;
+    }
+    if (originalImages != null && sourceTextIndex >= originalImages.textCount) {
+      appendOriginalImages();
+    }
+    if (
+      block.type === 'server_tool_call' ||
+      block.type === 'server_tool_call_chunk'
+    ) {
+      changed = true;
+      continue;
+    }
+    if (block.type === 'server_tool_call_result') {
+      const result = createNeutralServerToolResult(
+        block.output,
+        block.status,
+        maxChars
+      );
+      changed = true;
+      if (result != null) {
+        projected.push(result);
+        preservedServerToolResult = true;
+      }
+      continue;
+    }
+    if (block.type === 'image') {
+      if (
+        replayProjection === 'fallback' ||
+        (generatedImages != null &&
+          isProviderGeneratedImageBlock(block, generatedImages))
+      ) {
+        changed = true;
+        continue;
+      }
+    }
+    projected.push(block);
   }
 
   if (encryptedReasoning != null && !hasEncryptedReasoning) {
@@ -741,97 +899,303 @@ function projectPreemptedResponsesV1Content(
       type: 'non_standard',
       value: encryptedReasoning,
     };
-    if (projected != null) {
-      projected.splice(reasoningInsertionIndex ?? 0, 0, reasoningBlock);
-    } else {
-      projected = [reasoningBlock, ...contentBlocks];
+    projected.splice(reasoningInsertionIndex ?? 0, 0, reasoningBlock);
+    changed = true;
+  }
+  appendOriginalImages();
+  if (serverToolResults != null) {
+    projected.push(...serverToolResults);
+    if (serverToolResults.length > 0) {
+      changed = true;
+      preservedServerToolResult = true;
     }
   }
-  if (originalImages != null) {
-    projected ??= [...contentBlocks];
-    for (const block of originalImages) {
-      const isGeneratedImage =
-        generatedImages != null &&
-        isProviderGeneratedImageBlock(block, generatedImages);
-      if (!isGeneratedImage) {
-        projected.push(block);
-      }
-    }
-  }
-  if (generatedImages != null) {
-    projected ??= [...contentBlocks];
+  if (replayProjection === 'native' && generatedImages != null) {
     projected.push(...generatedImages.blocks);
+    changed ||= generatedImages.blocks.length > 0;
   }
-  return projected ?? content;
+  return {
+    content: changed ? toLangChainContent(projected) : content,
+    preservedServerToolResult,
+  };
 }
 
-function getCompletedGeneratedImages(message: AIMessage): {
-  blocks: LangChainContentBlock.Multimodal.Image[];
-  data: Set<string>;
-  ids: Set<string>;
-} {
+function getAuthoritativeResponsesOutput(message: AIMessage): unknown[] {
   const responseOutput = message.response_metadata.output;
   const toolOutputs = message.additional_kwargs.tool_outputs;
-  const responseOutputIsAuthoritative =
-    Array.isArray(responseOutput) && responseOutput.length > 0;
+  if (Array.isArray(responseOutput) && responseOutput.length > 0) {
+    return responseOutput;
+  }
+  return Array.isArray(toolOutputs) ? toolOutputs : [];
+}
+
+function getResponsesReplayArtifacts(
+  output: readonly unknown[],
+  maxChars: number,
+  replayProjection: ResponsesReplayProjection
+): ResponsesReplayArtifacts {
   const blocks: LangChainContentBlock.Multimodal.Image[] = [];
   const data = new Set<string>();
   const ids = new Set<string>();
-  const sources = [
-    [responseOutput, responseOutputIsAuthoritative],
-    [toolOutputs, !responseOutputIsAuthoritative],
-  ] as const;
-  for (const [output, isAuthoritative] of sources) {
-    for (const item of Array.isArray(output) ? output : []) {
+  const emittedData = new Set<string>();
+  const emittedIds = new Set<string>();
+  const serverToolResults: LangChainContentBlock.Standard[] = [];
+  for (const item of output) {
+    if (item == null || typeof item !== 'object' || !('type' in item)) {
+      continue;
+    }
+    if (item.type === 'code_interpreter_call') {
       if (
-        item == null ||
-        typeof item !== 'object' ||
-        !('type' in item) ||
-        item.type !== 'image_generation_call'
+        !('outputs' in item) ||
+        !Array.isArray(item.outputs) ||
+        !('status' in item) ||
+        (item.status !== 'completed' && item.status !== 'failed')
       ) {
         continue;
       }
-      if ('id' in item && typeof item.id === 'string' && item.id.length > 0) {
-        ids.add(item.id);
+      for (const result of item.outputs) {
+        if (
+          result == null ||
+          typeof result !== 'object' ||
+          !('type' in result) ||
+          result.type !== 'image' ||
+          !('url' in result) ||
+          typeof result.url !== 'string' ||
+          result.url.length === 0
+        ) {
+          continue;
+        }
+        const resultUrl: string = result.url;
+        if (
+          replayProjection === 'native' &&
+          resultUrl.startsWith('data:image/')
+        ) {
+          serverToolResults.push({ type: 'image', url: resultUrl });
+          continue;
+        }
+        const mediaResult = createNeutralServerToolResult(
+          { type: 'code_interpreter_image', url: resultUrl },
+          item.status === 'failed' ? 'error' : 'success',
+          maxChars
+        );
+        if (mediaResult != null) {
+          serverToolResults.push(mediaResult);
+        }
       }
+      continue;
+    }
+    if (item.type === 'mcp_list_tools') {
+      const hasError =
+        'error' in item &&
+        typeof item.error === 'string' &&
+        item.error.length > 0;
+      const listToolsResult = createNeutralServerToolResult(
+        {
+          ...('server_label' in item && typeof item.server_label === 'string'
+            ? { serverLabel: item.server_label }
+            : {}),
+          ...('tools' in item && Array.isArray(item.tools)
+            ? { tools: item.tools }
+            : {}),
+          ...(hasError ? { error: item.error } : {}),
+        },
+        hasError ? 'error' : 'success',
+        maxChars
+      );
+      if (listToolsResult != null) {
+        serverToolResults.push(listToolsResult);
+      }
+      continue;
+    }
+    if (item.type === 'mcp_call') {
+      const hasOutput =
+        'output' in item &&
+        typeof item.output === 'string' &&
+        item.output.length > 0;
+      const hasError =
+        'error' in item &&
+        typeof item.error === 'string' &&
+        item.error.length > 0;
+      if (!hasOutput && !hasError) {
+        continue;
+      }
+      const mcpOutput = {
+        ...('name' in item && typeof item.name === 'string'
+          ? { name: item.name }
+          : {}),
+        ...('server_label' in item && typeof item.server_label === 'string'
+          ? { serverLabel: item.server_label }
+          : {}),
+        ...('output' in item && typeof item.output === 'string'
+          ? { output: item.output }
+          : {}),
+        ...('error' in item && typeof item.error === 'string'
+          ? { error: item.error }
+          : {}),
+      };
+      const mcpResult = createNeutralServerToolResult(
+        mcpOutput,
+        hasError ||
+          ('status' in item &&
+            (item.status === 'failed' || item.status === 'incomplete'))
+          ? 'error'
+          : 'success',
+        maxChars
+      );
+      if (mcpResult != null) {
+        serverToolResults.push(mcpResult);
+      }
+      continue;
+    }
+    if (
+      item.type === 'local_shell_call_output' ||
+      item.type === 'shell_call_output' ||
+      item.type === 'apply_patch_call_output'
+    ) {
+      if (!('output' in item)) {
+        continue;
+      }
+      const result = createNeutralServerToolResult(
+        item.output,
+        'status' in item &&
+          (item.status === 'failed' || item.status === 'incomplete')
+          ? 'error'
+          : 'success',
+        maxChars
+      );
+      if (result != null) {
+        serverToolResults.push(result);
+      }
+      continue;
+    }
+    if (item.type === 'program_output') {
+      if (!('result' in item)) {
+        continue;
+      }
+      const result = createNeutralServerToolResult(
+        item.result,
+        'status' in item && item.status === 'incomplete' ? 'error' : 'success',
+        maxChars
+      );
+      if (result != null) {
+        serverToolResults.push(result);
+      }
+      continue;
+    }
+    if (item.type !== 'image_generation_call') {
+      continue;
+    }
+    if ('id' in item && typeof item.id === 'string' && item.id.length > 0) {
+      ids.add(item.id);
+    }
+    if (
+      !('result' in item) ||
+      typeof item.result !== 'string' ||
+      item.result.length === 0
+    ) {
+      continue;
+    }
+    data.add(item.result);
+    if ('status' in item && item.status === 'completed') {
+      const itemId =
+        'id' in item && typeof item.id === 'string' && item.id.length > 0
+          ? item.id
+          : undefined;
       if (
-        !('result' in item) ||
-        typeof item.result !== 'string' ||
-        item.result.length === 0
+        (itemId != null && emittedIds.has(itemId)) ||
+        (itemId == null && emittedData.has(item.result))
       ) {
         continue;
       }
-      data.add(item.result);
-      if (isAuthoritative && 'status' in item && item.status === 'completed') {
-        blocks.push({
-          type: 'image',
-          mimeType: 'image/png',
-          data: item.result,
-        });
+      if (itemId != null) {
+        emittedIds.add(itemId);
+      } else {
+        emittedData.add(item.result);
       }
+      blocks.push({
+        type: 'image',
+        mimeType: 'image/png',
+        data: item.result,
+      });
     }
   }
-  return { blocks, data, ids };
+  return {
+    generatedImages: { blocks, data, ids },
+    serverToolResults,
+  };
 }
 
 function getSelfContainedResponsesV0Images(
   message: AIMessage
-): LangChainContentBlock.Multimodal.Image[] {
+): PositionedResponsesImages {
   if (!Array.isArray(message.content)) {
-    return [];
+    return { blocks: [], textCount: 0 };
   }
-  const images: LangChainContentBlock.Multimodal.Image[] = [];
+  const images: PositionedResponsesImage[] = [];
+  let textCount = 0;
   for (const block of message.content as LangChainContentBlock.Standard[]) {
+    if (block.type === 'text') {
+      textCount++;
+      continue;
+    }
     if (
       block.type === 'image' &&
       'data' in block &&
       ((typeof block.data === 'string' && block.data.length > 0) ||
         (block.data instanceof Uint8Array && block.data.length > 0))
     ) {
-      images.push(block);
+      images.push({ block, textIndex: textCount });
     }
   }
-  return images;
+  return { blocks: images, textCount };
+}
+
+function getResponsesV0ContentBlocks(
+  message: AIMessage,
+  authoritativeOutput: unknown[]
+): AIMessage['content'] {
+  let content = message.content;
+  if (typeof content === 'string') {
+    content = toLangChainContent(
+      content.length > 0 ? [{ type: 'text', text: content }] : []
+    );
+  }
+  const translationMessage = cloneAIMessageWithResponsesReplayState(
+    message,
+    content,
+    message.id,
+    {
+      ...message.additional_kwargs,
+      tool_outputs: authoritativeOutput,
+    },
+    {
+      ...message.response_metadata,
+      model_provider: 'openai',
+    }
+  );
+  return toLangChainContent(translationMessage.contentBlocks);
+}
+
+function isPreemptedOpenAIResponsesMessage(message: AIMessage): boolean {
+  const metadata = message.response_metadata;
+  if (metadata.preempted !== true || metadata.model_provider !== 'openai') {
+    return false;
+  }
+  if (
+    message.id?.startsWith('msg_') === true ||
+    message.id?.startsWith('resp_') === true ||
+    (typeof metadata.id === 'string' && metadata.id.startsWith('resp_')) ||
+    Array.isArray(metadata.output) ||
+    metadata.tool_outputs != null ||
+    Array.isArray(message.additional_kwargs.tool_outputs) ||
+    message.additional_kwargs.__openai_function_call_ids__ != null ||
+    message.additional_kwargs.__openai_custom_tool_call_ids__ != null ||
+    (message.additional_kwargs.reasoning != null &&
+      typeof message.additional_kwargs.reasoning === 'object')
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -840,37 +1204,70 @@ function getSelfContainedResponsesV0Images(
  * Project a provider-neutral clone while preserving self-contained encrypted
  * reasoning and the original graph/checkpoint message.
  */
-function projectPreemptedOpenAIResponsesMessage(message: AIMessage): AIMessage {
-  const metadata = message.response_metadata;
-  if (metadata.preempted !== true) {
+function projectPreemptedOpenAIResponsesMessage(
+  message: AIMessage,
+  maxChars: number,
+  replayProjection: ResponsesReplayProjection
+): AIMessage {
+  if (!isPreemptedOpenAIResponsesMessage(message)) {
     return message;
   }
 
+  const metadata = message.response_metadata;
   const additionalKwargs = { ...message.additional_kwargs };
-  const hasEncryptedReasoning = hasReplayableEncryptedReasoning(
-    additionalKwargs.reasoning
+  const retainsEncryptedReasoning =
+    replayProjection === 'native' &&
+    hasReplayableEncryptedReasoning(additionalKwargs.reasoning);
+  const authoritativeOutput = getAuthoritativeResponsesOutput(message);
+  const { generatedImages, serverToolResults } = getResponsesReplayArtifacts(
+    authoritativeOutput,
+    maxChars,
+    replayProjection
   );
-  const generatedImages =
-    metadata.output_version === 'v1'
-      ? undefined
-      : getCompletedGeneratedImages(message);
-  const promotesGeneratedImages = (generatedImages?.blocks.length ?? 0) > 0;
+  const isV1 = metadata.output_version === 'v1';
+  const translatesV0 =
+    !isV1 &&
+    (replayProjection === 'fallback' || authoritativeOutput.length > 0);
   const originalImages =
-    promotesGeneratedImages && metadata.model_provider === 'openai'
+    replayProjection === 'native' && translatesV0
       ? getSelfContainedResponsesV0Images(message)
       : undefined;
-  const content = projectPreemptedResponsesV1Content(
-    metadata.output_version === 'v1' || promotesGeneratedImages
-      ? message.contentBlocks
-      : message.content,
-    additionalKwargs.reasoning,
-    promotesGeneratedImages ? generatedImages : undefined,
-    originalImages
+  let contentForProjection = message.content;
+  if (!isV1 && translatesV0) {
+    contentForProjection = getResponsesV0ContentBlocks(
+      message,
+      authoritativeOutput
+    );
+  }
+  const projectedContent = projectPreemptedResponsesV1Content(
+    contentForProjection,
+    isV1 || translatesV0 ? additionalKwargs.reasoning : undefined,
+    maxChars,
+    replayProjection,
+    replayProjection === 'native' ? generatedImages : undefined,
+    originalImages,
+    serverToolResults
   );
+  const promotesV0 =
+    !isV1 &&
+    (replayProjection === 'fallback' ||
+      generatedImages.blocks.length > 0 ||
+      projectedContent.preservedServerToolResult);
+  const unpromotedV0Content =
+    contentForProjection === message.content
+      ? projectedContent.content
+      : projectPreemptedResponsesV1Content(
+        message.content,
+        undefined,
+        maxChars,
+        replayProjection
+      ).content;
+  const content =
+    isV1 || promotesV0 ? projectedContent.content : unpromotedV0Content;
   const hasUnsafeProviderReferences =
     content !== message.content ||
     message.id?.startsWith('msg_') === true ||
-    (!hasEncryptedReasoning && additionalKwargs.reasoning != null) ||
+    (!retainsEncryptedReasoning && additionalKwargs.reasoning != null) ||
     additionalKwargs.tool_outputs != null ||
     additionalKwargs.__openai_function_call_ids__ != null ||
     additionalKwargs.__openai_custom_tool_call_ids__ != null ||
@@ -880,7 +1277,7 @@ function projectPreemptedOpenAIResponsesMessage(message: AIMessage): AIMessage {
   if (!hasUnsafeProviderReferences) {
     return message;
   }
-  if (!hasEncryptedReasoning) {
+  if (!retainsEncryptedReasoning) {
     delete additionalKwargs.reasoning;
   }
   delete additionalKwargs.tool_outputs;
@@ -891,8 +1288,7 @@ function projectPreemptedOpenAIResponsesMessage(message: AIMessage): AIMessage {
   delete responseMetadata.id;
   delete responseMetadata.output;
   delete responseMetadata.tool_outputs;
-  if (promotesGeneratedImages) {
-    responseMetadata.model_provider = 'openai';
+  if (promotesV0) {
     responseMetadata.output_version = 'v1';
   }
 
@@ -905,55 +1301,46 @@ function projectPreemptedOpenAIResponsesMessage(message: AIMessage): AIMessage {
   );
 }
 
-/**
- * Drops incomplete streamed text-input fragments that some providers retain
- * beside the assembled parsed tool call. They are neither user-visible text
- * nor valid content blocks for a subsequent provider.
- */
+/** Applies sealed-Responses safety and drops incomplete streamed text input. */
 export function projectToolStreamContentForProvider(
-  messages: BaseMessage[]
+  messages: BaseMessage[],
+  responsesReplayProjection?: ResponsesReplayProjection,
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
 ): BaseMessage[] {
   let projected: BaseMessage[] | undefined;
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i];
-    if (message.getType() !== 'ai' || !Array.isArray(message.content)) {
+    if (message.getType() !== 'ai') {
       continue;
     }
-    const content = message.content.filter((block) => {
-      if (block == null || typeof block !== 'object') {
-        return true;
+    const assistantMessage = message as AIMessage;
+    if (
+      responsesReplayProjection != null &&
+      isPreemptedOpenAIResponsesMessage(assistantMessage)
+    ) {
+      const replaySafeMessage = projectPreemptedOpenAIResponsesMessage(
+        assistantMessage,
+        maxChars,
+        responsesReplayProjection
+      );
+      if (replaySafeMessage !== assistantMessage) {
+        projected ??= [...messages];
+        projected[i] = replaySafeMessage;
       }
-      try {
-        if (isProxy(block)) {
-          return false;
-        }
-        const type = Object.getOwnPropertyDescriptor(block, 'type');
-        if (type == null) {
-          return true;
-        }
-        if (type.enumerable !== true || !('value' in type)) {
-          return false;
-        }
-        if (type.value !== 'text') {
-          return true;
-        }
-        const text = Object.getOwnPropertyDescriptor(block, 'text');
-        return (
-          text?.enumerable === true &&
-          'value' in text &&
-          typeof text.value === 'string' &&
-          text.value !== ''
-        );
-      } catch {
-        return false;
-      }
-    });
-    if (content.length === message.content.length) {
+      continue;
+    }
+    if (!Array.isArray(assistantMessage.content)) {
+      continue;
+    }
+    const content = assistantMessage.content.filter(
+      isCompleteToolStreamContentBlock
+    );
+    if (content.length === assistantMessage.content.length) {
       continue;
     }
     projected ??= [...messages];
     projected[i] = cloneAIMessageWithContent(
-      message as AIMessage,
+      assistantMessage,
       toLangChainContent(content)
     );
   }
@@ -1017,8 +1404,11 @@ function projectOpenAIToolMessageContentInternal(
     if (isAssistant) {
       let assistantMessage = message as AIMessage;
       if (nativeResponsesProjection) {
-        const replaySafeMessage =
-          projectPreemptedOpenAIResponsesMessage(assistantMessage);
+        const replaySafeMessage = projectPreemptedOpenAIResponsesMessage(
+          assistantMessage,
+          maxChars,
+          'native'
+        );
         if (replaySafeMessage !== assistantMessage) {
           projected ??= [...messages];
           projected[i] = replaySafeMessage;

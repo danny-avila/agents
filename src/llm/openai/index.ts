@@ -16,7 +16,10 @@ import {
 import {
   getEndpoint,
   OpenAIClient,
+  wrapOpenAIClientError,
   getHeadersWithUserAgent,
+  convertMessagesToResponsesInput,
+  convertResponsesDeltaToChatGenerationChunk,
   ChatOpenAI as OriginalChatOpenAI,
   ChatOpenAIResponses as OriginalChatOpenAIResponses,
   ChatOpenAICompletions as OriginalChatOpenAICompletions,
@@ -51,8 +54,8 @@ import {
   projectOpenAIResponsesToolMessageContent,
   projectToolStreamContentForProvider,
 } from '@/messages/core';
-import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
+import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
@@ -224,6 +227,10 @@ type ResponsesRequest =
 type ResponsesResult =
   | AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>
   | OpenAIClient.Responses.Response;
+type ResponsesStreamChunkOptions = {
+  promptIndex?: number;
+  signal?: AbortSignal;
+};
 type CacheableChatPart = {
   type: 'text' | 'image_url' | 'input_audio' | 'file' | 'refusal';
   prompt_cache_breakpoint?: { mode: 'explicit' };
@@ -566,6 +573,67 @@ function isResponsesStream(
   result: ResponsesResult
 ): result is AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent> {
   return Symbol.asyncIterator in result;
+}
+
+const RESPONSES_REPLAY_OUTPUT_ITEM_TYPES = new Set([
+  'local_shell_call_output',
+  'shell_call_output',
+  'apply_patch_call_output',
+  'program_output',
+]);
+
+function convertDroppedResponsesReplayOutput(
+  event: OpenAIClient.Responses.ResponseStreamEvent
+): ChatGenerationChunk | null {
+  if (
+    event.type !== 'response.output_item.done' ||
+    !RESPONSES_REPLAY_OUTPUT_ITEM_TYPES.has(event.item.type)
+  ) {
+    return null;
+  }
+  return new ChatGenerationChunk({
+    text: '',
+    message: new AIMessageChunk({
+      content: [],
+      additional_kwargs: { tool_outputs: [event.item] },
+      response_metadata: { model_provider: 'openai' },
+    }),
+  });
+}
+
+async function* convertLibreChatResponsesStream(
+  stream: AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>,
+  options: ResponsesStreamChunkOptions,
+  runManager?: CallbackManagerForLLMRun
+): AsyncGenerator<ChatGenerationChunk> {
+  try {
+    for await (const event of stream) {
+      if (options.signal?.aborted === true) {
+        return;
+      }
+      const chunk =
+        convertResponsesDeltaToChatGenerationChunk(event) ??
+        convertDroppedResponsesReplayOutput(event);
+      if (chunk == null) {
+        continue;
+      }
+      attachCacheWriteUsage(chunk.message);
+      yield chunk;
+      await runManager?.handleLLMNewToken(
+        chunk.text || '',
+        {
+          prompt: options.promptIndex ?? 0,
+          completion: 0,
+        },
+        undefined,
+        undefined,
+        undefined,
+        { chunk }
+      );
+    }
+  } catch (e) {
+    throw wrapOpenAIClientError(e);
+  }
 }
 
 function createUsageMetadata(
@@ -1754,14 +1822,20 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    for await (const chunk of super._streamResponseChunks(
-      projectOpenAIResponsesProviderMessages(messages),
-      options,
-      runManager
-    )) {
-      attachCacheWriteUsage(chunk.message);
-      yield chunk;
-    }
+    const projectedMessages = projectOpenAIResponsesProviderMessages(messages);
+    const stream = await this.completionWithRetry(
+      {
+        ...this.invocationParams(options),
+        input: convertMessagesToResponsesInput({
+          messages: projectedMessages,
+          zdrEnabled: this.zdrEnabled ?? false,
+          model: this.model,
+        }),
+        stream: true,
+      },
+      options
+    );
+    yield* convertLibreChatResponsesStream(stream, options, runManager);
   }
 
   async *_streamChatModelEvents(
@@ -2000,14 +2074,19 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    for await (const chunk of super._streamResponseChunks(
-      messages,
-      options,
-      runManager
-    )) {
-      attachCacheWriteUsage(chunk.message);
-      yield chunk;
-    }
+    const stream = await this.completionWithRetry(
+      {
+        ...this.invocationParams(options),
+        input: convertMessagesToResponsesInput({
+          messages,
+          zdrEnabled: this.zdrEnabled ?? false,
+          model: this.model,
+        }),
+        stream: true,
+      },
+      options
+    );
+    yield* convertLibreChatResponsesStream(stream, options, runManager);
   }
 
   protected _getReasoningParams(

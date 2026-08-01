@@ -1,14 +1,14 @@
 import { concat } from '@langchain/core/utils/stream';
 import { AIMessageChunk } from '@langchain/core/messages';
+import { getCallbackManagerForConfig } from '@langchain/core/runnables';
 import {
   CallbackManager,
   CallbackManagerForLLMRun,
   type Callbacks,
 } from '@langchain/core/callbacks/manager';
-import { getCallbackManagerForConfig } from '@langchain/core/runnables';
 import type { Serialized } from '@langchain/core/load/serializable';
-import type { ChatGeneration } from '@langchain/core/outputs';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { ChatGeneration } from '@langchain/core/outputs';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
@@ -25,27 +25,27 @@ import {
   projectToolStreamContentForProvider,
 } from '@/messages/core';
 import {
-  stripAnthropicCacheControl,
-  stripBedrockCacheControl,
-} from '@/messages/cache';
-import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
-import { assertNotTruncatedToolCall } from '@/llm/truncation';
-import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
-import { manualToolStreamProviders } from '@/llm/providers';
-import { appendCallbacks } from '@/utils/callbacks';
-import { safeDispatchCustomEvent } from '@/utils/events';
-import { getContextOverflowInfo } from '@/utils/errors';
-import {
   modifyDeltaProperties,
   coalesceAdjacentUserTurns,
   strictAlternationProviders,
   appendPredecessorHandoffCue,
   removePredecessorHandoffCue,
 } from '@/messages';
-import { canSealPreempt } from '@/llm/preempt';
+import {
+  stripAnthropicCacheControl,
+  stripBedrockCacheControl,
+} from '@/messages/cache';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
-import { initializeModel } from '@/llm/init';
+import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
+import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
+import { assertNotTruncatedToolCall } from '@/llm/truncation';
+import { manualToolStreamProviders } from '@/llm/providers';
 import { isAnthropicLike, isOpenAILike } from '@/utils/llm';
+import { safeDispatchCustomEvent } from '@/utils/events';
+import { getContextOverflowInfo } from '@/utils/errors';
+import { appendCallbacks } from '@/utils/callbacks';
+import { canSealPreempt } from '@/llm/preempt';
+import { initializeModel } from '@/llm/init';
 
 /**
  * Context passed to `attemptInvoke`. Matches the subset of Graph that
@@ -174,8 +174,17 @@ export function projectMessagesForProvider({
   maxToolResultChars?: number;
   callOptions?: unknown;
 }): BaseMessage[] {
-  const providerInputMessages = projectToolStreamContentForProvider(messages);
-  if (usesNativeOpenAIResponses(model, provider, callOptions)) {
+  const nativeOpenAIResponses = usesNativeOpenAIResponses(
+    model,
+    provider,
+    callOptions
+  );
+  const providerInputMessages = projectToolStreamContentForProvider(
+    messages,
+    nativeOpenAIResponses ? 'native' : 'fallback',
+    maxToolResultChars
+  );
+  if (nativeOpenAIResponses) {
     return projectOpenAIResponsesToolMessageContent(
       stripAnthropicCacheControl(
         stripBedrockCacheControl(providerInputMessages)
@@ -677,11 +686,7 @@ export async function attemptInvoke(
   });
   const registry = context?.getOrCreateToolOutputRegistry();
   const runId = config?.configurable?.run_id as string | undefined;
-  const annotated = annotateMessagesForLLM(
-    invocationMessages,
-    registry,
-    runId
-  );
+  const annotated = annotateMessagesForLLM(invocationMessages, registry, runId);
   /**
    * Keyed on the provider ACTUALLY serving this call, not the agent's primary.
    * `createCallModel` normalizes for the primary, but `tryFallbackProviders`

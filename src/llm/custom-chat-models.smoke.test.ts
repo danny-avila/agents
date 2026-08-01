@@ -37,6 +37,11 @@ type OpenAIResponsesDelegate = {
   client?: unknown;
   _getClientOptions: (options?: OpenAIRequestOptions) => OpenAIRequestOptions;
 };
+type StreamingOpenAIResponsesDelegate = OpenAIResponsesDelegate & {
+  completionWithRetry: (
+    request: OpenAIClient.Responses.ResponseCreateParamsStreaming
+  ) => Promise<AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>>;
+};
 type AnthropicCallOptions = Parameters<
   CustomAnthropic['invocationParams']
 >[0] & {
@@ -399,6 +404,88 @@ describe('custom chat model class smoke tests', () => {
     expect(requestOptions?.headers).toEqual(
       expect.objectContaining({ 'x-smoke': 'responses' })
     );
+  });
+
+  it('retains replayable Responses output items before a terminal event', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingOpenAIResponsesDelegate }
+    ).responses;
+    const items = [
+      {
+        id: 'local_output_item',
+        type: 'local_shell_call_output',
+        status: 'completed',
+        output: 'local output',
+      },
+      {
+        id: 'shell_output_item',
+        call_id: 'shell_call_id',
+        type: 'shell_call_output',
+        status: 'completed',
+        max_output_length: 1_000,
+        output: [
+          {
+            stdout: 'shell output',
+            stderr: '',
+            outcome: { type: 'exit', exit_code: 0 },
+          },
+        ],
+      },
+      {
+        id: 'patch_output_item',
+        call_id: 'patch_call_id',
+        type: 'apply_patch_call_output',
+        status: 'completed',
+        output: 'patch output',
+      },
+      {
+        id: 'program_output_item',
+        call_id: 'program_call_id',
+        type: 'program_output',
+        status: 'completed',
+        result: 'program output',
+      },
+    ] as const;
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        for (let i = 0; i < items.length; i++) {
+          yield {
+            type: 'response.output_item.done',
+            sequence_number: i,
+            output_index: i,
+            item: items[i],
+          } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
+        }
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: items.length,
+          output_index: items.length,
+          content_index: 0,
+          item_id: 'msg_partial',
+          delta: 'Partial answer.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    const chunks: AIMessageChunk[] = [];
+    const stream = await model.stream([new HumanMessage('run tools')]);
+    for await (const chunk of stream) {
+      chunks.push(chunk as AIMessageChunk);
+    }
+    const combined = chunks.reduce<AIMessageChunk | undefined>(
+      (current, chunk) =>
+        current == null ? chunk : (current.concat(chunk) as AIMessageChunk),
+      undefined
+    );
+
+    expect(chunks).toHaveLength(items.length + 1);
+    expect(combined?.text).toBe('Partial answer.');
+    expect(combined?.additional_kwargs.tool_outputs).toEqual(items);
   });
 
   it('keeps Azure client customization and gates reasoning to reasoning models', () => {
