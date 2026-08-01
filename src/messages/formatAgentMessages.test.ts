@@ -2694,6 +2694,48 @@ describe('formatAgentMessages', () => {
     }
   );
 
+  it('ignores dropped v0 text placeholders when restoring image positions', () => {
+    const applicationImage = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'AQ==',
+    };
+    const message = new AIMessage({
+      content: [
+        { type: 'text', text: '' },
+        applicationImage,
+        { type: 'text', text: 'Later narration.' },
+      ],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: 'ig_after_placeholder',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'AA==',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+
+    expect(projected.content).toEqual([
+      applicationImage,
+      { type: 'text', text: 'Later narration.' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+    ]);
+  });
+
   it('restores v0 image positions before appending a generated image', () => {
     const imageA = {
       type: 'image' as const,

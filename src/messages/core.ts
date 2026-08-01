@@ -1574,7 +1574,9 @@ function getSelfContainedResponsesV0Images(
   let textCount = 0;
   for (const block of message.content as LangChainContentBlock.Standard[]) {
     if (block.type === 'text') {
-      textCount++;
+      if (isCompleteToolStreamContentBlock(block)) {
+        textCount++;
+      }
       continue;
     }
     if (
