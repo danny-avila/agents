@@ -512,20 +512,20 @@ export const createSearchAPI = (
   } else if (searchProvider.toLowerCase() === 'tavily') {
     return createTavilyAPI(tavilyApiKey, tavilySearchUrl, {
       ...tavilySearchOptions,
-      httpAgent,
-      httpsAgent,
+      httpAgent: httpAgent ?? tavilySearchOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? tavilySearchOptions?.httpsAgent,
     });
   } else if (searchProvider.toLowerCase() === 'keenable') {
     return createKeenableAPI(keenableApiKey, keenableApiUrl, {
       ...keenableSearchOptions,
-      httpAgent,
-      httpsAgent,
+      httpAgent: httpAgent ?? keenableSearchOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? keenableSearchOptions?.httpsAgent,
     });
   } else if (searchProvider.toLowerCase() === 'crw') {
     return createCrwAPI(crwApiKey, crwApiUrl, {
       ...crwSearchOptions,
-      httpAgent,
-      httpsAgent,
+      httpAgent: httpAgent ?? crwSearchOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? crwSearchOptions?.httpsAgent,
     });
   } else {
     throw new Error(
