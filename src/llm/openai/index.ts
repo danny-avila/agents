@@ -245,7 +245,15 @@ type CacheableResponsePart = (
 ) & {
   prompt_cache_breakpoint?: { mode: 'explicit' };
 };
-type ResponsesUsageWithCacheWrite = OpenAIClient.Responses.ResponseUsage & {
+// `Omit` before re-adding `input_tokens_details` as optional matters: the SDK's own
+// `ResponseUsage` declares it required (true for OpenAI itself), so a plain intersection
+// would keep it required in the merged type despite the `?:` here — masking, at the type
+// level, that OpenAI-*compatible* servers (e.g. mlx_vlm.server) may omit it entirely.
+// Mirrors `CompletionUsageWithCacheWrite`'s handling of the analogous Completions API field.
+type ResponsesUsageWithCacheWrite = Omit<
+  OpenAIClient.Responses.ResponseUsage,
+  'input_tokens_details'
+> & {
   input_tokens_details?: OpenAIClient.Responses.ResponseUsage['input_tokens_details'] & {
     cache_write_tokens?: number;
   };
@@ -509,13 +517,13 @@ export function shouldIncludeEncryptedReasoning(
   );
 }
 
-function getCacheWriteTokens(message: BaseMessage): number | undefined {
+export function getCacheWriteTokens(message: BaseMessage): number | undefined {
   const responseMetadata = message.response_metadata as {
     usage?: ResponsesUsageWithCacheWrite;
     metadata?: Record<string, string>;
   };
   const reported =
-    responseMetadata.usage?.input_tokens_details.cache_write_tokens;
+    responseMetadata.usage?.input_tokens_details?.cache_write_tokens;
   if (reported != null) {
     return reported;
   }
@@ -527,7 +535,7 @@ function getCacheWriteTokens(message: BaseMessage): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function attachCacheWriteUsage(message: BaseMessage): void {
+export function attachCacheWriteUsage(message: BaseMessage): void {
   const cacheWriteTokens = getCacheWriteTokens(message);
   if (
     cacheWriteTokens == null ||
@@ -554,11 +562,11 @@ function attachCacheWriteUsage(message: BaseMessage): void {
   };
 }
 
-function attachCacheWriteMetadata(
+export function attachCacheWriteMetadata(
   response: OpenAIClient.Responses.Response
 ): OpenAIClient.Responses.Response {
   const usage = response.usage as ResponsesUsageWithCacheWrite | undefined;
-  const cacheWriteTokens = usage?.input_tokens_details.cache_write_tokens;
+  const cacheWriteTokens = usage?.input_tokens_details?.cache_write_tokens;
   if (cacheWriteTokens == null) {
     return response;
   }
