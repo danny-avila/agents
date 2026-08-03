@@ -30,6 +30,13 @@ export interface ResolvedStreamLimits {
 export interface StreamedToolCallArgTally {
   bytes: number;
   name?: string;
+  /**
+   * True when the previous chunk ended on an unpaired UTF-16 high surrogate.
+   * Counting each half of a split surrogate pair alone yields 3 bytes per
+   * half (the replacement-character encoding) versus 4 for the pair, so the
+   * next chunk starting with the low surrogate reconciles by subtracting 2.
+   */
+  pendingHighSurrogate?: boolean;
 }
 
 /**
@@ -204,6 +211,14 @@ function chunkToolName(chunk: ToolCallChunk): string | undefined {
   return chunk.name != null && chunk.name !== '' ? chunk.name : undefined;
 }
 
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
 /**
  * Accumulates the UTF-8 byte size of streamed tool-call argument chunks per
  * in-flight tool call and throws once a single call's cumulative bytes
@@ -282,7 +297,16 @@ export function enforceStreamedToolCallArgLimit({
       tally.name = chunkToolName(chunk);
     }
     const argBytes = Buffer.byteLength(args, 'utf8');
-    tally.bytes = sealed ? argBytes : tally.bytes + argBytes;
+    if (sealed) {
+      tally.bytes = argBytes;
+    } else {
+      const reconcilesSplitPair =
+        tally.pendingHighSurrogate === true &&
+        isLowSurrogate(args.charCodeAt(0));
+      tally.bytes += reconcilesSplitPair ? argBytes - 2 : argBytes;
+    }
+    tally.pendingHighSurrogate =
+      !sealed && isHighSurrogate(args.charCodeAt(args.length - 1));
     if (tally.bytes > limit) {
       throw new StreamLimitExceededError({
         kind: 'tool_call_args',

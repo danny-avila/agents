@@ -696,16 +696,24 @@ async function executeSummarizationWithFallback(params: {
       messagesToRefineCount: messages.length,
     });
 
+    /**
+     * A tripped stream circuit breaker is a safety abort, not a
+     * summarization failure to recover from: retrying on fallback providers
+     * would spend more provider work after the limit fired, and degrading to
+     * the metadata stub would let the run continue (and periodic compaction
+     * commit the stub) despite the `StreamLimits` contract that a breach
+     * rejects the run. Rethrown so the summarize node fails the run with
+     * the actionable limit error, consistent with agent turns and subagents.
+     */
+    if (primaryError instanceof StreamLimitExceededError) {
+      throw primaryError;
+    }
+
     const rawFallbacks = (
       clientConfig.clientOptions as unknown as t.LLMConfig | undefined
     )?.fallbacks;
     const fallbacks = Array.isArray(rawFallbacks) ? rawFallbacks : [];
-    /**
-     * A tripped stream circuit breaker is a safety abort: retrying the
-     * summary on fallback providers would spend more provider work after
-     * the limit fired. Skip straight to the metadata stub below.
-     */
-    if (fallbacks.length > 0 && !(primaryError instanceof StreamLimitExceededError)) {
+    if (fallbacks.length > 0) {
       try {
         const onChunk = createSummarizationChunkHandler({
           stepId,
@@ -738,6 +746,9 @@ async function executeSummarizationWithFallback(params: {
           );
         }
       } catch (fbErr) {
+        if (fbErr instanceof StreamLimitExceededError) {
+          throw fbErr;
+        }
         const fbDescribed = describeFallbackError(fbErr, fallbacks);
         log('warn', `Fallback providers also failed ${fbDescribed.suffix}`, {
           ...fbDescribed.data,
@@ -1373,9 +1384,9 @@ export function createSummarizationChunkHandler({
      * tool calls a tool-bound summarization model may emit. Keyed by the
      * attempt metadata `attemptInvoke` hands each chunk, so a fallback
      * summary attempt never inherits the failed primary's counts. A trip
-     * tears down the model stream; the caller then skips fallbacks and
-     * degrades to the metadata stub instead of aborting the user's run
-     * over an auxiliary stream.
+     * tears down the model stream and `executeSummarizationWithFallback`
+     * rethrows it past fallbacks and the metadata stub, failing the run
+     * with the limit error like any other breach.
      */
     if (graph != null) {
       const metadata = attemptMetadata ?? limitMetadata;

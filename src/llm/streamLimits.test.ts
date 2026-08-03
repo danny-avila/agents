@@ -163,6 +163,50 @@ describe('enforceStreamedToolCallArgLimit', () => {
     expect(graph.streamedToolCallArgTallies?.get('|agent|1|:0')?.bytes).toBe(6);
   });
 
+  it('reconciles surrogate pairs split across chunk boundaries', () => {
+    const graph: StreamLimitState = {
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 4 }),
+    };
+    const metadata = generation(1);
+    const [high, low] = ['\uD83D', '\uDE00'];
+    enforceStreamedToolCallArgLimit({
+      graph,
+      metadata,
+      toolCallChunks: [chunk({ args: high, index: 0 })],
+    });
+    enforceStreamedToolCallArgLimit({
+      graph,
+      metadata,
+      toolCallChunks: [chunk({ args: low, index: 0 })],
+    });
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:0')?.bytes).toBe(4);
+    expect(() =>
+      enforceStreamedToolCallArgLimit({
+        graph,
+        metadata,
+        toolCallChunks: [chunk({ args: 'x', index: 0 })],
+      })
+    ).toThrow(StreamLimitExceededError);
+  });
+
+  it('keeps counting unpaired surrogates conservatively', () => {
+    const graph: StreamLimitState = {
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    };
+    const metadata = generation(1);
+    enforceStreamedToolCallArgLimit({
+      graph,
+      metadata,
+      toolCallChunks: [chunk({ args: '\uD83D', index: 0 })],
+    });
+    enforceStreamedToolCallArgLimit({
+      graph,
+      metadata,
+      toolCallChunks: [chunk({ args: 'abc', index: 0 })],
+    });
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:0')?.bytes).toBe(6);
+  });
+
   it('tallies parallel tool calls and generations independently', () => {
     const graph: StreamLimitState = {
       streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 8 }),
