@@ -79,6 +79,7 @@ import {
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { RunnableCallable } from '@/utils';
@@ -1321,6 +1322,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         throw e;
       }
       if (isGraphInterrupt(e)) {
+        throw e;
+      }
+      /**
+       * A stream circuit breaker tripped by a child run (subagent) is a
+       * safety abort, not a tool failure to report back to the model. It
+       * passes through like an interrupt so the whole run rejects.
+       */
+      if (e instanceof StreamLimitExceededError) {
         throw e;
       }
       if (this.errorHandler) {

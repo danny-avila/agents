@@ -409,7 +409,7 @@ describe('per-generation delta event circuit breaker', () => {
     });
 
     await emptyChunkEvent(2);
-    expect(graph.streamDeltaEventCounts.get('|agent|2')).toBe(1);
+    expect(graph.streamDeltaEventCounts.get('|agent|2|')).toBe(1);
   });
 
   it('never counts when left at the default (disabled)', async () => {

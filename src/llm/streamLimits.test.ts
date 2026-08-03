@@ -9,6 +9,7 @@ import {
 } from '@/tools/streamedToolCallSeals';
 import {
   DEFAULT_MAX_TOOL_CALL_ARG_BYTES,
+  STREAM_LIMIT_REDISPATCH_KEY,
   enforceStreamedToolCallArgLimit,
   enforceStreamDeltaEventLimit,
   StreamLimitExceededError,
@@ -16,6 +17,7 @@ import {
   resolveGenerationKey,
   resolveStreamLimits,
 } from '@/llm/streamLimits';
+import { Constants } from '@/common';
 
 const chunk = (fields: Partial<ToolCallChunk>): ToolCallChunk =>
   ({ type: 'tool_call_chunk', ...fields }) as ToolCallChunk;
@@ -64,7 +66,7 @@ describe('resolveStreamLimits', () => {
 
 describe('resolveGenerationKey', () => {
   it('derives a stable key from langgraph node-execution metadata', () => {
-    expect(resolveGenerationKey(generation(3))).toBe('|agent|3');
+    expect(resolveGenerationKey(generation(3))).toBe('|agent|3|');
     expect(resolveGenerationKey(generation(3))).toBe(resolveGenerationKey(generation(3)));
   });
 
@@ -80,7 +82,29 @@ describe('resolveGenerationKey', () => {
 
   it('degrades to a shared bucket when metadata is absent', () => {
     expect(resolveGenerationKey(undefined)).toBe('');
-    expect(resolveGenerationKey({})).toBe('||');
+    expect(resolveGenerationKey({})).toBe('|||');
+  });
+
+  it('scopes fallback attempts via the INVOKED_MODEL metadata stamp', () => {
+    const primary = generation(1);
+    const fallback = { ...generation(1), [Constants.INVOKED_MODEL]: 'fb-model' };
+    expect(resolveGenerationKey(fallback)).not.toBe(resolveGenerationKey(primary));
+
+    const graph: StreamLimitState = {
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 10 }),
+    };
+    enforceStreamedToolCallArgLimit({
+      graph,
+      metadata: primary,
+      toolCallChunks: [chunk({ args: '12345678', index: 0 })],
+    });
+    enforceStreamedToolCallArgLimit({
+      graph,
+      metadata: fallback,
+      toolCallChunks: [chunk({ args: '12345678', index: 0 })],
+    });
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:0')?.bytes).toBe(8);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|fb-model:0')?.bytes).toBe(8);
   });
 });
 
@@ -137,7 +161,7 @@ describe('enforceStreamedToolCallArgLimit', () => {
         toolCallChunks: [chunk({ args: '€€', index: 0 })],
       })
     ).toThrow(StreamLimitExceededError);
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1:0')?.bytes).toBe(6);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:0')?.bytes).toBe(6);
   });
 
   it('tallies parallel tool calls and generations independently', () => {
@@ -181,7 +205,7 @@ describe('enforceStreamedToolCallArgLimit', () => {
       metadata,
       toolCallChunks: [chunk({ id: 'call_b', name: 'b_tool', args: '123456' })],
     });
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1:call_a')?.bytes).toBe(6);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:call_a')?.bytes).toBe(6);
     expect(() =>
       enforceStreamedToolCallArgLimit({
         graph,
@@ -204,8 +228,8 @@ describe('enforceStreamedToolCallArgLimit', () => {
         chunk({ name: 'anon_b', args: '123456' }),
       ],
     });
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1:#0')?.bytes).toBe(6);
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1:#1')?.bytes).toBe(6);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:#0')?.bytes).toBe(6);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:#1')?.bytes).toBe(6);
     expect(() =>
       enforceStreamedToolCallArgLimit({
         graph,
@@ -266,7 +290,7 @@ describe('enforceStreamedToolCallArgLimit', () => {
         [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'single', index: 0 },
       },
     });
-    expect(graph.streamedToolCallArgTallies?.has('|agent|1:0')).toBe(false);
+    expect(graph.streamedToolCallArgTallies?.has('|agent|1|:0')).toBe(false);
   });
 
   it('releases the tally on a Bedrock Converse stop chunk without counting it', () => {
@@ -289,7 +313,7 @@ describe('enforceStreamedToolCallArgLimit', () => {
         [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'single', index: 0 },
       },
     });
-    expect(graph.streamedToolCallArgTallies?.has('|agent|1:0')).toBe(false);
+    expect(graph.streamedToolCallArgTallies?.has('|agent|1|:0')).toBe(false);
   });
 
   it('resets one generation on a new model attempt, keeping other generations', () => {
@@ -313,16 +337,16 @@ describe('enforceStreamedToolCallArgLimit', () => {
 
     resetStreamLimitTallies({ graph, metadata: generation(1) });
 
-    expect(graph.streamedToolCallArgTallies?.has('|agent|1:0')).toBe(false);
-    expect(graph.streamedToolCallArgTallies?.get('|agent|2:0')?.bytes).toBe(4);
-    expect(graph.streamDeltaEventCounts?.has('|agent|1')).toBe(false);
+    expect(graph.streamedToolCallArgTallies?.has('|agent|1|:0')).toBe(false);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|2|:0')?.bytes).toBe(4);
+    expect(graph.streamDeltaEventCounts?.has('|agent|1|')).toBe(false);
 
     enforceStreamedToolCallArgLimit({
       graph,
       metadata: generation(1),
       toolCallChunks: [chunk({ args: '12345678', index: 0 })],
     });
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1:0')?.bytes).toBe(8);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:0')?.bytes).toBe(8);
   });
 
   it('reset is a no-op when nothing was counted', () => {
@@ -387,7 +411,7 @@ describe('enforceStreamDeltaEventLimit', () => {
     expect(limitError.observed).toBe(4);
     expect(limitError.message).toContain('maxDeltaEventsPerTurn');
     enforceStreamDeltaEventLimit({ graph, metadata: generation(2) });
-    expect(graph.streamDeltaEventCounts?.get('|agent|2')).toBe(1);
+    expect(graph.streamDeltaEventCounts?.get('|agent|2|')).toBe(1);
   });
 
   it('is disabled by default and allocates nothing', () => {
@@ -396,5 +420,23 @@ describe('enforceStreamDeltaEventLimit', () => {
       enforceStreamDeltaEventLimit({ graph, metadata: generation(1) });
     }
     expect(graph.streamDeltaEventCounts).toBeUndefined();
+  });
+
+  it('does not double-count inline re-dispatched transformed chunks', () => {
+    const graph: StreamLimitState = {
+      streamLimits: resolveStreamLimits({ maxDeltaEventsPerTurn: 2 }),
+    };
+    const redispatch = {
+      ...generation(1),
+      [STREAM_LIMIT_REDISPATCH_KEY]: true,
+    };
+    for (let i = 0; i < 10; i++) {
+      enforceStreamDeltaEventLimit({ graph, metadata: redispatch });
+    }
+    enforceStreamDeltaEventLimit({ graph, metadata: generation(1) });
+    enforceStreamDeltaEventLimit({ graph, metadata: generation(1) });
+    expect(() =>
+      enforceStreamDeltaEventLimit({ graph, metadata: generation(1) })
+    ).toThrow(StreamLimitExceededError);
   });
 });

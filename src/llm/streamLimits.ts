@@ -2,6 +2,7 @@
 import type { ToolCallChunk } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { getStreamedToolCallSeal } from '@/tools/streamedToolCallSeals';
+import { Constants } from '@/common';
 
 /**
  * Circuit breakers for pathological model streams.
@@ -139,6 +140,13 @@ export class StreamLimitExceededError extends Error {
  * segment. One agent-node execution is one superstep, so
  * `checkpoint_ns + node + step` stays stable for the whole generation and
  * distinguishes parallel agents in the same superstep.
+ *
+ * The `INVOKED_MODEL` stamp scopes attempts within one node execution:
+ * `tryFallbackProviders` (and summarization's fallback path) stamps it into
+ * each fallback's config metadata, so a fallback's chunks key separately
+ * from the failed primary's even when the decoupled `streamEvents` reader
+ * drains the primary's buffered chunks late. Those late chunks land in the
+ * primary's own bucket instead of polluting the fallback's.
  */
 export function resolveGenerationKey(
   metadata: Record<string, unknown> | undefined
@@ -149,8 +157,18 @@ export function resolveGenerationKey(
   const checkpointNs = metadata.langgraph_checkpoint_ns ?? '';
   const node = metadata.langgraph_node ?? '';
   const step = metadata.langgraph_step ?? '';
-  return `${checkpointNs}|${node}|${step}`;
+  const invokedModel = metadata[Constants.INVOKED_MODEL] ?? '';
+  return `${checkpointNs}|${node}|${step}|${invokedModel}`;
 }
+
+/**
+ * Event-metadata marker for a chunk the SDK re-dispatches inline after
+ * transforming it (`attemptInvoke`'s OpenRouter final-reasoning replay). The
+ * original wire chunk still reaches the handler through `streamEvents` and
+ * is counted there, so the re-dispatch must not consume a second
+ * event-budget slot.
+ */
+export const STREAM_LIMIT_REDISPATCH_KEY = 'lc_stream_limit_redispatch';
 
 /**
  * True when the event's `single` seal marks this chunk's own call as
@@ -286,6 +304,9 @@ export function enforceStreamDeltaEventLimit({
   const limit = (graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS)
     .maxDeltaEventsPerTurn;
   if (limit <= 0) {
+    return;
+  }
+  if (metadata?.[STREAM_LIMIT_REDISPATCH_KEY] === true) {
     return;
   }
   const counts = (graph.streamDeltaEventCounts ??= new Map());

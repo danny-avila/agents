@@ -20,6 +20,7 @@ import {
 } from '../subagent';
 import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecutor';
 import { Constants, Providers, GraphEvents, StepTypes } from '@/common';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { AgentContext } from '@/agents/AgentContext';
 import { HookRegistry } from '@/hooks/HookRegistry';
 import { HandlerRegistry } from '@/events';
@@ -449,6 +450,28 @@ describe('SubagentExecutor', () => {
     });
     expect(result.content).toContain('Maximum subagent nesting depth');
     expect(result.messages).toEqual([]);
+  });
+
+  it('rethrows a child stream-limit trip instead of converting it to a tool result', async () => {
+    const executor = createExecutor({
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockRejectedValue(
+              new StreamLimitExceededError({
+                kind: 'tool_call_args',
+                limit: 10,
+                observed: 11,
+                toolName: 'db_query',
+              })
+            ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    await expect(
+      executor.execute({ description: 'Do something', subagentType: 'researcher' })
+    ).rejects.toBeInstanceOf(StreamLimitExceededError);
   });
 
   it('threads run-level streamLimits into every child graph input', async () => {

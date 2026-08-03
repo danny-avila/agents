@@ -28,6 +28,7 @@ import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs/Graph';
 import type { HandlerRegistry } from '@/events';
 import { Constants, GraphEvents, Callback, StepTypes } from '@/common';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { executeHooks } from '@/hooks';
 
 const DEFAULT_MAX_TURNS = 25;
@@ -537,6 +538,16 @@ export class SubagentExecutor {
         });
       }
       childGraph.clearHeavyState();
+      /**
+       * A tripped stream circuit breaker is a safety abort, not a recoverable
+       * subagent failure: converting it into a tool result would let the
+       * parent keep generating (or spawn another child) after the limit
+       * fired. Rethrown here and passed through ToolNode's error conversion,
+       * so the parent run rejects with the child's limit error.
+       */
+      if (error instanceof StreamLimitExceededError) {
+        throw error;
+      }
       return {
         content: `Subagent error: ${errorMessage}`,
         messages: [],

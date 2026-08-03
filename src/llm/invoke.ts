@@ -40,6 +40,7 @@ import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import {
   resetStreamLimitTallies,
   StreamLimitExceededError,
+  STREAM_LIMIT_REDISPATCH_KEY,
 } from '@/llm/streamLimits';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
@@ -857,6 +858,14 @@ export async function attemptInvoke(
       }
     } else {
       const metadata = config.metadata as Record<string, unknown> | undefined;
+      /**
+       * The original wire chunk still reaches the registered handler through
+       * `streamEvents` (where the late-reasoning skip discards it AFTER the
+       * event guard counts it), so this inline re-dispatch of the transformed
+       * chunk is marked to not consume a second event-budget slot. Allocated
+       * once per attempt, only when a transformation occurs.
+       */
+      let redispatchMetadata: Record<string, unknown> | undefined;
       for await (const chunk of stream) {
         const handlingChunk = getStreamHandlingChunk({
           current: finalChunk,
@@ -864,10 +873,14 @@ export async function attemptInvoke(
           provider,
         });
         if (handlingChunk != null && handlingChunk !== chunk) {
+          redispatchMetadata ??= {
+            ...(metadata ?? {}),
+            [STREAM_LIMIT_REDISPATCH_KEY]: true,
+          };
           await registeredStreamHandler.handle(
             GraphEvents.CHAT_MODEL_STREAM,
             { chunk: handlingChunk },
-            metadata,
+            redispatchMetadata,
             context
           );
         }

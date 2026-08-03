@@ -4065,6 +4065,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             runId: this.runId,
             isMultiAgent: this.isMultiAgentGraph(),
             hookRegistry: this.hookRegistry,
+            /**
+             * Live references (both maps are cleared in place, never
+             * replaced), so summarization streams share the run's event
+             * budget accounting under their own generation key.
+             */
+            streamLimits: this.streamLimits,
+            streamDeltaEventCounts: this.streamDeltaEventCounts,
+            streamedToolCallArgTallies: this.streamedToolCallArgTallies,
             dispatchRunStep: async (runStep, nodeConfig) => {
               const resolvedConfig = nodeConfig ?? this.config;
               if (runStep.agentId != null) {

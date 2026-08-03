@@ -33,6 +33,11 @@ import {
   Providers,
 } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import type { StreamLimitState } from '@/llm/streamLimits';
+import {
+  enforceStreamDeltaEventLimit,
+  StreamLimitExceededError,
+} from '@/llm/streamLimits';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { createRemoveAllMessage } from '@/messages/reducer';
@@ -611,6 +616,8 @@ async function executeSummarizationWithFallback(params: {
   stepId: string;
   usePromptCache: boolean;
   log: LogFn;
+  /** Carries the run's stream limits so the event cap covers summary streams. */
+  graph?: StreamLimitState;
 }): Promise<{
   text: string;
   usage?: Partial<UsageMetadata>;
@@ -629,6 +636,7 @@ async function executeSummarizationWithFallback(params: {
     stepId,
     usePromptCache,
     log,
+    graph,
   } = params;
 
   const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
@@ -659,6 +667,7 @@ async function executeSummarizationWithFallback(params: {
       stepId,
       provider: clientConfig.provider as Providers,
       reasoningKey: agentContext.reasoningKey,
+      graph,
       usePromptCache,
       promptCacheTtl:
         (clientConfig.provider as Providers) === Providers.ANTHROPIC ||
@@ -690,13 +699,19 @@ async function executeSummarizationWithFallback(params: {
       clientConfig.clientOptions as unknown as t.LLMConfig | undefined
     )?.fallbacks;
     const fallbacks = Array.isArray(rawFallbacks) ? rawFallbacks : [];
-    if (fallbacks.length > 0) {
+    /**
+     * A tripped stream circuit breaker is a safety abort: retrying the
+     * summary on fallback providers would spend more provider work after
+     * the limit fired. Skip straight to the metadata stub below.
+     */
+    if (fallbacks.length > 0 && !(primaryError instanceof StreamLimitExceededError)) {
       try {
         const onChunk = createSummarizationChunkHandler({
           stepId,
           config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
           provider: clientConfig.provider as Providers,
           reasoningKey: agentContext.reasoningKey,
+          graph,
         });
         const fbResult = await tryFallbackProviders({
           fallbacks,
@@ -858,7 +873,7 @@ interface CreateSummarizeNodeParams {
       result: t.StepCompleted,
       config?: RunnableConfig
     ) => Promise<void>;
-  };
+  } & StreamLimitState;
   generateStepId: (stepKey: string) => [string, number];
 }
 
@@ -1127,6 +1142,7 @@ export function createSummarizeNode({
       stepId,
       usePromptCache: isSelfSummarizeModel && hasPromptCache,
       log,
+      graph,
     });
 
     /**
@@ -1336,16 +1352,29 @@ function createSummarizationChunkHandler({
   config,
   provider,
   reasoningKey = 'reasoning_content',
+  graph,
 }: {
   stepId?: string;
   config?: RunnableConfig;
   provider?: Providers;
   reasoningKey?: 'reasoning_content' | 'reasoning';
+  graph?: StreamLimitState;
 }): OnChunk | undefined {
   if (stepId == null || stepId === '' || !config) {
     return undefined;
   }
+  const limitMetadata = config.metadata as Record<string, unknown> | undefined;
   return (chunk) => {
+    /**
+     * Summarization streams bypass `ChatModelStreamHandler` (this onChunk
+     * replaces it in `attemptInvoke`), so the per-generation event cap is
+     * enforced here. A trip tears down the model stream; the caller then
+     * skips fallbacks and degrades to the metadata stub instead of aborting
+     * the user's run over an auxiliary stream.
+     */
+    if (graph != null) {
+      enforceStreamDeltaEventLimit({ graph, metadata: limitMetadata });
+    }
     const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];
     const raw = getChunkContent({ chunk: chunkAny, provider, reasoningKey });
     if (raw == null || (typeof raw === 'string' && !raw)) {
@@ -1404,6 +1433,7 @@ async function summarizeWithCacheHit({
   stepId,
   provider,
   reasoningKey,
+  graph,
   usePromptCache,
   promptCacheTtl,
   log,
@@ -1417,6 +1447,7 @@ async function summarizeWithCacheHit({
   stepId?: string;
   provider: Providers;
   reasoningKey?: 'reasoning_content' | 'reasoning';
+  graph?: StreamLimitState;
   usePromptCache?: boolean;
   promptCacheTtl?: PromptCacheTtl;
   log?: LogFn;
@@ -1443,6 +1474,7 @@ async function summarizeWithCacheHit({
         config: traceConfig(config, 'cache_hit_compaction'),
         provider,
         reasoningKey,
+        graph,
       }),
     },
     traceConfig(config, 'cache_hit_compaction')
