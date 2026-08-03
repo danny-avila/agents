@@ -115,6 +115,11 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
+import {
+  resolveStreamLimits,
+  type ResolvedStreamLimits,
+  type StreamedToolCallArgTally,
+} from '@/llm/streamLimits';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
@@ -1052,6 +1057,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /** See {@link t.StandardGraphInput.preemption}. */
   preemption?: t.StreamPreemption;
   /**
+   * Stream circuit breakers, resolved once from
+   * {@link t.StandardGraphInput.streamLimits}. The stream handler enforces
+   * these on every streamed chunk event.
+   */
+  streamLimits: ResolvedStreamLimits;
+  /**
+   * Cumulative streamed argument bytes per in-flight tool call, keyed by
+   * `stepKey:index`. Per-run accumulation state, cleared by both reset
+   * paths.
+   */
+  streamedToolCallArgTallies: Map<string, StreamedToolCallArgTally> =
+    new Map();
+  /** Streamed chunk events per generation turn, keyed by stepKey. */
+  streamDeltaEventCounts: Map<string, number> = new Map();
+  /**
    * Seals charged against `preemption.maxSeals`. Per-turn: cleared by both
    * reset paths so a fresh turn gets a fresh budget, while a HITL resume —
    * which skips `resetValues` — keeps what it had left.
@@ -1108,6 +1128,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     subagentUsageSink,
     subagentScope,
     preemption,
+    streamLimits,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
@@ -1117,6 +1138,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.subagentUsageSink = subagentUsageSink;
     this.subagentScope = subagentScope === true;
     this.preemption = preemption;
+    this.streamLimits = resolveStreamLimits(streamLimits);
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -1162,6 +1184,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
     this.eagerEventToolSuppressions.clear();
+    this.streamedToolCallArgTallies.clear();
+    this.streamDeltaEventCounts.clear();
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
@@ -1219,6 +1243,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
+    this.streamedToolCallArgTallies.clear();
+    this.streamDeltaEventCounts.clear();
     /**
      * Turn state only. The reported totals must outlive cleanup — this runs
      * in `processStream`'s `finally`, and the host reads `getPreemptStats()`

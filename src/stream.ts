@@ -39,6 +39,10 @@ import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
+import {
+  enforceStreamedToolCallArgLimit,
+  enforceStreamDeltaEventLimit,
+} from '@/llm/streamLimits';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent } from '@/utils/events';
@@ -1545,6 +1549,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     }
     this.handleReasoning(chunk, agentContext);
     const stepKey = graph.getStepKey(metadata);
+    enforceStreamDeltaEventLimit({ graph, stepKey });
     let hasToolCalls = false;
     const hasToolCallChunks =
       (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) ?? false;
@@ -1628,6 +1633,11 @@ export class ChatModelStreamHandler implements t.EventHandler {
       chunk.tool_call_chunks.length &&
       typeof chunk.tool_call_chunks[0]?.index === 'number'
     ) {
+      enforceStreamedToolCallArgLimit({
+        graph,
+        stepKey,
+        toolCallChunks: chunk.tool_call_chunks,
+      });
       const streamedToolCallSeal = getStreamedToolCallSeal(
         chunk.response_metadata as Record<string, unknown> | undefined
       );
