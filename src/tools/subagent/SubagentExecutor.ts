@@ -219,6 +219,15 @@ export type SubagentExecutorOptions = {
   parentAgentId?: string;
   langfuse?: StandardGraphInput['langfuse'];
   tokenCounter?: TokenCounter;
+  /**
+   * Run-level stream circuit breakers, forwarded into every child graph so
+   * a host raising, lowering, or disabling the limits governs subagents too.
+   * Child model calls run through `attemptInvoke`'s local stream handler
+   * (children have no registered dispatcher), which enforces the child
+   * graph's own resolved limits; without this the child would silently
+   * revert to the defaults.
+   */
+  streamLimits?: StandardGraphInput['streamLimits'];
   /** Remaining nesting budget. 0 or negative blocks execution. */
   maxDepth?: number;
   /**
@@ -259,6 +268,7 @@ export class SubagentExecutor {
   private readonly parentAgentId?: string;
   private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
+  private readonly streamLimits?: StandardGraphInput['streamLimits'];
   private readonly maxDepth: number;
   private readonly createChildGraph: ChildGraphFactory;
   private readonly usageSink?: SubagentUsageSink;
@@ -274,6 +284,7 @@ export class SubagentExecutor {
     this.parentAgentId = options.parentAgentId;
     this.langfuse = options.langfuse;
     this.tokenCounter = options.tokenCounter;
+    this.streamLimits = options.streamLimits;
     this.maxDepth = options.maxDepth ?? 1;
     this.createChildGraph = options.createChildGraph;
     this.usageSink = options.usageSink;
@@ -373,6 +384,7 @@ export class SubagentExecutor {
       agents: [childInputs],
       langfuse: this.langfuse,
       tokenCounter: this.tokenCounter,
+      streamLimits: this.streamLimits,
       subagentScope: true,
       /**
        * Forwarded so the child graph's own `SubagentExecutor` (created in

@@ -37,6 +37,10 @@ import {
 } from '@/messages/cache';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
+import {
+  resetStreamLimitTallies,
+  StreamLimitExceededError,
+} from '@/llm/streamLimits';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { manualToolStreamProviders } from '@/llm/providers';
@@ -676,6 +680,17 @@ export async function attemptInvoke(
   config?: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
   /**
+   * One `attemptInvoke` call is one model attempt; primary, fallback, and
+   * retry attempts within a node share the same langgraph metadata, so a
+   * fallback that re-streams a tool call from scratch would otherwise be
+   * charged the failed primary's partial bytes and could falsely trip the
+   * stream limits.
+   */
+  resetStreamLimitTallies({
+    graph: context,
+    metadata: config?.metadata as Record<string, unknown> | undefined,
+  });
+  /**
    * Pull the run-scoped tool output registry off the graph (when one
    * exists) and project ToolMessages carrying ref metadata into a
    * transient annotated copy. The original `messages` array stays
@@ -1086,6 +1101,14 @@ export async function tryFallbackProviders({
       );
       return result;
     } catch (e) {
+      /**
+       * A tripped stream circuit breaker is a deliberate abort, not a
+       * provider failure. Continuing would try the remaining fallbacks and a
+       * succeeding one would resolve a run that must reject.
+       */
+      if (e instanceof StreamLimitExceededError) {
+        throw e;
+      }
       lastError = e;
       const fallbackOverflowContext: ContextOverflowContext = {
         provider: fb.provider,

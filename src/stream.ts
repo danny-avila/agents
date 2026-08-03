@@ -1516,6 +1516,14 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
 
+    /**
+     * Counted before every content-specific early return below
+     * (server-tool results, deferred mixed reasoning, late OpenRouter
+     * reasoning): a looping provider can flood through any of those paths,
+     * and an uncounted early return would leave the event budget untouched.
+     */
+    enforceStreamDeltaEventLimit({ graph, metadata });
+
     const agentContext = graph.getAgentContext(metadata);
 
     const chunk = data.chunk as Partial<AIMessageChunk>;
@@ -1549,7 +1557,6 @@ export class ChatModelStreamHandler implements t.EventHandler {
     }
     this.handleReasoning(chunk, agentContext);
     const stepKey = graph.getStepKey(metadata);
-    enforceStreamDeltaEventLimit({ graph, metadata });
     let hasToolCalls = false;
     const hasToolCallChunks =
       (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) ?? false;

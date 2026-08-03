@@ -284,7 +284,45 @@ describe('streamed tool-call argument circuit breaker', () => {
     });
 
     const key = `${resolveGenerationKey({})}:0`;
-    expect(graph.streamedToolCallArgTallies.get(key)?.bytes).toBe(40);
+    expect(graph.streamedToolCallArgTallies.has(key)).toBe(false);
+    expect(graph.streamedToolCallArgTallies.size).toBe(0);
+  });
+
+  it('keeps parallel anonymous arrival-sealed calls on separate budgets (Google)', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 64 }),
+    });
+
+    await streamEvent({
+      handler,
+      graph,
+      chunk: {
+        content: '',
+        tool_call_chunks: [
+          { name: 'search_a', args: 'x'.repeat(40) },
+          { name: 'search_b', args: 'y'.repeat(40) },
+        ],
+        response_metadata: {
+          [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'all' },
+        },
+      },
+    });
+    expect(graph.streamedToolCallArgTallies.size).toBe(0);
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_call_chunks: [{ name: 'search_c', args: 'z'.repeat(70) }],
+          response_metadata: {
+            [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'all' },
+          },
+        },
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', toolName: 'search_c' });
   });
 
   it('streams unbounded when explicitly disabled', async () => {

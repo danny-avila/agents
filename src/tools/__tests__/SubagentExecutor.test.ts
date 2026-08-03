@@ -451,6 +451,27 @@ describe('SubagentExecutor', () => {
     expect(result.messages).toEqual([]);
   });
 
+  it('threads run-level streamLimits into every child graph input', async () => {
+    const childGraphInputs: StandardGraphInput[] = [];
+    const noopFactory = makeNoopGraphFactory();
+    const executor = createExecutor({
+      streamLimits: { maxToolCallArgBytes: 1234, maxDeltaEventsPerTurn: 9 },
+      createChildGraph: (input: StandardGraphInput): StandardGraph => {
+        childGraphInputs.push(input);
+        return noopFactory();
+      },
+    });
+    await executor.execute({
+      description: 'Do something',
+      subagentType: 'researcher',
+    });
+    expect(childGraphInputs).toHaveLength(1);
+    expect(childGraphInputs[0].streamLimits).toEqual({
+      maxToolCallArgBytes: 1234,
+      maxDeltaEventsPerTurn: 9,
+    });
+  });
+
   it('executes child graph and returns filtered content', async () => {
     const { factory, clearHeavyState } = makeStubGraphFactory({
       messages: [

@@ -12,6 +12,7 @@ import {
   enforceStreamedToolCallArgLimit,
   enforceStreamDeltaEventLimit,
   StreamLimitExceededError,
+  resetStreamLimitTallies,
   resolveGenerationKey,
   resolveStreamLimits,
 } from '@/llm/streamLimits';
@@ -165,7 +166,7 @@ describe('enforceStreamedToolCallArgLimit', () => {
     ).toThrow('(tool call: second)');
   });
 
-  it('falls back to the chunk id, then a shared bucket, when index is absent', () => {
+  it('falls back to the chunk id when index is absent', () => {
     const graph: StreamLimitState = {
       streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 8 }),
     };
@@ -188,6 +189,55 @@ describe('enforceStreamedToolCallArgLimit', () => {
         toolCallChunks: [chunk({ id: 'call_b', args: '789' })],
       })
     ).toThrow('(tool call: b_tool)');
+  });
+
+  it('keys anonymous chunks by batch position so parallel calls stay separate', () => {
+    const graph: StreamLimitState = {
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 8 }),
+    };
+    const metadata = generation(1);
+    enforceStreamedToolCallArgLimit({
+      graph,
+      metadata,
+      toolCallChunks: [
+        chunk({ name: 'anon_a', args: '123456' }),
+        chunk({ name: 'anon_b', args: '123456' }),
+      ],
+    });
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1:#0')?.bytes).toBe(6);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1:#1')?.bytes).toBe(6);
+    expect(() =>
+      enforceStreamedToolCallArgLimit({
+        graph,
+        metadata,
+        toolCallChunks: [chunk({ args: '789' })],
+      })
+    ).toThrow(StreamLimitExceededError);
+  });
+
+  it('checks arrival-sealed complete calls standalone, keeping no tally', () => {
+    const graph: StreamLimitState = {
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 64 }),
+    };
+    const sealAll = { [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'all' } };
+    enforceStreamedToolCallArgLimit({
+      graph,
+      metadata: generation(1),
+      toolCallChunks: [
+        chunk({ args: 'x'.repeat(40) }),
+        chunk({ args: 'y'.repeat(40) }),
+      ],
+      responseMetadata: sealAll,
+    });
+    expect(graph.streamedToolCallArgTallies?.size).toBe(0);
+    expect(() =>
+      enforceStreamedToolCallArgLimit({
+        graph,
+        metadata: generation(1),
+        toolCallChunks: [chunk({ name: 'big_call', args: 'z'.repeat(70) })],
+        responseMetadata: sealAll,
+      })
+    ).toThrow('(tool call: big_call)');
   });
 
   it('replaces the tally when a single-seal chunk restates complete args (OpenAI Responses)', () => {
@@ -216,10 +266,10 @@ describe('enforceStreamedToolCallArgLimit', () => {
         [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'single', index: 0 },
       },
     });
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1:0')?.bytes).toBe(40);
+    expect(graph.streamedToolCallArgTallies?.has('|agent|1:0')).toBe(false);
   });
 
-  it('ignores empty-args seal chunks (Bedrock Converse stop chunks)', () => {
+  it('releases the tally on a Bedrock Converse stop chunk without counting it', () => {
     const graph: StreamLimitState = {
       streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 50 }),
     };
@@ -239,7 +289,48 @@ describe('enforceStreamedToolCallArgLimit', () => {
         [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'single', index: 0 },
       },
     });
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1:0')?.bytes).toBe(10);
+    expect(graph.streamedToolCallArgTallies?.has('|agent|1:0')).toBe(false);
+  });
+
+  it('resets one generation on a new model attempt, keeping other generations', () => {
+    const graph: StreamLimitState = {
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 10,
+        maxDeltaEventsPerTurn: 5,
+      }),
+    };
+    enforceStreamedToolCallArgLimit({
+      graph,
+      metadata: generation(1),
+      toolCallChunks: [chunk({ args: '12345678', index: 0 })],
+    });
+    enforceStreamedToolCallArgLimit({
+      graph,
+      metadata: generation(2),
+      toolCallChunks: [chunk({ args: '1234', index: 0 })],
+    });
+    enforceStreamDeltaEventLimit({ graph, metadata: generation(1) });
+
+    resetStreamLimitTallies({ graph, metadata: generation(1) });
+
+    expect(graph.streamedToolCallArgTallies?.has('|agent|1:0')).toBe(false);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|2:0')?.bytes).toBe(4);
+    expect(graph.streamDeltaEventCounts?.has('|agent|1')).toBe(false);
+
+    enforceStreamedToolCallArgLimit({
+      graph,
+      metadata: generation(1),
+      toolCallChunks: [chunk({ args: '12345678', index: 0 })],
+    });
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1:0')?.bytes).toBe(8);
+  });
+
+  it('reset is a no-op when nothing was counted', () => {
+    const graph: StreamLimitState = {};
+    resetStreamLimitTallies({ graph, metadata: generation(1) });
+    resetStreamLimitTallies({ graph: undefined, metadata: generation(1) });
+    expect(graph.streamedToolCallArgTallies).toBeUndefined();
+    expect(graph.streamDeltaEventCounts).toBeUndefined();
   });
 
   it('does nothing when disabled', () => {

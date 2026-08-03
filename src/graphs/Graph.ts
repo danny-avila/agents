@@ -119,7 +119,10 @@ import type {
   ResolvedStreamLimits,
   StreamedToolCallArgTally,
 } from '@/llm/streamLimits';
-import { resolveStreamLimits } from '@/llm/streamLimits';
+import {
+  resolveStreamLimits,
+  StreamLimitExceededError,
+} from '@/llm/streamLimits';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
@@ -3216,6 +3219,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           metadata,
         });
         /**
+         * A tripped stream circuit breaker is a deliberate abort, not a
+         * provider failure: entering overflow recovery or the fallback chain
+         * would spend more provider work after the safety limit fired, and a
+         * succeeding fallback would resolve a run the public contract says
+         * must reject. Rethrow before any recovery path.
+         */
+        if (primaryError instanceof StreamLimitExceededError) {
+          throw primaryError;
+        }
+        /**
          * A context overflow is a deterministic consequence of the payload,
          * not a provider being unavailable — so it is answered by compacting
          * and retrying rather than by re-sending the same oversized prompt
@@ -3876,6 +3889,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           langfuse: this.langfuse,
           tokenCounter: agentContext.tokenCounter,
           usageSink: this.subagentUsageSink,
+          streamLimits: this.streamLimits,
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {
             const childGraph = new StandardGraph(input);

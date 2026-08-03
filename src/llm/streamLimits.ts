@@ -153,15 +153,14 @@ export function resolveGenerationKey(
 }
 
 /**
- * True when this chunk restates an already-streamed argument string instead
- * of extending it. The OpenAI Responses adapter attaches a `single` seal to
- * its `response.function_call_arguments.done` chunk, whose `args` is the
- * complete argument string all over again; summing it would double-count
- * every legitimate call. Adapters that seal without restating are unaffected:
- * Bedrock Converse seals with an empty-args chunk (skipped before this
- * check) and Google seals atomic single-chunk calls with `kind: 'all'`.
+ * True when the event's `single` seal marks this chunk's own call as
+ * complete. On the OpenAI Responses adapter the sealing chunk RESTATES the
+ * full argument string (`response.function_call_arguments.done`), so summing
+ * it would double-count every legitimate call; on Bedrock Converse the
+ * sealing chunk carries empty args. Either way the call is finished: its
+ * tally is replaced by the sealing chunk's own bytes, checked, and released.
  */
-function isSealRestatement(
+function sealsChunk(
   seal: ReturnType<typeof getStreamedToolCallSeal>,
   chunk: ToolCallChunk
 ): boolean {
@@ -174,6 +173,10 @@ function isSealRestatement(
   return seal.id != null && seal.id === chunk.id;
 }
 
+function chunkToolName(chunk: ToolCallChunk): string | undefined {
+  return chunk.name != null && chunk.name !== '' ? chunk.name : undefined;
+}
+
 /**
  * Accumulates the UTF-8 byte size of streamed tool-call argument chunks per
  * in-flight tool call and throws once a single call's cumulative bytes
@@ -183,10 +186,13 @@ function isSealRestatement(
  * offending call.
  *
  * Calls are keyed by generation and chunk `index`, falling back to the
- * chunk `id` and then to a shared bucket when a provider identifies chunks
- * by neither. The shared-bucket fallback is deliberately conservative: such
- * chunks cannot be attributed to distinct calls anywhere in the pipeline,
- * and a runaway stream is exactly the case that must still be bounded.
+ * chunk `id` and then to the chunk's position within the event's batch when
+ * a provider identifies chunks by neither (Google emits complete parallel
+ * calls with optional ids and no index). A `kind: 'all'` arrival seal marks
+ * every chunk in the event as its own complete call, so those are checked
+ * standalone and never share a budget; a matching `kind: 'single'` seal
+ * replaces the call's tally with the sealing chunk's own bytes (the OpenAI
+ * Responses done-chunk restates the full argument string) and releases it.
  */
 export function enforceStreamedToolCallArgLimit({
   graph,
@@ -207,31 +213,59 @@ export function enforceStreamedToolCallArgLimit({
   const tallies = (graph.streamedToolCallArgTallies ??= new Map());
   const generationKey = resolveGenerationKey(metadata);
   const seal = getStreamedToolCallSeal(responseMetadata);
-  for (const chunk of toolCallChunks) {
-    const key = `${generationKey}:${chunk.index ?? chunk.id ?? 0}`;
+  for (let i = 0; i < toolCallChunks.length; i++) {
+    const chunk = toolCallChunks[i];
+    const args = chunk.args;
+    const hasArgs = typeof args === 'string' && args !== '';
+    if (seal?.kind === 'all') {
+      if (!hasArgs) {
+        continue;
+      }
+      const bytes = Buffer.byteLength(args, 'utf8');
+      if (bytes > limit) {
+        throw new StreamLimitExceededError({
+          kind: 'tool_call_args',
+          limit,
+          observed: bytes,
+          toolName: chunkToolName(chunk),
+        });
+      }
+      continue;
+    }
+    const key = `${generationKey}:${chunk.index ?? chunk.id ?? `#${i}`}`;
+    const sealed = sealsChunk(seal, chunk);
     let tally = tallies.get(key);
+    if (!hasArgs) {
+      if (tally == null) {
+        if (!sealed) {
+          tallies.set(key, { bytes: 0, name: chunkToolName(chunk) });
+        }
+      } else if (sealed) {
+        tallies.delete(key);
+      } else if (tally.name == null) {
+        tally.name = chunkToolName(chunk);
+      }
+      continue;
+    }
     if (tally == null) {
       tally = { bytes: 0 };
       tallies.set(key, tally);
     }
-    if (tally.name == null && chunk.name != null && chunk.name !== '') {
-      tally.name = chunk.name;
-    }
-    const args = chunk.args;
-    if (typeof args !== 'string' || args === '') {
-      continue;
+    if (tally.name == null) {
+      tally.name = chunkToolName(chunk);
     }
     const argBytes = Buffer.byteLength(args, 'utf8');
-    tally.bytes = isSealRestatement(seal, chunk)
-      ? argBytes
-      : tally.bytes + argBytes;
+    tally.bytes = sealed ? argBytes : tally.bytes + argBytes;
     if (tally.bytes > limit) {
       throw new StreamLimitExceededError({
         kind: 'tool_call_args',
         limit,
         observed: tally.bytes,
-        toolName: tally.name,
+        toolName: tally.name ?? chunkToolName(chunk),
       });
+    }
+    if (sealed) {
+      tallies.delete(key);
     }
   }
 }
@@ -265,4 +299,46 @@ export function enforceStreamDeltaEventLimit({
     });
   }
   counts.set(key, next);
+}
+
+/**
+ * Releases one generation's tallies and event count. Called at the start of
+ * every model attempt (`attemptInvoke`): primary, fallback, and retry
+ * attempts within one node share the same langgraph metadata, so without
+ * this a fallback that re-streams a tool call from scratch would be charged
+ * the failed primary's partial bytes and could falsely trip the limit. The
+ * decoupled `streamEvents` reader can lag an attempt boundary by whatever it
+ * has buffered, so attribution is best-effort by design; the reset shrinks a
+ * mischarge from "the whole failed attempt" to that small in-flight tail.
+ * No-ops on two size checks while nothing was counted.
+ */
+export function resetStreamLimitTallies({
+  graph,
+  metadata,
+}: {
+  graph: StreamLimitState | undefined;
+  metadata: Record<string, unknown> | undefined;
+}): void {
+  if (graph == null) {
+    return;
+  }
+  const tallies = graph.streamedToolCallArgTallies;
+  const counts = graph.streamDeltaEventCounts;
+  const hasTallies = tallies != null && tallies.size > 0;
+  const hasCounts = counts != null && counts.size > 0;
+  if (!hasTallies && !hasCounts) {
+    return;
+  }
+  const generationKey = resolveGenerationKey(metadata);
+  if (hasTallies) {
+    const prefix = `${generationKey}:`;
+    for (const key of tallies.keys()) {
+      if (key.startsWith(prefix)) {
+        tallies.delete(key);
+      }
+    }
+  }
+  if (hasCounts) {
+    counts.delete(generationKey);
+  }
 }
