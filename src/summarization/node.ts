@@ -35,6 +35,7 @@ import {
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import type { StreamLimitState } from '@/llm/streamLimits';
 import {
+  enforceStreamedToolCallArgLimit,
   enforceStreamDeltaEventLimit,
   StreamLimitExceededError,
 } from '@/llm/streamLimits';
@@ -1347,7 +1348,7 @@ function buildSummarizationInstruction(
 }
 
 /** Creates an `onChunk` callback that dispatches `ON_SUMMARIZE_DELTA` events for streaming. */
-function createSummarizationChunkHandler({
+export function createSummarizationChunkHandler({
   stepId,
   config,
   provider,
@@ -1364,16 +1365,31 @@ function createSummarizationChunkHandler({
     return undefined;
   }
   const limitMetadata = config.metadata as Record<string, unknown> | undefined;
-  return (chunk) => {
+  return (chunk, attemptMetadata) => {
     /**
      * Summarization streams bypass `ChatModelStreamHandler` (this onChunk
-     * replaces it in `attemptInvoke`), so the per-generation event cap is
-     * enforced here. A trip tears down the model stream; the caller then
-     * skips fallbacks and degrades to the metadata stub instead of aborting
-     * the user's run over an auxiliary stream.
+     * replaces it in `attemptInvoke`), so both stream limits are enforced
+     * here: the per-generation event cap, and the argument byte cap for
+     * tool calls a tool-bound summarization model may emit. Keyed by the
+     * attempt metadata `attemptInvoke` hands each chunk, so a fallback
+     * summary attempt never inherits the failed primary's counts. A trip
+     * tears down the model stream; the caller then skips fallbacks and
+     * degrades to the metadata stub instead of aborting the user's run
+     * over an auxiliary stream.
      */
     if (graph != null) {
-      enforceStreamDeltaEventLimit({ graph, metadata: limitMetadata });
+      const metadata = attemptMetadata ?? limitMetadata;
+      enforceStreamDeltaEventLimit({ graph, metadata });
+      if (chunk.tool_call_chunks != null && chunk.tool_call_chunks.length > 0) {
+        enforceStreamedToolCallArgLimit({
+          graph,
+          metadata,
+          toolCallChunks: chunk.tool_call_chunks,
+          responseMetadata: chunk.response_metadata as
+            | Record<string, unknown>
+            | undefined,
+        });
+      }
     }
     const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];
     const raw = getChunkContent({ chunk: chunkAny, provider, reasoningKey });

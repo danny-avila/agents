@@ -38,9 +38,9 @@ import {
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import {
-  resetStreamLimitTallies,
   StreamLimitExceededError,
   STREAM_LIMIT_REDISPATCH_KEY,
+  STREAM_LIMIT_ATTEMPT_KEY,
 } from '@/llm/streamLimits';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
@@ -88,8 +88,18 @@ export type InvokeContext = NonNullable<
 /**
  * Per-chunk callback for custom stream processing.
  * When provided, replaces the default `ChatModelStreamHandler`.
+ *
+ * `metadata` is the attempt's callback metadata (carrying the provider and
+ * stream-limit attempt stamps), so consumers that count against the stream
+ * limits key each model attempt separately.
  */
-export type OnChunk = (chunk: AIMessageChunk) => void | Promise<void>;
+export type OnChunk = (
+  chunk: AIMessageChunk,
+  metadata?: Record<string, unknown>
+) => void | Promise<void>;
+
+/** Unique per-model-attempt sequence; see the stamp in `attemptInvoke`. */
+let streamLimitAttemptSeq = 0;
 
 export function usesNativeOpenAIResponses(
   model: t.ChatModel,
@@ -681,17 +691,6 @@ export async function attemptInvoke(
   config?: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
   /**
-   * One `attemptInvoke` call is one model attempt; primary, fallback, and
-   * retry attempts within a node share the same langgraph metadata, so a
-   * fallback that re-streams a tool call from scratch would otherwise be
-   * charged the failed primary's partial bytes and could falsely trip the
-   * stream limits.
-   */
-  resetStreamLimitTallies({
-    graph: context,
-    metadata: config?.metadata as Record<string, unknown> | undefined,
-  });
-  /**
    * Pull the run-scoped tool output registry off the graph (when one
    * exists) and project ToolMessages carrying ref metadata into a
    * transient annotated copy. The original `messages` array stays
@@ -769,6 +768,16 @@ export async function attemptInvoke(
     metadata: {
       ...(config?.metadata ?? {}),
       [Constants.INVOKED_PROVIDER]: provider,
+      /**
+       * One `attemptInvoke` call is one model attempt; primary, fallback,
+       * and retry attempts within a node otherwise share the same langgraph
+       * metadata, so without a unique attempt stamp a fallback re-streaming
+       * a tool call from scratch would be charged the failed primary's
+       * partial bytes (or a same-named sibling fallback's) and could
+       * falsely trip the stream limits. The stamp rides the same metadata
+       * rebuild that already attributes the serving provider.
+       */
+      [STREAM_LIMIT_ATTEMPT_KEY]: ++streamLimitAttemptSeq,
     },
   };
 
@@ -805,8 +814,11 @@ export async function attemptInvoke(
       getRegisteredDefaultChatStreamHandler(context);
 
     if (onChunk) {
+      const attemptMetadata = config.metadata as
+        | Record<string, unknown>
+        | undefined;
       for await (const chunk of stream) {
-        await onChunk(chunk);
+        await onChunk(chunk, attemptMetadata);
         finalChunk = appendStreamChunk({
           current: finalChunk,
           next: chunk,

@@ -2,7 +2,6 @@
 import type { ToolCallChunk } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { getStreamedToolCallSeal } from '@/tools/streamedToolCallSeals';
-import { Constants } from '@/common';
 
 /**
  * Circuit breakers for pathological model streams.
@@ -141,12 +140,15 @@ export class StreamLimitExceededError extends Error {
  * `checkpoint_ns + node + step` stays stable for the whole generation and
  * distinguishes parallel agents in the same superstep.
  *
- * The `INVOKED_MODEL` stamp scopes attempts within one node execution:
- * `tryFallbackProviders` (and summarization's fallback path) stamps it into
- * each fallback's config metadata, so a fallback's chunks key separately
- * from the failed primary's even when the decoupled `streamEvents` reader
- * drains the primary's buffered chunks late. Those late chunks land in the
- * primary's own bucket instead of polluting the fallback's.
+ * The attempt stamp scopes attempts within one node execution:
+ * `attemptInvoke` is the single funnel for primary, fallback, and
+ * summarization model calls and stamps {@link STREAM_LIMIT_ATTEMPT_KEY}
+ * with a unique sequence number into each attempt's callback metadata. A
+ * fallback's chunks therefore key separately from the failed primary's,
+ * even for two fallbacks configured with the same provider and model name,
+ * and even when the decoupled `streamEvents` reader drains a failed
+ * attempt's buffered chunks late. Those late chunks land in their own
+ * attempt's bucket instead of polluting the next one's.
  */
 export function resolveGenerationKey(
   metadata: Record<string, unknown> | undefined
@@ -157,9 +159,16 @@ export function resolveGenerationKey(
   const checkpointNs = metadata.langgraph_checkpoint_ns ?? '';
   const node = metadata.langgraph_node ?? '';
   const step = metadata.langgraph_step ?? '';
-  const invokedModel = metadata[Constants.INVOKED_MODEL] ?? '';
-  return `${checkpointNs}|${node}|${step}|${invokedModel}`;
+  const attempt = metadata[STREAM_LIMIT_ATTEMPT_KEY] ?? '';
+  return `${checkpointNs}|${node}|${step}|${attempt}`;
 }
+
+/**
+ * Metadata key carrying the unique per-model-attempt sequence number that
+ * `attemptInvoke` stamps into every attempt's callback metadata. Part of
+ * the generation key so budgets never alias across attempts.
+ */
+export const STREAM_LIMIT_ATTEMPT_KEY = 'lc_stream_limit_attempt';
 
 /**
  * Event-metadata marker for a chunk the SDK re-dispatches inline after
@@ -320,46 +329,4 @@ export function enforceStreamDeltaEventLimit({
     });
   }
   counts.set(key, next);
-}
-
-/**
- * Releases one generation's tallies and event count. Called at the start of
- * every model attempt (`attemptInvoke`): primary, fallback, and retry
- * attempts within one node share the same langgraph metadata, so without
- * this a fallback that re-streams a tool call from scratch would be charged
- * the failed primary's partial bytes and could falsely trip the limit. The
- * decoupled `streamEvents` reader can lag an attempt boundary by whatever it
- * has buffered, so attribution is best-effort by design; the reset shrinks a
- * mischarge from "the whole failed attempt" to that small in-flight tail.
- * No-ops on two size checks while nothing was counted.
- */
-export function resetStreamLimitTallies({
-  graph,
-  metadata,
-}: {
-  graph: StreamLimitState | undefined;
-  metadata: Record<string, unknown> | undefined;
-}): void {
-  if (graph == null) {
-    return;
-  }
-  const tallies = graph.streamedToolCallArgTallies;
-  const counts = graph.streamDeltaEventCounts;
-  const hasTallies = tallies != null && tallies.size > 0;
-  const hasCounts = counts != null && counts.size > 0;
-  if (!hasTallies && !hasCounts) {
-    return;
-  }
-  const generationKey = resolveGenerationKey(metadata);
-  if (hasTallies) {
-    const prefix = `${generationKey}:`;
-    for (const key of tallies.keys()) {
-      if (key.startsWith(prefix)) {
-        tallies.delete(key);
-      }
-    }
-  }
-  if (hasCounts) {
-    counts.delete(generationKey);
-  }
 }
