@@ -115,11 +115,11 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
-import {
-  resolveStreamLimits,
-  type ResolvedStreamLimits,
-  type StreamedToolCallArgTally,
+import type {
+  ResolvedStreamLimits,
+  StreamedToolCallArgTally,
 } from '@/llm/streamLimits';
+import { resolveStreamLimits } from '@/llm/streamLimits';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
@@ -1064,12 +1064,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   streamLimits: ResolvedStreamLimits;
   /**
    * Cumulative streamed argument bytes per in-flight tool call, keyed by
-   * `stepKey:index`. Per-run accumulation state, cleared by both reset
-   * paths.
+   * generation key + chunk index (see `resolveGenerationKey`). Per-run
+   * accumulation state, cleared by both reset paths.
    */
   streamedToolCallArgTallies: Map<string, StreamedToolCallArgTally> =
     new Map();
-  /** Streamed chunk events per generation turn, keyed by stepKey. */
+  /** Streamed chunk events per model generation, keyed by generation key. */
   streamDeltaEventCounts: Map<string, number> = new Map();
   /**
    * Seals charged against `preemption.maxSeals`. Per-turn: cleared by both

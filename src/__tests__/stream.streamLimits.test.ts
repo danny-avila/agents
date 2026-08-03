@@ -17,7 +17,13 @@ import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import {
+  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
+  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
+  OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
+} from '@/tools/streamedToolCallSeals';
+import {
   DEFAULT_MAX_TOOL_CALL_ARG_BYTES,
+  resolveGenerationKey,
   resolveStreamLimits,
 } from '@/llm/streamLimits';
 import { GraphEvents, Providers, StepTypes } from '@/common';
@@ -82,24 +88,41 @@ function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
   return graph as unknown as StandardGraph;
 }
 
+const generation = (step: number): Record<string, unknown> => ({
+  langgraph_checkpoint_ns: '',
+  langgraph_node: 'agent',
+  langgraph_step: step,
+});
+
+async function streamEvent(args: {
+  handler: ChatModelStreamHandler;
+  graph: StandardGraph;
+  chunk: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  const { handler, graph, chunk, metadata } = args;
+  await handler.handle(
+    GraphEvents.CHAT_MODEL_STREAM,
+    { chunk: chunk as unknown as t.StreamChunk },
+    metadata ?? {},
+    graph
+  );
+}
+
 async function streamToolCallChunks(args: {
   handler: ChatModelStreamHandler;
   graph: StandardGraph;
   chunks: Array<Record<string, unknown>>;
+  metadata?: Record<string, unknown>;
 }): Promise<void> {
-  const { handler, graph, chunks } = args;
+  const { handler, graph, chunks, metadata } = args;
   for (const toolCallChunk of chunks) {
-    await handler.handle(
-      GraphEvents.CHAT_MODEL_STREAM,
-      {
-        chunk: {
-          content: '',
-          tool_call_chunks: [toolCallChunk],
-        } as unknown as t.StreamChunk,
-      },
-      {},
-      graph
-    );
+    await streamEvent({
+      handler,
+      graph,
+      metadata,
+      chunk: { content: '', tool_call_chunks: [toolCallChunk] },
+    });
   }
 }
 
@@ -144,20 +167,17 @@ describe('streamed tool-call argument circuit breaker', () => {
       streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
     });
 
-    await handler.handle(
-      GraphEvents.CHAT_MODEL_STREAM,
-      {
-        chunk: {
-          content: '',
-          tool_call_chunks: [
-            { id: 'call_1', name: 'first', args: 'a'.repeat(60), index: 0 },
-            { id: 'call_2', name: 'second', args: 'b'.repeat(60), index: 1 },
-          ],
-        } as unknown as t.StreamChunk,
+    await streamEvent({
+      handler,
+      graph,
+      chunk: {
+        content: '',
+        tool_call_chunks: [
+          { id: 'call_1', name: 'first', args: 'a'.repeat(60), index: 0 },
+          { id: 'call_2', name: 'second', args: 'b'.repeat(60), index: 1 },
+        ],
       },
-      {},
-      graph
-    );
+    });
 
     await expect(
       streamToolCallChunks({
@@ -184,6 +204,87 @@ describe('streamed tool-call argument circuit breaker', () => {
         ],
       })
     ).rejects.toMatchObject({ kind: 'tool_call_args', observed: 1_200 });
+  });
+
+  it('enforces the cap before a complete arrival-sealed call can dispatch', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+    const oversized = JSON.stringify({ payload: 'x'.repeat(200) });
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_calls: [
+            { id: 'call_1', name: 'side_effect', args: { payload: 'x'.repeat(200) } },
+          ],
+          tool_call_chunks: [
+            { id: 'call_1', name: 'side_effect', args: oversized, index: 0 },
+          ],
+        },
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', toolName: 'side_effect' });
+
+    const dispatchStep = graph.dispatchRunStep as jest.Mock;
+    expect(dispatchStep).not.toHaveBeenCalled();
+  });
+
+  it('enforces the cap for chunks that carry no numeric index', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_1', name: 'no_index_tool', args: 'x'.repeat(80) }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ id: 'call_1', args: 'x'.repeat(21) }],
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', toolName: 'no_index_tool' });
+  });
+
+  it('does not double-count OpenAI Responses seal restatements', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 50 }),
+    });
+    const fullArgs = 'x'.repeat(40);
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [
+        { args: fullArgs.slice(0, 20), index: 0 },
+        { args: fullArgs.slice(20), index: 0 },
+      ],
+    });
+    await streamEvent({
+      handler,
+      graph,
+      chunk: {
+        content: '',
+        tool_call_chunks: [{ name: 'writer', args: fullArgs, index: 0 }],
+        response_metadata: {
+          [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+            OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
+          [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'single', index: 0 },
+        },
+      },
+    });
+
+    const key = `${resolveGenerationKey({})}:0`;
+    expect(graph.streamedToolCallArgTallies.get(key)?.bytes).toBe(40);
   });
 
   it('streams unbounded when explicitly disabled', async () => {
@@ -229,7 +330,7 @@ describe('streamed tool-call argument circuit breaker', () => {
   });
 });
 
-describe('per-turn delta event circuit breaker', () => {
+describe('per-generation delta event circuit breaker', () => {
   it('is opt-in and counts every streamed chunk event, including empty ones', async () => {
     const handler = new ChatModelStreamHandler();
     const graph = createGraph({
@@ -237,12 +338,7 @@ describe('per-turn delta event circuit breaker', () => {
     });
 
     const emptyChunkEvent = (): Promise<void> =>
-      handler.handle(
-        GraphEvents.CHAT_MODEL_STREAM,
-        { chunk: { content: '' } as unknown as t.StreamChunk },
-        {},
-        graph
-      );
+      streamEvent({ handler, graph, chunk: { content: '' }, metadata: generation(1) });
 
     await emptyChunkEvent();
     await emptyChunkEvent();
@@ -255,31 +351,27 @@ describe('per-turn delta event circuit breaker', () => {
     });
   });
 
-  it('scopes the budget per generation turn', async () => {
+  it('scopes the budget per model generation, surviving step-key forks', async () => {
     const handler = new ChatModelStreamHandler();
-    let turn = 'turn-1';
+    let stepKey = 'reasoning-key';
     const graph = createGraph({
       streamLimits: resolveStreamLimits({ maxDeltaEventsPerTurn: 2 }),
-      getStepKey: jest.fn(() => turn) as unknown as StandardGraph['getStepKey'],
+      getStepKey: jest.fn(() => stepKey) as unknown as StandardGraph['getStepKey'],
     });
 
-    const emptyChunkEvent = (): Promise<void> =>
-      handler.handle(
-        GraphEvents.CHAT_MODEL_STREAM,
-        { chunk: { content: '' } as unknown as t.StreamChunk },
-        {},
-        graph
-      );
+    const emptyChunkEvent = (step: number): Promise<void> =>
+      streamEvent({ handler, graph, chunk: { content: '' }, metadata: generation(step) });
 
-    await emptyChunkEvent();
-    await emptyChunkEvent();
-    turn = 'turn-2';
-    await emptyChunkEvent();
-    await emptyChunkEvent();
-    await expect(emptyChunkEvent()).rejects.toMatchObject({
+    await emptyChunkEvent(1);
+    stepKey = 'post-reasoning-key';
+    await emptyChunkEvent(1);
+    await expect(emptyChunkEvent(1)).rejects.toMatchObject({
       kind: 'delta_events',
       observed: 3,
     });
+
+    await emptyChunkEvent(2);
+    expect(graph.streamDeltaEventCounts.get('|agent|2')).toBe(1);
   });
 
   it('never counts when left at the default (disabled)', async () => {
@@ -287,12 +379,7 @@ describe('per-turn delta event circuit breaker', () => {
     const graph = createGraph({ streamLimits: resolveStreamLimits() });
 
     for (let i = 0; i < 10; i++) {
-      await handler.handle(
-        GraphEvents.CHAT_MODEL_STREAM,
-        { chunk: { content: '' } as unknown as t.StreamChunk },
-        {},
-        graph
-      );
+      await streamEvent({ handler, graph, chunk: { content: '' }, metadata: generation(1) });
     }
     expect(graph.streamDeltaEventCounts).toBeUndefined();
   });

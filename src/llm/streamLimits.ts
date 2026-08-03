@@ -1,6 +1,7 @@
 // src/llm/streamLimits.ts
 import type { ToolCallChunk } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
+import { getStreamedToolCallSeal } from '@/tools/streamedToolCallSeals';
 
 /**
  * Circuit breakers for pathological model streams.
@@ -130,20 +131,73 @@ export class StreamLimitExceededError extends Error {
 }
 
 /**
+ * Identity of one model generation, derived from langgraph's node-execution
+ * metadata. Deliberately NOT `Graph.getStepKey()`: the step key forks within
+ * a single generation on reasoning transitions (`'reasoning'` /
+ * `post-reasoning-<n>` suffixes in `getKeyList`) and on mid-turn server-tool
+ * results (`invokedToolIds` count), which would hand a fresh budget to each
+ * segment. One agent-node execution is one superstep, so
+ * `checkpoint_ns + node + step` stays stable for the whole generation and
+ * distinguishes parallel agents in the same superstep.
+ */
+export function resolveGenerationKey(
+  metadata: Record<string, unknown> | undefined
+): string {
+  if (metadata == null) {
+    return '';
+  }
+  const checkpointNs = metadata.langgraph_checkpoint_ns ?? '';
+  const node = metadata.langgraph_node ?? '';
+  const step = metadata.langgraph_step ?? '';
+  return `${checkpointNs}|${node}|${step}`;
+}
+
+/**
+ * True when this chunk restates an already-streamed argument string instead
+ * of extending it. The OpenAI Responses adapter attaches a `single` seal to
+ * its `response.function_call_arguments.done` chunk, whose `args` is the
+ * complete argument string all over again; summing it would double-count
+ * every legitimate call. Adapters that seal without restating are unaffected:
+ * Bedrock Converse seals with an empty-args chunk (skipped before this
+ * check) and Google seals atomic single-chunk calls with `kind: 'all'`.
+ */
+function isSealRestatement(
+  seal: ReturnType<typeof getStreamedToolCallSeal>,
+  chunk: ToolCallChunk
+): boolean {
+  if (seal == null || seal.kind !== 'single') {
+    return false;
+  }
+  if (seal.index != null) {
+    return seal.index === chunk.index;
+  }
+  return seal.id != null && seal.id === chunk.id;
+}
+
+/**
  * Accumulates the UTF-8 byte size of streamed tool-call argument chunks per
- * in-flight tool call (keyed by `stepKey:index`) and throws once a single
- * call's cumulative bytes exceed `maxToolCallArgBytes`. Runs once per
- * streamed chunk event, before the chunks are recorded or dispatched, so a
- * tripped limit stops the run without accumulating further.
+ * in-flight tool call and throws once a single call's cumulative bytes
+ * exceed `maxToolCallArgBytes`. Runs once per streamed chunk event, before
+ * complete tool calls are dispatched or eagerly executed and before chunks
+ * are recorded, so a tripped limit stops the run without dispatching the
+ * offending call.
+ *
+ * Calls are keyed by generation and chunk `index`, falling back to the
+ * chunk `id` and then to a shared bucket when a provider identifies chunks
+ * by neither. The shared-bucket fallback is deliberately conservative: such
+ * chunks cannot be attributed to distinct calls anywhere in the pipeline,
+ * and a runaway stream is exactly the case that must still be bounded.
  */
 export function enforceStreamedToolCallArgLimit({
   graph,
-  stepKey,
+  metadata,
   toolCallChunks,
+  responseMetadata,
 }: {
   graph: StreamLimitState;
-  stepKey: string;
+  metadata: Record<string, unknown> | undefined;
   toolCallChunks: ToolCallChunk[];
+  responseMetadata?: Record<string, unknown>;
 }): void {
   const limit = (graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS)
     .maxToolCallArgBytes;
@@ -151,8 +205,10 @@ export function enforceStreamedToolCallArgLimit({
     return;
   }
   const tallies = (graph.streamedToolCallArgTallies ??= new Map());
+  const generationKey = resolveGenerationKey(metadata);
+  const seal = getStreamedToolCallSeal(responseMetadata);
   for (const chunk of toolCallChunks) {
-    const key = `${stepKey}:${chunk.index ?? 0}`;
+    const key = `${generationKey}:${chunk.index ?? chunk.id ?? 0}`;
     let tally = tallies.get(key);
     if (tally == null) {
       tally = { bytes: 0 };
@@ -165,7 +221,10 @@ export function enforceStreamedToolCallArgLimit({
     if (typeof args !== 'string' || args === '') {
       continue;
     }
-    tally.bytes += Buffer.byteLength(args, 'utf8');
+    const argBytes = Buffer.byteLength(args, 'utf8');
+    tally.bytes = isSealRestatement(seal, chunk)
+      ? argBytes
+      : tally.bytes + argBytes;
     if (tally.bytes > limit) {
       throw new StreamLimitExceededError({
         kind: 'tool_call_args',
@@ -178,17 +237,17 @@ export function enforceStreamedToolCallArgLimit({
 }
 
 /**
- * Counts streamed chunk events per generation turn (stepKey) and throws once
- * a single turn exceeds `maxDeltaEventsPerTurn`. Opt-in defense in depth for
+ * Counts streamed chunk events per model generation and throws once a single
+ * generation exceeds `maxDeltaEventsPerTurn`. Opt-in defense in depth for
  * pathologies a byte cap cannot see, such as a provider stream looping on
  * empty chunks. Zero cost while disabled.
  */
 export function enforceStreamDeltaEventLimit({
   graph,
-  stepKey,
+  metadata,
 }: {
   graph: StreamLimitState;
-  stepKey: string;
+  metadata: Record<string, unknown> | undefined;
 }): void {
   const limit = (graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS)
     .maxDeltaEventsPerTurn;
@@ -196,7 +255,8 @@ export function enforceStreamDeltaEventLimit({
     return;
   }
   const counts = (graph.streamDeltaEventCounts ??= new Map());
-  const next = (counts.get(stepKey) ?? 0) + 1;
+  const key = resolveGenerationKey(metadata);
+  const next = (counts.get(key) ?? 0) + 1;
   if (next > limit) {
     throw new StreamLimitExceededError({
       kind: 'delta_events',
@@ -204,5 +264,5 @@ export function enforceStreamDeltaEventLimit({
       observed: next,
     });
   }
-  counts.set(stepKey, next);
+  counts.set(key, next);
 }

@@ -1549,10 +1549,28 @@ export class ChatModelStreamHandler implements t.EventHandler {
     }
     this.handleReasoning(chunk, agentContext);
     const stepKey = graph.getStepKey(metadata);
-    enforceStreamDeltaEventLimit({ graph, stepKey });
+    enforceStreamDeltaEventLimit({ graph, metadata });
     let hasToolCalls = false;
     const hasToolCallChunks =
       (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) ?? false;
+    /**
+     * Enforced before the complete-call branch below: an arrival-sealed
+     * oversized call (Google/Vertex) carries both `tool_calls` and
+     * `tool_call_chunks` in one event, and the complete-call branch can
+     * dispatch it and prestart a side-effecting tool. Also deliberately NOT
+     * gated on numeric chunk indices, unlike the dispatch branch further
+     * down, so id-only or index-less runaway streams stay bounded.
+     */
+    if (hasToolCallChunks && chunk.tool_call_chunks) {
+      enforceStreamedToolCallArgLimit({
+        graph,
+        metadata,
+        toolCallChunks: chunk.tool_call_chunks,
+        responseMetadata: chunk.response_metadata as
+          | Record<string, unknown>
+          | undefined,
+      });
+    }
     const hasGoogleServerSideToolContent =
       isGoogleLike(agentContext.provider) &&
       Array.isArray(content) &&
@@ -1633,11 +1651,6 @@ export class ChatModelStreamHandler implements t.EventHandler {
       chunk.tool_call_chunks.length &&
       typeof chunk.tool_call_chunks[0]?.index === 'number'
     ) {
-      enforceStreamedToolCallArgLimit({
-        graph,
-        stepKey,
-        toolCallChunks: chunk.tool_call_chunks,
-      });
       const streamedToolCallSeal = getStreamedToolCallSeal(
         chunk.response_metadata as Record<string, unknown> | undefined
       );
