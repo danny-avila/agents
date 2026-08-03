@@ -11,8 +11,10 @@ import {
   convertMessagesToResponsesInput,
   convertResponsesMessageToAIMessage,
 } from '@langchain/openai';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { MessageContentComplex, TPayload } from '@/types';
 import {
+  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
   convertMessagesToContent,
   formatAnthropicArtifactContent,
   formatArtifactPayload,
@@ -21,6 +23,7 @@ import {
   projectComputerCallOutputsToText,
   projectOpenAIToolMessageContent,
   projectOpenAIResponsesToolMessageContent,
+  projectToolStreamContentForProvider,
 } from './core';
 import {
   _convertMessagesToOpenAIParams,
@@ -40,6 +43,13 @@ type AnthropicPayloadBlock = {
   tool_use_id?: string;
   type: string;
 };
+
+const CODE_INTERPRETER_REPLAY_EXTRAS = {
+  librechatServerToolResult: { toolName: 'code_interpreter' },
+} as const;
+const IMAGE_GENERATION_REPLAY_EXTRAS = {
+  librechatServerToolResult: { toolName: 'image_generation' },
+} as const;
 
 const getAnthropicPayloadBlocks = (
   content: unknown
@@ -1750,6 +1760,2620 @@ describe('formatAgentMessages', () => {
       output: projectedTool.content,
       call_id: toolMessage.tool_call_id,
     });
+  });
+
+  it('neutralizes nonterminal Responses references on preempted provider input', () => {
+    const message = new AIMessage({
+      id: 'msg_interrupted',
+      content: 'Partial answer.',
+      additional_kwargs: {
+        reasoning: {
+          id: 'rs_interrupted',
+          type: 'reasoning',
+          summary: [],
+        },
+        tool_outputs: [
+          {
+            id: 'ci_interrupted',
+            type: 'code_interpreter_call',
+            status: 'completed',
+          },
+        ],
+        __openai_function_call_ids__: { call_1: 'fc_interrupted' },
+        __openai_custom_tool_call_ids__: { call_2: 'ctc_interrupted' },
+        retained: 'application metadata',
+      },
+      response_metadata: {
+        id: 'resp_interrupted',
+        model_provider: 'openai',
+        output: [],
+        tool_outputs: [{ id: 'ci_interrupted' }],
+        model_name: 'gpt-5.6',
+        preempted: true,
+      },
+    });
+
+    const messages = [message];
+    const unsafeProviderInput = convertMessagesToResponsesInput({
+      messages,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+    const projected = projectOpenAIResponsesToolMessageContent(messages);
+    const projectedMessage = projected[0] as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projected).not.toBe(messages);
+    expect(projectedMessage).not.toBe(message);
+    expect(Object.getPrototypeOf(projectedMessage)).toBe(
+      Object.getPrototypeOf(message)
+    );
+    expect(projectedMessage.id).toBeUndefined();
+    expect(projectedMessage.content).toBe('Partial answer.');
+    expect(projectedMessage.additional_kwargs).toEqual({
+      retained: 'application metadata',
+    });
+    expect(projectedMessage.response_metadata).toEqual({
+      model_provider: 'openai',
+      model_name: 'gpt-5.6',
+      preempted: true,
+    });
+    const unsafeSerializedInput = JSON.stringify(unsafeProviderInput);
+    const serializedInput = JSON.stringify(providerInput);
+    expect(unsafeSerializedInput).toContain('rs_interrupted');
+    expect(unsafeSerializedInput).toContain('ci_interrupted');
+    expect(serializedInput).toContain('Partial answer.');
+    expect(serializedInput).not.toContain('interrupted');
+    expect(message.id).toBe('msg_interrupted');
+    expect(message.additional_kwargs.reasoning).toBeDefined();
+    expect(message.response_metadata).toHaveProperty('output');
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
+  it('retains self-contained encrypted reasoning on preempted Responses input', () => {
+    const reasoning = {
+      id: 'rs_encrypted',
+      type: 'reasoning',
+      status: 'completed',
+      summary: [],
+      encrypted_content: 'opaque-reasoning',
+    };
+    const message = new AIMessage({
+      id: 'msg_interrupted',
+      content: 'Partial answer.',
+      additional_kwargs: { reasoning },
+      response_metadata: { model_provider: 'openai', preempted: true },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: [projected],
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projectedMessage.additional_kwargs.reasoning).toBe(reasoning);
+    expect(providerInput).toContainEqual(
+      expect.objectContaining({
+        id: 'rs_encrypted',
+        type: 'reasoning',
+        encrypted_content: 'opaque-reasoning',
+      })
+    );
+  });
+
+  it.each([
+    [
+      'Responses projector',
+      (messages: BaseMessage[]) =>
+        projectOpenAIResponsesToolMessageContent(messages),
+    ],
+    [
+      'common native projector',
+      (messages: BaseMessage[]) =>
+        projectToolStreamContentForProvider(messages, 'native'),
+    ],
+  ])(
+    'does not classify provider-neutral v1 Chat content as Responses through the %s',
+    (_name, project) => {
+      const applicationBlock = {
+        type: 'non_standard' as const,
+        value: { source: 'application' },
+      };
+      const message = new AIMessage({
+        content: [{ type: 'text', text: 'Chat answer.' }, applicationBlock],
+        response_metadata: {
+          model_provider: 'openai',
+          output_version: 'v1',
+          preempted: true,
+        },
+      });
+      const messages = [message];
+
+      const projected = project(messages);
+
+      expect(projected).toBe(messages);
+      expect(projected[0]).toBe(message);
+      expect(message.content).toEqual([
+        { type: 'text', text: 'Chat answer.' },
+        applicationBlock,
+      ]);
+    }
+  );
+
+  it('normalizes Responses text metadata before OpenAI Chat fallback replay', () => {
+    const annotatedText = {
+      type: 'text' as const,
+      text: 'Cited answer.',
+      annotations: [
+        {
+          type: 'citation' as const,
+          url: 'https://example.com/source',
+          title: 'Source',
+        },
+      ],
+      extras: { phase: 'final_answer' },
+      index: 0,
+    };
+    const message = new AIMessage({
+      content: [annotatedText],
+      response_metadata: {
+        model_provider: 'openai',
+        output: [],
+        output_version: 'v1',
+        preempted: true,
+      },
+    });
+
+    const native = projectToolStreamContentForProvider([message], 'native');
+    const fallback = projectToolStreamContentForProvider([message], 'fallback');
+    const fallbackMessage = fallback[0] as AIMessage;
+
+    expect((native[0] as AIMessage).content).toEqual([annotatedText]);
+    expect(fallbackMessage.content).toEqual([
+      { type: 'text', text: 'Cited answer.' },
+    ]);
+    expect(_convertMessagesToOpenAIParams(fallback)).toEqual([
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Cited answer.' }],
+      },
+    ]);
+    expect(message.content).toEqual([annotatedText]);
+
+    const fallbackAgain = projectToolStreamContentForProvider(
+      fallback,
+      'fallback'
+    );
+    expect(fallbackAgain).toBe(fallback);
+    expect(fallbackAgain[0]).toBe(fallbackMessage);
+  });
+
+  it.each([
+    [
+      'Responses projector',
+      (messages: BaseMessage[]) =>
+        projectOpenAIResponsesToolMessageContent(messages),
+    ],
+    [
+      'common native projector',
+      (messages: BaseMessage[]) =>
+        projectToolStreamContentForProvider(messages, 'native'),
+    ],
+  ])('sanitizes native v0 fragments through the %s', (_name, project) => {
+    const emptyText = { type: 'text' as const, text: '' };
+    const partialText = { type: 'text' as const, text: 'Partial answer.' };
+    const bareReasoning = {
+      type: 'reasoning' as const,
+      reasoning: 'summary',
+    };
+    const message = new AIMessage({
+      id: 'resp_fragmented',
+      content: [emptyText, partialText, bareReasoning],
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+    const messages = [message];
+
+    const projected = project(messages);
+    const projectedMessage = projected[0] as AIMessage;
+
+    expect(projected).not.toBe(messages);
+    expect(projectedMessage.content).toEqual([partialText]);
+    expect(projectedMessage.response_metadata.output_version).toBeUndefined();
+    expect(message.content).toEqual([emptyText, partialText, bareReasoning]);
+
+    const projectedAgain = project(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
+  it.each([
+    [
+      'Responses projector',
+      (messages: BaseMessage[]) =>
+        projectOpenAIResponsesToolMessageContent(messages),
+    ],
+    [
+      'common native projector',
+      (messages: BaseMessage[]) =>
+        projectToolStreamContentForProvider(messages, 'native'),
+    ],
+  ])(
+    'sanitizes unpromoted translated v0 content through the %s',
+    (_name, project) => {
+      const emptyText = { type: 'text' as const, text: '' };
+      const partialText = { type: 'text' as const, text: 'Partial answer.' };
+      const applicationImage = {
+        type: 'image' as const,
+        mimeType: 'image/png',
+        data: 'AQ==',
+      };
+      const bareReasoning = {
+        type: 'reasoning' as const,
+        reasoning: 'unfinished summary',
+      };
+      const message = new AIMessage({
+        id: 'msg_unpromoted',
+        content: [emptyText, partialText, applicationImage, bareReasoning],
+        additional_kwargs: {
+          tool_outputs: [
+            {
+              id: 'ig_unusable',
+              type: 'image_generation_call',
+              status: 'in_progress',
+              result: 'AA==',
+            },
+          ],
+        },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+      const messages = [message];
+
+      const projected = project(messages);
+      const projectedMessage = projected[0] as AIMessage;
+
+      expect(projected).not.toBe(messages);
+      expect(projectedMessage.id).toBeUndefined();
+      expect(projectedMessage.content).toEqual([partialText, applicationImage]);
+      expect(projectedMessage.additional_kwargs).not.toHaveProperty(
+        'tool_outputs'
+      );
+      expect(projectedMessage.response_metadata.output_version).toBeUndefined();
+      expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+        'ig_unusable'
+      );
+      expect(message.content).toEqual([
+        emptyText,
+        partialText,
+        applicationImage,
+        bareReasoning,
+      ]);
+
+      const projectedAgain = project(projected);
+      expect(projectedAgain).toBe(projected);
+      expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
+
+  it('recognizes response_metadata.tool_outputs as a Responses marker', () => {
+    const message = new AIMessage({
+      content: 'Partial answer.',
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+        tool_outputs: [{ id: 'ci_metadata_only' }],
+      },
+    });
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+
+    expect(projectedMessage).not.toBe(message);
+    expect(projectedMessage.content).toBe('Partial answer.');
+    expect(projectedMessage.response_metadata).not.toHaveProperty(
+      'tool_outputs'
+    );
+    expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+      'ci_metadata_only'
+    );
+    expect(message.response_metadata).toHaveProperty('tool_outputs');
+  });
+
+  it('neutralizes terminal Responses ids when request retention is unknown', () => {
+    const message = new AIMessage({
+      id: 'msg_completed',
+      content: 'Complete answer.',
+      additional_kwargs: {
+        reasoning: {
+          id: 'rs_completed',
+          type: 'reasoning',
+          summary: [],
+        },
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+        status: 'completed',
+        output: [
+          {
+            id: 'msg_completed',
+            type: 'message',
+            role: 'assistant',
+            status: 'completed',
+            content: [
+              {
+                type: 'output_text',
+                text: 'Complete answer.',
+                annotations: [],
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projectedMessage).not.toBe(message);
+    expect(projectedMessage.id).toBeUndefined();
+    expect(projectedMessage.additional_kwargs.reasoning).toBeUndefined();
+    expect(projectedMessage.response_metadata).toEqual({
+      model_provider: 'openai',
+      preempted: true,
+      status: 'completed',
+    });
+    expect(JSON.stringify(providerInput)).toContain('Complete answer.');
+    expect(JSON.stringify(providerInput)).not.toContain('msg_completed');
+    expect(JSON.stringify(providerInput)).not.toContain('rs_completed');
+    expect(message.response_metadata).toHaveProperty('output');
+  });
+
+  it.each(['additional_kwargs', 'response_metadata'] as const)(
+    'preserves completed v0 generated images from %s without provider ids',
+    (imageSource) => {
+      const events: Parameters<
+        typeof convertResponsesDeltaToChatGenerationChunk
+      >[0][] = [
+        {
+          type: 'response.output_item.done',
+          sequence_number: 0,
+          output_index: 0,
+          item: {
+            id: 'ig_interrupted',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'AA==',
+          },
+        },
+        {
+          type: 'response.output_item.added',
+          sequence_number: 1,
+          output_index: 1,
+          item: {
+            id: 'msg_interrupted',
+            type: 'message',
+            role: 'assistant',
+            status: 'in_progress',
+            content: [],
+          },
+        },
+        {
+          type: 'response.output_text.delta',
+          sequence_number: 2,
+          output_index: 1,
+          content_index: 0,
+          item_id: 'msg_interrupted',
+          delta: 'Partial answer.',
+          logprobs: [],
+        },
+      ];
+      let streamedMessage: AIMessageChunk | undefined;
+      for (const event of events) {
+        const generation = convertResponsesDeltaToChatGenerationChunk(event);
+        if (generation == null) {
+          continue;
+        }
+        streamedMessage =
+          streamedMessage == null
+            ? (generation.message as AIMessageChunk)
+            : (streamedMessage.concat(
+                generation.message as AIMessageChunk
+            ) as AIMessageChunk);
+      }
+      expect(streamedMessage).toBeDefined();
+      const toolOutputs = streamedMessage!.additional_kwargs.tool_outputs;
+      const message =
+        imageSource === 'additional_kwargs'
+          ? streamedMessage!
+          : new AIMessage({
+            content: 'Partial answer.',
+            response_metadata: {
+              model_provider: 'openai',
+              output: toolOutputs,
+            },
+          });
+      message.response_metadata.preempted = true;
+
+      const unsafeProviderInput = convertMessagesToResponsesInput({
+        messages: [message],
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+
+      expect(JSON.stringify(unsafeProviderInput)).toContain('ig_interrupted');
+      expect(projectedMessage.response_metadata).toMatchObject({
+        model_provider: 'openai',
+        output_version: 'v1',
+        preempted: true,
+      });
+      expect(projectedMessage.content).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: 'text', text: 'Partial answer.' }),
+          {
+            type: 'image',
+            mimeType: 'image/png',
+            data: 'AA==',
+            extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+          },
+        ])
+      );
+      expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+        'ig_interrupted'
+      );
+      expect(JSON.stringify(message.toJSON())).toContain('ig_interrupted');
+
+      for (const zdrEnabled of [false, true]) {
+        const providerInput = convertMessagesToResponsesInput({
+          messages: projected,
+          zdrEnabled,
+          model: 'gpt-5.6',
+        });
+        expect(providerInput).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: 'message',
+              role: 'assistant',
+              content: expect.arrayContaining([
+                expect.objectContaining({
+                  type: 'output_text',
+                  text: 'Partial answer.',
+                }),
+                {
+                  type: 'input_image',
+                  detail: 'auto',
+                  image_url: 'data:image/png;base64,AA==',
+                },
+              ]),
+            }),
+          ])
+        );
+        expect(JSON.stringify(providerInput)).not.toContain(
+          'image_generation_call'
+        );
+        expect(JSON.stringify(providerInput)).not.toContain('ig_interrupted');
+      }
+
+      const projectedAgain =
+        projectOpenAIResponsesToolMessageContent(projected);
+      expect(projectedAgain).toBe(projected);
+      expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
+
+  it('keeps completed v1 generated images in their Responses output positions', () => {
+    const firstGeneratedImage = {
+      id: 'ig_before_text',
+      type: 'image_generation_call',
+      status: 'completed',
+      result: 'AA==',
+    };
+    const secondGeneratedImage = {
+      id: 'ig_between_text',
+      type: 'image_generation_call',
+      status: 'completed',
+      result: 'AQ==',
+    };
+    const message = new AIMessage({
+      content: [
+        {
+          type: 'image',
+          mimeType: 'image/png',
+          data: firstGeneratedImage.result,
+          id: firstGeneratedImage.id,
+          metadata: { status: 'completed' },
+        },
+        { type: 'text', text: 'The image above is the first result.' },
+        {
+          type: 'image',
+          mimeType: 'image/png',
+          data: secondGeneratedImage.result,
+          id: secondGeneratedImage.id,
+          metadata: { status: 'completed' },
+        },
+        { type: 'text', text: 'The second image is directly above.' },
+      ],
+      response_metadata: {
+        model_provider: 'openai',
+        output_version: 'v1',
+        preempted: true,
+        output: [
+          firstGeneratedImage,
+          {
+            id: 'msg_first_narration',
+            type: 'message',
+            role: 'assistant',
+            status: 'completed',
+            content: [
+              {
+                type: 'output_text',
+                text: 'The image above is the first result.',
+                annotations: [],
+              },
+            ],
+          },
+          secondGeneratedImage,
+          {
+            id: 'msg_second_narration',
+            type: 'message',
+            role: 'assistant',
+            status: 'in_progress',
+            content: [
+              {
+                type: 'output_text',
+                text: 'The second image is directly above.',
+                annotations: [],
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projectedMessage.content).toEqual([
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+      { type: 'text', text: 'The image above is the first result.' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AQ==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+      { type: 'text', text: 'The second image is directly above.' },
+    ]);
+    expect(providerInput).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [
+          {
+            type: 'input_image',
+            detail: 'auto',
+            image_url: 'data:image/png;base64,AA==',
+          },
+          {
+            type: 'output_text',
+            text: 'The image above is the first result.',
+            annotations: [],
+          },
+          {
+            type: 'input_image',
+            detail: 'auto',
+            image_url: 'data:image/png;base64,AQ==',
+          },
+          {
+            type: 'output_text',
+            text: 'The second image is directly above.',
+            annotations: [],
+          },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(projectedMessage.toJSON())).not.toMatch(
+      /ig_(before|between)_text/
+    );
+    expect(message.response_metadata).toHaveProperty('output');
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
+  it.each([
+    ['v0', 'jpeg', '/9j/4AAQSkZJRg==', 'image/jpeg'],
+    ['v1', 'jpeg', '/9j/4AAQSkZJRg==', 'image/jpeg'],
+    ['v0', 'webp', 'UklGRgAAAABXRUJQ', 'image/webp'],
+    ['v1', 'webp', 'UklGRgAAAABXRUJQ', 'image/webp'],
+  ] as const)(
+    'preserves %s generated %s media type during replay',
+    (outputVersion, _format, data, mimeType) => {
+      const generatedImage = {
+        id: `ig_${outputVersion}_${_format}`,
+        type: 'image_generation_call',
+        status: 'completed',
+        result: data,
+      };
+      const v0Message = new AIMessage({
+        content: [{ type: 'text', text: 'Generated image.' }],
+        additional_kwargs: { tool_outputs: [generatedImage] },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+      const message =
+        outputVersion === 'v0'
+          ? v0Message
+          : new AIMessage({
+            contentBlocks: v0Message.contentBlocks,
+            additional_kwargs: v0Message.additional_kwargs,
+            response_metadata: {
+              model_provider: 'openai',
+              output_version: 'v1',
+              preempted: true,
+            },
+          });
+      const originalSerialized = JSON.stringify(message.toJSON());
+
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+      const providerInput = convertMessagesToResponsesInput({
+        messages: projected,
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+
+      expect(projectedMessage.content).toEqual(
+        expect.arrayContaining([
+          {
+            type: 'image',
+            mimeType,
+            data,
+            extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+          },
+        ])
+      );
+      expect(JSON.stringify(providerInput)).toContain(
+        `data:${mimeType};base64,${data}`
+      );
+      expect(JSON.stringify(providerInput)).not.toContain(generatedImage.id);
+      expect(JSON.stringify(providerInput)).not.toContain(
+        'librechatServerToolResult'
+      );
+      expect(JSON.stringify(providerInput)).not.toContain('extras');
+
+      const fallback = projectToolStreamContentForProvider(
+        [message],
+        'fallback'
+      );
+      expect((fallback[0] as AIMessage).content).toEqual([
+        { type: 'text', text: 'Generated image.' },
+      ]);
+      expect(_convertMessagesToOpenAIParams(fallback)).toEqual([
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Generated image.' }],
+        },
+      ]);
+      expect(JSON.stringify(fallback[0].toJSON())).not.toContain(
+        'librechatServerToolResult'
+      );
+      expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+      expect(originalSerialized).toContain(generatedImage.id);
+      expect(originalSerialized).not.toContain('librechatServerToolResult');
+
+      const projectedAgain =
+        projectOpenAIResponsesToolMessageContent(projected);
+      expect(projectedAgain).toBe(projected);
+      expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
+
+  it.each([
+    ['in_progress', 'AA=='],
+    ['completed', ''],
+  ] as const)(
+    'does not promote %s v0 generated image data %j',
+    (status, result) => {
+      const message = new AIMessage({
+        content: 'Partial answer.',
+        additional_kwargs: {
+          tool_outputs: [
+            {
+              id: 'ig_unusable',
+              type: 'image_generation_call',
+              status,
+              result,
+            },
+          ],
+        },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+
+      const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected as AIMessage;
+      const providerInput = convertMessagesToResponsesInput({
+        messages: [projected],
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+
+      expect(projectedMessage.response_metadata.output_version).toBeUndefined();
+      expect(JSON.stringify(providerInput)).toContain('Partial answer.');
+      expect(JSON.stringify(providerInput)).not.toContain('input_image');
+      expect(JSON.stringify(providerInput)).not.toContain('ig_unusable');
+    }
+  );
+
+  it('uses response output over stale v0 generated-image tool outputs', () => {
+    const message = new AIMessage({
+      content: [{ type: 'text', text: 'Partial answer.' }],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: 'ig_stale',
+            type: 'image_generation_call',
+            status: 'in_progress',
+            result: 'AQ==',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        output: [
+          {
+            id: 'ig_authoritative',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'AA==',
+          },
+        ],
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: [projected],
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projectedMessage.content).toEqual([
+      { type: 'text', text: 'Partial answer.' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+    ]);
+    expect(JSON.stringify(providerInput)).toContain(
+      'data:image/png;base64,AA=='
+    );
+    expect(JSON.stringify(providerInput)).not.toContain('AQ==');
+    expect(JSON.stringify(providerInput)).not.toContain('ig_stale');
+    expect(JSON.stringify(providerInput)).not.toContain('ig_authoritative');
+  });
+
+  it('preserves unrelated self-contained image blocks during v0 promotion', () => {
+    const applicationImage = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'AQ==',
+      metadata: { status: 'ready' },
+    };
+    const message = new AIMessage({
+      content: [{ type: 'text', text: 'Partial answer.' }, applicationImage],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: 'ig_interrupted',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'AA==',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected as AIMessage;
+
+    expect(projectedMessage.content).toEqual([
+      { type: 'text', text: 'Partial answer.' },
+      applicationImage,
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+    ]);
+    expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+      'ig_interrupted'
+    );
+  });
+
+  it.each([
+    [
+      'data URL',
+      { url: 'data:image/png;base64,AQ==' },
+      'data:image/png;base64,AQ==',
+    ],
+    [
+      'HTTPS URL',
+      { url: 'https://example.com/application-image.png' },
+      'https://example.com/application-image.png',
+    ],
+    [
+      'file ID',
+      { fileId: 'file_application_image' },
+      '"file_id":"file_application_image"',
+    ],
+  ])(
+    'preserves an unrelated v0 application image backed by a %s',
+    (_label, source, providerFragment) => {
+      const applicationImage = {
+        type: 'image' as const,
+        ...source,
+        metadata: { source: 'application' },
+      };
+      const providerImage = {
+        type: 'image' as const,
+        id: 'ig_url_provider',
+        url: 'data:image/png;base64,AA==',
+        metadata: { status: 'completed' },
+      };
+      const message = new AIMessage({
+        content: [
+          applicationImage,
+          { type: 'text', text: 'Partial answer.' },
+          providerImage,
+        ],
+        additional_kwargs: {
+          tool_outputs: [
+            {
+              id: providerImage.id,
+              type: 'image_generation_call',
+              status: 'completed',
+              result: 'AA==',
+            },
+          ],
+        },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+
+      const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+      const providerInput = convertMessagesToResponsesInput({
+        messages: [projected],
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+
+      expect(projected.content).toEqual([
+        applicationImage,
+        { type: 'text', text: 'Partial answer.' },
+        {
+          type: 'image',
+          mimeType: 'image/png',
+          data: 'AA==',
+          extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+        },
+      ]);
+      expect(JSON.stringify(projected.toJSON())).not.toContain(
+        providerImage.id
+      );
+      expect(JSON.stringify(providerInput)).toContain(providerFragment);
+    }
+  );
+
+  it('ignores dropped v0 text placeholders when restoring image positions', () => {
+    const applicationImage = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'AQ==',
+    };
+    const message = new AIMessage({
+      content: [
+        { type: 'text', text: '' },
+        applicationImage,
+        { type: 'text', text: 'Later narration.' },
+      ],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: 'ig_after_placeholder',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'AA==',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+
+    expect(projected.content).toEqual([
+      applicationImage,
+      { type: 'text', text: 'Later narration.' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+    ]);
+  });
+
+  it.each([
+    ['an earlier replay item before a leading image', true],
+    ['a trailing image before a later replay item', false],
+  ] as const)('keeps %s during v0 promotion', (_label, imageFirst) => {
+    const applicationImage = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'AQ==',
+    };
+    const narration = { type: 'text' as const, text: 'Narration.' };
+    const generatedImage = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'Ag==',
+      extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+    };
+    const generatedImageId = `ig_${imageFirst ? 'before' : 'after'}_image`;
+    const message = new AIMessage({
+      content: imageFirst
+        ? [applicationImage, narration]
+        : [narration, applicationImage],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: generatedImageId,
+            type: 'image_generation_call',
+            status: 'completed',
+            result: generatedImage.data,
+          },
+        ],
+        [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: imageFirst
+          ? [
+            {
+              itemId: generatedImageId,
+              kind: 'output',
+              outputIndex: 0,
+            },
+            {
+              itemId: 'msg_after_image',
+              kind: 'text',
+              outputIndex: 1,
+              contentIndex: 0,
+            },
+          ]
+          : [
+            {
+              itemId: 'msg_before_image',
+              kind: 'text',
+              outputIndex: 0,
+              contentIndex: 0,
+            },
+            {
+              itemId: generatedImageId,
+              kind: 'output',
+              outputIndex: 1,
+            },
+          ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+
+    expect(projected.content).toEqual(
+      imageFirst
+        ? [generatedImage, applicationImage, narration]
+        : [narration, applicationImage, generatedImage]
+    );
+  });
+
+  it('restores v0 image positions before appending a generated image', () => {
+    const imageA = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'AQ==',
+    };
+    const imageB = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'Ag==',
+    };
+    const imageC = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'Aw==',
+    };
+    const message = new AIMessage({
+      content: [
+        imageA,
+        { type: 'text', text: 'First.' },
+        imageB,
+        { type: 'text', text: 'Second.' },
+        imageC,
+      ],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: 'ig_ordered',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'BA==',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projectedMessage.content).toEqual([
+      imageA,
+      { type: 'text', text: 'First.' },
+      imageB,
+      { type: 'text', text: 'Second.' },
+      imageC,
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'BA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+    ]);
+    expect(providerInput).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [
+          {
+            type: 'input_image',
+            detail: 'auto',
+            image_url: 'data:image/png;base64,AQ==',
+          },
+          { type: 'output_text', text: 'First.', annotations: [] },
+          {
+            type: 'input_image',
+            detail: 'auto',
+            image_url: 'data:image/png;base64,Ag==',
+          },
+          { type: 'output_text', text: 'Second.', annotations: [] },
+          {
+            type: 'input_image',
+            detail: 'auto',
+            image_url: 'data:image/png;base64,Aw==',
+          },
+          {
+            type: 'input_image',
+            detail: 'auto',
+            image_url: 'data:image/png;base64,BA==',
+          },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+      'ig_ordered'
+    );
+    expect(message.content).toEqual([
+      imageA,
+      { type: 'text', text: 'First.' },
+      imageB,
+      { type: 'text', text: 'Second.' },
+      imageC,
+    ]);
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
+  it('keeps encrypted reasoning before image-only v0 content', () => {
+    const reasoning = {
+      id: 'rs_image_only',
+      type: 'reasoning',
+      status: 'completed',
+      summary: [],
+      encrypted_content: 'opaque-image-reasoning',
+    };
+    const applicationImage = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'AQ==',
+    };
+    const message = new AIMessage({
+      content: [applicationImage],
+      additional_kwargs: {
+        reasoning,
+        [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+          {
+            itemId: reasoning.id,
+            kind: 'reasoning',
+            outputIndex: 0,
+          },
+          {
+            itemId: 'msg_image_only',
+            kind: 'message',
+            outputIndex: 1,
+          },
+          {
+            itemId: 'ig_image_only',
+            kind: 'output',
+            outputIndex: 2,
+          },
+        ],
+        tool_outputs: [
+          {
+            id: 'ig_image_only',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'Ag==',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+
+    expect(projected.content).toEqual([
+      { type: 'non_standard', value: reasoning },
+      applicationImage,
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'Ag==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+    ]);
+  });
+
+  it('does not collapse identical application images during v0 promotion', () => {
+    const applicationImage = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'AA==',
+    };
+    const providerImage = {
+      ...applicationImage,
+      id: 'ig_duplicate',
+      metadata: { status: 'completed' },
+    };
+    const message = new AIMessage({
+      content: [applicationImage, applicationImage, providerImage],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: 'ig_duplicate',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'AA==',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+
+    expect(projected.content).toEqual([
+      applicationImage,
+      applicationImage,
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+    ]);
+  });
+
+  it('keeps an id-less completed application image with generated bytes', () => {
+    const applicationImage = {
+      type: 'image' as const,
+      mimeType: 'image/png',
+      data: 'AA==',
+      metadata: { source: 'application', status: 'completed' },
+    };
+    const message = new AIMessage({
+      content: [applicationImage],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: 'ig_same_bytes',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'AA==',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+
+    expect(projected.content).toEqual([
+      applicationImage,
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+    ]);
+  });
+
+  it('deduplicates repeated authoritative generated-image items by id', () => {
+    const generatedImage = {
+      id: 'ig_duplicate_output',
+      type: 'image_generation_call',
+      status: 'completed',
+      result: 'AA==',
+    };
+    const message = new AIMessage({
+      content: [{ type: 'text', text: 'Partial answer.' }],
+      additional_kwargs: {
+        tool_outputs: [generatedImage, { ...generatedImage }],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+
+    expect(projected.content).toEqual([
+      { type: 'text', text: 'Partial answer.' },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+    ]);
+  });
+
+  it.each(['v0', 'v1'] as const)(
+    'marks native %s code-interpreter data-url image replay without changing provider payload',
+    (outputVersion) => {
+      const dataUrl = 'data:image/png;base64,AA==';
+      const toolOutput = {
+        id: `ci_inline_${outputVersion}`,
+        type: 'code_interpreter_call',
+        status: 'completed',
+        code: 'display(chart)',
+        outputs: [{ type: 'image', url: dataUrl }],
+      };
+      const v0Message = new AIMessage({
+        content: [{ type: 'text', text: 'Partial answer.' }],
+        additional_kwargs: { tool_outputs: [toolOutput] },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+      const message =
+        outputVersion === 'v0'
+          ? v0Message
+          : new AIMessage({
+            contentBlocks: v0Message.contentBlocks,
+            additional_kwargs: v0Message.additional_kwargs,
+            response_metadata: {
+              model_provider: 'openai',
+              output_version: 'v1',
+              preempted: true,
+            },
+          });
+      const originalSerialized = JSON.stringify(message.toJSON());
+
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+      const providerInput = convertMessagesToResponsesInput({
+        messages: projected,
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+
+      expect(projectedMessage.content).toEqual([
+        { type: 'text', text: 'Partial answer.' },
+        {
+          type: 'image',
+          url: dataUrl,
+          extras: CODE_INTERPRETER_REPLAY_EXTRAS,
+        },
+      ]);
+      expect(providerInput).toEqual([
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'output_text',
+              text: 'Partial answer.',
+              annotations: [],
+            },
+            {
+              type: 'input_image',
+              detail: 'auto',
+              image_url: dataUrl,
+            },
+          ],
+        },
+      ]);
+      expect(JSON.stringify(providerInput)).not.toContain(
+        'librechatServerToolResult'
+      );
+      expect(JSON.stringify(providerInput)).not.toContain('extras');
+
+      const fallback = projectToolStreamContentForProvider(
+        [message],
+        'fallback'
+      );
+      const fallbackMessage = fallback[0] as AIMessage;
+      expect(fallbackMessage.content).toEqual([
+        { type: 'text', text: 'Partial answer.' },
+        {
+          type: 'text',
+          text: JSON.stringify({
+            serverToolResult: {
+              librechatResponsesReplay: true,
+              toolName: 'code_interpreter',
+              status: 'success',
+              output: {
+                type: 'code_interpreter_image',
+                url: dataUrl,
+              },
+            },
+          }),
+        },
+      ]);
+      expect(_convertMessagesToOpenAIParams(fallback)).toEqual([
+        {
+          role: 'assistant',
+          content: fallbackMessage.content,
+        },
+      ]);
+      expect(JSON.stringify(fallbackMessage.toJSON())).not.toContain('extras');
+      expect(JSON.stringify(fallbackMessage.toJSON())).not.toContain(
+        'librechatServerToolResult'
+      );
+      expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+      expect(originalSerialized).toContain(toolOutput.id);
+      expect(originalSerialized).not.toContain('librechatServerToolResult');
+
+      const projectedAgain =
+        projectOpenAIResponsesToolMessageContent(projected);
+      expect(projectedAgain).toBe(projected);
+      expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
+
+  it.each(['v0', 'v1'] as const)(
+    'preserves completed %s server-tool results without replay ids',
+    (outputVersion) => {
+      const toolOutput = {
+        id: 'ci_completed',
+        type: 'code_interpreter_call',
+        status: 'completed',
+        code: 'print("computed")',
+        outputs: [
+          { type: 'logs', logs: `computed${'x'.repeat(1_000)}` },
+          {
+            type: 'image',
+            url: 'https://example.com/ephemeral-chart.png',
+          },
+        ],
+      };
+      const v0Message = new AIMessage({
+        content: [{ type: 'text', text: 'Partial answer.' }],
+        additional_kwargs: { tool_outputs: [toolOutput] },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+      const message =
+        outputVersion === 'v0'
+          ? v0Message
+          : new AIMessage({
+            contentBlocks: v0Message.contentBlocks,
+            additional_kwargs: v0Message.additional_kwargs,
+            response_metadata: {
+              model_provider: 'openai',
+              output_version: 'v1',
+              preempted: true,
+            },
+          });
+
+      const projected = projectOpenAIResponsesToolMessageContent(
+        [message],
+        400
+      );
+      const projectedMessage = projected[0] as AIMessage;
+      const providerInput = convertMessagesToResponsesInput({
+        messages: projected,
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+
+      expect(projectedMessage.response_metadata.output_version).toBe('v1');
+      expect(projectedMessage.content).toEqual([
+        { type: 'text', text: 'Partial answer.' },
+        {
+          type: 'text',
+          text: expect.stringContaining('computed'),
+          extras: {
+            librechatServerToolResult: { toolName: 'code_interpreter' },
+          },
+        },
+        {
+          type: 'text',
+          text: expect.stringContaining(
+            'https://example.com/ephemeral-chart.png'
+          ),
+          extras: {
+            librechatServerToolResult: { toolName: 'code_interpreter' },
+          },
+        },
+      ]);
+      expect(
+        (projectedMessage.content[1] as { text: string }).text.length
+      ).toBeLessThanOrEqual(400);
+      const serializedProviderInput = JSON.stringify(providerInput);
+      expect(serializedProviderInput).toContain('computed');
+      expect(serializedProviderInput).toContain('ephemeral-chart.png');
+      expect(serializedProviderInput).not.toContain('ci_completed');
+      expect(serializedProviderInput).not.toContain('function_call_output');
+      expect(serializedProviderInput).not.toContain('server_tool_call');
+      expect(JSON.stringify(message.toJSON())).toContain('ci_completed');
+
+      const projectedAgain =
+        projectOpenAIResponsesToolMessageContent(projected);
+      expect(projectedAgain).toBe(projected);
+      expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
+
+  it('uses captured output positions for translated v0 server-tool results', () => {
+    const toolOutputs = [
+      {
+        id: 'ci_position_item',
+        type: 'code_interpreter_call',
+        status: 'completed',
+        code: 'print("CODE_BEFORE_TEXT")',
+        outputs: [{ type: 'logs', logs: 'CODE_BEFORE_TEXT' }],
+      },
+      {
+        id: 'fs_position_item',
+        type: 'file_search_call',
+        status: 'completed',
+        queries: ['positioned file result'],
+        results: [
+          {
+            file_id: 'file_without_provider_replay',
+            filename: 'position.txt',
+            score: 1,
+            text: 'FILE_BETWEEN_TEXT',
+          },
+        ],
+      },
+      {
+        id: 'ws_position_item',
+        type: 'web_search_call',
+        status: 'completed',
+        action: { type: 'search', query: 'positioned web result' },
+        results: [{ title: 'WEB_BETWEEN_TEXT' }],
+      },
+      {
+        id: 'ts_position_item',
+        type: 'tool_search_output',
+        status: 'completed',
+        tools: [
+          {
+            type: 'function',
+            name: 'TOOL_BETWEEN_TEXT',
+            description: 'positioned tool-search result',
+            parameters: { type: 'object', properties: {} },
+          },
+        ],
+      },
+    ];
+    const message = new AIMessage({
+      content: [
+        { type: 'text', text: 'First narration.' },
+        { type: 'text', text: 'Second narration.' },
+      ],
+      additional_kwargs: {
+        tool_outputs: toolOutputs,
+        [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+          { itemId: 'ci_position_item', kind: 'output', outputIndex: 0 },
+          {
+            itemId: 'msg_first_position',
+            kind: 'text',
+            outputIndex: 1,
+            contentIndex: 0,
+          },
+          { itemId: 'fs_position_item', kind: 'output', outputIndex: 2 },
+          { itemId: 'ws_position_item', kind: 'output', outputIndex: 3 },
+          { itemId: 'ts_position_item', kind: 'output', outputIndex: 4 },
+          {
+            itemId: 'msg_second_position',
+            kind: 'text',
+            outputIndex: 5,
+            contentIndex: 0,
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+    const originalSerialized = JSON.stringify(message.toJSON());
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const markers = [
+      'CODE_BEFORE_TEXT',
+      'FILE_BETWEEN_TEXT',
+      'WEB_BETWEEN_TEXT',
+      'TOOL_BETWEEN_TEXT',
+    ];
+    const orderedContent = (
+      projectedMessage.content as Array<{ text?: string; type: string }>
+    ).map((block) => {
+      if (
+        block.text === 'First narration.' ||
+        block.text === 'Second narration.'
+      ) {
+        return block.text;
+      }
+      return markers.find((marker) => block.text?.includes(marker) === true);
+    });
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+    const serializedProviderInput = JSON.stringify(providerInput);
+
+    expect(orderedContent).toEqual([
+      'CODE_BEFORE_TEXT',
+      'First narration.',
+      'FILE_BETWEEN_TEXT',
+      'WEB_BETWEEN_TEXT',
+      'TOOL_BETWEEN_TEXT',
+      'Second narration.',
+    ]);
+    expect(serializedProviderInput).toContain('WEB_BETWEEN_TEXT');
+    for (const toolOutput of toolOutputs) {
+      expect(serializedProviderInput).not.toContain(toolOutput.id);
+    }
+    expect(projectedMessage.additional_kwargs).not.toHaveProperty(
+      OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+    );
+    expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
+  it.each(['v0', 'v1'] as const)(
+    'preserves terminal incomplete %s file-search and code-interpreter outputs',
+    (outputVersion) => {
+      const dataUrl = 'data:image/png;base64,AA==';
+      const toolOutputs = [
+        {
+          id: `fs_incomplete_${outputVersion}`,
+          type: 'file_search_call',
+          status: 'incomplete',
+          queries: ['partial result'],
+          results: [
+            {
+              file_id: 'partial_file',
+              filename: 'partial.txt',
+              score: 0.5,
+              text: 'PARTIAL_FILE_RESULT',
+            },
+          ],
+        },
+        {
+          id: `ci_incomplete_${outputVersion}`,
+          type: 'code_interpreter_call',
+          status: 'incomplete',
+          code: 'display(partial_chart)',
+          outputs: [
+            { type: 'logs', logs: 'PARTIAL_CODE_LOG' },
+            { type: 'image', url: dataUrl },
+          ],
+        },
+      ];
+      const message = new AIMessage({
+        content: [{ type: 'text', text: 'Partial narration.' }],
+        additional_kwargs: {
+          tool_outputs: toolOutputs,
+          [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+            {
+              itemId: toolOutputs[0].id,
+              kind: 'output',
+              outputIndex: 0,
+            },
+            {
+              itemId: toolOutputs[1].id,
+              kind: 'output',
+              outputIndex: 1,
+            },
+            {
+              itemId: 'msg_incomplete',
+              kind: 'text',
+              outputIndex: 2,
+              contentIndex: 0,
+            },
+          ],
+        },
+        response_metadata: {
+          model_provider: 'openai',
+          ...(outputVersion === 'v1' ? { output_version: 'v1' } : {}),
+          preempted: true,
+        },
+      });
+      const originalSerialized = JSON.stringify(message.toJSON());
+
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+      const providerInput = convertMessagesToResponsesInput({
+        messages: projected,
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+      const serialized = JSON.stringify(projectedMessage.content);
+      const serializedProviderInput = JSON.stringify(providerInput);
+      const serverResults = (
+        projectedMessage.content as Array<{ text?: string; type: string }>
+      )
+        .filter(
+          (block) =>
+            block.type === 'text' &&
+            block.text?.startsWith('{"serverToolResult":') === true
+        )
+        .map(
+          (block) =>
+            (
+              JSON.parse(block.text!) as {
+                serverToolResult: { output: unknown; status: string };
+              }
+            ).serverToolResult
+        );
+
+      expect(serverResults).toEqual([
+        expect.objectContaining({ status: 'error' }),
+        expect.objectContaining({ status: 'error' }),
+      ]);
+      expect(serialized).toContain('PARTIAL_FILE_RESULT');
+      expect(serialized).toContain('PARTIAL_CODE_LOG');
+      expect(projectedMessage.content).toEqual(
+        expect.arrayContaining([
+          {
+            type: 'image',
+            url: dataUrl,
+            extras: CODE_INTERPRETER_REPLAY_EXTRAS,
+          },
+        ])
+      );
+      expect(serializedProviderInput).toContain(dataUrl);
+      expect(serializedProviderInput).not.toContain(toolOutputs[0].id);
+      expect(serializedProviderInput).not.toContain(toolOutputs[1].id);
+      expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+
+      const projectedAgain =
+        projectOpenAIResponsesToolMessageContent(projected);
+      expect(projectedAgain).toBe(projected);
+      expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
+
+  it.each([
+    ['logs then image', ['logs', 'image']],
+    ['image then logs', ['image', 'logs']],
+  ] as const)(
+    'preserves code-interpreter %s order at its cross-item position',
+    (_label, outputOrder) => {
+      const dataUrl = 'data:image/png;base64,AQ==';
+      const outputs = outputOrder.map((type) =>
+        type === 'logs'
+          ? { type: 'logs', logs: 'ORDERED_CODE_LOG' }
+          : { type: 'image', url: dataUrl }
+      );
+      const message = new AIMessage({
+        content: [
+          { type: 'text', text: 'First narration.' },
+          { type: 'text', text: 'Second narration.' },
+        ],
+        additional_kwargs: {
+          tool_outputs: [
+            {
+              id: 'ci_ordered_outputs',
+              type: 'code_interpreter_call',
+              status: 'completed',
+              code: 'display(result)',
+              outputs,
+            },
+          ],
+          [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+            {
+              itemId: 'msg_order_first',
+              kind: 'text',
+              outputIndex: 0,
+              contentIndex: 0,
+            },
+            {
+              itemId: 'ci_ordered_outputs',
+              kind: 'output',
+              outputIndex: 1,
+            },
+            {
+              itemId: 'msg_order_second',
+              kind: 'text',
+              outputIndex: 2,
+              contentIndex: 0,
+            },
+          ],
+        },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+      const orderedContent = (
+        projectedMessage.content as Array<{
+          text?: string;
+          type: string;
+          url?: string;
+        }>
+      ).map((block) => {
+        if (
+          block.text === 'First narration.' ||
+          block.text === 'Second narration.'
+        ) {
+          return block.text;
+        }
+        if (block.type === 'image' && block.url === dataUrl) {
+          return 'image';
+        }
+        return block.text?.includes('ORDERED_CODE_LOG') === true
+          ? 'logs'
+          : undefined;
+      });
+
+      expect(orderedContent).toEqual([
+        'First narration.',
+        ...outputOrder,
+        'Second narration.',
+      ]);
+      expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+        'ci_ordered_outputs'
+      );
+    }
+  );
+
+  it('uses response output over stale v0 server-tool results', () => {
+    const makeCodeOutput = (id: string, logs: string) => ({
+      id,
+      type: 'code_interpreter_call',
+      status: 'completed',
+      code: `print(${JSON.stringify(logs)})`,
+      outputs: [{ type: 'logs', logs }],
+    });
+    const message = new AIMessage({
+      content: [{ type: 'text', text: 'Partial answer.' }],
+      additional_kwargs: {
+        tool_outputs: [makeCodeOutput('ci_stale', 'stale result')],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        output: [makeCodeOutput('ci_authoritative', 'current result')],
+        preempted: true,
+      },
+    });
+
+    const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+    const serialized = JSON.stringify(projected.content);
+
+    expect(serialized).toContain('current result');
+    expect(serialized).not.toContain('stale result');
+    expect(serialized).not.toContain('ci_authoritative');
+    expect(serialized).not.toContain('ci_stale');
+  });
+
+  it.each(['v0', 'v1'] as const)(
+    'preserves embedded %s MCP output without its provider id',
+    (outputVersion) => {
+      const mcpOutput = {
+        id: 'mcp_provider_item',
+        type: 'mcp_call',
+        name: 'lookup',
+        server_label: 'documents',
+        arguments: '{"query":"answer"}',
+        status: 'completed',
+        output: 'MCP answer',
+      };
+      const v0Message = new AIMessage({
+        content: [{ type: 'text', text: 'Partial answer.' }],
+        additional_kwargs: { tool_outputs: [mcpOutput] },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+      const message =
+        outputVersion === 'v0'
+          ? v0Message
+          : new AIMessage({
+            contentBlocks: v0Message.contentBlocks,
+            additional_kwargs: v0Message.additional_kwargs,
+            response_metadata: {
+              model_provider: 'openai',
+              output_version: 'v1',
+              preempted: true,
+            },
+          });
+
+      const [projected] = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected as AIMessage;
+      const serialized = JSON.stringify(projected.content);
+
+      expect(projectedMessage.response_metadata.output_version).toBe('v1');
+      expect(serialized).toContain('MCP answer');
+      expect(serialized).toContain('documents');
+      expect(serialized).not.toContain('mcp_provider_item');
+      expect(JSON.stringify(message.toJSON())).toContain('mcp_provider_item');
+    }
+  );
+
+  it.each(['v0', 'v1'] as const)(
+    'preserves captured %s Responses results that LangChain does not convert',
+    (outputVersion) => {
+      const toolOutputs = [
+        {
+          id: 'local_output_item',
+          type: 'local_shell_call_output',
+          status: 'incomplete',
+          output: 'local shell partial output',
+        },
+        {
+          id: 'shell_output_item',
+          call_id: 'shell_call_id',
+          type: 'shell_call_output',
+          status: 'incomplete',
+          output: [
+            {
+              stdout: 'shell partial output',
+              stderr: '',
+              outcome: { type: 'exit', exit_code: 0 },
+            },
+          ],
+        },
+        {
+          id: 'patch_output_item',
+          call_id: 'patch_call_id',
+          type: 'apply_patch_call_output',
+          status: 'failed',
+          output: 'patch failed output',
+        },
+        {
+          id: 'program_output_item',
+          call_id: 'program_call_id',
+          type: 'program_output',
+          status: 'incomplete',
+          result: 'program partial output',
+        },
+        {
+          id: 'mcp_list_item',
+          type: 'mcp_list_tools',
+          server_label: 'documents',
+          tools: [
+            {
+              name: 'lookup',
+              description: 'Look up a document',
+              input_schema: { type: 'object' },
+            },
+          ],
+          error: 'listing was incomplete',
+        },
+      ];
+      const v0Message = new AIMessage({
+        content: [{ type: 'text', text: 'Partial answer.' }],
+        additional_kwargs: { tool_outputs: toolOutputs },
+        response_metadata: {
+          model_provider: 'openai',
+          preempted: true,
+        },
+      });
+      const message =
+        outputVersion === 'v0'
+          ? v0Message
+          : new AIMessage({
+            contentBlocks: v0Message.contentBlocks,
+            additional_kwargs: v0Message.additional_kwargs,
+            response_metadata: {
+              model_provider: 'openai',
+              output_version: 'v1',
+              preempted: true,
+            },
+          });
+
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+      const serialized = JSON.stringify(projectedMessage.content);
+      const providerInput = convertMessagesToResponsesInput({
+        messages: projected,
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+      const serializedProviderInput = JSON.stringify(providerInput);
+      const replayStatuses = (
+        projectedMessage.content as Array<{ text?: string; type: string }>
+      )
+        .filter(
+          (block) =>
+            block.type === 'text' &&
+            block.text?.startsWith('{"serverToolResult":') === true
+        )
+        .map(
+          (block) =>
+            (
+              JSON.parse(block.text!) as {
+                serverToolResult: { status: string };
+              }
+            ).serverToolResult.status
+        );
+
+      expect(projectedMessage.response_metadata.output_version).toBe('v1');
+      expect(serialized).toContain('local shell partial output');
+      expect(serialized).toContain('shell partial output');
+      expect(serialized).toContain('patch failed output');
+      expect(serialized).toContain('program partial output');
+      expect(serialized).toContain('listing was incomplete');
+      expect(serialized).toContain('lookup');
+      expect(replayStatuses).toEqual(Array(5).fill('error'));
+      expect(serializedProviderInput).not.toContain('local_output_item');
+      expect(serializedProviderInput).not.toContain('shell_call_id');
+      expect(serializedProviderInput).not.toContain('patch_call_id');
+      expect(serializedProviderInput).not.toContain('program_call_id');
+      expect(serializedProviderInput).not.toContain('mcp_list_item');
+      expect(serializedProviderInput).not.toContain('shell_call_output');
+      expect(serializedProviderInput).not.toContain('apply_patch_call_output');
+      expect(serializedProviderInput).not.toContain('program_output');
+    }
+  );
+
+  it('replays captured server-tool results at their output positions', () => {
+    const makeResult = (id: string, output: string) => ({
+      id,
+      type: 'local_shell_call_output',
+      status: 'completed',
+      output,
+    });
+    const results = [
+      makeResult('result_after', 'after result'),
+      {
+        call_id: 'patch_without_item_id',
+        type: 'apply_patch_call_output',
+        status: 'completed',
+        output: 'no-id patch result',
+      },
+      makeResult('result_before', 'before result'),
+      makeResult('result_middle', 'middle result'),
+    ];
+    const message = new AIMessage({
+      content: [
+        { type: 'text', text: 'First narration.' },
+        { type: 'text', text: 'Second narration.' },
+      ],
+      additional_kwargs: {
+        tool_outputs: results,
+        [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+          {
+            itemId: 'result_after',
+            kind: 'output',
+            outputIndex: 5,
+          },
+          {
+            itemId: 'msg_first',
+            kind: 'text',
+            outputIndex: 1,
+            contentIndex: 0,
+          },
+          {
+            itemId: 'result_before',
+            kind: 'output',
+            outputIndex: 0,
+          },
+          {
+            itemId: 'msg_first',
+            kind: 'text',
+            outputIndex: 1,
+            contentIndex: 0,
+          },
+          {
+            itemId: 'result_middle',
+            kind: 'output',
+            outputIndex: 3,
+          },
+          {
+            itemId: 'patch_without_item_id',
+            kind: 'output',
+            outputIndex: 2,
+          },
+          {
+            itemId: 'msg_second',
+            kind: 'text',
+            outputIndex: 4,
+            contentIndex: 0,
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const orderedText = (
+      projectedMessage.content as Array<{
+        extras?: { librechatServerToolResult?: unknown };
+        text?: string;
+        type: string;
+      }>
+    ).map((block) => {
+      if (block.extras?.librechatServerToolResult != null) {
+        return (
+          JSON.parse(block.text!) as {
+            serverToolResult: { output: string };
+          }
+        ).serverToolResult.output;
+      }
+      return block.text;
+    });
+
+    expect(orderedText).toEqual([
+      'before result',
+      'First narration.',
+      'no-id patch result',
+      'middle result',
+      'Second narration.',
+      'after result',
+    ]);
+    expect(projectedMessage.additional_kwargs).not.toHaveProperty(
+      OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+    );
+    expect(JSON.stringify(projectedMessage.toJSON())).not.toMatch(/result_/);
+    expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+      'patch_without_item_id'
+    );
+    expect(JSON.stringify(projectedMessage.toJSON())).not.toContain(
+      OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+    );
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
+  it('derives id-less server-result positions from authoritative output', () => {
+    const output = [
+      {
+        type: 'local_shell_call_output',
+        status: 'completed',
+        output: 'IDLESS_BEFORE_TEXT',
+      },
+      {
+        id: 'msg_authoritative_first',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [
+          {
+            type: 'output_text',
+            text: 'First narration.',
+            annotations: [],
+          },
+        ],
+      },
+      {
+        id: 'msg_authoritative_empty',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [
+          {
+            type: 'output_text',
+            text: '',
+            annotations: [],
+          },
+        ],
+      },
+      {
+        type: 'program_output',
+        status: 'completed',
+        result: 'IDLESS_BETWEEN_TEXT',
+      },
+      {
+        id: 'msg_authoritative_second',
+        type: 'message',
+        role: 'assistant',
+        status: 'in_progress',
+        content: [
+          {
+            type: 'output_text',
+            text: 'Second narration.',
+            annotations: [],
+          },
+        ],
+      },
+    ];
+    const message = new AIMessage({
+      content: [
+        { type: 'text', text: 'First narration.' },
+        { type: 'text', text: 'Second narration.' },
+      ],
+      response_metadata: {
+        model_provider: 'openai',
+        output,
+        output_version: 'v1',
+        preempted: true,
+      },
+    });
+    const originalSerialized = JSON.stringify(message.toJSON());
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const orderedContent = (
+      projectedMessage.content as Array<{ text?: string; type: string }>
+    ).map((block) => {
+      if (
+        block.text === 'First narration.' ||
+        block.text === 'Second narration.'
+      ) {
+        return block.text;
+      }
+      if (block.text?.includes('IDLESS_BEFORE_TEXT') === true) {
+        return 'IDLESS_BEFORE_TEXT';
+      }
+      return block.text?.includes('IDLESS_BETWEEN_TEXT') === true
+        ? 'IDLESS_BETWEEN_TEXT'
+        : undefined;
+    });
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(orderedContent).toEqual([
+      'IDLESS_BEFORE_TEXT',
+      'First narration.',
+      'IDLESS_BETWEEN_TEXT',
+      'Second narration.',
+    ]);
+    expect(JSON.stringify(providerInput)).not.toContain(
+      'local_shell_call_output'
+    );
+    expect(JSON.stringify(providerInput)).not.toContain('program_output');
+    expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
+  it.each(['v0', 'v1'] as const)(
+    'replays encrypted %s reasoning at its captured output position',
+    (outputVersion) => {
+      const reasoning = {
+        id: `rs_positioned_${outputVersion}`,
+        type: 'reasoning',
+        status: 'completed',
+        summary: [],
+        encrypted_content: `opaque-positioned-${outputVersion}`,
+      };
+      const serverResult = {
+        id: `local_before_reasoning_${outputVersion}`,
+        type: 'local_shell_call_output',
+        status: 'completed',
+        output: 'RESULT_BEFORE_REASONING',
+      };
+      const message = new AIMessage({
+        content: [
+          { type: 'reasoning', reasoning: 'unfinished summary' },
+          { type: 'text', text: 'Narration after reasoning.' },
+        ],
+        additional_kwargs: {
+          reasoning,
+          tool_outputs: [serverResult],
+          [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+            {
+              itemId: serverResult.id,
+              kind: 'output',
+              outputIndex: 0,
+            },
+            {
+              itemId: reasoning.id,
+              kind: 'reasoning',
+              outputIndex: 1,
+            },
+            {
+              itemId: 'msg_after_reasoning',
+              kind: 'text',
+              outputIndex: 2,
+              contentIndex: 0,
+            },
+          ],
+        },
+        response_metadata: {
+          model_provider: 'openai',
+          ...(outputVersion === 'v1' ? { output_version: 'v1' } : {}),
+          preempted: true,
+        },
+      });
+      const originalSerialized = JSON.stringify(message.toJSON());
+
+      const projected = projectOpenAIResponsesToolMessageContent([message]);
+      const projectedMessage = projected[0] as AIMessage;
+      const replayOrder = (
+        projectedMessage.content as Array<{
+          text?: string;
+          type: string;
+          value?: unknown;
+        }>
+      ).map((block) => {
+        if (block.type === 'non_standard' && block.value === reasoning) {
+          return 'reasoning';
+        }
+        if (block.text === 'Narration after reasoning.') {
+          return 'narration';
+        }
+        return block.text?.includes('RESULT_BEFORE_REASONING') === true
+          ? 'result'
+          : undefined;
+      });
+      const providerInput = convertMessagesToResponsesInput({
+        messages: projected,
+        zdrEnabled: false,
+        model: 'gpt-5.6',
+      });
+      const serializedProviderInput = JSON.stringify(providerInput);
+      const resultIndex = serializedProviderInput.indexOf(
+        'RESULT_BEFORE_REASONING'
+      );
+      const reasoningIndex = serializedProviderInput.indexOf(reasoning.id);
+      const narrationIndex = serializedProviderInput.indexOf(
+        'Narration after reasoning.'
+      );
+
+      expect(replayOrder).toEqual(['result', 'reasoning', 'narration']);
+      expect(resultIndex).toBeGreaterThanOrEqual(0);
+      expect(resultIndex).toBeLessThan(reasoningIndex);
+      expect(reasoningIndex).toBeLessThan(narrationIndex);
+      expect(serializedProviderInput).not.toContain(serverResult.id);
+      expect(projectedMessage.additional_kwargs.reasoning).toBe(reasoning);
+      expect(projectedMessage.additional_kwargs).not.toHaveProperty(
+        OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+      );
+      expect(JSON.stringify(message.toJSON())).toBe(originalSerialized);
+
+      const projectedAgain =
+        projectOpenAIResponsesToolMessageContent(projected);
+      expect(projectedAgain).toBe(projected);
+      expect(projectedAgain[0]).toBe(projectedMessage);
+    }
+  );
+
+  it('neutralizes provider references duplicated into v1 content blocks', () => {
+    const reasoning = {
+      id: 'rs_interrupted',
+      type: 'reasoning',
+      status: 'in_progress',
+      summary: [],
+    };
+    const toolOutputs = [
+      {
+        id: 'ci_interrupted',
+        type: 'code_interpreter_call',
+        status: 'completed',
+        code: 'print(1)',
+        outputs: [{ type: 'logs', logs: '1' }],
+      },
+      {
+        type: 'image_generation_call',
+        id: 'ig_interrupted',
+        status: 'completed',
+        result: 'AA==',
+      },
+    ];
+    const providerMessage = new AIMessage({
+      content: [{ type: 'text', text: 'Partial answer.' }],
+      additional_kwargs: { reasoning, tool_outputs: toolOutputs },
+      response_metadata: { model_provider: 'openai' },
+    });
+    const message = new AIMessage({
+      contentBlocks: providerMessage.contentBlocks,
+      additional_kwargs: providerMessage.additional_kwargs,
+      response_metadata: {
+        id: 'resp_interrupted',
+        model_provider: 'openai',
+        output_version: 'v1',
+        preempted: true,
+      },
+    });
+
+    expect(message.content).toEqual([
+      { type: 'reasoning', reasoning: '' },
+      { type: 'text', text: 'Partial answer.' },
+      {
+        type: 'server_tool_call',
+        id: 'ci_interrupted',
+        name: 'code_interpreter',
+        args: { code: 'print(1)' },
+      },
+      {
+        type: 'server_tool_call_result',
+        toolCallId: 'ci_interrupted',
+        status: 'success',
+        output: {
+          type: 'code_interpreter_output',
+          returnCode: 0,
+          stderr: undefined,
+          stdout: '1',
+        },
+      },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        id: 'ig_interrupted',
+        metadata: { status: 'completed' },
+      },
+      {
+        type: 'non_standard',
+        value: toolOutputs[1],
+      },
+    ]);
+    expect(message.additional_kwargs.tool_outputs).toBe(toolOutputs);
+
+    const unsafeProviderInput = convertMessagesToResponsesInput({
+      messages: [message],
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(unsafeProviderInput).toContainEqual(
+      expect.objectContaining({ type: 'reasoning' })
+    );
+    expect(JSON.stringify(unsafeProviderInput)).toContain('ci_interrupted');
+    expect(JSON.stringify(unsafeProviderInput)).toContain(
+      'image_generation_call'
+    );
+    expect(JSON.stringify(providerInput)).toContain('Partial answer.');
+    expect(JSON.stringify(providerInput)).toContain(
+      'data:image/png;base64,AA=='
+    );
+    expect(JSON.stringify(providerInput)).not.toContain('rs_interrupted');
+    expect(JSON.stringify(providerInput)).not.toContain('ci_interrupted');
+    expect(JSON.stringify(providerInput)).not.toContain(
+      'image_generation_call'
+    );
+    expect(projectedMessage.content).toEqual([
+      { type: 'text', text: 'Partial answer.' },
+      {
+        type: 'text',
+        text: JSON.stringify({
+          serverToolResult: {
+            librechatResponsesReplay: true,
+            toolName: 'code_interpreter',
+            status: 'success',
+            output: {
+              type: 'code_interpreter_output',
+              returnCode: 0,
+              stdout: '1',
+            },
+          },
+        }),
+        extras: {
+          librechatServerToolResult: { toolName: 'code_interpreter' },
+        },
+      },
+      {
+        type: 'image',
+        mimeType: 'image/png',
+        data: 'AA==',
+        extras: IMAGE_GENERATION_REPLAY_EXTRAS,
+      },
+    ]);
+    expect(projectedMessage.additional_kwargs).toEqual({});
+    const serialized = JSON.stringify(projectedMessage.toJSON());
+    expect(serialized).toContain('Partial answer.');
+    expect(serialized).toContain('AA==');
+    expect(serialized).not.toContain('rs_interrupted');
+    expect(serialized).not.toContain('ci_interrupted');
+    expect(serialized).not.toContain('image_generation_call');
+    expect(JSON.stringify(message.toJSON())).toContain('rs_interrupted');
+    expect(JSON.stringify(message.toJSON())).toContain('ci_interrupted');
+
+    const fallback = projectToolStreamContentForProvider([message], 'fallback');
+    const fallbackMessage = fallback[0] as AIMessage;
+    expect(fallbackMessage.content).toEqual([
+      { type: 'text', text: 'Partial answer.' },
+      {
+        type: 'text',
+        text: JSON.stringify({
+          serverToolResult: {
+            librechatResponsesReplay: true,
+            toolName: 'code_interpreter',
+            status: 'success',
+            output: {
+              type: 'code_interpreter_output',
+              returnCode: 0,
+              stdout: '1',
+            },
+          },
+        }),
+      },
+    ]);
+    expect(_convertMessagesToOpenAIParams(fallback)).toEqual([
+      {
+        role: 'assistant',
+        content: fallbackMessage.content,
+      },
+    ]);
+    expect(JSON.stringify(fallbackMessage.toJSON())).not.toContain('extras');
+    expect(JSON.stringify(fallbackMessage.toJSON())).not.toContain(
+      'librechatServerToolResult'
+    );
+
+    const projectedAgain = projectOpenAIResponsesToolMessageContent(projected);
+    expect(projectedAgain).toBe(projected);
+    expect(projectedAgain[0]).toBe(projectedMessage);
+  });
+
+  it('retains exactly one self-contained encrypted reasoning item in v1', () => {
+    const reasoning = {
+      id: 'rs_encrypted',
+      type: 'reasoning',
+      status: 'completed',
+      summary: [],
+      encrypted_content: 'opaque-reasoning',
+    };
+    const message = new AIMessage({
+      content: [
+        {
+          type: 'reasoning',
+          reasoning: 'summary',
+        },
+        { type: 'text', text: 'Partial answer.' },
+      ],
+      additional_kwargs: { reasoning },
+      response_metadata: {
+        model_provider: 'openai',
+        output_version: 'v1',
+        preempted: true,
+      },
+    });
+
+    const projected = projectOpenAIResponsesToolMessageContent([message]);
+    const projectedMessage = projected[0] as AIMessage;
+    const providerInput = convertMessagesToResponsesInput({
+      messages: projected,
+      zdrEnabled: false,
+      model: 'gpt-5.6',
+    });
+
+    expect(projectedMessage.content).toEqual([
+      { type: 'non_standard', value: reasoning },
+      { type: 'text', text: 'Partial answer.' },
+    ]);
+    expect(
+      providerInput.filter(
+        (item) => item.type === 'reasoning' && item.id === 'rs_encrypted'
+      )
+    ).toEqual([
+      expect.objectContaining({
+        id: 'rs_encrypted',
+        type: 'reasoning',
+        encrypted_content: 'opaque-reasoning',
+      }),
+    ]);
+    expect(JSON.stringify(providerInput)).toContain('Partial answer.');
   });
 
   it('preserves Responses computer outputs handled as provider-native media', () => {
@@ -4782,6 +7406,119 @@ describe('formatAgentMessages', () => {
   });
 
   describe('summary boundary token count adjustment', () => {
+    /** Atomic media costs a fixed provider price the character heuristic cannot
+     *  see, so scaling by the measurable siblings alone erases it. Both shapes
+     *  collapsed a four-figure count to 1 before this guard. */
+    it.each([
+      [
+        'text before the summary',
+        { type: ContentTypes.TEXT, text: 'hello there' },
+      ],
+      [
+        'a tool call before the summary',
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'tc1',
+            name: 'search',
+            args: '{"q":"x"}',
+            output: 'result text',
+          },
+        },
+      ],
+    ])(
+      'skips the positional discount when retained media is unmeasurable, with %s',
+      (_label, leading) => {
+        const payload: TPayload = [
+          {
+            role: 'assistant',
+            content: [
+              leading as MessageContentComplex,
+              {
+                type: ContentTypes.SUMMARY,
+                text: 'S'.repeat(400),
+                tokenCount: 100,
+              },
+              {
+                type: 'image_url',
+                image_url: { url: 'data:image/png;base64,x' },
+              },
+            ],
+          },
+        ];
+
+        const result = formatAgentMessages(payload, { 0: 1200 });
+
+        expect(result.indexTokenCountMap?.[0]).toBe(1200);
+        expect(result.boundaryTokenAdjustment).toBeUndefined();
+      }
+    );
+
+    /** The media sits a level down, inside `tool_call.output`, where serializing
+     *  gives it a nonzero length while the token counter charges its fixed media
+     *  cost. Eligibility is decided by part type, so nesting depth is irrelevant. */
+    it('skips the positional discount when retained tool output carries media', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'a'.repeat(4000) },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'S'.repeat(400),
+              tokenCount: 100,
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tc1',
+                name: 'render',
+                args: '{}',
+                output: [
+                  {
+                    type: 'image_url',
+                    image_url: { url: 'data:image/png;base64,y' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 4000 });
+
+      const emitted = Object.values(result.indexTokenCountMap ?? {}).reduce(
+        (sum, value) => sum + value,
+        0
+      );
+      expect(emitted).toBe(4000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
+    });
+
+    it('still proportions when every retained part is measurable', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'a'.repeat(400) },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'S'.repeat(100),
+              tokenCount: 20,
+            },
+            { type: ContentTypes.TEXT, text: 'b'.repeat(100) },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 600 });
+
+      expect(result.boundaryTokenAdjustment?.original).toBe(600);
+      expect(result.indexTokenCountMap?.[0]).toBeLessThan(600);
+      expect(result.indexTokenCountMap?.[0]).toBeGreaterThan(0);
+    });
+
     it('should proportion token count when thinking block is sliced off by boundary', () => {
       const thinkingText = 'x'.repeat(1000);
       const payload: TPayload = [
@@ -4815,7 +7552,10 @@ describe('formatAgentMessages', () => {
       expect(result.indexTokenCountMap?.[1]).toBe(8);
     });
 
-    it('should proportion token count when thinking + tool_use are sliced off', () => {
+    /** Reframed: a tool call anywhere in the entry now cancels the ratio, since
+     *  telling a text-bearing tool payload from a media-bearing one requires
+     *  recursing into arbitrary nested output. The entry keeps its count. */
+    it('should not proportion when a tool_use part is present', () => {
       const thinkingText = 'a'.repeat(800);
       const toolInput = JSON.stringify({ data: 'b'.repeat(400) });
       const payload: TPayload = [
@@ -4851,8 +7591,8 @@ describe('formatAgentMessages', () => {
         result.indexTokenCountMap || {}
       ).reduce((sum, v) => sum + v, 0);
 
-      expect(totalOutputTokens).toBeLessThan(200);
-      expect(totalOutputTokens).toBeGreaterThan(0);
+      expect(totalOutputTokens).toBe(2000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
     });
 
     it('should roughly halve token count when content is evenly split around boundary', () => {
@@ -4908,7 +7648,11 @@ describe('formatAgentMessages', () => {
       expect(result.indexTokenCountMap?.[1]).toBe(10);
     });
 
-    it('should account for tool_use input size in the char-length ratio', () => {
+    /** Previously the removed `tool_use` input was counted into the denominator.
+     *  A base64 payload there serializes to a huge length while the counter
+     *  charges a fixed estimate, so the ratio dragged retained text below its
+     *  real cost. The discount is cancelled instead. */
+    it('should not use tool_use input size in the char-length ratio', () => {
       const hugeInput = JSON.stringify({ payload: 'z'.repeat(5000) });
       const payload: TPayload = [
         {
@@ -4934,8 +7678,8 @@ describe('formatAgentMessages', () => {
       expect(result.summary).toBeDefined();
 
       const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
-      expect(adjustedTokens).toBeLessThan(100);
-      expect(adjustedTokens).toBeGreaterThan(0);
+      expect(adjustedTokens).toBe(3000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
     });
 
     it('should handle multiple content parts after the boundary', () => {
@@ -4994,6 +7738,187 @@ describe('formatAgentMessages', () => {
       const adjustedTokens = result.indexTokenCountMap?.[0];
       expect(adjustedTokens).toBeDefined();
       expect(Number.isInteger(adjustedTokens)).toBe(true);
+    });
+  });
+
+  describe('summary coverage boundary', () => {
+    const buildSummaryPart = (coverage?: {
+      retainedFromMessageId: string;
+    }) => ({
+      type: ContentTypes.SUMMARY,
+      content: [
+        { type: ContentTypes.TEXT, text: 'Summary of the earliest turns' },
+      ],
+      tokenCount: 12,
+      ...(coverage != null ? { coverage } : {}),
+    });
+
+    /** Mirrors a compaction with `retainRecent.turns: 1`: m1/m2 were refined
+     *  into the summary, m3/m4 are the retained tail, and the block itself is
+     *  persisted on the assistant message that came after all of them. */
+    const compactedPayload = (coverage?: {
+      retainedFromMessageId: string;
+    }): TPayload => [
+      { messageId: 'm1', role: 'user', content: 'Covered question' },
+      { messageId: 'm2', role: 'assistant', content: 'Covered answer' },
+      { messageId: 'm3', role: 'user', content: 'Retained question' },
+      { messageId: 'm4', role: 'assistant', content: 'Retained answer' },
+      {
+        messageId: 'm5',
+        role: 'assistant',
+        content: [
+          buildSummaryPart(coverage),
+          { type: ContentTypes.TEXT, text: 'Post-compaction reply' },
+        ],
+      },
+    ];
+
+    const textOf = (message: BaseMessage): string => {
+      const { content } = message;
+      if (typeof content === 'string') {
+        return content;
+      }
+      return (content as MessageContentComplex[])
+        .map((part) => ('text' in part ? (part as { text: string }).text : ''))
+        .join('');
+    };
+
+    it('preserves the retained tail that the summary never covered', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm3' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Retained question',
+        'Retained answer',
+        'Post-compaction reply',
+      ]);
+      expect(result.summary!.text).toBe('Summary of the earliest turns');
+      expect(result.summary!.tokenCount).toBe(12);
+    });
+
+    it('retains the anchor message itself, dropping only what precedes it', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm4' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Retained answer',
+        'Post-compaction reply',
+      ]);
+    });
+
+    /** Coverage mode leaves the block's entry at its full count on purpose. The
+     *  summary's cost in the reader's token units is not obtainable here — no
+     *  tokenizer reaches this function, and a figure recorded at write time is
+     *  in the writing run's units. Over-counting prunes early; under-counting
+     *  would risk an over-context request. */
+    it('does not discount the entry carrying the summary block', () => {
+      const payload: TPayload = [
+        { messageId: 'm1', role: 'user', content: 'Covered question' },
+        { messageId: 'm2', role: 'user', content: 'Retained question' },
+        {
+          messageId: 'm3',
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              content: [{ type: ContentTypes.TEXT, text: 'S'.repeat(500) }],
+              tokenCount: 120,
+              coverage: { retainedFromMessageId: 'm2' },
+            },
+            { type: ContentTypes.TEXT, text: 'Reply' },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload, { 0: 5, 1: 6, 2: 1000 });
+
+      expect(result.indexTokenCountMap?.[1]).toBe(1000);
+      expect(result.boundaryTokenAdjustment).toBeUndefined();
+    });
+
+    it('keeps token counts for the retained tail and drops covered entries', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm3' }),
+        { 0: 5, 1: 6, 2: 7, 3: 8, 4: 40 }
+      );
+
+      expect(result.indexTokenCountMap?.[0]).toBe(7);
+      expect(result.indexTokenCountMap?.[1]).toBe(8);
+      expect(Object.keys(result.indexTokenCountMap ?? {})).toHaveLength(3);
+    });
+
+    it('leaves entries without summary parts untouched', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'm3' }),
+        { 0: 5, 1: 6, 2: 7, 3: 8, 4: 40 }
+      );
+
+      expect(result.indexTokenCountMap?.[0]).toBe(7);
+      expect(result.indexTokenCountMap?.[1]).toBe(8);
+    });
+
+    it('falls back to positional trimming for legacy blocks without coverage', () => {
+      const result = formatAgentMessages(compactedPayload());
+
+      expect(result.messages.map(textOf)).toEqual(['Post-compaction reply']);
+      expect(result.summary!.text).toBe('Summary of the earliest turns');
+    });
+
+    it('falls back to positional trimming when coverage cannot be resolved', () => {
+      const result = formatAgentMessages(
+        compactedPayload({ retainedFromMessageId: 'pruned-from-payload' })
+      );
+
+      expect(result.messages.map(textOf)).toEqual(['Post-compaction reply']);
+    });
+
+    it('ignores an anchor pointing past its own block', () => {
+      const result = formatAgentMessages([
+        ...compactedPayload({ retainedFromMessageId: 'm6' }),
+        { messageId: 'm6', role: 'user', content: 'Later question' },
+      ]);
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Post-compaction reply',
+        'Later question',
+      ]);
+    });
+
+    it('applies last-summary-wins across mixed coverage and legacy blocks', () => {
+      const payload: TPayload = [
+        { messageId: 'm1', role: 'user', content: 'Covered question' },
+        {
+          messageId: 'm2',
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Older summary',
+              tokenCount: 3,
+            },
+            { type: ContentTypes.TEXT, text: 'Older tail' },
+          ],
+        },
+        { messageId: 'm3', role: 'user', content: 'Retained question' },
+        {
+          messageId: 'm4',
+          role: 'assistant',
+          content: [
+            buildSummaryPart({ retainedFromMessageId: 'm3' }),
+            { type: ContentTypes.TEXT, text: 'Newest reply' },
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(payload);
+
+      expect(result.messages.map(textOf)).toEqual([
+        'Retained question',
+        'Newest reply',
+      ]);
+      expect(result.summary!.text).toBe('Summary of the earliest turns');
     });
   });
 

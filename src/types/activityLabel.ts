@@ -38,6 +38,14 @@ export type RunActivityLabelOptions = {
   thinkingExcerpts?: string[];
   /** Assistant's last text before the block (~200 chars), as intent context. */
   lastAssistantText?: string;
+  /**
+   * Headers already committed for earlier batches in this run (run order,
+   * most recent last). Continuity context: the prompt shows them so the new
+   * header extends the run's story instead of restating a line already on
+   * screen. Hosts should pass only COMMITTED labels — a pending slot's text
+   * is empty and a dropped fill never surfaced to the user.
+   */
+  previousLabels?: string[];
   /** Override for the default label system prompt. */
   prompt?: string;
   /** Per-entry serialization cap for the prompt. Default 600. */

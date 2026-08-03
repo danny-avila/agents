@@ -7,6 +7,7 @@ import {
   HumanMessage,
   AIMessageChunk,
 } from '@langchain/core/messages';
+import type { ContentBlock as LangChainContentBlock } from '@langchain/core/messages';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
@@ -579,7 +580,9 @@ function cloneAIMessageWithContent(
       ...lcKwargs,
       value: {
         ...(lcKwargs.value as Record<string, unknown>),
-        content,
+        ...(message.response_metadata.output_version === 'v1'
+          ? { content: undefined, contentBlocks: content }
+          : { content }),
       },
     };
   }
@@ -589,55 +592,1287 @@ function cloneAIMessageWithContent(
   ) as AIMessage;
 }
 
+function cloneAIMessageWithResponsesReplayState(
+  message: AIMessage,
+  content: AIMessage['content'],
+  id: string | undefined,
+  additionalKwargs: AIMessage['additional_kwargs'],
+  responseMetadata: AIMessage['response_metadata']
+): AIMessage {
+  const descriptors = Object.getOwnPropertyDescriptors(message) as Record<
+    string,
+    PropertyDescriptor | undefined
+  >;
+  const replacements = {
+    content,
+    id,
+    additional_kwargs: additionalKwargs,
+    response_metadata: responseMetadata,
+  };
+  for (const [key, value] of Object.entries(replacements)) {
+    const descriptor = descriptors[key];
+    descriptors[key] = {
+      configurable: descriptor?.configurable ?? true,
+      enumerable: descriptor?.enumerable ?? true,
+      value,
+      writable: descriptor?.writable ?? true,
+    };
+  }
+  const lcKwargs = descriptors.lc_kwargs;
+  if (
+    lcKwargs != null &&
+    'value' in lcKwargs &&
+    typeof lcKwargs.value === 'object' &&
+    lcKwargs.value != null
+  ) {
+    descriptors.lc_kwargs = {
+      ...lcKwargs,
+      value: {
+        ...(lcKwargs.value as Record<string, unknown>),
+        ...replacements,
+        ...(responseMetadata.output_version === 'v1'
+          ? { content: undefined, contentBlocks: content }
+          : {}),
+      },
+    };
+  }
+  return Object.create(
+    Object.getPrototypeOf(message),
+    descriptors as PropertyDescriptorMap
+  ) as AIMessage;
+}
+
+function hasReplayableEncryptedReasoning(reasoning: unknown): boolean {
+  if (reasoning == null || typeof reasoning !== 'object') {
+    return false;
+  }
+  const item = reasoning as {
+    encrypted_content?: unknown;
+    id?: unknown;
+    status?: unknown;
+    summary?: unknown;
+    type?: unknown;
+  };
+  return (
+    item.type === 'reasoning' &&
+    typeof item.id === 'string' &&
+    item.id.length > 0 &&
+    Array.isArray(item.summary) &&
+    typeof item.encrypted_content === 'string' &&
+    item.encrypted_content.length > 0 &&
+    (item.status === undefined ||
+      item.status === 'completed' ||
+      item.status === 'incomplete')
+  );
+}
+
+type ResponsesReplayProjection = 'fallback' | 'native';
+
+export const OPENAI_RESPONSES_REPLAY_POSITIONS_KEY =
+  '__openai_responses_replay_positions__';
+
+export type ResponsesReplayPosition = {
+  contentIndex?: number;
+  itemId: string;
+  kind: 'message' | 'output' | 'reasoning' | 'text';
+  outputIndex: number;
+};
+
+type CompletedGeneratedImages = {
+  blocks: PositionedResponsesReplayBlock[];
+  data: Set<string>;
+  ids: Set<string>;
+};
+
+type ResponsesReplayArtifacts = {
+  generatedImages: CompletedGeneratedImages;
+  messagePositions: ResponsesReplayPosition[];
+  positionsByItemId: Map<string, ResponsesReplayItemPosition>;
+  positionedServerToolResultIds: Set<string>;
+  serverToolResults: PositionedResponsesReplayBlock[];
+  textPositions: ResponsesReplayPosition[];
+};
+
+type ResponsesReplayItemPosition = Pick<
+  PositionedResponsesReplayBlock,
+  'outputIndex' | 'textIndex'
+>;
+
+type PositionedResponsesReplayBlock = {
+  block: LangChainContentBlock.Standard;
+  outputIndex: number;
+  subIndex: number;
+  textIndex?: number;
+};
+
+type PositionedResponsesImage = {
+  block: LangChainContentBlock.Multimodal.Image;
+  textIndex: number;
+};
+
+type PositionedResponsesImages = {
+  blocks: PositionedResponsesImage[];
+  textCount: number;
+};
+
+function isProviderGeneratedImageBlock(
+  block: LangChainContentBlock.Multimodal.Image,
+  generatedImages: CompletedGeneratedImages,
+  allowDataFallback = true
+): boolean {
+  if (typeof block.id === 'string' && block.id.length > 0) {
+    return generatedImages.ids.has(block.id);
+  }
+  return (
+    allowDataFallback &&
+    typeof block.data === 'string' &&
+    generatedImages.data.has(block.data) &&
+    block.metadata != null &&
+    typeof block.metadata === 'object' &&
+    block.metadata.status === 'completed'
+  );
+}
+
+function hasMeaningfulServerToolOutput(output: unknown): boolean {
+  if (output == null || output === '') {
+    return false;
+  }
+  if (Array.isArray(output)) {
+    return output.length > 0;
+  }
+  if (typeof output !== 'object') {
+    return true;
+  }
+  try {
+    return Object.keys(output).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function createServerToolResultExtras(toolName?: string): {
+  librechatServerToolResult: { toolName?: string };
+} {
+  return {
+    librechatServerToolResult: {
+      ...(toolName != null ? { toolName } : {}),
+    },
+  };
+}
+
+function createNeutralServerToolResult(
+  output: unknown,
+  status: 'error' | 'success',
+  maxChars: number,
+  toolName?: string
+): LangChainContentBlock.Text | undefined {
+  if (!hasMeaningfulServerToolOutput(output)) {
+    return undefined;
+  }
+  return {
+    type: 'text',
+    text: serializeToolContentBounded(
+      {
+        serverToolResult: {
+          librechatResponsesReplay: true,
+          ...(toolName != null ? { toolName } : {}),
+          status,
+          output,
+        },
+      },
+      maxChars
+    ),
+    extras: createServerToolResultExtras(toolName),
+  };
+}
+
+function isCompleteToolStreamContentBlock(block: unknown): boolean {
+  if (block == null || typeof block !== 'object') {
+    return true;
+  }
+  try {
+    if (isProxy(block)) {
+      return false;
+    }
+    const type = Object.getOwnPropertyDescriptor(block, 'type');
+    if (type == null) {
+      return true;
+    }
+    if (type.enumerable !== true || !('value' in type)) {
+      return false;
+    }
+    if (type.value !== 'text') {
+      return true;
+    }
+    const text = Object.getOwnPropertyDescriptor(block, 'text');
+    return (
+      text?.enumerable === true &&
+      'value' in text &&
+      typeof text.value === 'string' &&
+      text.value !== ''
+    );
+  } catch {
+    return false;
+  }
+}
+
+function projectPreemptedResponsesV1Content(
+  content: AIMessage['content'],
+  reasoning: unknown,
+  maxChars: number,
+  replayProjection: ResponsesReplayProjection,
+  generatedImages?: CompletedGeneratedImages,
+  originalImages?: PositionedResponsesImages,
+  serverToolResults?: PositionedResponsesReplayBlock[],
+  positionedServerToolResultIds?: ReadonlySet<string>,
+  reasoningPosition?: ResponsesReplayItemPosition,
+  textPositions?: readonly ResponsesReplayPosition[],
+  messagePositions?: readonly ResponsesReplayPosition[]
+): {
+  content: AIMessage['content'];
+  preservedServerToolResult: boolean;
+} {
+  if (!Array.isArray(content)) {
+    return { content, preservedServerToolResult: false };
+  }
+
+  const contentBlocks = content as LangChainContentBlock.Standard[];
+  const encryptedReasoning =
+    replayProjection === 'native' && hasReplayableEncryptedReasoning(reasoning)
+      ? reasoning
+      : undefined;
+  const positionedReasoning: PositionedResponsesReplayBlock | undefined =
+    encryptedReasoning != null && reasoningPosition != null
+      ? {
+        block: {
+          type: 'non_standard' as const,
+          value: encryptedReasoning,
+        },
+        ...reasoningPosition,
+        subIndex: 0,
+      }
+      : undefined;
+  const projected: LangChainContentBlock.Standard[] = [];
+  let changed = false;
+  let hasEncryptedReasoning = false;
+  let preservedServerToolResult = false;
+  let reasoningInsertionIndex: number | undefined;
+  let generatedImageIndex = 0;
+  let originalImageIndex = 0;
+  let reasoningPending = positionedReasoning;
+  let serverToolResultIndex = 0;
+  let sourceTextIndex = 0;
+  const serverToolNamesByCallId = new Map<string, string>();
+
+  const appendOriginalImages = (throughTextIndex?: number): void => {
+    if (replayProjection !== 'native' || originalImages == null) {
+      return;
+    }
+    while (originalImageIndex < originalImages.blocks.length) {
+      const positionedImage = originalImages.blocks[originalImageIndex];
+      if (
+        throughTextIndex != null &&
+        positionedImage.textIndex > throughTextIndex
+      ) {
+        return;
+      }
+      originalImageIndex++;
+      if (
+        generatedImages != null &&
+        isProviderGeneratedImageBlock(
+          positionedImage.block,
+          generatedImages,
+          false
+        )
+      ) {
+        continue;
+      }
+      projected.push(positionedImage.block);
+      changed = true;
+    }
+  };
+
+  const appendReplayBlocks = (
+    throughTextIndex?: number,
+    beforeOutputIndex?: number
+  ): void => {
+    for (;;) {
+      const generatedImage = generatedImages?.blocks[generatedImageIndex];
+      const serverToolResult = serverToolResults?.[serverToolResultIndex];
+      const candidates: Array<{
+        kind: 'generatedImage' | 'reasoning' | 'serverToolResult';
+        value: PositionedResponsesReplayBlock;
+      }> = [];
+      if (generatedImage != null) {
+        candidates.push({ kind: 'generatedImage', value: generatedImage });
+      }
+      if (serverToolResult != null) {
+        candidates.push({ kind: 'serverToolResult', value: serverToolResult });
+      }
+      if (reasoningPending != null) {
+        candidates.push({ kind: 'reasoning', value: reasoningPending });
+      }
+      if (candidates.length === 0) {
+        return;
+      }
+      candidates.sort((a, b) =>
+        comparePositionedResponsesReplayBlocks(a.value, b.value)
+      );
+      const selected = candidates[0];
+      const positionedResult = selected.value;
+      if (
+        throughTextIndex != null &&
+        (positionedResult.textIndex == null ||
+          positionedResult.textIndex > throughTextIndex)
+      ) {
+        return;
+      }
+      if (
+        beforeOutputIndex != null &&
+        positionedResult.outputIndex >= beforeOutputIndex
+      ) {
+        return;
+      }
+      if (selected.kind === 'generatedImage') {
+        generatedImageIndex++;
+      } else if (selected.kind === 'serverToolResult') {
+        serverToolResultIndex++;
+      } else {
+        reasoningPending = undefined;
+      }
+      if (
+        replayProjection === 'fallback' &&
+        positionedResult.block.type === 'text'
+      ) {
+        projected.push({
+          type: 'text',
+          text: positionedResult.block.text,
+        });
+      } else {
+        projected.push(positionedResult.block);
+      }
+      changed = true;
+      preservedServerToolResult ||= selected.kind === 'serverToolResult';
+    }
+  };
+
+  const appendPositionedOriginalImages = (throughTextIndex?: number): void => {
+    const nextOriginalImage = originalImages?.blocks[originalImageIndex];
+    if (
+      nextOriginalImage == null ||
+      (throughTextIndex != null &&
+        nextOriginalImage.textIndex > throughTextIndex)
+    ) {
+      return;
+    }
+    const followingTextPosition = textPositions?.[nextOriginalImage.textIndex];
+    const imageOnlyMessagePosition =
+      originalImages?.textCount === 0 ? messagePositions?.[0] : undefined;
+    const outputBoundary = followingTextPosition ?? imageOnlyMessagePosition;
+    if (outputBoundary != null) {
+      appendReplayBlocks(
+        nextOriginalImage.textIndex,
+        outputBoundary.outputIndex
+      );
+    }
+    appendOriginalImages(throughTextIndex);
+  };
+
+  for (let i = 0; i < contentBlocks.length; i++) {
+    const block = contentBlocks[i];
+    if (!isCompleteToolStreamContentBlock(block)) {
+      changed = true;
+      continue;
+    }
+    if (block.type === 'reasoning') {
+      reasoningInsertionIndex ??= projected.length;
+      changed = true;
+      continue;
+    }
+    if (block.type === 'non_standard') {
+      if (
+        replayProjection === 'native' &&
+        !hasEncryptedReasoning &&
+        hasReplayableEncryptedReasoning(block.value)
+      ) {
+        hasEncryptedReasoning = true;
+        if (positionedReasoning == null) {
+          projected.push(block);
+        } else {
+          changed = true;
+        }
+      } else {
+        changed = true;
+      }
+      continue;
+    }
+    if (block.type === 'text') {
+      appendPositionedOriginalImages(sourceTextIndex);
+      appendReplayBlocks(sourceTextIndex);
+      if (replayProjection === 'fallback') {
+        projected.push({ type: 'text', text: block.text });
+        changed = true;
+      } else {
+        projected.push(block);
+      }
+      sourceTextIndex++;
+      continue;
+    }
+    if (originalImages != null && sourceTextIndex >= originalImages.textCount) {
+      appendPositionedOriginalImages();
+    }
+    if (
+      block.type === 'server_tool_call' ||
+      block.type === 'server_tool_call_chunk'
+    ) {
+      if (
+        typeof block.id === 'string' &&
+        block.id.length > 0 &&
+        typeof block.name === 'string' &&
+        block.name.length > 0
+      ) {
+        serverToolNamesByCallId.set(block.id, block.name);
+      }
+      changed = true;
+      continue;
+    }
+    if (block.type === 'server_tool_call_result') {
+      if (positionedServerToolResultIds?.has(block.toolCallId) === true) {
+        changed = true;
+        continue;
+      }
+      const result = createNeutralServerToolResult(
+        block.output,
+        block.status,
+        maxChars,
+        serverToolNamesByCallId.get(block.toolCallId)
+      );
+      changed = true;
+      if (result != null) {
+        projected.push(
+          replayProjection === 'fallback'
+            ? { type: 'text', text: result.text }
+            : result
+        );
+        preservedServerToolResult = true;
+      }
+      continue;
+    }
+    if (block.type === 'image') {
+      if (
+        replayProjection === 'fallback' ||
+        (generatedImages != null &&
+          isProviderGeneratedImageBlock(block, generatedImages))
+      ) {
+        changed = true;
+        continue;
+      }
+    }
+    projected.push(block);
+  }
+
+  if (
+    encryptedReasoning != null &&
+    !hasEncryptedReasoning &&
+    positionedReasoning == null
+  ) {
+    const reasoningBlock: LangChainContentBlock.Standard = {
+      type: 'non_standard',
+      value: encryptedReasoning,
+    };
+    projected.splice(reasoningInsertionIndex ?? 0, 0, reasoningBlock);
+    changed = true;
+  }
+  appendPositionedOriginalImages();
+  appendReplayBlocks();
+  return {
+    content: changed ? toLangChainContent(projected) : content,
+    preservedServerToolResult,
+  };
+}
+
+function getAuthoritativeResponsesOutput(message: AIMessage): unknown[] {
+  const responseOutput = message.response_metadata.output;
+  const toolOutputs = message.additional_kwargs.tool_outputs;
+  if (Array.isArray(responseOutput) && responseOutput.length > 0) {
+    return responseOutput;
+  }
+  return Array.isArray(toolOutputs) ? toolOutputs : [];
+}
+
+function isResponsesReplayPosition(
+  value: unknown
+): value is ResponsesReplayPosition {
+  if (value == null || typeof value !== 'object') {
+    return false;
+  }
+  const position = value as Partial<ResponsesReplayPosition>;
+  return (
+    (position.kind === 'message' ||
+      position.kind === 'output' ||
+      position.kind === 'reasoning' ||
+      position.kind === 'text') &&
+    typeof position.itemId === 'string' &&
+    position.itemId.length > 0 &&
+    typeof position.outputIndex === 'number' &&
+    Number.isSafeInteger(position.outputIndex) &&
+    position.outputIndex >= 0 &&
+    (position.contentIndex == null ||
+      (typeof position.contentIndex === 'number' &&
+        Number.isSafeInteger(position.contentIndex) &&
+        position.contentIndex >= 0))
+  );
+}
+
+function getGeneratedImageMimeType(data: string): string {
+  const bytes = Buffer.from(data.slice(0, 16), 'base64');
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return 'image/webp';
+  }
+  return 'image/png';
+}
+
+function getResponsesReplayItemKey(
+  item: Record<string, unknown>
+): string | undefined {
+  if (typeof item.id === 'string' && item.id.length > 0) {
+    return item.id;
+  }
+  return typeof item.call_id === 'string' && item.call_id.length > 0
+    ? item.call_id
+    : undefined;
+}
+
+function comparePositionedResponsesReplayBlocks(
+  a: PositionedResponsesReplayBlock,
+  b: PositionedResponsesReplayBlock
+): number {
+  return (
+    (a.textIndex ?? Number.MAX_SAFE_INTEGER) -
+      (b.textIndex ?? Number.MAX_SAFE_INTEGER) ||
+    a.outputIndex - b.outputIndex ||
+    a.subIndex - b.subIndex
+  );
+}
+
+const RESPONSES_REPLAY_OUTPUT_TOOL_NAMES = {
+  apply_patch_call_output: 'apply_patch',
+  local_shell_call_output: 'local_shell',
+  shell_call_output: 'shell',
+} as const;
+
+function getResponsesReplayArtifacts(
+  output: readonly unknown[],
+  maxChars: number,
+  replayProjection: ResponsesReplayProjection,
+  replayPositionValue?: unknown
+): ResponsesReplayArtifacts {
+  const blocks: PositionedResponsesReplayBlock[] = [];
+  const data = new Set<string>();
+  const ids = new Set<string>();
+  const emittedData = new Set<string>();
+  const emittedIds = new Set<string>();
+  const positionedServerToolResultIds = new Set<string>();
+  const rawOutputIndices = new Map<Record<string, unknown>, number>();
+  const serverToolResults: PositionedResponsesReplayBlock[] = [];
+  const replayPositions = Array.isArray(replayPositionValue)
+    ? replayPositionValue.filter(isResponsesReplayPosition)
+    : [];
+  const authoritativeOutputIndicesByItemId = new Map<string, number>();
+  const messagePositionsByKey = new Map<string, ResponsesReplayPosition>();
+  const outputPositionsByItemId = new Map<string, ResponsesReplayPosition>();
+  const textPositionsByKey = new Map<string, ResponsesReplayPosition>();
+  for (const position of replayPositions) {
+    if (position.kind === 'output' || position.kind === 'reasoning') {
+      outputPositionsByItemId.set(position.itemId, position);
+      continue;
+    }
+    if (position.kind === 'message') {
+      messagePositionsByKey.set(
+        `${position.itemId}:${position.outputIndex}`,
+        position
+      );
+      continue;
+    }
+    textPositionsByKey.set(
+      `${position.itemId}:${position.outputIndex}:${position.contentIndex ?? 0}`,
+      position
+    );
+  }
+  let hasAuthoritativeMessage = false;
+  for (let outputIndex = 0; outputIndex < output.length; outputIndex++) {
+    const item = output[outputIndex];
+    if (item == null || typeof item !== 'object') {
+      continue;
+    }
+    const itemRecord = item as Record<string, unknown>;
+    rawOutputIndices.set(itemRecord, outputIndex);
+    const itemKey = getResponsesReplayItemKey(itemRecord);
+    if (itemKey != null) {
+      authoritativeOutputIndicesByItemId.set(itemKey, outputIndex);
+    }
+    if (!('type' in item) || item.type !== 'message') {
+      continue;
+    }
+    hasAuthoritativeMessage = true;
+    const messageItemId =
+      'id' in item && typeof item.id === 'string'
+        ? item.id
+        : `message-${outputIndex}`;
+    messagePositionsByKey.set(`${messageItemId}:${outputIndex}`, {
+      itemId: messageItemId,
+      kind: 'message',
+      outputIndex,
+    });
+    if (!('content' in item) || !Array.isArray(item.content)) {
+      continue;
+    }
+    for (
+      let contentIndex = 0;
+      contentIndex < item.content.length;
+      contentIndex++
+    ) {
+      const content = item.content[contentIndex];
+      if (
+        content == null ||
+        typeof content !== 'object' ||
+        !('type' in content) ||
+        content.type !== 'output_text' ||
+        !('text' in content) ||
+        typeof content.text !== 'string' ||
+        content.text.length === 0
+      ) {
+        continue;
+      }
+      const itemId =
+        'id' in item && typeof item.id === 'string'
+          ? item.id
+          : `message-${outputIndex}`;
+      textPositionsByKey.set(`${itemId}:${outputIndex}:${contentIndex}`, {
+        contentIndex,
+        itemId,
+        kind: 'text',
+        outputIndex,
+      });
+    }
+  }
+  if (hasAuthoritativeMessage) {
+    for (const [itemId, outputIndex] of authoritativeOutputIndicesByItemId) {
+      outputPositionsByItemId.set(itemId, {
+        itemId,
+        kind: 'output',
+        outputIndex,
+      });
+    }
+  }
+  const textPositions = [...textPositionsByKey.values()].sort(
+    (a, b) =>
+      a.outputIndex - b.outputIndex ||
+      (a.contentIndex ?? 0) - (b.contentIndex ?? 0)
+  );
+  const messagePositions = [...messagePositionsByKey.values()].sort(
+    (a, b) => a.outputIndex - b.outputIndex
+  );
+  const textCountBeforeOutputIndex = new Map<number, number>();
+  const positionedOutputIndexSet = new Set<number>();
+  for (const position of outputPositionsByItemId.values()) {
+    positionedOutputIndexSet.add(position.outputIndex);
+  }
+  if (hasAuthoritativeMessage) {
+    for (const outputIndex of rawOutputIndices.values()) {
+      positionedOutputIndexSet.add(outputIndex);
+    }
+  }
+  const positionedOutputIndices = [...positionedOutputIndexSet].sort(
+    (a, b) => a - b
+  );
+  let textPositionIndex = 0;
+  for (const outputIndex of positionedOutputIndices) {
+    while (
+      textPositionIndex < textPositions.length &&
+      textPositions[textPositionIndex].outputIndex < outputIndex
+    ) {
+      textPositionIndex++;
+    }
+    textCountBeforeOutputIndex.set(outputIndex, textPositionIndex);
+  }
+  const positionsByItemId = new Map<string, ResponsesReplayItemPosition>();
+  for (const [itemId, position] of outputPositionsByItemId) {
+    positionsByItemId.set(itemId, {
+      outputIndex: position.outputIndex,
+      textIndex: textCountBeforeOutputIndex.get(position.outputIndex) ?? 0,
+    });
+  }
+  const getPosition = (
+    item: Record<string, unknown>
+  ): ResponsesReplayItemPosition => {
+    const itemId = getResponsesReplayItemKey(item);
+    const position = itemId != null ? positionsByItemId.get(itemId) : undefined;
+    if (position == null) {
+      const rawOutputIndex = rawOutputIndices.get(item);
+      return {
+        outputIndex: rawOutputIndex ?? Number.MAX_SAFE_INTEGER,
+        ...(hasAuthoritativeMessage && rawOutputIndex != null
+          ? {
+            textIndex: textCountBeforeOutputIndex.get(rawOutputIndex) ?? 0,
+          }
+          : {}),
+      };
+    }
+    return position;
+  };
+  const pushServerToolResult = (
+    block: LangChainContentBlock.Standard | undefined,
+    item: Record<string, unknown>,
+    subIndex = 0
+  ): void => {
+    if (block == null) {
+      return;
+    }
+    const itemId = getResponsesReplayItemKey(item);
+    if (itemId != null) {
+      positionedServerToolResultIds.add(itemId);
+    }
+    serverToolResults.push({ block, ...getPosition(item), subIndex });
+  };
+  for (const item of output) {
+    if (item == null || typeof item !== 'object' || !('type' in item)) {
+      continue;
+    }
+    if (item.type === 'code_interpreter_call') {
+      if (
+        !('outputs' in item) ||
+        !Array.isArray(item.outputs) ||
+        !('status' in item)
+      ) {
+        continue;
+      }
+      const resultStatus = item.status === 'completed' ? 'success' : 'error';
+      const returnCode = item.status === 'completed' ? 0 : 1;
+      for (
+        let resultIndex = 0;
+        resultIndex < item.outputs.length;
+        resultIndex++
+      ) {
+        const result = item.outputs[resultIndex];
+        if (
+          result == null ||
+          typeof result !== 'object' ||
+          !('type' in result)
+        ) {
+          continue;
+        }
+        if (
+          result.type === 'logs' &&
+          'logs' in result &&
+          typeof result.logs === 'string'
+        ) {
+          pushServerToolResult(
+            createNeutralServerToolResult(
+              {
+                type: 'code_interpreter_output',
+                returnCode,
+                stdout: result.logs,
+              },
+              resultStatus,
+              maxChars,
+              'code_interpreter'
+            ),
+            item,
+            resultIndex
+          );
+          continue;
+        }
+        if (
+          result.type !== 'image' ||
+          !('url' in result) ||
+          typeof result.url !== 'string' ||
+          result.url.length === 0
+        ) {
+          continue;
+        }
+        const resultUrl: string = result.url;
+        if (
+          replayProjection === 'native' &&
+          resultUrl.startsWith('data:image/')
+        ) {
+          pushServerToolResult(
+            {
+              type: 'image',
+              url: resultUrl,
+              extras: createServerToolResultExtras('code_interpreter'),
+            },
+            item,
+            resultIndex
+          );
+          continue;
+        }
+        const mediaResult = createNeutralServerToolResult(
+          { type: 'code_interpreter_image', url: resultUrl },
+          resultStatus,
+          maxChars,
+          'code_interpreter'
+        );
+        pushServerToolResult(mediaResult, item, resultIndex);
+      }
+      continue;
+    }
+    if (item.type === 'file_search_call') {
+      const result = createNeutralServerToolResult(
+        'results' in item && Array.isArray(item.results)
+          ? { results: item.results }
+          : undefined,
+        'status' in item && item.status === 'completed' ? 'success' : 'error',
+        maxChars,
+        'file_search'
+      );
+      pushServerToolResult(result, item);
+      continue;
+    }
+    if (item.type === 'web_search_call') {
+      const result = createNeutralServerToolResult(
+        {
+          ...('action' in item ? { action: item.action } : {}),
+          ...('results' in item && Array.isArray(item.results)
+            ? { results: item.results }
+            : {}),
+        },
+        'status' in item && item.status === 'completed' ? 'success' : 'error',
+        maxChars,
+        'web_search'
+      );
+      pushServerToolResult(result, item);
+      continue;
+    }
+    if (item.type === 'tool_search_output') {
+      const result = createNeutralServerToolResult(
+        'tools' in item && Array.isArray(item.tools)
+          ? { tools: item.tools }
+          : undefined,
+        'status' in item && item.status === 'completed' ? 'success' : 'error',
+        maxChars,
+        'tool_search'
+      );
+      pushServerToolResult(result, item);
+      continue;
+    }
+    if (item.type === 'mcp_list_tools') {
+      const hasError =
+        'error' in item &&
+        typeof item.error === 'string' &&
+        item.error.length > 0;
+      const listToolsResult = createNeutralServerToolResult(
+        {
+          ...('server_label' in item && typeof item.server_label === 'string'
+            ? { serverLabel: item.server_label }
+            : {}),
+          ...('tools' in item && Array.isArray(item.tools)
+            ? { tools: item.tools }
+            : {}),
+          ...(hasError ? { error: item.error } : {}),
+        },
+        hasError ? 'error' : 'success',
+        maxChars,
+        'mcp_list_tools'
+      );
+      pushServerToolResult(listToolsResult, item);
+      continue;
+    }
+    if (item.type === 'mcp_call') {
+      const hasOutput =
+        'output' in item &&
+        typeof item.output === 'string' &&
+        item.output.length > 0;
+      const hasError =
+        'error' in item &&
+        typeof item.error === 'string' &&
+        item.error.length > 0;
+      if (!hasOutput && !hasError) {
+        continue;
+      }
+      const mcpOutput = {
+        ...('name' in item && typeof item.name === 'string'
+          ? { name: item.name }
+          : {}),
+        ...('server_label' in item && typeof item.server_label === 'string'
+          ? { serverLabel: item.server_label }
+          : {}),
+        ...('output' in item && typeof item.output === 'string'
+          ? { output: item.output }
+          : {}),
+        ...('error' in item && typeof item.error === 'string'
+          ? { error: item.error }
+          : {}),
+      };
+      const mcpResult = createNeutralServerToolResult(
+        mcpOutput,
+        hasError ||
+          ('status' in item &&
+            (item.status === 'failed' || item.status === 'incomplete'))
+          ? 'error'
+          : 'success',
+        maxChars,
+        'name' in item && typeof item.name === 'string' && item.name.length > 0
+          ? item.name
+          : 'mcp'
+      );
+      pushServerToolResult(mcpResult, item);
+      continue;
+    }
+    if (
+      item.type === 'local_shell_call_output' ||
+      item.type === 'shell_call_output' ||
+      item.type === 'apply_patch_call_output'
+    ) {
+      if (!('output' in item)) {
+        continue;
+      }
+      const result = createNeutralServerToolResult(
+        item.output,
+        'status' in item &&
+          (item.status === 'failed' || item.status === 'incomplete')
+          ? 'error'
+          : 'success',
+        maxChars,
+        RESPONSES_REPLAY_OUTPUT_TOOL_NAMES[item.type]
+      );
+      pushServerToolResult(result, item);
+      continue;
+    }
+    if (item.type === 'program_output') {
+      if (!('result' in item)) {
+        continue;
+      }
+      const result = createNeutralServerToolResult(
+        item.result,
+        'status' in item && item.status === 'incomplete' ? 'error' : 'success',
+        maxChars,
+        'program'
+      );
+      pushServerToolResult(result, item);
+      continue;
+    }
+    if (item.type !== 'image_generation_call') {
+      continue;
+    }
+    if ('id' in item && typeof item.id === 'string' && item.id.length > 0) {
+      ids.add(item.id);
+    }
+    if (
+      !('result' in item) ||
+      typeof item.result !== 'string' ||
+      item.result.length === 0
+    ) {
+      continue;
+    }
+    data.add(item.result);
+    if ('status' in item && item.status === 'completed') {
+      const itemId =
+        'id' in item && typeof item.id === 'string' && item.id.length > 0
+          ? item.id
+          : undefined;
+      if (
+        (itemId != null && emittedIds.has(itemId)) ||
+        (itemId == null && emittedData.has(item.result))
+      ) {
+        continue;
+      }
+      if (itemId != null) {
+        emittedIds.add(itemId);
+      } else {
+        emittedData.add(item.result);
+      }
+      blocks.push({
+        block: {
+          type: 'image',
+          mimeType: getGeneratedImageMimeType(item.result),
+          data: item.result,
+          extras: createServerToolResultExtras('image_generation'),
+        },
+        ...getPosition(item),
+        subIndex: 0,
+      });
+    }
+  }
+  return {
+    generatedImages: {
+      blocks: blocks.sort(comparePositionedResponsesReplayBlocks),
+      data,
+      ids,
+    },
+    messagePositions,
+    positionedServerToolResultIds,
+    positionsByItemId,
+    serverToolResults: serverToolResults.sort(
+      comparePositionedResponsesReplayBlocks
+    ),
+    textPositions,
+  };
+}
+
+function getSelfContainedResponsesV0Images(
+  message: AIMessage
+): PositionedResponsesImages {
+  if (!Array.isArray(message.content)) {
+    return { blocks: [], textCount: 0 };
+  }
+  const images: PositionedResponsesImage[] = [];
+  let textCount = 0;
+  for (const block of message.content as LangChainContentBlock.Standard[]) {
+    if (block.type === 'text') {
+      if (isCompleteToolStreamContentBlock(block)) {
+        textCount++;
+      }
+      continue;
+    }
+    if (
+      block.type === 'image' &&
+      (('fileId' in block &&
+        typeof block.fileId === 'string' &&
+        block.fileId.length > 0) ||
+        ('url' in block &&
+          typeof block.url === 'string' &&
+          block.url.length > 0) ||
+        ('data' in block &&
+          ((typeof block.data === 'string' && block.data.length > 0) ||
+            (block.data instanceof Uint8Array && block.data.length > 0))))
+    ) {
+      images.push({ block, textIndex: textCount });
+    }
+  }
+  return { blocks: images, textCount };
+}
+
+function getResponsesV0ContentBlocks(
+  message: AIMessage,
+  authoritativeOutput: unknown[]
+): AIMessage['content'] {
+  let content = message.content;
+  if (typeof content === 'string') {
+    content = toLangChainContent(
+      content.length > 0 ? [{ type: 'text', text: content }] : []
+    );
+  }
+  const translationMessage = cloneAIMessageWithResponsesReplayState(
+    message,
+    content,
+    message.id,
+    {
+      ...message.additional_kwargs,
+      tool_outputs: authoritativeOutput,
+    },
+    {
+      ...message.response_metadata,
+      model_provider: 'openai',
+    }
+  );
+  return toLangChainContent(translationMessage.contentBlocks);
+}
+
+function isPreemptedOpenAIResponsesMessage(message: AIMessage): boolean {
+  const metadata = message.response_metadata;
+  if (metadata.preempted !== true || metadata.model_provider !== 'openai') {
+    return false;
+  }
+  if (
+    message.id?.startsWith('msg_') === true ||
+    message.id?.startsWith('resp_') === true ||
+    (typeof metadata.id === 'string' && metadata.id.startsWith('resp_')) ||
+    Array.isArray(metadata.output) ||
+    metadata.tool_outputs != null ||
+    Array.isArray(message.additional_kwargs.tool_outputs) ||
+    message.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY] != null ||
+    message.additional_kwargs.__openai_function_call_ids__ != null ||
+    message.additional_kwargs.__openai_custom_tool_call_ids__ != null ||
+    (message.additional_kwargs.reasoning != null &&
+      typeof message.additional_kwargs.reasoning === 'object')
+  ) {
+    return true;
+  }
+  return false;
+}
+
 /**
- * Drops incomplete streamed text-input fragments that some providers retain
- * beside the assembled parsed tool call. They are neither user-visible text
- * nor valid content blocks for a subsequent provider.
+ * A sealed Responses turn cannot prove that provider-side item ids were
+ * retained: the response object does not echo the request's `store` flag.
+ * Project a provider-neutral clone while preserving self-contained encrypted
+ * reasoning and the original graph/checkpoint message.
  */
+function projectPreemptedOpenAIResponsesMessage(
+  message: AIMessage,
+  maxChars: number,
+  replayProjection: ResponsesReplayProjection
+): AIMessage {
+  if (!isPreemptedOpenAIResponsesMessage(message)) {
+    return message;
+  }
+
+  const metadata = message.response_metadata;
+  const additionalKwargs = { ...message.additional_kwargs };
+  const retainsEncryptedReasoning =
+    replayProjection === 'native' &&
+    hasReplayableEncryptedReasoning(additionalKwargs.reasoning);
+  const authoritativeOutput = getAuthoritativeResponsesOutput(message);
+  const {
+    generatedImages,
+    messagePositions,
+    positionedServerToolResultIds,
+    positionsByItemId,
+    serverToolResults,
+    textPositions,
+  } = getResponsesReplayArtifacts(
+    authoritativeOutput,
+    maxChars,
+    replayProjection,
+    additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]
+  );
+  const reasoningItemId =
+    retainsEncryptedReasoning &&
+    additionalKwargs.reasoning != null &&
+    typeof additionalKwargs.reasoning === 'object' &&
+    'id' in additionalKwargs.reasoning &&
+    typeof additionalKwargs.reasoning.id === 'string'
+      ? additionalKwargs.reasoning.id
+      : undefined;
+  const reasoningPosition =
+    reasoningItemId != null
+      ? positionsByItemId.get(reasoningItemId)
+      : undefined;
+  const isV1 = metadata.output_version === 'v1';
+  const translatesV0 =
+    !isV1 &&
+    (replayProjection === 'fallback' || authoritativeOutput.length > 0);
+  const originalImages =
+    replayProjection === 'native' && translatesV0
+      ? getSelfContainedResponsesV0Images(message)
+      : undefined;
+  let contentForProjection = message.content;
+  if (!isV1 && translatesV0) {
+    contentForProjection = getResponsesV0ContentBlocks(
+      message,
+      authoritativeOutput
+    );
+  }
+  const projectedContent = projectPreemptedResponsesV1Content(
+    contentForProjection,
+    isV1 || translatesV0 ? additionalKwargs.reasoning : undefined,
+    maxChars,
+    replayProjection,
+    replayProjection === 'native' ? generatedImages : undefined,
+    originalImages,
+    serverToolResults,
+    positionedServerToolResultIds,
+    reasoningPosition,
+    textPositions,
+    messagePositions
+  );
+  const promotesV0 =
+    !isV1 &&
+    (replayProjection === 'fallback' ||
+      generatedImages.blocks.length > 0 ||
+      projectedContent.preservedServerToolResult);
+  const unpromotedV0Content =
+    contentForProjection === message.content
+      ? projectedContent.content
+      : projectPreemptedResponsesV1Content(
+        message.content,
+        undefined,
+        maxChars,
+        replayProjection
+      ).content;
+  const content =
+    isV1 || promotesV0 ? projectedContent.content : unpromotedV0Content;
+  const hasUnsafeProviderReferences =
+    content !== message.content ||
+    message.id?.startsWith('msg_') === true ||
+    (!retainsEncryptedReasoning && additionalKwargs.reasoning != null) ||
+    additionalKwargs.tool_outputs != null ||
+    additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY] != null ||
+    additionalKwargs.__openai_function_call_ids__ != null ||
+    additionalKwargs.__openai_custom_tool_call_ids__ != null ||
+    metadata.id != null ||
+    metadata.output != null ||
+    metadata.tool_outputs != null;
+  if (!hasUnsafeProviderReferences) {
+    return message;
+  }
+  if (!retainsEncryptedReasoning) {
+    delete additionalKwargs.reasoning;
+  }
+  delete additionalKwargs.tool_outputs;
+  delete additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY];
+  delete additionalKwargs.__openai_function_call_ids__;
+  delete additionalKwargs.__openai_custom_tool_call_ids__;
+
+  const responseMetadata: AIMessage['response_metadata'] = { ...metadata };
+  delete responseMetadata.id;
+  delete responseMetadata.output;
+  delete responseMetadata.tool_outputs;
+  if (promotesV0) {
+    responseMetadata.output_version = 'v1';
+  }
+
+  return cloneAIMessageWithResponsesReplayState(
+    message,
+    content,
+    message.id?.startsWith('msg_') === true ? undefined : message.id,
+    additionalKwargs,
+    responseMetadata
+  );
+}
+
+/** Applies sealed-Responses safety and drops incomplete streamed text input. */
 export function projectToolStreamContentForProvider(
-  messages: BaseMessage[]
+  messages: BaseMessage[],
+  responsesReplayProjection?: ResponsesReplayProjection,
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
 ): BaseMessage[] {
   let projected: BaseMessage[] | undefined;
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i];
-    if (message.getType() !== 'ai' || !Array.isArray(message.content)) {
+    if (message.getType() !== 'ai') {
       continue;
     }
-    const content = message.content.filter((block) => {
-      if (block == null || typeof block !== 'object') {
-        return true;
+    const assistantMessage = message as AIMessage;
+    if (
+      responsesReplayProjection != null &&
+      isPreemptedOpenAIResponsesMessage(assistantMessage)
+    ) {
+      const replaySafeMessage = projectPreemptedOpenAIResponsesMessage(
+        assistantMessage,
+        maxChars,
+        responsesReplayProjection
+      );
+      if (replaySafeMessage !== assistantMessage) {
+        projected ??= [...messages];
+        projected[i] = replaySafeMessage;
       }
-      try {
-        if (isProxy(block)) {
-          return false;
-        }
-        const type = Object.getOwnPropertyDescriptor(block, 'type');
-        if (type == null) {
-          return true;
-        }
-        if (type.enumerable !== true || !('value' in type)) {
-          return false;
-        }
-        if (type.value !== 'text') {
-          return true;
-        }
-        const text = Object.getOwnPropertyDescriptor(block, 'text');
-        return (
-          text?.enumerable === true &&
-          'value' in text &&
-          typeof text.value === 'string' &&
-          text.value !== ''
-        );
-      } catch {
-        return false;
-      }
-    });
-    if (content.length === message.content.length) {
+      continue;
+    }
+    if (!Array.isArray(assistantMessage.content)) {
+      continue;
+    }
+    const content = assistantMessage.content.filter(
+      isCompleteToolStreamContentBlock
+    );
+    if (content.length === assistantMessage.content.length) {
       continue;
     }
     projected ??= [...messages];
     projected[i] = cloneAIMessageWithContent(
-      message as AIMessage,
+      assistantMessage,
       toLangChainContent(content)
     );
   }
@@ -687,7 +1922,7 @@ function projectStructuredOpenAIToolContent(
 function projectOpenAIToolMessageContentInternal(
   messages: BaseMessage[],
   maxChars: number,
-  deduplicateResponsesComputerCalls: boolean,
+  nativeResponsesProjection: boolean,
   cacheControlledTextProjection: CacheControlledTextProjection
 ): BaseMessage[] {
   const pendingComputerCallIds: string[] = [];
@@ -699,8 +1934,21 @@ function projectOpenAIToolMessageContentInternal(
     const isAssistant =
       message.getType() === 'ai' || messageRole === 'assistant';
     if (isAssistant) {
+      let assistantMessage = message as AIMessage;
+      if (nativeResponsesProjection) {
+        const replaySafeMessage = projectPreemptedOpenAIResponsesMessage(
+          assistantMessage,
+          maxChars,
+          'native'
+        );
+        if (replaySafeMessage !== assistantMessage) {
+          projected ??= [...messages];
+          projected[i] = replaySafeMessage;
+          assistantMessage = replaySafeMessage;
+        }
+      }
       const parsedComputerCallIds = new Set<string>();
-      const toolCalls = (message as AIMessage).tool_calls;
+      const toolCalls = assistantMessage.tool_calls;
       if (Array.isArray(toolCalls)) {
         for (const toolCall of toolCalls) {
           const record = toolCall as ToolCall & {
@@ -727,12 +1975,12 @@ function projectOpenAIToolMessageContentInternal(
       }
 
       const rawOutput = (
-        message.response_metadata as {
+        assistantMessage.response_metadata as {
           output?: unknown;
         }
       ).output;
       const fallbackOutput = (
-        message.additional_kwargs as {
+        assistantMessage.additional_kwargs as {
           tool_outputs?: unknown;
         }
       ).tool_outputs;
@@ -775,7 +2023,7 @@ function projectOpenAIToolMessageContentInternal(
       }
 
       if (
-        deduplicateResponsesComputerCalls &&
+        nativeResponsesProjection &&
         Array.isArray(toolCalls) &&
         rawComputerCallIds.size > 0
       ) {
@@ -794,7 +2042,7 @@ function projectOpenAIToolMessageContentInternal(
         if (projectedToolCalls.length !== toolCalls.length) {
           projected ??= [...messages];
           projected[i] = cloneAIMessageWithToolCalls(
-            message as AIMessage,
+            assistantMessage,
             projectedToolCalls,
             rawComputerCallIds
           );

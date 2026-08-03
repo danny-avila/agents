@@ -1,11 +1,13 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import {
   createSummarizeNode,
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
 } from '@/summarization/node';
+import { convertInjectedMessages } from '@/messages/injected';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { AgentContext } from '@/agents/AgentContext';
 import * as providers from '@/llm/providers';
@@ -943,6 +945,192 @@ describe('recency window — first-turn protection', () => {
     expect(result.messages!.slice(1)).toHaveLength(2);
     expect((result.messages![1] as HumanMessage).content).toBe('turn 2 query');
     expect((result.messages![2] as AIMessage).content).toBe('turn 2 reply');
+  });
+
+  describe('summary coverage', () => {
+    const runCompaction = async (
+      messages: BaseMessage[],
+      turns = 1
+    ): Promise<t.SummaryContentBlock | undefined> => {
+      captureEvents();
+      jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+        class {
+          constructor() {
+            return mockInvokeModel('Summary of older turns');
+          }
+        } as never
+      );
+
+      let summaryBlock: t.SummaryContentBlock | undefined;
+      const graph = mockGraph((_stepId, result) => {
+        if (result.type === 'summary') {
+          summaryBlock = result.summary;
+        }
+      });
+      const summarizeNode = createSummarizeNode({
+        agentContext: createAgentContext({
+          summarizationConfig: { retainRecent: { turns } },
+        } as never),
+        graph: graph as never,
+        generateStepId,
+      });
+
+      await summarizeNode(
+        {
+          messages,
+          summarizationRequest: {
+            remainingContextTokens: 0,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+
+      return summaryBlock;
+    };
+
+    it('records the first retained message as the coverage anchor', async () => {
+      const summaryBlock = await runCompaction([
+        new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+        new AIMessage({ content: 'turn 1 reply', id: 'm2' }),
+        new HumanMessage({ content: 'turn 2 query', id: 'm3' }),
+        new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
+      ]);
+
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm3' });
+    });
+
+    it('skips a retained message that carries no source id', async () => {
+      const summaryBlock = await runCompaction([
+        new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+        new AIMessage({ content: 'turn 1 reply', id: 'm2' }),
+        new HumanMessage({ content: 'turn 2 query' }),
+        new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
+      ]);
+
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm4' });
+    });
+
+    it('omits coverage when no retained message carries a source id', async () => {
+      const summaryBlock = await runCompaction([
+        new HumanMessage('turn 1 query'),
+        new AIMessage('turn 1 reply'),
+        new HumanMessage('turn 2 query'),
+        new AIMessage('turn 2 reply'),
+      ]);
+
+      expect(summaryBlock?.coverage).toBeUndefined();
+    });
+
+    /** A steer expands one source message into pre-steer, steer, and post-steer
+     *  messages sharing its ID, and the recency split lands on the steer. The
+     *  straddling message is the anchor, so it survives whole. */
+    it('anchors on a source id that straddles the recency boundary', async () => {
+      const summaryBlock = await runCompaction([
+        new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+        new AIMessage({ content: 'pre-steer reply', id: 'm2' }),
+        new HumanMessage({
+          content: 'steer',
+          id: 'm2',
+          additional_kwargs: { role: 'user', source: 'steer' },
+        }),
+        new AIMessage({ content: 'post-steer reply', id: 'm2' }),
+      ]);
+
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm2' });
+    });
+
+    /** A steer carries `source: 'steer'` but is replayed from a payload entry
+     *  and stamped with its ID, so it is a valid anchor. When compaction lands
+     *  before any post-steer message exists it is the *only* retained entry —
+     *  treating every marked message as synthetic drops it. */
+    it('anchors on a retained steer with no post-steer message', async () => {
+      const summaryBlock = await runCompaction([
+        new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+        new AIMessage({ content: 'pre-steer reply', id: 'm2' }),
+        new HumanMessage({
+          content: 'steer',
+          id: 'm2',
+          additional_kwargs: { role: 'user', source: 'steer' },
+        }),
+      ]);
+
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm2' });
+    });
+
+    /** `formatAgentMessages` reconstructs skill bodies inside its payload loop
+     *  and keeps processing payload entries after, so this unstamped entry — a
+     *  reducer UUID by the time compaction sees it — precedes stamped messages.
+     *  Anchoring on it would resolve to nothing on the next run. */
+    it('skips a reconstructed skill body to reach the stamped message behind it', async () => {
+      const summaryBlock = await runCompaction(
+        [
+          new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+          new AIMessage({ content: 'turn 1 reply', id: 'm2' }),
+          new HumanMessage({
+            content: 'skill body',
+            id: 'reducer-uuid',
+            additional_kwargs: {
+              role: 'user',
+              isMeta: true,
+              source: 'skill',
+              skillName: 'demo',
+            },
+          }),
+          new HumanMessage({ content: 'turn 2 query', id: 'm3' }),
+          new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
+        ],
+        2
+      );
+
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm3' });
+    });
+
+    /** `InjectedMessage` leaves both `isMeta` and `source` optional, so a bare
+     *  injected turn carries no marker of its own — and an injected `steer` is
+     *  otherwise indistinguishable from a replayed one. `convertInjectedMessages`
+     *  records `injected` on everything it builds, which decides both. */
+    it.each([
+      ['a bare injected turn', { role: 'user' as const, content: 'injected' }],
+      [
+        'an injected steer',
+        {
+          role: 'user' as const,
+          content: 'injected steer',
+          source: 'steer' as const,
+        },
+      ],
+    ])('skips %s when anchoring', async (_label, injected) => {
+      const [converted] = convertInjectedMessages([injected]);
+      converted.id = 'reducer-uuid';
+
+      const summaryBlock = await runCompaction(
+        [
+          new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+          new AIMessage({ content: 'turn 1 reply', id: 'm2' }),
+          converted,
+          new HumanMessage({ content: 'turn 2 query', id: 'm3' }),
+          new AIMessage({ content: 'turn 2 reply', id: 'm4' }),
+        ],
+        2
+      );
+
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm3' });
+    });
+
+    it('anchors on the straddling id when it is the only source', async () => {
+      const summaryBlock = await runCompaction([
+        new AIMessage({ content: 'pre-steer reply', id: 'm1' }),
+        new HumanMessage({
+          content: 'steer',
+          id: 'm1',
+          additional_kwargs: { role: 'user', source: 'steer' },
+        }),
+        new AIMessage({ content: 'post-steer reply', id: 'm1' }),
+      ]);
+
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm1' });
+    });
   });
 
   it('keeps the masked tail content (does not re-inject restored tool payloads into state)', async () => {

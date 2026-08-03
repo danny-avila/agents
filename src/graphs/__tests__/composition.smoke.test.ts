@@ -135,6 +135,7 @@ describe('LangGraph composition smoke tests', () => {
     const usageCount = graph.eagerEventToolUsageCount;
     const scopedUsageCount = graph.getEagerEventToolUsageCount('agent');
     const chunks = graph.eagerEventToolCallChunks;
+    const suppressions = graph.eagerEventToolSuppressions;
 
     graph.eagerEventToolExecutions.set(
       'call_weather',
@@ -143,6 +144,7 @@ describe('LangGraph composition smoke tests', () => {
     graph.eagerEventToolUsageCount.set('weather', 1);
     scopedUsageCount.set('weather', 1);
     graph.eagerEventToolCallChunks.set('0', { argsText: '{"city":"NYC"}' });
+    graph.eagerEventToolSuppressions.add('weather');
 
     graph.resetValues();
 
@@ -150,10 +152,12 @@ describe('LangGraph composition smoke tests', () => {
     expect(graph.eagerEventToolUsageCount).toBe(usageCount);
     expect(graph.getEagerEventToolUsageCount('agent')).toBe(scopedUsageCount);
     expect(graph.eagerEventToolCallChunks).toBe(chunks);
+    expect(graph.eagerEventToolSuppressions).toBe(suppressions);
     expect(graph.eagerEventToolExecutions.size).toBe(0);
     expect(graph.eagerEventToolUsageCount.size).toBe(0);
     expect(scopedUsageCount.size).toBe(0);
     expect(graph.eagerEventToolCallChunks.size).toBe(0);
+    expect(graph.eagerEventToolSuppressions.size).toBe(0);
   });
 
   it('compiles and invokes the standard single-agent graph', async () => {

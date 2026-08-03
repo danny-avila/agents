@@ -256,7 +256,9 @@ function expectChildSpanParentName({
   const children = starts.filter((record) => record.name === childName);
   expect(children).not.toHaveLength(0);
   for (const child of children) {
-    const parent = starts.find((record) => record.spanId === child.parentSpanId);
+    const parent = starts.find(
+      (record) => record.spanId === child.parentSpanId
+    );
     expect(parent?.name.startsWith(parentNamePrefix)).toBe(true);
   }
 }
@@ -558,6 +560,141 @@ describe('Langfuse per-run routing integration', () => {
         traceId: summaryTraceId,
       });
     }
+  });
+
+  it('detaches root observations from foreign ambient spans', async () => {
+    const tenantId = 'tenant-ambient';
+    const foreignTraceId = 'f0e1d2c3b4a5968778695a4b3c2d1e0f';
+    const foreignSpanId = 'a1b2c3d4e5f60718';
+    initializeLangfuseTracing(tenantLangfuse(tenantId));
+
+    // Simulates a host running agent code inside its own OpenTelemetry span
+    // (HTTP server auto-instrumentation on the global provider): the span is
+    // never exported to Langfuse, so inheriting it would orphan the trace
+    // root, merge concurrent runs in one request into a single trace, and
+    // bypass deterministic trace ids.
+    const foreignSpan = otelTrace.wrapSpanContext({
+      traceId: foreignTraceId,
+      spanId: foreignSpanId,
+      traceFlags: 1,
+    });
+    await otelContext.with(
+      otelTrace.setSpan(otelContext.active(), foreignSpan),
+      () => runTenantFlow(tenantId)
+    );
+
+    const starts = startsForTenant(tenantId);
+    expect(starts).not.toHaveLength(0);
+    expect(
+      starts.filter(
+        (record) =>
+          record.traceId === foreignTraceId ||
+          record.parentSpanId === foreignSpanId
+      )
+    ).toHaveLength(0);
+
+    const agentRoot = starts.find(
+      (record) => record.name === `LibreChat Agent: Parent ${tenantId}`
+    );
+    expect(agentRoot?.traceId).toBe(traceIdFromSeed(`routing-${tenantId}`));
+    expect(agentRoot?.parentSpanId).toBeUndefined();
+
+    const titleRoot = starts.find(
+      (record) => record.name === `LibreChat Title: Parent ${tenantId}`
+    );
+    expect(titleRoot?.traceId).toBe(
+      traceIdFromSeed(`title-routing-${tenantId}`)
+    );
+    expect(titleRoot?.parentSpanId).toBeUndefined();
+  });
+
+  it('keeps root observations nested under Langfuse-managed ambient spans', async () => {
+    const tenantId = 'tenant-managed';
+    const langfuse = tenantLangfuse(tenantId);
+    initializeLangfuseTracing(langfuse);
+
+    let hostSpan: MockSpan | undefined;
+    await withLangfuseRuntimeScope({ langfuse }, async () => {
+      hostSpan = createMockSpan('host-group');
+      await otelContext.with(
+        otelTrace.setSpan(otelContext.active(), hostSpan as never),
+        () => runTenantFlow(tenantId)
+      );
+    });
+
+    const hostSpanContext = hostSpan?.spanContext() as {
+      traceId: string;
+      spanId: string;
+    };
+    const agentRoot = startsForTenant(tenantId).find(
+      (record) => record.name === `LibreChat Agent: Parent ${tenantId}`
+    );
+    expect(agentRoot?.traceId).toBe(hostSpanContext.traceId);
+    expect(agentRoot?.parentSpanId).toBe(hostSpanContext.spanId);
+  });
+
+  it('detaches root observations from managed ambient spans of another destination', async () => {
+    const hostTenantId = 'tenant-managed-a';
+    const runTenantId = 'tenant-managed-b';
+    const hostLangfuse = tenantLangfuse(hostTenantId);
+    initializeLangfuseTracing(hostLangfuse);
+    initializeLangfuseTracing(tenantLangfuse(runTenantId));
+
+    let hostSpan: MockSpan | undefined;
+    await withLangfuseRuntimeScope({ langfuse: hostLangfuse }, async () => {
+      hostSpan = createMockSpan('host-group');
+    });
+
+    // A managed span is only a safe parent for runs exporting to the SAME
+    // destination; nesting tenant-B under tenant-A's span would leave B's
+    // trace dangling in B's project with A's trace id.
+    await otelContext.with(
+      otelTrace.setSpan(otelContext.active(), hostSpan as never),
+      () => runTenantFlow(runTenantId)
+    );
+
+    const hostSpanContext = hostSpan?.spanContext() as {
+      traceId: string;
+      spanId: string;
+    };
+    const agentRoot = startsForTenant(runTenantId).find(
+      (record) => record.name === `LibreChat Agent: Parent ${runTenantId}`
+    );
+    expect(agentRoot?.traceId).toBe(traceIdFromSeed(`routing-${runTenantId}`));
+    expect(agentRoot?.traceId).not.toBe(hostSpanContext.traceId);
+    expect(agentRoot?.parentSpanId).toBeUndefined();
+  });
+
+  it('generates a scope stamp for directly-constructed graphs without a run id', async () => {
+    const { StandardGraph } = await import('@/graphs/Graph');
+    const buildGraph = (): { langfuseScopeRunId: string } =>
+      new StandardGraph({
+        agents: [createAgent('stampless')],
+        langfuse: tenantLangfuse('stampless'),
+      }) as unknown as { langfuseScopeRunId: string };
+
+    const graphA = buildGraph();
+    const graphB = buildGraph();
+    expect(graphA.langfuseScopeRunId).toEqual(expect.stringMatching(/^graph:/));
+    expect(graphB.langfuseScopeRunId).toEqual(expect.stringMatching(/^graph:/));
+    expect(graphA.langfuseScopeRunId).not.toBe(graphB.langfuseScopeRunId);
+  });
+
+  it('stamps concurrent executions of the same public run id distinctly', async () => {
+    const { StandardGraph } = await import('@/graphs/Graph');
+    const buildGraph = (): { langfuseScopeRunId: string } =>
+      new StandardGraph({
+        runId: 'duplicate-run',
+        agents: [createAgent('duplicate')],
+        langfuse: tenantLangfuse('duplicate'),
+      }) as unknown as { langfuseScopeRunId: string };
+
+    const first = buildGraph();
+    const second = buildGraph();
+    expect(first.langfuseScopeRunId).toEqual(
+      expect.stringMatching(/^duplicate-run:/)
+    );
+    expect(first.langfuseScopeRunId).not.toBe(second.langfuseScopeRunId);
   });
 
   it('routes spans from captured OTel context after ALS scope exits', () => {

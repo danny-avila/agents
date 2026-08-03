@@ -1708,6 +1708,11 @@ export class AgentContext {
     this.totalTokensFresh = false;
   }
 
+  /** Returns a snapshot of the deferred tools discovered in this context. */
+  getDiscoveredTools(): string[] {
+    return Array.from(this.discoveredToolNames);
+  }
+
   /**
    * Marks tools as discovered via tool search.
    * Discovered tools will be included in the next model binding.

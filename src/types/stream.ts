@@ -145,8 +145,14 @@ export type ProcessedToolCall = {
   /**
    * Settled label for the call, resolved from the tool-supplied
    * `outcome`/`outcome_patch` result fields against the model-authored
-   * `intent` arg. Only present when the tool authored one — hosts apply
-   * the mechanical intent transform themselves when absent.
+   * `intent` arg. Present ONLY when the tool authored one.
+   *
+   * When absent, display the `intent` arg unchanged — do NOT rewrite its
+   * tense. A gerund→past-tense rewrite can only be a closed list of English
+   * verbs, so it never fires for the non-English labels this feature expects
+   * and fires for some sibling calls but not others within one group.
+   * Completion belongs to UI state (the shimmer stopping, the icon settling),
+   * which is language-neutral and always consistent.
    */
   outcome?: string;
 };
@@ -295,10 +301,30 @@ export type SummaryBoundary = {
   contentIndex: number;
 };
 
+/**
+ * Semantic extent of a summary: the first source message compaction retained
+ * verbatim, meaning everything before it is covered. Distinct from `boundary`,
+ * which records where the block was emitted — a retained recency tail sits
+ * *before* the block's own position, so position alone cannot say what the
+ * summary replaced.
+ *
+ * Anchored to the retained side rather than the covered side so that a source
+ * message expanding into several messages (a steer splits an assistant entry
+ * into pre-steer, steer, and post-steer entries sharing one ID) stays whole:
+ * such a message is the retained anchor and survives intact.
+ */
+export type SummaryCoverage = {
+  retainedFromMessageId: string;
+};
+
 export type SummaryContentBlock = {
   type: ContentTypes.SUMMARY;
   content?: MessageContentComplex[];
+  /** Injection budget: provider output-token space when usage was reported, plus
+   *  the wrapper added at injection time. Not comparable with per-message counts
+   *  such as `indexTokenCountMap`, which are in the consumer's own tokenizer. */
   tokenCount?: number;
+  coverage?: SummaryCoverage;
   boundary?: SummaryBoundary;
   summaryVersion?: number;
   model?: string;

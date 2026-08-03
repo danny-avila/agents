@@ -99,15 +99,19 @@ jobs:
       - name: Detect version commit
         id: version
         run: |
-          VERSION=$(git log -1 --pretty=%s "$GITHUB_SHA")
-          if echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+          # Squash-merged release PRs carry a " (#123)" suffix in the subject
+          # (v3.3.6/7/9 releases were silently skipped by an exact match) —
+          # accept it and strip it back to the bare version.
+          SUBJECT=$(git log -1 --pretty=%s "$GITHUB_SHA")
+          if echo "$SUBJECT" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+( \(#[0-9]+\))?$'; then
+            VERSION=$(echo "$SUBJECT" | sed -E 's/ \(#[0-9]+\)$//')
             echo "is_version=true" >> "$GITHUB_OUTPUT"
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "is_version=false" >> "$GITHUB_OUTPUT"
-          echo "Head commit subject '$VERSION' is not a release commit; skipping."
+          echo "Head commit subject '$SUBJECT' is not a release commit; skipping."
 
       - name: Validate package version
         if: steps.version.outputs.is_version == 'true'

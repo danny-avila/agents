@@ -27,6 +27,20 @@ import { Constants } from '@/common';
 const HANDOFF_INSTRUCTIONS_PATTERN = /(?:Instructions?|Context):\s*(.+)/is;
 const HANDOFF_INSTRUCTIONS_KEY = 'handoff_instructions';
 
+/**
+ * Handoff and fan-in prompts that route work between agents. Built in-run and
+ * never persisted as standalone payload entries, so they are marked synthetic:
+ * `messagesStateReducer` would otherwise give them a plain UUID and downstream
+ * consumers — compaction coverage anchors — could not tell them apart from a
+ * message replayed out of the payload.
+ */
+function buildRoutingPrompt(content: string): HumanMessage {
+  return new HumanMessage({
+    content,
+    additional_kwargs: { role: 'user', isMeta: true, source: 'routing' },
+  });
+}
+
 function getHandoffInstructions(
   input: Record<string, unknown>,
   promptKey: string,
@@ -64,6 +78,46 @@ function extractLegacyHandoffInstructions(
     return content.slice(markerIndex + markerLength).trim();
   }
   return content.match(HANDOFF_INSTRUCTIONS_PATTERN)?.[1]?.trim() ?? null;
+}
+
+/** Whether a tool name marks a handoff transfer (static or conditional). */
+function isTransferToolName(name: unknown): boolean {
+  return (
+    typeof name === 'string' &&
+    (name.startsWith(Constants.LC_TRANSFER_TO_) ||
+      name === 'conditional_transfer')
+  );
+}
+
+/**
+ * Drop transfer `tool_use` content blocks from an AI message's array content.
+ * Companion to the reception's tool-call filtering: array-content providers
+ * (Anthropic) serialize retained blocks verbatim, so a transfer block whose
+ * call/result the reception stripped — or a parallel sibling's transfer block,
+ * whose result never reaches this recipient's state — would replay as an
+ * unmatched `tool_use`. Matched by the gathered ids AND by transfer name
+ * (sibling blocks have no collectable id here). String content passes through.
+ */
+function filterTransferToolUseBlocks(
+  content: AIMessage['content'],
+  transferToolCallIds: ReadonlySet<string>
+): AIMessage['content'] {
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  return content.filter((block) => {
+    if (
+      typeof block !== 'object' ||
+      (block as { type?: string } | null)?.type !== 'tool_use'
+    ) {
+      return true;
+    }
+    const toolUse = block as { id?: string; name?: string };
+    if (toolUse.id != null && transferToolCallIds.has(toolUse.id)) {
+      return false;
+    }
+    return !isTransferToolName(toolUse.name);
+  });
 }
 
 function isValidHandoffGroupId(value: unknown): value is number {
@@ -828,9 +882,23 @@ export class MultiAgentGraph extends StandardGraph {
               remainingToolCalls.length > 0 ||
               (typeof aiMsg.content === 'string' && aiMsg.content.trim())
             ) {
-              /** Keep the message but without transfer tool calls */
+              /**
+               * Keep the message but without transfer tool calls — AND
+               * without their `tool_use` content blocks. Array-content
+               * providers (Anthropic) serialize the retained blocks
+               * verbatim, so a transfer block whose call/result this
+               * filter just stripped would reach the receiving agent as
+               * an unmatched `tool_use` and the provider rejects the
+               * request. Filtered by transfer NAME as well as the
+               * gathered ids: a parallel sibling's transfer block has no
+               * result in THIS recipient's state, so its id is never
+               * collected, but its name still marks it.
+               */
               const filteredAiMsg = new AIMessage({
-                content: aiMsg.content,
+                content: filterTransferToolUseBlocks(
+                  aiMsg.content,
+                  transferToolCallIds
+                ),
                 tool_calls: remainingToolCalls,
                 id: aiMsg.id,
               });
@@ -986,12 +1054,12 @@ export class MultiAgentGraph extends StandardGraph {
                 new AIMessage(
                   `[Processed tool result and transferring to ${agentId}]`
                 ),
-                new HumanMessage(instructions),
+                buildRoutingPrompt(instructions),
               ];
             } else {
               messagesForAgent = [
                 ...filteredMessages,
-                new HumanMessage(instructions),
+                buildRoutingPrompt(instructions),
               ];
             }
           }
@@ -1204,7 +1272,7 @@ export class MultiAgentGraph extends StandardGraph {
               effectiveExcludeResults === false
             ) {
               return {
-                messages: [new HumanMessage(promptText)],
+                messages: [buildRoutingPrompt(promptText)],
               };
             }
 
@@ -1212,7 +1280,7 @@ export class MultiAgentGraph extends StandardGraph {
              * to pass filtered messages + prompt to the destination agent
              */
             const filteredMessages = state.messages.slice(0, this.startIndex);
-            const promptMessage = new HumanMessage(promptText);
+            const promptMessage = buildRoutingPrompt(promptText);
             return {
               messages: [promptMessage],
               agentMessages: messagesStateReducer(filteredMessages, [

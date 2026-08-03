@@ -25,6 +25,8 @@ import { resolveToolOutputTracingConfigForSpan } from '@/langfuseRuntimeScope';
 export { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, resolveLangfuseConfig };
 
 const LANGGRAPH_TOOL_NODE_PREFIX = 'tools=';
+const SERVER_TOOL_RESULT_PREFIX = '{"serverToolResult":';
+const SERVER_TOOL_RESULT_REPLAY_MARKER_KEY = 'librechatResponsesReplay';
 
 const CHAT_ROLES = new Set([
   'assistant',
@@ -44,10 +46,72 @@ type RedactionResult = {
 };
 
 type RedactionContext = {
+  generatedImageData: Set<string>;
+  generatedImageIds: Set<string>;
   toolNamesByCallId: Map<string, string>;
 };
 
 const TOOL_OUTPUT_FIELD_KEYS = ['content', 'artifact'];
+
+type ResponsesReplayOutputDescriptor = {
+  nestedOutputFields?: Readonly<Record<string, readonly string[]>>;
+  outputFields: readonly string[];
+  resolveToolNameFromCallId?: boolean;
+  toolName?: string;
+};
+
+const RESPONSES_REPLAY_OUTPUT_DESCRIPTORS: Readonly<
+  Record<string, ResponsesReplayOutputDescriptor>
+> = {
+  local_shell_call_output: {
+    outputFields: ['output'],
+    toolName: 'local_shell',
+  },
+  shell_call_output: { outputFields: ['output'], toolName: 'shell' },
+  apply_patch_call_output: {
+    outputFields: ['output'],
+    toolName: 'apply_patch',
+  },
+  program_output: { outputFields: ['result'], toolName: 'program' },
+  code_interpreter_call: {
+    outputFields: ['outputs'],
+    toolName: 'code_interpreter',
+  },
+  mcp_call: { outputFields: ['output', 'error'], toolName: 'mcp' },
+  mcp_list_tools: {
+    outputFields: ['tools', 'error'],
+    toolName: 'mcp_list_tools',
+  },
+  image_generation_call: {
+    outputFields: ['result'],
+    toolName: 'image_generation',
+  },
+  file_search_call: {
+    outputFields: ['results'],
+    toolName: 'file_search',
+  },
+  web_search_call: {
+    nestedOutputFields: { action: ['sources'] },
+    outputFields: ['results'],
+    toolName: 'web_search',
+  },
+  tool_search_output: {
+    outputFields: ['tools'],
+    toolName: 'tool_search',
+  },
+  function_call_output: {
+    outputFields: ['output'],
+    resolveToolNameFromCallId: true,
+  },
+  custom_tool_call_output: {
+    outputFields: ['output'],
+    resolveToolNameFromCallId: true,
+  },
+  computer_call_output: {
+    outputFields: ['output'],
+    toolName: 'computer_use',
+  },
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value);
@@ -119,6 +183,8 @@ function getSerializedToolCallId(
 ): string | undefined {
   return (
     getStringField(value, 'tool_call_id') ??
+    getStringField(value, 'toolCallId') ??
+    getStringField(value, 'call_id') ??
     getNestedStringField(value, 'kwargs', 'tool_call_id') ??
     getNestedStringField(value, 'additional_kwargs', 'tool_call_id') ??
     getNestedStringField(value, 'data', 'tool_call_id') ??
@@ -180,6 +246,26 @@ function hasToolMessageIdentity(value: Record<string, unknown>): boolean {
   );
 }
 
+function hasAssistantMessageIdentity(value: Record<string, unknown>): boolean {
+  const role = getStringField(value, 'role');
+  if (role?.toLowerCase() === 'assistant') {
+    return true;
+  }
+  const type = getStringField(value, 'type') ?? getStringField(value, '_type');
+  if (type === 'ai' || type === 'assistant') {
+    return true;
+  }
+  const id = value.id;
+  return (
+    Array.isArray(id) &&
+    id.some(
+      (part) =>
+        typeof part === 'string' &&
+        (part === 'AIMessage' || part === 'AIMessageChunk')
+    )
+  );
+}
+
 function redactToolContentFields(
   value: Record<string, unknown>,
   config: ResolvedLangfuseToolOutputTracingConfig
@@ -213,13 +299,250 @@ function redactToolContentFields(
   return next;
 }
 
-function collectToolCallNames(
+function redactResponsesReplayOutput(
+  value: Record<string, unknown>,
+  config: ResolvedLangfuseToolOutputTracingConfig,
+  redactionContext: RedactionContext
+): RedactionResult | undefined {
+  const type = getStringField(value, 'type');
+  if (
+    type == null ||
+    !Object.prototype.hasOwnProperty.call(
+      RESPONSES_REPLAY_OUTPUT_DESCRIPTORS,
+      type
+    )
+  ) {
+    return undefined;
+  }
+  const descriptor =
+    RESPONSES_REPLAY_OUTPUT_DESCRIPTORS[
+      type as keyof typeof RESPONSES_REPLAY_OUTPUT_DESCRIPTORS
+    ];
+  const hasDirectOutput = descriptor.outputFields.some(
+    (outputField) => outputField in value
+  );
+  const hasNestedOutput = Object.entries(
+    descriptor.nestedOutputFields ?? {}
+  ).some(([objectField, outputFields]) => {
+    const nested = value[objectField];
+    return (
+      isRecord(nested) &&
+      outputFields.some((outputField) => outputField in nested)
+    );
+  });
+  if (!hasDirectOutput && !hasNestedOutput) {
+    return undefined;
+  }
+  let toolName = descriptor.toolName;
+  if (descriptor.resolveToolNameFromCallId === true) {
+    toolName = getSerializedToolName(value, redactionContext);
+  } else if (type === 'mcp_call') {
+    toolName = getStringField(value, 'name') ?? descriptor.toolName;
+  }
+  if (!shouldRedactTool(toolName, config)) {
+    return undefined;
+  }
+  const redacted = { ...value };
+  for (const outputField of descriptor.outputFields) {
+    if (outputField in redacted) {
+      redacted[outputField] = config.redactionText;
+    }
+  }
+  for (const [objectField, outputFields] of Object.entries(
+    descriptor.nestedOutputFields ?? {}
+  )) {
+    const nested = redacted[objectField];
+    if (!isRecord(nested)) {
+      continue;
+    }
+    const redactedNested = { ...nested };
+    for (const outputField of outputFields) {
+      if (outputField in redactedNested) {
+        redactedNested[outputField] = config.redactionText;
+      }
+    }
+    redacted[objectField] = redactedNested;
+  }
+  return {
+    value: redacted,
+    changed: true,
+  };
+}
+
+function redactStandardServerToolResult(
+  value: Record<string, unknown>,
+  config: ResolvedLangfuseToolOutputTracingConfig,
+  redactionContext: RedactionContext
+): RedactionResult | undefined {
+  if (
+    getStringField(value, 'type') !== 'server_tool_call_result' ||
+    !('output' in value)
+  ) {
+    return undefined;
+  }
+  const toolName =
+    getNestedStringField(value, 'extras', 'name') ??
+    getSerializedToolName(value, redactionContext);
+  if (!shouldRedactTool(toolName, config)) {
+    return undefined;
+  }
+  return {
+    value: { ...value, output: config.redactionText },
+    changed: true,
+  };
+}
+
+function parseSerializedServerToolResultMarker(
+  text: string
+): { toolName?: string } | undefined {
+  if (!text.startsWith(SERVER_TOOL_RESULT_PREFIX)) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!isRecord(parsed) || !isRecord(parsed.serverToolResult)) {
+      return undefined;
+    }
+    const result = parsed.serverToolResult;
+    if (result[SERVER_TOOL_RESULT_REPLAY_MARKER_KEY] !== true) {
+      return undefined;
+    }
+    const status = getStringField(result, 'status');
+    if (
+      (status !== 'error' && status !== 'success') ||
+      !Object.prototype.hasOwnProperty.call(result, 'output')
+    ) {
+      return undefined;
+    }
+    const toolName = getStringField(result, 'toolName');
+    return toolName != null ? { toolName } : {};
+  } catch {
+    const match =
+      /^\{"serverToolResult":\{"librechatResponsesReplay":true,(?:"toolName":("(?:\\.|[^"\\])*"),)?"status":"(?:error|success)","output":/.exec(
+        text.slice(0, 512)
+      );
+    if (match == null) {
+      return undefined;
+    }
+    const encodedToolName = match.at(1);
+    if (encodedToolName == null) {
+      return {};
+    }
+    try {
+      const toolName = JSON.parse(encodedToolName) as unknown;
+      return typeof toolName === 'string' ? { toolName } : {};
+    } catch {
+      return {};
+    }
+  }
+}
+
+function redactMarkedServerToolResult(
+  value: Record<string, unknown>,
+  config: ResolvedLangfuseToolOutputTracingConfig,
+  allowSerializedMarker: boolean
+): RedactionResult | undefined {
+  const type = getStringField(value, 'type');
+  if (type !== 'text' && type !== 'image') {
+    return undefined;
+  }
+  const text = type === 'text' ? getStringField(value, 'text') : undefined;
+  const extras = value.extras;
+  const marker = isRecord(extras)
+    ? extras.librechatServerToolResult
+    : undefined;
+  const serializedMarker =
+    allowSerializedMarker && text != null
+      ? parseSerializedServerToolResultMarker(text)
+      : undefined;
+  if (!isRecord(marker) && serializedMarker == null) {
+    return undefined;
+  }
+  const toolName = isRecord(marker)
+    ? getStringField(marker, 'toolName')
+    : serializedMarker?.toolName;
+  if (!shouldRedactTool(toolName, config)) {
+    return undefined;
+  }
+  if (type === 'image') {
+    const redacted = { ...value };
+    let changed = false;
+    for (const outputField of ['data', 'url', 'fileId']) {
+      if (outputField in redacted) {
+        redacted[outputField] = config.redactionText;
+        changed = true;
+      }
+    }
+    return changed ? { value: redacted, changed: true } : undefined;
+  }
+  return {
+    value: { ...value, text: config.redactionText },
+    changed: true,
+  };
+}
+
+function redactGeneratedImageBlock(
+  value: Record<string, unknown>,
+  config: ResolvedLangfuseToolOutputTracingConfig,
+  redactionContext: RedactionContext,
+  isAssistantContent: boolean
+): RedactionResult | undefined {
+  if (
+    getStringField(value, 'type') !== 'image' ||
+    !shouldRedactTool('image_generation', config)
+  ) {
+    return undefined;
+  }
+  const extras = value.extras;
+  const explicitMarker = isRecord(extras)
+    ? extras.librechatServerToolResult
+    : undefined;
+  const explicitToolName = isRecord(explicitMarker)
+    ? getStringField(explicitMarker, 'toolName')
+    : undefined;
+  if (
+    explicitToolName != null &&
+    normalizeToolName(explicitToolName) !== 'image_generation'
+  ) {
+    return undefined;
+  }
+  const id = getStringField(value, 'id');
+  const data = getStringField(value, 'data');
+  const metadata = value.metadata;
+  const normalizedStatus = isRecord(metadata)
+    ? getStringField(metadata, 'status')
+    : undefined;
+  const hasNormalizedGeneratedImageIdentity =
+    isAssistantContent &&
+    id?.startsWith('ig_') === true &&
+    isPresent(normalizedStatus);
+  const isGeneratedImage =
+    explicitToolName != null ||
+    hasNormalizedGeneratedImageIdentity ||
+    (id != null
+      ? redactionContext.generatedImageIds.has(id)
+      : data != null && redactionContext.generatedImageData.has(data));
+  if (!isGeneratedImage) {
+    return undefined;
+  }
+  const redacted = { ...value };
+  let changed = false;
+  for (const outputField of ['data', 'url', 'fileId']) {
+    if (outputField in redacted) {
+      redacted[outputField] = config.redactionText;
+      changed = true;
+    }
+  }
+  return changed ? { value: redacted, changed: true } : undefined;
+}
+
+function collectRedactionContext(
   value: unknown,
   redactionContext: RedactionContext
 ): void {
   if (Array.isArray(value)) {
     for (const item of value) {
-      collectToolCallNames(item, redactionContext);
+      collectRedactionContext(item, redactionContext);
     }
     return;
   }
@@ -234,21 +557,38 @@ function collectToolCallNames(
     redactionContext.toolNamesByCallId.set(toolCallId, toolName);
   }
 
+  if (getStringField(value, 'type') === 'image_generation_call') {
+    const id = getStringField(value, 'id');
+    const result = getStringField(value, 'result');
+    if (id != null) {
+      redactionContext.generatedImageIds.add(id);
+    }
+    if (result != null) {
+      redactionContext.generatedImageData.add(result);
+    }
+  }
+
   for (const child of Object.values(value)) {
-    collectToolCallNames(child, redactionContext);
+    collectRedactionContext(child, redactionContext);
   }
 }
 
 function redactValue(
   value: unknown,
   config: ResolvedLangfuseToolOutputTracingConfig,
-  redactionContext: RedactionContext
+  redactionContext: RedactionContext,
+  allowSerializedServerToolResult = false
 ): RedactionResult {
   if (Array.isArray(value)) {
     let changed = false;
     const next: unknown[] = [];
     for (const item of value) {
-      const result = redactValue(item, config, redactionContext);
+      const result = redactValue(
+        item,
+        config,
+        redactionContext,
+        allowSerializedServerToolResult
+      );
       if (result.changed) {
         changed = true;
       }
@@ -259,6 +599,43 @@ function redactValue(
 
   if (!isRecord(value)) {
     return { value, changed: false };
+  }
+
+  const allowSerializedMarker =
+    allowSerializedServerToolResult || hasAssistantMessageIdentity(value);
+
+  const replayOutput = redactResponsesReplayOutput(
+    value,
+    config,
+    redactionContext
+  );
+  if (replayOutput != null) {
+    return replayOutput;
+  }
+  const standardServerToolResult = redactStandardServerToolResult(
+    value,
+    config,
+    redactionContext
+  );
+  if (standardServerToolResult != null) {
+    return standardServerToolResult;
+  }
+  const markedServerToolResult = redactMarkedServerToolResult(
+    value,
+    config,
+    allowSerializedMarker
+  );
+  if (markedServerToolResult != null) {
+    return markedServerToolResult;
+  }
+  const generatedImageBlock = redactGeneratedImageBlock(
+    value,
+    config,
+    redactionContext,
+    allowSerializedMarker
+  );
+  if (generatedImageBlock != null) {
+    return generatedImageBlock;
   }
 
   const toolName = getSerializedToolName(value, redactionContext);
@@ -272,7 +649,12 @@ function redactValue(
   let changed = false;
   const next: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
-    const result = redactValue(child, config, redactionContext);
+    const result = redactValue(
+      child,
+      config,
+      redactionContext,
+      allowSerializedMarker
+    );
     if (result.changed) {
       changed = true;
     }
@@ -287,10 +669,12 @@ function redactSerializedValue(
   config: ResolvedLangfuseToolOutputTracingConfig
 ): RedactionResult {
   const redactionContext: RedactionContext = {
+    generatedImageData: new Set(),
+    generatedImageIds: new Set(),
     toolNamesByCallId: new Map(),
   };
   if (typeof value !== 'string') {
-    collectToolCallNames(value, redactionContext);
+    collectRedactionContext(value, redactionContext);
     return redactValue(value, config, redactionContext);
   }
 
@@ -301,13 +685,18 @@ function redactSerializedValue(
 
   try {
     const parsed = JSON.parse(value) as unknown;
-    collectToolCallNames(parsed, redactionContext);
+    collectRedactionContext(parsed, redactionContext);
     const result = redactValue(parsed, config, redactionContext);
     return result.changed
       ? { value: JSON.stringify(result.value), changed: true }
       : { value, changed: false };
   } catch {
-    return { value, changed: false };
+    // OpenTelemetry truncates string attributes before span processors run.
+    // Langfuse serializes structured message values to JSON first, so a
+    // truncated attribute can still contain tool output even though it is no
+    // longer parseable. Fail closed for JSON-shaped attributes whenever tool
+    // output redaction is active instead of exporting a partial secret.
+    return { value: config.redactionText, changed: true };
   }
 }
 
@@ -397,6 +786,17 @@ export function redactLangfuseSpanToolOutputs(
   }
 }
 
+export function prepareLangfuseSpanForExport(
+  span: ReadableSpan,
+  config?: ResolvedLangfuseToolOutputTracingConfig
+): void {
+  classifyLangfuseToolNodeSpan(span);
+  if (config != null) {
+    redactLangfuseSpanToolOutputs(span, config);
+  }
+  shapeLangfuseSpan(span);
+}
+
 class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
   private readonly processor: LangfuseSpanProcessor;
   private readonly fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig;
@@ -430,12 +830,8 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
     if (shouldDropLangfuseSpan(span.name)) {
       return;
     }
-    classifyLangfuseToolNodeSpan(span);
-    shapeLangfuseSpan(span);
     const config = this.spanConfigs.get(span) ?? this.fallbackConfig;
-    if (config != null) {
-      redactLangfuseSpanToolOutputs(span, config);
-    }
+    prepareLangfuseSpanForExport(span, config);
     this.processor.onEnd(span);
   }
 

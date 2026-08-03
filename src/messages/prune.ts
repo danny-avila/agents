@@ -1403,7 +1403,18 @@ function createBoundedTruncationValue(
     _originalChars: originalChars,
   };
   if (JSON.stringify(emptyEnvelope).length > normalizedMaxChars) {
-    return null;
+    /**
+     * Even the empty envelope overflows the cap, so no preview survives —
+     * but the result must still be a JSON OBJECT, never `null`. This value
+     * replaces a `tool_use.input` / tool-call `args` on messages that are
+     * mutated IN PLACE into graph state (`preFlightTruncateToolCallInputs`),
+     * and Anthropic rejects a replayed non-object input with a 400
+     * (`tool_use.input: Input should be an object`). Observed live: a tight
+     * summarization budget shrank the cap below the envelope, nulled a
+     * retained calculator call's input and args, and the next model call
+     * failed on replay.
+     */
+    return {};
   }
 
   let low = 0;

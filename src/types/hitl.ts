@@ -158,6 +158,14 @@ export interface AskUserQuestionRequest {
 export interface AskUserQuestionInterruptPayload {
   type: 'ask_user_question';
   question: AskUserQuestionRequest;
+  /**
+   * The `tool_call_id` of the ask-tool call that raised this interrupt,
+   * when the tool body supplied it (see `askUserQuestion`'s `options`).
+   * Lets hosts attribute the question — and later the answer — to the
+   * exact tool-call content part instead of guessing by position, which
+   * mislabels cards when a model emits several ask calls in one turn.
+   */
+  tool_call_id?: string;
 }
 
 /**

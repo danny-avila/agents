@@ -35,6 +35,7 @@ import type * as t from '@/types';
 import { Providers as providers, GraphEvents } from '@/common';
 import * as events from '@/utils/events';
 import { HookRegistry, createToolPolicyHook } from '@/hooks';
+import { askUserQuestion } from '@/hitl';
 import { ToolNode } from '../ToolNode';
 
 async function flushAsyncWork(): Promise<void> {
@@ -4352,6 +4353,63 @@ describe('AskUserQuestion — interrupt + resume', () => {
     );
     expect(toolMessage).toBeDefined();
     expect(String(toolMessage!.content)).toBe('staging');
+  });
+
+  it('askUserQuestion surfaces the calling tool_call_id on the interrupt payload when the body supplies it', async () => {
+    /**
+     * LangChain stamps the full ToolCall onto the config a `tool(fn, …)`
+     * body receives, so the body can attribute its interrupt to the exact
+     * call. Hosts use `payload.tool_call_id` to stamp the question/answer
+     * onto the right content part when a model emits several ask calls in
+     * one turn — positional guessing mislabels the cards.
+     */
+    const askTool = tool(
+      async (input: { question: string }, config) => {
+        const resolution = askUserQuestion(input, {
+          toolCallId: config.toolCall?.id,
+        });
+        return resolution.answer;
+      },
+      {
+        name: 'ask_user_question',
+        description: 'Ask the user a clarifying question.',
+        schema: z.object({ question: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+
+    const node = new ToolNode({ tools: [askTool] });
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_ask_id_1',
+        name: 'ask_user_question',
+        args: { question: 'Which region?' },
+      },
+    ]);
+    const config = { configurable: { thread_id: 'thread-ask-call-id' } };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+    if (!isInterrupted<t.HumanInterruptPayload>(interrupted)) {
+      throw new Error('expected interrupt');
+    }
+    const payload = interrupted.__interrupt__[0].value!;
+    if (payload.type !== 'ask_user_question') {
+      throw new Error('expected ask_user_question payload');
+    }
+    expect(payload.tool_call_id).toBe('call_ask_id_1');
+    expect(payload.question.question).toBe('Which region?');
+
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      { answer: 'us-east' } satisfies t.AskUserQuestionResolution,
+      config
+    )) as MessagesUpdate;
+    const toolMessage = resumed.messages.find(
+      (m): m is ToolMessage =>
+        m._getType() === 'tool' &&
+        (m as ToolMessage).tool_call_id === 'call_ask_id_1'
+    );
+    expect(String(toolMessage!.content)).toBe('us-east');
   });
 
   it('isAskUserQuestionInterrupt narrows the payload union correctly', async () => {

@@ -1,4 +1,5 @@
 /* eslint-disable no-console */
+import { v4 } from 'uuid';
 import { nanoid } from 'nanoid';
 import { tool } from '@langchain/core/tools';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
@@ -54,6 +55,14 @@ import {
   removePredecessorHandoffCue,
 } from '@/messages';
 import {
+  attemptInvoke,
+  tryFallbackProviders,
+  getFallbackErrorContext,
+  getFallbackOverflowCandidates,
+  projectMessagesForProvider,
+  resolveServingModelId,
+} from '@/llm/invoke';
+import {
   resetIfNotEmpty,
   isAnthropicLike,
   isOpenAILike,
@@ -64,14 +73,14 @@ import {
   sleep,
 } from '@/utils';
 import {
-  attemptInvoke,
-  tryFallbackProviders,
-  getFallbackErrorContext,
-  getFallbackOverflowCandidates,
-  projectMessagesForProvider,
-  resolveServingModelId,
-} from '@/llm/invoke';
-import { v4 } from 'uuid';
+  Constants,
+  GraphNodeKeys,
+  ContentTypes,
+  GraphEvents,
+  Providers,
+  StepTypes,
+  PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
+} from '@/common';
 import {
   createLangfuseHandler,
   createLangfuseTraceMetadata,
@@ -84,20 +93,15 @@ import {
   translateRecoveryBudget,
 } from '@/llm/contextOverflowRecovery';
 import {
+  hasToolOutputTracingConfig,
+  resolveLangfuseConfig,
+  resolveToolOutputTracingConfig,
+} from '@/langfuseConfig';
+import {
   compactToolContent,
   getToolContentCharLength,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
-import { resolveMaxSeals } from '@/llm/preempt';
-import {
-  Constants,
-  GraphNodeKeys,
-  ContentTypes,
-  GraphEvents,
-  Providers,
-  StepTypes,
-  PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
-} from '@/common';
 import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
@@ -125,12 +129,12 @@ import { shouldTriggerSummarization } from '@/summarization';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
-import { resolveLangfuseConfig } from '@/langfuseConfig';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
 import { isThinkingEnabled } from '@/llm/request';
+import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
@@ -639,6 +643,10 @@ export abstract class Graph<
     currentToolMap?: t.ToolMap;
   }): CustomToolNode<T> | ToolNode<T>;
   abstract getRunMessages(): BaseMessage[] | undefined;
+  /** Returns a snapshot of deferred tools discovered by this graph. */
+  getDiscoveredTools(_agentId?: string): string[] {
+    return [];
+  }
   abstract getContentParts(): t.MessageContentComplex[] | undefined;
   abstract generateStepId(stepKey: string): [string, number];
   abstract getKeyList(
@@ -763,6 +771,15 @@ export abstract class Graph<
   eagerEventToolCallChunks: Map<string, t.EagerEventToolCallChunkState> =
     new Map();
   /**
+   * Per-run eager prestart circuit breaker, shared by reference with every
+   * ToolNode this graph compiles. When a prestarted execution's args turn
+   * out to differ from the final request, ToolNode records the tool name
+   * here and the stream handler stops prestarting that tool for the rest of
+   * the run — the retry then executes normally instead of re-diverging in a
+   * loop (LibreChat#14371).
+   */
+  eagerEventToolSuppressions: Set<string> = new Set();
+  /**
    * Run-scoped execution backend for built-in code tools. Defaults to the
    * remote Code API sandbox when unset.
    */
@@ -811,6 +828,7 @@ export abstract class Graph<
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
+    this.eagerEventToolSuppressions.clear();
     this.toolExecution = undefined;
     this.handlerDispatchedEventCounts.clear();
     /**
@@ -992,11 +1010,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   messages: BaseMessage[] = [];
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
+  /** Per-agent discovery snapshots preserved before contexts are reset on cleanup. */
+  private cachedDiscoveredTools?: Map<string, string[]>;
   /** Ids of AI turns the agent node returned THIS run; see isRunProducedMessage. */
   protected runProducedAiMessageIds = new Set<string>();
   /** Checkpoint scope whose messages match index-keyed tool snapshots. */
   private originalToolContentCheckpointScope?: string;
   runId: string | undefined;
+  /**
+   * Identity used to stamp Langfuse runtime scopes and handlers (see
+   * `LangfuseRuntimeContext.runId`). Carries an opaque per-instance
+   * component: public run ids are unrestricted and may repeat across
+   * concurrently executing runs (retries, duplicate submissions,
+   * tenant-local message ids), and equal stamps would let those runs adopt
+   * each other's scopes. One graph instance = one execution's stamp, shared
+   * by the stream handler and every graph-level scope of that execution.
+   */
+  readonly langfuseScopeRunId: string;
   /**
    * Boundary between historical messages (loaded from conversation state)
    * and messages produced during the current run.  Set once in the state
@@ -1081,6 +1111,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
+    this.langfuseScopeRunId = `${runId ?? 'graph'}:${nanoid()}`;
     this.signal = signal;
     this.langfuse = langfuse;
     this.subagentUsageSink = subagentUsageSink;
@@ -1112,6 +1143,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   resetValues(keepContent?: boolean, checkpointScope?: string): void {
     this.messages = [];
     this.cachedRunMessages = undefined;
+    this.cachedDiscoveredTools = undefined;
     this.config = resetIfNotEmpty(this.config, undefined);
     if (keepContent !== true) {
       this.contentData = resetIfNotEmpty(this.contentData, []);
@@ -1129,6 +1161,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
+    this.eagerEventToolSuppressions.clear();
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
@@ -1177,6 +1210,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   override clearHeavyState(): void {
     this.cachedRunMessages = this.messages.slice(this.startIndex);
+    this.cachedDiscoveredTools = new Map(
+      Array.from(this.agentContexts, ([agentId, context]) => [
+        agentId,
+        context.getDiscoveredTools(),
+      ])
+    );
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
@@ -1471,6 +1510,32 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return this.messages.slice(this.startIndex);
   }
 
+  override getDiscoveredTools(agentId?: string): string[] {
+    if (agentId != null) {
+      const current =
+        this.agentContexts.get(agentId)?.getDiscoveredTools() ?? [];
+      if (current.length > 0 || this.cachedDiscoveredTools == null) {
+        return current;
+      }
+      return [...(this.cachedDiscoveredTools.get(agentId) ?? [])];
+    }
+
+    const discoveredTools = new Set<string>();
+    for (const context of this.agentContexts.values()) {
+      for (const toolName of context.getDiscoveredTools()) {
+        discoveredTools.add(toolName);
+      }
+    }
+    if (discoveredTools.size === 0 && this.cachedDiscoveredTools != null) {
+      for (const snapshot of this.cachedDiscoveredTools.values()) {
+        for (const toolName of snapshot) {
+          discoveredTools.add(toolName);
+        }
+      }
+    }
+    return Array.from(discoveredTools);
+  }
+
   /**
    * True when THIS RUN produced `message` — the provenance the handoff cue
    * gate needs. Tracked as an id set rather than inferred from `startIndex`
@@ -1657,6 +1722,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         eagerEventToolUsageCount: this.getEagerEventToolUsageCount(
           agentContext?.agentId
         ),
+        eagerEventToolSuppressions: this.eagerEventToolSuppressions,
         toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         interruptingToolNames:
@@ -3057,6 +3123,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         metadata: {
           ...(config.metadata ?? {}),
           ...traceMetadata,
+          /** Canonical agent identity, stamped OUTSIDE trace-metadata
+           *  filtering: `createLangfuseTraceMetadata` drops values over its
+           *  length cap, but scope trust (`isForeignScope`) needs the id
+           *  verbatim regardless of length. */
+          agentId,
         },
       };
       initializeLangfuseTracing(langfuse);
@@ -3069,6 +3140,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           tags: ['librechat', 'agent'],
           traceIdSeed:
             langfuse?.deterministicTraceId === true ? this.runId : undefined,
+          runId: this.langfuseScopeRunId,
+          toolOutputTracing: hasToolOutputTracingConfig(
+            this.langfuse,
+            agentContext.langfuse
+          )
+            ? resolveToolOutputTracingConfig(
+              this.langfuse,
+              agentContext.langfuse
+            )
+            : undefined,
         });
         if (langfuseHandler != null) {
           invokeConfig = {
@@ -3089,6 +3170,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,
             langfuseOverlay: agentContext.langfuse,
+            runId: this.langfuseScopeRunId,
+            agentId,
           }),
           () =>
             attemptInvoke(
@@ -3251,6 +3334,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             resolveLangfuseRuntimeScope({
               runLangfuse: this.langfuse,
               langfuseOverlay: agentContext.langfuse,
+              runId: this.langfuseScopeRunId,
+              agentId,
             }),
             () =>
               tryFallbackProviders({
@@ -3673,7 +3758,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * the same run — `haltRun` is first-write-wins — is left alone.
      */
     const halt = this.hookRegistry.getHaltSignal(runId);
-    if (result.preventContinuation === true && halt?.source === 'PreemptBoundary') {
+    if (
+      result.preventContinuation === true &&
+      halt?.source === 'PreemptBoundary'
+    ) {
       this.preemptHaltReason = halt.reason;
       this.hookRegistry.clearHaltSignal(runId);
     }

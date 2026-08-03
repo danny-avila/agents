@@ -82,6 +82,17 @@ type CompletionsStreamDelegate = {
   ) => AsyncGenerator<ChatGenerationChunk>;
 };
 
+type ResponsesStreamDelegate = {
+  completionWithRetry: (
+    request: OpenAIClient.Responses.ResponseCreateParamsStreaming
+  ) => Promise<AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>>;
+  _streamResponseChunks: (
+    messages: BaseMessage[],
+    options: Record<string, unknown>,
+    runManager?: CallbackManagerForLLMRun
+  ) => AsyncGenerator<ChatGenerationChunk>;
+};
+
 type InvocationParamsDelegate = {
   invocationParams: (
     options: Record<string, unknown>,
@@ -108,6 +119,9 @@ function completionsDelegateOf(model: ChatOpenAI): CompletionsDelegate {
 
 const completionsOf = <T>(model: ChatOpenAI): T =>
   (model as unknown as { completions: T }).completions;
+
+const responsesOf = <T>(model: ChatOpenAI): T =>
+  (model as unknown as { responses: T }).responses;
 
 function newOpenAI(): ChatOpenAI {
   return new ChatOpenAI({ model: 'gpt-4o-mini', apiKey: 'test-key' });
@@ -1080,6 +1094,90 @@ describe('ChatOpenAICompletions streaming usage_metadata callback', () => {
   });
 });
 
+describe('ChatOpenAIResponses streaming callback dispatch', () => {
+  it('emits the callback before a consumer stops at the yielded chunk', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = responsesOf<ResponsesStreamDelegate>(model);
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 0,
+          content_index: 0,
+          item_id: 'msg_callback',
+          delta: 'visible chunk',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    const events: string[] = [];
+    const runManager = {
+      handleLLMNewToken(token: string): void {
+        events.push(`callback:${token}`);
+      },
+    } as unknown as CallbackManagerForLLMRun;
+
+    for await (const chunk of responses._streamResponseChunks(
+      [new HumanMessage('test')],
+      {},
+      runManager
+    )) {
+      events.push(`yield:${chunk.text}`);
+      break;
+    }
+
+    expect(events).toEqual(['callback:visible chunk', 'yield:visible chunk']);
+  });
+
+  it('propagates an abort received with the next buffered event', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = responsesOf<ResponsesStreamDelegate>(model);
+    const controller = new AbortController();
+    const abortReason = new Error('buffered Responses stream aborted');
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 0,
+          output_index: 0,
+          content_index: 0,
+          item_id: 'msg_abort',
+          delta: 'partial',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        controller.abort(abortReason);
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 1,
+          output_index: 0,
+          content_index: 0,
+          item_id: 'msg_abort',
+          delta: ' must not complete normally',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    const stream = responses._streamResponseChunks([new HumanMessage('test')], {
+      signal: controller.signal,
+    });
+
+    await expect(stream.next()).resolves.toMatchObject({
+      done: false,
+      value: { text: 'partial' },
+    });
+    await expect(stream.next()).rejects.toBe(abortReason);
+  });
+});
+
 describe('ChatOpenAICompletions reasoning_content compatibility', () => {
   it('should preserve reasoning_content on streamed assistant chunks', async () => {
     const model = new ChatOpenAI({
@@ -1237,11 +1335,15 @@ describe('ChatOpenAICompletions strict tools for structured output', () => {
       }) as unknown as {
         tools?: { function: { parameters: { properties: object } } }[];
       };
-      return Object.keys(params.tools?.[0]?.function.parameters.properties ?? {});
+      return Object.keys(
+        params.tools?.[0]?.function.parameters.properties ?? {}
+      );
     }
 
     it('drops the optional label when strict is auto-enabled (invalid otherwise)', () => {
-      expect(toolProperties({ response_format: jsonSchemaResponseFormat })).toEqual(['query']);
+      expect(
+        toolProperties({ response_format: jsonSchemaResponseFormat })
+      ).toEqual(['query']);
     });
 
     it('keeps the label on non-strict requests', () => {
@@ -1305,10 +1407,9 @@ describe('ChatOpenAICompletions strict tools for structured output', () => {
       }) as unknown as {
         tools?: { function: { parameters: { properties: object } } }[];
       };
-      expect(Object.keys(params.tools?.[0]?.function.parameters.properties ?? {})).toEqual([
-        'intent',
-        'title',
-      ]);
+      expect(
+        Object.keys(params.tools?.[0]?.function.parameters.properties ?? {})
+      ).toEqual(['intent', 'title']);
     });
   });
 });

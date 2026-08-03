@@ -75,6 +75,28 @@ export type EagerEventToolCallChunkState = {
   argsText: string;
   index?: number;
   lastArgsFragment?: string;
+  /**
+   * Cumulative length of every observed args fragment — the length of the
+   * plain in-order concatenation that LangChain's `AIMessageChunk.concat`
+   * performs to build the final tool call. Every reconciliation branch in
+   * `mergeToolCallArgsText` (and the repeat-fragment dedupe) produces text no
+   * longer than plain concatenation, with equality exactly when every merge
+   * was a pure append — so `argsText.length === rawArgsLength` proves
+   * `argsText` IS the canonical accumulation the final request will carry.
+   * Tracking only the length keeps cumulative/restating streams from
+   * retaining every prefix (quadratic growth) while still letting seal-time
+   * prestart verify the snapshot.
+   */
+  rawArgsLength?: number;
+  /**
+   * The non-empty args fragment carried by a chunk whose explicit adapter
+   * seal covered this call. Some adapters restate the finished call's full
+   * args on the seal chunk (OpenAI Responses `function_call_arguments.done`);
+   * only such a restatement may override the canonical-accumulation check at
+   * seal time. Pure-signal seals (Bedrock `contentBlockStop`, `args: ''`)
+   * never set this.
+   */
+  sealedArgsFragment?: string;
 };
 
 export type ToolNodeOptions = {
@@ -156,6 +178,14 @@ export type ToolNodeOptions = {
   eagerEventToolExecutions?: Map<string, EagerEventToolExecution>;
   /** Shared per-run per-tool turn counter used by eager and normal event dispatch. */
   eagerEventToolUsageCount?: Map<string, number>;
+  /**
+   * Shared per-run circuit breaker for eager prestart. When a prestarted
+   * execution's args turn out to differ from the final request ("changed
+   * after eager execution started"), the ToolNode adds the tool name here
+   * and the stream handler stops prestarting that tool for the remainder of
+   * the run, so the model's retry executes normally instead of looping.
+   */
+  eagerEventToolSuppressions?: Set<string>;
   /**
    * Hook registry for PreToolUse/PostToolUse/PostToolUseFailure/
    * PermissionDenied lifecycle hooks. Fires for **every** tool the
@@ -241,7 +271,11 @@ export type ToolEndEvent = {
    * present (see `ProcessedToolCall.outcome`) so `ON_RUN_STEP_COMPLETED`
    * consumers can read it without an unsafe cast.
    */
-  tool_call: ToolCall & { output?: string; progress?: number; outcome?: string };
+  tool_call: ToolCall & {
+    output?: string;
+    progress?: number;
+    outcome?: string;
+  };
   /** The content index of the tool call */
   index: number;
   type?: 'tool_call';

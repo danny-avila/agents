@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "3.3.6",
+  "version": "3.3.11",
   "main": "./dist/cjs/main.cjs",
   "module": "./dist/esm/main.mjs",
   "types": "./dist/types/index.d.ts",
@@ -199,7 +199,9 @@
     "re": "bun run clean && bun install && rm -rf ./dist && turbo build",
     "lint": "eslint \"{,!(node_modules|venv)/**/}*.{js,jsx,ts,tsx}\" --fix",
     "format": "prettier --write .",
-    "audit": "npm audit --omit=dev"
+    "audit": "npm audit --omit=dev",
+    "label:eval": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/activity-labels/run.ts",
+    "label:rescore": "node ./src/scripts/activity-labels/rescore.cjs"
   },
   "overrides": {
     "@langchain/openai": "1.5.5",
@@ -224,17 +226,17 @@
     "@langchain/google-gauth": "2.2.0",
     "@langchain/google-genai": "2.2.0",
     "@langchain/google-vertexai": "2.2.0",
-    "@langchain/langgraph": "^1.4.6",
+    "@langchain/langgraph": "1.4.8",
     "@langchain/mistralai": "^1.2.0",
     "@langchain/openai": "1.5.5",
     "@langchain/textsplitters": "^1.0.1",
     "@langchain/xai": "^1.4.3",
+    "@langfuse/core": "^5.4.1",
     "@langfuse/langchain": "^5.4.1",
     "@langfuse/otel": "^5.4.1",
     "@langfuse/tracing": "^5.4.1",
     "@opentelemetry/context-async-hooks": "^2.9.0",
     "@opentelemetry/sdk-node": "^0.220.0",
-    "@scarf/scarf": "^1.4.0",
     "@types/diff": "^7.0.2",
     "ai-tokenizer": "^1.0.6",
     "axios": "^1.18.1",
@@ -246,6 +248,7 @@
     "nanoid": "^3.3.7",
     "okapibm25": "^1.4.1",
     "openai": "^6.46.0",
+    "reo-census": "^1.2.9",
     "uuid": "^11.1.1"
   },
   "peerDependencies": {

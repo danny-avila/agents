@@ -28,6 +28,13 @@ const TRACE_INPUT = LangfuseOtelSpanAttributes.TRACE_INPUT;
 const TRACE_OUTPUT = LangfuseOtelSpanAttributes.TRACE_OUTPUT;
 const OBSERVATION_TYPE = LangfuseOtelSpanAttributes.OBSERVATION_TYPE;
 const TRACE_TAGS = LangfuseOtelSpanAttributes.TRACE_TAGS;
+const METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
+
+/** The outer workflow node: a non-root LangGraph node span whose
+ *  `langgraph_node` metadata equals its name. */
+function createWorkflowNodeSpan(name: string): TestSpan {
+  return createSpan(name, { [METADATA_LANGGRAPH_NODE]: name }, 'parent-1');
+}
 
 describe('shouldDropLangfuseSpan', () => {
   it('drops langgraph __start__ seed spans', () => {
@@ -127,6 +134,177 @@ describe('shapeLangfuseSpan', () => {
     expect(span.name).toBe('tool-dispatch');
   });
 
+  it('counts id-bearing invalid_tool_calls in the dispatch input (mixed and invalid-only)', () => {
+    /** ToolNode pairs attributable invalid calls with synthesized error
+     *  results (and routes invalid-only turns on them alone), so the span
+     *  input must include them — invalid-only used to find zero calls and
+     *  keep the full serialized graph state as the input. */
+    const mixed = [
+      {
+        type: 'ai',
+        id: 'ai_mixed_span',
+        tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+        invalid_tool_calls: [
+          {
+            name: 'echo',
+            args: '"raw unparsed',
+            id: 'tc_bad',
+            error: 'Malformed args.',
+            type: 'invalid_tool_call',
+          },
+          { name: 'echo', args: 'no-id — excluded', error: 'Malformed args.' },
+          {
+            name: 'echo',
+            args: 'empty-id — excluded',
+            id: '',
+            error: 'Malformed args.',
+          },
+          {
+            name: 'web_search',
+            args: 'server-tool — excluded',
+            id: 'srvtoolu_xyz',
+            error: 'Malformed args.',
+          },
+          {
+            args: 'nameless — included with the unknown fallback',
+            id: 'tc_nameless',
+            error: 'Malformed args.',
+          },
+        ],
+      },
+    ];
+    const mixedSpan = createSpan(
+      'tools=agent_abc',
+      { [INPUT]: JSON.stringify({ messages: mixed }) },
+      'parent-1'
+    );
+    shapeLangfuseSpan(mixedSpan);
+    expect(JSON.parse(mixedSpan.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: { command: 'hi' } },
+      { name: 'echo', args: '"raw unparsed' },
+      { name: 'unknown', args: 'nameless — included with the unknown fallback' },
+    ]);
+
+    const invalidOnly = [
+      {
+        type: 'ai',
+        id: 'ai_invalid_only_span',
+        tool_calls: [],
+        invalid_tool_calls: [
+          {
+            name: 'echo',
+            args: 'garbage',
+            id: 'tc_solo',
+            error: 'Malformed args.',
+            type: 'invalid_tool_call',
+          },
+        ],
+      },
+    ];
+    const invalidOnlySpan = createSpan(
+      'tools=agent_abc',
+      { [INPUT]: JSON.stringify({ messages: invalidOnly }) },
+      'parent-1'
+    );
+    shapeLangfuseSpan(invalidOnlySpan);
+    expect(JSON.parse(invalidOnlySpan.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: 'garbage' },
+    ]);
+  });
+
+  it('excludes invalid calls when ToolNode would skip them (array state / id-less message)', () => {
+    /** Mirrors ToolNode's canPromoteInvalidCalls gate: a bare-array state
+     *  returns a plain output list (invalid handling skipped) and an id-less
+     *  message cannot take the reducer upsert — the span must not report
+     *  those calls as pending work. Valid calls still count. */
+    const invalidCall = {
+      name: 'echo',
+      args: 'garbage',
+      id: 'tc_gated',
+      error: 'Malformed args.',
+      type: 'invalid_tool_call',
+    };
+    const arrayStateSpan = createSpan(
+      'tools=agent_abc',
+      {
+        [INPUT]: JSON.stringify([
+          {
+            type: 'ai',
+            id: 'ai_array_span',
+            tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+            invalid_tool_calls: [invalidCall],
+          },
+        ]),
+      },
+      'parent-1'
+    );
+    shapeLangfuseSpan(arrayStateSpan);
+    expect(JSON.parse(arrayStateSpan.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: { command: 'hi' } },
+    ]);
+
+    const idlessSpan = createSpan(
+      'tools=agent_abc',
+      {
+        [INPUT]: JSON.stringify({
+          messages: [
+            {
+              type: 'ai',
+              tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+              invalid_tool_calls: [invalidCall],
+            },
+          ],
+        }),
+      },
+      'parent-1'
+    );
+    shapeLangfuseSpan(idlessSpan);
+    expect(JSON.parse(idlessSpan.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: { command: 'hi' } },
+    ]);
+  });
+
+  it('excludes invalid calls already answered by a ToolMessage in the state', () => {
+    /** Mirrors ToolNode's !toolMessageIds.has(id) execution filter: an
+     *  answered invalid call is not pending work, even when the same turn
+     *  still has a pending valid call. */
+    const span = createSpan(
+      'tools=agent_abc',
+      {
+        [INPUT]: JSON.stringify({
+          messages: [
+            {
+              type: 'ai',
+              id: 'ai_answered_invalid',
+              tool_calls: [
+                { name: 'echo', args: { command: 'hi' }, id: 'tc_pending' },
+              ],
+              invalid_tool_calls: [
+                {
+                  name: 'echo',
+                  args: 'garbage',
+                  id: 'tc_answered_invalid',
+                  error: 'Malformed args.',
+                  type: 'invalid_tool_call',
+                },
+              ],
+            },
+            {
+              type: 'tool',
+              tool_call_id: 'tc_answered_invalid',
+              content: 'Error: Malformed args.',
+            },
+          ],
+        }),
+      },
+      'parent-1'
+    );
+    shapeLangfuseSpan(span);
+    expect(JSON.parse(span.attributes[INPUT] as string)).toEqual([
+      { name: 'echo', args: { command: 'hi' } },
+    ]);
+  });
+
   it('keeps a stable tool-dispatch shape when no tool calls are found', () => {
     const original = JSON.stringify({
       messages: [{ type: 'human', content: 'hi' }],
@@ -140,6 +318,75 @@ describe('shapeLangfuseSpan', () => {
     expect(span.name).toBe('tool-dispatch');
     expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
     expect(span.attributes[INPUT]).toBe(original);
+  });
+
+  it('reduces ephemeral workflow-agent node ids to agent observations named by sender', () => {
+    const span = createWorkflowNodeSpan(
+      'bedrock__claude-sonnet-5___ClickHouse Agent'
+    );
+    shapeLangfuseSpan(span);
+    expect(span.name).toBe('ClickHouse Agent');
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('agent');
+  });
+
+  it('strips parallel-instance index suffixes from ephemeral agent ids', () => {
+    const span = createWorkflowNodeSpan('openAI__gpt-4o___GPT-4o____1');
+    shapeLangfuseSpan(span);
+    expect(span.name).toBe('GPT-4o');
+  });
+
+  it('restores encoded colons in ephemeral agent sender names', () => {
+    const span = createWorkflowNodeSpan('openAI__gpt-4o___alias__variant');
+    shapeLangfuseSpan(span);
+    expect(span.name).toBe('alias:variant');
+  });
+
+  it('keeps persisted agent ids and senderless ephemeral ids unchanged', () => {
+    const persisted = createWorkflowNodeSpan('agent_okvkCroi6wXM4-7BY4ud1');
+    shapeLangfuseSpan(persisted);
+    expect(persisted.name).toBe('agent_okvkCroi6wXM4-7BY4ud1');
+
+    const senderless = createWorkflowNodeSpan('openAI__gpt-4o');
+    shapeLangfuseSpan(senderless);
+    expect(senderless.name).toBe('openAI__gpt-4o');
+  });
+
+  it('does not rename tool observations whose names embed triple underscores', () => {
+    const span = createSpan(
+      'server__toolkit___lookup',
+      { [OBSERVATION_TYPE]: 'tool' },
+      'parent-1'
+    );
+    shapeLangfuseSpan(span);
+    expect(span.name).toBe('server__toolkit___lookup');
+  });
+
+  it('only renames spans carrying matching langgraph node metadata', () => {
+    const runName = createSpan('LibreChat Agent: Ops___EU', {}, 'parent-1');
+    shapeLangfuseSpan(runName);
+    expect(runName.name).toBe('LibreChat Agent: Ops___EU');
+
+    const ordinaryChain = createSpan('pipeline__stage___EU', {}, 'parent-1');
+    shapeLangfuseSpan(ordinaryChain);
+    expect(ordinaryChain.name).toBe('pipeline__stage___EU');
+    expect(ordinaryChain.attributes[OBSERVATION_TYPE]).toBeUndefined();
+
+    const mismatchedNode = createSpan(
+      'pipeline__stage___EU',
+      { [METADATA_LANGGRAPH_NODE]: 'some-other-node' },
+      'parent-1'
+    );
+    shapeLangfuseSpan(mismatchedNode);
+    expect(mismatchedNode.name).toBe('pipeline__stage___EU');
+  });
+
+  it('never renames root observations, even with an encoded-id shape', () => {
+    const span = createSpan('bedrock__claude-sonnet-5___ClickHouse Agent', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+      [METADATA_LANGGRAPH_NODE]: 'bedrock__claude-sonnet-5___ClickHouse Agent',
+    });
+    shapeLangfuseSpan(span);
+    expect(span.name).toBe('bedrock__claude-sonnet-5___ClickHouse Agent');
   });
 
   it('sets root span and trace input/output to the question and answer', () => {
@@ -261,5 +508,52 @@ describe('shapeLangfuseSpan', () => {
     expect(span.attributes[OBSERVATION_TYPE]).toBe('generation');
     expect(span.attributes[TRACE_INPUT]).toBe('Generate a title');
     expect(span.attributes[TRACE_OUTPUT]).toBe('A useful title');
+  });
+
+  it('keeps a generation root\'s full observation input while reducing trace input', () => {
+    /** The activity-label path: a bare model.invoke traces the generation
+     *  as its own root, so the observation input is the ONLY record of
+     *  the system prompt. The exact shape @langfuse/langchain exports. */
+    const originalInput = JSON.stringify([
+      { role: 'system', content: 'Write a short label describing…' },
+      { role: 'user', content: 'Tool calls:\n- bash(ls) → ok\n\nLabel:' },
+    ]);
+    const originalOutput = JSON.stringify({
+      role: 'assistant',
+      content: 'Confirmed /mnt/data persists',
+    });
+    const span = createSpan('LibreChat Activity Label', {
+      [OBSERVATION_TYPE]: 'generation',
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'activity-label']),
+      [INPUT]: originalInput,
+      [OUTPUT]: originalOutput,
+    });
+
+    shapeLangfuseSpan(span);
+
+    expect(span.name).toBe('llm');
+    expect(span.attributes[INPUT]).toBe(originalInput);
+    expect(span.attributes[OUTPUT]).toBe(originalOutput);
+    expect(span.attributes[TRACE_INPUT]).toBe(
+      'Tool calls:\n- bash(ls) → ok\n\nLabel:'
+    );
+    expect(span.attributes[TRACE_OUTPUT]).toBe(originalOutput);
+  });
+
+  it('still reduces observation input on non-generation roots', () => {
+    const span = createSpan('LibreChat Agent', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+      [INPUT]: JSON.stringify({
+        messages: [
+          { type: 'system', content: 'You are helpful.' },
+          { type: 'human', content: 'What is ClickHouse?' },
+        ],
+      }),
+    });
+
+    shapeLangfuseSpan(span);
+
+    expect(span.attributes[INPUT]).toBe('What is ClickHouse?');
+    expect(span.attributes[TRACE_INPUT]).toBe('What is ClickHouse?');
   });
 });

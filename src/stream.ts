@@ -162,6 +162,13 @@ function isEagerExecutionExcludedTool(
   if (excluded != null && excluded.includes(name)) {
     return true;
   }
+  // Run-scoped circuit breaker: once a prestart for this tool diverged from
+  // the final request ("changed after eager execution started"), stop
+  // prestarting it so the model's retry executes normally instead of
+  // re-diverging in a loop (LibreChat#14371).
+  if (graph.eagerEventToolSuppressions?.has(name) === true) {
+    return true;
+  }
   // A code-session participant writes to the shared sandbox, so it is
   // side-effecting: never prestart it speculatively (a revised/superseded turn
   // would leave the write applied). Implies exclusion without the host having
@@ -1006,8 +1013,9 @@ function recordEagerToolCallChunks(args: {
   graph: StandardGraph;
   stepKey: string;
   toolCallChunks?: ToolCallChunk[];
+  seal?: StreamedToolCallSeal;
 }): void {
-  const { graph, stepKey, toolCallChunks } = args;
+  const { graph, stepKey, toolCallChunks, seal } = args;
   if (toolCallChunks == null || toolCallChunks.length === 0) {
     return;
   }
@@ -1054,13 +1062,33 @@ function recordEagerToolCallChunks(args: {
     const argsText = isRepeatedObservedFragment
       ? existing.argsText
       : mergeToolCallArgsText(existing.argsText, incomingArgs);
+    const index = getEagerToolChunkIndex(toolCallChunk) ?? existing.index;
+    // Only a chunk whose explicit adapter seal covers THIS call may supply a
+    // full-args restatement (OpenAI Responses `arguments.done`). Pure-signal
+    // seals carry empty args and never set this.
+    const sealCoversChunk =
+      seal != null &&
+      (seal.kind === 'all' ||
+        (seal.kind === 'single' &&
+          ((seal.id != null && seal.id === id) ||
+            (seal.index != null && seal.index === index))));
     const next = {
       id,
       name,
       argsText,
-      index: getEagerToolChunkIndex(toolCallChunk) ?? existing.index,
+      // Canonical accumulation length: LangChain concats fragments verbatim
+      // to build the final request, and every reconciliation branch above
+      // yields text no longer than that concat — equal exactly when every
+      // merge was a pure append. Tracking the length (not the text) keeps
+      // cumulative/restating streams from retaining every prefix.
+      rawArgsLength: (existing.rawArgsLength ?? 0) + incomingArgs.length,
+      index,
       lastArgsFragment:
         incomingArgs !== '' ? incomingArgs : existing.lastArgsFragment,
+      sealedArgsFragment:
+        sealCoversChunk && incomingArgs !== ''
+          ? incomingArgs
+          : existing.sealedArgsFragment,
     };
     graph.eagerEventToolCallChunks.set(key, next);
   }
@@ -1095,6 +1123,7 @@ function getStreamedReadyToolCalls(args: {
   const readyEntries: Array<{
     key: string;
     state: t.EagerEventToolCallChunkState;
+    sealedByAdapter: boolean;
   }> = [];
 
   for (const [key, state] of graph.eagerEventToolCallChunks) {
@@ -1124,7 +1153,11 @@ function getStreamedReadyToolCalls(args: {
       isSealedByLaterChunk ||
       isSealedExplicitly
     ) {
-      readyEntries.push({ key, state });
+      readyEntries.push({
+        key,
+        state,
+        sealedByAdapter: isSealedExplicitly || seal?.kind === 'all',
+      });
     }
   }
 
@@ -1143,9 +1176,35 @@ function getStreamedReadyToolCalls(args: {
 
   return readyEntries
     .sort((left, right) => (left.state.index ?? 0) - (right.state.index ?? 0))
-    .flatMap(({ state }) => {
+    .flatMap(({ state, sealedByAdapter }) => {
       const args = coerceRecordArgs(state.argsText);
       if (args == null) {
+        return [];
+      }
+      // The final request's args come from LangChain's canonical verbatim
+      // concatenation of fragments, while `argsText` reconciles provider
+      // quirks with lossy heuristics that can also swallow legitimately
+      // repetitive payload fragments (LibreChat#14371). `argsText` can never
+      // be LONGER than the plain concat, so length equality proves it IS the
+      // canonical accumulation.
+      const isCanonicalAccumulation =
+        state.rawArgsLength != null &&
+        state.argsText.length === state.rawArgsLength;
+      // Adapter seals may instead restate the finished call's full args on
+      // the seal chunk itself (OpenAI Responses
+      // `function_call_arguments.done`). Only when the seal-carrying chunk
+      // supplied that fragment AND the accumulated text IS that restatement
+      // has the adapter vouched for it — plain concatenation intentionally
+      // differs there. Pure-signal seals (Bedrock contentBlockStop,
+      // `args: ''`) never qualify.
+      const isAuthoritativeRestatement =
+        sealedByAdapter &&
+        state.sealedArgsFragment != null &&
+        state.sealedArgsFragment === state.argsText;
+      // Prestarting an unconfirmed snapshot trips the "changed after eager
+      // execution started" guard and burns a retry loop — leave unconfirmed
+      // calls to normal ToolNode execution with final args.
+      if (!isCanonicalAccumulation && !isAuthoritativeRestatement) {
         return [];
       }
       return [
@@ -1586,6 +1645,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
           graph,
           stepKey,
           toolCallChunks: chunk.tool_call_chunks,
+          seal: streamedToolCallSeal,
         });
       }
       await handleToolCallChunks({
@@ -2325,7 +2385,9 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
 
-      for (const contentPart of getDeltaContentParts(messageDelta.delta.content)) {
+      for (const contentPart of getDeltaContentParts(
+        messageDelta.delta.content
+      )) {
         updateContent(runStep.index, contentPart);
       }
     } else if (
@@ -2354,7 +2416,9 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
 
-      for (const contentPart of getDeltaContentParts(reasoningDelta.delta.content)) {
+      for (const contentPart of getDeltaContentParts(
+        reasoningDelta.delta.content
+      )) {
         updateContent(runStep.index, contentPart);
       }
     } else if (event === GraphEvents.ON_RUN_STEP_DELTA) {

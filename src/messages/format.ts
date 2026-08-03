@@ -20,6 +20,7 @@ import type {
   MessageContentComplex,
   ReasoningContentText,
   SummaryContentBlock,
+  SummaryCoverage,
   ThinkingContentText,
   ToolCallContent,
   ToolResultContent,
@@ -1185,20 +1186,73 @@ function extractToolNamesFromSearchOutput(output: string): string[] {
   return [];
 }
 
-type SummaryBoundary = {
-  messageIndex: number;
-  contentIndex: number;
-  text: string;
-  tokenCount: number;
+/**
+ * How far back a persisted summary reaches.
+ *
+ * `coverage` is authoritative: the block named the first source message that
+ * compaction retained, so `messageIndex` is exclusive — everything before it is
+ * covered and it survives whole. `positional` is the legacy reading for blocks
+ * written before coverage existed (or whose anchor is no longer in the payload)
+ * — the block's own location is the boundary, which is why it cannot
+ * distinguish a retained tail from covered history.
+ */
+type SummaryBoundary =
+  | {
+      mode: 'coverage';
+      messageIndex: number;
+      text: string;
+      tokenCount: number;
+    }
+  | {
+      mode: 'positional';
+      messageIndex: number;
+      contentIndex: number;
+      text: string;
+      tokenCount: number;
+    };
+
+type SummaryTokenAdjustment = {
+  original: number;
+  adjusted: number;
+  remainingChars: number;
+  totalChars: number;
 };
 
-function getLatestSummaryBoundary(
-  payload: TPayload
-): SummaryBoundary | undefined {
-  let summaryBoundary: SummaryBoundary | undefined;
+type SummaryScan = {
+  boundary?: SummaryBoundary;
+};
+
+function resolveCoverageIndex(
+  coverage: SummaryCoverage | undefined,
+  indexBySourceId: Map<string, number>,
+  summaryMessageIndex: number
+): number | undefined {
+  /** Persisted JSON, so the declared string type is not a runtime guarantee. */
+  if (typeof coverage?.retainedFromMessageId !== 'string') {
+    return undefined;
+  }
+  const retainedFromMessageId = coverage.retainedFromMessageId.trim();
+  if (retainedFromMessageId === '') {
+    return undefined;
+  }
+  const retainedIndex = indexBySourceId.get(retainedFromMessageId);
+  return retainedIndex != null && retainedIndex <= summaryMessageIndex
+    ? retainedIndex
+    : undefined;
+}
+
+function scanSummaryBlocks(payload: TPayload): SummaryScan {
+  let boundary: SummaryBoundary | undefined;
+  /** Filled as the scan advances, so a coverage lookup only ever resolves to a
+   *  message already passed — no second pass over the payload. */
+  const indexBySourceId = new Map<string, number>();
 
   for (let i = 0; i < payload.length; i++) {
     const message = payload[i];
+    const sourceMessageId = getSourceMessageId(message);
+    if (sourceMessageId != null) {
+      indexBySourceId.set(sourceMessageId, i);
+    }
     if (!Array.isArray(message.content)) {
       continue;
     }
@@ -1230,20 +1284,37 @@ function getLatestSummaryBoundary(
         continue;
       }
 
-      summaryBoundary = {
-        messageIndex: i,
-        contentIndex: j,
-        text: summaryText,
-        tokenCount:
-          typeof summaryPart.tokenCount === 'number' &&
-          Number.isFinite(summaryPart.tokenCount)
-            ? summaryPart.tokenCount
-            : 0,
-      };
+      const tokenCount =
+        typeof summaryPart.tokenCount === 'number' &&
+        Number.isFinite(summaryPart.tokenCount)
+          ? summaryPart.tokenCount
+          : 0;
+
+      const retainedIndex = resolveCoverageIndex(
+        summaryPart.coverage,
+        indexBySourceId,
+        i
+      );
+
+      boundary =
+        retainedIndex != null
+          ? {
+            mode: 'coverage',
+            messageIndex: retainedIndex,
+            text: summaryText,
+            tokenCount,
+          }
+          : {
+            mode: 'positional',
+            messageIndex: i,
+            contentIndex: j,
+            text: summaryText,
+            tokenCount,
+          };
     }
   }
 
-  return summaryBoundary;
+  return { boundary };
 }
 
 function applySummaryBoundary(
@@ -1253,6 +1324,14 @@ function applySummaryBoundary(
 ): Partial<TMessage> | null {
   if (!summaryBoundary) {
     return message;
+  }
+
+  /** The boundary names the first retained message, so it is exclusive: that
+   *  message and everything after it — the recency tail included — stays
+   *  verbatim, and only genuinely covered history is dropped. Summary parts on
+   *  surviving messages are filtered later by `formatAssistantMessage`. */
+  if (summaryBoundary.mode === 'coverage') {
+    return messageIndex < summaryBoundary.messageIndex ? null : message;
   }
 
   if (messageIndex < summaryBoundary.messageIndex) {
@@ -1272,6 +1351,61 @@ function applySummaryBoundary(
   };
 }
 
+/**
+ * Whether `formatAssistantMessage` filters this part out of the emitted message.
+ * Such a part contributes no prompt tokens, so measuring it as zero characters
+ * is accurate — it must not be mistaken for content the heuristic cannot see.
+ */
+function isDroppedByFormatting(
+  part: MessageContentComplex | undefined
+): boolean {
+  if (part == null) {
+    return true;
+  }
+  if (
+    part.type === ContentTypes.SUMMARY ||
+    part.type === ContentTypes.ERROR ||
+    part.type === ContentTypes.AGENT_UPDATE ||
+    part.type === ContentTypes.ACTIVITY_LABEL
+  ) {
+    return true;
+  }
+  return part.type === ContentTypes.TEXT && getTextContent(part).trim() === '';
+}
+
+function measureValueChars(value: unknown): number {
+  if (typeof value === 'string') {
+    return value.length;
+  }
+  if (value == null || typeof value !== 'object') {
+    return 0;
+  }
+  const measured = serializeStructuredValueBounded(value, 0).originalChars;
+  return measured === Number.MAX_SAFE_INTEGER
+    ? HARD_MAX_TOOL_RESULT_CHARS
+    : Math.min(measured, HARD_MAX_TOOL_RESULT_CHARS);
+}
+
+/**
+ * Whether a retained part's whole prompt cost is the text the char heuristic
+ * reads, making it safe to represent in a character ratio.
+ *
+ * An allowlist, not a denylist. Media, resources, and tool calls carry cost that
+ * is unrelated to their serialized length — a short image URL nested in
+ * `tool_call.output` stands in for a fixed four-figure media charge — and
+ * rejecting those case by case has repeatedly missed a nesting level. Listing
+ * the two shapes whose characters `contentPartCharLength` actually reads makes
+ * every other shape, present or future, ineligible by default: the ratio is
+ * skipped and the entry keeps its original count, which prunes early rather than
+ * exceeding the window.
+ */
+function isCharRatioEligible(part: MessageContentComplex | undefined): boolean {
+  if (part == null) {
+    return false;
+  }
+  return part.type === ContentTypes.TEXT || part.type === ContentTypes.THINKING;
+}
+
 function contentPartCharLength(part: MessageContentComplex): number {
   const record = part as Record<string, unknown>;
   let len = 0;
@@ -1281,15 +1415,15 @@ function contentPartCharLength(part: MessageContentComplex): number {
   if (typeof record.thinking === 'string') {
     len += record.thinking.length;
   }
-  const { input } = record;
-  if (typeof input === 'string') {
-    len += input.length;
-  } else if (input != null && typeof input === 'object') {
-    const measured = serializeStructuredValueBounded(input, 0).originalChars;
-    len +=
-      measured === Number.MAX_SAFE_INTEGER
-        ? HARD_MAX_TOOL_RESULT_CHARS
-        : Math.min(measured, HARD_MAX_TOOL_RESULT_CHARS);
+  len += measureValueChars(record.input);
+  /** Tool calls nest their payload a level down, so measuring only the
+   *  top-level fields scores an entire tool turn as zero characters. */
+  const { tool_call: toolCall } = record;
+  if (toolCall != null && typeof toolCall === 'object') {
+    const call = toolCall as Record<string, unknown>;
+    len += measureValueChars(call.name);
+    len += measureValueChars(call.args);
+    len += measureValueChars(call.output);
   }
   return len;
 }
@@ -1340,14 +1474,9 @@ export const formatAgentMessages = (
   /** Cross-run summary extracted from the payload. Should be forwarded to the
    *  agent run so it can be included in the system message via AgentContext. */
   summary?: { text: string; tokenCount: number };
-  /** When a summary boundary sliced content from a message, the token count
-   *  was proportionally reduced. Returned so the caller can log it. */
-  boundaryTokenAdjustment?: {
-    original: number;
-    adjusted: number;
-    remainingChars: number;
-    totalChars: number;
-  };
+  /** When a positional summary boundary sliced content from a message, the token
+   *  count was proportionally reduced. Returned so the caller can log it. */
+  boundaryTokenAdjustment?: SummaryTokenAdjustment;
 } => {
   const messages: Array<
     | RoleBearingMessage<HumanMessage>
@@ -1387,17 +1516,10 @@ export const formatAgentMessages = (
   };
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
-  let boundaryTokenAdjustment:
-    | {
-        original: number;
-        adjusted: number;
-        remainingChars: number;
-        totalChars: number;
-      }
-    | undefined;
+  let boundaryTokenAdjustment: SummaryTokenAdjustment | undefined;
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
-  const summaryBoundary = getLatestSummaryBoundary(payload);
+  const { boundary: summaryBoundary } = scanSummaryBlocks(payload);
 
   // Summary metadata is returned to the caller so it can be forwarded to the
   // agent run and included in the single system message via AgentContext.
@@ -1723,8 +1845,24 @@ export const formatAgentMessages = (
         continue;
       }
 
+      /**
+       * Coverage mode deliberately leaves the count alone, even though the entry
+       * holding the block is charged for summary text that `formatAssistantMessage`
+       * filters out and `summary.tokenCount` accounts separately.
+       *
+       * Discounting it needs the summary's cost in the same units as
+       * `indexTokenCountMap`, and that figure is not obtainable here: this
+       * function receives no tokenizer, and a count recorded at write time is in
+       * the writing run's units — `Run.create` derives its counter from the model
+       * in play, and a consumer may supply its own — so a conversation continued
+       * on a different model would subtract across encodings. Attempts to proxy
+       * it (character ratios, provider identity) all under-count some shape,
+       * which risks an over-context request; over-counting merely prunes early.
+       * Fixing it properly means passing the reader a tokenizer, which is a
+       * consumer-facing change and out of scope here.
+       */
       if (
-        summaryBoundary &&
+        summaryBoundary?.mode === 'positional' &&
         originalIndex === summaryBoundary.messageIndex &&
         Array.isArray(payload[originalIndex].content)
       ) {
@@ -1734,14 +1872,48 @@ export const formatAgentMessages = (
         if (contentIndex >= 0 && contentIndex < content.length - 1) {
           let totalCharLen = 0;
           let remainingCharLen = 0;
+          /**
+           * The ratio applies only when *every* part of the entry is one whose
+           * token cost tracks its character length. A single ineligible part
+           * cancels the discount, whichever side of the boundary it sits on.
+           *
+           * Both sides can break it, in opposite directions. A retained image has
+           * its fixed cost scaled away, collapsing the entry. A removed base64
+           * payload inflates the denominator — serializing to a huge length while
+           * the counter charges a fixed estimate — dragging retained text below
+           * its real cost. Either way the request can exceed the window.
+           *
+           * Telling a text-bearing tool payload from a media-bearing one means
+           * recursing into arbitrary nested output, which has already missed a
+           * level twice here. Cancelling instead keeps the original count: an
+           * over-count that prunes early rather than overflowing. Entries of
+           * plain text and reasoning — the common shape — still proportion.
+           */
+          let everyRetainedPartMeasurable = true;
           for (let p = 0; p < content.length; p++) {
-            const charLen = contentPartCharLength(content[p]);
+            const part = content[p];
+            const retained = p > contentIndex;
+
+            if (isDroppedByFormatting(part)) {
+              /** Removed summary text is real removed content: it is read as
+               *  plain text and belongs in the denominator. */
+              if (!retained && part.type === ContentTypes.SUMMARY) {
+                totalCharLen += contentPartCharLength(part);
+              }
+              continue;
+            }
+
+            const charLen = contentPartCharLength(part);
+            if (!isCharRatioEligible(part) || (retained && charLen === 0)) {
+              everyRetainedPartMeasurable = false;
+              break;
+            }
             totalCharLen += charLen;
-            if (p > contentIndex) {
+            if (retained) {
               remainingCharLen += charLen;
             }
           }
-          if (totalCharLen > 0) {
+          if (totalCharLen > 0 && everyRetainedPartMeasurable) {
             const original = tokenCount;
             tokenCount = Math.max(
               1,

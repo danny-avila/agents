@@ -125,6 +125,7 @@ type HandoffReceptionProbe = {
   ): {
     instructions: string | null;
     parallelGroupId?: number;
+    filteredMessages?: t.BaseGraphState['messages'];
   } | null;
 };
 
@@ -2154,6 +2155,311 @@ describe('Agent Handoffs Tests', () => {
       expect(wrongNameMessage?.content).toContain(
         `Did you mean "${correctName}"`
       );
+    });
+  });
+
+  describe('Handoffs with a malformed sibling call (invalid_tool_calls regression)', () => {
+    /**
+     * Regression for the invalid-call promotion crossing handoff boundaries:
+     * a handoff tool snapshots `update.messages` from the PRE-promotion state
+     * with a filtered same-id copy of the AI message, and commands apply
+     * after sibling reducer updates. Un-patched, the stale copy overwrote the
+     * promoted replacement and a parallel Send child's state omitted the
+     * synthesized result — the child agent's provider request then carried an
+     * invalid call/result pairing. `validateToolHistory` inside the scripted
+     * model asserts the pairing on EVERY model invocation, including the
+     * children's.
+     */
+    const MALFORMED_CALL_ID = 'tool_call_malformed_sibling';
+
+    /** Corrupts the malformed sibling's streamed args into a non-object JSON
+     *  string so `collapseToolCallChunks` files it under `invalid_tool_calls`
+     *  — the shape a malformed provider stream produces. */
+    class MalformedSiblingHandoffModel extends ScriptedHandoffModel {
+      override async *_streamResponseChunks(
+        messages: t.BaseGraphState['messages'],
+        options: this['ParsedCallOptions'],
+        runManager?: CallbackManagerForLLMRun
+      ): AsyncGenerator<ChatGenerationChunk> {
+        for await (const chunk of super._streamResponseChunks(
+          messages,
+          options,
+          runManager
+        )) {
+          const chunkMessage = chunk.message as unknown as {
+            tool_call_chunks?: Array<{ id?: string; args?: string }>;
+          };
+          for (const toolCallChunk of chunkMessage.tool_call_chunks ?? []) {
+            if (toolCallChunk.id === MALFORMED_CALL_ID) {
+              toolCallChunk.args = '"malformed';
+            }
+          }
+          yield chunk;
+        }
+      }
+    }
+
+    const expectPromotedPairing = (
+      finalMessages: t.BaseGraphState['messages']
+    ): void => {
+      const promoted = finalMessages.find(
+        (msg): msg is AIMessage =>
+          msg.getType() === 'ai' &&
+          ((msg as AIMessage).tool_calls ?? []).some(
+            (call) => call.id === MALFORMED_CALL_ID
+          )
+      );
+      expect(promoted).toBeDefined();
+      expect(promoted!.invalid_tool_calls ?? []).toHaveLength(0);
+      const synthesized = finalMessages.find(
+        (msg): msg is ToolMessage =>
+          msg.getType() === 'tool' &&
+          (msg as ToolMessage).tool_call_id === MALFORMED_CALL_ID
+      );
+      expect(synthesized).toBeDefined();
+      expect(String(synthesized!.content)).toContain('Malformed');
+    };
+
+    it('single handoff: the child state keeps the promoted call and its synthesized result', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'You are a router'),
+        createBasicAgent('specialist', 'You are the specialist'),
+      ];
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'specialist',
+          edgeType: 'handoff',
+          prompt: 'Work the specialist task',
+        },
+      ];
+      const run = await Run.create(createTestConfig(agents, edges));
+      if (run.Graph == null) {
+        throw new Error('Expected a multi-agent graph');
+      }
+      run.Graph.overrideModel = new MalformedSiblingHandoffModel([
+        {
+          promptMarker: 'single-malformed-request-marker',
+          response: 'Routing with a malformed sibling',
+          toolCalls: [
+            {
+              id: 'tool_call_transfer_specialist',
+              name: `${Constants.LC_TRANSFER_TO_}specialist`,
+              args: { instructions: 'single-specialist-instructions-marker' },
+            } as ToolCall,
+            {
+              id: MALFORMED_CALL_ID,
+              name: 'broken_tool',
+              args: {},
+            } as ToolCall,
+          ],
+        },
+        {
+          promptMarker: 'single-specialist-instructions-marker',
+          response: 'Specialist complete',
+        },
+      ]);
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: { thread_id: 'test-handoff-malformed-single-thread' },
+        streamMode: 'values',
+        version: 'v2',
+      };
+      await run.processStream(
+        { messages: [new HumanMessage('single-malformed-request-marker')] },
+        config
+      );
+
+      const finalMessages = run.getRunMessages();
+      expect(finalMessages).toBeDefined();
+      /** The child agent actually ran — its scripted response is present —
+       *  and every model call it made passed validateToolHistory. */
+      const specialistReply = finalMessages!.find(
+        (msg) =>
+          msg.getType() === 'ai' &&
+          String(msg.content).includes('Specialist complete')
+      );
+      expect(specialistReply).toBeDefined();
+      expectPromotedPairing(finalMessages!);
+    });
+
+    it('parallel Send handoffs: each child state keeps the promoted call and its synthesized result', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'You are a router'),
+        createBasicAgent('left', 'You are the left specialist'),
+        createBasicAgent('right', 'You are the right specialist'),
+      ];
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'left',
+          edgeType: 'handoff',
+          prompt: 'Work the left task',
+        },
+        {
+          from: 'router',
+          to: 'right',
+          edgeType: 'handoff',
+          prompt: 'Work the right task',
+        },
+      ];
+      const run = await Run.create(createTestConfig(agents, edges));
+      if (run.Graph == null) {
+        throw new Error('Expected a multi-agent graph');
+      }
+      run.Graph.overrideModel = new MalformedSiblingHandoffModel([
+        {
+          promptMarker: 'parallel-malformed-request-marker',
+          response: 'Routing both with a malformed sibling',
+          toolCalls: [
+            {
+              id: 'tool_call_transfer_left',
+              name: `${Constants.LC_TRANSFER_TO_}left`,
+              args: { instructions: 'parallel-left-instructions-marker' },
+            } as ToolCall,
+            {
+              id: 'tool_call_transfer_right',
+              name: `${Constants.LC_TRANSFER_TO_}right`,
+              args: { instructions: 'parallel-right-instructions-marker' },
+            } as ToolCall,
+            {
+              id: MALFORMED_CALL_ID,
+              name: 'broken_tool',
+              args: {},
+            } as ToolCall,
+          ],
+        },
+        {
+          promptMarker: 'parallel-left-instructions-marker',
+          response: 'Left complete',
+        },
+        {
+          promptMarker: 'parallel-right-instructions-marker',
+          response: 'Right complete',
+        },
+      ]);
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: { thread_id: 'test-handoff-malformed-parallel-thread' },
+        streamMode: 'values',
+        version: 'v2',
+      };
+      await run.processStream(
+        { messages: [new HumanMessage('parallel-malformed-request-marker')] },
+        config
+      );
+
+      const finalMessages = run.getRunMessages();
+      expect(finalMessages).toBeDefined();
+      /** Both Send children ran off their patched child states, and every
+       *  child model call passed validateToolHistory — the un-patched Send
+       *  state omitted the synthesized result and carried the stale same-id
+       *  copy instead. */
+      const leftReply = finalMessages!.find(
+        (msg) =>
+          msg.getType() === 'ai' &&
+          String(msg.content).includes('Left complete')
+      );
+      const rightReply = finalMessages!.find(
+        (msg) =>
+          msg.getType() === 'ai' &&
+          String(msg.content).includes('Right complete')
+      );
+      expect(leftReply).toBeDefined();
+      expect(rightReply).toBeDefined();
+      expectPromotedPairing(finalMessages!);
+    });
+
+    it('reception strips transfer tool_use content blocks alongside the calls (array-content providers)', async () => {
+      /**
+       * The retained filtered AI message used to keep `content` verbatim:
+       * with the promoted sibling holding the message in state, an
+       * Anthropic child would replay the stripped transfer's `tool_use`
+       * block (and a parallel sibling's block, whose result never reaches
+       * this recipient) as unmatched calls. Both must be filtered with the
+       * tool-call filtering; non-transfer blocks stay.
+       */
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'You are a router'),
+        createBasicAgent('left', 'You are the left specialist'),
+        createBasicAgent('right', 'You are the right specialist'),
+      ];
+      const edges: t.GraphEdge[] = [
+        { from: 'router', to: 'left', edgeType: 'handoff' },
+        { from: 'router', to: 'right', edgeType: 'handoff' },
+      ];
+      const run = await Run.create(createTestConfig(agents, edges));
+      const graph = run.Graph as unknown as HandoffReceptionProbe;
+
+      const transferLeft = {
+        id: 'tc_transfer_left',
+        name: `${Constants.LC_TRANSFER_TO_}left`,
+        args: {},
+      };
+      const context = graph.processHandoffReception(
+        [
+          new AIMessage({
+            id: 'ai_reception_blocks',
+            content: [
+              { type: 'text', text: 'Routing.' },
+              {
+                type: 'tool_use',
+                id: 'tc_transfer_left',
+                name: `${Constants.LC_TRANSFER_TO_}left`,
+                input: {},
+              },
+              {
+                type: 'tool_use',
+                id: 'tc_transfer_right_sibling',
+                name: `${Constants.LC_TRANSFER_TO_}right`,
+                input: {},
+              },
+              {
+                type: 'tool_use',
+                id: 'tc_promoted_sibling',
+                name: 'unknown',
+                input: {},
+              },
+            ],
+            tool_calls: [
+              transferLeft,
+              { id: 'tc_promoted_sibling', name: 'unknown', args: {} },
+            ],
+          }),
+          new ToolMessage({
+            content: 'Successfully transferred to left',
+            name: transferLeft.name,
+            tool_call_id: transferLeft.id,
+          }),
+          new ToolMessage({
+            content: 'Error: Malformed args.',
+            name: 'unknown',
+            tool_call_id: 'tc_promoted_sibling',
+          }),
+        ],
+        'left'
+      );
+
+      const retained = context?.filteredMessages?.find(
+        (msg): msg is AIMessage => msg.getType() === 'ai'
+      );
+      expect(retained).toBeDefined();
+      expect(retained!.tool_calls?.map((call) => call.id)).toEqual([
+        'tc_promoted_sibling',
+      ]);
+      const blocks = retained!.content as Array<{ type?: string; id?: string }>;
+      /** Both this recipient's transfer block AND the parallel sibling's
+       *  are gone; the text and the promoted sibling's block remain. */
+      expect(blocks.map((block) => block.id ?? block.type)).toEqual([
+        'text',
+        'tc_promoted_sibling',
+      ]);
     });
   });
 });

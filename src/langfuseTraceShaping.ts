@@ -1,5 +1,6 @@
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
+import { Constants } from '@/common';
 
 const LANGGRAPH_START_NODE = '__start__';
 const ANONYMOUS_LAMBDA_NAME = 'RunnableLambda';
@@ -10,8 +11,12 @@ const TOOL_DISPATCH_SPAN_NAME = 'tool-dispatch';
 const GENERATION_SPAN_NAME = 'llm';
 const ROOT_OBSERVATION_TYPE = 'agent';
 const CHAIN_OBSERVATION_TYPE = 'chain';
+const TOOL_OBSERVATION_TYPE = 'tool';
 const AGENT_TRACE_TAG = 'agent';
 const TITLE_TRACE_TAG = 'title';
+const EPHEMERAL_AGENT_SENDER_SEPARATOR = '___';
+const EPHEMERAL_AGENT_INDEX_SEPARATOR = '____';
+const OBSERVATION_METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
 
 type MutableSpan = ReadableSpan & {
   name: string;
@@ -175,17 +180,112 @@ function getMessageToolCalls(
   return calls;
 }
 
+/**
+ * Id-bearing `invalid_tool_calls` on the assistant turn. ToolNode pairs these
+ * with synthesized error results (and an invalid-only turn is routed on them
+ * alone), so the tool-dispatch span must count them as part of the executing
+ * batch — otherwise an invalid-only dispatch finds zero calls and the span
+ * keeps the full serialized graph state as its input, and a mixed dispatch
+ * silently omits the malformed call. `args` stays the raw unparsed string.
+ */
+/** Tool-result ids present in the serialized state — ToolNode's
+ *  `!toolMessageIds.has(id)` execution filter, mirrored for the span. */
+function getToolResultIds(
+  messages: Record<string, unknown>[]
+): Set<string> {
+  const ids = new Set<string>();
+  for (const message of messages) {
+    if (getMessageRole(message) !== 'tool') {
+      continue;
+    }
+    const rawId =
+      message.tool_call_id ??
+      (isRecord(message.kwargs) ? message.kwargs.tool_call_id : undefined) ??
+      (isRecord(message.data) ? message.data.tool_call_id : undefined);
+    if (typeof rawId === 'string' && rawId !== '') {
+      ids.add(rawId);
+    }
+  }
+  return ids;
+}
+
+function getMessageInvalidToolCalls(
+  message: Record<string, unknown>,
+  answeredIds: ReadonlySet<string>
+): SerializedToolCall[] {
+  const rawCalls =
+    message.invalid_tool_calls ??
+    (isRecord(message.kwargs) ? message.kwargs.invalid_tool_calls : undefined) ??
+    (isRecord(message.data) ? message.data.invalid_tool_calls : undefined);
+  if (!Array.isArray(rawCalls)) {
+    return [];
+  }
+  const calls: SerializedToolCall[] = [];
+  for (const rawCall of rawCalls) {
+    // Same attribution predicate ToolNode executes with (id-bearing,
+    // non-server) so the span never claims calls the node deliberately skips.
+    if (
+      !isRecord(rawCall) ||
+      typeof rawCall.id !== 'string' ||
+      rawCall.id === '' ||
+      answeredIds.has(rawCall.id) ||
+      rawCall.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+    ) {
+      continue;
+    }
+    // Same name fallback ToolNode synthesizes with — a nameless attributable
+    // call still gets a result, so it must still count in the span input.
+    const call = normalizeToolCall(
+      typeof rawCall.name === 'string' && rawCall.name !== ''
+        ? rawCall
+        : { ...rawCall, name: 'unknown' }
+    );
+    if (call != null) {
+      calls.push(call);
+    }
+  }
+  return calls;
+}
+
+/** The serialized message's own id (uuid), NOT the LC-serialization type id
+ *  array that `message.id` carries in constructor dumps. */
+function getSerializedMessageId(
+  message: Record<string, unknown>
+): string | undefined {
+  const kwargsId = isRecord(message.kwargs) ? message.kwargs.id : undefined;
+  const dataId = isRecord(message.data) ? message.data.id : undefined;
+  const rawId = message.id;
+  const id = kwargsId ?? dataId ?? rawId;
+  return typeof id === 'string' && id !== '' ? id : undefined;
+}
+
 /** Latest assistant turn's tool calls — the calls this tool node is executing. */
 function findPendingToolCalls(value: unknown): SerializedToolCall[] {
   const messages = getMessageArray(value);
   if (messages == null) {
     return [];
   }
+  /**
+   * Invalid calls count only where ToolNode's own gate lets them execute:
+   * the messages-state form (a bare-array state means the node returns a
+   * plain output list and skips invalid handling) with an id-bearing
+   * assistant message (no id, no reducer upsert). Mirrors
+   * `canPromoteInvalidCalls` so the span never reports skipped calls.
+   */
+  const invalidCallsApply = !Array.isArray(value);
+  const answeredIds = invalidCallsApply
+    ? getToolResultIds(messages)
+    : undefined;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (getMessageRole(messages[i]) !== 'assistant') {
       continue;
     }
-    const calls = getMessageToolCalls(messages[i]);
+    const calls = [
+      ...getMessageToolCalls(messages[i]),
+      ...(invalidCallsApply && getSerializedMessageId(messages[i]) != null
+        ? getMessageInvalidToolCalls(messages[i], answeredIds!)
+        : []),
+    ];
     if (calls.length > 0) {
       return calls;
     }
@@ -254,11 +354,20 @@ function shapeRootSpan(span: MutableSpan): void {
     parseAttributeValue(span.attributes[outputKey]),
     'assistant'
   );
-  if (question != null) {
-    span.attributes[inputKey] = question;
-  }
-  if (answer != null) {
-    span.attributes[outputKey] = answer;
+  /** A generation that IS the trace root — a bare `model.invoke` with no
+   *  wrapping chain, i.e. the activity-label path — is also the only
+   *  observation carrying its own prompt: reducing its observation input
+   *  would discard the SystemMessage from the one place it is traced.
+   *  Chain/agent roots keep the full reduction; their child generations
+   *  still record the complete prompt. Trace-level input/output reduce
+   *  either way, so the trace list keeps showing question and answer. */
+  if (!isGenerationSpan(span)) {
+    if (question != null) {
+      span.attributes[inputKey] = question;
+    }
+    if (answer != null) {
+      span.attributes[outputKey] = answer;
+    }
   }
   const traceInput = question ?? span.attributes[inputKey];
   const traceOutput = answer ?? span.attributes[outputKey];
@@ -273,6 +382,81 @@ function shapeRootSpan(span: MutableSpan): void {
 function isGenerationSpan(span: MutableSpan): boolean {
   const type = span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE];
   return typeof type === 'string' && type.toLowerCase() === 'generation';
+}
+
+function isToolSpan(span: MutableSpan): boolean {
+  const type = span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE];
+  return (
+    typeof type === 'string' && type.toLowerCase() === TOOL_OBSERVATION_TYPE
+  );
+}
+
+/**
+ * Whether the span is a LangGraph node execution whose node id is the span
+ * name — the shape of the outer workflow-agent node. `@langfuse/tracing`
+ * flattens object metadata to per-key attributes with string values stored
+ * raw, so LangGraph's `langgraph_node` arrives directly comparable.
+ */
+function isWorkflowNodeSpan(span: MutableSpan): boolean {
+  return span.attributes[OBSERVATION_METADATA_LANGGRAPH_NODE] === span.name;
+}
+
+/**
+ * LibreChat ephemeral agents are identified as
+ * `endpoint__model___sender[____index]` (`__` encodes `:`; see LibreChat's
+ * `encodeEphemeralAgentId`), and the outer workflow node carries that id as
+ * its span name — so switching models renames the span (item 1). Returns the
+ * stable human `sender` segment only when the name matches that encoding:
+ * the `endpoint__model` prefix must contain both segments and — unlike
+ * display names such as `LibreChat Agent: Ops___EU` — never contains
+ * whitespace, so legitimate names that merely embed `___` are left alone.
+ */
+function extractEphemeralAgentSender(name: string): string | undefined {
+  let workingId = name;
+  const indexSeparator = workingId.lastIndexOf(EPHEMERAL_AGENT_INDEX_SEPARATOR);
+  if (
+    indexSeparator !== -1 &&
+    /^\d+$/.test(
+      workingId.slice(indexSeparator + EPHEMERAL_AGENT_INDEX_SEPARATOR.length)
+    )
+  ) {
+    workingId = workingId.slice(0, indexSeparator);
+  }
+  const senderSeparator = workingId.indexOf(EPHEMERAL_AGENT_SENDER_SEPARATOR);
+  if (senderSeparator <= 0) {
+    return undefined;
+  }
+  const encodedPrefix = workingId.slice(0, senderSeparator);
+  if (/\s/.test(encodedPrefix)) {
+    return undefined;
+  }
+  const prefixParts = encodedPrefix.split('__');
+  if (prefixParts.length < 2 || prefixParts.some((part) => part === '')) {
+    return undefined;
+  }
+  const sender = workingId
+    .slice(senderSeparator + EPHEMERAL_AGENT_SENDER_SEPARATOR.length)
+    .replace(/__/g, ':');
+  return sender === '' ? undefined : sender;
+}
+
+/** Workflow-agent node spans are always children of the run's root chain and
+ *  always carry `langgraph_node` metadata equal to their name, so host-named
+ *  run roots (`LibreChat Agent: <name>`) and ordinary chains that merely look
+ *  like encoded ids (`pipeline__stage___EU`) are never rename candidates.
+ *  Successful decodes become `agent` observations, matching the inner
+ *  `agent=<id>` node shaping. */
+function shapeEphemeralAgentNodeSpan(span: MutableSpan): void {
+  if (isToolSpan(span) || isRootSpan(span) || !isWorkflowNodeSpan(span)) {
+    return;
+  }
+  const sender = extractEphemeralAgentSender(span.name);
+  if (sender == null) {
+    return;
+  }
+  span.name = sender;
+  span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] =
+    ROOT_OBSERVATION_TYPE;
 }
 
 function hasTraceTag(span: MutableSpan, expectedTag: string): boolean {
@@ -304,7 +488,8 @@ function shapeRootObservationType(span: MutableSpan): void {
  * Reshapes spans per Langfuse-team feedback before export:
  * - `agent=<id>` / `tools=<id>` node names carry the ephemeral agent id
  *   (`provider__model`) — strip it so switching models doesn't break
- *   name-based logic (item 1).
+ *   name-based logic (item 1). The outer workflow node is named with the
+ *   bare agent id; ephemeral ids reduce to their stable sender name.
  * - LLM generation spans keep the provider client class name (`ChatOpenAI`,
  *   `AzureChatOpenAI`, …); rename them to a provider-agnostic `llm` so the
  *   name reflects the operation, not the model (the model stays on the
@@ -324,6 +509,8 @@ export function shapeLangfuseSpan(span: ReadableSpan): void {
     shapeToolNodeSpan(mutable);
   } else if (isGenerationSpan(mutable)) {
     mutable.name = GENERATION_SPAN_NAME;
+  } else {
+    shapeEphemeralAgentNodeSpan(mutable);
   }
   if (!isRootSpan(span)) {
     return;

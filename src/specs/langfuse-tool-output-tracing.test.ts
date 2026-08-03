@@ -8,6 +8,7 @@ import type { TPayload } from '@/types';
 import {
   LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
   classifyLangfuseToolNodeSpan,
+  prepareLangfuseSpanForExport,
   redactLangfuseSpanToolOutputs,
   shouldTraceToolNodeForLangfuse,
 } from '@/langfuseToolOutputTracing';
@@ -26,6 +27,7 @@ import {
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import { ensureOpenTelemetryContextManager } from '@/instrumentation';
+import { projectToolStreamContentForProvider } from '@/messages/core';
 import { formatAgentMessages } from '@/messages/format';
 import { ContentTypes } from '@/common';
 
@@ -277,6 +279,891 @@ describe('Langfuse tool output tracing redaction', () => {
     ) as Array<{ role: string; content: string }>;
     expect(redacted[0].content).toBe('show tables');
     expect(redacted[1].content).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
+  it('redacts captured Responses server-tool outputs wherever they are serialized', () => {
+    const outputs = [
+      {
+        id: 'local_output',
+        type: 'local_shell_call_output',
+        status: 'completed',
+        output: 'local shell secret',
+      },
+      {
+        id: 'shell_output',
+        call_id: 'shell_call',
+        type: 'shell_call_output',
+        status: 'completed',
+        output: 'shell secret',
+      },
+      {
+        id: 'patch_output',
+        call_id: 'patch_call',
+        type: 'apply_patch_call_output',
+        status: 'completed',
+        output: 'patch secret',
+      },
+      {
+        id: 'program_output',
+        call_id: 'program_call',
+        type: 'program_output',
+        status: 'completed',
+        result: 'program secret',
+      },
+      {
+        id: 'code_interpreter_call',
+        type: 'code_interpreter_call',
+        code: 'code input stays visible',
+        container_id: 'container_1',
+        status: 'completed',
+        outputs: [{ type: 'logs', logs: 'code interpreter secret' }],
+      },
+      {
+        id: 'mcp_call',
+        type: 'mcp_call',
+        name: 'private_mcp_tool',
+        arguments: '{"query":"mcp input stays visible"}',
+        server_label: 'mcp_server',
+        status: 'failed',
+        output: 'mcp output secret',
+        error: 'mcp error secret',
+      },
+      {
+        id: 'mcp_list',
+        type: 'mcp_list_tools',
+        server_label: 'mcp_server',
+        tools: [{ name: 'listed secret tool', input_schema: {} }],
+        error: 'mcp list error secret',
+      },
+      {
+        id: 'image_generation_call',
+        type: 'image_generation_call',
+        status: 'completed',
+        revised_prompt: 'image prompt stays visible',
+        result: 'image generation secret',
+      },
+      {
+        id: 'file_search_call',
+        type: 'file_search_call',
+        status: 'completed',
+        queries: ['file query stays visible'],
+        results: [{ text: 'file search secret' }],
+      },
+      {
+        id: 'web_search_call',
+        type: 'web_search_call',
+        status: 'completed',
+        action: {
+          type: 'search',
+          queries: ['web query stays visible'],
+          sources: [{ type: 'url', url: 'web source secret' }],
+        },
+      },
+      {
+        id: 'tool_search_output',
+        call_id: 'tool_search_call',
+        type: 'tool_search_output',
+        status: 'completed',
+        tools: [{ type: 'function', name: 'tool definition secret' }],
+      },
+      {
+        id: 'function_call',
+        call_id: 'function_call_id',
+        type: 'function_call',
+        name: 'private_function',
+        arguments: 'function input stays visible',
+      },
+      {
+        id: 'function_output',
+        call_id: 'function_call_id',
+        type: 'function_call_output',
+        output: 'function output secret',
+      },
+      {
+        id: 'custom_call',
+        call_id: 'custom_call_id',
+        type: 'custom_tool_call',
+        name: 'private_custom',
+        input: 'custom input stays visible',
+      },
+      {
+        id: 'custom_output',
+        call_id: 'custom_call_id',
+        type: 'custom_tool_call_output',
+        output: 'custom output secret',
+      },
+      {
+        id: 'computer_output',
+        call_id: 'computer_call_id',
+        type: 'computer_call_output',
+        acknowledged_safety_checks: ['computer input stays visible'],
+        output: 'computer output secret',
+      },
+    ];
+    const serializedMessage = {
+      role: 'assistant',
+      content: outputs.map((value) => ({ type: 'non_standard', value })),
+      content_blocks: outputs.map((value) => ({
+        type: 'non_standard',
+        value,
+      })),
+      additional_kwargs: { tool_outputs: outputs },
+    };
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'generation',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify([
+        serializedMessage,
+      ]),
+    });
+
+    redactLangfuseSpanToolOutputs(span, createConfig({ enabled: false }));
+
+    const redacted = span.attributes[
+      LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT
+    ] as string;
+    for (const secret of [
+      'local shell secret',
+      'shell secret',
+      'patch secret',
+      'program secret',
+      'code interpreter secret',
+      'mcp output secret',
+      'mcp error secret',
+      'listed secret tool',
+      'mcp list error secret',
+      'image generation secret',
+      'file search secret',
+      'web source secret',
+      'tool definition secret',
+      'function output secret',
+      'custom output secret',
+      'computer output secret',
+    ]) {
+      expect(redacted).not.toContain(secret);
+    }
+    expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+    for (const input of [
+      'local_output',
+      'shell_call',
+      'patch_call',
+      'program_call',
+      'code input stays visible',
+      'mcp input stays visible',
+      'private_mcp_tool',
+      'mcp_server',
+      'image prompt stays visible',
+      'file query stays visible',
+      'web query stays visible',
+      'tool_search_call',
+      'function input stays visible',
+      'custom input stays visible',
+      'computer input stays visible',
+    ]) {
+      expect(redacted).toContain(input);
+    }
+  });
+
+  it('selectively redacts captured Responses outputs by canonical tool name', () => {
+    const outputs = [
+      {
+        type: 'local_shell_call_output',
+        output: 'public local output',
+      },
+      { type: 'shell_call_output', output: 'private shell output' },
+      { type: 'apply_patch_call_output', output: 'public patch output' },
+      { type: 'program_output', result: 'private program output' },
+      {
+        type: 'code_interpreter_call',
+        code: 'public code input',
+        outputs: [{ type: 'logs', logs: 'private code output' }],
+      },
+      {
+        type: 'mcp_call',
+        name: 'private_mcp_tool',
+        arguments: 'public mcp input',
+        output: 'private named mcp output',
+        error: 'private named mcp error',
+      },
+      {
+        type: 'mcp_call',
+        name: 'public_mcp_tool',
+        output: 'public named mcp output',
+      },
+      {
+        type: 'mcp_call',
+        output: 'private fallback mcp output',
+      },
+      {
+        type: 'mcp_list_tools',
+        server_label: 'public server label',
+        tools: [{ name: 'private listed tool' }],
+        error: 'private list error',
+      },
+      {
+        type: 'image_generation_call',
+        revised_prompt: 'public image prompt',
+        result: 'private generated image',
+      },
+      {
+        type: 'file_search_call',
+        queries: ['public file query'],
+        results: [{ text: 'private file result' }],
+      },
+      {
+        type: 'web_search_call',
+        results: [{ title: 'private web result' }],
+        action: {
+          type: 'search',
+          queries: ['public web query'],
+          sources: [{ url: 'private web source' }],
+        },
+      },
+      {
+        type: 'tool_search_output',
+        call_id: 'public tool search call id',
+        tools: [{ name: 'private tool definition' }],
+      },
+      {
+        type: 'computer_call_output',
+        acknowledged_safety_checks: ['public computer input'],
+        output: 'private computer output',
+      },
+    ];
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify(outputs),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({
+        redactedToolNames: new Set([
+          'shell',
+          'program',
+          'code_interpreter',
+          'private_mcp_tool',
+          'mcp',
+          'mcp_list_tools',
+          'image_generation',
+          'file_search',
+          'web_search',
+          'tool_search',
+          'computer_use',
+        ]),
+      })
+    );
+
+    const redacted = readJsonAttribute<Array<Record<string, unknown>>>(
+      span,
+      LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+    );
+    expect(redacted[0].output).toBe('public local output');
+    expect(redacted[1].output).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+    expect(redacted[2].output).toBe('public patch output');
+    expect(redacted[3].result).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+    expect(redacted[4]).toMatchObject({
+      code: 'public code input',
+      outputs: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+    });
+    expect(redacted[5]).toMatchObject({
+      name: 'private_mcp_tool',
+      arguments: 'public mcp input',
+      output: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+      error: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+    });
+    expect(redacted[6].output).toBe('public named mcp output');
+    expect(redacted[7].output).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+    expect(redacted[8]).toMatchObject({
+      server_label: 'public server label',
+      tools: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+      error: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+    });
+    expect(redacted[9]).toMatchObject({
+      revised_prompt: 'public image prompt',
+      result: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+    });
+    expect(redacted[10]).toMatchObject({
+      queries: ['public file query'],
+      results: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+    });
+    expect(redacted[11]).toMatchObject({
+      results: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+      action: {
+        type: 'search',
+        queries: ['public web query'],
+        sources: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+      },
+    });
+    expect(redacted[12]).toMatchObject({
+      call_id: 'public tool search call id',
+      tools: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+    });
+    expect(redacted[13]).toMatchObject({
+      acknowledged_safety_checks: ['public computer input'],
+      output: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+    });
+  });
+
+  it('maps Responses function and custom outputs to their call names', () => {
+    const outputs = [
+      {
+        type: 'function_call',
+        call_id: 'private_function_call',
+        name: 'execute_sql',
+        arguments: 'private function input stays visible',
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'private_function_call',
+        output: 'private function output',
+      },
+      {
+        type: 'function_call',
+        call_id: 'public_function_call',
+        name: 'public_function',
+        arguments: 'public function input',
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'public_function_call',
+        output: 'public function output',
+      },
+      {
+        type: 'custom_tool_call',
+        call_id: 'private_custom_call',
+        name: 'private_custom_tool',
+        input: 'private custom input stays visible',
+      },
+      {
+        type: 'custom_tool_call_output',
+        call_id: 'private_custom_call',
+        output: 'private custom output',
+      },
+      {
+        type: 'custom_tool_call_output',
+        call_id: 'unmatched_custom_call',
+        output: 'unmatched custom output stays visible',
+      },
+    ];
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify(outputs),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({
+        redactedToolNames: new Set(['execute_sql', 'private_custom_tool']),
+      })
+    );
+
+    const redacted = readJsonAttribute<Array<Record<string, unknown>>>(
+      span,
+      LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+    );
+    expect(redacted[0].arguments).toBe('private function input stays visible');
+    expect(redacted[1].output).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+    expect(redacted[3].output).toBe('public function output');
+    expect(redacted[4].input).toBe('private custom input stays visible');
+    expect(redacted[5].output).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+    expect(redacted[6].output).toBe('unmatched custom output stays visible');
+  });
+
+  it('redacts standard server-tool results globally and by paired call name', () => {
+    const blocks = [
+      {
+        type: 'server_tool_call',
+        id: 'private_server_call',
+        name: 'file_search',
+        args: { query: 'private server input stays visible' },
+      },
+      {
+        type: 'server_tool_call_result',
+        toolCallId: 'private_server_call',
+        status: 'success',
+        output: { results: ['private standard server result'] },
+      },
+      {
+        type: 'server_tool_call',
+        id: 'public_server_call',
+        name: 'web_search',
+        args: { query: 'public server input' },
+      },
+      {
+        type: 'server_tool_call_result',
+        toolCallId: 'public_server_call',
+        status: 'success',
+        output: 'public standard server result',
+      },
+      {
+        type: 'server_tool_call_result',
+        toolCallId: 'unknown_server_call',
+        status: 'success',
+        output: 'unmatched standard server result',
+      },
+    ];
+    const selectiveSpan = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify(blocks),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      selectiveSpan,
+      createConfig({ redactedToolNames: new Set(['file_search']) })
+    );
+
+    const selectivelyRedacted = readJsonAttribute<
+      Array<Record<string, unknown>>
+    >(selectiveSpan, LangfuseOtelSpanAttributes.OBSERVATION_INPUT);
+    expect(selectivelyRedacted[0]).toMatchObject({
+      args: { query: 'private server input stays visible' },
+    });
+    expect(selectivelyRedacted[1].output).toBe(
+      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
+    );
+    expect(selectivelyRedacted[3].output).toBe('public standard server result');
+    expect(selectivelyRedacted[4].output).toBe(
+      'unmatched standard server result'
+    );
+
+    const globalSpan = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify(blocks),
+    });
+    redactLangfuseSpanToolOutputs(globalSpan, createConfig({ enabled: false }));
+    const globallyRedacted = readJsonAttribute<Array<Record<string, unknown>>>(
+      globalSpan,
+      LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+    );
+    expect(globallyRedacted[1].output).toBe(
+      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
+    );
+    expect(globallyRedacted[3].output).toBe(
+      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
+    );
+    expect(globallyRedacted[4].output).toBe(
+      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
+    );
+  });
+
+  it('redacts marked projected server-tool images without touching user images', () => {
+    const message = new AIMessage({
+      content: [{ type: 'text', text: 'Partial answer stays visible.' }],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: 'code_image_call',
+            type: 'code_interpreter_call',
+            code: 'public image-producing code',
+            status: 'completed',
+            outputs: [
+              {
+                type: 'image',
+                url: 'data:image/png;base64,private-code-image-data',
+              },
+            ],
+          },
+          {
+            id: 'generated_image_call',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'private-generated-image-data',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+    const [projected] = projectToolStreamContentForProvider(
+      [message],
+      'native'
+    );
+    const projectedJson = projected.toJSON();
+    const serializedProjection = JSON.stringify(projectedJson);
+    expect(serializedProjection).toContain('private-code-image-data');
+    expect(serializedProjection).toContain('private-generated-image-data');
+    expect(serializedProjection).toContain('librechatServerToolResult');
+
+    const userImage = {
+      type: 'image',
+      mimeType: 'image/png',
+      data: 'public-user-image-data',
+    };
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        projectedJson,
+        userImage,
+      ]),
+    });
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({
+        redactedToolNames: new Set(['code_interpreter', 'image_generation']),
+      })
+    );
+
+    const redacted = span.attributes[
+      LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+    ] as string;
+    expect(redacted).toContain('Partial answer stays visible.');
+    expect(redacted).toContain('public-user-image-data');
+    expect(redacted).not.toContain('private-code-image-data');
+    expect(redacted).not.toContain('private-generated-image-data');
+    expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
+  it.each([
+    ['globally', createConfig({ enabled: false })],
+    [
+      'selectively',
+      createConfig({ redactedToolNames: new Set(['image_generation']) }),
+    ],
+  ] as const)(
+    'redacts serialized normalized generated images %s without touching user images',
+    (_scope, config) => {
+      const generatedById = {
+        id: 'ig_normal_response',
+        type: 'image_generation_call',
+        status: 'completed',
+        result: 'private-generated-image-by-id',
+      };
+      const generatedSecond = {
+        id: 'ig_normal_response_second',
+        type: 'image_generation_call',
+        status: 'completed',
+        result: 'private-generated-image-by-data',
+      };
+      const message = new AIMessage({
+        content: [
+          {
+            type: 'image',
+            mimeType: 'image/png',
+            data: generatedById.result,
+            id: generatedById.id,
+            metadata: { status: generatedById.status },
+          },
+          {
+            type: 'image',
+            mimeType: 'image/png',
+            data: generatedSecond.result,
+            id: generatedSecond.id,
+            metadata: { status: generatedSecond.status },
+          },
+          {
+            type: 'image',
+            mimeType: 'image/png',
+            id: generatedById.id,
+            url: 'private-generated-image-url',
+            fileId: 'private-generated-image-file-id',
+            metadata: { status: generatedById.status },
+          },
+          {
+            type: 'image',
+            mimeType: 'image/png',
+            data: 'public-assistant-application-image',
+            id: 'application-image',
+            metadata: { status: 'completed' },
+          },
+        ],
+        additional_kwargs: {
+          tool_outputs: [generatedById, generatedSecond],
+        },
+        response_metadata: {
+          model_provider: 'openai',
+          output: [generatedById, generatedSecond],
+        },
+      });
+      const serializedMessage = serializeMessageForLangfuse(message);
+      const serializedUserMessage = serializeMessageForLangfuse(
+        new HumanMessage({
+          content: [
+            {
+              type: 'image',
+              mimeType: 'image/png',
+              data: 'public-user-image-data',
+            },
+          ],
+        })
+      );
+      expect(JSON.stringify(serializedMessage)).not.toContain(
+        'image_generation_call'
+      );
+      const span = createSpan('gpt-5.6', {
+        [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify([
+          serializedMessage,
+          serializedUserMessage,
+        ]),
+      });
+
+      redactLangfuseSpanToolOutputs(span, config);
+
+      const redacted = span.attributes[
+        LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT
+      ] as string;
+      expect(redacted).not.toContain(generatedById.result);
+      expect(redacted).not.toContain(generatedSecond.result);
+      expect(redacted).not.toContain('private-generated-image-url');
+      expect(redacted).not.toContain('private-generated-image-file-id');
+      expect(redacted).toContain('public-assistant-application-image');
+      expect(redacted).toContain('public-user-image-data');
+      expect(redacted).toContain(generatedById.id);
+      expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+    }
+  );
+
+  it('does not reclassify a marked code-interpreter image as image generation', () => {
+    const codeImage = 'data:image/png;base64,public-code-image';
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify([
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'image',
+              url: codeImage,
+              extras: {
+                librechatServerToolResult: {
+                  toolName: 'code_interpreter',
+                },
+              },
+            },
+          ],
+        },
+      ]),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({
+        redactedToolNames: new Set(['image_generation']),
+      })
+    );
+
+    expect(
+      span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]
+    ).toContain(codeImage);
+    expect(
+      span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]
+    ).not.toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
+  it('fails closed when OpenTelemetry truncates a JSON-shaped attribute', () => {
+    const secret = 'private truncated tool output';
+    const serialized = JSON.stringify([
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              serverToolResult: {
+                toolName: 'shell',
+                status: 'success',
+                output: secret,
+              },
+            }),
+          },
+        ],
+      },
+    ]);
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: serialized.slice(0, -1),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({ redactedToolNames: new Set(['shell']) })
+    );
+
+    expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]).toBe(
+      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
+    );
+    expect(JSON.stringify(span.attributes)).not.toContain(secret);
+  });
+
+  it('redacts marked bounded replay text without parsing its payload', () => {
+    const truncatedSecret =
+      '{"serverToolResult":{"librechatResponsesReplay":true,"status":"success","output":"secret head…secret tail"';
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'text',
+              text: truncatedSecret,
+            },
+          ],
+        },
+      ]),
+    });
+
+    redactLangfuseSpanToolOutputs(span, createConfig({ enabled: false }));
+
+    const redacted = span.attributes[
+      LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+    ] as string;
+    expect(redacted).not.toContain('secret head');
+    expect(redacted).not.toContain('secret tail');
+    expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
+  it('redacts replay output before root-span answer shaping', () => {
+    const rootSecret = 'private root replay result';
+    const span = createSpan('LangGraph', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        { role: 'user', content: 'Continue.' },
+      ]),
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify([
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'Partial answer. ' },
+            {
+              type: 'text',
+              text: JSON.stringify({
+                serverToolResult: {
+                  toolName: 'shell',
+                  status: 'success',
+                  output: rootSecret,
+                },
+              }),
+              extras: {
+                librechatServerToolResult: { toolName: 'shell' },
+              },
+            },
+          ],
+        },
+      ]),
+    });
+
+    prepareLangfuseSpanForExport(span, createConfig({ enabled: false }));
+
+    for (const key of [
+      LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT,
+      LangfuseOtelSpanAttributes.TRACE_OUTPUT,
+    ]) {
+      const output = span.attributes[key] as string;
+      expect(output).toContain('Partial answer.');
+      expect(output).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+      expect(output).not.toContain(rootSecret);
+    }
+  });
+
+  it('redacts a root tool output before deriving trace output', () => {
+    const rootSecret = 'private root tool result';
+    const span = createSpan('shell', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: rootSecret,
+    });
+
+    prepareLangfuseSpanForExport(span, createConfig({ enabled: false }));
+
+    expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]).toBe(
+      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
+    );
+    expect(span.attributes[LangfuseOtelSpanAttributes.TRACE_OUTPUT]).toBe(
+      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
+    );
+    expect(JSON.stringify(span.attributes)).not.toContain(rootSecret);
+  });
+
+  it('preserves ordinary text that only resembles a server-tool result', () => {
+    const ordinaryText =
+      '{"serverToolResult":{"status":"success","output":"public literal text"}}';
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: ordinaryText }],
+        },
+      ]),
+    });
+
+    redactLangfuseSpanToolOutputs(span, createConfig({ enabled: false }));
+
+    expect(
+      span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
+    ).toContain('public literal text');
+    expect(
+      span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
+    ).not.toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
+  it('recognizes serialized fallback results only inside assistant messages', () => {
+    const userLiteral =
+      '{"serverToolResult":{"status":"success","output":"public user literal"}}';
+    const assistantResult =
+      '{"serverToolResult":{"librechatResponsesReplay":true,"status":"success","output":"private replay result"}}';
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        {
+          role: 'user',
+          content: [{ type: 'text', text: userLiteral }],
+        },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: assistantResult }],
+        },
+      ]),
+    });
+
+    redactLangfuseSpanToolOutputs(span, createConfig({ enabled: false }));
+
+    const redacted = span.attributes[
+      LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+    ] as string;
+    expect(redacted).toContain('public user literal');
+    expect(redacted).not.toContain('private replay result');
+    expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
+  it('redacts neutralized replay results from resumed generation input', () => {
+    const message = new AIMessage({
+      content: [{ type: 'text', text: 'Partial answer.' }],
+      additional_kwargs: {
+        tool_outputs: [
+          {
+            id: 'shell_output_item',
+            call_id: 'shell_call',
+            type: 'shell_call_output',
+            status: 'completed',
+            output: 'resumed generation secret',
+          },
+        ],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        preempted: true,
+      },
+    });
+    const [projected] = projectToolStreamContentForProvider(
+      [message],
+      'fallback'
+    );
+    expect(projected.content).toEqual([
+      { type: 'text', text: 'Partial answer.' },
+      expect.objectContaining({
+        type: 'text',
+        text: expect.stringContaining('resumed generation secret'),
+      }),
+    ]);
+    expect(JSON.stringify(projected.content)).not.toContain('extras');
+    const span = createSpan('gpt-5.6', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        projected.toJSON(),
+      ]),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({ redactedToolNames: new Set(['shell']) })
+    );
+
+    const redacted = span.attributes[
+      LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+    ] as string;
+    expect(redacted).toContain('Partial answer.');
+    expect(redacted).not.toContain('resumed generation secret');
+    expect(redacted).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   });
 
   it('redacts only configured tool names when output tracing stays enabled', () => {
