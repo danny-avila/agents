@@ -38,6 +38,7 @@ import {
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import {
+  enforceStreamDeltaEventLimit,
   StreamLimitExceededError,
   STREAM_LIMIT_REDISPATCH_KEY,
   STREAM_LIMIT_ATTEMPT_KEY,
@@ -841,6 +842,14 @@ export async function attemptInvoke(
             metadata,
             context
           );
+        } else if (context != null) {
+          /**
+           * A pure OpenRouter reasoning-replay chunk yields no handling
+           * chunk, and in this local branch no `streamEvents` consumer
+           * counts the wire event either. Charge the event budget directly
+           * so a looping replay stream cannot bypass an enabled cap.
+           */
+          enforceStreamDeltaEventLimit({ graph: context, metadata });
         }
         finalChunk = appendStreamChunk({
           current: finalChunk,
