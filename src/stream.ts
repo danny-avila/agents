@@ -1545,7 +1545,12 @@ export class ChatModelStreamHandler implements t.EventHandler {
             | Record<string, unknown>
             | undefined,
         });
-      } else if (chunk.tool_calls && chunk.tool_calls.length > 0) {
+      }
+      /** Judged whenever parsed calls are present, not only when raw chunks
+       * are absent — an adapter can pair an empty or partial raw chunk with
+       * a complete parsed call; the standalone check is stateless, so the
+       * common both-present case is not double-tallied. */
+      if (chunk.tool_calls && chunk.tool_calls.length > 0) {
         enforceCompleteToolCallArgLimit({
           graph,
           metadata,

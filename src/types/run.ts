@@ -28,7 +28,13 @@ export type BaseGraphConfig = {
 };
 export type LegacyGraphConfig = BaseGraphConfig & {
   type?: 'standard';
-} & Omit<g.StandardGraphInput, 'provider' | 'clientOptions' | 'agents'> &
+} & Omit<
+    g.StandardGraphInput,
+    /** `streamLimits` is excluded because legacy graphs receive limits only
+     * via the top-level `RunConfig.streamLimits`; accepting the field here
+     * would type-check but be silently ignored by `createLegacyGraph`. */
+    'provider' | 'clientOptions' | 'agents' | 'streamLimits'
+  > &
   Omit<g.AgentInputs, 'provider' | 'clientOptions' | 'agentId'>;
 
 /* Supervised graph (opt-in) */

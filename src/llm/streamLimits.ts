@@ -32,9 +32,10 @@ export interface ResolvedStreamLimits {
 export interface StreamedToolCallArgTally {
   bytes: number;
   name?: string;
-  /** Batch-position key this id-keyed tally is also registered under, so an
-   * id-less later delta of the same call shares the budget; both entries are
-   * released together. */
+  /** Secondary key this tally is also registered under — the batch position
+   * for id-only chunks, or the id for chunks carrying both identifiers — so
+   * a later delta that drops an identifier still shares the budget; both
+   * entries are released together. */
   aliasKey?: string;
   /**
    * True when the previous chunk ended on an unpaired UTF-16 high surrogate.
@@ -330,32 +331,34 @@ export function enforceStreamedToolCallArgLimit({
     const key = `${generationKey}:${chunk.index ?? chunk.id ?? `#${i}`}`;
     const sealed = sealsChunk(seal, chunk);
     let tally = tallies.get(key);
-    /** An index-less adapter can put the call id only on the first chunk and
-     * omit it from later argument deltas, which would fall back to the
-     * batch-position key and split one call's budget across two tallies. An
-     * id-keyed tally therefore also registers itself under its position key
-     * (same object, shared bytes), extending the position-stability
-     * assumption the `#i` fallback already makes. */
-    const positionAliasKey =
-      chunk.index == null && chunk.id != null
-        ? `${generationKey}:#${i}`
-        : undefined;
-    const registerPositionAlias = (target: StreamedToolCallArgTally): void => {
-      if (positionAliasKey == null) {
+    /** Secondary key this call is also reachable under, so a later delta
+     * that drops an identifier still lands on the same tally: the
+     * batch-position fallback for id-only chunks (an index-less adapter can
+     * put the id only on the first chunk), or the id itself for chunks
+     * carrying both identifiers (an adapter can drop the index later). */
+    let chunkAliasKey: string | undefined;
+    if (chunk.id != null) {
+      chunkAliasKey =
+        chunk.index == null
+          ? `${generationKey}:#${i}`
+          : `${generationKey}:${chunk.id}`;
+    }
+    const registerAliasKey = (target: StreamedToolCallArgTally): void => {
+      if (chunkAliasKey == null) {
         return;
       }
-      const currentOwner = tallies.get(positionAliasKey);
+      const currentOwner = tallies.get(chunkAliasKey);
       if (currentOwner === target) {
         return;
       }
       /** Parallel index-less calls all land on batch position #i, so the
        * newest live call takes the alias over and the previous owner is
        * disowned — its seal must not delete an alias it no longer holds. */
-      if (currentOwner?.aliasKey === positionAliasKey) {
+      if (currentOwner?.aliasKey === chunkAliasKey) {
         currentOwner.aliasKey = undefined;
       }
-      tallies.set(positionAliasKey, target);
-      target.aliasKey = positionAliasKey;
+      tallies.set(chunkAliasKey, target);
+      target.aliasKey = chunkAliasKey;
     };
     const releaseTally = (target: StreamedToolCallArgTally): void => {
       tallies.delete(key);
@@ -371,14 +374,14 @@ export function enforceStreamedToolCallArgLimit({
         if (!sealed) {
           tally = { bytes: 0, name: chunkToolName(chunk) };
           tallies.set(key, tally);
-          registerPositionAlias(tally);
+          registerAliasKey(tally);
         }
         continue;
       }
       /** A sealing chunk is about to release this tally; taking the position
        * alias here would steal it from a still-live parallel call. */
       if (!sealed) {
-        registerPositionAlias(tally);
+        registerAliasKey(tally);
       }
       if (tally.name == null) {
         const lateName = chunkToolName(chunk);
@@ -411,7 +414,7 @@ export function enforceStreamedToolCallArgLimit({
       tallies.set(key, tally);
     }
     if (!sealed) {
-      registerPositionAlias(tally);
+      registerAliasKey(tally);
     }
     if (tally.name == null) {
       tally.name = chunkToolName(chunk);
@@ -590,7 +593,12 @@ export function enforceStreamLimitsForWireChunk({
       toolCallChunks: chunk.tool_call_chunks,
       responseMetadata: chunk.response_metadata,
     });
-  } else if (chunk.tool_calls != null && chunk.tool_calls.length > 0) {
+  }
+  /** Judged whenever parsed calls are present, not only when raw chunks are
+   * absent: an adapter can pair an empty or partial raw chunk with a
+   * complete parsed call, and the standalone check is stateless so the
+   * common both-present case is not double-tallied. */
+  if (chunk.tool_calls != null && chunk.tool_calls.length > 0) {
     enforceCompleteToolCallArgLimit({ graph, metadata, toolCalls: chunk.tool_calls });
   }
 }

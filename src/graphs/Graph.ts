@@ -1074,6 +1074,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     new Map();
   /** Streamed chunk events per model generation, keyed by generation key. */
   streamDeltaEventCounts: Map<string, number> = new Map();
+  /** Per-chunk-object, per-generation charge balances (lazily created; see
+   * `StreamLimitState`). Reinitialized by both reset paths: a model may
+   * retain and re-yield one mutable chunk object, whose nested map would
+   * otherwise grow by one attempt-stamped entry per model call for the
+   * graph's lifetime. */
+  streamLimitChargeCredits?: WeakMap<object, Map<string, number>>;
   /**
    * Seals charged against `preemption.maxSeals`. Per-turn: cleared by both
    * reset paths so a fresh turn gets a fresh budget, while a HITL resume —
@@ -1189,6 +1195,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.eagerEventToolSuppressions.clear();
     this.streamedToolCallArgTallies.clear();
     this.streamDeltaEventCounts.clear();
+    this.streamLimitChargeCredits = undefined;
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
@@ -1248,6 +1255,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.overrideModel = undefined;
     this.streamedToolCallArgTallies.clear();
     this.streamDeltaEventCounts.clear();
+    this.streamLimitChargeCredits = undefined;
     /**
      * Turn state only. The reported totals must outlive cleanup — this runs
      * in `processStream`'s `finally`, and the host reads `getPreemptStats()`

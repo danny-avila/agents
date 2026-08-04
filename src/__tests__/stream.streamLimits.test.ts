@@ -865,6 +865,52 @@ describe('per-tool argument byte overrides', () => {
     ).rejects.toMatchObject({ kind: 'tool_call_args', observed: 101 });
   });
 
+  it('judges parsed calls even when a raw chunk representation is present', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_call_chunks: [{ id: 'call_1', name: 'side_effect', args: '', index: 0 }],
+          tool_calls: [
+            { id: 'call_1', name: 'side_effect', args: { payload: 'x'.repeat(200) } },
+          ],
+        },
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', toolName: 'side_effect' });
+  });
+
+  it('keeps one budget when a call drops its index but keeps its id', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_1', name: 'writer', args: 'a'.repeat(60), index: 0 }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ id: 'call_1', args: 'a'.repeat(41) }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      observed: 101,
+      toolName: 'writer',
+    });
+  });
+
   it('normalizes override entries like the global field', () => {
     const resolved = resolveStreamLimits({
       maxToolCallArgBytes: 100,
