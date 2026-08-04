@@ -318,22 +318,29 @@ export function enforceStreamedToolCallArgLimit({
   const tallies = (graph.streamedToolCallArgTallies ??= new Map());
   const generationKey = resolveGenerationKey(metadata);
   const seal = getStreamedToolCallSeal(responseMetadata);
-  const resolveChunkName = (chunk: ToolCallChunk): string | undefined => {
-    const name = chunkToolName(chunk);
-    if (name != null || parsedToolCalls == null) {
-      return name;
-    }
-    if (chunk.id != null) {
-      for (const parsed of parsedToolCalls) {
-        if (
-          parsed.id === chunk.id &&
-          parsed.name != null &&
-          parsed.name !== ''
-        ) {
-          return parsed.name;
-        }
-      }
+  /** The complete call in this event sharing the chunk's id — the strongest
+   * name evidence: adapters may stream raw names in FRAGMENTS, and an
+   * id-correlated complete call states the full name outright. */
+  const correlateParsedNameById = (id: string): string | undefined => {
+    if (parsedToolCalls == null) {
       return undefined;
+    }
+    for (const parsed of parsedToolCalls) {
+      if (parsed.id === id && parsed.name != null && parsed.name !== '') {
+        return parsed.name;
+      }
+    }
+    return undefined;
+  };
+  const resolveChunkName = (chunk: ToolCallChunk): string | undefined => {
+    const correlated =
+      chunk.id != null ? correlateParsedNameById(chunk.id) : undefined;
+    if (correlated != null) {
+      return correlated;
+    }
+    const name = chunkToolName(chunk);
+    if (name != null || parsedToolCalls == null || chunk.id != null) {
+      return name;
     }
     /** No id to correlate on; only a single-parsed-call event is an
      * unambiguous association. */
@@ -481,12 +488,20 @@ export function enforceStreamedToolCallArgLimit({
      * ("create_" then "file"), so unsealed fragments append — matching
      * langchain's own tool-call-chunk merge — while a sealing chunk's name
      * is a full restatement and replaces, mirroring how sealed args replace
-     * the tally bytes. Parsed-call correlation fills in only when the chunk
-     * carries no fragment. */
+     * the tally bytes. An id-correlated complete call in the same event
+     * outranks both; positional parsed-call correlation fills in only when
+     * the chunk carries no fragment. */
     const applyChunkName = (target: StreamedToolCallArgTally): boolean => {
+      const correlated =
+        chunk.id != null ? correlateParsedNameById(chunk.id) : undefined;
       const fragment = chunkToolName(chunk);
       let next = target.name;
-      if (fragment != null) {
+      if (correlated != null) {
+        /** An id-correlated complete call wins over fragment accumulation:
+         * a raw name like "create_" must not hide the "create_file"
+         * override behind the global cap. */
+        next = correlated;
+      } else if (fragment != null) {
         if (sealed || target.name == null) {
           next = fragment;
         } else if (fragment !== target.name) {

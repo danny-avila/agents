@@ -1432,11 +1432,15 @@ export function createSummarizationChunkHandler({
   const limitMetadata = config.metadata as Record<string, unknown> | undefined;
   return (chunk, attemptMetadata) => {
     /**
-     * Charged as `consumer` so it PAIRS with the producer-side charge in
-     * `attemptInvoke`'s onChunk branch: through attemptInvoke each emission
-     * is charged exactly once regardless of order, and a direct caller of
-     * this closure (tests, custom hosts) still gets single-sided
-     * enforcement. A trip tears down the model stream and
+     * Charged as `producer` so it PAIRS with the run's registered stream
+     * handler: inside a live run the provider callbacks route each chunk
+     * through the graph's `on_chat_model_stream` consumer too, and two
+     * same-side consumer claims would charge the chunk twice — halving an
+     * opt-in event cap. Standalone callers (tests, custom hosts, runs with
+     * no registered handler) still get single-sided enforcement from this
+     * one claim. Summarization deliberately passes NO `context` to
+     * `attemptInvoke`, whose onChunk branch would otherwise add a second
+     * producer claim. A trip tears down the model stream and
      * `executeSummarizationWithFallback` rethrows it past fallbacks and the
      * metadata stub, failing the run with the limit error like any other
      * breach.
@@ -1448,7 +1452,6 @@ export function createSummarizationChunkHandler({
         chunk: chunk as Parameters<
           typeof enforceStreamLimitsForWireChunk
         >[0]['chunk'],
-        side: 'consumer',
       });
     }
     const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];

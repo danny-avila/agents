@@ -217,13 +217,14 @@ export type SubagentExecutorOptions = {
   parentSignal?: AbortSignal;
   /** Run-scoped breaker abort shared by every executor of one graph, so a
    * child tripping a stream limit stops subagents running under OTHER
-   * parallel agent nodes too. Accessors rather than a captured controller:
-   * the graph recreates its controller per run, and children must always
-   * compose against the current one. Absent (tests, minimal hosts), the
-   * executor falls back to its own private controller. */
+   * parallel agent nodes too. An accessor rather than a captured controller:
+   * the graph recreates its controller per run, and each execution must
+   * bind to the controller current when it STARTS — signal and trip target
+   * together, so a straggler from a failed run can neither revive on nor
+   * circuit-break a later run's controller. Absent (tests, minimal hosts),
+   * the executor falls back to its own private controller. */
   breakerScope?: {
-    signal: () => AbortSignal;
-    trip: (reason: unknown) => void;
+    controller: () => AbortController;
   };
   hookRegistry?: HookRegistry;
   parentRunId: string;
@@ -316,24 +317,21 @@ export class SubagentExecutor {
     }
   }
 
-  /** One signal that fires on the parent's abort or the breaker-scope abort,
-   * collapsed to a single signal when possible (mirrors
-   * `composeAbortSignals` in Graph.ts). The scope signal is read per spawn
+  /** The breaker controller current for this execution — read per spawn
    * because the graph recreates its controller each run. */
-  private resolveChildSignal(): AbortSignal {
-    const child = this.breakerScope?.signal() ?? this.childRunAbort.signal;
+  private resolveBreakerController(): AbortController {
+    return this.breakerScope?.controller() ?? this.childRunAbort;
+  }
+
+  /** One signal that fires on the parent's abort or the breaker abort,
+   * collapsed to a single signal when possible (mirrors
+   * `composeAbortSignals` in Graph.ts). */
+  private composeChildSignal(breaker: AbortController): AbortSignal {
+    const child = breaker.signal;
     if (this.parentSignal == null || this.parentSignal === child) {
       return child;
     }
     return AbortSignal.any([this.parentSignal, child]);
-  }
-
-  private tripBreakerScope(reason: unknown): void {
-    if (this.breakerScope != null) {
-      this.breakerScope.trip(reason);
-      return;
-    }
-    this.childRunAbort.abort(reason);
   }
 
   /** Snapshot of the parent's registry at the moment a subagent is dispatched. */
@@ -344,11 +342,13 @@ export class SubagentExecutor {
   async execute(params: SubagentExecuteParams): Promise<SubagentExecuteResult> {
     const { description, subagentType, threadId, parentToolCallId } = params;
     /** Captured ONCE per execution: a failed run's graph reset replaces the
-     * breaker controller, and a straggling execution that re-resolved the
-     * signal later (e.g. after a slow start-update handler) would read the
-     * NEW run's un-aborted controller and revive old-run work. Binding to
-     * the controller active at execution start keeps old work cancelled. */
-    const childSignal = this.resolveChildSignal();
+     * breaker controller, and a straggling execution that re-resolved it
+     * later (e.g. after a slow start-update handler) would read the NEW
+     * run's un-aborted controller — reviving old-run work, or worse,
+     * tripping the new run's breaker from an old child's stream-limit
+     * breach. Signal and trip target both bind to this capture. */
+    const childBreaker = this.resolveBreakerController();
+    const childSignal = this.composeChildSignal(childBreaker);
     const config = this.configs.get(subagentType);
 
     if (!config) {
@@ -573,9 +573,11 @@ export class SubagentExecutor {
        * this executor and, via the graph-scoped breaker, under other
        * parallel agent nodes — stream on the composed child signal, and
        * awaiting forwarding.drain() first would let them consume provider
-       * quota for that entire interval. */
+       * quota for that entire interval. Trips the ENTRY-captured controller:
+       * after a reset, a straggler must break its own dead run, not the
+       * current one. */
       if (error instanceof StreamLimitExceededError) {
-        this.tripBreakerScope(error);
+        childBreaker.abort(error);
       }
       const errorMessage = truncateErrorMessage(error);
       if (forwarding) {

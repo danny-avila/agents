@@ -474,6 +474,52 @@ describe('SubagentExecutor', () => {
     ).rejects.toBeInstanceOf(StreamLimitExceededError);
   });
 
+  it('trips the breaker controller captured at execution start, not the current one', async () => {
+    const oldRun = new AbortController();
+    const newRun = new AbortController();
+    let current = oldRun;
+    let releaseChild: (() => void) | undefined;
+    const executor = createExecutor({
+      breakerScope: { controller: () => current },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(
+              () =>
+                new Promise((_resolve, reject) => {
+                  releaseChild = (): void =>
+                    reject(
+                      new StreamLimitExceededError({
+                        kind: 'tool_call_args',
+                        limit: 10,
+                        observed: 11,
+                        toolName: 'db_query',
+                      })
+                    );
+                })
+            ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    const pending = executor.execute({
+      description: 'Do something',
+      subagentType: 'researcher',
+    });
+    while (releaseChild == null) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    /** The failed run's reset installs a fresh controller while the child
+     * is still settling; the straggler's trip must land on the controller
+     * captured when its execution started. */
+    current = newRun;
+    releaseChild();
+    await expect(pending).rejects.toBeInstanceOf(StreamLimitExceededError);
+    expect(oldRun.signal.aborted).toBe(true);
+    expect(newRun.signal.aborted).toBe(false);
+  });
+
   it('threads run-level streamLimits into every child graph input', async () => {
     const childGraphInputs: StandardGraphInput[] = [];
     const noopFactory = makeNoopGraphFactory();

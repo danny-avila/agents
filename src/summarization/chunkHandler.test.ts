@@ -13,6 +13,7 @@ import type { StreamLimitState } from '@/llm/streamLimits';
 import {
   STREAM_LIMIT_ATTEMPT_KEY,
   StreamLimitExceededError,
+  enforceStreamLimitsForWireChunk,
   resolveStreamLimits,
 } from '@/llm/streamLimits';
 import { createSummarizationChunkHandler } from '@/summarization/node';
@@ -78,6 +79,74 @@ describe('createSummarizationChunkHandler stream limits', () => {
     await onChunk!(toolChunk('x'.repeat(40)));
     await expect(async () => onChunk!(toolChunk('x'.repeat(20)))).rejects.toThrow(
       '(tool call: db_query)'
+    );
+  });
+
+  it('charges a chunk once when the run wire consumer also claims it', async () => {
+    const graph: StreamLimitState = {
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    };
+    const onChunk = makeHandler(graph);
+    const metadata = { langgraph_node: 'summarize', langgraph_step: 4 };
+    const toolChunk = (args: string): AIMessageChunk =>
+      new AIMessageChunk({
+        content: '',
+        tool_call_chunks: [
+          { type: 'tool_call_chunk', name: 'db_query', args, index: 0 },
+        ],
+      });
+
+    /** Inside a live run the provider callbacks route the same chunk object
+     * through the graph's registered stream consumer as well. Wire consumer
+     * first, then the summarization handler: 60 bytes must be tallied once
+     * (a second same-side claim would put the tally at 120 and trip). */
+    const first = toolChunk('x'.repeat(60));
+    enforceStreamLimitsForWireChunk({
+      graph,
+      metadata,
+      chunk: first,
+      side: 'consumer',
+    });
+    await onChunk!(first, metadata);
+
+    /** Opposite order for the next chunk: handler (producer) before wire
+     * consumer. 60 + 39 = 99 stays under the cap only when each chunk was
+     * charged exactly once. */
+    const second = toolChunk('x'.repeat(39));
+    await onChunk!(second, metadata);
+    enforceStreamLimitsForWireChunk({
+      graph,
+      metadata,
+      chunk: second,
+      side: 'consumer',
+    });
+
+    /** Enforcement stays armed: two more bytes cross the 100-byte cap. */
+    await expect(async () => onChunk!(toolChunk('xx'), metadata)).rejects.toThrow(
+      StreamLimitExceededError
+    );
+  });
+
+  it('counts dual-consumed events once against the event cap', async () => {
+    const graph: StreamLimitState = {
+      streamLimits: resolveStreamLimits({ maxDeltaEventsPerTurn: 2 }),
+    };
+    const onChunk = makeHandler(graph);
+    const metadata = { langgraph_node: 'summarize', langgraph_step: 4 };
+    const passBoth = async (chunk: AIMessageChunk): Promise<void> => {
+      enforceStreamLimitsForWireChunk({
+        graph,
+        metadata,
+        chunk,
+        side: 'consumer',
+      });
+      await onChunk!(chunk, metadata);
+    };
+
+    await passBoth(textChunk());
+    await passBoth(textChunk());
+    await expect(async () => passBoth(textChunk())).rejects.toThrow(
+      StreamLimitExceededError
     );
   });
 

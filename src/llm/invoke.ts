@@ -821,8 +821,9 @@ export async function attemptInvoke(
       for await (const chunk of stream) {
         /** An onChunk consumer replaces the stream handler entirely, so
          * stream limits are enforced here for every such caller — public
-         * package consumers get no other accounting, and the internal
-         * summarization onChunk relies on this same charge. */
+         * package consumers get no other accounting. The internal
+         * summarization onChunk charges producer-side itself and passes no
+         * context, precisely so this claim and its own never stack. */
         if (context != null) {
           enforceStreamLimitsForWireChunk({
             graph: context,

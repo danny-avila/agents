@@ -3953,9 +3953,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
           parentSignal: this.signal,
           breakerScope: {
-            signal: (): AbortSignal => this.breakerAbort.signal,
-            trip: (reason: unknown): void =>
-              this.breakerAbort.abort(reason),
+            controller: (): AbortController => this.breakerAbort,
           },
           hookRegistry: this.hookRegistry,
           /** Lazy — Run wires the registry onto the graph AFTER

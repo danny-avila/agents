@@ -997,6 +997,52 @@ describe('per-tool argument byte overrides', () => {
     });
   });
 
+  it('prefers the id-correlated complete name over a raw name fragment', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: { create_file: 1_000 },
+      }),
+    });
+
+    /** A custom adapter can emit a raw chunk whose name is only a FRAGMENT
+     * ("create_") alongside the complete parsed call for the same id. The
+     * complete call's name must select the per-tool override — judging the
+     * bytes under the fragment would trip the global cap instead. */
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            { id: 'call_1', name: 'create_', args: 'x'.repeat(500), index: 0 },
+          ],
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'create_file',
+              args: { content: 'x'.repeat(500) },
+            },
+          ],
+        },
+      })
+    ).resolves.toBeUndefined();
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'x'.repeat(501), index: 0 }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 1_000,
+      toolName: 'create_file',
+    });
+  });
+
   it('keeps an index 0 call and an id "0" call on separate budgets', async () => {
     const handler = new ChatModelStreamHandler();
     const graph = createGraph({
