@@ -1203,6 +1203,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.streamedToolCallArgTallies.clear();
     this.streamDeltaEventCounts.clear();
     this.streamLimitChargeCredits = undefined;
+    /** Run-start is the only safe recreation point for a tripped breaker:
+     * end-of-run cleanup must leave it aborted so straggling parallel
+     * children from the failed run cannot start on a fresh signal. */
     if (this.breakerAbort.signal.aborted) {
       this.breakerAbort = new AbortController();
     }
@@ -1266,9 +1269,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.streamedToolCallArgTallies.clear();
     this.streamDeltaEventCounts.clear();
     this.streamLimitChargeCredits = undefined;
-    if (this.breakerAbort.signal.aborted) {
-      this.breakerAbort = new AbortController();
-    }
+    /** Deliberately NOT recreating a tripped breakerAbort here: this runs in
+     * `processStream`'s cleanup, which a rejected parallel batch reaches
+     * while sibling subagents can still be pre-invoke — a fresh controller
+     * would hand them an un-aborted signal and let provider requests start
+     * after the run already failed. `resetValues` recreates it when the next
+     * run begins. */
     /**
      * Turn state only. The reported totals must outlive cleanup — this runs
      * in `processStream`'s `finally`, and the host reads `getPreemptStats()`
