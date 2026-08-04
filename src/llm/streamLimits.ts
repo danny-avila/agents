@@ -26,12 +26,22 @@ export interface ResolvedStreamLimits {
   /** Per-tool overrides of the byte cap, keyed by model-facing tool name. */
   maxToolCallArgBytesByTool?: Readonly<Record<string, number>>;
   maxDeltaEventsPerTurn: number;
+  /** Precomputed once: whether ANY argument byte limit can fire. False when
+   * the global cap is disabled and every per-tool entry is a zero-valued
+   * disable — accounting must not allocate for guards that judge nothing. */
+  hasEnforceableToolCallArgLimit: boolean;
 }
 
 /** Cumulative streamed argument bytes for one in-flight tool call. */
 export interface StreamedToolCallArgTally {
   bytes: number;
   name?: string;
+  /** The graph's breaker epoch when this tally was created. Entries from
+   * the epoch that is ending survive one `resetValues` sweep, so producer
+   * loops of straggling attempts — which are not behind the consumer-only
+   * epoch gate — stay on their original budgets instead of receiving a
+   * fresh allowance at every run start. */
+  epoch?: number;
   /** Every tally-map key this tally is registered under: its primary key
    * (which can migrate through identifier transitions), the batch-position
    * fallback for id-bearing chunks, and the id for chunks carrying both
@@ -47,6 +57,14 @@ export interface StreamedToolCallArgTally {
   pendingHighSurrogate?: boolean;
 }
 
+/** Streamed chunk events counted against one generation's event cap. */
+export interface StreamDeltaEventTally {
+  count: number;
+  /** Creation-epoch tag, same grace semantics as
+   * {@link StreamedToolCallArgTally.epoch}. */
+  epoch?: number;
+}
+
 /**
  * The graph-owned state the guards read and write. Structural on purpose:
  * handler-level tests stub graphs with plain objects, and the guards lazily
@@ -55,7 +73,10 @@ export interface StreamedToolCallArgTally {
 export interface StreamLimitState {
   streamLimits?: ResolvedStreamLimits;
   streamedToolCallArgTallies?: Map<string, StreamedToolCallArgTally>;
-  streamDeltaEventCounts?: Map<string, number>;
+  streamDeltaEventCounts?: Map<string, StreamDeltaEventTally>;
+  /** The graph's live breaker epoch; new accounting entries are tagged with
+   * it so `resetValues` can sweep by age instead of clearing outright. */
+  breakerEpoch?: number;
   /** Per-chunk-object, per-generation charge balance: producer visits
    * increment, consumer (handler echo) visits decrement, and a visit only
    * charges when the other side has not pre-charged the same emission.
@@ -114,10 +135,15 @@ export function resolveStreamLimits(
       );
     }
   }
+  const hasEnforceableToolCallArgLimit =
+    maxToolCallArgBytes > 0 ||
+    (maxToolCallArgBytesByTool != null &&
+      Object.values(maxToolCallArgBytesByTool).some((value) => value > 0));
   return {
     maxToolCallArgBytes,
     ...(maxToolCallArgBytesByTool != null && { maxToolCallArgBytesByTool }),
     maxDeltaEventsPerTurn: resolveLimit(limits?.maxDeltaEventsPerTurn, 0),
+    hasEnforceableToolCallArgLimit,
   };
 }
 
@@ -324,7 +350,7 @@ export function enforceStreamedToolCallArgLimit({
   const resolved = graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS;
   const globalLimit = resolved.maxToolCallArgBytes;
   const byTool = resolved.maxToolCallArgBytesByTool;
-  if (globalLimit <= 0 && byTool == null) {
+  if (!resolved.hasEnforceableToolCallArgLimit) {
     return;
   }
   /** An inline re-dispatch of a transformed chunk (OpenRouter final-reasoning
@@ -629,7 +655,12 @@ export function enforceStreamedToolCallArgLimit({
     if (!hasArgs) {
       if (tally == null) {
         if (!sealed) {
-          tally = { bytes: 0, name: resolveChunkName(chunk), keys: [key] };
+          tally = {
+            bytes: 0,
+            name: resolveChunkName(chunk),
+            keys: [key],
+            epoch: graph.breakerEpoch,
+          };
           tallies.set(key, tally);
           registerAliases(tally);
           registerCreationPositionAlias(tally);
@@ -668,7 +699,7 @@ export function enforceStreamedToolCallArgLimit({
       continue;
     }
     if (tally == null) {
-      tally = { bytes: 0, keys: [key] };
+      tally = { bytes: 0, keys: [key], epoch: graph.breakerEpoch };
       tallies.set(key, tally);
       registerCreationPositionAlias(tally);
     }
@@ -733,7 +764,7 @@ export function enforceCompleteToolCallArgLimit({
   const resolved = graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS;
   const globalLimit = resolved.maxToolCallArgBytes;
   const byTool = resolved.maxToolCallArgBytesByTool;
-  if (globalLimit <= 0 && byTool == null) {
+  if (!resolved.hasEnforceableToolCallArgLimit) {
     return;
   }
   if (metadata?.[STREAM_LIMIT_REDISPATCH_KEY] === true) {
@@ -790,15 +821,12 @@ export function requiresStreamLimitAccounting(
   if (resolved.maxDeltaEventsPerTurn > 0) {
     return true;
   }
-  /** With the byte cap disabled and no per-tool overrides, neither
-   * enforcement function can fire — hosts that explicitly disable the
-   * guards for legitimate large arguments must not pay per-chunk claim
-   * allocations (generation keys, WeakMap entries, nested Maps) for
-   * bookkeeping that judges nothing. */
-  if (
-    resolved.maxToolCallArgBytes <= 0 &&
-    resolved.maxToolCallArgBytesByTool == null
-  ) {
+  /** With no argument limit able to fire (byte cap disabled and every
+   * per-tool entry a zero-valued disable), neither enforcement function can
+   * trip — hosts that explicitly disable the guards for legitimate large
+   * arguments must not pay per-chunk claim allocations (generation keys,
+   * WeakMap entries, nested Maps) for bookkeeping that judges nothing. */
+  if (!resolved.hasEnforceableToolCallArgLimit) {
     return false;
   }
   return (
@@ -806,6 +834,26 @@ export function requiresStreamLimitAccounting(
     (chunk.tool_calls?.length ?? 0) > 0 ||
     (chunk.invalid_tool_calls?.length ?? 0) > 0
   );
+}
+
+/**
+ * Deletes accounting entries older than the epoch that is ending. Called by
+ * `resetValues` INSTEAD of clearing: producer loops of straggling attempts
+ * use the graph's maps directly and are not behind the consumer-only epoch
+ * gate, so a clear would hand a cancellation-ignoring provider a fresh
+ * allowance at every run start. Entries tagged with the ending epoch
+ * survive exactly one reset (keeping those stragglers on their original
+ * budgets); untagged entries and anything older are removed.
+ */
+export function sweepStaleStreamLimitEntries(
+  entries: Map<string, { epoch?: number }>,
+  endingEpoch: number
+): void {
+  for (const [key, value] of entries) {
+    if (value.epoch !== endingEpoch) {
+      entries.delete(key);
+    }
+  }
 }
 
 /** Links a secondary representation of a wire chunk (e.g. a provider
@@ -980,7 +1028,8 @@ export function enforceStreamDeltaEventLimit({
   }
   const counts = (graph.streamDeltaEventCounts ??= new Map());
   const key = resolveGenerationKey(metadata);
-  const next = (counts.get(key) ?? 0) + 1;
+  const existing = counts.get(key);
+  const next = (existing?.count ?? 0) + 1;
   if (next > limit) {
     throw new StreamLimitExceededError({
       kind: 'delta_events',
@@ -988,5 +1037,9 @@ export function enforceStreamDeltaEventLimit({
       observed: next,
     });
   }
-  counts.set(key, next);
+  if (existing != null) {
+    existing.count = next;
+  } else {
+    counts.set(key, { count: next, epoch: graph.breakerEpoch });
+  }
 }

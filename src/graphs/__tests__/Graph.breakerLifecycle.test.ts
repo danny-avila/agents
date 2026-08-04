@@ -40,26 +40,77 @@ describe('run breaker lifecycle', () => {
     expect(graph.breakerAbort.signal.aborted).toBe(false);
   });
 
-  it('preserves stream-limit accounting through end-of-run cleanup', () => {
+  it('keeps straggler accounting through cleanup and one reset, then sweeps it', () => {
     const graph = makeGraph();
-    graph.streamedToolCallArgTallies.set('gen:i:0', { bytes: 42 });
-    graph.streamDeltaEventCounts.set('gen', 7);
+    const epoch = graph.breakerEpoch;
+    graph.streamedToolCallArgTallies.set('gen:i:0', { bytes: 42, epoch });
+    graph.streamDeltaEventCounts.set('gen', { count: 7, epoch });
     graph.streamLimitChargeCredits = new WeakMap();
 
     /** Cleanup runs while sibling attempts can still be unwinding on the
      * retained breaker; clearing here would hand a cancellation-ignoring
      * provider's late chunks a fresh budget. */
     graph.clearHeavyState();
-    expect(graph.streamedToolCallArgTallies.size).toBe(1);
-    expect(graph.streamDeltaEventCounts.size).toBe(1);
+    expect(graph.streamedToolCallArgTallies.get('gen:i:0')?.bytes).toBe(42);
+    expect(graph.streamDeltaEventCounts.get('gen')?.count).toBe(7);
     expect(graph.streamLimitChargeCredits).toBeDefined();
 
-    /** The next run start clears them — its epoch bump already drops
-     * stamped straggler events before accounting. */
+    /** Producer loops of straggling attempts sit OUTSIDE the consumer-only
+     * epoch gate, so their entries must survive the next run start too —
+     * one grace reset keeps them on their original budgets. */
+    graph.resetValues();
+    expect(graph.streamedToolCallArgTallies.get('gen:i:0')?.bytes).toBe(42);
+    expect(graph.streamDeltaEventCounts.get('gen')?.count).toBe(7);
+    expect(graph.streamLimitChargeCredits).toBeUndefined();
+
+    /** A second reset sweeps entries from older epochs. */
     graph.resetValues();
     expect(graph.streamedToolCallArgTallies.size).toBe(0);
     expect(graph.streamDeltaEventCounts.size).toBe(0);
-    expect(graph.streamLimitChargeCredits).toBeUndefined();
+  });
+
+  it('holds a post-reset producer straggler to its original byte budget', async () => {
+    const { enforceStreamLimitsForWireChunk } = await import(
+      '@/llm/streamLimits'
+    );
+    const graph = makeGraph();
+    graph.streamLimits = {
+      maxToolCallArgBytes: 100,
+      maxDeltaEventsPerTurn: 0,
+      hasEnforceableToolCallArgLimit: true,
+    };
+    const metadata = {
+      langgraph_checkpoint_ns: '',
+      langgraph_node: 'agent',
+      langgraph_step: 1,
+    };
+    const chunkOf = (
+      args: string
+    ): { tool_call_chunks: Array<Record<string, unknown>> } => ({
+      tool_call_chunks: [{ id: 'call_1', name: 'writer', args, index: 0 }],
+    });
+
+    enforceStreamLimitsForWireChunk({
+      graph,
+      metadata,
+      chunk: chunkOf('x'.repeat(60)) as Parameters<
+        typeof enforceStreamLimitsForWireChunk
+      >[0]['chunk'],
+    });
+
+    /** The next run starts while this producer is still draining. Its next
+     * chunk must land on the ORIGINAL 60-byte tally and trip, not open a
+     * fresh allowance. */
+    graph.resetValues();
+    expect(() =>
+      enforceStreamLimitsForWireChunk({
+        graph,
+        metadata,
+        chunk: chunkOf('x'.repeat(60)) as Parameters<
+          typeof enforceStreamLimitsForWireChunk
+        >[0]['chunk'],
+      })
+    ).toThrow(StreamLimitExceededError);
   });
 
   it('rejects a model node at entry when the breaker has already tripped', async () => {

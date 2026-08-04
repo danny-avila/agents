@@ -32,17 +32,23 @@ describe('resolveStreamLimits', () => {
     expect(resolveStreamLimits()).toEqual({
       maxToolCallArgBytes: DEFAULT_MAX_TOOL_CALL_ARG_BYTES,
       maxDeltaEventsPerTurn: 0,
+      hasEnforceableToolCallArgLimit: true,
     });
     expect(resolveStreamLimits({})).toEqual({
       maxToolCallArgBytes: DEFAULT_MAX_TOOL_CALL_ARG_BYTES,
       maxDeltaEventsPerTurn: 0,
+      hasEnforceableToolCallArgLimit: true,
     });
   });
 
   it('honors explicit values and floors fractions', () => {
     expect(
       resolveStreamLimits({ maxToolCallArgBytes: 100.9, maxDeltaEventsPerTurn: 5 })
-    ).toEqual({ maxToolCallArgBytes: 100, maxDeltaEventsPerTurn: 5 });
+    ).toEqual({
+      maxToolCallArgBytes: 100,
+      maxDeltaEventsPerTurn: 5,
+      hasEnforceableToolCallArgLimit: true,
+    });
   });
 
   it('treats 0, negatives, and Infinity as disabled', () => {
@@ -413,7 +419,7 @@ describe('enforceStreamDeltaEventLimit', () => {
     expect(limitError.observed).toBe(4);
     expect(limitError.message).toContain('maxDeltaEventsPerTurn');
     enforceStreamDeltaEventLimit({ graph, metadata: generation(2) });
-    expect(graph.streamDeltaEventCounts?.get('|agent|2|')).toBe(1);
+    expect(graph.streamDeltaEventCounts?.get('|agent|2|')?.count).toBe(1);
   });
 
   it('is disabled by default and allocates nothing', () => {

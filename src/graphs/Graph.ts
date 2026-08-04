@@ -20,6 +20,7 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
   ResolvedStreamLimits,
   StreamedToolCallArgTally,
+  StreamDeltaEventTally,
 } from '@/llm/streamLimits';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
 import type { FallbackErrorContext } from '@/llm/invoke';
@@ -123,6 +124,7 @@ import {
 import {
   resolveStreamLimits,
   StreamLimitExceededError,
+  sweepStaleStreamLimitEntries,
   STREAM_LIMIT_EPOCH_KEY,
 } from '@/llm/streamLimits';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
@@ -1056,7 +1058,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   streamedToolCallArgTallies: Map<string, StreamedToolCallArgTally> =
     new Map();
   /** Streamed chunk events per model generation, keyed by generation key. */
-  streamDeltaEventCounts: Map<string, number> = new Map();
+  streamDeltaEventCounts: Map<string, StreamDeltaEventTally> = new Map();
   /** Per-chunk-object, per-generation charge balances (lazily created; see
    * `StreamLimitState`). Reinitialized by both reset paths: a model may
    * retain and re-yield one mutable chunk object, whose nested map would
@@ -1213,8 +1215,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
     this.eagerEventToolSuppressions.clear();
-    this.streamedToolCallArgTallies.clear();
-    this.streamDeltaEventCounts.clear();
+    /** Grace sweep instead of a clear: producer loops of straggling
+     * attempts use these maps directly and sit outside the consumer-only
+     * epoch gate — clearing would hand a cancellation-ignoring provider a
+     * fresh allowance at every run start. Entries from the epoch that is
+     * ending survive exactly one reset so those stragglers stay on their
+     * original budgets; older entries are removed. */
+    sweepStaleStreamLimitEntries(
+      this.streamedToolCallArgTallies,
+      this.breakerEpoch
+    );
+    sweepStaleStreamLimitEntries(this.streamDeltaEventCounts, this.breakerEpoch);
     this.streamLimitChargeCredits = undefined;
     /** Run-start is the only safe replacement point for the breaker:
      * end-of-run cleanup must leave it in place so straggling parallel
@@ -1579,13 +1590,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /* Misc.*/
 
   getRunMessages(): BaseMessage[] | undefined {
-    if (this.messages == null) {
+    /** Runtime-honest widening: a disposed-but-cached graph (HITL
+     * resume/reconnect through a WeakRef cache) can carry null here despite
+     * the field type. */
+    const messages = this.messages as BaseMessage[] | undefined;
+    if (messages == null) {
       return this.cachedRunMessages;
     }
-    if (this.messages.length === 0 && this.cachedRunMessages != null) {
+    if (messages.length === 0 && this.cachedRunMessages != null) {
       return this.cachedRunMessages;
     }
-    return this.messages.slice(this.startIndex);
+    return messages.slice(this.startIndex);
   }
 
   override getDiscoveredTools(agentId?: string): string[] {
@@ -1637,10 +1652,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     // `messages` can be null/undefined on a graph that has been disposed
     // (clearHeavyState) but is still reachable via a cache (e.g. RedisJobStore's
     // WeakRef) during a HITL resume/reconnect. Guard instead of dereferencing null.
-    if (this.messages == null) {
+    const messages = this.messages as BaseMessage[] | undefined;
+    if (messages == null) {
       return undefined;
     }
-    return convertMessagesToContent(this.messages.slice(this.startIndex));
+    return convertMessagesToContent(messages.slice(this.startIndex));
   }
 
   getCalibrationRatio(): number {
@@ -1675,13 +1691,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     // `contentData` can be null/undefined on a disposed-but-cached graph during a
     // HITL resume/reconnect; without this guard `[...this.contentData]` throws
     // "this.contentData is not iterable".
-    if (this.contentData == null) {
+    const contentData = this.contentData as t.RunStep[] | undefined;
+    if (contentData == null) {
       return [];
     }
     if (agentId == null || agentId === '') {
-      return [...this.contentData];
+      return [...contentData];
     }
-    return this.contentData.filter((step) => step.agentId === agentId);
+    return contentData.filter((step) => step.agentId === agentId);
   }
 
   /**
@@ -4163,6 +4180,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const readChargeCredits = ():
       | WeakMap<object, Map<string, number>>
       | undefined => this.streamLimitChargeCredits;
+    const readBreakerEpoch = (): number => this.breakerEpoch;
     const writeChargeCredits = (
       value: WeakMap<object, Map<string, number>> | undefined
     ): void => {
@@ -4213,6 +4231,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               value: WeakMap<object, Map<string, number>> | undefined
             ) {
               writeChargeCredits(value);
+            },
+            /** Live epoch, so summary tallies are creation-tagged and the
+             * resetValues grace sweep treats them like model-attempt
+             * entries. */
+            get breakerEpoch(): number {
+              return readBreakerEpoch();
             },
             /** Read per attempt: a sibling branch tripping the run breaker
              * must also cancel in-flight summarization model calls. */

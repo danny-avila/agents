@@ -1167,6 +1167,31 @@ describe('per-tool argument byte overrides', () => {
     });
   });
 
+  it('allocates nothing when overrides contain only zero-valued disables', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 0,
+        maxToolCallArgBytesByTool: { writer: 0 },
+      }),
+    });
+
+    /** `{ writer: 0 }` is a per-tool disable, not a limit — with the global
+     * cap off too, no argument limit can fire and accounting must not
+     * allocate. */
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [
+          { id: 'call_1', name: 'writer', args: 'x'.repeat(100_000), index: 0 },
+        ],
+      })
+    ).resolves.toBeUndefined();
+    expect(graph.streamLimitChargeCredits).toBeUndefined();
+    expect(graph.streamedToolCallArgTallies).toBeUndefined();
+  });
+
   it('allocates no charge bookkeeping when every guard is disabled', async () => {
     const handler = new ChatModelStreamHandler();
     const graph = createGraph({
@@ -1183,10 +1208,7 @@ describe('per-tool argument byte overrides', () => {
       })
     ).resolves.toBeUndefined();
     expect(graph.streamLimitChargeCredits).toBeUndefined();
-    expect(graph.streamedToolCallArgTallies ?? new Map()).toHaveProperty(
-      'size',
-      0
-    );
+    expect(graph.streamedToolCallArgTallies).toBeUndefined();
   });
 
   it('binds consumer trips to the event epoch, sparing a newer run', async () => {
@@ -1794,7 +1816,7 @@ describe('per-generation delta event circuit breaker', () => {
     });
 
     await emptyChunkEvent(2);
-    expect(graph.streamDeltaEventCounts.get('|agent|2|')).toBe(1);
+    expect(graph.streamDeltaEventCounts.get('|agent|2|')?.count).toBe(1);
   });
 
   it('never counts when left at the default (disabled)', async () => {
