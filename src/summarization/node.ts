@@ -35,8 +35,7 @@ import {
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import type { StreamLimitState } from '@/llm/streamLimits';
 import {
-  enforceStreamedToolCallArgLimit,
-  enforceStreamDeltaEventLimit,
+  enforceStreamLimitsForWireChunk,
   StreamLimitExceededError,
 } from '@/llm/streamLimits';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
@@ -1390,17 +1389,13 @@ export function createSummarizationChunkHandler({
      */
     if (graph != null) {
       const metadata = attemptMetadata ?? limitMetadata;
-      enforceStreamDeltaEventLimit({ graph, metadata });
-      if (chunk.tool_call_chunks != null && chunk.tool_call_chunks.length > 0) {
-        enforceStreamedToolCallArgLimit({
-          graph,
-          metadata,
-          toolCallChunks: chunk.tool_call_chunks,
-          responseMetadata: chunk.response_metadata as
-            | Record<string, unknown>
-            | undefined,
-        });
-      }
+      enforceStreamLimitsForWireChunk({
+        graph,
+        metadata,
+        chunk: chunk as Parameters<
+          typeof enforceStreamLimitsForWireChunk
+        >[0]['chunk'],
+      });
     }
     const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];
     const raw = getChunkContent({ chunk: chunkAny, provider, reasoningKey });

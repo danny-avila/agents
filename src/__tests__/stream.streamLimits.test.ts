@@ -688,6 +688,37 @@ describe('per-tool argument byte overrides', () => {
     });
   });
 
+  it('charges a chunk once when the handler echo wins the race', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+    const wireChunk = {
+      content: '',
+      tool_call_chunks: [{ id: 'call_1', name: 'writer', args: 'a'.repeat(60), index: 0 }],
+    };
+
+    await streamEvent({ handler, graph, chunk: wireChunk });
+    enforceStreamLimitsForWireChunk({
+      graph,
+      metadata: {},
+      chunk: wireChunk as never,
+    });
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ args: 'a'.repeat(40), index: 0 }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'a', index: 0 }],
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', observed: 101 });
+  });
+
   it('charges wire chunks synchronously and skips the handler echo', async () => {
     const handler = new ChatModelStreamHandler();
     const graph = createGraph({

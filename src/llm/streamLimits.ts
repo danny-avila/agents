@@ -54,9 +54,11 @@ export interface StreamLimitState {
   streamLimits?: ResolvedStreamLimits;
   streamedToolCallArgTallies?: Map<string, StreamedToolCallArgTally>;
   streamDeltaEventCounts?: Map<string, number>;
-  /** Wire chunks already charged synchronously by the producer loop, so the
-   * decoupled handler echo of the same object does not charge them again. */
-  streamLimitPrecountedChunks?: WeakSet<object>;
+  /** Wire chunks some accounting path has already charged. The producer loop
+   * and the decoupled handler can observe the same chunk object in either
+   * order, so charging is claim-based: first claimer charges, the other
+   * skips. */
+  streamLimitChargedChunks?: WeakSet<object>;
 }
 
 function resolveLimit(value: number | undefined, fallback: number): number {
@@ -488,13 +490,36 @@ export function enforceCompleteToolCallArgLimit({
 }
 
 /**
- * Synchronous producer-side accounting for the registered-handler dispatch
- * branch, where original wire chunks are otherwise judged only when the
- * decoupled `streamEvents` reader catches up. A lagging reader would let an
- * oversized complete call return to LangGraph and reach `ToolNode` before
- * the queued handler throws; charging in the producer loop keeps the breaker
- * ahead of graph progression. The chunk object is marked so the later
- * handler echo of the same object skips accounting.
+ * Claims accounting ownership of a wire chunk. LangChain can hand the same
+ * chunk object to the decoupled `streamEvents` handler and to the producer
+ * loop in either order, so exactly one caller — whichever arrives first —
+ * charges it. Non-object chunks cannot be identity-tracked and are always
+ * claimable.
+ */
+export function claimStreamLimitCharge(
+  graph: StreamLimitState,
+  chunk: unknown
+): boolean {
+  if (typeof chunk !== 'object' || chunk == null) {
+    return true;
+  }
+  const charged = (graph.streamLimitChargedChunks ??= new WeakSet());
+  if (charged.has(chunk)) {
+    return false;
+  }
+  charged.add(chunk);
+  return true;
+}
+
+/**
+ * Synchronous producer-side accounting for wire chunks that would otherwise
+ * be judged only when the decoupled `streamEvents` reader catches up — or,
+ * on replay-skipped and summarization chunks, not at all. A lagging reader
+ * would let an oversized complete call return to LangGraph and reach
+ * `ToolNode` before the queued handler throws; charging in the producer
+ * loop keeps the breaker ahead of graph progression. Claim-based, so
+ * whichever of this path and the handler echo sees the chunk object first
+ * charges it and the other skips.
  */
 export function enforceStreamLimitsForWireChunk({
   graph,
@@ -509,7 +534,9 @@ export function enforceStreamLimitsForWireChunk({
     response_metadata?: Record<string, unknown>;
   };
 }): void {
-  (graph.streamLimitPrecountedChunks ??= new WeakSet()).add(chunk as object);
+  if (!claimStreamLimitCharge(graph, chunk)) {
+    return;
+  }
   enforceStreamDeltaEventLimit({ graph, metadata });
   if (chunk.tool_call_chunks != null && chunk.tool_call_chunks.length > 0) {
     enforceStreamedToolCallArgLimit({
@@ -521,18 +548,6 @@ export function enforceStreamLimitsForWireChunk({
   } else if (chunk.tool_calls != null && chunk.tool_calls.length > 0) {
     enforceCompleteToolCallArgLimit({ graph, metadata, toolCalls: chunk.tool_calls });
   }
-}
-
-/** True when the producer loop already charged this exact chunk object. */
-export function wasStreamLimitPrecounted(
-  graph: StreamLimitState,
-  chunk: unknown
-): boolean {
-  return (
-    typeof chunk === 'object' &&
-    chunk != null &&
-    graph.streamLimitPrecountedChunks?.has(chunk) === true
-  );
 }
 
 /**

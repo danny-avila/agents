@@ -40,10 +40,10 @@ import {
   truncateToolResultContent,
 } from '@/utils/truncation';
 import {
+  claimStreamLimitCharge,
   enforceCompleteToolCallArgLimit,
   enforceStreamedToolCallArgLimit,
   enforceStreamDeltaEventLimit,
-  wasStreamLimitPrecounted,
 } from '@/llm/streamLimits';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
@@ -1527,14 +1527,14 @@ export class ChatModelStreamHandler implements t.EventHandler {
      * a coalesced event can carry client `tool_call_chunks` alongside a
      * server-tool result, and the complete-call dispatch branch further
      * down can prestart a side-effecting tool from an arrival-sealed
-     * oversized call. Chunks the producer loop already charged
-     * synchronously (registered-handler dispatch) are skipped so the
-     * decoupled echo does not double-count. The argument guard is
+     * oversized call. Charging is claim-based: the producer loop and this
+     * decoupled echo can observe the same chunk object in either order, and
+     * only the first claimer charges it. The argument guard is
      * deliberately NOT gated on numeric chunk indices, so id-only or
      * index-less runaway streams stay bounded, and complete parsed
      * `tool_calls` without a raw chunk representation are judged standalone.
      */
-    if (!wasStreamLimitPrecounted(graph, data.chunk)) {
+    if (claimStreamLimitCharge(graph, data.chunk)) {
       enforceStreamDeltaEventLimit({ graph, metadata });
       if (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) {
         enforceStreamedToolCallArgLimit({
