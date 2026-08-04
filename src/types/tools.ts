@@ -259,6 +259,13 @@ export type ToolNodeOptions = {
    * `resolveLocalExecutionTools`.
    */
   fileCheckpointer?: LocalFileCheckpointer;
+  /**
+   * Returns the owning graph's run-scoped breaker signal. Read once per
+   * `run()` invocation and composed into the batch config's `signal`, so
+   * every tool execution in the batch aborts when a stream circuit breaker
+   * trips elsewhere in the run.
+   */
+  getBreakerSignal?: () => AbortSignal | undefined;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -523,6 +530,12 @@ export type ToolExecuteBatchRequest = {
   configurable?: Record<string, unknown>;
   /** Runtime metadata from RunnableConfig (includes thread_id, run_id, provider, etc.) */
   metadata?: Record<string, unknown>;
+  /**
+   * Aborts when the run is cancelled or its stream circuit breaker trips.
+   * Handlers SHOULD forward this to their tool executions so in-flight work
+   * stops consuming quota once the run is already failing.
+   */
+  signal?: AbortSignal;
   /** Promise resolver - handler calls this with ALL results */
   resolve: (results: ToolExecuteResult[]) => void;
   /** Promise rejector - handler calls this on fatal error */

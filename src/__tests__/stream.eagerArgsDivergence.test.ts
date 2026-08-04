@@ -59,6 +59,7 @@ function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
       configurable: { user_id: 'user_1' },
       metadata: { run_id: 'run_1' },
     },
+    breakerAbort: new AbortController(),
     eagerEventToolExecution: { enabled: true },
     eagerEventToolExecutions: new Map(),
     eagerEventToolUsageCount: eagerUsageCount,
@@ -487,6 +488,31 @@ describe('eager args divergence (LibreChat#14371)', () => {
       name: 'db_query',
       args: { sql: 'SELECT 1;' },
     });
+  });
+
+  it('sends a breaker-composed abort signal with eager prestart requests', async () => {
+    const graph = createGraph();
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    await streamChunks({
+      handler,
+      graph,
+      metadata,
+      toolCallChunks: toToolCallChunks('call_1', 'db_query', [
+        '{"sql":"SELECT 1;"}',
+      ]),
+    });
+    await streamNextToolIndex({ handler, graph, metadata, callId: 'call_2' });
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    const { signal } = toolExecuteCalls[0];
+    expect(signal).toBeDefined();
+    expect(signal?.aborted).toBe(false);
+
+    graph.breakerAbort.abort(new Error('stream limit breach'));
+    expect(signal?.aborted).toBe(true);
   });
 
   it('the retry path no longer loops: every round executes normally with canonical args', async () => {

@@ -82,7 +82,7 @@ import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
 import { safeDispatchCustomEvent } from '@/utils/events';
-import { RunnableCallable } from '@/utils';
+import { RunnableCallable, composeAbortSignals } from '@/utils';
 import { executeHooks } from '@/hooks';
 
 /**
@@ -637,6 +637,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private toolOutputRegistry?: ToolOutputReferenceRegistry;
   /** Run-scoped selection for swapping remote code tools to local executors. */
   private toolExecution?: t.ToolExecutionConfig;
+  /** Owning graph's run-scoped breaker signal, composed into each batch's config. */
+  private getBreakerSignal?: () => AbortSignal | undefined;
   /**
    * Monotonic counter used to mint a unique scope id for anonymous
    * batches (ones invoked without a `run_id` in
@@ -678,6 +680,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolOutputRegistry,
     toolExecution,
     fileCheckpointer,
+    getBreakerSignal,
   }: t.ToolNodeConstructorParams) {
     super({
       name: name ?? TOOL_NODE_RUN_NAME,
@@ -721,6 +724,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.hookRegistry = hookRegistry;
     this.humanInTheLoop = humanInTheLoop;
     this.toolExecution = toolExecution;
+    this.getBreakerSignal = getBreakerSignal;
     // Caller-provided checkpointer wins. Graphs use this to share a
     // single per-Run instance across every ToolNode they compile so
     // `Run.rewindFiles()` reaches the same snapshot store regardless
@@ -3003,6 +3007,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               metadata: config.metadata as
                   | Record<string, unknown>
                   | undefined,
+              signal: config.signal,
               resolve: (results): void => {
                 resultSettled = true;
                 settledResults = results;
@@ -3727,6 +3732,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   protected async run(input: any, config: RunnableConfig): Promise<T> {
+    /**
+     * Breaker read once at batch entry: every downstream path (direct
+     * `tool.invoke` runtimes and the ON_TOOL_EXECUTE dispatch) inherits this
+     * config, and a graph reset mid-batch must not detach in-flight tools
+     * from an already-tripped signal.
+     */
+    const breakerSignal = this.getBreakerSignal?.();
+    const composedSignal = composeAbortSignals(config.signal, breakerSignal);
+    if (composedSignal !== config.signal) {
+      config = { ...config, signal: composedSignal };
+    }
     this.toolCallTurns.clear();
     /**
      * Per-batch local map for resolved (post-substitution) args.

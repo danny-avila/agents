@@ -1707,3 +1707,70 @@ describe('createSummarizeNode — overflow recovery', () => {
     expect(agentContext.hasSummary()).toBe(true);
   });
 });
+
+describe('summarize node breaker capture', () => {
+  it('binds the model call to the breaker signal read at node entry', async () => {
+    const entryBreaker = new AbortController();
+    const lateBreaker = new AbortController();
+    let started = false;
+    jest.spyOn(eventUtils, 'safeDispatchCustomEvent').mockImplementation((async (
+      ...args: unknown[]
+    ) => {
+      if (args[0] === GraphEvents.ON_SUMMARIZE_START) {
+        started = true;
+      }
+    }) as never);
+
+    const capturedSignals: Array<AbortSignal | undefined> = [];
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest
+              .fn()
+              .mockImplementation(
+                async (_messages: unknown, config?: unknown) => {
+                  capturedSignals.push(
+                    (config as RunnableConfig | undefined)?.signal
+                  );
+                  return { content: 'Summary text' };
+                }
+              ),
+          };
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    /** Simulates a graph reset between node entry and the model call: once
+     * ON_SUMMARIZE_START has been awaited, the live accessor hands out a
+     * fresh controller's signal. The model call must still see the signal
+     * captured at entry. */
+    const graph = {
+      ...mockGraph(),
+      getBreakerSignal: (): AbortSignal =>
+        started ? lateBreaker.signal : entryBreaker.signal,
+    };
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(capturedSignals.length).toBeGreaterThan(0);
+    for (const signal of capturedSignals) {
+      expect(signal).toBe(entryBreaker.signal);
+    }
+  });
+});

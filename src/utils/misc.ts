@@ -73,3 +73,22 @@ export function unescapeObject(obj: unknown, key?: string): unknown {
   }
   return obj;
 }
+
+/**
+ * One signal that fires when either input fires. `AbortSignal.any` is skipped
+ * when the inputs collapse to a single signal — the composite is a fresh
+ * object per call, and the common cases (one channel, or the host reusing the
+ * same controller for both) don't need one.
+ */
+export function composeAbortSignals(
+  a: AbortSignal | undefined,
+  b: AbortSignal | undefined
+): AbortSignal | undefined {
+  if (a == null || a === b) {
+    return b;
+  }
+  if (b == null) {
+    return a;
+  }
+  return AbortSignal.any([a, b]);
+}

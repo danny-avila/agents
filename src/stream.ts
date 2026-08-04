@@ -51,6 +51,7 @@ import {
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent } from '@/utils/events';
+import { composeAbortSignals } from '@/utils/misc';
 import { isGoogleLike } from '@/utils/llm';
 import { getMessageId } from '@/messages';
 
@@ -787,6 +788,10 @@ function startEagerToolExecutions(args: {
         | Record<string, unknown>
         | undefined,
       metadata,
+      signal: composeAbortSignals(
+        graph.config?.signal,
+        graph.breakerAbort.signal
+      ),
       resolve: (results): void => {
         resultSettled = true;
         settledResults = results;

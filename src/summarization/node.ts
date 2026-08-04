@@ -931,7 +931,7 @@ function withBreakerSignal<T extends { signal?: AbortSignal }>(
 
 export function createSummarizeNode({
   agentContext,
-  graph,
+  graph: adapterGraph,
   generateStepId,
 }: CreateSummarizeNodeParams) {
   return async (
@@ -941,6 +941,20 @@ export function createSummarizeNode({
     },
     config?: RunnableConfig
   ): Promise<{ summarizationRequest: undefined; messages?: BaseMessage[] }> => {
+    /** The breaker signal is captured at node ENTRY, before dispatchRunStep,
+     * ON_SUMMARIZE_START, or PreCompact awaits: a sibling's trip plus a
+     * prompt next run can reset the controller during one of those awaits,
+     * and resolving the live accessor later would bind this summarization
+     * to the fresh controller. `Object.create` freezes the signal while
+     * DELEGATING every other adapter member — spreading would snapshot the
+     * charge-credit accessor pair and detach it from graph resets. */
+    const entryBreakerSignal = adapterGraph.getBreakerSignal?.();
+    const graph =
+      entryBreakerSignal == null
+        ? adapterGraph
+        : (Object.create(adapterGraph, {
+          getBreakerSignal: { value: (): AbortSignal => entryBreakerSignal },
+        }) as typeof adapterGraph);
     const request = state.summarizationRequest;
     if (request == null) {
       return { summarizationRequest: undefined };

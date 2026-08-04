@@ -73,6 +73,7 @@ import {
   isGoogleLike,
   apportionTokenCounts,
   calculateMaxToolResultChars,
+  composeAbortSignals,
   joinKeys,
   sleep,
 } from '@/utils';
@@ -161,25 +162,6 @@ const EMPTY_PREEMPT_BOUNDARY: PreemptBoundaryResult = {
   messages: [],
   preventContinuation: false,
 };
-
-/**
- * One signal that fires when either input fires. `AbortSignal.any` is skipped
- * when the inputs collapse to a single signal — the composite is a fresh
- * object per call, and the common cases (one channel, or the host reusing the
- * same controller for both) don't need one.
- */
-function composeAbortSignals(
-  a: AbortSignal | undefined,
-  b: AbortSignal | undefined
-): AbortSignal | undefined {
-  if (a == null || a === b) {
-    return b;
-  }
-  if (b == null) {
-    return a;
-  }
-  return AbortSignal.any([a, b]);
-}
 
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
@@ -1813,6 +1795,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
         fileCheckpointer: this.getOrCreateFileCheckpointer(),
+        getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
         errorHandler: (data, metadata): Promise<boolean> =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
@@ -1880,6 +1863,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       maxToolResultChars: agentContext?.maxToolResultChars,
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
       fileCheckpointer: this.getOrCreateFileCheckpointer(),
+      getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
     });
     this.registerCompiledToolNode(node);
     return node;
@@ -2006,6 +1990,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       state: t.AgentSubgraphState,
       config?: RunnableConfig
     ): Promise<Partial<t.AgentSubgraphState>> => {
+      /** Captured at node ENTRY, before any host-facing await (context-usage
+       * dispatch, hooks): a sibling's trip can fail the run and a prompt
+       * next run can reset the controller while this node is paused in one
+       * of those awaits, and a later capture would bind this attempt to the
+       * fresh controller. Trips and reason reads below stay on this
+       * capture. */
+      const attemptBreaker = this.breakerAbort;
       const agentContext = this.agentContexts.get(agentId);
       if (!agentContext) {
         throw new Error(`Agent context not found for agentId: ${agentId}`);
@@ -3197,11 +3188,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentName: agentContext.name,
       });
       let langfuseHandler: CallbackEntry | undefined;
-      /** Captured per attempt, like subagent executions: a failed run's
-       * reset replaces the controller, and an old attempt's catch reading
-       * the live controller would miss its own run's trip. Trips and reason
-       * reads below bind to this capture. */
-      const attemptBreaker = this.breakerAbort;
       let invokeConfig = {
         ...config,
         /** The run-scoped breaker composed in, so a stream-limit trip in one
