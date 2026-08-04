@@ -707,6 +707,19 @@ async function executeSummarizationWithFallback(params: {
     if (primaryError instanceof StreamLimitExceededError) {
       throw primaryError;
     }
+    /** A parallel branch's trip aborts the composed summarization signal,
+     * and a provider can surface that as a generic abort error; entering
+     * fallback recovery or degrading to the metadata stub would continue
+     * work after the run-wide safety abort. Rethrow the breaker's reason. */
+    {
+      const breakerSignal = graph?.getBreakerSignal?.();
+      if (
+        breakerSignal?.aborted === true &&
+        breakerSignal.reason instanceof StreamLimitExceededError
+      ) {
+        throw breakerSignal.reason;
+      }
+    }
 
     const rawFallbacks = (
       clientConfig.clientOptions as unknown as t.LLMConfig | undefined

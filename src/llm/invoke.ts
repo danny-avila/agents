@@ -1173,6 +1173,16 @@ export async function tryFallbackProviders({
       if (e instanceof StreamLimitExceededError) {
         throw e;
       }
+      /** A parallel sibling's trip aborts this branch's composed signal, and
+       * a provider can surface that as a generic abort error; advancing to
+       * the next fallback would start new provider work after the safety
+       * abort. Rethrow the breaker's own reason instead. */
+      if (
+        config?.signal?.aborted === true &&
+        config.signal.reason instanceof StreamLimitExceededError
+      ) {
+        throw config.signal.reason;
+      }
       lastError = e;
       const fallbackOverflowContext: ContextOverflowContext = {
         provider: fb.provider,

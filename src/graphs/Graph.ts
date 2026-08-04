@@ -1093,12 +1093,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * the composed constructor signal (child graphs own separate controllers).
    * Providers can translate either abort into a generic error, and recovery
    * paths must not run in that state. */
-  protected resolveTrippedBreakerReason(): StreamLimitExceededError | undefined {
+  protected resolveTrippedBreakerReason(
+    breakerSignal: AbortSignal = this.breakerAbort.signal
+  ): StreamLimitExceededError | undefined {
     if (
-      this.breakerAbort.signal.aborted &&
-      this.breakerAbort.signal.reason instanceof StreamLimitExceededError
+      breakerSignal.aborted &&
+      breakerSignal.reason instanceof StreamLimitExceededError
     ) {
-      return this.breakerAbort.signal.reason;
+      return breakerSignal.reason;
     }
     if (
       this.signal?.aborted === true &&
@@ -3195,12 +3197,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentName: agentContext.name,
       });
       let langfuseHandler: CallbackEntry | undefined;
+      /** Captured per attempt, like subagent executions: a failed run's
+       * reset replaces the controller, and an old attempt's catch reading
+       * the live controller would miss its own run's trip. Trips and reason
+       * reads below bind to this capture. */
+      const attemptBreaker = this.breakerAbort;
       let invokeConfig = {
         ...config,
         /** The run-scoped breaker composed in, so a stream-limit trip in one
          * parallel agent node also cancels sibling nodes' in-flight model
          * calls, not only their subagents. */
-        signal: composeAbortSignals(config.signal, this.breakerAbort.signal),
+        signal: composeAbortSignals(config.signal, attemptBreaker.signal),
         metadata: {
           ...(config.metadata ?? {}),
           ...traceMetadata,
@@ -3280,7 +3287,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (primaryError instanceof StreamLimitExceededError) {
           /** Tripped before rethrowing so parallel agent nodes' in-flight
            * model calls and subagents stop while the rejection propagates. */
-          this.breakerAbort.abort(primaryError);
+          attemptBreaker.abort(primaryError);
           throw primaryError;
         }
         /** A sibling that tripped the shared breaker aborts this branch's
@@ -3289,7 +3296,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * would start new provider work after the run-wide breaker fired.
          * Rethrow the breaker's own stream-limit reason instead. */
         {
-          const trippedReason = this.resolveTrippedBreakerReason();
+          const trippedReason = this.resolveTrippedBreakerReason(attemptBreaker.signal);
           if (trippedReason != null) {
             throw trippedReason;
           }
@@ -3531,12 +3538,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             /** Same treatment as the primary path: a fallback stream that
              * trips the breaker must stop parallel agent nodes' model calls
              * and subagents before the rejection propagates. */
-            this.breakerAbort.abort(fallbackError);
+            attemptBreaker.abort(fallbackError);
             throw fallbackError;
           }
           {
             /** Same sibling-abort translation guard as the primary catch. */
-            const trippedReason = this.resolveTrippedBreakerReason();
+            const trippedReason = this.resolveTrippedBreakerReason(attemptBreaker.signal);
             if (trippedReason != null) {
               throw trippedReason;
             }
