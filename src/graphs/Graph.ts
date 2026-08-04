@@ -3489,6 +3489,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               })
           );
         } catch (fallbackError) {
+          if (fallbackError instanceof StreamLimitExceededError) {
+            /** Same treatment as the primary path: a fallback stream that
+             * trips the breaker must stop parallel agent nodes' model calls
+             * and subagents before the rejection propagates. */
+            this.breakerAbort.abort(fallbackError);
+            throw fallbackError;
+          }
           const overflowCandidates =
             getFallbackOverflowCandidates(fallbackError);
           let fallbackRecovery: OverflowRecoveryPlan | null = null;

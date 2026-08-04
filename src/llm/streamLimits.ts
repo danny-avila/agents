@@ -435,8 +435,11 @@ export function enforceStreamedToolCallArgLimit({
         break;
       }
     }
-    const registerAliases = (target: StreamedToolCallArgTally): void => {
-      for (const aliasKey of aliasCandidates) {
+    const registerAliasKeys = (
+      target: StreamedToolCallArgTally,
+      candidates: string[]
+    ): void => {
+      for (const aliasKey of candidates) {
         const currentOwner = tallies.get(aliasKey);
         if (currentOwner === target) {
           continue;
@@ -453,6 +456,21 @@ export function enforceStreamedToolCallArgLimit({
         tallies.set(aliasKey, target);
         (target.keys ??= []).push(aliasKey);
       }
+    };
+    const registerAliases = (target: StreamedToolCallArgTally): void => {
+      registerAliasKeys(target, aliasCandidates);
+    };
+    /** Index-only calls register their batch position ONCE, at creation:
+     * later deltas that drop the index then land on the same tally, while
+     * the per-delta hot path (indexed id-less deltas) stays free of alias
+     * work. */
+    const registerCreationPositionAlias = (
+      target: StreamedToolCallArgTally
+    ): void => {
+      if (chunk.id != null || chunk.index == null || sealed) {
+        return;
+      }
+      registerAliasKeys(target, [`${generationKey}:#${i}`]);
     };
     const releaseTally = (target: StreamedToolCallArgTally): void => {
       tallies.delete(key);
@@ -471,6 +489,7 @@ export function enforceStreamedToolCallArgLimit({
           tally = { bytes: 0, name: resolveChunkName(chunk), keys: [key] };
           tallies.set(key, tally);
           registerAliases(tally);
+          registerCreationPositionAlias(tally);
         }
         continue;
       }
@@ -508,6 +527,7 @@ export function enforceStreamedToolCallArgLimit({
     if (tally == null) {
       tally = { bytes: 0, keys: [key] };
       tallies.set(key, tally);
+      registerCreationPositionAlias(tally);
     }
     if (!sealed) {
       registerAliases(tally);
@@ -697,6 +717,7 @@ export function enforceStreamLimitsForWireChunk({
   chunk: {
     tool_call_chunks?: ToolCallChunk[];
     tool_calls?: CompleteToolCallLike[];
+    invalid_tool_calls?: CompleteToolCallLike[];
     response_metadata?: Record<string, unknown>;
   };
   /** Claim side for the credit balance. The local dispatch branch charges
@@ -721,10 +742,33 @@ export function enforceStreamLimitsForWireChunk({
   /** Judged whenever parsed calls are present, not only when raw chunks are
    * absent: an adapter can pair an empty or partial raw chunk with a
    * complete parsed call, and the standalone check is stateless so the
-   * common both-present case is not double-tallied. */
-  if (chunk.tool_calls != null && chunk.tool_calls.length > 0) {
-    enforceCompleteToolCallArgLimit({ graph, metadata, toolCalls: chunk.tool_calls });
+   * common both-present case is not double-tallied. `invalid_tool_calls`
+   * are included — ToolNode processes and promotes them, and a malformed
+   * call streaming oversized arguments is the exact pathology this breaker
+   * exists to stop. */
+  const completeCalls = combineCompleteToolCalls(chunk);
+  if (completeCalls != null) {
+    enforceCompleteToolCallArgLimit({ graph, metadata, toolCalls: completeCalls });
   }
+}
+
+/** Combined view of a chunk's parsed and invalid complete calls, avoiding
+ * allocation on the common paths where one or both are absent. */
+export function combineCompleteToolCalls(chunk: {
+  tool_calls?: CompleteToolCallLike[];
+  invalid_tool_calls?: CompleteToolCallLike[];
+}): CompleteToolCallLike[] | undefined {
+  const parsed = chunk.tool_calls;
+  const invalid = chunk.invalid_tool_calls;
+  const hasParsed = parsed != null && parsed.length > 0;
+  const hasInvalid = invalid != null && invalid.length > 0;
+  if (hasParsed && hasInvalid) {
+    return [...parsed, ...invalid];
+  }
+  if (hasParsed) {
+    return parsed;
+  }
+  return hasInvalid ? invalid : undefined;
 }
 
 /**

@@ -41,6 +41,7 @@ import {
 } from '@/utils/truncation';
 import {
   claimStreamLimitCharge,
+  combineCompleteToolCalls,
   enforceCompleteToolCallArgLimit,
   enforceStreamedToolCallArgLimit,
   enforceStreamDeltaEventLimit,
@@ -1550,12 +1551,14 @@ export class ChatModelStreamHandler implements t.EventHandler {
       /** Judged whenever parsed calls are present, not only when raw chunks
        * are absent — an adapter can pair an empty or partial raw chunk with
        * a complete parsed call; the standalone check is stateless, so the
-       * common both-present case is not double-tallied. */
-      if (chunk.tool_calls && chunk.tool_calls.length > 0) {
+       * common both-present case is not double-tallied. Invalid calls are
+       * included because ToolNode processes and promotes them. */
+      const completeCalls = combineCompleteToolCalls(chunk);
+      if (completeCalls != null) {
         enforceCompleteToolCallArgLimit({
           graph,
           metadata,
-          toolCalls: chunk.tool_calls,
+          toolCalls: completeCalls,
         });
       }
     }

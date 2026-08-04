@@ -1154,6 +1154,60 @@ describe('per-tool argument byte overrides', () => {
     ).resolves.toBeUndefined();
   });
 
+  it('judges invalid parsed tool calls that arrive without raw chunks', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          invalid_tool_calls: [
+            {
+              id: 'call_1',
+              name: 'side_effect',
+              args: 'x'.repeat(200),
+              error: 'Unparseable arguments',
+            },
+          ],
+        },
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 100,
+      toolName: 'side_effect',
+    });
+  });
+
+  it('keeps one budget when an index-only call drops its index', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ name: 'writer', args: 'a'.repeat(60), index: 0 }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'a'.repeat(41) }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      observed: 101,
+      toolName: 'writer',
+    });
+  });
+
   it('normalizes override entries like the global field', () => {
     const resolved = resolveStreamLimits({
       maxToolCallArgBytes: 100,
