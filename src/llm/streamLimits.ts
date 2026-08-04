@@ -335,7 +335,11 @@ export function enforceStreamedToolCallArgLimit({
   if (metadata?.[STREAM_LIMIT_REDISPATCH_KEY] === true) {
     return;
   }
-  const tallies = (graph.streamedToolCallArgTallies ??= new Map());
+  const tallies: Map<string, StreamedToolCallArgTally> =
+    (graph.streamedToolCallArgTallies ??= new Map<
+      string,
+      StreamedToolCallArgTally
+    >());
   const generationKey = resolveGenerationKey(metadata);
   const seal = getStreamedToolCallSeal(responseMetadata);
   /** The complete call in this event sharing the chunk's id — the strongest
@@ -519,8 +523,8 @@ export function enforceStreamedToolCallArgLimit({
         if (existing.keys?.includes(adoptionKey) !== true) {
           (existing.keys ??= []).push(adoptionKey);
         }
-        if (existing.keys?.includes(key) !== true) {
-          (existing.keys ??= []).push(key);
+        if (!existing.keys.includes(key)) {
+          existing.keys.push(key);
         }
         break;
       }
@@ -742,7 +746,7 @@ export function enforceCompleteToolCallArgLimit({
     } else if (args == null) {
       serialized = '';
     } else {
-      serialized = JSON.stringify(args) ?? '';
+      serialized = JSON.stringify(args);
     }
     const bytes = Buffer.byteLength(serialized, 'utf8');
     if (bytes > limit) {

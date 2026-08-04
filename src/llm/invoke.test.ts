@@ -556,7 +556,7 @@ describe('attemptInvoke applies lazy ref annotation', () => {
     responses.model.defaultOptions = { tools: [] };
     responses.model._useResponsesApi = (options) =>
       Array.isArray((options as { tools?: unknown[] } | undefined)?.tools) &&
-      ((options as { tools: unknown[] }).tools.length ?? 0) > 0;
+      (options as { tools: unknown[] }).tools.length > 0;
 
     await attemptInvoke(
       {
