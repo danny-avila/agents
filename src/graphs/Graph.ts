@@ -123,6 +123,7 @@ import {
 import {
   resolveStreamLimits,
   StreamLimitExceededError,
+  STREAM_LIMIT_EPOCH_KEY,
 } from '@/llm/streamLimits';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
@@ -1070,6 +1071,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * a run, and a reused graph must start its next run unaborted. */
   breakerAbort = new AbortController();
 
+  /** Incremented whenever `breakerAbort` is replaced. Stamped into each
+   * model attempt's metadata ({@link STREAM_LIMIT_EPOCH_KEY}) so the stream
+   * handler's consumer-side trip binds to the run that produced the event
+   * rather than whichever controller is live when a straggling chunk is
+   * finally handled. */
+  breakerEpoch = 0;
+
   /** The stream-limit error behind an already-fired breaker, whether this
    * graph's own controller tripped or a parent run's breaker arrived through
    * the composed constructor signal (child graphs own separate controllers).
@@ -1216,6 +1224,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * hold their entry-time capture of it; a late stream-limit trip on that
      * old controller must not cancel the run starting now. */
     this.breakerAbort = new AbortController();
+    this.breakerEpoch += 1;
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
@@ -1999,6 +2008,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * fresh controller. Trips and reason reads below stay on this
        * capture. */
       const attemptBreaker = this.breakerAbort;
+      const attemptBreakerEpoch = this.breakerEpoch;
       /** Already-tripped-at-entry: a parallel sibling's breach has failed
        * the run before this node was scheduled. Rethrow before hooks or the
        * provider call — a custom provider that doesn't synchronously reject
@@ -3215,6 +3225,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
            *  length cap, but scope trust (`isForeignScope`) needs the id
            *  verbatim regardless of length. */
           agentId,
+          [STREAM_LIMIT_EPOCH_KEY]: attemptBreakerEpoch,
         },
       };
       initializeLangfuseTracing(langfuse);
@@ -3252,6 +3263,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       try {
         if (preInvokeContextOverflowError != null) {
           throw preInvokeContextOverflowError;
+        }
+        /** Rechecked after the pre-invoke awaits (context-usage dispatch,
+         * hooks): a sibling can trip the breaker while this node is paused
+         * in one of them, and a provider that doesn't synchronously reject
+         * an aborted signal would still start the request. */
+        {
+          const preInvokeTrip = this.resolveTrippedBreakerReason(
+            attemptBreaker.signal
+          );
+          if (preInvokeTrip != null) {
+            throw preInvokeTrip;
+          }
         }
         result = await withLangfuseRuntimeScope(
           resolveLangfuseRuntimeScope({
@@ -4188,6 +4211,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             /** Read per attempt: a sibling branch tripping the run breaker
              * must also cancel in-flight summarization model calls. */
             getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
+            /** The node captures this at entry so its own chunk handler's
+             * breach trips the run that STARTED the summarization, not a
+             * controller installed by a later reset. */
+            getBreakerController: (): AbortController => this.breakerAbort,
             dispatchRunStep: async (runStep, nodeConfig) => {
               const resolvedConfig = nodeConfig ?? this.config;
               if (runStep.agentId != null) {

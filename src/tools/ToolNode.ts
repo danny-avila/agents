@@ -2250,11 +2250,27 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * 4. Injected messages from results are collected and returned alongside
    *    ToolMessages (appended AFTER to respect provider ordering).
    */
+  /** Rethrows a stream-limit trip carried on the batch config's composed
+   * signal. Rechecked at each later execution/dispatch stage because a tool
+   * that ignores cancellation can complete normally across the trip, and
+   * the next stage would otherwise start fresh side effects on a failed
+   * run. */
+  private throwIfBreakerTripped(config: RunnableConfig): void {
+    const signal = config.signal;
+    if (
+      signal?.aborted === true &&
+      signal.reason instanceof StreamLimitExceededError
+    ) {
+      throw signal.reason;
+    }
+  }
+
   private async dispatchToolEvents(
     toolCalls: ToolCall[],
     config: RunnableConfig,
     batchContext: DispatchBatchContext = {}
   ): Promise<{ toolMessages: ToolMessage[]; injected: BaseMessage[] }> {
+    this.throwIfBreakerTripped(config);
     const {
       batchIndices,
       turn,
@@ -3691,6 +3707,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     interruptingPositions.forEach((i, k) => {
       outputs[i] = interruptingOutputs[k];
     });
+
+    /** The breaker can trip while the interrupting group is awaited — e.g.
+     * a tool that ignores cancellation and completes normally. Recheck
+     * before starting the non-idempotent siblings. */
+    this.throwIfBreakerTripped(config);
 
     // No interrupting call suspended — safe to run the remaining siblings.
     const regularOutputs = await Promise.all(

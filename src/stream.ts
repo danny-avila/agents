@@ -47,6 +47,7 @@ import {
   enforceStreamDeltaEventLimit,
   requiresStreamLimitAccounting,
   StreamLimitExceededError,
+  STREAM_LIMIT_EPOCH_KEY,
 } from '@/llm/streamLimits';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
@@ -1528,6 +1529,19 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     const chunk = data.chunk as Partial<AIMessageChunk>;
 
+    /** The breaker this event's run owns. Attempts stamp their breaker
+     * epoch into event metadata; a mismatch marks a straggling chunk from a
+     * failed run that outlived `resetValues()`, and tripping (or
+     * consulting) the LIVE controller for it would cancel the unrelated run
+     * now using it. Events without a stamp (direct handler callers, partial
+     * stubs) keep the live-controller behavior. */
+    const eventEpoch = metadata?.[STREAM_LIMIT_EPOCH_KEY];
+    const eventBreaker =
+      graph.breakerAbort instanceof AbortController &&
+      (eventEpoch == null || eventEpoch === graph.breakerEpoch)
+        ? graph.breakerAbort
+        : undefined;
+
     /**
      * Enforced before every content-specific early return below
      * (server-tool results, deferred mixed reasoning, late OpenRouter
@@ -1580,13 +1594,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
         /** A breach detected on this consumer path must still stop parallel
          * fan-out work: the producer skips its own enforcement once this
          * side has claimed the emission, so createCallModel's breaker-abort
-         * never fires for it. Trip the shared graph breaker before the
-         * throw rejects the run. */
-        if (
-          error instanceof StreamLimitExceededError &&
-          graph.breakerAbort instanceof AbortController
-        ) {
-          graph.breakerAbort.abort(error);
+         * never fires for it. Trip the EVENT's run-bound breaker before the
+         * throw rejects the run — never the live controller of a newer run. */
+        if (error instanceof StreamLimitExceededError && eventBreaker != null) {
+          eventBreaker.abort(error);
         }
         throw error;
       }
@@ -1597,11 +1608,11 @@ export class ChatModelStreamHandler implements t.EventHandler {
      * eager-tool paths below — those can dispatch a side-effecting host
      * tool with an already-aborted signal the handler never inspects. */
     if (
-      graph.breakerAbort instanceof AbortController &&
-      graph.breakerAbort.signal.aborted &&
-      graph.breakerAbort.signal.reason instanceof StreamLimitExceededError
+      eventBreaker != null &&
+      eventBreaker.signal.aborted &&
+      eventBreaker.signal.reason instanceof StreamLimitExceededError
     ) {
-      throw graph.breakerAbort.signal.reason;
+      throw eventBreaker.signal.reason;
     }
 
     const agentContext = graph.getAgentContext(metadata);

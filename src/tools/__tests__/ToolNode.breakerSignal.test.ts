@@ -33,6 +33,20 @@ function createToolCallMessage(id: string, name: string): AIMessage {
   return new AIMessage({ content: '', tool_calls: [{ id, name, args: {} }] });
 }
 
+/** A minimal tool whose invoke ignores the abort signal entirely — unlike
+ * langchain `tool()` Runnables, which race the signal and reject with its
+ * reason the moment a trip fires mid-execution. */
+function createSignalBlindTool(
+  name: string,
+  fn: () => Promise<string>
+): StructuredToolInterface {
+  return {
+    name,
+    description: `signal-blind ${name}`,
+    invoke: fn,
+  } as unknown as StructuredToolInterface;
+}
+
 function installToolExecuteResponder(): {
   toolExecuteCalls: t.ToolExecuteBatchRequest[];
   } {
@@ -149,6 +163,89 @@ describe('ToolNode breaker signal composition', () => {
       })
     ).rejects.toBe(trip);
     expect(toolRan).toBe(false);
+  });
+
+  it('stops regular siblings when an interrupting tool trips the breaker', async () => {
+    const breaker = new AbortController();
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    let sideEffectRan = false;
+    /** Plain tool objects, NOT langchain `tool()`: Runnable invokes race
+     * the composed signal and reject with its reason the instant the trip
+     * fires, which would mask the stage boundary this test targets. The
+     * exposure is exactly tools that ignore cancellation. */
+    const tripper = createSignalBlindTool('ask_question', async () => {
+      breaker.abort(trip);
+      return 'completed normally across the trip';
+    });
+    const sideEffect = createSignalBlindTool('send_email', async () => {
+      sideEffectRan = true;
+      return 'sent';
+    });
+    const node = new ToolNode({
+      tools: [tripper, sideEffect],
+      interruptingToolNames: new Set(['ask_question']),
+      getBreakerSignal: () => breaker.signal,
+    });
+
+    await expect(
+      node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              { id: 'call_1', name: 'ask_question', args: {} },
+              { id: 'call_2', name: 'send_email', args: {} },
+            ],
+          }),
+        ],
+      })
+    ).rejects.toBe(trip);
+    expect(sideEffectRan).toBe(false);
+  });
+
+  it('stops event dispatch when a direct tool trips the breaker mid-batch', async () => {
+    const breaker = new AbortController();
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const tripper = createSignalBlindTool('direct_tripper', async () => {
+      breaker.abort(trip);
+      return 'completed normally across the trip';
+    });
+    const node = new ToolNode({
+      tools: [tripper],
+      eventDrivenMode: true,
+      directToolNames: new Set(['direct_tripper']),
+      toolCallStepIds: new Map([
+        ['call_1', 'step_1'],
+        ['call_2', 'step_2'],
+      ]),
+      getBreakerSignal: () => breaker.signal,
+    });
+
+    await expect(
+      node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              { id: 'call_1', name: 'direct_tripper', args: {} },
+              { id: 'call_2', name: 'remote_tool', args: {} },
+            ],
+          }),
+        ],
+      })
+    ).rejects.toBe(trip);
+    expect(toolExecuteCalls).toHaveLength(0);
   });
 
   it('sends a breaker-composed signal on ON_TOOL_EXECUTE batch requests', async () => {

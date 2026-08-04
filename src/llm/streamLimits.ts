@@ -228,6 +228,17 @@ export const STREAM_LIMIT_ATTEMPT_KEY = 'lc_stream_limit_attempt';
 export const STREAM_LIMIT_REDISPATCH_KEY = 'lc_stream_limit_redispatch';
 
 /**
+ * Metadata key carrying the graph's breaker epoch at the time a model
+ * attempt started. The stream handler trips the shared breaker only when
+ * the event's epoch matches the live controller's — a straggling chunk from
+ * a failed run that outlived `resetValues()` must fail its own (dead) run,
+ * not abort the controller now serving the next one. A primitive rather
+ * than the controller itself so attempt metadata stays serialization-safe
+ * for tracing.
+ */
+export const STREAM_LIMIT_EPOCH_KEY = 'lc_stream_limit_epoch';
+
+/**
  * True when the event's `single` seal marks this chunk's own call as
  * complete. On the OpenAI Responses adapter the sealing chunk RESTATES the
  * full argument string (`response.function_call_arguments.done`), so summing

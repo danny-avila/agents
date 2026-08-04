@@ -906,6 +906,10 @@ interface CreateSummarizeNodeParams {
      * model attempt so a sibling branch tripping a stream limit also
      * cancels in-flight summaries. */
     getBreakerSignal?: () => AbortSignal;
+    /** The run's shared breaker controller. Preferred over the bare signal
+     * accessor: the node captures it at entry so a breach detected by its
+     * own chunk handler trips the run that STARTED the summarization. */
+    getBreakerController?: () => AbortController;
   } & StreamLimitState;
   generateStepId: (stepKey: string) => [string, number];
 }
@@ -968,12 +972,19 @@ export function createSummarizeNode({
      * to the fresh controller. `Object.create` freezes the signal while
      * DELEGATING every other adapter member — spreading would snapshot the
      * charge-credit accessor pair and detach it from graph resets. */
-    const entryBreakerSignal = adapterGraph.getBreakerSignal?.();
+    const entryBreakerController = adapterGraph.getBreakerController?.();
+    const entryBreakerSignal =
+      entryBreakerController?.signal ?? adapterGraph.getBreakerSignal?.();
     const graph =
       entryBreakerSignal == null
         ? adapterGraph
         : (Object.create(adapterGraph, {
           getBreakerSignal: { value: (): AbortSignal => entryBreakerSignal },
+          ...(entryBreakerController != null && {
+            getBreakerController: {
+              value: (): AbortController => entryBreakerController,
+            },
+          }),
         }) as typeof adapterGraph);
     const request = state.summarizationRequest;
     if (request == null) {
@@ -1457,7 +1468,7 @@ export function createSummarizationChunkHandler({
   config?: RunnableConfig;
   provider?: Providers;
   reasoningKey?: 'reasoning_content' | 'reasoning';
-  graph?: StreamLimitState;
+  graph?: StreamLimitState & { getBreakerController?: () => AbortController };
 }): OnChunk | undefined {
   if (stepId == null || stepId === '' || !config) {
     return undefined;
@@ -1473,19 +1484,30 @@ export function createSummarizationChunkHandler({
      * no registered handler) still get single-sided enforcement from this
      * one claim. Summarization deliberately passes NO `context` to
      * `attemptInvoke`, whose onChunk branch would otherwise add a second
-     * producer claim. A trip tears down the model stream and
-     * `executeSummarizationWithFallback` rethrows it past fallbacks and the
-     * metadata stub, failing the run with the limit error like any other
-     * breach.
+     * producer claim. A breach trips the run's shared breaker (the
+     * ENTRY-captured controller when the adapter provides one) before
+     * rethrowing: this producer claim wins the race, so the wire consumer's
+     * breaker-aborting catch never fires for the same chunk — without the
+     * trip here, sibling model calls, tools, and subagents would keep
+     * consuming quota while the summary branch rejects.
+     * `executeSummarizationWithFallback` then rethrows past fallbacks and
+     * the metadata stub, failing the run like any other breach.
      */
     if (graph != null) {
-      enforceStreamLimitsForWireChunk({
-        graph,
-        metadata: attemptMetadata ?? limitMetadata,
-        chunk: chunk as Parameters<
-          typeof enforceStreamLimitsForWireChunk
-        >[0]['chunk'],
-      });
+      try {
+        enforceStreamLimitsForWireChunk({
+          graph,
+          metadata: attemptMetadata ?? limitMetadata,
+          chunk: chunk as Parameters<
+            typeof enforceStreamLimitsForWireChunk
+          >[0]['chunk'],
+        });
+      } catch (error) {
+        if (error instanceof StreamLimitExceededError) {
+          graph.getBreakerController?.().abort(error);
+        }
+        throw error;
+      }
     }
     const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];
     const raw = getChunkContent({ chunk: chunkAny, provider, reasoningKey });

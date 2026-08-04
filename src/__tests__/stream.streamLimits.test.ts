@@ -24,6 +24,7 @@ import {
 import {
   DEFAULT_MAX_TOOL_CALL_ARG_BYTES,
   STREAM_LIMIT_REDISPATCH_KEY,
+  STREAM_LIMIT_EPOCH_KEY,
   StreamLimitExceededError,
   enforceStreamLimitsForWireChunk,
   resolveGenerationKey,
@@ -1019,6 +1020,84 @@ describe('per-tool argument byte overrides', () => {
     await expect(
       streamEvent({ handler, graph, chunk: { content: 'queued text' } })
     ).rejects.toBe(trip);
+  });
+
+  it('binds consumer trips to the event epoch, sparing a newer run', async () => {
+    const handler = new ChatModelStreamHandler();
+    const newRunBreaker = new AbortController();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+      breakerAbort: newRunBreaker,
+      breakerEpoch: 5,
+    });
+
+    /** A straggling oversized chunk from a failed run (epoch 4) handled
+     * after resetValues installed epoch 5: the breach still rejects, but
+     * the new run's controller must stay live. */
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [
+          { id: 'call_1', name: 'writer', args: 'x'.repeat(101), index: 0 },
+        ],
+        metadata: { [STREAM_LIMIT_EPOCH_KEY]: 4 },
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args' });
+    expect(newRunBreaker.signal.aborted).toBe(false);
+
+    /** Same breach with the matching epoch trips the controller. */
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [
+          { id: 'call_2', name: 'writer', args: 'x'.repeat(101), index: 0 },
+        ],
+        metadata: { [STREAM_LIMIT_EPOCH_KEY]: 5 },
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args' });
+    expect(newRunBreaker.signal.aborted).toBe(true);
+  });
+
+  it('lets stale-epoch events pass the queued-event breaker check', async () => {
+    const handler = new ChatModelStreamHandler();
+    const breakerAbort = new AbortController();
+    breakerAbort.abort(
+      new StreamLimitExceededError({
+        kind: 'tool_call_args',
+        limit: 10,
+        observed: 11,
+        toolName: 'db_query',
+      })
+    );
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits(),
+      breakerAbort,
+      breakerEpoch: 5,
+    });
+
+    /** The tripped controller belongs to the CURRENT run (epoch 5); an
+     * old-run chunk (epoch 4) must not be failed against it. The same
+     * event WITH the matching epoch throws, proving only the epoch gate
+     * differs. */
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: { content: '' },
+        metadata: { [STREAM_LIMIT_EPOCH_KEY]: 4 },
+      })
+    ).resolves.toBeUndefined();
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: { content: '' },
+        metadata: { [STREAM_LIMIT_EPOCH_KEY]: 5 },
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args' });
   });
 
   it('treats empty tool-call ids as anonymous, keeping parallel calls apart', async () => {

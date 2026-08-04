@@ -82,6 +82,39 @@ describe('createSummarizationChunkHandler stream limits', () => {
     );
   });
 
+  it('trips the run breaker when its own enforcement breaches', async () => {
+    const breaker = new AbortController();
+    const graph: StreamLimitState & {
+      getBreakerController?: () => AbortController;
+    } = {
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 50 }),
+      getBreakerController: () => breaker,
+    };
+    const onChunk = createSummarizationChunkHandler({
+      stepId: 'step_1',
+      config: { metadata: { langgraph_node: 'summarize', langgraph_step: 4 } },
+      provider: Providers.OPENAI,
+      reasoningKey: 'reasoning_content',
+      graph,
+    });
+    const toolChunk = (args: string): AIMessageChunk =>
+      new AIMessageChunk({
+        content: '',
+        tool_call_chunks: [
+          { type: 'tool_call_chunk', name: 'db_query', args, index: 0 },
+        ],
+      });
+
+    /** This producer claim wins the race, so the wire consumer's
+     * breaker-aborting catch never fires for the same chunk — the trip has
+     * to happen here or sibling branches keep consuming quota. */
+    await expect(async () => onChunk!(toolChunk('x'.repeat(60)))).rejects.toThrow(
+      StreamLimitExceededError
+    );
+    expect(breaker.signal.aborted).toBe(true);
+    expect(breaker.signal.reason).toMatchObject({ kind: 'tool_call_args' });
+  });
+
   it('charges a chunk once when the run wire consumer also claims it', async () => {
     const graph: StreamLimitState = {
       streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
