@@ -352,6 +352,16 @@ export function enforceStreamedToolCallArgLimit({
     }
     return undefined;
   };
+  const generationPrefix = `${generationKey}:`;
+  const getLiveGenerationTallies = (): StreamedToolCallArgTally[] => {
+    const live = new Set<StreamedToolCallArgTally>();
+    for (const [tallyKey, tally] of tallies) {
+      if (tallyKey.startsWith(generationPrefix)) {
+        live.add(tally);
+      }
+    }
+    return [...live];
+  };
   const resolveChunkName = (chunk: ToolCallChunk): string | undefined => {
     const chunkId = chunkCallId(chunk);
     const correlated =
@@ -405,6 +415,42 @@ export function enforceStreamedToolCallArgLimit({
      * value — index 0 and id "0" — cannot alias distinct calls onto one
      * tally. Empty-string ids are placeholders, not identities. */
     const chunkId = chunkCallId(chunk);
+    /** A single identifier-less event after several calls are live is a
+     * sparse parallel continuation: its position is relative to this event,
+     * not to the original batch, so `#0` cannot identify which call it
+     * belongs to. Charge the bytes against every live candidate using the
+     * global limit. This is conservative, but it prevents the continuation
+     * from inheriting whichever candidate currently owns the position alias,
+     * including a raised or disabled per-tool override. */
+    if (
+      chunk.index == null &&
+      chunkId == null &&
+      toolCallChunks.length === 1
+    ) {
+      const liveTallies = getLiveGenerationTallies();
+      if (liveTallies.length > 1) {
+        if (hasArgs) {
+          const argBytes = Buffer.byteLength(args, 'utf8');
+          for (const liveTally of liveTallies) {
+            const reconcilesSplitPair =
+              liveTally.pendingHighSurrogate === true &&
+              isLowSurrogate(args.charCodeAt(0));
+            liveTally.bytes += reconcilesSplitPair ? argBytes - 2 : argBytes;
+            liveTally.pendingHighSurrogate = isHighSurrogate(
+              args.charCodeAt(args.length - 1)
+            );
+            if (globalLimit > 0 && liveTally.bytes > globalLimit) {
+              throw new StreamLimitExceededError({
+                kind: 'tool_call_args',
+                limit: globalLimit,
+                observed: liveTally.bytes,
+              });
+            }
+          }
+        }
+        continue;
+      }
+    }
     let key: string;
     if (chunk.index != null) {
       key = `${generationKey}:i:${chunk.index}`;
@@ -414,13 +460,21 @@ export function enforceStreamedToolCallArgLimit({
       key = `${generationKey}:#${i}`;
     }
     const sealed = sealsChunk(seal, chunk);
+    /** Batch position is a stable identity only when the event carries a
+     * single chunk: sparse parallel events reuse position 0 for whichever
+     * call happens to continue, and a position alias would hand one call's
+     * tally — and its per-tool override — to another live call's deltas. */
+    const positionAliasSafe = toolCallChunks.length === 1;
     /** Secondary keys this call is also reachable under, so a later delta
      * that drops one or both identifiers still lands on the same tally:
-     * id-bearing chunks register the batch-position fallback, and chunks
-     * carrying both identifiers additionally register the id. */
+     * id-bearing chunks register the batch-position fallback (single-chunk
+     * events only), and chunks carrying both identifiers additionally
+     * register the id. */
     const aliasCandidates: string[] = [];
     if (chunkId != null) {
-      aliasCandidates.push(`${generationKey}:#${i}`);
+      if (positionAliasSafe) {
+        aliasCandidates.push(`${generationKey}:#${i}`);
+      }
       if (chunk.index != null) {
         aliasCandidates.push(`${generationKey}:c:${chunkId}`);
       }
@@ -504,6 +558,9 @@ export function enforceStreamedToolCallArgLimit({
       target: StreamedToolCallArgTally
     ): void => {
       if (chunkId != null || chunk.index == null || sealed) {
+        return;
+      }
+      if (!positionAliasSafe) {
         return;
       }
       registerAliasKeys(target, [`${generationKey}:#${i}`]);

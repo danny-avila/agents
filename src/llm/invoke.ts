@@ -1154,6 +1154,16 @@ export async function tryFallbackProviders({
           maxContextTokens: fb.maxContextTokens,
           config: fbConfig,
         })) ?? messages;
+      /** A sibling can trip the breaker while the preparation above is
+       * awaited — and the catch below only sees attempts that THROW, so a
+       * provider that ignores an aborted signal and succeeds would resolve
+       * a run that must reject. Check before every fallback invocation. */
+      if (
+        config?.signal?.aborted === true &&
+        config.signal.reason instanceof StreamLimitExceededError
+      ) {
+        throw config.signal.reason;
+      }
       const result = await attemptInvoke(
         {
           model: fbModel as t.ChatModel,

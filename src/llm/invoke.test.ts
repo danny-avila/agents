@@ -829,6 +829,54 @@ describe('tryFallbackProviders applies the same lazy annotation transform', () =
     jest.resetModules();
   });
 
+  it('rejects before invoking a fallback when the breaker tripped during preparation', async () => {
+    const abort = new AbortController();
+    const { invokeMessages, model } = buildCapturingModel();
+    await jest.isolateModulesAsync(async () => {
+      jest.doMock('@/llm/init', () => ({
+        initializeModel: (): unknown => model,
+      }));
+      const { tryFallbackProviders: freshTry } = (await import(
+        '@/llm/invoke'
+      )) as { tryFallbackProviders: typeof tryFallbackProviders };
+      const { StreamLimitExceededError: FreshStreamLimitError } = (await import(
+        '@/llm/streamLimits'
+      )) as typeof import('@/llm/streamLimits');
+      const trip = new FreshStreamLimitError({
+        kind: 'tool_call_args',
+        limit: 10,
+        observed: 11,
+        toolName: 'db_query',
+      });
+
+      /** The sibling's trip lands while fallback preparation is awaited; the
+       * fallback must not be invoked at all — a provider that ignores the
+       * aborted signal and SUCCEEDS would resolve a run that must reject. */
+      await expect(
+        freshTry({
+          fallbacks: [{ provider: Providers.ANTHROPIC }],
+          messages: [
+            new ToolMessage({
+              name: 'echo',
+              tool_call_id: 'tc1',
+              status: 'success',
+              content: 'output',
+            }),
+          ],
+          primaryError: new Error('primary failed'),
+          config: { signal: abort.signal },
+          prepareProviderMessages: async ({ messages: preparedMessages }) => {
+            abort.abort(trip);
+            return preparedMessages;
+          },
+        })
+      ).rejects.toBe(trip);
+    });
+    expect(invokeMessages).toHaveLength(0);
+
+    jest.dontMock('@/llm/init');
+  });
+
   it('neutralizes preempted Responses history before an OpenAI Chat fallback', async () => {
     const reasoning = {
       id: 'rs_fallback',

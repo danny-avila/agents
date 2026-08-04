@@ -1253,6 +1253,20 @@ export function createSummarizeNode({
       }
       : undefined;
 
+    /** Rechecked after the pre-call awaits (dispatchRunStep,
+     * ON_SUMMARIZE_START, PreCompact): a sibling can trip the breaker while
+     * this node is paused in one of them, and a provider that doesn't
+     * synchronously reject an aborted signal would still start the
+     * summarization call. Mirrors the model node's pre-invoke recheck. */
+    {
+      const preCallTrip = findStreamLimitAbortReason(
+        entryBreakerSignal,
+        config?.signal
+      );
+      if (preCallTrip != null) {
+        throw preCallTrip;
+      }
+    }
     const {
       text: rawText,
       usage: summaryUsage,

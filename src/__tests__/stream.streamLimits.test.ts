@@ -1022,6 +1022,43 @@ describe('per-tool argument byte overrides', () => {
     ).rejects.toBe(trip);
   });
 
+  it('does not charge an anonymous sparse delta to an identified call\'s override', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: { create_file: 1_000 },
+      }),
+    });
+
+    /** Parallel batch: two identified calls share one event, so batch
+     * positions are NOT stable identities for later sparse events. */
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            { id: 'call_a', name: 'create_file', args: 'x'.repeat(50) },
+            { id: 'call_b', name: 'db_query', args: 'x'.repeat(10) },
+          ],
+        },
+      })
+    ).resolves.toBeUndefined();
+
+    /** A sparse continuation event with a single anonymous delta lands on
+     * batch position 0 — inheriting call_a's tally would judge these bytes
+     * under create_file's 1000-byte override and bypass the global cap. */
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'x'.repeat(200) }],
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', limit: 100 });
+  });
+
   it('binds consumer trips to the event epoch, sparing a newer run', async () => {
     const handler = new ChatModelStreamHandler();
     const newRunBreaker = new AbortController();

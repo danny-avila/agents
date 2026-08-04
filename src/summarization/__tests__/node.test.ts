@@ -1760,6 +1760,59 @@ describe('summarize node breaker capture', () => {
     }
   });
 
+  it('rejects before the model call when the breaker trips during pre-call awaits', async () => {
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    const entryBreaker = new AbortController();
+    /** The trip lands while ON_SUMMARIZE_START is awaited — after the
+     * entry check already passed. */
+    jest.spyOn(eventUtils, 'safeDispatchCustomEvent').mockImplementation((async (
+      ...args: unknown[]
+    ) => {
+      if (args[0] === GraphEvents.ON_SUMMARIZE_START) {
+        entryBreaker.abort(trip);
+      }
+    }) as never);
+    const modelClassSpy = jest
+      .spyOn(providers, 'getChatModelClass')
+      .mockReturnValue(
+        class {
+          constructor() {
+            return mockInvokeModel('should never run');
+          }
+        } as never
+      );
+
+    const agentContext = createAgentContext();
+    const graph = {
+      ...mockGraph(),
+      getBreakerSignal: (): AbortSignal => entryBreaker.signal,
+    };
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await expect(
+      node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      )
+    ).rejects.toBe(trip);
+    expect(modelClassSpy).not.toHaveBeenCalled();
+  });
+
   it('rethrows a parent trip on the config signal instead of degrading to the stub', async () => {
     const trip = new StreamLimitExceededError({
       kind: 'tool_call_args',
