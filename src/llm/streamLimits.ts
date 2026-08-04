@@ -609,13 +609,13 @@ export function enforceStreamedToolCallArgLimit({
          * #0 and reveal a nonzero provider index only later. Exact indexed
          * position wins above; when it does not exist, one anonymous tally
          * is still an unambiguous fallback. */
-        const anonymousTallies = getLiveGenerationTallies().filter(
-          (liveTally: StreamedToolCallArgTally) =>
-            liveTally.keys?.[0]?.startsWith(`${generationPrefix}#`) === true
-        );
-        if (anonymousTallies.length === 1) {
-          const anonymousKey = anonymousTallies[0].keys?.[0];
-          if (anonymousKey != null && anonymousKey !== indexedPositionKey) {
+        const liveTallies = getLiveGenerationTallies();
+        const soleTally = liveTallies.length === 1 ? liveTallies[0] : undefined;
+        if (
+          soleTally?.keys?.[0]?.startsWith(`${generationPrefix}#`) === true
+        ) {
+          const anonymousKey = soleTally.keys[0];
+          if (anonymousKey !== indexedPositionKey) {
             adoptionCandidates.push(anonymousKey);
           }
         }

@@ -1509,6 +1509,41 @@ describe('per-tool argument byte overrides', () => {
     });
   });
 
+  it('does not use the sole anonymous fallback while another call is live', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: { wide_tool: 1_000 },
+      }),
+    });
+
+    await streamEvent({
+      handler,
+      graph,
+      chunk: {
+        content: '',
+        tool_call_chunks: [
+          { id: 'call_a', name: 'tight_tool', args: 'x'.repeat(10) },
+          { name: 'wide_tool', args: 'x'.repeat(10) },
+        ],
+      },
+    });
+
+    /** Index 0 could identify call_a; the one anonymous tally belongs to
+     * batch position 1 and must not lend wide_tool's raised override. */
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'x'.repeat(101), index: 0 }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 100,
+    });
+  });
+
   it('applies a late anonymous name before charging its lower override', async () => {
     const handler = new ChatModelStreamHandler();
     const graph = createGraph({
