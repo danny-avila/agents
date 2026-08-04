@@ -3743,6 +3743,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     if (composedSignal !== config.signal) {
       config = { ...config, signal: composedSignal };
     }
+    /** Already-tripped-at-entry: a parallel sibling's breach failed the run
+     * before this batch was scheduled. Rethrow before hooks, direct
+     * `tool.invoke` calls, or ON_TOOL_EXECUTE dispatch — a tool or host
+     * handler that doesn't synchronously inspect an aborted signal would
+     * otherwise perform side effects on a failed run. */
+    if (
+      composedSignal?.aborted === true &&
+      composedSignal.reason instanceof StreamLimitExceededError
+    ) {
+      throw composedSignal.reason;
+    }
     this.toolCallTurns.clear();
     /**
      * Per-batch local map for resolved (post-substitution) args.

@@ -24,6 +24,7 @@ import {
 import {
   DEFAULT_MAX_TOOL_CALL_ARG_BYTES,
   STREAM_LIMIT_REDISPATCH_KEY,
+  StreamLimitExceededError,
   enforceStreamLimitsForWireChunk,
   resolveGenerationKey,
   resolveStreamLimits,
@@ -995,6 +996,84 @@ describe('per-tool argument byte overrides', () => {
       limit: 1_000,
       toolName: 'create_file',
     });
+  });
+
+  it('stops queued events once the shared breaker has tripped', async () => {
+    const handler = new ChatModelStreamHandler();
+    const breakerAbort = new AbortController();
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    breakerAbort.abort(trip);
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits(),
+      breakerAbort,
+    });
+
+    /** A sibling branch tripped the breaker while this event sat queued in
+     * streamEvents; the handler must rethrow instead of continuing into
+     * content handling or the eager-tool dispatch paths. */
+    await expect(
+      streamEvent({ handler, graph, chunk: { content: 'queued text' } })
+    ).rejects.toBe(trip);
+  });
+
+  it('treats empty tool-call ids as anonymous, keeping parallel calls apart', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    /** OpenAI-compatible adapters can emit index-less parallel calls whose
+     * ids are empty placeholders; a shared ':c:' identity would merge the
+     * two 60-byte calls into a phantom 120-byte one and falsely trip. */
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            { id: '', args: 'x'.repeat(60) },
+            { id: '', args: 'x'.repeat(60) },
+          ],
+        },
+      })
+    ).resolves.toBeUndefined();
+  });
+
+  it('does not hand a lone parsed call\'s override to multiple id-less chunks', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: { create_file: 1_000 },
+      }),
+    });
+
+    /** Mixed event: two id-less raw chunks while only one call is parseable.
+     * Positional correlation is ambiguous here — naming both chunks
+     * 'create_file' would judge the unrelated 500-byte call against the
+     * higher override and bypass the global cap. */
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            { args: 'x'.repeat(50), index: 0 },
+            { args: 'x'.repeat(500), index: 1 },
+          ],
+          tool_calls: [
+            { id: 'call_1', name: 'create_file', args: { content: 'x' } },
+          ],
+        },
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', limit: 100 });
   });
 
   it('prefers the id-correlated complete name over a raw name fragment', async () => {

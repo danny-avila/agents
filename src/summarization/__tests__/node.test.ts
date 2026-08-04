@@ -1710,6 +1710,56 @@ describe('createSummarizeNode — overflow recovery', () => {
 });
 
 describe('summarize node breaker capture', () => {
+  it('rethrows a parent trip on the config signal instead of degrading to the stub', async () => {
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    /** Child graph's own breaker stays live: in a subagent, a ROOT
+     * sibling's trip arrives only through the composed invocation signal. */
+    const childBreaker = new AbortController();
+    const configAbort = new AbortController();
+    captureEvents();
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest.fn().mockImplementation(async () => {
+              configAbort.abort(trip);
+              throw new Error('The operation was aborted');
+            }),
+          };
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    const graph = {
+      ...mockGraph(),
+      getBreakerSignal: (): AbortSignal => childBreaker.signal,
+    };
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await expect(
+      node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        { signal: configAbort.signal } as RunnableConfig
+      )
+    ).rejects.toBe(trip);
+  });
+
   it('rejects at entry when the breaker has already tripped', async () => {
     const trip = new StreamLimitExceededError({
       kind: 'tool_call_args',

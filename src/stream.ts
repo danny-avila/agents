@@ -1592,6 +1592,18 @@ export class ChatModelStreamHandler implements t.EventHandler {
       }
     }
 
+    /** A parallel producer can trip the shared breaker while this event was
+     * already queued in `streamEvents`. Stop before content handling or the
+     * eager-tool paths below — those can dispatch a side-effecting host
+     * tool with an already-aborted signal the handler never inspects. */
+    if (
+      graph.breakerAbort instanceof AbortController &&
+      graph.breakerAbort.signal.aborted &&
+      graph.breakerAbort.signal.reason instanceof StreamLimitExceededError
+    ) {
+      throw graph.breakerAbort.signal.reason;
+    }
+
     const agentContext = graph.getAgentContext(metadata);
 
     const content = getChunkContent({

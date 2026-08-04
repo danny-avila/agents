@@ -710,14 +710,16 @@ async function executeSummarizationWithFallback(params: {
     /** A parallel branch's trip aborts the composed summarization signal,
      * and a provider can surface that as a generic abort error; entering
      * fallback recovery or degrading to the metadata stub would continue
-     * work after the run-wide safety abort. Rethrow the breaker's reason. */
+     * work after the run-wide safety abort. Checked on BOTH channels: the
+     * graph's own breaker, and the composed config signal that carries a
+     * parent run's trip into subagent child graphs. */
     {
-      const breakerSignal = graph?.getBreakerSignal?.();
-      if (
-        breakerSignal?.aborted === true &&
-        breakerSignal.reason instanceof StreamLimitExceededError
-      ) {
-        throw breakerSignal.reason;
+      const trippedReason = findStreamLimitAbortReason(
+        graph?.getBreakerSignal?.(),
+        summarizeConfig?.signal
+      );
+      if (trippedReason != null) {
+        throw trippedReason;
       }
     }
 
@@ -929,6 +931,24 @@ function withBreakerSignal<T extends { signal?: AbortSignal }>(
   return { ...config, signal: AbortSignal.any([existing, breakerSignal]) };
 }
 
+/** First stream-limit reason found on any of the given signals. Checked
+ * alongside the graph's own breaker because a subagent child graph receives
+ * a ROOT sibling's trip through its constructor/invocation signal — the
+ * child's private breaker never fires for it. */
+function findStreamLimitAbortReason(
+  ...signals: Array<AbortSignal | undefined>
+): StreamLimitExceededError | undefined {
+  for (const signal of signals) {
+    if (
+      signal?.aborted === true &&
+      signal.reason instanceof StreamLimitExceededError
+    ) {
+      return signal.reason;
+    }
+  }
+  return undefined;
+}
+
 export function createSummarizeNode({
   agentContext,
   graph: adapterGraph,
@@ -960,15 +980,17 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
     /** Already-tripped-at-entry: a parallel sibling's breach failed the run
-     * before this node was scheduled. Rethrow before dispatching steps,
-     * hooks, or the model call — an adapter that doesn't synchronously
-     * reject an aborted signal would otherwise spend summarization provider
-     * work on a failed run. */
-    if (
-      entryBreakerSignal?.aborted === true &&
-      entryBreakerSignal.reason instanceof StreamLimitExceededError
-    ) {
-      throw entryBreakerSignal.reason;
+     * before this node was scheduled — via this graph's own breaker or, in
+     * a subagent child graph, the parent trip on the invocation signal.
+     * Rethrow before dispatching steps, hooks, or the model call — an
+     * adapter that doesn't synchronously reject an aborted signal would
+     * otherwise spend summarization provider work on a failed run. */
+    const entryTripReason = findStreamLimitAbortReason(
+      entryBreakerSignal,
+      config?.signal
+    );
+    if (entryTripReason != null) {
+      throw entryTripReason;
     }
 
     /**

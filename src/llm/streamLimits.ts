@@ -254,11 +254,20 @@ function sealsChunk(
   ) {
     return true;
   }
-  return seal.id != null && chunk.id != null && seal.id === chunk.id;
+  const sealId = seal.id != null && seal.id !== '' ? seal.id : undefined;
+  return sealId != null && sealId === chunkCallId(chunk);
 }
 
 function chunkToolName(chunk: ToolCallChunk): string | undefined {
   return chunk.name != null && chunk.name !== '' ? chunk.name : undefined;
+}
+
+/** The chunk's id with empty-string placeholders treated as absent —
+ * OpenAI-compatible adapters emit `id: ''` on continuation deltas, and a
+ * shared placeholder must not merge independent calls onto one identity
+ * (mirrors `getEagerToolChunkKey`). */
+function chunkCallId(chunk: ToolCallChunk): string | undefined {
+  return chunk.id != null && chunk.id !== '' ? chunk.id : undefined;
 }
 
 function isHighSurrogate(code: number): boolean {
@@ -333,18 +342,22 @@ export function enforceStreamedToolCallArgLimit({
     return undefined;
   };
   const resolveChunkName = (chunk: ToolCallChunk): string | undefined => {
+    const chunkId = chunkCallId(chunk);
     const correlated =
-      chunk.id != null ? correlateParsedNameById(chunk.id) : undefined;
+      chunkId != null ? correlateParsedNameById(chunkId) : undefined;
     if (correlated != null) {
       return correlated;
     }
     const name = chunkToolName(chunk);
-    if (name != null || parsedToolCalls == null || chunk.id != null) {
+    if (name != null || parsedToolCalls == null || chunkId != null) {
       return name;
     }
-    /** No id to correlate on; only a single-parsed-call event is an
-     * unambiguous association. */
-    if (parsedToolCalls.length === 1) {
+    /** No id to correlate on; positional association is unambiguous only
+     * when the event carries exactly one raw chunk AND one parsed call —
+     * with several id-less raw chunks in flight, handing one parsed call's
+     * name (and its override) to all of them would let an unrelated
+     * still-partial call bypass the global cap. */
+    if (parsedToolCalls.length === 1 && toolCallChunks.length === 1) {
       const only = parsedToolCalls[0];
       if (only.name != null && only.name !== '') {
         return only.name;
@@ -379,12 +392,13 @@ export function enforceStreamedToolCallArgLimit({
     /** Keys are namespaced by identity kind (`i:` index, `c:` id, `#`
      * batch position) so an index and a string id with the same textual
      * value — index 0 and id "0" — cannot alias distinct calls onto one
-     * tally. */
+     * tally. Empty-string ids are placeholders, not identities. */
+    const chunkId = chunkCallId(chunk);
     let key: string;
     if (chunk.index != null) {
       key = `${generationKey}:i:${chunk.index}`;
-    } else if (chunk.id != null) {
-      key = `${generationKey}:c:${chunk.id}`;
+    } else if (chunkId != null) {
+      key = `${generationKey}:c:${chunkId}`;
     } else {
       key = `${generationKey}:#${i}`;
     }
@@ -394,10 +408,10 @@ export function enforceStreamedToolCallArgLimit({
      * id-bearing chunks register the batch-position fallback, and chunks
      * carrying both identifiers additionally register the id. */
     const aliasCandidates: string[] = [];
-    if (chunk.id != null) {
+    if (chunkId != null) {
       aliasCandidates.push(`${generationKey}:#${i}`);
       if (chunk.index != null) {
-        aliasCandidates.push(`${generationKey}:c:${chunk.id}`);
+        aliasCandidates.push(`${generationKey}:c:${chunkId}`);
       }
     }
     let tally = tallies.get(key);
@@ -411,10 +425,10 @@ export function enforceStreamedToolCallArgLimit({
      * an alias and released together with the rest. */
     if (tally == null) {
       const adoptionCandidates: string[] = [];
-      if (chunk.id != null) {
-        adoptionCandidates.push(`${generationKey}:c:${chunk.id}`);
+      if (chunkId != null) {
+        adoptionCandidates.push(`${generationKey}:c:${chunkId}`);
       }
-      if (chunk.id != null || chunk.index != null) {
+      if (chunkId != null || chunk.index != null) {
         adoptionCandidates.push(`${generationKey}:#${i}`);
       }
       for (const adoptionKey of adoptionCandidates) {
@@ -478,7 +492,7 @@ export function enforceStreamedToolCallArgLimit({
     const registerCreationPositionAlias = (
       target: StreamedToolCallArgTally
     ): void => {
-      if (chunk.id != null || chunk.index == null || sealed) {
+      if (chunkId != null || chunk.index == null || sealed) {
         return;
       }
       registerAliasKeys(target, [`${generationKey}:#${i}`]);
@@ -493,7 +507,7 @@ export function enforceStreamedToolCallArgLimit({
      * the chunk carries no fragment. */
     const applyChunkName = (target: StreamedToolCallArgTally): boolean => {
       const correlated =
-        chunk.id != null ? correlateParsedNameById(chunk.id) : undefined;
+        chunkId != null ? correlateParsedNameById(chunkId) : undefined;
       const fragment = chunkToolName(chunk);
       let next = target.name;
       if (correlated != null) {

@@ -6,6 +6,7 @@ import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import * as events from '@/utils/events';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { GraphEvents } from '@/common';
 import { ToolNode } from '../ToolNode';
 
@@ -114,6 +115,40 @@ describe('ToolNode breaker signal composition', () => {
     );
 
     expect(observed()).toBe(caller.signal);
+  });
+
+  it('rejects the batch at entry when the breaker has already tripped', async () => {
+    const breaker = new AbortController();
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    breaker.abort(trip);
+    let toolRan = false;
+    const sideEffect = tool(
+      async () => {
+        toolRan = true;
+        return 'ran';
+      },
+      {
+        name: 'side_effect',
+        description: 'must never run on a failed run',
+        schema: z.object({}),
+      }
+    ) as unknown as StructuredToolInterface;
+    const node = new ToolNode({
+      tools: [sideEffect],
+      getBreakerSignal: () => breaker.signal,
+    });
+
+    await expect(
+      node.invoke({
+        messages: [createToolCallMessage('call_1', 'side_effect')],
+      })
+    ).rejects.toBe(trip);
+    expect(toolRan).toBe(false);
   });
 
   it('sends a breaker-composed signal on ON_TOOL_EXECUTE batch requests', async () => {
