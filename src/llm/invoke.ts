@@ -819,6 +819,17 @@ export async function attemptInvoke(
         | Record<string, unknown>
         | undefined;
       for await (const chunk of stream) {
+        /** An onChunk consumer replaces the stream handler entirely, so
+         * stream limits are enforced here for every such caller — public
+         * package consumers get no other accounting, and the internal
+         * summarization onChunk relies on this same charge. */
+        if (context != null) {
+          enforceStreamLimitsForWireChunk({
+            graph: context,
+            metadata: attemptMetadata,
+            chunk,
+          });
+        }
         await onChunk(chunk, attemptMetadata);
         finalChunk = appendStreamChunk({
           current: finalChunk,

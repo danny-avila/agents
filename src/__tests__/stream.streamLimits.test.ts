@@ -1108,6 +1108,52 @@ describe('per-tool argument byte overrides', () => {
     expect(graph.streamedToolCallArgTallies.size).toBe(0);
   });
 
+  it('adopts an anonymous tally when a later delta adds only an id', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ name: 'writer', args: 'a'.repeat(60) }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ id: 'call_1', args: 'a'.repeat(41) }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      observed: 101,
+      toolName: 'writer',
+    });
+  });
+
+  it('does not adopt a live id-bearing call through its position alias', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_a', name: 'a_tool', args: 'a'.repeat(60) }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ id: 'call_b', name: 'b_tool', args: 'b'.repeat(60) }],
+      })
+    ).resolves.toBeUndefined();
+  });
+
   it('normalizes override entries like the global field', () => {
     const resolved = resolveStreamLimits({
       maxToolCallArgBytes: 100,

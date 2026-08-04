@@ -399,17 +399,31 @@ export function enforceStreamedToolCallArgLimit({
      * is unambiguous within the generation. The old identity is recorded as
      * an alias and released together with the rest. */
     if (tally == null) {
-      let adoptionKey: string | undefined;
+      const adoptionCandidates: string[] = [];
       if (chunk.id != null) {
-        adoptionKey = `${generationKey}:c:${chunk.id}`;
-      } else if (chunk.index != null) {
-        adoptionKey = `${generationKey}:#${i}`;
+        adoptionCandidates.push(`${generationKey}:c:${chunk.id}`);
       }
-      const existing =
-        adoptionKey == null || adoptionKey === key
-          ? undefined
-          : tallies.get(adoptionKey);
-      if (existing != null && adoptionKey != null) {
+      if (chunk.id != null || chunk.index != null) {
+        adoptionCandidates.push(`${generationKey}:#${i}`);
+      }
+      for (const adoptionKey of adoptionCandidates) {
+        if (adoptionKey === key) {
+          continue;
+        }
+        const existing = tallies.get(adoptionKey);
+        if (existing == null) {
+          continue;
+        }
+        /** A position entry may only be adopted when the tally was CREATED
+         * anonymous (its first key is the position): id-bearing calls also
+         * alias their position, and adopting a live parallel call's alias
+         * would merge distinct budgets. */
+        if (
+          adoptionKey.includes(':#') &&
+          existing.keys?.[0] !== adoptionKey
+        ) {
+          continue;
+        }
         tally = existing;
         tallies.set(key, existing);
         if (existing.keys?.includes(adoptionKey) !== true) {
@@ -418,6 +432,7 @@ export function enforceStreamedToolCallArgLimit({
         if (existing.keys?.includes(key) !== true) {
           (existing.keys ??= []).push(key);
         }
+        break;
       }
     }
     const registerAliases = (target: StreamedToolCallArgTally): void => {
@@ -594,6 +609,31 @@ export function enforceCompleteToolCallArgLimit({
   }
 }
 
+/** Links a secondary representation of a wire chunk (e.g. a provider
+ * adapter's callback copy) to its canonical emission object, so claim
+ * accounting treats both as one emission even though their identities
+ * differ. Non-enumerable, so the link stays out of serialization and chunk
+ * merges. */
+const STREAM_LIMIT_CANONICAL: unique symbol = Symbol('streamLimitCanonical');
+
+export function linkStreamLimitCanonical(
+  copy: object,
+  canonical: object
+): void {
+  Object.defineProperty(copy, STREAM_LIMIT_CANONICAL, {
+    value: canonical,
+    enumerable: false,
+    configurable: true,
+  });
+}
+
+function canonicalChunk(chunk: object): object {
+  const linked = (chunk as Record<PropertyKey, unknown>)[
+    STREAM_LIMIT_CANONICAL
+  ];
+  return typeof linked === 'object' && linked != null ? linked : chunk;
+}
+
 /**
  * Claims accounting ownership of one EMISSION of a wire chunk. LangChain can
  * hand the same chunk object to the decoupled `streamEvents` handler
@@ -619,11 +659,12 @@ export function claimStreamLimitCharge(
   if (typeof chunk !== 'object' || chunk == null) {
     return true;
   }
+  const emission = canonicalChunk(chunk);
   const credits = (graph.streamLimitChargeCredits ??= new WeakMap());
-  let byGeneration = credits.get(chunk);
+  let byGeneration = credits.get(emission);
   if (byGeneration == null) {
     byGeneration = new Map();
-    credits.set(chunk, byGeneration);
+    credits.set(emission, byGeneration);
   }
   const generationKey = resolveGenerationKey(metadata);
   const balance = byGeneration.get(generationKey) ?? 0;

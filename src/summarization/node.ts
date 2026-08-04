@@ -1377,24 +1377,23 @@ export function createSummarizationChunkHandler({
   const limitMetadata = config.metadata as Record<string, unknown> | undefined;
   return (chunk, attemptMetadata) => {
     /**
-     * Summarization streams bypass `ChatModelStreamHandler` (this onChunk
-     * replaces it in `attemptInvoke`), so both stream limits are enforced
-     * here: the per-generation event cap, and the argument byte cap for
-     * tool calls a tool-bound summarization model may emit. Keyed by the
-     * attempt metadata `attemptInvoke` hands each chunk, so a fallback
-     * summary attempt never inherits the failed primary's counts. A trip
-     * tears down the model stream and `executeSummarizationWithFallback`
-     * rethrows it past fallbacks and the metadata stub, failing the run
-     * with the limit error like any other breach.
+     * Charged as `consumer` so it PAIRS with the producer-side charge in
+     * `attemptInvoke`'s onChunk branch: through attemptInvoke each emission
+     * is charged exactly once regardless of order, and a direct caller of
+     * this closure (tests, custom hosts) still gets single-sided
+     * enforcement. A trip tears down the model stream and
+     * `executeSummarizationWithFallback` rethrows it past fallbacks and the
+     * metadata stub, failing the run with the limit error like any other
+     * breach.
      */
     if (graph != null) {
-      const metadata = attemptMetadata ?? limitMetadata;
       enforceStreamLimitsForWireChunk({
         graph,
-        metadata,
+        metadata: attemptMetadata ?? limitMetadata,
         chunk: chunk as Parameters<
           typeof enforceStreamLimitsForWireChunk
         >[0]['chunk'],
+        side: 'consumer',
       });
     }
     const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];
