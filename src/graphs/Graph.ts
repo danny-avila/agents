@@ -1087,6 +1087,27 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * propagates. Recreated by both reset paths — the abort is one-way within
    * a run, and a reused graph must start its next run unaborted. */
   breakerAbort = new AbortController();
+
+  /** The stream-limit error behind an already-fired breaker, whether this
+   * graph's own controller tripped or a parent run's breaker arrived through
+   * the composed constructor signal (child graphs own separate controllers).
+   * Providers can translate either abort into a generic error, and recovery
+   * paths must not run in that state. */
+  protected resolveTrippedBreakerReason(): StreamLimitExceededError | undefined {
+    if (
+      this.breakerAbort.signal.aborted &&
+      this.breakerAbort.signal.reason instanceof StreamLimitExceededError
+    ) {
+      return this.breakerAbort.signal.reason;
+    }
+    if (
+      this.signal?.aborted === true &&
+      this.signal.reason instanceof StreamLimitExceededError
+    ) {
+      return this.signal.reason;
+    }
+    return undefined;
+  }
   /**
    * Seals charged against `preemption.maxSeals`. Per-turn: cleared by both
    * reset paths so a fresh turn gets a fresh budget, while a HITL resume —
@@ -3267,11 +3288,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * abort error; entering overflow planning or the fallback chain
          * would start new provider work after the run-wide breaker fired.
          * Rethrow the breaker's own stream-limit reason instead. */
-        if (
-          this.breakerAbort.signal.aborted &&
-          this.breakerAbort.signal.reason instanceof StreamLimitExceededError
-        ) {
-          throw this.breakerAbort.signal.reason;
+        {
+          const trippedReason = this.resolveTrippedBreakerReason();
+          if (trippedReason != null) {
+            throw trippedReason;
+          }
         }
         /**
          * A context overflow is a deterministic consequence of the payload,
@@ -3513,12 +3534,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             this.breakerAbort.abort(fallbackError);
             throw fallbackError;
           }
-          if (
-            this.breakerAbort.signal.aborted &&
-            this.breakerAbort.signal.reason instanceof StreamLimitExceededError
-          ) {
+          {
             /** Same sibling-abort translation guard as the primary catch. */
-            throw this.breakerAbort.signal.reason;
+            const trippedReason = this.resolveTrippedBreakerReason();
+            if (trippedReason != null) {
+              throw trippedReason;
+            }
           }
           const overflowCandidates =
             getFallbackOverflowCandidates(fallbackError);

@@ -242,13 +242,17 @@ function sealsChunk(
   if (seal == null || seal.kind !== 'single') {
     return false;
   }
-  /** Either supplied identifier is sufficient (matching the eager-call seal
-   * handling in stream.ts): a seal carrying both index and id must still
-   * match a sealing chunk that carries only one of them, or an OpenAI-style
-   * full-argument restatement gets ADDED to the tally instead of replacing
-   * it, and an empty seal leaves the tally unreleased. */
-  if (seal.index != null && chunk.index != null) {
-    return seal.index === chunk.index;
+  /** Either supplied identifier agreeing is sufficient (matching the
+   * eager-call seal handling in stream.ts): a mismatch on one identifier
+   * must not veto a match on the other, or an OpenAI-style full-argument
+   * restatement gets ADDED to the tally instead of replacing it, and an
+   * empty seal leaves the tally unreleased. */
+  if (
+    seal.index != null &&
+    chunk.index != null &&
+    seal.index === chunk.index
+  ) {
+    return true;
   }
   return seal.id != null && chunk.id != null && seal.id === chunk.id;
 }
