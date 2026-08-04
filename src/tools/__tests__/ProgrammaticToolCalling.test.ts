@@ -51,10 +51,8 @@ describe('ProgrammaticToolCalling', () => {
       expect(description).toContain('raw=$(tool');
       expect(description).toContain('direct tool > file may be empty');
       expect(description).toContain('/mnt/data/sf.json');
-      expect(description).toContain(
-        'failed executions do not register new files'
-      );
-      expect(description).toContain('not later-call storage');
+      expect(description).toContain('Failed executions register nothing');
+      expect(description).toContain('`/tmp` never survives the call');
     });
   });
 

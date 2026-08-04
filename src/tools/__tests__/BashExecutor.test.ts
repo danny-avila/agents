@@ -24,9 +24,9 @@ describe('buildBashExecutionToolDescription', () => {
     expect(BashExecutionToolDescription).toContain('heredoc/printf');
     expect(BashExecutionToolDescription).toContain('not bare Python');
     expect(BashExecutionToolDescription).toContain(
-      'failed executions do not register new files'
+      'Failed executions register nothing'
     );
-    expect(BashExecutionToolDescription).toContain('not later-call storage');
+    expect(BashExecutionToolDescription).toContain('`/tmp` never survives the call');
   });
 
   it('appends the tool-output references guide when enabled', () => {
