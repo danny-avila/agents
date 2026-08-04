@@ -8,13 +8,15 @@ export type SearchProvider =
   | 'searxng'
   | 'tavily'
   | 'keenable'
-  | 'crw';
+  | 'crw'
+  | 'exa';
 export type ScraperProvider =
   | 'firecrawl'
   | 'serper'
   | 'tavily'
   | 'crw'
-  | 'keenable';
+  | 'keenable'
+  | 'exa';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
 export interface Highlight {
@@ -176,6 +178,9 @@ export interface SearchConfig {
   keenableApiKey?: string;
   keenableApiUrl?: string;
   keenableSearchOptions?: KeenableSearchOptions;
+  exaApiKey?: string;
+  exaApiUrl?: string;
+  exaSearchOptions?: ExaSearchOptions;
   crwApiKey?: string;
   crwApiUrl?: string;
   crwSearchOptions?: CrwSearchOptions;
@@ -243,6 +248,57 @@ export interface KeenableScrapeResponse {
   error?: string;
 }
 
+export interface ExaSearchOptions {
+  maxResults?: number;
+  /** Exa search mode. `auto` (default) balances speed and quality;
+   * `fast` and `instant` trade quality for lower latency. */
+  searchType?: 'auto' | 'fast' | 'instant';
+  /** Restrict results to a specialized Exa index,
+   * e.g. "news" or "research paper". */
+  category?: string;
+  includeDomains?: string[];
+  excludeDomains?: string[];
+  /** Return full page text per result instead of the default
+   * token-efficient highlights. */
+  text?: boolean;
+  /** Max cached-content age in hours before Exa recrawls a page. */
+  maxAgeHours?: number;
+  timeout?: number;
+}
+
+export interface ExaContentsRequest {
+  highlights?: boolean;
+  text?: boolean;
+  maxAgeHours?: number;
+}
+
+export interface ExaSearchPayload {
+  query: string;
+  type: string;
+  numResults: number;
+  contents: ExaContentsRequest;
+  category?: string;
+  startPublishedDate?: string;
+  userLocation?: string;
+  includeDomains?: string[];
+  excludeDomains?: string[];
+  moderation?: boolean;
+}
+
+export interface ExaSearchResult {
+  id?: string;
+  title?: string | null;
+  url?: string;
+  publishedDate?: string;
+  author?: string;
+  highlights?: string[];
+  text?: string;
+}
+
+export interface ExaSearchResponse {
+  results?: ExaSearchResult[];
+}
+
 export type References = {
   links: MediaReference[];
   images: MediaReference[];
@@ -306,6 +362,62 @@ export interface TavilyScraperConfig {
   format?: 'markdown' | 'text';
 }
 
+export interface ExaScraperConfig {
+  apiKey?: string;
+  apiUrl?: string;
+  timeout?: number;
+  logger?: Logger;
+  /** Max cached-content age in hours before Exa recrawls a page. */
+  maxAgeHours?: number;
+  /** Live crawl timeout in milliseconds. */
+  livecrawlTimeout?: number;
+}
+
+export interface ExaContentsPayload {
+  urls: string[];
+  text: boolean;
+  maxAgeHours?: number;
+  livecrawlTimeout?: number;
+}
+
+export interface ExaContentsResult {
+  id?: string;
+  url?: string;
+  title?: string | null;
+  author?: string | null;
+  publishedDate?: string;
+  text?: string;
+  image?: string;
+  favicon?: string;
+}
+
+export interface ExaContentsStatus {
+  id: string;
+  status: string;
+  error?: {
+    tag?: string;
+    httpStatusCode?: number;
+  };
+}
+
+export interface ExaContentsResponse {
+  results?: ExaContentsResult[];
+  statuses?: ExaContentsStatus[];
+}
+
+export interface ExaScrapeResponse {
+  success: boolean;
+  data?: {
+    text?: string;
+    title?: string;
+    author?: string;
+    publishedDate?: string;
+    image?: string;
+    favicon?: string;
+  };
+  error?: string;
+}
+
 export interface ScraperContentResult {
   content: string;
 }
@@ -357,6 +469,7 @@ export interface SearchToolConfig
   tavilyScraperOptions?: TavilyScraperConfig;
   crwScraperOptions?: CrwScraperConfig;
   keenableScraperOptions?: KeenableScraperConfig;
+  exaScraperOptions?: ExaScraperConfig;
   /** Max chars of highlight content this tool feeds the MODEL per search (the
    * dominant, otherwise-unbounded part of the output). Distinct from
    * `maxContentLength`, which caps scraped/reranked content per source — full
@@ -398,7 +511,8 @@ export type AnyScraperResponse =
   | SerperScrapeResponse
   | TavilyScrapeResponse
   | CrwScrapeResponse
-  | KeenableScrapeResponse;
+  | KeenableScrapeResponse
+  | ExaScrapeResponse;
 
 /** Base Scraper Interface */
 export interface BaseScraper {
@@ -454,6 +568,11 @@ export type SerperScrapeOptions = Omit<
 
 export type TavilyScrapeOptions = Omit<
   TavilyScraperConfig,
+  'apiKey' | 'apiUrl' | 'logger'
+>;
+
+export type ExaScrapeOptions = Omit<
+  ExaScraperConfig,
   'apiKey' | 'apiUrl' | 'logger'
 >;
 
