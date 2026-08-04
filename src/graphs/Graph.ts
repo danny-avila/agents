@@ -1080,12 +1080,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * otherwise grow by one attempt-stamped entry per model call for the
    * graph's lifetime. */
   streamLimitChargeCredits?: WeakMap<object, Map<string, number>>;
-  /** Run-scoped abort shared by every SubagentExecutor this graph builds, so
-   * one child tripping a stream circuit breaker stops subagents running
-   * under other parallel agent nodes too. Recreated by both reset paths —
-   * the abort is one-way within a run, and a reused graph must start its
-   * next run unaborted. */
-  subagentBreakerAbort = new AbortController();
+  /** Run-scoped breaker abort: composed into every model invocation and
+   * every SubagentExecutor child signal, and tripped when a stream circuit
+   * breaker fires anywhere in the run, so parallel agent nodes' in-flight
+   * provider calls and subagents stop consuming quota while the rejection
+   * propagates. Recreated by both reset paths — the abort is one-way within
+   * a run, and a reused graph must start its next run unaborted. */
+  breakerAbort = new AbortController();
   /**
    * Seals charged against `preemption.maxSeals`. Per-turn: cleared by both
    * reset paths so a fresh turn gets a fresh budget, while a HITL resume —
@@ -1202,8 +1203,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.streamedToolCallArgTallies.clear();
     this.streamDeltaEventCounts.clear();
     this.streamLimitChargeCredits = undefined;
-    if (this.subagentBreakerAbort.signal.aborted) {
-      this.subagentBreakerAbort = new AbortController();
+    if (this.breakerAbort.signal.aborted) {
+      this.breakerAbort = new AbortController();
     }
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
@@ -1265,8 +1266,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.streamedToolCallArgTallies.clear();
     this.streamDeltaEventCounts.clear();
     this.streamLimitChargeCredits = undefined;
-    if (this.subagentBreakerAbort.signal.aborted) {
-      this.subagentBreakerAbort = new AbortController();
+    if (this.breakerAbort.signal.aborted) {
+      this.breakerAbort = new AbortController();
     }
     /**
      * Turn state only. The reported totals must outlive cleanup — this runs
@@ -3169,6 +3170,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       let langfuseHandler: CallbackEntry | undefined;
       let invokeConfig = {
         ...config,
+        /** The run-scoped breaker composed in, so a stream-limit trip in one
+         * parallel agent node also cancels sibling nodes' in-flight model
+         * calls, not only their subagents. */
+        signal: composeAbortSignals(config.signal, this.breakerAbort.signal),
         metadata: {
           ...(config.metadata ?? {}),
           ...traceMetadata,
@@ -3246,6 +3251,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * must reject. Rethrow before any recovery path.
          */
         if (primaryError instanceof StreamLimitExceededError) {
+          /** Tripped before rethrowing so parallel agent nodes' in-flight
+           * model calls and subagents stop while the rejection propagates. */
+          this.breakerAbort.abort(primaryError);
           throw primaryError;
         }
         /**
@@ -3900,9 +3908,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
           parentSignal: this.signal,
           breakerScope: {
-            signal: (): AbortSignal => this.subagentBreakerAbort.signal,
+            signal: (): AbortSignal => this.breakerAbort.signal,
             trip: (reason: unknown): void =>
-              this.subagentBreakerAbort.abort(reason),
+              this.breakerAbort.abort(reason),
           },
           hookRegistry: this.hookRegistry,
           /** Lazy — Run wires the registry onto the graph AFTER

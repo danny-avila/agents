@@ -1076,6 +1076,38 @@ describe('per-tool argument byte overrides', () => {
     ).resolves.toBeUndefined();
   });
 
+  it('matches a dual-identifier seal against a chunk carrying only its id', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_1', name: 'writer', args: 'a'.repeat(60), index: 0 }],
+    });
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_call_chunks: [{ id: 'call_1', args: 'a'.repeat(60) }],
+          response_metadata: {
+            [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: {
+              kind: 'single',
+              index: 0,
+              id: 'call_1',
+            },
+          },
+        },
+      })
+    ).resolves.toBeUndefined();
+    expect(graph.streamedToolCallArgTallies.size).toBe(0);
+  });
+
   it('normalizes override entries like the global field', () => {
     const resolved = resolveStreamLimits({
       maxToolCallArgBytes: 100,

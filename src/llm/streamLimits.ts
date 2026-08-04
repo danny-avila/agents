@@ -32,11 +32,12 @@ export interface ResolvedStreamLimits {
 export interface StreamedToolCallArgTally {
   bytes: number;
   name?: string;
-  /** Secondary keys this tally is also registered under — the batch
-   * position for any id-bearing chunk, plus the id for chunks carrying both
-   * identifiers — so a later delta that drops one or both identifiers still
-   * shares the budget; all entries are released together. */
-  aliasKeys?: string[];
+  /** Every tally-map key this tally is registered under: its primary key
+   * (which can migrate through identifier transitions), the batch-position
+   * fallback for id-bearing chunks, and the id for chunks carrying both
+   * identifiers. Release deletes all of them — a call sealed through one
+   * identity must not leave entries behind under another. */
+  keys?: string[];
   /**
    * True when the previous chunk ended on an unpaired UTF-16 high surrogate.
    * Counting each half of a split surrogate pair alone yields 3 bytes per
@@ -241,10 +242,15 @@ function sealsChunk(
   if (seal == null || seal.kind !== 'single') {
     return false;
   }
-  if (seal.index != null) {
+  /** Either supplied identifier is sufficient (matching the eager-call seal
+   * handling in stream.ts): a seal carrying both index and id must still
+   * match a sealing chunk that carries only one of them, or an OpenAI-style
+   * full-argument restatement gets ADDED to the tally instead of replacing
+   * it, and an empty seal leaves the tally unreleased. */
+  if (seal.index != null && chunk.index != null) {
     return seal.index === chunk.index;
   }
-  return seal.id != null && seal.id === chunk.id;
+  return seal.id != null && chunk.id != null && seal.id === chunk.id;
 }
 
 function chunkToolName(chunk: ToolCallChunk): string | undefined {
@@ -406,8 +412,11 @@ export function enforceStreamedToolCallArgLimit({
       if (existing != null && adoptionKey != null) {
         tally = existing;
         tallies.set(key, existing);
-        if (existing.aliasKeys?.includes(adoptionKey) !== true) {
-          (existing.aliasKeys ??= []).push(adoptionKey);
+        if (existing.keys?.includes(adoptionKey) !== true) {
+          (existing.keys ??= []).push(adoptionKey);
+        }
+        if (existing.keys?.includes(key) !== true) {
+          (existing.keys ??= []).push(key);
         }
       }
     }
@@ -420,22 +429,22 @@ export function enforceStreamedToolCallArgLimit({
         /** Parallel calls can contend for one batch position, so the newest
          * live call takes the alias over and the previous owner is disowned
          * — its seal must not delete a key it no longer holds. */
-        if (currentOwner?.aliasKeys != null) {
-          const remaining = currentOwner.aliasKeys.filter(
+        if (currentOwner?.keys != null) {
+          const remaining = currentOwner.keys.filter(
             (ownedKey: string) => ownedKey !== aliasKey
           );
-          currentOwner.aliasKeys = remaining.length > 0 ? remaining : undefined;
+          currentOwner.keys = remaining.length > 0 ? remaining : undefined;
         }
         tallies.set(aliasKey, target);
-        (target.aliasKeys ??= []).push(aliasKey);
+        (target.keys ??= []).push(aliasKey);
       }
     };
     const releaseTally = (target: StreamedToolCallArgTally): void => {
       tallies.delete(key);
-      if (target.aliasKeys == null) {
+      if (target.keys == null) {
         return;
       }
-      for (const aliasKey of target.aliasKeys) {
+      for (const aliasKey of target.keys) {
         if (tallies.get(aliasKey) === target) {
           tallies.delete(aliasKey);
         }
@@ -444,7 +453,7 @@ export function enforceStreamedToolCallArgLimit({
     if (!hasArgs) {
       if (tally == null) {
         if (!sealed) {
-          tally = { bytes: 0, name: resolveChunkName(chunk) };
+          tally = { bytes: 0, name: resolveChunkName(chunk), keys: [key] };
           tallies.set(key, tally);
           registerAliases(tally);
         }
@@ -482,7 +491,7 @@ export function enforceStreamedToolCallArgLimit({
       continue;
     }
     if (tally == null) {
-      tally = { bytes: 0 };
+      tally = { bytes: 0, keys: [key] };
       tallies.set(key, tally);
     }
     if (!sealed) {
