@@ -1208,12 +1208,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.streamedToolCallArgTallies.clear();
     this.streamDeltaEventCounts.clear();
     this.streamLimitChargeCredits = undefined;
-    /** Run-start is the only safe recreation point for a tripped breaker:
-     * end-of-run cleanup must leave it aborted so straggling parallel
-     * children from the failed run cannot start on a fresh signal. */
-    if (this.breakerAbort.signal.aborted) {
-      this.breakerAbort = new AbortController();
-    }
+    /** Run-start is the only safe replacement point for the breaker:
+     * end-of-run cleanup must leave it in place so straggling parallel
+     * children from the failed run cannot start on a fresh signal.
+     * Replaced UNCONDITIONALLY here — a run that failed on an ordinary
+     * error leaves the controller un-aborted, and stragglers still settling
+     * hold their entry-time capture of it; a late stream-limit trip on that
+     * old controller must not cancel the run starting now. */
+    this.breakerAbort = new AbortController();
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
@@ -1997,6 +1999,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * fresh controller. Trips and reason reads below stay on this
        * capture. */
       const attemptBreaker = this.breakerAbort;
+      /** Already-tripped-at-entry: a parallel sibling's breach has failed
+       * the run before this node was scheduled. Rethrow before hooks or the
+       * provider call — a custom provider that doesn't synchronously reject
+       * an aborted signal would otherwise start another model request on a
+       * failed run. */
+      const entryTripReason = this.resolveTrippedBreakerReason(
+        attemptBreaker.signal
+      );
+      if (entryTripReason != null) {
+        throw entryTripReason;
+      }
       const agentContext = this.agentContexts.get(agentId);
       if (!agentContext) {
         throw new Error(`Agent context not found for agentId: ${agentId}`);

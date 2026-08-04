@@ -7,6 +7,7 @@ import {
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
 } from '@/summarization/node';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { AgentContext } from '@/agents/AgentContext';
@@ -1709,6 +1710,54 @@ describe('createSummarizeNode — overflow recovery', () => {
 });
 
 describe('summarize node breaker capture', () => {
+  it('rejects at entry when the breaker has already tripped', async () => {
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    const entryBreaker = new AbortController();
+    entryBreaker.abort(trip);
+
+    const modelClassSpy = jest
+      .spyOn(providers, 'getChatModelClass')
+      .mockReturnValue(
+        class {
+          constructor() {
+            return mockInvokeModel('should never run');
+          }
+        } as never
+      );
+
+    const agentContext = createAgentContext();
+    const graph = {
+      ...mockGraph(),
+      getBreakerSignal: (): AbortSignal => entryBreaker.signal,
+    };
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await expect(
+      node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      )
+    ).rejects.toBe(trip);
+
+    expect(graph.contentData).toHaveLength(0);
+    expect(modelClassSpy).not.toHaveBeenCalled();
+  });
+
   it('binds the model call to the breaker signal read at node entry', async () => {
     const entryBreaker = new AbortController();
     const lateBreaker = new AbortController();

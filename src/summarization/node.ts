@@ -959,6 +959,17 @@ export function createSummarizeNode({
     if (request == null) {
       return { summarizationRequest: undefined };
     }
+    /** Already-tripped-at-entry: a parallel sibling's breach failed the run
+     * before this node was scheduled. Rethrow before dispatching steps,
+     * hooks, or the model call — an adapter that doesn't synchronously
+     * reject an aborted signal would otherwise spend summarization provider
+     * work on a failed run. */
+    if (
+      entryBreakerSignal?.aborted === true &&
+      entryBreakerSignal.reason instanceof StreamLimitExceededError
+    ) {
+      throw entryBreakerSignal.reason;
+    }
 
     /**
      * Overflow recovery routes through this node purely to get back to the
