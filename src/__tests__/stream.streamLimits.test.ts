@@ -1484,6 +1484,31 @@ describe('per-tool argument byte overrides', () => {
     });
   });
 
+  it('adopts the sole anonymous tally when a later nonzero index appears', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ name: 'writer', args: 'x'.repeat(60) }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'x'.repeat(41), index: 1 }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      observed: 101,
+      toolName: 'writer',
+    });
+  });
+
   it('applies a late anonymous name before charging its lower override', async () => {
     const handler = new ChatModelStreamHandler();
     const graph = createGraph({

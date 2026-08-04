@@ -603,7 +603,22 @@ export function enforceStreamedToolCallArgLimit({
       if (chunk.index != null) {
         /** An index is stable across sparse events; the loop position is
          * merely this event's position and may be 0 for call index 1. */
-        adoptionCandidates.push(`${generationKey}:#${chunk.index}`);
+        const indexedPositionKey = `${generationKey}:#${chunk.index}`;
+        adoptionCandidates.push(indexedPositionKey);
+        /** A single anonymous call may first appear alone at event position
+         * #0 and reveal a nonzero provider index only later. Exact indexed
+         * position wins above; when it does not exist, one anonymous tally
+         * is still an unambiguous fallback. */
+        const anonymousTallies = getLiveGenerationTallies().filter(
+          (liveTally: StreamedToolCallArgTally) =>
+            liveTally.keys?.[0]?.startsWith(`${generationPrefix}#`) === true
+        );
+        if (anonymousTallies.length === 1) {
+          const anonymousKey = anonymousTallies[0].keys?.[0];
+          if (anonymousKey != null && anonymousKey !== indexedPositionKey) {
+            adoptionCandidates.push(anonymousKey);
+          }
+        }
       } else if (chunkId != null) {
         const anonymousTallies = getLiveGenerationTallies().filter(
           (liveTally: StreamedToolCallArgTally) =>
