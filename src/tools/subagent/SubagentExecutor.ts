@@ -343,6 +343,12 @@ export class SubagentExecutor {
 
   async execute(params: SubagentExecuteParams): Promise<SubagentExecuteResult> {
     const { description, subagentType, threadId, parentToolCallId } = params;
+    /** Captured ONCE per execution: a failed run's graph reset replaces the
+     * breaker controller, and a straggling execution that re-resolved the
+     * signal later (e.g. after a slow start-update handler) would read the
+     * NEW run's un-aborted controller and revive old-run work. Binding to
+     * the controller active at execution start keeps old work cancelled. */
+    const childSignal = this.resolveChildSignal();
     const config = this.configs.get(subagentType);
 
     if (!config) {
@@ -420,7 +426,7 @@ export class SubagentExecutor {
     const hostUsageSink = this.usageSink;
     const childGraph = this.createChildGraph({
       runId: childRunId,
-      signal: this.resolveChildSignal(),
+      signal: childSignal,
       agents: [childInputs],
       langfuse: this.langfuse,
       tokenCounter: this.tokenCounter,
@@ -553,7 +559,7 @@ export class SubagentExecutor {
         { messages: [new HumanMessage(description)] },
         {
           recursionLimit: maxTurns * RECURSION_MULTIPLIER,
-          signal: this.resolveChildSignal(),
+          signal: childSignal,
           callbacks,
           runName: `subagent:${subagentType}`,
           configurable: {

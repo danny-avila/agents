@@ -617,7 +617,7 @@ async function executeSummarizationWithFallback(params: {
   usePromptCache: boolean;
   log: LogFn;
   /** Carries the run's stream limits so the event cap covers summary streams. */
-  graph?: StreamLimitState;
+  graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
 }): Promise<{
   text: string;
   usage?: Partial<UsageMetadata>;
@@ -734,7 +734,10 @@ async function executeSummarizationWithFallback(params: {
               )
             ),
           ],
-          config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
+          config: withBreakerSignal(
+            traceConfig(summarizeConfig, 'cache_hit_compaction'),
+            graph
+          ),
           primaryError,
           onChunk,
         });
@@ -884,8 +887,33 @@ interface CreateSummarizeNodeParams {
       result: t.StepCompleted,
       config?: RunnableConfig
     ) => Promise<void>;
+    /** The run's shared breaker signal, composed into every summarization
+     * model attempt so a sibling branch tripping a stream limit also
+     * cancels in-flight summaries. */
+    getBreakerSignal?: () => AbortSignal;
   } & StreamLimitState;
   generateStepId: (stepKey: string) => [string, number];
+}
+
+/** Composes the run's breaker signal (when the adapter provides one) into a
+ * summarization attempt's config, so breaches in sibling branches cancel
+ * summaries too. */
+function withBreakerSignal<T extends { signal?: AbortSignal }>(
+  config: T | undefined,
+  graph?: { getBreakerSignal?: () => AbortSignal }
+): T | undefined {
+  const breakerSignal = graph?.getBreakerSignal?.();
+  if (breakerSignal == null) {
+    return config;
+  }
+  if (config == null) {
+    return { signal: breakerSignal } as T;
+  }
+  const existing = config.signal;
+  if (existing == null || existing === breakerSignal) {
+    return { ...config, signal: breakerSignal };
+  }
+  return { ...config, signal: AbortSignal.any([existing, breakerSignal]) };
 }
 
 export function createSummarizeNode({
@@ -1468,7 +1496,7 @@ async function summarizeWithCacheHit({
   stepId?: string;
   provider: Providers;
   reasoningKey?: 'reasoning_content' | 'reasoning';
-  graph?: StreamLimitState;
+  graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
   usePromptCache?: boolean;
   promptCacheTtl?: PromptCacheTtl;
   log?: LogFn;
@@ -1498,7 +1526,7 @@ async function summarizeWithCacheHit({
         graph,
       }),
     },
-    traceConfig(config, 'cache_hit_compaction')
+    withBreakerSignal(traceConfig(config, 'cache_hit_compaction'), graph)
   );
 
   const responseMsg = result.messages?.[0];

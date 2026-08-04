@@ -4181,6 +4181,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             ) {
               writeChargeCredits(value);
             },
+            /** Read per attempt: a sibling branch tripping the run breaker
+             * must also cancel in-flight summarization model calls. */
+            getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
             dispatchRunStep: async (runStep, nodeConfig) => {
               const resolvedConfig = nodeConfig ?? this.config;
               if (runStep.agentId != null) {
