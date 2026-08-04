@@ -69,6 +69,67 @@ describe('run breaker lifecycle', () => {
     expect(graph.streamDeltaEventCounts.size).toBe(0);
   });
 
+  it('holds a leased producer straggler to its budget across two run resets', async () => {
+    const { attemptInvoke } = await import('@/llm/invoke');
+    const { resolveStreamLimits } = await import('@/llm/streamLimits');
+    const { AIMessageChunk, HumanMessage } = await import(
+      '@langchain/core/messages'
+    );
+    const graph = makeGraph();
+    graph.streamLimits = resolveStreamLimits({ maxToolCallArgBytes: 100 });
+    const chunkOf = (args: string): InstanceType<typeof AIMessageChunk> =>
+      new AIMessageChunk({
+        content: '',
+        tool_call_chunks: [
+          {
+            type: 'tool_call_chunk',
+            id: 'call_1',
+            name: 'writer',
+            args,
+            index: 0,
+          },
+        ],
+      });
+    let yields = 0;
+    const model = {
+      stream: async function* (): AsyncGenerator<
+        InstanceType<typeof AIMessageChunk>
+        > {
+        yields += 1;
+        yield chunkOf('x'.repeat(60));
+        /** Two prompt runs start and reset while this attempt is still
+         * draining. Its lease must keep the tally alive — reset counting
+         * cannot prove the attempt finished. */
+        graph.resetValues();
+        graph.resetValues();
+        yields += 1;
+        yield chunkOf('x'.repeat(60));
+        yields += 1;
+        yield chunkOf('x');
+      },
+    };
+
+    await expect(
+      attemptInvoke(
+        {
+          model: model as unknown as t.ChatModel,
+          messages: [new HumanMessage('hi')],
+          provider: Providers.OPENAI,
+          context: graph as Parameters<
+            typeof attemptInvoke
+          >[0]['context'],
+          onChunk: () => {
+            /* producer loop enforcement is under test */
+          },
+        },
+        { metadata: {} }
+      )
+    ).rejects.toMatchObject({ kind: 'tool_call_args', limit: 100 });
+    expect(yields).toBe(2);
+    /** The attempt's finally released its lease and entries. */
+    expect(graph.activeStreamLimitGenerations?.size ?? 0).toBe(0);
+  });
+
   it('holds a post-reset producer straggler to its original byte budget', async () => {
     const { enforceStreamLimitsForWireChunk } = await import(
       '@/llm/streamLimits'

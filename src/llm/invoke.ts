@@ -12,6 +12,7 @@ import type { ChatGeneration } from '@langchain/core/outputs';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { StreamLimitState } from '@/llm/streamLimits';
 import type { ContextOverflowContext } from '@/utils/errors';
 import type * as t from '@/types';
 import {
@@ -39,6 +40,9 @@ import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import {
   enforceStreamLimitsForWireChunk,
+  registerActiveStreamLimitGeneration,
+  releaseStreamLimitGeneration,
+  resolveGenerationKey,
   StreamLimitExceededError,
   STREAM_LIMIT_REDISPATCH_KEY,
   STREAM_LIMIT_ATTEMPT_KEY,
@@ -675,21 +679,74 @@ function appendStreamChunk({
  * Pass an `onChunk` callback to override this with custom chunk processing
  * (e.g. summarization delta events).
  */
+interface AttemptInvokeParams {
+  model: t.ChatModel;
+  messages: BaseMessage[];
+  provider: Providers;
+  context?: InvokeContext;
+  onChunk?: OnChunk;
+  /** Accounting owner for callers that deliberately pass no `context`
+   * (summarization) — used ONLY for the attempt's accounting lease, never
+   * for charge claims. */
+  streamLimitState?: StreamLimitState;
+}
+
+/**
+ * One model attempt. Stamps the attempt identity into callback metadata
+ * (see the generation-key notes in `streamLimits.ts`), leases the attempt's
+ * accounting for its LIFETIME, and releases both from `finally`: retention
+ * must follow the attempt — a cancellation-ignoring straggler keeps its
+ * original budget no matter how many runs start and reset while it drains.
+ */
 export async function attemptInvoke(
+  params: AttemptInvokeParams,
+  config?: RunnableConfig
+): Promise<Partial<t.BaseGraphState>> {
+  const stampedConfig: RunnableConfig = {
+    ...config,
+    metadata: {
+      ...(config?.metadata ?? {}),
+      [Constants.INVOKED_PROVIDER]: params.provider,
+      /**
+       * One `attemptInvoke` call is one model attempt; primary, fallback,
+       * and retry attempts within a node otherwise share the same langgraph
+       * metadata, so without a unique attempt stamp a fallback re-streaming
+       * a tool call from scratch would be charged the failed primary's
+       * partial bytes (or a same-named sibling fallback's) and could
+       * falsely trip the stream limits. The stamp rides the same metadata
+       * rebuild that already attributes the serving provider.
+       */
+      [STREAM_LIMIT_ATTEMPT_KEY]: ++streamLimitAttemptSeq,
+    },
+  };
+  const leaseTarget = params.context ?? params.streamLimitState;
+  const generationKey =
+    leaseTarget != null
+      ? resolveGenerationKey(
+        stampedConfig.metadata as Record<string, unknown>
+      )
+      : undefined;
+  if (leaseTarget != null && generationKey != null) {
+    registerActiveStreamLimitGeneration(leaseTarget, generationKey);
+  }
+  try {
+    return await attemptInvokeBody(params, stampedConfig);
+  } finally {
+    if (leaseTarget != null && generationKey != null) {
+      releaseStreamLimitGeneration(leaseTarget, generationKey);
+    }
+  }
+}
+
+async function attemptInvokeBody(
   {
     model,
     messages,
     provider,
     context,
     onChunk,
-  }: {
-    model: t.ChatModel;
-    messages: BaseMessage[];
-    provider: Providers;
-    context?: InvokeContext;
-    onChunk?: OnChunk;
-  },
-  config?: RunnableConfig
+  }: AttemptInvokeParams,
+  config: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
   /**
    * Pull the run-scoped tool output registry off the graph (when one
@@ -705,7 +762,7 @@ export async function attemptInvoke(
     callOptions: config,
   });
   const registry = context?.getOrCreateToolOutputRegistry();
-  const runId = config?.configurable?.run_id as string | undefined;
+  const runId = config.configurable?.run_id as string | undefined;
   const annotated = annotateMessagesForLLM(invocationMessages, registry, runId);
   /**
    * Keyed on the provider ACTUALLY serving this call, not the agent's primary.
@@ -764,24 +821,6 @@ export async function attemptInvoke(
    * wrong for fallback-served calls — or `ls_provider` — which derived
    * providers inherit from their base class.
    */
-  config = {
-    ...config,
-    metadata: {
-      ...(config?.metadata ?? {}),
-      [Constants.INVOKED_PROVIDER]: provider,
-      /**
-       * One `attemptInvoke` call is one model attempt; primary, fallback,
-       * and retry attempts within a node otherwise share the same langgraph
-       * metadata, so without a unique attempt stamp a fallback re-streaming
-       * a tool call from scratch would be charged the failed primary's
-       * partial bytes (or a same-named sibling fallback's) and could
-       * falsely trip the stream limits. The stamp rides the same metadata
-       * rebuild that already attributes the serving provider.
-       */
-      [STREAM_LIMIT_ATTEMPT_KEY]: ++streamLimitAttemptSeq,
-    },
-  };
-
   if (model.stream) {
     /**
      * Observed, not dictated. `handleChatModelStart` fires with the chat
@@ -1091,6 +1130,7 @@ export async function tryFallbackProviders({
   primaryError,
   context,
   onChunk,
+  streamLimitState,
   overflowContext,
   prepareProviderMessages,
 }: {
@@ -1101,6 +1141,9 @@ export async function tryFallbackProviders({
   primaryError: unknown;
   context?: InvokeContext;
   onChunk?: OnChunk;
+  /** Accounting-lease owner forwarded to each fallback attempt (see
+   * `AttemptInvokeParams.streamLimitState`). */
+  streamLimitState?: StreamLimitState;
   /**
    * Prompt-size corroboration for signatures that are not self-describing.
    * Vertex AI's overflow is a bare `400` with no reason, so without this a
@@ -1188,6 +1231,7 @@ export async function tryFallbackProviders({
           provider: fb.provider,
           context,
           onChunk,
+          streamLimitState,
         },
         fbConfig
       );

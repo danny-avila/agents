@@ -28,7 +28,10 @@ import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs/Graph';
 import type { HandlerRegistry } from '@/events';
 import { Constants, GraphEvents, Callback, StepTypes } from '@/common';
-import { StreamLimitExceededError } from '@/llm/streamLimits';
+import {
+  StreamLimitExceededError,
+  RUN_BREAKER_SCOPE_CONFIG_KEY,
+} from '@/llm/streamLimits';
 import { executeHooks } from '@/hooks';
 
 const DEFAULT_MAX_TURNS = 25;
@@ -158,6 +161,14 @@ export type SubagentExecuteParams = {
   description: string;
   subagentType: string;
   threadId?: string;
+  /**
+   * Breaker controller captured at the parent TOOL BATCH's entry, before
+   * PreToolUse hooks. Preferred over the live scope accessor: a graph reset
+   * during a hook would otherwise bind this child to the NEW run's
+   * controller — reviving it on a fresh signal and letting its trips cancel
+   * unrelated work.
+   */
+  breaker?: AbortController;
   /**
    * Parent-side `tool_call_id` of the `subagent` tool invocation that
    * triggered this execution. Surfaced on {@link SubagentUpdateEvent} so
@@ -341,13 +352,14 @@ export class SubagentExecutor {
 
   async execute(params: SubagentExecuteParams): Promise<SubagentExecuteResult> {
     const { description, subagentType, threadId, parentToolCallId } = params;
-    /** Captured ONCE per execution: a failed run's graph reset replaces the
-     * breaker controller, and a straggling execution that re-resolved it
-     * later (e.g. after a slow start-update handler) would read the NEW
-     * run's un-aborted controller — reviving old-run work, or worse,
-     * tripping the new run's breaker from an old child's stream-limit
-     * breach. Signal and trip target both bind to this capture. */
-    const childBreaker = this.resolveBreakerController();
+    /** Captured ONCE per execution, preferring the controller the parent
+     * tool batch captured at ITS entry (before PreToolUse hooks): a failed
+     * run's graph reset replaces the live controller, and resolving it here
+     * — after the hook awaits — would bind this child to the NEW run's
+     * un-aborted controller: reviving old-run work, or worse, tripping the
+     * new run's breaker from an old child's stream-limit breach. Signal and
+     * trip target both bind to this capture. */
+    const childBreaker = params.breaker ?? this.resolveBreakerController();
     const childSignal = this.composeChildSignal(childBreaker);
     const config = this.configs.get(subagentType);
 
@@ -1034,7 +1046,10 @@ function sanitizeChildConfigurable(
 function isLangGraphRuntimeConfigKey(key: string): boolean {
   return (
     key.startsWith(LANGGRAPH_RUNTIME_CONFIG_PREFIX) ||
-    LANGGRAPH_CHECKPOINT_CONFIG_KEYS.has(key)
+    LANGGRAPH_CHECKPOINT_CONFIG_KEYS.has(key) ||
+    /** The parent batch's breaker scope must not leak into the child
+     * workflow's configurable — children own separate controllers. */
+    key === RUN_BREAKER_SCOPE_CONFIG_KEY
   );
 }
 

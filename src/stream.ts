@@ -39,6 +39,7 @@ import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
+import type { RunBreakerScope } from '@/llm/streamLimits';
 import {
   claimStreamLimitCharge,
   combineCompleteToolCalls,
@@ -177,7 +178,10 @@ function isEagerExecutionExcludedTool(
   // the final request ("changed after eager execution started"), stop
   // prestarting it so the model's retry executes normally instead of
   // re-diverging in a loop (LibreChat#14371).
-  if (graph.eagerEventToolSuppressions?.has(name) === true) {
+  if (
+    (graph.eagerEventToolSuppressions as Set<string> | undefined)?.has(name) ===
+    true
+  ) {
     return true;
   }
   // A code-session participant writes to the shared sandbox, so it is
@@ -1084,9 +1088,8 @@ function recordEagerToolCallChunks(args: {
     const sealCoversChunk =
       seal != null &&
       (seal.kind === 'all' ||
-        (seal.kind === 'single' &&
-          ((seal.id != null && seal.id === id) ||
-            (seal.index != null && seal.index === index))));
+        (seal.id != null && seal.id === id) ||
+        (seal.index != null && seal.index === index));
     const next = {
       id,
       name,
@@ -1537,17 +1540,23 @@ export class ChatModelStreamHandler implements t.EventHandler {
      * without a stamp (direct handler callers, partial stubs) keep the
      * live-controller behavior. */
     const eventEpoch = metadata?.[STREAM_LIMIT_EPOCH_KEY];
-    if (
-      eventEpoch != null &&
-      graph.breakerEpoch != null &&
-      eventEpoch !== graph.breakerEpoch
-    ) {
+    /** Runtime-honest widening: partial handler stubs carry neither an
+     * epoch nor a run scope despite the field types. */
+    const liveEpoch = graph.breakerEpoch as number | undefined;
+    if (eventEpoch != null && liveEpoch != null && eventEpoch !== liveEpoch) {
       return;
     }
     const eventBreaker =
       graph.breakerAbort instanceof AbortController
         ? graph.breakerAbort
         : undefined;
+    /** Immutable scope captured at handler entry. A reset while this
+     * handler is suspended in an await replaces the object, so ONE
+     * reference comparison proves the event still belongs to the live run
+     * before anything composes `graph.breakerAbort` or `graph.config`. */
+    const entryRunScope = graph.runScope as RunBreakerScope | undefined;
+    const runScopeInvalidated = (): boolean =>
+      entryRunScope != null && graph.runScope !== entryRunScope;
     const throwIfRunBreakerTripped = (): void => {
       if (
         eventBreaker != null &&
@@ -1625,7 +1634,11 @@ export class ChatModelStreamHandler implements t.EventHandler {
      * tool with an already-aborted signal the handler never inspects.
      * Rechecked again immediately before each eager dispatch: the awaits in
      * between (server-tool results, tool-call handling, content dispatch)
-     * are windows for a sibling's trip. */
+     * are windows for a sibling's trip — or for a full reset, after which
+     * this event belongs to a dead run and is dropped. */
+    if (runScopeInvalidated()) {
+      return;
+    }
     throwIfRunBreakerTripped();
 
     const agentContext = graph.getAgentContext(metadata);
@@ -1690,6 +1703,9 @@ export class ChatModelStreamHandler implements t.EventHandler {
     ) {
       hasToolCalls = true;
       await handleToolCalls(chunk.tool_calls, metadata, graph);
+      if (runScopeInvalidated()) {
+        return;
+      }
       throwIfRunBreakerTripped();
       if (hasFinalToolCallSignal(chunk)) {
         startEagerToolExecutions({
@@ -1770,6 +1786,9 @@ export class ChatModelStreamHandler implements t.EventHandler {
         metadata,
       });
       if (canStreamEager) {
+        if (runScopeInvalidated()) {
+          return;
+        }
         throwIfRunBreakerTripped();
         startReadyStreamedEagerToolExecutions({
           graph,

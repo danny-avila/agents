@@ -474,6 +474,42 @@ describe('SubagentExecutor', () => {
     ).rejects.toBeInstanceOf(StreamLimitExceededError);
   });
 
+  it('binds the child to the batch-captured controller, not the live scope', async () => {
+    const batchBreaker = new AbortController();
+    const liveBreaker = new AbortController();
+    const executor = createExecutor({
+      breakerScope: { controller: () => liveBreaker },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockRejectedValue(
+              new StreamLimitExceededError({
+                kind: 'tool_call_args',
+                limit: 10,
+                observed: 11,
+                toolName: 'db_query',
+              })
+            ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    /** `breaker` is the controller the parent TOOL BATCH captured before
+     * PreToolUse hooks; a reset during those hooks replaced the live
+     * scope, and the child must not revive on — or trip — the new run's
+     * controller. */
+    await expect(
+      executor.execute({
+        description: 'Do something',
+        subagentType: 'researcher',
+        breaker: batchBreaker,
+      })
+    ).rejects.toBeInstanceOf(StreamLimitExceededError);
+    expect(batchBreaker.signal.aborted).toBe(true);
+    expect(liveBreaker.signal.aborted).toBe(false);
+  });
+
   it('trips the breaker controller captured at execution start, not the current one', async () => {
     const oldRun = new AbortController();
     const newRun = new AbortController();

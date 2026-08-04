@@ -6,7 +6,10 @@ import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import * as events from '@/utils/events';
-import { StreamLimitExceededError } from '@/llm/streamLimits';
+import {
+  StreamLimitExceededError,
+  RUN_BREAKER_SCOPE_CONFIG_KEY,
+} from '@/llm/streamLimits';
 import { GraphEvents } from '@/common';
 import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
@@ -317,6 +320,48 @@ describe('ToolNode breaker signal composition', () => {
       })
     ).rejects.toBe(trip);
     expect(toolExecuteCalls).toHaveLength(0);
+  });
+
+  it('stamps the batch-entry run scope into tool configs and strips it from host batches', async () => {
+    const scope = Object.freeze({ epoch: 3, controller: new AbortController() });
+    let seenScope: unknown;
+    const capture = {
+      name: 'capture_scope',
+      description: 'captures the batch scope from its config',
+      invoke: async (
+        _params: unknown,
+        config?: { configurable?: Record<string, unknown> }
+      ): Promise<string> => {
+        seenScope = config?.configurable?.[RUN_BREAKER_SCOPE_CONFIG_KEY];
+        return 'ok';
+      },
+    } as unknown as StructuredToolInterface;
+    const node = new ToolNode({
+      tools: [capture],
+      getRunScope: () => scope,
+    });
+
+    await node.invoke({
+      messages: [createToolCallMessage('call_1', 'capture_scope')],
+    });
+    expect(seenScope).toBe(scope);
+
+    /** Host batch requests spread `configurable` into their own run
+     * configs — the scope must not leak there. */
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const eventNode = new ToolNode({
+      tools: [],
+      eventDrivenMode: true,
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      getRunScope: () => scope,
+    });
+    await eventNode.invoke({
+      messages: [createToolCallMessage('call_1', 'remote_tool')],
+    });
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(
+      toolExecuteCalls[0].configurable?.[RUN_BREAKER_SCOPE_CONFIG_KEY]
+    ).toBeUndefined();
   });
 
   it('sends a breaker-composed signal on ON_TOOL_EXECUTE batch requests', async () => {

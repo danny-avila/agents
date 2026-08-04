@@ -57,6 +57,14 @@ export interface StreamedToolCallArgTally {
   pendingHighSurrogate?: boolean;
 }
 
+/** Immutable snapshot of one run's breaker identity. Captured at
+ * model/event/tool-batch entry and revalidated by REFERENCE after awaits —
+ * one identity comparison proves no reset interleaved. */
+export interface RunBreakerScope {
+  readonly epoch: number;
+  readonly controller: AbortController;
+}
+
 /** Streamed chunk events counted against one generation's event cap. */
 export interface StreamDeltaEventTally {
   count: number;
@@ -77,6 +85,12 @@ export interface StreamLimitState {
   /** The graph's live breaker epoch; new accounting entries are tagged with
    * it so `resetValues` can sweep by age instead of clearing outright. */
   breakerEpoch?: number;
+  /** Generation keys of model attempts still in flight. Each attempt leases
+   * its generation at entry and releases it (with its accounting entries)
+   * from its `finally`, so retention follows ATTEMPT LIFETIME — a
+   * cancellation-ignoring straggler keeps its original budget no matter how
+   * many runs start and reset while it drains. */
+  activeStreamLimitGenerations?: Set<string>;
   /** Per-chunk-object, per-generation charge balance: producer visits
    * increment, consumer (handler echo) visits decrement, and a visit only
    * charges when the other side has not pre-charged the same emission.
@@ -263,6 +277,15 @@ export const STREAM_LIMIT_REDISPATCH_KEY = 'lc_stream_limit_redispatch';
  * for tracing.
  */
 export const STREAM_LIMIT_EPOCH_KEY = 'lc_stream_limit_epoch';
+
+/**
+ * Configurable key carrying the tool batch's entry-captured
+ * {@link RunBreakerScope} to tools that spawn their own runs (subagents).
+ * Captured BEFORE PreToolUse hooks, so a reset during a hook cannot rebind
+ * the spawned child to the new run's controller. Stripped from host-facing
+ * batch requests and from child-graph configurables.
+ */
+export const RUN_BREAKER_SCOPE_CONFIG_KEY = 'lc_run_breaker_scope';
 
 /**
  * True when the event's `single` seal marks this chunk's own call as
@@ -836,23 +859,78 @@ export function requiresStreamLimitAccounting(
   );
 }
 
+/** Leases a model attempt's generation: entries under it are exempt from
+ * the reset sweep until {@link releaseStreamLimitGeneration} runs from the
+ * attempt's `finally`. */
+export function registerActiveStreamLimitGeneration(
+  graph: StreamLimitState,
+  generationKey: string
+): void {
+  (graph.activeStreamLimitGenerations ??= new Set()).add(generationKey);
+}
+
+/** Ends an attempt's lease and deletes its accounting entries — the
+ * authoritative retirement point for attempt-scoped state. */
+export function releaseStreamLimitGeneration(
+  graph: StreamLimitState,
+  generationKey: string
+): void {
+  graph.activeStreamLimitGenerations?.delete(generationKey);
+  deleteGenerationEntries(graph.streamedToolCallArgTallies, generationKey);
+  deleteGenerationEntries(graph.streamDeltaEventCounts, generationKey);
+}
+
+function deleteGenerationEntries(
+  entries: Map<string, unknown> | undefined,
+  generationKey: string
+): void {
+  if (entries == null) {
+    return;
+  }
+  const prefix = `${generationKey}:`;
+  for (const key of entries.keys()) {
+    if (key === generationKey || key.startsWith(prefix)) {
+      entries.delete(key);
+    }
+  }
+}
+
+function isOwnedByActiveGeneration(
+  key: string,
+  activeGenerations: ReadonlySet<string>
+): boolean {
+  for (const generationKey of activeGenerations) {
+    if (key === generationKey || key.startsWith(`${generationKey}:`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
- * Deletes accounting entries older than the epoch that is ending. Called by
- * `resetValues` INSTEAD of clearing: producer loops of straggling attempts
- * use the graph's maps directly and are not behind the consumer-only epoch
- * gate, so a clear would hand a cancellation-ignoring provider a fresh
- * allowance at every run start. Entries tagged with the ending epoch
- * survive exactly one reset (keeping those stragglers on their original
- * budgets); untagged entries and anything older are removed.
+ * Deletes accounting entries older than the epoch that is ending, EXCEPT
+ * entries leased by a still-active attempt. Called by `resetValues` instead
+ * of clearing: producer loops of straggling attempts use the graph's maps
+ * directly and are not behind the consumer-only epoch gate, so a clear
+ * would hand a cancellation-ignoring provider a fresh allowance at every
+ * run start. Leased entries live until their attempt's `finally` releases
+ * them; unleased entries (direct callers with no attempt stamp) get one
+ * grace reset via their epoch tag.
  */
 export function sweepStaleStreamLimitEntries(
   entries: Map<string, { epoch?: number }>,
-  endingEpoch: number
+  endingEpoch: number,
+  activeGenerations?: ReadonlySet<string>
 ): void {
+  const hasActive = activeGenerations != null && activeGenerations.size > 0;
   for (const [key, value] of entries) {
-    if (value.epoch !== endingEpoch) {
-      entries.delete(key);
+    if (value.epoch === endingEpoch) {
+      continue;
     }
+    if (hasActive && isOwnedByActiveGeneration(key, activeGenerations)) {
+      continue;
+    }
+    entries.delete(key);
   }
 }
 

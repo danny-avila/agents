@@ -19,6 +19,7 @@ import type {
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
   ResolvedStreamLimits,
+  RunBreakerScope,
   StreamedToolCallArgTally,
   StreamDeltaEventTally,
 } from '@/llm/streamLimits';
@@ -126,6 +127,7 @@ import {
   StreamLimitExceededError,
   sweepStaleStreamLimitEntries,
   STREAM_LIMIT_EPOCH_KEY,
+  RUN_BREAKER_SCOPE_CONFIG_KEY,
 } from '@/llm/streamLimits';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
@@ -1080,6 +1082,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * finally handled. */
   breakerEpoch = 0;
 
+  /** Immutable snapshot of the run's breaker identity (epoch + controller),
+   * replaced as ONE object whenever `resetValues` installs a fresh
+   * controller. Sites that pause across awaits capture it at entry and
+   * revalidate by REFERENCE afterwards — a single identity comparison
+   * proves no reset happened while suspended, where separate epoch and
+   * controller reads could interleave with one. */
+  runScope: RunBreakerScope = Object.freeze({
+    epoch: 0,
+    controller: this.breakerAbort,
+  });
+
+  /** Generation keys of model attempts still in flight (see
+   * `StreamLimitState.activeStreamLimitGenerations`). Lazily created by the
+   * attempt lease; spans resets on purpose. */
+  activeStreamLimitGenerations?: Set<string>;
+
   /** The stream-limit error behind an already-fired breaker, whether this
    * graph's own controller tripped or a parent run's breaker arrived through
    * the composed constructor signal (child graphs own separate controllers).
@@ -1223,9 +1241,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * original budgets; older entries are removed. */
     sweepStaleStreamLimitEntries(
       this.streamedToolCallArgTallies,
-      this.breakerEpoch
+      this.breakerEpoch,
+      this.activeStreamLimitGenerations
     );
-    sweepStaleStreamLimitEntries(this.streamDeltaEventCounts, this.breakerEpoch);
+    sweepStaleStreamLimitEntries(
+      this.streamDeltaEventCounts,
+      this.breakerEpoch,
+      this.activeStreamLimitGenerations
+    );
     this.streamLimitChargeCredits = undefined;
     /** Run-start is the only safe replacement point for the breaker:
      * end-of-run cleanup must leave it in place so straggling parallel
@@ -1236,6 +1259,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * old controller must not cancel the run starting now. */
     this.breakerAbort = new AbortController();
     this.breakerEpoch += 1;
+    this.runScope = Object.freeze({
+      epoch: this.breakerEpoch,
+      controller: this.breakerAbort,
+    });
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
@@ -1830,6 +1857,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
         fileCheckpointer: this.getOrCreateFileCheckpointer(),
         getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
+        getRunScope: (): RunBreakerScope => this.runScope,
         errorHandler: (data, metadata): Promise<boolean> =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
@@ -1898,6 +1926,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
       fileCheckpointer: this.getOrCreateFileCheckpointer(),
       getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
+      getRunScope: (): RunBreakerScope => this.runScope,
     });
     this.registerCompiledToolNode(node);
     return node;
@@ -4087,11 +4116,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const toolCall = (config as { toolCall?: { id?: string } }).toolCall;
           const parentToolCallId =
             typeof toolCall?.id === 'string' ? toolCall.id : undefined;
+          /** The parent tool batch's entry-captured scope (stamped by
+           * ToolNode before PreToolUse hooks) — binds this child to the
+           * run that dispatched it, not to whatever controller a reset
+           * installed while the hooks were awaited. */
+          const batchScope = config.configurable?.[
+            RUN_BREAKER_SCOPE_CONFIG_KEY
+          ] as RunBreakerScope | undefined;
           const result = await executor.execute({
             description,
             subagentType,
             threadId,
             parentToolCallId,
+            breaker: batchScope?.controller,
             /**
              * Forward the parent's `configurable` so host-set fields
              * (`requestBody`, `user`, etc.) propagate into the child
@@ -4181,6 +4218,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       | WeakMap<object, Map<string, number>>
       | undefined => this.streamLimitChargeCredits;
     const readBreakerEpoch = (): number => this.breakerEpoch;
+    const readActiveGenerations = (): Set<string> | undefined =>
+      this.activeStreamLimitGenerations;
+    const writeActiveGenerations = (value: Set<string> | undefined): void => {
+      this.activeStreamLimitGenerations = value;
+    };
     const writeChargeCredits = (
       value: WeakMap<object, Map<string, number>> | undefined
     ): void => {
@@ -4237,6 +4279,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
              * entries. */
             get breakerEpoch(): number {
               return readBreakerEpoch();
+            },
+            /** Accessor pair like the charge credits: summary attempts
+             * lease their generations on the GRAPH's active set, and the
+             * lazy `??=` in the lease helper must install there. */
+            get activeStreamLimitGenerations(): Set<string> | undefined {
+              return readActiveGenerations();
+            },
+            set activeStreamLimitGenerations(value: Set<string> | undefined) {
+              writeActiveGenerations(value);
             },
             /** Read per attempt: a sibling branch tripping the run breaker
              * must also cancel in-flight summarization model calls. */

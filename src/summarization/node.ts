@@ -756,6 +756,7 @@ async function executeSummarizationWithFallback(params: {
           ),
           primaryError,
           onChunk,
+          streamLimitState: graph,
         });
         const fbMsg = fbResult?.messages?.[0];
         if (fbMsg) {
@@ -1637,6 +1638,9 @@ async function summarizeWithCacheHit({
         reasoningKey,
         graph,
       }),
+      /** Accounting lease only (summarization passes no `context` so its
+       * producer claim never stacks with the onChunk handler's). */
+      streamLimitState: graph,
     },
     withBreakerSignal(traceConfig(config, 'cache_hit_compaction'), graph)
   );

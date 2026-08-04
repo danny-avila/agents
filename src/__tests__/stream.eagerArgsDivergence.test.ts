@@ -523,6 +523,57 @@ describe('eager args divergence (LibreChat#14371)', () => {
     expect(graph.eagerEventToolExecutions.size).toBe(0);
   });
 
+  it('drops eager dispatch when the run scope is replaced during tool-call handling', async () => {
+    const graph = createGraph({
+      runScope: Object.freeze({
+        epoch: 1,
+        controller: new AbortController(),
+      }),
+    } as Partial<StandardGraph>);
+    /** The handler passes its entry checks, then a full reset lands while
+     * handleToolCalls awaits the run-step dispatch. The event now belongs
+     * to a dead run; dispatching eagerly would compose the NEW run's live
+     * controller and config. */
+    const originalDispatch = graph.dispatchRunStep;
+    graph.dispatchRunStep = (async (
+      stepKey: string,
+      details: unknown
+    ): Promise<string> => {
+      const stepId = await (
+        originalDispatch as unknown as (
+          stepKey: string,
+          details: unknown
+        ) => Promise<string>
+      )(stepKey, details);
+      (graph as { runScope: unknown }).runScope = Object.freeze({
+        epoch: 2,
+        controller: new AbortController(),
+      });
+      return stepId;
+    }) as typeof graph.dispatchRunStep;
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    await expect(
+      handler.handle(
+        GraphEvents.CHAT_MODEL_STREAM,
+        {
+          chunk: {
+            content: '',
+            tool_calls: [
+              { id: 'call_1', name: 'db_query', args: { sql: 'SELECT 1;' } },
+            ],
+            response_metadata: { finish_reason: 'tool_calls' },
+          } as unknown as t.StreamChunk,
+        },
+        metadata,
+        graph
+      )
+    ).resolves.toBeUndefined();
+    expect(toolExecuteCalls).toHaveLength(0);
+  });
+
   it('does not prestart eager tools when the breaker trips during tool-call handling', async () => {
     const graph = createGraph();
     const trip = new StreamLimitExceededError({

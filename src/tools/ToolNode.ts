@@ -79,7 +79,23 @@ import {
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
-import { StreamLimitExceededError } from '@/llm/streamLimits';
+import type { RunBreakerScope } from '@/llm/streamLimits';
+import {
+  StreamLimitExceededError,
+  RUN_BREAKER_SCOPE_CONFIG_KEY,
+} from '@/llm/streamLimits';
+
+/** Host-facing batch requests must not carry the batch's breaker scope —
+ * hosts spread `configurable` into their own run configs. */
+function stripRunBreakerScope(
+  configurable: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  if (configurable == null || !(RUN_BREAKER_SCOPE_CONFIG_KEY in configurable)) {
+    return configurable;
+  }
+  const { [RUN_BREAKER_SCOPE_CONFIG_KEY]: _scope, ...rest } = configurable;
+  return rest;
+}
 import { convertInjectedMessages } from '@/messages/injected';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { RunnableCallable, composeAbortSignals } from '@/utils';
@@ -639,6 +655,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private toolExecution?: t.ToolExecutionConfig;
   /** Owning graph's run-scoped breaker signal, composed into each batch's config. */
   private getBreakerSignal?: () => AbortSignal | undefined;
+  /** Owning graph's immutable run scope; captured once per batch. */
+  private getRunScope?: () => RunBreakerScope;
   /**
    * Monotonic counter used to mint a unique scope id for anonymous
    * batches (ones invoked without a `run_id` in
@@ -681,6 +699,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolExecution,
     fileCheckpointer,
     getBreakerSignal,
+    getRunScope,
   }: t.ToolNodeConstructorParams) {
     super({
       name: name ?? TOOL_NODE_RUN_NAME,
@@ -725,6 +744,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.humanInTheLoop = humanInTheLoop;
     this.toolExecution = toolExecution;
     this.getBreakerSignal = getBreakerSignal;
+    this.getRunScope = getRunScope;
     // Caller-provided checkpointer wins. Graphs use this to share a
     // single per-Run instance across every ToolNode they compile so
     // `Run.rewindFiles()` reaches the same snapshot store regardless
@@ -2974,9 +2994,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         dispatchRequests.map((request) => [request.id, request])
       );
       const onResult = (result: t.ToolExecuteResult): void => {
+        /** Runtime-honest widening: hosts may omit the id despite the
+         * field type. */
+        const resultToolCallId = result.toolCallId as string | undefined;
         const request =
-          result.toolCallId != null
-            ? dispatchRequestById.get(result.toolCallId)
+          resultToolCallId != null
+            ? dispatchRequestById.get(resultToolCallId)
             : undefined;
         if (
           request == null ||
@@ -3027,9 +3050,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               // the eager path sends `agentContext.agentId` — this must
               // match it at the top level too.
               agentId: this.executingAgentId,
-              configurable: config.configurable as
-                  | Record<string, unknown>
-                  | undefined,
+              configurable: stripRunBreakerScope(
+                config.configurable as Record<string, unknown> | undefined
+              ),
               metadata: config.metadata as
                   | Record<string, unknown>
                   | undefined,
@@ -3771,8 +3794,21 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      */
     const breakerSignal = this.getBreakerSignal?.();
     const composedSignal = composeAbortSignals(config.signal, breakerSignal);
-    if (composedSignal !== config.signal) {
-      config = { ...config, signal: composedSignal };
+    /** Immutable batch scope, captured with the signal BEFORE hooks: tools
+     * that spawn runs (subagents) bind their child to this controller, so a
+     * reset during a PreToolUse hook cannot hand them the new run's one. */
+    const batchRunScope = this.getRunScope?.();
+    if (composedSignal !== config.signal || batchRunScope != null) {
+      config = {
+        ...config,
+        signal: composedSignal,
+        ...(batchRunScope != null && {
+          configurable: {
+            ...config.configurable,
+            [RUN_BREAKER_SCOPE_CONFIG_KEY]: batchRunScope,
+          },
+        }),
+      };
     }
     /** Already-tripped-at-entry: a parallel sibling's breach failed the run
      * before this batch was scheduled. Rethrow before hooks, direct

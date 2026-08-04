@@ -3,6 +3,7 @@ import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableToolLike } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { MessageContentComplex, ToolErrorData } from './stream';
 import type { HumanInTheLoopConfig } from './hitl';
 import type { LangfuseConfig } from './graph';
@@ -266,6 +267,13 @@ export type ToolNodeOptions = {
    * trips elsewhere in the run.
    */
   getBreakerSignal?: () => AbortSignal | undefined;
+  /**
+   * Returns the owning graph's immutable run scope. Read once per batch,
+   * BEFORE hooks, and threaded to tools that spawn runs (subagents) so a
+   * reset during a hook cannot rebind their children to a newer run's
+   * controller.
+   */
+  getRunScope?: () => RunBreakerScope;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
