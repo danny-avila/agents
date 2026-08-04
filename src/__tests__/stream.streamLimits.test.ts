@@ -1305,6 +1305,62 @@ describe('per-tool argument byte overrides', () => {
     expect(graph.streamedToolCallArgTallies.size).toBe(0);
   });
 
+  it('trips the shared graph breaker when the consumer path detects a breach', async () => {
+    const handler = new ChatModelStreamHandler();
+    const breakerAbort = new AbortController();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+      breakerAbort,
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ id: 'call_1', name: 'writer', args: 'a'.repeat(101), index: 0 }],
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args' });
+
+    expect(breakerAbort.signal.aborted).toBe(true);
+    expect(breakerAbort.signal.reason).toMatchObject({
+      kind: 'tool_call_args',
+      observed: 101,
+    });
+  });
+
+  it('allocates no charge credits for text-only deltas with the event cap off', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits(),
+      dispatchMessageDelta: jest.fn(async () => undefined),
+      dispatchReasoningDelta: jest.fn(async () => undefined),
+    } as never);
+
+    await streamEvent({
+      handler,
+      graph,
+      chunk: { content: 'an ordinary text delta' },
+    });
+    expect(graph.streamLimitChargeCredits).toBeUndefined();
+
+    enforceStreamLimitsForWireChunk({
+      graph,
+      metadata: {},
+      chunk: { tool_call_chunks: undefined } as never,
+    });
+    expect(graph.streamLimitChargeCredits).toBeUndefined();
+
+    await streamEvent({
+      handler,
+      graph,
+      chunk: {
+        content: '',
+        tool_call_chunks: [{ id: 'call_1', name: 'writer', args: 'x', index: 0 }],
+      },
+    });
+    expect(graph.streamLimitChargeCredits).toBeDefined();
+  });
+
   it('normalizes override entries like the global field', () => {
     const resolved = resolveStreamLimits({
       maxToolCallArgBytes: 100,

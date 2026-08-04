@@ -659,6 +659,33 @@ export function enforceCompleteToolCallArgLimit({
   }
 }
 
+/**
+ * Whether a chunk needs charge accounting at all. With the event cap off
+ * (the default) and no tool payload on the chunk, there is nothing a claim
+ * could ever gate — skipping restores the documented zero-cost-disabled
+ * behavior by avoiding a WeakMap entry and nested Map per ordinary text
+ * delta. Both the producer and consumer paths use this same predicate on
+ * the same chunk, so claim pairing is unaffected.
+ */
+export function requiresStreamLimitAccounting(
+  graph: StreamLimitState,
+  chunk: {
+    tool_call_chunks?: unknown[];
+    tool_calls?: unknown[];
+    invalid_tool_calls?: unknown[];
+  }
+): boolean {
+  const resolved = graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS;
+  if (resolved.maxDeltaEventsPerTurn > 0) {
+    return true;
+  }
+  return (
+    (chunk.tool_call_chunks?.length ?? 0) > 0 ||
+    (chunk.tool_calls?.length ?? 0) > 0 ||
+    (chunk.invalid_tool_calls?.length ?? 0) > 0
+  );
+}
+
 /** Links a secondary representation of a wire chunk (e.g. a provider
  * adapter's callback copy) to its canonical emission object, so claim
  * accounting treats both as one emission even though their identities
@@ -756,6 +783,9 @@ export function enforceStreamLimitsForWireChunk({
    * producer/echo and swallow a charge. */
   side?: 'producer' | 'consumer';
 }): void {
+  if (!requiresStreamLimitAccounting(graph, chunk)) {
+    return;
+  }
   if (!claimStreamLimitCharge(graph, chunk, side, metadata)) {
     return;
   }

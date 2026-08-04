@@ -45,6 +45,8 @@ import {
   enforceCompleteToolCallArgLimit,
   enforceStreamedToolCallArgLimit,
   enforceStreamDeltaEventLimit,
+  requiresStreamLimitAccounting,
+  StreamLimitExceededError,
 } from '@/llm/streamLimits';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
@@ -1535,34 +1537,53 @@ export class ChatModelStreamHandler implements t.EventHandler {
      * index-less runaway streams stay bounded, and complete parsed
      * `tool_calls` without a raw chunk representation are judged standalone.
      */
-    if (claimStreamLimitCharge(graph, data.chunk, 'consumer', metadata)) {
-      enforceStreamDeltaEventLimit({ graph, metadata });
-      /** Combined first so raw-chunk name correlation sees invalid calls
-       * too; an unnamed raw chunk twinned with a named invalid call must
-       * select that tool's override, not the global cap. */
-      const completeCalls = combineCompleteToolCalls(chunk);
-      if (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) {
-        enforceStreamedToolCallArgLimit({
-          graph,
-          metadata,
-          toolCallChunks: chunk.tool_call_chunks,
-          responseMetadata: chunk.response_metadata as
-            | Record<string, unknown>
-            | undefined,
-          parsedToolCalls: completeCalls,
-        });
-      }
-      /** Judged whenever parsed calls are present, not only when raw chunks
-       * are absent — an adapter can pair an empty or partial raw chunk with
-       * a complete parsed call; the standalone check is stateless, so the
-       * common both-present case is not double-tallied. Invalid calls are
-       * included because ToolNode processes and promotes them. */
-      if (completeCalls != null) {
-        enforceCompleteToolCallArgLimit({
-          graph,
-          metadata,
-          toolCalls: completeCalls,
-        });
+    if (
+      requiresStreamLimitAccounting(graph, chunk) &&
+      claimStreamLimitCharge(graph, data.chunk, 'consumer', metadata)
+    ) {
+      try {
+        enforceStreamDeltaEventLimit({ graph, metadata });
+        /** Combined first so raw-chunk name correlation sees invalid calls
+         * too; an unnamed raw chunk twinned with a named invalid call must
+         * select that tool's override, not the global cap. */
+        const completeCalls = combineCompleteToolCalls(chunk);
+        if (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) {
+          enforceStreamedToolCallArgLimit({
+            graph,
+            metadata,
+            toolCallChunks: chunk.tool_call_chunks,
+            responseMetadata: chunk.response_metadata as
+              | Record<string, unknown>
+              | undefined,
+            parsedToolCalls: completeCalls,
+          });
+        }
+        /** Judged whenever parsed calls are present, not only when raw
+         * chunks are absent — an adapter can pair an empty or partial raw
+         * chunk with a complete parsed call; the standalone check is
+         * stateless, so the common both-present case is not double-tallied.
+         * Invalid calls are included because ToolNode processes and
+         * promotes them. */
+        if (completeCalls != null) {
+          enforceCompleteToolCallArgLimit({
+            graph,
+            metadata,
+            toolCalls: completeCalls,
+          });
+        }
+      } catch (error) {
+        /** A breach detected on this consumer path must still stop parallel
+         * fan-out work: the producer skips its own enforcement once this
+         * side has claimed the emission, so createCallModel's breaker-abort
+         * never fires for it. Trip the shared graph breaker before the
+         * throw rejects the run. */
+        if (
+          error instanceof StreamLimitExceededError &&
+          graph.breakerAbort instanceof AbortController
+        ) {
+          graph.breakerAbort.abort(error);
+        }
+        throw error;
       }
     }
 
