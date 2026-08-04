@@ -15,6 +15,8 @@ export class KeenableScraper implements t.BaseScraper {
   private timeout: number;
   private attributionTitle: string;
   private logger: t.Logger;
+  private httpAgent?: t.HttpAgent;
+  private httpsAgent?: t.HttpsAgent;
 
   constructor(config: t.KeenableScraperConfig = {}) {
     const resolvedKey = config.apiKey ?? process.env.KEENABLE_API_KEY;
@@ -28,6 +30,8 @@ export class KeenableScraper implements t.BaseScraper {
         : KEENABLE_FETCH_PUBLIC_URL);
     this.timeout = config.timeout ?? DEFAULT_KEENABLE_SCRAPE_TIMEOUT;
     this.attributionTitle = config.attributionTitle ?? 'LibreChat';
+    this.httpAgent = config.httpAgent;
+    this.httpsAgent = config.httpsAgent;
     this.logger = config.logger || createDefaultLogger();
   }
 
@@ -57,6 +61,8 @@ export class KeenableScraper implements t.BaseScraper {
         params: { url },
         headers: this.buildHeaders(),
         timeout: options.timeout ?? this.timeout,
+        httpAgent: this.httpAgent,
+        httpsAgent: this.httpsAgent,
       });
 
       const data = response.data;

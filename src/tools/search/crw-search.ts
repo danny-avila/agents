@@ -91,7 +91,12 @@ export const createCrwAPI = (
       const response = await axios.post<t.CrwSearchResponse>(
         config.apiUrl,
         payload,
-        { headers, timeout: config.timeout }
+        {
+          headers,
+          timeout: config.timeout,
+          httpAgent: options?.httpAgent,
+          httpsAgent: options?.httpsAgent,
+        }
       );
 
       const body = response.data;

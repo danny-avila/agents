@@ -452,6 +452,8 @@ export const createSearchTool = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    httpAgent,
+    httpsAgent,
     onSearchResults: _onSearchResults,
     onGetHighlights,
   } = config;
@@ -498,6 +500,8 @@ export const createSearchTool = (
     crwApiKey,
     crwApiUrl,
     crwSearchOptions,
+    httpAgent,
+    httpsAgent,
   });
 
   /** Create scraper based on scraperProvider */
@@ -508,6 +512,8 @@ export const createSearchTool = (
       ...serperScraperOptions,
       apiKey: serperApiKey,
       timeout: scraperTimeout ?? serperScraperOptions?.timeout,
+      httpAgent: httpAgent ?? serperScraperOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? serperScraperOptions?.httpsAgent,
       logger,
     });
   } else if (scraperProvider === 'tavily') {
@@ -519,6 +525,8 @@ export const createSearchTool = (
         process.env.TAVILY_API_KEY,
       apiUrl: tavilyScraperOptions?.apiUrl ?? tavilyExtractUrl,
       timeout: scraperTimeout ?? tavilyScraperOptions?.timeout,
+      httpAgent: httpAgent ?? tavilyScraperOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? tavilyScraperOptions?.httpsAgent,
       logger,
     });
   } else if (scraperProvider === 'crw') {
@@ -528,6 +536,8 @@ export const createSearchTool = (
       apiUrl: crwScraperOptions?.apiUrl ?? crwApiUrl,
       timeout: scraperTimeout ?? crwScraperOptions?.timeout,
       formats: crwScraperOptions?.formats ?? ['markdown', 'rawHtml'],
+      httpAgent: httpAgent ?? crwScraperOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? crwScraperOptions?.httpsAgent,
       logger,
     });
   } else if (scraperProvider === 'keenable') {
@@ -538,6 +548,8 @@ export const createSearchTool = (
       attributionTitle:
         keenableScraperOptions?.attributionTitle ??
         keenableSearchOptions?.attributionTitle,
+      httpAgent: httpAgent ?? keenableScraperOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? keenableScraperOptions?.httpsAgent,
       logger,
     });
   } else {
@@ -548,6 +560,8 @@ export const createSearchTool = (
       version: firecrawlVersion,
       timeout: scraperTimeout ?? firecrawlOptions?.timeout,
       formats: firecrawlOptions?.formats ?? ['markdown', 'rawHtml'],
+      httpAgent: httpAgent ?? firecrawlOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? firecrawlOptions?.httpsAgent,
       logger,
     });
   }
@@ -558,6 +572,8 @@ export const createSearchTool = (
     jinaApiUrl,
     cohereApiKey,
     rerankerTimeout,
+    httpAgent,
+    httpsAgent,
     logger,
   });
 

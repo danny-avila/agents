@@ -45,6 +45,8 @@ export class TavilyScraper implements t.BaseScraper {
   private includeImages: boolean;
   private includeFavicon: boolean;
   private format: 'markdown' | 'text' | undefined;
+  private httpAgent?: t.HttpAgent;
+  private httpsAgent?: t.HttpsAgent;
 
   constructor(config: t.TavilyScraperConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.TAVILY_API_KEY ?? '';
@@ -58,6 +60,8 @@ export class TavilyScraper implements t.BaseScraper {
     this.includeImages = config.includeImages ?? false;
     this.includeFavicon = config.includeFavicon ?? false;
     this.format = config.format;
+    this.httpAgent = config.httpAgent;
+    this.httpsAgent = config.httpsAgent;
     this.logger = config.logger || createDefaultLogger();
 
     if (!this.apiKey) {
@@ -140,6 +144,8 @@ export class TavilyScraper implements t.BaseScraper {
           'Content-Type': 'application/json',
         },
         timeout: effectiveTimeout,
+        httpAgent: this.httpAgent,
+        httpsAgent: this.httpsAgent,
       });
 
       const data = response.data;

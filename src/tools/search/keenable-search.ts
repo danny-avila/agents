@@ -65,7 +65,12 @@ export const createKeenableAPI = (
       const response = await axios.post<t.KeenableSearchResponse>(
         resolvedUrl,
         payload,
-        { headers, timeout }
+        {
+          headers,
+          timeout,
+          httpAgent: options?.httpAgent,
+          httpsAgent: options?.httpsAgent,
+        }
       );
 
       const maxResults = Math.min(
