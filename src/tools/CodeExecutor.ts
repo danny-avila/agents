@@ -23,7 +23,7 @@ export const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
 
 export const CODE_ARTIFACT_PATH_GUIDANCE =
-  'Persist handoff artifacts in `/mnt/data` with standard extensions (.json/.txt/.csv/.tsv/.log/.parquet/.png/.jpg/.pdf/.xlsx); failed executions do not register new files; `/tmp` and odd extensions are same-call scratch only, not later-call storage.';
+  'Anything a later call needs (data, helper scripts/modules, partial results) MUST be written under `/mnt/data` in the same call that produces it; `/tmp` never survives the call. `/mnt/data` keeps files with recognized extensions, covering common source, text, data, document, image, and archive formats (.py/.sh/.sql/.md/.json/.csv/.parquet/.png/.pdf/.zip and similar); extensionless or unusual extensions are not kept. Failed executions register nothing; fix the error and rerun before relying on new files.';
 
 export const BASH_SHELL_GUIDANCE =
   'Bash: multi-line files use heredoc/printf; run Python via python3 -c/heredoc, not bare Python.';
