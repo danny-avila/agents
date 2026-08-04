@@ -310,12 +310,27 @@ export function enforceStreamedToolCallArgLimit({
   const seal = getStreamedToolCallSeal(responseMetadata);
   const resolveChunkName = (chunk: ToolCallChunk): string | undefined => {
     const name = chunkToolName(chunk);
-    if (name != null || chunk.id == null || parsedToolCalls == null) {
+    if (name != null || parsedToolCalls == null) {
       return name;
     }
-    for (const parsed of parsedToolCalls) {
-      if (parsed.id === chunk.id && parsed.name != null && parsed.name !== '') {
-        return parsed.name;
+    if (chunk.id != null) {
+      for (const parsed of parsedToolCalls) {
+        if (
+          parsed.id === chunk.id &&
+          parsed.name != null &&
+          parsed.name !== ''
+        ) {
+          return parsed.name;
+        }
+      }
+      return undefined;
+    }
+    /** No id to correlate on; only a single-parsed-call event is an
+     * unambiguous association. */
+    if (parsedToolCalls.length === 1) {
+      const only = parsedToolCalls[0];
+      if (only.name != null && only.name !== '') {
+        return only.name;
       }
     }
     return undefined;
@@ -344,7 +359,18 @@ export function enforceStreamedToolCallArgLimit({
       }
       continue;
     }
-    const key = `${generationKey}:${chunk.index ?? chunk.id ?? `#${i}`}`;
+    /** Keys are namespaced by identity kind (`i:` index, `c:` id, `#`
+     * batch position) so an index and a string id with the same textual
+     * value — index 0 and id "0" — cannot alias distinct calls onto one
+     * tally. */
+    let key: string;
+    if (chunk.index != null) {
+      key = `${generationKey}:i:${chunk.index}`;
+    } else if (chunk.id != null) {
+      key = `${generationKey}:c:${chunk.id}`;
+    } else {
+      key = `${generationKey}:#${i}`;
+    }
     const sealed = sealsChunk(seal, chunk);
     /** Secondary keys this call is also reachable under, so a later delta
      * that drops one or both identifiers still lands on the same tally:
@@ -354,24 +380,34 @@ export function enforceStreamedToolCallArgLimit({
     if (chunk.id != null) {
       aliasCandidates.push(`${generationKey}:#${i}`);
       if (chunk.index != null) {
-        aliasCandidates.push(`${generationKey}:${chunk.id}`);
+        aliasCandidates.push(`${generationKey}:c:${chunk.id}`);
       }
     }
     let tally = tallies.get(key);
-    /** A later delta can also ADD an identifier (id-only start, id+index
-     * delta), which changes the primary key; adopt the call's existing tally
-     * through its id — and only its id: the batch position is a weak
-     * fallback identity that different parallel calls legitimately share, so
-     * adopting through it would merge their budgets. The old identity is
-     * recorded as an alias and released together with the rest. */
-    if (tally == null && chunk.id != null) {
-      const idKey = `${generationKey}:${chunk.id}`;
-      const existing = idKey === key ? undefined : tallies.get(idKey);
-      if (existing != null) {
+    /** A later delta can also ADD an identifier, changing the primary key;
+     * adopt the call's existing tally through a stronger prior identity
+     * before allocating. Id-bearing chunks adopt through the id — never the
+     * batch position, which different parallel calls legitimately share.
+     * Id-less indexed chunks adopt through their batch position: a position
+     * tally is singular per position, so an anonymous call gaining an index
+     * is unambiguous within the generation. The old identity is recorded as
+     * an alias and released together with the rest. */
+    if (tally == null) {
+      let adoptionKey: string | undefined;
+      if (chunk.id != null) {
+        adoptionKey = `${generationKey}:c:${chunk.id}`;
+      } else if (chunk.index != null) {
+        adoptionKey = `${generationKey}:#${i}`;
+      }
+      const existing =
+        adoptionKey == null || adoptionKey === key
+          ? undefined
+          : tallies.get(adoptionKey);
+      if (existing != null && adoptionKey != null) {
         tally = existing;
         tallies.set(key, existing);
-        if (existing.aliasKeys?.includes(idKey) !== true) {
-          (existing.aliasKeys ??= []).push(idKey);
+        if (existing.aliasKeys?.includes(adoptionKey) !== true) {
+          (existing.aliasKeys ??= []).push(adoptionKey);
         }
       }
     }

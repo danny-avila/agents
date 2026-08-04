@@ -997,6 +997,85 @@ describe('per-tool argument byte overrides', () => {
     });
   });
 
+  it('keeps an index 0 call and an id "0" call on separate budgets', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ name: 'a_tool', args: 'a'.repeat(60), index: 0 }],
+    });
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: '0', name: 'b_tool', args: 'b'.repeat(60) }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ id: '0', args: 'b'.repeat(41) }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      observed: 101,
+      toolName: 'b_tool',
+    });
+  });
+
+  it('adopts an anonymous tally when a later delta adds only an index', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ name: 'writer', args: 'a'.repeat(60) }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'a'.repeat(41), index: 0 }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      observed: 101,
+      toolName: 'writer',
+    });
+  });
+
+  it('names id-less raw chunks from a single parsed call so overrides apply', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: { create_file: 1_000 },
+      }),
+    });
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_call_chunks: [{ args: 'x'.repeat(500), index: 0 }],
+          tool_calls: [
+            { id: 'call_1', name: 'create_file', args: { content: 'x'.repeat(500) } },
+          ],
+        },
+      })
+    ).resolves.toBeUndefined();
+  });
+
   it('normalizes override entries like the global field', () => {
     const resolved = resolveStreamLimits({
       maxToolCallArgBytes: 100,

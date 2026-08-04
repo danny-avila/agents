@@ -1080,6 +1080,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * otherwise grow by one attempt-stamped entry per model call for the
    * graph's lifetime. */
   streamLimitChargeCredits?: WeakMap<object, Map<string, number>>;
+  /** Run-scoped abort shared by every SubagentExecutor this graph builds, so
+   * one child tripping a stream circuit breaker stops subagents running
+   * under other parallel agent nodes too. Recreated by both reset paths —
+   * the abort is one-way within a run, and a reused graph must start its
+   * next run unaborted. */
+  subagentBreakerAbort = new AbortController();
   /**
    * Seals charged against `preemption.maxSeals`. Per-turn: cleared by both
    * reset paths so a fresh turn gets a fresh budget, while a HITL resume —
@@ -1196,6 +1202,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.streamedToolCallArgTallies.clear();
     this.streamDeltaEventCounts.clear();
     this.streamLimitChargeCredits = undefined;
+    if (this.subagentBreakerAbort.signal.aborted) {
+      this.subagentBreakerAbort = new AbortController();
+    }
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
@@ -1256,6 +1265,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.streamedToolCallArgTallies.clear();
     this.streamDeltaEventCounts.clear();
     this.streamLimitChargeCredits = undefined;
+    if (this.subagentBreakerAbort.signal.aborted) {
+      this.subagentBreakerAbort = new AbortController();
+    }
     /**
      * Turn state only. The reported totals must outlive cleanup — this runs
      * in `processStream`'s `finally`, and the host reads `getPreemptStats()`
@@ -3887,6 +3899,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const executor = new SubagentExecutor({
           configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
           parentSignal: this.signal,
+          breakerScope: {
+            signal: (): AbortSignal => this.subagentBreakerAbort.signal,
+            trip: (reason: unknown): void =>
+              this.subagentBreakerAbort.abort(reason),
+          },
           hookRegistry: this.hookRegistry,
           /** Lazy — Run wires the registry onto the graph AFTER
            *  `createWorkflow()` runs, so a direct capture here would be

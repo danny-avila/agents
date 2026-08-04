@@ -215,6 +215,16 @@ export type ChildGraphFactory = (input: StandardGraphInput) => StandardGraph;
 export type SubagentExecutorOptions = {
   configs: Map<string, ResolvedSubagentConfig>;
   parentSignal?: AbortSignal;
+  /** Run-scoped breaker abort shared by every executor of one graph, so a
+   * child tripping a stream limit stops subagents running under OTHER
+   * parallel agent nodes too. Accessors rather than a captured controller:
+   * the graph recreates its controller per run, and children must always
+   * compose against the current one. Absent (tests, minimal hosts), the
+   * executor falls back to its own private controller. */
+  breakerScope?: {
+    signal: () => AbortSignal;
+    trip: (reason: unknown) => void;
+  };
   hookRegistry?: HookRegistry;
   parentRunId: string;
   parentAgentId?: string;
@@ -268,8 +278,10 @@ export class SubagentExecutor {
    * subagents run concurrently on the parent's signal, and rejecting the
    * batch alone would leave their provider requests streaming after the
    * safety abort. One-way by design — a tripped breaker ends the run, so no
-   * later child of this executor should start either. */
+   * later child of this executor should start either. Fallback for hosts
+   * that do not supply the graph's shared `breakerScope`. */
   private readonly childRunAbort = new AbortController();
+  private readonly breakerScope?: SubagentExecutorOptions['breakerScope'];
   private readonly hookRegistry?: HookRegistry;
   private readonly parentRunId: string;
   private readonly parentAgentId?: string;
@@ -286,6 +298,7 @@ export class SubagentExecutor {
   constructor(options: SubagentExecutorOptions) {
     this.configs = options.configs;
     this.parentSignal = options.parentSignal;
+    this.breakerScope = options.breakerScope;
     this.hookRegistry = options.hookRegistry;
     this.parentRunId = options.parentRunId;
     this.parentAgentId = options.parentAgentId;
@@ -303,15 +316,24 @@ export class SubagentExecutor {
     }
   }
 
-  /** One signal that fires on the parent's abort or the executor's own
-   * breaker abort, collapsed to a single signal when possible (mirrors
-   * `composeAbortSignals` in Graph.ts). */
+  /** One signal that fires on the parent's abort or the breaker-scope abort,
+   * collapsed to a single signal when possible (mirrors
+   * `composeAbortSignals` in Graph.ts). The scope signal is read per spawn
+   * because the graph recreates its controller each run. */
   private resolveChildSignal(): AbortSignal {
-    const child = this.childRunAbort.signal;
+    const child = this.breakerScope?.signal() ?? this.childRunAbort.signal;
     if (this.parentSignal == null || this.parentSignal === child) {
       return child;
     }
     return AbortSignal.any([this.parentSignal, child]);
+  }
+
+  private tripBreakerScope(reason: unknown): void {
+    if (this.breakerScope != null) {
+      this.breakerScope.trip(reason);
+      return;
+    }
+    this.childRunAbort.abort(reason);
   }
 
   /** Snapshot of the parent's registry at the moment a subagent is dispatched. */
@@ -541,6 +563,14 @@ export class SubagentExecutor {
         }
       );
     } catch (error) {
+      /** Aborted before any observational work below: parallel siblings — in
+       * this executor and, via the graph-scoped breaker, under other
+       * parallel agent nodes — stream on the composed child signal, and
+       * awaiting forwarding.drain() first would let them consume provider
+       * quota for that entire interval. */
+      if (error instanceof StreamLimitExceededError) {
+        this.tripBreakerScope(error);
+      }
       const errorMessage = truncateErrorMessage(error);
       if (forwarding) {
         await forwarding.drain();
@@ -563,10 +593,6 @@ export class SubagentExecutor {
        * so the parent run rejects with the child's limit error.
        */
       if (error instanceof StreamLimitExceededError) {
-        /** Stop concurrently running sibling subagents before failing the
-         * batch; they stream on the composed child signal and would
-         * otherwise keep consuming provider quota after the safety abort. */
-        this.childRunAbort.abort(error);
         throw error;
       }
       return {
