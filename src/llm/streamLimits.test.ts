@@ -102,8 +102,8 @@ describe('resolveGenerationKey', () => {
       metadata: attemptTwo,
       toolCallChunks: [chunk({ args: '12345678', index: 0 })],
     });
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1|7:0')?.bytes).toBe(8);
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1|8:0')?.bytes).toBe(8);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|7:i:0')?.bytes).toBe(8);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|8:i:0')?.bytes).toBe(8);
   });
 });
 
@@ -160,7 +160,7 @@ describe('enforceStreamedToolCallArgLimit', () => {
         toolCallChunks: [chunk({ args: '€€', index: 0 })],
       })
     ).toThrow(StreamLimitExceededError);
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:0')?.bytes).toBe(6);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:i:0')?.bytes).toBe(6);
   });
 
   it('reconciles surrogate pairs split across chunk boundaries', () => {
@@ -179,7 +179,7 @@ describe('enforceStreamedToolCallArgLimit', () => {
       metadata,
       toolCallChunks: [chunk({ args: low, index: 0 })],
     });
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:0')?.bytes).toBe(4);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:i:0')?.bytes).toBe(4);
     expect(() =>
       enforceStreamedToolCallArgLimit({
         graph,
@@ -204,7 +204,7 @@ describe('enforceStreamedToolCallArgLimit', () => {
       metadata,
       toolCallChunks: [chunk({ args: 'abc', index: 0 })],
     });
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:0')?.bytes).toBe(6);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:i:0')?.bytes).toBe(6);
   });
 
   it('tallies parallel tool calls and generations independently', () => {
@@ -248,7 +248,7 @@ describe('enforceStreamedToolCallArgLimit', () => {
       metadata,
       toolCallChunks: [chunk({ id: 'call_b', name: 'b_tool', args: '123456' })],
     });
-    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:call_a')?.bytes).toBe(6);
+    expect(graph.streamedToolCallArgTallies?.get('|agent|1|:c:call_a')?.bytes).toBe(6);
     expect(() =>
       enforceStreamedToolCallArgLimit({
         graph,
@@ -333,7 +333,7 @@ describe('enforceStreamedToolCallArgLimit', () => {
         [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'single', index: 0 },
       },
     });
-    expect(graph.streamedToolCallArgTallies?.has('|agent|1|:0')).toBe(false);
+    expect(graph.streamedToolCallArgTallies?.has('|agent|1|:i:0')).toBe(false);
   });
 
   it('releases the tally on a Bedrock Converse stop chunk without counting it', () => {
@@ -356,7 +356,7 @@ describe('enforceStreamedToolCallArgLimit', () => {
         [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'single', index: 0 },
       },
     });
-    expect(graph.streamedToolCallArgTallies?.has('|agent|1|:0')).toBe(false);
+    expect(graph.streamedToolCallArgTallies?.has('|agent|1|:i:0')).toBe(false);
   });
 
   it('does nothing when disabled', () => {
