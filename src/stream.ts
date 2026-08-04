@@ -1544,6 +1544,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
           responseMetadata: chunk.response_metadata as
             | Record<string, unknown>
             | undefined,
+          parsedToolCalls: chunk.tool_calls,
         });
       }
       /** Judged whenever parsed calls are present, not only when raw chunks

@@ -281,11 +281,15 @@ export function enforceStreamedToolCallArgLimit({
   metadata,
   toolCallChunks,
   responseMetadata,
+  parsedToolCalls,
 }: {
   graph: StreamLimitState;
   metadata: Record<string, unknown> | undefined;
   toolCallChunks: ToolCallChunk[];
   responseMetadata?: Record<string, unknown>;
+  /** Complete parsed calls from the same event, used to name anonymous raw
+   * chunks so per-tool overrides are honored before the global cap trips. */
+  parsedToolCalls?: CompleteToolCallLike[];
 }): void {
   const resolved = graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS;
   const globalLimit = resolved.maxToolCallArgBytes;
@@ -304,6 +308,18 @@ export function enforceStreamedToolCallArgLimit({
   const tallies = (graph.streamedToolCallArgTallies ??= new Map());
   const generationKey = resolveGenerationKey(metadata);
   const seal = getStreamedToolCallSeal(responseMetadata);
+  const resolveChunkName = (chunk: ToolCallChunk): string | undefined => {
+    const name = chunkToolName(chunk);
+    if (name != null || chunk.id == null || parsedToolCalls == null) {
+      return name;
+    }
+    for (const parsed of parsedToolCalls) {
+      if (parsed.id === chunk.id && parsed.name != null && parsed.name !== '') {
+        return parsed.name;
+      }
+    }
+    return undefined;
+  };
   for (let i = 0; i < toolCallChunks.length; i++) {
     const chunk = toolCallChunks[i];
     const args = chunk.args;
@@ -313,7 +329,7 @@ export function enforceStreamedToolCallArgLimit({
         continue;
       }
       const bytes = Buffer.byteLength(args, 'utf8');
-      const sealedName = chunkToolName(chunk);
+      const sealedName = resolveChunkName(chunk);
       const limit =
         byTool != null && sealedName != null && Object.hasOwn(byTool, sealedName)
           ? byTool[sealedName]
@@ -330,7 +346,6 @@ export function enforceStreamedToolCallArgLimit({
     }
     const key = `${generationKey}:${chunk.index ?? chunk.id ?? `#${i}`}`;
     const sealed = sealsChunk(seal, chunk);
-    let tally = tallies.get(key);
     /** Secondary keys this call is also reachable under, so a later delta
      * that drops one or both identifiers still lands on the same tally:
      * id-bearing chunks register the batch-position fallback, and chunks
@@ -340,6 +355,24 @@ export function enforceStreamedToolCallArgLimit({
       aliasCandidates.push(`${generationKey}:#${i}`);
       if (chunk.index != null) {
         aliasCandidates.push(`${generationKey}:${chunk.id}`);
+      }
+    }
+    let tally = tallies.get(key);
+    /** A later delta can also ADD an identifier (id-only start, id+index
+     * delta), which changes the primary key; adopt the call's existing tally
+     * through its id — and only its id: the batch position is a weak
+     * fallback identity that different parallel calls legitimately share, so
+     * adopting through it would merge their budgets. The old identity is
+     * recorded as an alias and released together with the rest. */
+    if (tally == null && chunk.id != null) {
+      const idKey = `${generationKey}:${chunk.id}`;
+      const existing = idKey === key ? undefined : tallies.get(idKey);
+      if (existing != null) {
+        tally = existing;
+        tallies.set(key, existing);
+        if (existing.aliasKeys?.includes(idKey) !== true) {
+          (existing.aliasKeys ??= []).push(idKey);
+        }
       }
     }
     const registerAliases = (target: StreamedToolCallArgTally): void => {
@@ -375,7 +408,7 @@ export function enforceStreamedToolCallArgLimit({
     if (!hasArgs) {
       if (tally == null) {
         if (!sealed) {
-          tally = { bytes: 0, name: chunkToolName(chunk) };
+          tally = { bytes: 0, name: resolveChunkName(chunk) };
           tallies.set(key, tally);
           registerAliases(tally);
         }
@@ -387,7 +420,7 @@ export function enforceStreamedToolCallArgLimit({
         registerAliases(tally);
       }
       if (tally.name == null) {
-        const lateName = chunkToolName(chunk);
+        const lateName = resolveChunkName(chunk);
         if (lateName != null) {
           /** Bytes tallied before the name arrived were only held against the
            * global cap; a newly applicable per-tool override must re-judge
@@ -420,7 +453,7 @@ export function enforceStreamedToolCallArgLimit({
       registerAliases(tally);
     }
     if (tally.name == null) {
-      tally.name = chunkToolName(chunk);
+      tally.name = resolveChunkName(chunk);
     }
     const argBytes = Buffer.byteLength(args, 'utf8');
     if (sealed) {
@@ -433,7 +466,7 @@ export function enforceStreamedToolCallArgLimit({
     }
     tally.pendingHighSurrogate =
       !sealed && isHighSurrogate(args.charCodeAt(args.length - 1));
-    const toolName = tally.name ?? chunkToolName(chunk);
+    const toolName = tally.name ?? resolveChunkName(chunk);
     const limit =
       byTool != null && toolName != null && Object.hasOwn(byTool, toolName)
         ? byTool[toolName]
@@ -454,6 +487,7 @@ export function enforceStreamedToolCallArgLimit({
 
 /** Structural subset of a complete parsed tool call. */
 interface CompleteToolCallLike {
+  id?: string;
   name?: string;
   args?: unknown;
 }
@@ -595,6 +629,7 @@ export function enforceStreamLimitsForWireChunk({
       metadata,
       toolCallChunks: chunk.tool_call_chunks,
       responseMetadata: chunk.response_metadata,
+      parsedToolCalls: chunk.tool_calls,
     });
   }
   /** Judged whenever parsed calls are present, not only when raw chunks are

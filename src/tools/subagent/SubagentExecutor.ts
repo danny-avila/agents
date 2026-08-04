@@ -264,6 +264,12 @@ export type SubagentExecutorOptions = {
 export class SubagentExecutor {
   private readonly configs: Map<string, ResolvedSubagentConfig>;
   private readonly parentSignal?: AbortSignal;
+  /** Aborted when a child trips a stream circuit breaker: parallel sibling
+   * subagents run concurrently on the parent's signal, and rejecting the
+   * batch alone would leave their provider requests streaming after the
+   * safety abort. One-way by design — a tripped breaker ends the run, so no
+   * later child of this executor should start either. */
+  private readonly childRunAbort = new AbortController();
   private readonly hookRegistry?: HookRegistry;
   private readonly parentRunId: string;
   private readonly parentAgentId?: string;
@@ -295,6 +301,17 @@ export class SubagentExecutor {
     } else if (rawRegistry != null) {
       this.resolveParentHandlerRegistry = (): HandlerRegistry => rawRegistry;
     }
+  }
+
+  /** One signal that fires on the parent's abort or the executor's own
+   * breaker abort, collapsed to a single signal when possible (mirrors
+   * `composeAbortSignals` in Graph.ts). */
+  private resolveChildSignal(): AbortSignal {
+    const child = this.childRunAbort.signal;
+    if (this.parentSignal == null || this.parentSignal === child) {
+      return child;
+    }
+    return AbortSignal.any([this.parentSignal, child]);
   }
 
   /** Snapshot of the parent's registry at the moment a subagent is dispatched. */
@@ -381,7 +398,7 @@ export class SubagentExecutor {
     const hostUsageSink = this.usageSink;
     const childGraph = this.createChildGraph({
       runId: childRunId,
-      signal: this.parentSignal,
+      signal: this.resolveChildSignal(),
       agents: [childInputs],
       langfuse: this.langfuse,
       tokenCounter: this.tokenCounter,
@@ -514,7 +531,7 @@ export class SubagentExecutor {
         { messages: [new HumanMessage(description)] },
         {
           recursionLimit: maxTurns * RECURSION_MULTIPLIER,
-          signal: this.parentSignal,
+          signal: this.resolveChildSignal(),
           callbacks,
           runName: `subagent:${subagentType}`,
           configurable: {
@@ -546,6 +563,10 @@ export class SubagentExecutor {
        * so the parent run rejects with the child's limit error.
        */
       if (error instanceof StreamLimitExceededError) {
+        /** Stop concurrently running sibling subagents before failing the
+         * batch; they stream on the composed child signal and would
+         * otherwise keep consuming provider quota after the safety abort. */
+        this.childRunAbort.abort(error);
         throw error;
       }
       return {

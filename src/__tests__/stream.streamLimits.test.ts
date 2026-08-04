@@ -936,6 +936,67 @@ describe('per-tool argument byte overrides', () => {
     });
   });
 
+  it('adopts the existing tally when a later delta adds an index', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_1', name: 'writer', args: 'a'.repeat(60) }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ id: 'call_1', args: 'a'.repeat(41), index: 0 }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      observed: 101,
+      toolName: 'writer',
+    });
+  });
+
+  it('names anonymous raw chunks from parsed calls so overrides apply', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: { create_file: 1_000 },
+      }),
+    });
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_call_chunks: [{ id: 'call_1', args: 'x'.repeat(500), index: 0 }],
+          tool_calls: [
+            { id: 'call_1', name: 'create_file', args: { content: 'x'.repeat(500) } },
+          ],
+        },
+      })
+    ).resolves.toBeUndefined();
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'x'.repeat(501), index: 0 }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 1_000,
+      toolName: 'create_file',
+    });
+  });
+
   it('normalizes override entries like the global field', () => {
     const resolved = resolveStreamLimits({
       maxToolCallArgBytes: 100,
