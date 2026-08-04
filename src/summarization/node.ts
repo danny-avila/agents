@@ -37,6 +37,7 @@ import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import {
   enforceStreamLimitsForWireChunk,
   StreamLimitExceededError,
+  STREAM_LIMIT_EPOCH_KEY,
 } from '@/llm/streamLimits';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
@@ -910,6 +911,10 @@ interface CreateSummarizeNodeParams {
      * accessor: the node captures it at entry so a breach detected by its
      * own chunk handler trips the run that STARTED the summarization. */
     getBreakerController?: () => AbortController;
+    /** The controller's epoch, captured at entry and stamped into summary
+     * attempt metadata so the wire consumer epoch-gates old-run summary
+     * chunks like model-attempt chunks. */
+    getBreakerEpoch?: () => number;
   } & StreamLimitState;
   generateStepId: (stepKey: string) => [string, number];
 }
@@ -975,6 +980,7 @@ export function createSummarizeNode({
     const entryBreakerController = adapterGraph.getBreakerController?.();
     const entryBreakerSignal =
       entryBreakerController?.signal ?? adapterGraph.getBreakerSignal?.();
+    const entryBreakerEpoch = adapterGraph.getBreakerEpoch?.();
     const graph =
       entryBreakerSignal == null
         ? adapterGraph
@@ -1235,6 +1241,13 @@ export function createSummarizeNode({
              */
           ...(clientConfig.modelName != null && clientConfig.modelName !== ''
             ? { [Constants.INVOKED_MODEL]: clientConfig.modelName }
+            : {}),
+          /** Entry-captured breaker epoch: the wire consumer epoch-gates
+           * old-run summary chunks exactly like model-attempt chunks —
+           * without the stamp, a straggling summary from a failed run
+           * reads as current and could abort the next run's controller. */
+          ...(entryBreakerEpoch != null
+            ? { [STREAM_LIMIT_EPOCH_KEY]: entryBreakerEpoch }
             : {}),
         },
       }

@@ -1217,6 +1217,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           (config.configurable?.writer as ToolRuntime<T>['writer']) ??
           null,
       };
+      /** A sibling can trip the breaker while the PreToolUse hooks above
+       * are awaited; a tool that never inspects its runtime signal would
+       * still run. Recheck at the last moment before execution. */
+      this.throwIfBreakerTripped(config);
       const output = await tool.invoke(invokeParams, runtime);
       if (isCommand(output)) {
         return output;
@@ -2995,6 +2999,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         );
       };
 
+      /** The approval hooks above are awaited; a sibling's trip during them
+       * must stop the approved batch before it reaches a host handler that
+       * may never inspect the request signal. */
+      if (dispatchRequests.length > 0) {
+        this.throwIfBreakerTripped(config);
+      }
       const dispatchPromise =
         dispatchRequests.length === 0
           ? Promise.resolve([] as t.ToolExecuteResult[])

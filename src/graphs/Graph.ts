@@ -4215,6 +4215,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
              * breach trips the run that STARTED the summarization, not a
              * controller installed by a later reset. */
             getBreakerController: (): AbortController => this.breakerAbort,
+            /** Captured at node entry and stamped into the summary attempt
+             * metadata, so the wire consumer epoch-gates old-run summary
+             * chunks exactly like model-attempt chunks. */
+            getBreakerEpoch: (): number => this.breakerEpoch,
             dispatchRunStep: async (runStep, nodeConfig) => {
               const resolvedConfig = nodeConfig ?? this.config;
               if (runStep.agentId != null) {

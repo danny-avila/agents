@@ -1529,18 +1529,34 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     const chunk = data.chunk as Partial<AIMessageChunk>;
 
-    /** The breaker this event's run owns. Attempts stamp their breaker
-     * epoch into event metadata; a mismatch marks a straggling chunk from a
-     * failed run that outlived `resetValues()`, and tripping (or
-     * consulting) the LIVE controller for it would cancel the unrelated run
-     * now using it. Events without a stamp (direct handler callers, partial
-     * stubs) keep the live-controller behavior. */
+    /** Attempts stamp their breaker epoch into event metadata; a mismatch
+     * marks a straggling chunk from a failed run that outlived
+     * `resetValues()`. Dropped OUTRIGHT: content handling and the eager
+     * paths below compose the LIVE controller, so acting on a dead run's
+     * chunk could dispatch host tools into the run now using it. Events
+     * without a stamp (direct handler callers, partial stubs) keep the
+     * live-controller behavior. */
     const eventEpoch = metadata?.[STREAM_LIMIT_EPOCH_KEY];
+    if (
+      eventEpoch != null &&
+      graph.breakerEpoch != null &&
+      eventEpoch !== graph.breakerEpoch
+    ) {
+      return;
+    }
     const eventBreaker =
-      graph.breakerAbort instanceof AbortController &&
-      (eventEpoch == null || eventEpoch === graph.breakerEpoch)
+      graph.breakerAbort instanceof AbortController
         ? graph.breakerAbort
         : undefined;
+    const throwIfRunBreakerTripped = (): void => {
+      if (
+        eventBreaker != null &&
+        eventBreaker.signal.aborted &&
+        eventBreaker.signal.reason instanceof StreamLimitExceededError
+      ) {
+        throw eventBreaker.signal.reason;
+      }
+    };
 
     /**
      * Enforced before every content-specific early return below
@@ -1606,14 +1622,11 @@ export class ChatModelStreamHandler implements t.EventHandler {
     /** A parallel producer can trip the shared breaker while this event was
      * already queued in `streamEvents`. Stop before content handling or the
      * eager-tool paths below — those can dispatch a side-effecting host
-     * tool with an already-aborted signal the handler never inspects. */
-    if (
-      eventBreaker != null &&
-      eventBreaker.signal.aborted &&
-      eventBreaker.signal.reason instanceof StreamLimitExceededError
-    ) {
-      throw eventBreaker.signal.reason;
-    }
+     * tool with an already-aborted signal the handler never inspects.
+     * Rechecked again immediately before each eager dispatch: the awaits in
+     * between (server-tool results, tool-call handling, content dispatch)
+     * are windows for a sibling's trip. */
+    throwIfRunBreakerTripped();
 
     const agentContext = graph.getAgentContext(metadata);
 
@@ -1677,6 +1690,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     ) {
       hasToolCalls = true;
       await handleToolCalls(chunk.tool_calls, metadata, graph);
+      throwIfRunBreakerTripped();
       if (hasFinalToolCallSignal(chunk)) {
         startEagerToolExecutions({
           graph,
@@ -1756,6 +1770,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
         metadata,
       });
       if (canStreamEager) {
+        throwIfRunBreakerTripped();
         startReadyStreamedEagerToolExecutions({
           graph,
           metadata,

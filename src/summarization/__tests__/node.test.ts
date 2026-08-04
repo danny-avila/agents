@@ -1710,6 +1710,56 @@ describe('createSummarizeNode — overflow recovery', () => {
 });
 
 describe('summarize node breaker capture', () => {
+  it('stamps the entry-captured breaker epoch into summary attempt metadata', async () => {
+    captureEvents();
+    const capturedConfigs: Array<{ metadata?: Record<string, unknown> }> = [];
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest
+              .fn()
+              .mockImplementation(
+                async (_messages: unknown, config?: unknown) => {
+                  capturedConfigs.push(
+                    config as { metadata?: Record<string, unknown> }
+                  );
+                  return { content: 'Summary text' };
+                }
+              ),
+          };
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    const graph = {
+      ...mockGraph(),
+      getBreakerEpoch: (): number => 7,
+    };
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(capturedConfigs.length).toBeGreaterThan(0);
+    for (const config of capturedConfigs) {
+      expect(config.metadata?.lc_stream_limit_epoch).toBe(7);
+    }
+  });
+
   it('rethrows a parent trip on the config signal instead of degrading to the stub', async () => {
     const trip = new StreamLimitExceededError({
       kind: 'tool_call_args',

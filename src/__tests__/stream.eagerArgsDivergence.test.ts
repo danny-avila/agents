@@ -38,6 +38,10 @@ import {
   BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
   OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
+import {
+  STREAM_LIMIT_EPOCH_KEY,
+  StreamLimitExceededError,
+} from '@/llm/streamLimits';
 import { GraphEvents, Providers, StepTypes } from '@/common';
 import { ChatModelStreamHandler } from '@/stream';
 import { ToolNode } from '@/tools/ToolNode';
@@ -488,6 +492,83 @@ describe('eager args divergence (LibreChat#14371)', () => {
       name: 'db_query',
       args: { sql: 'SELECT 1;' },
     });
+  });
+
+  it('does not prestart eager tools for stale-epoch events', async () => {
+    const graph = createGraph({ breakerEpoch: 5 } as Partial<StandardGraph>);
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const handler = new ChatModelStreamHandler();
+    const metadata = {
+      langgraph_node: 'agent',
+      [STREAM_LIMIT_EPOCH_KEY]: 4,
+    };
+
+    /** A final tool-call chunk from a failed run handled after resetValues
+     * advanced the epoch: dropped outright, so the dead run's call cannot
+     * dispatch a host tool into the run now using the live controller. */
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [{ id: 'call_1', name: 'db_query', args: { sql: 'SELECT 1;' } }],
+          response_metadata: { finish_reason: 'tool_calls' },
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+  });
+
+  it('does not prestart eager tools when the breaker trips during tool-call handling', async () => {
+    const graph = createGraph();
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    const originalDispatch = graph.dispatchRunStep;
+    graph.dispatchRunStep = (async (
+      stepKey: string,
+      details: unknown
+    ): Promise<string> => {
+      const stepId = await (
+        originalDispatch as unknown as (
+          stepKey: string,
+          details: unknown
+        ) => Promise<string>
+      )(stepKey, details);
+      graph.breakerAbort.abort(trip);
+      return stepId;
+    }) as typeof graph.dispatchRunStep;
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    /** The trip lands while handleToolCalls awaits the run-step dispatch —
+     * after the queued-event guard already passed. The recheck before the
+     * eager path must stop the prestart. */
+    await expect(
+      handler.handle(
+        GraphEvents.CHAT_MODEL_STREAM,
+        {
+          chunk: {
+            content: '',
+            tool_calls: [
+              { id: 'call_1', name: 'db_query', args: { sql: 'SELECT 1;' } },
+            ],
+            response_metadata: { finish_reason: 'tool_calls' },
+          } as unknown as t.StreamChunk,
+        },
+        metadata,
+        graph
+      )
+    ).rejects.toBe(trip);
+    expect(toolExecuteCalls).toHaveLength(0);
   });
 
   it('sends a breaker-composed abort signal with eager prestart requests', async () => {

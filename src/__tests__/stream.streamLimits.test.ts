@@ -1032,8 +1032,9 @@ describe('per-tool argument byte overrides', () => {
     });
 
     /** A straggling oversized chunk from a failed run (epoch 4) handled
-     * after resetValues installed epoch 5: the breach still rejects, but
-     * the new run's controller must stay live. */
+     * after resetValues installed epoch 5 is dropped outright — acting on
+     * it (content handling, eager dispatch) would compose the new run's
+     * live controller — and the new run's controller stays live. */
     await expect(
       streamToolCallChunks({
         handler,
@@ -1043,7 +1044,7 @@ describe('per-tool argument byte overrides', () => {
         ],
         metadata: { [STREAM_LIMIT_EPOCH_KEY]: 4 },
       })
-    ).rejects.toMatchObject({ kind: 'tool_call_args' });
+    ).resolves.toBeUndefined();
     expect(newRunBreaker.signal.aborted).toBe(false);
 
     /** Same breach with the matching epoch trips the controller. */
