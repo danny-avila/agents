@@ -12,6 +12,14 @@ export interface HttpAgentConfig {
   httpsAgent?: HttpsAgent;
 }
 
+/** Transport and credential fields shared by every provider scraper config. */
+export interface BaseSearchProviderConfig extends HttpAgentConfig {
+  apiKey?: string;
+  apiUrl?: string;
+  timeout?: number;
+  logger?: Logger;
+}
+
 export type SearchProvider =
   | 'serper'
   | 'searxng'
@@ -217,13 +225,10 @@ export interface KeenableSearchResponse {
   results?: KeenableSearchResult[];
 }
 
-export interface KeenableScraperConfig extends HttpAgentConfig {
-  apiKey?: string;
+export interface KeenableScraperConfig extends BaseSearchProviderConfig {
   /** Override the fetch endpoint base (default: public keyless, keyed when a
    * key is set). Env fallback: KEENABLE_FETCH_URL. */
   apiUrl?: string;
-  timeout?: number;
-  logger?: Logger;
   /** Sent as the X-Keenable-Title attribution header. Defaults to "LibreChat". */
   attributionTitle?: string;
 }
@@ -296,19 +301,11 @@ export interface FirecrawlConfig {
   firecrawlOptions?: FirecrawlScraperConfig;
 }
 
-export interface SerperScraperConfig extends HttpAgentConfig {
-  apiKey?: string;
-  apiUrl?: string;
-  timeout?: number;
-  logger?: Logger;
+export interface SerperScraperConfig extends BaseSearchProviderConfig {
   includeMarkdown?: boolean;
 }
 
-export interface TavilyScraperConfig extends HttpAgentConfig {
-  apiKey?: string;
-  apiUrl?: string;
-  timeout?: number;
-  logger?: Logger;
+export interface TavilyScraperConfig extends BaseSearchProviderConfig {
   extractDepth?: 'basic' | 'advanced';
   includeImages?: boolean;
   includeFavicon?: boolean;
@@ -433,12 +430,8 @@ export type FirecrawlScrapeOptions = Omit<
   'apiKey' | 'apiUrl' | 'version' | 'logger' | 'httpAgent' | 'httpsAgent'
 >;
 
-export interface CrwScraperConfig extends HttpAgentConfig {
-  apiKey?: string;
-  apiUrl?: string;
+export interface CrwScraperConfig extends BaseSearchProviderConfig {
   formats?: string[];
-  timeout?: number;
-  logger?: Logger;
   onlyMainContent?: boolean;
   includeTags?: string[];
   excludeTags?: string[];
@@ -629,13 +622,9 @@ export interface TavilyExtractResult {
   error?: string;
 }
 
-export interface FirecrawlScraperConfig extends HttpAgentConfig {
-  apiKey?: string;
-  apiUrl?: string;
+export interface FirecrawlScraperConfig extends BaseSearchProviderConfig {
   version?: string;
   formats?: string[];
-  timeout?: number;
-  logger?: Logger;
   includeTags?: string[];
   excludeTags?: string[];
   waitFor?: number;
