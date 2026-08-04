@@ -881,6 +881,19 @@ export function requiresStreamLimitAccounting(
   );
 }
 
+/** True when any stream-limit guard can fire for this graph. The attempt
+ * lease and per-chunk claims are both gated on it — fully disabled guards
+ * must allocate no bookkeeping at all, per-attempt included. */
+export function streamLimitAccountingEnabled(
+  graph: StreamLimitState
+): boolean {
+  const resolved = graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS;
+  return (
+    resolved.hasEnforceableToolCallArgLimit ||
+    resolved.maxDeltaEventsPerTurn > 0
+  );
+}
+
 /** Leases a model attempt's generation: entries under it are exempt from
  * the reset sweep until {@link releaseStreamLimitGeneration} runs from the
  * attempt's `finally`. */

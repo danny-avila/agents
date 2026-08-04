@@ -43,6 +43,7 @@ import {
   registerActiveStreamLimitGeneration,
   releaseStreamLimitGeneration,
   resolveGenerationKey,
+  streamLimitAccountingEnabled,
   StreamLimitExceededError,
   STREAM_LIMIT_REDISPATCH_KEY,
   STREAM_LIMIT_ATTEMPT_KEY,
@@ -719,7 +720,14 @@ export async function attemptInvoke(
       [STREAM_LIMIT_ATTEMPT_KEY]: ++streamLimitAttemptSeq,
     },
   };
-  const leaseTarget = params.context ?? params.streamLimitState;
+  const rawLeaseTarget = params.context ?? params.streamLimitState;
+  /** No lease when no guard can fire: the lease only protects accounting
+   * entries, and fully disabled guards must allocate no bookkeeping at
+   * all — per-attempt included. */
+  const leaseTarget =
+    rawLeaseTarget != null && streamLimitAccountingEnabled(rawLeaseTarget)
+      ? rawLeaseTarget
+      : undefined;
   const generationKey =
     leaseTarget != null
       ? resolveGenerationKey(

@@ -130,6 +130,37 @@ describe('run breaker lifecycle', () => {
     expect(graph.activeStreamLimitGenerations?.size ?? 0).toBe(0);
   });
 
+  it('takes no attempt lease when every guard is disabled', async () => {
+    const { attemptInvoke } = await import('@/llm/invoke');
+    const { resolveStreamLimits } = await import('@/llm/streamLimits');
+    const { AIMessage, HumanMessage } = await import(
+      '@langchain/core/messages'
+    );
+    const graph = makeGraph();
+    graph.streamLimits = resolveStreamLimits({
+      maxToolCallArgBytes: 0,
+      maxToolCallArgBytesByTool: { writer: 0 },
+    });
+    const model = {
+      invoke: async (): Promise<InstanceType<typeof AIMessage>> =>
+        new AIMessage({ content: 'ok' }),
+    };
+
+    await attemptInvoke(
+      {
+        model: model as unknown as t.ChatModel,
+        messages: [new HumanMessage('hi')],
+        provider: Providers.OPENAI,
+        context: graph as Parameters<typeof attemptInvoke>[0]['context'],
+      },
+      { metadata: {} }
+    );
+
+    /** The lease only protects accounting entries; with no guard able to
+     * fire there are none, and per-attempt bookkeeping must not allocate. */
+    expect(graph.activeStreamLimitGenerations).toBeUndefined();
+  });
+
   it('holds a post-reset producer straggler to its original byte budget', async () => {
     const { enforceStreamLimitsForWireChunk } = await import(
       '@/llm/streamLimits'
