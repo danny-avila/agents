@@ -1537,6 +1537,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
      */
     if (claimStreamLimitCharge(graph, data.chunk, 'consumer', metadata)) {
       enforceStreamDeltaEventLimit({ graph, metadata });
+      /** Combined first so raw-chunk name correlation sees invalid calls
+       * too; an unnamed raw chunk twinned with a named invalid call must
+       * select that tool's override, not the global cap. */
+      const completeCalls = combineCompleteToolCalls(chunk);
       if (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) {
         enforceStreamedToolCallArgLimit({
           graph,
@@ -1545,7 +1549,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
           responseMetadata: chunk.response_metadata as
             | Record<string, unknown>
             | undefined,
-          parsedToolCalls: chunk.tool_calls,
+          parsedToolCalls: completeCalls,
         });
       }
       /** Judged whenever parsed calls are present, not only when raw chunks
@@ -1553,7 +1557,6 @@ export class ChatModelStreamHandler implements t.EventHandler {
        * a complete parsed call; the standalone check is stateless, so the
        * common both-present case is not double-tallied. Invalid calls are
        * included because ToolNode processes and promotes them. */
-      const completeCalls = combineCompleteToolCalls(chunk);
       if (completeCalls != null) {
         enforceCompleteToolCallArgLimit({
           graph,

@@ -3262,6 +3262,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           this.breakerAbort.abort(primaryError);
           throw primaryError;
         }
+        /** A sibling that tripped the shared breaker aborts this branch's
+         * composed signal, and some providers surface that as a generic
+         * abort error; entering overflow planning or the fallback chain
+         * would start new provider work after the run-wide breaker fired.
+         * Rethrow the breaker's own stream-limit reason instead. */
+        if (
+          this.breakerAbort.signal.aborted &&
+          this.breakerAbort.signal.reason instanceof StreamLimitExceededError
+        ) {
+          throw this.breakerAbort.signal.reason;
+        }
         /**
          * A context overflow is a deterministic consequence of the payload,
          * not a provider being unavailable — so it is answered by compacting
@@ -3501,6 +3512,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
              * and subagents before the rejection propagates. */
             this.breakerAbort.abort(fallbackError);
             throw fallbackError;
+          }
+          if (
+            this.breakerAbort.signal.aborted &&
+            this.breakerAbort.signal.reason instanceof StreamLimitExceededError
+          ) {
+            /** Same sibling-abort translation guard as the primary catch. */
+            throw this.breakerAbort.signal.reason;
           }
           const overflowCandidates =
             getFallbackOverflowCandidates(fallbackError);

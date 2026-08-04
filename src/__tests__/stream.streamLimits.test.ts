@@ -1208,6 +1208,71 @@ describe('per-tool argument byte overrides', () => {
     });
   });
 
+  it('names unnamed raw chunks from invalid calls so overrides apply', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: { create_file: 1_000 },
+      }),
+    });
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_call_chunks: [{ id: 'call_1', args: 'x'.repeat(500), index: 0 }],
+          invalid_tool_calls: [
+            {
+              id: 'call_1',
+              name: 'create_file',
+              args: 'x'.repeat(500),
+              error: 'Unparseable arguments',
+            },
+          ],
+        },
+      })
+    ).resolves.toBeUndefined();
+  });
+
+  it('accumulates fragmented tool names before selecting overrides', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: { create_file: 1_000 },
+      }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_1', name: 'create_', args: 'x'.repeat(50), index: 0 }],
+    });
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ name: 'file', args: 'x'.repeat(100), index: 0 }],
+      })
+    ).resolves.toBeUndefined();
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'x'.repeat(900), index: 0 }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 1_000,
+      observed: 1_050,
+      toolName: 'create_file',
+    });
+  });
+
   it('normalizes override entries like the global field', () => {
     const resolved = resolveStreamLimits({
       maxToolCallArgBytes: 100,

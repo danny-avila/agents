@@ -472,6 +472,34 @@ export function enforceStreamedToolCallArgLimit({
       }
       registerAliasKeys(target, [`${generationKey}:#${i}`]);
     };
+    /** Applies this chunk's name contribution and reports whether the
+     * effective name changed. Adapters may stream the name in FRAGMENTS
+     * ("create_" then "file"), so unsealed fragments append — matching
+     * langchain's own tool-call-chunk merge — while a sealing chunk's name
+     * is a full restatement and replaces, mirroring how sealed args replace
+     * the tally bytes. Parsed-call correlation fills in only when the chunk
+     * carries no fragment. */
+    const applyChunkName = (target: StreamedToolCallArgTally): boolean => {
+      const fragment = chunkToolName(chunk);
+      let next = target.name;
+      if (fragment != null) {
+        if (sealed || target.name == null) {
+          next = fragment;
+        } else if (fragment !== target.name) {
+          /** A fragment identical to the accumulated name is a repeated
+           * full-name delta (a common provider shape) and is a no-op; a
+           * differing fragment is a continuation and appends. */
+          next = target.name + fragment;
+        }
+      } else if (target.name == null) {
+        next = resolveChunkName(chunk);
+      }
+      if (next === target.name) {
+        return false;
+      }
+      target.name = next;
+      return true;
+    };
     const releaseTally = (target: StreamedToolCallArgTally): void => {
       tallies.delete(key);
       if (target.keys == null) {
@@ -498,25 +526,25 @@ export function enforceStreamedToolCallArgLimit({
       if (!sealed) {
         registerAliases(tally);
       }
-      if (tally.name == null) {
-        const lateName = resolveChunkName(chunk);
-        if (lateName != null) {
-          /** Bytes tallied before the name arrived were only held against the
-           * global cap; a newly applicable per-tool override must re-judge
-           * them, including on a sealing chunk about to release the tally. */
-          tally.name = lateName;
-          const limit =
-            byTool != null && Object.hasOwn(byTool, lateName)
-              ? byTool[lateName]
-              : globalLimit;
-          if (limit > 0 && tally.bytes > limit) {
-            throw new StreamLimitExceededError({
-              kind: 'tool_call_args',
-              limit,
-              observed: tally.bytes,
-              toolName: lateName,
-            });
-          }
+      if (applyChunkName(tally)) {
+        /** Bytes tallied under the previous (or absent) name were held
+         * against that name's limit; a changed name — late arrival or a
+         * completed fragment — must re-judge them, including on a sealing
+         * chunk about to release the tally. */
+        const rejudgedName = tally.name;
+        const limit =
+          byTool != null &&
+          rejudgedName != null &&
+          Object.hasOwn(byTool, rejudgedName)
+            ? byTool[rejudgedName]
+            : globalLimit;
+        if (limit > 0 && tally.bytes > limit) {
+          throw new StreamLimitExceededError({
+            kind: 'tool_call_args',
+            limit,
+            observed: tally.bytes,
+            toolName: rejudgedName,
+          });
         }
       }
       if (sealed) {
@@ -532,9 +560,7 @@ export function enforceStreamedToolCallArgLimit({
     if (!sealed) {
       registerAliases(tally);
     }
-    if (tally.name == null) {
-      tally.name = resolveChunkName(chunk);
-    }
+    applyChunkName(tally);
     const argBytes = Buffer.byteLength(args, 'utf8');
     if (sealed) {
       tally.bytes = argBytes;
@@ -730,13 +756,18 @@ export function enforceStreamLimitsForWireChunk({
     return;
   }
   enforceStreamDeltaEventLimit({ graph, metadata });
+  /** Combined view computed first so the raw-chunk guard can correlate
+   * names from BOTH parsed and invalid calls in the same event; an unnamed
+   * raw chunk twinned with a named invalid call must select that tool's
+   * override, not the global cap. */
+  const completeCalls = combineCompleteToolCalls(chunk);
   if (chunk.tool_call_chunks != null && chunk.tool_call_chunks.length > 0) {
     enforceStreamedToolCallArgLimit({
       graph,
       metadata,
       toolCallChunks: chunk.tool_call_chunks,
       responseMetadata: chunk.response_metadata,
-      parsedToolCalls: chunk.tool_calls,
+      parsedToolCalls: completeCalls,
     });
   }
   /** Judged whenever parsed calls are present, not only when raw chunks are
@@ -746,7 +777,6 @@ export function enforceStreamLimitsForWireChunk({
    * are included — ToolNode processes and promotes them, and a malformed
    * call streaming oversized arguments is the exact pathology this breaker
    * exists to stop. */
-  const completeCalls = combineCompleteToolCalls(chunk);
   if (completeCalls != null) {
     enforceCompleteToolCallArgLimit({ graph, metadata, toolCalls: completeCalls });
   }
