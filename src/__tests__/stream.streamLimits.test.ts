@@ -24,6 +24,7 @@ import {
 import {
   DEFAULT_MAX_TOOL_CALL_ARG_BYTES,
   STREAM_LIMIT_REDISPATCH_KEY,
+  enforceStreamLimitsForWireChunk,
   resolveGenerationKey,
   resolveStreamLimits,
 } from '@/llm/streamLimits';
@@ -647,6 +648,75 @@ describe('per-tool argument byte overrides', () => {
         },
       })
     ).rejects.toMatchObject({ kind: 'tool_call_args', toolName: 'side_effect' });
+  });
+
+  it('judges complete parsed tool calls that arrive without raw chunks', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: { create_file: 1_000 },
+      }),
+    });
+
+    await streamEvent({
+      handler,
+      graph,
+      chunk: {
+        content: '',
+        tool_calls: [
+          { id: 'call_1', name: 'create_file', args: { content: 'x'.repeat(500) } },
+        ],
+      },
+    });
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_calls: [
+            { id: 'call_2', name: 'side_effect', args: { payload: 'x'.repeat(200) } },
+          ],
+        },
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 100,
+      toolName: 'side_effect',
+    });
+  });
+
+  it('charges wire chunks synchronously and skips the handler echo', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+    const wireChunk = {
+      content: '',
+      tool_call_chunks: [{ id: 'call_1', name: 'writer', args: 'a'.repeat(60), index: 0 }],
+    };
+
+    enforceStreamLimitsForWireChunk({
+      graph,
+      metadata: {},
+      chunk: wireChunk as never,
+    });
+    await streamEvent({ handler, graph, chunk: wireChunk });
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ args: 'a'.repeat(40), index: 0 }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'a', index: 0 }],
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', observed: 101 });
   });
 
   it('normalizes override entries like the global field', () => {

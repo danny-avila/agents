@@ -54,6 +54,9 @@ export interface StreamLimitState {
   streamLimits?: ResolvedStreamLimits;
   streamedToolCallArgTallies?: Map<string, StreamedToolCallArgTally>;
   streamDeltaEventCounts?: Map<string, number>;
+  /** Wire chunks already charged synchronously by the producer loop, so the
+   * decoupled handler echo of the same object does not charge them again. */
+  streamLimitPrecountedChunks?: WeakSet<object>;
 }
 
 function resolveLimit(value: number | undefined, fallback: number): number {
@@ -419,6 +422,117 @@ export function enforceStreamedToolCallArgLimit({
       releaseTally(tally);
     }
   }
+}
+
+/** Structural subset of a complete parsed tool call. */
+interface CompleteToolCallLike {
+  name?: string;
+  args?: unknown;
+}
+
+/**
+ * Standalone byte check for complete parsed tool calls that arrive without a
+ * raw chunk representation: a streaming custom or OpenAI-compatible
+ * `ChatModel` can yield fully parsed `tool_calls` with empty
+ * `tool_call_chunks`, which would otherwise dispatch without consuming any
+ * byte budget. Complete calls are self-contained, so each is judged
+ * standalone without tallying.
+ */
+export function enforceCompleteToolCallArgLimit({
+  graph,
+  metadata,
+  toolCalls,
+}: {
+  graph: StreamLimitState;
+  metadata: Record<string, unknown> | undefined;
+  toolCalls: CompleteToolCallLike[];
+}): void {
+  const resolved = graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS;
+  const globalLimit = resolved.maxToolCallArgBytes;
+  const byTool = resolved.maxToolCallArgBytesByTool;
+  if (globalLimit <= 0 && byTool == null) {
+    return;
+  }
+  if (metadata?.[STREAM_LIMIT_REDISPATCH_KEY] === true) {
+    return;
+  }
+  for (const toolCall of toolCalls) {
+    const name =
+      toolCall.name != null && toolCall.name !== '' ? toolCall.name : undefined;
+    const limit =
+      byTool != null && name != null && Object.hasOwn(byTool, name)
+        ? byTool[name]
+        : globalLimit;
+    if (limit <= 0) {
+      continue;
+    }
+    const args = toolCall.args;
+    let serialized: string;
+    if (typeof args === 'string') {
+      serialized = args;
+    } else if (args == null) {
+      serialized = '';
+    } else {
+      serialized = JSON.stringify(args) ?? '';
+    }
+    const bytes = Buffer.byteLength(serialized, 'utf8');
+    if (bytes > limit) {
+      throw new StreamLimitExceededError({
+        kind: 'tool_call_args',
+        limit,
+        observed: bytes,
+        toolName: name,
+      });
+    }
+  }
+}
+
+/**
+ * Synchronous producer-side accounting for the registered-handler dispatch
+ * branch, where original wire chunks are otherwise judged only when the
+ * decoupled `streamEvents` reader catches up. A lagging reader would let an
+ * oversized complete call return to LangGraph and reach `ToolNode` before
+ * the queued handler throws; charging in the producer loop keeps the breaker
+ * ahead of graph progression. The chunk object is marked so the later
+ * handler echo of the same object skips accounting.
+ */
+export function enforceStreamLimitsForWireChunk({
+  graph,
+  metadata,
+  chunk,
+}: {
+  graph: StreamLimitState;
+  metadata: Record<string, unknown> | undefined;
+  chunk: {
+    tool_call_chunks?: ToolCallChunk[];
+    tool_calls?: CompleteToolCallLike[];
+    response_metadata?: Record<string, unknown>;
+  };
+}): void {
+  (graph.streamLimitPrecountedChunks ??= new WeakSet()).add(chunk as object);
+  enforceStreamDeltaEventLimit({ graph, metadata });
+  if (chunk.tool_call_chunks != null && chunk.tool_call_chunks.length > 0) {
+    enforceStreamedToolCallArgLimit({
+      graph,
+      metadata,
+      toolCallChunks: chunk.tool_call_chunks,
+      responseMetadata: chunk.response_metadata,
+    });
+  } else if (chunk.tool_calls != null && chunk.tool_calls.length > 0) {
+    enforceCompleteToolCallArgLimit({ graph, metadata, toolCalls: chunk.tool_calls });
+  }
+}
+
+/** True when the producer loop already charged this exact chunk object. */
+export function wasStreamLimitPrecounted(
+  graph: StreamLimitState,
+  chunk: unknown
+): boolean {
+  return (
+    typeof chunk === 'object' &&
+    chunk != null &&
+    graph.streamLimitPrecountedChunks?.has(chunk) === true
+  );
 }
 
 /**

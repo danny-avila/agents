@@ -39,6 +39,7 @@ import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import {
   enforceStreamDeltaEventLimit,
+  enforceStreamLimitsForWireChunk,
   StreamLimitExceededError,
   STREAM_LIMIT_REDISPATCH_KEY,
   STREAM_LIMIT_ATTEMPT_KEY,
@@ -888,6 +889,16 @@ export async function attemptInvoke(
        */
       let redispatchMetadata: Record<string, unknown> | undefined;
       for await (const chunk of stream) {
+        /**
+         * Charged synchronously, ahead of the decoupled `streamEvents`
+         * reader that will echo this same chunk to the registered handler:
+         * a lagging reader would otherwise let an oversized complete call
+         * return to LangGraph and reach ToolNode before the queued handler
+         * throws. The chunk is marked so the echo skips accounting.
+         */
+        if (context != null) {
+          enforceStreamLimitsForWireChunk({ graph: context, metadata, chunk });
+        }
         const handlingChunk = getStreamHandlingChunk({
           current: finalChunk,
           next: chunk,

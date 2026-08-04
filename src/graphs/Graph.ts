@@ -17,6 +17,10 @@ import type {
   MessageContent,
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type {
+  ResolvedStreamLimits,
+  StreamedToolCallArgTally,
+} from '@/llm/streamLimits';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
 import type { FallbackErrorContext } from '@/llm/invoke';
 import type { HookRegistry } from '@/hooks';
@@ -115,10 +119,6 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
-import type {
-  ResolvedStreamLimits,
-  StreamedToolCallArgTally,
-} from '@/llm/streamLimits';
 import {
   resolveStreamLimits,
   StreamLimitExceededError,

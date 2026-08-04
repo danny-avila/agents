@@ -40,8 +40,10 @@ import {
   truncateToolResultContent,
 } from '@/utils/truncation';
 import {
+  enforceCompleteToolCallArgLimit,
   enforceStreamedToolCallArgLimit,
   enforceStreamDeltaEventLimit,
+  wasStreamLimitPrecounted,
 } from '@/llm/streamLimits';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
@@ -1516,40 +1518,43 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
 
-    /**
-     * Counted before every content-specific early return below
-     * (server-tool results, deferred mixed reasoning, late OpenRouter
-     * reasoning): a looping provider can flood through any of those paths,
-     * and an uncounted early return would leave the event budget untouched.
-     */
-    enforceStreamDeltaEventLimit({ graph, metadata });
-
-    const agentContext = graph.getAgentContext(metadata);
-
     const chunk = data.chunk as Partial<AIMessageChunk>;
 
     /**
-     * Enforced before every content-specific early return below, like the
-     * event counter above: a coalesced event can carry client
-     * `tool_call_chunks` alongside a server-tool result, and the
-     * server-result return would otherwise release those chunks into the
-     * accumulated message unjudged. Also enforced before the complete-call
-     * dispatch branch further down — an arrival-sealed oversized call
-     * (Google/Vertex) carries both `tool_calls` and `tool_call_chunks` in
-     * one event and can prestart a side-effecting tool — and deliberately
-     * NOT gated on numeric chunk indices, so id-only or index-less runaway
-     * streams stay bounded.
+     * Enforced before every content-specific early return below
+     * (server-tool results, deferred mixed reasoning, late OpenRouter
+     * reasoning): a looping provider can flood through any of those paths,
+     * a coalesced event can carry client `tool_call_chunks` alongside a
+     * server-tool result, and the complete-call dispatch branch further
+     * down can prestart a side-effecting tool from an arrival-sealed
+     * oversized call. Chunks the producer loop already charged
+     * synchronously (registered-handler dispatch) are skipped so the
+     * decoupled echo does not double-count. The argument guard is
+     * deliberately NOT gated on numeric chunk indices, so id-only or
+     * index-less runaway streams stay bounded, and complete parsed
+     * `tool_calls` without a raw chunk representation are judged standalone.
      */
-    if (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) {
-      enforceStreamedToolCallArgLimit({
-        graph,
-        metadata,
-        toolCallChunks: chunk.tool_call_chunks,
-        responseMetadata: chunk.response_metadata as
-          | Record<string, unknown>
-          | undefined,
-      });
+    if (!wasStreamLimitPrecounted(graph, data.chunk)) {
+      enforceStreamDeltaEventLimit({ graph, metadata });
+      if (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) {
+        enforceStreamedToolCallArgLimit({
+          graph,
+          metadata,
+          toolCallChunks: chunk.tool_call_chunks,
+          responseMetadata: chunk.response_metadata as
+            | Record<string, unknown>
+            | undefined,
+        });
+      } else if (chunk.tool_calls && chunk.tool_calls.length > 0) {
+        enforceCompleteToolCallArgLimit({
+          graph,
+          metadata,
+          toolCalls: chunk.tool_calls,
+        });
+      }
     }
+
+    const agentContext = graph.getAgentContext(metadata);
 
     const content = getChunkContent({
       chunk,
