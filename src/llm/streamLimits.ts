@@ -54,11 +54,12 @@ export interface StreamLimitState {
   streamLimits?: ResolvedStreamLimits;
   streamedToolCallArgTallies?: Map<string, StreamedToolCallArgTally>;
   streamDeltaEventCounts?: Map<string, number>;
-  /** Wire chunks some accounting path has already charged. The producer loop
-   * and the decoupled handler can observe the same chunk object in either
-   * order, so charging is claim-based: first claimer charges, the other
-   * skips. */
-  streamLimitChargedChunks?: WeakSet<object>;
+  /** Per-chunk-object charge balance: producer visits increment, consumer
+   * (handler echo) visits decrement, and a visit only charges when the other
+   * side has not pre-charged the same emission. Count-balancing rather than
+   * a lifetime set, because a streaming model may mutate and re-yield the
+   * same chunk object — each such emission must be charged exactly once. */
+  streamLimitChargeCredits?: WeakMap<object, number>;
 }
 
 function resolveLimit(value: number | undefined, fallback: number): number {
@@ -490,25 +491,35 @@ export function enforceCompleteToolCallArgLimit({
 }
 
 /**
- * Claims accounting ownership of a wire chunk. LangChain can hand the same
- * chunk object to the decoupled `streamEvents` handler and to the producer
- * loop in either order, so exactly one caller — whichever arrives first —
- * charges it. Non-object chunks cannot be identity-tracked and are always
+ * Claims accounting ownership of one EMISSION of a wire chunk. LangChain can
+ * hand the same chunk object to the decoupled `streamEvents` handler
+ * (`consumer`) and to the dispatch loop (`producer`) in either order, and a
+ * streaming model may mutate and re-yield the same object across emissions —
+ * so dedup is a signed credit balance per object rather than a lifetime set.
+ * Each producer visit adds a credit, each consumer visit removes one, and a
+ * visit charges only when the other side has not already charged that
+ * emission (positive balance = producer ahead, negative = consumer ahead).
+ * Paths where only one side ever observes the chunk (summarization, local
+ * replay-skip) charge every visit, since their balance never crosses zero
+ * the other way. Non-object chunks cannot be identity-tracked and are always
  * claimable.
  */
 export function claimStreamLimitCharge(
   graph: StreamLimitState,
-  chunk: unknown
+  chunk: unknown,
+  side: 'producer' | 'consumer'
 ): boolean {
   if (typeof chunk !== 'object' || chunk == null) {
     return true;
   }
-  const charged = (graph.streamLimitChargedChunks ??= new WeakSet());
-  if (charged.has(chunk)) {
-    return false;
+  const credits = (graph.streamLimitChargeCredits ??= new WeakMap());
+  const balance = credits.get(chunk) ?? 0;
+  if (side === 'producer') {
+    credits.set(chunk, balance + 1);
+    return balance >= 0;
   }
-  charged.add(chunk);
-  return true;
+  credits.set(chunk, balance - 1);
+  return balance <= 0;
 }
 
 /**
@@ -525,6 +536,7 @@ export function enforceStreamLimitsForWireChunk({
   graph,
   metadata,
   chunk,
+  side = 'producer',
 }: {
   graph: StreamLimitState;
   metadata: Record<string, unknown> | undefined;
@@ -533,8 +545,13 @@ export function enforceStreamLimitsForWireChunk({
     tool_calls?: CompleteToolCallLike[];
     response_metadata?: Record<string, unknown>;
   };
+  /** Claim side for the credit balance. The local dispatch branch charges
+   * as `consumer` because its handler-handled and replay-skipped emissions
+   * of one reused object ALTERNATE — mixed sides would pair them as
+   * producer/echo and swallow a charge. */
+  side?: 'producer' | 'consumer';
 }): void {
-  if (!claimStreamLimitCharge(graph, chunk)) {
+  if (!claimStreamLimitCharge(graph, chunk, side)) {
     return;
   }
   enforceStreamDeltaEventLimit({ graph, metadata });

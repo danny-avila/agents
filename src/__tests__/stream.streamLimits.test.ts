@@ -750,6 +750,53 @@ describe('per-tool argument byte overrides', () => {
     ).rejects.toMatchObject({ kind: 'tool_call_args', observed: 101 });
   });
 
+  it('keeps charging a mutable chunk object re-yielded across emissions', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+    const reused: Record<string, unknown> = {
+      content: '',
+      tool_call_chunks: [{ id: 'call_1', name: 'writer', args: 'a'.repeat(60), index: 0 }],
+    };
+
+    await streamEvent({ handler, graph, chunk: reused });
+    reused.tool_call_chunks = [{ args: 'a'.repeat(40), index: 0 }];
+    await streamEvent({ handler, graph, chunk: reused });
+    reused.tool_call_chunks = [{ args: 'a', index: 0 }];
+
+    await expect(streamEvent({ handler, graph, chunk: reused })).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      observed: 101,
+    });
+  });
+
+  it('pairs producer and echo charges per emission for reused chunk objects', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+    const reused: Record<string, unknown> = {
+      content: '',
+      tool_call_chunks: [{ id: 'call_1', name: 'writer', args: 'a'.repeat(60), index: 0 }],
+    };
+
+    enforceStreamLimitsForWireChunk({ graph, metadata: {}, chunk: reused as never });
+    await streamEvent({ handler, graph, chunk: reused });
+    reused.tool_call_chunks = [{ args: 'a'.repeat(40), index: 0 }];
+    enforceStreamLimitsForWireChunk({ graph, metadata: {}, chunk: reused as never });
+    await streamEvent({ handler, graph, chunk: reused });
+    reused.tool_call_chunks = [{ args: 'a', index: 0 }];
+
+    let thrown: unknown;
+    try {
+      enforceStreamLimitsForWireChunk({ graph, metadata: {}, chunk: reused as never });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ kind: 'tool_call_args', observed: 101 });
+  });
+
   it('normalizes override entries like the global field', () => {
     const resolved = resolveStreamLimits({
       maxToolCallArgBytes: 100,

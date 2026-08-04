@@ -6,6 +6,7 @@ import {
 } from '@langchain/core/messages';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { StreamLimitState } from '@/llm/streamLimits';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
@@ -33,7 +34,6 @@ import {
   Providers,
 } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
-import type { StreamLimitState } from '@/llm/streamLimits';
 import {
   enforceStreamLimitsForWireChunk,
   StreamLimitExceededError,

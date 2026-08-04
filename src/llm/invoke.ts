@@ -849,9 +849,16 @@ export async function attemptInvoke(
            * either — yet a cumulative OpenRouter replay can still carry
            * `tool_call_chunks` or complete `tool_calls` that are appended
            * below. Charge the full limits (event budget and argument bytes)
-           * directly so neither cap can be bypassed.
+           * directly so neither cap can be bypassed. Consumer side: the
+           * local handler.handle call above claims as consumer, and one
+           * reused chunk object can alternate between these two arms.
            */
-          enforceStreamLimitsForWireChunk({ graph: context, metadata, chunk });
+          enforceStreamLimitsForWireChunk({
+            graph: context,
+            metadata,
+            chunk,
+            side: 'consumer',
+          });
         }
         finalChunk = appendStreamChunk({
           current: finalChunk,

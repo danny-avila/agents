@@ -1534,7 +1534,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
      * index-less runaway streams stay bounded, and complete parsed
      * `tool_calls` without a raw chunk representation are judged standalone.
      */
-    if (claimStreamLimitCharge(graph, data.chunk)) {
+    if (claimStreamLimitCharge(graph, data.chunk, 'consumer')) {
       enforceStreamDeltaEventLimit({ graph, metadata });
       if (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) {
         enforceStreamedToolCallArgLimit({
