@@ -1528,6 +1528,29 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     const chunk = data.chunk as Partial<AIMessageChunk>;
 
+    /**
+     * Enforced before every content-specific early return below, like the
+     * event counter above: a coalesced event can carry client
+     * `tool_call_chunks` alongside a server-tool result, and the
+     * server-result return would otherwise release those chunks into the
+     * accumulated message unjudged. Also enforced before the complete-call
+     * dispatch branch further down — an arrival-sealed oversized call
+     * (Google/Vertex) carries both `tool_calls` and `tool_call_chunks` in
+     * one event and can prestart a side-effecting tool — and deliberately
+     * NOT gated on numeric chunk indices, so id-only or index-less runaway
+     * streams stay bounded.
+     */
+    if (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) {
+      enforceStreamedToolCallArgLimit({
+        graph,
+        metadata,
+        toolCallChunks: chunk.tool_call_chunks,
+        responseMetadata: chunk.response_metadata as
+          | Record<string, unknown>
+          | undefined,
+      });
+    }
+
     const content = getChunkContent({
       chunk,
       reasoningKey: agentContext.reasoningKey,
@@ -1560,24 +1583,6 @@ export class ChatModelStreamHandler implements t.EventHandler {
     let hasToolCalls = false;
     const hasToolCallChunks =
       (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) ?? false;
-    /**
-     * Enforced before the complete-call branch below: an arrival-sealed
-     * oversized call (Google/Vertex) carries both `tool_calls` and
-     * `tool_call_chunks` in one event, and the complete-call branch can
-     * dispatch it and prestart a side-effecting tool. Also deliberately NOT
-     * gated on numeric chunk indices, unlike the dispatch branch further
-     * down, so id-only or index-less runaway streams stay bounded.
-     */
-    if (hasToolCallChunks && chunk.tool_call_chunks) {
-      enforceStreamedToolCallArgLimit({
-        graph,
-        metadata,
-        toolCallChunks: chunk.tool_call_chunks,
-        responseMetadata: chunk.response_metadata as
-          | Record<string, unknown>
-          | undefined,
-      });
-    }
     const hasGoogleServerSideToolContent =
       isGoogleLike(agentContext.provider) &&
       Array.isArray(content) &&

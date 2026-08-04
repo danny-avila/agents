@@ -32,6 +32,10 @@ export interface ResolvedStreamLimits {
 export interface StreamedToolCallArgTally {
   bytes: number;
   name?: string;
+  /** Batch-position key this id-keyed tally is also registered under, so an
+   * id-less later delta of the same call shares the budget; both entries are
+   * released together. */
+  aliasKey?: string;
   /**
    * True when the previous chunk ended on an unpaired UTF-16 high surrogate.
    * Counting each half of a split surrogate pair alone yields 3 bytes per
@@ -280,6 +284,14 @@ export function enforceStreamedToolCallArgLimit({
   if (globalLimit <= 0 && byTool == null) {
     return;
   }
+  /** An inline re-dispatch of a transformed chunk (OpenRouter final-reasoning
+   * replay) duplicates tool-call chunks the original `streamEvents` event
+   * already charged — the original always survives the content-specific
+   * skips when it carries tool calls, so counting the marked copy would
+   * double every legitimate argument byte. */
+  if (metadata?.[STREAM_LIMIT_REDISPATCH_KEY] === true) {
+    return;
+  }
   const tallies = (graph.streamedToolCallArgTallies ??= new Map());
   const generationKey = resolveGenerationKey(metadata);
   const seal = getStreamedToolCallSeal(responseMetadata);
@@ -310,13 +322,41 @@ export function enforceStreamedToolCallArgLimit({
     const key = `${generationKey}:${chunk.index ?? chunk.id ?? `#${i}`}`;
     const sealed = sealsChunk(seal, chunk);
     let tally = tallies.get(key);
+    /** An index-less adapter can put the call id only on the first chunk and
+     * omit it from later argument deltas, which would fall back to the
+     * batch-position key and split one call's budget across two tallies. An
+     * id-keyed tally therefore also registers itself under its position key
+     * (same object, shared bytes), extending the position-stability
+     * assumption the `#i` fallback already makes. */
+    const positionAliasKey =
+      chunk.index == null && chunk.id != null
+        ? `${generationKey}:#${i}`
+        : undefined;
+    const registerPositionAlias = (target: StreamedToolCallArgTally): void => {
+      if (positionAliasKey == null) {
+        return;
+      }
+      if (tallies.get(positionAliasKey) !== target) {
+        tallies.set(positionAliasKey, target);
+        target.aliasKey = positionAliasKey;
+      }
+    };
+    const releaseTally = (target: StreamedToolCallArgTally): void => {
+      tallies.delete(key);
+      if (target.aliasKey != null) {
+        tallies.delete(target.aliasKey);
+      }
+    };
     if (!hasArgs) {
       if (tally == null) {
         if (!sealed) {
-          tallies.set(key, { bytes: 0, name: chunkToolName(chunk) });
+          tally = { bytes: 0, name: chunkToolName(chunk) };
+          tallies.set(key, tally);
+          registerPositionAlias(tally);
         }
         continue;
       }
+      registerPositionAlias(tally);
       if (tally.name == null) {
         const lateName = chunkToolName(chunk);
         if (lateName != null) {
@@ -339,7 +379,7 @@ export function enforceStreamedToolCallArgLimit({
         }
       }
       if (sealed) {
-        tallies.delete(key);
+        releaseTally(tally);
       }
       continue;
     }
@@ -347,6 +387,7 @@ export function enforceStreamedToolCallArgLimit({
       tally = { bytes: 0 };
       tallies.set(key, tally);
     }
+    registerPositionAlias(tally);
     if (tally.name == null) {
       tally.name = chunkToolName(chunk);
     }
@@ -375,7 +416,7 @@ export function enforceStreamedToolCallArgLimit({
       });
     }
     if (sealed) {
-      tallies.delete(key);
+      releaseTally(tally);
     }
   }
 }

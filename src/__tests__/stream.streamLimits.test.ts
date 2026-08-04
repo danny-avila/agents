@@ -23,6 +23,7 @@ import {
 } from '@/tools/streamedToolCallSeals';
 import {
   DEFAULT_MAX_TOOL_CALL_ARG_BYTES,
+  STREAM_LIMIT_REDISPATCH_KEY,
   resolveGenerationKey,
   resolveStreamLimits,
 } from '@/llm/streamLimits';
@@ -551,6 +552,101 @@ describe('per-tool argument byte overrides', () => {
       limit: 1_000,
       toolName: '__proto__',
     });
+  });
+
+  it('keeps charging a call whose later deltas omit both id and index', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_1', name: 'writer', args: 'a'.repeat(60) }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'a'.repeat(60) }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 100,
+      observed: 120,
+      toolName: 'writer',
+    });
+  });
+
+  it('does not charge argument bytes for marked OpenRouter redispatches', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_1', name: 'writer', args: 'a'.repeat(60), index: 0 }],
+    });
+    await streamEvent({
+      handler,
+      graph,
+      metadata: { [STREAM_LIMIT_REDISPATCH_KEY]: true },
+      chunk: {
+        content: '',
+        tool_call_chunks: [{ args: 'a'.repeat(60), index: 0 }],
+      },
+    });
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ args: 'a'.repeat(40), index: 0 }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'a', index: 0 }],
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', observed: 101 });
+  });
+
+  it('judges client tool chunks arriving with a server-tool result before the early return', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+    (graph.getAgentContext as jest.Mock).mockReturnValue({
+      provider: Providers.ANTHROPIC,
+      reasoningKey: 'reasoning_content',
+      toolDefinitions: [],
+      graphTools: [],
+      agentId: 'agent_1',
+    });
+    await graph.dispatchRunStep('step-key', {
+      type: StepTypes.TOOL_CALLS,
+      tool_calls: [{ id: 'srvtoolu_1', name: 'web_search', args: {} }],
+    });
+    graph.toolCallStepIds.set('srvtoolu_1', 'step_1');
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: [
+            { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_1', content: [] },
+          ],
+          tool_call_chunks: [
+            { id: 'call_big', name: 'side_effect', args: 'x'.repeat(200), index: 0 },
+          ],
+        },
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', toolName: 'side_effect' });
   });
 
   it('normalizes override entries like the global field', () => {
