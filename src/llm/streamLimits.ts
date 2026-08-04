@@ -87,7 +87,14 @@ export function resolveStreamLimits(
       if (name === '' || Number.isNaN(value)) {
         continue;
       }
-      (maxToolCallArgBytesByTool ??= {})[name] = resolveLimit(
+      /** Prototype-free: bracket-assigning a `__proto__` tool name into a
+       * plain object invokes the prototype setter instead of creating an own
+       * property, silently dropping that tool's configured override. */
+      maxToolCallArgBytesByTool ??= Object.create(null) as Record<
+        string,
+        number
+      >;
+      maxToolCallArgBytesByTool[name] = resolveLimit(
         value,
         maxToolCallArgBytes
       );
@@ -308,10 +315,31 @@ export function enforceStreamedToolCallArgLimit({
         if (!sealed) {
           tallies.set(key, { bytes: 0, name: chunkToolName(chunk) });
         }
-      } else if (sealed) {
+        continue;
+      }
+      if (tally.name == null) {
+        const lateName = chunkToolName(chunk);
+        if (lateName != null) {
+          /** Bytes tallied before the name arrived were only held against the
+           * global cap; a newly applicable per-tool override must re-judge
+           * them, including on a sealing chunk about to release the tally. */
+          tally.name = lateName;
+          const limit =
+            byTool != null && Object.hasOwn(byTool, lateName)
+              ? byTool[lateName]
+              : globalLimit;
+          if (limit > 0 && tally.bytes > limit) {
+            throw new StreamLimitExceededError({
+              kind: 'tool_call_args',
+              limit,
+              observed: tally.bytes,
+              toolName: lateName,
+            });
+          }
+        }
+      }
+      if (sealed) {
         tallies.delete(key);
-      } else if (tally.name == null) {
-        tally.name = chunkToolName(chunk);
       }
       continue;
     }

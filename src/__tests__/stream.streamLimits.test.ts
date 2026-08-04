@@ -493,6 +493,66 @@ describe('per-tool argument byte overrides', () => {
     ).rejects.toMatchObject({ kind: 'tool_call_args', toolName: 'search_c' });
   });
 
+  it('re-judges tallied bytes when the tool name arrives on a later empty chunk', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 1_000,
+        maxToolCallArgBytesByTool: { capped_tool: 50 },
+      }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ args: 'x'.repeat(60), index: 0 }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ id: 'call_1', name: 'capped_tool', args: '', index: 0 }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 50,
+      observed: 60,
+      toolName: 'capped_tool',
+    });
+  });
+
+  it('honors an override for a tool named __proto__', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: JSON.parse('{"__proto__": 1000}') as Record<
+          string,
+          number
+        >,
+      }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_1', name: '__proto__', args: 'x'.repeat(500), index: 0 }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'x'.repeat(501), index: 0 }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 1_000,
+      toolName: '__proto__',
+    });
+  });
+
   it('normalizes override entries like the global field', () => {
     const resolved = resolveStreamLimits({
       maxToolCallArgBytes: 100,
