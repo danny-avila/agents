@@ -32,11 +32,11 @@ export interface ResolvedStreamLimits {
 export interface StreamedToolCallArgTally {
   bytes: number;
   name?: string;
-  /** Secondary key this tally is also registered under — the batch position
-   * for id-only chunks, or the id for chunks carrying both identifiers — so
-   * a later delta that drops an identifier still shares the budget; both
-   * entries are released together. */
-  aliasKey?: string;
+  /** Secondary keys this tally is also registered under — the batch
+   * position for any id-bearing chunk, plus the id for chunks carrying both
+   * identifiers — so a later delta that drops one or both identifiers still
+   * shares the budget; all entries are released together. */
+  aliasKeys?: string[];
   /**
    * True when the previous chunk ended on an unpaired UTF-16 high surrogate.
    * Counting each half of a split surrogate pair alone yields 3 bytes per
@@ -331,42 +331,45 @@ export function enforceStreamedToolCallArgLimit({
     const key = `${generationKey}:${chunk.index ?? chunk.id ?? `#${i}`}`;
     const sealed = sealsChunk(seal, chunk);
     let tally = tallies.get(key);
-    /** Secondary key this call is also reachable under, so a later delta
-     * that drops an identifier still lands on the same tally: the
-     * batch-position fallback for id-only chunks (an index-less adapter can
-     * put the id only on the first chunk), or the id itself for chunks
-     * carrying both identifiers (an adapter can drop the index later). */
-    let chunkAliasKey: string | undefined;
+    /** Secondary keys this call is also reachable under, so a later delta
+     * that drops one or both identifiers still lands on the same tally:
+     * id-bearing chunks register the batch-position fallback, and chunks
+     * carrying both identifiers additionally register the id. */
+    const aliasCandidates: string[] = [];
     if (chunk.id != null) {
-      chunkAliasKey =
-        chunk.index == null
-          ? `${generationKey}:#${i}`
-          : `${generationKey}:${chunk.id}`;
+      aliasCandidates.push(`${generationKey}:#${i}`);
+      if (chunk.index != null) {
+        aliasCandidates.push(`${generationKey}:${chunk.id}`);
+      }
     }
-    const registerAliasKey = (target: StreamedToolCallArgTally): void => {
-      if (chunkAliasKey == null) {
-        return;
+    const registerAliases = (target: StreamedToolCallArgTally): void => {
+      for (const aliasKey of aliasCandidates) {
+        const currentOwner = tallies.get(aliasKey);
+        if (currentOwner === target) {
+          continue;
+        }
+        /** Parallel calls can contend for one batch position, so the newest
+         * live call takes the alias over and the previous owner is disowned
+         * — its seal must not delete a key it no longer holds. */
+        if (currentOwner?.aliasKeys != null) {
+          const remaining = currentOwner.aliasKeys.filter(
+            (ownedKey: string) => ownedKey !== aliasKey
+          );
+          currentOwner.aliasKeys = remaining.length > 0 ? remaining : undefined;
+        }
+        tallies.set(aliasKey, target);
+        (target.aliasKeys ??= []).push(aliasKey);
       }
-      const currentOwner = tallies.get(chunkAliasKey);
-      if (currentOwner === target) {
-        return;
-      }
-      /** Parallel index-less calls all land on batch position #i, so the
-       * newest live call takes the alias over and the previous owner is
-       * disowned — its seal must not delete an alias it no longer holds. */
-      if (currentOwner?.aliasKey === chunkAliasKey) {
-        currentOwner.aliasKey = undefined;
-      }
-      tallies.set(chunkAliasKey, target);
-      target.aliasKey = chunkAliasKey;
     };
     const releaseTally = (target: StreamedToolCallArgTally): void => {
       tallies.delete(key);
-      if (
-        target.aliasKey != null &&
-        tallies.get(target.aliasKey) === target
-      ) {
-        tallies.delete(target.aliasKey);
+      if (target.aliasKeys == null) {
+        return;
+      }
+      for (const aliasKey of target.aliasKeys) {
+        if (tallies.get(aliasKey) === target) {
+          tallies.delete(aliasKey);
+        }
       }
     };
     if (!hasArgs) {
@@ -374,14 +377,14 @@ export function enforceStreamedToolCallArgLimit({
         if (!sealed) {
           tally = { bytes: 0, name: chunkToolName(chunk) };
           tallies.set(key, tally);
-          registerAliasKey(tally);
+          registerAliases(tally);
         }
         continue;
       }
       /** A sealing chunk is about to release this tally; taking the position
        * alias here would steal it from a still-live parallel call. */
       if (!sealed) {
-        registerAliasKey(tally);
+        registerAliases(tally);
       }
       if (tally.name == null) {
         const lateName = chunkToolName(chunk);
@@ -414,7 +417,7 @@ export function enforceStreamedToolCallArgLimit({
       tallies.set(key, tally);
     }
     if (!sealed) {
-      registerAliasKey(tally);
+      registerAliases(tally);
     }
     if (tally.name == null) {
       tally.name = chunkToolName(chunk);

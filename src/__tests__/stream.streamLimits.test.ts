@@ -911,6 +911,31 @@ describe('per-tool argument byte overrides', () => {
     });
   });
 
+  it('keeps one budget when a call drops both identifiers on later deltas', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_1', name: 'writer', args: 'a'.repeat(60), index: 0 }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'a'.repeat(41) }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      observed: 101,
+      toolName: 'writer',
+    });
+  });
+
   it('normalizes override entries like the global field', () => {
     const resolved = resolveStreamLimits({
       maxToolCallArgBytes: 100,

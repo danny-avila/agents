@@ -4050,6 +4050,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }),
     });
 
+    const readChargeCredits = ():
+      | WeakMap<object, Map<string, number>>
+      | undefined => this.streamLimitChargeCredits;
+    const writeChargeCredits = (
+      value: WeakMap<object, Map<string, number>> | undefined
+    ): void => {
+      this.streamLimitChargeCredits = value;
+    };
+
     const workflow = new StateGraph(StateAnnotation)
       .addNode(agentNode, this.createCallModel(agentId))
       .addNode(
@@ -4081,6 +4090,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             streamLimits: this.streamLimits,
             streamDeltaEventCounts: this.streamDeltaEventCounts,
             streamedToolCallArgTallies: this.streamedToolCallArgTallies,
+            /** Accessor pair, not a value copy: unlike the two maps above,
+             * the credit map is REPLACED by graph resets rather than cleared
+             * in place, and the guards' lazy `??=` must install onto the
+             * graph — a copy held here would survive resets and grow one
+             * attempt-stamped entry per compaction for a retained reused
+             * chunk object. */
+            get streamLimitChargeCredits() {
+              return readChargeCredits();
+            },
+            set streamLimitChargeCredits(
+              value: WeakMap<object, Map<string, number>> | undefined
+            ) {
+              writeChargeCredits(value);
+            },
             dispatchRunStep: async (runStep, nodeConfig) => {
               const resolvedConfig = nodeConfig ?? this.config;
               if (runStep.agentId != null) {
