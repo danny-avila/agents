@@ -54,12 +54,14 @@ export interface StreamLimitState {
   streamLimits?: ResolvedStreamLimits;
   streamedToolCallArgTallies?: Map<string, StreamedToolCallArgTally>;
   streamDeltaEventCounts?: Map<string, number>;
-  /** Per-chunk-object charge balance: producer visits increment, consumer
-   * (handler echo) visits decrement, and a visit only charges when the other
-   * side has not pre-charged the same emission. Count-balancing rather than
-   * a lifetime set, because a streaming model may mutate and re-yield the
-   * same chunk object — each such emission must be charged exactly once. */
-  streamLimitChargeCredits?: WeakMap<object, number>;
+  /** Per-chunk-object, per-generation charge balance: producer visits
+   * increment, consumer (handler echo) visits decrement, and a visit only
+   * charges when the other side has not pre-charged the same emission.
+   * Count-balancing rather than a lifetime set, because a streaming model
+   * may mutate and re-yield the same chunk object; scoped by generation so
+   * parallel generations sharing one reused object cannot cancel each
+   * other's charges. */
+  streamLimitChargeCredits?: WeakMap<object, Map<string, number>>;
 }
 
 function resolveLimit(value: number | undefined, fallback: number): number {
@@ -342,14 +344,25 @@ export function enforceStreamedToolCallArgLimit({
       if (positionAliasKey == null) {
         return;
       }
-      if (tallies.get(positionAliasKey) !== target) {
-        tallies.set(positionAliasKey, target);
-        target.aliasKey = positionAliasKey;
+      const currentOwner = tallies.get(positionAliasKey);
+      if (currentOwner === target) {
+        return;
       }
+      /** Parallel index-less calls all land on batch position #i, so the
+       * newest live call takes the alias over and the previous owner is
+       * disowned — its seal must not delete an alias it no longer holds. */
+      if (currentOwner?.aliasKey === positionAliasKey) {
+        currentOwner.aliasKey = undefined;
+      }
+      tallies.set(positionAliasKey, target);
+      target.aliasKey = positionAliasKey;
     };
     const releaseTally = (target: StreamedToolCallArgTally): void => {
       tallies.delete(key);
-      if (target.aliasKey != null) {
+      if (
+        target.aliasKey != null &&
+        tallies.get(target.aliasKey) === target
+      ) {
         tallies.delete(target.aliasKey);
       }
     };
@@ -362,7 +375,11 @@ export function enforceStreamedToolCallArgLimit({
         }
         continue;
       }
-      registerPositionAlias(tally);
+      /** A sealing chunk is about to release this tally; taking the position
+       * alias here would steal it from a still-live parallel call. */
+      if (!sealed) {
+        registerPositionAlias(tally);
+      }
       if (tally.name == null) {
         const lateName = chunkToolName(chunk);
         if (lateName != null) {
@@ -393,7 +410,9 @@ export function enforceStreamedToolCallArgLimit({
       tally = { bytes: 0 };
       tallies.set(key, tally);
     }
-    registerPositionAlias(tally);
+    if (!sealed) {
+      registerPositionAlias(tally);
+    }
     if (tally.name == null) {
       tally.name = chunkToolName(chunk);
     }
@@ -501,24 +520,33 @@ export function enforceCompleteToolCallArgLimit({
  * emission (positive balance = producer ahead, negative = consumer ahead).
  * Paths where only one side ever observes the chunk (summarization, local
  * replay-skip) charge every visit, since their balance never crosses zero
- * the other way. Non-object chunks cannot be identity-tracked and are always
+ * the other way. Balances are scoped by generation identity so parallel
+ * generations sharing one reused chunk object cannot cancel each other's
+ * charges. Non-object chunks cannot be identity-tracked and are always
  * claimable.
  */
 export function claimStreamLimitCharge(
   graph: StreamLimitState,
   chunk: unknown,
-  side: 'producer' | 'consumer'
+  side: 'producer' | 'consumer',
+  metadata: Record<string, unknown> | undefined
 ): boolean {
   if (typeof chunk !== 'object' || chunk == null) {
     return true;
   }
   const credits = (graph.streamLimitChargeCredits ??= new WeakMap());
-  const balance = credits.get(chunk) ?? 0;
+  let byGeneration = credits.get(chunk);
+  if (byGeneration == null) {
+    byGeneration = new Map();
+    credits.set(chunk, byGeneration);
+  }
+  const generationKey = resolveGenerationKey(metadata);
+  const balance = byGeneration.get(generationKey) ?? 0;
   if (side === 'producer') {
-    credits.set(chunk, balance + 1);
+    byGeneration.set(generationKey, balance + 1);
     return balance >= 0;
   }
-  credits.set(chunk, balance - 1);
+  byGeneration.set(generationKey, balance - 1);
   return balance <= 0;
 }
 
@@ -551,7 +579,7 @@ export function enforceStreamLimitsForWireChunk({
    * producer/echo and swallow a charge. */
   side?: 'producer' | 'consumer';
 }): void {
-  if (!claimStreamLimitCharge(graph, chunk, side)) {
+  if (!claimStreamLimitCharge(graph, chunk, side, metadata)) {
     return;
   }
   enforceStreamDeltaEventLimit({ graph, metadata });

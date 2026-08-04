@@ -797,6 +797,74 @@ describe('per-tool argument byte overrides', () => {
     expect(thrown).toMatchObject({ kind: 'tool_call_args', observed: 101 });
   });
 
+  it('keeps parallel index-less calls on distinct budgets when one seals', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_a', name: 'a_tool', args: 'a'.repeat(60) }],
+    });
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_b', name: 'b_tool', args: 'b'.repeat(60) }],
+    });
+    await streamEvent({
+      handler,
+      graph,
+      chunk: {
+        content: '',
+        tool_call_chunks: [{ id: 'call_a', args: '' }],
+        response_metadata: {
+          [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'single', id: 'call_a' },
+        },
+      },
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'b'.repeat(41) }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      observed: 101,
+      toolName: 'b_tool',
+    });
+  });
+
+  it('scopes charge credits per generation for shared chunk objects', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+    const shared: Record<string, unknown> = {
+      content: '',
+      tool_call_chunks: [{ id: 'call_1', name: 'writer', args: 'a'.repeat(60), index: 0 }],
+    };
+
+    await streamEvent({ handler, graph, chunk: shared, metadata: generation(1) });
+    enforceStreamLimitsForWireChunk({
+      graph,
+      metadata: generation(2),
+      chunk: shared as never,
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'a'.repeat(41), index: 0 }],
+        metadata: generation(2),
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', observed: 101 });
+  });
+
   it('normalizes override entries like the global field', () => {
     const resolved = resolveStreamLimits({
       maxToolCallArgBytes: 100,
