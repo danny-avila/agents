@@ -439,6 +439,22 @@ export function enforceStreamedToolCallArgLimit({
     }
     return undefined;
   };
+  const enforceTallyLimit = (target: StreamedToolCallArgTally): void => {
+    const tallyLimit =
+      byTool != null &&
+      target.name != null &&
+      Object.hasOwn(byTool, target.name)
+        ? byTool[target.name]
+        : globalLimit;
+    if (tallyLimit > 0 && target.bytes > tallyLimit) {
+      throw new StreamLimitExceededError({
+        kind: 'tool_call_args',
+        limit: tallyLimit,
+        observed: target.bytes,
+        toolName: target.name,
+      });
+    }
+  };
   for (let i = 0; i < toolCallChunks.length; i++) {
     const chunk = toolCallChunks[i];
     const args = chunk.args;
@@ -468,6 +484,43 @@ export function enforceStreamedToolCallArgLimit({
      * value — index 0 and id "0" — cannot alias distinct calls onto one
      * tally. Empty-string ids are placeholders, not identities. */
     const chunkId = chunkCallId(chunk);
+    const sealed = sealsChunk(seal, chunk);
+    /** Applies this chunk's name contribution and reports whether the
+     * effective name changed. Adapters may stream the name in FRAGMENTS
+     * ("create_" then "file"), so unsealed fragments append — matching
+     * langchain's own tool-call-chunk merge — while a sealing chunk's name
+     * is a full restatement and replaces, mirroring how sealed args replace
+     * the tally bytes. An id-correlated complete call in the same event
+     * outranks both; positional parsed-call correlation fills in only when
+     * the chunk carries no fragment. */
+    const applyChunkName = (target: StreamedToolCallArgTally): boolean => {
+      const correlated =
+        chunkId != null ? correlateParsedNameById(chunkId) : undefined;
+      const fragment = chunkToolName(chunk);
+      let next = target.name;
+      if (correlated != null) {
+        /** An id-correlated complete call wins over fragment accumulation:
+         * a raw name like "create_" must not hide the "create_file"
+         * override behind the global cap. */
+        next = correlated;
+      } else if (fragment != null) {
+        if (sealed || target.name == null) {
+          next = fragment;
+        } else if (fragment !== target.name) {
+          /** A fragment identical to the accumulated name is a repeated
+           * full-name delta (a common provider shape) and is a no-op; a
+           * differing fragment is a continuation and appends. */
+          next = target.name + fragment;
+        }
+      } else if (target.name == null) {
+        next = resolveChunkName(chunk);
+      }
+      if (next === target.name) {
+        return false;
+      }
+      target.name = next;
+      return true;
+    };
     /** A single identifier-less event while calls are live is a sparse
      * parallel continuation: its position is relative to this event, not to
      * the original batch, so `#0` cannot identify which call it belongs to.
@@ -485,6 +538,12 @@ export function enforceStreamedToolCallArgLimit({
     ) {
       const liveTallies = getLiveGenerationTallies();
       if (liveTallies.length > 0) {
+        if (liveTallies.length === 1 && applyChunkName(liveTallies[0])) {
+          /** A late name can select a lower override than the limit under
+           * which prior bytes were accepted, so re-judge before charging
+           * this continuation. */
+          enforceTallyLimit(liveTallies[0]);
+        }
         if (hasArgs) {
           const argBytes = Buffer.byteLength(args, 'utf8');
           for (const liveTally of liveTallies) {
@@ -495,20 +554,7 @@ export function enforceStreamedToolCallArgLimit({
             liveTally.pendingHighSurrogate = isHighSurrogate(
               args.charCodeAt(args.length - 1)
             );
-            const tallyLimit =
-              byTool != null &&
-              liveTally.name != null &&
-              Object.hasOwn(byTool, liveTally.name)
-                ? byTool[liveTally.name]
-                : globalLimit;
-            if (tallyLimit > 0 && liveTally.bytes > tallyLimit) {
-              throw new StreamLimitExceededError({
-                kind: 'tool_call_args',
-                limit: tallyLimit,
-                observed: liveTally.bytes,
-                toolName: liveTally.name,
-              });
-            }
+            enforceTallyLimit(liveTally);
           }
         }
         continue;
@@ -522,7 +568,6 @@ export function enforceStreamedToolCallArgLimit({
     } else {
       key = `${generationKey}:#${i}`;
     }
-    const sealed = sealsChunk(seal, chunk);
     /** Batch position is a stable identity only when the event carries a
      * single chunk: sparse parallel events reuse position 0 for whichever
      * call happens to continue, and a position alias would hand one call's
@@ -545,19 +590,31 @@ export function enforceStreamedToolCallArgLimit({
     let tally = tallies.get(key);
     /** A later delta can also ADD an identifier, changing the primary key;
      * adopt the call's existing tally through a stronger prior identity
-     * before allocating. Id-bearing chunks adopt through the id — never the
-     * batch position, which different parallel calls legitimately share.
-     * Id-less indexed chunks adopt through their batch position: a position
-     * tally is singular per position, so an anonymous call gaining an index
-     * is unambiguous within the generation. The old identity is recorded as
+     * before allocating. An index maps to that call's original batch
+     * position, never this sparse event's position. A newly arrived id can
+     * adopt a position only when one anonymous tally is live; with several,
+     * positional association is ambiguous. The old identity is recorded as
      * an alias and released together with the rest. */
     if (tally == null) {
       const adoptionCandidates: string[] = [];
       if (chunkId != null) {
         adoptionCandidates.push(`${generationKey}:c:${chunkId}`);
       }
-      if (chunkId != null || chunk.index != null) {
-        adoptionCandidates.push(`${generationKey}:#${i}`);
+      if (chunk.index != null) {
+        /** An index is stable across sparse events; the loop position is
+         * merely this event's position and may be 0 for call index 1. */
+        adoptionCandidates.push(`${generationKey}:#${chunk.index}`);
+      } else if (chunkId != null) {
+        const anonymousTallies = getLiveGenerationTallies().filter(
+          (liveTally: StreamedToolCallArgTally) =>
+            liveTally.keys?.[0]?.startsWith(`${generationPrefix}#`) === true
+        );
+        if (anonymousTallies.length === 1) {
+          const anonymousKey = anonymousTallies[0].keys?.[0];
+          if (anonymousKey != null) {
+            adoptionCandidates.push(anonymousKey);
+          }
+        }
       }
       for (const adoptionKey of adoptionCandidates) {
         if (adoptionKey === key) {
@@ -628,42 +685,6 @@ export function enforceStreamedToolCallArgLimit({
       }
       registerAliasKeys(target, [`${generationKey}:#${i}`]);
     };
-    /** Applies this chunk's name contribution and reports whether the
-     * effective name changed. Adapters may stream the name in FRAGMENTS
-     * ("create_" then "file"), so unsealed fragments append — matching
-     * langchain's own tool-call-chunk merge — while a sealing chunk's name
-     * is a full restatement and replaces, mirroring how sealed args replace
-     * the tally bytes. An id-correlated complete call in the same event
-     * outranks both; positional parsed-call correlation fills in only when
-     * the chunk carries no fragment. */
-    const applyChunkName = (target: StreamedToolCallArgTally): boolean => {
-      const correlated =
-        chunkId != null ? correlateParsedNameById(chunkId) : undefined;
-      const fragment = chunkToolName(chunk);
-      let next = target.name;
-      if (correlated != null) {
-        /** An id-correlated complete call wins over fragment accumulation:
-         * a raw name like "create_" must not hide the "create_file"
-         * override behind the global cap. */
-        next = correlated;
-      } else if (fragment != null) {
-        if (sealed || target.name == null) {
-          next = fragment;
-        } else if (fragment !== target.name) {
-          /** A fragment identical to the accumulated name is a repeated
-           * full-name delta (a common provider shape) and is a no-op; a
-           * differing fragment is a continuation and appends. */
-          next = target.name + fragment;
-        }
-      } else if (target.name == null) {
-        next = resolveChunkName(chunk);
-      }
-      if (next === target.name) {
-        return false;
-      }
-      target.name = next;
-      return true;
-    };
     const releaseTally = (target: StreamedToolCallArgTally): void => {
       tallies.delete(key);
       if (target.keys == null) {
@@ -700,21 +721,7 @@ export function enforceStreamedToolCallArgLimit({
          * against that name's limit; a changed name — late arrival or a
          * completed fragment — must re-judge them, including on a sealing
          * chunk about to release the tally. */
-        const rejudgedName = tally.name;
-        const limit =
-          byTool != null &&
-          rejudgedName != null &&
-          Object.hasOwn(byTool, rejudgedName)
-            ? byTool[rejudgedName]
-            : globalLimit;
-        if (limit > 0 && tally.bytes > limit) {
-          throw new StreamLimitExceededError({
-            kind: 'tool_call_args',
-            limit,
-            observed: tally.bytes,
-            toolName: rejudgedName,
-          });
-        }
+        enforceTallyLimit(tally);
       }
       if (sealed) {
         releaseTally(tally);

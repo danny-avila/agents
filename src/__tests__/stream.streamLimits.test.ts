@@ -1446,6 +1446,97 @@ describe('per-tool argument byte overrides', () => {
     });
   });
 
+  it('adopts a sparse indexed continuation by its stable call index', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: { wide_tool: 1_000 },
+      }),
+    });
+
+    await streamEvent({
+      handler,
+      graph,
+      chunk: {
+        content: '',
+        tool_call_chunks: [
+          { name: 'wide_tool', args: 'x'.repeat(60) },
+          { name: 'tight_tool', args: 'x'.repeat(40) },
+        ],
+      },
+    });
+
+    /** The event position is 0, but index 1 identifies the second call from
+     * the original parallel batch. Its existing 40 bytes must stay under
+     * the global cap rather than adopting wide_tool's raised allowance. */
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'x'.repeat(61), index: 1 }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 100,
+      observed: 101,
+      toolName: 'tight_tool',
+    });
+  });
+
+  it('applies a late anonymous name before charging its lower override', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 1_000,
+        maxToolCallArgBytesByTool: { tight_tool: 50 },
+      }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ args: 'x'.repeat(40) }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ name: 'tight_tool', args: 'x'.repeat(11) }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 50,
+      observed: 51,
+      toolName: 'tight_tool',
+    });
+  });
+
+  it('assembles a late anonymous name before applying its higher override', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: { create_file: 1_000 },
+      }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ name: 'create_', args: 'x'.repeat(60) }],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ name: 'file', args: 'x'.repeat(60) }],
+      })
+    ).resolves.toBeUndefined();
+  });
+
   it('names id-less raw chunks from a single parsed call so overrides apply', async () => {
     const handler = new ChatModelStreamHandler();
     const graph = createGraph({
