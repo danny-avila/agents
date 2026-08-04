@@ -368,6 +368,151 @@ describe('streamed tool-call argument circuit breaker', () => {
   });
 });
 
+describe('per-tool argument byte overrides', () => {
+  it('raises the cap for the named tool without loosening others', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 100,
+        maxToolCallArgBytesByTool: { create_file: 1_000 },
+      }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [
+        { id: 'call_1', name: 'create_file', args: 'x'.repeat(500), index: 0 },
+      ],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [
+          { id: 'call_2', name: 'query_database', args: 'y'.repeat(101), index: 1 },
+        ],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 100,
+      toolName: 'query_database',
+    });
+  });
+
+  it('trips the named tool at its own lower cap', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 1_000,
+        maxToolCallArgBytesByTool: { chatty_tool: 50 },
+      }),
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [
+          { id: 'call_1', name: 'chatty_tool', args: 'x'.repeat(51), index: 0 },
+        ],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 50,
+      toolName: 'chatty_tool',
+    });
+  });
+
+  it('enforces a per-tool cap even when the global cap is disabled', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 0,
+        maxToolCallArgBytesByTool: { create_file: 100 },
+      }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [
+        { id: 'call_1', name: 'unbounded_tool', args: 'x'.repeat(500), index: 0 },
+      ],
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [
+          { id: 'call_2', name: 'create_file', args: 'y'.repeat(101), index: 1 },
+        ],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 100,
+      toolName: 'create_file',
+    });
+  });
+
+  it('applies overrides to arrival-sealed complete calls', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 64,
+        maxToolCallArgBytesByTool: { create_file: 1_000 },
+      }),
+    });
+
+    await streamEvent({
+      handler,
+      graph,
+      chunk: {
+        content: '',
+        tool_call_chunks: [{ name: 'create_file', args: 'x'.repeat(500) }],
+        response_metadata: {
+          [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'all' },
+        },
+      },
+    });
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_call_chunks: [{ name: 'search_c', args: 'z'.repeat(70) }],
+          response_metadata: {
+            [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'all' },
+          },
+        },
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', toolName: 'search_c' });
+  });
+
+  it('normalizes override entries like the global field', () => {
+    const resolved = resolveStreamLimits({
+      maxToolCallArgBytes: 100,
+      maxToolCallArgBytesByTool: {
+        create_file: 131_072.9,
+        disabled_tool: -5,
+        unlimited_tool: Infinity,
+        invalid_tool: Number.NaN,
+        '': 42,
+      },
+    });
+
+    expect(resolved.maxToolCallArgBytesByTool).toEqual({
+      create_file: 131_072,
+      disabled_tool: 0,
+      unlimited_tool: 0,
+    });
+  });
+});
+
 describe('per-generation delta event circuit breaker', () => {
   it('is opt-in and counts every streamed chunk event, including empty ones', async () => {
     const handler = new ChatModelStreamHandler();

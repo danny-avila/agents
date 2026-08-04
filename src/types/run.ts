@@ -190,6 +190,17 @@ export interface StreamLimits {
    */
   maxToolCallArgBytes?: number;
   /**
+   * Per-tool overrides for `maxToolCallArgBytes`, keyed by the model-facing
+   * tool name. A matching entry replaces the global cap for that tool's
+   * calls (`0` disables the guard for that tool only). Tools that
+   * legitimately stream whole documents as arguments (e.g. file creation)
+   * can run with a higher cap without loosening every other tool's guard.
+   * Calls whose tool name has not yet arrived on the stream use the global
+   * cap; providers send the name in the first chunk, so this only matters
+   * for malformed streams.
+   */
+  maxToolCallArgBytesByTool?: Record<string, number>;
+  /**
    * Max streamed chunk events a single model generation (turn) may emit
    * before the run is aborted. Defense in depth against looping or
    * duplicated provider streams that a byte limit cannot see (e.g. endless

@@ -23,6 +23,8 @@ export const DEFAULT_MAX_TOOL_CALL_ARG_BYTES = 65_536;
 /** Limits normalized by {@link resolveStreamLimits}; `0` uniformly means disabled. */
 export interface ResolvedStreamLimits {
   maxToolCallArgBytes: number;
+  /** Per-tool overrides of the byte cap, keyed by model-facing tool name. */
+  maxToolCallArgBytesByTool?: Readonly<Record<string, number>>;
   maxDeltaEventsPerTurn: number;
 }
 
@@ -71,11 +73,29 @@ function resolveLimit(value: number | undefined, fallback: number): number {
 export function resolveStreamLimits(
   limits?: t.StreamLimits
 ): ResolvedStreamLimits {
+  const maxToolCallArgBytes = resolveLimit(
+    limits?.maxToolCallArgBytes,
+    DEFAULT_MAX_TOOL_CALL_ARG_BYTES
+  );
+  let maxToolCallArgBytesByTool: Record<string, number> | undefined;
+  if (limits?.maxToolCallArgBytesByTool != null) {
+    for (const [name, value] of Object.entries(
+      limits.maxToolCallArgBytesByTool
+    )) {
+      /** An unusable entry (NaN) falls back to the global cap by omission,
+       * matching how the global field treats NaN. */
+      if (name === '' || Number.isNaN(value)) {
+        continue;
+      }
+      (maxToolCallArgBytesByTool ??= {})[name] = resolveLimit(
+        value,
+        maxToolCallArgBytes
+      );
+    }
+  }
   return {
-    maxToolCallArgBytes: resolveLimit(
-      limits?.maxToolCallArgBytes,
-      DEFAULT_MAX_TOOL_CALL_ARG_BYTES
-    ),
+    maxToolCallArgBytes,
+    ...(maxToolCallArgBytesByTool != null && { maxToolCallArgBytesByTool }),
     maxDeltaEventsPerTurn: resolveLimit(limits?.maxDeltaEventsPerTurn, 0),
   };
 }
@@ -95,8 +115,8 @@ function buildLimitMessage(
     return (
       `Streamed tool call arguments exceeded the ${limit}-byte safety limit${named}. ` +
       'The generation was aborted mid-stream: arguments growing this large without completing ' +
-      'usually indicate a runaway or malformed tool call. Raise \'maxToolCallArgBytes\' if your ' +
-      'tools legitimately need larger arguments.'
+      'usually indicate a runaway or malformed tool call. Raise \'maxToolCallArgBytes\' (or the ' +
+      'tool\'s \'maxToolCallArgBytesByTool\' entry) if your tools legitimately need larger arguments.'
     );
   }
   return (
@@ -247,9 +267,10 @@ export function enforceStreamedToolCallArgLimit({
   toolCallChunks: ToolCallChunk[];
   responseMetadata?: Record<string, unknown>;
 }): void {
-  const limit = (graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS)
-    .maxToolCallArgBytes;
-  if (limit <= 0) {
+  const resolved = graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS;
+  const globalLimit = resolved.maxToolCallArgBytes;
+  const byTool = resolved.maxToolCallArgBytesByTool;
+  if (globalLimit <= 0 && byTool == null) {
     return;
   }
   const tallies = (graph.streamedToolCallArgTallies ??= new Map());
@@ -264,12 +285,17 @@ export function enforceStreamedToolCallArgLimit({
         continue;
       }
       const bytes = Buffer.byteLength(args, 'utf8');
-      if (bytes > limit) {
+      const sealedName = chunkToolName(chunk);
+      const limit =
+        byTool != null && sealedName != null && Object.hasOwn(byTool, sealedName)
+          ? byTool[sealedName]
+          : globalLimit;
+      if (limit > 0 && bytes > limit) {
         throw new StreamLimitExceededError({
           kind: 'tool_call_args',
           limit,
           observed: bytes,
-          toolName: chunkToolName(chunk),
+          toolName: sealedName,
         });
       }
       continue;
@@ -307,12 +333,17 @@ export function enforceStreamedToolCallArgLimit({
     }
     tally.pendingHighSurrogate =
       !sealed && isHighSurrogate(args.charCodeAt(args.length - 1));
-    if (tally.bytes > limit) {
+    const toolName = tally.name ?? chunkToolName(chunk);
+    const limit =
+      byTool != null && toolName != null && Object.hasOwn(byTool, toolName)
+        ? byTool[toolName]
+        : globalLimit;
+    if (limit > 0 && tally.bytes > limit) {
       throw new StreamLimitExceededError({
         kind: 'tool_call_args',
         limit,
         observed: tally.bytes,
-        toolName: tally.name ?? chunkToolName(chunk),
+        toolName,
       });
     }
     if (sealed) {
