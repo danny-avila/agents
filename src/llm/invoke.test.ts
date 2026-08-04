@@ -19,6 +19,7 @@ import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/messag
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { convertMessageContentToParts } from '@/llm/google/utils/common';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { toLangChainContent } from '@/messages/langchain';
 import { Constants, Providers } from '@/common';
@@ -827,6 +828,45 @@ describe('tryFallbackProviders applies the same lazy annotation transform', () =
 
     jest.dontMock('@/llm/init');
     jest.resetModules();
+  });
+
+  it('stops draining a cancellation-ignoring stream once the breaker trips', async () => {
+    const abort = new AbortController();
+    /** Statically imported class: neighboring tests reset the module
+     * registry, and a dynamically imported instance would fail the
+     * statically-linked drain loop's instanceof check. */
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    let yields = 0;
+    const model: StubModel = {
+      stream: jest.fn(async function* (): AsyncGenerator<AIMessageChunk> {
+        for (let i = 0; i < 5; i++) {
+          yields += 1;
+          yield new AIMessageChunk({ content: `c${i}` });
+        }
+      }),
+    };
+
+    /** The stub ignores the abort signal entirely; only the per-chunk
+     * breaker check in the drain loop can stop it. */
+    await expect(
+      attemptInvoke(
+        {
+          model: model as t.ChatModel,
+          messages: [new HumanMessage('hi')],
+          provider: Providers.ANTHROPIC,
+          onChunk: () => {
+            abort.abort(trip);
+          },
+        },
+        { signal: abort.signal }
+      )
+    ).rejects.toBe(trip);
+    expect(yields).toBeLessThanOrEqual(2);
   });
 
   it('rejects before invoking a fallback when the breaker tripped during preparation', async () => {

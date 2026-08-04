@@ -1282,9 +1282,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
-    this.streamedToolCallArgTallies.clear();
-    this.streamDeltaEventCounts.clear();
-    this.streamLimitChargeCredits = undefined;
+    /** Stream-limit accounting (argument tallies, event counts, charge
+     * credits) deliberately SURVIVES cleanup: this runs in `processStream`'s
+     * finally, which an ordinary parallel-branch failure reaches while
+     * sibling attempts are still unwinding on the retained breaker — a
+     * cancellation-ignoring provider's late chunks would otherwise recreate
+     * their budgets from zero and stream another full allowance. The maps
+     * are bounded by in-flight call sizes and `resetValues` clears them at
+     * the next run start, where the epoch bump already drops stamped
+     * straggler events before accounting. */
     /** Deliberately NOT recreating a tripped breakerAbort here: this runs in
      * `processStream`'s cleanup, which a rejected parallel batch reaches
      * while sibling subagents can still be pre-invoke — a fresh controller

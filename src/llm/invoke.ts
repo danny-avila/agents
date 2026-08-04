@@ -813,12 +813,27 @@ export async function attemptInvoke(
     let preempted = false;
     const registeredStreamHandler =
       getRegisteredDefaultChatStreamHandler(context);
+    /** A sibling's trip aborts the composed signal, but an adapter that
+     * ignores cancellation keeps yielding — and text-only chunks with the
+     * event cap off never throw in enforcement, so nothing else would stop
+     * the drain. Checked on every yielded chunk in all three loops;
+     * throwing closes the iterator and tears down the provider stream. */
+    const throwIfBreakerTripped = (): void => {
+      const signal = config.signal;
+      if (
+        signal?.aborted === true &&
+        signal.reason instanceof StreamLimitExceededError
+      ) {
+        throw signal.reason;
+      }
+    };
 
     if (onChunk) {
       const attemptMetadata = config.metadata as
         | Record<string, unknown>
         | undefined;
       for await (const chunk of stream) {
+        throwIfBreakerTripped();
         /** An onChunk consumer replaces the stream handler entirely, so
          * stream limits are enforced here for every such caller — public
          * package consumers get no other accounting. The internal
@@ -842,6 +857,7 @@ export async function attemptInvoke(
       const metadata = config.metadata as Record<string, unknown> | undefined;
       const streamHandler = new ChatModelStreamHandler();
       for await (const chunk of stream) {
+        throwIfBreakerTripped();
         const handlingChunk = getStreamHandlingChunk({
           current: finalChunk,
           next: chunk,
@@ -909,6 +925,7 @@ export async function attemptInvoke(
        */
       let redispatchMetadata: Record<string, unknown> | undefined;
       for await (const chunk of stream) {
+        throwIfBreakerTripped();
         /**
          * Charged synchronously, ahead of the decoupled `streamEvents`
          * reader that will echo this same chunk to the registered handler:

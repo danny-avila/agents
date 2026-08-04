@@ -40,6 +40,28 @@ describe('run breaker lifecycle', () => {
     expect(graph.breakerAbort.signal.aborted).toBe(false);
   });
 
+  it('preserves stream-limit accounting through end-of-run cleanup', () => {
+    const graph = makeGraph();
+    graph.streamedToolCallArgTallies.set('gen:i:0', { bytes: 42 });
+    graph.streamDeltaEventCounts.set('gen', 7);
+    graph.streamLimitChargeCredits = new WeakMap();
+
+    /** Cleanup runs while sibling attempts can still be unwinding on the
+     * retained breaker; clearing here would hand a cancellation-ignoring
+     * provider's late chunks a fresh budget. */
+    graph.clearHeavyState();
+    expect(graph.streamedToolCallArgTallies.size).toBe(1);
+    expect(graph.streamDeltaEventCounts.size).toBe(1);
+    expect(graph.streamLimitChargeCredits).toBeDefined();
+
+    /** The next run start clears them — its epoch bump already drops
+     * stamped straggler events before accounting. */
+    graph.resetValues();
+    expect(graph.streamedToolCallArgTallies.size).toBe(0);
+    expect(graph.streamDeltaEventCounts.size).toBe(0);
+    expect(graph.streamLimitChargeCredits).toBeUndefined();
+  });
+
   it('rejects a model node at entry when the breaker has already tripped', async () => {
     const graph = makeGraph();
     const trip = makeTrip();

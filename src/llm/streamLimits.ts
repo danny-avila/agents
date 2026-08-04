@@ -419,20 +419,23 @@ export function enforceStreamedToolCallArgLimit({
      * value — index 0 and id "0" — cannot alias distinct calls onto one
      * tally. Empty-string ids are placeholders, not identities. */
     const chunkId = chunkCallId(chunk);
-    /** A single identifier-less event after several calls are live is a
-     * sparse parallel continuation: its position is relative to this event,
-     * not to the original batch, so `#0` cannot identify which call it
-     * belongs to. Charge the bytes against every live candidate using the
-     * global limit. This is conservative, but it prevents the continuation
-     * from inheriting whichever candidate currently owns the position alias,
-     * including a raised or disabled per-tool override. */
+    /** A single identifier-less event while calls are live is a sparse
+     * parallel continuation: its position is relative to this event, not to
+     * the original batch, so `#0` cannot identify which call it belongs to.
+     * With exactly one live call the association is unambiguous — charge
+     * that tally, keeping its budget continuous (a fresh `#0` tally here
+     * would RESET the sole remaining call's byte budget). With several,
+     * charge every live candidate. Each tally is judged under its OWN
+     * name-specific limit: comparing only against the global cap would let
+     * a call with a lower per-tool override stream past it indefinitely
+     * while its chunks stay anonymous. */
     if (
       chunk.index == null &&
       chunkId == null &&
       toolCallChunks.length === 1
     ) {
       const liveTallies = getLiveGenerationTallies();
-      if (liveTallies.length > 1) {
+      if (liveTallies.length > 0) {
         if (hasArgs) {
           const argBytes = Buffer.byteLength(args, 'utf8');
           for (const liveTally of liveTallies) {
@@ -443,11 +446,18 @@ export function enforceStreamedToolCallArgLimit({
             liveTally.pendingHighSurrogate = isHighSurrogate(
               args.charCodeAt(args.length - 1)
             );
-            if (globalLimit > 0 && liveTally.bytes > globalLimit) {
+            const tallyLimit =
+              byTool != null &&
+              liveTally.name != null &&
+              Object.hasOwn(byTool, liveTally.name)
+                ? byTool[liveTally.name]
+                : globalLimit;
+            if (tallyLimit > 0 && liveTally.bytes > tallyLimit) {
               throw new StreamLimitExceededError({
                 kind: 'tool_call_args',
-                limit: globalLimit,
+                limit: tallyLimit,
                 observed: liveTally.bytes,
+                toolName: liveTally.name,
               });
             }
           }
@@ -779,6 +789,17 @@ export function requiresStreamLimitAccounting(
   const resolved = graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS;
   if (resolved.maxDeltaEventsPerTurn > 0) {
     return true;
+  }
+  /** With the byte cap disabled and no per-tool overrides, neither
+   * enforcement function can fire — hosts that explicitly disable the
+   * guards for legitimate large arguments must not pay per-chunk claim
+   * allocations (generation keys, WeakMap entries, nested Maps) for
+   * bookkeeping that judges nothing. */
+  if (
+    resolved.maxToolCallArgBytes <= 0 &&
+    resolved.maxToolCallArgBytesByTool == null
+  ) {
+    return false;
   }
   return (
     (chunk.tool_call_chunks?.length ?? 0) > 0 ||

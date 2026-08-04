@@ -1059,6 +1059,136 @@ describe('per-tool argument byte overrides', () => {
     ).rejects.toMatchObject({ kind: 'tool_call_args', limit: 100 });
   });
 
+  it('judges ambiguous sparse deltas under each candidate\'s own limit', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 1_000,
+        maxToolCallArgBytesByTool: { tight_tool: 50 },
+      }),
+    });
+
+    await expect(
+      streamEvent({
+        handler,
+        graph,
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            { id: 'call_a', name: 'tight_tool', args: 'x'.repeat(10) },
+            { id: 'call_b', name: 'db_query', args: 'x'.repeat(10) },
+          ],
+        },
+      })
+    ).resolves.toBeUndefined();
+
+    /** The anonymous continuation might belong to tight_tool, whose 50-byte
+     * override is LOWER than the raised global cap — judging candidates
+     * only against the global limit would let it stream past indefinitely. */
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'x'.repeat(60) }],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 50,
+      toolName: 'tight_tool',
+    });
+  });
+
+  it('keeps the sole live call\'s budget continuous across anonymous continuations', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 100 }),
+    });
+
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_a', name: 'writer', args: 'x'.repeat(60) }],
+    });
+    /** A second id-only call takes over the #0 position alias, then seals —
+     * releasing it removes the alias while call_a stays live under its id. */
+    await streamToolCallChunks({
+      handler,
+      graph,
+      chunks: [{ id: 'call_b', name: 'other', args: 'x'.repeat(10) }],
+    });
+    await streamEvent({
+      handler,
+      graph,
+      chunk: {
+        content: '',
+        tool_call_chunks: [{ id: 'call_b', args: '' }],
+        response_metadata: {
+          [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: {
+            kind: 'single',
+            id: 'call_b',
+          },
+        },
+      },
+    });
+
+    /** The anonymous continuation must charge call_a's existing 60-byte
+     * tally — a fresh #0 tally would reset the sole remaining call's
+     * budget and let combined args exceed the cap. */
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [{ args: 'x'.repeat(60) }],
+      })
+    ).rejects.toMatchObject({ kind: 'tool_call_args', limit: 100 });
+  });
+
+  it('still accounts when per-tool overrides exist with the global cap off', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({
+        maxToolCallArgBytes: 0,
+        maxToolCallArgBytesByTool: { create_file: 500 },
+      }),
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [
+          { id: 'call_1', name: 'create_file', args: 'x'.repeat(501), index: 0 },
+        ],
+      })
+    ).rejects.toMatchObject({
+      kind: 'tool_call_args',
+      limit: 500,
+      toolName: 'create_file',
+    });
+  });
+
+  it('allocates no charge bookkeeping when every guard is disabled', async () => {
+    const handler = new ChatModelStreamHandler();
+    const graph = createGraph({
+      streamLimits: resolveStreamLimits({ maxToolCallArgBytes: 0 }),
+    });
+
+    await expect(
+      streamToolCallChunks({
+        handler,
+        graph,
+        chunks: [
+          { id: 'call_1', name: 'writer', args: 'x'.repeat(100_000), index: 0 },
+        ],
+      })
+    ).resolves.toBeUndefined();
+    expect(graph.streamLimitChargeCredits).toBeUndefined();
+    expect(graph.streamedToolCallArgTallies ?? new Map()).toHaveProperty(
+      'size',
+      0
+    );
+  });
+
   it('binds consumer trips to the event epoch, sparing a newer run', async () => {
     const handler = new ChatModelStreamHandler();
     const newRunBreaker = new AbortController();
