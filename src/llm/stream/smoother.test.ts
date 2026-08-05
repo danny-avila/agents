@@ -246,6 +246,40 @@ describe('smoothStream', () => {
     expect(Date.now() - start).toBeLessThan(50);
   });
 
+  it('stays fully lazy when smoothing is disabled', async () => {
+    const yielded: number[] = [];
+    const items = [
+      makeItem('a', 'first ', true),
+      makeItem('b', 'second ', true),
+      makeItem('c', 'third ', true),
+    ];
+    const stream = smoothStream({
+      source: arraySource(items, (i) => yielded.push(i)),
+      delayMs: 0,
+    });
+
+    await stream.next();
+    expect(yielded).toEqual([0]);
+    await stream.return(undefined);
+    expect(yielded).toEqual([0]);
+  });
+
+  it('segments an oversized item so pieces reassemble with exactly one isFirst/isLast', async () => {
+    const bigText = 'lorem ipsum dolor sit amet '.repeat(400);
+    const pieces = await collect(
+      smoothStream({
+        source: arraySource([makeItem('big', bigText, true)]),
+        delayMs: 1,
+      })
+    );
+
+    expect(pieces.map((p) => p.text).join('')).toBe(bigText);
+    expect(pieces.filter((p) => p.isFirst)).toHaveLength(1);
+    expect(pieces.filter((p) => p.isLast)).toHaveLength(1);
+    expect(pieces[0].isFirst).toBe(true);
+    expect(pieces[pieces.length - 1].isLast).toBe(true);
+  });
+
   it('skips empty-text smooth items entirely', async () => {
     const pieces = await collect(
       smoothStream({
@@ -351,11 +385,13 @@ describe('smoothStream', () => {
 
     const first = await stream.next();
     expect(first.done).toBe(false);
+    /** Segmented admission parks the producer mid-way through the first
+     * oversized item — later items are not read ahead past the text cap. */
     expect(yielded).toContain(0);
-    expect(yielded).toContain(1);
     expect(yielded).not.toContain(2);
 
     const rest = await collect(stream as AsyncGenerator<Emitted>);
+    expect(yielded).toContain(1);
     expect(yielded).toContain(2);
     const all = [first.value as Emitted, ...rest];
     expect(all.map((p) => p.text).join('')).toBe(bigText + bigText + 'tail text ');

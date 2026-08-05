@@ -72,6 +72,23 @@ describe('toGenerationSmoothItem classification', () => {
     );
   });
 
+  it('keeps mixed text/tool-call chunks atomic', () => {
+    const chunk = new ChatGenerationChunk({
+      text: 'calling the weather tool for you now',
+      message: new AIMessageChunk({
+        content: 'calling the weather tool for you now',
+        tool_call_chunks: [
+          { name: 'weather', args: '{"city":', id: 'call_1', index: 0 },
+        ],
+      }),
+    });
+    const item = toGenerationSmoothItem(chunk);
+    expect(item.atomic).toBe(true);
+    expect(item.emit({ text: item.text, isFirst: true, isLast: true })).toBe(
+      chunk
+    );
+  });
+
   it('classifies usage-only chunks as passthrough', () => {
     const chunk = new ChatGenerationChunk({
       text: '',
@@ -115,6 +132,28 @@ describe('cloneGenerationChunkPiece metadata scoping', () => {
     expect(laterMessage.additional_kwargs).toEqual({});
     expect(laterMessage.response_metadata).toEqual({});
     expect(laterMessage.usage_metadata).toBeUndefined();
+  });
+
+  it('keeps generationInfo on the first piece only', () => {
+    const infoChunk = new ChatGenerationChunk({
+      text: 'alpha beta gamma',
+      generationInfo: {
+        usage_metadata: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+      },
+      message: new AIMessageChunk({ content: 'alpha beta gamma' }),
+    });
+    const first = cloneGenerationChunkPiece(infoChunk, {
+      text: 'alpha ',
+      isFirst: true,
+      isLast: false,
+    });
+    const later = cloneGenerationChunkPiece(infoChunk, {
+      text: 'beta ',
+      isFirst: false,
+      isLast: false,
+    });
+    expect(first.generationInfo).toBeDefined();
+    expect(later.generationInfo).toBeUndefined();
   });
 
   it('returns the original chunk for unsplit pieces', () => {

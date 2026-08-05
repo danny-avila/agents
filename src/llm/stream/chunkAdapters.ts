@@ -22,7 +22,7 @@ export function cloneGenerationChunkPiece(
   const message = chunk.message as AIMessageChunk;
   return new ChatGenerationChunk({
     text: piece.text,
-    generationInfo: chunk.generationInfo,
+    generationInfo: piece.isFirst ? chunk.generationInfo : undefined,
     message: new AIMessageChunk(
       Object.assign({}, message, {
         content: piece.text,
@@ -82,7 +82,7 @@ function clonePartGenerationChunkPiece(
   const message = chunk.message as AIMessageChunk;
   return new ChatGenerationChunk({
     text: piece.text,
-    generationInfo: chunk.generationInfo,
+    generationInfo: piece.isFirst ? chunk.generationInfo : undefined,
     message: new AIMessageChunk(
       Object.assign({}, message, {
         content: [Object.assign({}, part, { text: piece.text })],
@@ -144,6 +144,15 @@ function hasFinishReason(
  * or OpenRouter's reasoning_details accumulation — duplicates them once per
  * piece.
  */
+/**
+ * Mixed text/tool-call deltas must never split: cloned pieces would each
+ * carry the same tool_call_chunks and downstream accumulation would corrupt
+ * the assembled tool arguments.
+ */
+export function hasToolCallChunks(message: AIMessageChunk): boolean {
+  return (message.tool_call_chunks?.length ?? 0) > 0;
+}
+
 export function hasReasoningKwargs(message: AIMessageChunk): boolean {
   const kwargs = message.additional_kwargs;
   if (
@@ -176,7 +185,8 @@ export function toGenerationSmoothItem(
     typeof message.content === 'string' &&
     message.content === chunk.text &&
     cleanGenerationInfo &&
-    !hasReasoningKwargs(message);
+    !hasReasoningKwargs(message) &&
+    !hasToolCallChunks(message);
 
   if (splittable) {
     return {
@@ -190,7 +200,8 @@ export function toGenerationSmoothItem(
     Boolean(chunk.text) &&
     isMessageChunk &&
     cleanGenerationInfo &&
-    !hasReasoningKwargs(message)
+    !hasReasoningKwargs(message) &&
+    !hasToolCallChunks(message)
       ? getSplittableTextPart(message, chunk.text)
       : null;
   if (splittablePart != null) {

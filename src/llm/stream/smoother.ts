@@ -2,6 +2,7 @@ export const DEFAULT_STREAM_DELAY = 25;
 export const SMOOTH_TARGET_LATENCY_MS = 250;
 export const MAX_STREAM_QUEUE_CHUNKS = 256;
 export const MAX_STREAM_QUEUE_TEXT_CHARS = 8192;
+export const MAX_SMOOTH_ITEM_SEGMENT_CHARS = 4096;
 export const STREAM_CHUNK_MIN_SIZE = 4;
 export const STREAM_BOUNDARIES: ReadonlySet<string> = new Set([
   ' ',
@@ -180,7 +181,20 @@ export async function* smoothStream<TEmit>({
   signal?: AbortSignal;
   abortUpstream?: () => void;
 }): AsyncGenerator<TEmit> {
-  const smoothingEnabled = delayMs > 0;
+  if (delayMs <= 0) {
+    /** Disabled smoothing preserves fully lazy streaming: no background
+     * producer, no read-ahead — each provider chunk is pulled only when the
+     * consumer asks, exactly like the pre-engine pass-through paths. */
+    for await (const item of source) {
+      if (isSignalAborted(signal)) {
+        abortUpstream?.();
+        throw new Error(STREAM_ABORT_MESSAGE);
+      }
+      yield item.emit({ text: item.text, isFirst: true, isLast: true });
+    }
+    return;
+  }
+
   const queuedItems: QueuedSmoothItem<TEmit>[] = [];
   const producerState: ProducerState = { done: false };
   let queuedItemIndex = 0;
@@ -283,11 +297,57 @@ export async function* smoothStream<TEmit>({
     if (consumerClosed || isSignalAborted(signal)) {
       throwAborted();
     }
-    const isSmooth = smoothingEnabled && item.smooth;
-    const textLength = isSmooth ? item.text.length : 0;
+    const textLength = item.smooth ? item.text.length : 0;
     queuedItems.push({ item, textLength });
     bufferedTextLength += textLength;
     notifyConsumerForItem();
+  };
+
+  /**
+   * Oversized splittable items are segmented at admission so a single giant
+   * provider chunk cannot blow past the text budget: each segment re-checks
+   * capacity, so the producer parks mid-chunk once the buffer fills — the
+   * same bound the legacy split-before-enqueue queues enforced. The wrapped
+   * emit maps segment-local pieces back to chunk-global isFirst/isLast so
+   * provider clone contracts are unaffected.
+   */
+  const enqueueSegmented = async (item: SmoothItem<TEmit>): Promise<void> => {
+    if (
+      !item.smooth ||
+      item.atomic === true ||
+      item.text.length <= MAX_SMOOTH_ITEM_SEGMENT_CHARS
+    ) {
+      await enqueue(item);
+      return;
+    }
+
+    const segments: { start: number; end: number }[] = [];
+    let offset = 0;
+    while (offset < item.text.length) {
+      const end =
+        offset +
+        findStreamChunkBoundary(
+          item.text.slice(offset),
+          MAX_SMOOTH_ITEM_SEGMENT_CHARS
+        );
+      segments.push({ start: offset, end });
+      offset = end;
+    }
+
+    for (let i = 0; i < segments.length; i++) {
+      const isFirstSegment = i === 0;
+      const isLastSegment = i === segments.length - 1;
+      await enqueue({
+        text: item.text.slice(segments[i].start, segments[i].end),
+        smooth: true,
+        emit: (piece) =>
+          item.emit({
+            text: piece.text,
+            isFirst: isFirstSegment && piece.isFirst,
+            isLast: isLastSegment && piece.isLast,
+          }),
+      });
+    }
   };
 
   const producer = (async (): Promise<void> => {
@@ -296,7 +356,7 @@ export async function* smoothStream<TEmit>({
         if (isSignalAborted(signal)) {
           throwAborted();
         }
-        await enqueue(item);
+        await enqueueSegmented(item);
       }
     } catch (error) {
       producerState.error = error;
@@ -330,7 +390,7 @@ export async function* smoothStream<TEmit>({
       }
 
       const { item } = queuedItem;
-      const isSmooth = smoothingEnabled && item.smooth;
+      const isSmooth = item.smooth;
 
       if (!isSmooth) {
         notifyProducerForSpace();
