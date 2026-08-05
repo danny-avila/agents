@@ -34,6 +34,15 @@ export function isSignalAborted(signal?: AbortSignal): boolean {
   return signal?.aborted === true;
 }
 
+/**
+ * How far past the target size the word-boundary search may extend before
+ * hard-cutting. Natural language hits a boundary within a few characters;
+ * boundary-free runs (base64, minified data, long identifiers) must not
+ * stretch a piece — or an admission segment — arbitrarily far past its
+ * budget.
+ */
+export const STREAM_BOUNDARY_LOOKAHEAD_CHARS = 64;
+
 export function findStreamChunkBoundary(
   text: string,
   minSize: number
@@ -42,13 +51,17 @@ export function findStreamChunkBoundary(
     return text.length;
   }
 
-  for (let position = minSize; position < text.length; position++) {
+  const scanEnd = Math.min(
+    text.length,
+    minSize + STREAM_BOUNDARY_LOOKAHEAD_CHARS
+  );
+  for (let position = minSize; position < scanEnd; position++) {
     if (STREAM_BOUNDARIES.has(text[position])) {
       return position + 1;
     }
   }
 
-  return text.length;
+  return scanEnd;
 }
 
 /**

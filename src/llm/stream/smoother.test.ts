@@ -5,6 +5,8 @@ import {
   STREAM_CHUNK_MIN_SIZE,
   DEFAULT_STREAM_DELAY,
   PRODUCER_CLOSE_GRACE_MS,
+  MAX_SMOOTH_ITEM_SEGMENT_CHARS,
+  STREAM_BOUNDARY_LOOKAHEAD_CHARS,
   findStreamChunkBoundary,
   computeAdaptivePieceSize,
   SMOOTH_TARGET_LATENCY_MS,
@@ -120,9 +122,16 @@ describe('findStreamChunkBoundary', () => {
     expect(findStreamChunkBoundary('hello world', 4)).toBe(6);
   });
 
-  it('returns full length when no boundary follows', () => {
+  it('returns full length when no boundary follows within the lookahead', () => {
     expect(findStreamChunkBoundary('hello', 4)).toBe(5);
     expect(findStreamChunkBoundary('hi', 4)).toBe(2);
+  });
+
+  it('hard-cuts boundary-free runs at the lookahead limit', () => {
+    const unbroken = 'a'.repeat(10000);
+    expect(findStreamChunkBoundary(unbroken, 4096)).toBe(
+      4096 + STREAM_BOUNDARY_LOOKAHEAD_CHARS
+    );
   });
 });
 
@@ -278,6 +287,22 @@ describe('smoothStream', () => {
     expect(pieces.filter((p) => p.isLast)).toHaveLength(1);
     expect(pieces[0].isFirst).toBe(true);
     expect(pieces[pieces.length - 1].isLast).toBe(true);
+  });
+
+  it('bounds pieces of boundary-free runs at the segment cap plus lookahead', async () => {
+    const unbroken = 'x'.repeat(20000);
+    const pieces = await collect(
+      smoothStream({
+        source: arraySource([makeItem('blob', unbroken, true)]),
+        delayMs: 1,
+      })
+    );
+
+    expect(pieces.map((p) => p.text).join('')).toBe(unbroken);
+    const maxPiece = Math.max(...pieces.map((p) => p.text.length));
+    expect(maxPiece).toBeLessThanOrEqual(
+      MAX_SMOOTH_ITEM_SEGMENT_CHARS + STREAM_BOUNDARY_LOOKAHEAD_CHARS
+    );
   });
 
   it('skips empty-text smooth items entirely', async () => {
