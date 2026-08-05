@@ -1115,9 +1115,6 @@ function getCustomOpenAIClientOptions(
 
 function getReasoningDeltaText(message: AIMessageChunk): string {
   const kwargs = message.additional_kwargs;
-  if (kwargs == null) {
-    return '';
-  }
   if (
     typeof kwargs.reasoning_content === 'string' &&
     kwargs.reasoning_content !== ''
@@ -1250,7 +1247,7 @@ async function* delayStreamChunks(
 ): AsyncGenerator<ChatGenerationChunk> {
   const source = (async function* (): AsyncGenerator<
     SmoothItem<ChatGenerationChunk>
-  > {
+    > {
     for await (const chunk of chunks) {
       yield toSmoothItem(chunk);
     }

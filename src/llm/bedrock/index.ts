@@ -84,7 +84,6 @@ function resolveVisibleText(text?: string, reasoningText?: string): string {
   return '';
 }
 
-
 /**
  * Extended input interface with additional features:
  * - applicationInferenceProfile: Use an inference profile ARN instead of model ID
@@ -385,7 +384,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
       const enrichChunk = this.enrichChunk.bind(this);
       const source = (async function* (): AsyncGenerator<
         SmoothItem<BedrockEmittedChunk>
-      > {
+        > {
         for await (const event of stream) {
           if (event.contentBlockStart != null) {
             const startChunk = handleConverseStreamContentBlockStart(
@@ -409,7 +408,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
               yield {
                 text: '',
                 smooth: false,
-                emit: () => ({
+                emit: (): BedrockEmittedChunk => ({
                   chunk: enrichedStart,
                   callbackChunk: startChunk,
                   callbackToken: startChunk.text,
@@ -438,7 +437,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
               yield {
                 text: '',
                 smooth: false,
-                emit: () =>
+                emit: (): BedrockEmittedChunk =>
                   buildDeltaEmission(
                     contentBlockDelta,
                     visibleText,
@@ -451,7 +450,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
             yield {
               text: visibleText,
               smooth: true,
-              emit: (piece) =>
+              emit: (piece): BedrockEmittedChunk =>
                 buildDeltaEmission(
                   contentBlockDelta,
                   piece.text,
@@ -465,7 +464,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
             yield {
               text: '',
               smooth: false,
-              emit: () => ({ chunk: metadataChunk, callbackToken: '' }),
+              emit: (): BedrockEmittedChunk => ({ chunk: metadataChunk, callbackToken: '' }),
             };
           } else if (event.contentBlockStop != null) {
             const stopIdx = event.contentBlockStop.contentBlockIndex;
@@ -476,7 +475,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
                 yield {
                   text: '',
                   smooth: false,
-                  emit: () => ({
+                  emit: (): BedrockEmittedChunk => ({
                     chunk: sealChunk,
                     callbackChunk: sealChunk,
                     callbackToken: sealChunk.text,
@@ -495,7 +494,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
             yield {
               text: '',
               smooth: false,
-              emit: () => ({ chunk: eventChunk, callbackToken: '' }),
+              emit: (): BedrockEmittedChunk => ({ chunk: eventChunk, callbackToken: '' }),
             };
           }
         }

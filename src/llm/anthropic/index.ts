@@ -688,7 +688,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
 
     const source = (async function* (): AsyncGenerator<
       SmoothItem<AnthropicEmittedChunk>
-    > {
+      > {
       for await (const data of stream) {
         const result = _makeMessageChunkFromAnthropicEvent(
           data as Anthropic.Beta.Messages.BetaRawMessageStreamEvent,
@@ -732,7 +732,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
           yield {
             text: '',
             smooth: false,
-            emit: () => toEmittedChunk(token, chunk),
+            emit: (): AnthropicEmittedChunk => toEmittedChunk(token, chunk),
           };
           continue;
         }
@@ -744,7 +744,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
         yield {
           text: token,
           smooth: true,
-          emit: (piece) => {
+          emit: (piece): AnthropicEmittedChunk => {
             if (piece.isFirst && piece.isLast) {
               return toEmittedChunk(token, chunk);
             }

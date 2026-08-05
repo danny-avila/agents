@@ -341,9 +341,10 @@ export async function* smoothStream<TEmit>({
         if (drainTicksRemaining != null && drainTicksRemaining > 1) {
           drainTicksRemaining -= 1;
         }
-        const pieceLength = item.atomic
-          ? remainingText.length
-          : findStreamChunkBoundary(remainingText, targetPieceSize);
+        const pieceLength =
+          item.atomic === true
+            ? remainingText.length
+            : findStreamChunkBoundary(remainingText, targetPieceSize);
         const pieceEnd = headOffset + pieceLength;
         const piece = item.text.slice(headOffset, pieceEnd);
 

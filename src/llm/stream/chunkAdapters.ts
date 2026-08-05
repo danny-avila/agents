@@ -51,7 +51,7 @@ function getSplittableTextPart(
   if (!Array.isArray(content) || content.length !== 1) {
     return null;
   }
-  const part = content[0];
+  const part: unknown = content[0];
   if (part == null || typeof part !== 'object') {
     return null;
   }
@@ -194,7 +194,7 @@ export async function* smoothGenerationChunks({
 }): AsyncGenerator<ChatGenerationChunk> {
   const source = (async function* (): AsyncGenerator<
     SmoothItem<ChatGenerationChunk>
-  > {
+    > {
     for await (const chunk of chunks) {
       yield toGenerationSmoothItem(chunk);
     }
