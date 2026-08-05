@@ -419,7 +419,7 @@ export async function* smoothStream<TEmit>({
         producer,
         new Promise<void>((resolve) => {
           const timeout = setTimeout(resolve, PRODUCER_CLOSE_GRACE_MS);
-          timeout.unref?.();
+          timeout.unref();
         }),
       ]);
     }
