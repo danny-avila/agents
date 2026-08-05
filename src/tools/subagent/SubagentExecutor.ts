@@ -1411,8 +1411,9 @@ export function summarizeEvent(eventName: string, data: unknown): string {
  * pure tool_use (e.g. the subagent hit `maxTurns` mid-tool-call), the walk
  * continues to earlier AIMessages so partial progress is salvaged — this
  * matches Claude Code's behavior in `agentToolUtils.finalizeAgentTool`.
- * Consecutive streamed text-delta blocks are coalesced without adding
- * whitespace; complete text blocks remain newline-separated.
+ * Consecutive streamed text-delta blocks with the same provider index are
+ * coalesced without adding whitespace. Annotation-only text blocks are
+ * ignored; complete text blocks and distinct delta indexes remain separated.
  * Returns "Task completed" only when no AIMessage in the history contains
  * any text.
  */
@@ -1435,12 +1436,14 @@ export function filterSubagentResult(messages: BaseMessage[]): string {
 
     const textParts: string[] = [];
     let textDeltaParts: string[] = [];
+    let textDeltaIndex: string | number | undefined;
     const flushTextDeltaParts = (): void => {
       if (textDeltaParts.length === 0) {
         return;
       }
       textParts.push(textDeltaParts.join(''));
       textDeltaParts = [];
+      textDeltaIndex = undefined;
     };
     for (const block of content) {
       if (typeof block === 'string') {
@@ -1460,9 +1463,27 @@ export function filterSubagentResult(messages: BaseMessage[]): string {
           ? block.text
           : '';
       if (isTextDelta) {
-        if (text !== '') {
-          textDeltaParts.push(text);
+        if (text === '') {
+          continue;
         }
+        const index =
+          'index' in block &&
+          (typeof block.index === 'string' || typeof block.index === 'number')
+            ? block.index
+            : undefined;
+        if (
+          textDeltaIndex != null &&
+          index != null &&
+          index !== textDeltaIndex
+        ) {
+          flushTextDeltaParts();
+        }
+        textDeltaIndex ??= index;
+        textDeltaParts.push(text);
+        continue;
+      }
+
+      if (type === ContentTypes.TEXT && text === '') {
         continue;
       }
 

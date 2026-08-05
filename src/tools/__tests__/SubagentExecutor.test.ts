@@ -78,12 +78,37 @@ describe('filterSubagentResult', () => {
       new ToolMessage({ content: 'result', tool_call_id: 'call_1' }),
       new AIMessage({
         content: [
-          { type: 'text_delta', text: 'Streamed ' },
-          { type: 'text_delta', text: 'result.' },
+          { type: 'text_delta', index: 0, text: 'Streamed ' },
+          { type: 'text_delta', index: 0, text: 'result.' },
         ],
       }),
     ];
     expect(filterSubagentResult(messages)).toBe('Streamed result.');
+  });
+
+  it('keeps annotation-only text blocks within a text_delta sequence', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage({
+        content: [
+          { type: 'text_delta', index: 0, text: 'Cited ' },
+          { type: 'text', index: 0, citations: [{ url: 'source' }] },
+          { type: 'text_delta', index: 0, text: 'answer.' },
+        ],
+      }),
+    ];
+    expect(filterSubagentResult(messages)).toBe('Cited answer.');
+  });
+
+  it('separates text_delta blocks with different indexes', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage({
+        content: [
+          { type: 'text_delta', index: 0, text: 'First.' },
+          { type: 'text_delta', index: 1, text: 'Second.' },
+        ],
+      }),
+    ];
+    expect(filterSubagentResult(messages)).toBe('First.\nSecond.');
   });
 
   it('strips tool_use blocks from array content', () => {
