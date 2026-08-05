@@ -998,6 +998,7 @@ export abstract class Graph<
 
 export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   overrideModel?: t.ChatModel;
+  private subagentModelOverride?: t.ChatModel;
   /** Optional compile options passed into workflow.compile() */
   compileOptions?: t.CompileOptions | undefined;
   /** Whether the workflow was actually compiled with a checkpointer. */
@@ -1320,6 +1321,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
+    this.subagentModelOverride = undefined;
     /** Stream-limit accounting (argument tallies, event counts, charge
      * credits) deliberately SURVIVES cleanup: this runs in `processStream`'s
      * finally, which an ordinary parallel-branch failure reaches while
@@ -1942,6 +1944,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       sleep,
       toolCalls,
     });
+  }
+
+  /** Explicitly overrides the model used by isolated descendant subagent graphs. */
+  setSubagentModelOverride(model: t.ChatModel): void {
+    this.subagentModelOverride = model;
   }
 
   getUsageMetadata(
@@ -4057,6 +4064,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {
             const childGraph = new StandardGraph(input);
+            if (this.subagentModelOverride != null) {
+              childGraph.overrideModel = this.subagentModelOverride;
+              childGraph.setSubagentModelOverride(this.subagentModelOverride);
+            }
             const toolHandlerRegistry = createToolHandlerRegistry(
               getParentHandlerRegistry()
             );

@@ -67,6 +67,50 @@ describe('filterSubagentResult', () => {
     expect(filterSubagentResult(messages)).toBe('First part.\nSecond part.');
   });
 
+  it('prefers final text_delta blocks over earlier AI text', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage({
+        content: [
+          { type: 'text', text: 'Let me search.' },
+          { type: 'tool_use', id: 'call_1', name: 'search', input: {} },
+        ],
+      }),
+      new ToolMessage({ content: 'result', tool_call_id: 'call_1' }),
+      new AIMessage({
+        content: [
+          { type: 'text_delta', index: 0, text: 'Streamed ' },
+          { type: 'text_delta', index: 0, text: 'result.' },
+        ],
+      }),
+    ];
+    expect(filterSubagentResult(messages)).toBe('Streamed result.');
+  });
+
+  it('keeps annotation-only text blocks within a text_delta sequence', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage({
+        content: [
+          { type: 'text_delta', index: 0, text: 'Cited ' },
+          { type: 'text', index: 0, citations: [{ url: 'source' }] },
+          { type: 'text_delta', index: 0, text: 'answer.' },
+        ],
+      }),
+    ];
+    expect(filterSubagentResult(messages)).toBe('Cited answer.');
+  });
+
+  it('separates text_delta blocks with different indexes', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage({
+        content: [
+          { type: 'text_delta', index: 0, text: 'First.' },
+          { type: 'text_delta', index: 1, text: 'Second.' },
+        ],
+      }),
+    ];
+    expect(filterSubagentResult(messages)).toBe('First.\nSecond.');
+  });
+
   it('strips tool_use blocks from array content', () => {
     const messages: BaseMessage[] = [
       new AIMessage({
@@ -470,7 +514,10 @@ describe('SubagentExecutor', () => {
         }) as unknown as StandardGraph,
     });
     await expect(
-      executor.execute({ description: 'Do something', subagentType: 'researcher' })
+      executor.execute({
+        description: 'Do something',
+        subagentType: 'researcher',
+      })
     ).rejects.toBeInstanceOf(StreamLimitExceededError);
   });
 
