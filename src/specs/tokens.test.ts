@@ -72,6 +72,32 @@ describe('createTokenCounter with different encodings', () => {
     expect(count).toBeGreaterThan(0);
   });
 
+  test('claude correction keeps proxy-backed tool history safely measurable', async () => {
+    let getCalls = 0;
+    const args = new Proxy(
+      { query: 'select * from reports' },
+      {
+        get(target, property, receiver) {
+          getCalls++;
+          return Reflect.get(target, property, receiver);
+        },
+      }
+    );
+    const message = {
+      content: '',
+      tool_calls: [{ id: 'proxy-call', name: 'query', args }],
+      getType: () => 'ai',
+    } as unknown as AIMessage;
+    const counter = await createTokenCounter('claude');
+
+    const count = counter(message);
+
+    expect(Number.isSafeInteger(count)).toBe(true);
+    expect(count).toBeGreaterThan(0);
+    expect(count).toBeLessThan(1_000);
+    expect(getCalls).toBe(0);
+  });
+
   test('o200k_base encoding produces valid token counts', async () => {
     const counter = await createTokenCounter('o200k_base');
     const msg = new HumanMessage('Hello, world!');
@@ -109,6 +135,22 @@ describe('getTokenCountForMessage', () => {
 
     expect(Math.max(...callbackLengths)).toBe(200_000);
     expect(count).toBe(600_003);
+  });
+
+  test.each([
+    -1,
+    1.5,
+    Number.MAX_SAFE_INTEGER,
+    Number.MAX_SAFE_INTEGER + 1,
+    Number.POSITIVE_INFINITY,
+    Number.NaN,
+  ])('rejects an unsafe tokenizer result of %s', (unsafeCount) => {
+    expect(() =>
+      getTokenCountForMessage(
+        new HumanMessage('unsafe count'),
+        () => unsafeCount
+      )
+    ).toThrow(UnsafeTokenMeasurementError);
   });
 
   test('bounds direct string tool args before tokenization and charges omitted characters', () => {

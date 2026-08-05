@@ -14,7 +14,8 @@ export type UnsafeTokenMeasurementReason =
   | 'message_proxy'
   | 'content_proxy'
   | 'metadata_proxy'
-  | 'metadata_accessor';
+  | 'metadata_accessor'
+  | 'invalid_count';
 
 export class UnsafeTokenMeasurementError extends Error {
   readonly type = 'unsafe_token_measurement';
@@ -39,6 +40,20 @@ export class UnsafeTokenMeasurementError extends Error {
     this.reason = reason;
     this.path = path;
   }
+}
+
+function ensureSafeTokenMeasurement(value: number, path: string): number {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value >= Number.MAX_SAFE_INTEGER
+  ) {
+    throw new UnsafeTokenMeasurementError({
+      reason: 'invalid_count',
+      path,
+    });
+  }
+  return value;
 }
 
 /** Anthropic minimum image token cost. */
@@ -875,7 +890,10 @@ function getBoundedTextTokenCount(
     value.length > MAX_STRUCTURED_TOKENIZATION_CHARS
       ? value.slice(0, MAX_STRUCTURED_TOKENIZATION_CHARS)
       : value;
-  const previewTokens = getTokenCount(preview);
+  const previewTokens = ensureSafeTokenMeasurement(
+    getTokenCount(preview),
+    'tokenizer'
+  );
   const omittedChars = value.length - preview.length;
   if (omittedChars <= 0) {
     return previewTokens;
@@ -894,7 +912,10 @@ function getBoundedStructuredTokenCount(
     value,
     MAX_STRUCTURED_TOKENIZATION_CHARS
   );
-  const previewTokens = getTokenCount(serialized.content);
+  const previewTokens = ensureSafeTokenMeasurement(
+    getTokenCount(serialized.content),
+    'tokenizer'
+  );
   if (!serialized.truncated) {
     return previewTokens;
   }
@@ -1125,9 +1146,7 @@ export function getTokenCountForMessage(
   } else {
     processValue(message.content, 'content');
   }
-  if (numTokens >= Number.MAX_SAFE_INTEGER) {
-    return Number.MAX_SAFE_INTEGER;
-  }
+  ensureSafeTokenMeasurement(numTokens, 'content');
   const messageRole = (message as BaseMessage & { role?: unknown }).role;
   if (messageType === 'ai' || messageRole === 'assistant') {
     const toolCalls = (message as AIMessage).tool_calls ?? [];
@@ -1188,7 +1207,7 @@ export function getTokenCountForMessage(
       }
     }
   }
-  return Math.min(Number.MAX_SAFE_INTEGER, numTokens);
+  return ensureSafeTokenMeasurement(numTokens, 'message');
 }
 
 /**
@@ -1243,7 +1262,10 @@ export const createTokenCounter = async (
   const isClaude = encoding === 'claude';
   return (message: BaseMessage): number => {
     const count = getTokenCountForMessage(message, countTokens, encoding);
-    return isClaude ? Math.ceil(count * CLAUDE_TOKEN_CORRECTION) : count;
+    const correctedCount = isClaude
+      ? Math.ceil(count * CLAUDE_TOKEN_CORRECTION)
+      : count;
+    return ensureSafeTokenMeasurement(correctedCount, 'message');
   };
 };
 
