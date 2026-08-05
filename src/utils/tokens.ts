@@ -10,6 +10,52 @@ import { ContentTypes } from '@/common/enum';
 
 export type EncodingName = 'o200k_base' | 'claude';
 
+export type UnsafeTokenMeasurementReason =
+  | 'message_proxy'
+  | 'content_proxy'
+  | 'metadata_proxy'
+  | 'metadata_accessor'
+  | 'invalid_count';
+
+export class UnsafeTokenMeasurementError extends Error {
+  readonly type = 'unsafe_token_measurement';
+  readonly reason: UnsafeTokenMeasurementReason;
+  readonly path: string;
+
+  constructor({
+    reason,
+    path,
+  }: {
+    reason: UnsafeTokenMeasurementReason;
+    path: string;
+  }) {
+    super(
+      JSON.stringify({
+        type: 'unsafe_token_measurement',
+        reason,
+        path,
+      })
+    );
+    this.name = 'UnsafeTokenMeasurementError';
+    this.reason = reason;
+    this.path = path;
+  }
+}
+
+function ensureSafeTokenMeasurement(value: number, path: string): number {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value >= Number.MAX_SAFE_INTEGER
+  ) {
+    throw new UnsafeTokenMeasurementError({
+      reason: 'invalid_count',
+      path,
+    });
+  }
+  return value;
+}
+
 /** Anthropic minimum image token cost. */
 const ANTHROPIC_IMAGE_MIN_TOKENS = 1024;
 /** Anthropic divisor: tokens = width × height / 750. */
@@ -844,7 +890,10 @@ function getBoundedTextTokenCount(
     value.length > MAX_STRUCTURED_TOKENIZATION_CHARS
       ? value.slice(0, MAX_STRUCTURED_TOKENIZATION_CHARS)
       : value;
-  const previewTokens = getTokenCount(preview);
+  const previewTokens = ensureSafeTokenMeasurement(
+    getTokenCount(preview),
+    'tokenizer'
+  );
   const omittedChars = value.length - preview.length;
   if (omittedChars <= 0) {
     return previewTokens;
@@ -859,19 +908,25 @@ function getBoundedStructuredTokenCount(
   value: unknown,
   getTokenCount: (text: string) => number
 ): number {
-  if (hasUnsafeStructuredSerialization(value)) {
-    return Number.MAX_SAFE_INTEGER;
-  }
   const serialized = serializeStructuredValueBounded(
     value,
     MAX_STRUCTURED_TOKENIZATION_CHARS
   );
-  const previewTokens = getTokenCount(serialized.content);
+  const previewTokens = ensureSafeTokenMeasurement(
+    getTokenCount(serialized.content),
+    'tokenizer'
+  );
   if (!serialized.truncated) {
     return previewTokens;
   }
-  if (!Number.isSafeInteger(serialized.originalChars)) {
-    return Number.MAX_SAFE_INTEGER;
+  // The bounded serializer uses MAX_SAFE_INTEGER as its unknown-size sentinel.
+  // Do not extrapolate from it: use its bounded preview and let the provider
+  // input projection preserve the same bounded behavior before invocation.
+  if (
+    !Number.isSafeInteger(serialized.originalChars) ||
+    serialized.originalChars >= Number.MAX_SAFE_INTEGER
+  ) {
+    return previewTokens;
   }
 
   const omittedChars = Math.max(
@@ -893,7 +948,10 @@ export function getTokenCountForMessage(
   const countText = (text: string): number =>
     getBoundedTextTokenCount(text, getTokenCount);
   if (isProxy(message)) {
-    return Number.MAX_SAFE_INTEGER;
+    throw new UnsafeTokenMeasurementError({
+      reason: 'message_proxy',
+      path: 'message',
+    });
   }
 
   type ContentBlock = Record<string, unknown> & {
@@ -907,19 +965,22 @@ export function getTokenCountForMessage(
   };
   const representedToolCallIds = new Set<string>();
 
-  const processValue = (value: unknown): void => {
+  const processValue = (value: unknown, path: string): void => {
     if (value != null && typeof value === 'object' && isProxy(value)) {
-      numTokens = Number.MAX_SAFE_INTEGER;
-      return;
+      throw new UnsafeTokenMeasurementError({
+        reason: 'content_proxy',
+        path,
+      });
     }
     if (Array.isArray(value)) {
-      for (const raw of value) {
+      for (let index = 0; index < value.length; index++) {
+        const raw = value[index];
         if (
           typeof raw === 'string' ||
           typeof raw === 'number' ||
           typeof raw === 'boolean'
         ) {
-          processValue(raw);
+          processValue(raw, `${path}[${index}]`);
           continue;
         }
         const item = raw as ContentBlock | null | undefined;
@@ -927,8 +988,10 @@ export function getTokenCountForMessage(
           continue;
         }
         if (isProxy(item)) {
-          numTokens = Number.MAX_SAFE_INTEGER;
-          return;
+          throw new UnsafeTokenMeasurementError({
+            reason: 'content_proxy',
+            path: `${path}[${index}]`,
+          });
         }
         if (typeof item.type !== 'string') {
           numTokens += getBoundedStructuredTokenCount(item, countText);
@@ -1010,7 +1073,7 @@ export function getTokenCountForMessage(
           }
           const output = item.tool_call.output;
           if (output != null) {
-            processValue(output);
+            processValue(output, `${path}[${index}].tool_call.output`);
           }
           continue;
         }
@@ -1021,7 +1084,7 @@ export function getTokenCountForMessage(
           continue;
         }
 
-        processValue(nestedValue);
+        processValue(nestedValue, `${path}[${index}].${item.type}`);
       }
     } else if (typeof value === 'string') {
       numTokens += countText(value);
@@ -1040,7 +1103,10 @@ export function getTokenCountForMessage(
       ? rawAdditionalKwargs
       : undefined;
   if (additionalKwargs != null && isProxy(additionalKwargs)) {
-    return Number.MAX_SAFE_INTEGER;
+    throw new UnsafeTokenMeasurementError({
+      reason: 'metadata_proxy',
+      path: 'additional_kwargs',
+    });
   }
   let additionalType: PropertyDescriptor | undefined;
   try {
@@ -1049,10 +1115,16 @@ export function getTokenCountForMessage(
         ? Object.getOwnPropertyDescriptor(additionalKwargs, 'type')
         : undefined;
   } catch {
-    return Number.MAX_SAFE_INTEGER;
+    throw new UnsafeTokenMeasurementError({
+      reason: 'metadata_accessor',
+      path: 'additional_kwargs.type',
+    });
   }
   if (additionalType != null && !('value' in additionalType)) {
-    return Number.MAX_SAFE_INTEGER;
+    throw new UnsafeTokenMeasurementError({
+      reason: 'metadata_accessor',
+      path: 'additional_kwargs.type',
+    });
   }
 
   let numTokens = tokensPerMessage;
@@ -1072,20 +1144,24 @@ export function getTokenCountForMessage(
       ) * IMAGE_TOKEN_SAFETY_MARGIN
     );
   } else {
-    processValue(message.content);
+    processValue(message.content, 'content');
   }
-  if (numTokens >= Number.MAX_SAFE_INTEGER) {
-    return Number.MAX_SAFE_INTEGER;
-  }
+  ensureSafeTokenMeasurement(numTokens, 'content');
   const messageRole = (message as BaseMessage & { role?: unknown }).role;
   if (messageType === 'ai' || messageRole === 'assistant') {
     const toolCalls = (message as AIMessage).tool_calls ?? [];
     if (isProxy(toolCalls)) {
-      return Number.MAX_SAFE_INTEGER;
+      throw new UnsafeTokenMeasurementError({
+        reason: 'metadata_proxy',
+        path: 'tool_calls',
+      });
     }
     for (const toolCall of toolCalls) {
       if (isProxy(toolCall)) {
-        return Number.MAX_SAFE_INTEGER;
+        throw new UnsafeTokenMeasurementError({
+          reason: 'metadata_proxy',
+          path: 'tool_calls',
+        });
       }
       if (
         typeof toolCall.id === 'string' &&
@@ -1111,11 +1187,17 @@ export function getTokenCountForMessage(
           ? Object.getOwnPropertyDescriptor(additionalKwargs, 'function_call')
           : undefined;
     } catch {
-      return Number.MAX_SAFE_INTEGER;
+      throw new UnsafeTokenMeasurementError({
+        reason: 'metadata_accessor',
+        path: 'additional_kwargs.function_call',
+      });
     }
     if (legacyFunctionCall != null) {
       if (!('value' in legacyFunctionCall)) {
-        return Number.MAX_SAFE_INTEGER;
+        throw new UnsafeTokenMeasurementError({
+          reason: 'metadata_accessor',
+          path: 'additional_kwargs.function_call',
+        });
       }
       if (legacyFunctionCall.value != null) {
         numTokens += getBoundedStructuredTokenCount(
@@ -1125,7 +1207,7 @@ export function getTokenCountForMessage(
       }
     }
   }
-  return Math.min(Number.MAX_SAFE_INTEGER, numTokens);
+  return ensureSafeTokenMeasurement(numTokens, 'message');
 }
 
 /**
@@ -1180,7 +1262,10 @@ export const createTokenCounter = async (
   const isClaude = encoding === 'claude';
   return (message: BaseMessage): number => {
     const count = getTokenCountForMessage(message, countTokens, encoding);
-    return isClaude ? Math.ceil(count * CLAUDE_TOKEN_CORRECTION) : count;
+    const correctedCount = isClaude
+      ? Math.ceil(count * CLAUDE_TOKEN_CORRECTION)
+      : count;
+    return ensureSafeTokenMeasurement(correctedCount, 'message');
   };
 };
 

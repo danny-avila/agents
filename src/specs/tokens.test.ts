@@ -13,6 +13,7 @@ import {
   estimateImageBlockTokens,
   estimateDocumentBlockTokens,
   estimateTimedMediaBlockTokens,
+  UnsafeTokenMeasurementError,
 } from '@/utils/tokens';
 
 /** Builds a minimal PNG data URI whose IHDR encodes the given dimensions. */
@@ -71,6 +72,32 @@ describe('createTokenCounter with different encodings', () => {
     expect(count).toBeGreaterThan(0);
   });
 
+  test('claude correction keeps proxy-backed tool history safely measurable', async () => {
+    let getCalls = 0;
+    const args = new Proxy(
+      { query: 'select * from reports' },
+      {
+        get(target, property, receiver) {
+          getCalls++;
+          return Reflect.get(target, property, receiver);
+        },
+      }
+    );
+    const message = {
+      content: '',
+      tool_calls: [{ id: 'proxy-call', name: 'query', args }],
+      getType: () => 'ai',
+    } as unknown as AIMessage;
+    const counter = await createTokenCounter('claude');
+
+    const count = counter(message);
+
+    expect(Number.isSafeInteger(count)).toBe(true);
+    expect(count).toBeGreaterThan(0);
+    expect(count).toBeLessThan(1_000);
+    expect(getCalls).toBe(0);
+  });
+
   test('o200k_base encoding produces valid token counts', async () => {
     const counter = await createTokenCounter('o200k_base');
     const msg = new HumanMessage('Hello, world!');
@@ -108,6 +135,22 @@ describe('getTokenCountForMessage', () => {
 
     expect(Math.max(...callbackLengths)).toBe(200_000);
     expect(count).toBe(600_003);
+  });
+
+  test.each([
+    -1,
+    1.5,
+    Number.MAX_SAFE_INTEGER,
+    Number.MAX_SAFE_INTEGER + 1,
+    Number.POSITIVE_INFINITY,
+    Number.NaN,
+  ])('rejects an unsafe tokenizer result of %s', (unsafeCount) => {
+    expect(() =>
+      getTokenCountForMessage(
+        new HumanMessage('unsafe count'),
+        () => unsafeCount
+      )
+    ).toThrow(UnsafeTokenMeasurementError);
   });
 
   test('bounds direct string tool args before tokenization and charges omitted characters', () => {
@@ -153,10 +196,13 @@ describe('getTokenCountForMessage', () => {
     );
 
     expect(Math.max(...callbackLengths)).toBeLessThanOrEqual(200_000);
-    expect(count).toBeGreaterThan(payload.length);
+    // A traversal-work sentinel is unknown size, not real context usage.
+    // The provider-input projection will compact the value before invoke.
+    expect(count).toBeGreaterThan(0);
+    expect(count).toBeLessThan(Number.MAX_SAFE_INTEGER);
   });
 
-  test('fails closed when prototype traps throw', () => {
+  test('counts an opaque proxy argument as its bounded provider-safe placeholder', () => {
     let prototypeCalls = 0;
     const args = new Proxy(
       { safe: true },
@@ -171,11 +217,11 @@ describe('getTokenCountForMessage', () => {
     expect(hasUnsafeStructuredSerialization(args)).toBe(true);
     expect(
       getTokenCountForMessage(messageWithToolArgs(args), (text) => text.length)
-    ).toBe(Number.MAX_SAFE_INTEGER);
+    ).toBeLessThan(Number.MAX_SAFE_INTEGER);
     expect(prototypeCalls).toBeLessThanOrEqual(2);
   });
 
-  test('fails closed without recursing through self-referential prototype proxies', () => {
+  test('does not recurse through self-referential prototype proxies', () => {
     let prototypeCalls = 0;
     const args: Record<string, unknown> = new Proxy<Record<string, unknown>>(
       {},
@@ -190,11 +236,11 @@ describe('getTokenCountForMessage', () => {
     expect(hasUnsafeStructuredSerialization(args)).toBe(true);
     expect(
       getTokenCountForMessage(messageWithToolArgs(args), (text) => text.length)
-    ).toBe(Number.MAX_SAFE_INTEGER);
+    ).toBeLessThan(Number.MAX_SAFE_INTEGER);
     expect(prototypeCalls).toBeLessThanOrEqual(2);
   });
 
-  test('fails closed when descriptor and own-key proxy traps throw', () => {
+  test('uses bounded placeholders when descriptor and own-key proxy traps throw', () => {
     const descriptorProxy = new Proxy(
       {},
       {
@@ -219,11 +265,11 @@ describe('getTokenCountForMessage', () => {
           messageWithToolArgs(args),
           (text) => text.length
         )
-      ).toBe(Number.MAX_SAFE_INTEGER);
+      ).toBeLessThan(Number.MAX_SAFE_INTEGER);
     }
   });
 
-  test('fails closed on get traps and revoked proxies without invoking them', () => {
+  test('does not invoke get traps or revoked proxies while measuring arguments', () => {
     let getCalls = 0;
     const getProxy = new Proxy(
       {},
@@ -250,12 +296,12 @@ describe('getTokenCountForMessage', () => {
           messageWithToolArgs(args),
           (text) => text.length
         )
-      ).toBe(Number.MAX_SAFE_INTEGER);
+      ).toBeLessThan(Number.MAX_SAFE_INTEGER);
     }
     expect(getCalls).toBe(0);
   });
 
-  test('fails closed on proxied content blocks without invoking their traps', () => {
+  test('reports a typed terminal error for a proxied content block', () => {
     let getCalls = 0;
     const contentBlock = new Proxy(
       { type: 'text', text: 'safe' },
@@ -271,10 +317,86 @@ describe('getTokenCountForMessage', () => {
       getType: () => 'tool',
     } as unknown as ToolMessage;
 
-    expect(getTokenCountForMessage(message, (text) => text.length)).toBe(
-      Number.MAX_SAFE_INTEGER
+    expect(() => getTokenCountForMessage(message, (text) => text.length)).toThrow(
+      UnsafeTokenMeasurementError
     );
+    try {
+      getTokenCountForMessage(message, (text) => text.length);
+    } catch (error) {
+      expect(JSON.parse((error as Error).message)).toEqual({
+        type: 'unsafe_token_measurement',
+        reason: 'content_proxy',
+        path: 'content[0]',
+      });
+    }
     expect(getCalls).toBe(0);
+  });
+
+  test('reports typed errors for unsafe message and metadata branches', () => {
+    let getterCalls = 0;
+    const messageProxy = new Proxy(new HumanMessage('secret payload'), {
+      get() {
+        getterCalls++;
+        throw new Error('message read denied');
+      },
+    });
+    const metadataProxy = new Proxy(
+      {},
+      {
+        get() {
+          getterCalls++;
+          throw new Error('metadata read denied');
+        },
+      }
+    );
+    const accessorMetadata = {};
+    Object.defineProperty(accessorMetadata, 'type', {
+      get() {
+        getterCalls++;
+        return 'computer_call_output';
+      },
+    });
+    const cases = [
+      {
+        message: messageProxy,
+        reason: 'message_proxy',
+        path: 'message',
+      },
+      {
+        message: {
+          content: '',
+          additional_kwargs: metadataProxy,
+          getType: () => 'tool',
+        } as unknown as ToolMessage,
+        reason: 'metadata_proxy',
+        path: 'additional_kwargs',
+      },
+      {
+        message: {
+          content: '',
+          additional_kwargs: accessorMetadata,
+          getType: () => 'tool',
+        } as unknown as ToolMessage,
+        reason: 'metadata_accessor',
+        path: 'additional_kwargs.type',
+      },
+    ];
+
+    for (const testCase of cases) {
+      try {
+        getTokenCountForMessage(testCase.message, (text) => text.length);
+        throw new Error('Expected token measurement to fail');
+      } catch (error) {
+        expect(error).toBeInstanceOf(UnsafeTokenMeasurementError);
+        expect(JSON.parse((error as Error).message)).toEqual({
+          type: 'unsafe_token_measurement',
+          reason: testCase.reason,
+          path: testCase.path,
+        });
+        expect((error as Error).message).not.toContain('secret payload');
+      }
+    }
+    expect(getterCalls).toBe(0);
   });
 
   test('detects inherited accessors without invoking them', () => {
@@ -292,8 +414,30 @@ describe('getTokenCountForMessage', () => {
     expect(hasUnsafeStructuredSerialization(args)).toBe(true);
     expect(
       getTokenCountForMessage(messageWithToolArgs(args), (text) => text.length)
-    ).toBe(Number.MAX_SAFE_INTEGER);
+    ).toBeLessThan(Number.MAX_SAFE_INTEGER);
     expect(accessorCalls).toBe(0);
+  });
+
+  test('counts safely serializable proxy tool-call history without invoking getters', () => {
+    let getCalls = 0;
+    const args = new Proxy(
+      { query: 'select * from reports' },
+      {
+        get(target, property, receiver) {
+          getCalls++;
+          return Reflect.get(target, property, receiver);
+        },
+      }
+    );
+
+    const count = getTokenCountForMessage(
+      messageWithToolArgs(args),
+      (text) => text.length
+    );
+
+    expect(count).toBeGreaterThan(0);
+    expect(count).toBeLessThan(Number.MAX_SAFE_INTEGER);
+    expect(getCalls).toBe(0);
   });
 
   test('counts tool_calls-only names and arguments', () => {
@@ -334,7 +478,8 @@ describe('getTokenCountForMessage', () => {
 
     const count = getTokenCountForMessage(message, (text) => text.length);
 
-    expect(count).toBeGreaterThanOrEqual(Number.MAX_SAFE_INTEGER);
+    expect(count).toBeLessThan(Number.MAX_SAFE_INTEGER);
+    expect(count).toBeGreaterThan(0);
     expect(toJSONCalls).toBe(0);
   });
 
