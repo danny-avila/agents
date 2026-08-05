@@ -13,6 +13,7 @@ import {
   estimateImageBlockTokens,
   estimateDocumentBlockTokens,
   estimateTimedMediaBlockTokens,
+  UnsafeTokenMeasurementError,
 } from '@/utils/tokens';
 
 /** Builds a minimal PNG data URI whose IHDR encodes the given dimensions. */
@@ -153,10 +154,13 @@ describe('getTokenCountForMessage', () => {
     );
 
     expect(Math.max(...callbackLengths)).toBeLessThanOrEqual(200_000);
-    expect(count).toBeGreaterThan(payload.length);
+    // A traversal-work sentinel is unknown size, not real context usage.
+    // The provider-input projection will compact the value before invoke.
+    expect(count).toBeGreaterThan(0);
+    expect(count).toBeLessThan(Number.MAX_SAFE_INTEGER);
   });
 
-  test('fails closed when prototype traps throw', () => {
+  test('counts an opaque proxy argument as its bounded provider-safe placeholder', () => {
     let prototypeCalls = 0;
     const args = new Proxy(
       { safe: true },
@@ -171,11 +175,11 @@ describe('getTokenCountForMessage', () => {
     expect(hasUnsafeStructuredSerialization(args)).toBe(true);
     expect(
       getTokenCountForMessage(messageWithToolArgs(args), (text) => text.length)
-    ).toBe(Number.MAX_SAFE_INTEGER);
+    ).toBeLessThan(Number.MAX_SAFE_INTEGER);
     expect(prototypeCalls).toBeLessThanOrEqual(2);
   });
 
-  test('fails closed without recursing through self-referential prototype proxies', () => {
+  test('does not recurse through self-referential prototype proxies', () => {
     let prototypeCalls = 0;
     const args: Record<string, unknown> = new Proxy<Record<string, unknown>>(
       {},
@@ -190,11 +194,11 @@ describe('getTokenCountForMessage', () => {
     expect(hasUnsafeStructuredSerialization(args)).toBe(true);
     expect(
       getTokenCountForMessage(messageWithToolArgs(args), (text) => text.length)
-    ).toBe(Number.MAX_SAFE_INTEGER);
+    ).toBeLessThan(Number.MAX_SAFE_INTEGER);
     expect(prototypeCalls).toBeLessThanOrEqual(2);
   });
 
-  test('fails closed when descriptor and own-key proxy traps throw', () => {
+  test('uses bounded placeholders when descriptor and own-key proxy traps throw', () => {
     const descriptorProxy = new Proxy(
       {},
       {
@@ -219,11 +223,11 @@ describe('getTokenCountForMessage', () => {
           messageWithToolArgs(args),
           (text) => text.length
         )
-      ).toBe(Number.MAX_SAFE_INTEGER);
+      ).toBeLessThan(Number.MAX_SAFE_INTEGER);
     }
   });
 
-  test('fails closed on get traps and revoked proxies without invoking them', () => {
+  test('does not invoke get traps or revoked proxies while measuring arguments', () => {
     let getCalls = 0;
     const getProxy = new Proxy(
       {},
@@ -250,12 +254,12 @@ describe('getTokenCountForMessage', () => {
           messageWithToolArgs(args),
           (text) => text.length
         )
-      ).toBe(Number.MAX_SAFE_INTEGER);
+      ).toBeLessThan(Number.MAX_SAFE_INTEGER);
     }
     expect(getCalls).toBe(0);
   });
 
-  test('fails closed on proxied content blocks without invoking their traps', () => {
+  test('reports a typed terminal error for a proxied content block', () => {
     let getCalls = 0;
     const contentBlock = new Proxy(
       { type: 'text', text: 'safe' },
@@ -271,9 +275,18 @@ describe('getTokenCountForMessage', () => {
       getType: () => 'tool',
     } as unknown as ToolMessage;
 
-    expect(getTokenCountForMessage(message, (text) => text.length)).toBe(
-      Number.MAX_SAFE_INTEGER
+    expect(() => getTokenCountForMessage(message, (text) => text.length)).toThrow(
+      UnsafeTokenMeasurementError
     );
+    try {
+      getTokenCountForMessage(message, (text) => text.length);
+    } catch (error) {
+      expect(JSON.parse((error as Error).message)).toEqual({
+        type: 'unsafe_token_measurement',
+        reason: 'content_proxy',
+        path: 'content[0]',
+      });
+    }
     expect(getCalls).toBe(0);
   });
 
@@ -292,8 +305,30 @@ describe('getTokenCountForMessage', () => {
     expect(hasUnsafeStructuredSerialization(args)).toBe(true);
     expect(
       getTokenCountForMessage(messageWithToolArgs(args), (text) => text.length)
-    ).toBe(Number.MAX_SAFE_INTEGER);
+    ).toBeLessThan(Number.MAX_SAFE_INTEGER);
     expect(accessorCalls).toBe(0);
+  });
+
+  test('counts safely serializable proxy tool-call history without invoking getters', () => {
+    let getCalls = 0;
+    const args = new Proxy(
+      { query: 'select * from reports' },
+      {
+        get(target, property, receiver) {
+          getCalls++;
+          return Reflect.get(target, property, receiver);
+        },
+      }
+    );
+
+    const count = getTokenCountForMessage(
+      messageWithToolArgs(args),
+      (text) => text.length
+    );
+
+    expect(count).toBeGreaterThan(0);
+    expect(count).toBeLessThan(Number.MAX_SAFE_INTEGER);
+    expect(getCalls).toBe(0);
   });
 
   test('counts tool_calls-only names and arguments', () => {
@@ -334,7 +369,8 @@ describe('getTokenCountForMessage', () => {
 
     const count = getTokenCountForMessage(message, (text) => text.length);
 
-    expect(count).toBeGreaterThanOrEqual(Number.MAX_SAFE_INTEGER);
+    expect(count).toBeLessThan(Number.MAX_SAFE_INTEGER);
+    expect(count).toBeGreaterThan(0);
     expect(toJSONCalls).toBe(0);
   });
 
