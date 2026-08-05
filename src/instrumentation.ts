@@ -84,6 +84,7 @@ function getLangfuseProcessorCacheKey(
 ): string {
   return JSON.stringify({
     destinationKey,
+    mediaUploadEnabled: langfuse?.mediaUploadEnabled,
     toolOutputTracing: langfuse?.toolOutputTracing,
   });
 }

@@ -571,6 +571,11 @@ export interface LangfuseConfig {
    * `default` environment.
    */
   environment?: string;
+  /**
+   * Whether the Langfuse span processor should detect and upload base64 media
+   * payloads. Defaults to the Langfuse SDK behavior.
+   */
+  mediaUploadEnabled?: boolean;
   metadata?: Record<string, string | number | boolean | null | undefined>;
   /**
    * Internal OTLP span attributes to attach to Langfuse observations before
