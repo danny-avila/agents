@@ -332,6 +332,73 @@ describe('getTokenCountForMessage', () => {
     expect(getCalls).toBe(0);
   });
 
+  test('reports typed errors for unsafe message and metadata branches', () => {
+    let getterCalls = 0;
+    const messageProxy = new Proxy(new HumanMessage('secret payload'), {
+      get() {
+        getterCalls++;
+        throw new Error('message read denied');
+      },
+    });
+    const metadataProxy = new Proxy(
+      {},
+      {
+        get() {
+          getterCalls++;
+          throw new Error('metadata read denied');
+        },
+      }
+    );
+    const accessorMetadata = {};
+    Object.defineProperty(accessorMetadata, 'type', {
+      get() {
+        getterCalls++;
+        return 'computer_call_output';
+      },
+    });
+    const cases = [
+      {
+        message: messageProxy,
+        reason: 'message_proxy',
+        path: 'message',
+      },
+      {
+        message: {
+          content: '',
+          additional_kwargs: metadataProxy,
+          getType: () => 'tool',
+        } as unknown as ToolMessage,
+        reason: 'metadata_proxy',
+        path: 'additional_kwargs',
+      },
+      {
+        message: {
+          content: '',
+          additional_kwargs: accessorMetadata,
+          getType: () => 'tool',
+        } as unknown as ToolMessage,
+        reason: 'metadata_accessor',
+        path: 'additional_kwargs.type',
+      },
+    ];
+
+    for (const testCase of cases) {
+      try {
+        getTokenCountForMessage(testCase.message, (text) => text.length);
+        throw new Error('Expected token measurement to fail');
+      } catch (error) {
+        expect(error).toBeInstanceOf(UnsafeTokenMeasurementError);
+        expect(JSON.parse((error as Error).message)).toEqual({
+          type: 'unsafe_token_measurement',
+          reason: testCase.reason,
+          path: testCase.path,
+        });
+        expect((error as Error).message).not.toContain('secret payload');
+      }
+    }
+    expect(getterCalls).toBe(0);
+  });
+
   test('detects inherited accessors without invoking them', () => {
     let accessorCalls = 0;
     const prototype = {};
