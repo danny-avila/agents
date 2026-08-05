@@ -102,6 +102,13 @@ function clonePartGenerationChunkPiece(
  * - passthrough: tool-call deltas, usage-only and metadata chunks — strict
  *   FIFO, zero delay.
  */
+/**
+ * google-common stamps `logprobs: { content: [] }` on every chunk, so only
+ * logprobs that actually carry data may block splitting here. This is looser
+ * than the OpenAI-family adapter in `llm/openai/index.ts`, which treats ANY
+ * logprobs as atomic (its providers only attach logprobs when requested, and
+ * the DeepSeek suite pins that contract) — do not unify the two predicates.
+ */
 function hasMeaningfulLogprobs(
   generationInfo: ChatGenerationChunk['generationInfo']
 ): boolean {

@@ -1139,6 +1139,10 @@ function getReasoningDeltaText(message: AIMessageChunk): string {
  * Classifies a generation chunk for the smoothing engine:
  * - splittable: plain visible text (string content equal to `chunk.text`, no
  *   logprobs / finish_reason) — sliced adaptively at the pacing cadence.
+ *   ANY logprobs value blocks splitting here (this family only attaches
+ *   logprobs on request; the DeepSeek suite pins chunks with them staying
+ *   intact) — deliberately stricter than `stream/chunkAdapters.ts`, where
+ *   google-common's always-present empty logprobs must not block.
  * - atomic: text- or reasoning-bearing chunks whose metadata cannot survive
  *   slicing — paced as one piece, never split (legacy parity: these were
  *   emitted whole but still paced).
