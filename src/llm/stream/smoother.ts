@@ -15,6 +15,7 @@ export const STREAM_BOUNDARIES: ReadonlySet<string> = new Set([
 ]);
 
 export const STREAM_ABORT_MESSAGE = 'AbortError: User aborted the request.';
+export const STREAM_PRODUCER_FAILURE = 'Stream producer failed.';
 
 /**
  * How long generator teardown waits for the background producer to observe a
@@ -25,9 +26,17 @@ export const STREAM_ABORT_MESSAGE = 'AbortError: User aborted the request.';
  */
 export const PRODUCER_CLOSE_GRACE_MS = 1000;
 
-/** Resolves a configured stream delay to its effective value (default 25ms; 0 disables smoothing). */
+/**
+ * Resolves a configured stream delay to its effective value (default 25ms;
+ * 0 disables smoothing). Non-finite inputs (NaN from a malformed config
+ * value, ±Infinity) normalize to the default rather than poisoning piece
+ * arithmetic downstream.
+ */
 export function resolveStreamDelay(delay?: number): number {
-  return Math.max(0, delay ?? DEFAULT_STREAM_DELAY);
+  if (delay == null || !Number.isFinite(delay)) {
+    return DEFAULT_STREAM_DELAY;
+  }
+  return Math.max(0, delay);
 }
 
 export function isSignalAborted(signal?: AbortSignal): boolean {
@@ -163,6 +172,7 @@ export type SmoothItem<TEmit> = {
 
 type ProducerState = {
   done: boolean;
+  failed: boolean;
   error?: unknown;
 };
 
@@ -194,7 +204,7 @@ export async function* smoothStream<TEmit>({
   signal?: AbortSignal;
   abortUpstream?: () => void;
 }): AsyncGenerator<TEmit> {
-  if (delayMs <= 0) {
+  if (!(delayMs > 0)) {
     /** Disabled smoothing preserves fully lazy streaming: no background
      * producer, no read-ahead — each provider chunk is pulled only when the
      * consumer asks, exactly like the pre-engine pass-through paths. */
@@ -209,7 +219,7 @@ export async function* smoothStream<TEmit>({
   }
 
   const queuedItems: QueuedSmoothItem<TEmit>[] = [];
-  const producerState: ProducerState = { done: false };
+  const producerState: ProducerState = { done: false, failed: false };
   let queuedItemIndex = 0;
   let bufferedTextLength = 0;
   let consumerClosed = false;
@@ -242,7 +252,7 @@ export async function* smoothStream<TEmit>({
     if (
       hasQueuedItems() ||
       producerState.done ||
-      producerState.error != null ||
+      producerState.failed ||
       isSignalAborted(signal)
     ) {
       return;
@@ -372,6 +382,7 @@ export async function* smoothStream<TEmit>({
         await enqueueSegmented(item);
       }
     } catch (error) {
+      producerState.failed = true;
       producerState.error = error;
     } finally {
       producerState.done = true;
@@ -382,6 +393,8 @@ export async function* smoothStream<TEmit>({
   let hasEmittedText = false;
   let lastVisibleTextAt: number | undefined;
   let drainTicksRemaining: number | undefined;
+  let current: QueuedSmoothItem<TEmit> | undefined;
+  let headOffset = 0;
   let keepStreaming = true;
   try {
     while (keepStreaming) {
@@ -389,12 +402,15 @@ export async function* smoothStream<TEmit>({
         throwAborted();
       }
 
-      await waitForNextItem();
-      const queuedItem = dequeue();
+      if (current == null) {
+        await waitForNextItem();
+        current = dequeue();
+        headOffset = 0;
+      }
 
-      if (!queuedItem) {
-        if (producerState.error != null) {
-          throw producerState.error;
+      if (current == null) {
+        if (producerState.failed) {
+          throw producerState.error ?? new Error(STREAM_PRODUCER_FAILURE);
         }
         if (producerState.done) {
           keepStreaming = false;
@@ -402,11 +418,11 @@ export async function* smoothStream<TEmit>({
         continue;
       }
 
-      const { item } = queuedItem;
-      const isSmooth = item.smooth;
+      const { item } = current;
 
-      if (!isSmooth) {
+      if (!item.smooth) {
         notifyProducerForSpace();
+        current = undefined;
         yield item.emit({ text: item.text, isFirst: true, isLast: true });
         continue;
       }
@@ -414,63 +430,121 @@ export async function* smoothStream<TEmit>({
       if (item.text === '') {
         bufferedTextLength = Math.max(
           0,
-          bufferedTextLength - queuedItem.textLength
+          bufferedTextLength - current.textLength
         );
         notifyProducerForSpace();
+        current = undefined;
         continue;
       }
 
-      let headOffset = 0;
-      while (headOffset < item.text.length) {
-        const remainingText = item.text.slice(headOffset);
-        /** Once the producer is done the backlog is final: drain it linearly
-         * across the remaining target window instead of letting the
-         * proportional formula decay geometrically and stretch the tail. */
-        if (producerState.done && drainTicksRemaining == null) {
-          drainTicksRemaining = Math.max(
-            1,
-            Math.floor(SMOOTH_TARGET_LATENCY_MS / delayMs)
-          );
-        }
-        const targetPieceSize =
-          drainTicksRemaining != null
-            ? Math.max(
-              STREAM_CHUNK_MIN_SIZE,
-              Math.ceil(bufferedTextLength / drainTicksRemaining)
-            )
-            : computeAdaptivePieceSize(bufferedTextLength, delayMs);
-        if (drainTicksRemaining != null && drainTicksRemaining > 1) {
-          drainTicksRemaining -= 1;
-        }
-        const pieceLength =
-          item.atomic === true
-            ? remainingText.length
-            : findStreamChunkBoundary(remainingText, targetPieceSize);
-        const pieceEnd = headOffset + pieceLength;
-        const piece = item.text.slice(headOffset, pieceEnd);
-
-        bufferedTextLength = Math.max(0, bufferedTextLength - piece.length);
-        notifyProducerForSpace();
-        await waitForStreamDelay(
-          getCadencedStreamDelay({
-            targetDelay: hasEmittedText ? delayMs : 0,
-            lastVisibleTextAt,
-            now: Date.now(),
-          }),
-          signal
+      /** Once the producer is done the backlog is final: drain it linearly
+       * across the remaining target window instead of letting the
+       * proportional formula decay geometrically and stretch the tail. */
+      if (producerState.done && drainTicksRemaining == null) {
+        drainTicksRemaining = Math.max(
+          1,
+          Math.floor(SMOOTH_TARGET_LATENCY_MS / delayMs)
         );
+      }
+      const tickBudget =
+        drainTicksRemaining != null
+          ? Math.max(
+            STREAM_CHUNK_MIN_SIZE,
+            Math.ceil(bufferedTextLength / drainTicksRemaining)
+          )
+          : computeAdaptivePieceSize(bufferedTextLength, delayMs);
+      if (drainTicksRemaining != null && drainTicksRemaining > 1) {
+        drainTicksRemaining -= 1;
+      }
+
+      await waitForStreamDelay(
+        getCadencedStreamDelay({
+          targetDelay: hasEmittedText ? delayMs : 0,
+          lastVisibleTextAt,
+          now: Date.now(),
+        }),
+        signal
+      );
+      if (isSignalAborted(signal)) {
+        throwAborted();
+      }
+      hasEmittedText = true;
+      lastVisibleTextAt = Date.now();
+
+      if (item.atomic === true) {
+        bufferedTextLength = Math.max(
+          0,
+          bufferedTextLength - current.textLength
+        );
+        notifyProducerForSpace();
+        current = undefined;
+        yield item.emit({ text: item.text, isFirst: true, isLast: true });
+        continue;
+      }
+
+      /** One cadence tick drains up to the adaptive budget ACROSS queued
+       * items, so token-sized provider deltas coalesce instead of costing a
+       * full tick each; passthrough items flush free mid-batch (FIFO), and
+       * atomic items end the batch to take their own tick. */
+      let consumed = 0;
+      while (consumed < tickBudget) {
         if (isSignalAborted(signal)) {
           throwAborted();
         }
-        hasEmittedText = true;
-        lastVisibleTextAt = Date.now();
+        if (current == null) {
+          if (!hasQueuedItems()) {
+            break;
+          }
+          current = dequeue();
+          headOffset = 0;
+          if (current == null) {
+            break;
+          }
+        }
 
-        yield item.emit({
-          text: piece,
-          isFirst: headOffset === 0,
-          isLast: pieceEnd === item.text.length,
-        });
-        headOffset = pieceEnd;
+        const batchItem = current.item;
+        if (!batchItem.smooth) {
+          notifyProducerForSpace();
+          current = undefined;
+          yield batchItem.emit({
+            text: batchItem.text,
+            isFirst: true,
+            isLast: true,
+          });
+          continue;
+        }
+        if (batchItem.text === '') {
+          bufferedTextLength = Math.max(
+            0,
+            bufferedTextLength - current.textLength
+          );
+          notifyProducerForSpace();
+          current = undefined;
+          continue;
+        }
+        if (batchItem.atomic === true) {
+          break;
+        }
+
+        const remainingText = batchItem.text.slice(headOffset);
+        const pieceLength = findStreamChunkBoundary(
+          remainingText,
+          tickBudget - consumed
+        );
+        const pieceEnd = headOffset + pieceLength;
+        const piece = batchItem.text.slice(headOffset, pieceEnd);
+        const isFirst = headOffset === 0;
+        const isLast = pieceEnd === batchItem.text.length;
+
+        bufferedTextLength = Math.max(0, bufferedTextLength - piece.length);
+        notifyProducerForSpace();
+        if (isLast) {
+          current = undefined;
+        } else {
+          headOffset = pieceEnd;
+        }
+        consumed += piece.length;
+        yield batchItem.emit({ text: piece, isFirst, isLast });
       }
     }
   } finally {

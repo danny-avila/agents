@@ -170,6 +170,50 @@ export function hasReasoningKwargs(message: AIMessageChunk): boolean {
   return kwargs.reasoning != null;
 }
 
+/**
+ * Extracts the visible reasoning text a kwargs-borne delta contributes, so
+ * reasoning-only chunks (Gemini thoughts, DeepSeek reasoning_content,
+ * OpenAI reasoning summaries, OpenRouter reasoning_details) pace atomically
+ * at the cadence instead of passing through unsmoothed.
+ */
+export function getReasoningKwargsText(message: AIMessageChunk): string {
+  const kwargs = message.additional_kwargs;
+  if (
+    typeof kwargs.reasoning_content === 'string' &&
+    kwargs.reasoning_content !== ''
+  ) {
+    return kwargs.reasoning_content;
+  }
+  const reasoning = kwargs.reasoning;
+  if (typeof reasoning === 'string' && reasoning !== '') {
+    return reasoning;
+  }
+  if (reasoning != null && typeof reasoning === 'object') {
+    const summaryText = (
+      reasoning as { summary?: { text?: unknown }[] }
+    ).summary?.[0]?.text;
+    if (typeof summaryText === 'string' && summaryText !== '') {
+      return summaryText;
+    }
+  }
+  const details = kwargs.reasoning_details;
+  if (Array.isArray(details)) {
+    let text = '';
+    for (const detail of details) {
+      if (detail != null && typeof detail === 'object') {
+        const detailText = (detail as { text?: unknown }).text;
+        if (typeof detailText === 'string') {
+          text += detailText;
+        }
+      }
+    }
+    if (text !== '') {
+      return text;
+    }
+  }
+  return '';
+}
+
 export function toGenerationSmoothItem(
   chunk: ChatGenerationChunk,
   getAtomicText?: (message: AIMessageChunk) => string
@@ -249,7 +293,7 @@ export async function* smoothGenerationChunks({
     SmoothItem<ChatGenerationChunk>
     > {
     for await (const chunk of chunks) {
-      yield toGenerationSmoothItem(chunk);
+      yield toGenerationSmoothItem(chunk, getReasoningKwargsText);
     }
   })();
 

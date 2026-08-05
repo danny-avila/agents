@@ -60,7 +60,11 @@ import {
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
-import { hasReasoningKwargs, hasToolCallChunks } from '@/llm/stream/chunkAdapters';
+import {
+  hasReasoningKwargs,
+  hasToolCallChunks,
+  getReasoningKwargsText,
+} from '@/llm/stream/chunkAdapters';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
@@ -1114,25 +1118,6 @@ function getCustomOpenAIClientOptions(
   return requestOptions;
 }
 
-function getReasoningDeltaText(message: AIMessageChunk): string {
-  const kwargs = message.additional_kwargs;
-  if (
-    typeof kwargs.reasoning_content === 'string' &&
-    kwargs.reasoning_content !== ''
-  ) {
-    return kwargs.reasoning_content;
-  }
-  if (kwargs.reasoning != null) {
-    const summaryText = (
-      kwargs.reasoning as Partial<t.ChatOpenAIReasoningSummary> | undefined
-    )?.summary?.[0]?.text;
-    if (typeof summaryText === 'string' && summaryText !== '') {
-      return summaryText;
-    }
-  }
-  return '';
-}
-
 /**
  * Classifies a generation chunk for the smoothing engine:
  * - splittable: plain visible text (string content equal to `chunk.text`, no
@@ -1173,7 +1158,7 @@ function toSmoothItem(chunk: ChatGenerationChunk): SmoothItem<ChatGenerationChun
   }
 
   const pacedText =
-    chunk.text || (isMessageChunk ? getReasoningDeltaText(message) : '');
+    chunk.text || (isMessageChunk ? getReasoningKwargsText(message) : '');
   if (pacedText !== '') {
     return {
       text: pacedText,

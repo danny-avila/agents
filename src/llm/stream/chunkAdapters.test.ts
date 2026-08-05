@@ -2,6 +2,7 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import {
   toGenerationSmoothItem,
+  getReasoningKwargsText,
   cloneGenerationChunkPiece,
 } from './chunkAdapters';
 
@@ -87,6 +88,39 @@ describe('toGenerationSmoothItem classification', () => {
     expect(item.emit({ text: item.text, isFirst: true, isLast: true })).toBe(
       chunk
     );
+  });
+
+  it('paces reasoning-only chunks atomically via the kwargs extractor', () => {
+    const thoughtOnly = new ChatGenerationChunk({
+      text: '',
+      message: new AIMessageChunk({
+        content: '',
+        additional_kwargs: { reasoning: 'a hidden gemini thought' },
+      }),
+    });
+    const item = toGenerationSmoothItem(thoughtOnly, getReasoningKwargsText);
+    expect(item.smooth).toBe(true);
+    expect(item.atomic).toBe(true);
+    expect(item.text).toBe('a hidden gemini thought');
+  });
+
+  it('paces reasoning_details-only chunks atomically via the kwargs extractor', () => {
+    const detailsOnly = new ChatGenerationChunk({
+      text: '',
+      message: new AIMessageChunk({
+        content: '',
+        additional_kwargs: {
+          reasoning_details: [
+            { type: 'reasoning.text', text: 'first thought ' },
+            { type: 'reasoning.text', text: 'second thought' },
+          ],
+        },
+      }),
+    });
+    const item = toGenerationSmoothItem(detailsOnly, getReasoningKwargsText);
+    expect(item.smooth).toBe(true);
+    expect(item.atomic).toBe(true);
+    expect(item.text).toBe('first thought second thought');
   });
 
   it('classifies usage-only chunks as passthrough', () => {

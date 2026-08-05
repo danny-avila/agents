@@ -63,6 +63,13 @@ describe('resolveStreamDelay', () => {
     expect(resolveStreamDelay(0)).toBe(0);
     expect(resolveStreamDelay(-5)).toBe(0);
   });
+
+  it('normalizes non-finite values to the default', () => {
+    expect(resolveStreamDelay(Number.NaN)).toBe(DEFAULT_STREAM_DELAY);
+    expect(resolveStreamDelay(Number.POSITIVE_INFINITY)).toBe(
+      DEFAULT_STREAM_DELAY
+    );
+  });
 });
 
 describe('computeAdaptivePieceSize', () => {
@@ -253,6 +260,36 @@ describe('smoothStream', () => {
     expect(pieces[0].isFirst).toBe(true);
     expect(pieces[0].isLast).toBe(true);
     expect(Date.now() - start).toBeLessThan(50);
+  });
+
+  it('coalesces token-sized items so backlog drains within the target window', async () => {
+    const tick = 10;
+    const items = Array.from({ length: 400 }, (_, i) =>
+      makeItem(`t${i}`, i % 5 === 4 ? 'x ' : 'x', true)
+    );
+    const expected = items.map((i) => i.text).join('');
+
+    const start = Date.now();
+    const pieces = await collect(
+      smoothStream({ source: arraySource(items), delayMs: tick })
+    );
+    const elapsed = Date.now() - start;
+
+    expect(pieces.map((p) => p.text).join('')).toBe(expected);
+    expect(elapsed).toBeLessThan(2000);
+    const tags = pieces.map((p) => p.tag);
+    expect(tags).toEqual([...tags].sort((a, b) => Number(a.slice(1)) - Number(b.slice(1))));
+  });
+
+  it('rethrows a producer failure even when the rejection value is nullish', async () => {
+    async function* failingSource(): AsyncGenerator<SmoothItem<Emitted>> {
+      yield makeItem('a', 'some text ', true);
+      throw undefined;
+    }
+
+    await expect(
+      collect(smoothStream({ source: failingSource(), delayMs: 1 }))
+    ).rejects.toThrow('Stream producer failed.');
   });
 
   it('stays fully lazy when smoothing is disabled', async () => {
