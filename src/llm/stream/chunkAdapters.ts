@@ -1,0 +1,207 @@
+import { AIMessageChunk } from '@langchain/core/messages';
+import { ChatGenerationChunk } from '@langchain/core/outputs';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { SmoothItem, SmoothPiece } from '@/llm/stream/smoother';
+import { smoothStream } from '@/llm/stream/smoother';
+
+/**
+ * Rebuilds a generation chunk carrying one piece of a split plain-text chunk.
+ * Unsplit pieces return the original chunk untouched, so disabled smoothing is
+ * byte-identical to no smoothing. Usage metadata survives only on the first
+ * piece to avoid double counting downstream.
+ */
+export function cloneGenerationChunkPiece(
+  chunk: ChatGenerationChunk,
+  piece: SmoothPiece
+): ChatGenerationChunk {
+  if (piece.isFirst && piece.isLast) {
+    return chunk;
+  }
+  const message = chunk.message as AIMessageChunk;
+  const usageMetadata = piece.isFirst ? message.usage_metadata : undefined;
+  return new ChatGenerationChunk({
+    text: piece.text,
+    generationInfo: chunk.generationInfo,
+    message: new AIMessageChunk(
+      Object.assign({}, message, {
+        content: piece.text,
+        usage_metadata: usageMetadata,
+      })
+    ),
+  });
+}
+
+const SPLITTABLE_TEXT_PART_KEYS: ReadonlySet<string> = new Set([
+  'type',
+  'text',
+  'index',
+]);
+
+/**
+ * Returns the sole plain text part of a single-element complex content array
+ * (the shape google-common emits for text deltas), or null when the part
+ * carries anything beyond `type`/`text`/`index` (thought signatures, media,
+ * function calls) and must not be sliced.
+ */
+function getSplittableTextPart(
+  message: AIMessageChunk,
+  chunkText: string
+): Record<string, unknown> | null {
+  const content = message.content;
+  if (!Array.isArray(content) || content.length !== 1) {
+    return null;
+  }
+  const part = content[0];
+  if (part == null || typeof part !== 'object') {
+    return null;
+  }
+  const record = part as Record<string, unknown>;
+  if (typeof record.text !== 'string' || record.text !== chunkText) {
+    return null;
+  }
+  if (record.type != null && record.type !== 'text') {
+    return null;
+  }
+  if (!Object.keys(record).every((key) => SPLITTABLE_TEXT_PART_KEYS.has(key))) {
+    return null;
+  }
+  return record;
+}
+
+function clonePartGenerationChunkPiece(
+  chunk: ChatGenerationChunk,
+  part: Record<string, unknown>,
+  piece: SmoothPiece
+): ChatGenerationChunk {
+  if (piece.isFirst && piece.isLast) {
+    return chunk;
+  }
+  const message = chunk.message as AIMessageChunk;
+  const usageMetadata = piece.isFirst ? message.usage_metadata : undefined;
+  return new ChatGenerationChunk({
+    text: piece.text,
+    generationInfo: chunk.generationInfo,
+    message: new AIMessageChunk(
+      Object.assign({}, message, {
+        content: [Object.assign({}, part, { text: piece.text })],
+        usage_metadata: usageMetadata,
+      })
+    ),
+  });
+}
+
+/**
+ * Provider-agnostic classification of a `ChatGenerationChunk` for the
+ * smoothing engine:
+ * - splittable: plain visible text — string content equal to `chunk.text`, or
+ *   a single plain text part (google-common's delta shape) — with no
+ *   logprobs / finish_reason; sliced adaptively at the pacing cadence.
+ * - atomic: any other text-bearing chunk (complex content arrays, logprobs,
+ *   finish_reason, provider-specific reasoning payloads surfaced via
+ *   `getAtomicText`) — paced as one piece, never split.
+ * - passthrough: tool-call deltas, usage-only and metadata chunks — strict
+ *   FIFO, zero delay.
+ */
+function hasMeaningfulLogprobs(
+  generationInfo: ChatGenerationChunk['generationInfo']
+): boolean {
+  const logprobs = generationInfo?.logprobs;
+  if (logprobs == null) {
+    return false;
+  }
+  const content = (logprobs as { content?: unknown }).content;
+  if (Array.isArray(content)) {
+    return content.length > 0;
+  }
+  return true;
+}
+
+export function toGenerationSmoothItem(
+  chunk: ChatGenerationChunk,
+  getAtomicText?: (message: AIMessageChunk) => string
+): SmoothItem<ChatGenerationChunk> {
+  const { message } = chunk;
+  const isMessageChunk = message instanceof AIMessageChunk;
+  const cleanGenerationInfo =
+    !hasMeaningfulLogprobs(chunk.generationInfo) &&
+    chunk.generationInfo?.finish_reason == null;
+  const splittable =
+    Boolean(chunk.text) &&
+    isMessageChunk &&
+    typeof message.content === 'string' &&
+    message.content === chunk.text &&
+    cleanGenerationInfo;
+
+  if (splittable) {
+    return {
+      text: chunk.text,
+      smooth: true,
+      emit: (piece) => cloneGenerationChunkPiece(chunk, piece),
+    };
+  }
+
+  const splittablePart =
+    Boolean(chunk.text) && isMessageChunk && cleanGenerationInfo
+      ? getSplittableTextPart(message, chunk.text)
+      : null;
+  if (splittablePart != null) {
+    return {
+      text: chunk.text,
+      smooth: true,
+      emit: (piece) =>
+        clonePartGenerationChunkPiece(chunk, splittablePart, piece),
+    };
+  }
+
+  const pacedText =
+    chunk.text ||
+    (isMessageChunk && getAtomicText != null ? getAtomicText(message) : '');
+  if (pacedText !== '') {
+    return {
+      text: pacedText,
+      smooth: true,
+      atomic: true,
+      emit: () => chunk,
+    };
+  }
+
+  return { text: '', smooth: false, emit: () => chunk };
+}
+
+/**
+ * Wraps a provider's raw chunk stream with adaptive smoothing and per-piece
+ * `handleLLMNewToken` dispatch. The raw stream must NOT dispatch runManager
+ * callbacks itself — callback-echo consumers would otherwise observe the
+ * unsmoothed deltas.
+ */
+export async function* smoothGenerationChunks({
+  chunks,
+  delayMs,
+  signal,
+  runManager,
+}: {
+  chunks: AsyncGenerator<ChatGenerationChunk>;
+  delayMs: number;
+  signal?: AbortSignal;
+  runManager?: CallbackManagerForLLMRun;
+}): AsyncGenerator<ChatGenerationChunk> {
+  const source = (async function* (): AsyncGenerator<
+    SmoothItem<ChatGenerationChunk>
+  > {
+    for await (const chunk of chunks) {
+      yield toGenerationSmoothItem(chunk);
+    }
+  })();
+
+  for await (const outputChunk of smoothStream({ source, delayMs, signal })) {
+    yield outputChunk;
+    await runManager?.handleLLMNewToken(
+      outputChunk.text || '',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { chunk: outputChunk }
+    );
+  }
+}

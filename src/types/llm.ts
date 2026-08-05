@@ -79,47 +79,63 @@ export type ManagedRequestOptions = {
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
 };
-export type OpenAIClientOptions = ChatOpenAIFields & ManagedRequestOptions;
-export type AnthropicClientOptions = Omit<AnthropicInput, 'thinking'> & {
-  thinking?: ThinkingConfig;
-  promptCache?: boolean;
-  /**
-   * Prompt-cache breakpoint TTL. Defaults to `'1h'` (extended cache) when
-   * `promptCache` is enabled; set `'5m'` to opt back into the legacy
-   * 5-minute behavior.
-   */
-  promptCacheTtl?: PromptCacheTtl;
-};
-export type MistralAIClientOptions = ChatMistralAIInput;
-export type VertexAIClientOptions = ChatVertexAIInput & {
-  includeThoughts?: boolean;
-  thinkingConfig?: GoogleThinkingConfig;
-};
-export type BedrockAnthropicInput = ChatBedrockConverseInput & {
-  additionalModelRequestFields?: ChatBedrockConverseInput['additionalModelRequestFields'] &
-    AnthropicReasoning;
-  promptCache?: boolean;
-  /**
-   * Prompt-cache checkpoint TTL. Defaults to `'1h'` (extended cache) when
-   * `promptCache` is enabled; set `'5m'` to opt into the legacy 5-minute
-   * behavior. Bedrock models that don't support the 1-hour TTL downgrade to 5m
-   * server-side, so the default is safe to leave on.
-   */
-  promptCacheTtl?: PromptCacheTtl;
+/**
+ * Adaptive stream-smoothing configuration shared by every provider client.
+ */
+export type StreamSmoothingOptions = {
   /**
    * Minimum delay in milliseconds between visible streamed content deltas.
+   * Defaults to 25; piece sizes adapt to the backlog so render lag stays
+   * bounded regardless of provider chunk size. Set 0 to disable smoothing.
    */
   _lc_stream_delay?: number;
 };
+
+export type OpenAIClientOptions = ChatOpenAIFields &
+  ManagedRequestOptions &
+  StreamSmoothingOptions;
+export type AnthropicClientOptions = Omit<AnthropicInput, 'thinking'> &
+  StreamSmoothingOptions & {
+    thinking?: ThinkingConfig;
+    promptCache?: boolean;
+    /**
+     * Prompt-cache breakpoint TTL. Defaults to `'1h'` (extended cache) when
+     * `promptCache` is enabled; set `'5m'` to opt back into the legacy
+     * 5-minute behavior.
+     */
+    promptCacheTtl?: PromptCacheTtl;
+  };
+export type MistralAIClientOptions = ChatMistralAIInput &
+  StreamSmoothingOptions;
+export type VertexAIClientOptions = ChatVertexAIInput &
+  StreamSmoothingOptions & {
+    includeThoughts?: boolean;
+    thinkingConfig?: GoogleThinkingConfig;
+  };
+export type BedrockAnthropicInput = ChatBedrockConverseInput &
+  StreamSmoothingOptions & {
+    additionalModelRequestFields?: ChatBedrockConverseInput['additionalModelRequestFields'] &
+      AnthropicReasoning;
+    promptCache?: boolean;
+    /**
+     * Prompt-cache checkpoint TTL. Defaults to `'1h'` (extended cache) when
+     * `promptCache` is enabled; set `'5m'` to opt into the legacy 5-minute
+     * behavior. Bedrock models that don't support the 1-hour TTL downgrade to 5m
+     * server-side, so the default is safe to leave on.
+     */
+    promptCacheTtl?: PromptCacheTtl;
+  };
 export type BedrockConverseClientOptions = BedrockAnthropicInput;
 export type BedrockAnthropicClientOptions = BedrockAnthropicInput;
-export type GoogleClientOptions = GoogleGenerativeAIChatInput & {
-  customHeaders?: RequestOptions['customHeaders'];
-  thinkingConfig?: GoogleThinkingConfig;
-  includeServerSideToolInvocations?: boolean;
-};
-export type DeepSeekClientOptions = Partial<ChatDeepSeekInput>;
-export type XAIClientOptions = ChatXAIInput;
+export type GoogleClientOptions = GoogleGenerativeAIChatInput &
+  StreamSmoothingOptions & {
+    customHeaders?: RequestOptions['customHeaders'];
+    thinkingConfig?: GoogleThinkingConfig;
+    includeServerSideToolInvocations?: boolean;
+  };
+export type DeepSeekClientOptions = Partial<ChatDeepSeekInput> &
+  StreamSmoothingOptions;
+export type XAIClientOptions = ChatXAIInput & StreamSmoothingOptions;
 
 export type ClientOptions =
   | OpenAIClientOptions

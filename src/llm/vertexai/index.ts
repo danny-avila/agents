@@ -16,6 +16,8 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
+import { smoothGenerationChunks } from '@/llm/stream/chunkAdapters';
+import { resolveStreamDelay } from '@/llm/stream/smoother';
 
 /**
  * `@langchain/google-common`'s `_streamResponseChunks` emits usage on TWO
@@ -474,6 +476,7 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
  */
 export class ChatVertexAI extends ChatGoogle {
   lc_namespace = ['langchain', 'chat_models', 'vertexai'];
+  _lc_stream_delay: number;
   dynamicThinkingBudget = false;
   thinkingConfig?: GoogleThinkingConfig;
 
@@ -498,6 +501,7 @@ export class ChatVertexAI extends ChatGoogle {
     });
     this.dynamicThinkingBudget = dynamicThinkingBudget;
     this.thinkingConfig = fields?.thinkingConfig;
+    this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
   }
   invocationParams(
     options?: this['ParsedCallOptions'] | undefined
@@ -513,11 +517,23 @@ export class ChatVertexAI extends ChatGoogle {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
+    yield* smoothGenerationChunks({
+      chunks: this._streamRepairedChunks(messages, options),
+      delayMs: this._lc_stream_delay,
+      signal: options.signal,
+      runManager,
+    });
+  }
+
+  private async *_streamRepairedChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions']
+  ): AsyncGenerator<ChatGenerationChunk> {
     let lastGoodUsage: UsageMetadata | undefined;
     for await (const chunk of super._streamResponseChunks(
       messages,
       options,
-      runManager
+      undefined
     )) {
       const genUsage = (
         chunk.generationInfo as { usage_metadata?: UsageMetadata } | undefined
