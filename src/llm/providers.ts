@@ -1,5 +1,5 @@
 // src/llm/providers.ts
-import { ChatMistralAI } from '@langchain/mistralai';
+import { CustomChatMistralAI } from '@/llm/mistral';
 import type {
   ChatModelConstructorMap,
   ProviderOptionsMap,
@@ -25,8 +25,8 @@ export const llmProviders: Partial<ChatModelConstructorMap> = {
   [Providers.AZURE]: AzureChatOpenAI,
   [Providers.VERTEXAI]: ChatVertexAI,
   [Providers.DEEPSEEK]: ChatDeepSeek,
-  [Providers.MISTRALAI]: ChatMistralAI,
-  [Providers.MISTRAL]: ChatMistralAI,
+  [Providers.MISTRALAI]: CustomChatMistralAI,
+  [Providers.MISTRAL]: CustomChatMistralAI,
   [Providers.ANTHROPIC]: CustomAnthropic,
   [Providers.OPENROUTER]: ChatOpenRouter,
   [Providers.BEDROCK]: CustomChatBedrockConverse,
