@@ -33,6 +33,7 @@ import {
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, ResponseMetadata } from '@langchain/core/messages';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
+import type { SmoothItem } from '@/llm/stream/smoother';
 import type { ContentBlockDeltaEvent } from './types';
 import {
   convertToConverseMessages,
@@ -46,6 +47,7 @@ import {
   supportsBedrockToolCache,
   type PromptCacheTtl,
 } from '@/messages/cache';
+import { smoothStream, resolveStreamDelay, isSignalAborted } from '@/llm/stream/smoother';
 import { linkStreamLimitCanonical } from '@/llm/streamLimits';
 import { applyCachePointsToConversePayload } from './cachePoints';
 import { insertBedrockToolCachePoint } from './toolCache';
@@ -60,49 +62,11 @@ export type ServiceTierType = 'priority' | 'default' | 'flex' | 'reserved';
 export type CustomGuardrailConfiguration = GuardrailConfiguration &
   Pick<GuardrailStreamConfiguration, 'streamProcessingMode'>;
 
-const MAX_STREAM_QUEUE_CHUNKS = 256;
-const MAX_STREAM_QUEUE_TEXT_CHARS = 8192;
-const STREAM_CHUNK_MIN_SIZE = 4;
-const STREAM_BOUNDARIES = new Set([' ', '.', ',', '!', '?', ';', ':']);
-
-type QueuedGenerationChunk = {
+type BedrockEmittedChunk = {
   chunk: ChatGenerationChunk;
   callbackChunk?: ChatGenerationChunk;
   callbackToken: string;
-  smooth: boolean;
-  textLength: number;
 };
-
-function findStreamChunkBoundary(text: string, minSize: number): number {
-  if (minSize >= text.length) {
-    return text.length;
-  }
-
-  for (let position = minSize; position < text.length; position++) {
-    if (STREAM_BOUNDARIES.has(text[position])) {
-      return position + 1;
-    }
-  }
-
-  return text.length;
-}
-
-function splitStreamToken(text: string): string[] {
-  const chunks: string[] = [];
-  let currentIndex = 0;
-
-  while (currentIndex < text.length) {
-    const remainingText = text.slice(currentIndex);
-    const chunkSize = findStreamChunkBoundary(
-      remainingText,
-      STREAM_CHUNK_MIN_SIZE
-    );
-    chunks.push(text.slice(currentIndex, currentIndex + chunkSize));
-    currentIndex += chunkSize;
-  }
-
-  return chunks;
-}
 
 /**
  * Resolves the text a delta contributes to the smoothing cadence, preferring a
@@ -120,51 +84,6 @@ function resolveVisibleText(text?: string, reasoningText?: string): string {
   return '';
 }
 
-function getCadencedStreamDelay({
-  targetDelay,
-  lastVisibleContentAt,
-  now,
-}: {
-  targetDelay: number;
-  lastVisibleContentAt?: number;
-  now: number;
-}): number {
-  if (targetDelay <= 0 || lastVisibleContentAt == null) {
-    return 0;
-  }
-  return Math.max(0, targetDelay - (now - lastVisibleContentAt));
-}
-
-async function waitForStreamDelay(
-  delay: number,
-  signal?: AbortSignal
-): Promise<void> {
-  if (delay <= 0 || isSignalAborted(signal)) {
-    return;
-  }
-  await new Promise<void>((resolve) => {
-    const timeoutRef: { current?: ReturnType<typeof setTimeout> } = {};
-    const onAbort = (): void => {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    };
-    timeoutRef.current = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, delay);
-    signal?.addEventListener('abort', onAbort, { once: true });
-    if (isSignalAborted(signal)) {
-      onAbort();
-    }
-  });
-}
-
-function isSignalAborted(signal?: AbortSignal): boolean {
-  return signal?.aborted === true;
-}
 
 /**
  * Extended input interface with additional features:
@@ -267,7 +186,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     super(fields);
     this.promptCache = fields?.promptCache;
     this.promptCacheTtl = fields?.promptCacheTtl;
-    this._lc_stream_delay = Math.max(0, fields?._lc_stream_delay ?? 0);
+    this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     this.applicationInferenceProfile = fields?.applicationInferenceProfile;
     this.serviceTier = fields?.serviceTier;
     // `super(fields)` initializes `this.model` to LangChain's default Claude
@@ -398,15 +317,6 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
 
       const seenBlockIndices = new Set<number>();
       const toolUseBlockIndices = new Set<number>();
-      const queuedChunks: QueuedGenerationChunk[] = [];
-      const producerState: { done: boolean; error?: unknown } = { done: false };
-      let queuedChunkIndex = 0;
-      let bufferedTextLength = 0;
-      let consumerClosed = false;
-      let notifyConsumer: (() => void) | undefined;
-      let notifyProducer: (() => void) | undefined;
-      let hasEmittedVisibleContent = false;
-      let lastVisibleContentAt: number | undefined;
 
       /**
        * Guardrails can reject an already-streamed toolUse block at
@@ -417,325 +327,200 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
       const sealToolUseOnStop =
         options.guardrailConfig == null && this.guardrailConfig == null;
 
-      const notifyConsumerForChunk = (): void => {
-        notifyConsumer?.();
-        notifyConsumer = undefined;
-      };
-
-      const notifyProducerForSpace = (): void => {
-        notifyProducer?.();
-        notifyProducer = undefined;
-      };
-
-      const hasQueuedChunks = (): boolean =>
-        queuedChunkIndex < queuedChunks.length;
-
-      const getQueuedChunkCount = (): number =>
-        queuedChunks.length - queuedChunkIndex;
-
-      const isQueueAtCapacity = (): boolean =>
-        getQueuedChunkCount() >= MAX_STREAM_QUEUE_CHUNKS ||
-        bufferedTextLength >= MAX_STREAM_QUEUE_TEXT_CHARS;
-
-      const waitForNextChunk = async (): Promise<void> => {
-        if (
-          hasQueuedChunks() ||
-          producerState.done ||
-          producerState.error != null
-        ) {
-          return;
-        }
-        await new Promise<void>((resolve) => {
-          notifyConsumer = resolve;
-        });
-      };
-
-      const waitForQueueSpace = async (): Promise<void> => {
-        while (
-          isQueueAtCapacity() &&
-          !consumerClosed &&
-          !isSignalAborted(options.signal)
-        ) {
-          await new Promise<void>((resolve) => {
-            const signal = options.signal;
-            const onAbort = (): void => {
-              signal?.removeEventListener('abort', onAbort);
-              resolve();
-            };
-            const onSpace = (): void => {
-              signal?.removeEventListener('abort', onAbort);
-              resolve();
-            };
-            notifyProducer = onSpace;
-            signal?.addEventListener('abort', onAbort, { once: true });
-            if (isSignalAborted(signal)) {
-              onAbort();
-            }
-          });
-        }
-      };
-
-      const dequeue = (): QueuedGenerationChunk | undefined => {
-        if (!hasQueuedChunks()) {
-          return undefined;
-        }
-        const queuedChunk = queuedChunks[queuedChunkIndex];
-        queuedChunkIndex++;
-        if (
-          queuedChunkIndex > 128 &&
-          queuedChunkIndex * 2 >= queuedChunks.length
-        ) {
-          queuedChunks.splice(0, queuedChunkIndex);
-          queuedChunkIndex = 0;
-        }
-        return queuedChunk;
-      };
-
-      const enqueue = async (
-        queuedChunk: QueuedGenerationChunk
-      ): Promise<void> => {
-        await waitForQueueSpace();
-        if (consumerClosed || isSignalAborted(options.signal)) {
-          abortStream();
-          throw new Error('AbortError: User aborted the request.');
-        }
-        queuedChunks.push(queuedChunk);
-        if (queuedChunk.smooth) {
-          bufferedTextLength += queuedChunk.textLength;
-        }
-        notifyConsumerForChunk();
-      };
-
-      const enqueueChunk = async ({
-        chunk,
-        callbackChunk,
-        callbackToken = '',
-        smooth = false,
-        textLength = 0,
-      }: {
-        chunk: ChatGenerationChunk;
-        callbackChunk?: ChatGenerationChunk;
-        callbackToken?: string;
-        smooth?: boolean;
-        textLength?: number;
-      }): Promise<void> => {
-        await enqueue({
-          chunk,
-          callbackChunk,
-          callbackToken,
-          smooth,
-          textLength: smooth ? textLength : 0,
-        });
-      };
-
-      const enqueueDelta = async (
-        contentBlockDelta: ContentBlockDeltaEvent
-      ): Promise<void> => {
+      /**
+       * Builds the emission for one piece of a delta, reproducing the exact
+       * per-piece pipeline (sliced delta → chunk → enrichment → stream-limit
+       * link). `indicesSnapshot` is the arrival-time copy of the seen block
+       * indices, so lazily emitted pieces observe the same enrichment
+       * decisions the delta saw when it arrived.
+       */
+      const buildDeltaEmission = (
+        contentBlockDelta: ContentBlockDeltaEvent,
+        token: string,
+        indicesSnapshot: Set<number>
+      ): BedrockEmittedChunk => {
         const delta = contentBlockDelta.delta;
-        if (delta == null) {
-          throw new Error('No delta found in content block.');
-        }
-
-        const idx = contentBlockDelta.contentBlockIndex;
-        if (idx != null) {
-          seenBlockIndices.add(idx);
-        }
-
-        const text = delta.text;
-        const reasoningContent = delta.reasoningContent;
+        const text = delta?.text;
+        const reasoningContent = delta?.reasoningContent;
         const reasoningText = reasoningContent?.text;
-        const visibleText = resolveVisibleText(text, reasoningText);
-        const smooth = this._lc_stream_delay > 0 && visibleText !== '';
-        const tokenChunks = smooth
-          ? splitStreamToken(visibleText)
-          : [visibleText];
 
-        for (const token of tokenChunks) {
-          let splitDelta = contentBlockDelta;
-          if (typeof text === 'string') {
-            splitDelta = {
-              ...contentBlockDelta,
-              delta: { text: token },
-            };
-          } else if (
-            typeof reasoningText === 'string' &&
-            reasoningContent != null
-          ) {
-            splitDelta = {
-              ...contentBlockDelta,
-              delta: {
-                reasoningContent: {
-                  ...reasoningContent,
-                  text: token,
-                },
+        let splitDelta = contentBlockDelta;
+        if (typeof text === 'string') {
+          splitDelta = {
+            ...contentBlockDelta,
+            delta: { text: token },
+          };
+        } else if (
+          typeof reasoningText === 'string' &&
+          reasoningContent != null
+        ) {
+          splitDelta = {
+            ...contentBlockDelta,
+            delta: {
+              reasoningContent: {
+                ...reasoningContent,
+                text: token,
               },
-            };
-          }
-
-          const deltaChunk = handleConverseStreamContentBlockDelta(splitDelta);
-          const enrichedChunk = this.enrichChunk(deltaChunk, seenBlockIndices);
-          if (enrichedChunk !== deltaChunk) {
-            /** The callback copy is the same emission as the enriched yield;
-             * without the link, stream-limit accounting charges both message
-             * objects and Bedrock tool arguments falsely trip near half the
-             * cap. Linked on the messages, which are what the accounting
-             * observes. */
-            linkStreamLimitCanonical(deltaChunk.message, enrichedChunk.message);
-          }
-          await enqueueChunk({
-            chunk: enrichedChunk,
-            callbackChunk: deltaChunk,
-            callbackToken: deltaChunk.text,
-            smooth,
-            textLength: token.length,
-          });
+            },
+          };
         }
+
+        const deltaChunk = handleConverseStreamContentBlockDelta(splitDelta);
+        const enrichedChunk = this.enrichChunk(deltaChunk, indicesSnapshot);
+        if (enrichedChunk !== deltaChunk) {
+          /** The callback copy is the same emission as the enriched yield;
+           * without the link, stream-limit accounting charges both message
+           * objects and Bedrock tool arguments falsely trip near half the
+           * cap. Linked on the messages, which are what the accounting
+           * observes. */
+          linkStreamLimitCanonical(deltaChunk.message, enrichedChunk.message);
+        }
+        return {
+          chunk: enrichedChunk,
+          callbackChunk: deltaChunk,
+          callbackToken: deltaChunk.text,
+        };
       };
 
-      const producer = (async (): Promise<void> => {
-        try {
-          for await (const event of stream) {
-            if (isSignalAborted(options.signal)) {
-              abortStream();
-              throw new Error('AbortError: User aborted the request.');
-            }
-
-            if (event.contentBlockStart != null) {
-              const startChunk = handleConverseStreamContentBlockStart(
-                event.contentBlockStart
-              );
-              if (startChunk != null) {
-                const idx = event.contentBlockStart.contentBlockIndex;
-                if (idx != null) {
-                  seenBlockIndices.add(idx);
-                  if (event.contentBlockStart.start?.toolUse != null) {
-                    toolUseBlockIndices.add(idx);
-                  }
+      const enrichChunk = this.enrichChunk.bind(this);
+      const source = (async function* (): AsyncGenerator<
+        SmoothItem<BedrockEmittedChunk>
+      > {
+        for await (const event of stream) {
+          if (event.contentBlockStart != null) {
+            const startChunk = handleConverseStreamContentBlockStart(
+              event.contentBlockStart
+            );
+            if (startChunk != null) {
+              const idx = event.contentBlockStart.contentBlockIndex;
+              if (idx != null) {
+                seenBlockIndices.add(idx);
+                if (event.contentBlockStart.start?.toolUse != null) {
+                  toolUseBlockIndices.add(idx);
                 }
-                const enrichedStart = this.enrichChunk(
-                  startChunk,
-                  seenBlockIndices
+              }
+              const enrichedStart = enrichChunk(startChunk, seenBlockIndices);
+              if (enrichedStart !== startChunk) {
+                linkStreamLimitCanonical(
+                  startChunk.message,
+                  enrichedStart.message
                 );
-                if (enrichedStart !== startChunk) {
-                  linkStreamLimitCanonical(
-                    startChunk.message,
-                    enrichedStart.message
-                  );
-                }
-                await enqueueChunk({
+              }
+              yield {
+                text: '',
+                smooth: false,
+                emit: () => ({
                   chunk: enrichedStart,
                   callbackChunk: startChunk,
                   callbackToken: startChunk.text,
-                });
-              }
-            } else if (event.contentBlockDelta != null) {
-              await enqueueDelta(event.contentBlockDelta);
-            } else if (event.metadata != null) {
-              await enqueueChunk({
-                chunk: handleConverseStreamMetadata(event.metadata, {
-                  streamUsage,
                 }),
-              });
-            } else if (event.contentBlockStop != null) {
-              const stopIdx = event.contentBlockStop.contentBlockIndex;
-              if (stopIdx != null) {
-                seenBlockIndices.add(stopIdx);
-                if (sealToolUseOnStop && toolUseBlockIndices.has(stopIdx)) {
-                  const sealChunk = createConverseToolUseStopChunk(stopIdx);
-                  await enqueueChunk({
+              };
+            }
+          } else if (event.contentBlockDelta != null) {
+            const contentBlockDelta = event.contentBlockDelta;
+            const delta = contentBlockDelta.delta;
+            if (delta == null) {
+              throw new Error('No delta found in content block.');
+            }
+
+            const idx = contentBlockDelta.contentBlockIndex;
+            if (idx != null) {
+              seenBlockIndices.add(idx);
+            }
+
+            const visibleText = resolveVisibleText(
+              delta.text,
+              delta.reasoningContent?.text
+            );
+            const indicesSnapshot = new Set(seenBlockIndices);
+
+            if (visibleText === '') {
+              yield {
+                text: '',
+                smooth: false,
+                emit: () =>
+                  buildDeltaEmission(
+                    contentBlockDelta,
+                    visibleText,
+                    indicesSnapshot
+                  ),
+              };
+              continue;
+            }
+
+            yield {
+              text: visibleText,
+              smooth: true,
+              emit: (piece) =>
+                buildDeltaEmission(
+                  contentBlockDelta,
+                  piece.text,
+                  indicesSnapshot
+                ),
+            };
+          } else if (event.metadata != null) {
+            const metadataChunk = handleConverseStreamMetadata(event.metadata, {
+              streamUsage,
+            });
+            yield {
+              text: '',
+              smooth: false,
+              emit: () => ({ chunk: metadataChunk, callbackToken: '' }),
+            };
+          } else if (event.contentBlockStop != null) {
+            const stopIdx = event.contentBlockStop.contentBlockIndex;
+            if (stopIdx != null) {
+              seenBlockIndices.add(stopIdx);
+              if (sealToolUseOnStop && toolUseBlockIndices.has(stopIdx)) {
+                const sealChunk = createConverseToolUseStopChunk(stopIdx);
+                yield {
+                  text: '',
+                  smooth: false,
+                  emit: () => ({
                     chunk: sealChunk,
                     callbackChunk: sealChunk,
                     callbackToken: sealChunk.text,
-                  });
-                }
-              }
-            } else {
-              await enqueueChunk({
-                chunk: new ChatGenerationChunk({
-                  text: '',
-                  message: new AIMessageChunk({
-                    content: '',
-                    response_metadata: { ...event } as ResponseMetadata,
                   }),
-                }),
-              });
+                };
+              }
             }
+          } else {
+            const eventChunk = new ChatGenerationChunk({
+              text: '',
+              message: new AIMessageChunk({
+                content: '',
+                response_metadata: { ...event } as ResponseMetadata,
+              }),
+            });
+            yield {
+              text: '',
+              smooth: false,
+              emit: () => ({ chunk: eventChunk, callbackToken: '' }),
+            };
           }
-        } catch (error) {
-          producerState.error = error;
-        } finally {
-          producerState.done = true;
-          notifyConsumerForChunk();
         }
       })();
 
-      try {
-        let keepStreaming = true;
-        while (keepStreaming) {
-          if (isSignalAborted(options.signal)) {
-            abortStream();
-            throw new Error('AbortError: User aborted the request.');
-          }
+      const smoothed = smoothStream({
+        source,
+        delayMs: this._lc_stream_delay,
+        signal: options.signal,
+        abortUpstream: abortStream,
+      });
 
-          await waitForNextChunk();
-          const queuedChunk = dequeue();
+      for await (const emitted of smoothed) {
+        yield emitted.chunk;
 
-          if (!queuedChunk) {
-            if (producerState.error != null) {
-              throw producerState.error;
-            }
-            if (producerState.done) {
-              keepStreaming = false;
-            }
-            continue;
-          }
-
-          if (queuedChunk.smooth) {
-            bufferedTextLength = Math.max(
-              0,
-              bufferedTextLength - queuedChunk.textLength
-            );
-            notifyProducerForSpace();
-            await waitForStreamDelay(
-              getCadencedStreamDelay({
-                targetDelay: hasEmittedVisibleContent
-                  ? this._lc_stream_delay
-                  : 0,
-                lastVisibleContentAt,
-                now: Date.now(),
-              }),
-              options.signal
-            );
-            if (isSignalAborted(options.signal)) {
-              abortStream();
-              throw new Error('AbortError: User aborted the request.');
-            }
-            hasEmittedVisibleContent = true;
-            lastVisibleContentAt = Date.now();
-          } else {
-            notifyProducerForSpace();
-          }
-
-          yield queuedChunk.chunk;
-
-          if (queuedChunk.callbackChunk != null) {
-            await runManager?.handleLLMNewToken(
-              queuedChunk.callbackToken,
-              undefined,
-              undefined,
-              undefined,
-              undefined,
-              { chunk: queuedChunk.callbackChunk }
-            );
-          }
+        if (emitted.callbackChunk != null) {
+          await runManager?.handleLLMNewToken(
+            emitted.callbackToken,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            { chunk: emitted.callbackChunk }
+          );
         }
-      } finally {
-        consumerClosed = true;
-        if (!producerState.done) {
-          abortStream();
-          notifyProducerForSpace();
-        }
-        await producer;
       }
     } finally {
       options.signal?.removeEventListener('abort', abortStream);

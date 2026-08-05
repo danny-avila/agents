@@ -252,4 +252,80 @@ describe('Converse stream seal dispatch', () => {
       setTimeoutSpy.mockRestore();
     }
   });
+
+  test('emits toolUse seal chunks without pacing delay while text is paced', async () => {
+    const model = new CustomChatBedrockConverse({
+      model: 'anthropic.claude-3-5-sonnet-20240620-v1:0',
+      region: 'us-east-1',
+      credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+      _lc_stream_delay: 60,
+    });
+
+    (model as unknown as { client: { send: unknown } }).client.send = jest.fn(
+      async () => ({
+        stream: (async function* () {
+          yield {
+            contentBlockDelta: {
+              contentBlockIndex: 0,
+              delta: { text: 'alpha beta' },
+            },
+          };
+          yield {
+            contentBlockStart: {
+              contentBlockIndex: 1,
+              start: { toolUse: { toolUseId: 'call_1', name: 'weather' } },
+            },
+          };
+          yield {
+            contentBlockDelta: {
+              contentBlockIndex: 1,
+              delta: { toolUse: { input: '{"city":"NYC"}' } },
+            },
+          };
+          yield { contentBlockStop: { contentBlockIndex: 1 } };
+        })(),
+      })
+    );
+
+    const arrivals: { isSeal: boolean; hasText: boolean; at: number }[] = [];
+    for await (const chunk of model._streamResponseChunks(
+      [new HumanMessage('hi')],
+      {} as Parameters<CustomChatBedrockConverse['_streamResponseChunks']>[1],
+      undefined
+    )) {
+      const message = chunk.message as AIMessageChunk;
+      arrivals.push({
+        isSeal:
+          (message.response_metadata as Record<string, unknown>)[
+            STREAMED_TOOL_CALL_SEAL_METADATA_KEY
+          ] != null,
+        hasText: chunk.text !== '',
+        at: Date.now(),
+      });
+    }
+
+    const lastText = [...arrivals].reverse().find((entry) => entry.hasText);
+    const seal = arrivals.find((entry) => entry.isSeal);
+    expect(lastText).toBeDefined();
+    expect(seal).toBeDefined();
+    expect((seal as { at: number }).at).toBeGreaterThanOrEqual(
+      (lastText as { at: number }).at
+    );
+    expect(
+      (seal as { at: number }).at - (lastText as { at: number }).at
+    ).toBeLessThan(45);
+  });
+
+  test('defaults to 25ms adaptive smoothing with 0 disabling', () => {
+    const base = {
+      model: 'anthropic.claude-3-5-sonnet-20240620-v1:0',
+      region: 'us-east-1',
+      credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+    };
+    expect(new CustomChatBedrockConverse(base)._lc_stream_delay).toBe(25);
+    expect(
+      new CustomChatBedrockConverse({ ...base, _lc_stream_delay: 0 })
+        ._lc_stream_delay
+    ).toBe(0);
+  });
 });

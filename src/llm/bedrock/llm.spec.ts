@@ -233,6 +233,7 @@ describe('CustomChatBedrockConverse', () => {
         model: 'anthropic.claude-3-haiku-20240307-v1:0',
         applicationInferenceProfile: testArn,
         client: mockClient,
+        _lc_stream_delay: 0,
       });
 
       let chunks = 0;
@@ -281,6 +282,7 @@ describe('CustomChatBedrockConverse', () => {
         model: 'anthropic.claude-3-haiku-20240307-v1:0',
         guardrailConfig,
         client: mockClient,
+        _lc_stream_delay: 0,
       });
 
       let chunks = 0;

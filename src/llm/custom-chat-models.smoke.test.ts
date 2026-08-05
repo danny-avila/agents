@@ -1836,7 +1836,7 @@ describe('custom chat model class smoke tests', () => {
     );
     expect(model.applicationInferenceProfile).toBe(applicationInferenceProfile);
     expect(model._lc_stream_delay).toBe(12);
-    expect(defaultStreamDelayModel._lc_stream_delay).toBe(0);
+    expect(defaultStreamDelayModel._lc_stream_delay).toBe(25);
     expect(model.invocationParams({}).serviceTier).toEqual({
       type: 'priority',
     });
