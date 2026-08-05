@@ -1,6 +1,7 @@
 import type { Span } from '@opentelemetry/api';
 import type * as t from '@/types';
 import {
+  getLangfuseSpanProcessorParams,
   getLangfuseManagedSpanDestination,
   registerLangfuseManagedSpan,
   resolveLangfuseDestinationKey,
@@ -41,7 +42,23 @@ describe('Langfuse span registry', () => {
     const redacting = resolveLangfuseDestinationKey(
       tenantConfig({ toolOutputTracing: { enabled: false } })
     );
+    const mediaDisabled = resolveLangfuseDestinationKey(
+      tenantConfig({ mediaUploadEnabled: false })
+    );
     expect(redacting).toBe(base);
+    expect(mediaDisabled).toBe(base);
+  });
+
+  it('passes media upload policy to the Langfuse span processor params', () => {
+    expect(
+      getLangfuseSpanProcessorParams(
+        tenantConfig({ mediaUploadEnabled: false })
+      )
+    ).toEqual(
+      expect.objectContaining({
+        mediaUploadEnabled: false,
+      })
+    );
   });
 
   it('separates destinations by credentials, endpoint, and environment', () => {
