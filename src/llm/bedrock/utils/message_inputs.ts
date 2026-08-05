@@ -184,10 +184,35 @@ export function concatenateLangchainReasoningBlocks(
   return result;
 }
 
-/**
- * Extract image info from a base64 string or URL.
- */
+const BEDROCK_UNRESOLVED_IMAGE_URL = 'BEDROCK_UNRESOLVED_IMAGE_URL';
+
+/** Raised before invoking Bedrock when image bytes could not be restored. */
+export class UnresolvedBedrockImageUrlError extends Error {
+  readonly code = BEDROCK_UNRESOLVED_IMAGE_URL;
+
+  constructor() {
+    super(
+      'Bedrock requires image bytes, but an image resource could not be restored. Reattach the image and try again.'
+    );
+    this.name = 'UnresolvedBedrockImageUrlError';
+  }
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const { protocol } = new URL(value);
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/** Extract image info from base64 image content. */
 export function extractImageInfo(base64: string): BedrockContentBlock {
+  if (isHttpUrl(base64)) {
+    throw new UnresolvedBedrockImageUrlError();
+  }
+
   // Extract the format from the base64 string
   const formatMatch = base64.match(/^data:image\/(\w+);base64,/);
   let format: 'gif' | 'jpeg' | 'png' | 'webp' | undefined;

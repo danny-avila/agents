@@ -1,6 +1,9 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
-import { convertToConverseMessages } from './message_inputs';
+import {
+  convertToConverseMessages,
+  UnresolvedBedrockImageUrlError,
+} from './message_inputs';
 import { toLangChainContent } from '@/messages/langchain';
 
 /**
@@ -31,6 +34,30 @@ const assistantContent = (result: ConverseResult): ConverseBlock[] => {
   const msg = result.converseMessages.find((m) => m.role === 'assistant');
   return (msg?.content ?? []) as ConverseBlock[];
 };
+
+describe('convertToConverseMessages — unresolved image URLs', () => {
+  it('rejects HTTPS image URLs before attempting base64 decoding', () => {
+    const atobSpy = jest.spyOn(globalThis, 'atob');
+    const messages: BaseMessage[] = [
+      new HumanMessage([
+        { type: 'text', text: 'Describe this image.' },
+        {
+          type: 'image_url',
+          image_url: { url: 'https://files.example.test/unavailable-image.png' },
+        },
+      ]),
+    ];
+
+    try {
+      expect(() => convertToConverseMessages(messages)).toThrow(
+        UnresolvedBedrockImageUrlError
+      );
+      expect(atobSpy).not.toHaveBeenCalled();
+    } finally {
+      atobSpy.mockRestore();
+    }
+  });
+});
 
 describe('convertToConverseMessages — Anthropic tool replay', () => {
   it('deduplicates raw tool_use blocks and unwraps tool_result content', () => {
