@@ -15,6 +15,15 @@ export const STREAM_BOUNDARIES: ReadonlySet<string> = new Set([
 
 export const STREAM_ABORT_MESSAGE = 'AbortError: User aborted the request.';
 
+/**
+ * How long generator teardown waits for the background producer to observe a
+ * consumer close before abandoning it. Well-behaved streams settle in
+ * microseconds (the next enqueue throws); a stalled provider that ignores
+ * aborts otherwise blocks teardown — and abort propagation — indefinitely.
+ * An abandoned producer still self-terminates on its next enqueue attempt.
+ */
+export const PRODUCER_CLOSE_GRACE_MS = 1000;
+
 /** Resolves a configured stream delay to its effective value (default 25ms; 0 disables smoothing). */
 export function resolveStreamDelay(delay?: number): number {
   return Math.max(0, delay ?? DEFAULT_STREAM_DELAY);
@@ -199,12 +208,31 @@ export async function* smoothStream<TEmit>({
     getQueuedItemCount() >= MAX_STREAM_QUEUE_CHUNKS ||
     bufferedTextLength >= MAX_STREAM_QUEUE_TEXT_CHARS;
 
+  /** Abort-aware: a consumer parked on an empty queue must wake when the
+   * signal fires even if the provider stream never honors the abort — the
+   * loop's top-of-iteration check then throws the canonical error. */
   const waitForNextItem = async (): Promise<void> => {
-    if (hasQueuedItems() || producerState.done || producerState.error != null) {
+    if (
+      hasQueuedItems() ||
+      producerState.done ||
+      producerState.error != null ||
+      isSignalAborted(signal)
+    ) {
       return;
     }
     await new Promise<void>((resolve) => {
-      notifyConsumer = resolve;
+      const onAbort = (): void => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      notifyConsumer = (): void => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (isSignalAborted(signal)) {
+        onAbort();
+      }
     });
   };
 
@@ -374,10 +402,26 @@ export async function* smoothStream<TEmit>({
     }
   } finally {
     consumerClosed = true;
-    if (!producerState.done) {
+    if (producerState.done) {
+      await producer;
+    } else {
       abortUpstream?.();
       notifyProducerForSpace();
+      const iterator = source as Partial<AsyncGenerator<SmoothItem<TEmit>>>;
+      const closing = iterator.return?.call(source, undefined as never);
+      if (closing != null) {
+        void closing.then(
+          () => undefined,
+          () => undefined
+        );
+      }
+      await Promise.race([
+        producer,
+        new Promise<void>((resolve) => {
+          const timeout = setTimeout(resolve, PRODUCER_CLOSE_GRACE_MS);
+          timeout.unref?.();
+        }),
+      ]);
     }
-    await producer;
   }
 }

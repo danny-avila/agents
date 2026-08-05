@@ -127,17 +127,34 @@ function hasMeaningfulLogprobs(
   return true;
 }
 
+/** google-common reports the terminal reason camelCase (`finishReason`). */
+function hasFinishReason(
+  generationInfo: ChatGenerationChunk['generationInfo']
+): boolean {
+  return (
+    generationInfo?.finish_reason != null || generationInfo?.finishReason != null
+  );
+}
+
 /**
  * Chunks that pair visible text with reasoning payloads in
- * `additional_kwargs` (Gemini thought summaries, reasoning_content deltas)
- * must pace whole: split pieces would each carry the same kwargs and the
- * aggregator's dict merge concatenates string fields once per piece.
+ * `additional_kwargs` (Gemini thought summaries, reasoning_content deltas,
+ * OpenRouter reasoning_details) must pace whole: split pieces would each
+ * carry the same kwargs and downstream merging — the aggregator's dict merge
+ * or OpenRouter's reasoning_details accumulation — duplicates them once per
+ * piece.
  */
-function hasReasoningKwargs(message: AIMessageChunk): boolean {
+export function hasReasoningKwargs(message: AIMessageChunk): boolean {
   const kwargs = message.additional_kwargs;
   if (
     typeof kwargs.reasoning_content === 'string' &&
     kwargs.reasoning_content !== ''
+  ) {
+    return true;
+  }
+  if (
+    Array.isArray(kwargs.reasoning_details) &&
+    kwargs.reasoning_details.length > 0
   ) {
     return true;
   }
@@ -152,7 +169,7 @@ export function toGenerationSmoothItem(
   const isMessageChunk = message instanceof AIMessageChunk;
   const cleanGenerationInfo =
     !hasMeaningfulLogprobs(chunk.generationInfo) &&
-    chunk.generationInfo?.finish_reason == null;
+    !hasFinishReason(chunk.generationInfo);
   const splittable =
     Boolean(chunk.text) &&
     isMessageChunk &&

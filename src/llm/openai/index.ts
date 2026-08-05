@@ -60,6 +60,7 @@ import {
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
+import { hasReasoningKwargs } from '@/llm/stream/chunkAdapters';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
@@ -1149,9 +1150,10 @@ function getReasoningDeltaText(message: AIMessageChunk): string {
 function toSmoothItem(chunk: ChatGenerationChunk): SmoothItem<ChatGenerationChunk> {
   const { message } = chunk;
   const isMessageChunk = message instanceof AIMessageChunk;
-  /** Chunks pairing visible text with a reasoning delta must pace whole:
-   * split pieces would each clone the same reasoning kwargs and the
-   * aggregator's dict merge concatenates them once per piece. */
+  /** Chunks pairing visible text with a reasoning delta (reasoning_content,
+   * reasoning summary, or OpenRouter reasoning_details) must pace whole:
+   * split pieces would each clone the same reasoning kwargs and downstream
+   * accumulation duplicates them once per piece. */
   const splittable =
     Boolean(chunk.text) &&
     isMessageChunk &&
@@ -1159,7 +1161,7 @@ function toSmoothItem(chunk: ChatGenerationChunk): SmoothItem<ChatGenerationChun
     message.content === chunk.text &&
     chunk.generationInfo?.logprobs == null &&
     chunk.generationInfo?.finish_reason == null &&
-    getReasoningDeltaText(message) === '';
+    !hasReasoningKwargs(message);
 
   if (splittable) {
     return {

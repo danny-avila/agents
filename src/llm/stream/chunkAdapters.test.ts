@@ -48,6 +48,30 @@ describe('toGenerationSmoothItem classification', () => {
     expect(toGenerationSmoothItem(chunk).atomic).toBe(true);
   });
 
+  it('keeps chunks carrying OpenRouter reasoning_details atomic', () => {
+    const chunk = textChunk('visible text here', {
+      additional_kwargs: {
+        reasoning_details: [{ type: 'reasoning.text', text: 'thought' }],
+      },
+    });
+    expect(toGenerationSmoothItem(chunk).atomic).toBe(true);
+  });
+
+  it('keeps chunks carrying camelCase finishReason atomic', () => {
+    const chunk = new ChatGenerationChunk({
+      text: 'final text with several words here',
+      generationInfo: { finishReason: 'STOP' },
+      message: new AIMessageChunk({
+        content: 'final text with several words here',
+      }),
+    });
+    const item = toGenerationSmoothItem(chunk);
+    expect(item.atomic).toBe(true);
+    expect(item.emit({ text: item.text, isFirst: true, isLast: true })).toBe(
+      chunk
+    );
+  });
+
   it('classifies usage-only chunks as passthrough', () => {
     const chunk = new ChatGenerationChunk({
       text: '',

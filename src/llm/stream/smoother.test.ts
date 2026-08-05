@@ -4,6 +4,7 @@ import {
   STREAM_ABORT_MESSAGE,
   STREAM_CHUNK_MIN_SIZE,
   DEFAULT_STREAM_DELAY,
+  PRODUCER_CLOSE_GRACE_MS,
   findStreamChunkBoundary,
   computeAdaptivePieceSize,
   SMOOTH_TARGET_LATENCY_MS,
@@ -257,6 +258,57 @@ describe('smoothStream', () => {
     );
     expect(pieces.every((p) => p.tag === 'real')).toBe(true);
     expect(pieces.length).toBeGreaterThan(0);
+  });
+
+  it('wakes a consumer parked on an empty queue when the signal aborts', async () => {
+    const controller = new AbortController();
+    const abortUpstream = jest.fn();
+    async function* stalledSource(): AsyncGenerator<SmoothItem<Emitted>> {
+      yield makeItem('a', 'first text ', true);
+      await new Promise<void>(() => undefined);
+    }
+
+    const stream = smoothStream({
+      source: stalledSource(),
+      delayMs: 5,
+      signal: controller.signal,
+      abortUpstream,
+    });
+
+    let next = await stream.next();
+    while (next.done !== true && (next.value as Emitted).isLast !== true) {
+      next = await stream.next();
+    }
+
+    const start = Date.now();
+    const parked = stream.next();
+    setTimeout(() => controller.abort(), 20);
+
+    await expect(parked).rejects.toThrow(STREAM_ABORT_MESSAGE);
+    expect(Date.now() - start).toBeLessThan(PRODUCER_CLOSE_GRACE_MS + 1500);
+    expect(abortUpstream).toHaveBeenCalled();
+  });
+
+  it('completes an early break promptly even when the source is stalled', async () => {
+    async function* stalledSource(): AsyncGenerator<SmoothItem<Emitted>> {
+      yield makeItem('a', 'first text ', true);
+      await new Promise<void>(() => undefined);
+    }
+
+    const stream = smoothStream({ source: stalledSource(), delayMs: 5 });
+    await stream.next();
+
+    const start = Date.now();
+    const closed = (async (): Promise<boolean> => {
+      await stream.return(undefined);
+      return true;
+    })();
+    const result = await Promise.race([
+      closed,
+      sleep(PRODUCER_CLOSE_GRACE_MS + 2000).then(() => false),
+    ]);
+    expect(result).toBe(true);
+    expect(Date.now() - start).toBeLessThan(PRODUCER_CLOSE_GRACE_MS + 1500);
   });
 
   it('throws the canonical abort message when aborted during the pacing sleep', async () => {
