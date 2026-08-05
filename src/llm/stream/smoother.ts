@@ -280,6 +280,7 @@ export async function* smoothStream<TEmit>({
 
   let hasEmittedText = false;
   let lastVisibleTextAt: number | undefined;
+  let drainTicksRemaining: number | undefined;
   let keepStreaming = true;
   try {
     while (keepStreaming) {
@@ -321,12 +322,28 @@ export async function* smoothStream<TEmit>({
       let headOffset = 0;
       while (headOffset < item.text.length) {
         const remainingText = item.text.slice(headOffset);
+        /** Once the producer is done the backlog is final: drain it linearly
+         * across the remaining target window instead of letting the
+         * proportional formula decay geometrically and stretch the tail. */
+        if (producerState.done && drainTicksRemaining == null) {
+          drainTicksRemaining = Math.max(
+            1,
+            Math.floor(SMOOTH_TARGET_LATENCY_MS / delayMs)
+          );
+        }
+        const targetPieceSize =
+          drainTicksRemaining != null
+            ? Math.max(
+              STREAM_CHUNK_MIN_SIZE,
+              Math.ceil(bufferedTextLength / drainTicksRemaining)
+            )
+            : computeAdaptivePieceSize(bufferedTextLength, delayMs);
+        if (drainTicksRemaining != null && drainTicksRemaining > 1) {
+          drainTicksRemaining -= 1;
+        }
         const pieceLength = item.atomic
           ? remainingText.length
-          : findStreamChunkBoundary(
-            remainingText,
-            computeAdaptivePieceSize(bufferedTextLength, delayMs)
-          );
+          : findStreamChunkBoundary(remainingText, targetPieceSize);
         const pieceEnd = headOffset + pieceLength;
         const piece = item.text.slice(headOffset, pieceEnd);
 
