@@ -3,6 +3,7 @@ import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableToolLike } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { MessageContentComplex, ToolErrorData } from './stream';
 import type { HumanInTheLoopConfig } from './hitl';
 import type { LangfuseConfig } from './graph';
@@ -259,6 +260,20 @@ export type ToolNodeOptions = {
    * `resolveLocalExecutionTools`.
    */
   fileCheckpointer?: LocalFileCheckpointer;
+  /**
+   * Returns the owning graph's run-scoped breaker signal. Read once per
+   * `run()` invocation and composed into the batch config's `signal`, so
+   * every tool execution in the batch aborts when a stream circuit breaker
+   * trips elsewhere in the run.
+   */
+  getBreakerSignal?: () => AbortSignal | undefined;
+  /**
+   * Returns the owning graph's immutable run scope. Read once per batch,
+   * BEFORE hooks, and threaded to tools that spawn runs (subagents) so a
+   * reset during a hook cannot rebind their children to a newer run's
+   * controller.
+   */
+  getRunScope?: () => RunBreakerScope;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -523,6 +538,12 @@ export type ToolExecuteBatchRequest = {
   configurable?: Record<string, unknown>;
   /** Runtime metadata from RunnableConfig (includes thread_id, run_id, provider, etc.) */
   metadata?: Record<string, unknown>;
+  /**
+   * Aborts when the run is cancelled or its stream circuit breaker trips.
+   * Handlers SHOULD forward this to their tool executions so in-flight work
+   * stops consuming quota once the run is already failing.
+   */
+  signal?: AbortSignal;
   /** Promise resolver - handler calls this with ALL results */
   resolve: (results: ToolExecuteResult[]) => void;
   /** Promise rejector - handler calls this on fatal error */

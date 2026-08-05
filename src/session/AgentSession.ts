@@ -25,6 +25,7 @@ import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import { deserializeMessage } from './messageSerialization';
 import { createSummarizeNode } from '@/summarization/node';
+import { resolveStreamLimits } from '@/llm/streamLimits';
 import { JsonlSessionStore } from './JsonlSessionStore';
 import { AgentContext } from '@/agents/AgentContext';
 import { ContentTypes, GraphEvents } from '@/common';
@@ -610,6 +611,8 @@ function createManualCompactGraph(params: {
   runId: string;
   customHandlers?: Record<string, t.EventHandler>;
   hooks?: HookRegistry;
+  /** Session run-level stream limits, so manual compaction honors them. */
+  streamLimits?: t.StreamLimits;
 }): {
   graph: Parameters<typeof createSummarizeNode>[0]['graph'];
   completedSummary?: t.SummaryContentBlock;
@@ -626,6 +629,7 @@ function createManualCompactGraph(params: {
       runId: params.runId,
       isMultiAgent: false,
       hookRegistry: params.hooks,
+      streamLimits: resolveStreamLimits(params.streamLimits),
       dispatchRunStep: async (runStep): Promise<void> => {
         contentData.push(runStep);
         contentIndexMap.set(runStep.id, runStep.index);
@@ -1251,6 +1255,7 @@ export class AgentSession {
       runId: compactRunId,
       customHandlers: this.runConfig.customHandlers,
       hooks: this.runConfig.hooks,
+      streamLimits: this.runConfig.streamLimits,
     });
     const summarizeNode = createSummarizeNode({
       agentContext,

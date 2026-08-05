@@ -46,6 +46,7 @@ import {
   supportsBedrockToolCache,
   type PromptCacheTtl,
 } from '@/messages/cache';
+import { linkStreamLimitCanonical } from '@/llm/streamLimits';
 import { applyCachePointsToConversePayload } from './cachePoints';
 import { insertBedrockToolCachePoint } from './toolCache';
 
@@ -572,8 +573,17 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
           }
 
           const deltaChunk = handleConverseStreamContentBlockDelta(splitDelta);
+          const enrichedChunk = this.enrichChunk(deltaChunk, seenBlockIndices);
+          if (enrichedChunk !== deltaChunk) {
+            /** The callback copy is the same emission as the enriched yield;
+             * without the link, stream-limit accounting charges both message
+             * objects and Bedrock tool arguments falsely trip near half the
+             * cap. Linked on the messages, which are what the accounting
+             * observes. */
+            linkStreamLimitCanonical(deltaChunk.message, enrichedChunk.message);
+          }
           await enqueueChunk({
-            chunk: this.enrichChunk(deltaChunk, seenBlockIndices),
+            chunk: enrichedChunk,
             callbackChunk: deltaChunk,
             callbackToken: deltaChunk.text,
             smooth,
@@ -602,8 +612,18 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
                     toolUseBlockIndices.add(idx);
                   }
                 }
+                const enrichedStart = this.enrichChunk(
+                  startChunk,
+                  seenBlockIndices
+                );
+                if (enrichedStart !== startChunk) {
+                  linkStreamLimitCanonical(
+                    startChunk.message,
+                    enrichedStart.message
+                  );
+                }
                 await enqueueChunk({
-                  chunk: this.enrichChunk(startChunk, seenBlockIndices),
+                  chunk: enrichedStart,
                   callbackChunk: startChunk,
                   callbackToken: startChunk.text,
                 });

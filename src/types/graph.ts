@@ -32,6 +32,7 @@ import type {
 } from '@/types/stream';
 import type {
   TokenCounter,
+  StreamLimits,
   StreamPreemption,
   TokenBudgetBreakdown,
 } from '@/types/run';
@@ -357,6 +358,12 @@ export type StandardGraphInput = {
    * this field.
    */
   preemption?: StreamPreemption;
+  /**
+   * Stream circuit breakers, forwarded from `RunConfig.streamLimits` and
+   * resolved once at graph construction. Enforced by the stream handler on
+   * every streamed chunk event. See {@link StreamLimits}.
+   */
+  streamLimits?: StreamLimits;
 };
 
 export type GraphEdge = {

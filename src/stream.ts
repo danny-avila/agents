@@ -39,9 +39,21 @@ import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
+import type { RunBreakerScope } from '@/llm/streamLimits';
+import {
+  claimStreamLimitCharge,
+  combineCompleteToolCalls,
+  enforceCompleteToolCallArgLimit,
+  enforceStreamedToolCallArgLimit,
+  enforceStreamDeltaEventLimit,
+  requiresStreamLimitAccounting,
+  StreamLimitExceededError,
+  STREAM_LIMIT_EPOCH_KEY,
+} from '@/llm/streamLimits';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent } from '@/utils/events';
+import { composeAbortSignals } from '@/utils/misc';
 import { isGoogleLike } from '@/utils/llm';
 import { getMessageId } from '@/messages';
 
@@ -166,7 +178,10 @@ function isEagerExecutionExcludedTool(
   // the final request ("changed after eager execution started"), stop
   // prestarting it so the model's retry executes normally instead of
   // re-diverging in a loop (LibreChat#14371).
-  if (graph.eagerEventToolSuppressions?.has(name) === true) {
+  if (
+    (graph.eagerEventToolSuppressions as Set<string> | undefined)?.has(name) ===
+    true
+  ) {
     return true;
   }
   // A code-session participant writes to the shared sandbox, so it is
@@ -778,6 +793,10 @@ function startEagerToolExecutions(args: {
         | Record<string, unknown>
         | undefined,
       metadata,
+      signal: composeAbortSignals(
+        graph.config?.signal,
+        graph.breakerAbort.signal
+      ),
       resolve: (results): void => {
         resultSettled = true;
         settledResults = results;
@@ -1069,9 +1088,8 @@ function recordEagerToolCallChunks(args: {
     const sealCoversChunk =
       seal != null &&
       (seal.kind === 'all' ||
-        (seal.kind === 'single' &&
-          ((seal.id != null && seal.id === id) ||
-            (seal.index != null && seal.index === index))));
+        (seal.id != null && seal.id === id) ||
+        (seal.index != null && seal.index === index));
     const next = {
       id,
       name,
@@ -1512,9 +1530,118 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
 
-    const agentContext = graph.getAgentContext(metadata);
-
     const chunk = data.chunk as Partial<AIMessageChunk>;
+
+    /** Attempts stamp their breaker epoch into event metadata; a mismatch
+     * marks a straggling chunk from a failed run that outlived
+     * `resetValues()`. Dropped OUTRIGHT: content handling and the eager
+     * paths below compose the LIVE controller, so acting on a dead run's
+     * chunk could dispatch host tools into the run now using it. Events
+     * without a stamp (direct handler callers, partial stubs) keep the
+     * live-controller behavior. */
+    const eventEpoch = metadata?.[STREAM_LIMIT_EPOCH_KEY];
+    /** Runtime-honest widening: partial handler stubs carry neither an
+     * epoch nor a run scope despite the field types. */
+    const liveEpoch = graph.breakerEpoch as number | undefined;
+    if (eventEpoch != null && liveEpoch != null && eventEpoch !== liveEpoch) {
+      return;
+    }
+    const eventBreaker =
+      graph.breakerAbort instanceof AbortController
+        ? graph.breakerAbort
+        : undefined;
+    /** Immutable scope captured at handler entry. A reset while this
+     * handler is suspended in an await replaces the object, so ONE
+     * reference comparison proves the event still belongs to the live run
+     * before anything composes `graph.breakerAbort` or `graph.config`. */
+    const entryRunScope = graph.runScope as RunBreakerScope | undefined;
+    const runScopeInvalidated = (): boolean =>
+      entryRunScope != null && graph.runScope !== entryRunScope;
+    const throwIfRunBreakerTripped = (): void => {
+      if (
+        eventBreaker != null &&
+        eventBreaker.signal.aborted &&
+        eventBreaker.signal.reason instanceof StreamLimitExceededError
+      ) {
+        throw eventBreaker.signal.reason;
+      }
+    };
+
+    /**
+     * Enforced before every content-specific early return below
+     * (server-tool results, deferred mixed reasoning, late OpenRouter
+     * reasoning): a looping provider can flood through any of those paths,
+     * a coalesced event can carry client `tool_call_chunks` alongside a
+     * server-tool result, and the complete-call dispatch branch further
+     * down can prestart a side-effecting tool from an arrival-sealed
+     * oversized call. Charging is claim-based: the producer loop and this
+     * decoupled echo can observe the same chunk object in either order, and
+     * only the first claimer charges it. The argument guard is
+     * deliberately NOT gated on numeric chunk indices, so id-only or
+     * index-less runaway streams stay bounded, and complete parsed
+     * `tool_calls` without a raw chunk representation are judged standalone.
+     */
+    if (
+      requiresStreamLimitAccounting(graph, chunk) &&
+      claimStreamLimitCharge(graph, data.chunk, 'consumer', metadata)
+    ) {
+      try {
+        enforceStreamDeltaEventLimit({ graph, metadata });
+        /** Combined first so raw-chunk name correlation sees invalid calls
+         * too; an unnamed raw chunk twinned with a named invalid call must
+         * select that tool's override, not the global cap. */
+        const completeCalls = combineCompleteToolCalls(chunk);
+        if (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) {
+          enforceStreamedToolCallArgLimit({
+            graph,
+            metadata,
+            toolCallChunks: chunk.tool_call_chunks,
+            responseMetadata: chunk.response_metadata as
+              | Record<string, unknown>
+              | undefined,
+            parsedToolCalls: completeCalls,
+          });
+        }
+        /** Judged whenever parsed calls are present, not only when raw
+         * chunks are absent — an adapter can pair an empty or partial raw
+         * chunk with a complete parsed call; the standalone check is
+         * stateless, so the common both-present case is not double-tallied.
+         * Invalid calls are included because ToolNode processes and
+         * promotes them. */
+        if (completeCalls != null) {
+          enforceCompleteToolCallArgLimit({
+            graph,
+            metadata,
+            toolCalls: completeCalls,
+          });
+        }
+      } catch (error) {
+        /** A breach detected on this consumer path must still stop parallel
+         * fan-out work: the producer skips its own enforcement once this
+         * side has claimed the emission, so createCallModel's breaker-abort
+         * never fires for it. Trip the EVENT's run-bound breaker before the
+         * throw rejects the run — never the live controller of a newer run. */
+        if (error instanceof StreamLimitExceededError && eventBreaker != null) {
+          eventBreaker.abort(error);
+        }
+        throw error;
+      }
+    }
+
+    /** A parallel producer can trip the shared breaker while this event was
+     * already queued in `streamEvents`. Stop before content handling or the
+     * eager-tool paths below — those can dispatch a side-effecting host
+     * tool with an already-aborted signal the handler never inspects.
+     * Rechecked again immediately before each eager dispatch: the awaits in
+     * between (server-tool results, tool-call handling, content dispatch)
+     * are windows for a sibling's trip — or for a full reset, after which
+     * this event belongs to a dead run and is dropped. */
+    if (runScopeInvalidated()) {
+      return;
+    }
+    throwIfRunBreakerTripped();
+
+    const agentContext = graph.getAgentContext(metadata);
 
     const content = getChunkContent({
       chunk,
@@ -1576,6 +1703,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
     ) {
       hasToolCalls = true;
       await handleToolCalls(chunk.tool_calls, metadata, graph);
+      if (runScopeInvalidated()) {
+        return;
+      }
+      throwIfRunBreakerTripped();
       if (hasFinalToolCallSignal(chunk)) {
         startEagerToolExecutions({
           graph,
@@ -1655,6 +1786,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
         metadata,
       });
       if (canStreamEager) {
+        if (runScopeInvalidated()) {
+          return;
+        }
+        throwIfRunBreakerTripped();
         startReadyStreamedEagerToolExecutions({
           graph,
           metadata,

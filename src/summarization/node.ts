@@ -6,6 +6,7 @@ import {
 } from '@langchain/core/messages';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { StreamLimitState } from '@/llm/streamLimits';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
@@ -33,6 +34,11 @@ import {
   Providers,
 } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import {
+  enforceStreamLimitsForWireChunk,
+  StreamLimitExceededError,
+  STREAM_LIMIT_EPOCH_KEY,
+} from '@/llm/streamLimits';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { createRemoveAllMessage } from '@/messages/reducer';
@@ -611,6 +617,8 @@ async function executeSummarizationWithFallback(params: {
   stepId: string;
   usePromptCache: boolean;
   log: LogFn;
+  /** Carries the run's stream limits so the event cap covers summary streams. */
+  graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
 }): Promise<{
   text: string;
   usage?: Partial<UsageMetadata>;
@@ -629,6 +637,7 @@ async function executeSummarizationWithFallback(params: {
     stepId,
     usePromptCache,
     log,
+    graph,
   } = params;
 
   const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
@@ -659,6 +668,7 @@ async function executeSummarizationWithFallback(params: {
       stepId,
       provider: clientConfig.provider as Providers,
       reasoningKey: agentContext.reasoningKey,
+      graph,
       usePromptCache,
       promptCacheTtl:
         (clientConfig.provider as Providers) === Providers.ANTHROPIC ||
@@ -686,6 +696,34 @@ async function executeSummarizationWithFallback(params: {
       messagesToRefineCount: messages.length,
     });
 
+    /**
+     * A tripped stream circuit breaker is a safety abort, not a
+     * summarization failure to recover from: retrying on fallback providers
+     * would spend more provider work after the limit fired, and degrading to
+     * the metadata stub would let the run continue (and periodic compaction
+     * commit the stub) despite the `StreamLimits` contract that a breach
+     * rejects the run. Rethrown so the summarize node fails the run with
+     * the actionable limit error, consistent with agent turns and subagents.
+     */
+    if (primaryError instanceof StreamLimitExceededError) {
+      throw primaryError;
+    }
+    /** A parallel branch's trip aborts the composed summarization signal,
+     * and a provider can surface that as a generic abort error; entering
+     * fallback recovery or degrading to the metadata stub would continue
+     * work after the run-wide safety abort. Checked on BOTH channels: the
+     * graph's own breaker, and the composed config signal that carries a
+     * parent run's trip into subagent child graphs. */
+    {
+      const trippedReason = findStreamLimitAbortReason(
+        graph?.getBreakerSignal?.(),
+        summarizeConfig?.signal
+      );
+      if (trippedReason != null) {
+        throw trippedReason;
+      }
+    }
+
     const rawFallbacks = (
       clientConfig.clientOptions as unknown as t.LLMConfig | undefined
     )?.fallbacks;
@@ -697,6 +735,7 @@ async function executeSummarizationWithFallback(params: {
           config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
           provider: clientConfig.provider as Providers,
           reasoningKey: agentContext.reasoningKey,
+          graph,
         });
         const fbResult = await tryFallbackProviders({
           fallbacks,
@@ -711,9 +750,13 @@ async function executeSummarizationWithFallback(params: {
               )
             ),
           ],
-          config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
+          config: withBreakerSignal(
+            traceConfig(summarizeConfig, 'cache_hit_compaction'),
+            graph
+          ),
           primaryError,
           onChunk,
+          streamLimitState: graph,
         });
         const fbMsg = fbResult?.messages?.[0];
         if (fbMsg) {
@@ -722,6 +765,9 @@ async function executeSummarizationWithFallback(params: {
           );
         }
       } catch (fbErr) {
+        if (fbErr instanceof StreamLimitExceededError) {
+          throw fbErr;
+        }
         const fbDescribed = describeFallbackError(fbErr, fallbacks);
         log('warn', `Fallback providers also failed ${fbDescribed.suffix}`, {
           ...fbDescribed.data,
@@ -858,13 +904,64 @@ interface CreateSummarizeNodeParams {
       result: t.StepCompleted,
       config?: RunnableConfig
     ) => Promise<void>;
-  };
+    /** The run's shared breaker signal, composed into every summarization
+     * model attempt so a sibling branch tripping a stream limit also
+     * cancels in-flight summaries. */
+    getBreakerSignal?: () => AbortSignal;
+    /** The run's shared breaker controller. Preferred over the bare signal
+     * accessor: the node captures it at entry so a breach detected by its
+     * own chunk handler trips the run that STARTED the summarization. */
+    getBreakerController?: () => AbortController;
+    /** The controller's epoch, captured at entry and stamped into summary
+     * attempt metadata so the wire consumer epoch-gates old-run summary
+     * chunks like model-attempt chunks. */
+    getBreakerEpoch?: () => number;
+  } & StreamLimitState;
   generateStepId: (stepKey: string) => [string, number];
+}
+
+/** Composes the run's breaker signal (when the adapter provides one) into a
+ * summarization attempt's config, so breaches in sibling branches cancel
+ * summaries too. */
+function withBreakerSignal<T extends { signal?: AbortSignal }>(
+  config: T | undefined,
+  graph?: { getBreakerSignal?: () => AbortSignal }
+): T | undefined {
+  const breakerSignal = graph?.getBreakerSignal?.();
+  if (breakerSignal == null) {
+    return config;
+  }
+  if (config == null) {
+    return { signal: breakerSignal } as T;
+  }
+  const existing = config.signal;
+  if (existing == null || existing === breakerSignal) {
+    return { ...config, signal: breakerSignal };
+  }
+  return { ...config, signal: AbortSignal.any([existing, breakerSignal]) };
+}
+
+/** First stream-limit reason found on any of the given signals. Checked
+ * alongside the graph's own breaker because a subagent child graph receives
+ * a ROOT sibling's trip through its constructor/invocation signal — the
+ * child's private breaker never fires for it. */
+function findStreamLimitAbortReason(
+  ...signals: Array<AbortSignal | undefined>
+): StreamLimitExceededError | undefined {
+  for (const signal of signals) {
+    if (
+      signal?.aborted === true &&
+      signal.reason instanceof StreamLimitExceededError
+    ) {
+      return signal.reason;
+    }
+  }
+  return undefined;
 }
 
 export function createSummarizeNode({
   agentContext,
-  graph,
+  graph: adapterGraph,
   generateStepId,
 }: CreateSummarizeNodeParams) {
   return async (
@@ -874,9 +971,44 @@ export function createSummarizeNode({
     },
     config?: RunnableConfig
   ): Promise<{ summarizationRequest: undefined; messages?: BaseMessage[] }> => {
+    /** The breaker signal is captured at node ENTRY, before dispatchRunStep,
+     * ON_SUMMARIZE_START, or PreCompact awaits: a sibling's trip plus a
+     * prompt next run can reset the controller during one of those awaits,
+     * and resolving the live accessor later would bind this summarization
+     * to the fresh controller. `Object.create` freezes the signal while
+     * DELEGATING every other adapter member — spreading would snapshot the
+     * charge-credit accessor pair and detach it from graph resets. */
+    const entryBreakerController = adapterGraph.getBreakerController?.();
+    const entryBreakerSignal =
+      entryBreakerController?.signal ?? adapterGraph.getBreakerSignal?.();
+    const entryBreakerEpoch = adapterGraph.getBreakerEpoch?.();
+    const graph =
+      entryBreakerSignal == null
+        ? adapterGraph
+        : (Object.create(adapterGraph, {
+          getBreakerSignal: { value: (): AbortSignal => entryBreakerSignal },
+          ...(entryBreakerController != null && {
+            getBreakerController: {
+              value: (): AbortController => entryBreakerController,
+            },
+          }),
+        }) as typeof adapterGraph);
     const request = state.summarizationRequest;
     if (request == null) {
       return { summarizationRequest: undefined };
+    }
+    /** Already-tripped-at-entry: a parallel sibling's breach failed the run
+     * before this node was scheduled — via this graph's own breaker or, in
+     * a subagent child graph, the parent trip on the invocation signal.
+     * Rethrow before dispatching steps, hooks, or the model call — an
+     * adapter that doesn't synchronously reject an aborted signal would
+     * otherwise spend summarization provider work on a failed run. */
+    const entryTripReason = findStreamLimitAbortReason(
+      entryBreakerSignal,
+      config?.signal
+    );
+    if (entryTripReason != null) {
+      throw entryTripReason;
     }
 
     /**
@@ -1111,10 +1243,31 @@ export function createSummarizeNode({
           ...(clientConfig.modelName != null && clientConfig.modelName !== ''
             ? { [Constants.INVOKED_MODEL]: clientConfig.modelName }
             : {}),
+          /** Entry-captured breaker epoch: the wire consumer epoch-gates
+           * old-run summary chunks exactly like model-attempt chunks —
+           * without the stamp, a straggling summary from a failed run
+           * reads as current and could abort the next run's controller. */
+          ...(entryBreakerEpoch != null
+            ? { [STREAM_LIMIT_EPOCH_KEY]: entryBreakerEpoch }
+            : {}),
         },
       }
       : undefined;
 
+    /** Rechecked after the pre-call awaits (dispatchRunStep,
+     * ON_SUMMARIZE_START, PreCompact): a sibling can trip the breaker while
+     * this node is paused in one of them, and a provider that doesn't
+     * synchronously reject an aborted signal would still start the
+     * summarization call. Mirrors the model node's pre-invoke recheck. */
+    {
+      const preCallTrip = findStreamLimitAbortReason(
+        entryBreakerSignal,
+        config?.signal
+      );
+      if (preCallTrip != null) {
+        throw preCallTrip;
+      }
+    }
     const {
       text: rawText,
       usage: summaryUsage,
@@ -1127,6 +1280,7 @@ export function createSummarizeNode({
       stepId,
       usePromptCache: isSelfSummarizeModel && hasPromptCache,
       log,
+      graph,
     });
 
     /**
@@ -1331,21 +1485,58 @@ function buildSummarizationInstruction(
 }
 
 /** Creates an `onChunk` callback that dispatches `ON_SUMMARIZE_DELTA` events for streaming. */
-function createSummarizationChunkHandler({
+export function createSummarizationChunkHandler({
   stepId,
   config,
   provider,
   reasoningKey = 'reasoning_content',
+  graph,
 }: {
   stepId?: string;
   config?: RunnableConfig;
   provider?: Providers;
   reasoningKey?: 'reasoning_content' | 'reasoning';
+  graph?: StreamLimitState & { getBreakerController?: () => AbortController };
 }): OnChunk | undefined {
   if (stepId == null || stepId === '' || !config) {
     return undefined;
   }
-  return (chunk) => {
+  const limitMetadata = config.metadata as Record<string, unknown> | undefined;
+  return (chunk, attemptMetadata) => {
+    /**
+     * Charged as `producer` so it PAIRS with the run's registered stream
+     * handler: inside a live run the provider callbacks route each chunk
+     * through the graph's `on_chat_model_stream` consumer too, and two
+     * same-side consumer claims would charge the chunk twice — halving an
+     * opt-in event cap. Standalone callers (tests, custom hosts, runs with
+     * no registered handler) still get single-sided enforcement from this
+     * one claim. Summarization deliberately passes NO `context` to
+     * `attemptInvoke`, whose onChunk branch would otherwise add a second
+     * producer claim. A breach trips the run's shared breaker (the
+     * ENTRY-captured controller when the adapter provides one) before
+     * rethrowing: this producer claim wins the race, so the wire consumer's
+     * breaker-aborting catch never fires for the same chunk — without the
+     * trip here, sibling model calls, tools, and subagents would keep
+     * consuming quota while the summary branch rejects.
+     * `executeSummarizationWithFallback` then rethrows past fallbacks and
+     * the metadata stub, failing the run like any other breach.
+     */
+    if (graph != null) {
+      try {
+        enforceStreamLimitsForWireChunk({
+          graph,
+          metadata: attemptMetadata ?? limitMetadata,
+          chunk: chunk as Parameters<
+            typeof enforceStreamLimitsForWireChunk
+          >[0]['chunk'],
+        });
+      } catch (error) {
+        if (error instanceof StreamLimitExceededError) {
+          graph.getBreakerController?.().abort(error);
+        }
+        throw error;
+      }
+    }
     const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];
     const raw = getChunkContent({ chunk: chunkAny, provider, reasoningKey });
     if (raw == null || (typeof raw === 'string' && !raw)) {
@@ -1404,6 +1595,7 @@ async function summarizeWithCacheHit({
   stepId,
   provider,
   reasoningKey,
+  graph,
   usePromptCache,
   promptCacheTtl,
   log,
@@ -1417,6 +1609,7 @@ async function summarizeWithCacheHit({
   stepId?: string;
   provider: Providers;
   reasoningKey?: 'reasoning_content' | 'reasoning';
+  graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
   usePromptCache?: boolean;
   promptCacheTtl?: PromptCacheTtl;
   log?: LogFn;
@@ -1443,9 +1636,13 @@ async function summarizeWithCacheHit({
         config: traceConfig(config, 'cache_hit_compaction'),
         provider,
         reasoningKey,
+        graph,
       }),
+      /** Accounting lease only (summarization passes no `context` so its
+       * producer claim never stacks with the onChunk handler's). */
+      streamLimitState: graph,
     },
-    traceConfig(config, 'cache_hit_compaction')
+    withBreakerSignal(traceConfig(config, 'cache_hit_compaction'), graph)
   );
 
   const responseMsg = result.messages?.[0];

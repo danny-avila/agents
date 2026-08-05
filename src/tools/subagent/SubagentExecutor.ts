@@ -28,6 +28,10 @@ import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs/Graph';
 import type { HandlerRegistry } from '@/events';
 import { Constants, GraphEvents, Callback, StepTypes } from '@/common';
+import {
+  StreamLimitExceededError,
+  RUN_BREAKER_SCOPE_CONFIG_KEY,
+} from '@/llm/streamLimits';
 import { executeHooks } from '@/hooks';
 
 const DEFAULT_MAX_TURNS = 25;
@@ -158,6 +162,14 @@ export type SubagentExecuteParams = {
   subagentType: string;
   threadId?: string;
   /**
+   * Breaker controller captured at the parent TOOL BATCH's entry, before
+   * PreToolUse hooks. Preferred over the live scope accessor: a graph reset
+   * during a hook would otherwise bind this child to the NEW run's
+   * controller — reviving it on a fresh signal and letting its trips cancel
+   * unrelated work.
+   */
+  breaker?: AbortController;
+  /**
    * Parent-side `tool_call_id` of the `subagent` tool invocation that
    * triggered this execution. Surfaced on {@link SubagentUpdateEvent} so
    * hosts can correlate child updates back to the originating tool call
@@ -214,11 +226,31 @@ export type ChildGraphFactory = (input: StandardGraphInput) => StandardGraph;
 export type SubagentExecutorOptions = {
   configs: Map<string, ResolvedSubagentConfig>;
   parentSignal?: AbortSignal;
+  /** Run-scoped breaker abort shared by every executor of one graph, so a
+   * child tripping a stream limit stops subagents running under OTHER
+   * parallel agent nodes too. An accessor rather than a captured controller:
+   * the graph recreates its controller per run, and each execution must
+   * bind to the controller current when it STARTS — signal and trip target
+   * together, so a straggler from a failed run can neither revive on nor
+   * circuit-break a later run's controller. Absent (tests, minimal hosts),
+   * the executor falls back to its own private controller. */
+  breakerScope?: {
+    controller: () => AbortController;
+  };
   hookRegistry?: HookRegistry;
   parentRunId: string;
   parentAgentId?: string;
   langfuse?: StandardGraphInput['langfuse'];
   tokenCounter?: TokenCounter;
+  /**
+   * Run-level stream circuit breakers, forwarded into every child graph so
+   * a host raising, lowering, or disabling the limits governs subagents too.
+   * Child model calls run through `attemptInvoke`'s local stream handler
+   * (children have no registered dispatcher), which enforces the child
+   * graph's own resolved limits; without this the child would silently
+   * revert to the defaults.
+   */
+  streamLimits?: StandardGraphInput['streamLimits'];
   /** Remaining nesting budget. 0 or negative blocks execution. */
   maxDepth?: number;
   /**
@@ -254,11 +286,20 @@ export type SubagentExecutorOptions = {
 export class SubagentExecutor {
   private readonly configs: Map<string, ResolvedSubagentConfig>;
   private readonly parentSignal?: AbortSignal;
+  /** Aborted when a child trips a stream circuit breaker: parallel sibling
+   * subagents run concurrently on the parent's signal, and rejecting the
+   * batch alone would leave their provider requests streaming after the
+   * safety abort. One-way by design — a tripped breaker ends the run, so no
+   * later child of this executor should start either. Fallback for hosts
+   * that do not supply the graph's shared `breakerScope`. */
+  private readonly childRunAbort = new AbortController();
+  private readonly breakerScope?: SubagentExecutorOptions['breakerScope'];
   private readonly hookRegistry?: HookRegistry;
   private readonly parentRunId: string;
   private readonly parentAgentId?: string;
   private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
+  private readonly streamLimits?: StandardGraphInput['streamLimits'];
   private readonly maxDepth: number;
   private readonly createChildGraph: ChildGraphFactory;
   private readonly usageSink?: SubagentUsageSink;
@@ -269,11 +310,13 @@ export class SubagentExecutor {
   constructor(options: SubagentExecutorOptions) {
     this.configs = options.configs;
     this.parentSignal = options.parentSignal;
+    this.breakerScope = options.breakerScope;
     this.hookRegistry = options.hookRegistry;
     this.parentRunId = options.parentRunId;
     this.parentAgentId = options.parentAgentId;
     this.langfuse = options.langfuse;
     this.tokenCounter = options.tokenCounter;
+    this.streamLimits = options.streamLimits;
     this.maxDepth = options.maxDepth ?? 1;
     this.createChildGraph = options.createChildGraph;
     this.usageSink = options.usageSink;
@@ -285,6 +328,23 @@ export class SubagentExecutor {
     }
   }
 
+  /** The breaker controller current for this execution — read per spawn
+   * because the graph recreates its controller each run. */
+  private resolveBreakerController(): AbortController {
+    return this.breakerScope?.controller() ?? this.childRunAbort;
+  }
+
+  /** One signal that fires on the parent's abort or the breaker abort,
+   * collapsed to a single signal when possible (mirrors
+   * `composeAbortSignals` in Graph.ts). */
+  private composeChildSignal(breaker: AbortController): AbortSignal {
+    const child = breaker.signal;
+    if (this.parentSignal == null || this.parentSignal === child) {
+      return child;
+    }
+    return AbortSignal.any([this.parentSignal, child]);
+  }
+
   /** Snapshot of the parent's registry at the moment a subagent is dispatched. */
   private getParentHandlerRegistry(): HandlerRegistry | undefined {
     return this.resolveParentHandlerRegistry?.();
@@ -292,6 +352,15 @@ export class SubagentExecutor {
 
   async execute(params: SubagentExecuteParams): Promise<SubagentExecuteResult> {
     const { description, subagentType, threadId, parentToolCallId } = params;
+    /** Captured ONCE per execution, preferring the controller the parent
+     * tool batch captured at ITS entry (before PreToolUse hooks): a failed
+     * run's graph reset replaces the live controller, and resolving it here
+     * — after the hook awaits — would bind this child to the NEW run's
+     * un-aborted controller: reviving old-run work, or worse, tripping the
+     * new run's breaker from an old child's stream-limit breach. Signal and
+     * trip target both bind to this capture. */
+    const childBreaker = params.breaker ?? this.resolveBreakerController();
+    const childSignal = this.composeChildSignal(childBreaker);
     const config = this.configs.get(subagentType);
 
     if (!config) {
@@ -369,10 +438,11 @@ export class SubagentExecutor {
     const hostUsageSink = this.usageSink;
     const childGraph = this.createChildGraph({
       runId: childRunId,
-      signal: this.parentSignal,
+      signal: childSignal,
       agents: [childInputs],
       langfuse: this.langfuse,
       tokenCounter: this.tokenCounter,
+      streamLimits: this.streamLimits,
       subagentScope: true,
       /**
        * Forwarded so the child graph's own `SubagentExecutor` (created in
@@ -501,7 +571,7 @@ export class SubagentExecutor {
         { messages: [new HumanMessage(description)] },
         {
           recursionLimit: maxTurns * RECURSION_MULTIPLIER,
-          signal: this.parentSignal,
+          signal: childSignal,
           callbacks,
           runName: `subagent:${subagentType}`,
           configurable: {
@@ -511,6 +581,16 @@ export class SubagentExecutor {
         }
       );
     } catch (error) {
+      /** Aborted before any observational work below: parallel siblings — in
+       * this executor and, via the graph-scoped breaker, under other
+       * parallel agent nodes — stream on the composed child signal, and
+       * awaiting forwarding.drain() first would let them consume provider
+       * quota for that entire interval. Trips the ENTRY-captured controller:
+       * after a reset, a straggler must break its own dead run, not the
+       * current one. */
+      if (error instanceof StreamLimitExceededError) {
+        childBreaker.abort(error);
+      }
       const errorMessage = truncateErrorMessage(error);
       if (forwarding) {
         await forwarding.drain();
@@ -525,6 +605,16 @@ export class SubagentExecutor {
         });
       }
       childGraph.clearHeavyState();
+      /**
+       * A tripped stream circuit breaker is a safety abort, not a recoverable
+       * subagent failure: converting it into a tool result would let the
+       * parent keep generating (or spawn another child) after the limit
+       * fired. Rethrown here and passed through ToolNode's error conversion,
+       * so the parent run rejects with the child's limit error.
+       */
+      if (error instanceof StreamLimitExceededError) {
+        throw error;
+      }
       return {
         content: `Subagent error: ${errorMessage}`,
         messages: [],
@@ -956,7 +1046,10 @@ function sanitizeChildConfigurable(
 function isLangGraphRuntimeConfigKey(key: string): boolean {
   return (
     key.startsWith(LANGGRAPH_RUNTIME_CONFIG_PREFIX) ||
-    LANGGRAPH_CHECKPOINT_CONFIG_KEYS.has(key)
+    LANGGRAPH_CHECKPOINT_CONFIG_KEYS.has(key) ||
+    /** The parent batch's breaker scope must not leak into the child
+     * workflow's configurable — children own separate controllers. */
+    key === RUN_BREAKER_SCOPE_CONFIG_KEY
   );
 }
 

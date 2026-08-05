@@ -20,6 +20,7 @@ import {
 } from '../subagent';
 import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecutor';
 import { Constants, Providers, GraphEvents, StepTypes } from '@/common';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { AgentContext } from '@/agents/AgentContext';
 import { HookRegistry } from '@/hooks/HookRegistry';
 import { HandlerRegistry } from '@/events';
@@ -449,6 +450,131 @@ describe('SubagentExecutor', () => {
     });
     expect(result.content).toContain('Maximum subagent nesting depth');
     expect(result.messages).toEqual([]);
+  });
+
+  it('rethrows a child stream-limit trip instead of converting it to a tool result', async () => {
+    const executor = createExecutor({
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockRejectedValue(
+              new StreamLimitExceededError({
+                kind: 'tool_call_args',
+                limit: 10,
+                observed: 11,
+                toolName: 'db_query',
+              })
+            ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    await expect(
+      executor.execute({ description: 'Do something', subagentType: 'researcher' })
+    ).rejects.toBeInstanceOf(StreamLimitExceededError);
+  });
+
+  it('binds the child to the batch-captured controller, not the live scope', async () => {
+    const batchBreaker = new AbortController();
+    const liveBreaker = new AbortController();
+    const executor = createExecutor({
+      breakerScope: { controller: () => liveBreaker },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockRejectedValue(
+              new StreamLimitExceededError({
+                kind: 'tool_call_args',
+                limit: 10,
+                observed: 11,
+                toolName: 'db_query',
+              })
+            ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    /** `breaker` is the controller the parent TOOL BATCH captured before
+     * PreToolUse hooks; a reset during those hooks replaced the live
+     * scope, and the child must not revive on — or trip — the new run's
+     * controller. */
+    await expect(
+      executor.execute({
+        description: 'Do something',
+        subagentType: 'researcher',
+        breaker: batchBreaker,
+      })
+    ).rejects.toBeInstanceOf(StreamLimitExceededError);
+    expect(batchBreaker.signal.aborted).toBe(true);
+    expect(liveBreaker.signal.aborted).toBe(false);
+  });
+
+  it('trips the breaker controller captured at execution start, not the current one', async () => {
+    const oldRun = new AbortController();
+    const newRun = new AbortController();
+    let current = oldRun;
+    let releaseChild: (() => void) | undefined;
+    const executor = createExecutor({
+      breakerScope: { controller: () => current },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(
+              () =>
+                new Promise((_resolve, reject) => {
+                  releaseChild = (): void =>
+                    reject(
+                      new StreamLimitExceededError({
+                        kind: 'tool_call_args',
+                        limit: 10,
+                        observed: 11,
+                        toolName: 'db_query',
+                      })
+                    );
+                })
+            ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    const pending = executor.execute({
+      description: 'Do something',
+      subagentType: 'researcher',
+    });
+    while (releaseChild == null) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    /** The failed run's reset installs a fresh controller while the child
+     * is still settling; the straggler's trip must land on the controller
+     * captured when its execution started. */
+    current = newRun;
+    releaseChild();
+    await expect(pending).rejects.toBeInstanceOf(StreamLimitExceededError);
+    expect(oldRun.signal.aborted).toBe(true);
+    expect(newRun.signal.aborted).toBe(false);
+  });
+
+  it('threads run-level streamLimits into every child graph input', async () => {
+    const childGraphInputs: StandardGraphInput[] = [];
+    const noopFactory = makeNoopGraphFactory();
+    const executor = createExecutor({
+      streamLimits: { maxToolCallArgBytes: 1234, maxDeltaEventsPerTurn: 9 },
+      createChildGraph: (input: StandardGraphInput): StandardGraph => {
+        childGraphInputs.push(input);
+        return noopFactory();
+      },
+    });
+    await executor.execute({
+      description: 'Do something',
+      subagentType: 'researcher',
+    });
+    expect(childGraphInputs).toHaveLength(1);
+    expect(childGraphInputs[0].streamLimits).toEqual({
+      maxToolCallArgBytes: 1234,
+      maxDeltaEventsPerTurn: 9,
+    });
   });
 
   it('executes child graph and returns filtered content', async () => {

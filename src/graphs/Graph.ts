@@ -17,6 +17,12 @@ import type {
   MessageContent,
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type {
+  ResolvedStreamLimits,
+  RunBreakerScope,
+  StreamedToolCallArgTally,
+  StreamDeltaEventTally,
+} from '@/llm/streamLimits';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
 import type { FallbackErrorContext } from '@/llm/invoke';
 import type { HookRegistry } from '@/hooks';
@@ -69,6 +75,7 @@ import {
   isGoogleLike,
   apportionTokenCounts,
   calculateMaxToolResultChars,
+  composeAbortSignals,
   joinKeys,
   sleep,
 } from '@/utils';
@@ -115,6 +122,13 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
+import {
+  resolveStreamLimits,
+  StreamLimitExceededError,
+  sweepStaleStreamLimitEntries,
+  STREAM_LIMIT_EPOCH_KEY,
+  RUN_BREAKER_SCOPE_CONFIG_KEY,
+} from '@/llm/streamLimits';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
@@ -153,25 +167,6 @@ const EMPTY_PREEMPT_BOUNDARY: PreemptBoundaryResult = {
   messages: [],
   preventContinuation: false,
 };
-
-/**
- * One signal that fires when either input fires. `AbortSignal.any` is skipped
- * when the inputs collapse to a single signal — the composite is a fresh
- * object per call, and the common cases (one channel, or the host reusing the
- * same controller for both) don't need one.
- */
-function composeAbortSignals(
-  a: AbortSignal | undefined,
-  b: AbortSignal | undefined
-): AbortSignal | undefined {
-  if (a == null || a === b) {
-    return b;
-  }
-  if (b == null) {
-    return a;
-  }
-  return AbortSignal.any([a, b]);
-}
 
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
@@ -1052,6 +1047,80 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /** See {@link t.StandardGraphInput.preemption}. */
   preemption?: t.StreamPreemption;
   /**
+   * Stream circuit breakers, resolved once from
+   * {@link t.StandardGraphInput.streamLimits}. The stream handler enforces
+   * these on every streamed chunk event.
+   */
+  streamLimits: ResolvedStreamLimits;
+  /**
+   * Cumulative streamed argument bytes per in-flight tool call, keyed by
+   * generation key + chunk index (see `resolveGenerationKey`). Per-run
+   * accumulation state, cleared by both reset paths.
+   */
+  streamedToolCallArgTallies: Map<string, StreamedToolCallArgTally> =
+    new Map();
+  /** Streamed chunk events per model generation, keyed by generation key. */
+  streamDeltaEventCounts: Map<string, StreamDeltaEventTally> = new Map();
+  /** Per-chunk-object, per-generation charge balances (lazily created; see
+   * `StreamLimitState`). Reinitialized by both reset paths: a model may
+   * retain and re-yield one mutable chunk object, whose nested map would
+   * otherwise grow by one attempt-stamped entry per model call for the
+   * graph's lifetime. */
+  streamLimitChargeCredits?: WeakMap<object, Map<string, number>>;
+  /** Run-scoped breaker abort: composed into every model invocation and
+   * every SubagentExecutor child signal, and tripped when a stream circuit
+   * breaker fires anywhere in the run, so parallel agent nodes' in-flight
+   * provider calls and subagents stop consuming quota while the rejection
+   * propagates. Recreated by both reset paths — the abort is one-way within
+   * a run, and a reused graph must start its next run unaborted. */
+  breakerAbort = new AbortController();
+
+  /** Incremented whenever `breakerAbort` is replaced. Stamped into each
+   * model attempt's metadata ({@link STREAM_LIMIT_EPOCH_KEY}) so the stream
+   * handler's consumer-side trip binds to the run that produced the event
+   * rather than whichever controller is live when a straggling chunk is
+   * finally handled. */
+  breakerEpoch = 0;
+
+  /** Immutable snapshot of the run's breaker identity (epoch + controller),
+   * replaced as ONE object whenever `resetValues` installs a fresh
+   * controller. Sites that pause across awaits capture it at entry and
+   * revalidate by REFERENCE afterwards — a single identity comparison
+   * proves no reset happened while suspended, where separate epoch and
+   * controller reads could interleave with one. */
+  runScope: RunBreakerScope = Object.freeze({
+    epoch: 0,
+    controller: this.breakerAbort,
+  });
+
+  /** Generation keys of model attempts still in flight (see
+   * `StreamLimitState.activeStreamLimitGenerations`). Lazily created by the
+   * attempt lease; spans resets on purpose. */
+  activeStreamLimitGenerations?: Set<string>;
+
+  /** The stream-limit error behind an already-fired breaker, whether this
+   * graph's own controller tripped or a parent run's breaker arrived through
+   * the composed constructor signal (child graphs own separate controllers).
+   * Providers can translate either abort into a generic error, and recovery
+   * paths must not run in that state. */
+  protected resolveTrippedBreakerReason(
+    breakerSignal: AbortSignal = this.breakerAbort.signal
+  ): StreamLimitExceededError | undefined {
+    if (
+      breakerSignal.aborted &&
+      breakerSignal.reason instanceof StreamLimitExceededError
+    ) {
+      return breakerSignal.reason;
+    }
+    if (
+      this.signal?.aborted === true &&
+      this.signal.reason instanceof StreamLimitExceededError
+    ) {
+      return this.signal.reason;
+    }
+    return undefined;
+  }
+  /**
    * Seals charged against `preemption.maxSeals`. Per-turn: cleared by both
    * reset paths so a fresh turn gets a fresh budget, while a HITL resume —
    * which skips `resetValues` — keeps what it had left.
@@ -1108,6 +1177,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     subagentUsageSink,
     subagentScope,
     preemption,
+    streamLimits,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
@@ -1117,6 +1187,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.subagentUsageSink = subagentUsageSink;
     this.subagentScope = subagentScope === true;
     this.preemption = preemption;
+    this.streamLimits = resolveStreamLimits(streamLimits);
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -1162,6 +1233,36 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
     this.eagerEventToolSuppressions.clear();
+    /** Grace sweep instead of a clear: producer loops of straggling
+     * attempts use these maps directly and sit outside the consumer-only
+     * epoch gate — clearing would hand a cancellation-ignoring provider a
+     * fresh allowance at every run start. Entries from the epoch that is
+     * ending survive exactly one reset so those stragglers stay on their
+     * original budgets; older entries are removed. */
+    sweepStaleStreamLimitEntries(
+      this.streamedToolCallArgTallies,
+      this.breakerEpoch,
+      this.activeStreamLimitGenerations
+    );
+    sweepStaleStreamLimitEntries(
+      this.streamDeltaEventCounts,
+      this.breakerEpoch,
+      this.activeStreamLimitGenerations
+    );
+    this.streamLimitChargeCredits = undefined;
+    /** Run-start is the only safe replacement point for the breaker:
+     * end-of-run cleanup must leave it in place so straggling parallel
+     * children from the failed run cannot start on a fresh signal.
+     * Replaced UNCONDITIONALLY here — a run that failed on an ordinary
+     * error leaves the controller un-aborted, and stragglers still settling
+     * hold their entry-time capture of it; a late stream-limit trip on that
+     * old controller must not cancel the run starting now. */
+    this.breakerAbort = new AbortController();
+    this.breakerEpoch += 1;
+    this.runScope = Object.freeze({
+      epoch: this.breakerEpoch,
+      controller: this.breakerAbort,
+    });
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
@@ -1219,6 +1320,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
+    /** Stream-limit accounting (argument tallies, event counts, charge
+     * credits) deliberately SURVIVES cleanup: this runs in `processStream`'s
+     * finally, which an ordinary parallel-branch failure reaches while
+     * sibling attempts are still unwinding on the retained breaker — a
+     * cancellation-ignoring provider's late chunks would otherwise recreate
+     * their budgets from zero and stream another full allowance. The maps
+     * are bounded by in-flight call sizes and `resetValues` clears them at
+     * the next run start, where the epoch bump already drops stamped
+     * straggler events before accounting. */
+    /** Deliberately NOT recreating a tripped breakerAbort here: this runs in
+     * `processStream`'s cleanup, which a rejected parallel batch reaches
+     * while sibling subagents can still be pre-invoke — a fresh controller
+     * would hand them an un-aborted signal and let provider requests start
+     * after the run already failed. `resetValues` recreates it when the next
+     * run begins. */
     /**
      * Turn state only. The reported totals must outlive cleanup — this runs
      * in `processStream`'s `finally`, and the host reads `getPreemptStats()`
@@ -1501,13 +1617,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /* Misc.*/
 
   getRunMessages(): BaseMessage[] | undefined {
-    if (this.messages == null) {
+    /** Runtime-honest widening: a disposed-but-cached graph (HITL
+     * resume/reconnect through a WeakRef cache) can carry null here despite
+     * the field type. */
+    const messages = this.messages as BaseMessage[] | undefined;
+    if (messages == null) {
       return this.cachedRunMessages;
     }
-    if (this.messages.length === 0 && this.cachedRunMessages != null) {
+    if (messages.length === 0 && this.cachedRunMessages != null) {
       return this.cachedRunMessages;
     }
-    return this.messages.slice(this.startIndex);
+    return messages.slice(this.startIndex);
   }
 
   override getDiscoveredTools(agentId?: string): string[] {
@@ -1559,10 +1679,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     // `messages` can be null/undefined on a graph that has been disposed
     // (clearHeavyState) but is still reachable via a cache (e.g. RedisJobStore's
     // WeakRef) during a HITL resume/reconnect. Guard instead of dereferencing null.
-    if (this.messages == null) {
+    const messages = this.messages as BaseMessage[] | undefined;
+    if (messages == null) {
       return undefined;
     }
-    return convertMessagesToContent(this.messages.slice(this.startIndex));
+    return convertMessagesToContent(messages.slice(this.startIndex));
   }
 
   getCalibrationRatio(): number {
@@ -1597,13 +1718,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     // `contentData` can be null/undefined on a disposed-but-cached graph during a
     // HITL resume/reconnect; without this guard `[...this.contentData]` throws
     // "this.contentData is not iterable".
-    if (this.contentData == null) {
+    const contentData = this.contentData as t.RunStep[] | undefined;
+    if (contentData == null) {
       return [];
     }
     if (agentId == null || agentId === '') {
-      return [...this.contentData];
+      return [...contentData];
     }
-    return this.contentData.filter((step) => step.agentId === agentId);
+    return contentData.filter((step) => step.agentId === agentId);
   }
 
   /**
@@ -1734,6 +1856,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
         fileCheckpointer: this.getOrCreateFileCheckpointer(),
+        getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
+        getRunScope: (): RunBreakerScope => this.runScope,
         errorHandler: (data, metadata): Promise<boolean> =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
@@ -1801,6 +1925,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       maxToolResultChars: agentContext?.maxToolResultChars,
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
       fileCheckpointer: this.getOrCreateFileCheckpointer(),
+      getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
+      getRunScope: (): RunBreakerScope => this.runScope,
     });
     this.registerCompiledToolNode(node);
     return node;
@@ -1927,6 +2053,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       state: t.AgentSubgraphState,
       config?: RunnableConfig
     ): Promise<Partial<t.AgentSubgraphState>> => {
+      /** Captured at node ENTRY, before any host-facing await (context-usage
+       * dispatch, hooks): a sibling's trip can fail the run and a prompt
+       * next run can reset the controller while this node is paused in one
+       * of those awaits, and a later capture would bind this attempt to the
+       * fresh controller. Trips and reason reads below stay on this
+       * capture. */
+      const attemptBreaker = this.breakerAbort;
+      const attemptBreakerEpoch = this.breakerEpoch;
+      /** Already-tripped-at-entry: a parallel sibling's breach has failed
+       * the run before this node was scheduled. Rethrow before hooks or the
+       * provider call — a custom provider that doesn't synchronously reject
+       * an aborted signal would otherwise start another model request on a
+       * failed run. */
+      const entryTripReason = this.resolveTrippedBreakerReason(
+        attemptBreaker.signal
+      );
+      if (entryTripReason != null) {
+        throw entryTripReason;
+      }
       const agentContext = this.agentContexts.get(agentId);
       if (!agentContext) {
         throw new Error(`Agent context not found for agentId: ${agentId}`);
@@ -3120,6 +3265,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       let langfuseHandler: CallbackEntry | undefined;
       let invokeConfig = {
         ...config,
+        /** The run-scoped breaker composed in, so a stream-limit trip in one
+         * parallel agent node also cancels sibling nodes' in-flight model
+         * calls, not only their subagents. */
+        signal: composeAbortSignals(config.signal, attemptBreaker.signal),
         metadata: {
           ...(config.metadata ?? {}),
           ...traceMetadata,
@@ -3128,6 +3277,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
            *  length cap, but scope trust (`isForeignScope`) needs the id
            *  verbatim regardless of length. */
           agentId,
+          [STREAM_LIMIT_EPOCH_KEY]: attemptBreakerEpoch,
         },
       };
       initializeLangfuseTracing(langfuse);
@@ -3166,6 +3316,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (preInvokeContextOverflowError != null) {
           throw preInvokeContextOverflowError;
         }
+        /** Rechecked after the pre-invoke awaits (context-usage dispatch,
+         * hooks): a sibling can trip the breaker while this node is paused
+         * in one of them, and a provider that doesn't synchronously reject
+         * an aborted signal would still start the request. */
+        {
+          const preInvokeTrip = this.resolveTrippedBreakerReason(
+            attemptBreaker.signal
+          );
+          if (preInvokeTrip != null) {
+            throw preInvokeTrip;
+          }
+        }
         result = await withLangfuseRuntimeScope(
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,
@@ -3189,6 +3351,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           graph: this,
           metadata,
         });
+        /**
+         * A tripped stream circuit breaker is a deliberate abort, not a
+         * provider failure: entering overflow recovery or the fallback chain
+         * would spend more provider work after the safety limit fired, and a
+         * succeeding fallback would resolve a run the public contract says
+         * must reject. Rethrow before any recovery path.
+         */
+        if (primaryError instanceof StreamLimitExceededError) {
+          /** Tripped before rethrowing so parallel agent nodes' in-flight
+           * model calls and subagents stop while the rejection propagates. */
+          attemptBreaker.abort(primaryError);
+          throw primaryError;
+        }
+        /** A sibling that tripped the shared breaker aborts this branch's
+         * composed signal, and some providers surface that as a generic
+         * abort error; entering overflow planning or the fallback chain
+         * would start new provider work after the run-wide breaker fired.
+         * Rethrow the breaker's own stream-limit reason instead. */
+        {
+          const trippedReason = this.resolveTrippedBreakerReason(attemptBreaker.signal);
+          if (trippedReason != null) {
+            throw trippedReason;
+          }
+        }
         /**
          * A context overflow is a deterministic consequence of the payload,
          * not a provider being unavailable — so it is answered by compacting
@@ -3422,6 +3608,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               })
           );
         } catch (fallbackError) {
+          if (fallbackError instanceof StreamLimitExceededError) {
+            /** Same treatment as the primary path: a fallback stream that
+             * trips the breaker must stop parallel agent nodes' model calls
+             * and subagents before the rejection propagates. */
+            attemptBreaker.abort(fallbackError);
+            throw fallbackError;
+          }
+          {
+            /** Same sibling-abort translation guard as the primary catch. */
+            const trippedReason = this.resolveTrippedBreakerReason(attemptBreaker.signal);
+            if (trippedReason != null) {
+              throw trippedReason;
+            }
+          }
           const overflowCandidates =
             getFallbackOverflowCandidates(fallbackError);
           let fallbackRecovery: OverflowRecoveryPlan | null = null;
@@ -3840,6 +4040,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const executor = new SubagentExecutor({
           configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
           parentSignal: this.signal,
+          breakerScope: {
+            controller: (): AbortController => this.breakerAbort,
+          },
           hookRegistry: this.hookRegistry,
           /** Lazy — Run wires the registry onto the graph AFTER
            *  `createWorkflow()` runs, so a direct capture here would be
@@ -3850,6 +4053,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           langfuse: this.langfuse,
           tokenCounter: agentContext.tokenCounter,
           usageSink: this.subagentUsageSink,
+          streamLimits: this.streamLimits,
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {
             const childGraph = new StandardGraph(input);
@@ -3912,11 +4116,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const toolCall = (config as { toolCall?: { id?: string } }).toolCall;
           const parentToolCallId =
             typeof toolCall?.id === 'string' ? toolCall.id : undefined;
+          /** The parent tool batch's entry-captured scope (stamped by
+           * ToolNode before PreToolUse hooks) — binds this child to the
+           * run that dispatched it, not to whatever controller a reset
+           * installed while the hooks were awaited. */
+          const batchScope = config.configurable?.[
+            RUN_BREAKER_SCOPE_CONFIG_KEY
+          ] as RunBreakerScope | undefined;
           const result = await executor.execute({
             description,
             subagentType,
             threadId,
             parentToolCallId,
+            breaker: batchScope?.controller,
             /**
              * Forward the parent's `configurable` so host-set fields
              * (`requestBody`, `user`, etc.) propagate into the child
@@ -4002,6 +4214,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }),
     });
 
+    const readChargeCredits = ():
+      | WeakMap<object, Map<string, number>>
+      | undefined => this.streamLimitChargeCredits;
+    const readBreakerEpoch = (): number => this.breakerEpoch;
+    const readActiveGenerations = (): Set<string> | undefined =>
+      this.activeStreamLimitGenerations;
+    const writeActiveGenerations = (value: Set<string> | undefined): void => {
+      this.activeStreamLimitGenerations = value;
+    };
+    const writeChargeCredits = (
+      value: WeakMap<object, Map<string, number>> | undefined
+    ): void => {
+      this.streamLimitChargeCredits = value;
+    };
+
     const workflow = new StateGraph(StateAnnotation)
       .addNode(agentNode, this.createCallModel(agentId))
       .addNode(
@@ -4025,6 +4252,54 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             runId: this.runId,
             isMultiAgent: this.isMultiAgentGraph(),
             hookRegistry: this.hookRegistry,
+            /**
+             * Live references (both maps are cleared in place, never
+             * replaced), so summarization streams share the run's event
+             * budget accounting under their own generation key.
+             */
+            streamLimits: this.streamLimits,
+            streamDeltaEventCounts: this.streamDeltaEventCounts,
+            streamedToolCallArgTallies: this.streamedToolCallArgTallies,
+            /** Accessor pair, not a value copy: unlike the two maps above,
+             * the credit map is REPLACED by graph resets rather than cleared
+             * in place, and the guards' lazy `??=` must install onto the
+             * graph — a copy held here would survive resets and grow one
+             * attempt-stamped entry per compaction for a retained reused
+             * chunk object. */
+            get streamLimitChargeCredits() {
+              return readChargeCredits();
+            },
+            set streamLimitChargeCredits(
+              value: WeakMap<object, Map<string, number>> | undefined
+            ) {
+              writeChargeCredits(value);
+            },
+            /** Live epoch, so summary tallies are creation-tagged and the
+             * resetValues grace sweep treats them like model-attempt
+             * entries. */
+            get breakerEpoch(): number {
+              return readBreakerEpoch();
+            },
+            /** Accessor pair like the charge credits: summary attempts
+             * lease their generations on the GRAPH's active set, and the
+             * lazy `??=` in the lease helper must install there. */
+            get activeStreamLimitGenerations(): Set<string> | undefined {
+              return readActiveGenerations();
+            },
+            set activeStreamLimitGenerations(value: Set<string> | undefined) {
+              writeActiveGenerations(value);
+            },
+            /** Read per attempt: a sibling branch tripping the run breaker
+             * must also cancel in-flight summarization model calls. */
+            getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
+            /** The node captures this at entry so its own chunk handler's
+             * breach trips the run that STARTED the summarization, not a
+             * controller installed by a later reset. */
+            getBreakerController: (): AbortController => this.breakerAbort,
+            /** Captured at node entry and stamped into the summary attempt
+             * metadata, so the wire consumer epoch-gates old-run summary
+             * chunks exactly like model-attempt chunks. */
+            getBreakerEpoch: (): number => this.breakerEpoch,
             dispatchRunStep: async (runStep, nodeConfig) => {
               const resolvedConfig = nodeConfig ?? this.config;
               if (runStep.agentId != null) {

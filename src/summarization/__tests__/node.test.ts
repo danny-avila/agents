@@ -7,6 +7,7 @@ import {
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
 } from '@/summarization/node';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { AgentContext } from '@/agents/AgentContext';
@@ -1705,5 +1706,273 @@ describe('createSummarizeNode — overflow recovery', () => {
     );
 
     expect(agentContext.hasSummary()).toBe(true);
+  });
+});
+
+describe('summarize node breaker capture', () => {
+  it('stamps the entry-captured breaker epoch into summary attempt metadata', async () => {
+    captureEvents();
+    const capturedConfigs: Array<{ metadata?: Record<string, unknown> }> = [];
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest
+              .fn()
+              .mockImplementation(
+                async (_messages: unknown, config?: unknown) => {
+                  capturedConfigs.push(
+                    config as { metadata?: Record<string, unknown> }
+                  );
+                  return { content: 'Summary text' };
+                }
+              ),
+          };
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    const graph = {
+      ...mockGraph(),
+      getBreakerEpoch: (): number => 7,
+    };
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(capturedConfigs.length).toBeGreaterThan(0);
+    for (const config of capturedConfigs) {
+      expect(config.metadata?.lc_stream_limit_epoch).toBe(7);
+    }
+  });
+
+  it('rejects before the model call when the breaker trips during pre-call awaits', async () => {
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    const entryBreaker = new AbortController();
+    /** The trip lands while ON_SUMMARIZE_START is awaited — after the
+     * entry check already passed. */
+    jest.spyOn(eventUtils, 'safeDispatchCustomEvent').mockImplementation((async (
+      ...args: unknown[]
+    ) => {
+      if (args[0] === GraphEvents.ON_SUMMARIZE_START) {
+        entryBreaker.abort(trip);
+      }
+    }) as never);
+    const modelClassSpy = jest
+      .spyOn(providers, 'getChatModelClass')
+      .mockReturnValue(
+        class {
+          constructor() {
+            return mockInvokeModel('should never run');
+          }
+        } as never
+      );
+
+    const agentContext = createAgentContext();
+    const graph = {
+      ...mockGraph(),
+      getBreakerSignal: (): AbortSignal => entryBreaker.signal,
+    };
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await expect(
+      node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      )
+    ).rejects.toBe(trip);
+    expect(modelClassSpy).not.toHaveBeenCalled();
+  });
+
+  it('rethrows a parent trip on the config signal instead of degrading to the stub', async () => {
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    /** Child graph's own breaker stays live: in a subagent, a ROOT
+     * sibling's trip arrives only through the composed invocation signal. */
+    const childBreaker = new AbortController();
+    const configAbort = new AbortController();
+    captureEvents();
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest.fn().mockImplementation(async () => {
+              configAbort.abort(trip);
+              throw new Error('The operation was aborted');
+            }),
+          };
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    const graph = {
+      ...mockGraph(),
+      getBreakerSignal: (): AbortSignal => childBreaker.signal,
+    };
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await expect(
+      node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        { signal: configAbort.signal } as RunnableConfig
+      )
+    ).rejects.toBe(trip);
+  });
+
+  it('rejects at entry when the breaker has already tripped', async () => {
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    const entryBreaker = new AbortController();
+    entryBreaker.abort(trip);
+
+    const modelClassSpy = jest
+      .spyOn(providers, 'getChatModelClass')
+      .mockReturnValue(
+        class {
+          constructor() {
+            return mockInvokeModel('should never run');
+          }
+        } as never
+      );
+
+    const agentContext = createAgentContext();
+    const graph = {
+      ...mockGraph(),
+      getBreakerSignal: (): AbortSignal => entryBreaker.signal,
+    };
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await expect(
+      node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      )
+    ).rejects.toBe(trip);
+
+    expect(graph.contentData).toHaveLength(0);
+    expect(modelClassSpy).not.toHaveBeenCalled();
+  });
+
+  it('binds the model call to the breaker signal read at node entry', async () => {
+    const entryBreaker = new AbortController();
+    const lateBreaker = new AbortController();
+    let started = false;
+    jest.spyOn(eventUtils, 'safeDispatchCustomEvent').mockImplementation((async (
+      ...args: unknown[]
+    ) => {
+      if (args[0] === GraphEvents.ON_SUMMARIZE_START) {
+        started = true;
+      }
+    }) as never);
+
+    const capturedSignals: Array<AbortSignal | undefined> = [];
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest
+              .fn()
+              .mockImplementation(
+                async (_messages: unknown, config?: unknown) => {
+                  capturedSignals.push(
+                    (config as RunnableConfig | undefined)?.signal
+                  );
+                  return { content: 'Summary text' };
+                }
+              ),
+          };
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    /** Simulates a graph reset between node entry and the model call: once
+     * ON_SUMMARIZE_START has been awaited, the live accessor hands out a
+     * fresh controller's signal. The model call must still see the signal
+     * captured at entry. */
+    const graph = {
+      ...mockGraph(),
+      getBreakerSignal: (): AbortSignal =>
+        started ? lateBreaker.signal : entryBreaker.signal,
+    };
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(capturedSignals.length).toBeGreaterThan(0);
+    for (const signal of capturedSignals) {
+      expect(signal).toBe(entryBreaker.signal);
+    }
   });
 });

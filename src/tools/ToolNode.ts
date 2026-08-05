@@ -79,9 +79,26 @@ import {
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
+import type { RunBreakerScope } from '@/llm/streamLimits';
+import {
+  StreamLimitExceededError,
+  RUN_BREAKER_SCOPE_CONFIG_KEY,
+} from '@/llm/streamLimits';
+
+/** Host-facing batch requests must not carry the batch's breaker scope —
+ * hosts spread `configurable` into their own run configs. */
+function stripRunBreakerScope(
+  configurable: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  if (configurable == null || !(RUN_BREAKER_SCOPE_CONFIG_KEY in configurable)) {
+    return configurable;
+  }
+  const { [RUN_BREAKER_SCOPE_CONFIG_KEY]: _scope, ...rest } = configurable;
+  return rest;
+}
 import { convertInjectedMessages } from '@/messages/injected';
 import { safeDispatchCustomEvent } from '@/utils/events';
-import { RunnableCallable } from '@/utils';
+import { RunnableCallable, composeAbortSignals } from '@/utils';
 import { executeHooks } from '@/hooks';
 
 /**
@@ -636,6 +653,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private toolOutputRegistry?: ToolOutputReferenceRegistry;
   /** Run-scoped selection for swapping remote code tools to local executors. */
   private toolExecution?: t.ToolExecutionConfig;
+  /** Owning graph's run-scoped breaker signal, composed into each batch's config. */
+  private getBreakerSignal?: () => AbortSignal | undefined;
+  /** Owning graph's immutable run scope; captured once per batch. */
+  private getRunScope?: () => RunBreakerScope;
   /**
    * Monotonic counter used to mint a unique scope id for anonymous
    * batches (ones invoked without a `run_id` in
@@ -677,6 +698,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolOutputRegistry,
     toolExecution,
     fileCheckpointer,
+    getBreakerSignal,
+    getRunScope,
   }: t.ToolNodeConstructorParams) {
     super({
       name: name ?? TOOL_NODE_RUN_NAME,
@@ -720,6 +743,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.hookRegistry = hookRegistry;
     this.humanInTheLoop = humanInTheLoop;
     this.toolExecution = toolExecution;
+    this.getBreakerSignal = getBreakerSignal;
+    this.getRunScope = getRunScope;
     // Caller-provided checkpointer wins. Graphs use this to share a
     // single per-Run instance across every ToolNode they compile so
     // `Run.rewindFiles()` reaches the same snapshot store regardless
@@ -1212,6 +1237,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           (config.configurable?.writer as ToolRuntime<T>['writer']) ??
           null,
       };
+      /** A sibling can trip the breaker while the PreToolUse hooks above
+       * are awaited; a tool that never inspects its runtime signal would
+       * still run. Recheck at the last moment before execution. */
+      this.throwIfBreakerTripped(config);
       const output = await tool.invoke(invokeParams, runtime);
       if (isCommand(output)) {
         return output;
@@ -1321,6 +1350,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         throw e;
       }
       if (isGraphInterrupt(e)) {
+        throw e;
+      }
+      /**
+       * A stream circuit breaker tripped by a child run (subagent) is a
+       * safety abort, not a tool failure to report back to the model. It
+       * passes through like an interrupt so the whole run rejects.
+       */
+      if (e instanceof StreamLimitExceededError) {
         throw e;
       }
       if (this.errorHandler) {
@@ -2237,11 +2274,27 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * 4. Injected messages from results are collected and returned alongside
    *    ToolMessages (appended AFTER to respect provider ordering).
    */
+  /** Rethrows a stream-limit trip carried on the batch config's composed
+   * signal. Rechecked at each later execution/dispatch stage because a tool
+   * that ignores cancellation can complete normally across the trip, and
+   * the next stage would otherwise start fresh side effects on a failed
+   * run. */
+  private throwIfBreakerTripped(config: RunnableConfig): void {
+    const signal = config.signal;
+    if (
+      signal?.aborted === true &&
+      signal.reason instanceof StreamLimitExceededError
+    ) {
+      throw signal.reason;
+    }
+  }
+
   private async dispatchToolEvents(
     toolCalls: ToolCall[],
     config: RunnableConfig,
     batchContext: DispatchBatchContext = {}
   ): Promise<{ toolMessages: ToolMessage[]; injected: BaseMessage[] }> {
+    this.throwIfBreakerTripped(config);
     const {
       batchIndices,
       turn,
@@ -2941,9 +2994,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         dispatchRequests.map((request) => [request.id, request])
       );
       const onResult = (result: t.ToolExecuteResult): void => {
+        /** Runtime-honest widening: hosts may omit the id despite the
+         * field type. */
+        const resultToolCallId = result.toolCallId as string | undefined;
         const request =
-          result.toolCallId != null
-            ? dispatchRequestById.get(result.toolCallId)
+          resultToolCallId != null
+            ? dispatchRequestById.get(resultToolCallId)
             : undefined;
         if (
           request == null ||
@@ -2966,6 +3022,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         );
       };
 
+      /** The approval hooks above are awaited; a sibling's trip during them
+       * must stop the approved batch before it reaches a host handler that
+       * may never inspect the request signal. */
+      if (dispatchRequests.length > 0) {
+        this.throwIfBreakerTripped(config);
+      }
       const dispatchPromise =
         dispatchRequests.length === 0
           ? Promise.resolve([] as t.ToolExecuteResult[])
@@ -2988,12 +3050,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               // the eager path sends `agentContext.agentId` — this must
               // match it at the top level too.
               agentId: this.executingAgentId,
-              configurable: config.configurable as
-                  | Record<string, unknown>
-                  | undefined,
+              configurable: stripRunBreakerScope(
+                config.configurable as Record<string, unknown> | undefined
+              ),
               metadata: config.metadata as
                   | Record<string, unknown>
                   | undefined,
+              signal: config.signal,
               resolve: (results): void => {
                 resultSettled = true;
                 settledResults = results;
@@ -3678,6 +3741,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       outputs[i] = interruptingOutputs[k];
     });
 
+    /** The breaker can trip while the interrupting group is awaited — e.g.
+     * a tool that ignores cancellation and completes normally. Recheck
+     * before starting the non-idempotent siblings. */
+    this.throwIfBreakerTripped(config);
+
     // No interrupting call suspended — safe to run the remaining siblings.
     const regularOutputs = await Promise.all(
       regularPositions.map((i) => runOne(directCalls[i], i))
@@ -3718,6 +3786,41 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   protected async run(input: any, config: RunnableConfig): Promise<T> {
+    /**
+     * Breaker read once at batch entry: every downstream path (direct
+     * `tool.invoke` runtimes and the ON_TOOL_EXECUTE dispatch) inherits this
+     * config, and a graph reset mid-batch must not detach in-flight tools
+     * from an already-tripped signal.
+     */
+    const breakerSignal = this.getBreakerSignal?.();
+    const composedSignal = composeAbortSignals(config.signal, breakerSignal);
+    /** Immutable batch scope, captured with the signal BEFORE hooks: tools
+     * that spawn runs (subagents) bind their child to this controller, so a
+     * reset during a PreToolUse hook cannot hand them the new run's one. */
+    const batchRunScope = this.getRunScope?.();
+    if (composedSignal !== config.signal || batchRunScope != null) {
+      config = {
+        ...config,
+        signal: composedSignal,
+        ...(batchRunScope != null && {
+          configurable: {
+            ...config.configurable,
+            [RUN_BREAKER_SCOPE_CONFIG_KEY]: batchRunScope,
+          },
+        }),
+      };
+    }
+    /** Already-tripped-at-entry: a parallel sibling's breach failed the run
+     * before this batch was scheduled. Rethrow before hooks, direct
+     * `tool.invoke` calls, or ON_TOOL_EXECUTE dispatch — a tool or host
+     * handler that doesn't synchronously inspect an aborted signal would
+     * otherwise perform side effects on a failed run. */
+    if (
+      composedSignal?.aborted === true &&
+      composedSignal.reason instanceof StreamLimitExceededError
+    ) {
+      throw composedSignal.reason;
+    }
     this.toolCallTurns.clear();
     /**
      * Per-batch local map for resolved (post-substitution) args.

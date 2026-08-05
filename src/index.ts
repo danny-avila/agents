@@ -82,3 +82,14 @@ export { initializeModel } from './llm/init';
 export { attemptInvoke, tryFallbackProviders } from './llm/invoke';
 export { canSealPreempt } from './llm/preempt';
 export { isThinkingEnabled, getMaxOutputTokensKey } from './llm/request';
+export {
+  DEFAULT_MAX_TOOL_CALL_ARG_BYTES,
+  StreamLimitExceededError,
+  resolveStreamLimits,
+} from './llm/streamLimits';
+export type {
+  StreamedToolCallArgTally,
+  ResolvedStreamLimits,
+  StreamLimitState,
+  StreamLimitKind,
+} from './llm/streamLimits';

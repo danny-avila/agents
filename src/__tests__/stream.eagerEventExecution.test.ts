@@ -44,6 +44,7 @@ function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
       configurable: { user_id: 'user_1' },
       metadata: { run_id: 'run_1' },
     },
+    breakerAbort: new AbortController(),
     eagerEventToolExecution: { enabled: true },
     eagerEventToolExecutions: new Map(),
     eagerEventToolUsageCount: eagerUsageCount,
