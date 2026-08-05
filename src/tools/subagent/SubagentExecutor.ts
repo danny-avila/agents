@@ -27,17 +27,24 @@ import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs/Graph';
 import type { HandlerRegistry } from '@/events';
-import { Constants, GraphEvents, Callback, StepTypes } from '@/common';
 import {
   StreamLimitExceededError,
   RUN_BREAKER_SCOPE_CONFIG_KEY,
 } from '@/llm/streamLimits';
+import {
+  ContentTypes,
+  Constants,
+  GraphEvents,
+  Callback,
+  StepTypes,
+} from '@/common';
 import { executeHooks } from '@/hooks';
 
 const DEFAULT_MAX_TURNS = 25;
 const RECURSION_MULTIPLIER = 3;
 const ERROR_MESSAGE_MAX_CHARS = 200;
 const MAX_PENDING_SUBAGENT_UPDATES = 64;
+const TEXT_DELTA_CONTENT_TYPE = `${ContentTypes.TEXT}_delta`;
 
 const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
   additionalContexts: [] as string[],
@@ -119,7 +126,10 @@ type SanitizedStepCompleted =
     };
 
 type SanitizedProcessedToolCall = Partial<
-  Pick<ProcessedToolCall, 'args' | 'id' | 'name' | 'output' | 'progress' | 'outcome'>
+  Pick<
+    ProcessedToolCall,
+    'args' | 'id' | 'name' | 'output' | 'progress' | 'outcome'
+  >
 >;
 
 type SanitizedRunStepCompleted = {
@@ -1401,6 +1411,8 @@ export function summarizeEvent(eventName: string, data: unknown): string {
  * pure tool_use (e.g. the subagent hit `maxTurns` mid-tool-call), the walk
  * continues to earlier AIMessages so partial progress is salvaged — this
  * matches Claude Code's behavior in `agentToolUtils.finalizeAgentTool`.
+ * Consecutive streamed text-delta blocks are coalesced without adding
+ * whitespace; complete text blocks remain newline-separated.
  * Returns "Task completed" only when no AIMessage in the history contains
  * any text.
  */
@@ -1422,13 +1434,44 @@ export function filterSubagentResult(messages: BaseMessage[]): string {
     }
 
     const textParts: string[] = [];
+    let textDeltaParts: string[] = [];
+    const flushTextDeltaParts = (): void => {
+      if (textDeltaParts.length === 0) {
+        return;
+      }
+      textParts.push(textDeltaParts.join(''));
+      textDeltaParts = [];
+    };
     for (const block of content) {
       if (typeof block === 'string') {
-        textParts.push(block);
-      } else if ('type' in block && block.type === 'text' && 'text' in block) {
-        textParts.push(block.text as string);
+        flushTextDeltaParts();
+        if (block !== '') {
+          textParts.push(block);
+        }
+        continue;
+      }
+
+      const type =
+        'type' in block && typeof block.type === 'string' ? block.type : '';
+      const isTextDelta = type === TEXT_DELTA_CONTENT_TYPE;
+      const isText = type === ContentTypes.TEXT || isTextDelta;
+      const text =
+        isText && 'text' in block && typeof block.text === 'string'
+          ? block.text
+          : '';
+      if (isTextDelta) {
+        if (text !== '') {
+          textDeltaParts.push(text);
+        }
+        continue;
+      }
+
+      flushTextDeltaParts();
+      if (text !== '') {
+        textParts.push(text);
       }
     }
+    flushTextDeltaParts();
 
     if (textParts.length > 0) {
       return textParts.join('\n');

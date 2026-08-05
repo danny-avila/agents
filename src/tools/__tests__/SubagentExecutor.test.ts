@@ -67,6 +67,25 @@ describe('filterSubagentResult', () => {
     expect(filterSubagentResult(messages)).toBe('First part.\nSecond part.');
   });
 
+  it('prefers final text_delta blocks over earlier AI text', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage({
+        content: [
+          { type: 'text', text: 'Let me search.' },
+          { type: 'tool_use', id: 'call_1', name: 'search', input: {} },
+        ],
+      }),
+      new ToolMessage({ content: 'result', tool_call_id: 'call_1' }),
+      new AIMessage({
+        content: [
+          { type: 'text_delta', text: 'Streamed ' },
+          { type: 'text_delta', text: 'result.' },
+        ],
+      }),
+    ];
+    expect(filterSubagentResult(messages)).toBe('Streamed result.');
+  });
+
   it('strips tool_use blocks from array content', () => {
     const messages: BaseMessage[] = [
       new AIMessage({
@@ -470,7 +489,10 @@ describe('SubagentExecutor', () => {
         }) as unknown as StandardGraph,
     });
     await expect(
-      executor.execute({ description: 'Do something', subagentType: 'researcher' })
+      executor.execute({
+        description: 'Do something',
+        subagentType: 'researcher',
+      })
     ).rejects.toBeInstanceOf(StreamLimitExceededError);
   });
 
