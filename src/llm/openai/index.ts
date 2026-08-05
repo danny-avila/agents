@@ -1149,13 +1149,17 @@ function getReasoningDeltaText(message: AIMessageChunk): string {
 function toSmoothItem(chunk: ChatGenerationChunk): SmoothItem<ChatGenerationChunk> {
   const { message } = chunk;
   const isMessageChunk = message instanceof AIMessageChunk;
+  /** Chunks pairing visible text with a reasoning delta must pace whole:
+   * split pieces would each clone the same reasoning kwargs and the
+   * aggregator's dict merge concatenates them once per piece. */
   const splittable =
     Boolean(chunk.text) &&
     isMessageChunk &&
     typeof message.content === 'string' &&
     message.content === chunk.text &&
     chunk.generationInfo?.logprobs == null &&
-    chunk.generationInfo?.finish_reason == null;
+    chunk.generationInfo?.finish_reason == null &&
+    getReasoningDeltaText(message) === '';
 
   if (splittable) {
     return {

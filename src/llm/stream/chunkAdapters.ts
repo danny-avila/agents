@@ -7,8 +7,10 @@ import { smoothStream } from '@/llm/stream/smoother';
 /**
  * Rebuilds a generation chunk carrying one piece of a split plain-text chunk.
  * Unsplit pieces return the original chunk untouched, so disabled smoothing is
- * byte-identical to no smoothing. Usage metadata survives only on the first
- * piece to avoid double counting downstream.
+ * byte-identical to no smoothing. Usage metadata, additional kwargs and
+ * response metadata survive only on the first piece: the aggregator merges
+ * dicts by concatenating string fields, so replicating them across pieces
+ * would duplicate reasoning text and scalar metadata once per piece.
  */
 export function cloneGenerationChunkPiece(
   chunk: ChatGenerationChunk,
@@ -18,14 +20,15 @@ export function cloneGenerationChunkPiece(
     return chunk;
   }
   const message = chunk.message as AIMessageChunk;
-  const usageMetadata = piece.isFirst ? message.usage_metadata : undefined;
   return new ChatGenerationChunk({
     text: piece.text,
     generationInfo: chunk.generationInfo,
     message: new AIMessageChunk(
       Object.assign({}, message, {
         content: piece.text,
-        usage_metadata: usageMetadata,
+        usage_metadata: piece.isFirst ? message.usage_metadata : undefined,
+        additional_kwargs: piece.isFirst ? message.additional_kwargs : {},
+        response_metadata: piece.isFirst ? message.response_metadata : {},
       })
     ),
   });
@@ -77,14 +80,15 @@ function clonePartGenerationChunkPiece(
     return chunk;
   }
   const message = chunk.message as AIMessageChunk;
-  const usageMetadata = piece.isFirst ? message.usage_metadata : undefined;
   return new ChatGenerationChunk({
     text: piece.text,
     generationInfo: chunk.generationInfo,
     message: new AIMessageChunk(
       Object.assign({}, message, {
         content: [Object.assign({}, part, { text: piece.text })],
-        usage_metadata: usageMetadata,
+        usage_metadata: piece.isFirst ? message.usage_metadata : undefined,
+        additional_kwargs: piece.isFirst ? message.additional_kwargs : {},
+        response_metadata: piece.isFirst ? message.response_metadata : {},
       })
     ),
   });
@@ -123,6 +127,23 @@ function hasMeaningfulLogprobs(
   return true;
 }
 
+/**
+ * Chunks that pair visible text with reasoning payloads in
+ * `additional_kwargs` (Gemini thought summaries, reasoning_content deltas)
+ * must pace whole: split pieces would each carry the same kwargs and the
+ * aggregator's dict merge concatenates string fields once per piece.
+ */
+function hasReasoningKwargs(message: AIMessageChunk): boolean {
+  const kwargs = message.additional_kwargs;
+  if (
+    typeof kwargs.reasoning_content === 'string' &&
+    kwargs.reasoning_content !== ''
+  ) {
+    return true;
+  }
+  return kwargs.reasoning != null;
+}
+
 export function toGenerationSmoothItem(
   chunk: ChatGenerationChunk,
   getAtomicText?: (message: AIMessageChunk) => string
@@ -137,7 +158,8 @@ export function toGenerationSmoothItem(
     isMessageChunk &&
     typeof message.content === 'string' &&
     message.content === chunk.text &&
-    cleanGenerationInfo;
+    cleanGenerationInfo &&
+    !hasReasoningKwargs(message);
 
   if (splittable) {
     return {
@@ -148,7 +170,10 @@ export function toGenerationSmoothItem(
   }
 
   const splittablePart =
-    Boolean(chunk.text) && isMessageChunk && cleanGenerationInfo
+    Boolean(chunk.text) &&
+    isMessageChunk &&
+    cleanGenerationInfo &&
+    !hasReasoningKwargs(message)
       ? getSplittableTextPart(message, chunk.text)
       : null;
   if (splittablePart != null) {
