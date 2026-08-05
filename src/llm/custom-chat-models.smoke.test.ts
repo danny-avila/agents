@@ -1949,3 +1949,18 @@ describe('custom chat model class smoke tests', () => {
     expect(capturedFetch.getSignal()?.aborted).toBe(true);
   });
 });
+
+describe('StreamSmoothingOptions type surface', () => {
+  it('accepts _lc_stream_delay: 0 across the typed provider options', () => {
+    const azure: import('@/types').AzureClientOptions = { _lc_stream_delay: 0 };
+    const openrouter: ChatOpenRouterCallOptions &
+      import('@/types').StreamSmoothingOptions = { _lc_stream_delay: 0 };
+    const mistral: import('@/types').MistralAIClientOptions = {
+      model: 'mistral-large-latest',
+      _lc_stream_delay: 0,
+    };
+    expect(azure._lc_stream_delay).toBe(0);
+    expect(openrouter._lc_stream_delay).toBe(0);
+    expect(mistral._lc_stream_delay).toBe(0);
+  });
+});

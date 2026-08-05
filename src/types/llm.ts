@@ -45,7 +45,8 @@ export type AzureClientOptions = Partial<OpenAIChatInput> &
     deploymentName?: string;
   } & BaseChatModelParams & {
     configuration?: OAIClientOptions;
-  } & ManagedRequestOptions;
+  } & ManagedRequestOptions &
+  StreamSmoothingOptions;
 /**
  * Controls whether Claude's reasoning content is returned in adaptive
  * thinking responses. Added for Claude Opus 4.7, which omits thinking by
@@ -175,7 +176,7 @@ export type ProviderOptionsMap = {
   [Providers.ANTHROPIC]: AnthropicClientOptions;
   [Providers.MISTRALAI]: MistralAIClientOptions;
   [Providers.MISTRAL]: MistralAIClientOptions;
-  [Providers.OPENROUTER]: ChatOpenRouterCallOptions;
+  [Providers.OPENROUTER]: ChatOpenRouterCallOptions & StreamSmoothingOptions;
   [Providers.BEDROCK]: BedrockAnthropicClientOptions;
   [Providers.XAI]: XAIClientOptions;
   [Providers.MOONSHOT]: OpenAIClientOptions;
