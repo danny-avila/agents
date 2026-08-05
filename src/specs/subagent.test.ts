@@ -21,6 +21,7 @@ import * as providers from '@/llm/providers';
 import { Run } from '@/run';
 
 const CHILD_RESPONSE = 'Research result: Paris is the capital of France.';
+const OVERRIDDEN_CHILD_RESPONSE = 'Deterministic child override result.';
 
 const callerConfig: Partial<RunnableConfig> & {
   version: 'v1' | 'v2';
@@ -224,6 +225,49 @@ describe('Subagent Integration', () => {
       (t) => 'name' in t && t.name === Constants.SUBAGENT
     );
     expect(subagentTool).toBeDefined();
+  });
+
+  it('only applies an explicitly configured subagent model override', async () => {
+    const invokeSubagent = async (
+      overrideSubagents: boolean
+    ): Promise<string> => {
+      const run = await Run.create<t.IState>({
+        runId: `subagent-model-override-${overrideSubagents}-${Date.now()}`,
+        graphConfig: {
+          type: 'standard',
+          agents: [createParentAgent()],
+        },
+        returnContent: true,
+        skipCleanup: true,
+      });
+      const graph = run.Graph as StandardGraph;
+      const model = new FakeListChatModel({
+        responses: [OVERRIDDEN_CHILD_RESPONSE],
+      });
+      graph.overrideModel = model;
+      if (overrideSubagents) {
+        graph.setSubagentModelOverride(model);
+      }
+
+      const context = graph.agentContexts.get('parent');
+      const subagentTool = (context?.graphTools as t.GenericTool[]).find(
+        (tool) => 'name' in tool && tool.name === Constants.SUBAGENT
+      );
+      expect(subagentTool).toBeDefined();
+
+      return String(
+        await subagentTool!.invoke(
+          {
+            description: 'What is the capital of France?',
+            subagent_type: 'researcher',
+          },
+          callerConfig
+        )
+      );
+    };
+
+    await expect(invokeSubagent(false)).resolves.toBe(CHILD_RESPONSE);
+    await expect(invokeSubagent(true)).resolves.toBe(OVERRIDDEN_CHILD_RESPONSE);
   });
 
   it('inherits eager event-tool settings into self-spawn child graphs', async () => {
