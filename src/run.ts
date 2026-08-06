@@ -124,15 +124,32 @@ function isLangGraphResumeMapForInterrupt(
 type InterruptStateSnapshot = {
   config?: RunnableConfig;
   tasks?: Array<{
-    interrupts?: Array<{ id?: string }>;
+    interrupts?: Array<{ id?: string; value?: unknown }>;
   }>;
 };
 
 type WorkflowWithStateHistory = {
+  getState?(config: RunnableConfig): Promise<InterruptStateSnapshot>;
   getStateHistory?(
     config: RunnableConfig
   ): AsyncIterableIterator<InterruptStateSnapshot>;
 };
+
+function getFirstPersistedInterrupt(
+  snapshot: InterruptStateSnapshot
+): { id: string; value: unknown } | undefined {
+  for (const task of snapshot.tasks ?? []) {
+    for (const pendingInterrupt of task.interrupts ?? []) {
+      if (
+        typeof pendingInterrupt.id === 'string' &&
+        pendingInterrupt.id.length > 0
+      ) {
+        return { id: pendingInterrupt.id, value: pendingInterrupt.value };
+      }
+    }
+  }
+  return undefined;
+}
 
 export class Run<_T extends t.BaseGraphState> {
   id: string;
@@ -1331,6 +1348,7 @@ export class Run<_T extends t.BaseGraphState> {
       'update' | 'goto'
     >
   ): Promise<MessageContentComplex[] | undefined> {
+    const resumeConfig = await this.resolveInterruptResumeConfig(callerConfig);
     const interruptId = this._interrupt?.interruptId;
     const scopedResume =
       typeof interruptId === 'string' &&
@@ -1338,7 +1356,6 @@ export class Run<_T extends t.BaseGraphState> {
       !isLangGraphResumeMapForInterrupt(resumeValue, interruptId)
         ? { [interruptId]: resumeValue }
         : resumeValue;
-    const resumeConfig = await this.resolveInterruptResumeConfig(callerConfig);
     // langgraph 1.4.5 applies resume + state update + reroute in one superstep
     // (single checkpoint). `update`/`goto` are omitted unless the caller sets them.
     return this.processStream(
@@ -1359,6 +1376,7 @@ export class Run<_T extends t.BaseGraphState> {
   private async resolveInterruptResumeConfig(
     callerConfig: t.RunStreamConfig
   ): Promise<t.RunStreamConfig> {
+    await this.restoreInterruptFromCheckpoint(callerConfig);
     const interrupt = this._interrupt;
     const interruptId = interrupt?.interruptId;
     const workflow = this.graphRunnable as
@@ -1424,6 +1442,38 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     return callerConfig;
+  }
+
+  private async restoreInterruptFromCheckpoint(
+    callerConfig: t.RunStreamConfig
+  ): Promise<void> {
+    if (this._interrupt != null || this.humanInTheLoop?.enabled !== true) {
+      return;
+    }
+    const workflow = this.graphRunnable as
+      | (t.CompiledStateWorkflow & WorkflowWithStateHistory)
+      | undefined;
+    if (typeof workflow?.getState !== 'function') {
+      return;
+    }
+
+    const snapshot = await workflow.getState(callerConfig as RunnableConfig);
+    const persistedInterrupt = getFirstPersistedInterrupt(snapshot);
+    if (persistedInterrupt == null) {
+      return;
+    }
+
+    const checkpointConfigurable = snapshot.config?.configurable;
+    const checkpointId = checkpointConfigurable?.checkpoint_id;
+    const checkpointNs = checkpointConfigurable?.checkpoint_ns;
+    const threadId = callerConfig.configurable?.thread_id;
+    this._interrupt = {
+      interruptId: persistedInterrupt.id,
+      payload: persistedInterrupt.value,
+      ...(typeof threadId === 'string' ? { threadId } : {}),
+      ...(typeof checkpointId === 'string' ? { checkpointId } : {}),
+      ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
+    };
   }
 
   private createSystemCallback<K extends keyof t.ClientCallbacks>(

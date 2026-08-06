@@ -188,7 +188,6 @@ type ActiveChildRun = {
 
 const LANGGRAPH_RUNTIME_CONFIG_PREFIX = '__pregel_';
 const LANGGRAPH_RESUME_MAP_CONFIG_KEY = '__pregel_resume_map';
-const LANGGRAPH_SCRATCHPAD_CONFIG_KEY = '__pregel_scratchpad';
 const LANGGRAPH_CHECKPOINT_CONFIG_KEYS = new Set([
   'checkpoint_id',
   'checkpoint_map',
@@ -222,43 +221,13 @@ function addSubagentScope(
 
 type ToolApprovalResumeValue = ToolApprovalDecision[] | ToolApprovalDecisionMap;
 
-function isToolApprovalDecisionMap(
-  value: object
-): value is ToolApprovalDecisionMap {
-  return (
-    !Array.isArray(value) &&
-    Object.values(value).every(
-      (decision) =>
-        decision != null &&
-        typeof decision === 'object' &&
-        typeof (decision as { type?: unknown }).type === 'string'
-    )
-  );
-}
-
 function getChildResumeMap(
   pendingInterrupts: Interrupt[],
   parentConfigurable: Record<string, unknown> | undefined
 ): Record<string, ToolApprovalResumeValue> | undefined {
-  const scratchpad = parentConfigurable?.[LANGGRAPH_SCRATCHPAD_CONFIG_KEY] as
-    | { nullResume?: unknown; resume?: unknown[] }
-    | undefined;
-  const scratchpadResume =
-    scratchpad?.resume?.length === 1
-      ? scratchpad.resume[0]
-      : scratchpad?.nullResume;
-  const resumeMap =
-    parentConfigurable?.[LANGGRAPH_RESUME_MAP_CONFIG_KEY] ?? scratchpadResume;
+  const resumeMap = parentConfigurable?.[LANGGRAPH_RESUME_MAP_CONFIG_KEY];
   if (resumeMap == null || typeof resumeMap !== 'object') {
     return undefined;
-  }
-
-  const pendingInterruptId =
-    pendingInterrupts.length === 1 ? pendingInterrupts[0].id : undefined;
-  if (Array.isArray(resumeMap)) {
-    return typeof pendingInterruptId === 'string'
-      ? { [pendingInterruptId]: resumeMap }
-      : undefined;
   }
 
   const parentResumeMap = resumeMap as Record<string, ToolApprovalResumeValue>;
@@ -272,16 +241,7 @@ function getChildResumeMap(
       childResumeMap[interruptId] = parentResumeMap[interruptId];
     }
   }
-  if (Object.keys(childResumeMap).length > 0) {
-    return childResumeMap;
-  }
-  if (
-    typeof pendingInterruptId === 'string' &&
-    isToolApprovalDecisionMap(resumeMap)
-  ) {
-    return { [pendingInterruptId]: resumeMap };
-  }
-  return undefined;
+  return Object.keys(childResumeMap).length > 0 ? childResumeMap : undefined;
 }
 
 function getPersistedInterrupts(snapshot: StateSnapshot): Interrupt[] {

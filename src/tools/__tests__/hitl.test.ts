@@ -33,8 +33,8 @@ import type {
 } from '@/hooks';
 import type * as t from '@/types';
 import { Providers as providers, GraphEvents } from '@/common';
-import * as events from '@/utils/events';
 import { HookRegistry, createToolPolicyHook } from '@/hooks';
+import * as events from '@/utils/events';
 import { askUserQuestion } from '@/hitl';
 import { ToolNode } from '../ToolNode';
 
@@ -1088,6 +1088,76 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     const cmd2 = spy.mock.calls[1]?.[0] as Command;
     expect(cmd2.update).toBeUndefined();
     expect(cmd2.goto).toEqual([]);
+  });
+
+  it('Run.resume restores a persisted interrupt before scoping a rebuilt resume', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+
+    const run = await Run.create<t.IState>({
+      runId: 'hitl-rebuilt-scope',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: {
+              modelName: 'gpt-4o-mini',
+              apiKey: 'test-key',
+            },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      humanInTheLoop: { enabled: true },
+    });
+    const persistedState = {
+      config: {
+        configurable: {
+          thread_id: 'durable-thread',
+          checkpoint_id: 'interrupted-checkpoint',
+          checkpoint_ns: '',
+        },
+      },
+      tasks: [
+        {
+          interrupts: [
+            {
+              id: 'persisted-interrupt',
+              value: { type: 'tool_approval' },
+            },
+          ],
+        },
+      ],
+    };
+    const getState = jest.fn(async (_config: RunnableConfig) => persistedState);
+    run.graphRunnable = { getState } as unknown as t.CompiledStateWorkflow;
+    const processSpy = jest
+      .spyOn(run, 'processStream')
+      .mockResolvedValue(undefined);
+    const callerConfig = {
+      version: 'v2' as const,
+      configurable: { thread_id: 'durable-thread' },
+    };
+    const decision = [{ type: 'approve' as const }];
+
+    await run.resume(decision, callerConfig);
+
+    expect(getState).toHaveBeenCalledWith(callerConfig);
+    const command = processSpy.mock.calls[0]?.[0] as Command;
+    expect(command.resume).toEqual({ 'persisted-interrupt': decision });
+    expect(processSpy.mock.calls[0]?.[1].configurable).toMatchObject({
+      thread_id: 'durable-thread',
+      checkpoint_id: 'interrupted-checkpoint',
+      checkpoint_ns: '',
+    });
+    expect(run.getInterrupt()).toMatchObject({
+      interruptId: 'persisted-interrupt',
+      threadId: 'durable-thread',
+      payload: { type: 'tool_approval' },
+    });
   });
 
   it('re-exports langgraph HITL primitives from the SDK barrel for host use', async () => {
