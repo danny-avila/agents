@@ -1,7 +1,7 @@
 import { concat } from '@langchain/core/utils/stream';
 import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
-import type { SmoothItem, SmoothPiece } from './smoother';
+import type { SmoothItem } from './smoother';
 import { toSmoothItem } from '@/llm/openai';
 import {
   toGenerationSmoothItem,
