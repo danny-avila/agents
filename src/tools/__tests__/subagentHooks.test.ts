@@ -1,5 +1,7 @@
-import { MemorySaver } from '@langchain/langgraph';
+import { z } from 'zod';
+import { tool } from '@langchain/core/tools';
 import { HumanMessage } from '@langchain/core/messages';
+import { MemorySaver, interrupt } from '@langchain/langgraph';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
@@ -27,6 +29,7 @@ import { FakeChatModel } from '@/llm/fake';
 import { Run } from '@/run';
 
 const CHILD_RESPONSE = 'Hook test child response.';
+const PRIMITIVE_INTERRUPT_TOOL_NAME = 'confirm_child';
 
 const calculatorDef: t.LCTool = {
   name: 'calculator',
@@ -123,6 +126,30 @@ function createParentAgentWithChildTool(): t.AgentInputs {
           instructions: 'Use calculator for arithmetic, then answer concisely.',
           maxContextTokens: 8000,
           toolDefinitions: [calculatorDef],
+        },
+      },
+    ],
+  };
+}
+
+function createParentAgentWithPrimitiveInterruptTool(
+  primitiveInterruptTool: t.GenericTool
+): t.AgentInputs {
+  const parent = createParentAgent();
+  const child = parent.subagentConfigs?.[0];
+  const childAgent = child?.agentInputs;
+  if (child == null || childAgent == null) {
+    throw new Error('Expected a child agent configuration.');
+  }
+  return {
+    ...parent,
+    subagentConfigs: [
+      {
+        ...child,
+        agentInputs: {
+          ...childAgent,
+          instructions: 'Request confirmation, then answer concisely.',
+          graphTools: [primitiveInterruptTool],
         },
       },
     ],
@@ -231,6 +258,42 @@ class HitlChildFakeChatModel extends FakeChatModel {
       tools,
     } as Parameters<FakeChatModel['withConfig']>[0];
     return this.withConfig(config);
+  }
+}
+
+class PrimitiveInterruptFakeChatModel extends FakeChatModel {
+  constructor(_options: object) {
+    super({ responses: [CHILD_RESPONSE], sleep: 1 });
+  }
+
+  _streamResponseChunks(
+    messages: Parameters<FakeChatModel['_streamResponseChunks']>[0],
+    options: Parameters<FakeChatModel['_streamResponseChunks']>[1],
+    runManager?: Parameters<FakeChatModel['_streamResponseChunks']>[2]
+  ): ReturnType<FakeChatModel['_streamResponseChunks']> {
+    const hasToolResult = messages.some(
+      (message) => message._getType() === 'tool'
+    );
+    return new FakeChatModel({
+      responses: [hasToolResult ? CHILD_RESPONSE : 'Requesting confirmation.'],
+      sleep: 1,
+      toolCalls: hasToolResult
+        ? []
+        : [
+          {
+            name: PRIMITIVE_INTERRUPT_TOOL_NAME,
+            args: {},
+            id: 'call_child_primitive_interrupt',
+            type: 'tool_call',
+          },
+        ],
+    })._streamResponseChunks(messages, options, runManager);
+  }
+
+  bindTools(tools: unknown): ReturnType<FakeChatModel['withConfig']> {
+    return this.withConfig({ tools } as Parameters<
+      FakeChatModel['withConfig']
+    >[0]);
   }
 }
 
@@ -999,6 +1062,81 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     expect(serializedUpdates).not.toContain('checkpoint_');
   });
 
+  it('resumes a primitive child interrupt through a rebuilt Run', async () => {
+    getChatModelClassSpy.mockImplementation(((provider: Providers) => {
+      if (provider === Providers.OPENAI) {
+        return PrimitiveInterruptFakeChatModel;
+      }
+      return originalGetChatModelClass(provider);
+    }) as typeof providers.getChatModelClass);
+
+    const checkpointer = new MemorySaver();
+    const resumedValues: string[] = [];
+    const primitiveInterruptTool = tool(
+      async () => {
+        const resumeValue = interrupt<string, string>('confirm child');
+        resumedValues.push(resumeValue);
+        return `confirmed:${resumeValue}`;
+      },
+      {
+        name: PRIMITIVE_INTERRUPT_TOOL_NAME,
+        description: 'Pause for primitive confirmation.',
+        schema: z.object({}),
+      }
+    );
+    const createRun = (currentRunId: string): Promise<Run<t.IState>> =>
+      Run.create<t.IState>({
+        runId: currentRunId,
+        graphConfig: {
+          type: 'standard',
+          agents: [
+            createParentAgentWithPrimitiveInterruptTool(primitiveInterruptTool),
+          ],
+          compileOptions: { checkpointer },
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers: {
+          [GraphEvents.TOOL_END]: new ToolEndHandler(),
+          [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+        },
+        humanInTheLoop: { enabled: true },
+      });
+    const runId = `primitive-subagent-rebuild-${Date.now()}`;
+    const parentCall = makeSubagentToolCall('call_primitive_rebuild');
+    const initialRun = await createRun(`${runId}-initial`);
+    initialRun.Graph!.overrideTestModel(['Delegating...', 'Final answer.'], 5, [
+      parentCall,
+    ]);
+
+    await initialRun.processStream(
+      { messages: [new HumanMessage('confirm inside the child')] },
+      callerConfig
+    );
+    const paused = initialRun.getInterrupt<string>();
+    expect(paused?.payload).toBe('confirm child');
+    expect(JSON.stringify(paused)).not.toContain(
+      '__librechat_subagent_resume_manifest'
+    );
+    if (paused?.checkpointId == null) {
+      throw new Error('Expected a persisted parent checkpoint.');
+    }
+
+    const rebuiltRun = await createRun(`${runId}-rebuilt`);
+    rebuiltRun.Graph!.overrideTestModel(['Final answer.'], 1);
+    await rebuiltRun.resume<string>('approved after restart', {
+      ...callerConfig,
+      configurable: {
+        ...callerConfig.configurable,
+        checkpoint_id: paused.checkpointId,
+        checkpoint_ns: paused.checkpointNs ?? '',
+      },
+    });
+
+    expect(rebuiltRun.getInterrupt()).toBeUndefined();
+    expect(resumedValues).toEqual(['approved after restart']);
+  });
+
   it('forks every resume from the paused child snapshot', async () => {
     getChatModelClassSpy.mockImplementation(((provider: Providers) => {
       if (provider === Providers.OPENAI) {
@@ -1095,28 +1233,77 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     const sharedRebuiltRunId = `${runId}-same-rebuilt-id`;
     const approvedRun = await createRun(sharedRebuiltRunId);
     const rejectedRun = await createRun(sharedRebuiltRunId);
-    const restoreApprovalSpy = jest.spyOn(
-      registry,
-      'restorePendingToolApprovals'
-    );
+    let armRestoredCheckpointBarrier = false;
+    let blockNextRestoredCheckpointRead = false;
+    const originalRestorePendingToolApprovals =
+      registry.restorePendingToolApprovals.bind(registry);
+    const restoreApprovalSpy = jest
+      .spyOn(registry, 'restorePendingToolApprovals')
+      .mockImplementation((sessionId, targetExecutionScope, snapshots) => {
+        originalRestorePendingToolApprovals(
+          sessionId,
+          targetExecutionScope,
+          snapshots
+        );
+        if (armRestoredCheckpointBarrier) {
+          armRestoredCheckpointBarrier = false;
+          blockNextRestoredCheckpointRead = true;
+        }
+      });
+    let markCheckpointReadBlocked = (): void => undefined;
+    const checkpointReadBlocked = new Promise<void>((resolve) => {
+      markCheckpointReadBlocked = resolve;
+    });
+    let releaseBlockedCheckpointRead = (): void => undefined;
+    const blockedCheckpointReadRelease = new Promise<void>((resolve) => {
+      releaseBlockedCheckpointRead = resolve;
+    });
+    const originalGetTuple = checkpointer.getTuple.bind(checkpointer);
+    const checkpointReadSpy = jest
+      .spyOn(checkpointer, 'getTuple')
+      .mockImplementation(async (config) => {
+        const tuple = await originalGetTuple(config);
+        const configurable = config.configurable;
+        const threadId = configurable?.thread_id;
+        if (
+          blockNextRestoredCheckpointRead &&
+          typeof threadId === 'string' &&
+          threadId.startsWith('subagent:') &&
+          configurable?.checkpoint_id == null
+        ) {
+          blockNextRestoredCheckpointRead = false;
+          markCheckpointReadBlocked();
+          await blockedCheckpointReadRelease;
+        }
+        return tuple;
+      });
     earlyApprovedRun.Graph!.overrideTestModel(['Final answer.'], 1);
     approvedRun.Graph!.overrideTestModel(['Final answer.'], 1);
     rejectedRun.Graph!.overrideTestModel(['Final answer.'], 1);
     const warningSpy = jest
       .spyOn(console, 'warn')
       .mockImplementation((): void => undefined);
+    let rejectedResume: Promise<t.MessageContentComplex[] | undefined> | null =
+      null;
     try {
       await earlyApprovedRun.resume([{ type: 'approve' }], branchConfig);
       await initialRun.resume([{ type: 'approve' }], callerConfig);
-      await approvedRun.resume([{ type: 'approve' }], branchConfig);
-      await rejectedRun.resume(
+      armRestoredCheckpointBarrier = true;
+      rejectedResume = rejectedRun.resume(
         [{ type: 'reject', reason: 'deny after restart' }],
         branchConfig
       );
+      await checkpointReadBlocked;
+      await approvedRun.resume([{ type: 'approve' }], branchConfig);
+      releaseBlockedCheckpointRead();
+      await rejectedResume;
       expect(warningSpy).not.toHaveBeenCalledWith(
         expect.stringContaining('toolCallStepIds missing entry')
       );
     } finally {
+      releaseBlockedCheckpointRead();
+      await rejectedResume?.catch(() => undefined);
+      checkpointReadSpy.mockRestore();
       warningSpy.mockRestore();
     }
 
