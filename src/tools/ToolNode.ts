@@ -370,6 +370,38 @@ function describeOfferedShape(value: unknown): string {
   return typeof value;
 }
 
+type AssistantBatch = {
+  message: AIMessage;
+  index: number;
+  messageCount: number;
+};
+
+function findAssistantBatch(
+  messages: BaseMessage[]
+): AssistantBatch | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (isAIMessage(message)) {
+      return { message, index: i, messageCount: messages.length };
+    }
+  }
+  return undefined;
+}
+
+function getAssistantBatchReplayKey(
+  batch: AssistantBatch,
+  runId: string | undefined,
+  threadId: string | undefined
+): string {
+  return JSON.stringify([
+    runId ?? null,
+    threadId ?? null,
+    batch.message.id ?? null,
+    batch.index,
+    batch.messageCount,
+  ]);
+}
+
 /**
  * Per-entry record collected during PreToolUse hook handling for tool
  * calls that need human approval. Carries everything
@@ -4263,6 +4295,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      * every subsequent registry call on this batch.
      */
     const incomingRunId = config.configurable?.run_id as string | undefined;
+    const incomingThreadId = config.configurable?.thread_id as
+      | string
+      | undefined;
     const batchScopeId = incomingRunId ?? `\0anon-${this.anonBatchCounter++}`;
     const turn = this.toolOutputRegistry?.nextTurn(batchScopeId) ?? 0;
     let outputs: (BaseMessage | Command)[];
@@ -4294,6 +4329,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       // Mirror langgraph's prebuilt ToolNode: the Send-input state is
       // the input minus the `lg_tool_call` envelope key.
       const { lg_tool_call: _sendToolCall, ...sendState } = input;
+      const sendMessages = (sendState as { messages?: unknown }).messages;
+      const sendAssistantBatch = Array.isArray(sendMessages)
+        ? findAssistantBatch(sendMessages as BaseMessage[])
+        : undefined;
+      const sendReplayBatchKey =
+        sendAssistantBatch == null
+          ? undefined
+          : getAssistantBatchReplayKey(
+            sendAssistantBatch,
+            incomingRunId,
+            incomingThreadId
+          );
       const sendOutput = await this.runDirectToolWithLifecycleHooks(
         input.lg_tool_call,
         config,
@@ -4304,6 +4351,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           resolvedArgsByCallId,
           errorOwnership,
           additionalContextsSink: directAdditionalContexts,
+          replayBatchKey: sendReplayBatchKey,
           runInput: sendState as T,
         }
       );
@@ -4347,26 +4395,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           .map((msg) => (msg as ToolMessage).tool_call_id)
       );
 
-      let aiMessage: AIMessage | undefined;
-      let aiMessageIndex = -1;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const message = messages[i];
-        if (isAIMessage(message)) {
-          aiMessage = message;
-          aiMessageIndex = i;
-          break;
-        }
-      }
-
-      if (aiMessage == null || !isAIMessage(aiMessage)) {
+      const assistantBatch = findAssistantBatch(messages);
+      if (assistantBatch == null) {
         throw new Error('ToolNode only accepts AIMessages as input.');
       }
-      replayBatchKey = JSON.stringify([
-        incomingRunId ?? null,
-        aiMessage.id ?? null,
-        aiMessageIndex,
-        messages.length,
-      ]);
+      const aiMessage = assistantBatch.message;
+      replayBatchKey = getAssistantBatchReplayKey(
+        assistantBatch,
+        incomingRunId,
+        incomingThreadId
+      );
 
       if (this.loadRuntimeTools) {
         const { tools, toolMap } = this.loadRuntimeTools(

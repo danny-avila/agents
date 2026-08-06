@@ -321,6 +321,67 @@ describe('direct-path HITL: resume scope', () => {
     expect(invokedBatchKeys).toEqual(replayConfigKeys);
   });
 
+  it('stamps the assistant batch into Send-input subagent configs', async () => {
+    const invokedBatchKeys: unknown[] = [];
+    const directTool = tool(
+      async (_input, config) => {
+        invokedBatchKeys.push(
+          config.configurable?.[SUBAGENT_PARENT_BATCH_CONFIG_KEY]
+        );
+        return 'done';
+      },
+      {
+        name: 'subagent',
+        description: 'replayable direct tool',
+        schema: z.object({ description: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    const replayConfigKeys: unknown[] = [];
+    const replayableTool = directTool as StructuredToolInterface &
+      ReplayableSubagentTool;
+    replayableTool[SUBAGENT_REPLAY_CONTROLLER] = {
+      getSettledOutput: async (_call, config) => {
+        replayConfigKeys.push(
+          config.configurable?.[SUBAGENT_PARENT_BATCH_CONFIG_KEY]
+        );
+        return undefined;
+      },
+      persistSettledOutput: async () => {},
+    };
+    const node = new ToolNode({
+      tools: [directTool],
+      directToolNames: new Set(['subagent']),
+    });
+    const toolCall = {
+      id: 'call_send',
+      name: 'subagent',
+      args: { description: 'send task' },
+    };
+
+    await node.invoke(
+      {
+        messages: [
+          new AIMessage({
+            id: 'assistant-send',
+            content: '',
+            tool_calls: [toolCall],
+          }),
+        ],
+        lg_tool_call: toolCall,
+      },
+      {
+        configurable: {
+          run_id: 'run-send',
+          thread_id: 'thread-send',
+        },
+      }
+    );
+
+    expect(replayConfigKeys).toHaveLength(1);
+    expect(replayConfigKeys[0]).toBeDefined();
+    expect(invokedBatchKeys).toEqual(replayConfigKeys);
+  });
+
   it('fails closed when an id-less direct call requires approval', async () => {
     const sideEffect = jest.fn(() => 'must not execute');
     const directTool = tool(async () => sideEffect(), {
