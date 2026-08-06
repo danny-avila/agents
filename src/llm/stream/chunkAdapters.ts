@@ -44,7 +44,10 @@ const SPLITTABLE_TEXT_PART_KEYS: ReadonlySet<string> = new Set([
  * Returns the sole plain text part of a single-element complex content array
  * (the shape google-common emits for text deltas), or null when the part
  * carries anything beyond `type`/`text`/`index` (thought signatures, media,
- * function calls) and must not be sliced.
+ * function calls) and must not be sliced. The part must carry a numeric
+ * `index`: it is the aggregator's list-merge key, and without it each split
+ * piece would append as a separate content part instead of merging back
+ * into one — index-less parts pace whole instead.
  */
 function getSplittableTextPart(
   message: AIMessageChunk,
@@ -63,6 +66,9 @@ function getSplittableTextPart(
     return null;
   }
   if (record.type != null && record.type !== 'text') {
+    return null;
+  }
+  if (typeof record.index !== 'number') {
     return null;
   }
   if (!Object.keys(record).every((key) => SPLITTABLE_TEXT_PART_KEYS.has(key))) {

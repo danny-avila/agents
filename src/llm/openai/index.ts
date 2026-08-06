@@ -1132,7 +1132,9 @@ function getCustomOpenAIClientOptions(
  * - passthrough: tool-call deltas, usage-only, finish_reason and other
  *   metadata chunks — strict FIFO, zero delay.
  */
-function toSmoothItem(chunk: ChatGenerationChunk): SmoothItem<ChatGenerationChunk> {
+export function toSmoothItem(
+  chunk: ChatGenerationChunk
+): SmoothItem<ChatGenerationChunk> {
   const { message } = chunk;
   const isMessageChunk = message instanceof AIMessageChunk;
   /** Chunks pairing visible text with a reasoning delta (reasoning_content,
@@ -1171,6 +1173,13 @@ function toSmoothItem(chunk: ChatGenerationChunk): SmoothItem<ChatGenerationChun
   return { text: '', smooth: false, emit: () => chunk };
 }
 
+/**
+ * Usage metadata, additional kwargs and response metadata survive only on
+ * the first piece: the aggregator's dict merge concatenates string fields
+ * and sums usage, so replication across pieces corrupts them. Unlike the
+ * generic adapter, `generationInfo` stays on every piece — per-piece token
+ * indices ride in it and `dropRepeatedScalarMetadata` owns repetition there.
+ */
 function cloneGenerationChunkPiece(
   chunk: ChatGenerationChunk,
   piece: SmoothPiece
@@ -1179,14 +1188,15 @@ function cloneGenerationChunkPiece(
     return chunk;
   }
   const message = chunk.message as AIMessageChunk;
-  const usageMetadata = piece.isFirst ? message.usage_metadata : undefined;
   return new ChatGenerationChunk({
     text: piece.text,
     generationInfo: chunk.generationInfo,
     message: new AIMessageChunk(
       Object.assign({}, message, {
         content: piece.text,
-        usage_metadata: usageMetadata,
+        usage_metadata: piece.isFirst ? message.usage_metadata : undefined,
+        additional_kwargs: piece.isFirst ? message.additional_kwargs : {},
+        response_metadata: piece.isFirst ? message.response_metadata : {},
       })
     ),
   });
