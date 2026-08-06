@@ -28,6 +28,8 @@ export interface ExecuteHooksOptions {
   sessionId?: string;
   /** Query string matched against each matcher's pattern (tool name, etc.). */
   matchQuery?: string;
+  /** Stable tool-call key for replaying a consumed one-shot approval. */
+  onceReplayKey?: string;
   /** Parent AbortSignal — combined with per-hook timeout into the hook signal. */
   signal?: AbortSignal;
   /** Default per-hook timeout; overridden by `matcher.timeout` when present. */
@@ -301,12 +303,16 @@ function applyAllowedDecisions(
   agg.allowedDecisions = output.allowedDecisions;
 }
 
-function fold(outcomes: readonly HookOutcome[]): AggregatedHookResult {
-  const agg = freshResult();
+function fold(outcomes: readonly HookOutcome[]): {
+  aggregated: AggregatedHookResult;
+  onceMatcherAsked: boolean;
+} {
+  const aggregated = freshResult();
+  let onceMatcherAsked = false;
   for (const outcome of outcomes) {
     if (outcome.error !== null) {
       if (outcome.matcher.internal !== true) {
-        agg.errors.push(outcome.error);
+        aggregated.errors.push(outcome.error);
       }
       continue;
     }
@@ -323,15 +329,22 @@ function fold(outcomes: readonly HookOutcome[]): AggregatedHookResult {
     if (output.async === true) {
       continue;
     }
-    applyContext(agg, output);
-    applyInjectedMessages(agg, output);
-    applyStopFlag(agg, output);
-    applyDecision(agg, output);
-    applyUpdatedInput(agg, output);
-    applyUpdatedOutput(agg, output);
-    applyAllowedDecisions(agg, output);
+    if (
+      outcome.matcher.once === true &&
+      'decision' in output &&
+      output.decision === 'ask'
+    ) {
+      onceMatcherAsked = true;
+    }
+    applyContext(aggregated, output);
+    applyInjectedMessages(aggregated, output);
+    applyStopFlag(aggregated, output);
+    applyDecision(aggregated, output);
+    applyUpdatedInput(aggregated, output);
+    applyUpdatedOutput(aggregated, output);
+    applyAllowedDecisions(aggregated, output);
   }
-  return agg;
+  return { aggregated, onceMatcherAsked };
 }
 
 /**
@@ -396,11 +409,18 @@ export async function executeHooks(
     input,
     sessionId,
     matchQuery,
+    onceReplayKey,
     signal,
     timeoutMs = DEFAULT_HOOK_TIMEOUT_MS,
     logger,
   } = opts;
   const event = input.hook_event_name;
+  if (event === 'PreToolUse' && sessionId != null && onceReplayKey != null) {
+    const pending = registry.getPendingToolApproval(sessionId, onceReplayKey);
+    if (pending != null) {
+      return pending;
+    }
+  }
   const matchers = registry.getMatchers(event, sessionId);
   if (matchers.length === 0) {
     return freshResult();
@@ -429,7 +449,16 @@ export async function executeHooks(
 
   const outcomes = (await Promise.all(tasks)).flat();
   reportErrors(outcomes, event, logger);
-  const aggregated = fold(outcomes);
+  const { aggregated, onceMatcherAsked } = fold(outcomes);
+  if (
+    event === 'PreToolUse' &&
+    aggregated.decision === 'ask' &&
+    onceMatcherAsked &&
+    sessionId != null &&
+    onceReplayKey != null
+  ) {
+    registry.setPendingToolApproval(sessionId, onceReplayKey, aggregated);
+  }
   /**
    * Centralized `preventContinuation` propagation: when any hook (across
    * any callsite — RunStart, PreToolUse, PostToolBatch, SubagentStop,

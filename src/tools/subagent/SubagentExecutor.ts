@@ -748,15 +748,26 @@ export class SubagentExecutor {
   }
 
   getChildCheckpointThreadIds(): string[] {
-    return [...this.checkpointThreadIds];
+    const threadIds = new Set(this.checkpointThreadIds);
+    for (const activeChildRun of this.activeChildRuns.values()) {
+      for (const threadId of this.getGraphChildCheckpointThreadIds(
+        activeChildRun.graph
+      )) {
+        threadIds.add(threadId);
+      }
+    }
+    return [...threadIds];
   }
 
-  private clearChildGraph(graph: StandardGraph): void {
+  private getGraphChildCheckpointThreadIds(graph: StandardGraph): string[] {
     const checkpointGraph = graph as {
       getChildCheckpointThreadIds?: () => string[];
     };
-    for (const threadId of checkpointGraph.getChildCheckpointThreadIds?.() ??
-      []) {
+    return checkpointGraph.getChildCheckpointThreadIds?.() ?? [];
+  }
+
+  private clearChildGraph(graph: StandardGraph): void {
+    for (const threadId of this.getGraphChildCheckpointThreadIds(graph)) {
       this.checkpointThreadIds.add(threadId);
     }
     graph.clearHeavyState();

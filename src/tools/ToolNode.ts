@@ -1496,9 +1496,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    *       `blockDirectCall`, `respond` returns the host-supplied
    *       `responseText` as a synthetic success ToolMessage,
    *       `edit` re-runs with edited args. LangGraph re-enters
-   *       ToolNode.run from the start on resume; the hook fires
-   *       again and the resume value distinguishes "first ask" from
-   *       "second pass with decision".
+   *       ToolNode.run from the start on resume. Reusable hooks fire
+   *       again; a consumed one-shot hook replays its pending approval
+   *       result. In both cases `interrupt()` consumes the resume value.
    *     • When HITL is off: collapses to a fail-closed deny (matches
    *       the rest of the SDK's HITL-disabled default). One-time
    *       warning logged so hosts notice the gap.
@@ -1599,13 +1599,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
     const hookRegistry = this.hookRegistry;
     const hasPreHook = hookRegistry?.hasHookFor('PreToolUse', runId) === true;
+    const pendingApproval =
+      call.id == null
+        ? undefined
+        : hookRegistry?.getPendingToolApproval(runId, call.id);
     const hasPostHook = hookRegistry?.hasHookFor('PostToolUse', runId) === true;
     const hasFailureHook =
       hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
 
     if (
       hookRegistry == null ||
-      (!hasPreHook && !hasPostHook && !hasFailureHook)
+      (!hasPreHook &&
+        pendingApproval == null &&
+        !hasPostHook &&
+        !hasFailureHook)
     ) {
       const output = await this.runTool(call, config, batchContext);
       return output instanceof ToolMessage ? persistOutput(output) : output;
@@ -1679,24 +1686,27 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
 
     let effectiveCall = call;
-    if (hasPreHook) {
-      const preResult = await executeHooks({
-        registry: hookRegistry,
-        input: {
-          hook_event_name: 'PreToolUse',
-          runId,
-          threadId,
-          agentId: this.agentId,
-          executingAgentId: this.executingAgentId,
-          toolName: call.name,
-          toolInput: resolvedArgs,
-          toolUseId: call.id ?? '',
-          stepId,
-          turn,
-        },
-        sessionId: runId,
-        matchQuery: call.name,
-      }).catch(() => undefined);
+    if (hasPreHook || pendingApproval != null) {
+      const preResult =
+        pendingApproval ??
+        (await executeHooks({
+          registry: hookRegistry,
+          input: {
+            hook_event_name: 'PreToolUse',
+            runId,
+            threadId,
+            agentId: this.agentId,
+            executingAgentId: this.executingAgentId,
+            toolName: call.name,
+            toolInput: resolvedArgs,
+            toolUseId: call.id ?? '',
+            stepId,
+            turn,
+          },
+          sessionId: runId,
+          matchQuery: call.name,
+          onceReplayKey: call.id,
+        }).catch(() => undefined));
 
       if (preResult != null) {
         // Forward any additionalContext strings hooks returned into
@@ -1757,14 +1767,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           // Raise a single-tool tool_approval interrupt. LangGraph
           // throws on the first execution (host gets the interrupt)
           // and returns the resume value on re-entry. Because direct
-          // tools re-enter the entire ToolNode.run on resume, the
-          // PreToolUse hook fires AGAIN — which is fine: the hook is
-          // expected to be deterministic, and the resume value is what
-          // distinguishes "first call asking" from "second call after
-          // approve/reject". We anchor `interrupt()` against the
+          // tools re-enter the entire ToolNode.run on resume. Reusable
+          // hooks fire again; a consumed one-shot hook instead replays
+          // the pending approval. We anchor `interrupt()` against the
           // node's RunnableConfig the same way `dispatchToolEvents`
-          // does (ToolNode disables LangSmith tracing, so the
-          // AsyncLocalStorage frame must be re-established here).
+          // does. A one-shot hook's pending aggregate reconstructs this
+          // same ask entry without dispatching the consumed hook again.
+          // ToolNode disables LangSmith tracing, so the AsyncLocalStorage
+          // frame must be re-established here.
           const askEntry: AskEntry = {
             entry: {
               call: effectiveCall,
@@ -1783,6 +1793,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap
               >(payload)
           );
+          hookRegistry.clearPendingToolApproval(runId, call.id!);
           const decisionByCallId = normalizeApprovalDecisions(
             [call.id!],
             resumeValue
@@ -2513,13 +2524,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       errors: [] as string[],
     });
 
-    if (this.hookRegistry?.hasHookFor('PreToolUse', runId) === true) {
-      /**
-       * Capture as a non-null local so the inner `blockEntry` closure
-       * doesn't lose narrowing on `this.hookRegistry` and we don't have
-       * to defensively `?.` it across every reference inside.
-       */
-      const hookRegistry = this.hookRegistry;
+    const hookRegistry = this.hookRegistry;
+    const hasPendingApproval = preToolCalls.some(
+      (entry) =>
+        entry.call.id != null &&
+        hookRegistry?.getPendingToolApproval(runId, entry.call.id) != null
+    );
+    if (
+      hookRegistry != null &&
+      (hookRegistry.hasHookFor('PreToolUse', runId) || hasPendingApproval)
+    ) {
       /**
        * Pull each call's prestarted eager record BEFORE awaiting the hooks:
        * an async deny must never race the eager host promise into emitting a
@@ -2547,8 +2561,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
       }
       const preResults = await Promise.all(
-        preToolCalls.map((entry) =>
-          executeHooks({
+        preToolCalls.map((entry) => {
+          const toolUseId = entry.call.id;
+          const pending =
+            toolUseId == null
+              ? undefined
+              : hookRegistry.getPendingToolApproval(runId, toolUseId);
+          if (pending != null) {
+            return pending;
+          }
+          return executeHooks({
             registry: hookRegistry,
             input: {
               hook_event_name: 'PreToolUse',
@@ -2564,8 +2586,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             },
             sessionId: runId,
             matchQuery: entry.call.name,
-          }).catch((): AggregatedHookResult => HOOK_FALLBACK)
-        )
+            onceReplayKey: toolUseId,
+          }).catch((): AggregatedHookResult => HOOK_FALLBACK);
+        })
       );
 
       type PendingEntry = (typeof preToolCalls)[number];
@@ -2785,9 +2808,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * pauses, gathers human input, and resumes the run with one
        * decision per request. On resume LangGraph re-executes this node
        * from the start; `interrupt()` then returns the resume value
-       * instead of throwing, so the loop above re-runs and the same
-       * `askEntries` list is rebuilt deterministically (assuming hooks
-       * are pure — see `humanInTheLoop` docs).
+       * instead of throwing. Reusable hooks rebuild their entries, while
+       * consumed one-shot hooks replay their pending approval aggregate.
        */
       if (askEntries.length > 0) {
         const payload = buildToolApprovalInterruptPayload(askEntries, runId);
@@ -2809,6 +2831,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap
             >(payload)
         );
+
+        for (const { entry } of askEntries) {
+          hookRegistry.clearPendingToolApproval(runId, entry.call.id!);
+        }
 
         const decisionByCallId = normalizeApprovalDecisions(
           askEntries.map(({ entry }) => entry.call.id!),

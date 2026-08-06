@@ -832,13 +832,16 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     const checkpointer = new MemorySaver();
     const registry = new HookRegistry();
     const executedTools: string[] = [];
+    let approvalHookCalls = 0;
     const runId = `subagent-rebuild-hitl-${Date.now()}`;
     registry.registerSession(`${runId}-initial`, 'PreToolUse', {
+      once: true,
+      pattern: '^calculator$',
       hooks: [
-        async (input): Promise<PreToolUseHookOutput> =>
-          input.toolName === 'calculator'
-            ? { decision: 'ask', reason: 'review calculator' }
-            : { decision: 'allow' },
+        async (): Promise<PreToolUseHookOutput> => {
+          approvalHookCalls += 1;
+          return { decision: 'ask', reason: 'review calculator' };
+        },
       ],
     });
     const customHandlers: Record<string, t.EventHandler> = {
@@ -887,6 +890,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       type: 'tool_approval',
       subagent: { parent_tool_call_id: tc.id },
     });
+    expect(approvalHookCalls).toBe(1);
 
     const rebuiltRun = await createRun(`${runId}-rebuilt`);
     rebuiltRun.Graph!.overrideTestModel(['Final answer.'], 1);
@@ -904,5 +908,6 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
 
     expect(rebuiltRun.getInterrupt()).toBeUndefined();
     expect(executedTools).toEqual([]);
+    expect(approvalHookCalls).toBe(1);
   });
 });

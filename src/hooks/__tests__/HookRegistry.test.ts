@@ -181,6 +181,34 @@ describe('HookRegistry', () => {
       expect(registry.getMatchers('PreToolUse', 'source')).toEqual([matcher]);
       expect(registry.getMatchers('PreToolUse', 'branch-b')).toEqual([matcher]);
     });
+
+    it('copies pending one-shot approvals and clears them with the target session', () => {
+      const registry = new HookRegistry();
+      const approval = {
+        decision: 'ask' as const,
+        reason: 'review tool',
+        additionalContexts: [],
+        injectedMessages: [],
+        errors: [],
+      };
+      registry.setPendingToolApproval('source', 'call_1', approval);
+
+      registry.copySession('source', 'branch');
+
+      expect(registry.getPendingToolApproval('source', 'call_1')).toBe(
+        approval
+      );
+      expect(registry.getPendingToolApproval('branch', 'call_1')).toBe(
+        approval
+      );
+      registry.clearSession('branch');
+      expect(
+        registry.getPendingToolApproval('branch', 'call_1')
+      ).toBeUndefined();
+      expect(registry.getPendingToolApproval('source', 'call_1')).toBe(
+        approval
+      );
+    });
   });
 
   describe('session isolation under parallel registration', () => {

@@ -88,6 +88,57 @@ describe('direct-path HITL: resume scope', () => {
     jest.restoreAllMocks();
   });
 
+  it('preserves a one-shot approval until a reject decision is applied', async () => {
+    const sideEffect = jest.fn(() => 'must not execute');
+    const directTool = tool(async () => sideEffect(), {
+      name: 'echo',
+      description: 'one-shot approval tool',
+      schema: z.object({ command: z.string() }),
+    }) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    let hookInvocations = 0;
+    registry.register('PreToolUse', {
+      once: true,
+      pattern: '^echo$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          hookInvocations += 1;
+          return { decision: 'ask', reason: 'review once' };
+        },
+      ],
+    });
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildGraph(node, [
+      { id: 'call_once', name: 'echo', args: { command: 'go' } },
+    ]);
+    const config = { configurable: { thread_id: 'thread-once-reject' } };
+
+    const first = await graph.invoke({ messages: [] }, config);
+    expect(isInterrupted<t.HumanInterruptPayload>(first)).toBe(true);
+
+    const resumed = await graph.invoke(
+      new Command({
+        resume: [{ type: 'reject', reason: 'rejected once' }],
+      }),
+      config
+    );
+
+    expect(hookInvocations).toBe(1);
+    expect(sideEffect).not.toHaveBeenCalled();
+    const messages = (resumed as { messages: ToolMessage[] }).messages;
+    const toolMessage = messages.find(
+      (message) => message instanceof ToolMessage
+    );
+    expect(toolMessage?.status).toBe('error');
+    expect(String(toolMessage?.content)).toContain('rejected once');
+  });
+
   it('re-executes the direct tool body on resume when interrupt() fires from the direct path', async () => {
     const sideEffect = jest.fn(() => 'EXECUTED');
     const directTool = tool(async () => sideEffect(), {

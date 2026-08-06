@@ -1,5 +1,5 @@
 // src/hooks/HookRegistry.ts
-import type { HookEvent, HookMatcher } from './types';
+import type { HookEvent, HookMatcher, AggregatedHookResult } from './types';
 
 /**
  * Internal matcher storage type.
@@ -71,6 +71,11 @@ export class HookRegistry {
    * O(1) insertion in hot paths, no spread-on-write.
    */
   private readonly haltSignals: Map<string, HookHaltSignal> = new Map();
+  /** One-shot approval results retained until the matching resume is consumed. */
+  private readonly pendingToolApprovals = new Map<
+    string,
+    Map<string, AggregatedHookResult>
+  >();
 
   /**
    * Register a matcher for the lifetime of this registry (= one Run).
@@ -160,6 +165,7 @@ export class HookRegistry {
    */
   clearSession(sessionId: string): void {
     this.sessions.delete(sessionId);
+    this.pendingToolApprovals.delete(sessionId);
   }
 
   /** Copies session-scoped policy into a rebuilt or branched Run. */
@@ -168,17 +174,61 @@ export class HookRegistry {
       return;
     }
     const source = this.sessions.get(sourceSessionId);
-    if (source == null) {
-      return;
-    }
-    const target = this.ensureSessionBucket(targetSessionId);
-    for (const event of Object.keys(source) as HookEvent[]) {
-      const targetList = ensureList(target, event);
-      for (const matcher of readList(source, event)) {
-        if (!targetList.includes(matcher)) {
-          targetList.push(matcher);
+    if (source != null) {
+      const target = this.ensureSessionBucket(targetSessionId);
+      for (const event of Object.keys(source) as HookEvent[]) {
+        const targetList = ensureList(target, event);
+        for (const matcher of readList(source, event)) {
+          if (!targetList.includes(matcher)) {
+            targetList.push(matcher);
+          }
         }
       }
+    }
+    const pending = this.pendingToolApprovals.get(sourceSessionId);
+    if (pending == null) {
+      return;
+    }
+    let targetPending = this.pendingToolApprovals.get(targetSessionId);
+    if (targetPending == null) {
+      targetPending = new Map();
+      this.pendingToolApprovals.set(targetSessionId, targetPending);
+    }
+    for (const [toolUseId, result] of pending) {
+      if (!targetPending.has(toolUseId)) {
+        targetPending.set(toolUseId, result);
+      }
+    }
+  }
+
+  getPendingToolApproval(
+    sessionId: string,
+    toolUseId: string
+  ): AggregatedHookResult | undefined {
+    return this.pendingToolApprovals.get(sessionId)?.get(toolUseId);
+  }
+
+  setPendingToolApproval(
+    sessionId: string,
+    toolUseId: string,
+    result: AggregatedHookResult
+  ): void {
+    let pending = this.pendingToolApprovals.get(sessionId);
+    if (pending == null) {
+      pending = new Map();
+      this.pendingToolApprovals.set(sessionId, pending);
+    }
+    pending.set(toolUseId, result);
+  }
+
+  clearPendingToolApproval(sessionId: string, toolUseId: string): void {
+    const pending = this.pendingToolApprovals.get(sessionId);
+    if (pending == null) {
+      return;
+    }
+    pending.delete(toolUseId);
+    if (pending.size === 0) {
+      this.pendingToolApprovals.delete(sessionId);
     }
   }
 

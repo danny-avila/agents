@@ -764,6 +764,43 @@ describe('executeHooks', () => {
   });
 
   describe('once: true self-removal', () => {
+    it('replays a one-shot approval until the tool decision is consumed', async () => {
+      const registry = new HookRegistry();
+      let calls = 0;
+      registry.registerSession('run-1', 'PreToolUse', {
+        once: true,
+        hooks: [
+          async (): Promise<PreToolUseHookOutput> => {
+            calls += 1;
+            return { decision: 'ask', reason: 'review once' };
+          },
+        ],
+      });
+      const options = {
+        registry,
+        input: preToolUseInput('Bash'),
+        matchQuery: 'Bash',
+        sessionId: 'run-1',
+        onceReplayKey: 'call_1',
+      };
+
+      const first = await executeHooks(options);
+      const replay = await executeHooks(options);
+
+      expect(first).toBe(replay);
+      expect(replay).toMatchObject({
+        decision: 'ask',
+        reason: 'review once',
+      });
+      expect(calls).toBe(1);
+      expect(registry.getMatchers('PreToolUse', 'run-1')).toHaveLength(0);
+
+      registry.clearPendingToolApproval('run-1', 'call_1');
+      const afterDecision = await executeHooks(options);
+      expect(afterDecision.decision).toBeUndefined();
+      expect(calls).toBe(1);
+    });
+
     it('removes the matcher after a successful fire', async () => {
       const registry = new HookRegistry();
       let calls = 0;

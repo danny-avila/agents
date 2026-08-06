@@ -1783,6 +1783,51 @@ describe('SubagentExecutor', () => {
       expect(executor.getChildCheckpointThreadIds()).toEqual(beforeCleanup);
     });
 
+    it('includes checkpoint threads from active descendant graphs', async () => {
+      const grandchildThreadId = 'subagent:grandchild';
+      const executor = createExecutor({
+        checkpointer: new MemorySaver(),
+        humanInTheLoop: { enabled: true },
+        createChildGraph: (): StandardGraph =>
+          ({
+            createWorkflow: () => ({
+              getState: jest.fn().mockResolvedValue({
+                values: {},
+                next: ['child-agent'],
+                tasks: [],
+              }),
+              invoke: jest.fn().mockRejectedValue(
+                new GraphInterrupt([
+                  {
+                    id: 'grandchild-interrupt',
+                    value: {
+                      type: 'tool_approval',
+                      action_requests: [],
+                      review_configs: [],
+                    },
+                  },
+                ])
+              ),
+            }),
+            getChildCheckpointThreadIds: jest.fn(() => [grandchildThreadId]),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph,
+      });
+
+      await expect(
+        executor.execute({
+          description: 'nested task',
+          subagentType: 'researcher',
+          threadId: 'parent',
+          parentToolCallId: 'call_child',
+        })
+      ).rejects.toBeInstanceOf(GraphInterrupt);
+
+      expect(executor.getChildCheckpointThreadIds()).toEqual(
+        expect.arrayContaining([grandchildThreadId])
+      );
+    });
+
     it('does not require parentConfigurable (back-compat with hosts that omit it)', async () => {
       const { factory, getInvokeConfig } = makeCapturingGraphFactory();
       const executor = createExecutor({ createChildGraph: factory });
