@@ -97,7 +97,7 @@ export class HookRegistry {
    * O(1) insertion in hot paths, no spread-on-write.
    */
   private readonly haltSignals: Map<string, HookHaltSignal> = new Map();
-  /** One-shot approval results retained until the matching resume is consumed. */
+  /** One-shot hook contributions retained until approval is consumed. */
   private readonly pendingToolApprovals = new Map<
     string,
     Map<string, AggregatedHookResult>

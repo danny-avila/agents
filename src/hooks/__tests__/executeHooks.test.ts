@@ -788,10 +788,9 @@ describe('executeHooks', () => {
         },
       };
 
-      const first = await executeHooks(options);
+      await executeHooks(options);
       const replay = await executeHooks(options);
 
-      expect(first).toBe(replay);
       expect(replay).toMatchObject({
         decision: 'ask',
         reason: 'review once',
@@ -812,6 +811,117 @@ describe('executeHooks', () => {
       const afterDecision = await executeHooks(options);
       expect(afterDecision.decision).toBeUndefined();
       expect(calls).toBe(1);
+    });
+
+    it('replays only one-shot contributions while rerunning ordinary hooks', async () => {
+      const registry = new HookRegistry();
+      let onceCalls = 0;
+      let ordinaryCalls = 0;
+      let ordinaryDecision: 'allow' | 'deny' = 'allow';
+      registry.registerSession('run-1', 'PreToolUse', {
+        once: true,
+        hooks: [
+          async (): Promise<PreToolUseHookOutput> => {
+            onceCalls += 1;
+            return {
+              decision: 'ask',
+              reason: 'review once',
+              additionalContext: 'once-context',
+            };
+          },
+        ],
+      });
+      registry.registerSession('run-1', 'PreToolUse', {
+        hooks: [
+          async (): Promise<PreToolUseHookOutput> => {
+            ordinaryCalls += 1;
+            return {
+              decision: ordinaryDecision,
+              reason: `ordinary-${ordinaryDecision}`,
+              additionalContext: `ordinary-${ordinaryCalls}`,
+            };
+          },
+        ],
+      });
+      const options = {
+        registry,
+        input: preToolUseInput('Bash'),
+        matchQuery: 'Bash',
+        sessionId: 'run-1',
+        onceReplayKey: {
+          executionScope: 'child-a',
+          agentId: 'researcher',
+          toolUseId: 'call_1',
+        },
+      };
+
+      const first = await executeHooks(options);
+      ordinaryDecision = 'deny';
+      const replay = await executeHooks(options);
+
+      expect(first.decision).toBe('ask');
+      expect(replay).toMatchObject({
+        decision: 'deny',
+        reason: 'ordinary-deny',
+        additionalContexts: ['once-context', 'ordinary-2'],
+      });
+      expect(onceCalls).toBe(1);
+      expect(ordinaryCalls).toBe(2);
+      expect(
+        registry.getPendingToolApproval('run-1', options.onceReplayKey)
+      ).toBeUndefined();
+    });
+
+    it('retains a consumed one-shot rewrite when an ordinary hook asks', async () => {
+      const registry = new HookRegistry();
+      let onceCalls = 0;
+      let ordinaryCalls = 0;
+      registry.registerSession('run-1', 'PreToolUse', {
+        once: true,
+        hooks: [
+          async (): Promise<PreToolUseHookOutput> => {
+            onceCalls += 1;
+            return {
+              decision: 'allow',
+              updatedInput: { command: 'sanitized' },
+            };
+          },
+        ],
+      });
+      registry.registerSession('run-1', 'PreToolUse', {
+        hooks: [
+          async (): Promise<PreToolUseHookOutput> => {
+            ordinaryCalls += 1;
+            return { decision: 'ask', reason: 'ordinary approval' };
+          },
+        ],
+      });
+      const options = {
+        registry,
+        input: preToolUseInput('Bash'),
+        matchQuery: 'Bash',
+        sessionId: 'run-1',
+        onceReplayKey: {
+          executionScope: 'child-a',
+          agentId: 'researcher',
+          toolUseId: 'call_1',
+        },
+      };
+
+      const first = await executeHooks(options);
+      const replay = await executeHooks(options);
+
+      expect(first).toMatchObject({
+        decision: 'ask',
+        updatedInput: { command: 'sanitized' },
+      });
+      expect(replay).toMatchObject({
+        decision: 'ask',
+        reason: 'ordinary approval',
+        updatedInput: { command: 'sanitized' },
+      });
+      expect(onceCalls).toBe(1);
+      expect(ordinaryCalls).toBe(2);
     });
 
     it('removes the matcher after a successful fire', async () => {

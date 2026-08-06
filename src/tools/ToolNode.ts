@@ -1663,7 +1663,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const hookRegistry = this.hookRegistry;
     const hasPreHook = hookRegistry?.hasHookFor('PreToolUse', runId) === true;
     const approvalReplayKey =
-      call.id == null
+      call.id == null || call.id === ''
         ? undefined
         : createToolApprovalReplayKey(
           config,
@@ -1757,26 +1757,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     let effectiveCall = call;
     if (hasPreHook || pendingApproval != null) {
-      const preResult =
-        pendingApproval ??
-        (await executeHooks({
-          registry: hookRegistry,
-          input: {
-            hook_event_name: 'PreToolUse',
-            runId,
-            threadId,
-            agentId: this.agentId,
-            executingAgentId: this.executingAgentId,
-            toolName: call.name,
-            toolInput: resolvedArgs,
-            toolUseId: call.id ?? '',
-            stepId,
-            turn,
-          },
-          sessionId: runId,
-          matchQuery: call.name,
-          onceReplayKey: approvalReplayKey,
-        }).catch(() => undefined));
+      const preResult = await executeHooks({
+        registry: hookRegistry,
+        input: {
+          hook_event_name: 'PreToolUse',
+          runId,
+          threadId,
+          agentId: this.agentId,
+          executingAgentId: this.executingAgentId,
+          toolName: call.name,
+          toolInput: resolvedArgs,
+          toolUseId: call.id ?? '',
+          stepId,
+          turn,
+        },
+        sessionId: runId,
+        matchQuery: call.name,
+        onceReplayKey: approvalReplayKey,
+      }).catch(() => undefined);
 
       if (preResult != null) {
         // Forward any additionalContext strings hooks returned into
@@ -1833,6 +1831,25 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               effectiveCall.args as Record<string, unknown>
             );
           }
+          const toolCallId = call.id;
+          if (
+            toolCallId == null ||
+            toolCallId === '' ||
+            approvalReplayKey == null
+          ) {
+            return persistOutput(
+              this.blockDirectCall({
+                call,
+                resolvedArgs,
+                reason:
+                  'Tool approval requires a non-empty tool call ID — failing closed',
+                hookRegistry,
+                runId,
+                threadId,
+              }),
+              effectiveCall.args as Record<string, unknown>
+            );
+          }
 
           // Raise a single-tool tool_approval interrupt. LangGraph
           // throws on the first execution (host gets the interrupt)
@@ -1841,7 +1858,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           // hooks fire again; a consumed one-shot hook instead replays
           // the pending approval. We anchor `interrupt()` against the
           // node's RunnableConfig the same way `dispatchToolEvents`
-          // does. A one-shot hook's pending aggregate reconstructs this
+          // does. A one-shot hook's pending contribution reconstructs this
           // same ask entry without dispatching the consumed hook again.
           // ToolNode disables LangSmith tracing, so the AsyncLocalStorage
           // frame must be re-established here.
@@ -1863,12 +1880,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap
               >(payload)
           );
-          hookRegistry.clearPendingToolApproval(runId, approvalReplayKey!);
+          hookRegistry.clearPendingToolApproval(runId, approvalReplayKey);
           const decisionByCallId = normalizeApprovalDecisions(
-            [call.id!],
+            [toolCallId],
             resumeValue
           );
-          const decision = decisionByCallId.get(call.id!) ?? {
+          const decision = decisionByCallId.get(toolCallId) ?? {
             type: 'reject' as const,
             reason: 'No decision provided for tool approval',
           };

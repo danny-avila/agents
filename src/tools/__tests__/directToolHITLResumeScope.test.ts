@@ -42,7 +42,7 @@ import { ToolNode } from '../ToolNode';
  */
 
 function aiCall(
-  callId: string,
+  callId: string | undefined,
   name: string,
   args: Record<string, unknown>
 ): AIMessage {
@@ -59,7 +59,11 @@ type CompiledMessagesGraph = Runnable<unknown, { messages: BaseMessage[] }> & {
 
 function buildGraph(
   toolNode: ToolNode,
-  toolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }>
+  toolCalls: Array<{
+    id: string | undefined;
+    name: string;
+    args: Record<string, unknown>;
+  }>
 ): CompiledMessagesGraph {
   let agentInvocations = 0;
   const builder = new StateGraph(MessagesAnnotation)
@@ -137,6 +141,112 @@ describe('direct-path HITL: resume scope', () => {
     );
     expect(toolMessage?.status).toBe('error');
     expect(String(toolMessage?.content)).toContain('rejected once');
+  });
+
+  it('fails closed when an id-less direct call requires approval', async () => {
+    const sideEffect = jest.fn(() => 'must not execute');
+    const directTool = tool(async () => sideEffect(), {
+      name: 'echo',
+      description: 'id-less approval tool',
+      schema: z.object({ command: z.string() }),
+    }) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      pattern: '^echo$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review id-less call',
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildGraph(node, [
+      { id: undefined, name: 'echo', args: { command: 'go' } },
+    ]);
+
+    const result = await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'thread-id-less-approval' } }
+    );
+
+    expect(isInterrupted(result)).toBe(false);
+    expect(sideEffect).not.toHaveBeenCalled();
+    const messages = (result as { messages: ToolMessage[] }).messages;
+    const toolMessage = messages.find(
+      (message) => message instanceof ToolMessage
+    );
+    expect(toolMessage?.status).toBe('error');
+    expect(String(toolMessage?.content)).toContain(
+      'requires a non-empty tool call ID'
+    );
+  });
+
+  it('reruns ordinary hooks while replaying a consumed one-shot approval', async () => {
+    const sideEffect = jest.fn(() => 'must not execute');
+    const directTool = tool(async () => sideEffect(), {
+      name: 'echo',
+      description: 'mixed replay hook tool',
+      schema: z.object({ command: z.string() }),
+    }) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    let onceCalls = 0;
+    let ordinaryCalls = 0;
+    registry.register('PreToolUse', {
+      once: true,
+      pattern: '^echo$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          onceCalls += 1;
+          return { decision: 'ask', reason: 'review once' };
+        },
+      ],
+    });
+    registry.register('PreToolUse', {
+      pattern: '^echo$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          ordinaryCalls += 1;
+          return ordinaryCalls === 1
+            ? { decision: 'allow' }
+            : { decision: 'deny', reason: 'policy changed on resume' };
+        },
+      ],
+    });
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildGraph(node, [
+      { id: 'call_mixed_hooks', name: 'echo', args: { command: 'go' } },
+    ]);
+    const config = { configurable: { thread_id: 'thread-mixed-hooks' } };
+
+    const first = await graph.invoke({ messages: [] }, config);
+    expect(isInterrupted(first)).toBe(true);
+    const resumed = await graph.invoke(
+      new Command({ resume: [{ type: 'approve' }] }),
+      config
+    );
+
+    expect(onceCalls).toBe(1);
+    expect(ordinaryCalls).toBe(2);
+    expect(sideEffect).not.toHaveBeenCalled();
+    const messages = (resumed as { messages: ToolMessage[] }).messages;
+    const toolMessage = messages.find(
+      (message) => message instanceof ToolMessage
+    );
+    expect(toolMessage?.status).toBe('error');
+    expect(String(toolMessage?.content)).toContain('policy changed on resume');
   });
 
   it('re-executes the direct tool body on resume when interrupt() fires from the direct path', async () => {

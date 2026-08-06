@@ -403,7 +403,7 @@ export interface ToolApprovalReplayKey {
   toolUseId: string;
 }
 
-/** Checkpoint-safe copy of a pending tool approval replay. */
+/** Checkpoint-safe copy of a consumed one-shot approval contribution. */
 export interface ToolApprovalReplaySnapshot {
   key: ToolApprovalReplayKey;
   result: AggregatedHookResult;
