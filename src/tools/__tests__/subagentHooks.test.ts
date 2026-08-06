@@ -1124,17 +1124,37 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
 
     const rebuiltRun = await createRun(`${runId}-rebuilt`);
     rebuiltRun.Graph!.overrideTestModel(['Final answer.'], 1);
-    await rebuiltRun.resume<string>('approved after restart', {
-      ...callerConfig,
-      configurable: {
-        ...callerConfig.configurable,
-        checkpoint_id: paused.checkpointId,
-        checkpoint_ns: paused.checkpointNs ?? '',
+    const injected = new HumanMessage('host edit on resume');
+    const rebuiltContent = await rebuiltRun.resume<string>(
+      'approved after restart',
+      {
+        ...callerConfig,
+        configurable: {
+          ...callerConfig.configurable,
+          checkpoint_id: paused.checkpointId,
+          checkpoint_ns: paused.checkpointNs ?? '',
+        },
       },
-    });
+      undefined,
+      { update: { messages: [injected] } }
+    );
 
     expect(rebuiltRun.getInterrupt()).toBeUndefined();
     expect(resumedValues).toEqual(['approved after restart']);
+    expect(JSON.stringify(rebuiltContent)).toContain('Final answer.');
+    expect(JSON.stringify(rebuiltContent)).not.toContain('host edit on resume');
+    expect(
+      rebuiltRun
+        .getRunMessages()
+        ?.some(
+          (message) =>
+            message._getType() === 'ai' &&
+            JSON.stringify(message.content).includes('Final answer.')
+        )
+    ).toBe(true);
+    expect(
+      rebuiltRun.getRunMessages()?.some((message) => message.id === injected.id)
+    ).toBe(false);
   });
 
   it('forks every resume from the paused child snapshot', async () => {

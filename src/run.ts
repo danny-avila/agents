@@ -4,18 +4,19 @@ import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import {
+  BaseMessage,
+  HumanMessage,
+  SystemMessage,
+} from '@langchain/core/messages';
 import {
   Command,
   INTERRUPT,
   MemorySaver,
   isInterrupted,
 } from '@langchain/langgraph';
-import type {
-  MessageContentComplex,
-  BaseMessage,
-} from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
+import type { MessageContentComplex } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
@@ -145,6 +146,7 @@ function getInterruptHookSessionId(payload: unknown): string | undefined {
 
 type InterruptStateSnapshot = {
   config?: RunnableConfig;
+  values?: { messages?: BaseMessage[] };
   tasks?: Array<{
     interrupts?: Array<{ id?: string; value?: unknown }>;
   }>;
@@ -171,6 +173,36 @@ function getFirstPersistedInterrupt(
     }
   }
   return undefined;
+}
+
+function getPersistedMessages(
+  snapshot: InterruptStateSnapshot
+): BaseMessage[] | undefined {
+  const messages = snapshot.values?.messages;
+  if (!Array.isArray(messages) || !messages.every(BaseMessage.isInstance)) {
+    return undefined;
+  }
+  return messages;
+}
+
+type ResumeCommandUpdate = ConstructorParameters<typeof Command>[0]['update'];
+
+function getResumeUpdateMessages(
+  update: ResumeCommandUpdate
+): BaseMessage[] | undefined {
+  if (update == null) {
+    return undefined;
+  }
+  const messages = Array.isArray(update)
+    ? update.find(([key]) => key === 'messages')?.[1]
+    : update.messages;
+  if (BaseMessage.isInstance(messages)) {
+    return [messages];
+  }
+  if (!Array.isArray(messages) || !messages.every(BaseMessage.isInstance)) {
+    return undefined;
+  }
+  return messages;
 }
 
 export class Run<_T extends t.BaseGraphState> {
@@ -1382,7 +1414,10 @@ export class Run<_T extends t.BaseGraphState> {
       'update' | 'goto'
     >
   ): Promise<MessageContentComplex[] | undefined> {
-    const resumeConfig = await this.resolveInterruptResumeConfig(callerConfig);
+    const resumeConfig = await this.resolveInterruptResumeConfig(
+      callerConfig,
+      commandOptions?.update
+    );
     const interruptId = this._interrupt?.interruptId;
     const scopedResume =
       typeof interruptId === 'string' &&
@@ -1408,9 +1443,10 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   private async resolveInterruptResumeConfig(
-    callerConfig: t.RunStreamConfig
+    callerConfig: t.RunStreamConfig,
+    resumeUpdate?: ResumeCommandUpdate
   ): Promise<t.RunStreamConfig> {
-    await this.restoreInterruptFromCheckpoint(callerConfig);
+    await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
     const interrupt = this._interrupt;
     const resumeManifest = requireValidSubagentResumeManifest(
       interrupt?.payload
@@ -1497,7 +1533,8 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   private async restoreInterruptFromCheckpoint(
-    callerConfig: t.RunStreamConfig
+    callerConfig: t.RunStreamConfig,
+    resumeUpdate?: ResumeCommandUpdate
   ): Promise<void> {
     if (this._interrupt != null || this.humanInTheLoop?.enabled !== true) {
       return;
@@ -1513,6 +1550,13 @@ export class Run<_T extends t.BaseGraphState> {
     const persistedInterrupt = getFirstPersistedInterrupt(snapshot);
     if (persistedInterrupt == null) {
       return;
+    }
+    const persistedMessages = getPersistedMessages(snapshot);
+    if (persistedMessages != null) {
+      this.Graph?.restoreCheckpointMessages(
+        persistedMessages,
+        getResumeUpdateMessages(resumeUpdate)
+      );
     }
 
     const checkpointConfigurable = snapshot.config?.configurable;

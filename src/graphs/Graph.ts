@@ -638,6 +638,10 @@ export abstract class Graph<
   _TNodeName extends string = string,
 > {
   abstract resetValues(keepContent?: boolean, checkpointScope?: string): void;
+  restoreCheckpointMessages(
+    _messages: BaseMessage[],
+    _pendingMessages?: BaseMessage[]
+  ): void {}
   abstract initializeTools({
     currentTools,
     currentToolMap,
@@ -1149,6 +1153,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /** Whether the workflow was actually compiled with a checkpointer. */
   hasCompiledCheckpointer: boolean = false;
   messages: BaseMessage[] = [];
+  /** Whether a rebuilt resume seeded the message baseline from its checkpoint. */
+  private hasRestoredCheckpointMessages = false;
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
   /** Per-agent discovery snapshots preserved before contexts are reset on cleanup. */
@@ -1359,6 +1365,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   resetValues(keepContent?: boolean, checkpointScope?: string): void {
     this.resetSubagentCheckpointThreadIds();
     this.messages = [];
+    this.hasRestoredCheckpointMessages = false;
     this.cachedRunMessages = undefined;
     this.cachedDiscoveredTools = undefined;
     this.config = resetIfNotEmpty(this.config, undefined);
@@ -1453,6 +1460,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.originalToolContentCheckpointScope = hasScopedCheckpoint
       ? checkpointScope
       : undefined;
+  }
+
+  /** Seeds the sidecar message view that checkpoint restoration bypasses. */
+  override restoreCheckpointMessages(
+    messages: BaseMessage[],
+    pendingMessages?: BaseMessage[]
+  ): void {
+    if (this.messages.length > 0) {
+      return;
+    }
+    this.messages =
+      pendingMessages == null
+        ? [...messages]
+        : messagesStateReducer(messages, pendingMessages);
+    this.startIndex = this.messages.length;
+    this.hasRestoredCheckpointMessages = true;
+    this.cachedRunMessages = undefined;
   }
 
   override clearHeavyState(): void {
@@ -4569,7 +4593,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: (a, b) => {
-          if (!this.messages.length) {
+          if (!this.messages.length && !this.hasRestoredCheckpointMessages) {
             this.startIndex = a.length + b.length;
           }
           const result = messagesStateReducer(a, b);
