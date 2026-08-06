@@ -136,6 +136,17 @@ function createToolApprovalReplayKey(
   };
 }
 
+function getToolApprovalReplaySessionId(
+  config: RunnableConfig,
+  hookSessionId: string
+): string {
+  const configuredScope =
+    config.configurable?.[TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY];
+  return typeof configuredScope === 'string' && configuredScope.length > 0
+    ? configuredScope
+    : hookSessionId;
+}
+
 /**
  * Per-call batch context for `runTool`. Bundles every optional
  * batch-scoped value the method needs so the signature stays at
@@ -1670,10 +1681,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           this.executingAgentId ?? this.agentId ?? '',
           call.id
         );
+    const approvalReplaySessionId = getToolApprovalReplaySessionId(
+      config,
+      runId
+    );
     const pendingApproval =
       approvalReplayKey == null
         ? undefined
-        : hookRegistry?.getPendingToolApproval(runId, approvalReplayKey);
+        : hookRegistry?.getPendingToolApproval(
+          approvalReplaySessionId,
+          approvalReplayKey
+        );
     const hasPostHook = hookRegistry?.hasHookFor('PostToolUse', runId) === true;
     const hasFailureHook =
       hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
@@ -1774,6 +1792,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         sessionId: runId,
         matchQuery: call.name,
         onceReplayKey: approvalReplayKey,
+        onceReplaySessionId: approvalReplaySessionId,
       }).catch(() => undefined);
 
       if (preResult != null) {
@@ -1880,7 +1899,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap
               >(payload)
           );
-          hookRegistry.clearPendingToolApproval(runId, approvalReplayKey);
+          hookRegistry.clearPendingToolApproval(
+            approvalReplaySessionId,
+            approvalReplayKey
+          );
           const decisionByCallId = normalizeApprovalDecisions(
             [toolCallId],
             resumeValue
@@ -2612,11 +2634,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     });
 
     const hookRegistry = this.hookRegistry;
+    const approvalReplaySessionId = getToolApprovalReplaySessionId(
+      config,
+      runId
+    );
     const hasPendingApproval = preToolCalls.some(
       (entry) =>
         entry.call.id != null &&
         hookRegistry?.getPendingToolApproval(
-          runId,
+          approvalReplaySessionId,
           createToolApprovalReplayKey(
             config,
             this.executingAgentId ?? this.agentId ?? '',
@@ -2665,13 +2691,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 this.executingAgentId ?? this.agentId ?? '',
                 toolUseId
               );
-          const pending =
-            approvalReplayKey == null
-              ? undefined
-              : hookRegistry.getPendingToolApproval(runId, approvalReplayKey);
-          if (pending != null) {
-            return pending;
-          }
           return executeHooks({
             registry: hookRegistry,
             input: {
@@ -2689,6 +2708,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             sessionId: runId,
             matchQuery: entry.call.name,
             onceReplayKey: approvalReplayKey,
+            onceReplaySessionId: approvalReplaySessionId,
           }).catch((): AggregatedHookResult => HOOK_FALLBACK);
         })
       );
@@ -2936,7 +2956,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         for (const { entry } of askEntries) {
           hookRegistry.clearPendingToolApproval(
-            runId,
+            approvalReplaySessionId,
             createToolApprovalReplayKey(
               config,
               this.executingAgentId ?? this.agentId ?? '',
@@ -4117,15 +4137,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           throw new GraphInterrupt(
             interruptingError.interrupts.map((pendingInterrupt) => ({
               ...pendingInterrupt,
-              value:
-                pendingInterrupt.value != null &&
-                typeof pendingInterrupt.value === 'object' &&
-                !Array.isArray(pendingInterrupt.value)
-                  ? attachSubagentResumeManifest(
-                    pendingInterrupt.value,
-                    manifest
-                  )
-                  : pendingInterrupt.value,
+              value: attachSubagentResumeManifest(
+                pendingInterrupt.value,
+                manifest
+              ),
             }))
           );
         }

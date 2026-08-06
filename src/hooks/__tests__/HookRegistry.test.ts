@@ -246,6 +246,19 @@ describe('HookRegistry', () => {
       expect(
         registry.getPendingToolApproval('restored', siblingKey)
       ).toBeUndefined();
+
+      const branchKey = { ...key, executionScope: 'child-a-attempt-2' };
+      registry.restorePendingToolApprovals(
+        'restored',
+        branchKey.executionScope,
+        checkpointSnapshot
+      );
+      expect(registry.getPendingToolApproval('restored', branchKey)).toBe(
+        approval
+      );
+      expect(registry.getPendingToolApproval('restored', key)).toBe(approval);
+      registry.clearPendingToolApproval('restored', branchKey);
+      expect(registry.getPendingToolApproval('restored', key)).toBe(approval);
     });
   });
 

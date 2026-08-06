@@ -1841,10 +1841,7 @@ describe('SubagentExecutor', () => {
         string,
         unknown
       >;
-      expect(Object.keys(configurable)).toEqual([
-        '__librechat_tool_approval_execution_scope',
-        'thread_id',
-      ]);
+      expect(Object.keys(configurable)).toEqual(['thread_id']);
     });
   });
 

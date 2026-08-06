@@ -128,14 +128,16 @@ function isLangGraphResumeMapForInterrupt(
 }
 
 function getInterruptHookSessionId(payload: unknown): string | undefined {
+  const publicPayload = stripSubagentResumeManifest(payload);
   if (
-    payload == null ||
-    typeof payload !== 'object' ||
-    (payload as { type?: unknown }).type !== 'tool_approval'
+    publicPayload == null ||
+    typeof publicPayload !== 'object' ||
+    (publicPayload as { type?: unknown }).type !== 'tool_approval'
   ) {
     return undefined;
   }
-  const sessionId = (payload as { hook_session_id?: unknown }).hook_session_id;
+  const sessionId = (publicPayload as { hook_session_id?: unknown })
+    .hook_session_id;
   return typeof sessionId === 'string' && sessionId.length > 0
     ? sessionId
     : undefined;

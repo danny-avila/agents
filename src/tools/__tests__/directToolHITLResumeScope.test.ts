@@ -7,6 +7,7 @@ import {
   START,
   StateGraph,
   MemorySaver,
+  GraphInterrupt,
   isInterrupted,
   MessagesAnnotation,
   Command,
@@ -21,7 +22,11 @@ import type {
 } from '@/tools/subagent/SubagentReplay';
 import type { PreToolUseHookOutput } from '@/hooks';
 import type * as t from '@/types';
-import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
+import {
+  getSubagentResumeManifest,
+  stripSubagentResumeManifest,
+  SUBAGENT_REPLAY_CONTROLLER,
+} from '@/tools/subagent/SubagentReplay';
 import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
 
@@ -90,6 +95,78 @@ function buildGraph(
 describe('direct-path HITL: resume scope', () => {
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('persists a resume manifest beside a primitive child interrupt', async () => {
+    const directTool = tool(
+      async () => {
+        throw new GraphInterrupt([
+          { id: 'primitive-interrupt', value: 'confirm child' },
+        ]);
+      },
+      {
+        name: 'subagent',
+        description: 'primitive interrupt subagent',
+        schema: z.object({ description: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    const manifest = {
+      version: 1 as const,
+      executions: [
+        {
+          parentToolCallId: 'call_primitive',
+          childRunId: 'child-run',
+          approvalExecutionScope: 'child-approval-attempt',
+          checkpoints: [
+            {
+              threadId: 'child-thread',
+              checkpointId: 'child-checkpoint',
+              checkpointNs: '',
+            },
+          ],
+          graphState: {
+            toolCallSteps: [],
+            toolSessions: [],
+            toolNodes: [],
+            eagerToolUsage: [],
+            eagerToolSuppressions: [],
+          },
+          approvalReplays: [],
+        },
+      ],
+    };
+    const replayableTool = directTool as StructuredToolInterface &
+      ReplayableSubagentTool;
+    replayableTool[SUBAGENT_REPLAY_CONTROLLER] = {
+      getResumeManifest: async () => manifest,
+      getSettledOutput: async () => undefined,
+      persistSettledOutput: async () => {},
+    };
+    const node = new ToolNode({
+      tools: [directTool],
+      directToolNames: new Set(['subagent']),
+      interruptingToolNames: new Set(['subagent']),
+    });
+    const graph = buildGraph(node, [
+      {
+        id: 'call_primitive',
+        name: 'subagent',
+        args: { description: 'pause with primitive data' },
+      },
+    ]);
+
+    const interrupted = await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'parent-thread' } }
+    );
+
+    expect(isInterrupted(interrupted)).toBe(true);
+    if (!isInterrupted(interrupted)) {
+      throw new Error('expected primitive child interrupt');
+    }
+    const internalPayload = interrupted.__interrupt__[0].value;
+    expect(getSubagentResumeManifest(internalPayload)).toEqual(manifest);
+    expect(stripSubagentResumeManifest(internalPayload)).toBe('confirm child');
   });
 
   it('preserves a one-shot approval until a reject decision is applied', async () => {

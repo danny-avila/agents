@@ -263,6 +263,7 @@ type SubagentCheckpointMarker = {
 type ChildExecutionIdentity = {
   childRunId: string;
   childThreadId: string;
+  approvalExecutionScope: string;
   resumeExecution?: SubagentResumeExecution;
 };
 
@@ -521,6 +522,15 @@ function getResumeAttemptId(
     : fallback;
 }
 
+function getApprovalExecutionScope(
+  childRunId: string,
+  resumeAttemptId: string
+): string {
+  return `subagent-approval:${Buffer.from(
+    JSON.stringify([childRunId, resumeAttemptId])
+  ).toString('base64url')}`;
+}
+
 function getChildThreadId(args: {
   parentRunId: string;
   parentAgentId?: string;
@@ -568,7 +578,7 @@ function addSubagentScope(
     return {
       ...childInterrupt,
       value:
-        resumeManifest == null || !isObjectLike(payload)
+        resumeManifest == null
           ? payload
           : attachSubagentResumeManifest(payload, resumeManifest),
     };
@@ -799,7 +809,10 @@ export class SubagentExecutor {
   >();
   private readonly childExecutionIdentities = new Map<
     string,
-    Pick<ChildExecutionIdentity, 'childRunId' | 'childThreadId'>
+    Pick<
+      ChildExecutionIdentity,
+      'childRunId' | 'childThreadId' | 'approvalExecutionScope'
+    >
   >();
   private readonly activeChildRuns = new Map<string, ActiveChildRun>();
   private replayCheckpointWorkflow?: ReplayCheckpointWorkflow;
@@ -864,6 +877,10 @@ export class SubagentExecutor {
     params: ChildExecutionIdentityParams
   ): Promise<ChildExecutionIdentity> {
     const currentChildRunId = `${this.parentRunId}_sub_${params.parentToolCallId}`;
+    const resumeAttemptId = getResumeAttemptId(
+      params.parentConfigurable,
+      this.parentRunId
+    );
     const baseChildThreadId = getChildThreadId({
       parentRunId: this.parentRunId,
       parentAgentId: this.parentAgentId,
@@ -875,6 +892,7 @@ export class SubagentExecutor {
       return {
         childRunId: currentChildRunId,
         childThreadId: baseChildThreadId,
+        approvalExecutionScope: currentChildRunId,
       };
     }
 
@@ -888,28 +906,27 @@ export class SubagentExecutor {
       threadId: params.threadId,
       parentToolCallId: params.parentToolCallId,
       parentConfigurable: params.parentConfigurable,
-      branchId: getResumeAttemptId(params.parentConfigurable, this.parentRunId),
+      branchId: resumeAttemptId,
     });
     if (resumeExecution != null) {
+      const approvalExecutionScope = getApprovalExecutionScope(
+        resumeExecution.childRunId,
+        resumeAttemptId
+      );
       await this.forkCheckpointSnapshot(
         resumeExecution.checkpoints,
         branchChildThreadId
       );
-      const configuredHookSessionId = params.parentConfigurable?.run_id;
-      const hookSessionId =
-        typeof configuredHookSessionId === 'string' &&
-        configuredHookSessionId.length > 0
-          ? configuredHookSessionId
-          : this.parentRunId;
       this.hookRegistry?.restorePendingToolApprovals(
-        hookSessionId,
-        resumeExecution.childRunId,
+        approvalExecutionScope,
+        approvalExecutionScope,
         resumeExecution.approvalReplays
       );
       this.checkpointThreadIds.add(branchChildThreadId);
       return {
         childRunId: resumeExecution.childRunId,
         childThreadId: branchChildThreadId,
+        approvalExecutionScope,
         resumeExecution,
       };
     }
@@ -918,11 +935,16 @@ export class SubagentExecutor {
       configurable: { thread_id: branchChildThreadId },
     });
     if (branchTuple != null) {
+      const childRunId =
+        getSubagentRunId(getTupleMessages(branchTuple)) ?? currentChildRunId;
       this.checkpointThreadIds.add(branchChildThreadId);
       return {
-        childRunId:
-          getSubagentRunId(getTupleMessages(branchTuple)) ?? currentChildRunId,
+        childRunId,
         childThreadId: branchChildThreadId,
+        approvalExecutionScope: getApprovalExecutionScope(
+          childRunId,
+          resumeAttemptId
+        ),
       };
     }
 
@@ -939,6 +961,10 @@ export class SubagentExecutor {
       return {
         childRunId: persistedChildRunId ?? currentChildRunId,
         childThreadId: baseChildThreadId,
+        approvalExecutionScope: getApprovalExecutionScope(
+          persistedChildRunId ?? currentChildRunId,
+          resumeAttemptId
+        ),
       };
     }
 
@@ -954,6 +980,10 @@ export class SubagentExecutor {
     return {
       childRunId: persistedChildRunId,
       childThreadId: branchChildThreadId,
+      approvalExecutionScope: getApprovalExecutionScope(
+        persistedChildRunId,
+        resumeAttemptId
+      ),
     };
   }
 
@@ -1123,8 +1153,8 @@ export class SubagentExecutor {
           : this.parentRunId;
       const approvalReplays =
         this.hookRegistry?.snapshotPendingToolApprovals(
-          hookSessionId,
-          identity.childRunId
+          identity.approvalExecutionScope,
+          identity.approvalExecutionScope
         ) ?? [];
       const descendant = activeChildRun?.pendingInterrupts
         .map((pendingInterrupt) =>
@@ -1143,6 +1173,7 @@ export class SubagentExecutor {
       executions.push({
         parentToolCallId,
         childRunId: identity.childRunId,
+        approvalExecutionScope: identity.approvalExecutionScope,
         checkpoints,
         graphState,
         approvalReplays,
@@ -1196,6 +1227,9 @@ export class SubagentExecutor {
     }
     this.activeChildRuns.clear();
     this.completedChildResults.clear();
+    for (const identity of this.childExecutionIdentities.values()) {
+      this.hookRegistry?.clearSession(identity.approvalExecutionScope);
+    }
     this.childExecutionIdentities.clear();
     this.startedChildRuns.clear();
     this.completedChildRuns.clear();
@@ -1219,7 +1253,7 @@ export class SubagentExecutor {
       | Record<string, unknown>
       | undefined;
     const threadId = parentConfigurable?.thread_id;
-    const { childRunId, childThreadId } =
+    const { childRunId, childThreadId, approvalExecutionScope } =
       await this.resolveChildExecutionIdentity({
         threadId: typeof threadId === 'string' ? threadId : undefined,
         parentToolCallId,
@@ -1228,6 +1262,7 @@ export class SubagentExecutor {
     this.childExecutionIdentities.set(parentToolCallId, {
       childRunId,
       childThreadId,
+      approvalExecutionScope,
     });
     this.checkpointThreadIds.add(childThreadId);
     const checkpoint = await this.checkpointer.getTuple({
@@ -1273,7 +1308,7 @@ export class SubagentExecutor {
       | Record<string, unknown>
       | undefined;
     const threadId = parentConfigurable?.thread_id;
-    const { childRunId, childThreadId } =
+    const { childRunId, childThreadId, approvalExecutionScope } =
       await this.resolveChildExecutionIdentity({
         threadId: typeof threadId === 'string' ? threadId : undefined,
         parentToolCallId,
@@ -1282,6 +1317,7 @@ export class SubagentExecutor {
     this.childExecutionIdentities.set(parentToolCallId, {
       childRunId,
       childThreadId,
+      approvalExecutionScope,
     });
     this.checkpointThreadIds.add(childThreadId);
     const activeChildRun = this.activeChildRuns.get(childThreadId);
@@ -1394,15 +1430,20 @@ export class SubagentExecutor {
     }
 
     const executionSuffix = parentToolCallId ?? nanoid(8);
-    const { childRunId, childThreadId, resumeExecution } =
-      await this.resolveChildExecutionIdentity({
-        threadId,
-        parentToolCallId: executionSuffix,
-        parentConfigurable: params.parentConfigurable,
-      });
+    const {
+      childRunId,
+      childThreadId,
+      approvalExecutionScope,
+      resumeExecution,
+    } = await this.resolveChildExecutionIdentity({
+      threadId,
+      parentToolCallId: executionSuffix,
+      parentConfigurable: params.parentConfigurable,
+    });
     this.childExecutionIdentities.set(executionSuffix, {
       childRunId,
       childThreadId,
+      approvalExecutionScope,
     });
     const childExecutionKey = childThreadId;
     const childAgentId =
@@ -1579,7 +1620,12 @@ export class SubagentExecutor {
         runName: `subagent:${subagentType}`,
         configurable: {
           ...inheritedConfigurable,
-          [TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY]: childRunId,
+          ...(this.humanInTheLoop?.enabled === true
+            ? {
+              [TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY]:
+                  approvalExecutionScope,
+            }
+            : {}),
           ...(resumeExecution?.descendant == null
             ? {}
             : {

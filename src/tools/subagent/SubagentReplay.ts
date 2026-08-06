@@ -11,6 +11,10 @@ export const SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY =
 
 const SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY =
   '__librechat_subagent_resume_manifest';
+const SUBAGENT_RESUME_WRAPPED_PAYLOAD_KEY =
+  '__librechat_subagent_resume_payload';
+const SUBAGENT_RESUME_WRAPPER_VERSION_KEY =
+  '__librechat_subagent_resume_wrapper';
 const MAX_RESUME_MANIFEST_DEPTH = 32;
 
 export interface SubagentCheckpointReference {
@@ -53,6 +57,7 @@ export interface SubagentGraphResumeState {
 export interface SubagentResumeExecution {
   parentToolCallId: string;
   childRunId: string;
+  approvalExecutionScope: string;
   checkpoints: SubagentCheckpointReference[];
   graphState: SubagentGraphResumeState;
   approvalReplays: ToolApprovalReplaySnapshot[];
@@ -67,6 +72,11 @@ export interface SubagentResumeManifest {
 
 type PayloadWithSubagentResumeManifest = {
   [SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY]?: unknown;
+};
+
+type WrappedSubagentResumePayload = PayloadWithSubagentResumeManifest & {
+  [SUBAGENT_RESUME_WRAPPER_VERSION_KEY]: 1;
+  [SUBAGENT_RESUME_WRAPPED_PAYLOAD_KEY]: unknown;
 };
 
 function isString(value: unknown): value is string {
@@ -305,12 +315,14 @@ function isSubagentResumeExecution(
   }
   const execution = value as Partial<SubagentResumeExecution>;
   const childRunId = execution.childRunId;
+  const approvalExecutionScope = execution.approvalExecutionScope;
   const checkpoints = execution.checkpoints;
   const graphState = execution.graphState;
   const approvalReplays = execution.approvalReplays;
   if (
     !isString(execution.parentToolCallId) ||
     !isString(childRunId) ||
+    !isString(approvalExecutionScope) ||
     !Array.isArray(checkpoints) ||
     checkpoints.length === 0 ||
     !checkpoints.every(isCheckpointReference) ||
@@ -326,7 +338,7 @@ function isSubagentResumeExecution(
   const validApprovalReplays = approvalReplays.every(
     (snapshot) =>
       isApprovalReplaySnapshot(snapshot) &&
-      snapshot.key.executionScope === childRunId
+      snapshot.key.executionScope === approvalExecutionScope
   );
   if (!validApprovalReplays) {
     return false;
@@ -423,9 +435,26 @@ export function requireValidSubagentResumeManifest(
 }
 
 export function attachSubagentResumeManifest(
-  payload: object,
+  payload: unknown,
   manifest: SubagentResumeManifest
 ): object {
+  if (isWrappedSubagentResumePayload(payload)) {
+    return {
+      ...payload,
+      [SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY]: manifest,
+    };
+  }
+  if (
+    payload == null ||
+    typeof payload !== 'object' ||
+    Array.isArray(payload)
+  ) {
+    return {
+      [SUBAGENT_RESUME_WRAPPER_VERSION_KEY]: 1,
+      [SUBAGENT_RESUME_WRAPPED_PAYLOAD_KEY]: payload,
+      [SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY]: manifest,
+    };
+  }
   return {
     ...payload,
     [SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY]: manifest,
@@ -433,6 +462,9 @@ export function attachSubagentResumeManifest(
 }
 
 export function stripSubagentResumeManifest(payload: unknown): unknown {
+  if (isWrappedSubagentResumePayload(payload)) {
+    return payload[SUBAGENT_RESUME_WRAPPED_PAYLOAD_KEY];
+  }
   if (
     payload == null ||
     typeof payload !== 'object' ||
@@ -446,6 +478,27 @@ export function stripSubagentResumeManifest(payload: unknown): unknown {
   return Object.fromEntries(
     Object.entries(payload).filter(
       ([key]) => key !== SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY
+    )
+  );
+}
+
+function isWrappedSubagentResumePayload(
+  payload: unknown
+): payload is WrappedSubagentResumePayload {
+  return (
+    payload != null &&
+    typeof payload === 'object' &&
+    !Array.isArray(payload) &&
+    (payload as Partial<WrappedSubagentResumePayload>)[
+      SUBAGENT_RESUME_WRAPPER_VERSION_KEY
+    ] === 1 &&
+    Object.prototype.hasOwnProperty.call(
+      payload,
+      SUBAGENT_RESUME_WRAPPED_PAYLOAD_KEY
+    ) &&
+    Object.prototype.hasOwnProperty.call(
+      payload,
+      SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY
     )
   );
 }

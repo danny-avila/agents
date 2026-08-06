@@ -31,6 +31,8 @@ export interface ExecuteHooksOptions {
   matchQuery?: string;
   /** Stable tool-call key for replaying consumed one-shot contributions. */
   onceReplayKey?: ToolApprovalReplayKey;
+  /** Storage scope for replay state when it must outlive or branch from the hook session. */
+  onceReplaySessionId?: string;
   /** Parent AbortSignal — combined with per-hook timeout into the hook signal. */
   signal?: AbortSignal;
   /** Default per-hook timeout; overridden by `matcher.timeout` when present. */
@@ -480,14 +482,16 @@ export async function executeHooks(
     sessionId,
     matchQuery,
     onceReplayKey,
+    onceReplaySessionId,
     signal,
     timeoutMs = DEFAULT_HOOK_TIMEOUT_MS,
     logger,
   } = opts;
   const event = input.hook_event_name;
+  const replaySessionId = onceReplaySessionId ?? sessionId;
   const pendingApproval =
-    event === 'PreToolUse' && sessionId != null && onceReplayKey != null
-      ? registry.getPendingToolApproval(sessionId, onceReplayKey)
+    event === 'PreToolUse' && replaySessionId != null && onceReplayKey != null
+      ? registry.getPendingToolApproval(replaySessionId, onceReplayKey)
       : undefined;
   const matchers = registry.getMatchers(event, sessionId);
   if (matchers.length === 0) {
@@ -523,11 +527,11 @@ export async function executeHooks(
     event === 'PreToolUse' &&
     aggregated.decision === 'ask' &&
     onceReplayContribution != null &&
-    sessionId != null &&
+    replaySessionId != null &&
     onceReplayKey != null
   ) {
     registry.setPendingToolApproval(
-      sessionId,
+      replaySessionId,
       onceReplayKey,
       createPendingApprovalReplay(
         aggregated,
@@ -539,10 +543,10 @@ export async function executeHooks(
     event === 'PreToolUse' &&
     aggregated.decision !== 'ask' &&
     pendingApproval != null &&
-    sessionId != null &&
+    replaySessionId != null &&
     onceReplayKey != null
   ) {
-    registry.clearPendingToolApproval(sessionId, onceReplayKey);
+    registry.clearPendingToolApproval(replaySessionId, onceReplayKey);
   }
   /**
    * Centralized `preventContinuation` propagation: when any hook (across

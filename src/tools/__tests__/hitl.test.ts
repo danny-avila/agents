@@ -2287,6 +2287,81 @@ describe('Codex review fixes', () => {
     jest.restoreAllMocks();
   });
 
+  it('reruns live hooks while replaying a consumed event-tool approval', async () => {
+    let dispatchCalls = 0;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        dispatchCalls += 1;
+        const request = data as {
+          resolve: (results: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve([
+          { toolCallId: 'call_event', content: 'ran', status: 'success' },
+        ]);
+      });
+
+    const registry = new HookRegistry();
+    let onceCalls = 0;
+    let liveCalls = 0;
+    registry.register('PreToolUse', {
+      once: true,
+      pattern: '^echo$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          onceCalls += 1;
+          return { decision: 'ask', reason: 'review once' };
+        },
+      ],
+    });
+    registry.register('PreToolUse', {
+      pattern: '^echo$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          liveCalls += 1;
+          return liveCalls === 1
+            ? { decision: 'allow' }
+            : { decision: 'deny', reason: 'policy changed before resume' };
+        },
+      ],
+    });
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-event-replay',
+      toolCallStepIds: new Map([['call_event', 'step_event']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_event', name: 'echo', args: { command: 'run' } },
+    ]);
+    const config = {
+      configurable: { thread_id: 'thread-event-hook-replay' },
+    };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+    expect(isInterrupted(interrupted)).toBe(true);
+    const resumed = await graph.invoke(
+      new Command({ resume: [{ type: 'approve' }] }),
+      config
+    );
+
+    expect(onceCalls).toBe(1);
+    expect(liveCalls).toBe(2);
+    expect(dispatchCalls).toBe(0);
+    const messages = (resumed as { messages: ToolMessage[] }).messages;
+    const result = messages.find(
+      (message) =>
+        message instanceof ToolMessage && message.tool_call_id === 'call_event'
+    );
+    expect(result?.status).toBe('error');
+    expect(String(result?.content)).toContain('policy changed before resume');
+  });
+
   it('preserves session-scoped hooks across HITL interrupt so the policy still fires on resume', async () => {
     let dispatchCalls = 0;
     jest

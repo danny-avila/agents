@@ -9,6 +9,7 @@ describe('SubagentReplay manifest', () => {
   const execution = {
     parentToolCallId: 'call_parent',
     childRunId: 'child-run',
+    approvalExecutionScope: 'child-approval-scope',
     checkpoints: [
       {
         threadId: 'child-thread',
@@ -52,7 +53,7 @@ describe('SubagentReplay manifest', () => {
     approvalReplays: [
       {
         key: {
-          executionScope: 'child-run',
+          executionScope: 'child-approval-scope',
           agentId: 'child-agent',
           toolUseId: 'call_tool',
         },
@@ -80,6 +81,22 @@ describe('SubagentReplay manifest', () => {
       visible: true,
     });
   });
+
+  it.each([
+    ['string', 'approve this child'],
+    ['number', 42],
+    ['null', null],
+    ['array', ['approve', { call: 1 }]],
+  ])(
+    'round-trips a private manifest around a %s interrupt payload',
+    (_label, visiblePayload) => {
+      const manifest = { version: 1 as const, executions: [execution] };
+      const payload = attachSubagentResumeManifest(visiblePayload, manifest);
+
+      expect(getSubagentResumeManifest(payload)).toEqual(manifest);
+      expect(stripSubagentResumeManifest(payload)).toEqual(visiblePayload);
+    }
+  );
 
   it('rejects ambiguous or cross-execution replay data', () => {
     const mismatchedScope = {

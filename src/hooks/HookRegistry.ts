@@ -284,7 +284,7 @@ export class HookRegistry {
 
   restorePendingToolApprovals(
     sessionId: string,
-    executionScope: string,
+    targetExecutionScope: string,
     snapshots: ReadonlyArray<ToolApprovalReplaySnapshot>
   ): void {
     const restored = new Map<string, AggregatedHookResult>();
@@ -292,12 +292,18 @@ export class HookRegistry {
       sessionId
     ) ?? []) {
       const key = deserializeApprovalKey(serializedKey);
-      if (key?.executionScope !== executionScope) {
+      if (key?.executionScope !== targetExecutionScope) {
         restored.set(serializedKey, result);
       }
     }
     for (const snapshot of snapshots) {
-      restored.set(serializeApprovalKey(snapshot.key), snapshot.result);
+      restored.set(
+        serializeApprovalKey({
+          ...snapshot.key,
+          executionScope: targetExecutionScope,
+        }),
+        snapshot.result
+      );
     }
     if (restored.size === 0) {
       this.pendingToolApprovals.delete(sessionId);

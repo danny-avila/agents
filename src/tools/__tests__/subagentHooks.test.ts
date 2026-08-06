@@ -1095,6 +1095,10 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     const sharedRebuiltRunId = `${runId}-same-rebuilt-id`;
     const approvedRun = await createRun(sharedRebuiltRunId);
     const rejectedRun = await createRun(sharedRebuiltRunId);
+    const restoreApprovalSpy = jest.spyOn(
+      registry,
+      'restorePendingToolApprovals'
+    );
     earlyApprovedRun.Graph!.overrideTestModel(['Final answer.'], 1);
     approvedRun.Graph!.overrideTestModel(['Final answer.'], 1);
     rejectedRun.Graph!.overrideTestModel(['Final answer.'], 1);
@@ -1122,6 +1126,10 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     expect(rejectedRun.getInterrupt()).toBeUndefined();
     expect(executedTools).toEqual(['calculator', 'calculator', 'calculator']);
     expect(approvalHookCalls).toBe(1);
+    const restoredApprovalScopes = new Set(
+      restoreApprovalSpy.mock.calls.map(([, executionScope]) => executionScope)
+    );
+    expect(restoredApprovalScopes.size).toBeGreaterThanOrEqual(4);
     const initialChildThreads = initialRun.getChildCheckpointThreadIds();
     const earlyApprovedChildThreads =
       earlyApprovedRun.getChildCheckpointThreadIds();
