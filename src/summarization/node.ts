@@ -18,6 +18,11 @@ import {
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
+  enforceStreamLimitsForWireChunk,
+  StreamLimitExceededError,
+  STREAM_LIMIT_EPOCH_KEY,
+} from '@/llm/streamLimits';
+import {
   addTailCacheControl,
   resolvePromptCacheTtl,
   type PromptCacheTtl,
@@ -34,11 +39,6 @@ import {
   Providers,
 } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
-import {
-  enforceStreamLimitsForWireChunk,
-  StreamLimitExceededError,
-  STREAM_LIMIT_EPOCH_KEY,
-} from '@/llm/streamLimits';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { createRemoveAllMessage } from '@/messages/reducer';
@@ -418,8 +418,9 @@ function computeSummaryTokenCount(
  * in `ToolNode` and `StandardGraph`, handoff cues, reconstructed skill bodies.
  *
  * `steer` is exempt from the `source` check because a replayed steer *is*
- * stamped from its payload entry; rejecting every marked `source` once dropped
- * exactly those retained steers. Injected steers are still caught, by `injected`.
+ * correlated with its payload entry; rejecting every marked `source` once
+ * dropped exactly those retained steers. Injected steers are still caught, by
+ * `injected`.
  *
  * Known limitation: a payload entry that omits `messageId` is never stamped, so
  * the reducer's UUID is recorded and cannot resolve on the next run. There is no
@@ -443,7 +444,10 @@ function resolveSummaryCoverage(
     if (isSyntheticContext(message)) {
       continue;
     }
-    const id = message.id?.trim();
+    const sourceMessageId = message.additional_kwargs.sourceMessageId;
+    const sourceId =
+      typeof sourceMessageId === 'string' ? sourceMessageId.trim() : '';
+    const id = sourceId !== '' ? sourceId : message.id?.trim();
     if (id != null && id !== '') {
       return { retainedFromMessageId: id };
     }
@@ -1244,9 +1248,9 @@ export function createSummarizeNode({
             ? { [Constants.INVOKED_MODEL]: clientConfig.modelName }
             : {}),
           /** Entry-captured breaker epoch: the wire consumer epoch-gates
-           * old-run summary chunks exactly like model-attempt chunks —
-           * without the stamp, a straggling summary from a failed run
-           * reads as current and could abort the next run's controller. */
+             * old-run summary chunks exactly like model-attempt chunks —
+             * without the stamp, a straggling summary from a failed run
+             * reads as current and could abort the next run's controller. */
           ...(entryBreakerEpoch != null
             ? { [STREAM_LIMIT_EPOCH_KEY]: entryBreakerEpoch }
             : {}),
