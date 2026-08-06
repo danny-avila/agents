@@ -1059,6 +1059,24 @@ describe('recency window — first-turn protection', () => {
       expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm2' });
     });
 
+    it('anchors a derived retained message on its persisted source id', async () => {
+      const summaryBlock = await runCompaction([
+        new HumanMessage({ content: 'turn 1 query', id: 'm1' }),
+        new AIMessage({ content: 'pre-steer reply', id: 'm2' }),
+        new HumanMessage({
+          content: 'steer',
+          id: 'reducer-uuid',
+          additional_kwargs: {
+            role: 'user',
+            source: 'steer',
+            sourceMessageId: 'm2',
+          },
+        }),
+      ]);
+
+      expect(summaryBlock?.coverage).toEqual({ retainedFromMessageId: 'm2' });
+    });
+
     /** `formatAgentMessages` reconstructs skill bodies inside its payload loop
      *  and keeps processing payload entries after, so this unstamped entry — a
      *  reducer UUID by the time compaction sees it — precedes stamped messages.
@@ -1770,13 +1788,13 @@ describe('summarize node breaker capture', () => {
     const entryBreaker = new AbortController();
     /** The trip lands while ON_SUMMARIZE_START is awaited — after the
      * entry check already passed. */
-    jest.spyOn(eventUtils, 'safeDispatchCustomEvent').mockImplementation((async (
-      ...args: unknown[]
-    ) => {
-      if (args[0] === GraphEvents.ON_SUMMARIZE_START) {
-        entryBreaker.abort(trip);
-      }
-    }) as never);
+    jest
+      .spyOn(eventUtils, 'safeDispatchCustomEvent')
+      .mockImplementation((async (...args: unknown[]) => {
+        if (args[0] === GraphEvents.ON_SUMMARIZE_START) {
+          entryBreaker.abort(trip);
+        }
+      }) as never);
     const modelClassSpy = jest
       .spyOn(providers, 'getChatModelClass')
       .mockReturnValue(
@@ -1915,13 +1933,13 @@ describe('summarize node breaker capture', () => {
     const entryBreaker = new AbortController();
     const lateBreaker = new AbortController();
     let started = false;
-    jest.spyOn(eventUtils, 'safeDispatchCustomEvent').mockImplementation((async (
-      ...args: unknown[]
-    ) => {
-      if (args[0] === GraphEvents.ON_SUMMARIZE_START) {
-        started = true;
-      }
-    }) as never);
+    jest
+      .spyOn(eventUtils, 'safeDispatchCustomEvent')
+      .mockImplementation((async (...args: unknown[]) => {
+        if (args[0] === GraphEvents.ON_SUMMARIZE_START) {
+          started = true;
+        }
+      }) as never);
 
     const capturedSignals: Array<AbortSignal | undefined> = [];
     jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
