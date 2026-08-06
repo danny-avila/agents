@@ -1,15 +1,16 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
+import { GraphInterrupt } from '@langchain/langgraph';
 import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
-import * as events from '@/utils/events';
 import {
   StreamLimitExceededError,
   RUN_BREAKER_SCOPE_CONFIG_KEY,
 } from '@/llm/streamLimits';
+import * as events from '@/utils/events';
 import { GraphEvents } from '@/common';
 import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
@@ -212,6 +213,42 @@ describe('ToolNode breaker signal composition', () => {
     expect(sideEffectRan).toBe(false);
   });
 
+  it('prioritizes a sibling breaker trip over an approval interrupt', async () => {
+    const breaker = new AbortController();
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    const approval = createSignalBlindTool('ask_question', async () => {
+      throw new GraphInterrupt([]);
+    });
+    const tripper = createSignalBlindTool('tripping_child', async () => {
+      breaker.abort(trip);
+      return 'tripped';
+    });
+    const node = new ToolNode({
+      tools: [approval, tripper],
+      interruptingToolNames: new Set(['ask_question', 'tripping_child']),
+      getBreakerSignal: () => breaker.signal,
+    });
+
+    await expect(
+      node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              { id: 'call_1', name: 'ask_question', args: {} },
+              { id: 'call_2', name: 'tripping_child', args: {} },
+            ],
+          }),
+        ],
+      })
+    ).rejects.toBe(trip);
+  });
+
   it('stops event dispatch when a direct tool trips the breaker mid-batch', async () => {
     const breaker = new AbortController();
     const trip = new StreamLimitExceededError({
@@ -323,7 +360,10 @@ describe('ToolNode breaker signal composition', () => {
   });
 
   it('stamps the batch-entry run scope into tool configs and strips it from host batches', async () => {
-    const scope = Object.freeze({ epoch: 3, controller: new AbortController() });
+    const scope = Object.freeze({
+      epoch: 3,
+      controller: new AbortController(),
+    });
     let seenScope: unknown;
     const capture = {
       name: 'capture_scope',

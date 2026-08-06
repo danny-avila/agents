@@ -3738,6 +3738,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const interruptingResults = await Promise.allSettled(
       interruptingPositions.map((i) => runOne(directCalls[i], i))
     );
+    /** A sibling may have tripped the run-wide breaker while another raised
+     * a GraphInterrupt. Safety failures take precedence over approval pauses
+     * regardless of input order. */
+    this.throwIfBreakerTripped(config);
     let hasInterruptingError = false;
     let interruptingError: unknown;
     for (let i = 0; i < interruptingResults.length; i++) {
