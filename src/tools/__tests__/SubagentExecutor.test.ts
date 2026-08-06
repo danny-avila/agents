@@ -1,3 +1,4 @@
+import { GraphInterrupt } from '@langchain/langgraph';
 import { describe, it, expect, beforeEach } from '@jest/globals';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
@@ -349,8 +350,7 @@ describe('buildChildInputs', () => {
     /**
      * Self-spawn: `resolveSubagentConfigs` fills `agentInputs` as a shallow
      * spread of the parent's `_sourceInputs`, so the parent-scoped direct
-     * tool would leak into a checkpointer-less child graph and fail with
-     * `No checkpointer set` — must be scrubbed.
+     * tool would leak into the child implicitly — it must be scrubbed.
      */
     const selfConfig: ResolvedSubagentConfig = {
       type: 'self',
@@ -365,9 +365,8 @@ describe('buildChildInputs', () => {
 
     /**
      * Explicit child config: a host that deliberately attaches its own
-     * in-process direct tools to a child keeps them (Codex #289 P2 —
-     * interrupt-capable tools still fail in children, but non-interrupting
-     * direct tools are legitimate there).
+     * in-process direct tools to a child keeps them (Codex #289 P2). With
+     * HITL enabled, interrupt-capable child tools use the shared checkpointer.
      */
     const explicitConfig: ResolvedSubagentConfig = {
       type: 'researcher',
@@ -494,6 +493,59 @@ describe('SubagentExecutor', () => {
     });
     expect(result.content).toContain('Maximum subagent nesting depth');
     expect(result.messages).toEqual([]);
+  });
+
+  it('preserves an existing nested approval scope', async () => {
+    const nestedScope = {
+      run_id: 'grandchild-run',
+      agent_id: 'grandchild-agent',
+      subagent_type: 'grandchild',
+      parent_tool_call_id: 'call_grandchild',
+    };
+    const nestedInterrupt = new GraphInterrupt([
+      {
+        id: 'nested-interrupt',
+        value: {
+          type: 'tool_approval',
+          action_requests: [],
+          review_configs: [],
+          subagent: nestedScope,
+        },
+      },
+    ]);
+    const executor = createExecutor({
+      humanInTheLoop: { enabled: true },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({
+            getState: jest.fn().mockResolvedValue({
+              values: {},
+              next: ['agent'],
+              tasks: [],
+            }),
+            invoke: jest.fn().mockRejectedValue(nestedInterrupt),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    let received: GraphInterrupt | undefined;
+    try {
+      await executor.execute({
+        description: 'Delegate again',
+        subagentType: 'researcher',
+        threadId: 'durable-thread',
+        parentToolCallId: 'call_child',
+      });
+    } catch (error) {
+      if (error instanceof GraphInterrupt) {
+        received = error;
+      }
+    }
+
+    expect(received?.interrupts[0].value).toMatchObject({
+      subagent: nestedScope,
+    });
   });
 
   it('rethrows a child stream-limit trip instead of converting it to a tool result', async () => {

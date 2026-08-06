@@ -249,6 +249,38 @@ describe('ToolNode breaker signal composition', () => {
     ).rejects.toBe(trip);
   });
 
+  it('reuses terminal interrupting sibling outputs across replay', async () => {
+    let terminalRuns = 0;
+    const terminal = createSignalBlindTool('terminal_child', async () => {
+      terminalRuns += 1;
+      return 'completed';
+    });
+    const approval = createSignalBlindTool('approval_child', async () => {
+      throw new GraphInterrupt([
+        { id: 'approval-interrupt', value: { type: 'approval' } },
+      ]);
+    });
+    const node = new ToolNode({
+      tools: [terminal, approval],
+      interruptingToolNames: new Set(['terminal_child', 'approval_child']),
+    });
+    const input = {
+      messages: [
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'call_terminal', name: 'terminal_child', args: {} },
+            { id: 'call_approval', name: 'approval_child', args: {} },
+          ],
+        }),
+      ],
+    };
+
+    await expect(node.invoke(input)).rejects.toBeInstanceOf(GraphInterrupt);
+    await expect(node.invoke(input)).rejects.toBeInstanceOf(GraphInterrupt);
+    expect(terminalRuns).toBe(1);
+  });
+
   it('stops event dispatch when a direct tool trips the breaker mid-batch', async () => {
     const breaker = new AbortController();
     const trip = new StreamLimitExceededError({

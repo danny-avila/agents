@@ -103,7 +103,7 @@ export type HumanInterruptType = 'tool_approval' | 'ask_user_question';
 
 /** Identifies an interrupt that originated inside a checkpointed subagent. */
 export interface SubagentInterruptScope {
-  /** Stable child run id used as the child checkpoint thread id. */
+  /** Child execution run id used by subagent update and usage events. */
   run_id: string;
   /** Child agent id that owns the interrupted tool call. */
   agent_id: string;

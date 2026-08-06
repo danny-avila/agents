@@ -188,6 +188,7 @@ type ActiveChildRun = {
 
 const LANGGRAPH_RUNTIME_CONFIG_PREFIX = '__pregel_';
 const LANGGRAPH_RESUME_MAP_CONFIG_KEY = '__pregel_resume_map';
+const LANGGRAPH_SCRATCHPAD_CONFIG_KEY = '__pregel_scratchpad';
 const LANGGRAPH_CHECKPOINT_CONFIG_KEYS = new Set([
   'checkpoint_id',
   'checkpoint_map',
@@ -211,20 +212,53 @@ function addSubagentScope(
   return interrupts.map((childInterrupt) => ({
     ...childInterrupt,
     value: isToolApprovalPayload(childInterrupt.value)
-      ? { ...childInterrupt.value, subagent: scope }
+      ? {
+        ...childInterrupt.value,
+        subagent: childInterrupt.value.subagent ?? scope,
+      }
       : childInterrupt.value,
   }));
 }
 
 type ToolApprovalResumeValue = ToolApprovalDecision[] | ToolApprovalDecisionMap;
 
+function isToolApprovalDecisionMap(
+  value: object
+): value is ToolApprovalDecisionMap {
+  return (
+    !Array.isArray(value) &&
+    Object.values(value).every(
+      (decision) =>
+        decision != null &&
+        typeof decision === 'object' &&
+        typeof (decision as { type?: unknown }).type === 'string'
+    )
+  );
+}
+
 function getChildResumeMap(
   pendingInterrupts: Interrupt[],
   parentConfigurable: Record<string, unknown> | undefined
 ): Record<string, ToolApprovalResumeValue> | undefined {
-  const resumeMap = parentConfigurable?.[LANGGRAPH_RESUME_MAP_CONFIG_KEY];
+  const scratchpad = parentConfigurable?.[LANGGRAPH_SCRATCHPAD_CONFIG_KEY] as
+    | { nullResume?: unknown; resume?: unknown[] }
+    | undefined;
+  const scratchpadResume =
+    scratchpad?.resume?.length === 1
+      ? scratchpad.resume[0]
+      : scratchpad?.nullResume;
+  const resumeMap =
+    parentConfigurable?.[LANGGRAPH_RESUME_MAP_CONFIG_KEY] ?? scratchpadResume;
   if (resumeMap == null || typeof resumeMap !== 'object') {
     return undefined;
+  }
+
+  const pendingInterruptId =
+    pendingInterrupts.length === 1 ? pendingInterrupts[0].id : undefined;
+  if (Array.isArray(resumeMap)) {
+    return typeof pendingInterruptId === 'string'
+      ? { [pendingInterruptId]: resumeMap }
+      : undefined;
   }
 
   const parentResumeMap = resumeMap as Record<string, ToolApprovalResumeValue>;
@@ -238,7 +272,16 @@ function getChildResumeMap(
       childResumeMap[interruptId] = parentResumeMap[interruptId];
     }
   }
-  return Object.keys(childResumeMap).length > 0 ? childResumeMap : undefined;
+  if (Object.keys(childResumeMap).length > 0) {
+    return childResumeMap;
+  }
+  if (
+    typeof pendingInterruptId === 'string' &&
+    isToolApprovalDecisionMap(resumeMap)
+  ) {
+    return { [pendingInterruptId]: resumeMap };
+  }
+  return undefined;
 }
 
 function getPersistedInterrupts(snapshot: StateSnapshot): Interrupt[] {
@@ -293,8 +336,10 @@ export type SubagentExecuteParams = {
    *
    * Inheritance details (verified empirically against LangGraph):
    *   - host-set keys propagate as-is into the child's tool dispatches;
-   *   - with nested HITL enabled, `thread_id` is replaced with the stable
-   *     child run id so parent and child checkpoints cannot collide;
+   *   - with nested HITL enabled, `thread_id` is replaced with a stable
+   *     child checkpoint id derived from the parent's durable thread id,
+   *     parent agent id, and spawning tool call id so parent and child
+   *     checkpoints cannot collide or drift when a host rebuilds the Run;
    *     parent-scoped hook lookup remains keyed by the inherited `run_id`;
    *   - `parent_run_id` propagates when the host put it on parent's
    *     configurable;
@@ -503,7 +548,9 @@ export class SubagentExecutor {
     }
 
     const executionSuffix = parentToolCallId ?? nanoid(8);
+    const durableParentId = threadId ?? this.parentRunId;
     const childRunId = `${this.parentRunId}_sub_${executionSuffix}`;
+    const childThreadId = `${durableParentId}_sub_${this.parentAgentId ?? 'agent'}_${executionSuffix}`;
     const childAgentId =
       config.agentInputs.agentId ||
       `${this.parentAgentId ?? 'agent'}_sub_${executionSuffix}`;
@@ -639,10 +686,11 @@ export class SubagentExecutor {
       const callbacks: Callbacks = callbackHandlers;
       /**
        * Inherit the parent's host `configurable` while binding LangGraph's
-       * checkpoint identity to the stable child run id. The parent thread id
-       * cannot be reused here: parent and child share one checkpointer when
-       * nested HITL is enabled, and root checkpoint namespaces are normalized
-       * by LangGraph, so a shared `thread_id` would collide with the parent.
+       * checkpoint identity to a stable child id derived from the durable
+       * parent thread. The parent thread id cannot be reused here: parent and
+       * child share one checkpointer when nested HITL is enabled, and root
+       * checkpoint namespaces are normalized by LangGraph, so a shared
+       * `thread_id` would collide with the parent.
        *
        * `run_id` still propagates as the parent run id, which is the key used
        * for session-scoped hook lookup. Child hook inputs therefore retain
@@ -660,7 +708,7 @@ export class SubagentExecutor {
           ...inheritedConfigurable,
           thread_id:
             this.humanInTheLoop?.enabled === true
-              ? childRunId
+              ? childThreadId
               : (inheritedConfigurable.thread_id ?? childRunId),
         },
       };
@@ -1790,11 +1838,10 @@ export function buildChildInputs(
      * Host-supplied direct tools are scrubbed from INHERITED configs only.
      * A self-spawn config's `agentInputs` is a shallow spread of the parent's
      * `_sourceInputs`, so without this a parent-scoped graph tool (e.g. an
-     * interrupt-raising ask_user_question, which needs the parent's
-     * checkpointer — child graphs compile without one) would silently leak
-     * into the child and deterministically throw `No checkpointer set`. An
-     * EXPLICIT child config that lists its own `graphTools` is a deliberate
-     * host choice and keeps them (Codex #289 P2).
+     * interrupt-raising ask_user_question) would silently become available to
+     * the child. An EXPLICIT child config that lists its own `graphTools` is a
+     * deliberate host choice and keeps them (Codex #289 P2); with HITL enabled,
+     * those tools use the shared checkpointer and can pause and resume safely.
      */
     graphTools: config.self === true ? undefined : agentInputs.graphTools,
   };

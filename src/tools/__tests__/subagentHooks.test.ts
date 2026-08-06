@@ -683,6 +683,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     const deniedToolIds: string[] = [];
     const executedToolIds: string[] = [];
     const updates: t.SubagentUpdateEvent[] = [];
+    const completedSubagentCalls: string[] = [];
 
     registry.register('PreToolUse', {
       hooks: [
@@ -690,6 +691,16 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
           input.toolName === 'calculator'
             ? { decision: 'ask', reason: 'review child calculator' }
             : { decision: 'allow' },
+      ],
+    });
+    registry.register('PostToolUse', {
+      hooks: [
+        async (input): Promise<PostToolUseHookOutput> => {
+          if (input.toolName === Constants.SUBAGENT) {
+            completedSubagentCalls.push(input.toolUseId);
+          }
+          return {};
+        },
       ],
     });
     registry.register('PermissionDenied', {
@@ -784,6 +795,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     expect(run.getInterrupt()).toBeUndefined();
     expect(executedToolIds).toHaveLength(1);
     expect(deniedToolIds).toHaveLength(1);
+    expect(completedSubagentCalls).toEqual([first.id, second.id]);
     const firstPhases = updates
       .filter((event) => event.parentToolCallId === first.id)
       .map((event) => event.phase);
@@ -838,9 +850,9 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       },
     };
     const runId = `subagent-rebuild-hitl-${Date.now()}`;
-    const createRun = (): Promise<Run<t.IState>> =>
+    const createRun = (currentRunId: string): Promise<Run<t.IState>> =>
       Run.create<t.IState>({
-        runId,
+        runId: currentRunId,
         graphConfig: {
           type: 'standard',
           agents: [createParentAgentWithChildTool()],
@@ -853,7 +865,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
         humanInTheLoop: { enabled: true },
       });
     const tc = makeSubagentToolCall('call_sub_rebuild');
-    const initialRun = await createRun();
+    const initialRun = await createRun(`${runId}-initial`);
     initialRun.Graph!.overrideTestModel(['Delegating...', 'Final answer.'], 5, [
       tc,
     ]);
@@ -868,18 +880,13 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       subagent: { parent_tool_call_id: tc.id },
     });
 
-    const rebuiltRun = await createRun();
+    const rebuiltRun = await createRun(`${runId}-rebuilt`);
     rebuiltRun.Graph!.overrideTestModel(['Final answer.'], 1);
     const warningSpy = jest
       .spyOn(console, 'warn')
       .mockImplementation((): void => undefined);
     try {
-      await rebuiltRun.resume(
-        {
-          [persistedInterrupt!.interruptId]: [{ type: 'approve' }],
-        },
-        callerConfig
-      );
+      await rebuiltRun.resume([{ type: 'approve' }], callerConfig);
     } finally {
       warningSpy.mockRestore();
     }

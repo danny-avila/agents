@@ -574,6 +574,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * the Run ends.
    */
   private directPathTurns: Map<string, number> = new Map();
+  /** Terminal outputs from interrupting siblings that must survive a
+   * LangGraph replay of the containing ToolNode. */
+  private settledInterruptingOutputs = new Map<string, BaseMessage | Command>();
   /** Tool registry for filtering (lazy computation of programmatic maps) */
   private toolRegistry?: t.LCToolRegistry;
   /** Cached programmatic tools (computed once on first PTC call) */
@@ -931,16 +934,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
-   * Flush the per-Run direct-path turn cache. Called by the Graph at
-   * end-of-Run via `clearHeavyState`. The map intentionally survives
-   * `run()` re-entry so an interrupt + resume reuses the original
-   * slot (Codex P2 #30), but it would otherwise grow linearly with
-   * tool calls and could collide across Runs if a provider reused
-   * call IDs (Codex P2 #33). Hosts can also call this directly if
+   * Flush per-Run direct replay state. Called by the Graph at end-of-Run via
+   * `clearHeavyState`. The state intentionally survives `run()` re-entry so
+   * interrupt + resume keeps both original turn slots and terminal sibling
+   * outputs, but it would otherwise grow linearly and could collide across
+   * Runs if a provider reused call IDs. Hosts can also call this directly if
    * they reuse a ToolNode across batches outside of a Graph.
    */
   clearDirectPathTurns(): void {
     this.directPathTurns.clear();
+    this.settledInterruptingOutputs.clear();
   }
 
   /**
@@ -3680,16 +3683,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * call throws a `GraphInterrupt`, the `await` below rejects and unwinds the
    * whole ToolNode *before* any non-interrupting sibling has started — so a
    * sibling with real side effects (send_email, billing) never executes on
-   * the first pass. On the resume pass LangGraph re-runs the batch from the
-   * top; the interrupting tool resolves with the host's answer instead of
-   * throwing, and the siblings execute for the FIRST time, exactly once.
+   * the first pass. Terminal interrupting siblings are cached by call id, so
+   * LangGraph replay reuses their complete lifecycle output instead of
+   * repeating model calls, hooks, or side effects.
    *
    * Without this ordering, a flat `Promise.all` starts every sibling
    * concurrently, so a non-idempotent sibling can complete its side effect
    * before the interrupt unwinds and then run a SECOND time on resume — the
-   * duplicate side effect this method exists to prevent. Interrupting tools
-   * are expected to be side-effect-free (they only suspend), so running them
-   * as a group and re-running them on resume is harmless.
+   * duplicate side effect this method exists to prevent. A tool that actually
+   * suspends re-enters until it reaches a terminal result; siblings that
+   * already settled do not re-enter.
    *
    * `batchIndices[i]` is `directCalls[i]`'s position within the parent
    * ToolNode batch (used for `{{tool<i>turn<n>}}` registration); it is
@@ -3706,11 +3709,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const runOne = (
       call: ToolCall,
       position: number
-    ): Promise<BaseMessage | Command> =>
-      this.runDirectToolWithLifecycleHooks(call, config, {
+    ): Promise<BaseMessage | Command> => {
+      const cachedOutput =
+        typeof call.id === 'string'
+          ? this.settledInterruptingOutputs.get(call.id)
+          : undefined;
+      if (cachedOutput != null) {
+        return Promise.resolve(cachedOutput);
+      }
+      return this.runDirectToolWithLifecycleHooks(call, config, {
         ...baseContext,
         batchIndex: batchIndices[position],
       });
+    };
 
     const interrupting = this.interruptingToolNames;
     const hasInterrupting =
@@ -3753,7 +3764,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
         continue;
       }
-      outputs[interruptingPositions[i]] = result.value;
+      const position = interruptingPositions[i];
+      outputs[position] = result.value;
+      const callId = directCalls[position].id;
+      if (typeof callId === 'string' && callId !== '') {
+        this.settledInterruptingOutputs.set(callId, result.value);
+      }
     }
     if (hasInterruptingError) {
       throw interruptingError;
