@@ -1,6 +1,10 @@
 {
   "name": "@librechat/agents",
   "version": "3.4.0",
+  "reova": {
+    "enabled": true,
+    "endpoint": "https://telemetry.reo.dev/data"
+  },
   "main": "./dist/cjs/main.cjs",
   "module": "./dist/esm/main.mjs",
   "types": "./dist/types/index.d.ts",
@@ -248,7 +252,7 @@
     "nanoid": "^3.3.7",
     "okapibm25": "^1.4.1",
     "openai": "^6.46.0",
-    "reo-census": "^1.2.10",
+    "reova": "^0.4.1",
     "socks-proxy-agent": "^8.0.5",
     "uuid": "^11.1.1"
   },
