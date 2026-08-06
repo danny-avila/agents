@@ -1338,7 +1338,7 @@ describe('context overflow recovery', () => {
     if (agentContext == null) {
       throw new Error('Expected default agent context');
     }
-    expect(run.Graph.compileOptions?.checkpointer).toBeUndefined();
+    expect(run.Graph.compileOptions?.checkpointer).toBeInstanceOf(MemorySaver);
     expect(run.Graph.hasCompiledCheckpointer).toBe(true);
     run.Graph.resetValues(undefined, 'checkpoint-scope');
     agentContext.preserveOriginalToolContent(new Map([[2, 'full output']]));
