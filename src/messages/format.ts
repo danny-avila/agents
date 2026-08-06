@@ -887,6 +887,28 @@ function getSourceMessageId(message: Partial<TMessage>): string | undefined {
 }
 
 /**
+ * Keeps the first formatted message backward-compatible with its persisted
+ * source id while giving every additional message a stable reducer identity.
+ * The metadata preserves exact source correlation without overloading the id
+ * that LangGraph uses for replace-in-place updates.
+ */
+function stampSourceMessageIdentity(
+  messages: Array<RoleBearingMessage<BaseMessage>>,
+  sourceMessageId: string | undefined
+): void {
+  if (sourceMessageId == null) {
+    return;
+  }
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    const id = i === 0 ? sourceMessageId : `${sourceMessageId}:derived:${i}`;
+    message.id = id;
+    message.lc_kwargs.id = id;
+    message.additional_kwargs.sourceMessageId = sourceMessageId;
+  }
+}
+
+/**
  * Labels all agent content for parallel patterns (fan-out/fan-in)
  * Groups consecutive content by agent and wraps with clear labels
  */
@@ -1565,9 +1587,7 @@ export const formatAgentMessages = (
         | RoleBearingMessage<HumanMessage>
         | RoleBearingMessage<AIMessage>
         | RoleBearingMessage<SystemMessage>;
-      if (sourceMessageId != null && sourceMessageId !== '') {
-        formattedMessage.id = sourceMessageId;
-      }
+      stampSourceMessageIdentity([formattedMessage], sourceMessageId);
       flushSteerAnchor(formattedMessage);
       messages.push(formattedMessage);
 
@@ -1747,11 +1767,7 @@ export const formatAgentMessages = (
         options?.provider === Providers.DEEPSEEK,
       provider: options?.provider,
     });
-    if (sourceMessageId != null && sourceMessageId !== '') {
-      for (const formattedMessage of formattedMessages) {
-        formattedMessage.id = sourceMessageId;
-      }
-    }
+    stampSourceMessageIdentity(formattedMessages, sourceMessageId);
     /**
      * A steer that ends an assistant message leaves the replay on a
      * `HumanMessage`. The next payload message is itself a user turn, so the
@@ -1775,12 +1791,12 @@ export const formatAgentMessages = (
      * the model may simply never answer. So the intent is recorded and flushed
      * only when a message actually follows.
      *
-     * Pushed AFTER the id stamping above, deliberately. `messagesStateReducer`
-     * treats a repeated id as replace-in-place, so an anchor carrying the
-     * shared `sourceMessageId` would overwrite the steer it exists to protect.
-     * Left unstamped, it reaches the reducer with a null id and is assigned a
-     * fresh one. `endsWithSteerMessage` reads only `additional_kwargs.source`,
-     * so the deferral cannot change which messages get anchored.
+     * Pushed AFTER source identity stamping above, deliberately. The anchor is
+     * synthetic rather than derived from the persisted assistant entry, so it
+     * must not claim that entry's source metadata. Left unstamped, it reaches
+     * the reducer with a null id and is assigned a fresh one.
+     * `endsWithSteerMessage` reads only `additional_kwargs.source`, so the
+     * deferral cannot change which messages get anchored.
      */
     /**
      * Guarded on emission: an assistant entry whose blocks all filtered away

@@ -370,12 +370,9 @@ describe('formatAgentMessages trailing-steer anchor', () => {
     expect(following.content).toEqual([{ type: 'text', text: 'Next turn' }]);
   });
 
-  /**
-   * `messagesStateReducer` treats a repeated id as replace-in-place, so an
-   * anchor stamped with the shared `sourceMessageId` would overwrite the very
-   * steer it exists to protect. It must reach the reducer unstamped.
-   */
-  it('does not stamp the anchor with the shared source message id', () => {
+  /** The synthetic anchor is not derived from the persisted assistant entry,
+   *  so it must not inherit that entry's source identity metadata. */
+  it('does not stamp the anchor with the source message identity', () => {
     const payload: TPayload = [
       { role: 'user', content: 'Original request' },
       {
@@ -395,13 +392,20 @@ describe('formatAgentMessages trailing-steer anchor', () => {
       (message) => message.additional_kwargs.source === 'steer'
     );
     expect(steerIndex).toBeGreaterThan(0);
-    expect(messages[steerIndex].id).toBe('assistant_1');
+    expect(messages[steerIndex].id).toBe('assistant_1:derived:1');
     expect(messages[steerIndex - 1].id).toBe('assistant_1');
+    expect(messages[steerIndex].additional_kwargs.sourceMessageId).toBe(
+      'assistant_1'
+    );
+    expect(messages[steerIndex - 1].additional_kwargs.sourceMessageId).toBe(
+      'assistant_1'
+    );
 
     const anchor = messages[steerIndex + 1];
     expect(anchor).toBeInstanceOf(AIMessage);
     expect(anchor.content).not.toBe('');
     expect(anchor.id).not.toBe('assistant_1');
+    expect(anchor.additional_kwargs.sourceMessageId).toBeUndefined();
   });
 
   /**
@@ -469,9 +473,7 @@ describe('formatAgentMessages trailing-steer anchor', () => {
     const last = messages[messages.length - 1];
     expect(last.additional_kwargs.source).toBe('steer');
     expect(
-      messages.some(
-        (m) => m instanceof AIMessage && m.content === '_'
-      )
+      messages.some((m) => m instanceof AIMessage && m.content === '_')
     ).toBe(false);
   });
 
@@ -536,7 +538,10 @@ describe('formatAgentMessages trailing-steer anchor', () => {
       {
         role: 'assistant',
         content: [
-          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Doing the other thing.' },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Doing the other thing.',
+          },
         ],
       },
     ];
