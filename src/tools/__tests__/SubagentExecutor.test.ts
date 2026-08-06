@@ -1484,6 +1484,66 @@ describe('SubagentExecutor', () => {
       expect(configurable.user).toEqual({ id: 'user_abc' });
     });
 
+    it('isolates child checkpoints created from different parent forks', async () => {
+      const invokedConfigs: Record<string, unknown>[] = [];
+      const invoke = jest
+        .fn()
+        .mockImplementation(
+          async (
+            _input: unknown,
+            config: Record<string, unknown>
+          ): Promise<{ messages: BaseMessage[] }> => {
+            invokedConfigs.push(config);
+            return { messages: [new AIMessage('done')] };
+          }
+        );
+      const executor = createExecutor({
+        humanInTheLoop: { enabled: true },
+        createChildGraph: (): StandardGraph =>
+          ({
+            createWorkflow: () => ({
+              getState: jest.fn().mockResolvedValue({
+                values: {},
+                next: [],
+                tasks: [],
+              }),
+              invoke,
+            }),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph,
+      });
+      const common = {
+        description: 'task',
+        subagentType: 'researcher',
+        threadId: 'parent-thread',
+        parentToolCallId: 'call_shared',
+      };
+
+      await executor.execute({
+        ...common,
+        parentConfigurable: {
+          thread_id: 'parent-thread',
+          checkpoint_id: 'fork-a',
+        },
+      });
+      await executor.execute({
+        ...common,
+        parentConfigurable: {
+          thread_id: 'parent-thread',
+          checkpoint_id: 'fork-b',
+        },
+      });
+
+      expect(invoke).toHaveBeenCalledTimes(2);
+      const childThreadIds = invokedConfigs.map(
+        (config) =>
+          (config.configurable as Record<string, unknown>).thread_id as string
+      );
+      expect(childThreadIds[0]).toContain('_sub_fork-a_');
+      expect(childThreadIds[1]).toContain('_sub_fork-b_');
+      expect(childThreadIds[0]).not.toBe(childThreadIds[1]);
+    });
+
     it('does not require parentConfigurable (back-compat with hosts that omit it)', async () => {
       const { factory, getInvokeConfig } = makeCapturingGraphFactory();
       const executor = createExecutor({ createChildGraph: factory });
@@ -1570,6 +1630,67 @@ describe('SubagentExecutor', () => {
       const input = capturedStop as Record<string, unknown>;
       expect(input.hook_event_name).toBe('SubagentStop');
       expect(input.agentType).toBe('researcher');
+    });
+
+    it('finishes missing child lifecycle after recovering a completed checkpoint', async () => {
+      const stopHook = jest.fn().mockResolvedValue({});
+      const hookRegistry = new HookRegistry();
+      hookRegistry.register('SubagentStop', { hooks: [stopHook] });
+      const updates: SubagentUpdateEvent[] = [];
+      const handlerRegistry = new HandlerRegistry();
+      handlerRegistry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: (_event, data): void => {
+          updates.push(data as SubagentUpdateEvent);
+        },
+      });
+      const invoke = jest.fn();
+      const updateState = jest.fn().mockResolvedValue({});
+      const executor = createExecutor({
+        humanInTheLoop: { enabled: true },
+        hookRegistry,
+        parentHandlerRegistry: handlerRegistry,
+        createChildGraph: (): StandardGraph =>
+          ({
+            createWorkflow: () => ({
+              getState: jest.fn().mockResolvedValue({
+                values: { messages: [new AIMessage('persisted result')] },
+                next: [],
+                tasks: [],
+              }),
+              invoke,
+              updateState,
+            }),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph,
+      });
+
+      const result = await executor.execute({
+        description: 'recover me',
+        subagentType: 'researcher',
+        threadId: 'durable-thread',
+        parentToolCallId: 'call_recovered',
+      });
+
+      expect(result.content).toBe('persisted result');
+      expect(invoke).not.toHaveBeenCalled();
+      expect(stopHook).toHaveBeenCalledTimes(1);
+      expect(updates.filter((update) => update.phase === 'stop')).toHaveLength(
+        1
+      );
+      expect(updateState).toHaveBeenCalledTimes(1);
+      expect(updateState.mock.calls[0][1]).toMatchObject({
+        messages: [
+          {
+            additional_kwargs: {
+              __librechat_subagent_checkpoint: {
+                version: 1,
+                parentToolCallId: 'call_recovered',
+                lifecycleComplete: true,
+              },
+            },
+          },
+        ],
+      });
     });
 
     it('SubagentStart deny blocks execution', async () => {

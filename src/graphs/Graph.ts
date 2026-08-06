@@ -23,6 +23,10 @@ import type {
   StreamedToolCallArgTally,
   StreamDeltaEventTally,
 } from '@/llm/streamLimits';
+import type {
+  ReplayableSubagentTool,
+  SettledSubagentToolOutput,
+} from '@/tools/subagent/SubagentReplay';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
 import type { FallbackErrorContext } from '@/llm/invoke';
 import type { HookRegistry } from '@/hooks';
@@ -133,6 +137,7 @@ import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache'
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
+import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
@@ -4075,6 +4080,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           usageSink: this.subagentUsageSink,
           streamLimits: this.streamLimits,
           humanInTheLoop: this.humanInTheLoop,
+          checkpointer: this.compileOptions?.checkpointer,
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {
             const childGraph = new StandardGraph(input);
@@ -4169,6 +4175,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           });
           return result.content;
         }, buildSubagentToolParams(resolvedConfigs));
+        const replayableSubagentTool = subagentTool as typeof subagentTool &
+          ReplayableSubagentTool;
+        replayableSubagentTool[SUBAGENT_REPLAY_CONTROLLER] = {
+          getSettledOutput: (
+            call,
+            config
+          ): Promise<SettledSubagentToolOutput | undefined> =>
+            executor.getSettledToolOutput(call, config),
+          persistSettledOutput: (call, config, output): Promise<void> =>
+            executor.persistSettledToolOutput(call, config, output),
+        };
 
         if (!agentContext.graphTools) {
           agentContext.graphTools = [];

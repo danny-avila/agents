@@ -39,6 +39,7 @@ import type {
   AggregatedHookResult,
   PostToolBatchEntry,
 } from '@/hooks';
+import type { ReplayableSubagentTool } from '@/tools/subagent/SubagentReplay';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
 import {
@@ -83,6 +84,7 @@ import {
   resolveLocalExecutionTools,
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
+import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 
 /** Host-facing batch requests must not carry the batch's breaker scope —
@@ -1504,6 +1506,69 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     config: RunnableConfig,
     batchContext: RunToolBatchContext<T> = {}
   ): Promise<BaseMessage | Command> {
+    const replayController = (
+      this.toolMap.get(call.name) as ReplayableSubagentTool | undefined
+    )?.[SUBAGENT_REPLAY_CONTROLLER];
+    const settledOutput = await replayController?.getSettledOutput(
+      call,
+      config
+    );
+    if (settledOutput != null) {
+      if (
+        batchContext.additionalContextsSink != null &&
+        settledOutput.additionalContexts.length > 0
+      ) {
+        batchContext.additionalContextsSink.push(
+          ...settledOutput.additionalContexts
+        );
+      }
+      if (
+        batchContext.resolvedArgsByCallId != null &&
+        call.id != null &&
+        settledOutput.resolvedArgs != null
+      ) {
+        batchContext.resolvedArgsByCallId.set(
+          call.id,
+          settledOutput.resolvedArgs
+        );
+      }
+      const refMeta = settledOutput.output.additional_kwargs as
+        | t.ToolMessageRefMetadata
+        | undefined;
+      if (
+        this.toolOutputRegistry != null &&
+        refMeta?._refKey != null &&
+        settledOutput.referenceContent != null
+      ) {
+        this.toolOutputRegistry.set(
+          refMeta._refScope,
+          refMeta._refKey,
+          settledOutput.referenceContent
+        );
+      }
+      return settledOutput.output;
+    }
+    const replayAdditionalContexts: string[] = [];
+    const persistOutput = async (output: ToolMessage): Promise<ToolMessage> => {
+      const refMeta = output.additional_kwargs as
+        | t.ToolMessageRefMetadata
+        | undefined;
+      const resolvedArgs =
+        call.id == null
+          ? undefined
+          : batchContext.resolvedArgsByCallId?.get(call.id);
+      const referenceContent =
+        this.toolOutputRegistry == null || refMeta?._refKey == null
+          ? undefined
+          : this.toolOutputRegistry.get(refMeta._refScope, refMeta._refKey);
+      await replayController?.persistSettledOutput(call, config, {
+        output,
+        additionalContexts: replayAdditionalContexts,
+        ...(resolvedArgs == null ? {} : { resolvedArgs }),
+        ...(referenceContent == null ? {} : { referenceContent }),
+      });
+      return output;
+    };
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
     const hookRegistry = this.hookRegistry;
     const hasPreHook = hookRegistry?.hasHookFor('PreToolUse', runId) === true;
@@ -1515,7 +1580,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       hookRegistry == null ||
       (!hasPreHook && !hasPostHook && !hasFailureHook)
     ) {
-      return this.runTool(call, config, batchContext);
+      const output = await this.runTool(call, config, batchContext);
+      return output instanceof ToolMessage ? persistOutput(output) : output;
     }
 
     const threadId = config.configurable?.thread_id as string | undefined;
@@ -1610,11 +1676,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         // the per-batch sink so the caller materializes them as a
         // HumanMessage for the next model turn — same shape as the
         // event-driven path's `injected[]`. Codex P2 #39.
-        if (
-          batchContext.additionalContextsSink != null &&
-          preResult.additionalContexts.length > 0
-        ) {
-          batchContext.additionalContextsSink.push(
+        if (preResult.additionalContexts.length > 0) {
+          replayAdditionalContexts.push(...preResult.additionalContexts);
+          batchContext.additionalContextsSink?.push(
             ...preResult.additionalContexts
           );
         }
@@ -1842,14 +1906,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }).catch(() => undefined);
       if (
         failureResult != null &&
-        batchContext.additionalContextsSink != null &&
         failureResult.additionalContexts.length > 0
       ) {
-        batchContext.additionalContextsSink.push(
+        replayAdditionalContexts.push(...failureResult.additionalContexts);
+        batchContext.additionalContextsSink?.push(
           ...failureResult.additionalContexts
         );
       }
-      return output;
+      return persistOutput(output);
     }
 
     if (output.status !== 'error' && hasPostHook) {
@@ -1874,12 +1938,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
       // Forward additionalContexts from the PostToolUse hook into
       // the per-batch sink (Codex P2 #39).
-      if (
-        postResult != null &&
-        batchContext.additionalContextsSink != null &&
-        postResult.additionalContexts.length > 0
-      ) {
-        batchContext.additionalContextsSink.push(
+      if (postResult != null && postResult.additionalContexts.length > 0) {
+        replayAdditionalContexts.push(...postResult.additionalContexts);
+        batchContext.additionalContextsSink?.push(
           ...postResult.additionalContexts
         );
       }
@@ -1891,7 +1952,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               'PostToolUse updatedOutput for a computer call must be a valid screenshot URL or screenshot content block.'
             );
           }
-          return cloneToolMessageWithContent(output, postResult.updatedOutput);
+          return persistOutput(
+            cloneToolMessageWithContent(output, postResult.updatedOutput)
+          );
         }
         // Keep the tool-output registry in sync with what the model
         // actually sees. Without this, `runTool` already registered
@@ -1921,11 +1984,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             replaced.registryContent
           );
         }
-        return cloneToolMessageWithContent(output, replaced.content);
+        return persistOutput(
+          cloneToolMessageWithContent(output, replaced.content)
+        );
       }
     }
 
-    return output;
+    return persistOutput(output);
   }
 
   /**

@@ -698,6 +698,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
         async (input): Promise<PostToolUseHookOutput> => {
           if (input.toolName === Constants.SUBAGENT) {
             completedSubagentCalls.push(input.toolUseId);
+            return { additionalContext: `context:${input.toolUseId}` };
           }
           return {};
         },
@@ -735,19 +736,23 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       },
     };
 
-    const run = await Run.create<t.IState>({
-      runId: `subagent-multi-hitl-${Date.now()}`,
-      graphConfig: {
-        type: 'standard',
-        agents: [createParentAgentWithChildTool()],
-        compileOptions: { interruptBefore: [] },
-      },
-      returnContent: true,
-      skipCleanup: true,
-      customHandlers,
-      hooks: registry,
-      humanInTheLoop: { enabled: true },
-    });
+    const checkpointer = new MemorySaver();
+    const baseRunId = `subagent-multi-hitl-${Date.now()}`;
+    const createRun = (runId: string): Promise<Run<t.IState>> =>
+      Run.create<t.IState>({
+        runId,
+        graphConfig: {
+          type: 'standard',
+          agents: [createParentAgentWithChildTool()],
+          compileOptions: { checkpointer, interruptBefore: [] },
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers,
+        hooks: registry,
+        humanInTheLoop: { enabled: true },
+      });
+    const run = await createRun(`${baseRunId}-initial`);
     const first = makeSubagentToolCall(
       'call_sub_first',
       'Run the first calculation'
@@ -788,12 +793,14 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       subagent: { parent_tool_call_id: second.id },
     });
 
-    await run.resume(
+    const rebuiltRun = await createRun(`${baseRunId}-rebuilt`);
+    rebuiltRun.Graph!.overrideTestModel(['Final answer.'], 1);
+    await rebuiltRun.resume(
       [{ type: 'reject', reason: 'reject second child' }],
       multiCallerConfig
     );
 
-    expect(run.getInterrupt()).toBeUndefined();
+    expect(rebuiltRun.getInterrupt()).toBeUndefined();
     expect(executedToolIds).toHaveLength(1);
     expect(deniedToolIds).toHaveLength(1);
     expect(completedSubagentCalls).toEqual([first.id, second.id]);
