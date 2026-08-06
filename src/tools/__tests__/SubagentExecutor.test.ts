@@ -1841,8 +1841,10 @@ describe('SubagentExecutor', () => {
         string,
         unknown
       >;
-      // Only thread_id (childRunId fallback) is set when no parent context is supplied.
-      expect(Object.keys(configurable)).toEqual(['thread_id']);
+      expect(Object.keys(configurable)).toEqual([
+        '__librechat_tool_approval_execution_scope',
+        'thread_id',
+      ]);
     });
   });
 

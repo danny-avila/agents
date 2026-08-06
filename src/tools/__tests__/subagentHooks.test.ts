@@ -821,7 +821,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     expect(serializedUpdates).not.toContain('checkpoint_');
   });
 
-  it('preserves a session-scoped child approval after rebuilding Run', async () => {
+  it('isolates rebuilt sibling approvals and preserves child run identity', async () => {
     getChatModelClassSpy.mockImplementation(((provider: Providers) => {
       if (provider === Providers.OPENAI) {
         return HitlChildFakeChatModel;
@@ -832,6 +832,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     const checkpointer = new MemorySaver();
     const registry = new HookRegistry();
     const executedTools: string[] = [];
+    const updates: t.SubagentUpdateEvent[] = [];
     let approvalHookCalls = 0;
     const runId = `subagent-rebuild-hitl-${Date.now()}`;
     registry.registerSession(`${runId}-initial`, 'PreToolUse', {
@@ -858,6 +859,11 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
               content: '42',
             }))
           );
+        },
+      },
+      [GraphEvents.ON_SUBAGENT_UPDATE]: {
+        handle: (_event, data): void => {
+          updates.push(data as t.SubagentUpdateEvent);
         },
       },
     };
@@ -891,23 +897,54 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       subagent: { parent_tool_call_id: tc.id },
     });
     expect(approvalHookCalls).toBe(1);
-
-    const rebuiltRun = await createRun(`${runId}-rebuilt`);
-    rebuiltRun.Graph!.overrideTestModel(['Final answer.'], 1);
+    const sourceChildRunId =
+      persistedInterrupt?.payload.type === 'tool_approval'
+        ? persistedInterrupt.payload.subagent?.run_id
+        : undefined;
+    expect(sourceChildRunId).toBeDefined();
+    const branchConfig = {
+      ...callerConfig,
+      configurable: {
+        ...callerConfig.configurable,
+        checkpoint_id: persistedInterrupt?.checkpointId,
+        checkpoint_ns: persistedInterrupt?.checkpointNs ?? '',
+      },
+    };
+    const approvedRun = await createRun(`${runId}-approved`);
+    const rejectedRun = await createRun(`${runId}-rejected`);
+    approvedRun.Graph!.overrideTestModel(['Final answer.'], 1);
+    rejectedRun.Graph!.overrideTestModel(['Final answer.'], 1);
     const warningSpy = jest
       .spyOn(console, 'warn')
       .mockImplementation((): void => undefined);
     try {
-      await rebuiltRun.resume(
+      await approvedRun.resume([{ type: 'approve' }], branchConfig);
+      await rejectedRun.resume(
         [{ type: 'reject', reason: 'deny after restart' }],
-        callerConfig
+        branchConfig
       );
     } finally {
       warningSpy.mockRestore();
     }
 
-    expect(rebuiltRun.getInterrupt()).toBeUndefined();
-    expect(executedTools).toEqual([]);
+    expect(approvedRun.getInterrupt()).toBeUndefined();
+    expect(rejectedRun.getInterrupt()).toBeUndefined();
+    expect(executedTools).toEqual(['calculator']);
     expect(approvalHookCalls).toBe(1);
+    const approvedChildThreads = approvedRun.getChildCheckpointThreadIds();
+    const rejectedChildThreads = rejectedRun.getChildCheckpointThreadIds();
+    expect(approvedChildThreads).toHaveLength(1);
+    expect(rejectedChildThreads).toHaveLength(1);
+    expect(approvedChildThreads[0]).not.toBe(rejectedChildThreads[0]);
+    expect(
+      updates
+        .filter((event) => event.parentToolCallId === tc.id)
+        .map((event) => event.subagentRunId)
+    ).toEqual(expect.arrayContaining([sourceChildRunId]));
+    expect(
+      updates
+        .filter((event) => event.parentToolCallId === tc.id)
+        .every((event) => event.subagentRunId === sourceChildRunId)
+    ).toBe(true);
   });
 });

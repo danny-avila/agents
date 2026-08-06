@@ -38,6 +38,7 @@ import type {
   HookRegistry,
   AggregatedHookResult,
   PostToolBatchEntry,
+  ToolApprovalReplayKey,
 } from '@/hooks';
 import type { ReplayableSubagentTool } from '@/tools/subagent/SubagentReplay';
 import type { RunBreakerScope } from '@/llm/streamLimits';
@@ -101,7 +102,31 @@ function stripRunBreakerScope(
 import { convertInjectedMessages } from '@/messages/injected';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { RunnableCallable, composeAbortSignals } from '@/utils';
-import { executeHooks } from '@/hooks';
+import {
+  executeHooks,
+  TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY,
+} from '@/hooks';
+
+function createToolApprovalReplayKey(
+  config: RunnableConfig,
+  agentId: string,
+  toolUseId: string
+): ToolApprovalReplayKey {
+  const configuredScope =
+    config.configurable?.[TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY];
+  const threadId = config.configurable?.thread_id;
+  let executionScope = '';
+  if (typeof configuredScope === 'string') {
+    executionScope = configuredScope;
+  } else if (typeof threadId === 'string') {
+    executionScope = threadId;
+  }
+  return {
+    executionScope,
+    agentId,
+    toolUseId,
+  };
+}
 
 /**
  * Per-call batch context for `runTool`. Bundles every optional
@@ -1597,12 +1622,21 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return output;
     };
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
+    const threadId = config.configurable?.thread_id as string | undefined;
     const hookRegistry = this.hookRegistry;
     const hasPreHook = hookRegistry?.hasHookFor('PreToolUse', runId) === true;
-    const pendingApproval =
+    const approvalReplayKey =
       call.id == null
         ? undefined
-        : hookRegistry?.getPendingToolApproval(runId, call.id);
+        : createToolApprovalReplayKey(
+          config,
+          this.executingAgentId ?? this.agentId ?? '',
+          call.id
+        );
+    const pendingApproval =
+      approvalReplayKey == null
+        ? undefined
+        : hookRegistry?.getPendingToolApproval(runId, approvalReplayKey);
     const hasPostHook = hookRegistry?.hasHookFor('PostToolUse', runId) === true;
     const hasFailureHook =
       hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
@@ -1618,7 +1652,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return output instanceof ToolMessage ? persistOutput(output) : output;
     }
 
-    const threadId = config.configurable?.thread_id as string | undefined;
     const registryRunId =
       batchContext.batchScopeId ??
       (config.configurable?.run_id as string | undefined);
@@ -1705,7 +1738,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           },
           sessionId: runId,
           matchQuery: call.name,
-          onceReplayKey: call.id,
+          onceReplayKey: approvalReplayKey,
         }).catch(() => undefined));
 
       if (preResult != null) {
@@ -1793,7 +1826,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap
               >(payload)
           );
-          hookRegistry.clearPendingToolApproval(runId, call.id!);
+          hookRegistry.clearPendingToolApproval(runId, approvalReplayKey!);
           const decisionByCallId = normalizeApprovalDecisions(
             [call.id!],
             resumeValue
@@ -2528,7 +2561,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const hasPendingApproval = preToolCalls.some(
       (entry) =>
         entry.call.id != null &&
-        hookRegistry?.getPendingToolApproval(runId, entry.call.id) != null
+        hookRegistry?.getPendingToolApproval(
+          runId,
+          createToolApprovalReplayKey(
+            config,
+            this.executingAgentId ?? this.agentId ?? '',
+            entry.call.id
+          )
+        ) != null
     );
     if (
       hookRegistry != null &&
@@ -2563,10 +2603,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const preResults = await Promise.all(
         preToolCalls.map((entry) => {
           const toolUseId = entry.call.id;
-          const pending =
+          const approvalReplayKey =
             toolUseId == null
               ? undefined
-              : hookRegistry.getPendingToolApproval(runId, toolUseId);
+              : createToolApprovalReplayKey(
+                config,
+                this.executingAgentId ?? this.agentId ?? '',
+                toolUseId
+              );
+          const pending =
+            approvalReplayKey == null
+              ? undefined
+              : hookRegistry.getPendingToolApproval(runId, approvalReplayKey);
           if (pending != null) {
             return pending;
           }
@@ -2586,7 +2634,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             },
             sessionId: runId,
             matchQuery: entry.call.name,
-            onceReplayKey: toolUseId,
+            onceReplayKey: approvalReplayKey,
           }).catch((): AggregatedHookResult => HOOK_FALLBACK);
         })
       );
@@ -2833,7 +2881,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         );
 
         for (const { entry } of askEntries) {
-          hookRegistry.clearPendingToolApproval(runId, entry.call.id!);
+          hookRegistry.clearPendingToolApproval(
+            runId,
+            createToolApprovalReplayKey(
+              config,
+              this.executingAgentId ?? this.agentId ?? '',
+              entry.call.id!
+            )
+          );
         }
 
         const decisionByCallId = normalizeApprovalDecisions(

@@ -191,23 +191,35 @@ describe('HookRegistry', () => {
         injectedMessages: [],
         errors: [],
       };
-      registry.setPendingToolApproval('source', 'call_1', approval);
+      const key = {
+        executionScope: 'child-a',
+        agentId: 'researcher',
+        toolUseId: 'call_1',
+      };
+      const siblingKey = { ...key, executionScope: 'child-b' };
+      registry.setPendingToolApproval('source', key, approval);
+      registry.setPendingToolApproval('source', siblingKey, {
+        ...approval,
+        reason: 'review sibling',
+      });
 
       registry.copySession('source', 'branch');
 
-      expect(registry.getPendingToolApproval('source', 'call_1')).toBe(
-        approval
-      );
-      expect(registry.getPendingToolApproval('branch', 'call_1')).toBe(
-        approval
-      );
+      expect(registry.getPendingToolApproval('source', key)).toBe(approval);
+      expect(registry.getPendingToolApproval('branch', key)).toBe(approval);
+      expect(
+        registry.getPendingToolApproval('branch', siblingKey)?.reason
+      ).toBe('review sibling');
+      registry.clearPendingToolApproval('branch', key);
+      expect(registry.getPendingToolApproval('branch', key)).toBeUndefined();
+      expect(
+        registry.getPendingToolApproval('branch', siblingKey)?.reason
+      ).toBe('review sibling');
       registry.clearSession('branch');
       expect(
-        registry.getPendingToolApproval('branch', 'call_1')
+        registry.getPendingToolApproval('branch', siblingKey)
       ).toBeUndefined();
-      expect(registry.getPendingToolApproval('source', 'call_1')).toBe(
-        approval
-      );
+      expect(registry.getPendingToolApproval('source', key)).toBe(approval);
     });
   });
 

@@ -42,7 +42,7 @@ export type {
   WorkspacePolicyConfig,
   PathExtractor,
 } from './createWorkspacePolicyHook';
-export { HOOK_EVENTS } from './types';
+export { HOOK_EVENTS, TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from './types';
 export type {
   HookEvent,
   HookInput,
@@ -56,6 +56,7 @@ export type {
   BaseHookOutput,
   ToolDecision,
   StopDecision,
+  ToolApprovalReplayKey,
   AggregatedHookResult,
   RunStartHookInput,
   UserPromptSubmitHookInput,

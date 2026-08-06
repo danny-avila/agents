@@ -1,5 +1,14 @@
 // src/hooks/HookRegistry.ts
-import type { HookEvent, HookMatcher, AggregatedHookResult } from './types';
+import type {
+  HookEvent,
+  HookMatcher,
+  ToolApprovalReplayKey,
+  AggregatedHookResult,
+} from './types';
+
+function serializeApprovalKey(key: ToolApprovalReplayKey): string {
+  return JSON.stringify([key.executionScope, key.agentId, key.toolUseId]);
+}
 
 /**
  * Internal matcher storage type.
@@ -203,14 +212,16 @@ export class HookRegistry {
 
   getPendingToolApproval(
     sessionId: string,
-    toolUseId: string
+    key: ToolApprovalReplayKey
   ): AggregatedHookResult | undefined {
-    return this.pendingToolApprovals.get(sessionId)?.get(toolUseId);
+    return this.pendingToolApprovals
+      .get(sessionId)
+      ?.get(serializeApprovalKey(key));
   }
 
   setPendingToolApproval(
     sessionId: string,
-    toolUseId: string,
+    key: ToolApprovalReplayKey,
     result: AggregatedHookResult
   ): void {
     let pending = this.pendingToolApprovals.get(sessionId);
@@ -218,15 +229,18 @@ export class HookRegistry {
       pending = new Map();
       this.pendingToolApprovals.set(sessionId, pending);
     }
-    pending.set(toolUseId, result);
+    pending.set(serializeApprovalKey(key), result);
   }
 
-  clearPendingToolApproval(sessionId: string, toolUseId: string): void {
+  clearPendingToolApproval(
+    sessionId: string,
+    key: ToolApprovalReplayKey
+  ): void {
     const pending = this.pendingToolApprovals.get(sessionId);
     if (pending == null) {
       return;
     }
-    pending.delete(toolUseId);
+    pending.delete(serializeApprovalKey(key));
     if (pending.size === 0) {
       this.pendingToolApprovals.delete(sessionId);
     }

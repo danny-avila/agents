@@ -781,7 +781,11 @@ describe('executeHooks', () => {
         input: preToolUseInput('Bash'),
         matchQuery: 'Bash',
         sessionId: 'run-1',
-        onceReplayKey: 'call_1',
+        onceReplayKey: {
+          executionScope: 'child-a',
+          agentId: 'researcher',
+          toolUseId: 'call_1',
+        },
       };
 
       const first = await executeHooks(options);
@@ -795,7 +799,16 @@ describe('executeHooks', () => {
       expect(calls).toBe(1);
       expect(registry.getMatchers('PreToolUse', 'run-1')).toHaveLength(0);
 
-      registry.clearPendingToolApproval('run-1', 'call_1');
+      const sibling = await executeHooks({
+        ...options,
+        onceReplayKey: {
+          ...options.onceReplayKey,
+          executionScope: 'child-b',
+        },
+      });
+      expect(sibling.decision).toBeUndefined();
+
+      registry.clearPendingToolApproval('run-1', options.onceReplayKey);
       const afterDecision = await executeHooks(options);
       expect(afterDecision.decision).toBeUndefined();
       expect(calls).toBe(1);

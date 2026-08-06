@@ -8,6 +8,7 @@ import type {
   ToolDecision,
   StopDecision,
   HookCallback,
+  ToolApprovalReplayKey,
   AggregatedHookResult,
 } from './types';
 import type { HookRegistry } from './HookRegistry';
@@ -29,7 +30,7 @@ export interface ExecuteHooksOptions {
   /** Query string matched against each matcher's pattern (tool name, etc.). */
   matchQuery?: string;
   /** Stable tool-call key for replaying a consumed one-shot approval. */
-  onceReplayKey?: string;
+  onceReplayKey?: ToolApprovalReplayKey;
   /** Parent AbortSignal — combined with per-hook timeout into the hook signal. */
   signal?: AbortSignal;
   /** Default per-hook timeout; overridden by `matcher.timeout` when present. */

@@ -15,12 +15,14 @@ import {
   MessagesAnnotation,
   START,
   StateGraph,
+  copyCheckpoint,
   isGraphInterrupt,
   isInterrupted,
 } from '@langchain/langgraph';
 import type {
   Interrupt,
   StateSnapshot,
+  CheckpointTuple,
   BaseCheckpointSaver,
 } from '@langchain/langgraph';
 import type { ChatGeneration, LLMResult } from '@langchain/core/outputs';
@@ -69,7 +71,10 @@ import {
   Callback,
   StepTypes,
 } from '@/common';
-import { executeHooks } from '@/hooks';
+import {
+  executeHooks,
+  TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY,
+} from '@/hooks';
 
 const DEFAULT_MAX_TURNS = 25;
 const RECURSION_MULTIPLIER = 3;
@@ -218,6 +223,7 @@ type ActiveChildRun = {
   pendingInterrupts: Interrupt[];
   invokeConfig?: RunnableConfig;
   childAgentId: string;
+  childRunId: string;
 };
 
 type PersistedToolOutput = {
@@ -239,7 +245,19 @@ type SubagentCheckpointMarker = {
   parentToolCallId: string;
   lifecycleComplete: true;
   hookSessionId?: string;
+  childRunId?: string;
   settledOutput?: PersistedToolOutput;
+};
+
+type ChildExecutionIdentity = {
+  childRunId: string;
+  childThreadId: string;
+};
+
+type ChildExecutionIdentityParams = {
+  threadId?: string;
+  parentToolCallId: string;
+  parentConfigurable?: Record<string, unknown>;
 };
 
 const LANGGRAPH_RUNTIME_CONFIG_PREFIX = '__pregel_';
@@ -251,6 +269,7 @@ const LANGGRAPH_CHECKPOINT_CONFIG_KEYS = new Set([
 ]);
 const SUBAGENT_CHECKPOINT_MARKER_KEY = '__librechat_subagent_checkpoint';
 const SUBAGENT_HOOK_SESSION_KEY = '__librechat_subagent_hook_session';
+const SUBAGENT_RUN_ID_KEY = '__librechat_subagent_run_id';
 const SUBAGENT_REPLAY_NODE = 'subagent-replay';
 
 function isCheckpointSaver(value: unknown): value is BaseCheckpointSaver {
@@ -280,6 +299,7 @@ function isSubagentCheckpointMarker(
     typeof marker.parentToolCallId === 'string' &&
     (marker.hookSessionId == null ||
       typeof marker.hookSessionId === 'string') &&
+    (marker.childRunId == null || typeof marker.childRunId === 'string') &&
     (marker.settledOutput == null ||
       isPersistedToolOutput(marker.settledOutput))
   );
@@ -354,6 +374,25 @@ function getSubagentHookSessionId(messages: BaseMessage[]): string | undefined {
   return undefined;
 }
 
+function getSubagentRunId(messages: BaseMessage[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const runId = messages[i].additional_kwargs[SUBAGENT_RUN_ID_KEY];
+    if (typeof runId === 'string' && runId.length > 0) {
+      return runId;
+    }
+    const marker =
+      messages[i].additional_kwargs[SUBAGENT_CHECKPOINT_MARKER_KEY];
+    if (
+      isSubagentCheckpointMarker(marker) &&
+      marker.childRunId != null &&
+      marker.childRunId.length > 0
+    ) {
+      return marker.childRunId;
+    }
+  }
+  return undefined;
+}
+
 function isSubagentCheckpointMarkerMessage(message: BaseMessage): boolean {
   return isSubagentCheckpointMarker(
     message.additional_kwargs[SUBAGENT_CHECKPOINT_MARKER_KEY]
@@ -371,6 +410,18 @@ function createSubagentCheckpointMarkerMessage(
 
 function getCheckpointMessages(value: unknown): BaseMessage[] {
   return Array.isArray(value) ? value.filter(BaseMessage.isInstance) : [];
+}
+
+function getConfigurableString(
+  config: RunnableConfig | undefined,
+  key: string
+): string | undefined {
+  const value = config?.configurable?.[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function getTupleMessages(tuple: CheckpointTuple | undefined): BaseMessage[] {
+  return getCheckpointMessages(tuple?.checkpoint.channel_values.messages);
 }
 
 function serializeToolOutput(
@@ -435,16 +486,20 @@ function getChildThreadId(args: {
   threadId?: string;
   parentToolCallId: string;
   parentConfigurable?: Record<string, unknown>;
+  branchId?: string;
 }): string {
   const durableParentId = args.threadId ?? args.parentRunId;
   const parentFork = getParentCheckpointFork(args.parentConfigurable);
-  const identity = JSON.stringify([
+  const identity = [
     durableParentId,
     parentFork,
     args.parentAgentId ?? 'agent',
     args.parentToolCallId,
-  ]);
-  return `subagent:${Buffer.from(identity).toString('base64url')}`;
+  ];
+  if (args.branchId != null) {
+    identity.push(args.branchId);
+  }
+  return `subagent:${Buffer.from(JSON.stringify(identity)).toString('base64url')}`;
 }
 
 function isToolApprovalPayload(
@@ -747,6 +802,137 @@ export class SubagentExecutor {
     return this.resolveParentHandlerRegistry?.();
   }
 
+  /**
+   * Keeps the original child thread as an immutable resume source once a
+   * different parent Run reconstructs it. Each rebuilt parent gets a private
+   * checkpoint fork, while the persisted child run ID remains stable for
+   * activity and usage correlation across the interrupt boundary.
+   */
+  private async resolveChildExecutionIdentity(
+    params: ChildExecutionIdentityParams
+  ): Promise<ChildExecutionIdentity> {
+    const currentChildRunId = `${this.parentRunId}_sub_${params.parentToolCallId}`;
+    const baseChildThreadId = getChildThreadId({
+      parentRunId: this.parentRunId,
+      parentAgentId: this.parentAgentId,
+      threadId: params.threadId,
+      parentToolCallId: params.parentToolCallId,
+      parentConfigurable: params.parentConfigurable,
+    });
+    if (this.humanInTheLoop?.enabled !== true || this.checkpointer == null) {
+      return {
+        childRunId: currentChildRunId,
+        childThreadId: baseChildThreadId,
+      };
+    }
+
+    const branchChildThreadId = getChildThreadId({
+      parentRunId: this.parentRunId,
+      parentAgentId: this.parentAgentId,
+      threadId: params.threadId,
+      parentToolCallId: params.parentToolCallId,
+      parentConfigurable: params.parentConfigurable,
+      branchId: this.parentRunId,
+    });
+    const branchTuple = await this.checkpointer.getTuple({
+      configurable: { thread_id: branchChildThreadId },
+    });
+    if (branchTuple != null) {
+      this.checkpointThreadIds.add(branchChildThreadId);
+      return {
+        childRunId:
+          getSubagentRunId(getTupleMessages(branchTuple)) ?? currentChildRunId,
+        childThreadId: branchChildThreadId,
+      };
+    }
+
+    const baseTuple = await this.checkpointer.getTuple({
+      configurable: { thread_id: baseChildThreadId },
+    });
+    const persistedChildRunId = getSubagentRunId(getTupleMessages(baseTuple));
+    if (
+      baseTuple == null ||
+      persistedChildRunId == null ||
+      persistedChildRunId === currentChildRunId
+    ) {
+      this.checkpointThreadIds.add(baseChildThreadId);
+      return {
+        childRunId: persistedChildRunId ?? currentChildRunId,
+        childThreadId: baseChildThreadId,
+      };
+    }
+
+    await this.forkCheckpointThread(baseChildThreadId, branchChildThreadId);
+    this.checkpointThreadIds.add(branchChildThreadId);
+    return {
+      childRunId: persistedChildRunId,
+      childThreadId: branchChildThreadId,
+    };
+  }
+
+  /** Copies a complete checkpoint lineage, including pending task writes. */
+  private async forkCheckpointThread(
+    sourceThreadId: string,
+    targetThreadId: string
+  ): Promise<void> {
+    if (this.checkpointer == null || sourceThreadId === targetThreadId) {
+      return;
+    }
+    const existing = await this.checkpointer.getTuple({
+      configurable: { thread_id: targetThreadId },
+    });
+    if (existing != null) {
+      return;
+    }
+
+    const tuples: CheckpointTuple[] = [];
+    for await (const tuple of this.checkpointer.list({
+      configurable: { thread_id: sourceThreadId },
+    })) {
+      tuples.push(tuple);
+    }
+    tuples.reverse();
+
+    for (const tuple of tuples) {
+      const checkpointNs =
+        getConfigurableString(tuple.config, 'checkpoint_ns') ?? '';
+      const parentCheckpointId = getConfigurableString(
+        tuple.parentConfig,
+        'checkpoint_id'
+      );
+      const storedConfig = await this.checkpointer.put(
+        {
+          configurable: {
+            thread_id: targetThreadId,
+            checkpoint_ns: checkpointNs,
+            ...(parentCheckpointId == null
+              ? {}
+              : { checkpoint_id: parentCheckpointId }),
+          },
+        },
+        copyCheckpoint(tuple.checkpoint),
+        tuple.metadata ?? {
+          source: 'fork',
+          step: -1,
+          parents: {},
+        },
+        tuple.checkpoint.channel_versions
+      );
+      const writesByTask = new Map<string, Array<[string, unknown]>>();
+      for (const [taskId, channel, value] of tuple.pendingWrites ?? []) {
+        let writes = writesByTask.get(taskId);
+        if (writes == null) {
+          writes = [];
+          writesByTask.set(taskId, writes);
+        }
+        writes.push([channel, value]);
+      }
+      for (const [taskId, writes] of writesByTask) {
+        await this.checkpointer.putWrites(storedConfig, writes, taskId);
+      }
+    }
+  }
+
   getChildCheckpointThreadIds(): string[] {
     const threadIds = new Set(this.checkpointThreadIds);
     for (const activeChildRun of this.activeChildRuns.values()) {
@@ -801,9 +987,7 @@ export class SubagentExecutor {
       | Record<string, unknown>
       | undefined;
     const threadId = parentConfigurable?.thread_id;
-    const childThreadId = getChildThreadId({
-      parentRunId: this.parentRunId,
-      parentAgentId: this.parentAgentId,
+    const { childThreadId } = await this.resolveChildExecutionIdentity({
       threadId: typeof threadId === 'string' ? threadId : undefined,
       parentToolCallId,
       parentConfigurable,
@@ -852,13 +1036,12 @@ export class SubagentExecutor {
       | Record<string, unknown>
       | undefined;
     const threadId = parentConfigurable?.thread_id;
-    const childThreadId = getChildThreadId({
-      parentRunId: this.parentRunId,
-      parentAgentId: this.parentAgentId,
-      threadId: typeof threadId === 'string' ? threadId : undefined,
-      parentToolCallId,
-      parentConfigurable,
-    });
+    const { childRunId, childThreadId } =
+      await this.resolveChildExecutionIdentity({
+        threadId: typeof threadId === 'string' ? threadId : undefined,
+        parentToolCallId,
+        parentConfigurable,
+      });
     this.checkpointThreadIds.add(childThreadId);
     const activeChildRun = this.activeChildRuns.get(childThreadId);
     const persistedOutput = serializeToolOutput(settled);
@@ -887,6 +1070,7 @@ export class SubagentExecutor {
               typeof parentConfigurable?.run_id === 'string'
                 ? parentConfigurable.run_id
                 : this.parentRunId,
+            childRunId,
             settledOutput: persistedOutput,
           }),
         ],
@@ -920,6 +1104,7 @@ export class SubagentExecutor {
               'string'
                 ? activeChildRun.invokeConfig.configurable.run_id
                 : this.parentRunId,
+            childRunId: activeChildRun.childRunId,
             ...(settledOutput == null ? {} : { settledOutput }),
           }),
         ],
@@ -968,17 +1153,12 @@ export class SubagentExecutor {
     }
 
     const executionSuffix = parentToolCallId ?? nanoid(8);
-    const childRunId = `${this.parentRunId}_sub_${executionSuffix}`;
-    const childThreadId = getChildThreadId({
-      parentRunId: this.parentRunId,
-      parentAgentId: this.parentAgentId,
-      threadId,
-      parentToolCallId: executionSuffix,
-      parentConfigurable: params.parentConfigurable,
-    });
-    if (this.humanInTheLoop?.enabled === true && this.checkpointer != null) {
-      this.checkpointThreadIds.add(childThreadId);
-    }
+    const { childRunId, childThreadId } =
+      await this.resolveChildExecutionIdentity({
+        threadId,
+        parentToolCallId: executionSuffix,
+        parentConfigurable: params.parentConfigurable,
+      });
     const childExecutionKey = childThreadId;
     const childAgentId =
       config.agentInputs.agentId ||
@@ -1071,6 +1251,7 @@ export class SubagentExecutor {
         workflow,
         pendingInterrupts: [],
         childAgentId,
+        childRunId,
       };
       if (cachedChildRun == null) {
         this.activeChildRuns.set(childExecutionKey, activeChildRun);
@@ -1144,6 +1325,7 @@ export class SubagentExecutor {
         runName: `subagent:${subagentType}`,
         configurable: {
           ...inheritedConfigurable,
+          [TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY]: childRunId,
           thread_id:
             this.humanInTheLoop?.enabled === true
               ? childThreadId
@@ -1214,6 +1396,7 @@ export class SubagentExecutor {
                 content: description,
                 additional_kwargs: {
                   [SUBAGENT_HOOK_SESSION_KEY]: currentHookSessionId,
+                  [SUBAGENT_RUN_ID_KEY]: childRunId,
                 },
               }),
             ],

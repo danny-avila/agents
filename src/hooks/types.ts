@@ -27,6 +27,9 @@ export const HOOK_EVENTS = [
   'PostCompact',
 ] as const;
 
+export const TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY =
+  '__librechat_tool_approval_execution_scope';
+
 export type HookEvent = (typeof HOOK_EVENTS)[number];
 
 /** Tool-gating decision; executeHooks folds with `deny > ask > allow` precedence. */
@@ -391,6 +394,13 @@ export interface PreToolUseHookOutput extends BaseHookOutput {
    * registration order, same precedence rules as `updatedInput`.
    */
   allowedDecisions?: ReadonlyArray<'approve' | 'reject' | 'edit' | 'respond'>;
+}
+
+/** Stable identity for replaying a consumed one-shot tool approval. */
+export interface ToolApprovalReplayKey {
+  executionScope: string;
+  agentId: string;
+  toolUseId: string;
 }
 
 export interface PostToolUseHookOutput extends BaseHookOutput {
