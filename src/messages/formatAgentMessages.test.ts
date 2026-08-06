@@ -112,7 +112,7 @@ describe('formatAgentMessages', () => {
       'user',
     ]);
     expect(result.messages[0].id).toBe('msg_assistant_1');
-    expect(result.messages[1].id).toBe('msg_assistant_1:derived:1');
+    expect(result.messages[1].id).toBeUndefined();
     expect(result.messages[2].id).toBe('msg_user_1');
     expect(
       result.messages.map(

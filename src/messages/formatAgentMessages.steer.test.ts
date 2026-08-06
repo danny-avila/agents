@@ -392,7 +392,7 @@ describe('formatAgentMessages trailing-steer anchor', () => {
       (message) => message.additional_kwargs.source === 'steer'
     );
     expect(steerIndex).toBeGreaterThan(0);
-    expect(messages[steerIndex].id).toBe('assistant_1:derived:1');
+    expect(messages[steerIndex].id).toBeUndefined();
     expect(messages[steerIndex - 1].id).toBe('assistant_1');
     expect(messages[steerIndex].additional_kwargs.sourceMessageId).toBe(
       'assistant_1'

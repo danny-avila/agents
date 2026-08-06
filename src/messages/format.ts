@@ -899,10 +899,10 @@ function getSourceMessageId(message: Partial<TMessage>): string | undefined {
 
 /**
  * Keeps the first formatted message backward-compatible with its persisted
- * source id while giving every additional message a stable reducer identity.
- * The metadata preserves exact source correlation without overloading the id
- * that LangGraph uses for replace-in-place updates. Assistant identities are
- * assigned at existing append points, avoiding a post-formatting pass.
+ * source id and preserves source correlation on every derived message.
+ * Derived ids remain unset so the reducer can assign collision-free identities
+ * during its existing pass. This also prevents invented provider-shaped ids
+ * from leaking into provider request payloads.
  */
 function stampSourceMessageIdentity(
   message: RoleBearingMessage<BaseMessage>,
@@ -912,13 +912,12 @@ function stampSourceMessageIdentity(
   if (sourceMessageId == null) {
     return;
   }
-  const id =
-    derivedIndex === 0
-      ? sourceMessageId
-      : `${sourceMessageId}:derived:${derivedIndex}`;
-  message.id = id;
-  message.lc_kwargs.id = id;
   message.additional_kwargs.sourceMessageId = sourceMessageId;
+  if (derivedIndex !== 0) {
+    return;
+  }
+  message.id = sourceMessageId;
+  message.lc_kwargs.id = sourceMessageId;
 }
 
 /**
