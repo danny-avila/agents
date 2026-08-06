@@ -9,8 +9,12 @@ import {
 } from '@langchain/core/messages';
 import {
   Command,
+  END,
   GraphInterrupt,
   INTERRUPT,
+  MessagesAnnotation,
+  START,
+  StateGraph,
   isGraphInterrupt,
   isInterrupted,
 } from '@langchain/langgraph';
@@ -196,6 +200,14 @@ type StatefulCompiledWorkflow = CompiledStateWorkflow & {
   ): Promise<RunnableConfig>;
 };
 
+type ReplayCheckpointWorkflow = {
+  updateState(
+    config: RunnableConfig,
+    values: { messages: BaseMessage[] },
+    asNode: string
+  ): Promise<RunnableConfig>;
+};
+
 type ActiveChildRun = {
   graph: StandardGraph;
   workflow: StatefulCompiledWorkflow;
@@ -222,6 +234,7 @@ type SubagentCheckpointMarker = {
   version: 1;
   parentToolCallId: string;
   lifecycleComplete: true;
+  hookSessionId?: string;
   settledOutput?: PersistedToolOutput;
 };
 
@@ -233,6 +246,8 @@ const LANGGRAPH_CHECKPOINT_CONFIG_KEYS = new Set([
   'checkpoint_ns',
 ]);
 const SUBAGENT_CHECKPOINT_MARKER_KEY = '__librechat_subagent_checkpoint';
+const SUBAGENT_HOOK_SESSION_KEY = '__librechat_subagent_hook_session';
+const SUBAGENT_REPLAY_NODE = 'subagent-replay';
 
 function isCheckpointSaver(value: unknown): value is BaseCheckpointSaver {
   if (value == null || typeof value !== 'object') {
@@ -259,6 +274,8 @@ function isSubagentCheckpointMarker(
     marker.version === 1 &&
     marker.lifecycleComplete === true &&
     typeof marker.parentToolCallId === 'string' &&
+    (marker.hookSessionId == null ||
+      typeof marker.hookSessionId === 'string') &&
     (marker.settledOutput == null ||
       isPersistedToolOutput(marker.settledOutput))
   );
@@ -318,6 +335,16 @@ function getSubagentCheckpointMarker(
       marker.parentToolCallId === parentToolCallId
     ) {
       return marker;
+    }
+  }
+  return undefined;
+}
+
+function getSubagentHookSessionId(messages: BaseMessage[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const sessionId = messages[i].additional_kwargs[SUBAGENT_HOOK_SESSION_KEY];
+    if (typeof sessionId === 'string' && sessionId.length > 0) {
+      return sessionId;
     }
   }
   return undefined;
@@ -486,6 +513,16 @@ function getPersistedMessages(
   return messages.length > 0 ? messages : undefined;
 }
 
+function createReplayCheckpointWorkflow(
+  checkpointer: BaseCheckpointSaver
+): ReplayCheckpointWorkflow {
+  return new StateGraph(MessagesAnnotation)
+    .addNode(SUBAGENT_REPLAY_NODE, (state) => state)
+    .addEdge(START, SUBAGENT_REPLAY_NODE)
+    .addEdge(SUBAGENT_REPLAY_NODE, END)
+    .compile({ checkpointer }) as ReplayCheckpointWorkflow;
+}
+
 export type SubagentExecuteParams = {
   description: string;
   subagentType: string;
@@ -647,6 +684,7 @@ export class SubagentExecutor {
     SubagentExecuteResult
   >();
   private readonly activeChildRuns = new Map<string, ActiveChildRun>();
+  private replayCheckpointWorkflow?: ReplayCheckpointWorkflow;
   private readonly resolveParentHandlerRegistry?: () =>
     | HandlerRegistry
     | undefined;
@@ -706,6 +744,7 @@ export class SubagentExecutor {
     this.completedChildResults.clear();
     this.startedChildRuns.clear();
     this.completedChildRuns.clear();
+    this.replayCheckpointWorkflow = undefined;
   }
 
   async getSettledToolOutput(
@@ -739,6 +778,19 @@ export class SubagentExecutor {
       checkpoint?.checkpoint.channel_values.messages
     );
     const marker = getSubagentCheckpointMarker(messages, parentToolCallId);
+    const persistedHookSessionId =
+      marker?.hookSessionId ?? getSubagentHookSessionId(messages);
+    const currentHookSessionId = parentConfigurable?.run_id;
+    if (
+      persistedHookSessionId != null &&
+      typeof currentHookSessionId === 'string' &&
+      currentHookSessionId.length > 0
+    ) {
+      this.hookRegistry?.migrateSession(
+        persistedHookSessionId,
+        currentHookSessionId
+      );
+    }
     return marker?.settledOutput == null
       ? undefined
       : deserializeToolOutput(marker.settledOutput);
@@ -750,7 +802,12 @@ export class SubagentExecutor {
     settled: SettledSubagentToolOutput
   ): Promise<void> {
     const parentToolCallId = call.id;
-    if (parentToolCallId == null || parentToolCallId === '') {
+    if (
+      this.humanInTheLoop?.enabled !== true ||
+      this.checkpointer == null ||
+      parentToolCallId == null ||
+      parentToolCallId === ''
+    ) {
       return;
     }
     const parentConfigurable = config.configurable as
@@ -765,15 +822,38 @@ export class SubagentExecutor {
       parentConfigurable,
     });
     const activeChildRun = this.activeChildRuns.get(childThreadId);
-    if (activeChildRun == null) {
+    const persistedOutput = serializeToolOutput(settled);
+    if (activeChildRun != null) {
+      await this.persistChildCheckpointMarker(
+        activeChildRun,
+        parentToolCallId,
+        persistedOutput
+      );
+      activeChildRun.graph.clearHeavyState();
+      this.activeChildRuns.delete(childThreadId);
       return;
     }
-    await this.persistChildCheckpointMarker(
-      activeChildRun,
-      parentToolCallId,
-      serializeToolOutput(settled)
+    this.replayCheckpointWorkflow ??= createReplayCheckpointWorkflow(
+      this.checkpointer
     );
-    this.activeChildRuns.delete(childThreadId);
+    await this.replayCheckpointWorkflow.updateState(
+      { configurable: { thread_id: childThreadId } },
+      {
+        messages: [
+          createSubagentCheckpointMarkerMessage({
+            version: 1,
+            parentToolCallId,
+            lifecycleComplete: true,
+            hookSessionId:
+              typeof parentConfigurable?.run_id === 'string'
+                ? parentConfigurable.run_id
+                : this.parentRunId,
+            settledOutput: persistedOutput,
+          }),
+        ],
+      },
+      SUBAGENT_REPLAY_NODE
+    );
   }
 
   private async persistChildCheckpointMarker(
@@ -796,6 +876,11 @@ export class SubagentExecutor {
             version: 1,
             parentToolCallId,
             lifecycleComplete: true,
+            hookSessionId:
+              typeof activeChildRun.invokeConfig.configurable?.run_id ===
+              'string'
+                ? activeChildRun.invokeConfig.configurable.run_id
+                : this.parentRunId,
             ...(settledOutput == null ? {} : { settledOutput }),
           }),
         ],
@@ -1004,6 +1089,11 @@ export class SubagentExecutor {
        */
       const inheritedConfigurable: Record<string, unknown> =
         sanitizeChildConfigurable(params.parentConfigurable);
+      const currentHookSessionId =
+        typeof inheritedConfigurable.run_id === 'string' &&
+        inheritedConfigurable.run_id.length > 0
+          ? inheritedConfigurable.run_id
+          : this.parentRunId;
       const childInvokeConfig = {
         recursionLimit: maxTurns * RECURSION_MULTIPLIER,
         signal: childSignal,
@@ -1022,6 +1112,18 @@ export class SubagentExecutor {
         /** Rehydrate child-owned interrupt state when a host rebuilds Run
          * around the same durable checkpointer after a process boundary. */
         const persistedState = await workflow.getState(childInvokeConfig);
+        const checkpointMessages = getCheckpointMessages(
+          (persistedState.values as { messages?: unknown } | undefined)
+            ?.messages
+        );
+        const persistedHookSessionId =
+          getSubagentHookSessionId(checkpointMessages);
+        if (persistedHookSessionId != null) {
+          this.hookRegistry?.migrateSession(
+            persistedHookSessionId,
+            currentHookSessionId
+          );
+        }
         const persistedInterrupts = getPersistedInterrupts(persistedState);
         if (persistedInterrupts.length > 0) {
           activeChildRun.pendingInterrupts = persistedInterrupts;
@@ -1030,11 +1132,8 @@ export class SubagentExecutor {
         } else if (persistedState.next.length === 0) {
           const persistedMessages = getPersistedMessages(persistedState);
           if (persistedMessages != null) {
-            const snapshotValues = persistedState.values as {
-              messages?: unknown;
-            };
             const marker = getSubagentCheckpointMarker(
-              getCheckpointMessages(snapshotValues.messages),
+              checkpointMessages,
               executionSuffix
             );
             result = { messages: persistedMessages };
@@ -1058,7 +1157,16 @@ export class SubagentExecutor {
         }
         const childInput =
           childResumeMap == null
-            ? { messages: [new HumanMessage(description)] }
+            ? {
+              messages: [
+                new HumanMessage({
+                  content: description,
+                  additional_kwargs: {
+                    [SUBAGENT_HOOK_SESSION_KEY]: currentHookSessionId,
+                  },
+                }),
+              ],
+            }
             : new Command({ resume: childResumeMap });
 
         if (

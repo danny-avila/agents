@@ -162,6 +162,34 @@ export class HookRegistry {
     this.sessions.delete(sessionId);
   }
 
+  /** Moves session-scoped policy state to a rebuilt Run's session ID. */
+  migrateSession(sourceSessionId: string, targetSessionId: string): void {
+    if (sourceSessionId === targetSessionId) {
+      return;
+    }
+    const source = this.sessions.get(sourceSessionId);
+    const target = this.sessions.get(targetSessionId);
+    if (source != null && target == null) {
+      this.sessions.set(targetSessionId, source);
+    } else if (source != null && target != null) {
+      for (const event of Object.keys(source) as HookEvent[]) {
+        const targetList = ensureList(target, event);
+        for (const matcher of readList(source, event)) {
+          if (!targetList.includes(matcher)) {
+            targetList.push(matcher);
+          }
+        }
+      }
+    }
+    this.sessions.delete(sourceSessionId);
+
+    const sourceHalt = this.haltSignals.get(sourceSessionId);
+    if (sourceHalt != null && !this.haltSignals.has(targetSessionId)) {
+      this.haltSignals.set(targetSessionId, sourceHalt);
+    }
+    this.haltSignals.delete(sourceSessionId);
+  }
+
   /**
    * Raise a halt signal scoped to `sessionId` (= the run id the hook
    * fired under). The SDK's run loop polls for this between stream

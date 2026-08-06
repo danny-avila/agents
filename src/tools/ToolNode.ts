@@ -147,6 +147,8 @@ type RunToolBatchContext<T = unknown> = {
    * contract for hosts relying on it for policy / recovery guidance.
    */
   additionalContextsSink?: string[];
+  /** Stable identity of the assistant tool-call batch across HITL replay. */
+  replayBatchKey?: string;
   /**
    * Graph state the ToolNode was invoked with, threaded from `run()`
    * so `tool.invoke` can forward it as langgraph 1.4's `runtime.state`
@@ -587,7 +589,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * the fresh batch needs for hook-context injection and completion events. */
   private settledInterruptingResults = new Map<
     string,
-    SettledDirectToolResult
+    Map<string, SettledDirectToolResult>
   >();
   /** Tool registry for filtering (lazy computation of programmatic maps) */
   private toolRegistry?: t.LCToolRegistry;
@@ -1559,14 +1561,25 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return settledOutput.output;
     }
     const replayAdditionalContexts: string[] = [];
-    const persistOutput = async (output: ToolMessage): Promise<ToolMessage> => {
+    const persistOutput = async (
+      output: ToolMessage,
+      terminalArgs?: Record<string, unknown>
+    ): Promise<ToolMessage> => {
       const refMeta = output.additional_kwargs as
         | t.ToolMessageRefMetadata
         | undefined;
+      if (
+        terminalArgs != null &&
+        call.id != null &&
+        batchContext.resolvedArgsByCallId != null
+      ) {
+        batchContext.resolvedArgsByCallId.set(call.id, terminalArgs);
+      }
       const resolvedArgs =
-        call.id == null
+        terminalArgs ??
+        (call.id == null
           ? undefined
-          : batchContext.resolvedArgsByCallId?.get(call.id);
+          : batchContext.resolvedArgsByCallId?.get(call.id));
       const referenceContent =
         this.toolOutputRegistry == null || refMeta?._refKey == null
           ? undefined
@@ -1703,14 +1716,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
 
         if (preResult.decision === 'deny') {
-          return this.blockDirectCall({
-            call,
-            resolvedArgs,
-            reason: preResult.reason ?? 'Blocked by hook',
-            hookRegistry,
-            runId,
-            threadId,
-          });
+          return persistOutput(
+            this.blockDirectCall({
+              call,
+              resolvedArgs,
+              reason: preResult.reason ?? 'Blocked by hook',
+              hookRegistry,
+              runId,
+              threadId,
+            }),
+            effectiveCall.args as Record<string, unknown>
+          );
         }
 
         if (preResult.decision === 'ask') {
@@ -1721,14 +1737,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               preResult.reason,
               call.name
             );
-            return this.blockDirectCall({
-              call,
-              resolvedArgs,
-              reason,
-              hookRegistry,
-              runId,
-              threadId,
-            });
+            return persistOutput(
+              this.blockDirectCall({
+                call,
+                resolvedArgs,
+                reason,
+                hookRegistry,
+                runId,
+                threadId,
+              }),
+              effectiveCall.args as Record<string, unknown>
+            );
           }
 
           // Raise a single-tool tool_approval interrupt. LangGraph
@@ -1777,25 +1796,32 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 declaredType as t.ToolApprovalDecisionType
               ))
           ) {
-            return this.blockDirectCall({
-              call,
-              resolvedArgs,
-              reason: `Decision "${typeof declaredType === 'string' ? declaredType : '<missing>'}" not in allowedDecisions [${preResult.allowedDecisions.join(', ')}] — failing closed`,
-              hookRegistry,
-              runId,
-              threadId,
-            });
+            return persistOutput(
+              this.blockDirectCall({
+                call,
+                resolvedArgs,
+                reason: `Decision "${typeof declaredType === 'string' ? declaredType : '<missing>'}" not in allowedDecisions [${preResult.allowedDecisions.join(', ')}] — failing closed`,
+                hookRegistry,
+                runId,
+                threadId,
+              }),
+              effectiveCall.args as Record<string, unknown>
+            );
           }
 
           if (decision.type === 'reject') {
-            return this.blockDirectCall({
-              call,
-              resolvedArgs,
-              reason: decision.reason ?? preResult.reason ?? 'Rejected by user',
-              hookRegistry,
-              runId,
-              threadId,
-            });
+            return persistOutput(
+              this.blockDirectCall({
+                call,
+                resolvedArgs,
+                reason:
+                  decision.reason ?? preResult.reason ?? 'Rejected by user',
+                hookRegistry,
+                runId,
+                threadId,
+              }),
+              effectiveCall.args as Record<string, unknown>
+            );
           }
 
           if (decision.type === 'respond') {
@@ -1812,12 +1838,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 threadId,
               });
             }
-            return new ToolMessage({
-              status: 'success',
-              content: responseText,
-              name: call.name,
-              tool_call_id: call.id ?? '',
-            });
+            return persistOutput(
+              new ToolMessage({
+                status: 'success',
+                content: responseText,
+                name: call.name,
+                tool_call_id: call.id ?? '',
+              }),
+              effectiveCall.args as Record<string, unknown>
+            );
           }
 
           if (decision.type === 'edit') {
@@ -1836,13 +1865,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               typeof updatedInput !== 'object' ||
               Array.isArray(updatedInput)
             ) {
-              return new ToolMessage({
-                status: 'error',
-                content:
-                  'Decision "edit" missing object updatedInput — failing closed.',
-                name: call.name,
-                tool_call_id: call.id ?? '',
-              });
+              return persistOutput(
+                new ToolMessage({
+                  status: 'error',
+                  content:
+                    'Decision "edit" missing object updatedInput — failing closed.',
+                  name: call.name,
+                  tool_call_id: call.id ?? '',
+                }),
+                effectiveCall.args as Record<string, unknown>
+              );
             }
             effectiveCall = {
               ...call,
@@ -3781,6 +3813,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     config: RunnableConfig,
     baseContext: Omit<RunToolBatchContext<T>, 'batchIndex'>
   ): Promise<(BaseMessage | Command)[]> {
+    const settledBatchResults =
+      baseContext.replayBatchKey == null
+        ? undefined
+        : this.settledInterruptingResults.get(baseContext.replayBatchKey);
     const restoreResult = (
       call: ToolCall,
       result: SettledDirectToolResult
@@ -3801,7 +3837,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     ): Promise<SettledDirectToolResult> => {
       const cachedResult =
         typeof call.id === 'string'
-          ? this.settledInterruptingResults.get(call.id)
+          ? settledBatchResults?.get(call.id)
           : undefined;
       if (cachedResult != null) {
         return restoreResult(call, cachedResult);
@@ -3870,8 +3906,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const position = interruptingPositions[i];
       outputs[position] = result.value.output;
       const callId = directCalls[position].id;
-      if (typeof callId === 'string' && callId !== '') {
-        this.settledInterruptingResults.set(callId, result.value);
+      if (
+        baseContext.replayBatchKey != null &&
+        typeof callId === 'string' &&
+        callId !== ''
+      ) {
+        const batchResults =
+          this.settledInterruptingResults.get(baseContext.replayBatchKey) ??
+          new Map<string, SettledDirectToolResult>();
+        batchResults.set(callId, result.value);
+        this.settledInterruptingResults.set(
+          baseContext.replayBatchKey,
+          batchResults
+        );
       }
     }
     if (hasInterruptingError) {
@@ -3982,6 +4029,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const batchScopeId = incomingRunId ?? `\0anon-${this.anonBatchCounter++}`;
     const turn = this.toolOutputRegistry?.nextTurn(batchScopeId) ?? 0;
     let outputs: (BaseMessage | Command)[];
+    let replayBatchKey: string | undefined;
     /** Hoisted from the messages-state branch so the Command tail can carry
      *  the promotion into handoff updates (same-id state copies there would
      *  otherwise overwrite the replacement message). */
@@ -4063,10 +4111,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       );
 
       let aiMessage: AIMessage | undefined;
+      let aiMessageIndex = -1;
       for (let i = messages.length - 1; i >= 0; i--) {
         const message = messages[i];
         if (isAIMessage(message)) {
           aiMessage = message;
+          aiMessageIndex = i;
           break;
         }
       }
@@ -4074,6 +4124,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       if (aiMessage == null || !isAIMessage(aiMessage)) {
         throw new Error('ToolNode only accepts AIMessages as input.');
       }
+      replayBatchKey = JSON.stringify([
+        incomingRunId ?? null,
+        aiMessage.id ?? null,
+        aiMessageIndex,
+        messages.length,
+      ]);
 
       if (this.loadRuntimeTools) {
         const { tools, toolMap } = this.loadRuntimeTools(
@@ -4293,6 +4349,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 errorOwnership,
                 preBatchSnapshot,
                 additionalContextsSink: directAdditionalContexts,
+                replayBatchKey,
                 runInput: input as T,
               }
             )
@@ -4365,6 +4422,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             errorOwnership,
             preBatchSnapshot,
             additionalContextsSink: directAdditionalContexts,
+            replayBatchKey,
             runInput: input as T,
           }
         );
@@ -4421,6 +4479,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
 
     if (!outputs.some(isCommand)) {
+      if (replayBatchKey != null) {
+        this.settledInterruptingResults.delete(replayBatchKey);
+      }
       return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
     }
 
@@ -4561,6 +4622,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       combinedOutputs.push(parentCommand);
     }
 
+    if (replayBatchKey != null) {
+      this.settledInterruptingResults.delete(replayBatchKey);
+    }
     return combinedOutputs as T;
   }
 

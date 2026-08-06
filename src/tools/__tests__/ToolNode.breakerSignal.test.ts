@@ -5,12 +5,17 @@ import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type {
+  ReplayableSubagentTool,
+  SettledSubagentToolOutput,
+} from '@/tools/subagent/SubagentReplay';
 import type { PreToolUseHookOutput } from '@/hooks';
 import type * as t from '@/types';
 import {
   StreamLimitExceededError,
   RUN_BREAKER_SCOPE_CONFIG_KEY,
 } from '@/llm/streamLimits';
+import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import * as events from '@/utils/events';
 import { GraphEvents } from '@/common';
 import { HookRegistry } from '@/hooks';
@@ -325,6 +330,89 @@ describe('ToolNode breaker signal composition', () => {
     expect(terminalCompletion?.result?.tool_call?.args).toContain(
       '"rewritten":true'
     );
+
+    await node.invoke({
+      messages: [
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_terminal',
+              name: 'terminal_child',
+              args: { laterTurn: true },
+              type: 'tool_call',
+            },
+          ],
+        }),
+      ],
+    });
+    expect(terminalRuns).toBe(2);
+    expect(terminalPreHooks).toBe(2);
+  });
+
+  it('persists a hook-terminal outcome before a sibling interrupts', async () => {
+    const persistedOutputs: SettledSubagentToolOutput[] = [];
+    const terminal = createSignalBlindTool('terminal_child', async () => {
+      throw new Error('denied tool must not execute');
+    }) as StructuredToolInterface & ReplayableSubagentTool;
+    terminal[SUBAGENT_REPLAY_CONTROLLER] = {
+      getSettledOutput: async () => undefined,
+      persistSettledOutput: async (_call, _config, settled): Promise<void> => {
+        persistedOutputs.push(settled);
+      },
+    };
+    const approval = createSignalBlindTool('approval_child', async () => {
+      throw new GraphInterrupt([
+        { id: 'approval-interrupt', value: { type: 'approval' } },
+      ]);
+    });
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> =>
+          input.toolName === 'terminal_child'
+            ? { decision: 'deny', reason: 'blocked by policy' }
+            : {},
+      ],
+    });
+    const node = new ToolNode({
+      tools: [terminal, approval],
+      hookRegistry,
+      interruptingToolNames: new Set(['terminal_child', 'approval_child']),
+    });
+
+    await expect(
+      node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_terminal',
+                name: 'terminal_child',
+                args: {},
+                type: 'tool_call',
+              },
+              {
+                id: 'call_approval',
+                name: 'approval_child',
+                args: {},
+                type: 'tool_call',
+              },
+            ],
+          }),
+        ],
+      })
+    ).rejects.toBeInstanceOf(GraphInterrupt);
+
+    expect(persistedOutputs).toHaveLength(1);
+    expect(persistedOutputs[0]).toMatchObject({
+      output: {
+        content: 'Blocked: blocked by policy',
+        status: 'error',
+        tool_call_id: 'call_terminal',
+      },
+    });
   });
 
   it('stops event dispatch when a direct tool trips the breaker mid-batch', async () => {

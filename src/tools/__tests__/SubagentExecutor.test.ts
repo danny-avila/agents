@@ -1,5 +1,5 @@
-import { GraphInterrupt } from '@langchain/langgraph';
 import { describe, it, expect, beforeEach } from '@jest/globals';
+import { GraphInterrupt, MemorySaver } from '@langchain/langgraph';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
@@ -511,6 +511,129 @@ describe('SubagentExecutor', () => {
     expect(result.content).toContain('requires a parent tool call ID');
     expect(result.messages).toEqual([]);
     expect(createChildGraph).not.toHaveBeenCalled();
+  });
+
+  it('persists terminal replay outcomes without an active child workflow', async () => {
+    const checkpointer = new MemorySaver();
+    const hookRegistry = new HookRegistry();
+    hookRegistry.registerSession('original-run', 'PreToolUse', {
+      hooks: [async (): Promise<Record<string, never>> => ({})],
+    });
+    const initialExecutor = createExecutor({
+      checkpointer,
+      hookRegistry,
+      humanInTheLoop: { enabled: true },
+      parentRunId: 'original-run',
+    });
+    const call = {
+      id: 'call_terminal',
+      name: Constants.SUBAGENT,
+      args: {
+        description: 'blocked before execution',
+        subagent_type: 'researcher',
+      },
+      type: 'tool_call' as const,
+    };
+    const originalConfig = {
+      configurable: {
+        thread_id: 'durable-parent',
+        checkpoint_id: 'parent-fork',
+        run_id: 'original-run',
+      },
+    };
+    const settled = {
+      output: new ToolMessage({
+        content: 'Blocked: policy',
+        status: 'error' as const,
+        name: Constants.SUBAGENT,
+        tool_call_id: call.id,
+      }),
+      additionalContexts: ['persisted context'],
+      resolvedArgs: { description: 'rewritten' },
+    };
+
+    await initialExecutor.persistSettledToolOutput(
+      call,
+      originalConfig,
+      settled
+    );
+
+    const rebuiltExecutor = createExecutor({
+      checkpointer,
+      hookRegistry,
+      humanInTheLoop: { enabled: true },
+      parentRunId: 'rebuilt-run',
+    });
+    const restored = await rebuiltExecutor.getSettledToolOutput(call, {
+      configurable: {
+        ...originalConfig.configurable,
+        run_id: 'rebuilt-run',
+      },
+    });
+
+    expect(restored?.output.content).toBe('Blocked: policy');
+    expect(restored?.additionalContexts).toEqual(['persisted context']);
+    expect(restored?.resolvedArgs).toEqual({ description: 'rewritten' });
+    expect(hookRegistry.hasHookFor('PreToolUse', 'original-run')).toBe(false);
+    expect(hookRegistry.hasHookFor('PreToolUse', 'rebuilt-run')).toBe(true);
+  });
+
+  it('persists an ordinary child error after the active workflow is released', async () => {
+    const checkpointer = new MemorySaver();
+    const invoke = jest.fn().mockRejectedValue(new Error('child failed'));
+    const executor = createExecutor({
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({
+            getState: jest.fn().mockResolvedValue({
+              values: {},
+              next: ['child-agent'],
+              tasks: [],
+            }),
+            invoke,
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    const call = {
+      id: 'call_error',
+      name: Constants.SUBAGENT,
+      args: { description: 'fail', subagent_type: 'researcher' },
+      type: 'tool_call' as const,
+    };
+    const runnableConfig = {
+      configurable: {
+        thread_id: 'durable-parent',
+        checkpoint_id: 'parent-fork',
+        run_id: 'original-run',
+      },
+    };
+    const result = await executor.execute({
+      description: 'fail',
+      subagentType: 'researcher',
+      threadId: 'durable-parent',
+      parentToolCallId: call.id,
+      parentConfigurable: runnableConfig.configurable,
+    });
+    expect(result.content).toBe('Subagent error: child failed');
+
+    await executor.persistSettledToolOutput(call, runnableConfig, {
+      output: new ToolMessage({
+        content: result.content,
+        name: Constants.SUBAGENT,
+        tool_call_id: call.id,
+      }),
+      additionalContexts: [],
+    });
+
+    const restored = await createExecutor({
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+    }).getSettledToolOutput(call, runnableConfig);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(restored?.output.content).toBe('Subagent error: child failed');
   });
 
   it('preserves an existing nested approval scope', async () => {

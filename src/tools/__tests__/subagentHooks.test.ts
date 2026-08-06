@@ -821,7 +821,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     expect(serializedUpdates).not.toContain('checkpoint_');
   });
 
-  it('resumes a child approval after rebuilding Run with the same checkpointer', async () => {
+  it('preserves a session-scoped child approval after rebuilding Run', async () => {
     getChatModelClassSpy.mockImplementation(((provider: Providers) => {
       if (provider === Providers.OPENAI) {
         return HitlChildFakeChatModel;
@@ -832,7 +832,8 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     const checkpointer = new MemorySaver();
     const registry = new HookRegistry();
     const executedTools: string[] = [];
-    registry.register('PreToolUse', {
+    const runId = `subagent-rebuild-hitl-${Date.now()}`;
+    registry.registerSession(`${runId}-initial`, 'PreToolUse', {
       hooks: [
         async (input): Promise<PreToolUseHookOutput> =>
           input.toolName === 'calculator'
@@ -857,7 +858,6 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
         },
       },
     };
-    const runId = `subagent-rebuild-hitl-${Date.now()}`;
     const createRun = (currentRunId: string): Promise<Run<t.IState>> =>
       Run.create<t.IState>({
         runId: currentRunId,
@@ -894,12 +894,15 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       .spyOn(console, 'warn')
       .mockImplementation((): void => undefined);
     try {
-      await rebuiltRun.resume([{ type: 'approve' }], callerConfig);
+      await rebuiltRun.resume(
+        [{ type: 'reject', reason: 'deny after restart' }],
+        callerConfig
+      );
     } finally {
       warningSpy.mockRestore();
     }
 
     expect(rebuiltRun.getInterrupt()).toBeUndefined();
-    expect(executedTools).toEqual(['calculator']);
+    expect(executedTools).toEqual([]);
   });
 });
