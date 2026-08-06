@@ -164,6 +164,23 @@ describe('HookRegistry', () => {
       expect(registry.hasHookFor('PreToolUse', 'run-a')).toBe(true);
       expect(registry.hasHookFor('PreToolUse', 'run-b')).toBe(false);
     });
+
+    it('copies session policy without consuming the source or sibling branches', () => {
+      const registry = new HookRegistry();
+      const matcher = makePreToolUseMatcher('subagent');
+      registry.registerSession('source', 'PreToolUse', matcher);
+
+      registry.copySession('source', 'branch-a');
+      registry.copySession('source', 'branch-b');
+
+      expect(registry.getMatchers('PreToolUse', 'source')).toEqual([matcher]);
+      expect(registry.getMatchers('PreToolUse', 'branch-a')).toEqual([matcher]);
+      expect(registry.getMatchers('PreToolUse', 'branch-b')).toEqual([matcher]);
+
+      registry.clearSession('branch-a');
+      expect(registry.getMatchers('PreToolUse', 'source')).toEqual([matcher]);
+      expect(registry.getMatchers('PreToolUse', 'branch-b')).toEqual([matcher]);
+    });
   });
 
   describe('session isolation under parallel registration', () => {

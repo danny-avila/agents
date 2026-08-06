@@ -853,15 +853,18 @@ export abstract class Graph<
     // Flush each compiled ToolNode's direct-path turn cache so it
     // doesn't leak across Runs (Codex P2 #33). The cache survives
     // `run()` re-entry by design (resume-stable), but end-of-Run
-    // is the right point to reset it.
+    // is the right point to reset it. Retain the registrations because
+    // the compiled workflow can be reused for later Runs; compilation
+    // will not register these instances again.
     for (const node of this._compiledToolNodes) {
       node.clearDirectPathTurns();
     }
-    this._compiledToolNodes.clear();
+    // Subagent executors are likewise compiled once and reused. Clear
+    // their per-Run state without dropping the registrations needed by
+    // subsequent cleanup cycles.
     for (const executor of this._subagentExecutors) {
       executor.clearHeavyState();
     }
-    this._subagentExecutors.clear();
     this.sessions.clear();
   }
 

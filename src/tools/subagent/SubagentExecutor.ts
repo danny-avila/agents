@@ -786,7 +786,7 @@ export class SubagentExecutor {
       typeof currentHookSessionId === 'string' &&
       currentHookSessionId.length > 0
     ) {
-      this.hookRegistry?.migrateSession(
+      this.hookRegistry?.copySession(
         persistedHookSessionId,
         currentHookSessionId
       );
@@ -1119,7 +1119,7 @@ export class SubagentExecutor {
         const persistedHookSessionId =
           getSubagentHookSessionId(checkpointMessages);
         if (persistedHookSessionId != null) {
-          this.hookRegistry?.migrateSession(
+          this.hookRegistry?.copySession(
             persistedHookSessionId,
             currentHookSessionId
           );

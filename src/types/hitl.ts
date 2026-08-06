@@ -126,6 +126,8 @@ export interface ToolApprovalInterruptPayload {
   type: 'tool_approval';
   action_requests: ToolApprovalRequest[];
   review_configs: ToolApprovalReviewConfig[];
+  /** Hook-registry session whose policy raised this interrupt. */
+  hook_session_id?: string;
   /** Present when the approval request was bridged from a child graph. */
   subagent?: SubagentInterruptScope;
 }

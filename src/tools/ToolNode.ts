@@ -352,10 +352,14 @@ type AskEntry = {
  * needs `interrupt()` plus the AsyncLocalStorage anchoring shim).
  */
 function buildToolApprovalInterruptPayload(
-  askEntries: ReadonlyArray<AskEntry>
+  askEntries: ReadonlyArray<AskEntry>,
+  hookSessionId?: string
 ): t.ToolApprovalInterruptPayload {
   return {
     type: 'tool_approval',
+    ...(hookSessionId == null || hookSessionId === ''
+      ? {}
+      : { hook_session_id: hookSessionId }),
     action_requests: askEntries.map(({ entry, reason }) => {
       const request: t.ToolApprovalRequest = {
         tool_call_id: entry.call.id!,
@@ -1770,7 +1774,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             reason: preResult.reason,
             allowedDecisions: preResult.allowedDecisions,
           };
-          const payload = buildToolApprovalInterruptPayload([askEntry]);
+          const payload = buildToolApprovalInterruptPayload([askEntry], runId);
           const resumeValue = AsyncLocalStorageProviderSingleton.runWithConfig(
             config,
             () =>
@@ -2768,7 +2772,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * are pure — see `humanInTheLoop` docs).
        */
       if (askEntries.length > 0) {
-        const payload = buildToolApprovalInterruptPayload(askEntries);
+        const payload = buildToolApprovalInterruptPayload(askEntries, runId);
 
         /**
          * `interrupt()` reads the current `RunnableConfig` from

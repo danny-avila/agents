@@ -574,7 +574,7 @@ describe('SubagentExecutor', () => {
     expect(restored?.output.content).toBe('Blocked: policy');
     expect(restored?.additionalContexts).toEqual(['persisted context']);
     expect(restored?.resolvedArgs).toEqual({ description: 'rewritten' });
-    expect(hookRegistry.hasHookFor('PreToolUse', 'original-run')).toBe(false);
+    expect(hookRegistry.hasHookFor('PreToolUse', 'original-run')).toBe(true);
     expect(hookRegistry.hasHookFor('PreToolUse', 'rebuilt-run')).toBe(true);
   });
 

@@ -121,6 +121,20 @@ function isLangGraphResumeMapForInterrupt(
   return Object.prototype.hasOwnProperty.call(value, interruptId);
 }
 
+function getInterruptHookSessionId(payload: unknown): string | undefined {
+  if (
+    payload == null ||
+    typeof payload !== 'object' ||
+    (payload as { type?: unknown }).type !== 'tool_approval'
+  ) {
+    return undefined;
+  }
+  const sessionId = (payload as { hook_session_id?: unknown }).hook_session_id;
+  return typeof sessionId === 'string' && sessionId.length > 0
+    ? sessionId
+    : undefined;
+}
+
 type InterruptStateSnapshot = {
   config?: RunnableConfig;
   tasks?: Array<{
@@ -1376,6 +1390,10 @@ export class Run<_T extends t.BaseGraphState> {
   ): Promise<t.RunStreamConfig> {
     await this.restoreInterruptFromCheckpoint(callerConfig);
     const interrupt = this._interrupt;
+    const hookSessionId = getInterruptHookSessionId(interrupt?.payload);
+    if (hookSessionId != null) {
+      this.hookRegistry?.copySession(hookSessionId, this.id);
+    }
     const interruptId = interrupt?.interruptId;
     const workflow = this.graphRunnable as
       | (t.CompiledStateWorkflow & WorkflowWithStateHistory)
