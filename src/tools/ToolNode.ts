@@ -158,6 +158,12 @@ type RunToolBatchContext<T = unknown> = {
   errorOwnership?: ToolErrorOwnership;
 };
 
+type SettledDirectToolResult = {
+  output: BaseMessage | Command;
+  additionalContexts: string[];
+  resolvedArgs?: Record<string, unknown>;
+};
+
 /**
  * Batch-local record of who owns each failed call's completion event.
  *
@@ -576,9 +582,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * the Run ends.
    */
   private directPathTurns: Map<string, number> = new Map();
-  /** Terminal outputs from interrupting siblings that must survive a
-   * LangGraph replay of the containing ToolNode. */
-  private settledInterruptingOutputs = new Map<string, BaseMessage | Command>();
+  /** Terminal results from interrupting siblings that must survive a
+   * LangGraph replay of the containing ToolNode. Includes the sidecar data
+   * the fresh batch needs for hook-context injection and completion events. */
+  private settledInterruptingResults = new Map<
+    string,
+    SettledDirectToolResult
+  >();
   /** Tool registry for filtering (lazy computation of programmatic maps) */
   private toolRegistry?: t.LCToolRegistry;
   /** Cached programmatic tools (computed once on first PTC call) */
@@ -945,7 +955,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    */
   clearDirectPathTurns(): void {
     this.directPathTurns.clear();
-    this.settledInterruptingOutputs.clear();
+    this.settledInterruptingResults.clear();
   }
 
   /**
@@ -3771,20 +3781,45 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     config: RunnableConfig,
     baseContext: Omit<RunToolBatchContext<T>, 'batchIndex'>
   ): Promise<(BaseMessage | Command)[]> {
-    const runOne = (
+    const restoreResult = (
+      call: ToolCall,
+      result: SettledDirectToolResult
+    ): SettledDirectToolResult => {
+      baseContext.additionalContextsSink?.push(...result.additionalContexts);
+      if (
+        call.id != null &&
+        result.resolvedArgs != null &&
+        baseContext.resolvedArgsByCallId != null
+      ) {
+        baseContext.resolvedArgsByCallId.set(call.id, result.resolvedArgs);
+      }
+      return result;
+    };
+    const runOne = async (
       call: ToolCall,
       position: number
-    ): Promise<BaseMessage | Command> => {
-      const cachedOutput =
+    ): Promise<SettledDirectToolResult> => {
+      const cachedResult =
         typeof call.id === 'string'
-          ? this.settledInterruptingOutputs.get(call.id)
+          ? this.settledInterruptingResults.get(call.id)
           : undefined;
-      if (cachedOutput != null) {
-        return Promise.resolve(cachedOutput);
+      if (cachedResult != null) {
+        return restoreResult(call, cachedResult);
       }
-      return this.runDirectToolWithLifecycleHooks(call, config, {
+      const additionalContexts: string[] = [];
+      const output = await this.runDirectToolWithLifecycleHooks(call, config, {
         ...baseContext,
         batchIndex: batchIndices[position],
+        additionalContextsSink: additionalContexts,
+      });
+      const resolvedArgs =
+        call.id == null
+          ? undefined
+          : baseContext.resolvedArgsByCallId?.get(call.id);
+      return restoreResult(call, {
+        output,
+        additionalContexts,
+        ...(resolvedArgs == null ? {} : { resolvedArgs }),
       });
     };
 
@@ -3794,7 +3829,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       directCalls.some((call) => interrupting.has(call.name));
 
     if (!hasInterrupting) {
-      return Promise.all(directCalls.map((call, i) => runOne(call, i)));
+      const results = await Promise.all(
+        directCalls.map((call, i) => runOne(call, i))
+      );
+      return results.map((result) => result.output);
     }
 
     const outputs: (BaseMessage | Command)[] = new Array(directCalls.length);
@@ -3830,10 +3868,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         continue;
       }
       const position = interruptingPositions[i];
-      outputs[position] = result.value;
+      outputs[position] = result.value.output;
       const callId = directCalls[position].id;
       if (typeof callId === 'string' && callId !== '') {
-        this.settledInterruptingOutputs.set(callId, result.value);
+        this.settledInterruptingResults.set(callId, result.value);
       }
     }
     if (hasInterruptingError) {
@@ -3850,7 +3888,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       regularPositions.map((i) => runOne(directCalls[i], i))
     );
     regularPositions.forEach((i, k) => {
-      outputs[i] = regularOutputs[k];
+      outputs[i] = regularOutputs[k].output;
     });
 
     return outputs;

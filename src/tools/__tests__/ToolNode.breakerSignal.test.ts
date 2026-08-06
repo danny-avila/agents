@@ -5,6 +5,7 @@ import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { PreToolUseHookOutput } from '@/hooks';
 import type * as t from '@/types';
 import {
   StreamLimitExceededError,
@@ -251,18 +252,55 @@ describe('ToolNode breaker signal composition', () => {
 
   it('reuses terminal interrupting sibling outputs across replay', async () => {
     let terminalRuns = 0;
+    let terminalPreHooks = 0;
+    let approvalRuns = 0;
+    const completions: Array<{
+      result?: { tool_call?: { id?: string; args?: string } };
+    }> = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<boolean> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push(data as (typeof completions)[number]);
+        }
+        return true;
+      });
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> => {
+          if (input.toolName !== 'terminal_child') {
+            return {};
+          }
+          terminalPreHooks += 1;
+          return {
+            additionalContext: 'cached terminal context',
+            updatedInput: { rewritten: true },
+          };
+        },
+      ],
+    });
     const terminal = createSignalBlindTool('terminal_child', async () => {
       terminalRuns += 1;
       return 'completed';
     });
     const approval = createSignalBlindTool('approval_child', async () => {
-      throw new GraphInterrupt([
-        { id: 'approval-interrupt', value: { type: 'approval' } },
-      ]);
+      approvalRuns += 1;
+      if (approvalRuns === 1) {
+        throw new GraphInterrupt([
+          { id: 'approval-interrupt', value: { type: 'approval' } },
+        ]);
+      }
+      return 'approved';
     });
     const node = new ToolNode({
       tools: [terminal, approval],
       interruptingToolNames: new Set(['terminal_child', 'approval_child']),
+      hookRegistry,
+      toolCallStepIds: new Map([
+        ['call_terminal', 'step_terminal'],
+        ['call_approval', 'step_approval'],
+      ]),
     });
     const input = {
       messages: [
@@ -277,8 +315,16 @@ describe('ToolNode breaker signal composition', () => {
     };
 
     await expect(node.invoke(input)).rejects.toBeInstanceOf(GraphInterrupt);
-    await expect(node.invoke(input)).rejects.toBeInstanceOf(GraphInterrupt);
+    const replayResult = await node.invoke(input);
     expect(terminalRuns).toBe(1);
+    expect(terminalPreHooks).toBe(1);
+    expect(JSON.stringify(replayResult)).toContain('cached terminal context');
+    const terminalCompletion = completions.find(
+      (completion) => completion.result?.tool_call?.id === 'call_terminal'
+    );
+    expect(terminalCompletion?.result?.tool_call?.args).toContain(
+      '"rewritten":true'
+    );
   });
 
   it('stops event dispatch when a direct tool trips the breaker mid-batch', async () => {
