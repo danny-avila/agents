@@ -6,6 +6,8 @@ import type { ToolSessionContext } from '@/types';
 
 export const SUBAGENT_RESUME_MANIFEST_CONFIG_KEY =
   '__librechat_subagent_resume_manifest';
+export const SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY =
+  '__librechat_subagent_resume_attempt';
 
 const SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY =
   '__librechat_subagent_resume_manifest';

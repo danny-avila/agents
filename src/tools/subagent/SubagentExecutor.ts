@@ -68,6 +68,7 @@ import type { HandlerRegistry } from '@/events';
 import {
   getSubagentResumeManifest,
   attachSubagentResumeManifest,
+  SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from './SubagentReplay';
 import {
@@ -510,6 +511,16 @@ function getParentCheckpointFork(
     : 'root';
 }
 
+function getResumeAttemptId(
+  configurable: Record<string, unknown> | undefined,
+  fallback: string
+): string {
+  const attemptId = configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
+  return typeof attemptId === 'string' && attemptId.length > 0
+    ? attemptId
+    : fallback;
+}
+
 function getChildThreadId(args: {
   parentRunId: string;
   parentAgentId?: string;
@@ -877,7 +888,7 @@ export class SubagentExecutor {
       threadId: params.threadId,
       parentToolCallId: params.parentToolCallId,
       parentConfigurable: params.parentConfigurable,
-      branchId: this.parentRunId,
+      branchId: getResumeAttemptId(params.parentConfigurable, this.parentRunId),
     });
     if (resumeExecution != null) {
       await this.forkCheckpointSnapshot(
@@ -1546,6 +1557,10 @@ export class SubagentExecutor {
        */
       const inheritedConfigurable: Record<string, unknown> =
         sanitizeChildConfigurable(params.parentConfigurable);
+      const resumeAttemptId = getResumeAttemptId(
+        params.parentConfigurable,
+        this.parentRunId
+      );
       const currentHookSessionId =
         typeof inheritedConfigurable.run_id === 'string' &&
         inheritedConfigurable.run_id.length > 0
@@ -1570,6 +1585,7 @@ export class SubagentExecutor {
             : {
               [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]:
                   resumeExecution.descendant,
+              [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: resumeAttemptId,
             }),
           thread_id:
             this.humanInTheLoop?.enabled === true
@@ -2221,6 +2237,7 @@ function isLangGraphRuntimeConfigKey(key: string): boolean {
   return (
     key.startsWith(LANGGRAPH_RUNTIME_CONFIG_PREFIX) ||
     LANGGRAPH_CHECKPOINT_CONFIG_KEYS.has(key) ||
+    key === SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY ||
     key === SUBAGENT_RESUME_MANIFEST_CONFIG_KEY ||
     /** The parent batch's breaker scope must not leak into the child
      * workflow's configurable — children own separate controllers. */

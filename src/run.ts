@@ -20,6 +20,12 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import {
+  requireValidSubagentResumeManifest,
+  stripSubagentResumeManifest,
+  SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
+  SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
+} from '@/tools/subagent/SubagentReplay';
+import {
   createLangfuseTraceMetadata,
   createLangfuseHandler,
   disposeLangfuseHandler,
@@ -27,11 +33,6 @@ import {
   isLangfuseCallbackHandler,
   withLangfuseAttributes,
 } from '@/langfuse';
-import {
-  requireValidSubagentResumeManifest,
-  stripSubagentResumeManifest,
-  SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
-} from '@/tools/subagent/SubagentReplay';
 import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
@@ -798,6 +799,7 @@ export class Run<_T extends t.BaseGraphState> {
       configurable: { ...callerConfig.configurable },
     };
     if (!isResume) {
+      delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
       delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
     }
 
@@ -1412,7 +1414,9 @@ export class Run<_T extends t.BaseGraphState> {
       interrupt?.payload
     );
     const resumeConfigurable = { ...callerConfig.configurable };
+    delete resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+    resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY] = nanoid();
     if (resumeManifest != null) {
       resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] = resumeManifest;
     }

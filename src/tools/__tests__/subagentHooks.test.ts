@@ -1092,8 +1092,9 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       },
     };
     const earlyApprovedRun = await createRun(`${runId}-early-approved`);
-    const approvedRun = await createRun(`${runId}-approved`);
-    const rejectedRun = await createRun(`${runId}-rejected`);
+    const sharedRebuiltRunId = `${runId}-same-rebuilt-id`;
+    const approvedRun = await createRun(sharedRebuiltRunId);
+    const rejectedRun = await createRun(sharedRebuiltRunId);
     earlyApprovedRun.Graph!.overrideTestModel(['Final answer.'], 1);
     approvedRun.Graph!.overrideTestModel(['Final answer.'], 1);
     rejectedRun.Graph!.overrideTestModel(['Final answer.'], 1);
