@@ -1836,7 +1836,7 @@ describe('custom chat model class smoke tests', () => {
     );
     expect(model.applicationInferenceProfile).toBe(applicationInferenceProfile);
     expect(model._lc_stream_delay).toBe(12);
-    expect(defaultStreamDelayModel._lc_stream_delay).toBe(0);
+    expect(defaultStreamDelayModel._lc_stream_delay).toBe(25);
     expect(model.invocationParams({}).serviceTier).toEqual({
       type: 'priority',
     });
@@ -1947,5 +1947,20 @@ describe('custom chat model class smoke tests', () => {
     await expect(waitForFetchOutcome(response)).resolves.toBe('rejected');
     expect(requestController.signal.aborted).toBe(true);
     expect(capturedFetch.getSignal()?.aborted).toBe(true);
+  });
+});
+
+describe('StreamSmoothingOptions type surface', () => {
+  it('accepts _lc_stream_delay: 0 across the typed provider options', () => {
+    const azure: import('@/types').AzureClientOptions = { _lc_stream_delay: 0 };
+    const openrouter: ChatOpenRouterCallOptions &
+      import('@/types').StreamSmoothingOptions = { _lc_stream_delay: 0 };
+    const mistral: import('@/types').MistralAIClientOptions = {
+      model: 'mistral-large-latest',
+      _lc_stream_delay: 0,
+    };
+    expect(azure._lc_stream_delay).toBe(0);
+    expect(openrouter._lc_stream_delay).toBe(0);
+    expect(mistral._lc_stream_delay).toBe(0);
   });
 });

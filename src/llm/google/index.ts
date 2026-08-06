@@ -16,6 +16,8 @@ import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { GeminiApiUsageMetadata, InputTokenDetails } from './types';
 import type { GoogleClientOptions, GoogleThinkingConfig } from '@/types';
+import { smoothGenerationChunks } from '@/llm/stream/chunkAdapters';
+import { resolveStreamDelay } from '@/llm/stream/smoother';
 import {
   convertResponseContentToChatGenerationChunk,
   convertBaseMessagesToContent,
@@ -36,6 +38,7 @@ type GoogleToolConfigWithServerSideInvocations = ToolConfig & {
 };
 
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
+  _lc_stream_delay: number;
   thinkingConfig?: GoogleThinkingConfig;
   includeServerSideToolInvocations?: boolean;
 
@@ -55,6 +58,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   constructor(fields: GoogleClientOptions) {
     super(fields);
 
+    this._lc_stream_delay = resolveStreamDelay(fields._lc_stream_delay);
     this.model = fields.model.replace(/^models\//, '');
 
     this.maxOutputTokens = fields.maxOutputTokens ?? this.maxOutputTokens;
@@ -297,6 +301,18 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
+    yield* smoothGenerationChunks({
+      chunks: this._streamProviderChunks(messages, options),
+      delayMs: this._lc_stream_delay,
+      signal: options.signal,
+      runManager,
+    });
+  }
+
+  private async *_streamProviderChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions']
+  ): AsyncGenerator<ChatGenerationChunk> {
     const prompt = convertBaseMessagesToContent(
       messages,
       this._isMultimodalModel,
@@ -349,33 +365,16 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       }
 
       yield chunk;
-      await runManager?.handleLLMNewToken(
-        chunk.text || '',
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        { chunk }
-      );
     }
 
     if (lastUsageMetadata) {
-      const finalChunk = new ChatGenerationChunk({
+      yield new ChatGenerationChunk({
         text: '',
         message: new AIMessageChunk({
           content: '',
           usage_metadata: lastUsageMetadata,
         }),
       });
-      yield finalChunk;
-      await runManager?.handleLLMNewToken(
-        finalChunk.text || '',
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        { chunk: finalChunk }
-      );
     }
   }
 }

@@ -77,6 +77,14 @@ export type {
   ChatOpenRouterCallOptions,
 } from './llm/openrouter';
 export { getChatModelClass } from './llm/providers';
+export { CustomChatMistralAI } from './llm/mistral';
+export {
+  smoothStream,
+  resolveStreamDelay,
+  DEFAULT_STREAM_DELAY,
+  computeAdaptivePieceSize,
+} from './llm/stream/smoother';
+export type { SmoothItem, SmoothPiece } from './llm/stream/smoother';
 export { FakeChatModel, createFakeStreamingLLM } from './llm/fake';
 export { initializeModel } from './llm/init';
 export { attemptInvoke, tryFallbackProviders } from './llm/invoke';

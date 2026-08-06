@@ -45,7 +45,10 @@ export interface ChatOpenRouterCallOptions
 
 export type ChatOpenRouterInput = Partial<
   ChatOpenRouterCallOptions & OpenAIChatInput
->;
+> & {
+  /** Minimum delay in ms between visible streamed deltas (default 25; 0 disables). */
+  _lc_stream_delay?: number;
+};
 
 /** invocationParams return type extended with OpenRouter reasoning */
 export type OpenRouterInvocationParams = Omit<

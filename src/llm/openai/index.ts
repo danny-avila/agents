@@ -37,6 +37,7 @@ import type { BindToolsInput } from '@langchain/core/language_models/chat_models
 import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
+import type { SmoothItem, SmoothPiece } from '@/llm/stream/smoother';
 import type { ResponsesReplayPosition } from '@/messages/core';
 import type { SeenScalarMetadata } from './streamMetadata';
 import type { HeaderValue, HeadersLike } from './types';
@@ -58,13 +59,16 @@ import {
 } from '@/tools/streamedToolCallSeals';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
+import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
+import {
+  hasReasoningKwargs,
+  hasToolCallChunks,
+  getReasoningKwargsText,
+} from '@/llm/stream/chunkAdapters';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 const iife = <T>(fn: () => T) => fn();
-
-const STREAM_CHUNK_MIN_SIZE = 4;
-const STREAM_BOUNDARIES = new Set([' ', '.', ',', '!', '?', ';', ':']);
 
 export function isHeaders(headers: unknown): headers is Headers {
   return (
@@ -1114,77 +1118,87 @@ function getCustomOpenAIClientOptions(
   return requestOptions;
 }
 
-function findStreamChunkBoundary(text: string, minSize: number): number {
-  if (minSize >= text.length) {
-    return text.length;
-  }
-
-  for (let position = minSize; position < text.length; position++) {
-    if (STREAM_BOUNDARIES.has(text[position])) {
-      return position + 1;
-    }
-  }
-
-  return text.length;
-}
-
-function splitStreamToken(text: string): string[] {
-  const chunks: string[] = [];
-  let currentIndex = 0;
-
-  while (currentIndex < text.length) {
-    const remainingText = text.slice(currentIndex);
-    const chunkSize = findStreamChunkBoundary(
-      remainingText,
-      STREAM_CHUNK_MIN_SIZE
-    );
-    chunks.push(text.slice(currentIndex, currentIndex + chunkSize));
-    currentIndex += chunkSize;
-  }
-
-  return chunks;
-}
-
-function splitTextGenerationChunk(
+/**
+ * Classifies a generation chunk for the smoothing engine:
+ * - splittable: plain visible text (string content equal to `chunk.text`, no
+ *   logprobs / finish_reason) — sliced adaptively at the pacing cadence.
+ *   ANY logprobs value blocks splitting here (this family only attaches
+ *   logprobs on request; the DeepSeek suite pins chunks with them staying
+ *   intact) — deliberately stricter than `stream/chunkAdapters.ts`, where
+ *   google-common's always-present empty logprobs must not block.
+ * - atomic: text- or reasoning-bearing chunks whose metadata cannot survive
+ *   slicing — paced as one piece, never split (legacy parity: these were
+ *   emitted whole but still paced).
+ * - passthrough: tool-call deltas, usage-only, finish_reason and other
+ *   metadata chunks — strict FIFO, zero delay.
+ */
+export function toSmoothItem(
   chunk: ChatGenerationChunk
-): ChatGenerationChunk[] {
+): SmoothItem<ChatGenerationChunk> {
   const { message } = chunk;
-  if (
-    !chunk.text ||
-    !(message instanceof AIMessageChunk) ||
-    typeof message.content !== 'string' ||
-    message.content !== chunk.text ||
-    chunk.generationInfo?.logprobs != null ||
-    chunk.generationInfo?.finish_reason != null
-  ) {
-    return [chunk];
+  const isMessageChunk = message instanceof AIMessageChunk;
+  /** Chunks pairing visible text with a reasoning delta (reasoning_content,
+   * reasoning summary, or OpenRouter reasoning_details) or with tool-call
+   * deltas must pace whole: split pieces would each clone the same kwargs /
+   * tool_call_chunks and downstream accumulation duplicates them per piece. */
+  const splittable =
+    Boolean(chunk.text) &&
+    isMessageChunk &&
+    typeof message.content === 'string' &&
+    message.content === chunk.text &&
+    chunk.generationInfo?.logprobs == null &&
+    chunk.generationInfo?.finish_reason == null &&
+    !hasReasoningKwargs(message) &&
+    !hasToolCallChunks(message);
+
+  if (splittable) {
+    return {
+      text: chunk.text,
+      smooth: true,
+      emit: (piece) => cloneGenerationChunkPiece(chunk, piece),
+    };
   }
 
-  const tokenChunks = splitStreamToken(chunk.text);
-  if (tokenChunks.length <= 1) {
-    return [chunk];
+  const pacedText =
+    chunk.text || (isMessageChunk ? getReasoningKwargsText(message) : '');
+  if (pacedText !== '') {
+    return {
+      text: pacedText,
+      smooth: true,
+      atomic: true,
+      emit: () => chunk,
+    };
   }
 
-  let emittedUsage = false;
-  return tokenChunks.map((token) => {
-    const usageMetadata =
-      emittedUsage && message.usage_metadata != null
-        ? undefined
-        : message.usage_metadata;
-    if (message.usage_metadata != null && !emittedUsage) {
-      emittedUsage = true;
-    }
+  return { text: '', smooth: false, emit: () => chunk };
+}
 
-    return new ChatGenerationChunk({
-      text: token,
-      generationInfo: chunk.generationInfo,
-      message: new AIMessageChunk(
-        Object.assign({}, message, {
-          content: token,
-          usage_metadata: usageMetadata,
-        })
-      ),
-    });
+/**
+ * Usage metadata, additional kwargs and response metadata survive only on
+ * the first piece: the aggregator's dict merge concatenates string fields
+ * and sums usage, so replication across pieces corrupts them. Unlike the
+ * generic adapter, `generationInfo` stays on every piece — per-piece token
+ * indices ride in it and `dropRepeatedScalarMetadata` owns repetition there.
+ */
+function cloneGenerationChunkPiece(
+  chunk: ChatGenerationChunk,
+  piece: SmoothPiece
+): ChatGenerationChunk {
+  if (piece.isFirst && piece.isLast) {
+    return chunk;
+  }
+  const message = chunk.message as AIMessageChunk;
+  return new ChatGenerationChunk({
+    text: piece.text,
+    generationInfo: chunk.generationInfo,
+    message: new AIMessageChunk(
+      Object.assign({}, message, {
+        content: piece.text,
+        usage_metadata: piece.isFirst ? message.usage_metadata : undefined,
+        additional_kwargs: piece.isFirst ? message.additional_kwargs : {},
+        response_metadata: piece.isFirst ? message.response_metadata : {},
+      })
+    ),
   });
 }
 
@@ -1215,66 +1229,45 @@ function getStreamChunkTokenIndices(
   return undefined;
 }
 
+/**
+ * Adaptive smoothing adapter for the OpenAI chat-model family, layered over
+ * the shared `smoothStream` engine. Keeps the historical signature so every
+ * `_streamResponseChunks` call site is unchanged.
+ *
+ * `seenScalarMetadata`: when provided, de-duplicates repeated scalar metadata
+ * just before emitting, so token callbacks and the yielded chunk observe the
+ * same cleaned data. Omitted by callers that wrap this stream and finalize
+ * downstream (e.g. `ChatOpenRouter`, which needs the raw `finish_reason` as
+ * its flush signal and de-duplicates after its own processing).
+ */
 async function* delayStreamChunks(
   chunks: AsyncGenerator<ChatGenerationChunk>,
   delay?: number,
   signal?: AbortSignal,
   runManager?: CallbackManagerForLLMRun,
-  // When provided, de-duplicate repeated scalar metadata just before emitting,
-  // so token callbacks and the yielded chunk observe the same cleaned data.
-  // Omitted by callers that wrap this stream and finalize downstream (e.g.
-  // `ChatOpenRouter`, which needs the raw `finish_reason` as its flush signal
-  // and de-duplicates after its own processing).
   seenScalarMetadata?: SeenScalarMetadata
 ): AsyncGenerator<ChatGenerationChunk> {
-  let lastYieldedAt: number | undefined;
-  for await (const chunk of chunks) {
-    const outputChunks =
-      delay != null && delay > 0 ? splitTextGenerationChunk(chunk) : [chunk];
-    for (const outputChunk of outputChunks) {
-      signal?.throwIfAborted();
-      if (delay != null && delay > 0 && lastYieldedAt != null) {
-        const timeSinceLastYield = Date.now() - lastYieldedAt;
-        const timeToWait = Math.max(0, delay - timeSinceLastYield);
-        if (timeToWait > 0) {
-          await sleepWithAbort(timeToWait, signal);
-        }
-      }
-      signal?.throwIfAborted();
-      lastYieldedAt = Date.now();
-      if (seenScalarMetadata != null) {
-        dropRepeatedScalarMetadata(outputChunk, seenScalarMetadata);
-      }
-      await emitStreamChunkCallback(outputChunk, runManager);
-      signal?.throwIfAborted();
-      yield outputChunk;
+  const source = (async function* (): AsyncGenerator<
+    SmoothItem<ChatGenerationChunk>
+    > {
+    for await (const chunk of chunks) {
+      yield toSmoothItem(chunk);
     }
-  }
-}
+  })();
 
-async function sleepWithAbort(
-  delay: number,
-  signal?: AbortSignal
-): Promise<void> {
-  if (delay <= 0) {
-    return;
-  }
-  signal?.throwIfAborted();
-  await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, delay);
-    const onAbort = (): void => {
-      clearTimeout(timeout);
-      signal?.removeEventListener('abort', onAbort);
-      reject(signal?.reason ?? new Error('AbortError: User aborted request.'));
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-    if (signal?.aborted === true) {
-      onAbort();
-    }
+  const smoothed = smoothStream({
+    source,
+    delayMs: delay != null && delay > 0 ? delay : 0,
+    signal,
   });
+
+  for await (const outputChunk of smoothed) {
+    if (seenScalarMetadata != null) {
+      dropRepeatedScalarMetadata(outputChunk, seenScalarMetadata);
+    }
+    await emitStreamChunkCallback(outputChunk, runManager);
+    yield outputChunk;
+  }
 }
 
 function createAbortHandler(controller: AbortController): () => void {
@@ -2410,13 +2403,13 @@ function withLibreChatOpenAIFields(
 }
 
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
-  _lc_stream_delay?: number;
+  _lc_stream_delay: number;
 
   constructor(
     fields?: LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
   ) {
     super(withLibreChatOpenAIFields(fields));
-    this._lc_stream_delay = fields?._lc_stream_delay;
+    this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2507,13 +2500,13 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
 }
 
 export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
-  _lc_stream_delay?: number;
+  _lc_stream_delay: number;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
     super(fields);
     this.completions = new LibreChatAzureOpenAICompletions(fields);
     this.responses = new LibreChatAzureOpenAIResponses(fields);
-    this._lc_stream_delay = fields?._lc_stream_delay;
+    this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2619,7 +2612,7 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   }
 }
 export class ChatDeepSeek extends OriginalChatDeepSeek {
-  _lc_stream_delay?: number;
+  _lc_stream_delay: number;
 
   constructor(
     fields?: ConstructorParameters<typeof OriginalChatDeepSeek>[0] & {
@@ -2627,7 +2620,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     }
   ) {
     super(fields);
-    this._lc_stream_delay = fields?._lc_stream_delay;
+    this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -3140,7 +3133,7 @@ export class ChatMoonshot extends ChatOpenAI {
 }
 
 export class ChatXAI extends OriginalChatXAI {
-  _lc_stream_delay?: number;
+  _lc_stream_delay: number;
 
   constructor(
     fields?: Partial<ChatXAIInput> & {
@@ -3150,7 +3143,7 @@ export class ChatXAI extends OriginalChatXAI {
     }
   ) {
     super(fields);
-    this._lc_stream_delay = fields?._lc_stream_delay;
+    this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     const customBaseURL =
       fields?.configuration?.baseURL ?? fields?.clientConfig?.baseURL;
     if (customBaseURL != null && customBaseURL) {
