@@ -25,6 +25,7 @@ import type * as t from '@/types';
 import {
   getSubagentResumeManifest,
   stripSubagentResumeManifest,
+  SUBAGENT_PARENT_BATCH_CONFIG_KEY,
   SUBAGENT_REPLAY_CONTROLLER,
 } from '@/tools/subagent/SubagentReplay';
 import { HookRegistry } from '@/hooks';
@@ -218,6 +219,106 @@ describe('direct-path HITL: resume scope', () => {
     );
     expect(toolMessage?.status).toBe('error');
     expect(String(toolMessage?.content)).toContain('rejected once');
+  });
+
+  it('truncates direct respond decisions before returning them', async () => {
+    const executeTool = jest.fn(async () => 'must not execute');
+    const directTool = tool(executeTool, {
+      name: 'echo',
+      description: 'approval response tool',
+      schema: z.object({ command: z.string() }),
+    }) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [async (): Promise<PreToolUseHookOutput> => ({ decision: 'ask' })],
+    });
+    const node = new ToolNode({
+      tools: [directTool],
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+      humanInTheLoop: { enabled: true },
+      maxToolResultChars: 50,
+    });
+    const graph = buildGraph(node, [
+      { id: 'call_respond', name: 'echo', args: { command: 'go' } },
+    ]);
+    const config = { configurable: { thread_id: 'thread-respond-truncate' } };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+    expect(isInterrupted(interrupted)).toBe(true);
+
+    const oversized = 'A'.repeat(200);
+    const resumed = await graph.invoke(
+      new Command({
+        resume: [{ type: 'respond', responseText: oversized }],
+      }),
+      config
+    );
+
+    const messages = (resumed as { messages: ToolMessage[] }).messages;
+    const toolMessage = messages.find(
+      (message) => message instanceof ToolMessage
+    );
+    expect(String(toolMessage?.content).length).toBeLessThan(oversized.length);
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
+  it('stamps distinct assistant batches into subagent replay configs', async () => {
+    const invokedBatchKeys: unknown[] = [];
+    const directTool = tool(
+      async (_input, config) => {
+        invokedBatchKeys.push(
+          config.configurable?.[SUBAGENT_PARENT_BATCH_CONFIG_KEY]
+        );
+        return 'done';
+      },
+      {
+        name: 'subagent',
+        description: 'replayable direct tool',
+        schema: z.object({ description: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    const replayConfigKeys: unknown[] = [];
+    const replayableTool = directTool as StructuredToolInterface &
+      ReplayableSubagentTool;
+    replayableTool[SUBAGENT_REPLAY_CONTROLLER] = {
+      getSettledOutput: async (_call, config) => {
+        replayConfigKeys.push(
+          config.configurable?.[SUBAGENT_PARENT_BATCH_CONFIG_KEY]
+        );
+        return undefined;
+      },
+      persistSettledOutput: async () => {},
+    };
+    const node = new ToolNode({
+      tools: [directTool],
+      directToolNames: new Set(['subagent']),
+    });
+    const config = {
+      configurable: { run_id: 'run-shared', thread_id: 'thread-shared' },
+    };
+    const input = (assistantMessageId: string): { messages: AIMessage[] } => ({
+      messages: [
+        new AIMessage({
+          id: assistantMessageId,
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_reused',
+              name: 'subagent',
+              args: { description: assistantMessageId },
+            },
+          ],
+        }),
+      ],
+    });
+
+    await node.invoke(input('assistant-1'), config);
+    await node.invoke(input('assistant-2'), config);
+
+    expect(replayConfigKeys).toHaveLength(2);
+    expect(replayConfigKeys[0]).not.toBe(replayConfigKeys[1]);
+    expect(invokedBatchKeys).toEqual(replayConfigKeys);
   });
 
   it('fails closed when an id-less direct call requires approval', async () => {

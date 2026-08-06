@@ -929,6 +929,12 @@ export abstract class Graph<
     this._subagentExecutors.add(executor);
   }
 
+  protected resetSubagentCheckpointThreadIds(): void {
+    for (const executor of this._subagentExecutors) {
+      executor.resetCheckpointThreadIds();
+    }
+  }
+
   getChildCheckpointThreadIds(): string[] {
     const threadIds = new Set<string>();
     for (const executor of this._subagentExecutors) {
@@ -1351,6 +1357,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /* Init */
 
   resetValues(keepContent?: boolean, checkpointScope?: string): void {
+    this.resetSubagentCheckpointThreadIds();
     this.messages = [];
     this.cachedRunMessages = undefined;
     this.cachedDiscoveredTools = undefined;

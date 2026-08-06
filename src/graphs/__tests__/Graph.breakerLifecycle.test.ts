@@ -27,7 +27,10 @@ const makeTrip = (): StreamLimitExceededError =>
 
 type CompiledRegistrationInternals = {
   _compiledToolNodes: Set<{ clearDirectPathTurns(): void }>;
-  _subagentExecutors: Set<{ clearHeavyState(): void }>;
+  _subagentExecutors: Set<{
+    clearHeavyState(): void;
+    resetCheckpointThreadIds(): void;
+  }>;
 };
 
 describe('run breaker lifecycle', () => {
@@ -36,8 +39,12 @@ describe('run breaker lifecycle', () => {
     const internals = graph as unknown as CompiledRegistrationInternals;
     const clearDirectPathTurns = jest.fn();
     const clearSubagentState = jest.fn();
+    const resetCheckpointThreadIds = jest.fn();
     internals._compiledToolNodes.add({ clearDirectPathTurns });
-    internals._subagentExecutors.add({ clearHeavyState: clearSubagentState });
+    internals._subagentExecutors.add({
+      clearHeavyState: clearSubagentState,
+      resetCheckpointThreadIds,
+    });
 
     graph.clearHeavyState();
     graph.clearHeavyState();
@@ -46,6 +53,21 @@ describe('run breaker lifecycle', () => {
     expect(clearSubagentState).toHaveBeenCalledTimes(2);
     expect(internals._compiledToolNodes.size).toBe(1);
     expect(internals._subagentExecutors.size).toBe(1);
+  });
+
+  it('resets subagent checkpoint ownership at each fresh run start', () => {
+    const graph = makeGraph();
+    const internals = graph as unknown as CompiledRegistrationInternals;
+    const resetCheckpointThreadIds = jest.fn();
+    internals._subagentExecutors.add({
+      clearHeavyState: jest.fn(),
+      resetCheckpointThreadIds,
+    });
+
+    graph.resetValues();
+    graph.resetValues();
+
+    expect(resetCheckpointThreadIds).toHaveBeenCalledTimes(2);
   });
 
   it('replaces the breaker at every run start, even when un-aborted', () => {

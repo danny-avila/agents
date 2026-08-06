@@ -8,6 +8,8 @@ export const SUBAGENT_RESUME_MANIFEST_CONFIG_KEY =
   '__librechat_subagent_resume_manifest';
 export const SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY =
   '__librechat_subagent_resume_attempt';
+export const SUBAGENT_PARENT_BATCH_CONFIG_KEY =
+  '__librechat_subagent_parent_batch';
 
 const SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY =
   '__librechat_subagent_resume_manifest';

@@ -68,6 +68,7 @@ import type { HandlerRegistry } from '@/events';
 import {
   getSubagentResumeManifest,
   attachSubagentResumeManifest,
+  SUBAGENT_PARENT_BATCH_CONFIG_KEY,
   SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from './SubagentReplay';
@@ -541,11 +542,16 @@ function getChildThreadId(args: {
 }): string {
   const durableParentId = args.threadId ?? args.parentRunId;
   const parentFork = getParentCheckpointFork(args.parentConfigurable);
+  const parentBatch =
+    args.parentConfigurable?.[SUBAGENT_PARENT_BATCH_CONFIG_KEY];
   const identity = [
     durableParentId,
     parentFork,
     args.parentAgentId ?? 'agent',
     args.parentToolCallId,
+    typeof parentBatch === 'string' && parentBatch.length > 0
+      ? parentBatch
+      : 'batch',
   ];
   if (args.branchId != null) {
     identity.push(args.branchId);
@@ -1205,6 +1211,10 @@ export class SubagentExecutor {
       }
     }
     return [...threadIds];
+  }
+
+  resetCheckpointThreadIds(): void {
+    this.checkpointThreadIds.clear();
   }
 
   private getGraphChildCheckpointThreadIds(graph: StandardGraph): string[] {
@@ -2285,6 +2295,7 @@ function isLangGraphRuntimeConfigKey(key: string): boolean {
     LANGGRAPH_CHECKPOINT_CONFIG_KEYS.has(key) ||
     key === SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY ||
     key === SUBAGENT_RESUME_MANIFEST_CONFIG_KEY ||
+    key === SUBAGENT_PARENT_BATCH_CONFIG_KEY ||
     /** The parent batch's breaker scope must not leak into the child
      * workflow's configurable — children own separate controllers. */
     key === RUN_BREAKER_SCOPE_CONFIG_KEY

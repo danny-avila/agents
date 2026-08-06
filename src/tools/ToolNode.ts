@@ -58,6 +58,11 @@ import {
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
+  attachSubagentResumeManifest,
+  SUBAGENT_PARENT_BATCH_CONFIG_KEY,
+  SUBAGENT_REPLAY_CONTROLLER,
+} from '@/tools/subagent/SubagentReplay';
+import {
   INTENT_ARG,
   readOutcomeFields,
   resolveToolOutcome,
@@ -69,10 +74,6 @@ import {
   resolveRuntimeSessionHint,
   recordArgsEqual,
 } from '@/tools/eagerEventExecution';
-import {
-  attachSubagentResumeManifest,
-  SUBAGENT_REPLAY_CONTROLLER,
-} from '@/tools/subagent/SubagentReplay';
 import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
@@ -1598,9 +1599,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const replayController = (
       this.toolMap.get(call.name) as ReplayableSubagentTool | undefined
     )?.[SUBAGENT_REPLAY_CONTROLLER];
+    const replayConfig =
+      replayController == null || batchContext.replayBatchKey == null
+        ? config
+        : {
+          ...config,
+          configurable: {
+            ...config.configurable,
+            [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: batchContext.replayBatchKey,
+          },
+        };
     const settledOutput = await replayController?.getSettledOutput(
       call,
-      config
+      replayConfig
     );
     if (settledOutput != null) {
       if (
@@ -1661,7 +1672,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.toolOutputRegistry == null || refMeta?._refKey == null
           ? undefined
           : this.toolOutputRegistry.get(refMeta._refScope, refMeta._refKey);
-      await replayController?.persistSettledOutput(call, config, {
+      await replayController?.persistSettledOutput(call, replayConfig, {
         output,
         additionalContexts: replayAdditionalContexts,
         ...(resolvedArgs == null ? {} : { resolvedArgs }),
@@ -1703,7 +1714,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         !hasPostHook &&
         !hasFailureHook)
     ) {
-      const output = await this.runTool(call, config, batchContext);
+      const output = await this.runTool(call, replayConfig, batchContext);
       return output instanceof ToolMessage ? persistOutput(output) : output;
     }
 
@@ -1968,7 +1979,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             return persistOutput(
               new ToolMessage({
                 status: 'success',
-                content: responseText,
+                content: truncateToolResultContent(
+                  responseText,
+                  this.maxToolResultChars
+                ),
                 name: call.name,
                 tool_call_id: call.id ?? '',
               }),
@@ -2050,7 +2064,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       );
     }
 
-    const output = await this.runTool(effectiveCall, config, {
+    const output = await this.runTool(effectiveCall, replayConfig, {
       ...batchContext,
       usageCount,
     });

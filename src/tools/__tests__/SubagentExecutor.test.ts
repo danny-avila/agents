@@ -20,6 +20,7 @@ import {
   summarizeEvent,
 } from '../subagent';
 import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecutor';
+import { SUBAGENT_PARENT_BATCH_CONFIG_KEY } from '../subagent/SubagentReplay';
 import { Constants, Providers, GraphEvents, StepTypes } from '@/common';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { AgentContext } from '@/agents/AgentContext';
@@ -1618,6 +1619,7 @@ describe('SubagentExecutor', () => {
           checkpoint_id: 'parent-checkpoint-id',
           checkpoint_map: { parent: 'checkpoint' },
           checkpoint_ns: 'parent-checkpoint-ns',
+          [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'assistant-batch',
           requestBody: { messageId: 'msg-1' },
           thread_id: 'parent-thread',
           user: { id: 'user_abc' },
@@ -1634,6 +1636,7 @@ describe('SubagentExecutor', () => {
       expect(configurable.checkpoint_id).toBeUndefined();
       expect(configurable.checkpoint_map).toBeUndefined();
       expect(configurable.checkpoint_ns).toBeUndefined();
+      expect(configurable[SUBAGENT_PARENT_BATCH_CONFIG_KEY]).toBeUndefined();
       expect(configurable.requestBody).toEqual({ messageId: 'msg-1' });
       expect(configurable.thread_id).toBe('parent-thread');
       expect(configurable.user).toEqual({ id: 'user_abc' });
@@ -1697,6 +1700,62 @@ describe('SubagentExecutor', () => {
       expect(childThreadIds[0]).toMatch(/^subagent:/);
       expect(childThreadIds[1]).toMatch(/^subagent:/);
       expect(childThreadIds[0]).not.toBe(childThreadIds[1]);
+    });
+
+    it('isolates reused tool-call IDs across assistant batches', async () => {
+      const invokedThreadIds: string[] = [];
+      const executor = createExecutor({
+        humanInTheLoop: { enabled: true },
+        createChildGraph: (): StandardGraph =>
+          ({
+            createWorkflow: () => ({
+              getState: jest.fn().mockResolvedValue({
+                values: {},
+                next: [],
+                tasks: [],
+              }),
+              invoke: jest
+                .fn()
+                .mockImplementation(
+                  async (
+                    _input: unknown,
+                    invokeConfig: Record<string, unknown>
+                  ): Promise<{ messages: BaseMessage[] }> => {
+                    invokedThreadIds.push(
+                      (invokeConfig.configurable as Record<string, unknown>)
+                        .thread_id as string
+                    );
+                    return { messages: [new AIMessage('done')] };
+                  }
+                ),
+            }),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph,
+      });
+      const common = {
+        description: 'task',
+        subagentType: 'researcher',
+        threadId: 'parent-thread',
+        parentToolCallId: 'call_reused',
+      };
+
+      await executor.execute({
+        ...common,
+        parentConfigurable: {
+          thread_id: 'parent-thread',
+          [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'assistant-batch-1',
+        },
+      });
+      await executor.execute({
+        ...common,
+        parentConfigurable: {
+          thread_id: 'parent-thread',
+          [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'assistant-batch-2',
+        },
+      });
+
+      expect(invokedThreadIds).toHaveLength(2);
+      expect(invokedThreadIds[0]).not.toBe(invokedThreadIds[1]);
     });
 
     it('keeps ambiguous parent agent and tool-call components collision-free', async () => {
@@ -1781,6 +1840,9 @@ describe('SubagentExecutor', () => {
 
       expect(beforeCleanup).toHaveLength(1);
       expect(executor.getChildCheckpointThreadIds()).toEqual(beforeCleanup);
+
+      executor.resetCheckpointThreadIds();
+      expect(executor.getChildCheckpointThreadIds()).toEqual([]);
     });
 
     it('includes checkpoint threads from active descendant graphs', async () => {
