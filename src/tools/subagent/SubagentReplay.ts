@@ -17,6 +17,11 @@ const SUBAGENT_RESUME_WRAPPED_PAYLOAD_KEY =
   '__librechat_subagent_resume_payload';
 const SUBAGENT_RESUME_WRAPPER_VERSION_KEY =
   '__librechat_subagent_resume_wrapper';
+const SUBAGENT_RESUME_PRIVATE_PAYLOAD_KEYS = [
+  SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY,
+  SUBAGENT_RESUME_WRAPPED_PAYLOAD_KEY,
+  SUBAGENT_RESUME_WRAPPER_VERSION_KEY,
+] as const;
 const MAX_RESUME_MANIFEST_DEPTH = 32;
 
 export interface SubagentCheckpointReference {
@@ -436,21 +441,56 @@ export function requireValidSubagentResumeManifest(
   return manifest;
 }
 
+function canAttachSubagentResumeManifestInline(
+  payload: unknown
+): payload is Record<string, unknown> {
+  if (
+    payload == null ||
+    typeof payload !== 'object' ||
+    Array.isArray(payload) ||
+    Object.getPrototypeOf(payload) !== Object.prototype
+  ) {
+    return false;
+  }
+  return SUBAGENT_RESUME_PRIVATE_PAYLOAD_KEYS.every(
+    (key) => !Object.prototype.hasOwnProperty.call(payload, key)
+  );
+}
+
+function isInlineSubagentResumePayload(
+  payload: unknown
+): payload is PayloadWithSubagentResumeManifest & Record<string, unknown> {
+  return (
+    payload != null &&
+    typeof payload === 'object' &&
+    !Array.isArray(payload) &&
+    Object.getPrototypeOf(payload) === Object.prototype &&
+    !Object.prototype.hasOwnProperty.call(
+      payload,
+      SUBAGENT_RESUME_WRAPPER_VERSION_KEY
+    ) &&
+    !Object.prototype.hasOwnProperty.call(
+      payload,
+      SUBAGENT_RESUME_WRAPPED_PAYLOAD_KEY
+    ) &&
+    getSubagentResumeManifest(payload) != null
+  );
+}
+
 export function attachSubagentResumeManifest(
   payload: unknown,
   manifest: SubagentResumeManifest
 ): object {
-  if (isWrappedSubagentResumePayload(payload)) {
+  if (
+    isWrappedSubagentResumePayload(payload) ||
+    isInlineSubagentResumePayload(payload)
+  ) {
     return {
       ...payload,
       [SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY]: manifest,
     };
   }
-  if (
-    payload == null ||
-    typeof payload !== 'object' ||
-    Array.isArray(payload)
-  ) {
+  if (!canAttachSubagentResumeManifestInline(payload)) {
     return {
       [SUBAGENT_RESUME_WRAPPER_VERSION_KEY]: 1,
       [SUBAGENT_RESUME_WRAPPED_PAYLOAD_KEY]: payload,
@@ -470,10 +510,7 @@ export function stripSubagentResumeManifest(payload: unknown): unknown {
   if (
     payload == null ||
     typeof payload !== 'object' ||
-    !Object.prototype.hasOwnProperty.call(
-      payload,
-      SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY
-    )
+    getSubagentResumeManifest(payload) == null
   ) {
     return payload;
   }
@@ -487,21 +524,23 @@ export function stripSubagentResumeManifest(payload: unknown): unknown {
 function isWrappedSubagentResumePayload(
   payload: unknown
 ): payload is WrappedSubagentResumePayload {
+  if (
+    payload == null ||
+    typeof payload !== 'object' ||
+    Array.isArray(payload) ||
+    Object.getPrototypeOf(payload) !== Object.prototype ||
+    Object.keys(payload).length !== SUBAGENT_RESUME_PRIVATE_PAYLOAD_KEYS.length
+  ) {
+    return false;
+  }
+  const wrapper = payload as Partial<WrappedSubagentResumePayload>;
   return (
-    payload != null &&
-    typeof payload === 'object' &&
-    !Array.isArray(payload) &&
-    (payload as Partial<WrappedSubagentResumePayload>)[
-      SUBAGENT_RESUME_WRAPPER_VERSION_KEY
-    ] === 1 &&
+    wrapper[SUBAGENT_RESUME_WRAPPER_VERSION_KEY] === 1 &&
     Object.prototype.hasOwnProperty.call(
-      payload,
+      wrapper,
       SUBAGENT_RESUME_WRAPPED_PAYLOAD_KEY
     ) &&
-    Object.prototype.hasOwnProperty.call(
-      payload,
-      SUBAGENT_RESUME_MANIFEST_PAYLOAD_KEY
-    )
+    getSubagentResumeManifest(wrapper) != null
   );
 }
 

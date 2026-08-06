@@ -98,6 +98,84 @@ describe('SubagentReplay manifest', () => {
     }
   );
 
+  it.each([
+    ['Map', new Map([['decision', 'approve']])],
+    ['Set', new Set(['approve'])],
+    ['RegExp', /^approve$/i],
+  ])(
+    'round-trips a private manifest around a %s interrupt payload',
+    (_label, visiblePayload) => {
+      const manifest = { version: 1 as const, executions: [execution] };
+      const payload = attachSubagentResumeManifest(visiblePayload, manifest);
+
+      expect(getSubagentResumeManifest(payload)).toEqual(manifest);
+      expect(stripSubagentResumeManifest(payload)).toBe(visiblePayload);
+    }
+  );
+
+  it.each([
+    {
+      __librechat_subagent_resume_manifest: { visible: true },
+      value: 'manifest collision',
+    },
+    {
+      __librechat_subagent_resume_wrapper: 1,
+      __librechat_subagent_resume_payload: 'visible nested value',
+      value: 'wrapper collision',
+    },
+  ])(
+    'preserves a custom payload containing private transport keys',
+    (value) => {
+      const manifest = { version: 1 as const, executions: [execution] };
+      const payload = attachSubagentResumeManifest(value, manifest);
+
+      expect(stripSubagentResumeManifest(value)).toBe(value);
+      expect(getSubagentResumeManifest(payload)).toEqual(manifest);
+      expect(stripSubagentResumeManifest(payload)).toBe(value);
+    }
+  );
+
+  it('updates the manifest on an existing inline payload', () => {
+    const firstManifest = { version: 1 as const, executions: [execution] };
+    const nextManifest = {
+      version: 1 as const,
+      executions: [{ ...execution, childRunId: 'next-inline-child-run' }],
+    };
+    const firstPayload = attachSubagentResumeManifest(
+      { type: 'tool_approval', visible: true },
+      firstManifest
+    );
+    const nextPayload = attachSubagentResumeManifest(
+      firstPayload,
+      nextManifest
+    );
+
+    expect(getSubagentResumeManifest(nextPayload)).toEqual(nextManifest);
+    expect(stripSubagentResumeManifest(nextPayload)).toEqual({
+      type: 'tool_approval',
+      visible: true,
+    });
+  });
+
+  it('updates the manifest on an existing private wrapper', () => {
+    const firstManifest = { version: 1 as const, executions: [execution] };
+    const nextManifest = {
+      version: 1 as const,
+      executions: [{ ...execution, childRunId: 'next-child-run' }],
+    };
+    const firstPayload = attachSubagentResumeManifest(
+      'visible payload',
+      firstManifest
+    );
+    const nextPayload = attachSubagentResumeManifest(
+      firstPayload,
+      nextManifest
+    );
+
+    expect(getSubagentResumeManifest(nextPayload)).toEqual(nextManifest);
+    expect(stripSubagentResumeManifest(nextPayload)).toBe('visible payload');
+  });
+
   it('rejects ambiguous or cross-execution replay data', () => {
     const mismatchedScope = {
       ...execution,
