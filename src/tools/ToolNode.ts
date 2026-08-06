@@ -25,8 +25,8 @@ import type {
   ToolRuntime,
   StructuredToolInterface,
 } from '@langchain/core/tools';
-import type { BaseMessage } from '@langchain/core/messages';
 import type { LangGraphRunnableConfig } from '@langchain/langgraph';
+import type { BaseMessage } from '@langchain/core/messages';
 import type {
   ToolOutputResolveView,
   PreResolvedArgsMap,
@@ -39,6 +39,7 @@ import type {
   AggregatedHookResult,
   PostToolBatchEntry,
 } from '@/hooks';
+import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
 import {
   cloneToolMessageWithContent,
@@ -74,16 +75,15 @@ import {
   truncateToolResultContent,
 } from '@/utils/truncation';
 import {
+  StreamLimitExceededError,
+  RUN_BREAKER_SCOPE_CONFIG_KEY,
+} from '@/llm/streamLimits';
+import {
   resolveLocalToolRegistry,
   resolveLocalExecutionTools,
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
-import type { RunBreakerScope } from '@/llm/streamLimits';
-import {
-  StreamLimitExceededError,
-  RUN_BREAKER_SCOPE_CONFIG_KEY,
-} from '@/llm/streamLimits';
 
 /** Host-facing batch requests must not carry the batch's breaker scope —
  * hosts spread `configurable` into their own run configs. */
@@ -3051,7 +3051,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               // match it at the top level too.
               agentId: this.executingAgentId,
               configurable: stripRunBreakerScope(
-                config.configurable as Record<string, unknown> | undefined
+                  config.configurable as Record<string, unknown> | undefined
               ),
               metadata: config.metadata as
                   | Record<string, unknown>
@@ -3732,14 +3732,28 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
     }
 
-    // Interrupting group first. A GraphInterrupt here propagates out of the
-    // `await` before any regular sibling is dispatched below.
-    const interruptingOutputs = await Promise.all(
+    // Interrupting group first. Wait for every sibling to settle before
+    // propagating an interrupt so approved subagents cannot keep running in
+    // the background while the parent exposes the next pending approval.
+    const interruptingResults = await Promise.allSettled(
       interruptingPositions.map((i) => runOne(directCalls[i], i))
     );
-    interruptingPositions.forEach((i, k) => {
-      outputs[i] = interruptingOutputs[k];
-    });
+    let hasInterruptingError = false;
+    let interruptingError: unknown;
+    for (let i = 0; i < interruptingResults.length; i++) {
+      const result = interruptingResults[i];
+      if (result.status === 'rejected') {
+        if (!hasInterruptingError) {
+          hasInterruptingError = true;
+          interruptingError = result.reason;
+        }
+        continue;
+      }
+      outputs[interruptingPositions[i]] = result.value;
+    }
+    if (hasInterruptingError) {
+      throw interruptingError;
+    }
 
     /** The breaker can trip while the interrupting group is awaited — e.g.
      * a tool that ignores cancellation and completes normally. Recheck
@@ -3999,9 +4013,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         : (aiMessage.invalid_tool_calls ?? []).filter(
           (call) =>
             call.id != null &&
-            call.id !== '' &&
-            !toolMessageIds.has(call.id) &&
-            !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+              call.id !== '' &&
+              !toolMessageIds.has(call.id) &&
+              !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
         );
       invalidCallResults = attributableInvalidCalls.map(
         (call) =>
@@ -4240,7 +4254,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         );
         // Append accumulated additionalContexts as a single
         // HumanMessage so the next model turn sees them. Codex P2 #39.
-        const promotedPrefix = promotedAiMessage != null ? [promotedAiMessage] : [];
+        const promotedPrefix =
+          promotedAiMessage != null ? [promotedAiMessage] : [];
         outputs =
           directAdditionalContexts.length > 0
             ? [
@@ -4301,8 +4316,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         isCommand(output)
           ? patchCommandUpdateForPromotedInvalidCalls(
             output,
-            promotedAiMessage!,
-            invalidCallResults
+              promotedAiMessage!,
+              invalidCallResults
           )
           : output
       );
@@ -4498,8 +4513,7 @@ function sanitizeInvalidToolUseBlocks(
     /** `name` normalizes with the SAME fallback the promoted `tool_calls`
      *  entry uses — a nameless block would fail provider validation on its
      *  own even with a valid input. */
-    const nameIsValid =
-      typeof toolUse.name === 'string' && toolUse.name !== '';
+    const nameIsValid = typeof toolUse.name === 'string' && toolUse.name !== '';
     if (inputIsObject && nameIsValid) {
       return block;
     }
@@ -4571,9 +4585,7 @@ function patchCommandUpdateForPromotedInvalidCalls(
     if (!isAIMessage(msg) || msg.id !== promoted.id) {
       return msg;
     }
-    const existingIds = new Set(
-      (msg.tool_calls ?? []).map((call) => call.id)
-    );
+    const existingIds = new Set((msg.tool_calls ?? []).map((call) => call.id));
     const promotedEntries = invalidResults
       .filter((result) => !existingIds.has(result.tool_call_id))
       .map((result) => ({

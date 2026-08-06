@@ -61,14 +61,6 @@ import {
   removePredecessorHandoffCue,
 } from '@/messages';
 import {
-  attemptInvoke,
-  tryFallbackProviders,
-  getFallbackErrorContext,
-  getFallbackOverflowCandidates,
-  projectMessagesForProvider,
-  resolveServingModelId,
-} from '@/llm/invoke';
-import {
   resetIfNotEmpty,
   isAnthropicLike,
   isOpenAILike,
@@ -79,6 +71,21 @@ import {
   joinKeys,
   sleep,
 } from '@/utils';
+import {
+  attemptInvoke,
+  tryFallbackProviders,
+  getFallbackErrorContext,
+  getFallbackOverflowCandidates,
+  projectMessagesForProvider,
+  resolveServingModelId,
+} from '@/llm/invoke';
+import {
+  resolveStreamLimits,
+  StreamLimitExceededError,
+  sweepStaleStreamLimitEntries,
+  STREAM_LIMIT_EPOCH_KEY,
+  RUN_BREAKER_SCOPE_CONFIG_KEY,
+} from '@/llm/streamLimits';
 import {
   Constants,
   GraphNodeKeys,
@@ -122,13 +129,6 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
-import {
-  resolveStreamLimits,
-  StreamLimitExceededError,
-  sweepStaleStreamLimitEntries,
-  STREAM_LIMIT_EPOCH_KEY,
-  RUN_BREAKER_SCOPE_CONFIG_KEY,
-} from '@/llm/streamLimits';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
@@ -853,6 +853,10 @@ export abstract class Graph<
       node.clearDirectPathTurns();
     }
     this._compiledToolNodes.clear();
+    for (const executor of this._subagentExecutors) {
+      executor.clearHeavyState();
+    }
+    this._subagentExecutors.clear();
     this.sessions.clear();
   }
 
@@ -908,6 +912,10 @@ export abstract class Graph<
     this._compiledToolNodes.add(node);
   }
 
+  protected registerSubagentExecutor(executor: SubagentExecutor): void {
+    this._subagentExecutors.add(executor);
+  }
+
   /**
    * Returns the shared `ToolOutputReferenceRegistry` for this run,
    * constructing it on first access. Returns `undefined` when the
@@ -958,6 +966,7 @@ export abstract class Graph<
   private _compiledToolNodes: Set<{
     clearDirectPathTurns(): void;
   }> = new Set();
+  private _subagentExecutors = new Set<SubagentExecutor>();
   public getOrCreateFileCheckpointer(): t.LocalFileCheckpointer | undefined {
     // Return the cached instance unconditionally if one exists. The
     // toolExecution check below decides whether to *create* a new
@@ -1058,8 +1067,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * generation key + chunk index (see `resolveGenerationKey`). Per-run
    * accumulation state, cleared by both reset paths.
    */
-  streamedToolCallArgTallies: Map<string, StreamedToolCallArgTally> =
-    new Map();
+  streamedToolCallArgTallies: Map<string, StreamedToolCallArgTally> = new Map();
   /** Streamed chunk events per model generation, keyed by generation key. */
   streamDeltaEventCounts: Map<string, StreamDeltaEventTally> = new Map();
   /** Per-chunk-object, per-generation charge balances (lazily created; see
@@ -1798,6 +1806,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       runLangfuse: this.langfuse,
       agentLangfuse: agentContext?.langfuse,
     });
+    const interruptingToolNames = new Set(this.interruptingToolNames ?? []);
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      (agentContext?.subagentConfigs?.length ?? 0) > 0
+    ) {
+      interruptingToolNames.add(Constants.SUBAGENT);
+    }
+    const effectiveInterruptingToolNames =
+      interruptingToolNames.size > 0 ? interruptingToolNames : undefined;
 
     if (eventDrivenMode) {
       const schemaTools = createSchemaOnlyTools(toolDefinitions);
@@ -1849,11 +1866,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         eagerEventToolSuppressions: this.eagerEventToolSuppressions,
         toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
-        interruptingToolNames:
-          this.interruptingToolNames != null &&
-          this.interruptingToolNames.length > 0
-            ? new Set(this.interruptingToolNames)
-            : undefined,
+        interruptingToolNames: effectiveInterruptingToolNames,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
@@ -1916,11 +1929,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       sessions: this.sessions,
       toolExecution: this.toolExecution,
       codeSessionToolNames: this.codeSessionToolNames,
-      interruptingToolNames:
-        this.interruptingToolNames != null &&
-        this.interruptingToolNames.length > 0
-          ? new Set(this.interruptingToolNames)
-          : undefined,
+      interruptingToolNames: effectiveInterruptingToolNames,
       hookRegistry: this.hookRegistry,
       humanInTheLoop: this.humanInTheLoop,
       maxContextTokens: agentContext?.maxContextTokens,
@@ -3377,7 +3386,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * would start new provider work after the run-wide breaker fired.
          * Rethrow the breaker's own stream-limit reason instead. */
         {
-          const trippedReason = this.resolveTrippedBreakerReason(attemptBreaker.signal);
+          const trippedReason = this.resolveTrippedBreakerReason(
+            attemptBreaker.signal
+          );
           if (trippedReason != null) {
             throw trippedReason;
           }
@@ -3624,7 +3635,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           }
           {
             /** Same sibling-abort translation guard as the primary catch. */
-            const trippedReason = this.resolveTrippedBreakerReason(attemptBreaker.signal);
+            const trippedReason = this.resolveTrippedBreakerReason(
+              attemptBreaker.signal
+            );
             if (trippedReason != null) {
               throw trippedReason;
             }
@@ -4061,6 +4074,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           tokenCounter: agentContext.tokenCounter,
           usageSink: this.subagentUsageSink,
           streamLimits: this.streamLimits,
+          humanInTheLoop: this.humanInTheLoop,
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {
             const childGraph = new StandardGraph(input);
@@ -4072,12 +4086,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               getParentHandlerRegistry()
             );
             childGraph.hookRegistry = this.hookRegistry;
-            /**
-             * Do not propagate `humanInTheLoop` into the child graph yet:
-             * nested subagent interrupts need a stable child checkpoint and
-             * resume bridge. Child hooks still fire; `ask` decisions fail
-             * closed inside the subagent until that flow is implemented.
-             */
+            childGraph.humanInTheLoop = this.humanInTheLoop;
+            if (this.humanInTheLoop?.enabled === true) {
+              childGraph.compileOptions = {
+                checkpointer: this.compileOptions?.checkpointer,
+              };
+            }
             childGraph.toolOutputReferences = this.toolOutputReferences;
             childGraph.eagerEventToolExecution = this.eagerEventToolExecution;
             childGraph.codeSessionToolNames = this.codeSessionToolNames;
@@ -4099,6 +4113,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             return childGraph;
           },
         });
+        this.registerSubagentExecutor(executor);
 
         const subagentTool = tool(async (rawInput, config) => {
           const input = rawInput as {
@@ -4113,20 +4128,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const subagentType =
             typeof input.subagent_type === 'string' ? input.subagent_type : '';
           const threadId = config.configurable?.thread_id as string | undefined;
-          /**
-           * When the tool is dispatched from an LLM's `tool_call`, LangChain
-           * threads the originating `ToolCall` onto the RunnableConfig as
-           * `config.toolCall` (see `ToolRunnableConfig` in
-           * `@langchain/core/tools` — internal but stable since ≥0.3.x).
-           * Surfacing its id lets hosts correlate `SubagentUpdateEvent`s
-           * back to the parent's `tool_call_id` deterministically — no
-           * temporal heuristics needed. If a future LangChain version
-           * changes the threading, the type-guarded read falls back to
-           * `undefined` and the correlation degrades gracefully.
-           */
-          const toolCall = (config as { toolCall?: { id?: string } }).toolCall;
-          const parentToolCallId =
-            typeof toolCall?.id === 'string' ? toolCall.id : undefined;
+          /** Surface the parent call id so child checkpoints, interrupts, and
+           * update events remain correlated across replay and resume. */
+          const toolRuntime = config as {
+            toolCallId?: string;
+            toolCall?: { id?: string };
+          };
+          const toolCall = toolRuntime.toolCall;
+          let parentToolCallId: string | undefined;
+          if (
+            typeof toolRuntime.toolCallId === 'string' &&
+            toolRuntime.toolCallId !== ''
+          ) {
+            parentToolCallId = toolRuntime.toolCallId;
+          } else if (typeof toolCall?.id === 'string' && toolCall.id !== '') {
+            parentToolCallId = toolCall.id;
+          }
           /** The parent tool batch's entry-captured scope (stamped by
            * ToolNode before PreToolUse hooks) — binds this child to the
            * run that dispatched it, not to whatever controller a reset

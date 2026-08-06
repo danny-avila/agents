@@ -1,3 +1,4 @@
+import { MemorySaver } from '@langchain/langgraph';
 import { HumanMessage } from '@langchain/core/messages';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import type { ToolCall } from '@langchain/core/messages/tool';
@@ -47,14 +48,17 @@ const callerConfig = {
 
 const originalGetChatModelClass = providers.getChatModelClass;
 
-function makeSubagentToolCall(): ToolCall {
+function makeSubagentToolCall(
+  id = `call_sub_${Date.now()}`,
+  description = 'Test task for hook verification'
+): ToolCall {
   return {
     name: Constants.SUBAGENT,
     args: {
-      description: 'Test task for hook verification',
+      description,
       subagent_type: 'researcher',
     },
-    id: `call_sub_${Date.now()}`,
+    id,
     type: 'tool_call',
   };
 }
@@ -115,6 +119,34 @@ function createCalculatorToolCall(): ToolCall {
     id: 'call_child_calculator',
     type: 'tool_call',
   };
+}
+
+class HitlChildFakeChatModel extends FakeChatModel {
+  constructor(_options: object) {
+    super({ responses: [CHILD_RESPONSE], sleep: 1 });
+  }
+
+  _streamResponseChunks(
+    messages: Parameters<FakeChatModel['_streamResponseChunks']>[0],
+    options: Parameters<FakeChatModel['_streamResponseChunks']>[1],
+    runManager?: Parameters<FakeChatModel['_streamResponseChunks']>[2]
+  ): ReturnType<FakeChatModel['_streamResponseChunks']> {
+    const hasToolResult = messages.some(
+      (message) => message._getType() === 'tool'
+    );
+    return new FakeChatModel({
+      responses: [hasToolResult ? CHILD_RESPONSE : 'Using calculator.'],
+      sleep: 1,
+      toolCalls: hasToolResult ? [] : [createCalculatorToolCall()],
+    })._streamResponseChunks(messages, options, runManager);
+  }
+
+  bindTools(tools: unknown): ReturnType<FakeChatModel['withConfig']> {
+    const config = {
+      tools,
+    } as Parameters<FakeChatModel['withConfig']>[0];
+    return this.withConfig(config);
+  }
 }
 
 async function createSubagentRun(
@@ -489,53 +521,185 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     expect(dispatchAgentIds).toEqual(['hook-parent']);
   });
 
-  it('child subagent tool ask hooks fail closed instead of starting unsupported nested HITL', async () => {
+  it.each([
+    {
+      label: 'approve',
+      resumeDecision: { type: 'approve' } as const,
+      shouldExecute: true,
+      deniedReason: undefined,
+    },
+    {
+      label: 'reject',
+      resumeDecision: {
+        type: 'reject',
+        reason: 'host rejected child tool',
+      } as const,
+      shouldExecute: false,
+      deniedReason: 'host rejected child tool',
+    },
+    {
+      label: 'deny',
+      resumeDecision: undefined,
+      shouldExecute: false,
+      deniedReason: 'policy denied child tool',
+    },
+  ])(
+    'handles a child subagent tool $label through the parent Run',
+    async ({ resumeDecision, shouldExecute, deniedReason }) => {
+      getChatModelClassSpy.mockImplementation(((provider: Providers) => {
+        if (provider === Providers.OPENAI) {
+          return HitlChildFakeChatModel;
+        }
+        return originalGetChatModelClass(provider);
+      }) as typeof providers.getChatModelClass);
+
+      const registry = new HookRegistry();
+      const deniedTools: string[] = [];
+      const executedTools: string[] = [];
+      let calculatorPreToolCalls = 0;
+      let calculatorPostToolCalls = 0;
+
+      const preHook: HookCallback<'PreToolUse'> = async (
+        input
+      ): Promise<PreToolUseHookOutput> => {
+        if (input.toolName === 'calculator') {
+          calculatorPreToolCalls += 1;
+          if (resumeDecision == null) {
+            return {
+              decision: 'deny',
+              reason: 'policy denied child tool',
+            };
+          }
+          return { decision: 'ask', reason: 'review calculator' };
+        }
+        return { decision: 'allow' };
+      };
+      registry.register('PreToolUse', { hooks: [preHook] });
+      registry.register('PostToolUse', {
+        hooks: [
+          async (input): Promise<PostToolUseHookOutput> => {
+            if (input.toolName === 'calculator') {
+              calculatorPostToolCalls += 1;
+            }
+            return {};
+          },
+        ],
+      });
+
+      const deniedHook: HookCallback<'PermissionDenied'> = async (
+        input
+      ): Promise<PermissionDeniedHookOutput> => {
+        deniedTools.push(
+          `${input.agentId ?? '-'}:${input.toolName}:${input.reason}`
+        );
+        return {};
+      };
+      registry.register('PermissionDenied', { hooks: [deniedHook] });
+
+      const customHandlers: Record<string, t.EventHandler> = {
+        [GraphEvents.TOOL_END]: new ToolEndHandler(),
+        [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+        [GraphEvents.ON_TOOL_EXECUTE]: {
+          handle: (_event, rawData): void => {
+            const request = rawData as t.ToolExecuteBatchRequest;
+            executedTools.push(...request.toolCalls.map((call) => call.name));
+            const results: t.ToolExecuteResult[] = request.toolCalls.map(
+              (call) => ({
+                toolCallId: call.id,
+                status: 'success',
+                content: '42',
+              })
+            );
+            request.resolve(results);
+          },
+        },
+      };
+
+      const run = await Run.create<t.IState>({
+        runId: `subagent-tool-ask-${Date.now()}`,
+        graphConfig: {
+          type: 'standard',
+          agents: [createParentAgentWithChildTool()],
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers,
+        hooks: registry,
+        humanInTheLoop: { enabled: true },
+      });
+
+      const tc = makeSubagentToolCall();
+      run.Graph!.overrideTestModel(['Delegating...', 'Final answer.'], 5, [tc]);
+
+      await run.processStream(
+        { messages: [new HumanMessage('calculate something')] },
+        callerConfig
+      );
+
+      if (resumeDecision == null) {
+        expect(run.getInterrupt()).toBeUndefined();
+        expect(calculatorPreToolCalls).toBe(1);
+        expect(executedTools).not.toContain('calculator');
+        expect(deniedTools).toEqual([
+          `researcher-child:calculator:${deniedReason}`,
+        ]);
+        return;
+      }
+
+      const pending = run.getInterrupt();
+      expect(pending?.payload).toMatchObject({
+        type: 'tool_approval',
+        subagent: {
+          agent_id: 'researcher-child',
+          parent_tool_call_id: tc.id,
+          subagent_type: 'researcher',
+        },
+      });
+      expect(executedTools).not.toContain('calculator');
+
+      await run.resume([resumeDecision], callerConfig);
+
+      expect(run.getInterrupt()).toBeUndefined();
+      expect(calculatorPreToolCalls).toBe(2);
+      expect(
+        executedTools.filter((name) => name === 'calculator')
+      ).toHaveLength(shouldExecute ? 1 : 0);
+      expect(calculatorPostToolCalls).toBe(shouldExecute ? 1 : 0);
+      expect(deniedTools).toEqual(
+        shouldExecute ? [] : [`researcher-child:calculator:${deniedReason}`]
+      );
+    }
+  );
+
+  it('resumes approvals across multiple subagents and keeps updates sanitized', async () => {
     getChatModelClassSpy.mockImplementation(((provider: Providers) => {
       if (provider === Providers.OPENAI) {
-        return class extends FakeChatModel {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          constructor(_options: any) {
-            super({
-              responses: ['Using calculator.', CHILD_RESPONSE],
-              sleep: 1,
-              toolCalls: [createCalculatorToolCall()],
-            });
-          }
-          bindTools(tools: unknown): ReturnType<FakeChatModel['withConfig']> {
-            const config = {
-              tools,
-            } as Parameters<FakeChatModel['withConfig']>[0];
-            return this.withConfig(config);
-          }
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        } as any;
+        return HitlChildFakeChatModel;
       }
       return originalGetChatModelClass(provider);
     }) as typeof providers.getChatModelClass);
 
     const registry = new HookRegistry();
-    const deniedTools: string[] = [];
-    const executedTools: string[] = [];
+    const deniedToolIds: string[] = [];
+    const executedToolIds: string[] = [];
+    const updates: t.SubagentUpdateEvent[] = [];
 
-    const preHook: HookCallback<'PreToolUse'> = async (
-      input
-    ): Promise<PreToolUseHookOutput> => {
-      if (input.toolName === 'calculator') {
-        return { decision: 'ask', reason: 'review calculator' };
-      }
-      return { decision: 'allow' };
-    };
-    registry.register('PreToolUse', { hooks: [preHook] });
-
-    const deniedHook: HookCallback<'PermissionDenied'> = async (
-      input
-    ): Promise<PermissionDeniedHookOutput> => {
-      deniedTools.push(
-        `${input.agentId ?? '-'}:${input.toolName}:${input.reason}`
-      );
-      return {};
-    };
-    registry.register('PermissionDenied', { hooks: [deniedHook] });
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> =>
+          input.toolName === 'calculator'
+            ? { decision: 'ask', reason: 'review child calculator' }
+            : { decision: 'allow' },
+      ],
+    });
+    registry.register('PermissionDenied', {
+      hooks: [
+        async (input): Promise<PermissionDeniedHookOutput> => {
+          deniedToolIds.push(input.toolUseId);
+          return {};
+        },
+      ],
+    });
 
     const customHandlers: Record<string, t.EventHandler> = {
       [GraphEvents.TOOL_END]: new ToolEndHandler(),
@@ -543,21 +707,25 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       [GraphEvents.ON_TOOL_EXECUTE]: {
         handle: (_event, rawData): void => {
           const request = rawData as t.ToolExecuteBatchRequest;
-          executedTools.push(...request.toolCalls.map((call) => call.name));
-          const results: t.ToolExecuteResult[] = request.toolCalls.map(
-            (call) => ({
+          executedToolIds.push(...request.toolCalls.map((call) => call.id));
+          request.resolve(
+            request.toolCalls.map((call) => ({
               toolCallId: call.id,
-              status: 'success',
+              status: 'success' as const,
               content: '42',
-            })
+            }))
           );
-          request.resolve(results);
+        },
+      },
+      [GraphEvents.ON_SUBAGENT_UPDATE]: {
+        handle: (_event, data): void => {
+          updates.push(data as t.SubagentUpdateEvent);
         },
       },
     };
 
     const run = await Run.create<t.IState>({
-      runId: `subagent-tool-ask-${Date.now()}`,
+      runId: `subagent-multi-hitl-${Date.now()}`,
       graphConfig: {
         type: 'standard',
         agents: [createParentAgentWithChildTool()],
@@ -568,19 +736,155 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       hooks: registry,
       humanInTheLoop: { enabled: true },
     });
-
-    const tc = makeSubagentToolCall();
-    run.Graph!.overrideTestModel(['Delegating...', 'Final answer.'], 5, [tc]);
+    const first = makeSubagentToolCall(
+      'call_sub_first',
+      'Run the first calculation'
+    );
+    const second = makeSubagentToolCall(
+      'call_sub_second',
+      'Run the second calculation'
+    );
+    run.Graph!.overrideTestModel(['Delegating...', 'Final answer.'], 5, [
+      first,
+      second,
+    ]);
+    const multiCallerConfig = {
+      ...callerConfig,
+      configurable: {
+        thread_id: 'multi-subagent-hitl-thread',
+        access_token: 'must-not-leak',
+        requestBody: { currentTaskInput: 'must-not-leak-task' },
+        userMCPAuthMap: { private: { token: 'must-not-leak-mcp' } },
+      },
+    };
 
     await run.processStream(
-      { messages: [new HumanMessage('calculate something')] },
-      callerConfig
+      { messages: [new HumanMessage('calculate twice')] },
+      multiCallerConfig
+    );
+    expect(run.getInterrupt()?.payload).toMatchObject({
+      type: 'tool_approval',
+      subagent: { parent_tool_call_id: first.id },
+    });
+    expect(updates.some((event) => event.parentToolCallId === second.id)).toBe(
+      true
+    );
+
+    await run.resume([{ type: 'approve' }], multiCallerConfig);
+    expect(run.getInterrupt()?.payload).toMatchObject({
+      type: 'tool_approval',
+      subagent: { parent_tool_call_id: second.id },
+    });
+
+    await run.resume(
+      [{ type: 'reject', reason: 'reject second child' }],
+      multiCallerConfig
     );
 
     expect(run.getInterrupt()).toBeUndefined();
-    expect(deniedTools).toContain(
-      'researcher-child:calculator:review calculator'
+    expect(executedToolIds).toHaveLength(1);
+    expect(deniedToolIds).toHaveLength(1);
+    const firstPhases = updates
+      .filter((event) => event.parentToolCallId === first.id)
+      .map((event) => event.phase);
+    const secondPhases = updates
+      .filter((event) => event.parentToolCallId === second.id)
+      .map((event) => event.phase);
+    expect(firstPhases[0]).toBe('start');
+    expect(firstPhases[firstPhases.length - 1]).toBe('stop');
+    expect(secondPhases[0]).toBe('start');
+    expect(secondPhases[secondPhases.length - 1]).toBe('stop');
+    const serializedUpdates = JSON.stringify(updates);
+    expect(serializedUpdates).not.toContain('must-not-leak');
+    expect(serializedUpdates).not.toContain('currentTaskInput');
+    expect(serializedUpdates).not.toContain('userMCPAuthMap');
+    expect(serializedUpdates).not.toContain('checkpoint_');
+  });
+
+  it('resumes a child approval after rebuilding Run with the same checkpointer', async () => {
+    getChatModelClassSpy.mockImplementation(((provider: Providers) => {
+      if (provider === Providers.OPENAI) {
+        return HitlChildFakeChatModel;
+      }
+      return originalGetChatModelClass(provider);
+    }) as typeof providers.getChatModelClass);
+
+    const checkpointer = new MemorySaver();
+    const registry = new HookRegistry();
+    const executedTools: string[] = [];
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> =>
+          input.toolName === 'calculator'
+            ? { decision: 'ask', reason: 'review calculator' }
+            : { decision: 'allow' },
+      ],
+    });
+    const customHandlers: Record<string, t.EventHandler> = {
+      [GraphEvents.TOOL_END]: new ToolEndHandler(),
+      [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+      [GraphEvents.ON_TOOL_EXECUTE]: {
+        handle: (_event, rawData): void => {
+          const request = rawData as t.ToolExecuteBatchRequest;
+          executedTools.push(...request.toolCalls.map((call) => call.name));
+          request.resolve(
+            request.toolCalls.map((call) => ({
+              toolCallId: call.id,
+              status: 'success' as const,
+              content: '42',
+            }))
+          );
+        },
+      },
+    };
+    const runId = `subagent-rebuild-hitl-${Date.now()}`;
+    const createRun = (): Promise<Run<t.IState>> =>
+      Run.create<t.IState>({
+        runId,
+        graphConfig: {
+          type: 'standard',
+          agents: [createParentAgentWithChildTool()],
+          compileOptions: { checkpointer },
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers,
+        hooks: registry,
+        humanInTheLoop: { enabled: true },
+      });
+    const tc = makeSubagentToolCall('call_sub_rebuild');
+    const initialRun = await createRun();
+    initialRun.Graph!.overrideTestModel(['Delegating...', 'Final answer.'], 5, [
+      tc,
+    ]);
+
+    await initialRun.processStream(
+      { messages: [new HumanMessage('calculate after restart')] },
+      callerConfig
     );
-    expect(executedTools).not.toContain('calculator');
+    const persistedInterrupt = initialRun.getInterrupt();
+    expect(persistedInterrupt?.payload).toMatchObject({
+      type: 'tool_approval',
+      subagent: { parent_tool_call_id: tc.id },
+    });
+
+    const rebuiltRun = await createRun();
+    rebuiltRun.Graph!.overrideTestModel(['Final answer.'], 1);
+    const warningSpy = jest
+      .spyOn(console, 'warn')
+      .mockImplementation((): void => undefined);
+    try {
+      await rebuiltRun.resume(
+        {
+          [persistedInterrupt!.interruptId]: [{ type: 'approve' }],
+        },
+        callerConfig
+      );
+    } finally {
+      warningSpy.mockRestore();
+    }
+
+    expect(rebuiltRun.getInterrupt()).toBeUndefined();
+    expect(executedTools).toEqual(['calculator']);
   });
 });
