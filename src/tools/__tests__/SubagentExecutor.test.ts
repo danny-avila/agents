@@ -636,6 +636,38 @@ describe('SubagentExecutor', () => {
     expect(restored?.output.content).toBe('Subagent error: child failed');
   });
 
+  it('continues a recovered in-progress child without reseeding its task', async () => {
+    const invoke = jest.fn().mockResolvedValue({
+      messages: [new AIMessage('continued')],
+    });
+    const executor = createExecutor({
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({
+            getState: jest.fn().mockResolvedValue({
+              values: {},
+              next: ['child-agent'],
+              tasks: [],
+            }),
+            invoke,
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    const result = await executor.execute({
+      description: 'Do not duplicate this task',
+      subagentType: 'researcher',
+      threadId: 'durable-parent',
+      parentToolCallId: 'call_in_progress',
+    });
+
+    expect(result.content).toBe('continued');
+    expect(invoke).toHaveBeenCalledWith(null, expect.any(Object));
+  });
+
   it('preserves an existing nested approval scope', async () => {
     const nestedScope = {
       run_id: 'grandchild-run',
@@ -1662,9 +1694,93 @@ describe('SubagentExecutor', () => {
         (config) =>
           (config.configurable as Record<string, unknown>).thread_id as string
       );
-      expect(childThreadIds[0]).toContain('_sub_fork-a_');
-      expect(childThreadIds[1]).toContain('_sub_fork-b_');
+      expect(childThreadIds[0]).toMatch(/^subagent:/);
+      expect(childThreadIds[1]).toMatch(/^subagent:/);
       expect(childThreadIds[0]).not.toBe(childThreadIds[1]);
+    });
+
+    it('keeps ambiguous parent agent and tool-call components collision-free', async () => {
+      const invokedThreadIds: string[] = [];
+      const createChildGraph = (): StandardGraph =>
+        ({
+          createWorkflow: () => ({
+            getState: jest.fn().mockResolvedValue({
+              values: {},
+              next: [],
+              tasks: [],
+            }),
+            invoke: jest
+              .fn()
+              .mockImplementation(
+                async (
+                  _input: unknown,
+                  invokeConfig: Record<string, unknown>
+                ): Promise<{ messages: BaseMessage[] }> => {
+                  invokedThreadIds.push(
+                    (invokeConfig.configurable as Record<string, unknown>)
+                      .thread_id as string
+                  );
+                  return { messages: [new AIMessage('done')] };
+                }
+              ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+      const common = {
+        description: 'task',
+        subagentType: 'researcher',
+        threadId: 'parent',
+        parentConfigurable: { thread_id: 'parent' },
+      };
+
+      await createExecutor({
+        checkpointer: new MemorySaver(),
+        humanInTheLoop: { enabled: true },
+        parentAgentId: 'a_b',
+        createChildGraph,
+      }).execute({ ...common, parentToolCallId: 'c' });
+      await createExecutor({
+        checkpointer: new MemorySaver(),
+        humanInTheLoop: { enabled: true },
+        parentAgentId: 'a',
+        createChildGraph,
+      }).execute({ ...common, parentToolCallId: 'b_c' });
+
+      expect(invokedThreadIds).toHaveLength(2);
+      expect(invokedThreadIds[0]).not.toBe(invokedThreadIds[1]);
+    });
+
+    it('retains owned child checkpoint threads after heavy-state cleanup', async () => {
+      const executor = createExecutor({
+        checkpointer: new MemorySaver(),
+        humanInTheLoop: { enabled: true },
+        createChildGraph: (): StandardGraph =>
+          ({
+            createWorkflow: () => ({
+              getState: jest.fn().mockResolvedValue({
+                values: {},
+                next: [],
+                tasks: [],
+              }),
+              invoke: jest.fn().mockResolvedValue({
+                messages: [new AIMessage('done')],
+              }),
+            }),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph,
+      });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+        threadId: 'parent',
+        parentToolCallId: 'call_owned',
+      });
+      const beforeCleanup = executor.getChildCheckpointThreadIds();
+      executor.clearHeavyState();
+
+      expect(beforeCleanup).toHaveLength(1);
+      expect(executor.getChildCheckpointThreadIds()).toEqual(beforeCleanup);
     });
 
     it('does not require parentConfigurable (back-compat with hosts that omit it)', async () => {

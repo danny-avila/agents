@@ -924,6 +924,16 @@ export abstract class Graph<
     this._subagentExecutors.add(executor);
   }
 
+  getChildCheckpointThreadIds(): string[] {
+    const threadIds = new Set<string>();
+    for (const executor of this._subagentExecutors) {
+      for (const threadId of executor.getChildCheckpointThreadIds()) {
+        threadIds.add(threadId);
+      }
+    }
+    return [...threadIds];
+  }
+
   /**
    * Returns the shared `ToolOutputReferenceRegistry` for this run,
    * constructing it on first access. Returns `undefined` when the

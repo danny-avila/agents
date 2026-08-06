@@ -25,6 +25,9 @@ type MockRun = {
   >;
   getInterrupt: jest.MockedFunction<Run<t.IState>['getInterrupt']>;
   getHaltReason: jest.MockedFunction<Run<t.IState>['getHaltReason']>;
+  getChildCheckpointThreadIds: jest.MockedFunction<
+    Run<t.IState>['getChildCheckpointThreadIds']
+  >;
 };
 
 function createMockRun(outputText = 'ok'): MockRun {
@@ -45,6 +48,7 @@ function createMockRun(outputText = 'ok'): MockRun {
     getCalibrationRatio: jest.fn(() => 1),
     getInterrupt: jest.fn(() => undefined),
     getHaltReason: jest.fn(() => undefined),
+    getChildCheckpointThreadIds: jest.fn(() => []),
   };
 }
 
@@ -1117,6 +1121,55 @@ describe('JsonlSessionStore', () => {
       source: 'reset',
       reason: 'branch',
     });
+  });
+
+  it('records and resets child checkpoint threads owned by a run', async () => {
+    const checkpointer = new MemorySaver();
+    const childThreadId = 'subagent:owned-child';
+    const mockRun = createMockRun('child result');
+    mockRun.getChildCheckpointThreadIds.mockReturnValue([childThreadId]);
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await putCheckpoint({
+      checkpointer,
+      threadId: childThreadId,
+      id: 'checkpoint_child',
+    });
+
+    await session.run('fresh turn', { runId: 'run_with_child' });
+
+    expect(
+      session.getSessionStore()?.getCheckpoints(childThreadId).at(-1)?.data
+    ).toMatchObject({
+      source: 'run',
+      runId: 'run_with_child',
+      threadId: childThreadId,
+    });
+    const firstMessage = session
+      .getSessionStore()
+      ?.getPath()
+      .find((entry) => entry.type === 'message');
+    await session.branch(firstMessage?.id ?? '', { position: 'at' });
+
+    const tuple = await checkpointer.getTuple({
+      configurable: { thread_id: childThreadId },
+    });
+    expect(tuple).toBeUndefined();
+    expect(
+      session.getSessionStore()?.getCheckpoints(childThreadId).at(-1)?.data
+    ).toMatchObject({ source: 'reset', reason: 'branch' });
   });
 
   it('keeps checkpoint state when branching to the active JSONL leaf', async () => {

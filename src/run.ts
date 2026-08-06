@@ -571,6 +571,10 @@ export class Run<_T extends t.BaseGraphState> {
     return this.Graph.getRunMessages();
   }
 
+  getChildCheckpointThreadIds(): string[] {
+    return this.Graph?.getChildCheckpointThreadIds() ?? [];
+  }
+
   /**
    * Returns a defensive snapshot of tools discovered by the current run.
    * Pass an agent id for that context, or omit it for the ordered union across
