@@ -495,6 +495,24 @@ describe('SubagentExecutor', () => {
     expect(result.messages).toEqual([]);
   });
 
+  it('fails closed when resumable execution has no parent tool call ID', async () => {
+    const createChildGraph = jest.fn(makeNoopGraphFactory());
+    const executor = createExecutor({
+      humanInTheLoop: { enabled: true },
+      createChildGraph,
+    });
+
+    const result = await executor.execute({
+      description: 'Do something',
+      subagentType: 'researcher',
+      threadId: 'durable-thread',
+    });
+
+    expect(result.content).toContain('requires a parent tool call ID');
+    expect(result.messages).toEqual([]);
+    expect(createChildGraph).not.toHaveBeenCalled();
+  });
+
   it('preserves an existing nested approval scope', async () => {
     const nestedScope = {
       run_id: 'grandchild-run',

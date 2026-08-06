@@ -244,8 +244,6 @@ export class Run<_T extends t.BaseGraphState> {
       /** Default to legacy graph for 'standard' or undefined type */
       this.graphRunnable = this.createLegacyGraph(config.graphConfig);
       if (this.Graph) {
-        this.Graph.compileOptions =
-          config.graphConfig.compileOptions ?? this.Graph.compileOptions;
         this.Graph.handlerRegistry = handlerRegistry;
       }
     }

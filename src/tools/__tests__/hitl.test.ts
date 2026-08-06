@@ -1015,13 +1015,13 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
           },
         ],
         // Caller compileOptions without a checkpointer: HITL adds a MemorySaver
-        // fallback to the compiled graph, but the constructor restores this raw
-        // metadata (no checkpointer) onto Graph.compileOptions.
+        // fallback while preserving the caller's remaining compile options.
         compileOptions: { interruptBefore: [] },
       },
       humanInTheLoop: { enabled: true },
     });
-    expect(run.Graph?.compileOptions?.checkpointer).toBeUndefined();
+    expect(run.Graph?.compileOptions?.checkpointer).toBeInstanceOf(MemorySaver);
+    expect(run.Graph?.compileOptions?.interruptBefore).toEqual([]);
 
     const graph = new StateGraph(MessagesAnnotation)
       .addNode('noop', (): MessagesUpdate => ({ messages: [] }))

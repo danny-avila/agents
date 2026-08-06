@@ -740,6 +740,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       graphConfig: {
         type: 'standard',
         agents: [createParentAgentWithChildTool()],
+        compileOptions: { interruptBefore: [] },
       },
       returnContent: true,
       skipCleanup: true,

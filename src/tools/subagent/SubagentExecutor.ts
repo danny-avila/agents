@@ -507,6 +507,17 @@ export class SubagentExecutor {
       };
     }
 
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      (parentToolCallId == null || parentToolCallId === '')
+    ) {
+      return {
+        content:
+          'Error: Resumable subagent execution requires a parent tool call ID.',
+        messages: [],
+      };
+    }
+
     const executionSuffix = parentToolCallId ?? nanoid(8);
     const durableParentId = threadId ?? this.parentRunId;
     const childRunId = `${this.parentRunId}_sub_${executionSuffix}`;
