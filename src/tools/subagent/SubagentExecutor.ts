@@ -880,6 +880,10 @@ export class SubagentExecutor {
       branchId: this.parentRunId,
     });
     if (resumeExecution != null) {
+      await this.forkCheckpointSnapshot(
+        resumeExecution.checkpoints,
+        branchChildThreadId
+      );
       const configuredHookSessionId = params.parentConfigurable?.run_id;
       const hookSessionId =
         typeof configuredHookSessionId === 'string' &&
@@ -890,10 +894,6 @@ export class SubagentExecutor {
         hookSessionId,
         resumeExecution.childRunId,
         resumeExecution.approvalReplays
-      );
-      await this.forkCheckpointSnapshot(
-        resumeExecution.checkpoints,
-        branchChildThreadId
       );
       this.checkpointThreadIds.add(branchChildThreadId);
       return {
