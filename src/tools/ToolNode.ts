@@ -1832,15 +1832,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             const responseText = (decision as { responseText?: unknown })
               .responseText;
             if (typeof responseText !== 'string') {
-              return this.blockDirectCall({
-                call,
-                resolvedArgs,
-                reason:
-                  'Approval payload `respond` was missing a string `responseText`',
-                hookRegistry,
-                runId,
-                threadId,
-              });
+              return persistOutput(
+                this.blockDirectCall({
+                  call,
+                  resolvedArgs,
+                  reason:
+                    'Approval payload `respond` was missing a string `responseText`',
+                  hookRegistry,
+                  runId,
+                  threadId,
+                }),
+                effectiveCall.args as Record<string, unknown>
+              );
             }
             return persistOutput(
               new ToolMessage({
@@ -1885,6 +1888,21 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               args: updatedInput as Record<string, unknown>,
             };
             // fall through to executing the edited call
+          }
+          if (declaredType !== 'approve' && declaredType !== 'edit') {
+            const unknownType =
+              typeof declaredType === 'string' ? declaredType : '<missing>';
+            return persistOutput(
+              this.blockDirectCall({
+                call,
+                resolvedArgs,
+                reason: `Unknown approval decision type "${unknownType}" — failing closed`,
+                hookRegistry,
+                runId,
+                threadId,
+              }),
+              effectiveCall.args as Record<string, unknown>
+            );
           }
           // 'approve' (or 'edit' after applying edits) → fall through
         }

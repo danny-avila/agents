@@ -13,9 +13,15 @@ import {
 } from '@langchain/langgraph';
 import type { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
+import type {
+  ReplayableSubagentTool,
+  SettledSubagentToolOutput,
+} from '@/tools/subagent/SubagentReplay';
 import type { PreToolUseHookOutput } from '@/hooks';
 import type * as t from '@/types';
+import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
 
@@ -373,6 +379,84 @@ describe('direct-path HITL: resume scope', () => {
       );
       expect(String(toolMsg.content)).not.toContain('should-not-execute');
     });
+  });
+
+  describe('untrusted resume decisions', () => {
+    it.each([
+      [
+        { type: 'respond' },
+        'Approval payload `respond` was missing a string `responseText`',
+      ],
+      [
+        { type: 'aproved' },
+        'Unknown approval decision type "aproved" — failing closed',
+      ],
+    ])(
+      'blocks and persists malformed direct decision %#',
+      async (rawDecision, expectedError) => {
+        const executeTool = jest.fn(async () => 'should-not-execute');
+        const directTool = tool(executeTool, {
+          name: 'subagent',
+          description: 'replayable direct tool',
+          schema: z.object({ description: z.string() }),
+        }) as unknown as StructuredToolInterface;
+        const persistSettledOutput = jest.fn(
+          async (
+            _call: ToolCall,
+            _config: RunnableConfig,
+            _settled: SettledSubagentToolOutput
+          ): Promise<void> => {}
+        );
+        const replayableTool = directTool as StructuredToolInterface &
+          ReplayableSubagentTool;
+        replayableTool[SUBAGENT_REPLAY_CONTROLLER] = {
+          getSettledOutput: async () => undefined,
+          persistSettledOutput,
+        };
+        const registry = new HookRegistry();
+        registry.register('PreToolUse', {
+          hooks: [
+            async (): Promise<PreToolUseHookOutput> => ({ decision: 'ask' }),
+          ],
+        });
+        const node = new ToolNode({
+          tools: [directTool],
+          hookRegistry: registry,
+          directToolNames: new Set(['subagent']),
+          humanInTheLoop: { enabled: true },
+        });
+        const graph = buildGraph(node, [
+          {
+            id: 'call_malformed',
+            name: 'subagent',
+            args: { description: 'inspect' },
+          },
+        ]);
+        const config = {
+          configurable: { thread_id: `thread-malformed-${rawDecision.type}` },
+        };
+
+        await graph.invoke({ messages: [] }, config);
+        const resumed = await graph.invoke(
+          new Command({
+            resume: [rawDecision as unknown as t.ToolApprovalDecision],
+          }),
+          config
+        );
+
+        const messages = (resumed as { messages: ToolMessage[] }).messages;
+        const toolMessage = messages.find(
+          (message) => message instanceof ToolMessage
+        );
+        expect(toolMessage?.status).toBe('error');
+        expect(String(toolMessage?.content)).toContain(expectedError);
+        expect(executeTool).not.toHaveBeenCalled();
+        expect(persistSettledOutput).toHaveBeenCalledTimes(1);
+        expect(persistSettledOutput.mock.calls[0]?.[2].output.status).toBe(
+          'error'
+        );
+      }
+    );
   });
 
   describe('usage counter stability across resume (Codex P2 #30)', () => {
