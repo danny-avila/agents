@@ -41,7 +41,11 @@ function parseStringifiedArgsObject(
   }
   try {
     const parsed = JSON.parse(value) as unknown;
-    if (parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    if (
+      parsed != null &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed)
+    ) {
       return parsed as Record<string, unknown>;
     }
   } catch {
@@ -90,6 +94,12 @@ export type ToolOutputReferenceRegistryOptions = {
    */
   maxActiveRuns?: number;
 };
+
+export interface ToolOutputReferenceState {
+  entries: Array<{ key: string; value: string }>;
+  turnCounter: number;
+  warnedNonStringTools: string[];
+}
 
 /**
  * Result of resolving placeholders in tool args.
@@ -395,6 +405,35 @@ export class ToolOutputReferenceRegistry {
       resolve: <T>(args: T, options?: ResolveOptions): ResolveResult<T> =>
         this.resolveAgainst(entries, args, options),
     };
+  }
+
+  /** Captures the checkpoint-safe state needed to resume one run bucket. */
+  snapshotState(runId: string | undefined): ToolOutputReferenceState {
+    const bucket = this.runStates.get(this.keyFor(runId));
+    return {
+      entries: [...(bucket?.entries ?? EMPTY_ENTRIES)].map(([key, value]) => ({
+        key,
+        value,
+      })),
+      turnCounter: bucket?.turnCounter ?? 0,
+      warnedNonStringTools: [...(bucket?.warnedNonStringTools ?? [])],
+    };
+  }
+
+  /** Restores a checkpointed run bucket under the current resume scope. */
+  restoreState(
+    runId: string | undefined,
+    state: ToolOutputReferenceState
+  ): void {
+    this.releaseRun(runId);
+    const bucket = this.getOrCreate(runId);
+    for (const { key, value } of state.entries) {
+      this.set(runId, key, value);
+    }
+    bucket.turnCounter = state.turnCounter;
+    for (const toolName of state.warnedNonStringTools) {
+      bucket.warnedNonStringTools.add(toolName);
+    }
   }
 
   private resolveAgainst<T>(

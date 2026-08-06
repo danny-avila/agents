@@ -40,6 +40,23 @@ const calculatorDef: t.LCTool = {
   },
 };
 
+const referenceToolDefs: t.LCTool[] = [
+  {
+    name: 'produce_value',
+    description: 'Produce a value for a later tool.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'consume_value',
+    description: 'Consume a value from an earlier tool.',
+    parameters: {
+      type: 'object',
+      properties: { value: { type: 'string' } },
+      required: ['value'],
+    },
+  },
+];
+
 const callerConfig = {
   configurable: { thread_id: 'hook-test-thread' },
   streamMode: 'values' as const,
@@ -112,6 +129,74 @@ function createParentAgentWithChildTool(): t.AgentInputs {
   };
 }
 
+function createParentAgentWithNestedChildTool(): t.AgentInputs {
+  return {
+    agentId: 'nested-hook-parent',
+    provider: Providers.OPENAI,
+    clientOptions: { modelName: 'parent-model', apiKey: 'test-key' },
+    instructions: 'Delegate nested calculations.',
+    maxContextTokens: 8000,
+    maxSubagentDepth: 2,
+    subagentConfigs: [
+      {
+        type: 'researcher',
+        name: 'Researcher',
+        description: 'Delegates calculations',
+        allowNested: true,
+        agentInputs: {
+          agentId: 'nested-researcher-child',
+          provider: Providers.OPENAI,
+          clientOptions: {
+            modelName: 'nested-child-model',
+            apiKey: 'test-key',
+          },
+          instructions: 'Delegate arithmetic to the calculator worker.',
+          maxContextTokens: 8000,
+          subagentConfigs: [
+            {
+              type: 'calculator-worker',
+              name: 'Calculator Worker',
+              description: 'Runs calculator tools',
+              agentInputs: {
+                agentId: 'calculator-grandchild',
+                provider: Providers.OPENAI,
+                clientOptions: {
+                  modelName: 'grandchild-model',
+                  apiKey: 'test-key',
+                },
+                instructions: 'Use calculator, then answer.',
+                maxContextTokens: 8000,
+                toolDefinitions: [calculatorDef],
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+}
+
+function createParentAgentWithReferenceTools(): t.AgentInputs {
+  const parent = createParentAgentWithChildTool();
+  const child = parent.subagentConfigs?.[0];
+  const childAgent = child?.agentInputs;
+  if (child == null || childAgent == null) {
+    throw new Error('Expected a child agent configuration.');
+  }
+  return {
+    ...parent,
+    subagentConfigs: [
+      {
+        ...child,
+        agentInputs: {
+          ...childAgent,
+          toolDefinitions: referenceToolDefs,
+        },
+      },
+    ],
+  };
+}
+
 function createCalculatorToolCall(): ToolCall {
   return {
     name: 'calculator',
@@ -146,6 +231,99 @@ class HitlChildFakeChatModel extends FakeChatModel {
       tools,
     } as Parameters<FakeChatModel['withConfig']>[0];
     return this.withConfig(config);
+  }
+}
+
+class NestedHitlFakeChatModel extends FakeChatModel {
+  private readonly nestedChild: boolean;
+
+  constructor(options: { modelName?: string }) {
+    super({ responses: [CHILD_RESPONSE], sleep: 1 });
+    this.nestedChild = options.modelName === 'nested-child-model';
+  }
+
+  _streamResponseChunks(
+    messages: Parameters<FakeChatModel['_streamResponseChunks']>[0],
+    options: Parameters<FakeChatModel['_streamResponseChunks']>[1],
+    runManager?: Parameters<FakeChatModel['_streamResponseChunks']>[2]
+  ): ReturnType<FakeChatModel['_streamResponseChunks']> {
+    const hasToolResult = messages.some(
+      (message) => message._getType() === 'tool'
+    );
+    let toolCalls: ToolCall[] = [];
+    if (!hasToolResult && this.nestedChild) {
+      toolCalls = [
+        {
+          name: Constants.SUBAGENT,
+          args: {
+            description: 'Calculate the result',
+            subagent_type: 'calculator-worker',
+          },
+          id: 'call_nested_calculator_worker',
+          type: 'tool_call',
+        },
+      ];
+    } else if (!hasToolResult) {
+      toolCalls = [createCalculatorToolCall()];
+    }
+    return new FakeChatModel({
+      responses: [hasToolResult ? CHILD_RESPONSE : 'Delegating calculation.'],
+      sleep: 1,
+      toolCalls,
+    })._streamResponseChunks(messages, options, runManager);
+  }
+
+  bindTools(tools: unknown): ReturnType<FakeChatModel['withConfig']> {
+    return this.withConfig({ tools } as Parameters<
+      FakeChatModel['withConfig']
+    >[0]);
+  }
+}
+
+class ReferenceHitlFakeChatModel extends FakeChatModel {
+  constructor(_options: object) {
+    super({ responses: [CHILD_RESPONSE], sleep: 1 });
+  }
+
+  _streamResponseChunks(
+    messages: Parameters<FakeChatModel['_streamResponseChunks']>[0],
+    options: Parameters<FakeChatModel['_streamResponseChunks']>[1],
+    runManager?: Parameters<FakeChatModel['_streamResponseChunks']>[2]
+  ): ReturnType<FakeChatModel['_streamResponseChunks']> {
+    const toolResultCount = messages.filter(
+      (message) => message._getType() === 'tool'
+    ).length;
+    let toolCalls: ToolCall[] = [];
+    if (toolResultCount === 0) {
+      toolCalls = [
+        {
+          name: 'produce_value',
+          args: {},
+          id: 'call_produce_value',
+          type: 'tool_call',
+        },
+      ];
+    } else if (toolResultCount === 1) {
+      toolCalls = [
+        {
+          name: 'consume_value',
+          args: { value: '{{tool0turn0}}' },
+          id: 'call_consume_value',
+          type: 'tool_call',
+        },
+      ];
+    }
+    return new FakeChatModel({
+      responses: [toolCalls.length > 0 ? 'Using a tool.' : CHILD_RESPONSE],
+      sleep: 1,
+      toolCalls,
+    })._streamResponseChunks(messages, options, runManager);
+  }
+
+  bindTools(tools: unknown): ReturnType<FakeChatModel['withConfig']> {
+    return this.withConfig({ tools } as Parameters<
+      FakeChatModel['withConfig']
+    >[0]);
   }
 }
 
@@ -821,7 +999,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     expect(serializedUpdates).not.toContain('checkpoint_');
   });
 
-  it('isolates rebuilt sibling approvals and preserves child run identity', async () => {
+  it('forks every resume from the paused child snapshot', async () => {
     getChatModelClassSpy.mockImplementation(((provider: Providers) => {
       if (provider === Providers.OPENAI) {
         return HitlChildFakeChatModel;
@@ -896,6 +1074,9 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       type: 'tool_approval',
       subagent: { parent_tool_call_id: tc.id },
     });
+    expect(JSON.stringify(persistedInterrupt)).not.toContain(
+      '__librechat_subagent_resume_manifest'
+    );
     expect(approvalHookCalls).toBe(1);
     const sourceChildRunId =
       persistedInterrupt?.payload.type === 'tool_approval'
@@ -910,32 +1091,50 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
         checkpoint_ns: persistedInterrupt?.checkpointNs ?? '',
       },
     };
+    const earlyApprovedRun = await createRun(`${runId}-early-approved`);
     const approvedRun = await createRun(`${runId}-approved`);
     const rejectedRun = await createRun(`${runId}-rejected`);
+    earlyApprovedRun.Graph!.overrideTestModel(['Final answer.'], 1);
     approvedRun.Graph!.overrideTestModel(['Final answer.'], 1);
     rejectedRun.Graph!.overrideTestModel(['Final answer.'], 1);
     const warningSpy = jest
       .spyOn(console, 'warn')
       .mockImplementation((): void => undefined);
     try {
+      await earlyApprovedRun.resume([{ type: 'approve' }], branchConfig);
+      await initialRun.resume([{ type: 'approve' }], callerConfig);
       await approvedRun.resume([{ type: 'approve' }], branchConfig);
       await rejectedRun.resume(
         [{ type: 'reject', reason: 'deny after restart' }],
         branchConfig
       );
+      expect(warningSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('toolCallStepIds missing entry')
+      );
     } finally {
       warningSpy.mockRestore();
     }
 
+    expect(earlyApprovedRun.getInterrupt()).toBeUndefined();
+    expect(initialRun.getInterrupt()).toBeUndefined();
     expect(approvedRun.getInterrupt()).toBeUndefined();
     expect(rejectedRun.getInterrupt()).toBeUndefined();
-    expect(executedTools).toEqual(['calculator']);
+    expect(executedTools).toEqual(['calculator', 'calculator', 'calculator']);
     expect(approvalHookCalls).toBe(1);
+    const initialChildThreads = initialRun.getChildCheckpointThreadIds();
+    const earlyApprovedChildThreads =
+      earlyApprovedRun.getChildCheckpointThreadIds();
     const approvedChildThreads = approvedRun.getChildCheckpointThreadIds();
     const rejectedChildThreads = rejectedRun.getChildCheckpointThreadIds();
+    expect(initialChildThreads).toHaveLength(2);
+    expect(earlyApprovedChildThreads).toHaveLength(1);
     expect(approvedChildThreads).toHaveLength(1);
     expect(rejectedChildThreads).toHaveLength(1);
     expect(approvedChildThreads[0]).not.toBe(rejectedChildThreads[0]);
+    expect(earlyApprovedChildThreads[0]).not.toBe(approvedChildThreads[0]);
+    expect(earlyApprovedChildThreads[0]).not.toBe(rejectedChildThreads[0]);
+    expect(initialChildThreads).not.toContain(approvedChildThreads[0]);
+    expect(initialChildThreads).not.toContain(rejectedChildThreads[0]);
     expect(
       updates
         .filter((event) => event.parentToolCallId === tc.id)
@@ -946,5 +1145,204 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
         .filter((event) => event.parentToolCallId === tc.id)
         .every((event) => event.subagentRunId === sourceChildRunId)
     ).toBe(true);
+  });
+
+  it('forks nested resumes from each checkpoint in the manifest chain', async () => {
+    getChatModelClassSpy.mockImplementation(((provider: Providers) => {
+      if (provider === Providers.OPENAI) {
+        return NestedHitlFakeChatModel;
+      }
+      return originalGetChatModelClass(provider);
+    }) as typeof providers.getChatModelClass);
+
+    const checkpointer = new MemorySaver();
+    const registry = new HookRegistry();
+    const executedTools: string[] = [];
+    const baseRunId = `nested-subagent-rebuild-${Date.now()}`;
+    registry.registerSession(`${baseRunId}-initial`, 'PreToolUse', {
+      once: true,
+      pattern: '^calculator$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review nested calculator',
+        }),
+      ],
+    });
+    const customHandlers: Record<string, t.EventHandler> = {
+      [GraphEvents.TOOL_END]: new ToolEndHandler(),
+      [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+      [GraphEvents.ON_TOOL_EXECUTE]: {
+        handle: (_event, rawData): void => {
+          const request = rawData as t.ToolExecuteBatchRequest;
+          executedTools.push(...request.toolCalls.map((call) => call.name));
+          request.resolve(
+            request.toolCalls.map((call) => ({
+              toolCallId: call.id,
+              status: 'success' as const,
+              content: '42',
+            }))
+          );
+        },
+      },
+    };
+    const createRun = (runId: string): Promise<Run<t.IState>> =>
+      Run.create<t.IState>({
+        runId,
+        graphConfig: {
+          type: 'standard',
+          agents: [createParentAgentWithNestedChildTool()],
+          compileOptions: { checkpointer },
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers,
+        hooks: registry,
+        humanInTheLoop: { enabled: true },
+      });
+    const parentCall = makeSubagentToolCall(
+      'call_nested_researcher',
+      'Delegate a nested calculation'
+    );
+    const initialRun = await createRun(`${baseRunId}-initial`);
+    initialRun.Graph!.overrideTestModel(['Delegating...', 'Final answer.'], 5, [
+      parentCall,
+    ]);
+
+    await initialRun.processStream(
+      { messages: [new HumanMessage('calculate through two agents')] },
+      callerConfig
+    );
+    const paused = initialRun.getInterrupt();
+    expect(paused?.payload).toMatchObject({
+      type: 'tool_approval',
+      subagent: {
+        agent_id: 'calculator-grandchild',
+        parent_tool_call_id: 'call_nested_calculator_worker',
+      },
+    });
+    const oldParentCheckpoint = {
+      ...callerConfig,
+      configurable: {
+        ...callerConfig.configurable,
+        checkpoint_id: paused?.checkpointId,
+        checkpoint_ns: paused?.checkpointNs ?? '',
+      },
+    };
+    const rebuiltRun = await createRun(`${baseRunId}-rebuilt`);
+    rebuiltRun.Graph!.overrideTestModel(['Final answer.'], 1);
+    const warningSpy = jest
+      .spyOn(console, 'warn')
+      .mockImplementation((): void => undefined);
+    try {
+      await initialRun.resume([{ type: 'approve' }], callerConfig);
+      await rebuiltRun.resume(
+        [{ type: 'reject', reason: 'reject stale nested branch' }],
+        oldParentCheckpoint
+      );
+      expect(warningSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('toolCallStepIds missing entry')
+      );
+    } finally {
+      warningSpy.mockRestore();
+    }
+
+    expect(initialRun.getInterrupt()).toBeUndefined();
+    expect(rebuiltRun.getInterrupt()).toBeUndefined();
+    expect(executedTools).toEqual(['calculator']);
+    expect(initialRun.getChildCheckpointThreadIds().length).toBeGreaterThan(2);
+    expect(rebuiltRun.getChildCheckpointThreadIds().length).toBeGreaterThan(1);
+  });
+
+  it('restores child tool-output references into rebuilt branches', async () => {
+    getChatModelClassSpy.mockImplementation(((provider: Providers) => {
+      if (provider === Providers.OPENAI) {
+        return ReferenceHitlFakeChatModel;
+      }
+      return originalGetChatModelClass(provider);
+    }) as typeof providers.getChatModelClass);
+
+    const referenceValue = 'checkpoint-scoped producer output';
+    const consumedValues: unknown[] = [];
+    const checkpointer = new MemorySaver();
+    const registry = new HookRegistry();
+    const baseRunId = `subagent-reference-rebuild-${Date.now()}`;
+    registry.registerSession(`${baseRunId}-initial`, 'PreToolUse', {
+      once: true,
+      pattern: '^consume_value$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review referenced input',
+        }),
+      ],
+    });
+    const customHandlers: Record<string, t.EventHandler> = {
+      [GraphEvents.TOOL_END]: new ToolEndHandler(),
+      [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+      [GraphEvents.ON_TOOL_EXECUTE]: {
+        handle: (_event, rawData): void => {
+          const request = rawData as t.ToolExecuteBatchRequest;
+          request.resolve(
+            request.toolCalls.map((call) => {
+              if (call.name === 'consume_value') {
+                consumedValues.push(call.args.value);
+              }
+              return {
+                toolCallId: call.id,
+                status: 'success' as const,
+                content:
+                  call.name === 'produce_value' ? referenceValue : 'consumed',
+              };
+            })
+          );
+        },
+      },
+    };
+    const createRun = (runId: string): Promise<Run<t.IState>> =>
+      Run.create<t.IState>({
+        runId,
+        graphConfig: {
+          type: 'standard',
+          agents: [createParentAgentWithReferenceTools()],
+          compileOptions: { checkpointer },
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers,
+        hooks: registry,
+        humanInTheLoop: { enabled: true },
+        toolOutputReferences: { enabled: true },
+      });
+    const parentCall = makeSubagentToolCall('call_reference_researcher');
+    const initialRun = await createRun(`${baseRunId}-initial`);
+    initialRun.Graph!.overrideTestModel(['Delegating...', 'Final answer.'], 5, [
+      parentCall,
+    ]);
+
+    await initialRun.processStream(
+      { messages: [new HumanMessage('produce and consume a value')] },
+      callerConfig
+    );
+    const paused = initialRun.getInterrupt();
+    expect(paused?.payload).toMatchObject({
+      type: 'tool_approval',
+      action_requests: [
+        { tool_call_id: 'call_consume_value', name: 'consume_value' },
+      ],
+    });
+    const rebuiltRun = await createRun(`${baseRunId}-rebuilt`);
+    rebuiltRun.Graph!.overrideTestModel(['Final answer.'], 1);
+    await rebuiltRun.resume([{ type: 'approve' }], {
+      ...callerConfig,
+      configurable: {
+        ...callerConfig.configurable,
+        checkpoint_id: paused?.checkpointId,
+        checkpoint_ns: paused?.checkpointNs ?? '',
+      },
+    });
+
+    expect(rebuiltRun.getInterrupt()).toBeUndefined();
+    expect(consumedValues).toEqual([referenceValue]);
   });
 });

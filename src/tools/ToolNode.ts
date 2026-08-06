@@ -12,6 +12,7 @@ import {
   END,
   Send,
   Command,
+  GraphInterrupt,
   isCommand,
   interrupt,
   isGraphInterrupt,
@@ -35,12 +36,16 @@ import type {
   ResolveOptions,
 } from '@/tools/toolOutputReferences';
 import type {
+  ReplayableSubagentTool,
+  SubagentResumeManifest,
+  SubagentToolNodeResumeState,
+} from '@/tools/subagent/SubagentReplay';
+import type {
   HookRegistry,
   AggregatedHookResult,
   PostToolBatchEntry,
   ToolApprovalReplayKey,
 } from '@/hooks';
-import type { ReplayableSubagentTool } from '@/tools/subagent/SubagentReplay';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
 import {
@@ -65,6 +70,10 @@ import {
   recordArgsEqual,
 } from '@/tools/eagerEventExecution';
 import {
+  attachSubagentResumeManifest,
+  SUBAGENT_REPLAY_CONTROLLER,
+} from '@/tools/subagent/SubagentReplay';
+import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
@@ -85,7 +94,6 @@ import {
   resolveLocalExecutionTools,
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
-import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 
 /** Host-facing batch requests must not carry the batch's breaker scope —
@@ -1021,6 +1029,35 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    */
   public getToolUsageCounts(): ReadonlyMap<string, number> {
     return new Map(this.toolUsageCount); // Return a copy
+  }
+
+  createSubagentResumeState(): SubagentToolNodeResumeState {
+    return {
+      stateKey: JSON.stringify([
+        this.executingAgentId ?? '',
+        this.agentId ?? '',
+        this.name,
+      ]),
+      toolUsageCounts: [...this.toolUsageCount].map(([toolName, count]) => ({
+        toolName,
+        count,
+      })),
+      directPathTurns: [...this.directPathTurns].map(([toolCallId, turn]) => ({
+        toolCallId,
+        turn,
+      })),
+    };
+  }
+
+  restoreSubagentResumeState(state: SubagentToolNodeResumeState): void {
+    this.toolUsageCount.clear();
+    for (const { toolName, count } of state.toolUsageCounts) {
+      this.toolUsageCount.set(toolName, count);
+    }
+    this.directPathTurns.clear();
+    for (const { toolCallId, turn } of state.directPathTurns) {
+      this.directPathTurns.set(toolCallId, turn);
+    }
   }
 
   private recordToolUsageTurn(
@@ -4025,6 +4062,57 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
     }
     if (hasInterruptingError) {
+      if (isGraphInterrupt(interruptingError)) {
+        const controllers = new Set<
+          NonNullable<ReplayableSubagentTool[typeof SUBAGENT_REPLAY_CONTROLLER]>
+        >();
+        const parentToolCallIds = new Set<string>();
+        for (const call of directCalls) {
+          const controller = (
+            this.toolMap.get(call.name) as ReplayableSubagentTool | undefined
+          )?.[SUBAGENT_REPLAY_CONTROLLER];
+          if (controller?.getResumeManifest != null) {
+            controllers.add(controller);
+          }
+          if (call.id != null && call.id !== '') {
+            parentToolCallIds.add(call.id);
+          }
+        }
+        const executionsByParentCall = new Map<
+          string,
+          SubagentResumeManifest['executions'][number]
+        >();
+        for (const controller of controllers) {
+          const manifest =
+            await controller.getResumeManifest?.(parentToolCallIds);
+          if (manifest != null) {
+            for (const execution of manifest.executions) {
+              executionsByParentCall.set(execution.parentToolCallId, execution);
+            }
+          }
+        }
+        const executions = [...executionsByParentCall.values()];
+        if (executions.length > 0) {
+          const manifest: SubagentResumeManifest = {
+            version: 1,
+            executions,
+          };
+          throw new GraphInterrupt(
+            interruptingError.interrupts.map((pendingInterrupt) => ({
+              ...pendingInterrupt,
+              value:
+                pendingInterrupt.value != null &&
+                typeof pendingInterrupt.value === 'object' &&
+                !Array.isArray(pendingInterrupt.value)
+                  ? attachSubagentResumeManifest(
+                    pendingInterrupt.value,
+                    manifest
+                  )
+                  : pendingInterrupt.value,
+            }))
+          );
+        }
+      }
       throw interruptingError;
     }
 

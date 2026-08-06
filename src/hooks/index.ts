@@ -57,6 +57,7 @@ export type {
   ToolDecision,
   StopDecision,
   ToolApprovalReplayKey,
+  ToolApprovalReplaySnapshot,
   AggregatedHookResult,
   RunStartHookInput,
   UserPromptSubmitHookInput,

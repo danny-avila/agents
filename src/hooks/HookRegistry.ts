@@ -3,11 +3,28 @@ import type {
   HookEvent,
   HookMatcher,
   ToolApprovalReplayKey,
+  ToolApprovalReplaySnapshot,
   AggregatedHookResult,
 } from './types';
 
 function serializeApprovalKey(key: ToolApprovalReplayKey): string {
   return JSON.stringify([key.executionScope, key.agentId, key.toolUseId]);
+}
+
+function deserializeApprovalKey(value: string): ToolApprovalReplayKey | null {
+  const parsed: unknown = JSON.parse(value);
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length !== 3 ||
+    parsed.some((part) => typeof part !== 'string')
+  ) {
+    return null;
+  }
+  return {
+    executionScope: parsed[0],
+    agentId: parsed[1],
+    toolUseId: parsed[2],
+  };
 }
 
 /**
@@ -244,6 +261,49 @@ export class HookRegistry {
     if (pending.size === 0) {
       this.pendingToolApprovals.delete(sessionId);
     }
+  }
+
+  snapshotPendingToolApprovals(
+    sessionId: string,
+    executionScope: string
+  ): ToolApprovalReplaySnapshot[] {
+    const pending = this.pendingToolApprovals.get(sessionId);
+    if (pending == null) {
+      return [];
+    }
+    const snapshots: ToolApprovalReplaySnapshot[] = [];
+    for (const [serializedKey, result] of pending) {
+      const key = deserializeApprovalKey(serializedKey);
+      if (key == null || key.executionScope !== executionScope) {
+        continue;
+      }
+      snapshots.push({ key, result });
+    }
+    return snapshots;
+  }
+
+  restorePendingToolApprovals(
+    sessionId: string,
+    executionScope: string,
+    snapshots: ReadonlyArray<ToolApprovalReplaySnapshot>
+  ): void {
+    const restored = new Map<string, AggregatedHookResult>();
+    for (const [serializedKey, result] of this.pendingToolApprovals.get(
+      sessionId
+    ) ?? []) {
+      const key = deserializeApprovalKey(serializedKey);
+      if (key?.executionScope !== executionScope) {
+        restored.set(serializedKey, result);
+      }
+    }
+    for (const snapshot of snapshots) {
+      restored.set(serializeApprovalKey(snapshot.key), snapshot.result);
+    }
+    if (restored.size === 0) {
+      this.pendingToolApprovals.delete(sessionId);
+      return;
+    }
+    this.pendingToolApprovals.set(sessionId, restored);
   }
 
   /**

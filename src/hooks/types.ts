@@ -403,6 +403,12 @@ export interface ToolApprovalReplayKey {
   toolUseId: string;
 }
 
+/** Checkpoint-safe copy of a pending tool approval replay. */
+export interface ToolApprovalReplaySnapshot {
+  key: ToolApprovalReplayKey;
+  result: AggregatedHookResult;
+}
+
 export interface PostToolUseHookOutput extends BaseHookOutput {
   /**
    * Replacement tool output. Flows through the aggregated result so the

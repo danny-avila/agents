@@ -18,15 +18,18 @@ import type {
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
+  ReplayableSubagentTool,
+  SubagentGraphResumeState,
+  SubagentResumeManifest,
+  SubagentToolNodeResumeState,
+  SettledSubagentToolOutput,
+} from '@/tools/subagent/SubagentReplay';
+import type {
   ResolvedStreamLimits,
   RunBreakerScope,
   StreamedToolCallArgTally,
   StreamDeltaEventTally,
 } from '@/llm/streamLimits';
-import type {
-  ReplayableSubagentTool,
-  SettledSubagentToolOutput,
-} from '@/tools/subagent/SubagentReplay';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
 import type { FallbackErrorContext } from '@/llm/invoke';
 import type { HookRegistry } from '@/hooks';
@@ -916,6 +919,8 @@ export abstract class Graph<
    */
   protected registerCompiledToolNode(node: {
     clearDirectPathTurns(): void;
+    createSubagentResumeState(): SubagentToolNodeResumeState;
+    restoreSubagentResumeState(state: SubagentToolNodeResumeState): void;
   }): void {
     this._compiledToolNodes.add(node);
   }
@@ -932,6 +937,111 @@ export abstract class Graph<
       }
     }
     return [...threadIds];
+  }
+
+  createSubagentResumeState(runId: string): SubagentGraphResumeState {
+    return {
+      toolCallSteps: [...this.toolCallStepIds].map(([toolCallId, stepId]) => ({
+        toolCallId,
+        stepId,
+      })),
+      toolSessions: [...this.sessions].map(([toolName, context]) => ({
+        toolName,
+        context: {
+          ...context,
+          ...(context.files == null
+            ? {}
+            : { files: context.files.map((file) => ({ ...file })) }),
+        },
+      })),
+      toolNodes: [...this._compiledToolNodes].map((node) =>
+        node.createSubagentResumeState()
+      ),
+      eagerToolUsage: [
+        {
+          agentId: '',
+          toolUsageCounts: [...this.eagerEventToolUsageCount].map(
+            ([toolName, count]) => ({ toolName, count })
+          ),
+        },
+        ...[...this.eagerEventToolUsageCountsByAgentId].map(
+          ([agentId, usageCounts]) => ({
+            agentId,
+            toolUsageCounts: [...usageCounts].map(([toolName, count]) => ({
+              toolName,
+              count,
+            })),
+          })
+        ),
+      ],
+      eagerToolSuppressions: [...this.eagerEventToolSuppressions],
+      ...(this._toolOutputRegistry == null
+        ? {}
+        : {
+          toolOutputReferences: this._toolOutputRegistry.snapshotState(runId),
+        }),
+    };
+  }
+
+  restoreSubagentResumeState(
+    state: SubagentGraphResumeState,
+    runId: string
+  ): void {
+    const toolNodesByKey = new Map(
+      [...this._compiledToolNodes].map((node) => {
+        const nodeState = node.createSubagentResumeState();
+        return [nodeState.stateKey, node] as const;
+      })
+    );
+    if (toolNodesByKey.size !== state.toolNodes.length) {
+      throw new Error('Cannot restore changed subagent tool topology.');
+    }
+    for (const nodeState of state.toolNodes) {
+      if (!toolNodesByKey.has(nodeState.stateKey)) {
+        throw new Error(
+          `Cannot restore subagent tool state for "${nodeState.stateKey}".`
+        );
+      }
+    }
+    const registry =
+      state.toolOutputReferences == null
+        ? undefined
+        : this.getOrCreateToolOutputRegistry();
+    if (state.toolOutputReferences != null && registry == null) {
+      throw new Error('Cannot restore disabled tool output references.');
+    }
+
+    this.toolCallStepIds.clear();
+    for (const { toolCallId, stepId } of state.toolCallSteps) {
+      this.toolCallStepIds.set(toolCallId, stepId);
+    }
+    this.sessions.clear();
+    for (const { toolName, context } of state.toolSessions) {
+      this.sessions.set(toolName, {
+        ...context,
+        ...(context.files == null
+          ? {}
+          : { files: context.files.map((file) => ({ ...file })) }),
+      });
+    }
+    for (const nodeState of state.toolNodes) {
+      const node = toolNodesByKey.get(nodeState.stateKey)!;
+      node.restoreSubagentResumeState(nodeState);
+    }
+    this.clearEagerEventToolUsageCounts();
+    for (const usageState of state.eagerToolUsage) {
+      const usageCounts = this.getEagerEventToolUsageCount(usageState.agentId);
+      for (const { toolName, count } of usageState.toolUsageCounts) {
+        usageCounts.set(toolName, count);
+      }
+    }
+    this.eagerEventToolSuppressions.clear();
+    for (const toolName of state.eagerToolSuppressions) {
+      this.eagerEventToolSuppressions.add(toolName);
+    }
+    if (state.toolOutputReferences != null && registry != null) {
+      registry.restoreState(runId, state.toolOutputReferences);
+    }
   }
 
   /**
@@ -983,6 +1093,8 @@ export abstract class Graph<
    */
   private _compiledToolNodes: Set<{
     clearDirectPathTurns(): void;
+    createSubagentResumeState(): SubagentToolNodeResumeState;
+    restoreSubagentResumeState(state: SubagentToolNodeResumeState): void;
   }> = new Set();
   private _subagentExecutors = new Set<SubagentExecutor>();
   public getOrCreateFileCheckpointer(): t.LocalFileCheckpointer | undefined {
@@ -4191,6 +4303,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const replayableSubagentTool = subagentTool as typeof subagentTool &
           ReplayableSubagentTool;
         replayableSubagentTool[SUBAGENT_REPLAY_CONTROLLER] = {
+          getResumeManifest: (
+            parentToolCallIds
+          ): Promise<SubagentResumeManifest | undefined> =>
+            executor.getResumeManifest(parentToolCallIds),
           getSettledOutput: (
             call,
             config

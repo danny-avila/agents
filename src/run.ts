@@ -28,6 +28,11 @@ import {
   withLangfuseAttributes,
 } from '@/langfuse';
 import {
+  requireValidSubagentResumeManifest,
+  stripSubagentResumeManifest,
+  SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
+} from '@/tools/subagent/SubagentReplay';
+import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
@@ -792,6 +797,9 @@ export class Run<_T extends t.BaseGraphState> {
       recursionLimit,
       configurable: { ...callerConfig.configurable },
     };
+    if (!isResume) {
+      delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+    }
 
     /**
      * Cancellation can arrive either at graph construction or per-call through
@@ -1281,7 +1289,13 @@ export class Run<_T extends t.BaseGraphState> {
   getInterrupt<TPayload = t.HumanInterruptPayload>():
     | t.RunInterruptResult<TPayload>
     | undefined {
-    return this._interrupt as t.RunInterruptResult<TPayload> | undefined;
+    if (this._interrupt == null) {
+      return undefined;
+    }
+    return {
+      ...this._interrupt,
+      payload: stripSubagentResumeManifest(this._interrupt.payload),
+    } as t.RunInterruptResult<TPayload>;
   }
 
   /**
@@ -1394,6 +1408,18 @@ export class Run<_T extends t.BaseGraphState> {
   ): Promise<t.RunStreamConfig> {
     await this.restoreInterruptFromCheckpoint(callerConfig);
     const interrupt = this._interrupt;
+    const resumeManifest = requireValidSubagentResumeManifest(
+      interrupt?.payload
+    );
+    const resumeConfigurable = { ...callerConfig.configurable };
+    delete resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+    if (resumeManifest != null) {
+      resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] = resumeManifest;
+    }
+    const manifestConfig = {
+      ...callerConfig,
+      configurable: resumeConfigurable,
+    };
     const hookSessionId = getInterruptHookSessionId(interrupt?.payload);
     if (hookSessionId != null) {
       this.hookRegistry?.copySession(hookSessionId, this.id);
@@ -1405,9 +1431,9 @@ export class Run<_T extends t.BaseGraphState> {
     const stateHistory = workflow?.getStateHistory;
     if (interrupt?.checkpointId != null && interrupt.checkpointId.length > 0) {
       return {
-        ...callerConfig,
+        ...manifestConfig,
         configurable: {
-          ...callerConfig.configurable,
+          ...manifestConfig.configurable,
           checkpoint_id: interrupt.checkpointId,
           ...(typeof interrupt.checkpointNs === 'string'
             ? { checkpoint_ns: interrupt.checkpointNs }
@@ -1421,12 +1447,12 @@ export class Run<_T extends t.BaseGraphState> {
       interruptId.length === 0 ||
       typeof stateHistory !== 'function'
     ) {
-      return callerConfig;
+      return manifestConfig;
     }
 
     for await (const snapshot of stateHistory.call(
       this.graphRunnable,
-      callerConfig as RunnableConfig
+      manifestConfig as RunnableConfig
     )) {
       const hasMatchingInterrupt =
         snapshot.tasks?.some(
@@ -1449,9 +1475,9 @@ export class Run<_T extends t.BaseGraphState> {
           ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
         };
         return {
-          ...callerConfig,
+          ...manifestConfig,
           configurable: {
-            ...callerConfig.configurable,
+            ...manifestConfig.configurable,
             checkpoint_id: checkpointId,
             ...(typeof checkpointNs === 'string'
               ? { checkpoint_ns: checkpointNs }
@@ -1461,7 +1487,7 @@ export class Run<_T extends t.BaseGraphState> {
       }
     }
 
-    return callerConfig;
+    return manifestConfig;
   }
 
   private async restoreInterruptFromCheckpoint(

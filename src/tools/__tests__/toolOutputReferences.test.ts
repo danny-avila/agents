@@ -265,8 +265,10 @@ describe('ToolOutputReferenceRegistry', () => {
         intent: 'x {{tool0turn0}}',
       });
       expect(
-        view.resolve({ intent: 'x {{tool0turn0}}' }, { substituteIntentKey: true })
-          .resolved
+        view.resolve(
+          { intent: 'x {{tool0turn0}}' },
+          { substituteIntentKey: true }
+        ).resolved
       ).toEqual({ intent: 'x STORED' });
     });
 
@@ -282,6 +284,21 @@ describe('ToolOutputReferenceRegistry', () => {
   });
 
   describe('snapshot', () => {
+    it('restores entries and counters under a new run scope', () => {
+      const source = new ToolOutputReferenceRegistry();
+      source.set('source', 'tool0turn0', 'A');
+      expect(source.nextTurn('source')).toBe(0);
+      expect(source.claimWarnOnce('source', 'calculator')).toBe(true);
+
+      const restored = new ToolOutputReferenceRegistry();
+      restored.restoreState('branch', source.snapshotState('source'));
+
+      expect(restored.get('branch', 'tool0turn0')).toBe('A');
+      expect(restored.nextTurn('branch')).toBe(1);
+      expect(restored.claimWarnOnce('branch', 'calculator')).toBe(false);
+      expect(restored.get('source', 'tool0turn0')).toBeUndefined();
+    });
+
     it('resolves against the captured state and ignores later mutations', () => {
       const reg = new ToolOutputReferenceRegistry();
       reg.set('r', 'tool0turn0', 'OLD');

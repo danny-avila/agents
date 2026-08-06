@@ -215,11 +215,37 @@ describe('HookRegistry', () => {
       expect(
         registry.getPendingToolApproval('branch', siblingKey)?.reason
       ).toBe('review sibling');
+      const checkpointSnapshot = registry.snapshotPendingToolApprovals(
+        'source',
+        'child-a'
+      );
+      expect(checkpointSnapshot).toEqual([{ key, result: approval }]);
       registry.clearSession('branch');
       expect(
         registry.getPendingToolApproval('branch', siblingKey)
       ).toBeUndefined();
       expect(registry.getPendingToolApproval('source', key)).toBe(approval);
+      registry.setPendingToolApproval('restored', key, {
+        ...approval,
+        reason: 'stale approval',
+      });
+      registry.setPendingToolApproval('restored', siblingKey, {
+        ...approval,
+        reason: 'preserved sibling',
+      });
+      registry.restorePendingToolApprovals(
+        'restored',
+        'child-a',
+        checkpointSnapshot
+      );
+      expect(registry.getPendingToolApproval('restored', key)).toBe(approval);
+      expect(
+        registry.getPendingToolApproval('restored', siblingKey)?.reason
+      ).toBe('preserved sibling');
+      registry.restorePendingToolApprovals('restored', 'child-b', []);
+      expect(
+        registry.getPendingToolApproval('restored', siblingKey)
+      ).toBeUndefined();
     });
   });
 
