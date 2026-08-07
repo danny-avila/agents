@@ -1553,9 +1553,9 @@ export class SubagentExecutor {
       resumeExecution?.configId != null &&
       executableConfig.configId !== resumeExecution.configId
     ) {
-      const currentConfigId = executableConfig.configId ?? 'missing';
       return {
-        content: `Subagent error: Configuration identity mismatch for "${subagentType}". Expected "${resumeExecution.configId}" but received "${currentConfigId}".`,
+        content:
+          'Subagent error: Subagent configuration changed since this execution was paused.',
         messages: [],
       };
     }
@@ -2864,9 +2864,10 @@ export function filterSubagentResult(messages: BaseMessage[]): string {
 }
 
 /**
- * Resolve self-spawn configs by filling in agentInputs from the parent context.
- * Returns configs with agentInputs guaranteed present. Throws on duplicate
- * `type` values to prevent silent config shadowing.
+ * Normalize executable subagent configs for tool advertisement. Eager and
+ * self-spawn configs return with `agentInputs`; lazy configs return with a
+ * resolver and durable `configId`. Unusable configs are filtered, while
+ * duplicate types and unversioned lazy descriptors fail closed.
  */
 export function resolveSubagentConfigs(
   configs: SubagentConfig[],

@@ -857,9 +857,11 @@ describe('SubagentExecutor', () => {
         },
       });
 
-      expect(result.content).toContain('Configuration identity mismatch');
-      expect(result.content).toContain('researcher@v1');
-      expect(result.content).toContain('researcher@v2');
+      expect(result.content).toBe(
+        'Subagent error: Subagent configuration changed since this execution was paused.'
+      );
+      expect(result.content).not.toContain('researcher@v1');
+      expect(result.content).not.toContain('researcher@v2');
       expect(resolver).not.toHaveBeenCalled();
     });
   });
