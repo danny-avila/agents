@@ -1,7 +1,10 @@
 export {
   SubagentExecutor,
   filterSubagentResult,
+  filterGraphSubagentResult,
+  isGraphSubagentConfig,
   resolveSubagentConfigs,
+  resolveSubagentConfigEntries,
   buildChildInputs,
   summarizeEvent,
 } from './SubagentExecutor';

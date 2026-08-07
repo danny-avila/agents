@@ -80,8 +80,14 @@ export type AgentSubgraphState = BaseGraphState & {
   summarizationRequest?: SummarizationNodeInput;
 };
 
+export type SubagentGraphResult = {
+  agentId: string;
+  message?: BaseMessage;
+};
+
 export type MultiAgentGraphState = BaseGraphState & {
   agentMessages?: BaseMessage[];
+  subagentResult?: SubagentGraphResult;
 };
 
 export type IState = BaseGraphState;
@@ -331,9 +337,9 @@ export type StandardGraphInput = {
   indexTokenCountMap?: Record<string, number>;
   calibrationRatio?: number;
   /**
-   * Receives a {@link SubagentUsageEvent} for every model call made inside
-   * a subagent child run spawned from this graph (including nested
-   * subagents and child-side summarization calls). Child graphs run via
+   * Receives a {@link SubagentUsageEvent} for every model call that reports
+   * usage metadata inside a subagent child run spawned from this graph
+   * (including nested subagents and child-side summarization calls). Child graphs run via
    * `invoke()` outside the host's `streamEvents` loop, so their
    * `on_chat_model_end` events never reach the run's handler registry —
    * this sink is the only way hosts can observe child token usage for
@@ -364,10 +370,12 @@ export type StandardGraphInput = {
    * every streamed chunk event. See {@link StreamLimits}.
    */
   streamLimits?: StreamLimits;
+  /** Structured lineage for a graph executing as a subagent child. */
+  subagentExecutionContext?: SubagentExecutionContext;
 };
 
 export type GraphEdge = {
-  /** Agent ID, use a list for multiple sources */
+  /** Agent ID; direct edges use an array as an all-of waiting source group. */
   from: string | string[];
   /** Agent ID, use a list for multiple destinations */
   to: string | string[];
@@ -403,32 +411,88 @@ export type GraphEdge = {
   promptKey?: string;
 };
 
-export type MultiAgentGraphInput = StandardGraphInput & {
-  edges: GraphEdge[];
+export type GraphSubagentEdge = Omit<
+  GraphEdge,
+  'edgeType' | 'condition' | 'promptKey'
+> & {
+  edgeType: 'direct';
+  condition?: never;
+  promptKey?: never;
 };
 
-/** Configuration for a subagent type that can be spawned by a parent agent. */
-export type SubagentConfig = {
+export type MultiAgentGraphInput = StandardGraphInput & {
+  edges: GraphEdge[];
+  /** Captures the designated member's final AI turn in graph state. */
+  resultAgentId?: string;
+  /** Optional per-member Pregel budget when the outer graph has its own topology budget. */
+  memberRecursionLimit?: number;
+};
+
+interface SubagentConfigBase {
   /** Identifier used in the tool's `subagent_type` enum (e.g. 'researcher', 'coder'). */
   type: string;
   /** Human-readable display name. */
   name: string;
   /** What this subagent specializes in — shown to the LLM. */
   description: string;
-  /** Full agent config for the child graph. Omit when `self` is true. */
-  agentInputs?: AgentInputs;
-  /** When true, reuse the parent's AgentInputs (context isolation without separate config). */
-  self?: boolean;
   /** Max AGENT→TOOLS cycles before forced stop (default: 25). */
   maxTurns?: number;
   /** Allow this subagent to spawn its own subagents (default: false). */
   allowNested?: boolean;
-};
+}
 
-/** SubagentConfig with agentInputs guaranteed present (self-spawn resolved). */
-export type ResolvedSubagentConfig = SubagentConfig & {
+export interface SubagentConfig extends SubagentConfigBase {
+  /** Full agent config for the child graph. Omit when `self` is true. */
+  agentInputs?: AgentInputs;
+  /** When true, reuse the parent's AgentInputs (context isolation without separate config). */
+  self?: boolean;
+}
+
+export interface SingleAgentSubagentConfig extends SubagentConfig {
+  kind?: 'agent';
+  agents?: never;
+  edges?: never;
+  entryAgentId?: never;
+  resultAgentId?: never;
+}
+
+export interface GraphSubagentConfig extends SubagentConfig {
+  kind: 'graph';
+  allowNested?: false;
+  agents: AgentInputs[];
+  /**
+   * Explicit direct DAG edges. Array-valued sources are all-of waiting edges.
+   * Relative message order between parallel branches is implementation-dependent.
+   * Prompted edges are supported in chains or on the final converged result transition.
+   */
+  edges: GraphSubagentEdge[];
+  entryAgentId: string;
+  resultAgentId: string;
+  agentInputs?: never;
+  self?: never;
+}
+
+/** Any configuration that can be spawned through the subagent tool. */
+export type SubagentConfigEntry = SubagentConfig | GraphSubagentConfig;
+
+/** Legacy single-agent config with self-spawn resolution completed. */
+export interface ResolvedSubagentConfig extends SubagentConfig {
   agentInputs: AgentInputs;
-};
+}
+
+/** Explicit alias for graph-aware code that needs to name the legacy variant. */
+export interface ResolvedSingleAgentSubagentConfig
+  extends ResolvedSubagentConfig {
+  kind?: 'agent';
+  agents?: never;
+  edges?: never;
+  entryAgentId?: never;
+  resultAgentId?: never;
+}
+
+export type ResolvedSubagentConfigEntry =
+  | ResolvedSubagentConfig
+  | GraphSubagentConfig;
 
 /** Lifecycle phase carried on {@link SubagentUpdateEvent}. */
 export type SubagentUpdatePhase =
@@ -441,14 +505,34 @@ export type SubagentUpdatePhase =
   | 'stop'
   | 'error';
 
+export interface SubagentAncestryEntry {
+  readonly subagentRunId: string;
+  readonly subagentType: string;
+  readonly subagentKind: 'agent' | 'graph';
+  /** Execution subject ID; synthetic for graph subagents. */
+  readonly subagentAgentId: string;
+  readonly parentRunId: string;
+  readonly parentAgentId?: string;
+  readonly parentToolCallId?: string;
+}
+
+export interface SubagentExecutionContext {
+  readonly rootRunId: string;
+  readonly hookSessionId: string;
+  readonly depth: number;
+  readonly ancestry: readonly SubagentAncestryEntry[];
+}
+
 /**
  * Wrapper event emitted when a subagent's child graph dispatches activity.
  * Lets hosts show subagent progress in a UI surface separate from the parent
  * conversation without having to untangle events by agent ID.
  */
 export interface SubagentUpdateEvent {
-  /** Parent run ID. */
+  /** Root run ID that owns this execution tree. */
   runId: string;
+  /** Immediate parent run that spawned this child. */
+  parentRunId?: string;
   /** Child run ID (unique per subagent execution). */
   subagentRunId: string;
   /**
@@ -460,8 +544,16 @@ export interface SubagentUpdateEvent {
   parentToolCallId?: string;
   /** Subagent `type` identifier from the SubagentConfig. */
   subagentType: string;
-  /** Child agent ID assigned to this subagent execution. */
+  /** Execution shape. Omitted by older emitters. */
+  subagentKind?: 'agent' | 'graph';
+  /** Execution subject ID; synthetic for graph subagents. */
   subagentAgentId: string;
+  /** Graph member that produced this update, when attributable. */
+  memberAgentId?: string;
+  /** One-based nesting depth beneath the root graph. */
+  depth?: number;
+  /** Root-to-leaf execution lineage, without parsing composed run IDs. */
+  ancestry?: readonly SubagentAncestryEntry[];
   /** Parent agent ID that spawned this subagent. */
   parentAgentId?: string;
   /** Lifecycle phase carried by this update. */
@@ -504,10 +596,20 @@ export interface SubagentUsageEvent {
   provider?: string;
   /** Subagent `type` identifier from the SubagentConfig. */
   subagentType: string;
+  /** Execution shape. Omitted by older emitters. */
+  subagentKind?: 'agent' | 'graph';
   /** Child run ID (unique per subagent execution). */
   subagentRunId: string;
-  /** Child agent ID assigned to this subagent execution. */
+  /** Execution subject ID; synthetic for graph subagents. */
   subagentAgentId: string;
+  /** Graph member whose model call produced this usage. */
+  memberAgentId?: string;
+  /** Immediate parent run that spawned this child. */
+  parentRunId?: string;
+  /** One-based nesting depth beneath the root graph. */
+  depth?: number;
+  /** Root-to-leaf execution lineage, without parsing composed run IDs. */
+  ancestry?: readonly SubagentAncestryEntry[];
   /**
    * ROOT run ID of the host run that owns billing. For nested subagents
    * each forwarding layer rewrites this upward, so events from any depth
@@ -647,7 +749,7 @@ export interface AgentInputs {
   /** Pre-computed tool schema token count (from cache). Skips recalculation when provided. */
   toolSchemaTokens?: number;
   /** Subagent configurations for hierarchical delegation. Each defines a child agent type. */
-  subagentConfigs?: SubagentConfig[];
+  subagentConfigs?: SubagentConfigEntry[];
   /** Maximum subagent nesting depth. Default 1 means top-level agents can spawn subagents but subagents cannot nest further. */
   maxSubagentDepth?: number;
   /**
