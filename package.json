@@ -120,6 +120,7 @@
     "prepublishOnly": "npm run build",
     "build": "tsdown && tsc -p tsconfig.build.json",
     "build:dev": "tsdown",
+    "check:circular-deps": "node config/circular-deps.mjs",
     "sort-imports": "node scripts/sort-imports.ts",
     "sort-imports:check": "node scripts/sort-imports.ts --check",
     "start": "node dist/esm/main.js",
