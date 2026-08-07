@@ -270,7 +270,7 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(resolutionState.pendingExecutions.size).toBe(0);
   });
 
-  it('ignores a stale resolver completion after cleanup and preserves a newer retry', async () => {
+  it('rejects a stale resolver completion after cleanup and preserves a newer retry', async () => {
     let finishFirst = (_inputs: AgentInputs): void => undefined;
     let finishSecond = (_inputs: AgentInputs): void => undefined;
     const firstResult = new Promise<AgentInputs>((resolve) => {
@@ -315,9 +315,9 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     );
 
     finishFirst(makeAgent('stale-child'));
-    await expect(staleResolution).resolves.toMatchObject({
-      agentInputs: { agentId: 'stale-child' },
-    });
+    await expect(staleResolution).rejects.toThrow(
+      'Subagent execution was invalidated.'
+    );
     expect(resolutionState.resolvedConfigs.has(childExecutionKey)).toBe(false);
     expect(
       resolutionState.pendingConfigResolutions.get(childExecutionKey)
@@ -334,7 +334,67 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(resolutionState.pendingConfigResolutions.size).toBe(0);
   });
 
+  it('does not execute a child after its lazy resolution was invalidated', async () => {
+    let finishFirst = (_inputs: AgentInputs): void => undefined;
+    let finishSecond = (_inputs: AgentInputs): void => undefined;
+    const firstResult = new Promise<AgentInputs>((resolve) => {
+      finishFirst = resolve;
+    });
+    const secondResult = new Promise<AgentInputs>((resolve) => {
+      finishSecond = resolve;
+    });
+    let markFirstStarted = (): void => undefined;
+    let markSecondStarted = (): void => undefined;
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    const secondStarted = new Promise<void>((resolve) => {
+      markSecondStarted = resolve;
+    });
+    let resolverInvocation = 0;
+    const config = makeLazyConfig('researcher', () => {
+      resolverInvocation += 1;
+      if (resolverInvocation === 1) {
+        markFirstStarted();
+        return firstResult;
+      }
+      markSecondStarted();
+      return secondResult;
+    });
+    const observedAgentIds: string[] = [];
+    const createChildGraph = jest.fn((input: StandardGraphInput) => {
+      observedAgentIds.push(input.agents[0].agentId);
+      return makeGraph();
+    });
+    const executor = createExecutor([config], { createChildGraph });
+    const params = {
+      description: 'Run the selected child.',
+      subagentType: config.type,
+      parentToolCallId: 'call_cleanup_retry',
+    };
+
+    const staleExecution = executor.execute(params);
+    await firstStarted;
+    executor.clearHeavyState();
+    const currentExecution = executor.execute(params);
+    await secondStarted;
+
+    finishFirst(makeAgent('stale-child'));
+    await expect(staleExecution).resolves.toMatchObject({
+      content: 'Subagent error: Unable to initialize the selected subagent.',
+    });
+    expect(createChildGraph).not.toHaveBeenCalled();
+
+    finishSecond(makeAgent('current-child'));
+    await expect(currentExecution).resolves.toMatchObject({
+      content: 'Task completed',
+    });
+    expect(createChildGraph).toHaveBeenCalledTimes(1);
+    expect(observedAgentIds).toEqual(['current-child']);
+  });
+
   it('keeps concurrent checkpoint forks as distinct child executions', async () => {
+    const resolverContexts: SubagentResolveContext[] = [];
     let releaseInvocations = (): void => undefined;
     const invocationGate = new Promise<void>((resolve) => {
       releaseInvocations = resolve;
@@ -346,7 +406,10 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
       await invocationGate;
       return { messages: [new AIMessage(`result-${current}`)] };
     });
-    const config = makeLazyConfig('researcher', async () => makeAgent());
+    const config = makeLazyConfig('researcher', async (context) => {
+      resolverContexts.push(context);
+      return makeAgent();
+    });
     const executor = createExecutor([config], {
       createChildGraph: () =>
         ({
@@ -381,6 +444,10 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     const [firstResult, secondResult] = await Promise.all([first, second]);
 
     expect(callsBeforeRelease).toBe(2);
+    expect(resolverContexts).toHaveLength(2);
+    expect(
+      new Set(resolverContexts.map((context) => context.executionId)).size
+    ).toBe(2);
     expect(new Set([firstResult.content, secondResult.content])).toEqual(
       new Set(['result-1', 'result-2'])
     );
@@ -583,6 +650,46 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(contexts[0].parentToolCallId).toBe('call_rebuild');
   });
 
+  it('keeps the persisted executionId when resuming a lazy child', async () => {
+    let resolverContext: SubagentResolveContext | undefined;
+    const config = makeLazyConfig('researcher', async (context) => {
+      resolverContext = context;
+      return makeAgent();
+    });
+    const parentToolCallId = 'call_persisted_identity';
+    const resumeExecution = makeResumeExecution(
+      parentToolCallId,
+      config.configId
+    );
+    resumeExecution.childRunId = 'persisted-execution-id';
+    const executor = createExecutor([config], {
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+      createChildGraph: makeRecoveredGraph,
+    });
+    const forkTarget = executor as unknown as {
+      forkCheckpointSnapshot: () => Promise<void>;
+    };
+    jest
+      .spyOn(forkTarget, 'forkCheckpointSnapshot')
+      .mockResolvedValue(undefined);
+
+    await executor.execute({
+      description: 'Resume the selected child.',
+      subagentType: config.type,
+      threadId: 'durable-thread',
+      parentToolCallId,
+      parentConfigurable: {
+        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
+          version: 1,
+          executions: [resumeExecution],
+        },
+      },
+    });
+
+    expect(resolverContext?.executionId).toBe('persisted-execution-id');
+  });
+
   it('rejects a changed configId before restoring or recording resume state', async () => {
     const resolver = jest.fn(async () => makeAgent());
     const config = makeLazyConfig('researcher', resolver, {
@@ -649,6 +756,45 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     );
     expect(result.content).not.toContain('researcher@v1');
     expect(result.content).not.toContain('researcher@v2');
+    expect(resolver).not.toHaveBeenCalled();
+    const rejectedState = executor as unknown as {
+      childExecutionIdentities: Map<string, object>;
+      checkpointThreadIds: Set<string>;
+    };
+    expect(rejectedState.childExecutionIdentities.size).toBe(0);
+    expect(rejectedState.checkpointThreadIds.size).toBe(0);
+  });
+
+  it('rejects a versionless resume manifest for a lazy config', async () => {
+    const resolver = jest.fn(async () => makeAgent());
+    const config = makeLazyConfig('researcher', resolver);
+    const parentToolCallId = 'call_versionless_resume';
+    const resumeExecution = makeResumeExecution(
+      parentToolCallId,
+      config.configId
+    );
+    delete resumeExecution.configId;
+    const executor = createExecutor([config], {
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+    });
+
+    const result = await executor.execute({
+      description: 'Resume the selected child.',
+      subagentType: config.type,
+      threadId: 'durable-thread',
+      parentToolCallId,
+      parentConfigurable: {
+        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
+          version: 1,
+          executions: [resumeExecution],
+        },
+      },
+    });
+
+    expect(result.content).toBe(
+      'Subagent error: Subagent configuration changed since this execution was paused.'
+    );
     expect(resolver).not.toHaveBeenCalled();
     const rejectedState = executor as unknown as {
       childExecutionIdentities: Map<string, object>;
@@ -818,6 +964,122 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     );
     expect(manifest?.executions).toHaveLength(1);
     expect(manifest?.executions[0].configId).toBe(config.configId);
+  });
+
+  it('persists the configId for the effective rewritten subagent type', async () => {
+    const researcher = makeLazyConfig('researcher', async () =>
+      makeAgent('researcher')
+    );
+    const coder = makeLazyConfig('coder', async () => {
+      throw new Error('transient coder resolver failure');
+    });
+    const executor = createExecutor([researcher, coder], {
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+    });
+    const parentToolCallId = 'call_rewritten_type';
+    const call = {
+      id: parentToolCallId,
+      name: 'spawn_subagent',
+      args: {
+        description: 'Start the original child.',
+        subagent_type: researcher.type,
+      },
+      type: 'tool_call' as const,
+    };
+    const parentConfigurable = {
+      thread_id: 'durable-thread',
+      checkpoint_id: 'parent-checkpoint',
+      run_id: 'parent-run',
+    };
+    const runnableConfig = { configurable: parentConfigurable };
+
+    await expect(
+      executor.getSettledToolOutput(call, runnableConfig)
+    ).resolves.toBeUndefined();
+    const result = await executor.execute({
+      description: 'Run the rewritten child.',
+      subagentType: coder.type,
+      threadId: parentConfigurable.thread_id,
+      parentToolCallId,
+      parentConfigurable,
+    });
+    await executor.persistSettledToolOutput(call, runnableConfig, {
+      output: new ToolMessage({
+        content: result.content,
+        name: call.name,
+        tool_call_id: parentToolCallId,
+      }),
+      additionalContexts: [],
+      resolvedArgs: {
+        description: 'Run the rewritten child.',
+        subagent_type: coder.type,
+      },
+    });
+    const manifest = await executor.getResumeManifest(
+      new Set([parentToolCallId])
+    );
+
+    expect(result.content).toBe(
+      'Subagent error: Unable to initialize the selected subagent.'
+    );
+    expect(manifest?.executions).toHaveLength(1);
+    expect(manifest?.executions[0].configId).toBe(coder.configId);
+  });
+
+  it('does not retain the original configId after rewriting to an eager config', async () => {
+    const original = makeLazyConfig('researcher', async () =>
+      makeAgent('researcher')
+    );
+    const eager: ResolvedSubagentConfig = {
+      type: 'eager',
+      name: 'Eager worker',
+      description: 'Runs from eager inputs.',
+      agentInputs: makeAgent('eager-child'),
+    };
+    const executor = createExecutor([original, eager], {
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+    });
+    const parentToolCallId = 'call_rewritten_eager';
+    const call = {
+      id: parentToolCallId,
+      name: 'spawn_subagent',
+      args: {
+        description: 'Start the original child.',
+        subagent_type: original.type,
+      },
+      type: 'tool_call' as const,
+    };
+    const runnableConfig = {
+      configurable: {
+        thread_id: 'durable-thread',
+        checkpoint_id: 'parent-checkpoint',
+        run_id: 'parent-run',
+      },
+    };
+
+    await expect(
+      executor.getSettledToolOutput(call, runnableConfig)
+    ).resolves.toBeUndefined();
+    await executor.persistSettledToolOutput(call, runnableConfig, {
+      output: new ToolMessage({
+        content: 'Eager child completed.',
+        name: call.name,
+        tool_call_id: parentToolCallId,
+      }),
+      additionalContexts: [],
+      resolvedArgs: {
+        description: 'Run the eager child.',
+        subagent_type: eager.type,
+      },
+    });
+    const manifest = await executor.getResumeManifest(
+      new Set([parentToolCallId])
+    );
+
+    expect(manifest?.executions).toHaveLength(1);
+    expect(manifest?.executions[0].configId).toBeUndefined();
   });
 
   it('uses the standard factory for lazy agents and the polymorphic factory for graphs', async () => {

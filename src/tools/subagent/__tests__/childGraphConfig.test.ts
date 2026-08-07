@@ -502,4 +502,20 @@ describe('lazy and graph subagent normalization', () => {
       normalizeSubagentConfigs([invalidConfig], makeParentContext())
     ).toThrow(/cannot combine self with resolveAgentInputs/);
   });
+
+  it('rejects self configs with both eager inputs and a resolver', () => {
+    const invalidConfig: SubagentConfig = {
+      type: 'eager-self-or-lazy',
+      name: 'Ambiguous Eager Worker',
+      description: 'Cannot combine self shaping with lazy resolution.',
+      self: true,
+      agentInputs: makeAgent('eager-child'),
+      configId: 'eager-self-or-lazy@v1',
+      resolveAgentInputs: async () => makeAgent('unexpected'),
+    };
+
+    expect(() =>
+      normalizeSubagentConfigs([invalidConfig], makeParentContext())
+    ).toThrow(/cannot combine self with resolveAgentInputs/);
+  });
 });

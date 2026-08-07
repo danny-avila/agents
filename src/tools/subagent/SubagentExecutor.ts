@@ -117,8 +117,11 @@ const ERROR_MESSAGE_MAX_CHARS = 200;
 const MAX_QUEUED_SUBAGENT_UPDATES = 64;
 const SUBAGENT_UPDATE_HANDLER_TIMEOUT_MS = 5_000;
 const TEXT_DELTA_CONTENT_TYPE = `${ContentTypes.TEXT}_delta`;
+const SUBAGENT_THREAD_ID_PREFIX = 'subagent:';
 const SUBAGENT_RESOLUTION_ERROR_MESSAGE =
   'Subagent error: Unable to initialize the selected subagent.';
+const SUBAGENT_EXECUTION_INVALIDATED_MESSAGE =
+  'Subagent execution was invalidated.';
 
 async function dispatchObservationalSubagentUpdate(
   handler: EventHandler,
@@ -344,18 +347,18 @@ function isResumeExecutionCompatible(
   resumeExecution: SubagentResumeExecution | undefined,
   configId: string | undefined
 ): boolean {
-  return (
-    resumeExecution?.configId == null || resumeExecution.configId === configId
-  );
+  return resumeExecution == null || resumeExecution.configId === configId;
+}
+
+function getSubagentTypeFromArgs(args: unknown): string | undefined {
+  if (!isObjectLike(args)) {
+    return undefined;
+  }
+  return asNonEmptyString((args as { subagent_type?: unknown }).subagent_type);
 }
 
 function getSubagentType(call: ToolCall): string | undefined {
-  if (!isObjectLike(call.args)) {
-    return undefined;
-  }
-  return asNonEmptyString(
-    (call.args as { subagent_type?: unknown }).subagent_type
-  );
+  return getSubagentTypeFromArgs(call.args);
 }
 
 const LANGGRAPH_RUNTIME_CONFIG_PREFIX = '__pregel_';
@@ -640,7 +643,7 @@ function getChildThreadId(args: {
   if (args.branchId != null) {
     identity.push(args.branchId);
   }
-  return `subagent:${Buffer.from(JSON.stringify(identity)).toString('base64url')}`;
+  return `${SUBAGENT_THREAD_ID_PREFIX}${Buffer.from(JSON.stringify(identity)).toString('base64url')}`;
 }
 
 function isToolApprovalPayload(
@@ -988,6 +991,18 @@ export class SubagentExecutor {
     return this.resolveParentHandlerRegistry?.();
   }
 
+  private assertConfigResolutionActive(
+    generation: number,
+    signal: AbortSignal
+  ): void {
+    if (signal.aborted) {
+      throw getAbortReason(signal);
+    }
+    if (generation !== this.configResolutionGeneration) {
+      throw new Error(SUBAGENT_EXECUTION_INVALIDATED_MESSAGE);
+    }
+  }
+
   /** Resolve one lazy descriptor per stable child execution. Concurrent
    * duplicate dispatches share the same in-flight resolution; HITL re-entry
    * on this executor reuses the resolved config until the child settles. */
@@ -1043,17 +1058,21 @@ export class SubagentExecutor {
         context.childSignal
       )
         .then((agentInputs): ResolvedSubagentConfig => {
+          this.assertConfigResolutionActive(
+            resolutionGeneration,
+            context.childSignal
+          );
+          if (
+            this.pendingConfigResolutions.get(context.childExecutionKey) !==
+            resolution
+          ) {
+            throw new Error(SUBAGENT_EXECUTION_INVALIDATED_MESSAGE);
+          }
           const resolved: ResolvedSubagentConfig = {
             ...config,
             agentInputs,
           };
-          if (
-            this.configResolutionGeneration === resolutionGeneration &&
-            this.pendingConfigResolutions.get(context.childExecutionKey) ===
-              resolution
-          ) {
-            this.resolvedConfigs.set(context.childExecutionKey, resolved);
-          }
+          this.resolvedConfigs.set(context.childExecutionKey, resolved);
           return resolved;
         })
         .finally(() => {
@@ -1077,7 +1096,6 @@ export class SubagentExecutor {
   private async resolveChildExecutionIdentity(
     params: ChildExecutionIdentityParams
   ): Promise<ChildExecutionIdentity> {
-    const currentChildRunId = `${this.parentRunId}_sub_${params.parentToolCallId}`;
     const resumeAttemptId = getResumeAttemptId(
       params.parentConfigurable,
       this.parentRunId
@@ -1089,6 +1107,7 @@ export class SubagentExecutor {
       parentToolCallId: params.parentToolCallId,
       parentConfigurable: params.parentConfigurable,
     });
+    const currentChildRunId = `${this.parentRunId}_sub_${baseChildThreadId.slice(SUBAGENT_THREAD_ID_PREFIX.length)}`;
     if (this.humanInTheLoop?.enabled !== true || this.checkpointer == null) {
       return {
         childRunId: currentChildRunId,
@@ -1536,15 +1555,21 @@ export class SubagentExecutor {
       parentConfigurable,
       parentToolCallId
     );
-    const subagentType = getSubagentType(call);
+    const resolvedSubagentType = getSubagentTypeFromArgs(settled.resolvedArgs);
+    const subagentType = resolvedSubagentType ?? getSubagentType(call);
     const executableConfig =
       subagentType == null ? undefined : this.configs.get(subagentType);
-    if (
-      !isResumeExecutionCompatible(resumeExecution, executableConfig?.configId)
-    ) {
+    const existingConfigId =
+      this.childExecutionIdentities.get(parentToolCallId)?.configId;
+    const configId =
+      resolvedSubagentType == null
+        ? (existingConfigId ??
+          executableConfig?.configId ??
+          resumeExecution?.configId)
+        : executableConfig?.configId;
+    if (!isResumeExecutionCompatible(resumeExecution, configId)) {
       return;
     }
-    const configId = executableConfig?.configId ?? resumeExecution?.configId;
     const { childRunId, childThreadId, approvalExecutionScope } =
       await this.resolveChildExecutionIdentity({
         threadId: typeof threadId === 'string' ? threadId : undefined,
@@ -1663,6 +1688,7 @@ export class SubagentExecutor {
     params: SubagentExecuteParams
   ): Promise<SubagentExecuteResult> {
     const { description, subagentType, threadId, parentToolCallId } = params;
+    const executionGeneration = this.configResolutionGeneration;
     /** Captured ONCE per execution, preferring the controller the parent
      * tool batch captured at ITS entry (before PreToolUse hooks): a failed
      * run's graph reset replaces the live controller, and resolving it here
@@ -1732,6 +1758,17 @@ export class SubagentExecutor {
         parentConfigurable: params.parentConfigurable,
         resumeExecution,
       });
+    try {
+      this.assertConfigResolutionActive(executionGeneration, childSignal);
+    } catch (error) {
+      if (error instanceof StreamLimitExceededError) {
+        throw error;
+      }
+      return {
+        content: SUBAGENT_RESOLUTION_ERROR_MESSAGE,
+        messages: [],
+      };
+    }
     this.childExecutionIdentities.set(executionSuffix, {
       childRunId,
       childThreadId,
@@ -1757,6 +1794,7 @@ export class SubagentExecutor {
         parentToolCallId,
         parentConfigurable: params.parentConfigurable,
       });
+      this.assertConfigResolutionActive(executionGeneration, childSignal);
     } catch (error) {
       if (error instanceof StreamLimitExceededError) {
         throw error;

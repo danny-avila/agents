@@ -477,13 +477,13 @@ function normalizeSingleAgentConfig(
       `Single-agent subagent "${config.type}" cannot define graph topology fields.`
     );
   }
-  if (config.agentInputs != null) {
-    return config as ResolvedSingleAgentSubagentConfig;
-  }
   if (config.self === true && config.resolveAgentInputs != null) {
     throw new Error(
       `Subagent "${config.type}" cannot combine self with resolveAgentInputs.`
     );
+  }
+  if (config.agentInputs != null) {
+    return config as ResolvedSingleAgentSubagentConfig;
   }
   if (config.self === true && parentContext._sourceInputs != null) {
     return {
