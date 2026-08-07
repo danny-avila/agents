@@ -81,16 +81,19 @@ const makeRecoveredGraph = (): StandardGraph =>
       invoke: jest.fn(),
       updateState: jest.fn(async () => ({})),
     }),
+    restoreSubagentResumeState: jest.fn(),
     clearHeavyState: jest.fn(),
   }) as unknown as StandardGraph;
 
 const makeResumeExecution = (
   parentToolCallId: string,
   configId: string,
-  checkpointThreadId = 'resume-source-thread'
+  checkpointThreadId = 'resume-source-thread',
+  subagentType = 'researcher'
 ): SubagentResumeExecution => ({
   parentToolCallId,
   childRunId: 'original-child-run',
+  subagentType,
   configId,
   approvalExecutionScope: 'original-approval-scope',
   checkpoints: [
@@ -586,6 +589,46 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(observedInput?.agents[0].agentId).toBe(eagerInputs.agentId);
   });
 
+  it('accepts a legacy type-less resume for a versioned eager config', async () => {
+    const configId = 'eager@v1';
+    const eagerConfig: ResolvedSubagentConfig = {
+      type: 'eager',
+      name: 'Eager Worker',
+      description: 'Already has complete inputs.',
+      configId,
+      agentInputs: makeAgent('eager-child'),
+    };
+    const parentToolCallId = 'call_legacy_eager';
+    const resumeExecution = makeResumeExecution(parentToolCallId, configId);
+    delete resumeExecution.subagentType;
+    const executor = createExecutor([eagerConfig], {
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+      createChildGraph: makeRecoveredGraph,
+    });
+    const forkTarget = executor as unknown as {
+      forkCheckpointSnapshot: () => Promise<void>;
+    };
+    jest
+      .spyOn(forkTarget, 'forkCheckpointSnapshot')
+      .mockResolvedValue(undefined);
+
+    const result = await executor.execute({
+      description: 'Resume eager inputs.',
+      subagentType: eagerConfig.type,
+      threadId: 'durable-thread',
+      parentToolCallId,
+      parentConfigurable: {
+        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
+          version: 1,
+          executions: [resumeExecution],
+        },
+      },
+    });
+
+    expect(result.content).toBe('persisted result');
+  });
+
   it('preserves nested lazy descriptors and decrements the child depth', async () => {
     const nestedDescriptor = makeLazyConfig('grandchild', async () =>
       makeAgent('grandchild')
@@ -804,6 +847,81 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(rejectedState.checkpointThreadIds.size).toBe(0);
   });
 
+  it('rejects a lazy resume without manifest or checkpoint type evidence', async () => {
+    const resolver = jest.fn(async () => makeAgent());
+    const config = makeLazyConfig('researcher', resolver);
+    const parentToolCallId = 'call_unbound_lazy_resume';
+    const resumeExecution = makeResumeExecution(
+      parentToolCallId,
+      config.configId
+    );
+    delete resumeExecution.subagentType;
+    const executor = createExecutor([config], {
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+    });
+
+    const result = await executor.execute({
+      description: 'Resume the selected child.',
+      subagentType: config.type,
+      threadId: 'durable-thread',
+      parentToolCallId,
+      parentConfigurable: {
+        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
+          version: 1,
+          executions: [resumeExecution],
+        },
+      },
+    });
+
+    expect(result.content).toBe(
+      'Subagent error: Subagent configuration changed since this execution was paused.'
+    );
+    expect(resolver).not.toHaveBeenCalled();
+  });
+
+  it('rejects a resume manifest bound to another type with the same configId', async () => {
+    const resolver = jest.fn(async () => makeAgent('coder'));
+    const config = makeLazyConfig('coder', resolver, {
+      configId: 'shared@v1',
+    });
+    const parentToolCallId = 'call_cross_type_resume';
+    const resumeExecution = makeResumeExecution(
+      parentToolCallId,
+      'shared@v1',
+      'resume-source-thread',
+      'researcher'
+    );
+    const executor = createExecutor([config], {
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+    });
+
+    const result = await executor.execute({
+      description: 'Resume the selected child.',
+      subagentType: config.type,
+      threadId: 'durable-thread',
+      parentToolCallId,
+      parentConfigurable: {
+        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
+          version: 1,
+          executions: [resumeExecution],
+        },
+      },
+    });
+
+    expect(result.content).toBe(
+      'Subagent error: Subagent configuration changed since this execution was paused.'
+    );
+    expect(resolver).not.toHaveBeenCalled();
+    const rejectedState = executor as unknown as {
+      childExecutionIdentities: Map<string, object>;
+      checkpointThreadIds: Set<string>;
+    };
+    expect(rejectedState.childExecutionIdentities.size).toBe(0);
+    expect(rejectedState.checkpointThreadIds.size).toBe(0);
+  });
+
   it('rejects replay lifecycle revision mismatches before restoring state', async () => {
     const config = makeLazyConfig('researcher', async () => makeAgent(), {
       configId: 'researcher@v2',
@@ -841,6 +959,64 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
         tool_call_id: parentToolCallId,
       }),
       additionalContexts: [],
+    });
+
+    const rejectedState = executor as unknown as {
+      childExecutionIdentities: Map<string, object>;
+      checkpointThreadIds: Set<string>;
+    };
+    expect(rejectedState.childExecutionIdentities.size).toBe(0);
+    expect(rejectedState.checkpointThreadIds.size).toBe(0);
+  });
+
+  it('rejects replay lifecycle type mismatches with the same configId', async () => {
+    const config = makeLazyConfig('coder', async () => makeAgent('coder'), {
+      configId: 'shared@v1',
+    });
+    const executor = createExecutor([config], {
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+    });
+    const parentToolCallId = 'call_lifecycle_type_mismatch';
+    const call = {
+      id: parentToolCallId,
+      name: 'spawn_subagent',
+      args: {
+        description: 'Resume the selected child.',
+        subagent_type: config.type,
+      },
+      type: 'tool_call' as const,
+    };
+    const runnableConfig = {
+      configurable: {
+        thread_id: 'durable-thread',
+        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
+          version: 1 as const,
+          executions: [
+            makeResumeExecution(
+              parentToolCallId,
+              'shared@v1',
+              'resume-source-thread',
+              'researcher'
+            ),
+          ],
+        },
+      },
+    };
+
+    await expect(
+      executor.getSettledToolOutput(call, runnableConfig)
+    ).resolves.toBeUndefined();
+    await executor.persistSettledToolOutput(call, runnableConfig, {
+      output: new ToolMessage({
+        content: 'Do not persist this mismatch.',
+        tool_call_id: parentToolCallId,
+      }),
+      additionalContexts: [],
+      resolvedArgs: {
+        description: 'Run the coder.',
+        subagent_type: config.type,
+      },
     });
 
     const rejectedState = executor as unknown as {
@@ -1024,7 +1200,107 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
       'Subagent error: Unable to initialize the selected subagent.'
     );
     expect(manifest?.executions).toHaveLength(1);
+    expect(manifest?.executions[0].subagentType).toBe(coder.type);
     expect(manifest?.executions[0].configId).toBe(coder.configId);
+  });
+
+  it('replays a persisted effective type before rerunning lifecycle hooks', async () => {
+    const checkpointer = new MemorySaver();
+    const researcher = makeLazyConfig('researcher', async () =>
+      makeAgent('researcher')
+    );
+    const coder = makeLazyConfig('coder', async () => makeAgent('coder'));
+    const source = createExecutor([researcher, coder], {
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+    });
+    const parentToolCallId = 'call_effective_replay';
+    const call = {
+      id: parentToolCallId,
+      name: 'spawn_subagent',
+      args: {
+        description: 'Start the original child.',
+        subagent_type: researcher.type,
+      },
+      type: 'tool_call' as const,
+    };
+    const parentConfigurable = {
+      thread_id: 'durable-thread',
+      checkpoint_id: 'parent-checkpoint',
+      run_id: 'parent-run',
+    };
+    const runnableConfig = { configurable: parentConfigurable };
+
+    await expect(
+      source.getSettledToolOutput(call, runnableConfig)
+    ).resolves.toBeUndefined();
+    await source.persistSettledToolOutput(call, runnableConfig, {
+      output: new ToolMessage({
+        content: 'Coder completed.',
+        name: call.name,
+        tool_call_id: parentToolCallId,
+      }),
+      additionalContexts: [],
+      resolvedArgs: {
+        description: 'Run the rewritten child.',
+        subagent_type: coder.type,
+      },
+    });
+    const manifest = await source.getResumeManifest(
+      new Set([parentToolCallId])
+    );
+    expect(manifest?.executions[0].subagentType).toBe(coder.type);
+    if (manifest == null) {
+      throw new Error('Expected a persisted replay manifest.');
+    }
+    const mismatchedManifest = {
+      ...manifest,
+      executions: [
+        {
+          ...manifest.executions[0],
+          subagentType: researcher.type,
+        },
+      ],
+    };
+    const rejected = createExecutor([researcher, coder], {
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+    });
+    const rejectedForkTarget = rejected as unknown as {
+      forkCheckpointSnapshot: () => Promise<void>;
+      childExecutionIdentities: Map<string, object>;
+    };
+    const forkCheckpointSnapshot = jest
+      .spyOn(rejectedForkTarget, 'forkCheckpointSnapshot')
+      .mockResolvedValue(undefined);
+    await expect(
+      rejected.getSettledToolOutput(call, {
+        configurable: {
+          ...parentConfigurable,
+          [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: mismatchedManifest,
+        },
+      })
+    ).resolves.toBeUndefined();
+    expect(forkCheckpointSnapshot).not.toHaveBeenCalled();
+    expect(rejectedForkTarget.childExecutionIdentities.size).toBe(0);
+
+    delete manifest.executions[0].subagentType;
+
+    const rebuilt = createExecutor([researcher, coder], {
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+    });
+    const replayed = await rebuilt.getSettledToolOutput(call, {
+      configurable: {
+        ...parentConfigurable,
+        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: manifest,
+      },
+    });
+
+    expect(replayed?.output.content).toBe('Coder completed.');
+    expect(replayed?.resolvedArgs).toMatchObject({
+      subagent_type: coder.type,
+    });
   });
 
   it('does not retain the original configId after rewriting to an eager config', async () => {
@@ -1079,6 +1355,7 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     );
 
     expect(manifest?.executions).toHaveLength(1);
+    expect(manifest?.executions[0].subagentType).toBe(eager.type);
     expect(manifest?.executions[0].configId).toBeUndefined();
   });
 
