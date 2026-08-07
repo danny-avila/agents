@@ -64,17 +64,23 @@ import type {
   ToolApprovalDecisionMap,
 } from '@/types';
 import type {
+  PreparedSubagentExecutionIdentity,
+  SubagentDefinitionBinding,
+  SubagentExecutionIdentity,
+  SubagentExecutionPreparationLease,
+  SubagentExecutionRecord,
+} from './SubagentExecutionRegistry';
+import type {
   SubagentResumeExecution,
   SubagentResumeManifest,
   SubagentCheckpointReference,
   SettledSubagentToolOutput,
 } from './SubagentReplay';
 import type {
-  SubagentDefinitionBinding,
-  SubagentExecutionIdentity,
-  SubagentExecutionRecord,
-} from './SubagentExecutionRegistry';
-import type { AggregatedHookResult, HookRegistry } from '@/hooks';
+  AggregatedHookResult,
+  HookRegistry,
+  ToolApprovalReplaySnapshot,
+} from '@/hooks';
 import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
 import type { HandlerRegistry } from '@/events';
@@ -373,7 +379,10 @@ function getSubagentDescriptionFromArgs(args: unknown): string | undefined {
   if (!isObjectLike(args)) {
     return undefined;
   }
-  return asNonEmptyString((args as { description?: unknown }).description);
+  const description = (args as { description?: unknown }).description;
+  return typeof description === 'string' && description.trim().length > 0
+    ? description
+    : undefined;
 }
 
 function getSubagentType(call: ToolCall): string | undefined {
@@ -391,6 +400,7 @@ const SUBAGENT_CHECKPOINT_MARKER_KEY = '__librechat_subagent_checkpoint';
 const SUBAGENT_HOOK_SESSION_KEY = '__librechat_subagent_hook_session';
 const SUBAGENT_RUN_ID_KEY = '__librechat_subagent_run_id';
 const SUBAGENT_REPLAY_NODE = 'subagent-replay';
+export const DEFAULT_SUBAGENT_DESCRIPTION = 'No task description provided';
 
 function isCheckpointSaver(value: unknown): value is BaseCheckpointSaver {
   if (value == null || typeof value !== 'object') {
@@ -1031,37 +1041,52 @@ export class SubagentExecutor {
   private async resolveChildExecutionIdentity(
     execution: DurableExecutionRecord
   ): Promise<SubagentExecutionIdentity> {
-    const identity = await execution.resolveIdentity(() =>
-      this.createChildExecutionIdentity(execution)
-    );
-    if (this.humanInTheLoop?.enabled === true && this.checkpointer != null) {
-      this.executions.rememberCheckpointThread(identity.childThreadId);
-    }
-    const { resumeExecution } = execution;
-    if (resumeExecution != null) {
-      this.executions.retireResumeSources(
-        execution,
-        new Set(
-          resumeExecution.checkpoints.map((checkpoint) => checkpoint.threadId)
-        ),
-        (source) => {
-          if (source.activeRun != null) {
-            this.clearChildGraph(source.activeRun.graph);
-          }
-          if (source.identity != null) {
-            this.hookRegistry?.clearSession(
-              source.identity.approvalExecutionScope
+    return execution.resolveIdentity(async () => {
+      const preparation = await this.createChildExecutionIdentity(execution);
+      const { identity } = preparation;
+      return {
+        identity,
+        lease: preparation.lease,
+        commit: (lease): void => {
+          const { resumeExecution } = execution;
+          if (resumeExecution != null) {
+            this.executions.retireResumeSources(
+              execution,
+              new Set(
+                resumeExecution.checkpoints.map(
+                  (checkpoint) => checkpoint.threadId
+                )
+              ),
+              (source) => {
+                if (source.activeRun != null) {
+                  this.clearChildGraph(source.activeRun.graph);
+                }
+                if (source.identity != null) {
+                  this.hookRegistry?.clearSession(
+                    source.identity.approvalExecutionScope
+                  );
+                }
+              }
             );
           }
-        }
-      );
-    }
-    return identity;
+          preparation.commit?.(lease);
+          if (
+            this.humanInTheLoop?.enabled === true &&
+            this.checkpointer != null
+          ) {
+            this.executions.rememberCheckpointThread(identity.childThreadId);
+          }
+        },
+        rollback: async (lease): Promise<void> => {
+          await preparation.rollback?.(lease);
+        },
+      };
+    });
   }
 
   private async createChildExecutionIdentity(
     execution: DurableExecutionRecord
-  ): Promise<SubagentExecutionIdentity> {
+  ): Promise<PreparedSubagentExecutionIdentity> {
     const {
       baseChildThreadId,
       branchChildThreadId,
@@ -1070,11 +1095,11 @@ export class SubagentExecutor {
       resumeAttemptId,
     } = execution.address;
     if (this.humanInTheLoop?.enabled !== true || this.checkpointer == null) {
-      return {
+      return this.prepareIdentity(execution, {
         childRunId: currentChildRunId,
         childThreadId: baseChildThreadId,
         approvalExecutionScope: currentChildRunId,
-      };
+      });
     }
 
     const { resumeExecution } = execution;
@@ -1083,19 +1108,69 @@ export class SubagentExecutor {
         resumeExecution.childRunId,
         resumeAttemptId
       );
-      await this.forkCheckpointSnapshot(
-        resumeExecution.checkpoints,
-        branchChildThreadId
-      );
-      this.hookRegistry?.restorePendingToolApprovals(
-        approvalExecutionScope,
-        approvalExecutionScope,
-        resumeExecution.approvalReplays
-      );
-      return {
+      const identity = {
         childRunId: resumeExecution.childRunId,
         childThreadId: branchChildThreadId,
         approvalExecutionScope,
+      };
+      const lease = this.executions.beginIdentityPreparation(
+        execution,
+        identity
+      );
+      await this.prepareCheckpointFork(
+        resumeExecution.checkpoints,
+        branchChildThreadId,
+        lease
+      );
+      let previousApprovals: ToolApprovalReplaySnapshot[] = [];
+      let approvalsMutated = false;
+      return {
+        identity,
+        lease,
+        commit: (currentLease): void => {
+          const hookRegistry = this.hookRegistry;
+          if (hookRegistry == null) {
+            return;
+          }
+          previousApprovals = hookRegistry.snapshotPendingToolApprovals(
+            approvalExecutionScope,
+            approvalExecutionScope
+          );
+          const approvalReplayCreatesScope =
+            previousApprovals.length === 0 &&
+            resumeExecution.approvalReplays.length > 0;
+          const approvalsChanged =
+            previousApprovals.length > 0 ||
+            resumeExecution.approvalReplays.length > 0;
+          if (approvalReplayCreatesScope) {
+            currentLease.markApprovalScopeCreated(async (): Promise<void> => {
+              hookRegistry.restorePendingToolApprovals(
+                approvalExecutionScope,
+                approvalExecutionScope,
+                previousApprovals
+              );
+            });
+          }
+          approvalsMutated = approvalsChanged && !approvalReplayCreatesScope;
+          hookRegistry.restorePendingToolApprovals(
+            approvalExecutionScope,
+            approvalExecutionScope,
+            resumeExecution.approvalReplays
+          );
+        },
+        rollback: async (currentLease): Promise<void> => {
+          if (
+            approvalsMutated &&
+            currentLease.ownsApprovalScope &&
+            this.hookRegistry != null
+          ) {
+            this.hookRegistry.restorePendingToolApprovals(
+              approvalExecutionScope,
+              approvalExecutionScope,
+              previousApprovals
+            );
+          }
+        },
       };
     }
 
@@ -1105,21 +1180,21 @@ export class SubagentExecutor {
     if (branchTuple != null) {
       const childRunId =
         getSubagentRunId(getTupleMessages(branchTuple)) ?? currentChildRunId;
-      return {
+      return this.prepareIdentity(execution, {
         childRunId,
         childThreadId: branchChildThreadId,
         approvalExecutionScope: getSubagentApprovalExecutionScope(
           childRunId,
           resumeAttemptId
         ),
-      };
+      });
     }
 
     const baseTuple = await this.checkpointer.getTuple({
       configurable: { thread_id: baseChildThreadId },
     });
     if (baseTuple == null) {
-      return {
+      return this.prepareIdentity(execution, {
         childRunId: currentChildRunId,
         childThreadId: explicitResumeAttempt
           ? branchChildThreadId
@@ -1128,7 +1203,7 @@ export class SubagentExecutor {
           currentChildRunId,
           resumeAttemptId
         ),
-      };
+      });
     }
     const persistedChildRunId = getSubagentRunId(getTupleMessages(baseTuple));
     if (
@@ -1136,14 +1211,14 @@ export class SubagentExecutor {
       (persistedChildRunId == null || persistedChildRunId === currentChildRunId)
     ) {
       const childRunId = persistedChildRunId ?? currentChildRunId;
-      return {
+      return this.prepareIdentity(execution, {
         childRunId,
         childThreadId: baseChildThreadId,
         approvalExecutionScope: getSubagentApprovalExecutionScope(
           childRunId,
           resumeAttemptId
         ),
-      };
+      });
     }
     const sourceCheckpoints =
       await this.getLatestCheckpointSnapshot(baseChildThreadId);
@@ -1152,9 +1227,8 @@ export class SubagentExecutor {
         `Cannot fork subagent checkpoint thread "${baseChildThreadId}" without a checkpoint ID.`
       );
     }
-    await this.forkCheckpointSnapshot(sourceCheckpoints, branchChildThreadId);
     const childRunId = persistedChildRunId ?? currentChildRunId;
-    return {
+    const identity = {
       childRunId,
       childThreadId: branchChildThreadId,
       approvalExecutionScope: getSubagentApprovalExecutionScope(
@@ -1162,6 +1236,68 @@ export class SubagentExecutor {
         resumeAttemptId
       ),
     };
+    const lease = this.executions.beginIdentityPreparation(execution, identity);
+    await this.prepareCheckpointFork(
+      sourceCheckpoints,
+      branchChildThreadId,
+      lease
+    );
+    return {
+      identity,
+      lease,
+    };
+  }
+
+  private prepareIdentity(
+    execution: DurableExecutionRecord,
+    identity: SubagentExecutionIdentity
+  ): PreparedSubagentExecutionIdentity {
+    return {
+      identity,
+      lease: this.executions.beginIdentityPreparation(execution, identity),
+    };
+  }
+
+  private async prepareCheckpointFork(
+    sources: ReadonlyArray<SubagentCheckpointReference>,
+    targetThreadId: string,
+    lease: SubagentExecutionPreparationLease
+  ): Promise<void> {
+    const checkpointer = this.checkpointer;
+    try {
+      if (
+        checkpointer == null ||
+        sources.length === 0 ||
+        sources.every((source) => source.threadId === targetThreadId)
+      ) {
+        lease.assertOwned();
+        return;
+      }
+      const targetExists = await this.checkpointThreadExists(targetThreadId);
+      lease.assertOwned();
+      if (!targetExists) {
+        lease.markCheckpointCreated(() =>
+          checkpointer.deleteThread(targetThreadId)
+        );
+      }
+      await this.forkCheckpointSnapshot(sources, targetThreadId);
+      lease.assertOwned();
+    } catch (error) {
+      return lease.rollback(error);
+    }
+  }
+
+  private async checkpointThreadExists(threadId: string): Promise<boolean> {
+    if (this.checkpointer == null) {
+      return false;
+    }
+    for await (const _tuple of this.checkpointer.list(
+      { configurable: { thread_id: threadId } },
+      { limit: 1 }
+    )) {
+      return true;
+    }
+    return false;
   }
 
   /** Captures one exact checkpoint head per namespace for a child thread. */
@@ -1609,10 +1745,22 @@ export class SubagentExecutor {
     });
     const { resumeExecution } = execution;
     const resolvedSubagentType = getSubagentTypeFromArgs(settled.resolvedArgs);
+    const resolvedDescription = getSubagentDescriptionFromArgs(
+      settled.resolvedArgs
+    );
+    const boundInvocation = execution.invocation;
+    if (
+      boundInvocation != null &&
+      resolvedDescription != null &&
+      resolvedDescription !== boundInvocation.description
+    ) {
+      return;
+    }
     const description =
-      getSubagentDescriptionFromArgs(settled.resolvedArgs) ??
+      boundInvocation?.description ??
+      resolvedDescription ??
       getSubagentDescriptionFromArgs(call.args) ??
-      execution.invocation?.description;
+      DEFAULT_SUBAGENT_DESCRIPTION;
     const subagentType =
       resolvedSubagentType ??
       execution.binding?.subagentType ??
@@ -1625,7 +1773,7 @@ export class SubagentExecutor {
           executableConfig?.configId ??
           resumeExecution?.configId)
         : executableConfig?.configId;
-    if (subagentType == null || description == null) {
+    if (subagentType == null) {
       return;
     }
     if (
@@ -1639,17 +1787,18 @@ export class SubagentExecutor {
       return;
     }
     const persistedOutput = serializeToolOutput(settled);
+    const invocation = boundInvocation ?? {
+      description,
+      subagentType,
+      ...(configId == null ? {} : { configId }),
+    };
     try {
       await execution.settle(
         {
           definitionAuthority:
             resolvedSubagentType == null ? 'provisional' : 'effective',
           fingerprint: getSettlementFingerprint(persistedOutput),
-          invocation: {
-            description,
-            subagentType,
-            ...(configId == null ? {} : { configId }),
-          },
+          invocation,
           subagentType,
           ...(configId == null ? {} : { configId }),
         },
@@ -1835,9 +1984,9 @@ export class SubagentExecutor {
         messages: [],
       };
     }
-    const { childRunId, childThreadId, approvalExecutionScope } =
-      await this.resolveChildExecutionIdentity(execution);
+    let identity: SubagentExecutionIdentity;
     try {
+      identity = await this.resolveChildExecutionIdentity(execution);
       execution.assertUsable(childSignal);
     } catch (error) {
       if (error instanceof StreamLimitExceededError) {
@@ -1848,6 +1997,7 @@ export class SubagentExecutor {
         messages: [],
       };
     }
+    const { childRunId, childThreadId, approvalExecutionScope } = identity;
     const bound = this.bindExecutionDefinition(
       execution,
       {

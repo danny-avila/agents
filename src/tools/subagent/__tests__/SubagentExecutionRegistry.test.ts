@@ -164,7 +164,8 @@ describe('SubagentExecutionRegistry', () => {
   });
 
   it('coalesces identity resolution before binding the resolved identity', async () => {
-    const record = createRegistry().open(createInput());
+    const registry = createRegistry();
+    const record = registry.open(createInput());
     let finish = (_identity: {
       childRunId: string;
       childThreadId: string;
@@ -177,7 +178,13 @@ describe('SubagentExecutionRegistry', () => {
     }>((resolve) => {
       finish = resolve;
     });
-    const resolveIdentity = jest.fn(() => identity);
+    const resolveIdentity = jest.fn(async () => {
+      const resolvedIdentity = await identity;
+      return {
+        identity: resolvedIdentity,
+        lease: registry.beginIdentityPreparation(record, resolvedIdentity),
+      };
+    });
 
     const first = record.resolveIdentity(resolveIdentity);
     const duplicate = record.resolveIdentity(resolveIdentity);
@@ -196,6 +203,200 @@ describe('SubagentExecutionRegistry', () => {
       resolvingIdentity: false,
       identity: { childThreadId: 'child-thread' },
     });
+  });
+
+  it('rolls back prepared identity side effects after invalidation', async () => {
+    const registry = createRegistry();
+    const record = registry.open(createInput());
+    let finishPreparation = (): void => undefined;
+    let markPreparationStarted = (): void => undefined;
+    const preparationStarted = new Promise<void>((resolve) => {
+      markPreparationStarted = resolve;
+    });
+    const preparationGate = new Promise<void>((resolve) => {
+      finishPreparation = resolve;
+    });
+    const commit = jest.fn();
+    const rollback = jest.fn(async (): Promise<void> => undefined);
+    const staleIdentity = {
+      childRunId: 'stale-run',
+      childThreadId: 'stale-thread',
+      approvalExecutionScope: 'stale-scope',
+    };
+    const lease = registry.beginIdentityPreparation(record, staleIdentity);
+    const pending = record.resolveIdentity(async () => {
+      markPreparationStarted();
+      await preparationGate;
+      return {
+        identity: staleIdentity,
+        lease,
+        commit: () => commit(),
+        rollback: async () => rollback(),
+      };
+    });
+
+    await preparationStarted;
+    registry.clear();
+    finishPreparation();
+
+    await expect(pending).rejects.toBeInstanceOf(
+      SubagentExecutionInvalidatedError
+    );
+    expect(commit).not.toHaveBeenCalled();
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(record.snapshot.identity).toBeUndefined();
+    expect(registry.selectForResume()).toEqual([]);
+  });
+
+  it('keeps created-resource ownership exclusive through rollback', async () => {
+    const registry = createRegistry();
+    const staleRecord = registry.open(createInput());
+    const sharedIdentity = {
+      childRunId: 'shared-run',
+      childThreadId: 'shared-thread',
+      approvalExecutionScope: 'shared-scope',
+    };
+    const staleLease = registry.beginIdentityPreparation(
+      staleRecord,
+      sharedIdentity
+    );
+    const checkpointCleanup = jest.fn(async (): Promise<void> => undefined);
+    const approvalCleanup = jest.fn(async (): Promise<void> => undefined);
+    staleLease.markCheckpointCreated(checkpointCleanup);
+    staleLease.markApprovalScopeCreated(approvalCleanup);
+    registry.clear();
+    const currentRecord = registry.open(createInput());
+    const staleCause = new Error('stale preparation');
+
+    expect(() =>
+      registry.beginIdentityPreparation(currentRecord, sharedIdentity)
+    ).toThrow(SubagentExecutionInvalidatedError);
+
+    await expect(staleLease.rollback(staleCause)).rejects.toBe(staleCause);
+
+    expect(staleLease.ownsCheckpoint).toBe(false);
+    expect(staleLease.ownsApprovalScope).toBe(false);
+    expect(checkpointCleanup).toHaveBeenCalledTimes(1);
+    expect(approvalCleanup).toHaveBeenCalledTimes(1);
+    const currentLease = registry.beginIdentityPreparation(
+      currentRecord,
+      sharedIdentity
+    );
+    expect(currentLease.ownsCreatedCheckpoint).toBe(false);
+    expect(currentLease.ownsCreatedApprovalScope).toBe(false);
+    currentLease.release();
+  });
+
+  it('blocks a cleaning checkpoint without claiming an independent approval scope', async () => {
+    const registry = createRegistry();
+    const staleRecord = registry.open(createInput());
+    const staleIdentity = {
+      childRunId: 'stale-run',
+      childThreadId: 'shared-cleaning-thread',
+      approvalExecutionScope: 'stale-scope',
+    };
+    const staleLease = registry.beginIdentityPreparation(
+      staleRecord,
+      staleIdentity
+    );
+    let finishCleanup = (): void => undefined;
+    let markCleanupStarted = (): void => undefined;
+    const cleanupGate = new Promise<void>((resolve) => {
+      finishCleanup = resolve;
+    });
+    const cleanupStarted = new Promise<void>((resolve) => {
+      markCleanupStarted = resolve;
+    });
+    const cleanup = jest.fn(async (): Promise<void> => {
+      markCleanupStarted();
+      await cleanupGate;
+    });
+    staleLease.markCheckpointCreated(cleanup);
+    registry.clear();
+    const currentRecord = registry.open(createInput());
+    const replacementIdentity = {
+      childRunId: 'replacement-run',
+      childThreadId: staleIdentity.childThreadId,
+      approvalExecutionScope: 'replacement-scope',
+    };
+    const staleCause = new Error('stale preparation');
+    const rollback = staleLease.rollback(staleCause);
+    await cleanupStarted;
+
+    expect(() =>
+      registry.beginIdentityPreparation(currentRecord, replacementIdentity)
+    ).toThrow(SubagentExecutionInvalidatedError);
+    const independentRecord = registry.open(
+      createInput({ checkpoint_id: 'independent-fork' })
+    );
+    const independentLease = registry.beginIdentityPreparation(
+      independentRecord,
+      {
+        childRunId: 'independent-run',
+        childThreadId: 'independent-thread',
+        approvalExecutionScope: replacementIdentity.approvalExecutionScope,
+      }
+    );
+    expect(independentLease.ownsCheckpoint).toBe(true);
+    expect(independentLease.ownsApprovalScope).toBe(true);
+    independentLease.release();
+
+    finishCleanup();
+    await expect(rollback).rejects.toBe(staleCause);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    const retryLease = registry.beginIdentityPreparation(
+      currentRecord,
+      replacementIdentity
+    );
+    expect(retryLease.ownsCheckpoint).toBe(true);
+    expect(retryLease.ownsApprovalScope).toBe(true);
+    retryLease.release();
+  });
+
+  it('preserves the primary failure when preparation rollback also fails', async () => {
+    const registry = createRegistry();
+    const record = registry.open(createInput());
+    const lease = registry.beginIdentityPreparation(record, {
+      childRunId: 'failed-run',
+      childThreadId: 'failed-thread',
+      approvalExecutionScope: 'failed-scope',
+    });
+    const cause = new Error('checkpoint fork failed');
+    const rollbackError = new Error('checkpoint cleanup failed');
+
+    await expect(
+      lease.rollback(cause, async () => {
+        throw rollbackError;
+      })
+    ).rejects.toBe(cause);
+
+    expect((cause as Error & { rollbackError?: unknown }).rollbackError).toBe(
+      rollbackError
+    );
+  });
+
+  it('preserves a frozen primary failure and releases a failed lease', async () => {
+    const registry = createRegistry();
+    const record = registry.open(createInput());
+    const identity = {
+      childRunId: 'frozen-run',
+      childThreadId: 'frozen-thread',
+      approvalExecutionScope: 'frozen-scope',
+    };
+    const lease = registry.beginIdentityPreparation(record, identity);
+    const cause = Object.freeze(new Error('frozen preparation failure'));
+    lease.markCheckpointCreated(async () => {
+      throw new Error('cleanup failure');
+    });
+
+    await expect(lease.rollback(cause)).rejects.toBe(cause);
+
+    expect(lease.ownsCheckpoint).toBe(false);
+    expect(lease.ownsApprovalScope).toBe(false);
+    const retryLease = registry.beginIdentityPreparation(record, identity);
+    expect(retryLease.ownsCheckpoint).toBe(true);
+    expect(retryLease.ownsApprovalScope).toBe(true);
+    retryLease.release();
   });
 
   it('coalesces invocation and owns active, interrupted, and completed state', async () => {

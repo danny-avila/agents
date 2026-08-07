@@ -13,6 +13,16 @@ run and checkpoint-thread identity, approval scope, effective subagent type and
 configuration revision, pending resolution and invocation work, active graph
 state, completion state, and invalidation.
 
+Child identity resolution is prepared before it is committed. Checkpoint
+forks, approval replay restoration, and cleanup tracking become authoritative
+only while the same Execution Record is still current; invalidated
+preparations roll back only resources owned by their preparation lease. A
+checkpoint writer keeps exclusive ownership until its preparation settles and
+any owned cleanup finishes, so a retry cannot adopt a branch that the old
+writer can still modify. Pre-existing branches are never deleted as
+preparation-owned state. Active and cleaning resources stay fenced; retries
+fail closed and can reacquire them only after they become free.
+
 An **Invocation Binding** is the immutable subagent type, configuration
 revision, and description accepted when an Execution Record starts. Exact
 duplicate dispatches share its pending result. A same-address dispatch with a

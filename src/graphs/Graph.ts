@@ -98,6 +98,12 @@ import {
   RUN_BREAKER_SCOPE_CONFIG_KEY,
 } from '@/llm/streamLimits';
 import {
+  DEFAULT_SUBAGENT_DESCRIPTION,
+  SubagentExecutor,
+  isGraphSubagentConfig,
+  normalizeSubagentConfigEntries,
+} from '@/tools/subagent';
+import {
   Constants,
   GraphNodeKeys,
   ContentTypes,
@@ -127,11 +133,6 @@ import {
   getToolContentCharLength,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
-import {
-  SubagentExecutor,
-  isGraphSubagentConfig,
-  normalizeSubagentConfigEntries,
-} from '@/tools/subagent';
 import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
@@ -4334,7 +4335,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             typeof input.description === 'string' &&
             input.description.trim().length > 0
               ? input.description
-              : 'No task description provided';
+              : DEFAULT_SUBAGENT_DESCRIPTION;
           const subagentType =
             typeof input.subagent_type === 'string' ? input.subagent_type : '';
           const threadId = config.configurable?.thread_id as string | undefined;

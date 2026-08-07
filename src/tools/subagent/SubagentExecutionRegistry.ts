@@ -32,6 +32,28 @@ export type SubagentExecutionIdentity = Readonly<{
   approvalExecutionScope: string;
 }>;
 
+export interface SubagentExecutionPreparationLease {
+  readonly ownsCheckpoint: boolean;
+  readonly ownsCreatedCheckpoint: boolean;
+  readonly ownsApprovalScope: boolean;
+  readonly ownsCreatedApprovalScope: boolean;
+  assertOwned(): void;
+  markCheckpointCreated(cleanup: () => Promise<void>): void;
+  markApprovalScopeCreated(cleanup: () => Promise<void>): void;
+  release(): void;
+  rollback(
+    cause: unknown,
+    cleanup?: (lease: SubagentExecutionPreparationLease) => Promise<void>
+  ): Promise<never>;
+}
+
+export type PreparedSubagentExecutionIdentity = Readonly<{
+  identity: SubagentExecutionIdentity;
+  lease: SubagentExecutionPreparationLease;
+  commit?: (lease: SubagentExecutionPreparationLease) => void;
+  rollback?: (lease: SubagentExecutionPreparationLease) => Promise<void>;
+}>;
+
 export type SubagentDefinitionBinding = Readonly<{
   subagentType?: string;
   configId?: string;
@@ -89,6 +111,192 @@ type ResumeSelection = {
   parentToolCallIds?: ReadonlySet<string>;
   config?: RunnableConfig;
 };
+
+type OwnedPreparationResource = {
+  status: 'owned';
+  token: number;
+  created: boolean;
+  cleanup?: () => Promise<void>;
+};
+
+type CleaningPreparationResource = {
+  status: 'cleaning';
+  token: number;
+};
+
+type PreparationResourceState =
+  | OwnedPreparationResource
+  | CleaningPreparationResource;
+
+function getPreparationResourceKey(
+  kind: 'checkpoint' | 'approval',
+  identity: string
+): string {
+  return JSON.stringify([kind, identity]);
+}
+
+function attachRollbackError(cause: unknown, rollbackError: unknown): void {
+  if (!(cause instanceof Error)) {
+    return;
+  }
+  try {
+    Object.defineProperty(cause, 'rollbackError', {
+      configurable: true,
+      value: rollbackError,
+    });
+  } catch {
+    return;
+  }
+}
+
+class PreparationLease implements SubagentExecutionPreparationLease {
+  constructor(
+    private readonly owners: Map<string, PreparationResourceState>,
+    private readonly token: number,
+    private readonly checkpointKey: string,
+    private readonly approvalKey: string
+  ) {}
+
+  get ownsCheckpoint(): boolean {
+    return this.owns(this.checkpointKey);
+  }
+
+  get ownsCreatedCheckpoint(): boolean {
+    return this.isCreated(this.checkpointKey);
+  }
+
+  get ownsApprovalScope(): boolean {
+    return this.owns(this.approvalKey);
+  }
+
+  get ownsCreatedApprovalScope(): boolean {
+    return this.isCreated(this.approvalKey);
+  }
+
+  assertOwned(): void {
+    if (!this.owns(this.checkpointKey) || !this.owns(this.approvalKey)) {
+      throw new SubagentExecutionInvalidatedError();
+    }
+  }
+
+  markCheckpointCreated(cleanup: () => Promise<void>): void {
+    this.markCreated(this.checkpointKey, cleanup);
+  }
+
+  markApprovalScopeCreated(cleanup: () => Promise<void>): void {
+    this.markCreated(this.approvalKey, cleanup);
+  }
+
+  release(): void {
+    this.releaseResource(this.checkpointKey);
+    this.releaseResource(this.approvalKey);
+  }
+
+  async rollback(
+    cause: unknown,
+    cleanup?: (lease: SubagentExecutionPreparationLease) => Promise<void>
+  ): Promise<never> {
+    let rollbackError: unknown;
+    let rollbackFailed = false;
+    try {
+      await cleanup?.(this);
+    } catch (error) {
+      rollbackError = error;
+      rollbackFailed = true;
+    }
+    const resourceRollback = await this.rollbackOwnedResources();
+    if (!rollbackFailed && resourceRollback.failed) {
+      rollbackError = resourceRollback.error;
+      rollbackFailed = true;
+    }
+    try {
+      if (rollbackFailed) {
+        attachRollbackError(cause, rollbackError);
+      }
+    } finally {
+      this.release();
+    }
+    throw cause;
+  }
+
+  private owns(key: string): boolean {
+    const owner = this.owners.get(key);
+    return owner?.status === 'owned' && owner.token === this.token;
+  }
+
+  private isCreated(key: string): boolean {
+    const owner = this.owners.get(key);
+    return (
+      owner?.status === 'owned' && owner.token === this.token && owner.created
+    );
+  }
+
+  private markCreated(key: string, cleanup: () => Promise<void>): void {
+    const owner = this.owners.get(key);
+    if (owner?.status !== 'owned' || owner.token !== this.token) {
+      throw new SubagentExecutionInvalidatedError();
+    }
+    owner.created = true;
+    owner.cleanup = cleanup;
+  }
+
+  private async rollbackOwnedResources(): Promise<{
+    failed: boolean;
+    error?: unknown;
+  }> {
+    const cleanups: Array<{
+      key: string;
+      state: CleaningPreparationResource;
+      cleanup: () => Promise<void>;
+    }> = [];
+    for (const key of [this.checkpointKey, this.approvalKey]) {
+      const owner = this.owners.get(key);
+      if (owner?.status !== 'owned' || owner.token !== this.token) {
+        continue;
+      }
+      if (!owner.created || owner.cleanup == null) {
+        this.owners.delete(key);
+        continue;
+      }
+      const state: CleaningPreparationResource = {
+        status: 'cleaning',
+        token: this.token,
+      };
+      this.owners.set(key, state);
+      cleanups.push({ key, state, cleanup: owner.cleanup });
+    }
+    const results = await Promise.all(
+      cleanups.map(({ key, state, cleanup }) =>
+        this.cleanResource(key, state, cleanup)
+      )
+    );
+    return results.find((result) => result.failed) ?? { failed: false };
+  }
+
+  private async cleanResource(
+    key: string,
+    state: CleaningPreparationResource,
+    cleanup: () => Promise<void>
+  ): Promise<{ failed: boolean; error?: unknown }> {
+    try {
+      await cleanup();
+      return { failed: false };
+    } catch (error) {
+      return { failed: true, error };
+    } finally {
+      if (this.owners.get(key) === state) {
+        this.owners.delete(key);
+      }
+    }
+  }
+
+  private releaseResource(key: string): void {
+    const owner = this.owners.get(key);
+    if (owner?.status === 'owned' && owner.token === this.token) {
+      this.owners.delete(key);
+    }
+  }
+}
 
 function getConfigurable(
   config?: RunnableConfig
@@ -353,7 +561,7 @@ export class SubagentExecutionRecord<
   }
 
   resolveIdentity(
-    resolve: () => Promise<SubagentExecutionIdentity>
+    resolve: () => Promise<PreparedSubagentExecutionIdentity>
   ): Promise<SubagentExecutionIdentity> {
     this.assertUsable();
     if (this.identityValue != null) {
@@ -363,18 +571,32 @@ export class SubagentExecutionRecord<
       return this.pendingIdentityResolution;
     }
     const pending = Promise.resolve()
-      .then(resolve)
-      .then((identity): SubagentExecutionIdentity => {
-        this.assertUsable();
-        if (this.pendingIdentityResolution !== pending) {
-          throw new SubagentExecutionInvalidatedError();
+      .then(() => {
+        this.assertCurrentIdentityResolution(pending);
+        return resolve();
+      })
+      .then(async (resolution): Promise<SubagentExecutionIdentity> => {
+        try {
+          this.assertCurrentIdentityResolution(pending);
+          resolution.lease.assertOwned();
+          resolution.commit?.(resolution.lease);
+          this.assertCurrentIdentityResolution(pending);
+          resolution.lease.assertOwned();
+          this.bindIdentity(resolution.identity);
+          const boundIdentity = this.identityValue;
+          if (boundIdentity == null) {
+            throw new SubagentExecutionInvalidatedError();
+          }
+          resolution.lease.release();
+          return boundIdentity;
+        } catch (error) {
+          return resolution.lease.rollback(
+            error,
+            async (lease): Promise<void> => {
+              await resolution.rollback?.(lease);
+            }
+          );
         }
-        this.bindIdentity(identity);
-        const boundIdentity = this.identityValue;
-        if (boundIdentity == null) {
-          throw new SubagentExecutionInvalidatedError();
-        }
-        return boundIdentity;
       })
       .finally(() => {
         if (this.pendingIdentityResolution === pending) {
@@ -603,6 +825,15 @@ export class SubagentExecutionRecord<
     this.invocationValue = Object.freeze({ ...invocation });
   }
 
+  private assertCurrentIdentityResolution(
+    pending: Promise<SubagentExecutionIdentity>
+  ): void {
+    this.assertUsable();
+    if (this.pendingIdentityResolution !== pending) {
+      throw new SubagentExecutionInvalidatedError();
+    }
+  }
+
   private transitionTo(
     next: SubagentExecutionPhase,
     allowed: ReadonlyArray<SubagentExecutionPhase>
@@ -634,6 +865,11 @@ export class SubagentExecutionRegistry<
     >
   >();
   private readonly checkpointThreadIds = new Set<string>();
+  private readonly preparationResourceOwners = new Map<
+    string,
+    PreparationResourceState
+  >();
+  private nextPreparationToken = 0;
 
   constructor(private readonly options: SubagentExecutionRegistryOptions) {}
 
@@ -679,6 +915,52 @@ export class SubagentExecutionRegistry<
     }
     this.recordsByAddress.delete(record.address.key);
     record.invalidate();
+  }
+
+  beginIdentityPreparation(
+    record: SubagentExecutionRecord<
+      TResult,
+      TResolvedConfig,
+      TActiveRun,
+      TSettledOutput
+    >,
+    identity: SubagentExecutionIdentity
+  ): SubagentExecutionPreparationLease {
+    record.assertUsable();
+    if (this.recordsByAddress.get(record.address.key) !== record) {
+      throw new SubagentExecutionInvalidatedError();
+    }
+    const checkpointKey = getPreparationResourceKey(
+      'checkpoint',
+      identity.childThreadId
+    );
+    const approvalKey = getPreparationResourceKey(
+      'approval',
+      identity.approvalExecutionScope
+    );
+    const resourceKeys = [checkpointKey, approvalKey];
+    const currentResources = resourceKeys.map((key) =>
+      this.preparationResourceOwners.get(key)
+    );
+    if (currentResources.some((resource) => resource != null)) {
+      throw new SubagentExecutionInvalidatedError();
+    }
+    this.nextPreparationToken += 1;
+    const token = this.nextPreparationToken;
+    for (let i = 0; i < resourceKeys.length; i++) {
+      const key = resourceKeys[i];
+      this.preparationResourceOwners.set(key, {
+        status: 'owned',
+        token,
+        created: false,
+      });
+    }
+    return new PreparationLease(
+      this.preparationResourceOwners,
+      token,
+      checkpointKey,
+      approvalKey
+    );
   }
 
   selectForResume(

@@ -1,4 +1,5 @@
 export {
+  DEFAULT_SUBAGENT_DESCRIPTION,
   SubagentExecutor,
   filterSubagentResult,
   filterGraphSubagentResult,
