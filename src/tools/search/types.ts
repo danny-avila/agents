@@ -32,7 +32,7 @@ export type ScraperProvider =
   | 'tavily'
   | 'crw'
   | 'keenable';
-export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
+export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'rag-api' | 'none';
 
 export interface Highlight {
   score: number;
@@ -353,6 +353,35 @@ export interface CohereRerankerResponse {
   };
 }
 
+/** Mints a short-lived JWT per call; rag_api tokens are never cached or
+ * reused across requests by the reranker itself. */
+export type RagApiTokenSupplier = () => string | Promise<string>;
+
+export interface RagApiRerankCandidate {
+  id: string;
+  text: string;
+  base_score: number;
+}
+
+export interface RagApiRerankRequestBody {
+  profile: string;
+  query: string;
+  candidates: RagApiRerankCandidate[];
+  top_n: number;
+}
+
+export interface RagApiRerankResult {
+  id: string;
+  index: number;
+  score: number;
+}
+
+export interface RagApiRerankResponse {
+  profile: string;
+  model: string;
+  results: RagApiRerankResult[];
+}
+
 export type SafeSearchLevel = 0 | 1 | 2;
 
 export type Logger = WinstonLogger;
@@ -375,6 +404,15 @@ export interface SearchToolConfig
   jinaApiKey?: string;
   jinaApiUrl?: string;
   cohereApiKey?: string;
+  /** Base URL of the public `rag_api` service (`RAG_API_URL` env fallback).
+   * Requests post to `${ragApiUrl}/v1/rerank`. */
+  ragApiUrl?: string;
+  /** Resolves a short-lived rag_api JWT immediately before each rerank call.
+   * Required for the `'rag-api'` reranker type — without it, reranking falls
+   * back to default (unranked) ordering. */
+  ragApiTokenSupplier?: RagApiTokenSupplier;
+  /** rag_api rerank profile. Defaults to `'fast-v1'`. */
+  ragApiProfile?: string;
   rerankerType?: RerankerType;
   /** Timeout (ms) for rerank API requests. Defaults to 10,000. */
   rerankerTimeout?: number;
