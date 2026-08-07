@@ -18,6 +18,8 @@ import {
 import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { MessageContentComplex } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
+import type { StandardGraph } from '@/graphs/Graph';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import {
@@ -62,12 +64,12 @@ import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
+import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { initializeLangfuseTracing } from './instrumentation';
-import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
+import { createGraph } from '@/graphs/createGraph';
 import { resolveMaxSeals } from '@/llm/preempt';
-import { StandardGraph } from '@/graphs/Graph';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { isOpenAILike } from '@/utils/llm';
@@ -346,30 +348,35 @@ export class Run<_T extends t.BaseGraphState> {
       signal = legacySignal;
     }
 
-    const standardGraph = new StandardGraph({
-      signal,
-      runId: this.id,
-      agents: [agentConfig],
-      langfuse: this.langfuse,
-      tokenCounter: this.tokenCounter,
-      indexTokenCountMap: this.indexTokenCountMap,
-      calibrationRatio: this.calibrationRatio,
-      subagentUsageSink: this.subagentUsageSink,
-      preemption: this.preemption,
-      streamLimits: this.streamLimits,
+    const standardGraph = createGraph({
+      kind: 'standard',
+      input: {
+        signal,
+        runId: this.id,
+        agents: [agentConfig],
+        langfuse: this.langfuse,
+        tokenCounter: this.tokenCounter,
+        indexTokenCountMap: this.indexTokenCountMap,
+        calibrationRatio: this.calibrationRatio,
+        subagentUsageSink: this.subagentUsageSink,
+        preemption: this.preemption,
+        streamLimits: this.streamLimits,
+      },
     });
     /** Propagate compile options from graph config */
     standardGraph.compileOptions = this.applyHITLCheckpointerFallback(
       config.compileOptions
     );
     this.hasCheckpointer = standardGraph.compileOptions?.checkpointer != null;
-    standardGraph.hookRegistry = this.hookRegistry;
-    standardGraph.humanInTheLoop = this.humanInTheLoop;
-    standardGraph.toolOutputReferences = this.toolOutputReferences;
-    standardGraph.eagerEventToolExecution = this.eagerEventToolExecution;
-    standardGraph.codeSessionToolNames = this.codeSessionToolNames;
-    standardGraph.interruptingToolNames = this.interruptingToolNames;
-    standardGraph.toolExecution = this.toolExecution;
+    applyGraphRuntimeConfig(standardGraph, {
+      hookRegistry: this.hookRegistry,
+      humanInTheLoop: this.humanInTheLoop,
+      toolOutputReferences: this.toolOutputReferences,
+      eagerEventToolExecution: this.eagerEventToolExecution,
+      codeSessionToolNames: this.codeSessionToolNames,
+      interruptingToolNames: this.interruptingToolNames,
+      toolExecution: this.toolExecution,
+    });
     this.Graph = standardGraph;
     return standardGraph.createWorkflow();
   }
@@ -379,30 +386,35 @@ export class Run<_T extends t.BaseGraphState> {
   ): t.CompiledStateWorkflow {
     const { agents, edges, compileOptions } = config;
 
-    const multiAgentGraph = new MultiAgentGraph({
-      runId: this.id,
-      agents,
-      edges,
-      langfuse: this.langfuse,
-      tokenCounter: this.tokenCounter,
-      indexTokenCountMap: this.indexTokenCountMap,
-      calibrationRatio: this.calibrationRatio,
-      subagentUsageSink: this.subagentUsageSink,
-      preemption: this.preemption,
-      streamLimits: this.streamLimits,
+    const multiAgentGraph = createGraph({
+      kind: 'multi-agent',
+      input: {
+        runId: this.id,
+        agents,
+        edges,
+        langfuse: this.langfuse,
+        tokenCounter: this.tokenCounter,
+        indexTokenCountMap: this.indexTokenCountMap,
+        calibrationRatio: this.calibrationRatio,
+        subagentUsageSink: this.subagentUsageSink,
+        preemption: this.preemption,
+        streamLimits: this.streamLimits,
+      },
     });
 
     multiAgentGraph.compileOptions =
       this.applyHITLCheckpointerFallback(compileOptions);
     this.hasCheckpointer = multiAgentGraph.compileOptions?.checkpointer != null;
 
-    multiAgentGraph.hookRegistry = this.hookRegistry;
-    multiAgentGraph.humanInTheLoop = this.humanInTheLoop;
-    multiAgentGraph.toolOutputReferences = this.toolOutputReferences;
-    multiAgentGraph.eagerEventToolExecution = this.eagerEventToolExecution;
-    multiAgentGraph.codeSessionToolNames = this.codeSessionToolNames;
-    multiAgentGraph.interruptingToolNames = this.interruptingToolNames;
-    multiAgentGraph.toolExecution = this.toolExecution;
+    applyGraphRuntimeConfig(multiAgentGraph, {
+      hookRegistry: this.hookRegistry,
+      humanInTheLoop: this.humanInTheLoop,
+      toolOutputReferences: this.toolOutputReferences,
+      eagerEventToolExecution: this.eagerEventToolExecution,
+      codeSessionToolNames: this.codeSessionToolNames,
+      interruptingToolNames: this.interruptingToolNames,
+      toolExecution: this.toolExecution,
+    });
     this.Graph = multiAgentGraph;
     return multiAgentGraph.createWorkflow();
   }

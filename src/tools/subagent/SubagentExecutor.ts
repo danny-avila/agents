@@ -34,6 +34,8 @@ import type {
   AgentInputs,
   BaseGraphState,
   CompiledStateWorkflow,
+  EventHandler,
+  MultiAgentGraphState,
   HumanInTheLoopConfig,
   InjectedMessage,
   MessageDeltaEvent,
@@ -42,10 +44,11 @@ import type {
   RunStep,
   RunStepDeltaEvent,
   StandardGraphInput,
-  ExecutableSubagentConfig,
+  ExecutableSubagentConfigEntry,
   ResolvedSubagentConfig,
+  ResolvedSubagentConfigEntry,
+  SubagentExecutionContext,
   StepCompleted,
-  SubagentConfig,
   SubagentUpdateEvent,
   SubagentUpdatePhase,
   SubagentUsageSink,
@@ -63,7 +66,7 @@ import type {
   SettledSubagentToolOutput,
 } from './SubagentReplay';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
-import type { AgentContext } from '@/agents/AgentContext';
+import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
 import type { HandlerRegistry } from '@/events';
 import {
@@ -78,6 +81,10 @@ import {
   RUN_BREAKER_SCOPE_CONFIG_KEY,
 } from '@/llm/streamLimits';
 import {
+  DEFAULT_SUBAGENT_MAX_TURNS,
+  SUBAGENT_RECURSION_MULTIPLIER,
+} from './runtimeLimits';
+import {
   ContentTypes,
   Constants,
   GraphEvents,
@@ -88,15 +95,54 @@ import {
   executeHooks,
   TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY,
 } from '@/hooks';
+import {
+  createChildGraphPlan,
+  isGraphSubagentConfig,
+} from './childGraphConfig';
 import { composeAbortSignals } from '@/utils/misc';
 
-const DEFAULT_MAX_TURNS = 25;
-const RECURSION_MULTIPLIER = 3;
+export {
+  buildChildInputs,
+  isGraphSubagentConfig,
+  normalizeSubagentConfigs,
+  normalizeSubagentConfigEntries,
+  resolveSubagentConfigs,
+  resolveSubagentConfigEntries,
+} from './childGraphConfig';
+
 const ERROR_MESSAGE_MAX_CHARS = 200;
-const MAX_PENDING_SUBAGENT_UPDATES = 64;
+const MAX_QUEUED_SUBAGENT_UPDATES = 64;
+const SUBAGENT_UPDATE_HANDLER_TIMEOUT_MS = 5_000;
 const TEXT_DELTA_CONTENT_TYPE = `${ContentTypes.TEXT}_delta`;
 const SUBAGENT_RESOLUTION_ERROR_MESSAGE =
   'Subagent error: Unable to initialize the selected subagent.';
+
+async function dispatchObservationalSubagentUpdate(
+  handler: EventHandler,
+  event: SubagentUpdateEvent
+): Promise<boolean> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve()
+        .then(() => handler.handle(GraphEvents.ON_SUBAGENT_UPDATE, event))
+        .then(
+          () => true,
+          () => true
+        ),
+      new Promise<boolean>((resolve) => {
+        timeout = setTimeout(
+          () => resolve(false),
+          SUBAGENT_UPDATE_HANDLER_TIMEOUT_MS
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout != null) {
+      clearTimeout(timeout);
+    }
+  }
+}
 
 const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
   additionalContexts: [] as string[],
@@ -205,6 +251,7 @@ type QueuedSubagentUpdate = {
   eventName: string;
   phase: SubagentUpdatePhase;
   data: unknown;
+  memberAgentId?: string;
 };
 
 type ForwarderCallback = {
@@ -216,7 +263,7 @@ type StatefulCompiledWorkflow = Omit<CompiledStateWorkflow, 'invoke'> & {
   invoke(
     input: BaseGraphState | Command | null,
     config?: RunnableConfig
-  ): Promise<BaseGraphState>;
+  ): Promise<MultiAgentGraphState>;
   getState(config: RunnableConfig): Promise<StateSnapshot>;
   updateState?(
     config: RunnableConfig,
@@ -239,6 +286,7 @@ type ActiveChildRun = {
   pendingInterrupts: Interrupt[];
   invokeConfig?: RunnableConfig;
   childAgentId: string;
+  checkpointNodeId: string;
   childRunId: string;
 };
 
@@ -726,7 +774,7 @@ export type SubagentExecuteResult = {
 export type ChildGraphFactory = (input: StandardGraphInput) => StandardGraph;
 
 export type SubagentExecutorOptions = {
-  configs: ReadonlyMap<string, SubagentConfig>;
+  configs: ReadonlyMap<string, ExecutableSubagentConfigEntry>;
   parentSignal?: AbortSignal;
   /** Run-scoped breaker abort shared by every executor of one graph, so a
    * child tripping a stream limit stops subagents running under OTHER
@@ -742,6 +790,8 @@ export type SubagentExecutorOptions = {
   hookRegistry?: HookRegistry;
   parentRunId: string;
   parentAgentId?: string;
+  /** Root identity, policy session, and lineage inherited by a child graph. */
+  executionContext?: SubagentExecutionContext;
   langfuse?: StandardGraphInput['langfuse'];
   tokenCounter?: TokenCounter;
   /**
@@ -766,6 +816,9 @@ export type SubagentExecutorOptions = {
    * module dependency.
    */
   createChildGraph: ChildGraphFactory;
+  /** Preferred polymorphic child constructor. The legacy standard-only
+   * factory remains required for source compatibility. */
+  createChildGraphByKind?: GraphFactory;
   /**
    * Parent's event handler registry. When provided, child-graph events are
    * forwarded through this registry so hosts can:
@@ -791,7 +844,7 @@ export type SubagentExecutorOptions = {
 };
 
 export class SubagentExecutor {
-  private readonly configs: ReadonlyMap<string, SubagentConfig>;
+  private readonly configs: ReadonlyMap<string, ExecutableSubagentConfigEntry>;
   private readonly parentSignal?: AbortSignal;
   /** Aborted when a child trips a stream circuit breaker: parallel sibling
    * subagents run concurrently on the parent's signal, and rejecting the
@@ -804,6 +857,7 @@ export class SubagentExecutor {
   private readonly hookRegistry?: HookRegistry;
   private readonly parentRunId: string;
   private readonly parentAgentId?: string;
+  private readonly executionContext: SubagentExecutionContext;
   private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
   private readonly streamLimits?: StandardGraphInput['streamLimits'];
@@ -811,6 +865,7 @@ export class SubagentExecutor {
   private readonly checkpointer?: BaseCheckpointSaver;
   private readonly maxDepth: number;
   private readonly createChildGraph: ChildGraphFactory;
+  private readonly createChildGraphByKind?: GraphFactory;
   private readonly usageSink?: SubagentUsageSink;
   private readonly checkpointThreadIds = new Set<string>();
   private readonly startedChildRuns = new Set<string>();
@@ -844,6 +899,12 @@ export class SubagentExecutor {
     this.hookRegistry = options.hookRegistry;
     this.parentRunId = options.parentRunId;
     this.parentAgentId = options.parentAgentId;
+    this.executionContext = options.executionContext ?? {
+      rootRunId: options.parentRunId,
+      hookSessionId: options.parentRunId,
+      depth: 0,
+      ancestry: [],
+    };
     this.langfuse = options.langfuse;
     this.tokenCounter = options.tokenCounter;
     this.streamLimits = options.streamLimits;
@@ -853,6 +914,7 @@ export class SubagentExecutor {
       : undefined;
     this.maxDepth = options.maxDepth ?? 1;
     this.createChildGraph = options.createChildGraph;
+    this.createChildGraphByKind = options.createChildGraphByKind;
     this.usageSink = options.usageSink;
     const rawRegistry = options.parentHandlerRegistry;
     if (typeof rawRegistry === 'function') {
@@ -893,7 +955,7 @@ export class SubagentExecutor {
    * duplicate dispatches share the same in-flight resolution; HITL re-entry
    * on this executor reuses the resolved config until the child settles. */
   private resolveExecutionConfig(
-    config: SubagentConfig,
+    config: ExecutableSubagentConfigEntry,
     context: {
       childExecutionKey: string;
       childRunId: string;
@@ -902,9 +964,9 @@ export class SubagentExecutor {
       parentToolCallId?: string;
       parentConfigurable?: Record<string, unknown>;
     }
-  ): Promise<ResolvedSubagentConfig> {
-    if (config.agentInputs != null) {
-      return Promise.resolve(config as ResolvedSubagentConfig);
+  ): Promise<ResolvedSubagentConfigEntry> {
+    if (isGraphSubagentConfig(config) || config.agentInputs != null) {
+      return Promise.resolve(config as ResolvedSubagentConfigEntry);
     }
 
     const cached = this.resolvedConfigs.get(context.childExecutionKey);
@@ -918,20 +980,7 @@ export class SubagentExecutor {
       return pending;
     }
     const resolver = config.resolveAgentInputs;
-    if (resolver == null) {
-      return Promise.reject(
-        new Error(`Subagent "${config.type}" has no executable configuration.`)
-      );
-    }
     const configId = config.configId;
-    if (typeof configId !== 'string' || configId.length === 0) {
-      return Promise.reject(
-        new Error(
-          `Lazy subagent "${config.type}" requires a non-empty "configId".`
-        )
-      );
-    }
-
     const resolution = (async (): Promise<ResolvedSubagentConfig> => {
       try {
         const agentInputs = await resolveAgentInputsWithSignal(
@@ -1337,9 +1386,9 @@ export class SubagentExecutor {
       this.clearChildGraph(activeChildRun.graph);
     }
     this.activeChildRuns.clear();
+    this.completedChildResults.clear();
     this.resolvedConfigs.clear();
     this.pendingConfigResolutions.clear();
-    this.completedChildResults.clear();
     for (const identity of this.childExecutionIdentities.values()) {
       this.hookRegistry?.clearSession(identity.approvalExecutionScope);
     }
@@ -1499,7 +1548,7 @@ export class SubagentExecutor {
           }),
         ],
       },
-      activeChildRun.childAgentId
+      activeChildRun.checkpointNodeId
     );
   }
 
@@ -1527,6 +1576,17 @@ export class SubagentExecutor {
     if (this.maxDepth <= 0) {
       return {
         content: 'Error: Maximum subagent nesting depth exceeded.',
+        messages: [],
+      };
+    }
+
+    if (
+      isGraphSubagentConfig(executableConfig) &&
+      this.humanInTheLoop?.enabled === true
+    ) {
+      return {
+        content:
+          'Error: Human-in-the-loop execution is not yet supported for graph subagents.',
         messages: [],
       };
     }
@@ -1575,7 +1635,7 @@ export class SubagentExecutor {
       return completedChildResult;
     }
 
-    let config: ResolvedSubagentConfig;
+    let config: ResolvedSubagentConfigEntry;
     try {
       config = await this.resolveExecutionConfig(executableConfig, {
         childExecutionKey,
@@ -1591,9 +1651,6 @@ export class SubagentExecutor {
         messages: [],
       };
     }
-    const childAgentId =
-      config.agentInputs.agentId ||
-      `${this.parentAgentId ?? 'agent'}_sub_${executionSuffix}`;
 
     const parentRegistry = this.getParentHandlerRegistry();
     const forwardingEnabled = parentRegistry != null;
@@ -1608,64 +1665,105 @@ export class SubagentExecutor {
      */
     const hasToolExecuteHandler =
       parentRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) != null;
-    const childInputs = buildChildInputs(
+    const childPlan = createChildGraphPlan({
       config,
-      childAgentId,
-      this.maxDepth,
-      /* keepToolDefinitions */ hasToolExecuteHandler
-    );
-    const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
+      executionSuffix,
+      parentAgentId: this.parentAgentId,
+      parentMaxDepth: this.maxDepth,
+      keepToolDefinitions: hasToolExecuteHandler,
+    });
+    const childAgentId = childPlan.subjectAgentId;
+    const currentHookSessionId =
+      asNonEmptyString(params.parentConfigurable?.run_id) ??
+      this.executionContext.hookSessionId;
+    const childExecutionContext: SubagentExecutionContext = {
+      rootRunId: this.executionContext.rootRunId,
+      hookSessionId: currentHookSessionId,
+      depth: this.executionContext.depth + 1,
+      ancestry: [
+        ...this.executionContext.ancestry,
+        {
+          subagentRunId: childRunId,
+          subagentType,
+          subagentKind: childPlan.kind,
+          subagentAgentId: childAgentId,
+          parentRunId: this.parentRunId,
+          parentAgentId: this.parentAgentId,
+          parentToolCallId,
+        },
+      ],
+    };
+    const maxTurns = config.maxTurns ?? DEFAULT_SUBAGENT_MAX_TURNS;
+    const memberRecursionLimit = maxTurns * SUBAGENT_RECURSION_MULTIPLIER;
+    const recursionLimit =
+      memberRecursionLimit *
+      (childPlan.kind === 'graph' ? childPlan.agents.length : 1);
 
     const hostUsageSink = this.usageSink;
     const cachedChildRun = this.activeChildRuns.get(childExecutionKey);
-    const childGraph =
-      cachedChildRun?.graph ??
-      this.createChildGraph({
-        runId: childRunId,
-        signal: childSignal,
-        agents: [childInputs],
-        langfuse: this.langfuse,
-        tokenCounter: this.tokenCounter,
-        streamLimits: this.streamLimits,
-        subagentScope: true,
-        /**
-         * Forwarded so the child graph's own `SubagentExecutor` (created in
-         * its `createAgentNode` when `allowNested` keeps subagentConfigs)
-         * reports nested-child usage through the same host sink. Each nesting
-         * level attaches its own capture callback — `workflow.invoke` replaces
-         * the inherited callback chain, so a single top-level handler would
-         * never see grandchild model calls.
-         *
-         * The wrapper rewrites `runId` to THIS executor's parent run: nested
-         * executors emit with their own `parentRunId` (a `*_sub_*` child id),
-         * and each wrapper layer rewrites upward, so by the time an event
-         * reaches the host sink its `runId` is the ROOT run — hosts keying
-         * billing by run id never see intermediate child run ids there
-         * (`subagentRunId` still identifies the emitting child).
-         */
-        subagentUsageSink:
-          hostUsageSink == null
-            ? undefined
-            : /** Returns the host sink's result so async sinks stay awaited
-               *  through every wrapper layer. */
-            (event): void | Promise<void> =>
-              hostUsageSink({ ...event, runId: this.parentRunId }),
+    const childGraphInput: StandardGraphInput = {
+      runId: childRunId,
+      signal: childSignal,
+      agents: childPlan.agents,
+      langfuse: this.langfuse,
+      tokenCounter: this.tokenCounter,
+      streamLimits: this.streamLimits,
+      subagentScope: true,
+      subagentExecutionContext: childExecutionContext,
+      /**
+       * Forwarded so the child graph's own `SubagentExecutor` (created in
+       * its `createAgentNode` when `allowNested` keeps subagentConfigs)
+       * reports nested-child usage through the same host sink. Each nesting
+       * level attaches its own capture callback — `workflow.invoke` replaces
+       * the inherited callback chain, so a single top-level handler would
+       * never see grandchild model calls.
+       */
+      subagentUsageSink:
+        hostUsageSink == null
+          ? undefined
+          : (event): void | Promise<void> =>
+            hostUsageSink({
+              ...event,
+              runId: this.executionContext.rootRunId,
+            }),
+    };
+    let childGraph = cachedChildRun?.graph;
+    if (childGraph == null && childPlan.kind === 'graph') {
+      if (this.createChildGraphByKind == null) {
+        return {
+          content:
+            'Error: Graph subagent execution requires a polymorphic child graph factory.',
+          messages: [],
+        };
+      }
+      childGraph = this.createChildGraphByKind({
+        kind: 'multi-agent',
+        input: {
+          ...childGraphInput,
+          edges: childPlan.edges,
+          resultAgentId: childPlan.resultAgentId,
+          memberRecursionLimit,
+        },
       });
+    }
+    childGraph ??= this.createChildGraph(childGraphInput);
     let forwarding: ForwarderCallback | undefined;
     if (forwardingEnabled) {
       forwarding = this.createForwarderCallback({
         parentRegistry: parentRegistry!,
         subagentType,
+        subagentKind: childPlan.kind,
         subagentAgentId: childAgentId,
         childRunId,
         parentToolCallId,
+        executionContext: childExecutionContext,
       });
     }
     const forwarder = forwarding?.handler;
     let childAlreadyStarted = this.startedChildRuns.has(childExecutionKey);
     let childAlreadyCompleted = this.completedChildRuns.has(childExecutionKey);
 
-    let result: { messages: BaseMessage[] } | undefined;
+    let result: MultiAgentGraphState | undefined;
     let recoveredComplete = false;
     let recoveredInProgress = false;
     try {
@@ -1676,6 +1774,7 @@ export class SubagentExecutor {
         workflow,
         pendingInterrupts: [],
         childAgentId,
+        checkpointNodeId: childPlan.checkpointNodeId,
         childRunId,
       };
       if (cachedChildRun == null) {
@@ -1714,11 +1813,12 @@ export class SubagentExecutor {
           createUsageCaptureHandler({
             sink: this.usageSink,
             subagentType,
+            subagentKind: childPlan.kind,
             subagentRunId: childRunId,
             subagentAgentId: childAgentId,
             parentRunId: this.parentRunId,
-            provider: config.agentInputs.provider,
-            fallbackModel: extractConfiguredModel(config.agentInputs),
+            executionContext: childExecutionContext,
+            memberInputs: childPlan.memberInputs,
           })
         );
       }
@@ -1742,11 +1842,6 @@ export class SubagentExecutor {
         params.parentConfigurable,
         this.parentRunId
       );
-      const currentHookSessionId =
-        typeof inheritedConfigurable.run_id === 'string' &&
-        inheritedConfigurable.run_id.length > 0
-          ? inheritedConfigurable.run_id
-          : this.parentRunId;
       if (cachedChildRun == null && resumeExecution != null) {
         childGraph.restoreSubagentResumeState(
           resumeExecution.graphState,
@@ -1754,7 +1849,7 @@ export class SubagentExecutor {
         );
       }
       const childInvokeConfig = {
-        recursionLimit: maxTurns * RECURSION_MULTIPLIER,
+        recursionLimit,
         signal: childSignal,
         callbacks,
         runName: `subagent:${subagentType}`,
@@ -1852,21 +1947,23 @@ export class SubagentExecutor {
 
         if (
           !childAlreadyStarted &&
-          this.hookRegistry?.hasHookFor('SubagentStart', this.parentRunId) ===
-            true
+          this.hookRegistry?.hasHookFor(
+            'SubagentStart',
+            currentHookSessionId
+          ) === true
         ) {
           const hookResult = await executeHooks({
             registry: this.hookRegistry,
             input: {
               hook_event_name: 'SubagentStart',
-              runId: this.parentRunId,
+              runId: currentHookSessionId,
               threadId,
               parentAgentId: this.parentAgentId,
               agentId: childAgentId,
               agentType: subagentType,
               inputs: [new HumanMessage(description)],
             },
-            sessionId: this.parentRunId,
+            sessionId: currentHookSessionId,
             matchQuery: subagentType,
           }).catch((): AggregatedHookResult => HOOK_FALLBACK);
 
@@ -1887,21 +1984,23 @@ export class SubagentExecutor {
           await this.emitSubagentUpdate(parentRegistry!, {
             childRunId,
             subagentType,
+            subagentKind: childPlan.kind,
             subagentAgentId: childAgentId,
             parentToolCallId,
+            executionContext: childExecutionContext,
             phase: 'start',
             label: `Subagent "${subagentType}" started`,
           });
         }
 
-        let childResult: BaseGraphState;
+        let childResult: MultiAgentGraphState;
         if (this.humanInTheLoop?.enabled === true) {
           /** Execute as an independently checkpointed root instead of inheriting
            * the parent's Pregel namespace. Parent decisions are routed explicitly
            * by interrupt id, so concurrent children keep isolated resume state. */
           childResult = await AsyncLocalStorageProviderSingleton.runWithConfig(
             childInvokeConfig,
-            (): Promise<BaseGraphState> =>
+            (): Promise<MultiAgentGraphState> =>
               workflow.invoke(childInput, childInvokeConfig)
           );
         } else {
@@ -1913,7 +2012,7 @@ export class SubagentExecutor {
         if (childInterrupts != null && childInterrupts.length > 0) {
           throw new GraphInterrupt(childInterrupts);
         }
-        result = { messages: childResult.messages };
+        result = childResult;
       }
     } catch (error) {
       if (isGraphInterrupt(error)) {
@@ -1955,8 +2054,10 @@ export class SubagentExecutor {
         await this.emitSubagentUpdate(parentRegistry!, {
           childRunId,
           subagentType,
+          subagentKind: childPlan.kind,
           subagentAgentId: childAgentId,
           parentToolCallId,
+          executionContext: childExecutionContext,
           phase: 'error',
           label: `Subagent "${subagentType}" errored: ${errorMessage}`,
           data: { message: errorMessage },
@@ -1984,11 +2085,15 @@ export class SubagentExecutor {
     if (result == null) {
       throw new Error('Subagent completed without producing graph state.');
     }
-    const filteredContent = filterSubagentResult(result.messages);
+    const filteredContent =
+      childPlan.kind === 'graph'
+        ? filterGraphSubagentResult(result, childPlan.resultAgentId)
+        : filterSubagentResult(result.messages);
 
     if (
       !childAlreadyCompleted &&
-      this.hookRegistry?.hasHookFor('SubagentStop', this.parentRunId) === true
+      this.hookRegistry?.hasHookFor('SubagentStop', currentHookSessionId) ===
+        true
     ) {
       /**
        * Awaited (not fire-and-forget) for deterministic test synchronization
@@ -2000,13 +2105,13 @@ export class SubagentExecutor {
         registry: this.hookRegistry,
         input: {
           hook_event_name: 'SubagentStop',
-          runId: this.parentRunId,
+          runId: currentHookSessionId,
           threadId,
           agentId: childAgentId,
           agentType: subagentType,
           messages: result.messages,
         },
-        sessionId: this.parentRunId,
+        sessionId: currentHookSessionId,
         matchQuery: subagentType,
       }).catch(() => {
         /* SubagentStop is observational — swallow errors */
@@ -2018,8 +2123,10 @@ export class SubagentExecutor {
       await this.emitSubagentUpdate(parentRegistry!, {
         childRunId,
         subagentType,
+        subagentKind: childPlan.kind,
         subagentAgentId: childAgentId,
         parentToolCallId,
+        executionContext: childExecutionContext,
         phase: 'stop',
         label: `Subagent "${subagentType}" finished`,
       });
@@ -2056,8 +2163,11 @@ export class SubagentExecutor {
     args: {
       childRunId: string;
       subagentType: string;
+      subagentKind: 'agent' | 'graph';
       subagentAgentId: string;
+      memberAgentId?: string;
       parentToolCallId?: string;
+      executionContext: SubagentExecutionContext;
       phase: SubagentUpdatePhase;
       data?: unknown;
       label?: string;
@@ -2068,22 +2178,23 @@ export class SubagentExecutor {
       return;
     }
     const event: SubagentUpdateEvent = {
-      runId: this.parentRunId,
+      runId: args.executionContext.rootRunId,
+      parentRunId: this.parentRunId,
       subagentRunId: args.childRunId,
       subagentType: args.subagentType,
+      subagentKind: args.subagentKind,
       subagentAgentId: args.subagentAgentId,
+      memberAgentId: args.memberAgentId,
       parentAgentId: this.parentAgentId,
       parentToolCallId: args.parentToolCallId,
+      depth: args.executionContext.depth,
+      ancestry: args.executionContext.ancestry,
       phase: args.phase,
       data: args.data,
       label: args.label,
       timestamp: new Date().toISOString(),
     };
-    try {
-      await handler.handle(GraphEvents.ON_SUBAGENT_UPDATE, event);
-    } catch {
-      /* observational — swallow */
-    }
+    await dispatchObservationalSubagentUpdate(handler, event);
   }
 
   /**
@@ -2101,60 +2212,72 @@ export class SubagentExecutor {
   private createForwarderCallback(args: {
     parentRegistry: HandlerRegistry;
     subagentType: string;
+    subagentKind: 'agent' | 'graph';
     subagentAgentId: string;
     childRunId: string;
     parentToolCallId?: string;
+    executionContext: SubagentExecutionContext;
   }): ForwarderCallback {
     const {
       parentRegistry,
       subagentType,
+      subagentKind,
       subagentAgentId,
       childRunId,
       parentToolCallId,
+      executionContext,
     } = args;
-    const parentRunId = this.parentRunId;
+    const immediateParentRunId = this.parentRunId;
     const parentAgentId = this.parentAgentId;
 
     const wrap = async (
       eventName: string,
       phase: SubagentUpdatePhase,
-      data: unknown
-    ): Promise<void> => {
+      data: unknown,
+      memberAgentId?: string
+    ): Promise<boolean> => {
       const handler = parentRegistry.getHandler(GraphEvents.ON_SUBAGENT_UPDATE);
       if (!handler) {
-        return;
+        return true;
       }
-      try {
-        const event: SubagentUpdateEvent = {
-          runId: parentRunId,
-          subagentRunId: childRunId,
-          subagentType,
-          subagentAgentId,
-          parentAgentId,
-          parentToolCallId,
-          phase,
-          data: sanitizeForwardedSubagentUpdateData(eventName, data),
-          label: summarizeEvent(eventName, data),
-          timestamp: new Date().toISOString(),
-        };
-        await handler.handle(GraphEvents.ON_SUBAGENT_UPDATE, event);
-      } catch {
-        /* observational — swallow */
-      }
+      const event: SubagentUpdateEvent = {
+        runId: executionContext.rootRunId,
+        parentRunId: immediateParentRunId,
+        subagentRunId: childRunId,
+        subagentType,
+        subagentKind,
+        subagentAgentId,
+        memberAgentId,
+        parentAgentId,
+        parentToolCallId,
+        depth: executionContext.depth,
+        ancestry: executionContext.ancestry,
+        phase,
+        data: sanitizeForwardedSubagentUpdateData(eventName, data),
+        label: summarizeEvent(eventName, data),
+        timestamp: new Date().toISOString(),
+      };
+      return dispatchObservationalSubagentUpdate(handler, event);
     };
 
     const queuedUpdates: QueuedSubagentUpdate[] = [];
     let drainPromise: Promise<void> | undefined;
+    let queueOpen = true;
 
     const enqueue = (update: QueuedSubagentUpdate): void => {
-      if (queuedUpdates.length >= MAX_PENDING_SUBAGENT_UPDATES) {
+      if (!queueOpen) {
+        return;
+      }
+      if (queuedUpdates.length >= MAX_QUEUED_SUBAGENT_UPDATES) {
         const dropIndex = queuedUpdates.findIndex((queued) =>
-          isDroppableSubagentUpdatePhase(queued.phase)
+          isLowPrioritySubagentUpdatePhase(queued.phase)
         );
         if (dropIndex >= 0) {
           queuedUpdates.splice(dropIndex, 1);
-        } else if (isDroppableSubagentUpdatePhase(update.phase)) {
+        } else if (isLowPrioritySubagentUpdatePhase(update.phase)) {
           return;
+        } else {
+          queuedUpdates.shift();
         }
       }
       queuedUpdates.push(update);
@@ -2171,7 +2294,16 @@ export class SubagentExecutor {
           if (update == null) {
             continue;
           }
-          await wrap(update.eventName, update.phase, update.data);
+          const handlerSettled = await wrap(
+            update.eventName,
+            update.phase,
+            update.data,
+            update.memberAgentId
+          );
+          if (!handlerSettled) {
+            queueOpen = false;
+            queuedUpdates.length = 0;
+          }
         }
       })();
       try {
@@ -2187,17 +2319,23 @@ export class SubagentExecutor {
     const scheduleWrap = (
       eventName: string,
       phase: SubagentUpdatePhase,
-      data: unknown
+      data: unknown,
+      memberAgentId?: string
     ): void => {
-      enqueue({ eventName, phase, data });
+      enqueue({ eventName, phase, data, memberAgentId });
       void drain();
     };
 
     const handler = BaseCallbackHandler.fromMethods({
       [Callback.CUSTOM_EVENT]: async (
         eventName: string,
-        data: unknown
+        data: unknown,
+        _runId?: string,
+        _tags?: string[],
+        metadata?: Record<string, unknown>
       ): Promise<void> => {
+        const memberAgentId =
+          asNonEmptyString(metadata?.agentId) ?? getEventAgentId(data);
         if (eventName === GraphEvents.ON_TOOL_EXECUTE) {
           const toolHandler = parentRegistry.getHandler(
             GraphEvents.ON_TOOL_EXECUTE
@@ -2212,28 +2350,28 @@ export class SubagentExecutor {
            * We also surface a short notice in the subagent-update stream so
            * the UI can show "calling <tool>" for each tool the child spawns.
            */
-          scheduleWrap(eventName, 'run_step', data);
+          scheduleWrap(eventName, 'run_step', data, memberAgentId);
           return;
         }
 
         if (eventName === GraphEvents.ON_RUN_STEP) {
-          scheduleWrap(eventName, 'run_step', data);
+          scheduleWrap(eventName, 'run_step', data, memberAgentId);
           return;
         }
         if (eventName === GraphEvents.ON_RUN_STEP_DELTA) {
-          scheduleWrap(eventName, 'run_step_delta', data);
+          scheduleWrap(eventName, 'run_step_delta', data, memberAgentId);
           return;
         }
         if (eventName === GraphEvents.ON_RUN_STEP_COMPLETED) {
-          scheduleWrap(eventName, 'run_step_completed', data);
+          scheduleWrap(eventName, 'run_step_completed', data, memberAgentId);
           return;
         }
         if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
-          scheduleWrap(eventName, 'message_delta', data);
+          scheduleWrap(eventName, 'message_delta', data, memberAgentId);
           return;
         }
         if (eventName === GraphEvents.ON_REASONING_DELTA) {
-          scheduleWrap(eventName, 'reasoning_delta', data);
+          scheduleWrap(eventName, 'reasoning_delta', data, memberAgentId);
           return;
         }
       },
@@ -2268,29 +2406,25 @@ export class SubagentExecutor {
 function createUsageCaptureHandler(args: {
   sink: SubagentUsageSink;
   subagentType: string;
+  subagentKind: 'agent' | 'graph';
   subagentRunId: string;
   subagentAgentId: string;
   parentRunId: string;
-  /**
-   * Child config's provider enum — the default tag when a call carries no
-   * `INVOKED_PROVIDER` metadata (hosts key pricing/cache semantics off it).
-   */
-  provider?: string;
-  /**
-   * Child config's model, used when a call carries neither `ls_model_name`
-   * nor `INVOKED_MODEL` metadata.
-   */
-  fallbackModel?: string;
+  executionContext: SubagentExecutionContext;
+  memberInputs: ReadonlyMap<string, AgentInputs>;
 }): BaseCallbackHandler {
   const {
     sink,
     subagentType,
+    subagentKind,
     subagentRunId,
     subagentAgentId,
     parentRunId,
-    provider,
-    fallbackModel,
+    executionContext,
+    memberInputs,
   } = args;
+  const defaultMember =
+    memberInputs.size === 1 ? memberInputs.entries().next().value : undefined;
   /**
    * Per-call attribution keyed by LangChain callback runId. `model` joins
    * `ls_model_name` (provider-reported) with `INVOKED_MODEL` (stamped by
@@ -2302,7 +2436,7 @@ function createUsageCaptureHandler(args: {
    */
   const callInfoByCallId = new Map<
     string,
-    { model?: string; provider?: string }
+    { model?: string; provider?: string; memberAgentId?: string }
   >();
   const handler = BaseCallbackHandler.fromMethods({
     handleChatModelStart: (
@@ -2320,18 +2454,30 @@ function createUsageCaptureHandler(args: {
       const callProvider = asNonEmptyString(
         metadata?.[Constants.INVOKED_PROVIDER]
       );
-      if (callModel != null || callProvider != null) {
+      const memberAgentId = asNonEmptyString(metadata?.agentId);
+      if (callModel != null || callProvider != null || memberAgentId != null) {
         callInfoByCallId.set(runId, {
           model: callModel,
           provider: callProvider,
+          memberAgentId,
         });
       }
     },
     handleLLMEnd: async (output: LLMResult, runId: string): Promise<void> => {
       const callInfo = callInfoByCallId.get(runId);
       callInfoByCallId.delete(runId);
-      const model = callInfo?.model ?? fallbackModel;
-      const callProvider = callInfo?.provider ?? provider;
+      const observedMemberAgentId = callInfo?.memberAgentId;
+      const memberAgentId =
+        observedMemberAgentId != null && memberInputs.has(observedMemberAgentId)
+          ? observedMemberAgentId
+          : defaultMember?.[0];
+      const memberInput =
+        (memberAgentId == null ? undefined : memberInputs.get(memberAgentId)) ??
+        defaultMember?.[1];
+      const model =
+        callInfo?.model ??
+        (memberInput == null ? undefined : extractConfiguredModel(memberInput));
+      const callProvider = callInfo?.provider ?? memberInput?.provider;
       for (const generationGroup of output.generations) {
         /**
          * At most ONE event per generation group: each group is one
@@ -2361,9 +2507,14 @@ function createUsageCaptureHandler(args: {
               model,
               provider: callProvider,
               subagentType,
+              subagentKind,
               subagentRunId,
               subagentAgentId,
-              runId: parentRunId,
+              memberAgentId,
+              parentRunId,
+              depth: executionContext.depth,
+              ancestry: executionContext.ancestry,
+              runId: executionContext.rootRunId,
             });
           } catch {
             /* observational — a throwing/rejecting host sink must not break the child run */
@@ -2387,6 +2538,19 @@ function createUsageCaptureHandler(args: {
 
 function asNonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined;
+}
+
+function getEventAgentId(data: unknown): string | undefined {
+  if (data == null || typeof data !== 'object') {
+    return undefined;
+  }
+  const event = data as {
+    agentId?: unknown;
+    result?: { agentId?: unknown };
+  };
+  return (
+    asNonEmptyString(event.agentId) ?? asNonEmptyString(event.result?.agentId)
+  );
 }
 
 /**
@@ -2462,7 +2626,7 @@ export function sanitizeForwardedSubagentUpdateData(
   return undefined;
 }
 
-function isDroppableSubagentUpdatePhase(phase: SubagentUpdatePhase): boolean {
+function isLowPrioritySubagentUpdatePhase(phase: SubagentUpdatePhase): boolean {
   return (
     phase === 'message_delta' ||
     phase === 'reasoning_delta' ||
@@ -2779,6 +2943,24 @@ export function summarizeEvent(eventName: string, data: unknown): string {
 }
 
 /**
+ * Reads only the result member captured by MultiAgentGraph. Worker output is
+ * never used as a fallback when the designated result member is textless.
+ */
+export function filterGraphSubagentResult(
+  state: MultiAgentGraphState,
+  resultAgentId: string
+): string {
+  const result = state.subagentResult;
+  if (result == null || result.agentId !== resultAgentId) {
+    return `Error: Graph subagent result agent "${resultAgentId}" did not produce a result.`;
+  }
+  if (result.message == null) {
+    return 'Task completed';
+  }
+  return filterSubagentResult([result.message]);
+}
+
+/**
  * Walk messages from last to first, returning the text content of the most
  * recent AIMessage that has any. Non-text blocks (tool_use, thinking,
  * redacted_thinking, tool_result) are stripped. If the last AIMessage is
@@ -2874,145 +3056,6 @@ export function filterSubagentResult(messages: BaseMessage[]): string {
   }
 
   return 'Task completed';
-}
-
-/** Resolve eager and self-spawn configs with `agentInputs` guaranteed. */
-export function resolveSubagentConfigs(
-  configs: SubagentConfig[],
-  parentContext: AgentContext
-): ResolvedSubagentConfig[] {
-  const resolved = configs
-    .map((config) => resolveEagerSubagentConfig(config, parentContext))
-    .filter((config): config is ResolvedSubagentConfig => config != null);
-
-  assertUniqueSubagentTypes(resolved);
-  return resolved;
-}
-
-/**
- * Normalize executable subagent configs for tool advertisement. Eager and
- * self-spawn configs return with `agentInputs`; lazy configs return with a
- * resolver and durable `configId`. Unusable configs are filtered, while
- * duplicate types and unversioned lazy descriptors fail closed.
- */
-export function normalizeSubagentConfigs(
-  configs: SubagentConfig[],
-  parentContext: AgentContext
-): ExecutableSubagentConfig[] {
-  const normalized = configs
-    .map((config): ExecutableSubagentConfig | null => {
-      const eager = resolveEagerSubagentConfig(config, parentContext);
-      if (eager != null) {
-        return eager;
-      }
-      if (config.resolveAgentInputs == null) {
-        return null;
-      }
-      if (typeof config.configId !== 'string' || config.configId.length === 0) {
-        throw new Error(
-          `Lazy subagent "${config.type}" requires a non-empty "configId".`
-        );
-      }
-      return config as ExecutableSubagentConfig;
-    })
-    .filter((config): config is ExecutableSubagentConfig => config != null);
-
-  assertUniqueSubagentTypes(normalized);
-  return normalized;
-}
-
-function resolveEagerSubagentConfig(
-  config: SubagentConfig,
-  parentContext: AgentContext
-): ResolvedSubagentConfig | null {
-  if (config.agentInputs != null) {
-    return config as ResolvedSubagentConfig;
-  }
-  if (config.self !== true || parentContext._sourceInputs == null) {
-    return null;
-  }
-  return {
-    ...config,
-    agentInputs: { ...parentContext._sourceInputs },
-  } as ResolvedSubagentConfig;
-}
-
-function assertUniqueSubagentTypes(configs: SubagentConfig[]): void {
-  const seenTypes = new Set<string>();
-  for (const config of configs) {
-    if (seenTypes.has(config.type)) {
-      throw new Error(
-        `Duplicate subagent type "${config.type}". Each SubagentConfig must have a unique "type" field.`
-      );
-    }
-    seenTypes.add(config.type);
-  }
-}
-
-/**
- * Build child AgentInputs from a resolved config, stripping nesting and
- * (optionally) event-driven fields. When `allowNested: true`, the child's
- * `maxSubagentDepth` is decremented so that depth is consumed as the call
- * chain deepens across graph boundaries — the parent's executor-level check
- * alone cannot see into the child graph's separate executor.
- *
- * When `keepToolDefinitions` is `true`, the child retains the parent's
- * `toolDefinitions` so event-driven tools remain usable. This is only safe
- * when the caller has wired a forwarder for `ON_TOOL_EXECUTE` to a
- * registered handler — otherwise the child will hang on tool dispatch.
- *
- * @remarks Advanced utility: exported primarily for testing and by
- * {@link SubagentExecutor}. Host applications configuring subagents should
- * not need to call this directly — it is invoked internally when a subagent
- * tool is dispatched. The depth-countdown contract (parent's `maxDepth` in,
- * child's decremented `maxSubagentDepth` on the returned inputs) is the
- * mechanism that bounds nesting across graph boundaries; callers must
- * respect it.
- */
-export function buildChildInputs(
-  config: ResolvedSubagentConfig,
-  childAgentId: string,
-  parentMaxDepth: number,
-  keepToolDefinitions: boolean = false
-): AgentInputs {
-  const { agentInputs } = config;
-  const childInputs: AgentInputs = {
-    ...agentInputs,
-    agentId: childAgentId,
-    toolDefinitions: keepToolDefinitions
-      ? agentInputs.toolDefinitions
-      : undefined,
-    /**
-     * Subagents run in an isolated context by contract. Parent-run-scoped
-     * fields that would otherwise survive the shallow-spread clone — the
-     * cross-run conversation summary and the prior-turn tool-discovery
-     * set — are cleared here so the child starts fresh. Host applications
-     * that want a subagent to see parent context must thread it in
-     * explicitly (e.g. via the `description` argument to the subagent
-     * tool), not via inherited state.
-     */
-    initialSummary: undefined,
-    discoveredTools: undefined,
-    /**
-     * Host-supplied direct tools are scrubbed from INHERITED configs only.
-     * A self-spawn config's `agentInputs` is a shallow spread of the parent's
-     * `_sourceInputs`, so without this a parent-scoped graph tool (e.g. an
-     * interrupt-raising ask_user_question) would silently become available to
-     * the child. An EXPLICIT child config that lists its own `graphTools` is a
-     * deliberate host choice and keeps them (Codex #289 P2); with HITL enabled,
-     * those tools use the shared checkpointer and can pause and resume safely.
-     */
-    graphTools: config.self === true ? undefined : agentInputs.graphTools,
-  };
-
-  if (config.allowNested === true) {
-    childInputs.maxSubagentDepth = Math.max(0, parentMaxDepth - 1);
-  } else {
-    childInputs.subagentConfigs = undefined;
-    childInputs.maxSubagentDepth = undefined;
-  }
-
-  return childInputs;
 }
 
 function truncateErrorMessage(error: unknown): string {

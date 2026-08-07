@@ -319,6 +319,50 @@ function createAgent(tenantId: string): t.AgentInputs {
   };
 }
 
+function createGraphSubagentParent(tenantId: string): t.AgentInputs {
+  const makeMember = (agentId: string): t.AgentInputs => ({
+    agentId,
+    name: `${agentId} ${tenantId}`,
+    provider: Providers.OPENAI,
+    clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+    instructions: `Complete the ${agentId} stage.`,
+    maxContextTokens: 8000,
+  });
+  return {
+    ...makeMember('parent'),
+    maxSubagentDepth: 1,
+    subagentConfigs: [
+      {
+        kind: 'graph',
+        type: 'research-team',
+        name: 'Research Team',
+        description: 'Runs a bounded research chain.',
+        agents: [
+          makeMember('entry'),
+          makeMember('worker'),
+          makeMember('result'),
+        ],
+        edges: [
+          {
+            from: 'entry',
+            to: 'worker',
+            edgeType: 'direct',
+            prompt: 'Proceed to worker.',
+          },
+          {
+            from: 'worker',
+            to: 'result',
+            edgeType: 'direct',
+            prompt: 'Proceed to result.',
+          },
+        ],
+        entryAgentId: 'entry',
+        resultAgentId: 'result',
+      },
+    ],
+  };
+}
+
 async function runTenantFlow(tenantId: string): Promise<void> {
   const runId = `routing-${tenantId}`;
   const run = await Run.create<t.IState>({
@@ -380,6 +424,49 @@ async function runTenantFlow(tenantId: string): Promise<void> {
       },
     },
   });
+}
+
+async function runGraphSubagentTenantFlow(tenantId: string): Promise<void> {
+  const runId = `routing-graph-${tenantId}`;
+  const run = await Run.create<t.IState>({
+    runId,
+    graphConfig: {
+      type: 'standard',
+      agents: [createGraphSubagentParent(tenantId)],
+    },
+    langfuse: tenantLangfuse(tenantId),
+    returnContent: true,
+    skipCleanup: true,
+  });
+  run.Graph?.overrideTestModel(
+    [
+      `Delegating graph work for ${tenantId}.`,
+      `Graph work complete for ${tenantId}.`,
+    ],
+    1,
+    [
+      {
+        id: `call_graph_subagent_${tenantId}`,
+        name: Constants.SUBAGENT,
+        args: {
+          description: `Run the research chain for ${tenantId}.`,
+          subagent_type: 'research-team',
+        },
+        type: 'tool_call',
+      },
+    ]
+  );
+
+  await run.processStream(
+    { messages: [new HumanMessage(`Run graph work for ${tenantId}`)] },
+    {
+      ...callerConfig,
+      configurable: {
+        thread_id: `graph-thread-${tenantId}`,
+        user_id: `graph-user-${tenantId}`,
+      },
+    }
+  );
 }
 
 const compactingTokenCounter: t.TokenCounter = (message) => {
@@ -454,7 +541,7 @@ describe('Langfuse per-run routing integration', () => {
       .spyOn(providers, 'getChatModelClass')
       .mockImplementation(((provider: Providers) => {
         if (provider === Providers.OPENAI) {
-          return class extends FakeListChatModel {
+          return class RoutingProviderFakeChatModel extends FakeListChatModel {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             constructor(_options: any) {
               super({ responses: ['provider response'] });
@@ -528,6 +615,38 @@ describe('Langfuse per-run routing integration', () => {
         otherTenantId,
         traceId: titleTraceId,
       });
+    }
+  });
+
+  it('keeps graph-subagent member spans in the owning tenant trace', async () => {
+    await Promise.all([
+      runGraphSubagentTenantFlow('graph-tenant-a'),
+      runGraphSubagentTenantFlow('graph-tenant-b'),
+    ]);
+
+    for (const tenantId of ['graph-tenant-a', 'graph-tenant-b']) {
+      const otherTenantId =
+        tenantId === 'graph-tenant-a' ? 'graph-tenant-b' : 'graph-tenant-a';
+      const starts = startsForTenant(tenantId);
+      const traceId = traceIdFromSeed(`routing-graph-${tenantId}`);
+
+      expectTenantCredentials(starts, tenantId);
+      expectOnlyTraceIds(starts, [traceId]);
+      expectNamedSpansUseTraceId({
+        starts,
+        traceId,
+        names: [
+          `LibreChat Agent: parent ${tenantId}`,
+          'FakeChatModel',
+          'subagent',
+        ],
+      });
+      expect(
+        starts.filter(
+          (record) => record.name === 'RoutingProviderFakeChatModel'
+        )
+      ).toHaveLength(3);
+      expectNoCrossTenantTrace({ tenantId, otherTenantId, traceId });
     }
   });
 

@@ -5,8 +5,8 @@ import {
   AIMessageChunk,
   HumanMessage,
 } from '@langchain/core/messages';
+import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { UsageMetadata } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
@@ -371,6 +371,8 @@ describe('Subagent Integration', () => {
       }
     );
     const parentUpdateHandler = jest.fn();
+    const rootModelEndHandler = jest.fn();
+    const nestedUsageEvents: t.SubagentUsageEvent[] = [];
     let specialistToolDefinitions: t.LCTool[] | undefined;
     let forwardedToolResults: t.ToolExecuteResult[] | undefined;
 
@@ -409,11 +411,37 @@ describe('Subagent Integration', () => {
               const invokeOptions = options as
                 | { callbacks?: unknown[] }
                 | undefined;
-              const forwarder = (invokeOptions?.callbacks ?? [])[0] as
+              const callbacks = invokeOptions?.callbacks ?? [];
+              const forwarder = callbacks.find(
+                (callback) =>
+                  typeof (callback as { handleCustomEvent?: unknown })
+                    .handleCustomEvent === 'function'
+              ) as
                 | {
                     handleCustomEvent?: (
                       eventName: string,
                       data: unknown,
+                      runId: string
+                    ) => Promise<void> | void;
+                  }
+                | undefined;
+              const usageHandler = callbacks.find(
+                (callback) =>
+                  typeof (callback as { handleLLMEnd?: unknown })
+                    .handleLLMEnd === 'function'
+              ) as
+                | {
+                    handleChatModelStart?: (
+                      llm: unknown,
+                      messages: BaseMessage[][],
+                      runId: string,
+                      parentRunId?: string,
+                      extraParams?: unknown,
+                      tags?: string[],
+                      metadata?: Record<string, unknown>
+                    ) => Promise<void> | void;
+                    handleLLMEnd?: (
+                      output: unknown,
                       runId: string
                     ) => Promise<void> | void;
                   }
@@ -442,6 +470,38 @@ describe('Subagent Integration', () => {
                   'specialist-run'
                 );
               }
+              await usageHandler?.handleChatModelStart?.(
+                {},
+                [[]],
+                'specialist-model-call',
+                undefined,
+                undefined,
+                undefined,
+                {
+                  agentId: 'specialist',
+                  ls_model_name: 'gpt-4o-mini',
+                }
+              );
+              await usageHandler?.handleLLMEnd?.(
+                {
+                  generations: [
+                    [
+                      {
+                        text: 'specialist done',
+                        message: new AIMessage({
+                          content: 'specialist done',
+                          usage_metadata: {
+                            input_tokens: 5,
+                            output_tokens: 3,
+                            total_tokens: 8,
+                          },
+                        }),
+                      },
+                    ],
+                  ],
+                },
+                'specialist-model-call'
+              );
               return { messages: [new AIMessage('specialist done')] };
             }),
           } as unknown as ReturnType<StandardGraph['createWorkflow']>;
@@ -492,17 +552,22 @@ describe('Subagent Integration', () => {
     };
 
     try {
+      const rootRunId = `nested-event-tools-${Date.now()}`;
       const run = await Run.create<t.IState>({
-        runId: `nested-event-tools-${Date.now()}`,
+        runId: rootRunId,
         graphConfig: { type: 'standard', agents: [rootAgent] },
         customHandlers: {
           [GraphEvents.ON_TOOL_EXECUTE]: { handle: parentToolHandler },
+          [GraphEvents.CHAT_MODEL_END]: { handle: rootModelEndHandler },
           [GraphEvents.ON_SUBAGENT_UPDATE]: {
             handle: parentUpdateHandler,
           },
         },
         returnContent: true,
         skipCleanup: true,
+        subagentUsageSink: (event) => {
+          nestedUsageEvents.push(event);
+        },
       });
       const rootContext = (run.Graph as StandardGraph).agentContexts.get(
         'root'
@@ -530,7 +595,68 @@ describe('Subagent Integration', () => {
         ([, data]) => (data as t.SubagentUpdateEvent).subagentType
       );
       expect(forwardedSubagentTypes).toContain('router');
-      expect(forwardedSubagentTypes).not.toContain('specialist');
+      expect(forwardedSubagentTypes).toContain('specialist');
+      const specialistStepUpdates = parentUpdateHandler.mock.calls.filter(
+        ([, data]) => {
+          const event = data as t.SubagentUpdateEvent;
+          return (
+            event.subagentType === 'specialist' &&
+            (event.data as { id?: string } | undefined)?.id ===
+              'specialist-step'
+          );
+        }
+      );
+      expect(specialistStepUpdates).toHaveLength(1);
+      const routerEvent = parentUpdateHandler.mock.calls
+        .map(([, data]) => data as t.SubagentUpdateEvent)
+        .find((event) => event.subagentType === 'router');
+      const specialistEvent =
+        specialistStepUpdates[0][1] as t.SubagentUpdateEvent;
+      expect(routerEvent).toMatchObject({
+        runId: rootRunId,
+        parentRunId: rootRunId,
+        depth: 1,
+      });
+      expect(routerEvent?.ancestry?.map((entry) => entry.subagentType)).toEqual(
+        ['router']
+      );
+      expect(specialistEvent).toMatchObject({
+        runId: rootRunId,
+        parentRunId: routerEvent?.subagentRunId,
+        depth: 2,
+      });
+      expect(
+        specialistEvent.ancestry?.map((entry) => ({
+          type: entry.subagentType,
+          kind: entry.subagentKind,
+        }))
+      ).toEqual([
+        { type: 'router', kind: 'agent' },
+        { type: 'specialist', kind: 'agent' },
+      ]);
+      expect(nestedUsageEvents).toHaveLength(1);
+      expect(rootModelEndHandler).not.toHaveBeenCalled();
+      expect(nestedUsageEvents[0]).toMatchObject({
+        runId: rootRunId,
+        parentRunId: routerEvent?.subagentRunId,
+        subagentType: 'specialist',
+        subagentAgentId: 'specialist',
+        depth: 2,
+        usage: {
+          input_tokens: 5,
+          output_tokens: 3,
+          total_tokens: 8,
+        },
+      });
+      expect(
+        nestedUsageEvents[0].ancestry?.map((entry) => ({
+          type: entry.subagentType,
+          kind: entry.subagentKind,
+        }))
+      ).toEqual([
+        { type: 'router', kind: 'agent' },
+        { type: 'specialist', kind: 'agent' },
+      ]);
     } finally {
       createWorkflowSpy.mockRestore();
     }

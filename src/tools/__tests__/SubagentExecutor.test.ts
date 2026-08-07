@@ -4,10 +4,10 @@ import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
   AgentInputs,
+  GraphSubagentConfig,
   ResolvedSubagentConfig,
+  ResolvedSingleAgentSubagentConfig,
   StandardGraphInput,
-  SubagentConfig,
-  SubagentResolveContext,
   SubagentUpdateEvent,
   SubagentUsageEvent,
   ToolExecuteBatchRequest,
@@ -16,23 +16,16 @@ import type {
 import type { StandardGraph } from '@/graphs/Graph';
 import {
   SubagentExecutor,
+  filterGraphSubagentResult,
   filterSubagentResult,
-  normalizeSubagentConfigs,
   resolveSubagentConfigs,
   buildChildInputs,
   summarizeEvent,
 } from '../subagent';
-import {
-  SUBAGENT_PARENT_BATCH_CONFIG_KEY,
-  SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
-} from '../subagent/SubagentReplay';
-import {
-  RUN_BREAKER_SCOPE_CONFIG_KEY,
-  StreamLimitExceededError,
-} from '@/llm/streamLimits';
 import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecutor';
+import { SUBAGENT_PARENT_BATCH_CONFIG_KEY } from '../subagent/SubagentReplay';
 import { Constants, Providers, GraphEvents, StepTypes } from '@/common';
-import { TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from '@/hooks';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { AgentContext } from '@/agents/AgentContext';
 import { HookRegistry } from '@/hooks/HookRegistry';
 import { HandlerRegistry } from '@/events';
@@ -49,8 +42,8 @@ const makeChildInputs = (agentId = 'child-agent'): AgentInputs => ({
 
 const makeConfig = (
   type = 'researcher',
-  overrides: Partial<ResolvedSubagentConfig> = {}
-): ResolvedSubagentConfig => ({
+  overrides: Partial<ResolvedSingleAgentSubagentConfig> = {}
+): ResolvedSingleAgentSubagentConfig => ({
   type,
   name: 'Test Researcher',
   description: 'Researches things',
@@ -59,6 +52,18 @@ const makeConfig = (
 });
 
 describe('filterSubagentResult', () => {
+  it('treats a result member with no new AI message as textless completion', () => {
+    expect(
+      filterGraphSubagentResult(
+        {
+          messages: [new AIMessage('worker output')],
+          subagentResult: { agentId: 'result' },
+        },
+        'result'
+      )
+    ).toBe('Task completed');
+  });
+
   it('extracts text from last AIMessage string content', () => {
     const messages: BaseMessage[] = [
       new HumanMessage('task'),
@@ -228,43 +233,10 @@ describe('resolveSubagentConfigs', () => {
   it('passes through configs with explicit agentInputs', () => {
     const config = makeConfig();
     const parentContext = AgentContext.fromConfig(parentInputs);
-    const resolved: ResolvedSubagentConfig[] = resolveSubagentConfigs(
-      [config],
-      parentContext
-    );
+    const resolved = resolveSubagentConfigs([config], parentContext);
     expect(resolved).toHaveLength(1);
-    expect(resolved[0].agentInputs.agentId).toBe('child-agent');
-  });
-
-  it('retains lazy descriptors without resolving them during initialization', () => {
-    const resolveAgentInputs = jest.fn(async () => makeChildInputs());
-    const lazyConfig: SubagentConfig = {
-      type: 'lazy',
-      name: 'Lazy Worker',
-      description: 'Loads only when selected',
-      configId: 'lazy@v1',
-      resolveAgentInputs,
-    };
-    const parentContext = AgentContext.fromConfig(parentInputs);
-
-    const resolved = normalizeSubagentConfigs([lazyConfig], parentContext);
-
-    expect(resolved).toEqual([lazyConfig]);
-    expect(resolveAgentInputs).not.toHaveBeenCalled();
-  });
-
-  it('rejects a lazy descriptor without a durable config identity', () => {
-    const parentContext = AgentContext.fromConfig(parentInputs);
-    const lazyConfig: SubagentConfig = {
-      type: 'unversioned',
-      name: 'Unversioned Worker',
-      description: 'Missing a durable identity',
-      resolveAgentInputs: async () => makeChildInputs(),
-    };
-
-    expect(() => normalizeSubagentConfigs([lazyConfig], parentContext)).toThrow(
-      'requires a non-empty "configId"'
-    );
+    const resolvedConfig = resolved[0];
+    expect(resolvedConfig.agentInputs.agentId).toBe('child-agent');
   });
 
   it('resolves self-spawn from parent _sourceInputs', () => {
@@ -277,8 +249,9 @@ describe('resolveSubagentConfigs', () => {
     const parentContext = AgentContext.fromConfig(parentInputs);
     const resolved = resolveSubagentConfigs([selfConfig], parentContext);
     expect(resolved).toHaveLength(1);
-    expect(resolved[0].agentInputs.provider).toBe(Providers.OPENAI);
-    expect(resolved[0].agentInputs.instructions).toBe(
+    const resolvedConfig = resolved[0];
+    expect(resolvedConfig.agentInputs.provider).toBe(Providers.OPENAI);
+    expect(resolvedConfig.agentInputs.instructions).toBe(
       'You are a parent agent.'
     );
   });
@@ -540,424 +513,53 @@ describe('SubagentExecutor', () => {
     expect(result.messages).toEqual([]);
   });
 
-  describe('lazy agent input resolution', () => {
-    function makeLazyConfig(
-      type: string,
-      resolveAgentInputs: (
-        context: SubagentResolveContext
-      ) => Promise<AgentInputs>,
-      overrides: Partial<SubagentConfig> = {}
-    ): SubagentConfig {
-      return {
-        type,
-        name: `${type} worker`,
-        description: `Handles ${type} tasks`,
-        configId: `${type}@v1`,
-        resolveAgentInputs,
-        ...overrides,
-      };
-    }
-
-    it('resolves only the selected descriptor and never loads unused siblings', async () => {
-      const researcherResolver = jest.fn(async () =>
-        makeChildInputs('lazy-researcher')
-      );
-      const coderResolver = jest.fn(async () => makeChildInputs('lazy-coder'));
-      const researcher = makeLazyConfig('researcher', researcherResolver);
-      const coder = makeLazyConfig('coder', coderResolver);
-      let observedChildInputs: AgentInputs | undefined;
-      const executor = new SubagentExecutor({
-        configs: new Map([
-          [researcher.type, researcher],
-          [coder.type, coder],
-        ]),
-        parentRunId: 'lazy-run',
-        parentAgentId: 'parent-agent',
-        createChildGraph: (input): StandardGraph => {
-          observedChildInputs = input.agents[0];
-          return makeNoopGraphFactory()();
-        },
-      });
-
-      await executor.execute({
-        description: 'Research this',
-        subagentType: 'researcher',
-        parentToolCallId: 'call_research',
-      });
-
-      expect(researcherResolver).toHaveBeenCalledTimes(1);
-      expect(coderResolver).not.toHaveBeenCalled();
-      expect(observedChildInputs?.agentId).toBe('lazy-researcher');
+  it('fails graph HITL before factories, hooks, events, or usage can run', async () => {
+    const graphConfig: GraphSubagentConfig = {
+      kind: 'graph',
+      type: 'graph-team',
+      name: 'Graph Team',
+      description: 'Runs a graph.',
+      agents: [makeChildInputs('graph-member')],
+      edges: [],
+      entryAgentId: 'graph-member',
+      resultAgentId: 'graph-member',
+    };
+    const createChildGraph = jest.fn(makeNoopGraphFactory());
+    const createChildGraphByKind = jest.fn(
+      (): StandardGraph => makeNoopGraphFactory()()
+    );
+    const hook = jest.fn(async (): Promise<Record<string, never>> => ({}));
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('SubagentStart', { hooks: [hook] });
+    const update = jest.fn();
+    const handlerRegistry = new HandlerRegistry();
+    handlerRegistry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+      handle: update,
+    });
+    const usageSink = jest.fn();
+    const executor = createExecutor({
+      configs: new Map([[graphConfig.type, graphConfig]]),
+      humanInTheLoop: { enabled: true },
+      createChildGraph,
+      createChildGraphByKind,
+      hookRegistry,
+      parentHandlerRegistry: handlerRegistry,
+      usageSink,
     });
 
-    it('coalesces concurrent duplicate resolution by child execution identity', async () => {
-      let finishResolution = (_inputs: AgentInputs): void => undefined;
-      const resolverResult = new Promise<AgentInputs>((resolve) => {
-        finishResolution = resolve;
-      });
-      let markResolutionStarted = (): void => undefined;
-      const resolutionStarted = new Promise<void>((resolve) => {
-        markResolutionStarted = resolve;
-      });
-      const resolver = jest.fn(async () => {
-        markResolutionStarted();
-        return resolverResult;
-      });
-      const lazyConfig = makeLazyConfig('researcher', resolver);
-      const executor = new SubagentExecutor({
-        configs: new Map([[lazyConfig.type, lazyConfig]]),
-        parentRunId: 'coalesced-run',
-        parentAgentId: 'parent-agent',
-        createChildGraph: makeNoopGraphFactory(),
-      });
-      const params = {
-        description: 'Same selected execution',
-        subagentType: 'researcher',
-        parentToolCallId: 'call_same',
-      };
-
-      const first = executor.execute(params);
-      const duplicate = executor.execute(params);
-      await resolutionStarted;
-      expect(resolver).toHaveBeenCalledTimes(1);
-
-      finishResolution(makeChildInputs());
-      await Promise.all([first, duplicate]);
-
-      await executor.execute({
-        ...params,
-        parentToolCallId: 'call_fresh',
-      });
-      expect(resolver).toHaveBeenCalledTimes(2);
-      const resolutionState = executor as unknown as {
-        resolvedConfigs: Map<string, ResolvedSubagentConfig>;
-        pendingConfigResolutions: Map<string, Promise<ResolvedSubagentConfig>>;
-      };
-      expect(resolutionState.resolvedConfigs.size).toBe(0);
-      expect(resolutionState.pendingConfigResolutions.size).toBe(0);
+    const result = await executor.execute({
+      description: 'Do not run.',
+      subagentType: graphConfig.type,
     });
 
-    it('isolates a selected resolver failure from other descriptors', async () => {
-      const failing = makeLazyConfig('failing', async () => {
-        throw new Error(
-          'selected config unavailable: oauth-token=must-not-leak'
-        );
-      });
-      const healthyResolver = jest.fn(async () => makeChildInputs('healthy'));
-      const healthy = makeLazyConfig('healthy', healthyResolver);
-      const executor = new SubagentExecutor({
-        configs: new Map([
-          [failing.type, failing],
-          [healthy.type, healthy],
-        ]),
-        parentRunId: 'isolated-failure-run',
-        createChildGraph: makeNoopGraphFactory(),
-      });
-
-      const failed = await executor.execute({
-        description: 'Fail only this child',
-        subagentType: 'failing',
-        parentToolCallId: 'call_failing',
-      });
-      const succeeded = await executor.execute({
-        description: 'Run the healthy child',
-        subagentType: 'healthy',
-        parentToolCallId: 'call_healthy',
-      });
-
-      expect(failed.content).toBe(
-        'Subagent error: Unable to initialize the selected subagent.'
-      );
-      expect(failed.content).not.toContain('oauth-token');
-      expect(failed.content).not.toContain('must-not-leak');
-      expect(succeeded.content).toBe('Task completed');
-      expect(healthyResolver).toHaveBeenCalledTimes(1);
-    });
-
-    it('releases lazy inputs when SubagentStart blocks the execution', async () => {
-      const resolver = jest.fn(async () => makeChildInputs());
-      const lazyConfig = makeLazyConfig('researcher', resolver);
-      const hookRegistry = new HookRegistry();
-      hookRegistry.register('SubagentStart', {
-        hooks: [
-          async (): Promise<{ decision: 'deny'; reason: string }> => ({
-            decision: 'deny',
-            reason: 'blocked by policy',
-          }),
-        ],
-      });
-      const executor = new SubagentExecutor({
-        configs: new Map([[lazyConfig.type, lazyConfig]]),
-        hookRegistry,
-        parentRunId: 'blocked-lazy-run',
-        createChildGraph: makeNoopGraphFactory(),
-      });
-      const params = {
-        description: 'Blocked lazy child',
-        subagentType: 'researcher',
-        parentToolCallId: 'call_blocked_lazy',
-      };
-
-      const first = await executor.execute(params);
-      const blockedState = executor as unknown as {
-        resolvedConfigs: Map<string, ResolvedSubagentConfig>;
-        childExecutionIdentities: Map<string, object>;
-      };
-      expect(blockedState.resolvedConfigs.size).toBe(0);
-      expect(blockedState.childExecutionIdentities.size).toBe(0);
-      const retry = await executor.execute(params);
-
-      expect(first.content).toBe('Blocked: blocked by policy');
-      expect(retry.content).toBe('Blocked: blocked by policy');
-      expect(resolver).toHaveBeenCalledTimes(2);
-    });
-
-    it('sanitizes private runtime state before exposing configurable to the resolver', async () => {
-      let resolverConfigurable: Readonly<Record<string, unknown>> | undefined;
-      const lazyConfig = makeLazyConfig('researcher', async (context) => {
-        resolverConfigurable = context.configurable;
-        return makeChildInputs();
-      });
-      const executor = new SubagentExecutor({
-        configs: new Map([[lazyConfig.type, lazyConfig]]),
-        parentRunId: 'sanitized-resolver-run',
-        createChildGraph: makeNoopGraphFactory(),
-      });
-
-      await executor.execute({
-        description: 'Resolve without private runtime state',
-        subagentType: 'researcher',
-        parentToolCallId: 'call_sanitized_resolver',
-        parentConfigurable: {
-          requestBody: { messageId: 'allowed-message' },
-          user: { id: 'allowed-user' },
-          __pregel_scratchpad: { secret: 'pregel-secret' },
-          checkpoint_id: 'checkpoint-secret',
-          [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'batch-secret',
-          [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
-            graphState: {
-              toolOutputReferences: {
-                entries: [{ key: 'tool0turn0', value: 'output-ref-secret' }],
-              },
-            },
-          },
-          [TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY]: 'approval-secret',
-          [RUN_BREAKER_SCOPE_CONFIG_KEY]: { secret: 'breaker-secret' },
-        },
-      });
-
-      expect(resolverConfigurable).toEqual({
-        requestBody: { messageId: 'allowed-message' },
-        user: { id: 'allowed-user' },
-      });
-      expect(JSON.stringify(resolverConfigurable)).not.toContain('secret');
-    });
-
-    it('passes the composed signal and stops awaiting a non-cooperative resolver on abort', async () => {
-      const parentAbort = new AbortController();
-      let observedContext: SubagentResolveContext | undefined;
-      const lazyConfig = makeLazyConfig('researcher', async (context) => {
-        observedContext = context;
-        return new Promise<AgentInputs>(() => {
-          /* Intentionally ignores cancellation to exercise the SDK race. */
-        });
-      });
-      const executor = new SubagentExecutor({
-        configs: new Map([[lazyConfig.type, lazyConfig]]),
-        parentSignal: parentAbort.signal,
-        parentRunId: 'cancel-run',
-        createChildGraph: makeNoopGraphFactory(),
-      });
-
-      const execution = executor.execute({
-        description: 'Cancel during resolution',
-        subagentType: 'researcher',
-        parentToolCallId: 'call_cancel',
-      });
-      await Promise.resolve();
-      parentAbort.abort(new Error('host cancelled'));
-      const result = await execution;
-
-      expect(observedContext?.signal.aborted).toBe(true);
-      expect(result.content).toBe(
-        'Subagent error: Unable to initialize the selected subagent.'
-      );
-      expect(result.content).not.toContain('host cancelled');
-    });
-
-    it('prefers eager agentInputs over a resolver for backward compatibility', async () => {
-      const resolver = jest.fn(async () => makeChildInputs('unexpected'));
-      const eagerConfig: SubagentConfig = {
-        ...makeConfig(),
-        resolveAgentInputs: resolver,
-      };
-      const executor = new SubagentExecutor({
-        configs: new Map([[eagerConfig.type, eagerConfig]]),
-        parentRunId: 'eager-run',
-        createChildGraph: makeNoopGraphFactory(),
-      });
-
-      await executor.execute({
-        description: 'Use eager config',
-        subagentType: eagerConfig.type,
-        parentToolCallId: 'call_eager',
-      });
-
-      expect(resolver).not.toHaveBeenCalled();
-    });
-
-    it('preserves nested configs and decrements depth after lazy resolution', async () => {
-      const nestedDescriptor: SubagentConfig = {
-        type: 'grandchild',
-        name: 'Grandchild',
-        description: 'Nested specialist',
-        configId: 'grandchild@v1',
-        resolveAgentInputs: async () => makeChildInputs('grandchild'),
-      };
-      const lazyConfig = makeLazyConfig(
-        'nested',
-        async () => ({
-          ...makeChildInputs('nested-child'),
-          subagentConfigs: [nestedDescriptor],
-          maxSubagentDepth: 3,
-        }),
-        { allowNested: true }
-      );
-      let observedChildInputs: AgentInputs | undefined;
-      const executor = new SubagentExecutor({
-        configs: new Map([[lazyConfig.type, lazyConfig]]),
-        parentRunId: 'nested-lazy-run',
-        maxDepth: 3,
-        createChildGraph: (input): StandardGraph => {
-          observedChildInputs = input.agents[0];
-          return makeNoopGraphFactory()();
-        },
-      });
-
-      await executor.execute({
-        description: 'Delegate recursively',
-        subagentType: 'nested',
-        parentToolCallId: 'call_nested',
-      });
-
-      expect(observedChildInputs?.maxSubagentDepth).toBe(2);
-      expect(observedChildInputs?.subagentConfigs).toEqual([nestedDescriptor]);
-    });
-
-    it('supplies the same stable resolution identity after executor reconstruction', async () => {
-      const contexts: SubagentResolveContext[] = [];
-      const lazyConfig = makeLazyConfig('researcher', async (context) => {
-        contexts.push(context);
-        return makeChildInputs();
-      });
-      const makeRebuiltExecutor = (): SubagentExecutor =>
-        new SubagentExecutor({
-          configs: new Map([[lazyConfig.type, lazyConfig]]),
-          parentRunId: 'rebuilt-parent-run',
-          parentAgentId: 'parent-agent',
-          humanInTheLoop: { enabled: true },
-          createChildGraph: (): StandardGraph =>
-            ({
-              createWorkflow: () => ({
-                getState: jest.fn().mockResolvedValue({
-                  values: { messages: [new AIMessage('persisted result')] },
-                  next: [],
-                  tasks: [],
-                }),
-                invoke: jest.fn(),
-                updateState: jest.fn().mockResolvedValue({}),
-              }),
-              clearHeavyState: jest.fn(),
-            }) as unknown as StandardGraph,
-        });
-      const params = {
-        description: 'Recover deterministic child',
-        subagentType: 'researcher',
-        threadId: 'durable-thread',
-        parentToolCallId: 'call_rebuild',
-      };
-
-      await makeRebuiltExecutor().execute(params);
-      await makeRebuiltExecutor().execute(params);
-
-      expect(contexts).toHaveLength(2);
-      expect(contexts[0].executionId).toBe(contexts[1].executionId);
-      expect(contexts[0].descriptor).toEqual(contexts[1].descriptor);
-      expect(contexts[0].descriptor.configId).toBe('researcher@v1');
-      expect(contexts[0].threadId).toBe('durable-thread');
-      expect(contexts[0].parentToolCallId).toBe('call_rebuild');
-    });
-
-    it('fails closed before resolution when a resume manifest binds a different config identity', async () => {
-      const resolver = jest.fn(async () => makeChildInputs());
-      const lazyConfig = makeLazyConfig('researcher', resolver, {
-        configId: 'researcher@v2',
-      });
-      const parentRunId = 'rebuilt-parent-run';
-      const parentAgentId = 'parent-agent';
-      const threadId = 'durable-thread';
-      const parentToolCallId = 'call_rebuild';
-      const branchThreadId = `subagent:${Buffer.from(
-        JSON.stringify([
-          threadId,
-          'root',
-          parentAgentId,
-          parentToolCallId,
-          'batch',
-          parentRunId,
-        ])
-      ).toString('base64url')}`;
-      const executor = new SubagentExecutor({
-        configs: new Map([[lazyConfig.type, lazyConfig]]),
-        parentRunId,
-        parentAgentId,
-        checkpointer: new MemorySaver(),
-        humanInTheLoop: { enabled: true },
-        createChildGraph: makeNoopGraphFactory(),
-      });
-
-      const result = await executor.execute({
-        description: 'Resume the original child',
-        subagentType: 'researcher',
-        threadId,
-        parentToolCallId,
-        parentConfigurable: {
-          [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
-            version: 1,
-            executions: [
-              {
-                parentToolCallId,
-                childRunId: 'original-child-run',
-                configId: 'researcher@v1',
-                approvalExecutionScope: 'original-approval-scope',
-                checkpoints: [
-                  {
-                    threadId: branchThreadId,
-                    checkpointId: 'original-checkpoint',
-                    checkpointNs: '',
-                  },
-                ],
-                graphState: {
-                  toolCallSteps: [],
-                  toolSessions: [],
-                  toolNodes: [],
-                  eagerToolUsage: [],
-                  eagerToolSuppressions: [],
-                },
-                approvalReplays: [],
-              },
-            ],
-          },
-        },
-      });
-
-      expect(result.content).toBe(
-        'Subagent error: Subagent configuration changed since this execution was paused.'
-      );
-      expect(result.content).not.toContain('researcher@v1');
-      expect(result.content).not.toContain('researcher@v2');
-      expect(resolver).not.toHaveBeenCalled();
-    });
+    expect(result.content).toBe(
+      'Error: Human-in-the-loop execution is not yet supported for graph subagents.'
+    );
+    expect(createChildGraph).not.toHaveBeenCalled();
+    expect(createChildGraphByKind).not.toHaveBeenCalled();
+    expect(hook).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(usageSink).not.toHaveBeenCalled();
   });
 
   it('fails closed when resumable execution has no parent tool call ID', async () => {
@@ -3022,6 +2624,107 @@ describe('SubagentExecutor', () => {
       expect(phases[phases.length - 1]).toBe('stop');
     });
 
+    it('does not let a stalled observational update handler block child completion', async () => {
+      jest.useFakeTimers();
+      try {
+        const registry = new HandlerRegistry();
+        const updateHandler = jest.fn(
+          (): Promise<void> => new Promise<void>(() => {})
+        );
+        registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+          handle: updateHandler,
+        });
+        const { factory } = makeStubGraphFactory({
+          messages: [new AIMessage('ok')],
+        });
+        const executor = createExecutor({
+          createChildGraph: factory,
+          parentHandlerRegistry: registry,
+        });
+
+        const execution = executor.execute({
+          description: 'Task',
+          subagentType: 'researcher',
+        });
+        const outcome = Promise.race([
+          execution.then(({ content }) => content),
+          new Promise<string>((resolve) =>
+            setTimeout(() => resolve('stalled'), 20_000)
+          ),
+        ]);
+
+        await jest.advanceTimersByTimeAsync(20_000);
+
+        await expect(outcome).resolves.toBe('ok');
+        expect(updateHandler).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not let a stalled queued update block the terminal stop envelope', async () => {
+      jest.useFakeTimers();
+      try {
+        const phases: SubagentUpdateEvent['phase'][] = [];
+        const registry = new HandlerRegistry();
+        registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+          handle: (_event, rawData): void | Promise<void> => {
+            const update = rawData as SubagentUpdateEvent;
+            phases.push(update.phase);
+            if (update.phase === 'run_step') {
+              return new Promise<void>(() => {});
+            }
+          },
+        });
+        const factory: () => StandardGraph = (): StandardGraph =>
+          ({
+            createWorkflow: (): { invoke: jest.Mock } => ({
+              invoke: jest.fn().mockImplementation(async (_state, options) => {
+                const opts = options as { callbacks?: unknown[] };
+                const forwarder = (opts.callbacks ?? [])[0] as {
+                  handleCustomEvent?: (
+                    eventName: string,
+                    data: unknown
+                  ) => Promise<void> | void;
+                };
+                for (let index = 0; index < 80; index++) {
+                  await forwarder.handleCustomEvent?.(GraphEvents.ON_RUN_STEP, {
+                    id: `step_${index}`,
+                    type: StepTypes.MESSAGE_CREATION,
+                    agentId: 'researcher',
+                    index,
+                  });
+                }
+                return { messages: [new AIMessage('ok')] };
+              }),
+            }),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph;
+        const executor = createExecutor({
+          createChildGraph: factory,
+          parentHandlerRegistry: registry,
+        });
+
+        const execution = executor.execute({
+          description: 'Task',
+          subagentType: 'researcher',
+        });
+        const outcome = Promise.race([
+          execution.then(({ content }) => content),
+          new Promise<string>((resolve) =>
+            setTimeout(() => resolve('stalled'), 20_000)
+          ),
+        ]);
+
+        await jest.advanceTimersByTimeAsync(20_000);
+
+        await expect(outcome).resolves.toBe('ok');
+        expect(phases).toEqual(['start', 'run_step', 'stop']);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     it('allowlists forwarded run step payloads before wrapping them in ON_SUBAGENT_UPDATE', async () => {
       const subagentUpdates: SubagentUpdateEvent[] = [];
       const registry = new HandlerRegistry();
@@ -3149,18 +2852,32 @@ describe('SubagentExecutor', () => {
       expect(serialized).not.toContain('nested-completed-secret');
     });
 
-    it('does not drop non-droppable updates when the forwarding queue overflows', async () => {
+    it('bounds queued updates under overload while preserving lifecycle envelopes', async () => {
+      const phases: SubagentUpdateEvent['phase'][] = [];
       const completedIds: string[] = [];
+      let releaseFirstCompleted!: () => void;
+      const firstCompletedBlocked = new Promise<void>((resolve) => {
+        releaseFirstCompleted = resolve;
+      });
+      let markAllEmitted!: () => void;
+      const allEmitted = new Promise<void>((resolve) => {
+        markAllEmitted = resolve;
+      });
+      let blockedFirstCompleted = false;
       const registry = new HandlerRegistry();
       registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
         handle: async (_event, rawData): Promise<void> => {
           const update = rawData as SubagentUpdateEvent;
+          phases.push(update.phase);
           if (update.phase === 'run_step_completed') {
             const data = update.data as { result?: { id?: string } };
             if (data.result?.id != null) {
               completedIds.push(data.result.id);
             }
-            await new Promise((resolve) => setTimeout(resolve, 1));
+            if (!blockedFirstCompleted) {
+              blockedFirstCompleted = true;
+              await firstCompletedBlocked;
+            }
           }
         },
       });
@@ -3195,6 +2912,7 @@ describe('SubagentExecutor', () => {
                   }
                 );
               }
+              markAllEmitted();
               return { messages: [new AIMessage('ok')] };
             }),
           }),
@@ -3206,14 +2924,21 @@ describe('SubagentExecutor', () => {
         parentHandlerRegistry: registry,
       });
 
-      await executor.execute({
+      const execution = executor.execute({
         description: 'Task',
         subagentType: 'researcher',
       });
+      await allEmitted;
+      releaseFirstCompleted();
+      await execution;
 
-      expect(completedIds).toHaveLength(80);
+      expect(completedIds).toHaveLength(65);
       expect(completedIds[0]).toBe('step_0');
+      expect(completedIds).not.toContain('step_1');
+      expect(completedIds).toContain('step_16');
       expect(completedIds[completedIds.length - 1]).toBe('step_79');
+      expect(phases[0]).toBe('start');
+      expect(phases[phases.length - 1]).toBe('stop');
     });
 
     it('does NOT forward ON_TOOL_EXECUTE when the parent registry has no handler (safe fallback)', async () => {

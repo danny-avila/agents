@@ -30,6 +30,10 @@ import type {
   StreamedToolCallArgTally,
   StreamDeltaEventTally,
 } from '@/llm/streamLimits';
+import type {
+  GraphFactory,
+  GraphFactoryDependencies,
+} from '@/graphs/graphFactory';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
 import type { FallbackErrorContext } from '@/llm/invoke';
 import type { HookRegistry } from '@/hooks';
@@ -124,6 +128,11 @@ import {
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
+  SubagentExecutor,
+  isGraphSubagentConfig,
+  normalizeSubagentConfigEntries,
+} from '@/tools/subagent';
+import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
@@ -138,10 +147,10 @@ import {
 } from '@/utils/callbacks';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
-import { SubagentExecutor, normalizeSubagentConfigs } from '@/tools/subagent';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
+import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
@@ -179,15 +188,21 @@ const EMPTY_PREEMPT_BOUNDARY: PreemptBoundaryResult = {
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
 
-function createToolHandlerRegistry(
+function createChildHandlerRegistry(
   source: HandlerRegistry | undefined
 ): HandlerRegistry | undefined {
   const toolHandler = source?.getHandler(GraphEvents.ON_TOOL_EXECUTE);
-  if (toolHandler == null) {
+  const updateHandler = source?.getHandler(GraphEvents.ON_SUBAGENT_UPDATE);
+  if (toolHandler == null && updateHandler == null) {
     return undefined;
   }
   const registry = new HandlerRegistry();
-  registry.register(GraphEvents.ON_TOOL_EXECUTE, toolHandler);
+  if (toolHandler != null) {
+    registry.register(GraphEvents.ON_TOOL_EXECUTE, toolHandler);
+  }
+  if (updateHandler != null) {
+    registry.register(GraphEvents.ON_SUBAGENT_UPDATE, updateHandler);
+  }
   return registry;
 }
 
@@ -1148,6 +1163,8 @@ export abstract class Graph<
 export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   overrideModel?: t.ChatModel;
   private subagentModelOverride?: t.ChatModel;
+  private readonly graphFactory: GraphFactory;
+  private readonly supportsMultiAgentChildren: boolean;
   /** Optional compile options passed into workflow.compile() */
   compileOptions?: t.CompileOptions | undefined;
   /** Whether the workflow was actually compiled with a checkpointer. */
@@ -1196,6 +1213,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   subagentUsageSink?: t.SubagentUsageSink;
   /** See {@link t.StandardGraphInput.subagentScope}. */
   subagentScope: boolean;
+  /** See {@link t.StandardGraphInput.subagentExecutionContext}. */
+  private readonly subagentExecutionContext?: t.SubagentExecutionContext;
   /** See {@link t.StandardGraphInput.preemption}. */
   preemption?: t.StreamPreemption;
   /**
@@ -1317,26 +1336,42 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   pendingPreemptReturn = new Set<string>();
 
-  constructor({
-    runId,
-    signal,
-    agents,
-    langfuse,
-    tokenCounter,
-    indexTokenCountMap,
-    calibrationRatio,
-    subagentUsageSink,
-    subagentScope,
-    preemption,
-    streamLimits,
-  }: t.StandardGraphInput) {
+  constructor(
+    {
+      runId,
+      signal,
+      agents,
+      langfuse,
+      tokenCounter,
+      indexTokenCountMap,
+      calibrationRatio,
+      subagentUsageSink,
+      subagentScope,
+      subagentExecutionContext,
+      preemption,
+      streamLimits,
+    }: t.StandardGraphInput,
+    dependencies?: GraphFactoryDependencies
+  ) {
     super();
+    this.supportsMultiAgentChildren = dependencies != null;
+    this.graphFactory =
+      dependencies?.graphFactory ??
+      ((request): StandardGraph => {
+        if (request.kind !== 'standard') {
+          throw new Error(
+            'A polymorphic graph factory is required for multi-agent graph construction.'
+          );
+        }
+        return new StandardGraph(request.input);
+      });
     this.runId = runId;
     this.langfuseScopeRunId = `${runId ?? 'graph'}:${nanoid()}`;
     this.signal = signal;
     this.langfuse = langfuse;
     this.subagentUsageSink = subagentUsageSink;
     this.subagentScope = subagentScope === true;
+    this.subagentExecutionContext = subagentExecutionContext;
     this.preemption = preemption;
     this.streamLimits = resolveStreamLimits(streamLimits);
 
@@ -4211,15 +4246,57 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       agentContext.subagentConfigs.length > 0 &&
       effectiveSubagentDepth > 0
     ) {
-      const resolvedConfigs = normalizeSubagentConfigs(
+      const executableConfigs = normalizeSubagentConfigEntries(
         agentContext.subagentConfigs,
         agentContext
       );
-      if (resolvedConfigs.length > 0) {
+      if (executableConfigs.length > 0) {
+        if (
+          !this.supportsMultiAgentChildren &&
+          executableConfigs.some(isGraphSubagentConfig)
+        ) {
+          throw new Error(
+            'Graph subagents require constructing the parent with createGraph() or an injected GraphFactory dependency.'
+          );
+        }
         const getParentHandlerRegistry = (): HandlerRegistry | undefined =>
           this.handlerRegistry ?? this.parentToolHandlerRegistry;
+        const createConfiguredChildGraph: GraphFactory = (request) => {
+          const childGraph = this.graphFactory(request);
+          if (this.subagentModelOverride != null) {
+            childGraph.overrideModel = this.subagentModelOverride;
+            childGraph.setSubagentModelOverride(this.subagentModelOverride);
+          }
+          const childHandlerRegistry = createChildHandlerRegistry(
+            getParentHandlerRegistry()
+          );
+          // Pure execution-ordering hint (unlike `humanInTheLoop`). It only
+          // reorders tools already in the child's direct group; it does not
+          // force a schema-only event tool onto the direct execution path.
+          applyGraphRuntimeConfig(childGraph, {
+            hookRegistry: this.hookRegistry,
+            humanInTheLoop: this.humanInTheLoop,
+            toolOutputReferences: this.toolOutputReferences,
+            eagerEventToolExecution: this.eagerEventToolExecution,
+            codeSessionToolNames: this.codeSessionToolNames,
+            interruptingToolNames: this.interruptingToolNames,
+            toolExecution: this.toolExecution,
+          });
+          if (this.humanInTheLoop?.enabled === true) {
+            childGraph.compileOptions = {
+              checkpointer: this.compileOptions?.checkpointer,
+            };
+          }
+          childGraph.parentToolHandlerRegistry = childHandlerRegistry;
+          childGraph.eventToolExecutionAvailable =
+            childHandlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) !=
+            null;
+          return childGraph;
+        };
         const executor = new SubagentExecutor({
-          configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
+          configs: new Map(
+            executableConfigs.map((config) => [config.type, config])
+          ),
           parentSignal: this.signal,
           breakerScope: {
             controller: (): AbortController => this.breakerAbort,
@@ -4231,6 +4308,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           parentHandlerRegistry: getParentHandlerRegistry,
           parentRunId: this.runId ?? '',
           parentAgentId: agentContext.agentId,
+          executionContext: this.subagentExecutionContext,
           langfuse: this.langfuse,
           tokenCounter: agentContext.tokenCounter,
           usageSink: this.subagentUsageSink,
@@ -4238,42 +4316,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           humanInTheLoop: this.humanInTheLoop,
           checkpointer: this.compileOptions?.checkpointer,
           maxDepth: effectiveSubagentDepth,
-          createChildGraph: (input): StandardGraph => {
-            const childGraph = new StandardGraph(input);
-            if (this.subagentModelOverride != null) {
-              childGraph.overrideModel = this.subagentModelOverride;
-              childGraph.setSubagentModelOverride(this.subagentModelOverride);
-            }
-            const toolHandlerRegistry = createToolHandlerRegistry(
-              getParentHandlerRegistry()
-            );
-            childGraph.hookRegistry = this.hookRegistry;
-            childGraph.humanInTheLoop = this.humanInTheLoop;
-            if (this.humanInTheLoop?.enabled === true) {
-              childGraph.compileOptions = {
-                checkpointer: this.compileOptions?.checkpointer,
-              };
-            }
-            childGraph.toolOutputReferences = this.toolOutputReferences;
-            childGraph.eagerEventToolExecution = this.eagerEventToolExecution;
-            childGraph.codeSessionToolNames = this.codeSessionToolNames;
-            // Pure execution-ordering hint (unlike `humanInTheLoop` above).
-            // It ONLY reorders tools already in the child's direct group;
-            // it does not force a name onto the direct path (that fold-in
-            // was removed — Codex review of #294). So for a self-spawned
-            // child that scrubs inherited `graphTools` (keeping only the
-            // event `toolDefinition` / schema-only stub for a name like
-            // `ask_user_question`), the name isn't in the child's direct
-            // group and this is a no-op — the stub is still dispatched via
-            // ON_TOOL_EXECUTE, never invoked directly. Where the child DOES
-            // have the executable graphTool, the guard correctly applies.
-            childGraph.interruptingToolNames = this.interruptingToolNames;
-            childGraph.toolExecution = this.toolExecution;
-            childGraph.parentToolHandlerRegistry = toolHandlerRegistry;
-            childGraph.eventToolExecutionAvailable =
-              toolHandlerRegistry != null;
-            return childGraph;
-          },
+          createChildGraph: (input): StandardGraph =>
+            createConfiguredChildGraph({
+              kind: 'standard',
+              input,
+            }),
+          createChildGraphByKind: createConfiguredChildGraph,
         });
         this.registerSubagentExecutor(executor);
 
@@ -4331,7 +4379,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               | undefined,
           });
           return result.content;
-        }, buildSubagentToolParams(resolvedConfigs));
+        }, buildSubagentToolParams(executableConfigs));
         const replayableSubagentTool = subagentTool as typeof subagentTool &
           ReplayableSubagentTool;
         replayableSubagentTool[SUBAGENT_REPLAY_CONTROLLER] = {
