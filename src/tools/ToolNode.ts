@@ -205,6 +205,22 @@ type RunToolBatchContext<T = unknown> = {
   errorOwnership?: ToolErrorOwnership;
 };
 
+function withSubagentReplayBatch(
+  config: RunnableConfig,
+  replayBatchKey: string | undefined
+): RunnableConfig {
+  if (replayBatchKey == null) {
+    return config;
+  }
+  return {
+    ...config,
+    configurable: {
+      ...config.configurable,
+      [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: replayBatchKey,
+    },
+  };
+}
+
 type SettledDirectToolResult = {
   output: BaseMessage | Command;
   additionalContexts: string[];
@@ -1632,15 +1648,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       this.toolMap.get(call.name) as ReplayableSubagentTool | undefined
     )?.[SUBAGENT_REPLAY_CONTROLLER];
     const replayConfig =
-      replayController == null || batchContext.replayBatchKey == null
+      replayController == null
         ? config
-        : {
-          ...config,
-          configurable: {
-            ...config.configurable,
-            [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: batchContext.replayBatchKey,
-          },
-        };
+        : withSubagentReplayBatch(config, batchContext.replayBatchKey);
     const settledOutput = await replayController?.getSettledOutput(
       call,
       replayConfig
@@ -4166,8 +4176,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           SubagentResumeManifest['executions'][number]
         >();
         for (const controller of controllers) {
-          const manifest =
-            await controller.getResumeManifest?.(parentToolCallIds);
+          const manifest = await controller.getResumeManifest?.(
+            parentToolCallIds,
+            withSubagentReplayBatch(config, baseContext.replayBatchKey)
+          );
           if (manifest != null) {
             for (const execution of manifest.executions) {
               executionsByParentCall.set(execution.parentToolCallId, execution);

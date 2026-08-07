@@ -138,9 +138,21 @@ describe('direct-path HITL: resume scope', () => {
     };
     const replayableTool = directTool as StructuredToolInterface &
       ReplayableSubagentTool;
+    const getResumeManifest = jest.fn(
+      async (
+        _parentToolCallIds?: ReadonlySet<string>,
+        _config?: RunnableConfig
+      ) => manifest
+    );
+    const getSettledOutput = jest.fn(
+      async (
+        _call: ToolCall,
+        _config: RunnableConfig
+      ): Promise<SettledSubagentToolOutput | undefined> => undefined
+    );
     replayableTool[SUBAGENT_REPLAY_CONTROLLER] = {
-      getResumeManifest: async () => manifest,
-      getSettledOutput: async () => undefined,
+      getResumeManifest,
+      getSettledOutput,
       persistSettledOutput: async () => {},
     };
     const node = new ToolNode({
@@ -166,6 +178,20 @@ describe('direct-path HITL: resume scope', () => {
       throw new Error('expected primitive child interrupt');
     }
     const internalPayload = interrupted.__interrupt__[0].value;
+    const replayBatchKey =
+      getSettledOutput.mock.calls[0]?.[1].configurable?.[
+        SUBAGENT_PARENT_BATCH_CONFIG_KEY
+      ];
+    expect(replayBatchKey).toEqual(expect.any(String));
+    expect(getResumeManifest).toHaveBeenCalledWith(
+      new Set(['call_primitive']),
+      expect.objectContaining({
+        configurable: expect.objectContaining({
+          thread_id: 'parent-thread',
+          [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: replayBatchKey,
+        }),
+      })
+    );
     expect(getSubagentResumeManifest(internalPayload)).toEqual(manifest);
     expect(stripSubagentResumeManifest(internalPayload)).toBe('confirm child');
   });

@@ -1,6 +1,7 @@
-import { MemorySaver } from '@langchain/langgraph';
 import { describe, expect, it, jest } from '@jest/globals';
 import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import { GraphInterrupt, MemorySaver } from '@langchain/langgraph';
+import type { Checkpoint, CheckpointMetadata } from '@langchain/langgraph';
 import type {
   AgentInputs,
   ExecutableSubagentConfigEntry,
@@ -12,13 +13,22 @@ import type {
   StandardGraphInput,
   SubagentResolveContext,
 } from '@/types';
-import type { SubagentResumeExecution } from '@/tools/subagent/SubagentReplay';
+import type {
+  SubagentResumeExecution,
+  SubagentResumeManifest,
+  SettledSubagentToolOutput,
+} from '@/tools/subagent/SubagentReplay';
 import type { GraphFactoryRequest } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
 import {
   SUBAGENT_PARENT_BATCH_CONFIG_KEY,
+  SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from '@/tools/subagent/SubagentReplay';
+import {
+  getSubagentApprovalExecutionScope,
+  SubagentExecutionRegistry,
+} from '@/tools/subagent/SubagentExecutionRegistry';
 import {
   RUN_BREAKER_SCOPE_CONFIG_KEY,
   StreamLimitExceededError,
@@ -113,6 +123,31 @@ const makeResumeExecution = (
   approvalReplays: [],
 });
 
+const putCheckpoint = async (
+  checkpointer: MemorySaver,
+  threadId: string,
+  checkpointId: string
+): Promise<void> => {
+  const checkpoint: Checkpoint = {
+    v: 4,
+    id: checkpointId,
+    ts: new Date().toISOString(),
+    channel_values: {},
+    channel_versions: {},
+    versions_seen: {},
+  };
+  const metadata: CheckpointMetadata = {
+    source: 'loop',
+    step: 0,
+    parents: {},
+  };
+  await checkpointer.put(
+    { configurable: { thread_id: threadId, checkpoint_ns: '' } },
+    checkpoint,
+    metadata
+  );
+};
+
 const createExecutor = (
   configs: ExecutableSubagentConfigEntry[],
   overrides: Partial<ConstructorParameters<typeof SubagentExecutor>[0]> = {}
@@ -180,7 +215,7 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(healthyResolver).toHaveBeenCalledTimes(1);
   });
 
-  it('clears lazy resolution and execution identity when SubagentStart denies', async () => {
+  it('releases lazy resolution when SubagentStart denies', async () => {
     const resolver = jest.fn(async () => makeAgent());
     const config = makeLazyConfig('researcher', resolver);
     const hookRegistry = new HookRegistry();
@@ -200,14 +235,7 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     };
 
     const first = await executor.execute(params);
-    const blockedState = executor as unknown as {
-      resolvedConfigs: Map<string, ResolvedSubagentConfig>;
-      childExecutionIdentities: Map<string, object>;
-    };
-
     expect(first.content).toBe('Blocked: blocked by policy');
-    expect(blockedState.resolvedConfigs.size).toBe(0);
-    expect(blockedState.childExecutionIdentities.size).toBe(0);
 
     const retry = await executor.execute(params);
 
@@ -263,78 +291,56 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
 
     expect(resolver).toHaveBeenCalledTimes(2);
     expect(invoke).toHaveBeenCalledTimes(2);
-    const resolutionState = executor as unknown as {
-      resolvedConfigs: Map<string, ResolvedSubagentConfig>;
-      pendingConfigResolutions: Map<string, Promise<ResolvedSubagentConfig>>;
-      pendingExecutions: Map<string, Promise<object>>;
-    };
-    expect(resolutionState.resolvedConfigs.size).toBe(0);
-    expect(resolutionState.pendingConfigResolutions.size).toBe(0);
-    expect(resolutionState.pendingExecutions.size).toBe(0);
   });
 
-  it('rejects a stale resolver completion after cleanup and preserves a newer retry', async () => {
-    let finishFirst = (_inputs: AgentInputs): void => undefined;
-    let finishSecond = (_inputs: AgentInputs): void => undefined;
-    const firstResult = new Promise<AgentInputs>((resolve) => {
-      finishFirst = resolve;
+  it('rejects a different invocation before sharing an in-flight result', async () => {
+    let finish = (_result: MultiAgentGraphState): void => undefined;
+    const invocation = new Promise<MultiAgentGraphState>((resolve) => {
+      finish = resolve;
     });
-    const secondResult = new Promise<AgentInputs>((resolve) => {
-      finishSecond = resolve;
+    const researcherResolver = jest.fn(async () => makeAgent('researcher'));
+    const coderResolver = jest.fn(async () => makeAgent('coder'));
+    const researcher = makeLazyConfig('researcher', researcherResolver);
+    const coder = makeLazyConfig('coder', coderResolver);
+    const invoke = jest.fn(() => invocation);
+    const executor = createExecutor([researcher, coder], {
+      createChildGraph: () =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
     });
-    let resolverInvocation = 0;
-    const config = makeLazyConfig('researcher', () => {
-      resolverInvocation += 1;
-      return resolverInvocation === 1 ? firstResult : secondResult;
-    });
-    const executor = createExecutor([config]);
-    const resolutionState = executor as unknown as {
-      resolveExecutionConfig: (
-        executableConfig: ExecutableSubagentConfigEntry,
-        context: {
-          childExecutionKey: string;
-          childRunId: string;
-          childSignal: AbortSignal;
-        }
-      ) => Promise<ResolvedSubagentConfig>;
-      resolvedConfigs: Map<string, ResolvedSubagentConfig>;
-      pendingConfigResolutions: Map<string, Promise<ResolvedSubagentConfig>>;
-    };
-    const childExecutionKey = 'stable-child-execution';
-    const context = {
-      childExecutionKey,
-      childRunId: 'stable-child-run',
-      childSignal: new AbortController().signal,
-    };
+    const common = { parentToolCallId: 'call_immutable_invocation' };
 
-    const staleResolution = resolutionState.resolveExecutionConfig(
-      config,
-      context
-    );
-    executor.clearHeavyState();
-    const currentResolution = resolutionState.resolveExecutionConfig(
-      config,
-      context
-    );
-
-    finishFirst(makeAgent('stale-child'));
-    await expect(staleResolution).rejects.toThrow(
-      'Subagent execution was invalidated.'
-    );
-    expect(resolutionState.resolvedConfigs.has(childExecutionKey)).toBe(false);
-    expect(
-      resolutionState.pendingConfigResolutions.get(childExecutionKey)
-    ).toBe(currentResolution);
-
-    finishSecond(makeAgent('current-child'));
-    await expect(currentResolution).resolves.toMatchObject({
-      agentInputs: { agentId: 'current-child' },
+    const first = executor.execute({
+      ...common,
+      description: 'Run the original request.',
+      subagentType: researcher.type,
     });
-    expect(
-      resolutionState.resolvedConfigs.get(childExecutionKey)?.agentInputs
-        .agentId
-    ).toBe('current-child');
-    expect(resolutionState.pendingConfigResolutions.size).toBe(0);
+    const changedType = executor.execute({
+      ...common,
+      description: 'Run the original request.',
+      subagentType: coder.type,
+    });
+    const changedDescription = executor.execute({
+      ...common,
+      description: 'Run a changed request.',
+      subagentType: researcher.type,
+    });
+
+    await expect(changedType).resolves.toMatchObject({
+      content:
+        'Subagent error: Subagent configuration changed since this execution was paused.',
+    });
+    await expect(changedDescription).resolves.toMatchObject({
+      content:
+        'Subagent error: Subagent invocation changed for this execution.',
+    });
+    expect(coderResolver).not.toHaveBeenCalled();
+    finish({ messages: [new AIMessage('original result')] });
+    await expect(first).resolves.toMatchObject({ content: 'original result' });
+    expect(researcherResolver).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledTimes(1);
   });
 
   it('does not execute a child after its lazy resolution was invalidated', async () => {
@@ -396,6 +402,61 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(observedAgentIds).toEqual(['current-child']);
   });
 
+  it('rejects a missing durable tool call ID before opening an execution record', async () => {
+    const config = makeLazyConfig('researcher', async () => makeAgent());
+    const openExecution = jest.spyOn(
+      SubagentExecutionRegistry.prototype,
+      'open'
+    );
+    const executor = createExecutor([config], {
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+    });
+
+    const result = await executor.execute({
+      description: 'Do not register this child.',
+      subagentType: config.type,
+    });
+
+    expect(result.content).toBe(
+      'Error: Resumable subagent execution requires a parent tool call ID.'
+    );
+    expect(openExecution).not.toHaveBeenCalled();
+    openExecution.mockRestore();
+  });
+
+  it('preserves a workflow construction error and allows a retry', async () => {
+    const config = makeLazyConfig('researcher', async () => makeAgent());
+    const clearFailedGraph = jest.fn();
+    let graphCount = 0;
+    const executor = createExecutor([config], {
+      createChildGraph: (): StandardGraph => {
+        graphCount += 1;
+        if (graphCount > 1) {
+          return makeGraph();
+        }
+        return {
+          createWorkflow: () => {
+            throw new Error('workflow setup failed');
+          },
+          clearHeavyState: clearFailedGraph,
+        } as unknown as StandardGraph;
+      },
+    });
+    const params = {
+      description: 'Retry workflow construction.',
+      subagentType: config.type,
+      parentToolCallId: 'call_workflow_retry',
+    };
+
+    const failed = await executor.execute(params);
+    const retried = await executor.execute(params);
+
+    expect(failed.content).toBe('Subagent error: workflow setup failed');
+    expect(retried.content).toBe('Task completed');
+    expect(clearFailedGraph).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps concurrent checkpoint forks as distinct child executions', async () => {
     const resolverContexts: SubagentResolveContext[] = [];
     let releaseInvocations = (): void => undefined;
@@ -403,9 +464,16 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
       releaseInvocations = resolve;
     });
     let invocationCount = 0;
+    let markInvocationsStarted = (): void => undefined;
+    const invocationsStarted = new Promise<void>((resolve) => {
+      markInvocationsStarted = resolve;
+    });
     const invoke = jest.fn(async (): Promise<MultiAgentGraphState> => {
       invocationCount += 1;
       const current = invocationCount;
+      if (invocationCount === 2) {
+        markInvocationsStarted();
+      }
       await invocationGate;
       return { messages: [new AIMessage(`result-${current}`)] };
     });
@@ -435,13 +503,7 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
       ...common,
       parentConfigurable: { checkpoint_id: 'fork-b' },
     });
-    for (
-      let attempt = 0;
-      attempt < 20 && invoke.mock.calls.length < 2;
-      attempt += 1
-    ) {
-      await Promise.resolve();
-    }
+    await invocationsStarted;
     const callsBeforeRelease = invoke.mock.calls.length;
     releaseInvocations();
     const [firstResult, secondResult] = await Promise.all([first, second]);
@@ -454,6 +516,601 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(new Set([firstResult.content, secondResult.content])).toEqual(
       new Set(['result-1', 'result-2'])
     );
+  });
+
+  it('scopes resume manifests to concurrent forks sharing a tool call ID', async () => {
+    const checkpointer = new MemorySaver();
+    const config = makeLazyConfig('researcher', async () => makeAgent());
+    const executor = createExecutor([config], {
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+    });
+    const parentToolCallId = 'call_shared_forks';
+    const call = {
+      id: parentToolCallId,
+      name: 'spawn_subagent',
+      args: {
+        description: 'Run the forked child.',
+        subagent_type: config.type,
+      },
+      type: 'tool_call' as const,
+    };
+    const forkAConfig = {
+      configurable: {
+        thread_id: 'durable-thread',
+        checkpoint_id: 'fork-a',
+        [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'shared-batch',
+        [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: 'attempt-a',
+      },
+    };
+    const forkBConfig = {
+      configurable: {
+        thread_id: 'durable-thread',
+        checkpoint_id: 'fork-b',
+        [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'shared-batch',
+        [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: 'attempt-b',
+      },
+    };
+    const forkCConfig = {
+      configurable: {
+        thread_id: 'durable-thread',
+        checkpoint_id: 'fork-a',
+        [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'shared-batch',
+        [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: 'attempt-c',
+      },
+    };
+    const makeSettledOutput = (content: string): SettledSubagentToolOutput => ({
+      output: new ToolMessage({
+        content,
+        name: call.name,
+        tool_call_id: parentToolCallId,
+      }),
+      additionalContexts: [],
+      resolvedArgs: call.args,
+    });
+
+    await Promise.all([
+      executor.persistSettledToolOutput(
+        call,
+        forkAConfig,
+        makeSettledOutput('fork-a result')
+      ),
+      executor.persistSettledToolOutput(
+        call,
+        forkBConfig,
+        makeSettledOutput('fork-b result')
+      ),
+    ]);
+
+    const parentToolCallIds = new Set([parentToolCallId]);
+    const [manifestA, manifestB] = await Promise.all([
+      executor.getResumeManifest(parentToolCallIds, forkAConfig),
+      executor.getResumeManifest(parentToolCallIds, forkBConfig),
+    ]);
+    if (manifestA == null) {
+      throw new Error('Expected fork A resume state.');
+    }
+    const forkCResumeConfig = {
+      configurable: {
+        ...forkCConfig.configurable,
+        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: manifestA,
+      },
+    };
+    await executor.persistSettledToolOutput(
+      call,
+      forkCResumeConfig,
+      makeSettledOutput('fork-c result')
+    );
+    const manifestC = await executor.getResumeManifest(
+      parentToolCallIds,
+      forkCResumeConfig
+    );
+    if (manifestB == null || manifestC == null) {
+      throw new Error('Expected fork B and C resume state.');
+    }
+
+    await expect(
+      executor.getResumeManifest(parentToolCallIds)
+    ).resolves.toBeUndefined();
+    expect(manifestA.executions).toHaveLength(1);
+    expect(manifestB.executions).toHaveLength(1);
+    expect(manifestC.executions).toHaveLength(1);
+    expect(manifestA.executions[0].childRunId).toBe(
+      manifestC.executions[0].childRunId
+    );
+    expect(manifestA.executions[0].childRunId).not.toBe(
+      manifestB.executions[0].childRunId
+    );
+    expect(
+      new Set(
+        [manifestA, manifestB, manifestC].map(
+          (manifest) => manifest.executions[0].checkpoints[0].threadId
+        )
+      ).size
+    ).toBe(3);
+
+    const replay = async (
+      manifest: SubagentResumeManifest | undefined,
+      parentConfigurable: Record<string, unknown>
+    ): Promise<SettledSubagentToolOutput | undefined> =>
+      createExecutor([config], {
+        checkpointer,
+        humanInTheLoop: { enabled: true },
+      }).getSettledToolOutput(call, {
+        configurable: {
+          ...parentConfigurable,
+          [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: manifest,
+        },
+      });
+    const [replayedA, replayedB, replayedC] = await Promise.all([
+      replay(manifestA, forkAConfig.configurable),
+      replay(manifestB, forkBConfig.configurable),
+      replay(manifestC, forkCConfig.configurable),
+    ]);
+    expect(replayedA?.output.content).toBe('fork-a result');
+    expect(replayedB?.output.content).toBe('fork-b result');
+    expect(replayedC?.output.content).toBe('fork-c result');
+  });
+
+  it('isolates concurrent resume attempts without a manifest', async () => {
+    const checkpointer = new MemorySaver();
+    const config = makeLazyConfig('researcher', async () => makeAgent());
+    const executor = createExecutor([config], {
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+    });
+    const parentToolCallId = 'call_shared_attempts';
+    const call = {
+      id: parentToolCallId,
+      name: 'spawn_subagent',
+      args: {
+        description: 'Run the attempted child.',
+        subagent_type: config.type,
+      },
+      type: 'tool_call' as const,
+    };
+    const baseConfigurable = {
+      thread_id: 'durable-thread',
+      checkpoint_id: 'shared-fork',
+      [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'shared-batch',
+    };
+    const attemptA = {
+      configurable: {
+        ...baseConfigurable,
+        [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: 'attempt-a',
+      },
+    };
+    const attemptB = {
+      configurable: {
+        ...baseConfigurable,
+        [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: 'attempt-b',
+      },
+    };
+    const makeSettled = (content: string): SettledSubagentToolOutput => ({
+      output: new ToolMessage({
+        content,
+        name: call.name,
+        tool_call_id: parentToolCallId,
+      }),
+      additionalContexts: [],
+      resolvedArgs: call.args,
+    });
+
+    await Promise.all([
+      executor.persistSettledToolOutput(
+        call,
+        attemptA,
+        makeSettled('attempt-a result')
+      ),
+      executor.persistSettledToolOutput(
+        call,
+        attemptB,
+        makeSettled('attempt-b result')
+      ),
+    ]);
+    const [manifestA, manifestB] = await Promise.all([
+      executor.getResumeManifest(new Set([parentToolCallId]), attemptA),
+      executor.getResumeManifest(new Set([parentToolCallId]), attemptB),
+    ]);
+
+    expect(manifestA?.executions).toHaveLength(1);
+    expect(manifestB?.executions).toHaveLength(1);
+    expect(manifestA?.executions[0].childRunId).toBe(
+      manifestB?.executions[0].childRunId
+    );
+    expect(manifestA?.executions[0].checkpoints[0].threadId).not.toBe(
+      manifestB?.executions[0].checkpoints[0].threadId
+    );
+  });
+
+  it('forks a legacy base checkpoint into each concurrent resume attempt', async () => {
+    const checkpointer = new MemorySaver();
+    const config = makeLazyConfig('researcher', async () => makeAgent());
+    const parentToolCallId = 'call_legacy_attempts';
+    const baseConfigurable = {
+      checkpoint_id: 'shared-fork',
+      [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'shared-batch',
+    };
+    const addressRegistry = new SubagentExecutionRegistry({
+      parentRunId: 'parent-run',
+      parentAgentId: 'parent-agent',
+      durable: true,
+    });
+    const legacyAddress = addressRegistry.open({
+      threadId: 'durable-thread',
+      parentToolCallId,
+      parentConfigurable: {
+        ...baseConfigurable,
+        [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: 'attempt-a',
+      },
+    }).address;
+    await putCheckpoint(
+      checkpointer,
+      legacyAddress.baseChildThreadId,
+      '00000000-0000-0000-0000-000000000001'
+    );
+    const executor = createExecutor([config], {
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+    });
+    const call = {
+      id: parentToolCallId,
+      name: 'spawn_subagent',
+      args: {
+        description: 'Resume the legacy child.',
+        subagent_type: config.type,
+      },
+      type: 'tool_call' as const,
+    };
+    const attemptConfig = (attempt: string) => ({
+      configurable: {
+        thread_id: 'durable-thread',
+        ...baseConfigurable,
+        [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: attempt,
+      },
+    });
+    const attemptA = attemptConfig('attempt-a');
+    const attemptB = attemptConfig('attempt-b');
+    const makeSettled = (content: string): SettledSubagentToolOutput => ({
+      output: new ToolMessage({
+        content,
+        name: call.name,
+        tool_call_id: parentToolCallId,
+      }),
+      additionalContexts: [],
+      resolvedArgs: call.args,
+    });
+
+    await Promise.all([
+      executor.persistSettledToolOutput(
+        call,
+        attemptA,
+        makeSettled('attempt-a result')
+      ),
+      executor.persistSettledToolOutput(
+        call,
+        attemptB,
+        makeSettled('attempt-b result')
+      ),
+    ]);
+    const [manifestA, manifestB] = await Promise.all([
+      executor.getResumeManifest(new Set([parentToolCallId]), attemptA),
+      executor.getResumeManifest(new Set([parentToolCallId]), attemptB),
+    ]);
+    const threadA = manifestA?.executions[0].checkpoints[0].threadId;
+    const threadB = manifestB?.executions[0].checkpoints[0].threadId;
+
+    expect(threadA).toBe(
+      addressRegistry.open({
+        threadId: 'durable-thread',
+        parentToolCallId,
+        parentConfigurable: attemptA.configurable,
+      }).address.branchChildThreadId
+    );
+    expect(threadB).toBe(
+      addressRegistry.open({
+        threadId: 'durable-thread',
+        parentToolCallId,
+        parentConfigurable: attemptB.configurable,
+      }).address.branchChildThreadId
+    );
+    expect(threadA).not.toBe(threadB);
+    expect(threadA).not.toBe(legacyAddress.baseChildThreadId);
+    expect(threadB).not.toBe(legacyAddress.baseChildThreadId);
+  });
+
+  it('retires superseded graphs across sequential resume attempts', async () => {
+    const checkpointer = new MemorySaver();
+    const config = makeLazyConfig('researcher', async () => makeAgent());
+    const parentToolCallId = 'call_sequential_attempts';
+    const addressRegistry = new SubagentExecutionRegistry({
+      parentRunId: 'parent-run',
+      parentAgentId: 'parent-agent',
+      durable: true,
+    });
+    const baseConfigurable = {
+      thread_id: 'durable-thread',
+      [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'shared-batch',
+    };
+    const attemptConfig = (
+      attempt: string,
+      checkpointId: string,
+      sourceThreadId?: string
+    ): Record<string, unknown> => {
+      const configurable: Record<string, unknown> = {
+        ...baseConfigurable,
+        checkpoint_id: checkpointId,
+        [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: attempt,
+      };
+      if (sourceThreadId != null) {
+        configurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] = {
+          version: 1,
+          executions: [
+            makeResumeExecution(
+              parentToolCallId,
+              config.configId,
+              sourceThreadId
+            ),
+          ],
+        };
+      }
+      return configurable;
+    };
+    const configA = attemptConfig('attempt-a', 'fork-a');
+    const addressA = addressRegistry.open({
+      threadId: baseConfigurable.thread_id,
+      parentToolCallId,
+      parentConfigurable: configA,
+    }).address;
+    const configB = attemptConfig(
+      'attempt-b',
+      'fork-b',
+      addressA.branchChildThreadId
+    );
+    const addressB = addressRegistry.open({
+      threadId: baseConfigurable.thread_id,
+      parentToolCallId,
+      parentConfigurable: configB,
+    }).address;
+    const configC = attemptConfig(
+      'attempt-c',
+      'fork-c',
+      addressB.branchChildThreadId
+    );
+    const hookRegistry = new HookRegistry();
+    const scopeA = getSubagentApprovalExecutionScope(
+      addressA.currentChildRunId,
+      'attempt-a'
+    );
+    const scopeB = getSubagentApprovalExecutionScope(
+      'original-child-run',
+      'attempt-b'
+    );
+    for (const scope of [scopeA, scopeB]) {
+      hookRegistry.registerSession(scope, 'PreToolUse', {
+        hooks: [async (): Promise<Record<string, never>> => ({})],
+      });
+    }
+    const clearHeavyState: Array<jest.MockedFunction<() => void>> = [];
+    let graphIndex = 0;
+    const executor = createExecutor([config], {
+      checkpointer,
+      hookRegistry,
+      humanInTheLoop: { enabled: true },
+      createChildGraph: (): StandardGraph => {
+        graphIndex += 1;
+        const currentGraphIndex = graphIndex;
+        const clear = jest.fn();
+        clearHeavyState.push(clear);
+        return {
+          createWorkflow: () => ({
+            getState: jest.fn(async () => ({
+              values: {},
+              next: [],
+              tasks: [],
+            })),
+            invoke: jest.fn(async (): Promise<MultiAgentGraphState> => {
+              throw new GraphInterrupt([
+                {
+                  id: `interrupt-${currentGraphIndex}`,
+                  value: 'pause',
+                },
+              ]);
+            }),
+            updateState: jest.fn(async () => ({})),
+          }),
+          createSubagentResumeState: jest.fn(() => ({
+            toolCallSteps: [],
+            toolSessions: [],
+            toolNodes: [],
+            eagerToolUsage: [],
+            eagerToolSuppressions: [],
+          })),
+          restoreSubagentResumeState: jest.fn(),
+          clearHeavyState: clear,
+        } as unknown as StandardGraph;
+      },
+    });
+    const checkpointTarget = executor as unknown as {
+      forkCheckpointSnapshot: () => Promise<void>;
+      getLatestCheckpointSnapshot: (
+        threadId: string
+      ) => Promise<SubagentResumeExecution['checkpoints']>;
+    };
+    jest
+      .spyOn(checkpointTarget, 'forkCheckpointSnapshot')
+      .mockResolvedValue(undefined);
+    jest
+      .spyOn(checkpointTarget, 'getLatestCheckpointSnapshot')
+      .mockImplementation(async (threadId) => [
+        {
+          threadId,
+          checkpointId: '00000000-0000-0000-0000-000000000001',
+          checkpointNs: '',
+        },
+      ]);
+    const runAttempt = (parentConfigurable: Record<string, unknown>) =>
+      executor.execute({
+        description: 'Resume the interrupted child.',
+        subagentType: config.type,
+        threadId: baseConfigurable.thread_id,
+        parentToolCallId,
+        parentConfigurable,
+      });
+
+    await expect(runAttempt(configA)).rejects.toBeInstanceOf(GraphInterrupt);
+    expect(clearHeavyState.map((clear) => clear.mock.calls.length)).toEqual([
+      0,
+    ]);
+    await expect(runAttempt(configB)).rejects.toBeInstanceOf(GraphInterrupt);
+    expect(clearHeavyState.map((clear) => clear.mock.calls.length)).toEqual([
+      1, 0,
+    ]);
+    expect(hookRegistry.hasHookFor('PreToolUse', scopeA)).toBe(false);
+    expect(hookRegistry.hasHookFor('PreToolUse', scopeB)).toBe(true);
+    await expect(runAttempt(configC)).rejects.toBeInstanceOf(GraphInterrupt);
+    expect(clearHeavyState.map((clear) => clear.mock.calls.length)).toEqual([
+      1, 1, 0,
+    ]);
+    expect(hookRegistry.hasHookFor('PreToolUse', scopeB)).toBe(false);
+  });
+
+  it('coalesces duplicate settlement and replays its retained output in-process', async () => {
+    const checkpointer = new MemorySaver();
+    const config = makeLazyConfig('researcher', async () => makeAgent());
+    const executor = createExecutor([config], {
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+    });
+    const parentToolCallId = 'call_duplicate_settlement';
+    const call = {
+      id: parentToolCallId,
+      name: 'spawn_subagent',
+      args: {
+        description: 'Persist this result once.',
+        subagent_type: config.type,
+      },
+      type: 'tool_call' as const,
+    };
+    const runnableConfig = {
+      configurable: {
+        thread_id: 'durable-thread',
+        checkpoint_id: 'shared-fork',
+        [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: 'attempt-a',
+      },
+    };
+    const settled: SettledSubagentToolOutput = {
+      output: new ToolMessage({
+        content: 'settled once',
+        name: call.name,
+        tool_call_id: parentToolCallId,
+      }),
+      additionalContexts: [],
+      resolvedArgs: call.args,
+    };
+    const persistCheckpoint = jest.spyOn(checkpointer, 'put');
+
+    await Promise.all([
+      executor.persistSettledToolOutput(call, runnableConfig, settled),
+      executor.persistSettledToolOutput(call, runnableConfig, settled),
+    ]);
+
+    expect(persistCheckpoint).toHaveBeenCalledTimes(1);
+    const readCheckpoint = jest.spyOn(checkpointer, 'getTuple');
+    readCheckpoint.mockClear();
+    await expect(
+      executor.getSettledToolOutput(call, runnableConfig)
+    ).resolves.toMatchObject({
+      output: { content: 'settled once' },
+      resolvedArgs: call.args,
+    });
+    expect(readCheckpoint).not.toHaveBeenCalled();
+  });
+
+  it('rejects mismatched settled args before they can win an execution race', async () => {
+    let releaseResolver = (): void => undefined;
+    const resolverGate = new Promise<void>((resolve) => {
+      releaseResolver = resolve;
+    });
+    const config = makeLazyConfig('researcher', async () => {
+      await resolverGate;
+      return makeAgent();
+    });
+    const checkpointer = new MemorySaver();
+    const updateState = jest.fn(async () => ({}));
+    const executor = createExecutor([config], {
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+      createChildGraph: () =>
+        ({
+          createWorkflow: () => ({
+            getState: jest.fn(async () => ({
+              values: { messages: [new AIMessage('original result')] },
+              next: [],
+              tasks: [],
+            })),
+            invoke: jest.fn(),
+            updateState,
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    const parentToolCallId = 'call_settlement_race';
+    const call = {
+      id: parentToolCallId,
+      name: 'spawn_subagent',
+      args: {
+        description: 'Run the original request.',
+        subagent_type: config.type,
+      },
+      type: 'tool_call' as const,
+    };
+    const parentConfigurable = {
+      thread_id: 'durable-thread',
+      checkpoint_id: 'shared-fork',
+      [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: 'attempt-a',
+    };
+    const runnableConfig = { configurable: parentConfigurable };
+    const execution = executor.execute({
+      description: call.args.description,
+      subagentType: config.type,
+      threadId: parentConfigurable.thread_id,
+      parentToolCallId,
+      parentConfigurable,
+    });
+    const mismatched: SettledSubagentToolOutput = {
+      output: new ToolMessage({
+        content: 'mismatched result',
+        name: call.name,
+        tool_call_id: parentToolCallId,
+      }),
+      additionalContexts: [],
+      resolvedArgs: {
+        ...call.args,
+        description: 'Run a changed request.',
+      },
+    };
+
+    await executor.persistSettledToolOutput(call, runnableConfig, mismatched);
+    expect(updateState).not.toHaveBeenCalled();
+    releaseResolver();
+    await expect(execution).resolves.toMatchObject({
+      content: 'original result',
+    });
+    const accepted: SettledSubagentToolOutput = {
+      output: new ToolMessage({
+        content: 'original result',
+        name: call.name,
+        tool_call_id: parentToolCallId,
+      }),
+      additionalContexts: [],
+      resolvedArgs: call.args,
+    };
+    await executor.persistSettledToolOutput(call, runnableConfig, accepted);
+
+    await expect(
+      executor.getSettledToolOutput(call, runnableConfig)
+    ).resolves.toMatchObject({ output: { content: 'original result' } });
   });
 
   it('sanitizes private runtime state before calling the resolver', async () => {
@@ -800,12 +1457,10 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(result.content).not.toContain('researcher@v1');
     expect(result.content).not.toContain('researcher@v2');
     expect(resolver).not.toHaveBeenCalled();
-    const rejectedState = executor as unknown as {
-      childExecutionIdentities: Map<string, object>;
-      checkpointThreadIds: Set<string>;
-    };
-    expect(rejectedState.childExecutionIdentities.size).toBe(0);
-    expect(rejectedState.checkpointThreadIds.size).toBe(0);
+    expect(executor.getChildCheckpointThreadIds()).toEqual([]);
+    await expect(
+      executor.getResumeManifest(new Set([parentToolCallId]))
+    ).resolves.toBeUndefined();
   });
 
   it('rejects a versionless resume manifest for a lazy config', async () => {
@@ -839,12 +1494,10 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
       'Subagent error: Subagent configuration changed since this execution was paused.'
     );
     expect(resolver).not.toHaveBeenCalled();
-    const rejectedState = executor as unknown as {
-      childExecutionIdentities: Map<string, object>;
-      checkpointThreadIds: Set<string>;
-    };
-    expect(rejectedState.childExecutionIdentities.size).toBe(0);
-    expect(rejectedState.checkpointThreadIds.size).toBe(0);
+    expect(executor.getChildCheckpointThreadIds()).toEqual([]);
+    await expect(
+      executor.getResumeManifest(new Set([parentToolCallId]))
+    ).resolves.toBeUndefined();
   });
 
   it('rejects a lazy resume without manifest or checkpoint type evidence', async () => {
@@ -914,12 +1567,10 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
       'Subagent error: Subagent configuration changed since this execution was paused.'
     );
     expect(resolver).not.toHaveBeenCalled();
-    const rejectedState = executor as unknown as {
-      childExecutionIdentities: Map<string, object>;
-      checkpointThreadIds: Set<string>;
-    };
-    expect(rejectedState.childExecutionIdentities.size).toBe(0);
-    expect(rejectedState.checkpointThreadIds.size).toBe(0);
+    expect(executor.getChildCheckpointThreadIds()).toEqual([]);
+    await expect(
+      executor.getResumeManifest(new Set([parentToolCallId]))
+    ).resolves.toBeUndefined();
   });
 
   it('rejects replay lifecycle revision mismatches before restoring state', async () => {
@@ -961,12 +1612,10 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
       additionalContexts: [],
     });
 
-    const rejectedState = executor as unknown as {
-      childExecutionIdentities: Map<string, object>;
-      checkpointThreadIds: Set<string>;
-    };
-    expect(rejectedState.childExecutionIdentities.size).toBe(0);
-    expect(rejectedState.checkpointThreadIds.size).toBe(0);
+    expect(executor.getChildCheckpointThreadIds()).toEqual([]);
+    await expect(
+      executor.getResumeManifest(new Set([parentToolCallId]))
+    ).resolves.toBeUndefined();
   });
 
   it('rejects replay lifecycle type mismatches with the same configId', async () => {
@@ -1019,12 +1668,10 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
       },
     });
 
-    const rejectedState = executor as unknown as {
-      childExecutionIdentities: Map<string, object>;
-      checkpointThreadIds: Set<string>;
-    };
-    expect(rejectedState.childExecutionIdentities.size).toBe(0);
-    expect(rejectedState.checkpointThreadIds.size).toBe(0);
+    expect(executor.getChildCheckpointThreadIds()).toEqual([]);
+    await expect(
+      executor.getResumeManifest(new Set([parentToolCallId]))
+    ).resolves.toBeUndefined();
   });
 
   it('retains configId in regenerated manifests after resolver failure', async () => {
@@ -1268,7 +1915,6 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     });
     const rejectedForkTarget = rejected as unknown as {
       forkCheckpointSnapshot: () => Promise<void>;
-      childExecutionIdentities: Map<string, object>;
     };
     const forkCheckpointSnapshot = jest
       .spyOn(rejectedForkTarget, 'forkCheckpointSnapshot')
@@ -1282,7 +1928,7 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
       })
     ).resolves.toBeUndefined();
     expect(forkCheckpointSnapshot).not.toHaveBeenCalled();
-    expect(rejectedForkTarget.childExecutionIdentities.size).toBe(0);
+    expect(rejected.getChildCheckpointThreadIds()).toEqual([]);
 
     delete manifest.executions[0].subagentType;
 

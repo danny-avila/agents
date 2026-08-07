@@ -4384,9 +4384,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           ReplayableSubagentTool;
         replayableSubagentTool[SUBAGENT_REPLAY_CONTROLLER] = {
           getResumeManifest: (
-            parentToolCallIds
+            parentToolCallIds,
+            config
           ): Promise<SubagentResumeManifest | undefined> =>
-            executor.getResumeManifest(parentToolCallIds),
+            executor.getResumeManifest(parentToolCallIds, config),
           getSettledOutput: (
             call,
             config

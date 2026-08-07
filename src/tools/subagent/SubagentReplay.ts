@@ -565,7 +565,8 @@ export type SettledSubagentToolOutput = {
 
 export interface SubagentReplayController {
   getResumeManifest?(
-    parentToolCallIds?: ReadonlySet<string>
+    parentToolCallIds?: ReadonlySet<string>,
+    config?: RunnableConfig
   ): Promise<SubagentResumeManifest | undefined>;
   getSettledOutput(
     call: ToolCall,
