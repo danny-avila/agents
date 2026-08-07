@@ -354,8 +354,14 @@ export interface CohereRerankerResponse {
 }
 
 /** Mints a short-lived JWT per call; rag_api tokens are never cached or
- * reused across requests by the reranker itself. */
-export type RagApiTokenSupplier = () => string | Promise<string>;
+ * reused across requests by the reranker itself. Receives the rerank
+ * deadline's `AbortSignal` so a supplier minting its token over the network
+ * can cancel that request when the deadline fires instead of leaving it
+ * running past its caller. The argument is optional: zero-argument suppliers
+ * remain valid. */
+export type RagApiTokenSupplier = (
+  signal?: AbortSignal
+) => string | Promise<string>;
 
 export interface RagApiRerankCandidate {
   id: string;

@@ -289,9 +289,32 @@ const isValidRagApiResult = (
   typeof result.score === 'number' &&
   Number.isFinite(result.score);
 
+/** A repeated index would map one document into several `top_n` slots and
+ * silently drop distinct results, so a duplicate invalidates the batch just
+ * like any other malformed row. Seen indices are tracked in the same pass
+ * that validates each row. */
+const isValidRagApiBatch = (
+  results: t.RagApiRerankResult[],
+  candidateCount: number
+): boolean => {
+  const seenIndices = new Set<number>();
+  return results.every((result) => {
+    if (!isValidRagApiResult(result, candidateCount)) {
+      return false;
+    }
+    if (seenIndices.has(result.index)) {
+      return false;
+    }
+    seenIndices.add(result.index);
+    return true;
+  });
+};
+
 /** Bounds the whole rerank round trip, token acquisition included: the
  * supplier mints its token over the network, so awaiting it before axios
  * starts would leave the search unbounded whenever an auth service stalls.
+ * The signal reaches both legs, so returning a fallback also cancels whatever
+ * is still in flight rather than leaving a request running past its caller.
  * A non-positive timeout keeps axios' "no timeout" semantics. */
 const withRerankDeadline = <T>(
   operation: (signal?: AbortSignal) => Promise<T>,
@@ -395,7 +418,7 @@ export class RagApiReranker extends BaseReranker {
 
     try {
       const data = await withRerankDeadline(async (signal) => {
-        const token = await tokenSupplier();
+        const token = await tokenSupplier(signal);
         const response = await axios.post<t.RagApiRerankResponse | undefined>(
           `${baseUrl}/v1/rerank`,
           requestData,
@@ -423,10 +446,7 @@ export class RagApiReranker extends BaseReranker {
         return this.getDefaultRanking(documents, topK);
       }
 
-      const isFullBatchValid = rawResults.every((result) =>
-        isValidRagApiResult(result, candidates.length)
-      );
-      if (!isFullBatchValid) {
+      if (!isValidRagApiBatch(rawResults, candidates.length)) {
         this.logger.warn(
           'rag_api rerank response contained no valid results. Using default ranking.'
         );

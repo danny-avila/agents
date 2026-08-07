@@ -639,6 +639,65 @@ describe('RagApiReranker', () => {
       );
     });
 
+    it('should abort the token supplier when the deadline fires', async () => {
+      let supplierSignal: AbortSignal | undefined;
+      const tokenSupplier = jest.fn(
+        (signal?: AbortSignal) =>
+          new Promise<string>((_resolve, reject) => {
+            supplierSignal = signal;
+            signal?.addEventListener('abort', () =>
+              reject(new Error('token acquisition aborted'))
+            );
+          })
+      );
+      const reranker = new RagApiReranker({
+        baseUrl,
+        tokenSupplier,
+        timeout: 50,
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      jest.spyOn(mockLogger, 'error').mockImplementation(() => mockLogger);
+      const postSpy = jest.spyOn(axios, 'post');
+
+      const result = await reranker.rerank(
+        'query',
+        ['document1', 'document2'],
+        2
+      );
+
+      expect(supplierSignal).toBeInstanceOf(AbortSignal);
+      expect(supplierSignal?.aborted).toBe(true);
+      expect(result).toEqual([
+        { text: 'document1', score: 0 },
+        { text: 'document2', score: 0 },
+      ]);
+      expect(postSpy).not.toHaveBeenCalled();
+    });
+
+    it('should not pass a signal to the token supplier when the timeout is disabled', async () => {
+      let supplierSignal: AbortSignal | undefined;
+      const tokenSupplier = jest.fn((signal?: AbortSignal) => {
+        supplierSignal = signal;
+        return 'token';
+      });
+      const reranker = new RagApiReranker({
+        baseUrl,
+        tokenSupplier,
+        timeout: 0,
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: { results: [{ id: '0', index: 0, score: 0.9 }] },
+      });
+
+      const result = await reranker.rerank('query', ['document1'], 1);
+
+      expect(supplierSignal).toBeUndefined();
+      expect(result).toEqual([{ text: 'document1', score: 0.9 }]);
+    });
+
     it('should fall back to the candidates original order when the request never settles', async () => {
       const tokenSupplier = jest.fn().mockResolvedValue('token');
       const reranker = new RagApiReranker({
@@ -711,6 +770,41 @@ describe('RagApiReranker', () => {
           results: [
             { id: '1', index: 1, score: 0.95 },
             { id: '0', index: 0, score: Number.NaN },
+          ],
+        },
+      });
+
+      const result = await reranker.rerank(
+        'query',
+        ['document1', 'document2'],
+        2
+      );
+
+      expect(result).toEqual([
+        { text: 'document1', score: 0 },
+        { text: 'document2', score: 0 },
+      ]);
+      expect(warnSpy).toHaveBeenCalledWith(
+        'rag_api rerank response contained no valid results. Using default ranking.'
+      );
+    });
+
+    it('should reject the whole batch when a valid index is duplicated', async () => {
+      const tokenSupplier = jest.fn().mockResolvedValue('token');
+      const reranker = new RagApiReranker({
+        baseUrl,
+        tokenSupplier,
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      const warnSpy = jest
+        .spyOn(mockLogger, 'warn')
+        .mockImplementation(() => mockLogger);
+      jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: {
+          results: [
+            { id: '0', index: 0, score: 0.95 },
+            { id: '0', index: 0, score: 0.75 },
           ],
         },
       });
