@@ -1,3 +1,4 @@
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { HumanMessage, getBufferString } from '@langchain/core/messages';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
@@ -64,6 +65,40 @@ class CapturingChatModel extends FakeChatModel {
     yield* super._streamResponseChunks(messages, options, runManager);
   }
 }
+
+class GatedMessageCountChatModel extends FakeChatModel {
+  private responseIndex = 0;
+
+  constructor(
+    private readonly gatedAiMessageCount: number,
+    private readonly onGatedStart: () => void,
+    private readonly releaseGate: Promise<void>
+  ) {
+    super({ responses: ['unused'] });
+  }
+
+  override async *_streamResponseChunks(
+    messages: BaseMessage[],
+    _options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    const aiMessageCount = messages.filter(
+      (message) => message.getType() === 'ai'
+    ).length;
+    if (aiMessageCount === this.gatedAiMessageCount) {
+      this.onGatedStart();
+      await this.releaseGate;
+    }
+    const output = `response-${this.responseIndex++}`;
+    yield this._createResponseChunk(output);
+    void runManager?.handleLLMNewToken(output);
+  }
+}
+
+type AgentInvocation = {
+  agentId: string;
+  messages: BaseMessage[];
+};
 
 const expectCompiledWorkflow = (
   workflow: t.CompiledWorkflow | t.CompiledMultiAgentWorkflow
@@ -340,6 +375,123 @@ describe('LangGraph composition smoke tests', () => {
     expect(graph.getParallelGroupId('left')).toBe(1);
     expect(graph.getParallelGroupId('right')).toBe(1);
     expect(graph.getParallelGroupId('final')).toBeUndefined();
+  });
+
+  it.each([
+    ['without a prompt wrapper', undefined],
+    ['with a prompt wrapper', 'Summarize these results:\n{results}'],
+  ])('waits for every explicit fan-in source %s', async (_label, prompt) => {
+    const invocations: AgentInvocation[] = [];
+    let releaseLeft2!: () => void;
+    let markLeft2Started!: () => void;
+    const left2Release = new Promise<void>((resolve) => {
+      releaseLeft2 = resolve;
+    });
+    const left2Started = new Promise<void>((resolve) => {
+      markLeft2Started = resolve;
+    });
+    const invocationHandler = BaseCallbackHandler.fromMethods({
+      handleChatModelStart: (
+        _llm,
+        messages,
+        _runId,
+        _parentRunId,
+        _extraParams,
+        _tags,
+        metadata
+      ) => {
+        const agentId = metadata?.agentId;
+        if (typeof agentId === 'string') {
+          invocations.push({ agentId, messages: [...messages[0]] });
+        }
+      },
+    });
+    const graph = new MultiAgentGraph({
+      runId: 'fan-in-waiting-edge-smoke',
+      agents: [
+        makeAgent('root'),
+        makeAgent('left'),
+        makeAgent('left2'),
+        makeAgent('right'),
+        makeAgent('final'),
+      ],
+      edges: [
+        { from: 'root', to: ['left', 'right'], edgeType: 'direct' },
+        { from: 'left', to: 'left2', edgeType: 'direct' },
+        {
+          from: ['left2', 'right'],
+          to: 'final',
+          edgeType: 'direct',
+          prompt,
+        },
+      ],
+    });
+    graph.overrideModel = new GatedMessageCountChatModel(
+      3,
+      markLeft2Started,
+      left2Release
+    );
+
+    const invocation = graph.createWorkflow().invoke(
+      { messages: [new HumanMessage('start')] },
+      {
+        ...makeConfig('fan-in-waiting-edge-smoke'),
+        callbacks: [invocationHandler],
+      }
+    );
+
+    let gateTimeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        left2Started,
+        new Promise<void>((_resolve, reject) => {
+          gateTimeout = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `Timed out waiting for the gated branch; started: ${invocations
+                    .map(({ agentId }) => agentId)
+                    .join(', ')}`
+                )
+              ),
+            5_000
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(gateTimeout);
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(
+      invocations.filter(({ agentId }) => agentId === 'final')
+    ).toHaveLength(0);
+    releaseLeft2();
+    await invocation;
+
+    const invokedAgentIds = invocations.map(({ agentId }) => agentId);
+    expect(
+      invokedAgentIds.filter((agentId) => agentId === 'final')
+    ).toHaveLength(1);
+    expect(invokedAgentIds.indexOf('final')).toBeGreaterThan(
+      invokedAgentIds.indexOf('left2')
+    );
+    expect(invokedAgentIds.indexOf('final')).toBeGreaterThan(
+      invokedAgentIds.indexOf('right')
+    );
+    const finalInvocation = invocations.find(
+      ({ agentId }) => agentId === 'final'
+    );
+    if (prompt == null) {
+      expect(
+        finalInvocation?.messages.filter(
+          (message) => message.getType() === 'ai'
+        )
+      ).toHaveLength(4);
+    } else {
+      expect(getBufferString(finalInvocation?.messages ?? [])).toContain(
+        'response-3'
+      );
+    }
   });
 
   it('compiles mixed handoff and direct routing from the same agent', () => {

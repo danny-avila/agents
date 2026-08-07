@@ -4,7 +4,9 @@ import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
   AgentInputs,
+  GraphSubagentConfig,
   ResolvedSubagentConfig,
+  ResolvedSingleAgentSubagentConfig,
   StandardGraphInput,
   SubagentUpdateEvent,
   SubagentUsageEvent,
@@ -14,6 +16,7 @@ import type {
 import type { StandardGraph } from '@/graphs/Graph';
 import {
   SubagentExecutor,
+  filterGraphSubagentResult,
   filterSubagentResult,
   resolveSubagentConfigs,
   buildChildInputs,
@@ -39,8 +42,8 @@ const makeChildInputs = (agentId = 'child-agent'): AgentInputs => ({
 
 const makeConfig = (
   type = 'researcher',
-  overrides: Partial<ResolvedSubagentConfig> = {}
-): ResolvedSubagentConfig => ({
+  overrides: Partial<ResolvedSingleAgentSubagentConfig> = {}
+): ResolvedSingleAgentSubagentConfig => ({
   type,
   name: 'Test Researcher',
   description: 'Researches things',
@@ -49,6 +52,18 @@ const makeConfig = (
 });
 
 describe('filterSubagentResult', () => {
+  it('treats a result member with no new AI message as textless completion', () => {
+    expect(
+      filterGraphSubagentResult(
+        {
+          messages: [new AIMessage('worker output')],
+          subagentResult: { agentId: 'result' },
+        },
+        'result'
+      )
+    ).toBe('Task completed');
+  });
+
   it('extracts text from last AIMessage string content', () => {
     const messages: BaseMessage[] = [
       new HumanMessage('task'),
@@ -220,7 +235,8 @@ describe('resolveSubagentConfigs', () => {
     const parentContext = AgentContext.fromConfig(parentInputs);
     const resolved = resolveSubagentConfigs([config], parentContext);
     expect(resolved).toHaveLength(1);
-    expect(resolved[0].agentInputs.agentId).toBe('child-agent');
+    const resolvedConfig = resolved[0];
+    expect(resolvedConfig.agentInputs.agentId).toBe('child-agent');
   });
 
   it('resolves self-spawn from parent _sourceInputs', () => {
@@ -233,8 +249,9 @@ describe('resolveSubagentConfigs', () => {
     const parentContext = AgentContext.fromConfig(parentInputs);
     const resolved = resolveSubagentConfigs([selfConfig], parentContext);
     expect(resolved).toHaveLength(1);
-    expect(resolved[0].agentInputs.provider).toBe(Providers.OPENAI);
-    expect(resolved[0].agentInputs.instructions).toBe(
+    const resolvedConfig = resolved[0];
+    expect(resolvedConfig.agentInputs.provider).toBe(Providers.OPENAI);
+    expect(resolvedConfig.agentInputs.instructions).toBe(
       'You are a parent agent.'
     );
   });
@@ -494,6 +511,55 @@ describe('SubagentExecutor', () => {
     });
     expect(result.content).toContain('Maximum subagent nesting depth');
     expect(result.messages).toEqual([]);
+  });
+
+  it('fails graph HITL before factories, hooks, events, or usage can run', async () => {
+    const graphConfig: GraphSubagentConfig = {
+      kind: 'graph',
+      type: 'graph-team',
+      name: 'Graph Team',
+      description: 'Runs a graph.',
+      agents: [makeChildInputs('graph-member')],
+      edges: [],
+      entryAgentId: 'graph-member',
+      resultAgentId: 'graph-member',
+    };
+    const createChildGraph = jest.fn(makeNoopGraphFactory());
+    const createChildGraphByKind = jest.fn(
+      (): StandardGraph => makeNoopGraphFactory()()
+    );
+    const hook = jest.fn(async (): Promise<Record<string, never>> => ({}));
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('SubagentStart', { hooks: [hook] });
+    const update = jest.fn();
+    const handlerRegistry = new HandlerRegistry();
+    handlerRegistry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+      handle: update,
+    });
+    const usageSink = jest.fn();
+    const executor = createExecutor({
+      configs: new Map([[graphConfig.type, graphConfig]]),
+      humanInTheLoop: { enabled: true },
+      createChildGraph,
+      createChildGraphByKind,
+      hookRegistry,
+      parentHandlerRegistry: handlerRegistry,
+      usageSink,
+    });
+
+    const result = await executor.execute({
+      description: 'Do not run.',
+      subagentType: graphConfig.type,
+    });
+
+    expect(result.content).toBe(
+      'Error: Human-in-the-loop execution is not yet supported for graph subagents.'
+    );
+    expect(createChildGraph).not.toHaveBeenCalled();
+    expect(createChildGraphByKind).not.toHaveBeenCalled();
+    expect(hook).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(usageSink).not.toHaveBeenCalled();
   });
 
   it('fails closed when resumable execution has no parent tool call ID', async () => {
@@ -2558,6 +2624,110 @@ describe('SubagentExecutor', () => {
       expect(phases[phases.length - 1]).toBe('stop');
     });
 
+    it('does not let a stalled observational update handler block child completion', async () => {
+      jest.useFakeTimers();
+      try {
+        const registry = new HandlerRegistry();
+        const updateHandler = jest.fn(
+          (): Promise<void> => new Promise<void>(() => {})
+        );
+        registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+          handle: updateHandler,
+        });
+        const { factory } = makeStubGraphFactory({
+          messages: [new AIMessage('ok')],
+        });
+        const executor = createExecutor({
+          createChildGraph: factory,
+          parentHandlerRegistry: registry,
+        });
+
+        const execution = executor.execute({
+          description: 'Task',
+          subagentType: 'researcher',
+        });
+        const outcome = Promise.race([
+          execution.then(({ content }) => content),
+          new Promise<string>((resolve) =>
+            setTimeout(() => resolve('stalled'), 20_000)
+          ),
+        ]);
+
+        await jest.advanceTimersByTimeAsync(20_000);
+
+        await expect(outcome).resolves.toBe('ok');
+        expect(updateHandler).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not let a stalled queued update block the terminal stop envelope', async () => {
+      jest.useFakeTimers();
+      try {
+        const phases: SubagentUpdateEvent['phase'][] = [];
+        const registry = new HandlerRegistry();
+        registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+          handle: (_event, rawData): void | Promise<void> => {
+            const update = rawData as SubagentUpdateEvent;
+            phases.push(update.phase);
+            if (update.phase === 'run_step') {
+              return new Promise<void>(() => {});
+            }
+          },
+        });
+        const factory: () => StandardGraph = (): StandardGraph =>
+          ({
+            createWorkflow: (): { invoke: jest.Mock } => ({
+              invoke: jest.fn().mockImplementation(async (_state, options) => {
+                const opts = options as { callbacks?: unknown[] };
+                const forwarder = (opts.callbacks ?? [])[0] as {
+                  handleCustomEvent?: (
+                    eventName: string,
+                    data: unknown
+                  ) => Promise<void> | void;
+                };
+                for (let index = 0; index < 80; index++) {
+                  await forwarder.handleCustomEvent?.(
+                    GraphEvents.ON_RUN_STEP,
+                    {
+                      id: `step_${index}`,
+                      type: StepTypes.MESSAGE_CREATION,
+                      agentId: 'researcher',
+                      index,
+                    }
+                  );
+                }
+                return { messages: [new AIMessage('ok')] };
+              }),
+            }),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph;
+        const executor = createExecutor({
+          createChildGraph: factory,
+          parentHandlerRegistry: registry,
+        });
+
+        const execution = executor.execute({
+          description: 'Task',
+          subagentType: 'researcher',
+        });
+        const outcome = Promise.race([
+          execution.then(({ content }) => content),
+          new Promise<string>((resolve) =>
+            setTimeout(() => resolve('stalled'), 20_000)
+          ),
+        ]);
+
+        await jest.advanceTimersByTimeAsync(20_000);
+
+        await expect(outcome).resolves.toBe('ok');
+        expect(phases).toEqual(['start', 'run_step', 'stop']);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     it('allowlists forwarded run step payloads before wrapping them in ON_SUBAGENT_UPDATE', async () => {
       const subagentUpdates: SubagentUpdateEvent[] = [];
       const registry = new HandlerRegistry();
@@ -2685,18 +2855,32 @@ describe('SubagentExecutor', () => {
       expect(serialized).not.toContain('nested-completed-secret');
     });
 
-    it('does not drop non-droppable updates when the forwarding queue overflows', async () => {
+    it('bounds queued updates under overload while preserving lifecycle envelopes', async () => {
+      const phases: SubagentUpdateEvent['phase'][] = [];
       const completedIds: string[] = [];
+      let releaseFirstCompleted!: () => void;
+      const firstCompletedBlocked = new Promise<void>((resolve) => {
+        releaseFirstCompleted = resolve;
+      });
+      let markAllEmitted!: () => void;
+      const allEmitted = new Promise<void>((resolve) => {
+        markAllEmitted = resolve;
+      });
+      let blockedFirstCompleted = false;
       const registry = new HandlerRegistry();
       registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
         handle: async (_event, rawData): Promise<void> => {
           const update = rawData as SubagentUpdateEvent;
+          phases.push(update.phase);
           if (update.phase === 'run_step_completed') {
             const data = update.data as { result?: { id?: string } };
             if (data.result?.id != null) {
               completedIds.push(data.result.id);
             }
-            await new Promise((resolve) => setTimeout(resolve, 1));
+            if (!blockedFirstCompleted) {
+              blockedFirstCompleted = true;
+              await firstCompletedBlocked;
+            }
           }
         },
       });
@@ -2731,6 +2915,7 @@ describe('SubagentExecutor', () => {
                   }
                 );
               }
+              markAllEmitted();
               return { messages: [new AIMessage('ok')] };
             }),
           }),
@@ -2742,14 +2927,21 @@ describe('SubagentExecutor', () => {
         parentHandlerRegistry: registry,
       });
 
-      await executor.execute({
+      const execution = executor.execute({
         description: 'Task',
         subagentType: 'researcher',
       });
+      await allEmitted;
+      releaseFirstCompleted();
+      await execution;
 
-      expect(completedIds).toHaveLength(80);
+      expect(completedIds).toHaveLength(65);
       expect(completedIds[0]).toBe('step_0');
+      expect(completedIds).not.toContain('step_1');
+      expect(completedIds).toContain('step_16');
       expect(completedIds[completedIds.length - 1]).toBe('step_79');
+      expect(phases[0]).toBe('start');
+      expect(phases[phases.length - 1]).toBe('stop');
     });
 
     it('does NOT forward ON_TOOL_EXECUTE when the parent registry has no handler (safe fallback)', async () => {

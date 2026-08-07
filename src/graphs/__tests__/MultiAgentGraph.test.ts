@@ -88,4 +88,90 @@ describe('MultiAgentGraph.validateEdgeAgents', () => {
     };
     expect(() => new MultiAgentGraph(input)).not.toThrow();
   });
+
+  it('rejects grouped fan-in containing a command-routed source', () => {
+    const input: t.MultiAgentGraphInput = {
+      runId: 'hybrid-fan-in',
+      agents: [
+        makeAgent('router'),
+        makeAgent('worker'),
+        makeAgent('result'),
+        makeAgent('alternate'),
+      ],
+      edges: [
+        {
+          from: ['router', 'worker'],
+          to: 'result',
+          edgeType: 'direct',
+        },
+        {
+          from: 'router',
+          to: 'alternate',
+          edgeType: 'handoff',
+        },
+      ],
+    };
+
+    expect(() => new MultiAgentGraph(input)).toThrow(
+      /grouped direct edge.*command-routed source.*router/i
+    );
+  });
+
+  it('rejects a prompted direct edge from a command-routed source', () => {
+    const input: t.MultiAgentGraphInput = {
+      runId: 'hybrid-prompt',
+      agents: [
+        makeAgent('router'),
+        makeAgent('result'),
+        makeAgent('alternate'),
+      ],
+      edges: [
+        {
+          from: 'router',
+          to: 'result',
+          edgeType: 'direct',
+          prompt: 'Continue through the direct path.',
+        },
+        {
+          from: 'router',
+          to: 'alternate',
+          edgeType: 'handoff',
+        },
+      ],
+    };
+
+    expect(() => new MultiAgentGraph(input)).toThrow(
+      /prompted direct edge.*command-routed source.*router/i
+    );
+  });
+
+  it('rejects a command-routed source sharing a prompted destination group', () => {
+    const input: t.MultiAgentGraphInput = {
+      runId: 'hybrid-prompt-group',
+      agents: [
+        makeAgent('router'),
+        makeAgent('worker'),
+        makeAgent('result'),
+        makeAgent('alternate'),
+      ],
+      edges: [
+        { from: 'router', to: 'result', edgeType: 'direct' },
+        {
+          from: 'worker',
+          to: 'result',
+          edgeType: 'direct',
+          prompt: 'Combine the inputs.',
+        },
+        {
+          from: 'router',
+          to: 'alternate',
+          edgeType: 'handoff',
+        },
+      ],
+    };
+
+    expect(() => new MultiAgentGraph(input)).toThrow(
+      /prompted direct edge.*command-routed source.*router/i
+    );
+  });
 });
