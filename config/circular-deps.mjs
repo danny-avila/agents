@@ -5,12 +5,20 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { packageEntries } from './package-entries.mjs';
 
 const root = path.resolve(fileURLToPath(import.meta.url), '../..');
-const minimumModuleCount = 100;
+
 /**
- * The public type barrels contain pre-existing declaration-only cycles. Runtime
- * edges are enforced now; type edges can be enabled after that graph is untangled.
+ * Type-only cycles in the public barrels predate this check. Runtime edges are
+ * enforced now; the exclusion remains explicit until the type graph is
+ * untangled in a dedicated change.
  */
-const includeTypeEdges = false;
+export const agentsTarget = Object.freeze({
+  name: '@librechat/agents',
+  entries: Object.values(packageEntries).map((entry) => path.join(root, entry)),
+  alias: { '@': path.join(root, 'src') },
+  internalPrefixes: ['@/'],
+  minModules: 100,
+  typeEdges: false,
+});
 
 /** Collect every type-only dependency specifier from a parsed TypeScript AST. */
 const collectTypeSpecifiers = (node, specifiers) => {
@@ -44,7 +52,7 @@ const collectTypeSpecifiers = (node, specifiers) => {
   }
 };
 
-/** Materialize type-only imports so Rolldown checks the declaration graph too. */
+/** Materialize type-only imports when a target opts into declaration edges. */
 const typeEdgesPlugin = (parseAst) => ({
   name: 'type-edges',
   transform(code, id) {
@@ -69,9 +77,12 @@ const typeEdgesPlugin = (parseAst) => ({
   },
 });
 
-async function loadRolldown() {
+/** Load the exact Rolldown installation resolved from tsdown. */
+export async function loadRolldown() {
   const packageRequire = createRequire(path.join(root, 'package.json'));
-  const tsdownRequire = createRequire(packageRequire.resolve('tsdown'));
+  const tsdownRequire = createRequire(
+    packageRequire.resolve('tsdown/package.json')
+  );
   const { rolldown } = await import(
     pathToFileURL(tsdownRequire.resolve('rolldown')).href
   );
@@ -85,77 +96,153 @@ async function loadRolldown() {
 const stripAnsi = (message) => message.replace(/\u001B\[[0-9;]*m/g, '');
 const relativize = (message) =>
   stripAnsi(message).replaceAll(root + path.sep, '');
+const errorMessage = (error) =>
+  error instanceof Error ? error.message : String(error);
+const uniqueSorted = (values) => [...new Set(values)].sort();
+const unresolvedCodes = new Set(['UNRESOLVED_IMPORT', 'RESOLVE_ERROR']);
 
-async function scan({ rolldown, parseAst }) {
+const getNestedErrors = (error) => {
+  if (
+    error === null ||
+    typeof error !== 'object' ||
+    !Array.isArray(error.errors)
+  ) {
+    return [];
+  }
+  return error.errors;
+};
+
+const isInternal = (id, target) =>
+  id.startsWith('.') ||
+  path.isAbsolute(id) ||
+  target.internalPrefixes.some((prefix) => id.startsWith(prefix));
+const isUnresolvedFirstParty = (diagnostic, target) =>
+  unresolvedCodes.has(diagnostic?.code) &&
+  (typeof diagnostic.exporter !== 'string' ||
+    isInternal(diagnostic.exporter, target));
+
+export async function scan(engine, target = agentsTarget) {
   const cycles = [];
   const unresolved = [];
-  const isInternal = (id) =>
-    id.startsWith('.') || path.isAbsolute(id) || id.startsWith('@/');
+  const moduleIds = new Set();
+  const graphCounterPlugin = {
+    name: 'resolved-module-counter',
+    async resolveId(source, importer) {
+      const resolved = await this.resolve(source, importer, { skipSelf: true });
+      if (resolved && !resolved.external && path.isAbsolute(resolved.id)) {
+        moduleIds.add(resolved.id);
+      }
+      return resolved;
+    },
+  };
 
   try {
-    const build = await rolldown({
-      input: Object.values(packageEntries).map((entry) =>
-        path.join(root, entry)
-      ),
+    const build = await engine.rolldown({
+      input: target.entries,
       platform: 'node',
-      resolve: { alias: { '@': path.join(root, 'src') } },
-      external: (id) => !isInternal(id),
-      plugins: includeTypeEdges ? [typeEdgesPlugin(parseAst)] : [],
+      resolve: { alias: target.alias },
+      external: (id) => !isInternal(id, target),
+      plugins: [
+        ...(target.typeEdges ? [typeEdgesPlugin(engine.parseAst)] : []),
+        graphCounterPlugin,
+      ],
       checks: { circularDependency: true },
       onLog(_level, log) {
         if (log.code === 'CIRCULAR_DEPENDENCY') {
           cycles.push(relativize(log.message));
-        } else if (log.code === 'UNRESOLVED_IMPORT') {
+        } else if (isUnresolvedFirstParty(log, target)) {
           unresolved.push(relativize(log.message));
         }
       },
     });
-    const { output } = await build.generate({ format: 'cjs' });
-    const modules = output.reduce(
-      (sum, chunk) => sum + (chunk.moduleIds?.length ?? 0),
-      0
-    );
-    await build.close();
-    return { cycles, unresolved, modules, error: null };
+
+    try {
+      await build.generate({ format: 'cjs' });
+      return {
+        target,
+        cycles: uniqueSorted(cycles),
+        unresolved: uniqueSorted(unresolved),
+        modules: moduleIds.size,
+        error: null,
+      };
+    } finally {
+      await build.close();
+    }
   } catch (error) {
-    return { cycles, unresolved, modules: 0, error };
+    const unresolvedErrors = getNestedErrors(error)
+      .filter((nestedError) => isUnresolvedFirstParty(nestedError, target))
+      .map((nestedError) => relativize(errorMessage(nestedError)));
+    return {
+      target,
+      cycles: uniqueSorted(cycles),
+      unresolved: uniqueSorted([...unresolved, ...unresolvedErrors]),
+      modules: 0,
+      error,
+    };
   }
 }
 
-function report({ cycles, unresolved, modules, error }) {
+export function getProblems({ target, cycles, unresolved, modules, error }) {
   const problems = [];
   if (error) {
-    problems.push(`build failed: ${relativize(error.message)}`);
+    problems.push(`build failed: ${relativize(errorMessage(error))}`);
   }
   problems.push(...cycles);
   problems.push(
     ...unresolved.map((message) => `unresolved first-party import: ${message}`)
   );
-  if (!error && modules < minimumModuleCount) {
+  if (!error && modules < target.minModules) {
     problems.push(
-      `graph has ${modules} modules, below the ${minimumModuleCount} floor; the scan is no longer resolving the full package`
+      `graph has ${modules} modules, below the ${target.minModules} floor; the scan is no longer resolving the full package`
     );
   }
+  return problems;
+}
 
+export function report(result) {
+  const { target, modules } = result;
+  const problems = getProblems(result);
   if (problems.length === 0) {
-    const scope = includeTypeEdges
+    const scope = target.typeEdges
       ? 'runtime + type edges'
       : 'runtime edges only, type edges grandfathered';
     console.log(
-      `✓ @librechat/agents: no circular dependencies (${modules} modules, ${scope})`
+      `✓ ${target.name}: no circular dependencies (${modules} modules, ${scope})`
     );
     return true;
   }
 
-  console.error('✗ @librechat/agents:');
+  console.error(`✗ ${target.name}:`);
   for (const problem of problems) {
     console.error(`    ${problem}`);
   }
   return false;
 }
 
-const passed = report(await scan(await loadRolldown()));
-if (!passed) {
-  console.error('\nCircular dependency check failed.');
-  process.exit(1);
+export async function main() {
+  let result;
+  try {
+    result = await scan(await loadRolldown());
+  } catch (error) {
+    result = {
+      target: agentsTarget,
+      cycles: [],
+      unresolved: [],
+      modules: 0,
+      error,
+    };
+  }
+
+  const passed = report(result);
+  if (!passed) {
+    console.error('\nCircular dependency check failed.');
+  }
+  return passed;
+}
+
+const isDirectRun =
+  process.argv[1] !== undefined &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isDirectRun && !(await main())) {
+  process.exitCode = 1;
 }
