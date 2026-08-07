@@ -237,17 +237,25 @@ const getDefaultRagApiUrl = (): string | undefined =>
     ? process.env.RAG_API_URL
     : undefined;
 
-const clampRagApiCandidates = (
-  candidates: t.RagApiRerankCandidate[],
+const toRagApiCandidate = (
+  text: string,
+  index: number
+): t.RagApiRerankCandidate => ({ id: String(index), text, base_score: 0 });
+
+/** A single source split into overlapping chunks routinely exceeds the
+ * contract limit, so documents are capped before any candidate is built:
+ * only the submittable window is ever allocated. */
+const buildRagApiCandidates = (
+  documents: string[],
   logger: t.Logger
 ): t.RagApiRerankCandidate[] => {
-  if (candidates.length <= RAG_API_MAX_CANDIDATES) {
-    return candidates;
+  if (documents.length <= RAG_API_MAX_CANDIDATES) {
+    return documents.map(toRagApiCandidate);
   }
   logger.debug(
-    `rag_api fast-v1 accepts at most ${RAG_API_MAX_CANDIDATES} candidates; truncating ${candidates.length} to ${RAG_API_MAX_CANDIDATES}.`
+    `rag_api fast-v1 accepts at most ${RAG_API_MAX_CANDIDATES} candidates; truncating ${documents.length} to ${RAG_API_MAX_CANDIDATES}.`
   );
-  return candidates.slice(0, RAG_API_MAX_CANDIDATES);
+  return documents.slice(0, RAG_API_MAX_CANDIDATES).map(toRagApiCandidate);
 };
 
 const clampRagApiTopN = (topN: number, logger: t.Logger): number => {
@@ -267,26 +275,55 @@ const sortRagApiResults = (
 ): t.RagApiRerankResult[] =>
   [...results].sort((a, b) => b.score - a.score || a.index - b.index);
 
+/** Indices are only meaningful against the candidates actually submitted:
+ * anything beyond `candidateCount` refers to text the server never saw. */
 const isValidRagApiResult = (
   result: t.RagApiRerankResult | undefined,
-  documentCount: number
+  candidateCount: number
 ): result is t.RagApiRerankResult =>
   result != null &&
   typeof result.index === 'number' &&
   Number.isInteger(result.index) &&
   result.index >= 0 &&
-  result.index < documentCount &&
+  result.index < candidateCount &&
   typeof result.score === 'number' &&
   Number.isFinite(result.score);
+
+/** Bounds the whole rerank round trip, token acquisition included: the
+ * supplier mints its token over the network, so awaiting it before axios
+ * starts would leave the search unbounded whenever an auth service stalls.
+ * A non-positive timeout keeps axios' "no timeout" semantics. */
+const withRerankDeadline = <T>(
+  operation: (signal?: AbortSignal) => Promise<T>,
+  timeout: number
+): Promise<T> => {
+  if (timeout <= 0) {
+    return operation();
+  }
+
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`rag_api rerank exceeded its ${timeout}ms timeout.`));
+    }, timeout);
+  });
+
+  const pending = operation(controller.signal);
+  pending.catch(() => undefined);
+
+  return Promise.race([pending, deadline]).finally(() => clearTimeout(timer));
+};
 
 /**
  * Calls the public `danny-avila/rag_api` `/v1/rerank` endpoint (the
  * `fast-v1` profile). Auth is supplied per call by a token supplier (a
  * short-lived JWT minted by the host app) rather than a static key. A
  * reranker failure must never throw into the search flow: on a missing
- * base URL/token supplier, timeout, non-2xx response, or malformed payload,
- * this falls back to the candidates' original order via
- * {@link BaseReranker.getDefaultRanking}.
+ * base URL/token supplier, a timeout (covering token acquisition as well as
+ * the request), a non-2xx response, or any malformed payload, this falls back
+ * to the candidates' original order via {@link BaseReranker.getDefaultRanking}.
  */
 export class RagApiReranker extends BaseReranker {
   private baseUrl?: string;
@@ -312,7 +349,7 @@ export class RagApiReranker extends BaseReranker {
     logger?: t.Logger;
   } & t.HttpAgentConfig) {
     super(logger);
-    this.baseUrl = baseUrl;
+    this.baseUrl = baseUrl?.replace(/\/+$/, '');
     this.tokenSupplier = tokenSupplier;
     this.profile = profile;
     this.timeout = timeout;
@@ -333,50 +370,52 @@ export class RagApiReranker extends BaseReranker {
       `Reranking ${documents.length} chunks with rag_api (${this.profile}) using base URL: ${this.baseUrl}`
     );
 
-    if (this.baseUrl == null || this.baseUrl === '') {
+    const baseUrl = this.baseUrl;
+    if (baseUrl == null || baseUrl === '') {
       this.logger.warn('RAG_API_URL is not set. Using default ranking.');
       return this.getDefaultRanking(documents, topK);
     }
 
-    if (this.tokenSupplier == null) {
+    const tokenSupplier = this.tokenSupplier;
+    if (tokenSupplier == null) {
       this.logger.warn(
         'No rag_api token supplier configured. Using default ranking.'
       );
       return this.getDefaultRanking(documents, topK);
     }
 
-    const candidates = clampRagApiCandidates(
-      documents.map((text, index) => ({ id: String(index), text, base_score: 0 })),
-      this.logger
-    );
+    const candidates = buildRagApiCandidates(documents, this.logger);
     const topN = clampRagApiTopN(Math.max(0, topK), this.logger);
+    const requestData: t.RagApiRerankRequestBody = {
+      profile: this.profile,
+      query,
+      candidates,
+      top_n: topN,
+    };
 
     try {
-      const token = await this.tokenSupplier();
-      const requestData: t.RagApiRerankRequestBody = {
-        profile: this.profile,
-        query,
-        candidates,
-        top_n: topN,
-      };
+      const data = await withRerankDeadline(async (signal) => {
+        const token = await tokenSupplier();
+        const response = await axios.post<t.RagApiRerankResponse | undefined>(
+          `${baseUrl}/v1/rerank`,
+          requestData,
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            timeout: this.timeout,
+            httpAgent: this.httpAgent,
+            httpsAgent: this.httpsAgent,
+            signal,
+          }
+        );
+        return response.data;
+      }, this.timeout);
 
-      const response = await axios.post<t.RagApiRerankResponse | undefined>(
-        `${this.baseUrl}/v1/rerank`,
-        requestData,
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          timeout: this.timeout,
-          httpAgent: this.httpAgent,
-          httpsAgent: this.httpsAgent,
-        }
-      );
+      this.logger.debug('rag_api rerank model:', data?.model);
 
-      this.logger.debug('rag_api rerank model:', response.data?.model);
-
-      const rawResults = response.data?.results;
+      const rawResults = data?.results;
       if (!Array.isArray(rawResults) || rawResults.length === 0) {
         this.logger.warn(
           'Unexpected response format from rag_api rerank. Using default ranking.'
@@ -384,17 +423,17 @@ export class RagApiReranker extends BaseReranker {
         return this.getDefaultRanking(documents, topK);
       }
 
-      const validResults = rawResults.filter((result) =>
-        isValidRagApiResult(result, documents.length)
+      const isFullBatchValid = rawResults.every((result) =>
+        isValidRagApiResult(result, candidates.length)
       );
-      if (validResults.length === 0) {
+      if (!isFullBatchValid) {
         this.logger.warn(
           'rag_api rerank response contained no valid results. Using default ranking.'
         );
         return this.getDefaultRanking(documents, topK);
       }
 
-      return sortRagApiResults(validResults)
+      return sortRagApiResults(rawResults)
         .slice(0, topN)
         .map((result) => ({
           text: documents[result.index],

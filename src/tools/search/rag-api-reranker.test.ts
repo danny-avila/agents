@@ -74,6 +74,56 @@ describe('RagApiReranker', () => {
         delete process.env.RAG_API_URL;
       }
     });
+
+    it('should strip a trailing slash from an explicit baseUrl', async () => {
+      const tokenSupplier = jest.fn().mockResolvedValue('token');
+      const reranker = new RagApiReranker({
+        baseUrl: 'https://rag.example.com/',
+        tokenSupplier,
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      const postSpy = jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: { results: [{ id: '0', index: 0, score: 0.9 }] },
+      });
+
+      await reranker.rerank('query', ['document1'], 1);
+
+      expect(postSpy).toHaveBeenCalledWith(
+        'https://rag.example.com/v1/rerank',
+        expect.any(Object),
+        expect.any(Object)
+      );
+    });
+
+    it('should strip trailing slashes from RAG_API_URL', async () => {
+      const originalEnv = process.env.RAG_API_URL;
+      process.env.RAG_API_URL = 'https://env-rag-endpoint.com//';
+
+      const tokenSupplier = jest.fn().mockResolvedValue('token');
+      const reranker = new RagApiReranker({
+        tokenSupplier,
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      const postSpy = jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: { results: [{ id: '0', index: 0, score: 0.9 }] },
+      });
+
+      await reranker.rerank('query', ['document1'], 1);
+
+      expect(postSpy).toHaveBeenCalledWith(
+        'https://env-rag-endpoint.com/v1/rerank',
+        expect.any(Object),
+        expect.any(Object)
+      );
+
+      if (typeof originalEnv === 'string') {
+        process.env.RAG_API_URL = originalEnv;
+      } else {
+        delete process.env.RAG_API_URL;
+      }
+    });
   });
 
   describe('rerank method', () => {
@@ -553,6 +603,156 @@ describe('RagApiReranker', () => {
 
       expect(result).toEqual([{ text: 'document1', score: 0 }]);
       expect(postSpy).not.toHaveBeenCalled();
+    });
+
+    it('should fall back to the candidates original order when the token supplier never resolves', async () => {
+      const reranker = new RagApiReranker({
+        baseUrl,
+        tokenSupplier: () => new Promise<string>(() => undefined),
+        timeout: 50,
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      const errorSpy = jest
+        .spyOn(mockLogger, 'error')
+        .mockImplementation(() => mockLogger);
+      const postSpy = jest.spyOn(axios, 'post');
+
+      const startedAt = Date.now();
+      const result = await reranker.rerank(
+        'query',
+        ['document1', 'document2'],
+        2
+      );
+
+      expect(result).toEqual([
+        { text: 'document1', score: 0 },
+        { text: 'document2', score: 0 },
+      ]);
+      expect(Date.now() - startedAt).toBeLessThan(2000);
+      expect(postSpy).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalledWith(
+        'Error using rag_api reranker',
+        expect.objectContaining({
+          message: 'rag_api rerank exceeded its 50ms timeout.',
+        })
+      );
+    });
+
+    it('should fall back to the candidates original order when the request never settles', async () => {
+      const tokenSupplier = jest.fn().mockResolvedValue('token');
+      const reranker = new RagApiReranker({
+        baseUrl,
+        tokenSupplier,
+        timeout: 50,
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      jest.spyOn(mockLogger, 'error').mockImplementation(() => mockLogger);
+      jest
+        .spyOn(axios, 'post')
+        .mockReturnValueOnce(new Promise(() => undefined));
+
+      const startedAt = Date.now();
+      const result = await reranker.rerank('query', ['document1'], 1);
+
+      expect(result).toEqual([{ text: 'document1', score: 0 }]);
+      expect(Date.now() - startedAt).toBeLessThan(2000);
+      expect(tokenSupplier).toHaveBeenCalledTimes(1);
+    });
+
+    it('should fall back to the candidates original order when an index exceeds the submitted candidate count', async () => {
+      const tokenSupplier = jest.fn().mockResolvedValue('token');
+      const reranker = new RagApiReranker({
+        baseUrl,
+        tokenSupplier,
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      const warnSpy = jest
+        .spyOn(mockLogger, 'warn')
+        .mockImplementation(() => mockLogger);
+      const documents = Array.from({ length: 60 }, (_, i) => `document${i}`);
+      jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: {
+          results: [
+            { id: '0', index: 0, score: 0.9 },
+            // Within `documents` but beyond the 50 candidates submitted.
+            { id: '55', index: 55, score: 0.8 },
+          ],
+        },
+      });
+
+      const result = await reranker.rerank('query', documents, 3);
+
+      expect(result).toEqual([
+        { text: 'document0', score: 0 },
+        { text: 'document1', score: 0 },
+        { text: 'document2', score: 0 },
+      ]);
+      expect(warnSpy).toHaveBeenCalledWith(
+        'rag_api rerank response contained no valid results. Using default ranking.'
+      );
+    });
+
+    it('should reject the whole batch when valid and malformed results are mixed', async () => {
+      const tokenSupplier = jest.fn().mockResolvedValue('token');
+      const reranker = new RagApiReranker({
+        baseUrl,
+        tokenSupplier,
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      const warnSpy = jest
+        .spyOn(mockLogger, 'warn')
+        .mockImplementation(() => mockLogger);
+      jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: {
+          results: [
+            { id: '1', index: 1, score: 0.95 },
+            { id: '0', index: 0, score: Number.NaN },
+          ],
+        },
+      });
+
+      const result = await reranker.rerank(
+        'query',
+        ['document1', 'document2'],
+        2
+      );
+
+      expect(result).toEqual([
+        { text: 'document1', score: 0 },
+        { text: 'document2', score: 0 },
+      ]);
+      expect(warnSpy).toHaveBeenCalledWith(
+        'rag_api rerank response contained no valid results. Using default ranking.'
+      );
+    });
+
+    it('should submit only the first 50 documents as candidates', async () => {
+      const tokenSupplier = jest.fn().mockResolvedValue('token');
+      const reranker = new RagApiReranker({
+        baseUrl,
+        tokenSupplier,
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      const documents = Array.from({ length: 400 }, (_, i) => `document${i}`);
+      const postSpy = jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: { results: [{ id: '0', index: 0, score: 0.9 }] },
+      });
+
+      await reranker.rerank('query', documents, 1);
+
+      const [, requestBody] = postSpy.mock.calls[0];
+      const { candidates } = requestBody as t.RagApiRerankRequestBody;
+      expect(candidates).toHaveLength(50);
+      expect(candidates[49]).toEqual({
+        id: '49',
+        text: 'document49',
+        base_score: 0,
+      });
     });
   });
 });
