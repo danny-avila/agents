@@ -9,6 +9,7 @@ describe('SubagentReplay manifest', () => {
   const execution = {
     parentToolCallId: 'call_parent',
     childRunId: 'child-run',
+    configId: 'researcher@v1',
     approvalExecutionScope: 'child-approval-scope',
     checkpoints: [
       {

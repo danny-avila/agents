@@ -407,16 +407,69 @@ export type MultiAgentGraphInput = StandardGraphInput & {
   edges: GraphEdge[];
 };
 
-/** Configuration for a subagent type that can be spawned by a parent agent. */
-export type SubagentConfig = {
-  /** Identifier used in the tool's `subagent_type` enum (e.g. 'researcher', 'coder'). */
+/** Lightweight identity advertised to the model for a spawnable subagent. */
+export type SubagentDescriptor = {
+  /** Stable identifier used in the tool's `subagent_type` enum (e.g. 'researcher', 'coder'). */
   type: string;
   /** Human-readable display name. */
   name: string;
   /** What this subagent specializes in — shown to the LLM. */
   description: string;
+  /**
+   * Opaque, versioned identity of the child configuration. Required when
+   * `resolveAgentInputs` is used and changed whenever its resolved inputs
+   * change incompatibly.
+   */
+  configId?: string;
+};
+
+/** Lazy descriptor with the durable configuration identity required to resolve it. */
+export type LazySubagentDescriptor = SubagentDescriptor & {
+  configId: string;
+};
+
+/** Runtime context supplied when a host lazily resolves a selected subagent. */
+export type SubagentResolveContext = {
+  /** Stable subagent identity selected by the model. */
+  descriptor: Readonly<LazySubagentDescriptor>;
+  /** Stable child execution identity, including across HITL reconstruction. */
+  executionId: string;
+  /** Parent run that dispatched this execution. */
+  parentRunId: string;
+  /** Parent agent that dispatched this execution. */
+  parentAgentId?: string;
+  /** Parent-side tool call that selected the subagent. */
+  parentToolCallId?: string;
+  /** Durable parent conversation thread, when supplied by the host. */
+  threadId?: string;
+  /** Parent/breaker cancellation composed for this child execution. */
+  signal: AbortSignal;
+  /** Snapshot of host runtime context from the parent tool invocation. */
+  configurable?: Readonly<Record<string, unknown>>;
+};
+
+/** Host contract for resolving a selected subagent's full graph inputs. */
+export type SubagentAgentInputsResolver = (
+  context: SubagentResolveContext
+) => Promise<AgentInputs>;
+
+/** Configuration for a subagent type that can be spawned by a parent agent. */
+export type SubagentConfig = SubagentDescriptor & {
   /** Full agent config for the child graph. Omit when `self` is true. */
   agentInputs?: AgentInputs;
+  /**
+   * Resolve the full child config only after this descriptor is selected.
+   * Eager `agentInputs` and `self` take precedence when also supplied.
+   *
+   * Resolvers should rebuild inputs from the stable execution context instead
+   * of retaining request-owned state. The SDK keeps resolved inputs in memory
+   * only for the lifetime of the selected execution and supplies cancellation
+   * through `context.signal`. A reconstructed execution may invoke the
+   * resolver again, so the same `context.executionId` must produce an
+   * equivalent child configuration. Durable resolver work should be
+   * idempotent on the tuple `(context.executionId, context.descriptor.configId)`.
+   */
+  resolveAgentInputs?: SubagentAgentInputsResolver;
   /** When true, reuse the parent's AgentInputs (context isolation without separate config). */
   self?: boolean;
   /** Max AGENT→TOOLS cycles before forced stop (default: 25). */
@@ -429,6 +482,14 @@ export type SubagentConfig = {
 export type ResolvedSubagentConfig = SubagentConfig & {
   agentInputs: AgentInputs;
 };
+
+/** Config accepted by the executor after eager/self/lazy eligibility checks. */
+export type ExecutableSubagentConfig =
+  | ResolvedSubagentConfig
+  | (SubagentConfig & {
+      configId: string;
+      resolveAgentInputs: SubagentAgentInputsResolver;
+    });
 
 /** Lifecycle phase carried on {@link SubagentUpdateEvent}. */
 export type SubagentUpdatePhase =

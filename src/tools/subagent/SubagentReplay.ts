@@ -64,6 +64,8 @@ export interface SubagentGraphResumeState {
 export interface SubagentResumeExecution {
   parentToolCallId: string;
   childRunId: string;
+  /** Lazy child revision bound when this execution first resolved. */
+  configId?: string;
   approvalExecutionScope: string;
   checkpoints: SubagentCheckpointReference[];
   graphState: SubagentGraphResumeState;
@@ -322,6 +324,7 @@ function isSubagentResumeExecution(
   }
   const execution = value as Partial<SubagentResumeExecution>;
   const childRunId = execution.childRunId;
+  const configId = execution.configId;
   const approvalExecutionScope = execution.approvalExecutionScope;
   const checkpoints = execution.checkpoints;
   const graphState = execution.graphState;
@@ -329,6 +332,7 @@ function isSubagentResumeExecution(
   if (
     !isString(execution.parentToolCallId) ||
     !isString(childRunId) ||
+    (configId != null && !isString(configId)) ||
     !isString(approvalExecutionScope) ||
     !Array.isArray(checkpoints) ||
     checkpoints.length === 0 ||

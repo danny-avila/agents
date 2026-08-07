@@ -42,6 +42,7 @@ import type {
   RunStep,
   RunStepDeltaEvent,
   StandardGraphInput,
+  ExecutableSubagentConfig,
   ResolvedSubagentConfig,
   StepCompleted,
   SubagentConfig,
@@ -720,7 +721,7 @@ export type SubagentExecuteResult = {
 export type ChildGraphFactory = (input: StandardGraphInput) => StandardGraph;
 
 export type SubagentExecutorOptions = {
-  configs: Map<string, ResolvedSubagentConfig>;
+  configs: ReadonlyMap<string, SubagentConfig>;
   parentSignal?: AbortSignal;
   /** Run-scoped breaker abort shared by every executor of one graph, so a
    * child tripping a stream limit stops subagents running under OTHER
@@ -785,7 +786,7 @@ export type SubagentExecutorOptions = {
 };
 
 export class SubagentExecutor {
-  private readonly configs: Map<string, ResolvedSubagentConfig>;
+  private readonly configs: ReadonlyMap<string, SubagentConfig>;
   private readonly parentSignal?: AbortSignal;
   /** Aborted when a child trips a stream circuit breaker: parallel sibling
    * subagents run concurrently on the parent's signal, and rejecting the
@@ -821,6 +822,11 @@ export class SubagentExecutor {
     >
   >();
   private readonly activeChildRuns = new Map<string, ActiveChildRun>();
+  private readonly resolvedConfigs = new Map<string, ResolvedSubagentConfig>();
+  private readonly pendingConfigResolutions = new Map<
+    string,
+    Promise<ResolvedSubagentConfig>
+  >();
   private replayCheckpointWorkflow?: ReplayCheckpointWorkflow;
   private readonly resolveParentHandlerRegistry?: () =>
     | HandlerRegistry
@@ -871,6 +877,87 @@ export class SubagentExecutor {
   /** Snapshot of the parent's registry at the moment a subagent is dispatched. */
   private getParentHandlerRegistry(): HandlerRegistry | undefined {
     return this.resolveParentHandlerRegistry?.();
+  }
+
+  /** Resolve one lazy descriptor per stable child execution. Concurrent
+   * duplicate dispatches share the same in-flight resolution; HITL re-entry
+   * on this executor reuses the resolved config until the child settles. */
+  private resolveExecutionConfig(
+    config: SubagentConfig,
+    context: {
+      childExecutionKey: string;
+      childRunId: string;
+      childSignal: AbortSignal;
+      threadId?: string;
+      parentToolCallId?: string;
+      parentConfigurable?: Record<string, unknown>;
+    }
+  ): Promise<ResolvedSubagentConfig> {
+    if (config.agentInputs != null) {
+      return Promise.resolve(config as ResolvedSubagentConfig);
+    }
+
+    const cached = this.resolvedConfigs.get(context.childExecutionKey);
+    if (cached != null) {
+      return Promise.resolve(cached);
+    }
+    const pending = this.pendingConfigResolutions.get(
+      context.childExecutionKey
+    );
+    if (pending != null) {
+      return pending;
+    }
+    const resolver = config.resolveAgentInputs;
+    if (resolver == null) {
+      return Promise.reject(
+        new Error(`Subagent "${config.type}" has no executable configuration.`)
+      );
+    }
+    const configId = config.configId;
+    if (typeof configId !== 'string' || configId.length === 0) {
+      return Promise.reject(
+        new Error(
+          `Lazy subagent "${config.type}" requires a non-empty "configId".`
+        )
+      );
+    }
+
+    const resolution = (async (): Promise<ResolvedSubagentConfig> => {
+      try {
+        const agentInputs = await resolveAgentInputsWithSignal(
+          (): Promise<AgentInputs> =>
+            resolver({
+              descriptor: {
+                type: config.type,
+                name: config.name,
+                description: config.description,
+                configId,
+              },
+              executionId: context.childRunId,
+              parentRunId: this.parentRunId,
+              parentAgentId: this.parentAgentId,
+              parentToolCallId: context.parentToolCallId,
+              threadId: context.threadId,
+              signal: context.childSignal,
+              configurable:
+                context.parentConfigurable == null
+                  ? undefined
+                  : { ...context.parentConfigurable },
+            }),
+          context.childSignal
+        );
+        const resolved: ResolvedSubagentConfig = {
+          ...config,
+          agentInputs,
+        };
+        this.resolvedConfigs.set(context.childExecutionKey, resolved);
+        return resolved;
+      } finally {
+        this.pendingConfigResolutions.delete(context.childExecutionKey);
+      }
+    })();
+    this.pendingConfigResolutions.set(context.childExecutionKey, resolution);
+    return resolution;
   }
 
   /**
@@ -1176,9 +1263,13 @@ export class SubagentExecutor {
         eagerToolUsage: [],
         eagerToolSuppressions: [],
       };
+      const configId = this.resolvedConfigs.get(
+        identity.childThreadId
+      )?.configId;
       executions.push({
         parentToolCallId,
         childRunId: identity.childRunId,
+        ...(configId == null ? {} : { configId }),
         approvalExecutionScope: identity.approvalExecutionScope,
         checkpoints,
         graphState,
@@ -1236,6 +1327,8 @@ export class SubagentExecutor {
       this.clearChildGraph(activeChildRun.graph);
     }
     this.activeChildRuns.clear();
+    this.resolvedConfigs.clear();
+    this.pendingConfigResolutions.clear();
     this.completedChildResults.clear();
     for (const identity of this.childExecutionIdentities.values()) {
       this.hookRegistry?.clearSession(identity.approvalExecutionScope);
@@ -1411,9 +1504,9 @@ export class SubagentExecutor {
      * trip target both bind to this capture. */
     const childBreaker = params.breaker ?? this.resolveBreakerController();
     const childSignal = this.composeChildSignal(childBreaker);
-    const config = this.configs.get(subagentType);
+    const executableConfig = this.configs.get(subagentType);
 
-    if (!config) {
+    if (!executableConfig) {
       const available = [...this.configs.keys()].join(', ');
       return {
         content: `Error: Unknown subagent type "${subagentType}". Available types: ${available}`,
@@ -1456,14 +1549,41 @@ export class SubagentExecutor {
       approvalExecutionScope,
     });
     const childExecutionKey = childThreadId;
-    const childAgentId =
-      config.agentInputs.agentId ||
-      `${this.parentAgentId ?? 'agent'}_sub_${executionSuffix}`;
+    if (
+      resumeExecution?.configId != null &&
+      executableConfig.configId !== resumeExecution.configId
+    ) {
+      const currentConfigId = executableConfig.configId ?? 'missing';
+      return {
+        content: `Subagent error: Configuration identity mismatch for "${subagentType}". Expected "${resumeExecution.configId}" but received "${currentConfigId}".`,
+        messages: [],
+      };
+    }
     const completedChildResult =
       this.completedChildResults.get(childExecutionKey);
     if (completedChildResult != null) {
       return completedChildResult;
     }
+
+    let config: ResolvedSubagentConfig;
+    try {
+      config = await this.resolveExecutionConfig(executableConfig, {
+        childExecutionKey,
+        childRunId,
+        childSignal,
+        threadId,
+        parentToolCallId,
+        parentConfigurable: params.parentConfigurable,
+      });
+    } catch (error) {
+      return {
+        content: `Subagent error: ${truncateErrorMessage(error)}`,
+        messages: [],
+      };
+    }
+    const childAgentId =
+      config.agentInputs.agentId ||
+      `${this.parentAgentId ?? 'agent'}_sub_${executionSuffix}`;
 
     const parentRegistry = this.getParentHandlerRegistry();
     const forwardingEnabled = parentRegistry != null;
@@ -1832,6 +1952,7 @@ export class SubagentExecutor {
       }
       this.clearChildGraph(childGraph);
       this.activeChildRuns.delete(childExecutionKey);
+      this.resolvedConfigs.delete(childExecutionKey);
       /**
        * A tripped stream circuit breaker is a safety abort, not a recoverable
        * subagent failure: converting it into a tool result would let the
@@ -1909,6 +2030,7 @@ export class SubagentExecutor {
       messages: result.messages,
     };
     this.completedChildResults.set(childExecutionKey, completedResult);
+    this.resolvedConfigs.delete(childExecutionKey);
     return completedResult;
   }
 
@@ -2749,21 +2871,32 @@ export function filterSubagentResult(messages: BaseMessage[]): string {
 export function resolveSubagentConfigs(
   configs: SubagentConfig[],
   parentContext: AgentContext
-): ResolvedSubagentConfig[] {
+): ExecutableSubagentConfig[] {
   const resolved = configs
-    .map((config) => {
+    .map((config): ExecutableSubagentConfig | null => {
       if (config.agentInputs != null) {
         return config as ResolvedSubagentConfig;
       }
-      if (config.self !== true || parentContext._sourceInputs == null) {
-        return null;
+      if (config.self === true && parentContext._sourceInputs != null) {
+        return {
+          ...config,
+          agentInputs: { ...parentContext._sourceInputs },
+        } as ResolvedSubagentConfig;
       }
-      return {
-        ...config,
-        agentInputs: { ...parentContext._sourceInputs },
-      } as ResolvedSubagentConfig;
+      if (config.resolveAgentInputs != null) {
+        if (
+          typeof config.configId !== 'string' ||
+          config.configId.length === 0
+        ) {
+          throw new Error(
+            `Lazy subagent "${config.type}" requires a non-empty "configId".`
+          );
+        }
+        return config as ExecutableSubagentConfig;
+      }
+      return null;
     })
-    .filter((c): c is ResolvedSubagentConfig => c != null);
+    .filter((c): c is ExecutableSubagentConfig => c != null);
 
   const seenTypes = new Set<string>();
   for (const config of resolved) {
@@ -2850,4 +2983,40 @@ function truncateErrorMessage(error: unknown): string {
     return message;
   }
   return `${message.slice(0, ERROR_MESSAGE_MAX_CHARS)}...`;
+}
+
+function resolveAgentInputsWithSignal(
+  resolve: () => Promise<AgentInputs>,
+  signal: AbortSignal
+): Promise<AgentInputs> {
+  if (signal.aborted) {
+    return Promise.reject(getAbortReason(signal));
+  }
+
+  return new Promise<AgentInputs>((resolvePromise, rejectPromise) => {
+    const cleanup = (): void => signal.removeEventListener('abort', onAbort);
+    const onAbort = (): void => {
+      cleanup();
+      rejectPromise(getAbortReason(signal));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve()
+      .then(resolve)
+      .then(
+        (agentInputs) => {
+          cleanup();
+          resolvePromise(agentInputs);
+        },
+        (error: unknown) => {
+          cleanup();
+          rejectPromise(error);
+        }
+      );
+  });
+}
+
+function getAbortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error('Subagent resolution aborted.');
 }
