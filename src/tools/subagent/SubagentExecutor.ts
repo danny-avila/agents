@@ -48,6 +48,9 @@ import type {
   ResolvedSubagentConfig,
   ResolvedSubagentConfigEntry,
   SubagentExecutionContext,
+  SubagentResolveConfigurable,
+  SubagentResolveRequestContext,
+  SubagentResolveUserContext,
   StepCompleted,
   SubagentUpdateEvent,
   SubagentUpdatePhase,
@@ -317,6 +320,7 @@ type ChildExecutionIdentity = {
   childRunId: string;
   childThreadId: string;
   approvalExecutionScope: string;
+  configId?: string;
   resumeExecution?: SubagentResumeExecution;
 };
 
@@ -333,6 +337,24 @@ function getResumeExecution(
 ): SubagentResumeExecution | undefined {
   return getSubagentResumeManifest(parentConfigurable)?.executions.find(
     (execution) => execution.parentToolCallId === parentToolCallId
+  );
+}
+
+function isResumeExecutionCompatible(
+  resumeExecution: SubagentResumeExecution | undefined,
+  configId: string | undefined
+): boolean {
+  return (
+    resumeExecution?.configId == null || resumeExecution.configId === configId
+  );
+}
+
+function getSubagentType(call: ToolCall): string | undefined {
+  if (!isObjectLike(call.args)) {
+    return undefined;
+  }
+  return asNonEmptyString(
+    (call.args as { subagent_type?: unknown }).subagent_type
   );
 }
 
@@ -888,7 +910,7 @@ export class SubagentExecutor {
     string,
     Pick<
       ChildExecutionIdentity,
-      'childRunId' | 'childThreadId' | 'approvalExecutionScope'
+      'childRunId' | 'childThreadId' | 'approvalExecutionScope' | 'configId'
     >
   >();
   private readonly activeChildRuns = new Map<string, ActiveChildRun>();
@@ -897,6 +919,7 @@ export class SubagentExecutor {
     string,
     Promise<ResolvedSubagentConfig>
   >();
+  private configResolutionGeneration = 0;
   private readonly pendingExecutions = new Map<
     string,
     Promise<SubagentExecuteResult>
@@ -995,40 +1018,52 @@ export class SubagentExecutor {
     }
     const resolver = config.resolveAgentInputs;
     const configId = config.configId;
-    const resolution = (async (): Promise<ResolvedSubagentConfig> => {
-      try {
-        const agentInputs = await resolveAgentInputsWithSignal(
-          (): Promise<AgentInputs> =>
-            resolver({
-              descriptor: {
-                type: config.type,
-                name: config.name,
-                description: config.description,
-                configId,
-              },
-              executionId: context.childRunId,
-              parentRunId: this.parentRunId,
-              parentAgentId: this.parentAgentId,
-              parentToolCallId: context.parentToolCallId,
-              threadId: context.threadId,
-              signal: context.childSignal,
-              configurable:
-                context.parentConfigurable == null
-                  ? undefined
-                  : sanitizeChildConfigurable(context.parentConfigurable),
-            }),
-          context.childSignal
-        );
-        const resolved: ResolvedSubagentConfig = {
-          ...config,
-          agentInputs,
-        };
-        this.resolvedConfigs.set(context.childExecutionKey, resolved);
-        return resolved;
-      } finally {
-        this.pendingConfigResolutions.delete(context.childExecutionKey);
-      }
-    })();
+    const resolutionGeneration = this.configResolutionGeneration;
+    const resolution: Promise<ResolvedSubagentConfig> =
+      resolveAgentInputsWithSignal(
+        (): Promise<AgentInputs> =>
+          resolver({
+            descriptor: {
+              type: config.type,
+              name: config.name,
+              description: config.description,
+              configId,
+            },
+            executionId: context.childRunId,
+            parentRunId: this.parentRunId,
+            parentAgentId: this.parentAgentId,
+            parentToolCallId: context.parentToolCallId,
+            threadId: context.threadId,
+            signal: context.childSignal,
+            configurable:
+              context.parentConfigurable == null
+                ? undefined
+                : sanitizeResolverConfigurable(context.parentConfigurable),
+          }),
+        context.childSignal
+      )
+        .then((agentInputs): ResolvedSubagentConfig => {
+          const resolved: ResolvedSubagentConfig = {
+            ...config,
+            agentInputs,
+          };
+          if (
+            this.configResolutionGeneration === resolutionGeneration &&
+            this.pendingConfigResolutions.get(context.childExecutionKey) ===
+              resolution
+          ) {
+            this.resolvedConfigs.set(context.childExecutionKey, resolved);
+          }
+          return resolved;
+        })
+        .finally(() => {
+          if (
+            this.pendingConfigResolutions.get(context.childExecutionKey) ===
+            resolution
+          ) {
+            this.pendingConfigResolutions.delete(context.childExecutionKey);
+          }
+        });
     this.pendingConfigResolutions.set(context.childExecutionKey, resolution);
     return resolution;
   }
@@ -1335,13 +1370,10 @@ export class SubagentExecutor {
         eagerToolUsage: [],
         eagerToolSuppressions: [],
       };
-      const configId = this.resolvedConfigs.get(
-        identity.childThreadId
-      )?.configId;
       executions.push({
         parentToolCallId,
         childRunId: identity.childRunId,
-        ...(configId == null ? {} : { configId }),
+        ...(identity.configId == null ? {} : { configId: identity.configId }),
         approvalExecutionScope: identity.approvalExecutionScope,
         checkpoints,
         graphState,
@@ -1395,6 +1427,7 @@ export class SubagentExecutor {
   }
 
   clearHeavyState(): void {
+    this.configResolutionGeneration += 1;
     for (const activeChildRun of this.activeChildRuns.values()) {
       this.clearChildGraph(activeChildRun.graph);
     }
@@ -1429,16 +1462,31 @@ export class SubagentExecutor {
       | Record<string, unknown>
       | undefined;
     const threadId = parentConfigurable?.thread_id;
+    const resumeExecution = getResumeExecution(
+      parentConfigurable,
+      parentToolCallId
+    );
+    const subagentType = getSubagentType(call);
+    const executableConfig =
+      subagentType == null ? undefined : this.configs.get(subagentType);
+    if (
+      !isResumeExecutionCompatible(resumeExecution, executableConfig?.configId)
+    ) {
+      return undefined;
+    }
+    const configId = executableConfig?.configId ?? resumeExecution?.configId;
     const { childRunId, childThreadId, approvalExecutionScope } =
       await this.resolveChildExecutionIdentity({
         threadId: typeof threadId === 'string' ? threadId : undefined,
         parentToolCallId,
         parentConfigurable,
+        resumeExecution,
       });
     this.childExecutionIdentities.set(parentToolCallId, {
       childRunId,
       childThreadId,
       approvalExecutionScope,
+      ...(configId == null ? {} : { configId }),
     });
     this.checkpointThreadIds.add(childThreadId);
     const checkpoint = await this.checkpointer.getTuple({
@@ -1484,16 +1532,31 @@ export class SubagentExecutor {
       | Record<string, unknown>
       | undefined;
     const threadId = parentConfigurable?.thread_id;
+    const resumeExecution = getResumeExecution(
+      parentConfigurable,
+      parentToolCallId
+    );
+    const subagentType = getSubagentType(call);
+    const executableConfig =
+      subagentType == null ? undefined : this.configs.get(subagentType);
+    if (
+      !isResumeExecutionCompatible(resumeExecution, executableConfig?.configId)
+    ) {
+      return;
+    }
+    const configId = executableConfig?.configId ?? resumeExecution?.configId;
     const { childRunId, childThreadId, approvalExecutionScope } =
       await this.resolveChildExecutionIdentity({
         threadId: typeof threadId === 'string' ? threadId : undefined,
         parentToolCallId,
         parentConfigurable,
+        resumeExecution,
       });
     this.childExecutionIdentities.set(parentToolCallId, {
       childRunId,
       childThreadId,
       approvalExecutionScope,
+      ...(configId == null ? {} : { configId }),
     });
     this.checkpointThreadIds.add(childThreadId);
     const activeChildRun = this.activeChildRuns.get(childThreadId);
@@ -1571,10 +1634,18 @@ export class SubagentExecutor {
     if (parentToolCallId == null || parentToolCallId === '') {
       return this.executeOnce(params);
     }
-    const executionKey = JSON.stringify([
-      params.threadId ?? null,
+    const branchId =
+      this.humanInTheLoop?.enabled === true && this.checkpointer != null
+        ? getResumeAttemptId(params.parentConfigurable, this.parentRunId)
+        : undefined;
+    const executionKey = getChildThreadId({
+      parentRunId: this.parentRunId,
+      parentAgentId: this.parentAgentId,
+      threadId: params.threadId,
       parentToolCallId,
-    ]);
+      parentConfigurable: params.parentConfigurable,
+      branchId,
+    });
     const pending = this.pendingExecutions.get(executionKey);
     if (pending != null) {
       return pending;
@@ -1646,8 +1717,7 @@ export class SubagentExecutor {
       executionSuffix
     );
     if (
-      resumeExecution?.configId != null &&
-      executableConfig.configId !== resumeExecution.configId
+      !isResumeExecutionCompatible(resumeExecution, executableConfig.configId)
     ) {
       return {
         content:
@@ -1666,6 +1736,9 @@ export class SubagentExecutor {
       childRunId,
       childThreadId,
       approvalExecutionScope,
+      ...(executableConfig.configId == null
+        ? {}
+        : { configId: executableConfig.configId }),
     });
     const childExecutionKey = childThreadId;
     const completedChildResult =
@@ -1684,7 +1757,10 @@ export class SubagentExecutor {
         parentToolCallId,
         parentConfigurable: params.parentConfigurable,
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof StreamLimitExceededError) {
+        throw error;
+      }
       return {
         content: SUBAGENT_RESOLUTION_ERROR_MESSAGE,
         messages: [],
@@ -2611,6 +2687,63 @@ function extractConfiguredModel(agentInputs: AgentInputs): string | undefined {
     return clientOptions.modelName;
   }
   return undefined;
+}
+
+function sanitizeResolverConfigurable(
+  parentConfigurable: Record<string, unknown>
+): SubagentResolveConfigurable | undefined {
+  const configurable = sanitizeChildConfigurable(parentConfigurable);
+  const requestBody = createResolveRequestContext(configurable.requestBody);
+  const user = createResolveUserContext(configurable.user);
+  const userId = asNonEmptyString(configurable.user_id) ?? user?.id;
+  if (requestBody == null && user == null && userId == null) {
+    return undefined;
+  }
+  return {
+    ...(requestBody == null ? {} : { requestBody }),
+    ...(user == null ? {} : { user }),
+    ...(userId == null ? {} : { user_id: userId }),
+  };
+}
+
+function createResolveRequestContext(
+  value: unknown
+): SubagentResolveRequestContext | undefined {
+  if (!isObjectLike(value)) {
+    return undefined;
+  }
+  const source = value as SubagentResolveRequestContext;
+  const conversationId = asNonEmptyString(source.conversationId);
+  const messageId = asNonEmptyString(source.messageId);
+  const parentMessageId = asNonEmptyString(source.parentMessageId);
+  if (conversationId == null && messageId == null && parentMessageId == null) {
+    return undefined;
+  }
+  return {
+    ...(conversationId == null ? {} : { conversationId }),
+    ...(messageId == null ? {} : { messageId }),
+    ...(parentMessageId == null ? {} : { parentMessageId }),
+  };
+}
+
+function createResolveUserContext(
+  value: unknown
+): SubagentResolveUserContext | undefined {
+  if (!isObjectLike(value)) {
+    return undefined;
+  }
+  const source = value as SubagentResolveUserContext;
+  const id = asNonEmptyString(source.id);
+  const role = asNonEmptyString(source.role);
+  const tenantId = asNonEmptyString(source.tenantId);
+  if (id == null && role == null && tenantId == null) {
+    return undefined;
+  }
+  return {
+    ...(id == null ? {} : { id }),
+    ...(role == null ? {} : { role }),
+    ...(tenantId == null ? {} : { tenantId }),
+  };
 }
 
 function sanitizeChildConfigurable(

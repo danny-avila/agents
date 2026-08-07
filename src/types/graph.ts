@@ -449,6 +449,27 @@ export interface LazySubagentDescriptor extends SubagentDescriptor {
   configId: string;
 }
 
+/** Stable request identifiers exposed to a selected subagent resolver. */
+export interface SubagentResolveRequestContext {
+  conversationId?: string;
+  messageId?: string;
+  parentMessageId?: string;
+}
+
+/** Stable user identifiers exposed to a selected subagent resolver. */
+export interface SubagentResolveUserContext {
+  id?: string;
+  role?: string;
+  tenantId?: string;
+}
+
+/** Sanitized host runtime context safe for lazy subagent resolution. */
+export interface SubagentResolveConfigurable {
+  requestBody?: Readonly<SubagentResolveRequestContext>;
+  user?: Readonly<SubagentResolveUserContext>;
+  user_id?: string;
+}
+
 /** Runtime context supplied when a host lazily resolves a selected subagent. */
 export interface SubagentResolveContext {
   /** Stable subagent identity selected by the model. */
@@ -465,8 +486,8 @@ export interface SubagentResolveContext {
   threadId?: string;
   /** Parent/breaker cancellation composed for this child execution. */
   signal: AbortSignal;
-  /** Snapshot of host runtime context from the parent tool invocation. */
-  configurable?: Readonly<Record<string, unknown>>;
+  /** Stable, sanitized host context from the parent tool invocation. */
+  configurable?: Readonly<SubagentResolveConfigurable>;
 }
 
 /** Host contract for resolving a selected subagent's full graph inputs. */
@@ -486,7 +507,8 @@ export interface SubagentConfig extends SubagentConfigBase {
   agentInputs?: AgentInputs;
   /**
    * Resolve the full child config only after this descriptor is selected.
-   * Eager `agentInputs` and `self` take precedence when also supplied.
+   * Eager `agentInputs` take precedence when also supplied. `self` and a
+   * resolver are mutually exclusive and normalization rejects that pairing.
    *
    * Resolvers should rebuild inputs from the stable execution context instead
    * of retaining request-owned state. The SDK keeps resolved inputs in memory
