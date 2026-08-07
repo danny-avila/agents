@@ -101,6 +101,18 @@ export type ToolApprovalDecisionMap = Record<string, ToolApprovalDecision>;
  */
 export type HumanInterruptType = 'tool_approval' | 'ask_user_question';
 
+/** Identifies an interrupt that originated inside a checkpointed subagent. */
+export interface SubagentInterruptScope {
+  /** Child execution run id used by subagent update and usage events. */
+  run_id: string;
+  /** Child agent id that owns the interrupted tool call. */
+  agent_id: string;
+  /** Configured subagent type selected by the parent tool call. */
+  subagent_type: string;
+  /** Parent `subagent` tool call that launched this child. */
+  parent_tool_call_id?: string;
+}
+
 /**
  * Structured payload the SDK passes to `interrupt()` when one or more
  * pending tool calls require host approval. All `ask`-decision tool calls
@@ -114,6 +126,10 @@ export interface ToolApprovalInterruptPayload {
   type: 'tool_approval';
   action_requests: ToolApprovalRequest[];
   review_configs: ToolApprovalReviewConfig[];
+  /** Hook-registry session whose policy raised this interrupt. */
+  hook_session_id?: string;
+  /** Present when the approval request was bridged from a child graph. */
+  subagent?: SubagentInterruptScope;
 }
 
 /**

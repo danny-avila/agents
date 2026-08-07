@@ -1,11 +1,40 @@
 import { nanoid } from 'nanoid';
-import { HumanMessage } from '@langchain/core/messages';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
-import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
+import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
+import {
+  AIMessage,
+  BaseMessage,
+  HumanMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
+import {
+  Command,
+  END,
+  GraphInterrupt,
+  INTERRUPT,
+  MessagesAnnotation,
+  START,
+  StateGraph,
+  copyCheckpoint,
+  isGraphInterrupt,
+  isInterrupted,
+} from '@langchain/langgraph';
+import type {
+  Interrupt,
+  StateSnapshot,
+  CheckpointTuple,
+  BaseCheckpointSaver,
+} from '@langchain/langgraph';
 import type { ChatGeneration, LLMResult } from '@langchain/core/outputs';
 import type { Callbacks } from '@langchain/core/callbacks/manager';
+import type { RunnableConfig } from '@langchain/core/runnables';
+import type { UsageMetadata } from '@langchain/core/messages';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
   AgentInputs,
+  BaseGraphState,
+  CompiledStateWorkflow,
+  HumanInTheLoopConfig,
   InjectedMessage,
   MessageDeltaEvent,
   ProcessedToolCall,
@@ -19,14 +48,30 @@ import type {
   SubagentUpdateEvent,
   SubagentUpdatePhase,
   SubagentUsageSink,
+  ToolApprovalInterruptPayload,
   ToolExecuteBatchRequest,
   ToolCallDelta,
   TokenCounter,
+  ToolApprovalDecision,
+  ToolApprovalDecisionMap,
 } from '@/types';
+import type {
+  SubagentResumeExecution,
+  SubagentResumeManifest,
+  SubagentCheckpointReference,
+  SettledSubagentToolOutput,
+} from './SubagentReplay';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs/Graph';
 import type { HandlerRegistry } from '@/events';
+import {
+  getSubagentResumeManifest,
+  attachSubagentResumeManifest,
+  SUBAGENT_PARENT_BATCH_CONFIG_KEY,
+  SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
+  SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
+} from './SubagentReplay';
 import {
   StreamLimitExceededError,
   RUN_BREAKER_SCOPE_CONFIG_KEY,
@@ -38,7 +83,10 @@ import {
   Callback,
   StepTypes,
 } from '@/common';
-import { executeHooks } from '@/hooks';
+import {
+  executeHooks,
+  TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY,
+} from '@/hooks';
 
 const DEFAULT_MAX_TURNS = 25;
 const RECURSION_MULTIPLIER = 3;
@@ -160,12 +208,449 @@ type ForwarderCallback = {
   drain: () => Promise<void>;
 };
 
+type StatefulCompiledWorkflow = Omit<CompiledStateWorkflow, 'invoke'> & {
+  invoke(
+    input: BaseGraphState | Command | null,
+    config?: RunnableConfig
+  ): Promise<BaseGraphState>;
+  getState(config: RunnableConfig): Promise<StateSnapshot>;
+  updateState?(
+    config: RunnableConfig,
+    values: Record<string, unknown>,
+    asNode?: string
+  ): Promise<RunnableConfig>;
+};
+
+type ReplayCheckpointWorkflow = {
+  updateState(
+    config: RunnableConfig,
+    values: { messages: BaseMessage[] },
+    asNode: string
+  ): Promise<RunnableConfig>;
+};
+
+type ActiveChildRun = {
+  graph: StandardGraph;
+  workflow: StatefulCompiledWorkflow;
+  pendingInterrupts: Interrupt[];
+  invokeConfig?: RunnableConfig;
+  childAgentId: string;
+  childRunId: string;
+};
+
+type PersistedToolOutput = {
+  content: ToolMessage['content'];
+  toolCallId: string;
+  id?: string;
+  name?: string;
+  status?: 'success' | 'error';
+  additionalKwargs: ToolMessage['additional_kwargs'];
+  responseMetadata: ToolMessage['response_metadata'];
+  metadata?: Record<string, unknown>;
+  additionalContexts: string[];
+  resolvedArgs?: Record<string, unknown>;
+  referenceContent?: string;
+};
+
+type SubagentCheckpointMarker = {
+  version: 1;
+  parentToolCallId: string;
+  lifecycleComplete: true;
+  hookSessionId?: string;
+  childRunId?: string;
+  settledOutput?: PersistedToolOutput;
+};
+
+type ChildExecutionIdentity = {
+  childRunId: string;
+  childThreadId: string;
+  approvalExecutionScope: string;
+  resumeExecution?: SubagentResumeExecution;
+};
+
+type ChildExecutionIdentityParams = {
+  threadId?: string;
+  parentToolCallId: string;
+  parentConfigurable?: Record<string, unknown>;
+};
+
 const LANGGRAPH_RUNTIME_CONFIG_PREFIX = '__pregel_';
+const LANGGRAPH_RESUME_MAP_CONFIG_KEY = '__pregel_resume_map';
 const LANGGRAPH_CHECKPOINT_CONFIG_KEYS = new Set([
   'checkpoint_id',
   'checkpoint_map',
   'checkpoint_ns',
 ]);
+const SUBAGENT_CHECKPOINT_MARKER_KEY = '__librechat_subagent_checkpoint';
+const SUBAGENT_HOOK_SESSION_KEY = '__librechat_subagent_hook_session';
+const SUBAGENT_RUN_ID_KEY = '__librechat_subagent_run_id';
+const SUBAGENT_REPLAY_NODE = 'subagent-replay';
+
+function isCheckpointSaver(value: unknown): value is BaseCheckpointSaver {
+  if (value == null || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as Partial<BaseCheckpointSaver>;
+  return (
+    typeof candidate.getTuple === 'function' &&
+    typeof candidate.list === 'function' &&
+    typeof candidate.put === 'function' &&
+    typeof candidate.putWrites === 'function' &&
+    typeof candidate.deleteThread === 'function'
+  );
+}
+
+function isSubagentCheckpointMarker(
+  value: unknown
+): value is SubagentCheckpointMarker {
+  if (value == null || typeof value !== 'object') {
+    return false;
+  }
+  const marker = value as Partial<SubagentCheckpointMarker>;
+  return (
+    marker.version === 1 &&
+    marker.lifecycleComplete === true &&
+    typeof marker.parentToolCallId === 'string' &&
+    (marker.hookSessionId == null ||
+      typeof marker.hookSessionId === 'string') &&
+    (marker.childRunId == null || typeof marker.childRunId === 'string') &&
+    (marker.settledOutput == null ||
+      isPersistedToolOutput(marker.settledOutput))
+  );
+}
+
+function isPersistedToolOutput(value: unknown): value is PersistedToolOutput {
+  if (value == null || typeof value !== 'object') {
+    return false;
+  }
+  const output = value as {
+    content?: unknown;
+    toolCallId?: unknown;
+    status?: unknown;
+    additionalKwargs?: unknown;
+    responseMetadata?: unknown;
+    additionalContexts?: unknown;
+    resolvedArgs?: unknown;
+    referenceContent?: unknown;
+  };
+  const contentIsValid =
+    typeof output.content === 'string' || Array.isArray(output.content);
+  const statusIsValid =
+    output.status == null ||
+    output.status === 'success' ||
+    output.status === 'error';
+  const contextsAreValid =
+    Array.isArray(output.additionalContexts) &&
+    output.additionalContexts.every((context) => typeof context === 'string');
+  const resolvedArgsAreValid =
+    output.resolvedArgs == null ||
+    (typeof output.resolvedArgs === 'object' &&
+      !Array.isArray(output.resolvedArgs));
+  return (
+    contentIsValid &&
+    typeof output.toolCallId === 'string' &&
+    output.additionalKwargs != null &&
+    typeof output.additionalKwargs === 'object' &&
+    output.responseMetadata != null &&
+    typeof output.responseMetadata === 'object' &&
+    statusIsValid &&
+    contextsAreValid &&
+    resolvedArgsAreValid &&
+    (output.referenceContent == null ||
+      typeof output.referenceContent === 'string')
+  );
+}
+
+function getSubagentCheckpointMarker(
+  messages: BaseMessage[],
+  parentToolCallId: string
+): SubagentCheckpointMarker | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const marker =
+      messages[i].additional_kwargs[SUBAGENT_CHECKPOINT_MARKER_KEY];
+    if (
+      isSubagentCheckpointMarker(marker) &&
+      marker.parentToolCallId === parentToolCallId
+    ) {
+      return marker;
+    }
+  }
+  return undefined;
+}
+
+function getSubagentHookSessionId(messages: BaseMessage[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const sessionId = messages[i].additional_kwargs[SUBAGENT_HOOK_SESSION_KEY];
+    if (typeof sessionId === 'string' && sessionId.length > 0) {
+      return sessionId;
+    }
+  }
+  return undefined;
+}
+
+function getSubagentRunId(messages: BaseMessage[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const runId = messages[i].additional_kwargs[SUBAGENT_RUN_ID_KEY];
+    if (typeof runId === 'string' && runId.length > 0) {
+      return runId;
+    }
+    const marker =
+      messages[i].additional_kwargs[SUBAGENT_CHECKPOINT_MARKER_KEY];
+    if (
+      isSubagentCheckpointMarker(marker) &&
+      marker.childRunId != null &&
+      marker.childRunId.length > 0
+    ) {
+      return marker.childRunId;
+    }
+  }
+  return undefined;
+}
+
+function isSubagentCheckpointMarkerMessage(message: BaseMessage): boolean {
+  return isSubagentCheckpointMarker(
+    message.additional_kwargs[SUBAGENT_CHECKPOINT_MARKER_KEY]
+  );
+}
+
+function createSubagentCheckpointMarkerMessage(
+  marker: SubagentCheckpointMarker
+): AIMessage {
+  return new AIMessage({
+    content: '',
+    additional_kwargs: { [SUBAGENT_CHECKPOINT_MARKER_KEY]: marker },
+  });
+}
+
+function getCheckpointMessages(value: unknown): BaseMessage[] {
+  return Array.isArray(value) ? value.filter(BaseMessage.isInstance) : [];
+}
+
+function getConfigurableString(
+  config: RunnableConfig | undefined,
+  key: string
+): string | undefined {
+  const value = config?.configurable?.[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function getTupleMessages(tuple: CheckpointTuple | undefined): BaseMessage[] {
+  return getCheckpointMessages(tuple?.checkpoint.channel_values.messages);
+}
+
+function getCheckpointReference(
+  tuple: CheckpointTuple | undefined
+): SubagentCheckpointReference | undefined {
+  const configurable = tuple?.config.configurable;
+  const threadId = configurable?.thread_id;
+  const checkpointId = configurable?.checkpoint_id;
+  const checkpointNs = configurable?.checkpoint_ns ?? '';
+  if (
+    typeof threadId !== 'string' ||
+    threadId.length === 0 ||
+    typeof checkpointId !== 'string' ||
+    checkpointId.length === 0 ||
+    typeof checkpointNs !== 'string'
+  ) {
+    return undefined;
+  }
+  return { threadId, checkpointId, checkpointNs };
+}
+
+function serializeToolOutput(
+  settled: SettledSubagentToolOutput
+): PersistedToolOutput {
+  const { output } = settled;
+  return {
+    content: output.content,
+    toolCallId: output.tool_call_id,
+    ...(output.id == null ? {} : { id: output.id }),
+    ...(output.name == null ? {} : { name: output.name }),
+    ...(output.status == null ? {} : { status: output.status }),
+    additionalKwargs: output.additional_kwargs,
+    responseMetadata: output.response_metadata,
+    ...(output.metadata == null ? {} : { metadata: output.metadata }),
+    additionalContexts: settled.additionalContexts,
+    ...(settled.resolvedArgs == null
+      ? {}
+      : { resolvedArgs: settled.resolvedArgs }),
+    ...(settled.referenceContent == null
+      ? {}
+      : { referenceContent: settled.referenceContent }),
+  };
+}
+
+function deserializeToolOutput(
+  output: PersistedToolOutput
+): SettledSubagentToolOutput {
+  return {
+    output: new ToolMessage({
+      content: output.content,
+      tool_call_id: output.toolCallId,
+      ...(output.id == null ? {} : { id: output.id }),
+      ...(output.name == null ? {} : { name: output.name }),
+      ...(output.status == null ? {} : { status: output.status }),
+      additional_kwargs: output.additionalKwargs,
+      response_metadata: output.responseMetadata,
+      ...(output.metadata == null ? {} : { metadata: output.metadata }),
+    }),
+    additionalContexts: output.additionalContexts,
+    ...(output.resolvedArgs == null
+      ? {}
+      : { resolvedArgs: output.resolvedArgs }),
+    ...(output.referenceContent == null
+      ? {}
+      : { referenceContent: output.referenceContent }),
+  };
+}
+
+function getParentCheckpointFork(
+  configurable: Record<string, unknown> | undefined
+): string {
+  const checkpointId = configurable?.checkpoint_id;
+  return typeof checkpointId === 'string' && checkpointId.length > 0
+    ? checkpointId
+    : 'root';
+}
+
+function getResumeAttemptId(
+  configurable: Record<string, unknown> | undefined,
+  fallback: string
+): string {
+  const attemptId = configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
+  return typeof attemptId === 'string' && attemptId.length > 0
+    ? attemptId
+    : fallback;
+}
+
+function getApprovalExecutionScope(
+  childRunId: string,
+  resumeAttemptId: string
+): string {
+  return `subagent-approval:${Buffer.from(
+    JSON.stringify([childRunId, resumeAttemptId])
+  ).toString('base64url')}`;
+}
+
+function getChildThreadId(args: {
+  parentRunId: string;
+  parentAgentId?: string;
+  threadId?: string;
+  parentToolCallId: string;
+  parentConfigurable?: Record<string, unknown>;
+  branchId?: string;
+}): string {
+  const durableParentId = args.threadId ?? args.parentRunId;
+  const parentFork = getParentCheckpointFork(args.parentConfigurable);
+  const parentBatch =
+    args.parentConfigurable?.[SUBAGENT_PARENT_BATCH_CONFIG_KEY];
+  const identity = [
+    durableParentId,
+    parentFork,
+    args.parentAgentId ?? 'agent',
+    args.parentToolCallId,
+    typeof parentBatch === 'string' && parentBatch.length > 0
+      ? parentBatch
+      : 'batch',
+  ];
+  if (args.branchId != null) {
+    identity.push(args.branchId);
+  }
+  return `subagent:${Buffer.from(JSON.stringify(identity)).toString('base64url')}`;
+}
+
+function isToolApprovalPayload(
+  value: unknown
+): value is ToolApprovalInterruptPayload {
+  return (
+    value != null &&
+    typeof value === 'object' &&
+    (value as { type?: unknown }).type === 'tool_approval'
+  );
+}
+
+function addSubagentScope(
+  interrupts: Interrupt[],
+  scope: NonNullable<ToolApprovalInterruptPayload['subagent']>,
+  resumeManifest?: SubagentResumeManifest
+): Interrupt[] {
+  return interrupts.map((childInterrupt) => {
+    const payload = isToolApprovalPayload(childInterrupt.value)
+      ? {
+        ...childInterrupt.value,
+        subagent: childInterrupt.value.subagent ?? scope,
+      }
+      : childInterrupt.value;
+    return {
+      ...childInterrupt,
+      value:
+        resumeManifest == null
+          ? payload
+          : attachSubagentResumeManifest(payload, resumeManifest),
+    };
+  });
+}
+
+type ToolApprovalResumeValue = ToolApprovalDecision[] | ToolApprovalDecisionMap;
+
+function getChildResumeMap(
+  pendingInterrupts: Interrupt[],
+  parentConfigurable: Record<string, unknown> | undefined
+): Record<string, ToolApprovalResumeValue> | undefined {
+  const resumeMap = parentConfigurable?.[LANGGRAPH_RESUME_MAP_CONFIG_KEY];
+  if (resumeMap == null || typeof resumeMap !== 'object') {
+    return undefined;
+  }
+
+  const parentResumeMap = resumeMap as Record<string, ToolApprovalResumeValue>;
+  const childResumeMap: Record<string, ToolApprovalResumeValue> = {};
+  for (const childInterrupt of pendingInterrupts) {
+    const interruptId = childInterrupt.id;
+    if (
+      typeof interruptId === 'string' &&
+      Object.prototype.hasOwnProperty.call(parentResumeMap, interruptId)
+    ) {
+      childResumeMap[interruptId] = parentResumeMap[interruptId];
+    }
+  }
+  return Object.keys(childResumeMap).length > 0 ? childResumeMap : undefined;
+}
+
+function getPersistedInterrupts(snapshot: StateSnapshot): Interrupt[] {
+  const interrupts: Interrupt[] = [];
+  for (const task of snapshot.tasks) {
+    for (const pendingInterrupt of task.interrupts) {
+      interrupts.push(pendingInterrupt);
+    }
+  }
+  return interrupts;
+}
+
+function getPersistedMessages(
+  snapshot: StateSnapshot
+): BaseMessage[] | undefined {
+  if (snapshot.values == null || typeof snapshot.values !== 'object') {
+    return undefined;
+  }
+  const values = snapshot.values as { messages?: BaseMessage[] };
+  if (!Array.isArray(values.messages) || values.messages.length === 0) {
+    return undefined;
+  }
+  const messages = values.messages.filter(
+    (message) => !isSubagentCheckpointMarkerMessage(message)
+  );
+  return messages.length > 0 ? messages : undefined;
+}
+
+function createReplayCheckpointWorkflow(
+  checkpointer: BaseCheckpointSaver
+): ReplayCheckpointWorkflow {
+  return new StateGraph(MessagesAnnotation)
+    .addNode(SUBAGENT_REPLAY_NODE, (state) => state)
+    .addEdge(START, SUBAGENT_REPLAY_NODE)
+    .addEdge(SUBAGENT_REPLAY_NODE, END)
+    .compile({ checkpointer }) as ReplayCheckpointWorkflow;
+}
 
 export type SubagentExecuteParams = {
   description: string;
@@ -197,11 +682,12 @@ export type SubagentExecuteParams = {
    *
    * Inheritance details (verified empirically against LangGraph):
    *   - host-set keys propagate as-is into the child's tool dispatches;
-   *   - `thread_id` propagates (with `childRunId` as a fallback when
-   *     parent did not supply one) — matches the "subagent is part of
-   *     the same conversation" mental model and aligns with the
-   *     `sessionId: this.parentRunId` convention this executor already
-   *     uses for `SubagentStart` / `SubagentStop` hooks;
+   *   - with nested HITL enabled, `thread_id` is replaced with a stable
+   *     child checkpoint id derived from the parent's durable thread id,
+   *     checkpoint fork, parent agent id, and spawning tool call id so parent
+   *     and child checkpoints cannot collide, sibling parent forks stay
+   *     isolated, and reconstruction returns to the same child checkpoint;
+   *     parent-scoped hook lookup remains keyed by the inherited `run_id`;
    *   - `parent_run_id` propagates when the host put it on parent's
    *     configurable;
    *   - `run_id` is *overwritten by the LangGraph runtime* at child
@@ -261,6 +747,11 @@ export type SubagentExecutorOptions = {
    * revert to the defaults.
    */
   streamLimits?: StandardGraphInput['streamLimits'];
+  humanInTheLoop?: HumanInTheLoopConfig;
+  /** Shared durable saver used to recover outer tool lifecycle results before
+   * parent hooks re-enter after a process rebuild. Narrowed structurally at
+   * construction because graph compile options also permit framework flags. */
+  checkpointer?: unknown;
   /** Remaining nesting budget. 0 or negative blocks execution. */
   maxDepth?: number;
   /**
@@ -310,9 +801,27 @@ export class SubagentExecutor {
   private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
   private readonly streamLimits?: StandardGraphInput['streamLimits'];
+  private readonly humanInTheLoop?: HumanInTheLoopConfig;
+  private readonly checkpointer?: BaseCheckpointSaver;
   private readonly maxDepth: number;
   private readonly createChildGraph: ChildGraphFactory;
   private readonly usageSink?: SubagentUsageSink;
+  private readonly checkpointThreadIds = new Set<string>();
+  private readonly startedChildRuns = new Set<string>();
+  private readonly completedChildRuns = new Set<string>();
+  private readonly completedChildResults = new Map<
+    string,
+    SubagentExecuteResult
+  >();
+  private readonly childExecutionIdentities = new Map<
+    string,
+    Pick<
+      ChildExecutionIdentity,
+      'childRunId' | 'childThreadId' | 'approvalExecutionScope'
+    >
+  >();
+  private readonly activeChildRuns = new Map<string, ActiveChildRun>();
+  private replayCheckpointWorkflow?: ReplayCheckpointWorkflow;
   private readonly resolveParentHandlerRegistry?: () =>
     | HandlerRegistry
     | undefined;
@@ -327,6 +836,10 @@ export class SubagentExecutor {
     this.langfuse = options.langfuse;
     this.tokenCounter = options.tokenCounter;
     this.streamLimits = options.streamLimits;
+    this.humanInTheLoop = options.humanInTheLoop;
+    this.checkpointer = isCheckpointSaver(options.checkpointer)
+      ? options.checkpointer
+      : undefined;
     this.maxDepth = options.maxDepth ?? 1;
     this.createChildGraph = options.createChildGraph;
     this.usageSink = options.usageSink;
@@ -360,6 +873,533 @@ export class SubagentExecutor {
     return this.resolveParentHandlerRegistry?.();
   }
 
+  /**
+   * Keeps the original child thread as an immutable resume source once a
+   * different parent Run reconstructs it. Each rebuilt parent gets a private
+   * checkpoint fork, while the persisted child run ID remains stable for
+   * activity and usage correlation across the interrupt boundary.
+   */
+  private async resolveChildExecutionIdentity(
+    params: ChildExecutionIdentityParams
+  ): Promise<ChildExecutionIdentity> {
+    const currentChildRunId = `${this.parentRunId}_sub_${params.parentToolCallId}`;
+    const resumeAttemptId = getResumeAttemptId(
+      params.parentConfigurable,
+      this.parentRunId
+    );
+    const baseChildThreadId = getChildThreadId({
+      parentRunId: this.parentRunId,
+      parentAgentId: this.parentAgentId,
+      threadId: params.threadId,
+      parentToolCallId: params.parentToolCallId,
+      parentConfigurable: params.parentConfigurable,
+    });
+    if (this.humanInTheLoop?.enabled !== true || this.checkpointer == null) {
+      return {
+        childRunId: currentChildRunId,
+        childThreadId: baseChildThreadId,
+        approvalExecutionScope: currentChildRunId,
+      };
+    }
+
+    const resumeManifest = getSubagentResumeManifest(params.parentConfigurable);
+    const resumeExecution = resumeManifest?.executions.find(
+      (execution) => execution.parentToolCallId === params.parentToolCallId
+    );
+    const branchChildThreadId = getChildThreadId({
+      parentRunId: this.parentRunId,
+      parentAgentId: this.parentAgentId,
+      threadId: params.threadId,
+      parentToolCallId: params.parentToolCallId,
+      parentConfigurable: params.parentConfigurable,
+      branchId: resumeAttemptId,
+    });
+    if (resumeExecution != null) {
+      const approvalExecutionScope = getApprovalExecutionScope(
+        resumeExecution.childRunId,
+        resumeAttemptId
+      );
+      await this.forkCheckpointSnapshot(
+        resumeExecution.checkpoints,
+        branchChildThreadId
+      );
+      this.hookRegistry?.restorePendingToolApprovals(
+        approvalExecutionScope,
+        approvalExecutionScope,
+        resumeExecution.approvalReplays
+      );
+      this.checkpointThreadIds.add(branchChildThreadId);
+      return {
+        childRunId: resumeExecution.childRunId,
+        childThreadId: branchChildThreadId,
+        approvalExecutionScope,
+        resumeExecution,
+      };
+    }
+
+    const branchTuple = await this.checkpointer.getTuple({
+      configurable: { thread_id: branchChildThreadId },
+    });
+    if (branchTuple != null) {
+      const childRunId =
+        getSubagentRunId(getTupleMessages(branchTuple)) ?? currentChildRunId;
+      this.checkpointThreadIds.add(branchChildThreadId);
+      return {
+        childRunId,
+        childThreadId: branchChildThreadId,
+        approvalExecutionScope: getApprovalExecutionScope(
+          childRunId,
+          resumeAttemptId
+        ),
+      };
+    }
+
+    const baseTuple = await this.checkpointer.getTuple({
+      configurable: { thread_id: baseChildThreadId },
+    });
+    const persistedChildRunId = getSubagentRunId(getTupleMessages(baseTuple));
+    if (
+      baseTuple == null ||
+      persistedChildRunId == null ||
+      persistedChildRunId === currentChildRunId
+    ) {
+      this.checkpointThreadIds.add(baseChildThreadId);
+      return {
+        childRunId: persistedChildRunId ?? currentChildRunId,
+        childThreadId: baseChildThreadId,
+        approvalExecutionScope: getApprovalExecutionScope(
+          persistedChildRunId ?? currentChildRunId,
+          resumeAttemptId
+        ),
+      };
+    }
+
+    const sourceCheckpoints =
+      await this.getLatestCheckpointSnapshot(baseChildThreadId);
+    if (sourceCheckpoints.length === 0) {
+      throw new Error(
+        `Cannot fork subagent checkpoint thread "${baseChildThreadId}" without a checkpoint ID.`
+      );
+    }
+    await this.forkCheckpointSnapshot(sourceCheckpoints, branchChildThreadId);
+    this.checkpointThreadIds.add(branchChildThreadId);
+    return {
+      childRunId: persistedChildRunId,
+      childThreadId: branchChildThreadId,
+      approvalExecutionScope: getApprovalExecutionScope(
+        persistedChildRunId,
+        resumeAttemptId
+      ),
+    };
+  }
+
+  /** Captures one exact checkpoint head per namespace for a child thread. */
+  private async getLatestCheckpointSnapshot(
+    threadId: string
+  ): Promise<SubagentCheckpointReference[]> {
+    if (this.checkpointer == null) {
+      return [];
+    }
+    const checkpointsByNamespace = new Map<
+      string,
+      SubagentCheckpointReference
+    >();
+    for await (const tuple of this.checkpointer.list({
+      configurable: { thread_id: threadId },
+    })) {
+      const checkpoint = getCheckpointReference(tuple);
+      const current =
+        checkpoint == null
+          ? undefined
+          : checkpointsByNamespace.get(checkpoint.checkpointNs);
+      if (
+        checkpoint != null &&
+        (current == null ||
+          checkpoint.checkpointId.localeCompare(current.checkpointId) > 0)
+      ) {
+        checkpointsByNamespace.set(checkpoint.checkpointNs, checkpoint);
+      }
+    }
+    return [...checkpointsByNamespace.values()].sort((left, right) =>
+      left.checkpointNs.localeCompare(right.checkpointNs)
+    );
+  }
+
+  /** Copies exact checkpoint lineages, including pending task writes. */
+  private async forkCheckpointSnapshot(
+    sources: ReadonlyArray<SubagentCheckpointReference>,
+    targetThreadId: string
+  ): Promise<void> {
+    if (
+      this.checkpointer == null ||
+      sources.length === 0 ||
+      sources.every((source) => source.threadId === targetThreadId)
+    ) {
+      return;
+    }
+    for (const source of sources) {
+      const tuples: CheckpointTuple[] = [];
+      const visited = new Set<string>();
+      let tuple = await this.checkpointer.getTuple({
+        configurable: {
+          thread_id: source.threadId,
+          checkpoint_ns: source.checkpointNs,
+          checkpoint_id: source.checkpointId,
+        },
+      });
+      if (tuple == null) {
+        throw new Error(
+          `Subagent checkpoint "${source.checkpointId}" is unavailable.`
+        );
+      }
+      for (;;) {
+        const reference = getCheckpointReference(tuple);
+        if (reference == null) {
+          throw new Error(
+            'Subagent checkpoint lineage contains an invalid tuple.'
+          );
+        }
+        if (
+          reference.threadId !== source.threadId ||
+          reference.checkpointNs !== source.checkpointNs
+        ) {
+          throw new Error(
+            'Subagent checkpoint lineage escapes its source namespace.'
+          );
+        }
+        const lineageKey = JSON.stringify([
+          reference.threadId,
+          reference.checkpointNs,
+          reference.checkpointId,
+        ]);
+        if (visited.has(lineageKey)) {
+          throw new Error('Subagent checkpoint lineage contains a cycle.');
+        }
+        visited.add(lineageKey);
+        tuples.push(tuple);
+        if (tuple.parentConfig == null) {
+          break;
+        }
+        tuple = await this.checkpointer.getTuple(tuple.parentConfig);
+        if (tuple == null) {
+          throw new Error('Subagent checkpoint lineage is incomplete.');
+        }
+      }
+      tuples.reverse();
+
+      for (const lineageTuple of tuples) {
+        const checkpointNs =
+          getConfigurableString(lineageTuple.config, 'checkpoint_ns') ?? '';
+        const parentCheckpointId = getConfigurableString(
+          lineageTuple.parentConfig,
+          'checkpoint_id'
+        );
+        const storedConfig = await this.checkpointer.put(
+          {
+            configurable: {
+              thread_id: targetThreadId,
+              checkpoint_ns: checkpointNs,
+              ...(parentCheckpointId == null
+                ? {}
+                : { checkpoint_id: parentCheckpointId }),
+            },
+          },
+          copyCheckpoint(lineageTuple.checkpoint),
+          lineageTuple.metadata ?? {
+            source: 'fork',
+            step: -1,
+            parents: {},
+          },
+          lineageTuple.checkpoint.channel_versions
+        );
+        const writesByTask = new Map<string, Array<[string, unknown]>>();
+        for (const [taskId, channel, value] of lineageTuple.pendingWrites ??
+          []) {
+          let writes = writesByTask.get(taskId);
+          if (writes == null) {
+            writes = [];
+            writesByTask.set(taskId, writes);
+          }
+          writes.push([channel, value]);
+        }
+        for (const [taskId, writes] of writesByTask) {
+          await this.checkpointer.putWrites(storedConfig, writes, taskId);
+        }
+      }
+    }
+  }
+
+  private async createResumeManifest(
+    parentToolCallIds?: ReadonlySet<string>
+  ): Promise<SubagentResumeManifest | undefined> {
+    if (this.checkpointer == null) {
+      return undefined;
+    }
+    const executions: SubagentResumeExecution[] = [];
+    for (const [parentToolCallId, identity] of this.childExecutionIdentities) {
+      if (
+        parentToolCallIds != null &&
+        !parentToolCallIds.has(parentToolCallId)
+      ) {
+        continue;
+      }
+      const checkpoints = await this.getLatestCheckpointSnapshot(
+        identity.childThreadId
+      );
+      if (checkpoints.length === 0) {
+        continue;
+      }
+      const activeChildRun = this.activeChildRuns.get(identity.childThreadId);
+      const configuredHookSessionId =
+        activeChildRun?.invokeConfig?.configurable?.run_id;
+      const hookSessionId =
+        typeof configuredHookSessionId === 'string' &&
+        configuredHookSessionId.length > 0
+          ? configuredHookSessionId
+          : this.parentRunId;
+      const approvalReplays =
+        this.hookRegistry?.snapshotPendingToolApprovals(
+          identity.approvalExecutionScope,
+          identity.approvalExecutionScope
+        ) ?? [];
+      const descendant = activeChildRun?.pendingInterrupts
+        .map((pendingInterrupt) =>
+          getSubagentResumeManifest(pendingInterrupt.value)
+        )
+        .find((manifest) => manifest != null);
+      const graphState = activeChildRun?.graph.createSubagentResumeState(
+        hookSessionId
+      ) ?? {
+        toolCallSteps: [],
+        toolSessions: [],
+        toolNodes: [],
+        eagerToolUsage: [],
+        eagerToolSuppressions: [],
+      };
+      executions.push({
+        parentToolCallId,
+        childRunId: identity.childRunId,
+        approvalExecutionScope: identity.approvalExecutionScope,
+        checkpoints,
+        graphState,
+        approvalReplays,
+        ...(descendant == null ? {} : { descendant }),
+      });
+    }
+    if (executions.length === 0) {
+      return undefined;
+    }
+    return {
+      version: 1,
+      executions,
+    };
+  }
+
+  getResumeManifest(
+    parentToolCallIds?: ReadonlySet<string>
+  ): Promise<SubagentResumeManifest | undefined> {
+    return this.createResumeManifest(parentToolCallIds);
+  }
+
+  getChildCheckpointThreadIds(): string[] {
+    const threadIds = new Set(this.checkpointThreadIds);
+    for (const activeChildRun of this.activeChildRuns.values()) {
+      for (const threadId of this.getGraphChildCheckpointThreadIds(
+        activeChildRun.graph
+      )) {
+        threadIds.add(threadId);
+      }
+    }
+    return [...threadIds];
+  }
+
+  resetCheckpointThreadIds(): void {
+    this.checkpointThreadIds.clear();
+  }
+
+  private getGraphChildCheckpointThreadIds(graph: StandardGraph): string[] {
+    const checkpointGraph = graph as {
+      getChildCheckpointThreadIds?: () => string[];
+    };
+    return checkpointGraph.getChildCheckpointThreadIds?.() ?? [];
+  }
+
+  private clearChildGraph(graph: StandardGraph): void {
+    for (const threadId of this.getGraphChildCheckpointThreadIds(graph)) {
+      this.checkpointThreadIds.add(threadId);
+    }
+    graph.clearHeavyState();
+  }
+
+  clearHeavyState(): void {
+    for (const activeChildRun of this.activeChildRuns.values()) {
+      this.clearChildGraph(activeChildRun.graph);
+    }
+    this.activeChildRuns.clear();
+    this.completedChildResults.clear();
+    for (const identity of this.childExecutionIdentities.values()) {
+      this.hookRegistry?.clearSession(identity.approvalExecutionScope);
+    }
+    this.childExecutionIdentities.clear();
+    this.startedChildRuns.clear();
+    this.completedChildRuns.clear();
+    this.replayCheckpointWorkflow = undefined;
+  }
+
+  async getSettledToolOutput(
+    call: ToolCall,
+    config: RunnableConfig
+  ): Promise<SettledSubagentToolOutput | undefined> {
+    const parentToolCallId = call.id;
+    if (
+      this.humanInTheLoop?.enabled !== true ||
+      this.checkpointer == null ||
+      parentToolCallId == null ||
+      parentToolCallId === ''
+    ) {
+      return undefined;
+    }
+    const parentConfigurable = config.configurable as
+      | Record<string, unknown>
+      | undefined;
+    const threadId = parentConfigurable?.thread_id;
+    const { childRunId, childThreadId, approvalExecutionScope } =
+      await this.resolveChildExecutionIdentity({
+        threadId: typeof threadId === 'string' ? threadId : undefined,
+        parentToolCallId,
+        parentConfigurable,
+      });
+    this.childExecutionIdentities.set(parentToolCallId, {
+      childRunId,
+      childThreadId,
+      approvalExecutionScope,
+    });
+    this.checkpointThreadIds.add(childThreadId);
+    const checkpoint = await this.checkpointer.getTuple({
+      configurable: { thread_id: childThreadId },
+    });
+    const messages = getCheckpointMessages(
+      checkpoint?.checkpoint.channel_values.messages
+    );
+    const marker = getSubagentCheckpointMarker(messages, parentToolCallId);
+    const persistedHookSessionId =
+      marker?.hookSessionId ?? getSubagentHookSessionId(messages);
+    const currentHookSessionId = parentConfigurable?.run_id;
+    if (
+      persistedHookSessionId != null &&
+      typeof currentHookSessionId === 'string' &&
+      currentHookSessionId.length > 0
+    ) {
+      this.hookRegistry?.copySession(
+        persistedHookSessionId,
+        currentHookSessionId
+      );
+    }
+    return marker?.settledOutput == null
+      ? undefined
+      : deserializeToolOutput(marker.settledOutput);
+  }
+
+  async persistSettledToolOutput(
+    call: ToolCall,
+    config: RunnableConfig,
+    settled: SettledSubagentToolOutput
+  ): Promise<void> {
+    const parentToolCallId = call.id;
+    if (
+      this.humanInTheLoop?.enabled !== true ||
+      this.checkpointer == null ||
+      parentToolCallId == null ||
+      parentToolCallId === ''
+    ) {
+      return;
+    }
+    const parentConfigurable = config.configurable as
+      | Record<string, unknown>
+      | undefined;
+    const threadId = parentConfigurable?.thread_id;
+    const { childRunId, childThreadId, approvalExecutionScope } =
+      await this.resolveChildExecutionIdentity({
+        threadId: typeof threadId === 'string' ? threadId : undefined,
+        parentToolCallId,
+        parentConfigurable,
+      });
+    this.childExecutionIdentities.set(parentToolCallId, {
+      childRunId,
+      childThreadId,
+      approvalExecutionScope,
+    });
+    this.checkpointThreadIds.add(childThreadId);
+    const activeChildRun = this.activeChildRuns.get(childThreadId);
+    const persistedOutput = serializeToolOutput(settled);
+    if (activeChildRun != null) {
+      await this.persistChildCheckpointMarker(
+        activeChildRun,
+        parentToolCallId,
+        persistedOutput
+      );
+      this.clearChildGraph(activeChildRun.graph);
+      this.activeChildRuns.delete(childThreadId);
+      return;
+    }
+    this.replayCheckpointWorkflow ??= createReplayCheckpointWorkflow(
+      this.checkpointer
+    );
+    await this.replayCheckpointWorkflow.updateState(
+      { configurable: { thread_id: childThreadId } },
+      {
+        messages: [
+          createSubagentCheckpointMarkerMessage({
+            version: 1,
+            parentToolCallId,
+            lifecycleComplete: true,
+            hookSessionId:
+              typeof parentConfigurable?.run_id === 'string'
+                ? parentConfigurable.run_id
+                : this.parentRunId,
+            childRunId,
+            settledOutput: persistedOutput,
+          }),
+        ],
+      },
+      SUBAGENT_REPLAY_NODE
+    );
+  }
+
+  private async persistChildCheckpointMarker(
+    activeChildRun: ActiveChildRun,
+    parentToolCallId: string,
+    settledOutput?: PersistedToolOutput
+  ): Promise<void> {
+    if (
+      this.humanInTheLoop?.enabled !== true ||
+      activeChildRun.workflow.updateState == null ||
+      activeChildRun.invokeConfig == null
+    ) {
+      return;
+    }
+    await activeChildRun.workflow.updateState(
+      activeChildRun.invokeConfig,
+      {
+        messages: [
+          createSubagentCheckpointMarkerMessage({
+            version: 1,
+            parentToolCallId,
+            lifecycleComplete: true,
+            hookSessionId:
+              typeof activeChildRun.invokeConfig.configurable?.run_id ===
+              'string'
+                ? activeChildRun.invokeConfig.configurable.run_id
+                : this.parentRunId,
+            childRunId: activeChildRun.childRunId,
+            ...(settledOutput == null ? {} : { settledOutput }),
+          }),
+        ],
+      },
+      activeChildRun.childAgentId
+    );
+  }
+
   async execute(params: SubagentExecuteParams): Promise<SubagentExecuteResult> {
     const { description, subagentType, threadId, parentToolCallId } = params;
     /** Captured ONCE per execution, preferring the controller the parent
@@ -388,39 +1428,41 @@ export class SubagentExecutor {
       };
     }
 
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      (parentToolCallId == null || parentToolCallId === '')
+    ) {
+      return {
+        content:
+          'Error: Resumable subagent execution requires a parent tool call ID.',
+        messages: [],
+      };
+    }
+
+    const executionSuffix = parentToolCallId ?? nanoid(8);
+    const {
+      childRunId,
+      childThreadId,
+      approvalExecutionScope,
+      resumeExecution,
+    } = await this.resolveChildExecutionIdentity({
+      threadId,
+      parentToolCallId: executionSuffix,
+      parentConfigurable: params.parentConfigurable,
+    });
+    this.childExecutionIdentities.set(executionSuffix, {
+      childRunId,
+      childThreadId,
+      approvalExecutionScope,
+    });
+    const childExecutionKey = childThreadId;
     const childAgentId =
       config.agentInputs.agentId ||
-      `${this.parentAgentId ?? 'agent'}_sub_${nanoid(8)}`;
-
-    if (
-      this.hookRegistry?.hasHookFor('SubagentStart', this.parentRunId) === true
-    ) {
-      const hookResult = await executeHooks({
-        registry: this.hookRegistry,
-        input: {
-          hook_event_name: 'SubagentStart',
-          runId: this.parentRunId,
-          threadId,
-          parentAgentId: this.parentAgentId,
-          agentId: childAgentId,
-          agentType: subagentType,
-          inputs: [new HumanMessage(description)],
-        },
-        sessionId: this.parentRunId,
-        matchQuery: subagentType,
-      }).catch((): AggregatedHookResult => HOOK_FALLBACK);
-
-      /**
-       * `ask` is treated identically to `deny` in the subagent context:
-       * subagents are non-interactive, so there is no prompt path for `ask`.
-       * Both decisions block execution and return a "Blocked" tool result.
-       */
-      if (hookResult.decision === 'deny' || hookResult.decision === 'ask') {
-        return {
-          content: `Blocked: ${hookResult.reason ?? 'Blocked by hook'}`,
-          messages: [],
-        };
-      }
+      `${this.parentAgentId ?? 'agent'}_sub_${executionSuffix}`;
+    const completedChildResult =
+      this.completedChildResults.get(childExecutionKey);
+    if (completedChildResult != null) {
+      return completedChildResult;
     }
 
     const parentRegistry = this.getParentHandlerRegistry();
@@ -442,42 +1484,43 @@ export class SubagentExecutor {
       this.maxDepth,
       /* keepToolDefinitions */ hasToolExecuteHandler
     );
-    const childRunId = `${this.parentRunId}_sub_${nanoid(8)}`;
     const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
 
     const hostUsageSink = this.usageSink;
-    const childGraph = this.createChildGraph({
-      runId: childRunId,
-      signal: childSignal,
-      agents: [childInputs],
-      langfuse: this.langfuse,
-      tokenCounter: this.tokenCounter,
-      streamLimits: this.streamLimits,
-      subagentScope: true,
-      /**
-       * Forwarded so the child graph's own `SubagentExecutor` (created in
-       * its `createAgentNode` when `allowNested` keeps subagentConfigs)
-       * reports nested-child usage through the same host sink. Each nesting
-       * level attaches its own capture callback — `workflow.invoke` replaces
-       * the inherited callback chain, so a single top-level handler would
-       * never see grandchild model calls.
-       *
-       * The wrapper rewrites `runId` to THIS executor's parent run: nested
-       * executors emit with their own `parentRunId` (a `*_sub_*` child id),
-       * and each wrapper layer rewrites upward, so by the time an event
-       * reaches the host sink its `runId` is the ROOT run — hosts keying
-       * billing by run id never see intermediate child run ids there
-       * (`subagentRunId` still identifies the emitting child).
-       */
-      subagentUsageSink:
-        hostUsageSink == null
-          ? undefined
-          : /** Returns the host sink's result so async sinks stay awaited
-             *  through every wrapper layer. */
-          (event): void | Promise<void> =>
-            hostUsageSink({ ...event, runId: this.parentRunId }),
-    });
-
+    const cachedChildRun = this.activeChildRuns.get(childExecutionKey);
+    const childGraph =
+      cachedChildRun?.graph ??
+      this.createChildGraph({
+        runId: childRunId,
+        signal: childSignal,
+        agents: [childInputs],
+        langfuse: this.langfuse,
+        tokenCounter: this.tokenCounter,
+        streamLimits: this.streamLimits,
+        subagentScope: true,
+        /**
+         * Forwarded so the child graph's own `SubagentExecutor` (created in
+         * its `createAgentNode` when `allowNested` keeps subagentConfigs)
+         * reports nested-child usage through the same host sink. Each nesting
+         * level attaches its own capture callback — `workflow.invoke` replaces
+         * the inherited callback chain, so a single top-level handler would
+         * never see grandchild model calls.
+         *
+         * The wrapper rewrites `runId` to THIS executor's parent run: nested
+         * executors emit with their own `parentRunId` (a `*_sub_*` child id),
+         * and each wrapper layer rewrites upward, so by the time an event
+         * reaches the host sink its `runId` is the ROOT run — hosts keying
+         * billing by run id never see intermediate child run ids there
+         * (`subagentRunId` still identifies the emitting child).
+         */
+        subagentUsageSink:
+          hostUsageSink == null
+            ? undefined
+            : /** Returns the host sink's result so async sinks stay awaited
+               *  through every wrapper layer. */
+            (event): void | Promise<void> =>
+              hostUsageSink({ ...event, runId: this.parentRunId }),
+      });
     let forwarding: ForwarderCallback | undefined;
     if (forwardingEnabled) {
       forwarding = this.createForwarderCallback({
@@ -489,21 +1532,25 @@ export class SubagentExecutor {
       });
     }
     const forwarder = forwarding?.handler;
+    let childAlreadyStarted = this.startedChildRuns.has(childExecutionKey);
+    let childAlreadyCompleted = this.completedChildRuns.has(childExecutionKey);
 
-    if (forwarder) {
-      await this.emitSubagentUpdate(parentRegistry!, {
-        childRunId,
-        subagentType,
-        subagentAgentId: childAgentId,
-        parentToolCallId,
-        phase: 'start',
-        label: `Subagent "${subagentType}" started`,
-      });
-    }
-
-    let result: { messages: BaseMessage[] };
+    let result: { messages: BaseMessage[] } | undefined;
+    let recoveredComplete = false;
+    let recoveredInProgress = false;
     try {
-      const workflow = childGraph.createWorkflow();
+      const workflow = (cachedChildRun?.workflow ??
+        childGraph.createWorkflow()) as StatefulCompiledWorkflow;
+      const activeChildRun = cachedChildRun ?? {
+        graph: childGraph,
+        workflow,
+        pendingInterrupts: [],
+        childAgentId,
+        childRunId,
+      };
+      if (cachedChildRun == null) {
+        this.activeChildRuns.set(childExecutionKey, activeChildRun);
+      }
       /**
        * When `parentHandlerRegistry` is provided (forwarding mode), attach a
        * lightweight callback that intercepts the child's `on_custom_event`
@@ -547,50 +1594,219 @@ export class SubagentExecutor {
       }
       const callbacks: Callbacks = callbackHandlers;
       /**
-       * Inherit the parent's host `configurable` — host-set fields
-       * (`requestBody`, `user`, `userMCPAuthMap`, etc.) AND the run-
-       * identity fields (`run_id`, `parent_run_id`, `thread_id`) all
-       * propagate. LangGraph's own runtime keys are excluded because the
-       * child graph creates its own scratchpad/checkpoint/abort plumbing.
+       * Inherit the parent's host `configurable` while binding LangGraph's
+       * checkpoint identity to a stable child id derived from the durable
+       * parent thread and checkpoint fork. The parent thread id cannot be
+       * reused here: parent and child share one checkpointer when nested HITL
+       * is enabled, and root checkpoint namespaces are normalized by
+       * LangGraph, so a shared `thread_id` would collide with the parent.
        *
-       * Run-identity propagation is intentional and matches the
-       * convention this executor itself already uses for `SubagentStart`
-       * / `SubagentStop` hooks (`sessionId: this.parentRunId`): the
-       * subagent runs under the parent's session scope, not its own.
-       * Forwarding `run_id` / `parent_run_id` / `thread_id` makes
-       * `ToolNode`'s hook lookups (`hasHookFor(eventName, runId)`),
-       * `ToolOutputReferenceRegistry` keying, and trace lineage all
-       * resolve to the parent's session for tools dispatched from the
-       * subagent — so `PreToolUse` / `PostToolUse` hooks the host
-       * registered against the parent's run fire for subagent tool
-       * calls too. "Same run" matches the user-perceptual mental model.
-       *
-       * `thread_id` falls back to `childRunId` only when the parent
-       * didn't supply one (legacy behavior preserved for hosts that
-       * never set thread_id).
-       *
-       * NOTE: a future revision will likely make this configurable per
-       * spawn type — e.g. a background / async subagent that runs after
-       * the parent's run completes wants isolation, not inheritance.
-       * For now the inheritance path matches LibreChat's primary use
-       * case (synchronous subagents within a single user turn).
+       * `run_id` still propagates as the parent run id, which is the key used
+       * for session-scoped hook lookup. Child hook inputs therefore retain
+       * the parent policy scope while their `threadId` truthfully identifies
+       * the independently checkpointed child execution.
        */
       const inheritedConfigurable: Record<string, unknown> =
         sanitizeChildConfigurable(params.parentConfigurable);
-      result = await workflow.invoke(
-        { messages: [new HumanMessage(description)] },
-        {
-          recursionLimit: maxTurns * RECURSION_MULTIPLIER,
-          signal: childSignal,
-          callbacks,
-          runName: `subagent:${subagentType}`,
-          configurable: {
-            thread_id: childRunId,
-            ...inheritedConfigurable,
-          },
-        }
+      const resumeAttemptId = getResumeAttemptId(
+        params.parentConfigurable,
+        this.parentRunId
       );
+      const currentHookSessionId =
+        typeof inheritedConfigurable.run_id === 'string' &&
+        inheritedConfigurable.run_id.length > 0
+          ? inheritedConfigurable.run_id
+          : this.parentRunId;
+      if (cachedChildRun == null && resumeExecution != null) {
+        childGraph.restoreSubagentResumeState(
+          resumeExecution.graphState,
+          currentHookSessionId
+        );
+      }
+      const childInvokeConfig = {
+        recursionLimit: maxTurns * RECURSION_MULTIPLIER,
+        signal: childSignal,
+        callbacks,
+        runName: `subagent:${subagentType}`,
+        configurable: {
+          ...inheritedConfigurable,
+          ...(this.humanInTheLoop?.enabled === true
+            ? {
+              [TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY]:
+                  approvalExecutionScope,
+            }
+            : {}),
+          ...(resumeExecution?.descendant == null
+            ? {}
+            : {
+              [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]:
+                  resumeExecution.descendant,
+              [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: resumeAttemptId,
+            }),
+          thread_id:
+            this.humanInTheLoop?.enabled === true
+              ? childThreadId
+              : (inheritedConfigurable.thread_id ?? childRunId),
+        },
+      };
+      activeChildRun.invokeConfig = childInvokeConfig;
+      if (cachedChildRun == null && this.humanInTheLoop?.enabled === true) {
+        /** Rehydrate child-owned interrupt state when a host rebuilds Run
+         * around the same durable checkpointer after a process boundary. */
+        const persistedState = await workflow.getState(childInvokeConfig);
+        const checkpointMessages = getCheckpointMessages(
+          (persistedState.values as { messages?: unknown } | undefined)
+            ?.messages
+        );
+        const persistedHookSessionId =
+          getSubagentHookSessionId(checkpointMessages);
+        if (persistedHookSessionId != null) {
+          this.hookRegistry?.copySession(
+            persistedHookSessionId,
+            currentHookSessionId
+          );
+        }
+        const persistedInterrupts = getPersistedInterrupts(persistedState);
+        if (persistedInterrupts.length > 0) {
+          activeChildRun.pendingInterrupts = persistedInterrupts;
+          this.startedChildRuns.add(childExecutionKey);
+          childAlreadyStarted = true;
+        } else if (persistedState.next.length > 0) {
+          recoveredInProgress = true;
+          childAlreadyStarted = true;
+          this.startedChildRuns.add(childExecutionKey);
+        } else if (persistedState.next.length === 0) {
+          const persistedMessages = getPersistedMessages(persistedState);
+          if (persistedMessages != null) {
+            const marker = getSubagentCheckpointMarker(
+              checkpointMessages,
+              executionSuffix
+            );
+            result = { messages: persistedMessages };
+            recoveredComplete = true;
+            childAlreadyStarted = true;
+            childAlreadyCompleted = marker?.lifecycleComplete === true;
+            this.startedChildRuns.add(childExecutionKey);
+          }
+        }
+      }
+      if (!recoveredComplete) {
+        const childResumeMap = getChildResumeMap(
+          activeChildRun.pendingInterrupts,
+          params.parentConfigurable
+        );
+        if (
+          activeChildRun.pendingInterrupts.length > 0 &&
+          childResumeMap == null
+        ) {
+          throw new GraphInterrupt(activeChildRun.pendingInterrupts);
+        }
+        let childInput: BaseGraphState | Command | null;
+        if (childResumeMap != null) {
+          childInput = new Command({ resume: childResumeMap });
+        } else if (recoveredInProgress) {
+          childInput = null;
+        } else {
+          childInput = {
+            messages: [
+              new HumanMessage({
+                content: description,
+                additional_kwargs: {
+                  [SUBAGENT_HOOK_SESSION_KEY]: currentHookSessionId,
+                  [SUBAGENT_RUN_ID_KEY]: childRunId,
+                },
+              }),
+            ],
+          };
+        }
+
+        if (
+          !childAlreadyStarted &&
+          this.hookRegistry?.hasHookFor('SubagentStart', this.parentRunId) ===
+            true
+        ) {
+          const hookResult = await executeHooks({
+            registry: this.hookRegistry,
+            input: {
+              hook_event_name: 'SubagentStart',
+              runId: this.parentRunId,
+              threadId,
+              parentAgentId: this.parentAgentId,
+              agentId: childAgentId,
+              agentType: subagentType,
+              inputs: [new HumanMessage(description)],
+            },
+            sessionId: this.parentRunId,
+            matchQuery: subagentType,
+          }).catch((): AggregatedHookResult => HOOK_FALLBACK);
+
+          if (hookResult.decision === 'deny' || hookResult.decision === 'ask') {
+            this.clearChildGraph(childGraph);
+            this.activeChildRuns.delete(childExecutionKey);
+            return {
+              content: `Blocked: ${hookResult.reason ?? 'Blocked by hook'}`,
+              messages: [],
+            };
+          }
+        }
+        this.startedChildRuns.add(childExecutionKey);
+
+        if (forwarder && !childAlreadyStarted) {
+          await this.emitSubagentUpdate(parentRegistry!, {
+            childRunId,
+            subagentType,
+            subagentAgentId: childAgentId,
+            parentToolCallId,
+            phase: 'start',
+            label: `Subagent "${subagentType}" started`,
+          });
+        }
+
+        let childResult: BaseGraphState;
+        if (this.humanInTheLoop?.enabled === true) {
+          /** Execute as an independently checkpointed root instead of inheriting
+           * the parent's Pregel namespace. Parent decisions are routed explicitly
+           * by interrupt id, so concurrent children keep isolated resume state. */
+          childResult = await AsyncLocalStorageProviderSingleton.runWithConfig(
+            childInvokeConfig,
+            (): Promise<BaseGraphState> =>
+              workflow.invoke(childInput, childInvokeConfig)
+          );
+        } else {
+          childResult = await workflow.invoke(childInput, childInvokeConfig);
+        }
+        const childInterrupts = isInterrupted(childResult)
+          ? childResult[INTERRUPT]
+          : undefined;
+        if (childInterrupts != null && childInterrupts.length > 0) {
+          throw new GraphInterrupt(childInterrupts);
+        }
+        result = { messages: childResult.messages };
+      }
     } catch (error) {
+      if (isGraphInterrupt(error)) {
+        const activeChildRun = this.activeChildRuns.get(childExecutionKey);
+        if (activeChildRun != null) {
+          activeChildRun.pendingInterrupts = error.interrupts;
+        }
+        const resumeManifest =
+          activeChildRun == null || parentToolCallId == null
+            ? undefined
+            : await this.createResumeManifest();
+        await forwarding?.drain();
+        throw new GraphInterrupt(
+          addSubagentScope(
+            error.interrupts,
+            {
+              run_id: childRunId,
+              agent_id: childAgentId,
+              subagent_type: subagentType,
+              parent_tool_call_id: parentToolCallId,
+            },
+            resumeManifest
+          )
+        );
+      }
       /** Aborted before any observational work below: parallel siblings — in
        * this executor and, via the graph-scoped breaker, under other
        * parallel agent nodes — stream on the composed child signal, and
@@ -614,7 +1830,8 @@ export class SubagentExecutor {
           data: { message: errorMessage },
         });
       }
-      childGraph.clearHeavyState();
+      this.clearChildGraph(childGraph);
+      this.activeChildRuns.delete(childExecutionKey);
       /**
        * A tripped stream circuit breaker is a safety abort, not a recoverable
        * subagent failure: converting it into a tool result would let the
@@ -631,9 +1848,13 @@ export class SubagentExecutor {
       };
     }
 
+    if (result == null) {
+      throw new Error('Subagent completed without producing graph state.');
+    }
     const filteredContent = filterSubagentResult(result.messages);
 
     if (
+      !childAlreadyCompleted &&
       this.hookRegistry?.hasHookFor('SubagentStop', this.parentRunId) === true
     ) {
       /**
@@ -659,7 +1880,7 @@ export class SubagentExecutor {
       });
     }
 
-    if (forwarding) {
+    if (forwarding && !childAlreadyCompleted) {
       await forwarding.drain();
       await this.emitSubagentUpdate(parentRegistry!, {
         childRunId,
@@ -670,10 +1891,25 @@ export class SubagentExecutor {
         label: `Subagent "${subagentType}" finished`,
       });
     }
+    if (!childAlreadyCompleted) {
+      const activeChildRun = this.activeChildRuns.get(childExecutionKey);
+      if (activeChildRun != null && parentToolCallId != null) {
+        await this.persistChildCheckpointMarker(
+          activeChildRun,
+          parentToolCallId
+        );
+      }
+    }
+    this.completedChildRuns.add(childExecutionKey);
 
-    childGraph.clearHeavyState();
+    this.clearChildGraph(childGraph);
 
-    return { content: filteredContent, messages: result.messages };
+    const completedResult = {
+      content: filteredContent,
+      messages: result.messages,
+    };
+    this.completedChildResults.set(childExecutionKey, completedResult);
+    return completedResult;
   }
 
   /**
@@ -1057,6 +2293,9 @@ function isLangGraphRuntimeConfigKey(key: string): boolean {
   return (
     key.startsWith(LANGGRAPH_RUNTIME_CONFIG_PREFIX) ||
     LANGGRAPH_CHECKPOINT_CONFIG_KEYS.has(key) ||
+    key === SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY ||
+    key === SUBAGENT_RESUME_MANIFEST_CONFIG_KEY ||
+    key === SUBAGENT_PARENT_BATCH_CONFIG_KEY ||
     /** The parent batch's breaker scope must not leak into the child
      * workflow's configurable — children own separate controllers. */
     key === RUN_BREAKER_SCOPE_CONFIG_KEY
@@ -1587,11 +2826,10 @@ export function buildChildInputs(
      * Host-supplied direct tools are scrubbed from INHERITED configs only.
      * A self-spawn config's `agentInputs` is a shallow spread of the parent's
      * `_sourceInputs`, so without this a parent-scoped graph tool (e.g. an
-     * interrupt-raising ask_user_question, which needs the parent's
-     * checkpointer — child graphs compile without one) would silently leak
-     * into the child and deterministically throw `No checkpointer set`. An
-     * EXPLICIT child config that lists its own `graphTools` is a deliberate
-     * host choice and keeps them (Codex #289 P2).
+     * interrupt-raising ask_user_question) would silently become available to
+     * the child. An EXPLICIT child config that lists its own `graphTools` is a
+     * deliberate host choice and keeps them (Codex #289 P2); with HITL enabled,
+     * those tools use the shared checkpointer and can pause and resume safely.
      */
     graphTools: config.self === true ? undefined : agentInputs.graphTools,
   };

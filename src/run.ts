@@ -4,21 +4,28 @@ import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import {
+  BaseMessage,
+  HumanMessage,
+  SystemMessage,
+} from '@langchain/core/messages';
 import {
   Command,
   INTERRUPT,
   MemorySaver,
   isInterrupted,
 } from '@langchain/langgraph';
-import type {
-  MessageContentComplex,
-  BaseMessage,
-} from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
+import type { MessageContentComplex } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
+import {
+  requireValidSubagentResumeManifest,
+  stripSubagentResumeManifest,
+  SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
+  SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
+} from '@/tools/subagent/SubagentReplay';
 import {
   createLangfuseTraceMetadata,
   createLangfuseHandler,
@@ -121,18 +128,82 @@ function isLangGraphResumeMapForInterrupt(
   return Object.prototype.hasOwnProperty.call(value, interruptId);
 }
 
+function getInterruptHookSessionId(payload: unknown): string | undefined {
+  const publicPayload = stripSubagentResumeManifest(payload);
+  if (
+    publicPayload == null ||
+    typeof publicPayload !== 'object' ||
+    (publicPayload as { type?: unknown }).type !== 'tool_approval'
+  ) {
+    return undefined;
+  }
+  const sessionId = (publicPayload as { hook_session_id?: unknown })
+    .hook_session_id;
+  return typeof sessionId === 'string' && sessionId.length > 0
+    ? sessionId
+    : undefined;
+}
+
 type InterruptStateSnapshot = {
   config?: RunnableConfig;
+  values?: { messages?: BaseMessage[] };
   tasks?: Array<{
-    interrupts?: Array<{ id?: string }>;
+    interrupts?: Array<{ id?: string; value?: unknown }>;
   }>;
 };
 
 type WorkflowWithStateHistory = {
+  getState?(config: RunnableConfig): Promise<InterruptStateSnapshot>;
   getStateHistory?(
     config: RunnableConfig
   ): AsyncIterableIterator<InterruptStateSnapshot>;
 };
+
+function getFirstPersistedInterrupt(
+  snapshot: InterruptStateSnapshot
+): { id: string; value: unknown } | undefined {
+  for (const task of snapshot.tasks ?? []) {
+    for (const pendingInterrupt of task.interrupts ?? []) {
+      if (
+        typeof pendingInterrupt.id === 'string' &&
+        pendingInterrupt.id.length > 0
+      ) {
+        return { id: pendingInterrupt.id, value: pendingInterrupt.value };
+      }
+    }
+  }
+  return undefined;
+}
+
+function getPersistedMessages(
+  snapshot: InterruptStateSnapshot
+): BaseMessage[] | undefined {
+  const messages = snapshot.values?.messages;
+  if (!Array.isArray(messages) || !messages.every(BaseMessage.isInstance)) {
+    return undefined;
+  }
+  return messages;
+}
+
+type ResumeCommandUpdate = ConstructorParameters<typeof Command>[0]['update'];
+
+function getResumeUpdateMessages(
+  update: ResumeCommandUpdate
+): BaseMessage[] | undefined {
+  if (update == null) {
+    return undefined;
+  }
+  const messages = Array.isArray(update)
+    ? update.find(([key]) => key === 'messages')?.[1]
+    : update.messages;
+  if (BaseMessage.isInstance(messages)) {
+    return [messages];
+  }
+  if (!Array.isArray(messages) || !messages.every(BaseMessage.isInstance)) {
+    return undefined;
+  }
+  return messages;
+}
 
 export class Run<_T extends t.BaseGraphState> {
   id: string;
@@ -227,8 +298,6 @@ export class Run<_T extends t.BaseGraphState> {
       /** Default to legacy graph for 'standard' or undefined type */
       this.graphRunnable = this.createLegacyGraph(config.graphConfig);
       if (this.Graph) {
-        this.Graph.compileOptions =
-          config.graphConfig.compileOptions ?? this.Graph.compileOptions;
         this.Graph.handlerRegistry = handlerRegistry;
       }
     }
@@ -542,6 +611,10 @@ export class Run<_T extends t.BaseGraphState> {
     return this.Graph.getRunMessages();
   }
 
+  getChildCheckpointThreadIds(): string[] {
+    return this.Graph?.getChildCheckpointThreadIds() ?? [];
+  }
+
   /**
    * Returns a defensive snapshot of tools discovered by the current run.
    * Pass an agent id for that context, or omit it for the ordered union across
@@ -759,6 +832,10 @@ export class Run<_T extends t.BaseGraphState> {
       recursionLimit,
       configurable: { ...callerConfig.configurable },
     };
+    if (!isResume) {
+      delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
+      delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+    }
 
     /**
      * Cancellation can arrive either at graph construction or per-call through
@@ -1248,7 +1325,13 @@ export class Run<_T extends t.BaseGraphState> {
   getInterrupt<TPayload = t.HumanInterruptPayload>():
     | t.RunInterruptResult<TPayload>
     | undefined {
-    return this._interrupt as t.RunInterruptResult<TPayload> | undefined;
+    if (this._interrupt == null) {
+      return undefined;
+    }
+    return {
+      ...this._interrupt,
+      payload: stripSubagentResumeManifest(this._interrupt.payload),
+    } as t.RunInterruptResult<TPayload>;
   }
 
   /**
@@ -1331,6 +1414,10 @@ export class Run<_T extends t.BaseGraphState> {
       'update' | 'goto'
     >
   ): Promise<MessageContentComplex[] | undefined> {
+    const resumeConfig = await this.resolveInterruptResumeConfig(
+      callerConfig,
+      commandOptions?.update
+    );
     const interruptId = this._interrupt?.interruptId;
     const scopedResume =
       typeof interruptId === 'string' &&
@@ -1338,7 +1425,6 @@ export class Run<_T extends t.BaseGraphState> {
       !isLangGraphResumeMapForInterrupt(resumeValue, interruptId)
         ? { [interruptId]: resumeValue }
         : resumeValue;
-    const resumeConfig = await this.resolveInterruptResumeConfig(callerConfig);
     // langgraph 1.4.5 applies resume + state update + reroute in one superstep
     // (single checkpoint). `update`/`goto` are omitted unless the caller sets them.
     return this.processStream(
@@ -1357,9 +1443,29 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   private async resolveInterruptResumeConfig(
-    callerConfig: t.RunStreamConfig
+    callerConfig: t.RunStreamConfig,
+    resumeUpdate?: ResumeCommandUpdate
   ): Promise<t.RunStreamConfig> {
+    await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
     const interrupt = this._interrupt;
+    const resumeManifest = requireValidSubagentResumeManifest(
+      interrupt?.payload
+    );
+    const resumeConfigurable = { ...callerConfig.configurable };
+    delete resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
+    delete resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+    resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY] = nanoid();
+    if (resumeManifest != null) {
+      resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] = resumeManifest;
+    }
+    const manifestConfig = {
+      ...callerConfig,
+      configurable: resumeConfigurable,
+    };
+    const hookSessionId = getInterruptHookSessionId(interrupt?.payload);
+    if (hookSessionId != null) {
+      this.hookRegistry?.copySession(hookSessionId, this.id);
+    }
     const interruptId = interrupt?.interruptId;
     const workflow = this.graphRunnable as
       | (t.CompiledStateWorkflow & WorkflowWithStateHistory)
@@ -1367,9 +1473,9 @@ export class Run<_T extends t.BaseGraphState> {
     const stateHistory = workflow?.getStateHistory;
     if (interrupt?.checkpointId != null && interrupt.checkpointId.length > 0) {
       return {
-        ...callerConfig,
+        ...manifestConfig,
         configurable: {
-          ...callerConfig.configurable,
+          ...manifestConfig.configurable,
           checkpoint_id: interrupt.checkpointId,
           ...(typeof interrupt.checkpointNs === 'string'
             ? { checkpoint_ns: interrupt.checkpointNs }
@@ -1383,12 +1489,12 @@ export class Run<_T extends t.BaseGraphState> {
       interruptId.length === 0 ||
       typeof stateHistory !== 'function'
     ) {
-      return callerConfig;
+      return manifestConfig;
     }
 
     for await (const snapshot of stateHistory.call(
       this.graphRunnable,
-      callerConfig as RunnableConfig
+      manifestConfig as RunnableConfig
     )) {
       const hasMatchingInterrupt =
         snapshot.tasks?.some(
@@ -1411,9 +1517,9 @@ export class Run<_T extends t.BaseGraphState> {
           ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
         };
         return {
-          ...callerConfig,
+          ...manifestConfig,
           configurable: {
-            ...callerConfig.configurable,
+            ...manifestConfig.configurable,
             checkpoint_id: checkpointId,
             ...(typeof checkpointNs === 'string'
               ? { checkpoint_ns: checkpointNs }
@@ -1423,7 +1529,47 @@ export class Run<_T extends t.BaseGraphState> {
       }
     }
 
-    return callerConfig;
+    return manifestConfig;
+  }
+
+  private async restoreInterruptFromCheckpoint(
+    callerConfig: t.RunStreamConfig,
+    resumeUpdate?: ResumeCommandUpdate
+  ): Promise<void> {
+    if (this._interrupt != null || this.humanInTheLoop?.enabled !== true) {
+      return;
+    }
+    const workflow = this.graphRunnable as
+      | (t.CompiledStateWorkflow & WorkflowWithStateHistory)
+      | undefined;
+    if (typeof workflow?.getState !== 'function') {
+      return;
+    }
+
+    const snapshot = await workflow.getState(callerConfig as RunnableConfig);
+    const persistedInterrupt = getFirstPersistedInterrupt(snapshot);
+    if (persistedInterrupt == null) {
+      return;
+    }
+    const persistedMessages = getPersistedMessages(snapshot);
+    if (persistedMessages != null) {
+      this.Graph?.restoreCheckpointMessages(
+        persistedMessages,
+        getResumeUpdateMessages(resumeUpdate)
+      );
+    }
+
+    const checkpointConfigurable = snapshot.config?.configurable;
+    const checkpointId = checkpointConfigurable?.checkpoint_id;
+    const checkpointNs = checkpointConfigurable?.checkpoint_ns;
+    const threadId = callerConfig.configurable?.thread_id;
+    this._interrupt = {
+      interruptId: persistedInterrupt.id,
+      payload: persistedInterrupt.value,
+      ...(typeof threadId === 'string' ? { threadId } : {}),
+      ...(typeof checkpointId === 'string' ? { checkpointId } : {}),
+      ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
+    };
   }
 
   private createSystemCallback<K extends keyof t.ClientCallbacks>(

@@ -18,6 +18,13 @@ import type {
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
+  ReplayableSubagentTool,
+  SubagentGraphResumeState,
+  SubagentResumeManifest,
+  SubagentToolNodeResumeState,
+  SettledSubagentToolOutput,
+} from '@/tools/subagent/SubagentReplay';
+import type {
   ResolvedStreamLimits,
   RunBreakerScope,
   StreamedToolCallArgTally,
@@ -61,14 +68,6 @@ import {
   removePredecessorHandoffCue,
 } from '@/messages';
 import {
-  attemptInvoke,
-  tryFallbackProviders,
-  getFallbackErrorContext,
-  getFallbackOverflowCandidates,
-  projectMessagesForProvider,
-  resolveServingModelId,
-} from '@/llm/invoke';
-import {
   resetIfNotEmpty,
   isAnthropicLike,
   isOpenAILike,
@@ -79,6 +78,21 @@ import {
   joinKeys,
   sleep,
 } from '@/utils';
+import {
+  attemptInvoke,
+  tryFallbackProviders,
+  getFallbackErrorContext,
+  getFallbackOverflowCandidates,
+  projectMessagesForProvider,
+  resolveServingModelId,
+} from '@/llm/invoke';
+import {
+  resolveStreamLimits,
+  StreamLimitExceededError,
+  sweepStaleStreamLimitEntries,
+  STREAM_LIMIT_EPOCH_KEY,
+  RUN_BREAKER_SCOPE_CONFIG_KEY,
+} from '@/llm/streamLimits';
 import {
   Constants,
   GraphNodeKeys,
@@ -122,17 +136,11 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
-import {
-  resolveStreamLimits,
-  StreamLimitExceededError,
-  sweepStaleStreamLimitEntries,
-  STREAM_LIMIT_EPOCH_KEY,
-  RUN_BREAKER_SCOPE_CONFIG_KEY,
-} from '@/llm/streamLimits';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
+import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
@@ -630,6 +638,10 @@ export abstract class Graph<
   _TNodeName extends string = string,
 > {
   abstract resetValues(keepContent?: boolean, checkpointScope?: string): void;
+  restoreCheckpointMessages(
+    _messages: BaseMessage[],
+    _pendingMessages?: BaseMessage[]
+  ): void {}
   abstract initializeTools({
     currentTools,
     currentToolMap,
@@ -848,11 +860,18 @@ export abstract class Graph<
     // Flush each compiled ToolNode's direct-path turn cache so it
     // doesn't leak across Runs (Codex P2 #33). The cache survives
     // `run()` re-entry by design (resume-stable), but end-of-Run
-    // is the right point to reset it.
+    // is the right point to reset it. Retain the registrations because
+    // the compiled workflow can be reused for later Runs; compilation
+    // will not register these instances again.
     for (const node of this._compiledToolNodes) {
       node.clearDirectPathTurns();
     }
-    this._compiledToolNodes.clear();
+    // Subagent executors are likewise compiled once and reused. Clear
+    // their per-Run state without dropping the registrations needed by
+    // subsequent cleanup cycles.
+    for (const executor of this._subagentExecutors) {
+      executor.clearHeavyState();
+    }
     this.sessions.clear();
   }
 
@@ -904,8 +923,135 @@ export abstract class Graph<
    */
   protected registerCompiledToolNode(node: {
     clearDirectPathTurns(): void;
+    createSubagentResumeState(): SubagentToolNodeResumeState;
+    restoreSubagentResumeState(state: SubagentToolNodeResumeState): void;
   }): void {
     this._compiledToolNodes.add(node);
+  }
+
+  protected registerSubagentExecutor(executor: SubagentExecutor): void {
+    this._subagentExecutors.add(executor);
+  }
+
+  protected resetSubagentCheckpointThreadIds(): void {
+    for (const executor of this._subagentExecutors) {
+      executor.resetCheckpointThreadIds();
+    }
+  }
+
+  getChildCheckpointThreadIds(): string[] {
+    const threadIds = new Set<string>();
+    for (const executor of this._subagentExecutors) {
+      for (const threadId of executor.getChildCheckpointThreadIds()) {
+        threadIds.add(threadId);
+      }
+    }
+    return [...threadIds];
+  }
+
+  createSubagentResumeState(runId: string): SubagentGraphResumeState {
+    return {
+      toolCallSteps: [...this.toolCallStepIds].map(([toolCallId, stepId]) => ({
+        toolCallId,
+        stepId,
+      })),
+      toolSessions: [...this.sessions].map(([toolName, context]) => ({
+        toolName,
+        context: {
+          ...context,
+          ...(context.files == null
+            ? {}
+            : { files: context.files.map((file) => ({ ...file })) }),
+        },
+      })),
+      toolNodes: [...this._compiledToolNodes].map((node) =>
+        node.createSubagentResumeState()
+      ),
+      eagerToolUsage: [
+        {
+          agentId: '',
+          toolUsageCounts: [...this.eagerEventToolUsageCount].map(
+            ([toolName, count]) => ({ toolName, count })
+          ),
+        },
+        ...[...this.eagerEventToolUsageCountsByAgentId].map(
+          ([agentId, usageCounts]) => ({
+            agentId,
+            toolUsageCounts: [...usageCounts].map(([toolName, count]) => ({
+              toolName,
+              count,
+            })),
+          })
+        ),
+      ],
+      eagerToolSuppressions: [...this.eagerEventToolSuppressions],
+      ...(this._toolOutputRegistry == null
+        ? {}
+        : {
+          toolOutputReferences: this._toolOutputRegistry.snapshotState(runId),
+        }),
+    };
+  }
+
+  restoreSubagentResumeState(
+    state: SubagentGraphResumeState,
+    runId: string
+  ): void {
+    const toolNodesByKey = new Map(
+      [...this._compiledToolNodes].map((node) => {
+        const nodeState = node.createSubagentResumeState();
+        return [nodeState.stateKey, node] as const;
+      })
+    );
+    if (toolNodesByKey.size !== state.toolNodes.length) {
+      throw new Error('Cannot restore changed subagent tool topology.');
+    }
+    for (const nodeState of state.toolNodes) {
+      if (!toolNodesByKey.has(nodeState.stateKey)) {
+        throw new Error(
+          `Cannot restore subagent tool state for "${nodeState.stateKey}".`
+        );
+      }
+    }
+    const registry =
+      state.toolOutputReferences == null
+        ? undefined
+        : this.getOrCreateToolOutputRegistry();
+    if (state.toolOutputReferences != null && registry == null) {
+      throw new Error('Cannot restore disabled tool output references.');
+    }
+
+    this.toolCallStepIds.clear();
+    for (const { toolCallId, stepId } of state.toolCallSteps) {
+      this.toolCallStepIds.set(toolCallId, stepId);
+    }
+    this.sessions.clear();
+    for (const { toolName, context } of state.toolSessions) {
+      this.sessions.set(toolName, {
+        ...context,
+        ...(context.files == null
+          ? {}
+          : { files: context.files.map((file) => ({ ...file })) }),
+      });
+    }
+    for (const nodeState of state.toolNodes) {
+      const node = toolNodesByKey.get(nodeState.stateKey)!;
+      node.restoreSubagentResumeState(nodeState);
+    }
+    this.clearEagerEventToolUsageCounts();
+    for (const usageState of state.eagerToolUsage) {
+      const usageCounts = this.getEagerEventToolUsageCount(usageState.agentId);
+      for (const { toolName, count } of usageState.toolUsageCounts) {
+        usageCounts.set(toolName, count);
+      }
+    }
+    this.eagerEventToolSuppressions.clear();
+    for (const toolName of state.eagerToolSuppressions) {
+      this.eagerEventToolSuppressions.add(toolName);
+    }
+    if (state.toolOutputReferences != null && registry != null) {
+      registry.restoreState(runId, state.toolOutputReferences);
+    }
   }
 
   /**
@@ -957,7 +1103,10 @@ export abstract class Graph<
    */
   private _compiledToolNodes: Set<{
     clearDirectPathTurns(): void;
+    createSubagentResumeState(): SubagentToolNodeResumeState;
+    restoreSubagentResumeState(state: SubagentToolNodeResumeState): void;
   }> = new Set();
+  private _subagentExecutors = new Set<SubagentExecutor>();
   public getOrCreateFileCheckpointer(): t.LocalFileCheckpointer | undefined {
     // Return the cached instance unconditionally if one exists. The
     // toolExecution check below decides whether to *create* a new
@@ -1004,6 +1153,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /** Whether the workflow was actually compiled with a checkpointer. */
   hasCompiledCheckpointer: boolean = false;
   messages: BaseMessage[] = [];
+  /** Whether a rebuilt resume seeded the message baseline from its checkpoint. */
+  private hasRestoredCheckpointMessages = false;
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
   /** Per-agent discovery snapshots preserved before contexts are reset on cleanup. */
@@ -1058,8 +1209,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * generation key + chunk index (see `resolveGenerationKey`). Per-run
    * accumulation state, cleared by both reset paths.
    */
-  streamedToolCallArgTallies: Map<string, StreamedToolCallArgTally> =
-    new Map();
+  streamedToolCallArgTallies: Map<string, StreamedToolCallArgTally> = new Map();
   /** Streamed chunk events per model generation, keyed by generation key. */
   streamDeltaEventCounts: Map<string, StreamDeltaEventTally> = new Map();
   /** Per-chunk-object, per-generation charge balances (lazily created; see
@@ -1213,7 +1363,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /* Init */
 
   resetValues(keepContent?: boolean, checkpointScope?: string): void {
+    this.resetSubagentCheckpointThreadIds();
     this.messages = [];
+    this.hasRestoredCheckpointMessages = false;
     this.cachedRunMessages = undefined;
     this.cachedDiscoveredTools = undefined;
     this.config = resetIfNotEmpty(this.config, undefined);
@@ -1308,6 +1460,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.originalToolContentCheckpointScope = hasScopedCheckpoint
       ? checkpointScope
       : undefined;
+  }
+
+  /** Seeds the sidecar message view that checkpoint restoration bypasses. */
+  override restoreCheckpointMessages(
+    messages: BaseMessage[],
+    pendingMessages?: BaseMessage[]
+  ): void {
+    if (this.messages.length > 0) {
+      return;
+    }
+    this.messages =
+      pendingMessages == null
+        ? [...messages]
+        : messagesStateReducer(messages, pendingMessages);
+    this.startIndex = this.messages.length;
+    this.hasRestoredCheckpointMessages = true;
+    this.cachedRunMessages = undefined;
   }
 
   override clearHeavyState(): void {
@@ -1798,6 +1967,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       runLangfuse: this.langfuse,
       agentLangfuse: agentContext?.langfuse,
     });
+    const interruptingToolNames = new Set(this.interruptingToolNames ?? []);
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      (agentContext?.subagentConfigs?.length ?? 0) > 0
+    ) {
+      interruptingToolNames.add(Constants.SUBAGENT);
+    }
+    const effectiveInterruptingToolNames =
+      interruptingToolNames.size > 0 ? interruptingToolNames : undefined;
 
     if (eventDrivenMode) {
       const schemaTools = createSchemaOnlyTools(toolDefinitions);
@@ -1849,11 +2027,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         eagerEventToolSuppressions: this.eagerEventToolSuppressions,
         toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
-        interruptingToolNames:
-          this.interruptingToolNames != null &&
-          this.interruptingToolNames.length > 0
-            ? new Set(this.interruptingToolNames)
-            : undefined,
+        interruptingToolNames: effectiveInterruptingToolNames,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
@@ -1916,11 +2090,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       sessions: this.sessions,
       toolExecution: this.toolExecution,
       codeSessionToolNames: this.codeSessionToolNames,
-      interruptingToolNames:
-        this.interruptingToolNames != null &&
-        this.interruptingToolNames.length > 0
-          ? new Set(this.interruptingToolNames)
-          : undefined,
+      interruptingToolNames: effectiveInterruptingToolNames,
       hookRegistry: this.hookRegistry,
       humanInTheLoop: this.humanInTheLoop,
       maxContextTokens: agentContext?.maxContextTokens,
@@ -3377,7 +3547,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * would start new provider work after the run-wide breaker fired.
          * Rethrow the breaker's own stream-limit reason instead. */
         {
-          const trippedReason = this.resolveTrippedBreakerReason(attemptBreaker.signal);
+          const trippedReason = this.resolveTrippedBreakerReason(
+            attemptBreaker.signal
+          );
           if (trippedReason != null) {
             throw trippedReason;
           }
@@ -3624,7 +3796,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           }
           {
             /** Same sibling-abort translation guard as the primary catch. */
-            const trippedReason = this.resolveTrippedBreakerReason(attemptBreaker.signal);
+            const trippedReason = this.resolveTrippedBreakerReason(
+              attemptBreaker.signal
+            );
             if (trippedReason != null) {
               throw trippedReason;
             }
@@ -4061,6 +4235,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           tokenCounter: agentContext.tokenCounter,
           usageSink: this.subagentUsageSink,
           streamLimits: this.streamLimits,
+          humanInTheLoop: this.humanInTheLoop,
+          checkpointer: this.compileOptions?.checkpointer,
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {
             const childGraph = new StandardGraph(input);
@@ -4072,12 +4248,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               getParentHandlerRegistry()
             );
             childGraph.hookRegistry = this.hookRegistry;
-            /**
-             * Do not propagate `humanInTheLoop` into the child graph yet:
-             * nested subagent interrupts need a stable child checkpoint and
-             * resume bridge. Child hooks still fire; `ask` decisions fail
-             * closed inside the subagent until that flow is implemented.
-             */
+            childGraph.humanInTheLoop = this.humanInTheLoop;
+            if (this.humanInTheLoop?.enabled === true) {
+              childGraph.compileOptions = {
+                checkpointer: this.compileOptions?.checkpointer,
+              };
+            }
             childGraph.toolOutputReferences = this.toolOutputReferences;
             childGraph.eagerEventToolExecution = this.eagerEventToolExecution;
             childGraph.codeSessionToolNames = this.codeSessionToolNames;
@@ -4099,6 +4275,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             return childGraph;
           },
         });
+        this.registerSubagentExecutor(executor);
 
         const subagentTool = tool(async (rawInput, config) => {
           const input = rawInput as {
@@ -4113,20 +4290,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const subagentType =
             typeof input.subagent_type === 'string' ? input.subagent_type : '';
           const threadId = config.configurable?.thread_id as string | undefined;
-          /**
-           * When the tool is dispatched from an LLM's `tool_call`, LangChain
-           * threads the originating `ToolCall` onto the RunnableConfig as
-           * `config.toolCall` (see `ToolRunnableConfig` in
-           * `@langchain/core/tools` — internal but stable since ≥0.3.x).
-           * Surfacing its id lets hosts correlate `SubagentUpdateEvent`s
-           * back to the parent's `tool_call_id` deterministically — no
-           * temporal heuristics needed. If a future LangChain version
-           * changes the threading, the type-guarded read falls back to
-           * `undefined` and the correlation degrades gracefully.
-           */
-          const toolCall = (config as { toolCall?: { id?: string } }).toolCall;
-          const parentToolCallId =
-            typeof toolCall?.id === 'string' ? toolCall.id : undefined;
+          /** Surface the parent call id so child checkpoints, interrupts, and
+           * update events remain correlated across replay and resume. */
+          const toolRuntime = config as {
+            toolCallId?: string;
+            toolCall?: { id?: string };
+          };
+          const toolCall = toolRuntime.toolCall;
+          let parentToolCallId: string | undefined;
+          if (
+            typeof toolRuntime.toolCallId === 'string' &&
+            toolRuntime.toolCallId !== ''
+          ) {
+            parentToolCallId = toolRuntime.toolCallId;
+          } else if (typeof toolCall?.id === 'string' && toolCall.id !== '') {
+            parentToolCallId = toolCall.id;
+          }
           /** The parent tool batch's entry-captured scope (stamped by
            * ToolNode before PreToolUse hooks) — binds this child to the
            * run that dispatched it, not to whatever controller a reset
@@ -4152,6 +4331,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           });
           return result.content;
         }, buildSubagentToolParams(resolvedConfigs));
+        const replayableSubagentTool = subagentTool as typeof subagentTool &
+          ReplayableSubagentTool;
+        replayableSubagentTool[SUBAGENT_REPLAY_CONTROLLER] = {
+          getResumeManifest: (
+            parentToolCallIds
+          ): Promise<SubagentResumeManifest | undefined> =>
+            executor.getResumeManifest(parentToolCallIds),
+          getSettledOutput: (
+            call,
+            config
+          ): Promise<SettledSubagentToolOutput | undefined> =>
+            executor.getSettledToolOutput(call, config),
+          persistSettledOutput: (call, config, output): Promise<void> =>
+            executor.persistSettledToolOutput(call, config, output),
+        };
 
         if (!agentContext.graphTools) {
           agentContext.graphTools = [];
@@ -4399,7 +4593,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: (a, b) => {
-          if (!this.messages.length) {
+          if (!this.messages.length && !this.hasRestoredCheckpointMessages) {
             this.startIndex = a.length + b.length;
           }
           const result = messagesStateReducer(a, b);

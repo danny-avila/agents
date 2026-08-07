@@ -1,9 +1,9 @@
-import { describe, it, expect } from '@jest/globals';
+import { describe, it, expect, jest } from '@jest/globals';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
-import { Providers } from '@/common';
 import { StandardGraph } from '../Graph';
+import { Providers } from '@/common';
 
 const makeAgent = (agentId: string): t.AgentInputs => ({
   agentId,
@@ -25,7 +25,51 @@ const makeTrip = (): StreamLimitExceededError =>
     toolName: 'db_query',
   });
 
+type CompiledRegistrationInternals = {
+  _compiledToolNodes: Set<{ clearDirectPathTurns(): void }>;
+  _subagentExecutors: Set<{
+    clearHeavyState(): void;
+    resetCheckpointThreadIds(): void;
+  }>;
+};
+
 describe('run breaker lifecycle', () => {
+  it('retains compiled cleanup registrations across graph reuse', () => {
+    const graph = makeGraph();
+    const internals = graph as unknown as CompiledRegistrationInternals;
+    const clearDirectPathTurns = jest.fn();
+    const clearSubagentState = jest.fn();
+    const resetCheckpointThreadIds = jest.fn();
+    internals._compiledToolNodes.add({ clearDirectPathTurns });
+    internals._subagentExecutors.add({
+      clearHeavyState: clearSubagentState,
+      resetCheckpointThreadIds,
+    });
+
+    graph.clearHeavyState();
+    graph.clearHeavyState();
+
+    expect(clearDirectPathTurns).toHaveBeenCalledTimes(2);
+    expect(clearSubagentState).toHaveBeenCalledTimes(2);
+    expect(internals._compiledToolNodes.size).toBe(1);
+    expect(internals._subagentExecutors.size).toBe(1);
+  });
+
+  it('resets subagent checkpoint ownership at each fresh run start', () => {
+    const graph = makeGraph();
+    const internals = graph as unknown as CompiledRegistrationInternals;
+    const resetCheckpointThreadIds = jest.fn();
+    internals._subagentExecutors.add({
+      clearHeavyState: jest.fn(),
+      resetCheckpointThreadIds,
+    });
+
+    graph.resetValues();
+    graph.resetValues();
+
+    expect(resetCheckpointThreadIds).toHaveBeenCalledTimes(2);
+  });
+
   it('replaces the breaker at every run start, even when un-aborted', () => {
     const graph = makeGraph();
     const previous = graph.breakerAbort;
@@ -115,9 +159,7 @@ describe('run breaker lifecycle', () => {
           model: model as unknown as t.ChatModel,
           messages: [new HumanMessage('hi')],
           provider: Providers.OPENAI,
-          context: graph as Parameters<
-            typeof attemptInvoke
-          >[0]['context'],
+          context: graph as Parameters<typeof attemptInvoke>[0]['context'],
           onChunk: () => {
             /* producer loop enforcement is under test */
           },
@@ -225,10 +267,7 @@ describe('run breaker lifecycle', () => {
     /** With a live breaker the entry guard must not fire; the node then
      * fails later, on the missing config, proving it got past the guard. */
     await expect(
-      node(
-        { messages: [] } as unknown as t.AgentSubgraphState,
-        undefined
-      )
+      node({ messages: [] } as unknown as t.AgentSubgraphState, undefined)
     ).rejects.toThrow('No config provided');
   });
 });
