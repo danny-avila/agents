@@ -64,6 +64,10 @@ export interface SubagentGraphResumeState {
 export interface SubagentResumeExecution {
   parentToolCallId: string;
   childRunId: string;
+  /** Effective child type bound when this execution first ran. */
+  subagentType?: string;
+  /** Lazy child revision bound when this execution first resolved. */
+  configId?: string;
   approvalExecutionScope: string;
   checkpoints: SubagentCheckpointReference[];
   graphState: SubagentGraphResumeState;
@@ -322,6 +326,8 @@ function isSubagentResumeExecution(
   }
   const execution = value as Partial<SubagentResumeExecution>;
   const childRunId = execution.childRunId;
+  const subagentType = execution.subagentType;
+  const configId = execution.configId;
   const approvalExecutionScope = execution.approvalExecutionScope;
   const checkpoints = execution.checkpoints;
   const graphState = execution.graphState;
@@ -329,6 +335,8 @@ function isSubagentResumeExecution(
   if (
     !isString(execution.parentToolCallId) ||
     !isString(childRunId) ||
+    (subagentType != null && !isString(subagentType)) ||
+    (configId != null && !isString(configId)) ||
     !isString(approvalExecutionScope) ||
     !Array.isArray(checkpoints) ||
     checkpoints.length === 0 ||
@@ -557,7 +565,8 @@ export type SettledSubagentToolOutput = {
 
 export interface SubagentReplayController {
   getResumeManifest?(
-    parentToolCallIds?: ReadonlySet<string>
+    parentToolCallIds?: ReadonlySet<string>,
+    config?: RunnableConfig
   ): Promise<SubagentResumeManifest | undefined>;
   getSettledOutput(
     call: ToolCall,

@@ -5,7 +5,7 @@ import {
   AIMessageChunk,
   HumanMessage,
 } from '@langchain/core/messages';
-import type { UsageMetadata, BaseMessage  } from '@langchain/core/messages';
+import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';

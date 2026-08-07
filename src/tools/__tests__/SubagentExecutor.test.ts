@@ -2688,15 +2688,12 @@ describe('SubagentExecutor', () => {
                   ) => Promise<void> | void;
                 };
                 for (let index = 0; index < 80; index++) {
-                  await forwarder.handleCustomEvent?.(
-                    GraphEvents.ON_RUN_STEP,
-                    {
-                      id: `step_${index}`,
-                      type: StepTypes.MESSAGE_CREATION,
-                      agentId: 'researcher',
-                      index,
-                    }
-                  );
+                  await forwarder.handleCustomEvent?.(GraphEvents.ON_RUN_STEP, {
+                    id: `step_${index}`,
+                    type: StepTypes.MESSAGE_CREATION,
+                    agentId: 'researcher',
+                    index,
+                  });
                 }
                 return { messages: [new AIMessage('ok')] };
               }),

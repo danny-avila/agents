@@ -98,6 +98,12 @@ import {
   RUN_BREAKER_SCOPE_CONFIG_KEY,
 } from '@/llm/streamLimits';
 import {
+  DEFAULT_SUBAGENT_DESCRIPTION,
+  SubagentExecutor,
+  isGraphSubagentConfig,
+  normalizeSubagentConfigEntries,
+} from '@/tools/subagent';
+import {
   Constants,
   GraphNodeKeys,
   ContentTypes,
@@ -127,11 +133,6 @@ import {
   getToolContentCharLength,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
-import {
-  SubagentExecutor,
-  isGraphSubagentConfig,
-  resolveSubagentConfigEntries,
-} from '@/tools/subagent';
 import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
@@ -4246,14 +4247,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       agentContext.subagentConfigs.length > 0 &&
       effectiveSubagentDepth > 0
     ) {
-      const resolvedConfigs = resolveSubagentConfigEntries(
+      const executableConfigs = normalizeSubagentConfigEntries(
         agentContext.subagentConfigs,
         agentContext
       );
-      if (resolvedConfigs.length > 0) {
+      if (executableConfigs.length > 0) {
         if (
           !this.supportsMultiAgentChildren &&
-          resolvedConfigs.some(isGraphSubagentConfig)
+          executableConfigs.some(isGraphSubagentConfig)
         ) {
           throw new Error(
             'Graph subagents require constructing the parent with createGraph() or an injected GraphFactory dependency.'
@@ -4294,7 +4295,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           return childGraph;
         };
         const executor = new SubagentExecutor({
-          configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
+          configs: new Map(
+            executableConfigs.map((config) => [config.type, config])
+          ),
           parentSignal: this.signal,
           breakerScope: {
             controller: (): AbortController => this.breakerAbort,
@@ -4332,7 +4335,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             typeof input.description === 'string' &&
             input.description.trim().length > 0
               ? input.description
-              : 'No task description provided';
+              : DEFAULT_SUBAGENT_DESCRIPTION;
           const subagentType =
             typeof input.subagent_type === 'string' ? input.subagent_type : '';
           const threadId = config.configurable?.thread_id as string | undefined;
@@ -4363,6 +4366,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             description,
             subagentType,
             threadId,
+            signal: config.signal,
             parentToolCallId,
             breaker: batchScope?.controller,
             /**
@@ -4376,14 +4380,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               | undefined,
           });
           return result.content;
-        }, buildSubagentToolParams(resolvedConfigs));
+        }, buildSubagentToolParams(executableConfigs));
         const replayableSubagentTool = subagentTool as typeof subagentTool &
           ReplayableSubagentTool;
         replayableSubagentTool[SUBAGENT_REPLAY_CONTROLLER] = {
           getResumeManifest: (
-            parentToolCallIds
+            parentToolCallIds,
+            config
           ): Promise<SubagentResumeManifest | undefined> =>
-            executor.getResumeManifest(parentToolCallIds),
+            executor.getResumeManifest(parentToolCallIds, config),
           getSettledOutput: (
             call,
             config

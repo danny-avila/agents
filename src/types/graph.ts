@@ -428,13 +428,74 @@ export type MultiAgentGraphInput = StandardGraphInput & {
   memberRecursionLimit?: number;
 };
 
-interface SubagentConfigBase {
-  /** Identifier used in the tool's `subagent_type` enum (e.g. 'researcher', 'coder'). */
+/** Lightweight identity advertised to the model for a spawnable subagent. */
+export interface SubagentDescriptor {
+  /** Stable identifier used in the tool's `subagent_type` enum (e.g. 'researcher', 'coder'). */
   type: string;
   /** Human-readable display name. */
   name: string;
   /** What this subagent specializes in — shown to the LLM. */
   description: string;
+  /**
+   * Opaque, versioned identity of the child configuration. Required when
+   * `resolveAgentInputs` is used and changed whenever its resolved inputs
+   * change incompatibly.
+   */
+  configId?: string;
+}
+
+/** Lazy descriptor with the durable configuration identity required to resolve it. */
+export interface LazySubagentDescriptor extends SubagentDescriptor {
+  configId: string;
+}
+
+/** Stable request identifiers exposed to a selected subagent resolver. */
+export interface SubagentResolveRequestContext {
+  conversationId?: string;
+  messageId?: string;
+  parentMessageId?: string;
+}
+
+/** Stable user identifiers exposed to a selected subagent resolver. */
+export interface SubagentResolveUserContext {
+  id?: string;
+  role?: string;
+  tenantId?: string;
+}
+
+/** Sanitized host runtime context safe for lazy subagent resolution. */
+export interface SubagentResolveConfigurable {
+  requestBody?: Readonly<SubagentResolveRequestContext>;
+  user?: Readonly<SubagentResolveUserContext>;
+  user_id?: string;
+}
+
+/** Runtime context supplied when a host lazily resolves a selected subagent. */
+export interface SubagentResolveContext {
+  /** Stable subagent identity selected by the model. */
+  descriptor: Readonly<LazySubagentDescriptor>;
+  /** Stable child execution identity, including across HITL reconstruction. */
+  executionId: string;
+  /** Parent run that dispatched this execution. */
+  parentRunId: string;
+  /** Parent agent that dispatched this execution. */
+  parentAgentId?: string;
+  /** Parent-side tool call that selected the subagent. */
+  parentToolCallId?: string;
+  /** Durable parent conversation thread, when supplied by the host. */
+  threadId?: string;
+  /** Parent/breaker cancellation composed for this child execution. */
+  signal: AbortSignal;
+  /** Stable, sanitized host context from the parent tool invocation. */
+  configurable?: Readonly<SubagentResolveConfigurable>;
+}
+
+/** Host contract for resolving a selected subagent's full graph inputs. */
+export type SubagentAgentInputsResolver = (
+  context: SubagentResolveContext
+) => Promise<AgentInputs>;
+
+interface SubagentConfigBase extends SubagentDescriptor {
   /** Max AGENT→TOOLS cycles before forced stop (default: 25). */
   maxTurns?: number;
   /** Allow this subagent to spawn its own subagents (default: false). */
@@ -444,6 +505,20 @@ interface SubagentConfigBase {
 export interface SubagentConfig extends SubagentConfigBase {
   /** Full agent config for the child graph. Omit when `self` is true. */
   agentInputs?: AgentInputs;
+  /**
+   * Resolve the full child config only after this descriptor is selected.
+   * Eager `agentInputs` take precedence when also supplied. `self` and a
+   * resolver are mutually exclusive and normalization rejects that pairing.
+   *
+   * Resolvers should rebuild inputs from the stable execution context instead
+   * of retaining request-owned state. The SDK keeps resolved inputs in memory
+   * only for the lifetime of the selected execution and supplies cancellation
+   * through `context.signal`. A reconstructed execution may invoke the
+   * resolver again, so the same `context.executionId` must produce equivalent
+   * child inputs. Durable resolver work should be idempotent on
+   * `(context.executionId, context.descriptor.configId)`.
+   */
+  resolveAgentInputs?: SubagentAgentInputsResolver;
   /** When true, reuse the parent's AgentInputs (context isolation without separate config). */
   self?: boolean;
 }
@@ -456,8 +531,10 @@ export interface SingleAgentSubagentConfig extends SubagentConfig {
   resultAgentId?: never;
 }
 
-export interface GraphSubagentConfig extends SubagentConfig {
+export interface GraphSubagentConfig extends SubagentConfigBase {
   kind: 'graph';
+  configId?: never;
+  resolveAgentInputs?: never;
   allowNested?: false;
   agents: AgentInputs[];
   /**
@@ -492,6 +569,25 @@ export interface ResolvedSingleAgentSubagentConfig
 
 export type ResolvedSubagentConfigEntry =
   | ResolvedSubagentConfig
+  | GraphSubagentConfig;
+
+/** Lazy single-agent entry accepted after descriptor validation. */
+export interface LazySingleAgentSubagentConfig
+  extends SingleAgentSubagentConfig {
+  configId: string;
+  resolveAgentInputs: SubagentAgentInputsResolver;
+  agentInputs?: never;
+  self?: never;
+}
+
+/** Single-agent config accepted after eager/self/lazy eligibility checks. */
+export type ExecutableSubagentConfig =
+  | ResolvedSubagentConfig
+  | LazySingleAgentSubagentConfig;
+
+/** Graph-aware config accepted by the executor. Graph configs stay eager. */
+export type ExecutableSubagentConfigEntry =
+  | ExecutableSubagentConfig
   | GraphSubagentConfig;
 
 /** Lifecycle phase carried on {@link SubagentUpdateEvent}. */

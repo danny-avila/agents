@@ -1,8 +1,11 @@
 export {
+  DEFAULT_SUBAGENT_DESCRIPTION,
   SubagentExecutor,
   filterSubagentResult,
   filterGraphSubagentResult,
   isGraphSubagentConfig,
+  normalizeSubagentConfigs,
+  normalizeSubagentConfigEntries,
   resolveSubagentConfigs,
   resolveSubagentConfigEntries,
   buildChildInputs,

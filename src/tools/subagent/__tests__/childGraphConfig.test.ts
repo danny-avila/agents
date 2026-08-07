@@ -7,6 +7,8 @@ import type {
 } from '@/types';
 import {
   buildGraphChildInputs,
+  normalizeSubagentConfigEntries,
+  normalizeSubagentConfigs,
   resolveSubagentConfigEntries,
   resolveSubagentConfigs,
   validateGraphSubagentConfig,
@@ -396,5 +398,124 @@ describe('graph subagent config', () => {
       tokenCount: 2,
     });
     expect(sourceAgent.maxSubagentDepth).toBe(9);
+  });
+});
+
+describe('lazy and graph subagent normalization', () => {
+  const makeParentContext = (): AgentContext =>
+    AgentContext.fromConfig(makeAgent('parent'));
+
+  it('retains a versioned lazy descriptor without invoking its resolver', () => {
+    const resolveAgentInputs = jest.fn(async () => makeAgent('lazy-child'));
+    const lazyConfig: SubagentConfig = {
+      type: 'lazy-worker',
+      name: 'Lazy Worker',
+      description: 'Loads only after selection.',
+      configId: 'lazy-worker@v1',
+      resolveAgentInputs,
+    };
+
+    expect(normalizeSubagentConfigs([lazyConfig], makeParentContext())).toEqual(
+      [lazyConfig]
+    );
+    expect(resolveAgentInputs).not.toHaveBeenCalled();
+  });
+
+  it.each(['', '   '])(
+    'rejects lazy descriptors with empty configId %#',
+    (configId) => {
+      const lazyConfig: SubagentConfig = {
+        type: 'unversioned',
+        name: 'Unversioned Worker',
+        description: 'Has no durable configuration identity.',
+        configId,
+        resolveAgentInputs: async () => makeAgent('lazy-child'),
+      };
+
+      expect(() =>
+        normalizeSubagentConfigs([lazyConfig], makeParentContext())
+      ).toThrow('requires a non-empty "configId"');
+    }
+  );
+
+  it('normalizes mixed graph and lazy entries without resolving the lazy entry', () => {
+    const graphConfig = makeGraphConfig();
+    const resolveAgentInputs = jest.fn(async () => makeAgent('lazy-child'));
+    const lazyConfig: SubagentConfig = {
+      type: 'lazy-worker',
+      name: 'Lazy Worker',
+      description: 'Loads only after selection.',
+      configId: 'lazy-worker@v1',
+      resolveAgentInputs,
+    };
+
+    expect(
+      normalizeSubagentConfigEntries(
+        [graphConfig, lazyConfig],
+        makeParentContext()
+      )
+    ).toEqual([graphConfig, lazyConfig]);
+    expect(resolveAgentInputs).not.toHaveBeenCalled();
+  });
+
+  it('rejects duplicate types across graph and lazy variants', () => {
+    const graphConfig = makeGraphConfig();
+    const lazyConfig: SubagentConfig = {
+      type: graphConfig.type,
+      name: 'Conflicting Worker',
+      description: 'Conflicts with a graph descriptor.',
+      configId: 'conflicting-worker@v1',
+      resolveAgentInputs: async () => makeAgent('lazy-child'),
+    };
+
+    expect(() =>
+      normalizeSubagentConfigEntries(
+        [graphConfig, lazyConfig],
+        makeParentContext()
+      )
+    ).toThrow(`Duplicate subagent type "${graphConfig.type}"`);
+  });
+
+  it.each([
+    ['configId', 'graph@v1'],
+    ['resolveAgentInputs', async () => makeAgent('unexpected')],
+  ] as const)('rejects %s on graph descriptors', (field, value) => {
+    const graphConfig = makeGraphConfig();
+    Reflect.set(graphConfig, field, value);
+
+    expect(() =>
+      normalizeSubagentConfigEntries([graphConfig], makeParentContext())
+    ).toThrow(/lazy fields configId\/resolveAgentInputs/);
+  });
+
+  it('rejects unresolved self configs that also declare a resolver', () => {
+    const invalidConfig: SubagentConfig = {
+      type: 'self-or-lazy',
+      name: 'Ambiguous Worker',
+      description: 'Cannot choose between self and lazy resolution.',
+      self: true,
+      configId: 'self-or-lazy@v1',
+      resolveAgentInputs: async () => makeAgent('unexpected'),
+    };
+
+    expect(() =>
+      normalizeSubagentConfigs([invalidConfig], makeParentContext())
+    ).toThrow(/cannot combine self with resolveAgentInputs/);
+  });
+
+  it('rejects self configs with both eager inputs and a resolver', () => {
+    const invalidConfig: SubagentConfig = {
+      type: 'eager-self-or-lazy',
+      name: 'Ambiguous Eager Worker',
+      description: 'Cannot combine self shaping with lazy resolution.',
+      self: true,
+      agentInputs: makeAgent('eager-child'),
+      configId: 'eager-self-or-lazy@v1',
+      resolveAgentInputs: async () => makeAgent('unexpected'),
+    };
+
+    expect(() =>
+      normalizeSubagentConfigs([invalidConfig], makeParentContext())
+    ).toThrow(/cannot combine self with resolveAgentInputs/);
   });
 });

@@ -9,6 +9,8 @@ describe('SubagentReplay manifest', () => {
   const execution = {
     parentToolCallId: 'call_parent',
     childRunId: 'child-run',
+    subagentType: 'researcher',
+    configId: 'researcher@v1',
     approvalExecutionScope: 'child-approval-scope',
     checkpoints: [
       {
@@ -81,6 +83,33 @@ describe('SubagentReplay manifest', () => {
       visible: true,
     });
   });
+
+  it('accepts legacy executions without a bound subagent type', () => {
+    const { subagentType: _subagentType, ...legacyExecution } = execution;
+    const manifest = { version: 1 as const, executions: [legacyExecution] };
+    const payload = attachSubagentResumeManifest(
+      { type: 'tool_approval' },
+      manifest
+    );
+
+    expect(getSubagentResumeManifest(payload)).toEqual(manifest);
+  });
+
+  it.each(['', 42, { type: 'researcher' }])(
+    'rejects malformed bound subagent type %#',
+    (subagentType) => {
+      const manifest = {
+        version: 1 as const,
+        executions: [{ ...execution, subagentType }],
+      };
+
+      expect(
+        getSubagentResumeManifest({
+          __librechat_subagent_resume_manifest: manifest,
+        })
+      ).toBeUndefined();
+    }
+  );
 
   it.each([
     ['string', 'approve this child'],

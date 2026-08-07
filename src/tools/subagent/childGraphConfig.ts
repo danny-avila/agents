@@ -1,5 +1,7 @@
 import type {
   AgentInputs,
+  ExecutableSubagentConfig,
+  ExecutableSubagentConfigEntry,
   GraphEdge,
   GraphSubagentConfig,
   ResolvedSingleAgentSubagentConfig,
@@ -64,7 +66,9 @@ type GraphSubagentConfigCandidate = {
   edges?: unknown;
   entryAgentId?: unknown;
   resultAgentId?: unknown;
+  configId?: unknown;
   agentInputs?: unknown;
+  resolveAgentInputs?: unknown;
   self?: unknown;
 };
 
@@ -77,7 +81,7 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 export function isGraphSubagentConfig(
-  config: SubagentConfig
+  config: SubagentConfigEntry
 ): config is GraphSubagentConfig {
   return (config as { kind?: unknown }).kind === 'graph';
 }
@@ -148,9 +152,14 @@ function assertGraphSubagentConfigShape(
       `Graph subagent "${configType}" maxTurns must be a positive safe integer.`
     );
   }
-  if (candidate.agentInputs !== undefined || candidate.self !== undefined) {
+  if (
+    candidate.agentInputs !== undefined ||
+    candidate.resolveAgentInputs !== undefined ||
+    candidate.configId !== undefined ||
+    candidate.self !== undefined
+  ) {
     throw new Error(
-      `Graph subagent "${configType}" cannot define agentInputs or self.`
+      `Graph subagent "${configType}" cannot define agentInputs or self, or lazy fields configId/resolveAgentInputs.`
     );
   }
 }
@@ -216,10 +225,7 @@ export function validateGraphSubagentConfig(config: unknown): void {
       `Graph subagent "${config.type}" cannot exceed ${MAX_GRAPH_SUBAGENT_MEMBERS} agents.`
     );
   }
-  if (
-    config.maxTurns != null &&
-    config.maxTurns > MAX_GRAPH_SUBAGENT_TURNS
-  ) {
+  if (config.maxTurns != null && config.maxTurns > MAX_GRAPH_SUBAGENT_TURNS) {
     throw new Error(
       `Graph subagent "${config.type}" maxTurns exceeds the safe graph recursion budget.`
     );
@@ -455,52 +461,85 @@ export function validateGraphSubagentConfig(config: unknown): void {
   }
 }
 
+function normalizeSingleAgentConfig(
+  config: SubagentConfig,
+  parentContext: AgentContext
+): ExecutableSubagentConfig | null {
+  const candidate = config as GraphSubagentConfigCandidate;
+  if (
+    candidate.kind === 'agent' &&
+    (candidate.agents !== undefined ||
+      candidate.edges !== undefined ||
+      candidate.entryAgentId !== undefined ||
+      candidate.resultAgentId !== undefined)
+  ) {
+    throw new Error(
+      `Single-agent subagent "${config.type}" cannot define graph topology fields.`
+    );
+  }
+  if (config.self === true && config.resolveAgentInputs != null) {
+    throw new Error(
+      `Subagent "${config.type}" cannot combine self with resolveAgentInputs.`
+    );
+  }
+  if (config.agentInputs != null) {
+    return config as ResolvedSingleAgentSubagentConfig;
+  }
+  if (config.self === true && parentContext._sourceInputs != null) {
+    return {
+      ...config,
+      agentInputs: { ...parentContext._sourceInputs },
+    };
+  }
+  if (config.resolveAgentInputs == null) {
+    return null;
+  }
+  if (!isNonEmptyString(config.configId)) {
+    throw new Error(
+      `Lazy subagent "${config.type}" requires a non-empty "configId".`
+    );
+  }
+  return config as ExecutableSubagentConfig;
+}
+
+/** Normalize eager, self, lazy, and graph subagent entries for advertisement. */
+export function normalizeSubagentConfigEntries(
+  configs: SubagentConfigEntry[],
+  parentContext: AgentContext
+): ExecutableSubagentConfigEntry[] {
+  const normalized: ExecutableSubagentConfigEntry[] = [];
+  const seenTypes = new Set<string>();
+  for (const config of configs) {
+    let executable: ExecutableSubagentConfigEntry | null;
+    if (isGraphSubagentConfig(config)) {
+      validateGraphSubagentConfig(config);
+      executable = config;
+    } else {
+      executable = normalizeSingleAgentConfig(config, parentContext);
+    }
+    if (executable == null) {
+      continue;
+    }
+    if (seenTypes.has(executable.type)) {
+      throw new Error(
+        `Duplicate subagent type "${executable.type}". Each SubagentConfig must have a unique "type" field.`
+      );
+    }
+    seenTypes.add(executable.type);
+    normalized.push(executable);
+  }
+  return normalized;
+}
+
 /** Resolve self-spawn inputs and validate explicit graph configs. */
 export function resolveSubagentConfigEntries(
   configs: SubagentConfigEntry[],
   parentContext: AgentContext
 ): ResolvedSubagentConfigEntry[] {
-  const resolved = configs
-    .map((config): ResolvedSubagentConfigEntry | null => {
-      if (isGraphSubagentConfig(config)) {
-        validateGraphSubagentConfig(config);
-        return config;
-      }
-      const candidate = config as GraphSubagentConfigCandidate;
-      if (
-        candidate.kind === 'agent' &&
-        (candidate.agents !== undefined ||
-          candidate.edges !== undefined ||
-          candidate.entryAgentId !== undefined ||
-          candidate.resultAgentId !== undefined)
-      ) {
-        throw new Error(
-          `Single-agent subagent "${config.type}" cannot define graph topology fields.`
-        );
-      }
-      if (config.agentInputs != null) {
-        return config as ResolvedSingleAgentSubagentConfig;
-      }
-      if (config.self !== true || parentContext._sourceInputs == null) {
-        return null;
-      }
-      return {
-        ...config,
-        agentInputs: { ...parentContext._sourceInputs },
-      };
-    })
-    .filter((config): config is ResolvedSubagentConfigEntry => config != null);
-
-  const seenTypes = new Set<string>();
-  for (const config of resolved) {
-    if (seenTypes.has(config.type)) {
-      throw new Error(
-        `Duplicate subagent type "${config.type}". Each SubagentConfig must have a unique "type" field.`
-      );
-    }
-    seenTypes.add(config.type);
-  }
-  return resolved;
+  return normalizeSubagentConfigEntries(configs, parentContext).filter(
+    (config): config is ResolvedSubagentConfigEntry =>
+      isGraphSubagentConfig(config) || config.agentInputs != null
+  );
 }
 
 /** Resolve legacy single-agent configs with the original public signature. */
@@ -518,6 +557,23 @@ export function resolveSubagentConfigs(
     configs,
     parentContext
   ) as ResolvedSubagentConfig[];
+}
+
+/** Normalize legacy single-agent configs while rejecting graph entries. */
+export function normalizeSubagentConfigs(
+  configs: SubagentConfig[],
+  parentContext: AgentContext
+): ExecutableSubagentConfig[] {
+  const graphConfig = configs.find(isGraphSubagentConfig);
+  if (graphConfig != null) {
+    throw new Error(
+      `Graph subagent "${graphConfig.type}" requires normalizeSubagentConfigEntries().`
+    );
+  }
+  return normalizeSubagentConfigEntries(
+    configs,
+    parentContext
+  ) as ExecutableSubagentConfig[];
 }
 
 function prepareChildInputs({
