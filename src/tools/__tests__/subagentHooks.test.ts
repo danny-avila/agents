@@ -496,6 +496,60 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     expect(captured!.messages.length).toBeGreaterThan(0);
   });
 
+  it('propagates a caller-only Run signal into lazy subagent resolution', async () => {
+    const callerAbort = new AbortController();
+    let resolverSignal: AbortSignal | undefined;
+    let markResolverStarted = (): void => undefined;
+    const resolverStarted = new Promise<void>((resolve) => {
+      markResolverStarted = resolve;
+    });
+    let releaseResolver = (): void => undefined;
+    const resolverRelease = new Promise<void>((resolve) => {
+      releaseResolver = resolve;
+    });
+    const parent = createParentAgent();
+    const eagerChild = parent.subagentConfigs?.[0]?.agentInputs;
+    if (eagerChild == null) {
+      throw new Error('Expected eager child inputs.');
+    }
+    parent.subagentConfigs = [
+      {
+        type: 'researcher',
+        name: 'Researcher',
+        description: 'Researches topics',
+        configId: 'caller-signal-researcher@v1',
+        resolveAgentInputs: async (context) => {
+          resolverSignal = context.signal;
+          markResolverStarted();
+          await resolverRelease;
+          return eagerChild;
+        },
+      },
+    ];
+    const run = await Run.create<t.IState>({
+      runId: `subagent-caller-signal-${Date.now()}`,
+      graphConfig: { type: 'standard', agents: [parent] },
+      returnContent: true,
+      skipCleanup: true,
+    });
+    run.Graph!.overrideTestModel(['Delegating...', 'Caller cancelled.'], 5, [
+      makeSubagentToolCall('call_caller_signal'),
+    ]);
+
+    const processing = run.processStream(
+      { messages: [new HumanMessage('cancel this delegation')] },
+      { ...callerConfig, signal: callerAbort.signal }
+    );
+    await resolverStarted;
+    callerAbort.abort(new Error('caller cancelled'));
+    await Promise.resolve();
+    const resolverWasAborted = resolverSignal?.aborted === true;
+    releaseResolver();
+    await processing.catch(() => undefined);
+
+    expect(resolverWasAborted).toBe(true);
+  });
+
   it('SubagentStart deny blocks subagent execution and returns blocked message', async () => {
     const registry = new HookRegistry();
     const denyHook: HookCallback<

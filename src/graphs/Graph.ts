@@ -138,10 +138,10 @@ import {
 } from '@/utils/callbacks';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
+import { SubagentExecutor, normalizeSubagentConfigs } from '@/tools/subagent';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
-import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
@@ -4211,7 +4211,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       agentContext.subagentConfigs.length > 0 &&
       effectiveSubagentDepth > 0
     ) {
-      const resolvedConfigs = resolveSubagentConfigs(
+      const resolvedConfigs = normalizeSubagentConfigs(
         agentContext.subagentConfigs,
         agentContext
       );
@@ -4317,6 +4317,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             description,
             subagentType,
             threadId,
+            signal: config.signal,
             parentToolCallId,
             breaker: batchScope?.controller,
             /**

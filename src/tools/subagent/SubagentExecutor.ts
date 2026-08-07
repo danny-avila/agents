@@ -88,12 +88,15 @@ import {
   executeHooks,
   TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY,
 } from '@/hooks';
+import { composeAbortSignals } from '@/utils/misc';
 
 const DEFAULT_MAX_TURNS = 25;
 const RECURSION_MULTIPLIER = 3;
 const ERROR_MESSAGE_MAX_CHARS = 200;
 const MAX_PENDING_SUBAGENT_UPDATES = 64;
 const TEXT_DELTA_CONTENT_TYPE = `${ContentTypes.TEXT}_delta`;
+const SUBAGENT_RESOLUTION_ERROR_MESSAGE =
+  'Subagent error: Unable to initialize the selected subagent.';
 
 const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
   additionalContexts: [] as string[],
@@ -657,6 +660,8 @@ export type SubagentExecuteParams = {
   description: string;
   subagentType: string;
   threadId?: string;
+  /** Signal attached to this specific parent tool invocation. */
+  signal?: AbortSignal;
   /**
    * Breaker controller captured at the parent TOOL BATCH's entry, before
    * PreToolUse hooks. Preferred over the live scope accessor: a graph reset
@@ -866,12 +871,17 @@ export class SubagentExecutor {
   /** One signal that fires on the parent's abort or the breaker abort,
    * collapsed to a single signal when possible (mirrors
    * `composeAbortSignals` in Graph.ts). */
-  private composeChildSignal(breaker: AbortController): AbortSignal {
-    const child = breaker.signal;
-    if (this.parentSignal == null || this.parentSignal === child) {
-      return child;
-    }
-    return AbortSignal.any([this.parentSignal, child]);
+  private composeChildSignal(
+    breaker: AbortController,
+    executionSignal?: AbortSignal
+  ): AbortSignal {
+    const parentAndBreaker = composeAbortSignals(
+      this.parentSignal,
+      breaker.signal
+    );
+    return (
+      composeAbortSignals(parentAndBreaker, executionSignal) ?? breaker.signal
+    );
   }
 
   /** Snapshot of the parent's registry at the moment a subagent is dispatched. */
@@ -942,7 +952,7 @@ export class SubagentExecutor {
               configurable:
                 context.parentConfigurable == null
                   ? undefined
-                  : { ...context.parentConfigurable },
+                  : sanitizeChildConfigurable(context.parentConfigurable),
             }),
           context.childSignal
         );
@@ -1503,7 +1513,7 @@ export class SubagentExecutor {
      * new run's breaker from an old child's stream-limit breach. Signal and
      * trip target both bind to this capture. */
     const childBreaker = params.breaker ?? this.resolveBreakerController();
-    const childSignal = this.composeChildSignal(childBreaker);
+    const childSignal = this.composeChildSignal(childBreaker, params.signal);
     const executableConfig = this.configs.get(subagentType);
 
     if (!executableConfig) {
@@ -1575,9 +1585,9 @@ export class SubagentExecutor {
         parentToolCallId,
         parentConfigurable: params.parentConfigurable,
       });
-    } catch (error) {
+    } catch {
       return {
-        content: `Subagent error: ${truncateErrorMessage(error)}`,
+        content: SUBAGENT_RESOLUTION_ERROR_MESSAGE,
         messages: [],
       };
     }
@@ -1863,6 +1873,8 @@ export class SubagentExecutor {
           if (hookResult.decision === 'deny' || hookResult.decision === 'ask') {
             this.clearChildGraph(childGraph);
             this.activeChildRuns.delete(childExecutionKey);
+            this.resolvedConfigs.delete(childExecutionKey);
+            this.childExecutionIdentities.delete(executionSuffix);
             return {
               content: `Blocked: ${hookResult.reason ?? 'Blocked by hook'}`,
               messages: [],
@@ -2418,6 +2430,7 @@ function isLangGraphRuntimeConfigKey(key: string): boolean {
     key === SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY ||
     key === SUBAGENT_RESUME_MANIFEST_CONFIG_KEY ||
     key === SUBAGENT_PARENT_BATCH_CONFIG_KEY ||
+    key === TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY ||
     /** The parent batch's breaker scope must not leak into the child
      * workflow's configurable — children own separate controllers. */
     key === RUN_BREAKER_SCOPE_CONFIG_KEY
@@ -2863,44 +2876,70 @@ export function filterSubagentResult(messages: BaseMessage[]): string {
   return 'Task completed';
 }
 
+/** Resolve eager and self-spawn configs with `agentInputs` guaranteed. */
+export function resolveSubagentConfigs(
+  configs: SubagentConfig[],
+  parentContext: AgentContext
+): ResolvedSubagentConfig[] {
+  const resolved = configs
+    .map((config) => resolveEagerSubagentConfig(config, parentContext))
+    .filter((config): config is ResolvedSubagentConfig => config != null);
+
+  assertUniqueSubagentTypes(resolved);
+  return resolved;
+}
+
 /**
  * Normalize executable subagent configs for tool advertisement. Eager and
  * self-spawn configs return with `agentInputs`; lazy configs return with a
  * resolver and durable `configId`. Unusable configs are filtered, while
  * duplicate types and unversioned lazy descriptors fail closed.
  */
-export function resolveSubagentConfigs(
+export function normalizeSubagentConfigs(
   configs: SubagentConfig[],
   parentContext: AgentContext
 ): ExecutableSubagentConfig[] {
-  const resolved = configs
+  const normalized = configs
     .map((config): ExecutableSubagentConfig | null => {
-      if (config.agentInputs != null) {
-        return config as ResolvedSubagentConfig;
+      const eager = resolveEagerSubagentConfig(config, parentContext);
+      if (eager != null) {
+        return eager;
       }
-      if (config.self === true && parentContext._sourceInputs != null) {
-        return {
-          ...config,
-          agentInputs: { ...parentContext._sourceInputs },
-        } as ResolvedSubagentConfig;
+      if (config.resolveAgentInputs == null) {
+        return null;
       }
-      if (config.resolveAgentInputs != null) {
-        if (
-          typeof config.configId !== 'string' ||
-          config.configId.length === 0
-        ) {
-          throw new Error(
-            `Lazy subagent "${config.type}" requires a non-empty "configId".`
-          );
-        }
-        return config as ExecutableSubagentConfig;
+      if (typeof config.configId !== 'string' || config.configId.length === 0) {
+        throw new Error(
+          `Lazy subagent "${config.type}" requires a non-empty "configId".`
+        );
       }
-      return null;
+      return config as ExecutableSubagentConfig;
     })
-    .filter((c): c is ExecutableSubagentConfig => c != null);
+    .filter((config): config is ExecutableSubagentConfig => config != null);
 
+  assertUniqueSubagentTypes(normalized);
+  return normalized;
+}
+
+function resolveEagerSubagentConfig(
+  config: SubagentConfig,
+  parentContext: AgentContext
+): ResolvedSubagentConfig | null {
+  if (config.agentInputs != null) {
+    return config as ResolvedSubagentConfig;
+  }
+  if (config.self !== true || parentContext._sourceInputs == null) {
+    return null;
+  }
+  return {
+    ...config,
+    agentInputs: { ...parentContext._sourceInputs },
+  } as ResolvedSubagentConfig;
+}
+
+function assertUniqueSubagentTypes(configs: SubagentConfig[]): void {
   const seenTypes = new Set<string>();
-  for (const config of resolved) {
+  for (const config of configs) {
     if (seenTypes.has(config.type)) {
       throw new Error(
         `Duplicate subagent type "${config.type}". Each SubagentConfig must have a unique "type" field.`
@@ -2908,8 +2947,6 @@ export function resolveSubagentConfigs(
     }
     seenTypes.add(config.type);
   }
-
-  return resolved;
 }
 
 /**

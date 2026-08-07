@@ -17,6 +17,7 @@ import type { StandardGraph } from '@/graphs/Graph';
 import {
   SubagentExecutor,
   filterSubagentResult,
+  normalizeSubagentConfigs,
   resolveSubagentConfigs,
   buildChildInputs,
   summarizeEvent,
@@ -25,9 +26,13 @@ import {
   SUBAGENT_PARENT_BATCH_CONFIG_KEY,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from '../subagent/SubagentReplay';
+import {
+  RUN_BREAKER_SCOPE_CONFIG_KEY,
+  StreamLimitExceededError,
+} from '@/llm/streamLimits';
 import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecutor';
 import { Constants, Providers, GraphEvents, StepTypes } from '@/common';
-import { StreamLimitExceededError } from '@/llm/streamLimits';
+import { TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from '@/hooks';
 import { AgentContext } from '@/agents/AgentContext';
 import { HookRegistry } from '@/hooks/HookRegistry';
 import { HandlerRegistry } from '@/events';
@@ -223,9 +228,12 @@ describe('resolveSubagentConfigs', () => {
   it('passes through configs with explicit agentInputs', () => {
     const config = makeConfig();
     const parentContext = AgentContext.fromConfig(parentInputs);
-    const resolved = resolveSubagentConfigs([config], parentContext);
+    const resolved: ResolvedSubagentConfig[] = resolveSubagentConfigs(
+      [config],
+      parentContext
+    );
     expect(resolved).toHaveLength(1);
-    expect(resolved[0].agentInputs?.agentId).toBe('child-agent');
+    expect(resolved[0].agentInputs.agentId).toBe('child-agent');
   });
 
   it('retains lazy descriptors without resolving them during initialization', () => {
@@ -239,7 +247,7 @@ describe('resolveSubagentConfigs', () => {
     };
     const parentContext = AgentContext.fromConfig(parentInputs);
 
-    const resolved = resolveSubagentConfigs([lazyConfig], parentContext);
+    const resolved = normalizeSubagentConfigs([lazyConfig], parentContext);
 
     expect(resolved).toEqual([lazyConfig]);
     expect(resolveAgentInputs).not.toHaveBeenCalled();
@@ -254,7 +262,7 @@ describe('resolveSubagentConfigs', () => {
       resolveAgentInputs: async () => makeChildInputs(),
     };
 
-    expect(() => resolveSubagentConfigs([lazyConfig], parentContext)).toThrow(
+    expect(() => normalizeSubagentConfigs([lazyConfig], parentContext)).toThrow(
       'requires a non-empty "configId"'
     );
   });
@@ -269,8 +277,8 @@ describe('resolveSubagentConfigs', () => {
     const parentContext = AgentContext.fromConfig(parentInputs);
     const resolved = resolveSubagentConfigs([selfConfig], parentContext);
     expect(resolved).toHaveLength(1);
-    expect(resolved[0].agentInputs?.provider).toBe(Providers.OPENAI);
-    expect(resolved[0].agentInputs?.instructions).toBe(
+    expect(resolved[0].agentInputs.provider).toBe(Providers.OPENAI);
+    expect(resolved[0].agentInputs.instructions).toBe(
       'You are a parent agent.'
     );
   });
@@ -631,7 +639,9 @@ describe('SubagentExecutor', () => {
 
     it('isolates a selected resolver failure from other descriptors', async () => {
       const failing = makeLazyConfig('failing', async () => {
-        throw new Error('selected config unavailable');
+        throw new Error(
+          'selected config unavailable: oauth-token=must-not-leak'
+        );
       });
       const healthyResolver = jest.fn(async () => makeChildInputs('healthy'));
       const healthy = makeLazyConfig('healthy', healthyResolver);
@@ -656,10 +666,91 @@ describe('SubagentExecutor', () => {
       });
 
       expect(failed.content).toBe(
-        'Subagent error: selected config unavailable'
+        'Subagent error: Unable to initialize the selected subagent.'
       );
+      expect(failed.content).not.toContain('oauth-token');
+      expect(failed.content).not.toContain('must-not-leak');
       expect(succeeded.content).toBe('Task completed');
       expect(healthyResolver).toHaveBeenCalledTimes(1);
+    });
+
+    it('releases lazy inputs when SubagentStart blocks the execution', async () => {
+      const resolver = jest.fn(async () => makeChildInputs());
+      const lazyConfig = makeLazyConfig('researcher', resolver);
+      const hookRegistry = new HookRegistry();
+      hookRegistry.register('SubagentStart', {
+        hooks: [
+          async (): Promise<{ decision: 'deny'; reason: string }> => ({
+            decision: 'deny',
+            reason: 'blocked by policy',
+          }),
+        ],
+      });
+      const executor = new SubagentExecutor({
+        configs: new Map([[lazyConfig.type, lazyConfig]]),
+        hookRegistry,
+        parentRunId: 'blocked-lazy-run',
+        createChildGraph: makeNoopGraphFactory(),
+      });
+      const params = {
+        description: 'Blocked lazy child',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_blocked_lazy',
+      };
+
+      const first = await executor.execute(params);
+      const blockedState = executor as unknown as {
+        resolvedConfigs: Map<string, ResolvedSubagentConfig>;
+        childExecutionIdentities: Map<string, object>;
+      };
+      expect(blockedState.resolvedConfigs.size).toBe(0);
+      expect(blockedState.childExecutionIdentities.size).toBe(0);
+      const retry = await executor.execute(params);
+
+      expect(first.content).toBe('Blocked: blocked by policy');
+      expect(retry.content).toBe('Blocked: blocked by policy');
+      expect(resolver).toHaveBeenCalledTimes(2);
+    });
+
+    it('sanitizes private runtime state before exposing configurable to the resolver', async () => {
+      let resolverConfigurable: Readonly<Record<string, unknown>> | undefined;
+      const lazyConfig = makeLazyConfig('researcher', async (context) => {
+        resolverConfigurable = context.configurable;
+        return makeChildInputs();
+      });
+      const executor = new SubagentExecutor({
+        configs: new Map([[lazyConfig.type, lazyConfig]]),
+        parentRunId: 'sanitized-resolver-run',
+        createChildGraph: makeNoopGraphFactory(),
+      });
+
+      await executor.execute({
+        description: 'Resolve without private runtime state',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_sanitized_resolver',
+        parentConfigurable: {
+          requestBody: { messageId: 'allowed-message' },
+          user: { id: 'allowed-user' },
+          __pregel_scratchpad: { secret: 'pregel-secret' },
+          checkpoint_id: 'checkpoint-secret',
+          [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'batch-secret',
+          [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
+            graphState: {
+              toolOutputReferences: {
+                entries: [{ key: 'tool0turn0', value: 'output-ref-secret' }],
+              },
+            },
+          },
+          [TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY]: 'approval-secret',
+          [RUN_BREAKER_SCOPE_CONFIG_KEY]: { secret: 'breaker-secret' },
+        },
+      });
+
+      expect(resolverConfigurable).toEqual({
+        requestBody: { messageId: 'allowed-message' },
+        user: { id: 'allowed-user' },
+      });
+      expect(JSON.stringify(resolverConfigurable)).not.toContain('secret');
     });
 
     it('passes the composed signal and stops awaiting a non-cooperative resolver on abort', async () => {
@@ -688,7 +779,10 @@ describe('SubagentExecutor', () => {
       const result = await execution;
 
       expect(observedContext?.signal.aborted).toBe(true);
-      expect(result.content).toBe('Subagent error: host cancelled');
+      expect(result.content).toBe(
+        'Subagent error: Unable to initialize the selected subagent.'
+      );
+      expect(result.content).not.toContain('host cancelled');
     });
 
     it('prefers eager agentInputs over a resolver for backward compatibility', async () => {
