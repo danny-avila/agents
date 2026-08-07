@@ -181,7 +181,7 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(resolver).toHaveBeenCalledTimes(2);
   });
 
-  it('coalesces concurrent resolution and releases resolved inputs after completion', async () => {
+  it('coalesces concurrent execution and releases resolved inputs after completion', async () => {
     let finishResolution = (_inputs: AgentInputs): void => undefined;
     const resolverResult = new Promise<AgentInputs>((resolve) => {
       finishResolution = resolve;
@@ -195,8 +195,18 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
       return resolverResult;
     });
     const config = makeLazyConfig('researcher', resolver);
+    const invoke = jest.fn(
+      async (): Promise<MultiAgentGraphState> => ({
+        messages: [new AIMessage('Task completed')],
+      })
+    );
     const executor = createExecutor([config], {
       parentRunId: 'coalesced-run',
+      createChildGraph: () =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
     });
     const params = {
       description: 'Run the same selected execution.',
@@ -211,18 +221,22 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
 
     finishResolution(makeAgent('coalesced-child'));
     await Promise.all([first, duplicate]);
+    expect(invoke).toHaveBeenCalledTimes(1);
     await executor.execute({
       ...params,
       parentToolCallId: 'call_fresh',
     });
 
     expect(resolver).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledTimes(2);
     const resolutionState = executor as unknown as {
       resolvedConfigs: Map<string, ResolvedSubagentConfig>;
       pendingConfigResolutions: Map<string, Promise<ResolvedSubagentConfig>>;
+      pendingExecutions: Map<string, Promise<object>>;
     };
     expect(resolutionState.resolvedConfigs.size).toBe(0);
     expect(resolutionState.pendingConfigResolutions.size).toBe(0);
+    expect(resolutionState.pendingExecutions.size).toBe(0);
   });
 
   it('sanitizes private runtime state before calling the resolver', async () => {
@@ -380,7 +394,7 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(contexts[0].parentToolCallId).toBe('call_rebuild');
   });
 
-  it('rejects a resumed execution with a different configId before resolution', async () => {
+  it('rejects a changed configId before restoring or recording resume state', async () => {
     const resolver = jest.fn(async () => makeAgent());
     const config = makeLazyConfig('researcher', resolver, {
       configId: 'researcher@v2',
@@ -447,6 +461,12 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(result.content).not.toContain('researcher@v1');
     expect(result.content).not.toContain('researcher@v2');
     expect(resolver).not.toHaveBeenCalled();
+    const rejectedState = executor as unknown as {
+      childExecutionIdentities: Map<string, object>;
+      checkpointThreadIds: Set<string>;
+    };
+    expect(rejectedState.childExecutionIdentities.size).toBe(0);
+    expect(rejectedState.checkpointThreadIds.size).toBe(0);
   });
 
   it('uses the standard factory for lazy agents and the polymorphic factory for graphs', async () => {

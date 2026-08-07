@@ -324,7 +324,17 @@ type ChildExecutionIdentityParams = {
   threadId?: string;
   parentToolCallId: string;
   parentConfigurable?: Record<string, unknown>;
+  resumeExecution?: SubagentResumeExecution;
 };
+
+function getResumeExecution(
+  parentConfigurable: Record<string, unknown> | undefined,
+  parentToolCallId: string
+): SubagentResumeExecution | undefined {
+  return getSubagentResumeManifest(parentConfigurable)?.executions.find(
+    (execution) => execution.parentToolCallId === parentToolCallId
+  );
+}
 
 const LANGGRAPH_RUNTIME_CONFIG_PREFIX = '__pregel_';
 const LANGGRAPH_RESUME_MAP_CONFIG_KEY = '__pregel_resume_map';
@@ -887,6 +897,10 @@ export class SubagentExecutor {
     string,
     Promise<ResolvedSubagentConfig>
   >();
+  private readonly pendingExecutions = new Map<
+    string,
+    Promise<SubagentExecuteResult>
+  >();
   private replayCheckpointWorkflow?: ReplayCheckpointWorkflow;
   private readonly resolveParentHandlerRegistry?: () =>
     | HandlerRegistry
@@ -1048,10 +1062,9 @@ export class SubagentExecutor {
       };
     }
 
-    const resumeManifest = getSubagentResumeManifest(params.parentConfigurable);
-    const resumeExecution = resumeManifest?.executions.find(
-      (execution) => execution.parentToolCallId === params.parentToolCallId
-    );
+    const resumeExecution =
+      params.resumeExecution ??
+      getResumeExecution(params.parentConfigurable, params.parentToolCallId);
     const branchChildThreadId = getChildThreadId({
       parentRunId: this.parentRunId,
       parentAgentId: this.parentAgentId,
@@ -1389,6 +1402,7 @@ export class SubagentExecutor {
     this.completedChildResults.clear();
     this.resolvedConfigs.clear();
     this.pendingConfigResolutions.clear();
+    this.pendingExecutions.clear();
     for (const identity of this.childExecutionIdentities.values()) {
       this.hookRegistry?.clearSession(identity.approvalExecutionScope);
     }
@@ -1552,7 +1566,31 @@ export class SubagentExecutor {
     );
   }
 
-  async execute(params: SubagentExecuteParams): Promise<SubagentExecuteResult> {
+  execute(params: SubagentExecuteParams): Promise<SubagentExecuteResult> {
+    const parentToolCallId = params.parentToolCallId;
+    if (parentToolCallId == null || parentToolCallId === '') {
+      return this.executeOnce(params);
+    }
+    const executionKey = JSON.stringify([
+      params.threadId ?? null,
+      parentToolCallId,
+    ]);
+    const pending = this.pendingExecutions.get(executionKey);
+    if (pending != null) {
+      return pending;
+    }
+    const execution = this.executeOnce(params).finally(() => {
+      if (this.pendingExecutions.get(executionKey) === execution) {
+        this.pendingExecutions.delete(executionKey);
+      }
+    });
+    this.pendingExecutions.set(executionKey, execution);
+    return execution;
+  }
+
+  private async executeOnce(
+    params: SubagentExecuteParams
+  ): Promise<SubagentExecuteResult> {
     const { description, subagentType, threadId, parentToolCallId } = params;
     /** Captured ONCE per execution, preferring the controller the parent
      * tool batch captured at ITS entry (before PreToolUse hooks): a failed
@@ -1603,22 +1641,10 @@ export class SubagentExecutor {
     }
 
     const executionSuffix = parentToolCallId ?? nanoid(8);
-    const {
-      childRunId,
-      childThreadId,
-      approvalExecutionScope,
-      resumeExecution,
-    } = await this.resolveChildExecutionIdentity({
-      threadId,
-      parentToolCallId: executionSuffix,
-      parentConfigurable: params.parentConfigurable,
-    });
-    this.childExecutionIdentities.set(executionSuffix, {
-      childRunId,
-      childThreadId,
-      approvalExecutionScope,
-    });
-    const childExecutionKey = childThreadId;
+    const resumeExecution = getResumeExecution(
+      params.parentConfigurable,
+      executionSuffix
+    );
     if (
       resumeExecution?.configId != null &&
       executableConfig.configId !== resumeExecution.configId
@@ -1629,6 +1655,19 @@ export class SubagentExecutor {
         messages: [],
       };
     }
+    const { childRunId, childThreadId, approvalExecutionScope } =
+      await this.resolveChildExecutionIdentity({
+        threadId,
+        parentToolCallId: executionSuffix,
+        parentConfigurable: params.parentConfigurable,
+        resumeExecution,
+      });
+    this.childExecutionIdentities.set(executionSuffix, {
+      childRunId,
+      childThreadId,
+      approvalExecutionScope,
+    });
+    const childExecutionKey = childThreadId;
     const completedChildResult =
       this.completedChildResults.get(childExecutionKey);
     if (completedChildResult != null) {
