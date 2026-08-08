@@ -251,7 +251,7 @@
     "dotenv": "^16.4.7",
     "https-proxy-agent": "^7.0.6",
     "mathjs": "^15.2.0",
-    "nanoid": "^3.3.7",
+    "nanoid": "^3.3.18",
     "okapibm25": "^1.4.1",
     "openai": "^6.46.0",
     "reova": "^0.4.1",
