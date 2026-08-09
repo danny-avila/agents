@@ -312,12 +312,18 @@ export function buildActivityPhaseLabelPrompt({
   const activityLines = activities
     .slice(0, MAX_PHASE_ACTIVITIES)
     .map((activity, index) => {
+      const status =
+        activity.status === 'error'
+          ? 'failed'
+          : activity.status === 'partial'
+            ? 'partial'
+            : 'completed';
       if (
         !freeFormSuppressed &&
         activity.label != null &&
         activity.label.trim() !== ''
       ) {
-        return `${index + 1}. ${truncateForLabel(activity.label.replace(/\s+/g, ' ').trim(), charLimit)}`;
+        return `${index + 1}. ${status}: ${truncateForLabel(activity.label.replace(/\s+/g, ' ').trim(), charLimit)}`;
       }
 
       const evidence: string[] = [];
@@ -363,7 +369,6 @@ export function buildActivityPhaseLabelPrompt({
           })
         );
       }
-      const status = activity.status === 'error' ? 'failed' : 'completed';
       return `${index + 1}. ${status}${evidence.length > 0 ? `: ${evidence.join('; ')}` : ''}`;
     });
 

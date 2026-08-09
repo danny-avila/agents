@@ -260,6 +260,24 @@ describe('buildActivityPhaseLabelPrompt', () => {
     expect(prompt).not.toContain(entries[0].toolName);
   });
 
+  it('preserves partial outcomes when a committed child label is available', () => {
+    const prompt = buildActivityPhaseLabelPrompt({
+      activities: [
+        {
+          label: 'Checked the deployment and found one unhealthy replica',
+          status: 'partial',
+        },
+        { label: 'Recovered the remaining replicas', status: 'success' },
+      ],
+      charLimit: 600,
+    });
+
+    expect(prompt).toContain(
+      'partial: Checked the deployment and found one unhealthy replica'
+    );
+    expect(prompt).toContain('completed: Recovered the remaining replicas');
+  });
+
   it('uses raw fallback while applying the strict redaction policy', () => {
     const prompt = buildActivityPhaseLabelPrompt({
       activities: [

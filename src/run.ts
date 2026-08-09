@@ -2111,7 +2111,7 @@ export class Run<_T extends t.BaseGraphState> {
 
   /**
    * Generates one parent summary for two or more logical activities. The
-   * summary model is traced as a dedicated `activity-phase` agent root in the
+   * summary model is traced as a dedicated activity-phase chain root in the
    * conversation session, with the model callback recorded as its generation
    * child. No session id means no phase trace, avoiding orphan observations.
    */
@@ -2126,6 +2126,7 @@ export class Run<_T extends t.BaseGraphState> {
     chainOptions,
     traceSeed,
     sourceRunId,
+    sourceTraceId,
     responseId,
     phaseIndex,
     status = 'completed',
@@ -2338,6 +2339,7 @@ export class Run<_T extends t.BaseGraphState> {
     };
     const phaseMetadata: Record<string, unknown> = {
       sourceRunId: sourceRunId ?? this.id,
+      ...(sourceTraceId == null ? {} : { sourceTraceId }),
       responseId: phaseMessageId,
       phaseIndex: resolvedPhaseIndex,
       activityCount: activities.length,
@@ -2387,7 +2389,7 @@ export class Run<_T extends t.BaseGraphState> {
             },
             () =>
               startActiveObservation(
-                'activity-phase',
+                'summarize-activity-phase',
                 async (phaseObservation) => {
                   phaseObservation.update({
                     input: userPrompt,
@@ -2411,7 +2413,7 @@ export class Run<_T extends t.BaseGraphState> {
                     throw error;
                   }
                 },
-                { asType: 'agent' }
+                { asType: 'chain' }
               )
           )
         );

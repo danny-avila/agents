@@ -79,7 +79,7 @@ export type ActivityPhaseEntry = {
   /** Agent lane that produced the activity. */
   agentId?: string;
   /** Failed activities remain useful evidence and still count. */
-  status?: 'success' | 'error';
+  status?: 'success' | 'partial' | 'error';
 };
 
 /** Options for `Run.generateActivityPhaseLabel`. */
@@ -110,12 +110,14 @@ export type RunActivityPhaseLabelOptions = {
   traceSeed?: string;
   /** Stable source run identifier recorded on the phase observation. */
   sourceRunId?: string;
+  /** Source Langfuse trace id for linking this detached summary trace. */
+  sourceTraceId?: string;
   /** Host response/message identifier recorded on the phase observation. */
   responseId?: string;
   /** Zero-based index of the phase within the source run. */
   phaseIndex?: number;
   /** Completion state recorded on the phase observation. */
-  status?: 'completed' | 'failed';
+  status?: 'completed' | 'partial' | 'failed';
   /**
    * Contributing agents. Their Langfuse redaction policies are combined into
    * the strictest union before any phase evidence enters the model or trace.
