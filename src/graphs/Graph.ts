@@ -62,6 +62,7 @@ import {
   isSyntheticProviderContextMessage,
   getMessageId,
   getMessageCreationContentMetadata,
+  splitAssistantTextContentByPhase,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
   DEFAULT_RETAIN_RECENT_TURNS,
@@ -567,15 +568,24 @@ async function dispatchTextMessageContent({
     }
     return true;
   }
-  const stepId = await dispatchMessageCreationStep({
-    graph,
-    stepKey,
-    messageId,
-    content,
-    contentType: ContentTypes.TEXT,
-    metadata,
-  });
-  await graph.dispatchMessageDelta(stepId, { content }, metadata);
+  const contentGroups = Array.isArray(content)
+    ? splitAssistantTextContentByPhase(content)
+    : [content];
+  for (const contentGroup of contentGroups) {
+    const stepId = await dispatchMessageCreationStep({
+      graph,
+      stepKey,
+      messageId,
+      content: contentGroup,
+      contentType: ContentTypes.TEXT,
+      metadata,
+    });
+    await graph.dispatchMessageDelta(
+      stepId,
+      { content: contentGroup },
+      metadata
+    );
+  }
   return true;
 }
 

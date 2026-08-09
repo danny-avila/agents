@@ -1,5 +1,6 @@
 import type { ActivityLabelToolEntry } from '@/types/activityLabel';
 import {
+  ACTIVITY_PHASE_PROMPT_MAX_LENGTH,
   buildActivityLabelPrompt,
   buildActivityPhaseLabelPrompt,
   normalizeActivityPhaseLabel,
@@ -312,6 +313,29 @@ describe('buildActivityPhaseLabelPrompt', () => {
     expect(prompt).toContain('[REDACTED]');
     expect(prompt).not.toContain('Secret result');
     expect(prompt).not.toContain(String(entries[0].toolOutput));
+  });
+
+  it('caps aggregate phase evidence while preserving the terminal cue', () => {
+    const oversized = 'x'.repeat(600);
+    const prompt = buildActivityPhaseLabelPrompt({
+      activities: Array.from({ length: 12 }, (_, activityIndex) => ({
+        thinkingExcerpts: Array.from(
+          { length: 4 },
+          (_, excerptIndex) => `${activityIndex}-${excerptIndex}-${oversized}`
+        ),
+        entries: Array.from({ length: 6 }, (_, entryIndex) => ({
+          toolName: `tool_${activityIndex}_${entryIndex}`,
+          toolInput: oversized,
+          toolOutput: oversized,
+          status: 'success' as const,
+        })),
+      })),
+      assistantContext: [oversized, oversized],
+      charLimit: 600,
+    });
+
+    expect(prompt.length).toBeLessThanOrEqual(ACTIVITY_PHASE_PROMPT_MAX_LENGTH);
+    expect(prompt.endsWith('\n\nPhase summary:')).toBe(true);
   });
 
   it('normalizes phase summaries to one bounded row', () => {

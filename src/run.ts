@@ -2,10 +2,8 @@
 import { nanoid } from 'nanoid';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
-import { startActiveObservation } from '@langfuse/tracing';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
-import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import {
   BaseMessage,
   HumanMessage,
@@ -2138,6 +2136,9 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     const phaseSeq = ++this.activityPhaseLabelSeq;
+    const hasUnattributedActivity = activities.some(
+      (activity) => activity.agentId == null
+    );
     const contributingAgentIds = [
       ...new Set([
         ...(agentIds ?? []),
@@ -2170,7 +2171,7 @@ export class Run<_T extends t.BaseGraphState> {
       ? resolveToolOutputTracingConfig(this.langfuse, phaseContext?.langfuse)
       : undefined;
     const redactionContexts =
-      contributingAgentIds.length > 0
+      contributingAgentIds.length > 0 && !hasUnattributedActivity
         ? contributingAgentIds.flatMap((agentId) => {
           const context = agentContexts?.get(agentId);
           return context == null ? [] : [context];
@@ -2242,13 +2243,40 @@ export class Run<_T extends t.BaseGraphState> {
     const resolvedPhaseIndex = phaseIndex ?? phaseSeq - 1;
     const phaseMessageId =
       responseId ?? `activity-phase-${this.id}-${resolvedPhaseIndex}`;
-    const traceMetadata = createLangfuseTraceMetadata({
-      messageId: phaseMessageId,
-    });
+    const phaseMetadata: Record<string, unknown> = {
+      sourceRunId: sourceRunId ?? this.id,
+      ...(sourceTraceId == null ? {} : { sourceTraceId }),
+      responseId: phaseMessageId,
+      phaseIndex: resolvedPhaseIndex,
+      activityCount: Math.max(activities.length, totalActivityCount ?? 0),
+      status,
+      contributingAgentIds,
+      ...(closingTextPhase == null ? {} : { closingTextPhase }),
+    };
+    const traceMetadata = {
+      ...createLangfuseTraceMetadata({ messageId: phaseMessageId }),
+      sourceRunId: String(phaseMetadata.sourceRunId),
+      ...(sourceTraceId == null ? {} : { sourceTraceId }),
+      responseId: phaseMessageId,
+      phaseIndex: String(resolvedPhaseIndex),
+      activityCount: String(phaseMetadata.activityCount),
+      status,
+      ...(contributingAgentIds.length === 0
+        ? {}
+        : { contributingAgentIds: contributingAgentIds.join(',') }),
+      ...(closingTextPhase == null ? {} : { closingTextPhase }),
+    };
     const phaseRunName = getLangfuseTraceName(
       traceMetadata,
       'LibreChat Activity Phase'
     );
+    const phaseTraceName = phaseChainOptions.runName ?? phaseRunName;
+    const phaseTags = [
+      'librechat',
+      'activity-phase',
+      'agent-run-summary',
+      'agent',
+    ];
     initializeLangfuseTracing(phaseLangfuseConfig);
 
     const inheritedTraceSeed = getTraceIdSeed();
@@ -2271,14 +2299,14 @@ export class Run<_T extends t.BaseGraphState> {
         userId: phaseUserId,
         sessionId: phaseSessionId,
         traceMetadata,
-        tags: ['librechat', 'activity-phase', 'agent-run-summary'],
+        tags: phaseTags,
         traceIdSeed:
           phaseLangfuseConfig?.deterministicTraceId === true
             ? phaseTraceSeed
             : undefined,
         runId: phaseScopeRunId,
         toolOutputTracing: phaseRuntimeScope.toolOutputTracing,
-        traceName: phaseChainOptions.runName ?? phaseRunName,
+        traceName: phaseTraceName,
       });
     }
     if (phaseLangfuseHandler != null) {
@@ -2299,7 +2327,12 @@ export class Run<_T extends t.BaseGraphState> {
     const invokeConfig = Object.assign({}, phaseChainOptions, {
       run_id: phaseRunId,
       runId: phaseRunId,
-      runName: phaseChainOptions.runName ?? phaseRunName,
+      runName: 'summarize-activity-phase',
+      tags: [...new Set([...(phaseChainOptions.tags ?? []), ...phaseTags])],
+      metadata: {
+        ...(phaseChainOptions.metadata ?? {}),
+        ...phaseMetadata,
+      },
     }) as Partial<RunnableConfig>;
     const invokeModel = (
       runtimeConfig: Partial<RunnableConfig>
@@ -2311,12 +2344,14 @@ export class Run<_T extends t.BaseGraphState> {
         ],
         runtimeConfig
       );
-    const invokeWithCallbackFallback = async (): Promise<unknown> => {
+    const invokeWithCallbackFallback = async (
+      runtimeConfig: Partial<RunnableConfig>
+    ): Promise<unknown> => {
       try {
-        return await invokeModel(invokeConfig);
+        return await invokeModel(runtimeConfig);
       } catch (error) {
         const aborted =
-          (phaseChainOptions as { signal?: AbortSignal }).signal?.aborted ===
+          (runtimeConfig as { signal?: AbortSignal }).signal?.aborted ===
             true || (error as Error | null)?.name === 'AbortError';
         const callbackFailure = /callback|tracer|event.?stream/i.test(
           String(
@@ -2329,25 +2364,15 @@ export class Run<_T extends t.BaseGraphState> {
           throw error;
         }
         const langfuseHandler = findCallback(
-          invokeConfig.callbacks,
+          runtimeConfig.callbacks,
           isLangfuseCallbackHandler
         );
-        const { callbacks: _callbacks, ...rest } = invokeConfig;
+        const { callbacks: _callbacks, ...rest } = runtimeConfig;
         const safeConfig = Object.assign({}, rest, {
           callbacks: langfuseHandler ? [langfuseHandler] : [],
         });
         return invokeModel(safeConfig as Partial<RunnableConfig>);
       }
-    };
-    const phaseMetadata: Record<string, unknown> = {
-      sourceRunId: sourceRunId ?? this.id,
-      ...(sourceTraceId == null ? {} : { sourceTraceId }),
-      responseId: phaseMessageId,
-      phaseIndex: resolvedPhaseIndex,
-      activityCount: Math.max(activities.length, totalActivityCount ?? 0),
-      status,
-      contributingAgentIds,
-      ...(closingTextPhase == null ? {} : { closingTextPhase }),
     };
     const extractPhaseLabel = (response: unknown): string => {
       const content = (response as { content?: unknown } | null)?.content;
@@ -2367,59 +2392,31 @@ export class Run<_T extends t.BaseGraphState> {
           .join('')
       );
     };
+    const phaseRunnable = new RunnableLambda({
+      func: async (
+        _input: string,
+        runtimeConfig?: Partial<RunnableConfig>
+      ): Promise<{ label?: string }> => {
+        const response = await invokeWithCallbackFallback(runtimeConfig ?? {});
+        const label = extractPhaseLabel(response);
+        return label.length > 0 ? { label } : {};
+      },
+    }).withConfig({ runName: 'summarize-activity-phase' });
 
     try {
-      return await withLangfuseRuntimeScope(phaseRuntimeScope, async () => {
-        const invokePhase = async (): Promise<{ label?: string }> => {
-          const response = await invokeWithCallbackFallback();
-          const label = extractPhaseLabel(response);
-          return label.length > 0 ? { label } : {};
-        };
-        if (phaseLangfuseHandler == null) {
-          return invokePhase();
-        }
-        const detachedContext = otelTrace.deleteSpan(otelContext.active());
-        return otelContext.with(detachedContext, () =>
-          withLangfuseAttributes(
-            {
-              langfuse: phaseLangfuseConfig,
-              userId: phaseUserId,
-              sessionId: phaseSessionId,
-              traceName: phaseChainOptions.runName ?? phaseRunName,
-              traceMetadata,
-              tags: ['librechat', 'activity-phase', 'agent-run-summary'],
-            },
-            () =>
-              startActiveObservation(
-                'summarize-activity-phase',
-                async (phaseObservation) => {
-                  phaseObservation.update({
-                    input: userPrompt,
-                    metadata: phaseMetadata,
-                  });
-                  try {
-                    const result = await invokePhase();
-                    phaseObservation.update({
-                      output: result.label,
-                      metadata: phaseMetadata,
-                    });
-                    return result;
-                  } catch (error) {
-                    phaseObservation.update({
-                      level: 'ERROR',
-                      statusMessage: String(
-                        (error as Error | null)?.message ?? error
-                      ),
-                      metadata: { ...phaseMetadata, status: 'failed' },
-                    });
-                    throw error;
-                  }
-                },
-                { asType: 'chain' }
-              )
-          )
-        );
-      });
+      return await withLangfuseRuntimeScope(phaseRuntimeScope, () =>
+        withLangfuseAttributes(
+          {
+            langfuse: phaseLangfuseConfig,
+            userId: phaseUserId,
+            sessionId: phaseSessionId,
+            traceName: phaseTraceName,
+            traceMetadata,
+            tags: phaseTags,
+          },
+          () => phaseRunnable.invoke(userPrompt, invokeConfig)
+        )
+      );
     } finally {
       await disposeLangfuseHandler(phaseLangfuseHandler);
     }

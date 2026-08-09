@@ -51,7 +51,10 @@ import {
   truncateToolResultContent,
 } from '@/utils/truncation';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
-import { getMessageCreationContentMetadata } from '@/messages/assistantPhase';
+import {
+  getMessageCreationContentMetadata,
+  splitAssistantTextContentByPhase,
+} from '@/messages/assistantPhase';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { composeAbortSignals } from '@/utils/misc';
@@ -1818,6 +1821,26 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     if (hasGoogleServerSideToolContent) {
       return;
+    }
+
+    if (Array.isArray(content) && content.every(isTextContentPart)) {
+      const contentGroups = splitAssistantTextContentByPhase(content);
+      if (contentGroups.length > 1) {
+        for (const contentGroup of contentGroups) {
+          const currentStepId = await dispatchMessageCreationStep({
+            graph,
+            stepKey,
+            content: contentGroup,
+            metadata,
+          });
+          await graph.dispatchMessageDelta(
+            currentStepId,
+            { content: contentGroup },
+            metadata
+          );
+        }
+        return;
+      }
     }
 
     const message_id = getMessageId(stepKey, graph) ?? '';

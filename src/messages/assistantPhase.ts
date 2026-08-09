@@ -21,6 +21,31 @@ export function getAssistantTextPhase(
   );
 }
 
+/**
+ * Keeps provider-authored text phases in distinct message-creation steps.
+ * Open Responses may return commentary and final-answer blocks in one chunk;
+ * collapsing the array into one step would assign the first block's phase to
+ * every block and hide the boundary that closes an activity phase.
+ */
+export function splitAssistantTextContentByPhase(
+  content: MessageContentComplex[]
+): MessageContentComplex[][] {
+  const groups: MessageContentComplex[][] = [];
+  for (const contentPart of content) {
+    const phase = getAssistantTextPhase(contentPart);
+    const currentGroup = groups.at(-1);
+    if (
+      currentGroup == null ||
+      getAssistantTextPhase(currentGroup[0]) !== phase
+    ) {
+      groups.push([contentPart]);
+      continue;
+    }
+    currentGroup.push(contentPart);
+  }
+  return groups;
+}
+
 function isTextPart(contentPart: MessageContentComplex): boolean {
   return contentPart.type?.startsWith(ContentTypes.TEXT) ?? false;
 }

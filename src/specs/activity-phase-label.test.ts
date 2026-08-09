@@ -1,5 +1,6 @@
 import { AIMessage } from '@langchain/core/messages';
 import { Providers } from '@/common';
+import { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT } from '@/langfuseToolOutputTracing';
 import { Run } from '@/run';
 
 const invoke = jest.fn();
@@ -68,6 +69,63 @@ describe('generateActivityPhaseLabel', () => {
     );
     expect(String(messages[1].content)).toContain(
       'Fixed refresh token validation'
+    );
+    const modelConfig = invoke.mock.calls[0][1] as {
+      callbacks?: { parentRunId?: string };
+      tags?: string[];
+    };
+    expect(modelConfig.callbacks?.parentRunId).toEqual(expect.any(String));
+    expect(modelConfig.tags).toEqual(
+      expect.arrayContaining(['activity-phase', 'agent'])
+    );
+  });
+
+  it('applies every agent redaction policy when any activity is unattributed', async () => {
+    const run = await Run.create({
+      runId: 'mixed-attribution-phase-run',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'agent-1',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4.1-mini' },
+            tools: [],
+          },
+          {
+            agentId: 'agent-2',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4.1-mini' },
+            tools: [],
+            langfuse: {
+              toolOutputTracing: { redactedToolNames: ['secret_tool'] },
+            },
+          },
+        ],
+      },
+    });
+
+    await run.generateActivityPhaseLabel({
+      provider: Providers.OPENAI,
+      activities: [
+        { agentId: 'agent-1', label: 'Inspected public session behavior' },
+        {
+          entries: [
+            {
+              toolName: 'secret_tool',
+              toolInput: { key: 'public-key' },
+              toolOutput: 'STRICT_AGENT_SECRET',
+              status: 'success',
+            },
+          ],
+        },
+      ],
+    });
+
+    const messages = invoke.mock.calls[0][0] as AIMessage[];
+    expect(String(messages[1].content)).not.toContain('STRICT_AGENT_SECRET');
+    expect(String(messages[1].content)).toContain(
+      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
     );
   });
 });

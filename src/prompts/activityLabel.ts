@@ -48,6 +48,9 @@ Bad examples:
 - Used three tools to inspect files and run tests
 - Searched code, read configuration, and updated middleware`;
 
+/** Hard ceiling across every activity/context section in one phase request. */
+export const ACTIVITY_PHASE_PROMPT_MAX_LENGTH = 12_000;
+
 /** Truncates a serialized value for the label prompt. */
 export function truncateForLabel(value: string, maxLength: number): string {
   if (value.length <= maxLength) {
@@ -384,8 +387,15 @@ export function buildActivityPhaseLabelPrompt({
     'Activities in this phase (synthesize; do not restate):\n' +
       activityLines.join('\n')
   );
-  sections.push('Phase summary:');
-  return sections.join('\n\n');
+  const terminalCue = '\n\nPhase summary:';
+  const evidence = sections.join('\n\n');
+  const prompt = evidence + terminalCue;
+  if (prompt.length <= ACTIVITY_PHASE_PROMPT_MAX_LENGTH) {
+    return prompt;
+  }
+  const evidenceLimit =
+    ACTIVITY_PHASE_PROMPT_MAX_LENGTH - terminalCue.length - 1;
+  return `${evidence.slice(0, evidenceLimit).trimEnd()}…${terminalCue}`;
 }
 
 /** Normalizes a model result for safe single-row persistence and display. */
