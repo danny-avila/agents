@@ -58,6 +58,9 @@ describe('generateActivityPhaseLabel', () => {
         ],
         assistantContext: ['I am checking the auth path.'],
         closingTextPhase: 'final_answer',
+        chainOptions: {
+          callbacks: [{ handleChainStart: jest.fn() }],
+        },
       })
     ).resolves.toEqual({
       label: 'Fixed session refresh handling and verified auth tests',
