@@ -1825,7 +1825,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     if (Array.isArray(content) && content.every(isTextContentPart)) {
       const contentGroups = splitAssistantTextContentByPhase(content);
-      const currentStepId = graph.stepKeyIds.get(stepKey)?.at(-1);
+      const currentStepId = graph.stepKeyIds?.get(stepKey)?.at(-1);
       const currentStep =
         currentStepId == null ? undefined : graph.getRunStep(currentStepId);
       const currentPhase =
