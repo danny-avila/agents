@@ -158,6 +158,41 @@ describe('generateActivityPhaseLabel', () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  it('preserves the phase parent when retrying without a failing callback', async () => {
+    invoke.mockRejectedValueOnce(new Error('event stream callback failed'));
+    const run = await createRun();
+
+    await expect(
+      run.generateActivityPhaseLabel({
+        provider: Providers.OPENAI,
+        activities: [
+          { label: 'Inspected session refresh middleware' },
+          { label: 'Fixed refresh token validation' },
+        ],
+        chainOptions: {
+          callbacks: [{ handleChainStart: jest.fn() }],
+        },
+      })
+    ).resolves.toEqual({
+      label: 'Fixed session refresh handling and verified auth tests',
+    });
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    const firstCallbacks = invoke.mock.calls[0][1].callbacks as {
+      getParentRunId: () => string | undefined;
+      handlers: unknown[];
+    };
+    const retryCallbacks = invoke.mock.calls[1][1].callbacks as {
+      getParentRunId: () => string | undefined;
+      handlers: unknown[];
+    };
+    expect(firstCallbacks.getParentRunId()).toEqual(expect.any(String));
+    expect(retryCallbacks.getParentRunId()).toBe(
+      firstCallbacks.getParentRunId()
+    );
+    expect(retryCallbacks.handlers).toHaveLength(0);
+  });
+
   it('applies every agent redaction policy when any activity is unattributed', async () => {
     const run = await Run.create({
       runId: 'mixed-attribution-phase-run',

@@ -37,3 +37,24 @@ export function findCallback(
   const handlers = Array.isArray(callbacks) ? callbacks : callbacks.handlers;
   return handlers.find(predicate);
 }
+
+export function filterCallbacks(
+  callbacks: Callbacks | undefined,
+  predicate: (callback: CallbackEntry) => boolean
+): Callbacks {
+  if (callbacks == null) {
+    return [];
+  }
+
+  if (Array.isArray(callbacks)) {
+    return callbacks.filter(predicate);
+  }
+
+  const filtered = callbacks.copy();
+  for (const handler of [...filtered.handlers]) {
+    if (!predicate(handler)) {
+      filtered.removeHandler(handler);
+    }
+  }
+  return filtered;
+}

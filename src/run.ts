@@ -61,6 +61,7 @@ import {
 } from '@/common';
 import {
   appendCallbacks,
+  filterCallbacks,
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
@@ -2103,9 +2104,12 @@ export class Run<_T extends t.BaseGraphState> {
           invokeConfig.callbacks,
           isLangfuseCallbackHandler
         );
-        const { callbacks: _cb, ...rest } = invokeConfig;
+        const { callbacks, ...rest } = invokeConfig;
         const safeConfig = Object.assign({}, rest, {
-          callbacks: langfuseHandler ? [langfuseHandler] : [],
+          callbacks: filterCallbacks(
+            callbacks,
+            (callback) => callback === langfuseHandler
+          ),
         });
         response = await withLangfuseRuntimeScope(labelRuntimeScope, () =>
           invokeLabel(safeConfig as Partial<RunnableConfig>)
@@ -2384,9 +2388,12 @@ export class Run<_T extends t.BaseGraphState> {
           runtimeConfig.callbacks,
           isLangfuseCallbackHandler
         );
-        const { callbacks: _callbacks, ...rest } = runtimeConfig;
+        const { callbacks, ...rest } = runtimeConfig;
         const safeConfig = Object.assign({}, rest, {
-          callbacks: langfuseHandler ? [langfuseHandler] : [],
+          callbacks: filterCallbacks(
+            callbacks,
+            (callback) => callback === langfuseHandler
+          ),
         });
         return invokeModel(safeConfig as Partial<RunnableConfig>);
       }
