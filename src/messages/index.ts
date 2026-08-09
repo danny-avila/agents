@@ -14,3 +14,4 @@ export * from './contextPruning';
 export * from './contextPruningSettings';
 export * from './reducer';
 export * from './recency';
+export * from './assistantPhase';

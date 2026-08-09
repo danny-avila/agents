@@ -9,3 +9,4 @@ export * from './stream';
 export * from './tools';
 export * from './summarize';
 export * from './activityLabel';
+export * from './assistantPhase';

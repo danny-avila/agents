@@ -3,8 +3,19 @@ import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { ChatOpenAIReasoningSummary } from '@langchain/openai';
 import type { AIMessageChunk } from '@langchain/core/messages';
 import type { AgentContext } from '@/agents/AgentContext';
+import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
+import {
+  claimStreamLimitCharge,
+  combineCompleteToolCalls,
+  enforceCompleteToolCallArgLimit,
+  enforceStreamedToolCallArgLimit,
+  enforceStreamDeltaEventLimit,
+  requiresStreamLimitAccounting,
+  StreamLimitExceededError,
+  STREAM_LIMIT_EPOCH_KEY,
+} from '@/llm/streamLimits';
 import {
   getStreamedToolCallSeal,
   getStreamedToolCallAdapter,
@@ -39,18 +50,8 @@ import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
-import type { RunBreakerScope } from '@/llm/streamLimits';
-import {
-  claimStreamLimitCharge,
-  combineCompleteToolCalls,
-  enforceCompleteToolCallArgLimit,
-  enforceStreamedToolCallArgLimit,
-  enforceStreamDeltaEventLimit,
-  requiresStreamLimitAccounting,
-  StreamLimitExceededError,
-  STREAM_LIMIT_EPOCH_KEY,
-} from '@/llm/streamLimits';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
+import { getMessageCreationContentMetadata } from '@/messages/assistantPhase';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { composeAbortSignals } from '@/utils/misc';
@@ -521,10 +522,14 @@ function shouldStartFreshMessageStepAfterGoogleServerSideTool({
 async function dispatchMessageCreationStep({
   graph,
   stepKey,
+  content,
+  contentType,
   metadata,
 }: {
   graph: StandardGraph;
   stepKey: string;
+  content?: string | t.MessageContentComplex[];
+  contentType?: ContentTypes.TEXT | ContentTypes.THINK;
   metadata?: Record<string, unknown>;
 }): Promise<string> {
   const messageId = getMessageId(stepKey, graph, true) ?? '';
@@ -534,6 +539,7 @@ async function dispatchMessageCreationStep({
       type: StepTypes.MESSAGE_CREATION,
       message_creation: {
         message_id: messageId,
+        ...getMessageCreationContentMetadata(content, contentType),
       },
     },
     metadata
@@ -555,6 +561,7 @@ async function dispatchMessageContentParts({
     const currentStepId = await dispatchMessageCreationStep({
       graph,
       stepKey,
+      content: [contentPart],
       metadata,
     });
     if (isGoogleServerSideToolContentPart(contentPart)) {
@@ -587,6 +594,8 @@ async function dispatchReasoningContentParts({
   const currentStepId = await dispatchMessageCreationStep({
     graph,
     stepKey,
+    content,
+    contentType: ContentTypes.THINK,
     metadata,
   });
   await graph.dispatchReasoningDelta(
@@ -1813,12 +1822,17 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     const message_id = getMessageId(stepKey, graph) ?? '';
     if (message_id) {
+      const fallbackContentType =
+        agentContext.currentTokenType === ContentTypes.TEXT
+          ? ContentTypes.TEXT
+          : ContentTypes.THINK;
       await graph.dispatchRunStep(
         stepKey,
         {
           type: StepTypes.MESSAGE_CREATION,
           message_creation: {
             message_id,
+            ...getMessageCreationContentMetadata(content, fallbackContentType),
           },
         },
         metadata
@@ -1835,7 +1849,12 @@ export class ChatModelStreamHandler implements t.EventHandler {
         content,
       })
     ) {
-      stepId = await dispatchMessageCreationStep({ graph, stepKey, metadata });
+      stepId = await dispatchMessageCreationStep({
+        graph,
+        stepKey,
+        content,
+        metadata,
+      });
       runStep = graph.getRunStep(stepId);
     }
     if (!runStep) {
@@ -1906,6 +1925,7 @@ hasToolCallChunks: ${hasToolCallChunks}
               type: StepTypes.MESSAGE_CREATION,
               message_creation: {
                 message_id,
+                content_type: ContentTypes.TEXT,
               },
             },
             metadata

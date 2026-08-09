@@ -61,6 +61,7 @@ import {
   supportsBedrockToolCache,
   isSyntheticProviderContextMessage,
   getMessageId,
+  getMessageCreationContentMetadata,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
   DEFAULT_RETAIN_RECENT_TURNS,
@@ -507,18 +508,25 @@ async function dispatchMessageCreationStep({
   graph,
   stepKey,
   messageId,
+  content,
+  contentType,
   metadata,
 }: {
   graph: Graph<t.BaseGraphState>;
   stepKey: string;
   messageId: string;
+  content?: string | t.MessageContentComplex[];
+  contentType?: ContentTypes.TEXT | ContentTypes.THINK;
   metadata: Record<string, unknown>;
 }): Promise<string> {
   await graph.dispatchRunStep(
     stepKey,
     {
       type: StepTypes.MESSAGE_CREATION,
-      message_creation: { message_id: messageId },
+      message_creation: {
+        message_id: messageId,
+        ...getMessageCreationContentMetadata(content, contentType),
+      },
     },
     metadata
   );
@@ -548,6 +556,7 @@ async function dispatchTextMessageContent({
         graph,
         stepKey,
         messageId,
+        content: [contentPart],
         metadata,
       });
       await graph.dispatchMessageDelta(
@@ -562,6 +571,8 @@ async function dispatchTextMessageContent({
     graph,
     stepKey,
     messageId,
+    content,
+    contentType: ContentTypes.TEXT,
     metadata,
   });
   await graph.dispatchMessageDelta(stepId, { content }, metadata);
@@ -599,7 +610,10 @@ async function dispatchReasoningContent({
     stepKey,
     {
       type: StepTypes.MESSAGE_CREATION,
-      message_creation: { message_id: messageId },
+      message_creation: {
+        message_id: messageId,
+        content_type: ContentTypes.THINK,
+      },
     },
     metadata
   );

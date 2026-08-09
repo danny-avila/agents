@@ -1,5 +1,8 @@
+import type {
+  ActivityLabelToolEntry,
+  ActivityPhaseEntry,
+} from '@/types/activityLabel';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
-import type { ActivityLabelToolEntry } from '@/types/activityLabel';
 import { shouldRedactTool } from '@/langfuseToolOutputTracing';
 
 /**
@@ -24,6 +27,26 @@ Examples:
 - Fixed failing auth middleware tests
 - Read project config and dependency manifests
 - Attempted database migration, hit permission errors`;
+
+/** Default system prompt for a run-wide parent activity phase. */
+export const ACTIVITY_PHASE_LABEL_PROMPT = `Summarize what this phase of an agent run accomplished. The result appears as the header of one collapsed parent group containing several activities.
+
+Rules:
+- One line, 8 to 18 words, past tense
+- Lead with the concrete outcome and name the most distinctive subject
+- Synthesize the phase; do not enumerate, count, or restate individual activities
+- Describe failures plainly when they are the phase's material outcome
+- Never mention tool names, calls, arguments, reasoning, commentary, or activity counts
+- Output only the summary — no quotes, no trailing punctuation, no preamble
+
+Examples:
+- Reconciled authentication behavior and fixed the failing session refresh path
+- Compared deployment options and documented the safest production rollout
+- Investigated database latency but could not confirm the suspected index regression
+
+Bad examples:
+- Used three tools to inspect files and run tests
+- Searched code, read configuration, and updated middleware`;
 
 /** Truncates a serialized value for the label prompt. */
 export function truncateForLabel(value: string, maxLength: number): string {
@@ -105,6 +128,10 @@ const PREVIOUS_LABEL_LIMIT = 200;
  *  produce one, and the cap keeps a 200-call programmatic batch from
  *  building an enormous prompt out of per-field-bounded pieces. */
 const MAX_PROMPT_ENTRIES = 12;
+const MAX_PHASE_ACTIVITIES = 12;
+const MAX_PHASE_CONTEXT = 3;
+const MAX_PHASE_TOOL_ENTRIES = 6;
+export const ACTIVITY_PHASE_LABEL_MAX_LENGTH = 160;
 
 export type BuildActivityLabelPromptParams = {
   entries: ActivityLabelToolEntry[];
@@ -239,4 +266,126 @@ export function buildActivityLabelPrompt({
    *  output as "the header of a collapsed activity group". */
   sections.push('Header:');
   return sections.join('\n\n');
+}
+
+export type BuildActivityPhaseLabelPromptParams = {
+  activities: ActivityPhaseEntry[];
+  charLimit: number;
+  assistantContext?: string[];
+  redaction?: ResolvedLangfuseToolOutputTracingConfig;
+};
+
+/**
+ * Builds bounded, redaction-aware evidence for a parent activity phase.
+ * Committed child labels are preferred; raw tool/reasoning evidence is only
+ * used when no child label exists.
+ */
+export function buildActivityPhaseLabelPrompt({
+  activities,
+  charLimit,
+  assistantContext,
+  redaction,
+}: BuildActivityPhaseLabelPromptParams): string {
+  const freeFormSuppressed =
+    redaction != null &&
+    (redaction.enabled === false || redaction.redactedToolNames.size > 0);
+  const sections: string[] = [];
+  if (
+    !freeFormSuppressed &&
+    assistantContext != null &&
+    assistantContext.length > 0
+  ) {
+    const context = assistantContext
+      .slice(-MAX_PHASE_CONTEXT)
+      .map((text) =>
+        truncateForLabel(text.replace(/\s+/g, ' ').trim(), charLimit)
+      )
+      .filter((text) => text.length > 0);
+    if (context.length > 0) {
+      sections.push(
+        'Intermediate assistant context (do not quote or restate):\n' +
+          context.map((text) => `- ${text}`).join('\n')
+      );
+    }
+  }
+
+  const activityLines = activities
+    .slice(0, MAX_PHASE_ACTIVITIES)
+    .map((activity, index) => {
+      if (
+        !freeFormSuppressed &&
+        activity.label != null &&
+        activity.label.trim() !== ''
+      ) {
+        return `${index + 1}. ${truncateForLabel(activity.label.replace(/\s+/g, ' ').trim(), charLimit)}`;
+      }
+
+      const evidence: string[] = [];
+      if (
+        !freeFormSuppressed &&
+        activity.thinkingExcerpts != null &&
+        activity.thinkingExcerpts.length > 0
+      ) {
+        evidence.push(
+          ...activity.thinkingExcerpts
+            .slice(0, MAX_THINKING_EXCERPTS)
+            .map((excerpt) =>
+              truncateForLabel(excerpt.replace(/\s+/g, ' ').trim(), charLimit)
+            )
+            .filter((excerpt) => excerpt.length > 0)
+            .map((excerpt) => `context=${excerpt}`)
+        );
+      }
+      if (activity.entries != null && activity.entries.length > 0) {
+        evidence.push(
+          ...activity.entries.slice(0, MAX_PHASE_TOOL_ENTRIES).map((entry) => {
+            const entryRedacted =
+              redaction != null && shouldRedactTool(entry.toolName, redaction);
+            const input = truncateForLabel(
+              serializeForLabel(entry.toolInput, charLimit),
+              charLimit
+            );
+            let outcome: string;
+            if (entryRedacted) {
+              outcome = redaction.redactionText;
+            } else if (entry.status === 'error') {
+              outcome = `ERROR: ${truncateForLabel(
+                entry.error ?? 'unknown error',
+                charLimit
+              )}`;
+            } else {
+              outcome = truncateForLabel(
+                serializeForLabel(entry.toolOutput, charLimit),
+                charLimit
+              );
+            }
+            return `${entry.toolName}(${input}) → ${outcome}`;
+          })
+        );
+      }
+      const status = activity.status === 'error' ? 'failed' : 'completed';
+      return `${index + 1}. ${status}${evidence.length > 0 ? `: ${evidence.join('; ')}` : ''}`;
+    });
+
+  if (activities.length > MAX_PHASE_ACTIVITIES) {
+    activityLines.push(
+      `${MAX_PHASE_ACTIVITIES + 1}. …and ${activities.length - MAX_PHASE_ACTIVITIES} more activities`
+    );
+  }
+  sections.push(
+    'Activities in this phase (synthesize; do not restate):\n' +
+      activityLines.join('\n')
+  );
+  sections.push('Phase summary:');
+  return sections.join('\n\n');
+}
+
+/** Normalizes a model result for safe single-row persistence and display. */
+export function normalizeActivityPhaseLabel(label: string): string {
+  const normalized = label
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .replace(/[.!?]+$/g, '');
+  return truncateForLabel(normalized, ACTIVITY_PHASE_LABEL_MAX_LENGTH);
 }
