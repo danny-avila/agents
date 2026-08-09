@@ -91,6 +91,8 @@ export type RunActivityPhaseLabelOptions = {
    * cannot accidentally spend a model call summarizing a single activity.
    */
   activities: ActivityPhaseEntry[];
+  /** Full count when the host retained only bounded prompt evidence. */
+  totalActivityCount?: number;
   /**
    * Bounded assistant commentary emitted inside the phase. Human messages
    * must not be supplied through this low-scrutiny summarization path.

@@ -278,6 +278,18 @@ describe('buildActivityPhaseLabelPrompt', () => {
     expect(prompt).toContain('completed: Recovered the remaining replicas');
   });
 
+  it('reports omitted activities from the host total without retaining their evidence', () => {
+    const prompt = buildActivityPhaseLabelPrompt({
+      activities: Array.from({ length: 12 }, (_, index) => ({
+        label: `Completed activity ${index + 1}`,
+      })),
+      totalActivityCount: 20,
+      charLimit: 600,
+    });
+
+    expect(prompt).toContain('…and 8 more activities');
+  });
+
   it('uses raw fallback while applying the strict redaction policy', () => {
     const prompt = buildActivityPhaseLabelPrompt({
       activities: [

@@ -270,6 +270,7 @@ export function buildActivityLabelPrompt({
 
 export type BuildActivityPhaseLabelPromptParams = {
   activities: ActivityPhaseEntry[];
+  totalActivityCount?: number;
   charLimit: number;
   assistantContext?: string[];
   redaction?: ResolvedLangfuseToolOutputTracingConfig;
@@ -282,6 +283,7 @@ export type BuildActivityPhaseLabelPromptParams = {
  */
 export function buildActivityPhaseLabelPrompt({
   activities,
+  totalActivityCount,
   charLimit,
   assistantContext,
   redaction,
@@ -372,9 +374,10 @@ export function buildActivityPhaseLabelPrompt({
       return `${index + 1}. ${status}${evidence.length > 0 ? `: ${evidence.join('; ')}` : ''}`;
     });
 
-  if (activities.length > MAX_PHASE_ACTIVITIES) {
+  const activityCount = Math.max(activities.length, totalActivityCount ?? 0);
+  if (activityCount > MAX_PHASE_ACTIVITIES) {
     activityLines.push(
-      `${MAX_PHASE_ACTIVITIES + 1}. …and ${activities.length - MAX_PHASE_ACTIVITIES} more activities`
+      `${MAX_PHASE_ACTIVITIES + 1}. …and ${activityCount - MAX_PHASE_ACTIVITIES} more activities`
     );
   }
   sections.push(

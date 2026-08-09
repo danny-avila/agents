@@ -2119,6 +2119,7 @@ export class Run<_T extends t.BaseGraphState> {
     provider,
     clientOptions,
     activities,
+    totalActivityCount,
     assistantContext,
     closingTextPhase,
     prompt,
@@ -2220,6 +2221,7 @@ export class Run<_T extends t.BaseGraphState> {
 
     const userPrompt = buildActivityPhaseLabelPrompt({
       activities,
+      totalActivityCount,
       charLimit,
       assistantContext,
       redaction,
@@ -2342,7 +2344,7 @@ export class Run<_T extends t.BaseGraphState> {
       ...(sourceTraceId == null ? {} : { sourceTraceId }),
       responseId: phaseMessageId,
       phaseIndex: resolvedPhaseIndex,
-      activityCount: activities.length,
+      activityCount: Math.max(activities.length, totalActivityCount ?? 0),
       status,
       contributingAgentIds,
       ...(closingTextPhase == null ? {} : { closingTextPhase }),
