@@ -52,6 +52,14 @@ describe('generateActivityPhaseLabel', () => {
     if (run.Graph != null) {
       run.Graph.messages = [
         new HumanMessage('Why is session refresh failing?'),
+        new HumanMessage({
+          content: 'Internal routing instructions',
+          additional_kwargs: {
+            role: 'user',
+            isMeta: true,
+            source: 'routing',
+          },
+        }),
       ];
     }
     const handleChainStart = jest.fn();
@@ -68,6 +76,9 @@ describe('generateActivityPhaseLabel', () => {
         closingTextPhase: 'final_answer',
         chainOptions: {
           callbacks: [{ handleChainStart, handleChainEnd }],
+          configurable: {
+            requestBody: { parentMessageId: 'parent-message-1' },
+          },
         },
       })
     ).resolves.toEqual({
@@ -99,6 +110,7 @@ describe('generateActivityPhaseLabel', () => {
       expect.objectContaining({
         agentId: 'agent-1',
         agentName: 'Phase Agent',
+        parentMessageId: 'parent-message-1',
       })
     );
     expect(handleChainStart.mock.calls[0]?.[1]).toEqual(
@@ -109,6 +121,9 @@ describe('generateActivityPhaseLabel', () => {
           }),
         ]),
       })
+    );
+    expect(JSON.stringify(handleChainStart.mock.calls[0]?.[1])).not.toContain(
+      'Internal routing instructions'
     );
     expect(handleChainEnd.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({

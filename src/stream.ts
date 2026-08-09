@@ -33,6 +33,10 @@ import {
   LOCAL_CODING_BUNDLE_NAMES,
 } from '@/common';
 import {
+  getMessageCreationContentMetadata,
+  splitAssistantTextContentByPhase,
+} from '@/messages/assistantPhase';
+import {
   buildToolExecutionRequestPlan,
   coerceRecordArgs,
   normalizeError,
@@ -51,10 +55,6 @@ import {
   truncateToolResultContent,
 } from '@/utils/truncation';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
-import {
-  getMessageCreationContentMetadata,
-  splitAssistantTextContentByPhase,
-} from '@/messages/assistantPhase';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { composeAbortSignals } from '@/utils/misc';
@@ -1825,7 +1825,21 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     if (Array.isArray(content) && content.every(isTextContentPart)) {
       const contentGroups = splitAssistantTextContentByPhase(content);
-      if (contentGroups.length > 1) {
+      const currentStepId = graph.stepKeyIds.get(stepKey)?.at(-1);
+      const currentStep =
+        currentStepId == null ? undefined : graph.getRunStep(currentStepId);
+      const currentPhase =
+        currentStep?.stepDetails.type === StepTypes.MESSAGE_CREATION
+          ? currentStep.stepDetails.message_creation.phase
+          : undefined;
+      const nextPhase = getMessageCreationContentMetadata(
+        contentGroups[0]
+      ).phase;
+      const phaseChanged =
+        currentPhase != null &&
+        nextPhase != null &&
+        currentPhase !== nextPhase;
+      if (contentGroups.length > 1 || phaseChanged) {
         for (const contentGroup of contentGroups) {
           const currentStepId = await dispatchMessageCreationStep({
             graph,

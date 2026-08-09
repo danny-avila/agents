@@ -2228,7 +2228,9 @@ export class Run<_T extends t.BaseGraphState> {
     const phaseChainOptions = {
       ...(chainOptions ?? {}),
     } as Partial<RunnableConfig> & {
-      configurable?: Record<string, unknown>;
+      configurable?: Record<string, unknown> & {
+        requestBody?: { parentMessageId?: unknown };
+      };
     };
     const phaseUserId =
       typeof phaseChainOptions.configurable?.user_id === 'string'
@@ -2243,6 +2245,8 @@ export class Run<_T extends t.BaseGraphState> {
       responseId ?? `activity-phase-${this.id}-${resolvedPhaseIndex}`;
     const phaseAgentId = this.Graph?.defaultAgentId;
     const phaseAgentName = phaseContext?.name;
+    const phaseParentMessageId =
+      phaseChainOptions.configurable?.requestBody?.parentMessageId;
     const phaseMetadata: Record<string, unknown> = {
       sourceRunId: sourceRunId ?? this.id,
       ...(sourceTraceId == null ? {} : { sourceTraceId }),
@@ -2251,6 +2255,9 @@ export class Run<_T extends t.BaseGraphState> {
       activityCount: Math.max(activities.length, totalActivityCount ?? 0),
       status,
       contributingAgentIds,
+      ...(typeof phaseParentMessageId === 'string'
+        ? { parentMessageId: phaseParentMessageId }
+        : {}),
       ...(phaseAgentId == null ? {} : { agentId: phaseAgentId }),
       ...(phaseAgentName == null ? {} : { agentName: phaseAgentName }),
       ...(closingTextPhase == null ? {} : { closingTextPhase }),
@@ -2258,6 +2265,7 @@ export class Run<_T extends t.BaseGraphState> {
     const traceMetadata = {
       ...createLangfuseTraceMetadata({
         messageId: phaseMessageId,
+        parentMessageId: phaseParentMessageId,
         agentId: phaseAgentId,
         agentName: phaseAgentName,
       }),
@@ -2300,8 +2308,8 @@ export class Run<_T extends t.BaseGraphState> {
     });
     let phaseLangfuseHandler: CallbackEntry | undefined;
     const sourceUserText =
-      findActivityPhaseTraceInput(this.Graph?.getRunMessages() ?? []) ??
-      this.activityPhaseTraceInput;
+      this.activityPhaseTraceInput ??
+      findActivityPhaseTraceInput(this.Graph?.getRunMessages() ?? []);
     if (phaseSessionId != null && sourceUserText != null) {
       phaseLangfuseHandler = createLangfuseHandler({
         langfuse: phaseLangfuseConfig,
@@ -2463,7 +2471,8 @@ function findActivityPhaseTraceInput(
     const message = messages[i];
     if (
       message.getType() !== 'human' ||
-      message.additional_kwargs?.role === 'system'
+      message.additional_kwargs?.role === 'system' ||
+      message.additional_kwargs?.isMeta === true
     ) {
       continue;
     }
