@@ -242,4 +242,65 @@ describe('generateActivityPhaseLabel', () => {
       LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
     );
   });
+
+  it('applies every policy when omitted activities have no complete agent list', async () => {
+    const run = await Run.create({
+      runId: 'omitted-attribution-phase-run',
+      graphConfig: {
+        type: 'multi-agent',
+        agents: [
+          {
+            agentId: 'agent-1',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4.1-mini' },
+            tools: [],
+          },
+          {
+            agentId: 'agent-2',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4.1-mini' },
+            tools: [],
+            langfuse: {
+              toolOutputTracing: { redactedToolNames: ['secret_tool'] },
+            },
+          },
+        ],
+        edges: [],
+      },
+    });
+
+    await run.generateActivityPhaseLabel({
+      provider: Providers.OPENAI,
+      activities: [
+        {
+          agentId: 'agent-1',
+          entries: [
+            {
+              toolName: 'public_lookup',
+              toolInput: { id: 'one' },
+              toolOutput: 'public-one',
+              status: 'success',
+            },
+          ],
+        },
+        {
+          agentId: 'agent-1',
+          entries: [
+            {
+              toolName: 'public_lookup',
+              toolInput: { id: 'two' },
+              toolOutput: 'public-two',
+              status: 'success',
+            },
+          ],
+        },
+      ],
+      totalActivityCount: 3,
+      assistantContext: ['OMITTED_AGENT_SECRET'],
+    });
+
+    const messages = invoke.mock.calls[0][0] as AIMessage[];
+    expect(String(messages[1].content)).not.toContain('OMITTED_AGENT_SECRET');
+    expect(String(messages[1].content)).toContain('public-one');
+  });
 });

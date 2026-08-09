@@ -2154,6 +2154,9 @@ export class Run<_T extends t.BaseGraphState> {
     const hasUnattributedActivity = activities.some(
       (activity) => activity.agentId == null
     );
+    const hasOmittedActivitiesWithoutAgentIds =
+      agentIds == null &&
+      (totalActivityCount ?? activities.length) > activities.length;
     const contributingAgentIds = [
       ...new Set([
         ...(agentIds ?? []),
@@ -2186,7 +2189,9 @@ export class Run<_T extends t.BaseGraphState> {
       ? resolveToolOutputTracingConfig(this.langfuse, phaseContext?.langfuse)
       : undefined;
     const redactionContexts =
-      contributingAgentIds.length > 0 && !hasUnattributedActivity
+      contributingAgentIds.length > 0 &&
+      !hasUnattributedActivity &&
+      !hasOmittedActivitiesWithoutAgentIds
         ? contributingAgentIds.flatMap((agentId) => {
           const context = agentContexts?.get(agentId);
           return context == null ? [] : [context];
