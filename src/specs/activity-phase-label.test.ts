@@ -71,10 +71,12 @@ describe('generateActivityPhaseLabel', () => {
       'Fixed refresh token validation'
     );
     const modelConfig = invoke.mock.calls[0][1] as {
-      callbacks?: { parentRunId?: string };
+      callbacks?: { getParentRunId?: () => string | undefined };
       tags?: string[];
     };
-    expect(modelConfig.callbacks?.parentRunId).toEqual(expect.any(String));
+    expect(modelConfig.callbacks?.getParentRunId?.()).toEqual(
+      expect.any(String)
+    );
     expect(modelConfig.tags).toEqual(
       expect.arrayContaining(['activity-phase', 'agent'])
     );
@@ -84,7 +86,7 @@ describe('generateActivityPhaseLabel', () => {
     const run = await Run.create({
       runId: 'mixed-attribution-phase-run',
       graphConfig: {
-        type: 'standard',
+        type: 'multi-agent',
         agents: [
           {
             agentId: 'agent-1',
@@ -102,6 +104,7 @@ describe('generateActivityPhaseLabel', () => {
             },
           },
         ],
+        edges: [],
       },
     });
 
