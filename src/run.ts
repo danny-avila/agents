@@ -2109,7 +2109,7 @@ export class Run<_T extends t.BaseGraphState> {
 
   /**
    * Generates one parent summary for two or more logical activities. The
-   * summary model is traced as a dedicated activity-phase chain root in the
+   * summary model is traced as a dedicated activity-phase agent root in the
    * conversation session, with the model callback recorded as its generation
    * child. No session id means no phase trace, avoiding orphan observations.
    */
