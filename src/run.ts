@@ -2494,14 +2494,13 @@ function extractPromptText(message: BaseMessage): string {
   }
   const parts: string[] = [];
   for (const block of content) {
+    const textBlock = block as { type?: unknown; text?: unknown } | null;
     if (
-      typeof block === 'object' &&
-      'type' in block &&
-      block.type === 'text' &&
-      'text' in block &&
-      typeof block.text === 'string'
+      textBlock != null &&
+      (textBlock.type === 'text' || textBlock.type === 'input_text') &&
+      typeof textBlock.text === 'string'
     ) {
-      parts.push(block.text);
+      parts.push(textBlock.text);
     }
   }
   return parts.join('\n');

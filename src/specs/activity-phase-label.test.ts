@@ -51,7 +51,14 @@ describe('generateActivityPhaseLabel', () => {
     const run = await createRun();
     if (run.Graph != null) {
       run.Graph.messages = [
-        new HumanMessage('Why is session refresh failing?'),
+        new HumanMessage({
+          content: [
+            {
+              type: 'input_text',
+              text: 'Why is session refresh failing?',
+            } as never,
+          ],
+        }),
         new HumanMessage({
           content: 'Internal routing instructions',
           additional_kwargs: {
