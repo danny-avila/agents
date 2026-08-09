@@ -314,12 +314,12 @@ export function buildActivityPhaseLabelPrompt({
   const activityLines = activities
     .slice(0, MAX_PHASE_ACTIVITIES)
     .map((activity, index) => {
-      const status =
-        activity.status === 'error'
-          ? 'failed'
-          : activity.status === 'partial'
-            ? 'partial'
-            : 'completed';
+      let status = 'completed';
+      if (activity.status === 'error') {
+        status = 'failed';
+      } else if (activity.status === 'partial') {
+        status = 'partial';
+      }
       if (
         !freeFormSuppressed &&
         activity.label != null &&
