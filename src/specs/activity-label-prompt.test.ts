@@ -291,6 +291,18 @@ describe('buildActivityPhaseLabelPrompt', () => {
     expect(prompt).toContain('…and 8 more activities');
   });
 
+  it('rejects status-only retained activities when evidence exists only beyond the cap', () => {
+    const prompt = buildActivityPhaseLabelPrompt({
+      activities: [
+        ...Array.from({ length: 12 }, () => ({ status: 'success' as const })),
+        { label: 'This evidence is outside the retained activity window' },
+      ],
+      charLimit: 600,
+    });
+
+    expect(prompt).toBe('');
+  });
+
   it('uses raw fallback while applying the strict redaction policy', () => {
     const prompt = buildActivityPhaseLabelPrompt({
       activities: [

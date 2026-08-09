@@ -314,6 +314,7 @@ export function buildActivityPhaseLabelPrompt({
     }
   }
 
+  let hasDescribableEvidence = false;
   const activityLines = activities
     .slice(0, MAX_PHASE_ACTIVITIES)
     .map((activity, index) => {
@@ -328,6 +329,7 @@ export function buildActivityPhaseLabelPrompt({
         activity.label != null &&
         activity.label.trim() !== ''
       ) {
+        hasDescribableEvidence = true;
         return `${index + 1}. ${status}: ${truncateForLabel(activity.label.replace(/\s+/g, ' ').trim(), charLimit)}`;
       }
 
@@ -374,8 +376,15 @@ export function buildActivityPhaseLabelPrompt({
           })
         );
       }
+      if (evidence.length > 0) {
+        hasDescribableEvidence = true;
+      }
       return `${index + 1}. ${status}${evidence.length > 0 ? `: ${evidence.join('; ')}` : ''}`;
     });
+
+  if (!hasDescribableEvidence) {
+    return '';
+  }
 
   const activityCount = Math.max(activities.length, totalActivityCount ?? 0);
   if (activityCount > MAX_PHASE_ACTIVITIES) {

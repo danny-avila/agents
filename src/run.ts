@@ -5,16 +5,17 @@ import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import {
-  BaseMessage,
-  HumanMessage,
-  SystemMessage,
-} from '@langchain/core/messages';
-import {
   Command,
   INTERRUPT,
   MemorySaver,
   isInterrupted,
 } from '@langchain/langgraph';
+import {
+  AIMessage,
+  BaseMessage,
+  HumanMessage,
+  SystemMessage,
+} from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { MessageContentComplex } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
@@ -251,6 +252,8 @@ export class Run<_T extends t.BaseGraphState> {
   private activityLabelSeq = 0;
   /** Per-run sequence for parent activity-phase trace and invocation ids. */
   private activityPhaseLabelSeq = 0;
+  /** Latest user turn used to keep detached phase roots conversation-shaped. */
+  private activityPhaseTraceInput?: string;
   /** Distinguishes sibling forks started from the same explicit checkpoint. */
   private checkpointForkSeq = 0;
   private _haltedReason: string | undefined;
@@ -831,6 +834,11 @@ export class Run<_T extends t.BaseGraphState> {
      */
     const isResume = inputs instanceof Command;
     const stateInputs = isResume ? undefined : (inputs as t.IState);
+    if (stateInputs != null) {
+      this.activityPhaseTraceInput = findActivityPhaseTraceInput(
+        stateInputs.messages
+      );
+    }
 
     /**
      * Every honored seal costs one extra superstep, so a preemption-enabled
@@ -1570,9 +1578,12 @@ export class Run<_T extends t.BaseGraphState> {
     }
     const persistedMessages = getPersistedMessages(snapshot);
     if (persistedMessages != null) {
-      this.Graph?.restoreCheckpointMessages(
-        persistedMessages,
-        getResumeUpdateMessages(resumeUpdate)
+      const resumeMessages = getResumeUpdateMessages(resumeUpdate);
+      this.Graph?.restoreCheckpointMessages(persistedMessages, resumeMessages);
+      this.activityPhaseTraceInput = findActivityPhaseTraceInput(
+        resumeMessages == null
+          ? persistedMessages
+          : [...persistedMessages, ...resumeMessages]
       );
     }
 
@@ -2204,22 +2215,6 @@ export class Run<_T extends t.BaseGraphState> {
       };
     }
 
-    const freeFormSuppressed =
-      redaction != null &&
-      (redaction.enabled === false || redaction.redactedToolNames.size > 0);
-    const hasDescribableEvidence = activities.some(
-      (activity) =>
-        (!freeFormSuppressed &&
-          ((activity.label?.trim().length ?? 0) > 0 ||
-            activity.thinkingExcerpts?.some(
-              (excerpt) => excerpt.trim().length > 0
-            ) === true)) ||
-        (activity.entries?.length ?? 0) > 0
-    );
-    if (!hasDescribableEvidence) {
-      return {};
-    }
-
     const userPrompt = buildActivityPhaseLabelPrompt({
       activities,
       totalActivityCount,
@@ -2227,6 +2222,9 @@ export class Run<_T extends t.BaseGraphState> {
       assistantContext,
       redaction,
     });
+    if (userPrompt === '') {
+      return {};
+    }
     const phaseChainOptions = {
       ...(chainOptions ?? {}),
     } as Partial<RunnableConfig> & {
@@ -2243,6 +2241,8 @@ export class Run<_T extends t.BaseGraphState> {
     const resolvedPhaseIndex = phaseIndex ?? phaseSeq - 1;
     const phaseMessageId =
       responseId ?? `activity-phase-${this.id}-${resolvedPhaseIndex}`;
+    const phaseAgentId = this.Graph?.defaultAgentId;
+    const phaseAgentName = phaseContext?.name;
     const phaseMetadata: Record<string, unknown> = {
       sourceRunId: sourceRunId ?? this.id,
       ...(sourceTraceId == null ? {} : { sourceTraceId }),
@@ -2251,10 +2251,16 @@ export class Run<_T extends t.BaseGraphState> {
       activityCount: Math.max(activities.length, totalActivityCount ?? 0),
       status,
       contributingAgentIds,
+      ...(phaseAgentId == null ? {} : { agentId: phaseAgentId }),
+      ...(phaseAgentName == null ? {} : { agentName: phaseAgentName }),
       ...(closingTextPhase == null ? {} : { closingTextPhase }),
     };
     const traceMetadata = {
-      ...createLangfuseTraceMetadata({ messageId: phaseMessageId }),
+      ...createLangfuseTraceMetadata({
+        messageId: phaseMessageId,
+        agentId: phaseAgentId,
+        agentName: phaseAgentName,
+      }),
       sourceRunId: String(phaseMetadata.sourceRunId),
       ...(sourceTraceId == null ? {} : { sourceTraceId }),
       responseId: phaseMessageId,
@@ -2293,7 +2299,10 @@ export class Run<_T extends t.BaseGraphState> {
       runId: phaseScopeRunId,
     });
     let phaseLangfuseHandler: CallbackEntry | undefined;
-    if (phaseSessionId != null) {
+    const sourceUserText =
+      findActivityPhaseTraceInput(this.Graph?.getRunMessages() ?? []) ??
+      this.activityPhaseTraceInput;
+    if (phaseSessionId != null && sourceUserText != null) {
       phaseLangfuseHandler = createLangfuseHandler({
         langfuse: phaseLangfuseConfig,
         userId: phaseUserId,
@@ -2394,17 +2403,19 @@ export class Run<_T extends t.BaseGraphState> {
     };
     const phaseRunnable = new RunnableLambda({
       func: async (
-        _input: string,
+        _input: { messages: BaseMessage[] },
         runtimeConfig?: Partial<RunnableConfig>
-      ): Promise<{ label?: string }> => {
+      ): Promise<{ label?: string; messages: BaseMessage[] }> => {
         const response = await invokeWithCallbackFallback(runtimeConfig ?? {});
         const label = extractPhaseLabel(response);
-        return label.length > 0 ? { label } : {};
+        return label.length > 0
+          ? { label, messages: [new AIMessage(label)] }
+          : { messages: [] };
       },
     }).withConfig({ runName: 'summarize-activity-phase' });
 
     try {
-      return await withLangfuseRuntimeScope(phaseRuntimeScope, () =>
+      const result = await withLangfuseRuntimeScope(phaseRuntimeScope, () =>
         withLangfuseAttributes(
           {
             langfuse: phaseLangfuseConfig,
@@ -2414,9 +2425,19 @@ export class Run<_T extends t.BaseGraphState> {
             traceMetadata,
             tags: phaseTags,
           },
-          () => phaseRunnable.invoke(userPrompt, invokeConfig)
+          () =>
+            phaseRunnable.invoke(
+              {
+                messages:
+                  sourceUserText == null
+                    ? []
+                    : [new HumanMessage(sourceUserText)],
+              },
+              invokeConfig
+            )
         )
       );
+      return result.label == null ? {} : { label: result.label };
     } finally {
       await disposeLangfuseHandler(phaseLangfuseHandler);
     }
@@ -2430,6 +2451,25 @@ function findLastMessageOfType(
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].getType() === type) {
       return messages[i];
+    }
+  }
+  return undefined;
+}
+
+function findActivityPhaseTraceInput(
+  messages: BaseMessage[]
+): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (
+      message.getType() !== 'human' ||
+      message.additional_kwargs?.role === 'system'
+    ) {
+      continue;
+    }
+    const input = extractPromptText(message).trim();
+    if (input !== '') {
+      return input;
     }
   }
   return undefined;

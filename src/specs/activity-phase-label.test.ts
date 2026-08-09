@@ -1,6 +1,6 @@
-import { AIMessage } from '@langchain/core/messages';
-import { Providers } from '@/common';
+import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT } from '@/langfuseToolOutputTracing';
+import { Providers } from '@/common';
 import { Run } from '@/run';
 
 const invoke = jest.fn();
@@ -17,6 +17,7 @@ async function createRun(): Promise<Run<never>> {
       agents: [
         {
           agentId: 'agent-1',
+          name: 'Phase Agent',
           provider: Providers.OPENAI,
           clientOptions: { model: 'gpt-4.1-mini' },
           tools: [],
@@ -48,6 +49,13 @@ describe('generateActivityPhaseLabel', () => {
 
   it('summarizes two activities and normalizes the persisted row', async () => {
     const run = await createRun();
+    if (run.Graph != null) {
+      run.Graph.messages = [
+        new HumanMessage('Why is session refresh failing?'),
+      ];
+    }
+    const handleChainStart = jest.fn();
+    const handleChainEnd = jest.fn();
 
     await expect(
       run.generateActivityPhaseLabel({
@@ -59,7 +67,7 @@ describe('generateActivityPhaseLabel', () => {
         assistantContext: ['I am checking the auth path.'],
         closingTextPhase: 'final_answer',
         chainOptions: {
-          callbacks: [{ handleChainStart: jest.fn() }],
+          callbacks: [{ handleChainStart, handleChainEnd }],
         },
       })
     ).resolves.toEqual({
@@ -73,9 +81,13 @@ describe('generateActivityPhaseLabel', () => {
     expect(String(messages[1].content)).toContain(
       'Fixed refresh token validation'
     );
+    expect(String(messages[1].content)).not.toContain(
+      'Why is session refresh failing?'
+    );
     const modelConfig = invoke.mock.calls[0][1] as {
       callbacks?: { getParentRunId?: () => string | undefined };
       tags?: string[];
+      metadata?: Record<string, unknown>;
     };
     expect(modelConfig.callbacks?.getParentRunId?.()).toEqual(
       expect.any(String)
@@ -83,6 +95,45 @@ describe('generateActivityPhaseLabel', () => {
     expect(modelConfig.tags).toEqual(
       expect.arrayContaining(['activity-phase', 'agent'])
     );
+    expect(modelConfig.metadata).toEqual(
+      expect.objectContaining({
+        agentId: 'agent-1',
+        agentName: 'Phase Agent',
+      })
+    );
+    expect(handleChainStart.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        messages: expect.arrayContaining([
+          expect.objectContaining({
+            content: 'Why is session refresh failing?',
+          }),
+        ]),
+      })
+    );
+    expect(handleChainEnd.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        messages: expect.arrayContaining([
+          expect.objectContaining({
+            content: 'Fixed session refresh handling and verified auth tests',
+          }),
+        ]),
+      })
+    );
+  });
+
+  it('does not call the model when retained activities have no evidence', async () => {
+    const run = await createRun();
+
+    await expect(
+      run.generateActivityPhaseLabel({
+        provider: Providers.OPENAI,
+        activities: [
+          ...Array.from({ length: 12 }, () => ({ status: 'success' as const })),
+          { label: 'Evidence beyond the prompt cap' },
+        ],
+      })
+    ).resolves.toEqual({});
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it('applies every agent redaction policy when any activity is unattributed', async () => {
