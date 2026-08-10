@@ -6,3 +6,4 @@
 
 export { askUserQuestion } from './askUserQuestion';
 export { askUserQuestions } from './askUserQuestions';
+export { isAskUserQuestionsInterrupt } from '@/types/hitl';
