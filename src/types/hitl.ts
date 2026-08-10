@@ -175,7 +175,7 @@ export interface AskUserQuestionBatchItem extends AskUserQuestionRequest {
 
 /** Input shape for one tool call that asks one to four questions together. */
 export interface AskUserQuestionsRequest {
-  questions: [AskUserQuestionBatchItem, ...AskUserQuestionBatchItem[]];
+  questions: AskUserQuestionBatchItem[];
 }
 
 /**

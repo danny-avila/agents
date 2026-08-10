@@ -53,10 +53,14 @@ const questionSchema = z.object({
     .array(z.object({ label: z.string(), value: z.string() }))
     .optional(),
 });
+const askUserQuestionsSchema = z.object({
+  questions: z.array(questionSchema).min(1).max(MAX_ASK_USER_QUESTIONS),
+});
+type AskUserQuestionsInput = z.infer<typeof askUserQuestionsSchema>;
 
 function buildGraph(): CompiledMessagesGraph {
   const askTool = tool(
-    async (input: t.AskUserQuestionsRequest, config) => {
+    async (input: AskUserQuestionsInput, config) => {
       const resolution = askUserQuestions(input, {
         toolCallId: config.toolCall?.id,
       });
@@ -65,7 +69,7 @@ function buildGraph(): CompiledMessagesGraph {
     {
       name: 'ask_user_question',
       description: 'Ask several related questions in one interaction.',
-      schema: z.object({ questions: z.array(questionSchema).min(1).max(4) }),
+      schema: askUserQuestionsSchema,
     }
   ) as unknown as StructuredToolInterface;
   const node = new ToolNode({

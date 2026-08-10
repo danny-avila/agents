@@ -42,9 +42,13 @@ const questionSchema = z.object({
     .max(3),
   multiSelect: z.boolean(),
 });
+const askUserQuestionsSchema = z.object({
+  questions: z.array(questionSchema).length(2),
+});
+type AskUserQuestionsInput = z.infer<typeof askUserQuestionsSchema>;
 
 const askTool = tool(
-  async (input: t.AskUserQuestionsRequest, config) => {
+  async (input: AskUserQuestionsInput, config) => {
     const resolution = askUserQuestions(input, {
       toolCallId: config.toolCall?.id,
     });
@@ -54,7 +58,7 @@ const askTool = tool(
     name: 'ask_user_question',
     description:
       'Ask the user one to four related questions in one interaction. Put every question in this single tool call.',
-    schema: z.object({ questions: z.array(questionSchema).length(2) }),
+    schema: askUserQuestionsSchema,
   }
 );
 
