@@ -2138,6 +2138,8 @@ export class SubagentExecutor {
         subagentType,
         subagentKind: childPlan.kind,
         subagentAgentId: childAgentId,
+        graphMemberInputs:
+          childPlan.kind === 'graph' ? childPlan.memberInputs : undefined,
         childRunId,
         parentToolCallId,
         executionContext: childExecutionContext,
@@ -2588,6 +2590,7 @@ export class SubagentExecutor {
     subagentType: string;
     subagentKind: 'agent' | 'graph';
     subagentAgentId: string;
+    graphMemberInputs?: ReadonlyMap<string, AgentInputs>;
     childRunId: string;
     parentToolCallId?: string;
     executionContext: SubagentExecutionContext;
@@ -2597,12 +2600,14 @@ export class SubagentExecutor {
       subagentType,
       subagentKind,
       subagentAgentId,
+      graphMemberInputs,
       childRunId,
       parentToolCallId,
       executionContext,
     } = args;
     const immediateParentRunId = this.parentRunId;
     const parentAgentId = this.parentAgentId;
+    const memberAgentIdByStepId = new Map<string, string>();
 
     const wrap = async (
       eventName: string,
@@ -2709,7 +2714,14 @@ export class SubagentExecutor {
         metadata?: Record<string, unknown>
       ): Promise<void> => {
         const memberAgentId =
-          asNonEmptyString(metadata?.agentId) ?? getEventAgentId(data);
+          graphMemberInputs == null
+            ? (asNonEmptyString(metadata?.agentId) ?? getEventAgentId(data))
+            : getGraphEventMemberAgentId({
+              data,
+              metadata,
+              memberInputs: graphMemberInputs,
+              memberAgentIdByStepId,
+            });
         if (eventName === GraphEvents.ON_TOOL_EXECUTE) {
           const toolHandler = parentRegistry.getHandler(
             GraphEvents.ON_TOOL_EXECUTE
@@ -2925,6 +2937,52 @@ function getEventAgentId(data: unknown): string | undefined {
   return (
     asNonEmptyString(event.agentId) ?? asNonEmptyString(event.result?.agentId)
   );
+}
+
+function getEventStepId(data: unknown): string | undefined {
+  if (data == null || typeof data !== 'object') {
+    return undefined;
+  }
+  const event = data as {
+    id?: unknown;
+    result?: { id?: unknown };
+  };
+  return asNonEmptyString(event.id) ?? asNonEmptyString(event.result?.id);
+}
+
+function getGraphEventMemberAgentId({
+  data,
+  metadata,
+  memberInputs,
+  memberAgentIdByStepId,
+}: {
+  data: unknown;
+  metadata?: Record<string, unknown>;
+  memberInputs: ReadonlyMap<string, AgentInputs>;
+  memberAgentIdByStepId: Map<string, string>;
+}): string | undefined {
+  const eventAgentId = getEventAgentId(data);
+  const stepId = getEventStepId(data);
+  if (eventAgentId != null) {
+    if (!memberInputs.has(eventAgentId)) {
+      return undefined;
+    }
+    if (stepId != null) {
+      memberAgentIdByStepId.set(stepId, eventAgentId);
+    }
+    return eventAgentId;
+  }
+
+  const stepMemberAgentId =
+    stepId == null ? undefined : memberAgentIdByStepId.get(stepId);
+  if (stepMemberAgentId != null) {
+    return stepMemberAgentId;
+  }
+
+  const metadataAgentId = asNonEmptyString(metadata?.agentId);
+  return metadataAgentId != null && memberInputs.has(metadataAgentId)
+    ? metadataAgentId
+    : undefined;
 }
 
 /**
