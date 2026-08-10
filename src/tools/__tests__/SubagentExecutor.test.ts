@@ -10,6 +10,7 @@ import type {
   StandardGraphInput,
   SubagentUpdateEvent,
   SubagentUsageEvent,
+  ToolSessionMap,
   ToolExecuteBatchRequest,
   ToolExecuteResult,
 } from '@/types';
@@ -1534,6 +1535,253 @@ describe('SubagentExecutor', () => {
     expect(observedChildInputs).toBeDefined();
     expect(observedChildInputs!.subagentConfigs).toBeUndefined();
     expect(observedChildInputs!.maxSubagentDepth).toBeUndefined();
+  });
+
+  it('seeds only the selected single-agent child before its first invocation', async () => {
+    const selectedSession = {
+      session_id: 'selected-storage',
+      files: [
+        {
+          id: 'selected-file',
+          name: 'selected.txt',
+          storage_session_id: 'selected-storage',
+        },
+      ],
+      lastUpdated: 1,
+    };
+    const siblingSession = {
+      session_id: 'sibling-storage',
+      files: [
+        {
+          id: 'sibling-file',
+          name: 'sibling.txt',
+          storage_session_id: 'sibling-storage',
+        },
+      ],
+      lastUpdated: 1,
+    };
+    const selected = makeConfig('selected', {
+      agentInputs: {
+        ...makeChildInputs('selected-agent'),
+        initialSessions: new Map([
+          [Constants.EXECUTE_CODE, selectedSession],
+        ]),
+      },
+    });
+    const sibling = makeConfig('sibling', {
+      agentInputs: {
+        ...makeChildInputs('sibling-agent'),
+        initialSessions: new Map([
+          [Constants.EXECUTE_CODE, siblingSession],
+        ]),
+      },
+    });
+    const childSessions: ToolSessionMap = new Map();
+    const invoke = jest.fn(async () => {
+      expect(childSessions.get(Constants.EXECUTE_CODE)).toEqual(
+        selectedSession
+      );
+      expect(childSessions.get(Constants.EXECUTE_CODE)).not.toBe(
+        selectedSession
+      );
+      return { messages: [new AIMessage('done')] };
+    });
+    const executor = createExecutor({
+      configs: new Map([
+        [selected.type, selected],
+        [sibling.type, sibling],
+      ]),
+      createChildGraph: (): StandardGraph =>
+        ({
+          sessions: childSessions,
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    await executor.execute({
+      description: 'Use the selected file.',
+      subagentType: selected.type,
+    });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(
+      childSessions
+        .get(Constants.EXECUTE_CODE)
+        ?.files?.some((file) => file.id === 'sibling-file')
+    ).toBe(false);
+  });
+
+  it('combines member session seeds inside a selected graph child', async () => {
+    const makeSession = (storageSessionId: string, includeFileSession = true) => ({
+      session_id: storageSessionId,
+      files: [
+        {
+          id: 'shared-file-id',
+          name: `${storageSessionId}.txt`,
+          ...(includeFileSession
+            ? { storage_session_id: storageSessionId }
+            : {}),
+        },
+      ],
+      lastUpdated: 1,
+    });
+    const first = {
+      ...makeChildInputs('first'),
+      initialSessions: new Map([
+        [Constants.EXECUTE_CODE, makeSession('first-storage')],
+      ]),
+    };
+    const second = {
+      ...makeChildInputs('second'),
+      initialSessions: new Map([
+        [Constants.EXECUTE_CODE, makeSession('second-storage', false)],
+      ]),
+    };
+    const graphConfig: GraphSubagentConfig = {
+      kind: 'graph',
+      type: 'graph-team',
+      name: 'Graph Team',
+      description: 'Runs a graph.',
+      agents: [first, second],
+      edges: [{ from: 'first', to: 'second', edgeType: 'direct' }],
+      entryAgentId: 'first',
+      resultAgentId: 'second',
+    };
+    const childSessions: ToolSessionMap = new Map();
+    const invoke = jest.fn(async () => {
+      expect(
+        childSessions
+          .get(Constants.EXECUTE_CODE)
+          ?.files?.map((file) => [file.id, file.storage_session_id])
+      ).toEqual([
+        ['shared-file-id', 'first-storage'],
+        ['shared-file-id', 'second-storage'],
+      ]);
+      return {
+        messages: [new AIMessage('done')],
+        subagentResult: { agentId: 'second' },
+      };
+    });
+    const childGraph = {
+      sessions: childSessions,
+      createWorkflow: () => ({ invoke }),
+      clearHeavyState: jest.fn(),
+    } as unknown as StandardGraph;
+    const executor = createExecutor({
+      configs: new Map([[graphConfig.type, graphConfig]]),
+      createChildGraphByKind: () => childGraph,
+    });
+
+    await executor.execute({
+      description: 'Use both files.',
+      subagentType: graphConfig.type,
+    });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves the child session across an in-memory HITL resume', async () => {
+    const seededSession = {
+      session_id: 'seed-storage',
+      files: [
+        {
+          id: 'seed-file',
+          name: 'seed.txt',
+          storage_session_id: 'seed-storage',
+        },
+      ],
+      lastUpdated: 1,
+    };
+    const hitlConfig = makeConfig('hitl-child', {
+      agentInputs: {
+        ...makeChildInputs('hitl-child'),
+        initialSessions: new Map([
+          [Constants.EXECUTE_CODE, seededSession],
+        ]),
+      },
+    });
+    const childSessions: ToolSessionMap = new Map();
+    const childInterrupt = new GraphInterrupt([
+      {
+        id: 'approval-1',
+        value: {
+          type: 'tool_approval',
+          action_requests: [],
+          review_configs: [],
+        },
+      },
+    ]);
+    const invoke = jest
+      .fn()
+      .mockImplementationOnce(async () => {
+        const session = childSessions.get(Constants.EXECUTE_CODE)!;
+        childSessions.set(Constants.EXECUTE_CODE, {
+          ...session,
+          session_id: 'live-execution',
+          files: [
+            ...(session.files ?? []),
+            {
+              id: 'generated-file',
+              name: 'generated.txt',
+              storage_session_id: 'live-execution',
+            },
+          ],
+        });
+        throw childInterrupt;
+      })
+      .mockImplementationOnce(async () => {
+        expect(childSessions.get(Constants.EXECUTE_CODE)).toMatchObject({
+          session_id: 'live-execution',
+          files: [{ id: 'seed-file' }, { id: 'generated-file' }],
+        });
+        return { messages: [new AIMessage('resumed')] };
+      });
+    const executor = createExecutor({
+      configs: new Map([[hitlConfig.type, hitlConfig]]),
+      humanInTheLoop: { enabled: true },
+      checkpointer: new MemorySaver(),
+      createChildGraph: (): StandardGraph =>
+        ({
+          sessions: childSessions,
+          createWorkflow: () => ({
+            getState: jest.fn().mockResolvedValue({
+              values: {},
+              next: [],
+              tasks: [],
+            }),
+            invoke,
+          }),
+          getChildCheckpointThreadIds: jest.fn(() => []),
+          createSubagentResumeState: jest.fn(() => ({
+            toolCallSteps: [],
+            toolSessions: [],
+            toolNodes: [],
+            eagerToolUsage: [],
+            eagerToolSuppressions: [],
+          })),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    const params = {
+      description: 'Pause and resume.',
+      subagentType: hitlConfig.type,
+      threadId: 'durable-parent',
+      parentToolCallId: 'call-hitl',
+    };
+
+    await expect(executor.execute(params)).rejects.toBeInstanceOf(
+      GraphInterrupt
+    );
+    const result = await executor.execute({
+      ...params,
+      parentConfigurable: {
+        __pregel_resume_map: { 'approval-1': [] },
+      },
+    });
+
+    expect(result.content).toBe('resumed');
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 
   describe('parentConfigurable inheritance', () => {
