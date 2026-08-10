@@ -6,4 +6,7 @@
 
 export { askUserQuestion } from './askUserQuestion';
 export { askUserQuestions } from './askUserQuestions';
-export { isAskUserQuestionsInterrupt } from '@/types/hitl';
+export {
+  isAskUserQuestionsInterrupt,
+  MAX_ASK_USER_QUESTIONS,
+} from '@/types/hitl';
