@@ -1613,13 +1613,15 @@ describe('SubagentExecutor', () => {
   });
 
   it('combines member session seeds inside a selected graph child', async () => {
-    const makeSession = (id: string) => ({
-      session_id: `${id}-storage`,
+    const makeSession = (storageSessionId: string, includeFileSession = true) => ({
+      session_id: storageSessionId,
       files: [
         {
-          id,
-          name: `${id}.txt`,
-          storage_session_id: `${id}-storage`,
+          id: 'shared-file-id',
+          name: `${storageSessionId}.txt`,
+          ...(includeFileSession
+            ? { storage_session_id: storageSessionId }
+            : {}),
         },
       ],
       lastUpdated: 1,
@@ -1627,13 +1629,13 @@ describe('SubagentExecutor', () => {
     const first = {
       ...makeChildInputs('first'),
       initialSessions: new Map([
-        [Constants.EXECUTE_CODE, makeSession('first-file')],
+        [Constants.EXECUTE_CODE, makeSession('first-storage')],
       ]),
     };
     const second = {
       ...makeChildInputs('second'),
       initialSessions: new Map([
-        [Constants.EXECUTE_CODE, makeSession('second-file')],
+        [Constants.EXECUTE_CODE, makeSession('second-storage', false)],
       ]),
     };
     const graphConfig: GraphSubagentConfig = {
@@ -1651,8 +1653,11 @@ describe('SubagentExecutor', () => {
       expect(
         childSessions
           .get(Constants.EXECUTE_CODE)
-          ?.files?.map((file) => file.id)
-      ).toEqual(['first-file', 'second-file']);
+          ?.files?.map((file) => [file.id, file.storage_session_id])
+      ).toEqual([
+        ['shared-file-id', 'first-storage'],
+        ['shared-file-id', 'second-storage'],
+      ]);
       return {
         messages: [new AIMessage('done')],
         subagentResult: { agentId: 'second' },

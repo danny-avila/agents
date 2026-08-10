@@ -153,7 +153,13 @@ function cloneToolSessionContext(
     ...context,
     ...(context.files == null
       ? {}
-      : { files: context.files.map((file) => ({ ...file })) }),
+      : {
+        files: context.files.map((file) => ({
+          ...file,
+          storage_session_id:
+              file.storage_session_id ?? context.session_id,
+        })),
+      }),
   };
 }
 
@@ -188,17 +194,20 @@ function seedChildGraphSessions(
         seenFilesByTool.get(toolName) ??
         new Set(
           existing.files?.map(
-            (file) => `${file.storage_session_id ?? ''}\0${file.id}`
+            (file) =>
+              `${file.storage_session_id ?? existing.session_id}\0${file.id}`
           ) ?? []
         );
       const files = existing.files == null ? [] : [...existing.files];
       for (const file of context.files) {
-        const key = `${file.storage_session_id ?? ''}\0${file.id}`;
+        const storageSessionId =
+          file.storage_session_id ?? context.session_id;
+        const key = `${storageSessionId}\0${file.id}`;
         if (seenFiles.has(key)) {
           continue;
         }
         seenFiles.add(key);
-        files.push({ ...file });
+        files.push({ ...file, storage_session_id: storageSessionId });
       }
       seenFilesByTool.set(toolName, seenFiles);
       childGraph.sessions.set(toolName, { ...existing, files });
