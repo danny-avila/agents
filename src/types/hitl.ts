@@ -165,15 +165,37 @@ export interface AskUserQuestionRequest {
   multiSelect?: boolean;
 }
 
+/** One independently answerable question in a batched question request. */
+export interface AskUserQuestionBatchItem extends AskUserQuestionRequest {
+  /** Batch-unique identifier (`[A-Za-z][A-Za-z0-9_-]{0,63}`). */
+  id: string;
+  /** Optional short heading rendered above the question. */
+  header?: string;
+}
+
+/** Input shape for one tool call that asks one to four questions together. */
+export interface AskUserQuestionsRequest {
+  questions: AskUserQuestionBatchItem[];
+}
+
 /**
  * Structured payload the SDK passes to `interrupt()` when an agent (or
  * a custom node) needs to ask the user a clarifying question. Mirrors
- * Claude Code's `AskUserQuestion` semantic. Resume value:
- * `AskUserQuestionResolution`.
+ * Claude Code's `AskUserQuestion` semantic. Resume value is
+ * `AskUserQuestionResolution` for a single question, or
+ * `AskUserQuestionsResolution` when `questions` is present.
  */
 export interface AskUserQuestionInterruptPayload {
   type: 'ask_user_question';
+  /**
+   * Single-question request, or the first question as a compatibility
+   * fallback when `questions` contains a batch. This lets existing hosts show
+   * a useful preview during a staged rollout, but they must support `questions`
+   * and `AskUserQuestionsResolution` before enabling a batched tool schema.
+   */
   question: AskUserQuestionRequest;
+  /** One to four questions collected by one `ask_user_question` tool call. */
+  questions?: AskUserQuestionsRequest['questions'];
   /**
    * The `tool_call_id` of the ask-tool call that raised this interrupt,
    * when the tool body supplied it (see `askUserQuestion`'s `options`).
@@ -182,6 +204,12 @@ export interface AskUserQuestionInterruptPayload {
    * mislabels cards when a model emits several ask calls in one turn.
    */
   tool_call_id?: string;
+}
+
+/** Batch-specialized ask payload for hosts that render several questions. */
+export interface AskUserQuestionsInterruptPayload
+  extends AskUserQuestionInterruptPayload {
+  questions: AskUserQuestionsRequest['questions'];
 }
 
 /**
@@ -205,6 +233,12 @@ export interface AskUserQuestionResolution {
    * host docs for what your downstream consumer expects.
    */
   answer: string;
+}
+
+/** Resume value for a batched `ask_user_question` interrupt. */
+export interface AskUserQuestionsResolution {
+  /** Human answers keyed by each `AskUserQuestionBatchItem.id`. */
+  answers: Record<string, string>;
 }
 
 /**
