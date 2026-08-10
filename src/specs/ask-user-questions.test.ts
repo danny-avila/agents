@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import { describe, expect, it } from '@jest/globals';
+import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import {
   END,
   START,
@@ -12,8 +12,6 @@ import {
   MessagesAnnotation,
 } from '@langchain/langgraph';
 import type { BaseMessage } from '@langchain/core/messages';
-import type { Runnable, RunnableConfig } from '@langchain/core/runnables';
-import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
 import {
   askUserQuestions,
@@ -23,10 +21,6 @@ import {
 import { ToolNode } from '@/tools/ToolNode';
 
 type MessagesUpdate = { messages: BaseMessage[] };
-type CompiledMessagesGraph = Runnable<unknown, MessagesUpdate> & {
-  invoke(input: unknown, config?: RunnableConfig): Promise<unknown>;
-};
-
 const questions = [
   {
     id: 'metric',
@@ -61,7 +55,7 @@ const askUserQuestionsSchema = z.object({
 });
 type AskUserQuestionsInput = z.infer<typeof askUserQuestionsSchema>;
 
-function buildGraph(): CompiledMessagesGraph {
+function buildGraph() {
   const askTool = tool(
     async (input: AskUserQuestionsInput, config) => {
       const resolution = askUserQuestions(input, {
@@ -74,7 +68,7 @@ function buildGraph(): CompiledMessagesGraph {
       description: 'Ask several related questions in one interaction.',
       schema: askUserQuestionsSchema,
     }
-  ) as unknown as StructuredToolInterface;
+  );
   const node = new ToolNode({
     tools: [askTool],
     directToolNames: new Set(['ask_user_question']),
@@ -105,7 +99,7 @@ function buildGraph(): CompiledMessagesGraph {
     .addEdge('tools', END)
     .compile({
       checkpointer: new MemorySaver(),
-    }) as unknown as CompiledMessagesGraph;
+    });
 }
 
 describe('askUserQuestions', () => {
@@ -155,6 +149,9 @@ describe('askUserQuestions', () => {
   });
 
   it('distinguishes singular ask payloads from batched payloads', () => {
+    const sparseOptions: unknown[] = [];
+    sparseOptions.length = 2;
+
     expect(
       isAskUserQuestionsInterrupt({
         type: 'ask_user_question',
@@ -204,6 +201,19 @@ describe('askUserQuestions', () => {
             id: 'choice',
             question: 'Choose?',
             options: [{ label: 'Missing value' }],
+          },
+        ],
+      })
+    ).toBe(false);
+    expect(
+      isAskUserQuestionsInterrupt({
+        type: 'ask_user_question',
+        question: { question: 'Proceed?' },
+        questions: [
+          {
+            id: 'choice',
+            question: 'Choose?',
+            options: sparseOptions,
           },
         ],
       })

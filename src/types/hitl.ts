@@ -306,6 +306,20 @@ function isAskUserQuestionOption(
   return typeof option.label === 'string' && typeof option.value === 'string';
 }
 
+function isAskUserQuestionOptions(
+  value: unknown
+): value is AskUserQuestionOption[] {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index++) {
+    if (!Object.hasOwn(value, index) || !isAskUserQuestionOption(value[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function isAskUserQuestionRequest(
   value: unknown
 ): value is AskUserQuestionRequest {
@@ -318,8 +332,7 @@ function isAskUserQuestionRequest(
     (question.description === undefined ||
       typeof question.description === 'string') &&
     (question.options === undefined ||
-      (Array.isArray(question.options) &&
-        question.options.every(isAskUserQuestionOption))) &&
+      isAskUserQuestionOptions(question.options)) &&
     (question.multiSelect === undefined ||
       typeof question.multiSelect === 'boolean')
   );
