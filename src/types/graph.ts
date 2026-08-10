@@ -19,6 +19,7 @@ import type {
 } from '@/types/summarize';
 import type {
   ToolMap,
+  ToolSessionMap,
   ToolEndEvent,
   GenericTool,
   LCTool,
@@ -848,6 +849,13 @@ export interface AgentInputs {
   subagentConfigs?: SubagentConfigEntry[];
   /** Maximum subagent nesting depth. Default 1 means top-level agents can spawn subagents but subagents cannot nest further. */
   maxSubagentDepth?: number;
+  /**
+   * Initial tool-session state owned by this agent when it runs as a
+   * subagent. The executor copies these sessions into the isolated child
+   * graph before its first invocation. Top-level runs continue to use
+   * `RunConfig.initialSessions`.
+   */
+  initialSessions?: ToolSessionMap;
   /**
    * Host-supplied tool instances that must execute IN-PROCESS inside the graph's
    * ToolNode even when the run is event-driven (`toolDefinitions` non-empty). Each
