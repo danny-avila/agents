@@ -5,4 +5,4 @@
  */
 
 export { askUserQuestion } from './askUserQuestion';
-export { askUserQuestions, MAX_ASK_USER_QUESTIONS } from './askUserQuestions';
+export { askUserQuestions } from './askUserQuestions';

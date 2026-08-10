@@ -15,8 +15,11 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
-import { askUserQuestions, MAX_ASK_USER_QUESTIONS } from '@/hitl';
-import { isAskUserQuestionsInterrupt } from '@/types/hitl';
+import { askUserQuestions } from '@/hitl';
+import {
+  isAskUserQuestionsInterrupt,
+  MAX_ASK_USER_QUESTIONS,
+} from '@/types/hitl';
 import { ToolNode } from '@/tools/ToolNode';
 
 type MessagesUpdate = { messages: BaseMessage[] };
@@ -165,6 +168,67 @@ describe('askUserQuestions', () => {
         questions: [],
       })
     ).toBe(false);
+    expect(
+      isAskUserQuestionsInterrupt({
+        type: 'ask_user_question',
+        question: { question: 'Proceed?' },
+        questions: [null],
+      })
+    ).toBe(false);
+    expect(
+      isAskUserQuestionsInterrupt({
+        type: 'ask_user_question',
+        question: { question: 'Proceed?' },
+        questions: [{ id: '__proto__', question: 'Unsafe key?' }],
+      })
+    ).toBe(false);
+    expect(
+      isAskUserQuestionsInterrupt({
+        type: 'ask_user_question',
+        question: { question: 'Proceed?' },
+        questions: Array.from(
+          { length: MAX_ASK_USER_QUESTIONS + 1 },
+          (_, index) => ({
+            id: `question-${index}`,
+            question: `Question ${index}?`,
+          })
+        ),
+      })
+    ).toBe(false);
+    expect(
+      isAskUserQuestionsInterrupt({
+        type: 'ask_user_question',
+        question: { question: 'Proceed?' },
+        questions: [
+          {
+            id: 'choice',
+            question: 'Choose?',
+            options: [{ label: 'Missing value' }],
+          },
+        ],
+      })
+    ).toBe(false);
+  });
+
+  it('returns a tool error when a resumed batch omits an answer', async () => {
+    const graph = buildGraph();
+    const config = { configurable: { thread_id: 'incomplete-answers' } };
+
+    await graph.invoke({ messages: [] }, config);
+    const resumed = (await graph.invoke(
+      new Command({ resume: { answers: { metric: 'workload' } } }),
+      config
+    )) as MessagesUpdate;
+    const result = resumed.messages.find(
+      (message): message is ToolMessage =>
+        message.getType() === 'tool' &&
+        (message as ToolMessage).name === 'ask_user_question'
+    );
+
+    expect(result?.status).toBe('error');
+    expect(String(result?.content)).toContain(
+      'requires a string answer for question id "window"'
+    );
   });
 
   it('rejects empty question ids before raising an interrupt', () => {
@@ -173,7 +237,17 @@ describe('askUserQuestions', () => {
     };
 
     expect(() => askUserQuestions(request)).toThrow(
-      'requires every question to have an id'
+      'requires each question id to match'
+    );
+  });
+
+  it('rejects unsafe answer-map keys before raising an interrupt', () => {
+    const request: t.AskUserQuestionsRequest = {
+      questions: [{ ...questions[0], id: '__proto__' }],
+    };
+
+    expect(() => askUserQuestions(request)).toThrow(
+      'requires each question id to match'
     );
   });
 

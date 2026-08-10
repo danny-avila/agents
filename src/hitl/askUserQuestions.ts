@@ -6,9 +6,10 @@ import type {
   AskUserQuestionsRequest,
   AskUserQuestionsResolution,
 } from '@/types/hitl';
-
-/** Maximum questions supported by one batched clarification interaction. */
-export const MAX_ASK_USER_QUESTIONS = 4;
+import {
+  ASK_USER_QUESTION_ID_PATTERN,
+  MAX_ASK_USER_QUESTIONS,
+} from '@/types/hitl';
 
 function validateQuestions(
   questions: readonly AskUserQuestionBatchItem[]
@@ -24,9 +25,9 @@ function validateQuestions(
 
   const ids = new Set<string>();
   for (const question of questions) {
-    if (question.id.trim() === '') {
+    if (!ASK_USER_QUESTION_ID_PATTERN.test(question.id)) {
       throw new Error(
-        'askUserQuestions requires every question to have an id.'
+        'askUserQuestions requires each question id to match [A-Za-z][A-Za-z0-9_-]{0,63}.'
       );
     }
     if (ids.has(question.id)) {
@@ -37,6 +38,40 @@ function validateQuestions(
     ids.add(question.id);
   }
   return questions[0];
+}
+
+interface AskUserQuestionsResolutionCandidate {
+  answers?: unknown;
+}
+
+function validateResolution(
+  value: unknown,
+  questions: readonly AskUserQuestionBatchItem[]
+): AskUserQuestionsResolution {
+  if (typeof value !== 'object' || value === null) {
+    throw new TypeError('askUserQuestions requires an answers object.');
+  }
+  const answers = (value as AskUserQuestionsResolutionCandidate).answers;
+  if (
+    typeof answers !== 'object' ||
+    answers === null ||
+    Array.isArray(answers)
+  ) {
+    throw new TypeError('askUserQuestions requires an answers object.');
+  }
+
+  const validated: Record<string, string> = {};
+  for (const question of questions) {
+    const descriptor = Object.getOwnPropertyDescriptor(answers, question.id);
+    const answer: unknown = descriptor?.value;
+    if (descriptor == null || typeof answer !== 'string') {
+      throw new TypeError(
+        `askUserQuestions requires a string answer for question id "${question.id}".`
+      );
+    }
+    validated[question.id] = answer;
+  }
+  return { answers: validated };
 }
 
 /**
@@ -78,8 +113,8 @@ export function askUserQuestions(
       options.toolCallId !== '' && { tool_call_id: options.toolCallId }),
   };
 
-  return interrupt<
-    AskUserQuestionsInterruptPayload,
-    AskUserQuestionsResolution
-  >(payload);
+  const resolution = interrupt<AskUserQuestionsInterruptPayload, unknown>(
+    payload
+  );
+  return validateResolution(resolution, request.questions);
 }

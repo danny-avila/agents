@@ -167,11 +167,17 @@ export interface AskUserQuestionRequest {
 
 /** One independently answerable question in a batched question request. */
 export interface AskUserQuestionBatchItem extends AskUserQuestionRequest {
-  /** Non-empty, batch-unique key used to correlate the answer on resume. */
+  /** Batch-unique identifier (`[A-Za-z][A-Za-z0-9_-]{0,63}`). */
   id: string;
   /** Optional short heading rendered above the question. */
   header?: string;
 }
+
+/** Maximum questions supported by one batched clarification interaction. */
+export const MAX_ASK_USER_QUESTIONS = 4;
+
+/** Safe identifier format for answer-map keys in a batched question. */
+export const ASK_USER_QUESTION_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 
 /** Input shape for one tool call that asks one to four questions together. */
 export interface AskUserQuestionsRequest {
@@ -273,6 +279,66 @@ export function isAskUserQuestionInterrupt(
   );
 }
 
+interface AskUserQuestionOptionCandidate {
+  label?: unknown;
+  value?: unknown;
+}
+
+interface AskUserQuestionCandidate {
+  question?: unknown;
+  description?: unknown;
+  options?: unknown;
+  multiSelect?: unknown;
+}
+
+interface AskUserQuestionBatchItemCandidate extends AskUserQuestionCandidate {
+  id?: unknown;
+  header?: unknown;
+}
+
+function isAskUserQuestionOption(
+  value: unknown
+): value is AskUserQuestionOption {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const option = value as AskUserQuestionOptionCandidate;
+  return typeof option.label === 'string' && typeof option.value === 'string';
+}
+
+function isAskUserQuestionRequest(
+  value: unknown
+): value is AskUserQuestionRequest {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const question = value as AskUserQuestionCandidate;
+  return (
+    typeof question.question === 'string' &&
+    (question.description === undefined ||
+      typeof question.description === 'string') &&
+    (question.options === undefined ||
+      (Array.isArray(question.options) &&
+        question.options.every(isAskUserQuestionOption))) &&
+    (question.multiSelect === undefined ||
+      typeof question.multiSelect === 'boolean')
+  );
+}
+
+function isAskUserQuestionBatchItem(
+  value: unknown
+): value is AskUserQuestionBatchItem {
+  if (!isAskUserQuestionRequest(value)) {
+    return false;
+  }
+  const question = value as AskUserQuestionBatchItemCandidate;
+  return (
+    typeof question.id === 'string' &&
+    ASK_USER_QUESTION_ID_PATTERN.test(question.id) &&
+    (question.header === undefined || typeof question.header === 'string')
+  );
+}
+
 /**
  * Type guard for the batched form of an `ask_user_question` interrupt. Hosts
  * use this to select the multi-question UI and `AskUserQuestionsResolution`.
@@ -280,11 +346,26 @@ export function isAskUserQuestionInterrupt(
 export function isAskUserQuestionsInterrupt(
   payload: unknown
 ): payload is AskUserQuestionsInterruptPayload {
-  return (
-    isAskUserQuestionInterrupt(payload) &&
-    Array.isArray(payload.questions) &&
-    payload.questions.length > 0
-  );
+  if (
+    !isAskUserQuestionInterrupt(payload) ||
+    !isAskUserQuestionRequest(payload.question) ||
+    (payload.tool_call_id !== undefined &&
+      typeof payload.tool_call_id !== 'string') ||
+    !Array.isArray(payload.questions) ||
+    payload.questions.length === 0 ||
+    payload.questions.length > MAX_ASK_USER_QUESTIONS
+  ) {
+    return false;
+  }
+
+  const ids = new Set<string>();
+  for (const question of payload.questions) {
+    if (!isAskUserQuestionBatchItem(question) || ids.has(question.id)) {
+      return false;
+    }
+    ids.add(question.id);
+  }
+  return true;
 }
 
 /**
