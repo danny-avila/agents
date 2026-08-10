@@ -2154,6 +2154,146 @@ describe('SubagentExecutor', () => {
       expect(phases[phases.length - 1]).toBe('stop');
     });
 
+    it('attributes graph updates to validated payload and step-local member identities', async () => {
+      const updates: SubagentUpdateEvent[] = [];
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: (_event, data): void => {
+          updates.push(data as SubagentUpdateEvent);
+        },
+      });
+      const graphConfig: GraphSubagentConfig = {
+        kind: 'graph',
+        type: 'graph-team',
+        name: 'Graph Team',
+        description: 'Runs a graph.',
+        agents: [
+          makeChildInputs('entry'),
+          makeChildInputs('worker'),
+          makeChildInputs('result'),
+        ],
+        edges: [
+          { from: 'entry', to: 'worker', edgeType: 'direct' },
+          { from: 'worker', to: 'result', edgeType: 'direct' },
+        ],
+        entryAgentId: 'entry',
+        resultAgentId: 'result',
+      };
+      const graphFactory = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(async (_state, options) => {
+              const opts = options as { callbacks?: unknown[] };
+              const forwarder = (opts.callbacks ?? [])[0] as {
+                handleCustomEvent?: (
+                  eventName: string,
+                  data: unknown,
+                  runId: string,
+                  tags?: string[],
+                  metadata?: Record<string, unknown>
+                ) => Promise<void> | void;
+              };
+              const emit = async (
+                eventName: string,
+                data: unknown,
+                agentId: string
+              ): Promise<void> => {
+                await forwarder.handleCustomEvent?.(
+                  eventName,
+                  data,
+                  'child-run',
+                  [],
+                  { agentId }
+                );
+              };
+
+              await emit(
+                GraphEvents.ON_RUN_STEP,
+                {
+                  id: 'step_entry',
+                  type: StepTypes.MESSAGE_CREATION,
+                  agentId: 'entry',
+                },
+                'parent-agent'
+              );
+              await emit(
+                GraphEvents.ON_MESSAGE_DELTA,
+                { id: 'step_entry', delta: { content: 'entry' } },
+                'parent-agent'
+              );
+              await emit(
+                GraphEvents.ON_REASONING_DELTA,
+                { id: 'step_entry', delta: { content: [] } },
+                'parent-agent'
+              );
+              await emit(
+                GraphEvents.ON_RUN_STEP,
+                {
+                  id: 'step_worker',
+                  type: StepTypes.MESSAGE_CREATION,
+                  agentId: 'worker',
+                },
+                'entry'
+              );
+              await emit(
+                GraphEvents.ON_RUN_STEP,
+                {
+                  id: 'step_spoofed',
+                  type: StepTypes.MESSAGE_CREATION,
+                  agentId: 'unknown-member',
+                },
+                'worker'
+              );
+              await emit(
+                GraphEvents.ON_RUN_STEP_COMPLETED,
+                { result: { id: 'step_result', agentId: 'result' } },
+                'parent-agent'
+              );
+              await emit(
+                GraphEvents.ON_MESSAGE_DELTA,
+                { id: 'step_metadata', delta: { content: 'worker' } },
+                'worker'
+              );
+              return {
+                messages: [new AIMessage('ok')],
+                subagentResult: { agentId: 'result' },
+              };
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+      const executor = createExecutor({
+        configs: new Map([[graphConfig.type, graphConfig]]),
+        createChildGraphByKind: graphFactory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Run the graph.',
+        subagentType: graphConfig.type,
+      });
+
+      const activity = updates.filter(
+        (update) => update.phase !== 'start' && update.phase !== 'stop'
+      );
+      expect(
+        activity.map(({ phase, memberAgentId }) => ({
+          phase,
+          memberAgentId,
+        }))
+      ).toEqual([
+        { phase: 'run_step', memberAgentId: 'entry' },
+        { phase: 'message_delta', memberAgentId: 'entry' },
+        { phase: 'reasoning_delta', memberAgentId: 'entry' },
+        { phase: 'run_step', memberAgentId: 'worker' },
+        { phase: 'run_step', memberAgentId: undefined },
+        { phase: 'run_step_completed', memberAgentId: 'result' },
+        { phase: 'message_delta', memberAgentId: 'worker' },
+      ]);
+      expect(updates[0].memberAgentId).toBeUndefined();
+      expect(updates[updates.length - 1].memberAgentId).toBeUndefined();
+    });
+
     it('keeps toolDefinitions on child when registry has ON_TOOL_EXECUTE handler', async () => {
       const registry = new HandlerRegistry();
       registry.register(GraphEvents.ON_TOOL_EXECUTE, {
