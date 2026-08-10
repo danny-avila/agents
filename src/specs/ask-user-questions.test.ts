@@ -261,6 +261,18 @@ describe('askUserQuestions', () => {
     );
   });
 
+  it('rejects sparse option arrays before raising an interrupt', () => {
+    const sparseOptions: t.AskUserQuestionOption[] = [];
+    sparseOptions.length = 2;
+    const request: t.AskUserQuestionsRequest = {
+      questions: [{ ...questions[0], options: sparseOptions }],
+    };
+
+    expect(() => askUserQuestions(request)).toThrow(
+      'requires each question and option to have valid string fields'
+    );
+  });
+
   it('rejects batches larger than four questions', () => {
     expect(MAX_ASK_USER_QUESTIONS).toBe(4);
     const request: t.AskUserQuestionsRequest = {

@@ -8,6 +8,7 @@ import type {
 } from '@/types/hitl';
 import {
   ASK_USER_QUESTION_ID_PATTERN,
+  isAskUserQuestionRequest,
   MAX_ASK_USER_QUESTIONS,
 } from './askUserQuestionsInterrupt';
 
@@ -25,6 +26,11 @@ function validateQuestions(
 
   const ids = new Set<string>();
   for (const question of questions) {
+    if (!isAskUserQuestionRequest(question)) {
+      throw new TypeError(
+        'askUserQuestions requires each question and option to have valid string fields.'
+      );
+    }
     if (!ASK_USER_QUESTION_ID_PATTERN.test(question.id)) {
       throw new Error(
         'askUserQuestions requires each question id to match [A-Za-z][A-Za-z0-9_-]{0,63}.'

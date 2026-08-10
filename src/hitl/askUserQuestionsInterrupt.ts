@@ -53,7 +53,7 @@ function isAskUserQuestionOptions(
   return true;
 }
 
-function isAskUserQuestionRequest(
+export function isAskUserQuestionRequest(
   value: unknown
 ): value is AskUserQuestionRequest {
   if (typeof value !== 'object' || value === null) {
