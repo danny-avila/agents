@@ -9,4 +9,4 @@ export { askUserQuestions } from './askUserQuestions';
 export {
   isAskUserQuestionsInterrupt,
   MAX_ASK_USER_QUESTIONS,
-} from '@/types/hitl';
+} from './askUserQuestionsInterrupt';

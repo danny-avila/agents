@@ -9,7 +9,7 @@ import type {
 import {
   ASK_USER_QUESTION_ID_PATTERN,
   MAX_ASK_USER_QUESTIONS,
-} from '@/types/hitl';
+} from './askUserQuestionsInterrupt';
 
 function validateQuestions(
   questions: readonly AskUserQuestionBatchItem[]
