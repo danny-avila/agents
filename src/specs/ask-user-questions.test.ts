@@ -14,6 +14,7 @@ import {
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import {
+  ASK_USER_QUESTION_ID_PATTERN,
   askUserQuestions,
   isAskUserQuestionsInterrupt,
   MAX_ASK_USER_QUESTIONS,
@@ -43,7 +44,7 @@ const questions = [
 ] satisfies t.AskUserQuestionBatchItem[];
 
 const questionSchema = z.object({
-  id: z.string(),
+  id: z.string().regex(ASK_USER_QUESTION_ID_PATTERN),
   header: z.string().optional(),
   question: z.string(),
   options: z
