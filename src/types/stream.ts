@@ -9,6 +9,7 @@ import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { LLMResult, Generation } from '@langchain/core/outputs';
 import type { Command } from '@langchain/langgraph';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
+import type { AssistantTextPhase } from '@/types/assistantPhase';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
 import type { ToolEndEvent } from '@/types/tools';
 import { StepTypes, ContentTypes, GraphEvents } from '@/common/enum';
@@ -119,6 +120,10 @@ export type MessageCreationDetails = {
   type: StepTypes.MESSAGE_CREATION;
   message_creation: {
     message_id: string;
+    /** Content lane announced before its first delta. */
+    content_type?: ContentTypes.TEXT | ContentTypes.THINK;
+    /** Provider-authored assistant text phase, when available. */
+    phase?: AssistantTextPhase;
   };
 };
 
@@ -415,6 +420,10 @@ export type MessageContentComplex = (
       type?: never;
     })
 ) & {
+  /** Open Responses-compatible semantic phase for assistant text. */
+  phase?: AssistantTextPhase;
+  /** LangChain standard-content form of provider-specific block fields. */
+  extras?: { phase?: AssistantTextPhase } & Record<string, unknown>;
   tool_call_ids?: string[];
   // Optional agentId for parallel execution attribution
   agentId?: string;

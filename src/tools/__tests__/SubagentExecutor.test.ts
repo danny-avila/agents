@@ -3138,6 +3138,54 @@ describe('summarizeEvent', () => {
 });
 
 describe('sanitizeForwardedSubagentUpdateData', () => {
+  it('preserves bounded assistant phase metadata on message-creation steps', () => {
+    const sanitized = sanitizeForwardedSubagentUpdateData(
+      GraphEvents.ON_RUN_STEP,
+      {
+        id: 'step_1',
+        stepDetails: {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: {
+            message_id: 'message_1',
+            content_type: 'text',
+            phase: 'commentary',
+            futureSecret: 'nested-secret',
+          },
+        },
+      }
+    );
+
+    expect(sanitized).toEqual({
+      id: 'step_1',
+      stepDetails: {
+        type: StepTypes.MESSAGE_CREATION,
+        message_creation: {
+          message_id: 'message_1',
+          content_type: 'text',
+          phase: 'commentary',
+        },
+      },
+    });
+
+    expect(
+      sanitizeForwardedSubagentUpdateData(GraphEvents.ON_RUN_STEP, {
+        stepDetails: {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: {
+            message_id: 'message_2',
+            content_type: 'image',
+            phase: 'internal',
+          },
+        },
+      })
+    ).toEqual({
+      stepDetails: {
+        type: StepTypes.MESSAGE_CREATION,
+        message_creation: { message_id: 'message_2' },
+      },
+    });
+  });
+
   it('uses an allowlist for run step payloads', () => {
     const sanitized = sanitizeForwardedSubagentUpdateData(
       GraphEvents.ON_RUN_STEP,

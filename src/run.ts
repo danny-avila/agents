@@ -5,16 +5,17 @@ import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import {
-  BaseMessage,
-  HumanMessage,
-  SystemMessage,
-} from '@langchain/core/messages';
-import {
   Command,
   INTERRUPT,
   MemorySaver,
   isInterrupted,
 } from '@langchain/langgraph';
+import {
+  AIMessage,
+  BaseMessage,
+  HumanMessage,
+  SystemMessage,
+} from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { MessageContentComplex } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
@@ -28,6 +29,13 @@ import {
   SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from '@/tools/subagent/SubagentReplay';
+import {
+  ACTIVITY_PHASE_LABEL_PROMPT,
+  ACTIVITY_LABEL_PROMPT,
+  buildActivityLabelPrompt,
+  buildActivityPhaseLabelPrompt,
+  normalizeActivityPhaseLabel,
+} from '@/prompts/activityLabel';
 import {
   createLangfuseTraceMetadata,
   createLangfuseHandler,
@@ -46,10 +54,6 @@ import {
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
 import {
-  ACTIVITY_LABEL_PROMPT,
-  buildActivityLabelPrompt,
-} from '@/prompts/activityLabel';
-import {
   Callback,
   GraphEvents,
   TitleMethod,
@@ -57,6 +61,7 @@ import {
 } from '@/common';
 import {
   appendCallbacks,
+  filterCallbacks,
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
@@ -246,6 +251,10 @@ export class Run<_T extends t.BaseGraphState> {
   private _interrupt: t.RunInterruptResult<unknown> | undefined;
   /** Per-run sequence for batch-unique activity-label trace-seed fallbacks. */
   private activityLabelSeq = 0;
+  /** Per-run sequence for parent activity-phase trace and invocation ids. */
+  private activityPhaseLabelSeq = 0;
+  /** Latest user turn used to keep detached phase roots conversation-shaped. */
+  private activityPhaseTraceInput?: string;
   /** Distinguishes sibling forks started from the same explicit checkpoint. */
   private checkpointForkSeq = 0;
   private _haltedReason: string | undefined;
@@ -826,6 +835,11 @@ export class Run<_T extends t.BaseGraphState> {
      */
     const isResume = inputs instanceof Command;
     const stateInputs = isResume ? undefined : (inputs as t.IState);
+    if (stateInputs != null) {
+      this.activityPhaseTraceInput = findActivityPhaseTraceInput(
+        stateInputs.messages
+      );
+    }
 
     /**
      * Every honored seal costs one extra superstep, so a preemption-enabled
@@ -1565,9 +1579,12 @@ export class Run<_T extends t.BaseGraphState> {
     }
     const persistedMessages = getPersistedMessages(snapshot);
     if (persistedMessages != null) {
-      this.Graph?.restoreCheckpointMessages(
-        persistedMessages,
-        getResumeUpdateMessages(resumeUpdate)
+      const resumeMessages = getResumeUpdateMessages(resumeUpdate);
+      this.Graph?.restoreCheckpointMessages(persistedMessages, resumeMessages);
+      this.activityPhaseTraceInput = findActivityPhaseTraceInput(
+        resumeMessages == null
+          ? persistedMessages
+          : [...persistedMessages, ...resumeMessages]
       );
     }
 
@@ -1815,6 +1832,7 @@ export class Run<_T extends t.BaseGraphState> {
     entries,
     thinkingExcerpts,
     lastAssistantText,
+    lastAssistantPhase,
     previousLabels,
     prompt,
     charLimit = 600,
@@ -1988,7 +2006,8 @@ export class Run<_T extends t.BaseGraphState> {
       entries,
       charLimit,
       thinkingExcerpts,
-      lastAssistantText,
+      lastAssistantText:
+        lastAssistantPhase === 'final_answer' ? undefined : lastAssistantText,
       previousLabels,
       redaction,
     });
@@ -2085,9 +2104,12 @@ export class Run<_T extends t.BaseGraphState> {
           invokeConfig.callbacks,
           isLangfuseCallbackHandler
         );
-        const { callbacks: _cb, ...rest } = invokeConfig;
+        const { callbacks, ...rest } = invokeConfig;
         const safeConfig = Object.assign({}, rest, {
-          callbacks: langfuseHandler ? [langfuseHandler] : [],
+          callbacks: filterCallbacks(
+            callbacks,
+            (callback) => callback === langfuseHandler
+          ),
         });
         response = await withLangfuseRuntimeScope(labelRuntimeScope, () =>
           invokeLabel(safeConfig as Partial<RunnableConfig>)
@@ -2097,6 +2119,347 @@ export class Run<_T extends t.BaseGraphState> {
       return label.length > 0 ? { label } : {};
     } finally {
       await disposeLangfuseHandler(labelLangfuseHandler);
+    }
+  }
+
+  /**
+   * Generates one parent summary for two or more logical activities. The
+   * summary model is traced as a dedicated activity-phase agent root in the
+   * conversation session, with the model callback recorded as its generation
+   * child. No session id means no phase trace, avoiding orphan observations.
+   */
+  async generateActivityPhaseLabel({
+    provider,
+    clientOptions,
+    activities,
+    totalActivityCount,
+    assistantContext,
+    closingTextPhase,
+    prompt,
+    charLimit = 600,
+    chainOptions,
+    traceSeed,
+    sourceRunId,
+    sourceTraceId,
+    responseId,
+    phaseIndex,
+    status = 'completed',
+    agentIds,
+  }: t.RunActivityPhaseLabelOptions): Promise<{ label?: string }> {
+    if (activities.length < 2) {
+      return {};
+    }
+
+    const phaseSeq = ++this.activityPhaseLabelSeq;
+    const hasUnattributedActivity = activities.some(
+      (activity) => activity.agentId == null
+    );
+    const hasOmittedActivitiesWithoutAgentIds =
+      agentIds == null &&
+      (totalActivityCount ?? activities.length) > activities.length;
+    const contributingAgentIds = [
+      ...new Set([
+        ...(agentIds ?? []),
+        ...activities.flatMap((activity) =>
+          activity.agentId == null ? [] : [activity.agentId]
+        ),
+      ]),
+    ];
+    const agentContexts = this.Graph?.agentContexts;
+    if (
+      contributingAgentIds.some(
+        (agentId) => agentContexts?.get(agentId) == null
+      )
+    ) {
+      return {};
+    }
+    const phaseContext =
+      this.Graph == null
+        ? undefined
+        : this.Graph.agentContexts.get(this.Graph.defaultAgentId);
+    const phaseLangfuseConfig = resolveLangfuseConfig(
+      this.langfuse,
+      phaseContext?.langfuse
+    );
+
+    let redaction = hasToolOutputTracingConfig(
+      this.langfuse,
+      phaseContext?.langfuse
+    )
+      ? resolveToolOutputTracingConfig(this.langfuse, phaseContext?.langfuse)
+      : undefined;
+    const redactionContexts =
+      contributingAgentIds.length > 0 &&
+      !hasUnattributedActivity &&
+      !hasOmittedActivitiesWithoutAgentIds
+        ? contributingAgentIds.flatMap((agentId) => {
+          const context = agentContexts?.get(agentId);
+          return context == null ? [] : [context];
+        })
+        : Array.from(agentContexts?.values() ?? []);
+    for (const context of redactionContexts) {
+      if (!hasToolOutputTracingConfig(this.langfuse, context.langfuse)) {
+        continue;
+      }
+      const candidate = resolveToolOutputTracingConfig(
+        this.langfuse,
+        context.langfuse
+      );
+      if (redaction == null) {
+        redaction = candidate;
+        continue;
+      }
+      redaction = {
+        enabled: redaction.enabled === false ? false : candidate.enabled,
+        redactedToolNames: new Set([
+          ...redaction.redactedToolNames,
+          ...candidate.redactedToolNames,
+        ]),
+        redactedToolNameMatchMode:
+          redaction.redactedToolNameMatchMode === 'partial' ||
+          candidate.redactedToolNameMatchMode === 'partial'
+            ? 'partial'
+            : 'exact',
+        redactionText: redaction.redactionText,
+      };
+    }
+
+    const userPrompt = buildActivityPhaseLabelPrompt({
+      activities,
+      totalActivityCount,
+      charLimit,
+      assistantContext,
+      redaction,
+    });
+    if (userPrompt === '') {
+      return {};
+    }
+    const phaseChainOptions = {
+      ...(chainOptions ?? {}),
+    } as Partial<RunnableConfig> & {
+      configurable?: Record<string, unknown> & {
+        requestBody?: { parentMessageId?: unknown };
+      };
+    };
+    const phaseUserId =
+      typeof phaseChainOptions.configurable?.user_id === 'string'
+        ? phaseChainOptions.configurable.user_id
+        : undefined;
+    const phaseSessionId =
+      typeof phaseChainOptions.configurable?.thread_id === 'string'
+        ? phaseChainOptions.configurable.thread_id
+        : undefined;
+    const resolvedPhaseIndex = phaseIndex ?? phaseSeq - 1;
+    const phaseMessageId =
+      responseId ?? `activity-phase-${this.id}-${resolvedPhaseIndex}`;
+    const phaseAgentId = this.Graph?.defaultAgentId;
+    const phaseAgentName = phaseContext?.name;
+    const phaseParentMessageId =
+      phaseChainOptions.configurable?.requestBody?.parentMessageId;
+    const phaseMetadata: Record<string, unknown> = {
+      sourceRunId: sourceRunId ?? this.id,
+      ...(sourceTraceId == null ? {} : { sourceTraceId }),
+      responseId: phaseMessageId,
+      phaseIndex: resolvedPhaseIndex,
+      activityCount: Math.max(activities.length, totalActivityCount ?? 0),
+      status,
+      contributingAgentIds,
+      ...(typeof phaseParentMessageId === 'string'
+        ? { parentMessageId: phaseParentMessageId }
+        : {}),
+      ...(phaseAgentId == null ? {} : { agentId: phaseAgentId }),
+      ...(phaseAgentName == null ? {} : { agentName: phaseAgentName }),
+      ...(closingTextPhase == null ? {} : { closingTextPhase }),
+    };
+    const traceMetadata = {
+      ...createLangfuseTraceMetadata({
+        messageId: phaseMessageId,
+        parentMessageId: phaseParentMessageId,
+        agentId: phaseAgentId,
+        agentName: phaseAgentName,
+      }),
+      sourceRunId: String(phaseMetadata.sourceRunId),
+      ...(sourceTraceId == null ? {} : { sourceTraceId }),
+      responseId: phaseMessageId,
+      phaseIndex: String(resolvedPhaseIndex),
+      activityCount: String(phaseMetadata.activityCount),
+      status,
+      ...(contributingAgentIds.length === 0
+        ? {}
+        : { contributingAgentIds: contributingAgentIds.join(',') }),
+      ...(closingTextPhase == null ? {} : { closingTextPhase }),
+    };
+    const phaseRunName = getLangfuseTraceName(
+      traceMetadata,
+      'LibreChat Activity Phase'
+    );
+    const phaseTraceName = phaseChainOptions.runName ?? phaseRunName;
+    const phaseTags = [
+      'librechat',
+      'activity-phase',
+      'agent-run-summary',
+      'agent',
+    ];
+    initializeLangfuseTracing(phaseLangfuseConfig);
+
+    const inheritedTraceSeed = getTraceIdSeed();
+    const phaseTraceSeed =
+      phaseLangfuseConfig?.deterministicTraceId === true ||
+      inheritedTraceSeed != null
+        ? (traceSeed ?? `activity-phase-${this.id}-${resolvedPhaseIndex}`)
+        : undefined;
+    const phaseScopeRunId = `activity-phase:${this.id}:${phaseSeq}:${nanoid()}`;
+    const phaseRuntimeScope = resolveLangfuseRuntimeScope({
+      runLangfuse: this.langfuse,
+      langfuseOverlay: phaseContext?.langfuse,
+      traceIdSeed: phaseTraceSeed,
+      runId: phaseScopeRunId,
+    });
+    let phaseLangfuseHandler: CallbackEntry | undefined;
+    const sourceUserText =
+      this.activityPhaseTraceInput ??
+      findActivityPhaseTraceInput(this.Graph?.getRunMessages() ?? []);
+    if (phaseSessionId != null && sourceUserText != null) {
+      phaseLangfuseHandler = createLangfuseHandler({
+        langfuse: phaseLangfuseConfig,
+        userId: phaseUserId,
+        sessionId: phaseSessionId,
+        traceMetadata,
+        tags: phaseTags,
+        traceIdSeed:
+          phaseLangfuseConfig?.deterministicTraceId === true
+            ? phaseTraceSeed
+            : undefined,
+        runId: phaseScopeRunId,
+        toolOutputTracing: phaseRuntimeScope.toolOutputTracing,
+        traceName: phaseTraceName,
+      });
+    }
+    if (phaseLangfuseHandler != null) {
+      phaseChainOptions.callbacks = appendCallbacks(
+        phaseChainOptions.callbacks,
+        [phaseLangfuseHandler]
+      );
+    }
+
+    const model = initializeModel({
+      provider,
+      clientOptions: {
+        ...(clientOptions ?? {}),
+        streaming: false,
+      } as t.ClientOptions,
+    }) as t.ChatModelInstance;
+    const phaseRunId = `${this.id}-activity-phase-${phaseSeq}`;
+    const invokeConfig = Object.assign({}, phaseChainOptions, {
+      run_id: phaseRunId,
+      runId: phaseRunId,
+      runName: 'summarize-activity-phase',
+      tags: [...new Set([...(phaseChainOptions.tags ?? []), ...phaseTags])],
+      metadata: {
+        ...(phaseChainOptions.metadata ?? {}),
+        ...phaseMetadata,
+      },
+    }) as Partial<RunnableConfig>;
+    const invokeModel = (
+      runtimeConfig: Partial<RunnableConfig>
+    ): Promise<unknown> =>
+      model.invoke(
+        [
+          new SystemMessage(prompt ?? ACTIVITY_PHASE_LABEL_PROMPT),
+          new HumanMessage(userPrompt),
+        ],
+        runtimeConfig
+      );
+    const invokeWithCallbackFallback = async (
+      runtimeConfig: Partial<RunnableConfig>
+    ): Promise<unknown> => {
+      try {
+        return await invokeModel(runtimeConfig);
+      } catch (error) {
+        const aborted =
+          (runtimeConfig as { signal?: AbortSignal }).signal?.aborted ===
+            true || (error as Error | null)?.name === 'AbortError';
+        const callbackFailure = /callback|tracer|event.?stream/i.test(
+          String(
+            (error as Error | null)?.stack ??
+              (error as Error | null)?.message ??
+              ''
+          )
+        );
+        if (aborted || !callbackFailure) {
+          throw error;
+        }
+        const langfuseHandler = findCallback(
+          runtimeConfig.callbacks,
+          isLangfuseCallbackHandler
+        );
+        const { callbacks, ...rest } = runtimeConfig;
+        const safeConfig = Object.assign({}, rest, {
+          callbacks: filterCallbacks(
+            callbacks,
+            (callback) => callback === langfuseHandler
+          ),
+        });
+        return invokeModel(safeConfig as Partial<RunnableConfig>);
+      }
+    };
+    const extractPhaseLabel = (response: unknown): string => {
+      const content = (response as { content?: unknown } | null)?.content;
+      if (typeof content === 'string') {
+        return normalizeActivityPhaseLabel(content);
+      }
+      if (!Array.isArray(content)) {
+        return '';
+      }
+      return normalizeActivityPhaseLabel(
+        content
+          .map((block) =>
+            typeof block === 'string'
+              ? block
+              : ((block as { text?: string }).text ?? '')
+          )
+          .join('')
+      );
+    };
+    const phaseRunnable = new RunnableLambda({
+      func: async (
+        _input: { messages: BaseMessage[] },
+        runtimeConfig?: Partial<RunnableConfig>
+      ): Promise<{ label?: string; messages: BaseMessage[] }> => {
+        const response = await invokeWithCallbackFallback(runtimeConfig ?? {});
+        const label = extractPhaseLabel(response);
+        return label.length > 0
+          ? { label, messages: [new AIMessage(label)] }
+          : { messages: [] };
+      },
+    }).withConfig({ runName: 'summarize-activity-phase' });
+
+    try {
+      const result = await withLangfuseRuntimeScope(phaseRuntimeScope, () =>
+        withLangfuseAttributes(
+          {
+            langfuse: phaseLangfuseConfig,
+            userId: phaseUserId,
+            sessionId: phaseSessionId,
+            traceName: phaseTraceName,
+            traceMetadata,
+            tags: phaseTags,
+          },
+          () =>
+            phaseRunnable.invoke(
+              {
+                messages:
+                  sourceUserText == null
+                    ? []
+                    : [new HumanMessage(sourceUserText)],
+              },
+              invokeConfig
+            )
+        )
+      );
+      return result.label == null ? {} : { label: result.label };
+    } finally {
+      await disposeLangfuseHandler(phaseLangfuseHandler);
     }
   }
 }
@@ -2113,6 +2476,26 @@ function findLastMessageOfType(
   return undefined;
 }
 
+function findActivityPhaseTraceInput(
+  messages: BaseMessage[]
+): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (
+      message.getType() !== 'human' ||
+      message.additional_kwargs?.role === 'system' ||
+      message.additional_kwargs?.isMeta === true
+    ) {
+      continue;
+    }
+    const input = extractPromptText(message).trim();
+    if (input !== '') {
+      return input;
+    }
+  }
+  return undefined;
+}
+
 function extractPromptText(message: BaseMessage): string {
   const content = message.content;
   if (typeof content === 'string') {
@@ -2123,14 +2506,13 @@ function extractPromptText(message: BaseMessage): string {
   }
   const parts: string[] = [];
   for (const block of content) {
+    const textBlock = block as { type?: unknown; text?: unknown } | null;
     if (
-      typeof block === 'object' &&
-      'type' in block &&
-      block.type === 'text' &&
-      'text' in block &&
-      typeof block.text === 'string'
+      textBlock != null &&
+      (textBlock.type === 'text' || textBlock.type === 'input_text') &&
+      typeof textBlock.text === 'string'
     ) {
-      parts.push(block.text);
+      parts.push(textBlock.text);
     }
   }
   return parts.join('\n');

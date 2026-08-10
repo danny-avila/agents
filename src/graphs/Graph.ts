@@ -61,6 +61,8 @@ import {
   supportsBedrockToolCache,
   isSyntheticProviderContextMessage,
   getMessageId,
+  getMessageCreationContentMetadata,
+  splitAssistantTextContentByPhase,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
   DEFAULT_RETAIN_RECENT_TURNS,
@@ -507,18 +509,25 @@ async function dispatchMessageCreationStep({
   graph,
   stepKey,
   messageId,
+  content,
+  contentType,
   metadata,
 }: {
   graph: Graph<t.BaseGraphState>;
   stepKey: string;
   messageId: string;
+  content?: string | t.MessageContentComplex[];
+  contentType?: ContentTypes.TEXT | ContentTypes.THINK;
   metadata: Record<string, unknown>;
 }): Promise<string> {
   await graph.dispatchRunStep(
     stepKey,
     {
       type: StepTypes.MESSAGE_CREATION,
-      message_creation: { message_id: messageId },
+      message_creation: {
+        message_id: messageId,
+        ...getMessageCreationContentMetadata(content, contentType),
+      },
     },
     metadata
   );
@@ -548,6 +557,7 @@ async function dispatchTextMessageContent({
         graph,
         stepKey,
         messageId,
+        content: [contentPart],
         metadata,
       });
       await graph.dispatchMessageDelta(
@@ -558,13 +568,24 @@ async function dispatchTextMessageContent({
     }
     return true;
   }
-  const stepId = await dispatchMessageCreationStep({
-    graph,
-    stepKey,
-    messageId,
-    metadata,
-  });
-  await graph.dispatchMessageDelta(stepId, { content }, metadata);
+  const contentGroups = Array.isArray(content)
+    ? splitAssistantTextContentByPhase(content)
+    : [content];
+  for (const contentGroup of contentGroups) {
+    const stepId = await dispatchMessageCreationStep({
+      graph,
+      stepKey,
+      messageId,
+      content: contentGroup,
+      contentType: ContentTypes.TEXT,
+      metadata,
+    });
+    await graph.dispatchMessageDelta(
+      stepId,
+      { content: contentGroup },
+      metadata
+    );
+  }
   return true;
 }
 
@@ -599,7 +620,10 @@ async function dispatchReasoningContent({
     stepKey,
     {
       type: StepTypes.MESSAGE_CREATION,
-      message_creation: { message_id: messageId },
+      message_creation: {
+        message_id: messageId,
+        content_type: ContentTypes.THINK,
+      },
     },
     metadata
   );

@@ -275,6 +275,63 @@ describe('StandardGraph final response reasoning fallback', () => {
     streamUsage: false,
   };
 
+  it('starts a new message step when streamed assistant phases change', async () => {
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const messageDeltas: t.MessageDeltaEvent[] = [];
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'separate-streamed-assistant-phases',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(
+        aggregateContent,
+        reasoningDeltas,
+        messageDeltas
+      ),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    run.Graph.overrideModel = new StreamingReasoningModel([
+      new AIMessageChunk({
+        content: [
+          { type: 'text', text: 'Checking the session.', phase: 'commentary' },
+        ] as never,
+      }),
+      new AIMessageChunk({
+        content: [
+          { type: 'text', text: 'The session is fixed.', phase: 'final_answer' },
+        ] as never,
+      }),
+    ]);
+
+    await run.processStream(
+      { messages: [new HumanMessage('fix the session')] },
+      config
+    );
+
+    expect(new Set(messageDeltas.map((delta) => delta.id)).size).toBe(2);
+    expect(contentParts).toEqual([
+      { type: 'text', text: 'Checking the session.' },
+      { type: 'text', text: 'The session is fixed.' },
+    ]);
+    expect(
+      run.Graph.getRunSteps()
+        .filter((step) => step.stepDetails.type === StepTypes.MESSAGE_CREATION)
+        .map((step) =>
+          step.stepDetails.type === StepTypes.MESSAGE_CREATION
+            ? step.stepDetails.message_creation.phase
+            : undefined
+        )
+    ).toEqual(['commentary', 'final_answer']);
+  });
+
   it('emits reasoning_content from invoke-only final responses', async () => {
     const reasoningText = 'Need to inspect the Home Assistant tool state.';
     const reasoningDeltas: t.ReasoningDeltaEvent[] = [];

@@ -40,6 +40,7 @@ import type {
   HumanInTheLoopConfig,
   InjectedMessage,
   MessageDeltaEvent,
+  MessageCreationDetails,
   ProcessedToolCall,
   ReasoningDeltaEvent,
   RunStep,
@@ -208,9 +209,7 @@ type SanitizedRunStep = Partial<
 type SanitizedStepDetails =
   | {
       type: StepTypes.MESSAGE_CREATION;
-      message_creation?: {
-        message_id?: string;
-      };
+      message_creation?: Partial<MessageCreationDetails['message_creation']>;
     }
   | {
       type: StepTypes.TOOL_CALLS;
@@ -3182,7 +3181,11 @@ function sanitizeStepDetails(
     return undefined;
   }
   const rawDetails = stepDetails as {
-    message_creation?: { message_id?: unknown };
+    message_creation?: {
+      message_id?: unknown;
+      content_type?: unknown;
+      phase?: unknown;
+    };
     tool_calls?: unknown[];
     type?: unknown;
   };
@@ -3190,9 +3193,27 @@ function sanitizeStepDetails(
     const sanitized: SanitizedStepDetails = {
       type: StepTypes.MESSAGE_CREATION,
     };
-    const messageId = rawDetails.message_creation?.message_id;
-    if (typeof messageId === 'string') {
-      sanitized.message_creation = { message_id: messageId };
+    const rawMessageCreation = rawDetails.message_creation;
+    const messageId = rawMessageCreation?.message_id;
+    const contentType = rawMessageCreation?.content_type;
+    const phase = rawMessageCreation?.phase;
+    if (
+      typeof messageId === 'string' ||
+      contentType === ContentTypes.TEXT ||
+      contentType === ContentTypes.THINK ||
+      phase === 'commentary' ||
+      phase === 'final_answer'
+    ) {
+      sanitized.message_creation = {
+        ...(typeof messageId === 'string' ? { message_id: messageId } : {}),
+        ...(contentType === ContentTypes.TEXT ||
+        contentType === ContentTypes.THINK
+          ? { content_type: contentType }
+          : {}),
+        ...(phase === 'commentary' || phase === 'final_answer'
+          ? { phase }
+          : {}),
+      };
     }
     return sanitized;
   }

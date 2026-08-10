@@ -1,6 +1,11 @@
 import type { ActivityLabelToolEntry } from '@/types/activityLabel';
+import {
+  ACTIVITY_PHASE_PROMPT_MAX_LENGTH,
+  buildActivityLabelPrompt,
+  buildActivityPhaseLabelPrompt,
+  normalizeActivityPhaseLabel,
+} from '@/prompts/activityLabel';
 import { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT } from '@/langfuseToolOutputTracing';
-import { buildActivityLabelPrompt } from '@/prompts/activityLabel';
 import { resolveToolOutputTracingConfig } from '@/langfuseConfig';
 
 const entries: ActivityLabelToolEntry[] = [
@@ -233,5 +238,122 @@ describe('buildActivityLabelPrompt redaction', () => {
     expect(prompt).toContain('PUBLIC_SEARCH_RESULTS');
     expect(prompt).not.toContain('SECRET_CONNECTION_STRING_LEAK');
     expect(prompt).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+});
+
+describe('buildActivityPhaseLabelPrompt', () => {
+  it('prefers committed child labels and includes bounded commentary', () => {
+    const prompt = buildActivityPhaseLabelPrompt({
+      activities: [
+        {
+          label: 'Inspected session middleware behavior',
+          entries: [entries[0]],
+        },
+        { label: 'Fixed refresh token validation' },
+      ],
+      assistantContext: ['I am checking the auth path before changing it.'],
+      charLimit: 600,
+    });
+
+    expect(prompt).toContain('Inspected session middleware behavior');
+    expect(prompt).toContain('Fixed refresh token validation');
+    expect(prompt).toContain('I am checking the auth path');
+    expect(prompt).not.toContain(entries[0].toolName);
+  });
+
+  it('preserves partial outcomes when a committed child label is available', () => {
+    const prompt = buildActivityPhaseLabelPrompt({
+      activities: [
+        {
+          label: 'Checked the deployment and found one unhealthy replica',
+          status: 'partial',
+        },
+        { label: 'Recovered the remaining replicas', status: 'success' },
+      ],
+      charLimit: 600,
+    });
+
+    expect(prompt).toContain(
+      'partial: Checked the deployment and found one unhealthy replica'
+    );
+    expect(prompt).toContain('completed: Recovered the remaining replicas');
+  });
+
+  it('reports omitted activities from the host total without retaining their evidence', () => {
+    const prompt = buildActivityPhaseLabelPrompt({
+      activities: Array.from({ length: 12 }, (_, index) => ({
+        label: `Completed activity ${index + 1}`,
+      })),
+      totalActivityCount: 20,
+      charLimit: 600,
+    });
+
+    expect(prompt).toContain('…and 8 more activities');
+  });
+
+  it('rejects status-only retained activities when evidence exists only beyond the cap', () => {
+    const prompt = buildActivityPhaseLabelPrompt({
+      activities: [
+        ...Array.from({ length: 12 }, () => ({ status: 'success' as const })),
+        { label: 'This evidence is outside the retained activity window' },
+      ],
+      charLimit: 600,
+    });
+
+    expect(prompt).toBe('');
+  });
+
+  it('uses raw fallback while applying the strict redaction policy', () => {
+    const prompt = buildActivityPhaseLabelPrompt({
+      activities: [
+        {
+          thinkingExcerpts: ['Secret result quoted in reasoning'],
+          entries,
+        },
+        { status: 'error', entries: [entries[0]] },
+      ],
+      assistantContext: ['Secret result quoted in commentary'],
+      charLimit: 600,
+      redaction: {
+        enabled: true,
+        redactedToolNames: new Set([entries[0].toolName]),
+        redactedToolNameMatchMode: 'exact',
+        redactionText: '[REDACTED]',
+      },
+    });
+
+    expect(prompt).toContain('[REDACTED]');
+    expect(prompt).not.toContain('Secret result');
+    expect(prompt).not.toContain(String(entries[0].toolOutput));
+  });
+
+  it('caps aggregate phase evidence while preserving the terminal cue', () => {
+    const oversized = 'x'.repeat(600);
+    const prompt = buildActivityPhaseLabelPrompt({
+      activities: Array.from({ length: 12 }, (_, activityIndex) => ({
+        thinkingExcerpts: Array.from(
+          { length: 4 },
+          (_, excerptIndex) => `${activityIndex}-${excerptIndex}-${oversized}`
+        ),
+        entries: Array.from({ length: 6 }, (_, entryIndex) => ({
+          toolName: `tool_${activityIndex}_${entryIndex}`,
+          toolInput: oversized,
+          toolOutput: oversized,
+          status: 'success' as const,
+        })),
+      })),
+      assistantContext: [oversized, oversized],
+      charLimit: 600,
+    });
+
+    expect(prompt.length).toBeLessThanOrEqual(ACTIVITY_PHASE_PROMPT_MAX_LENGTH);
+    expect(prompt.endsWith('\n\nPhase summary:')).toBe(true);
+  });
+
+  it('normalizes phase summaries to one bounded row', () => {
+    expect(normalizeActivityPhaseLabel('"Fixed auth\nrefresh handling."')).toBe(
+      'Fixed auth refresh handling'
+    );
+    expect(normalizeActivityPhaseLabel('x'.repeat(300))).toHaveLength(160);
   });
 });
