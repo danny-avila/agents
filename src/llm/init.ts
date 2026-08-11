@@ -2,18 +2,14 @@ import { ChatVertexAI } from '@langchain/google-vertexai';
 import type { Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
-import { getChatModelClass } from '@/llm/providers';
+import { getRegisteredChatModelClass } from '@/llm/providers';
 import { isOpenAILike } from '@/utils';
 import { Providers } from '@/common';
 
 /**
- * Creates a chat model instance for a given provider, applies provider-specific
- * field assignments, and optionally binds tools.
- *
- * This is the single entry point for model creation across the codebase — used
- * by both the agent graph (main LLM) and the summarization node (compaction LLM).
- * An optional `override` model can be passed to skip construction entirely
- * (useful for cached/reused model instances or test fakes).
+ * Creates a chat model instance for a given built-in or host-registered
+ * provider, applies provider-specific field assignments, and optionally binds
+ * tools.
  */
 export function initializeModel({
   provider,
@@ -21,14 +17,14 @@ export function initializeModel({
   tools,
   override,
 }: {
-  provider: Providers;
+  provider: Providers | string;
   clientOptions?: t.ClientOptions;
   tools?: t.GraphTools;
   override?: t.ChatModelInstance;
 }): Runnable {
   const model =
     override ??
-    new (getChatModelClass(provider))(clientOptions ?? ({} as never));
+    new (getRegisteredChatModelClass(provider))(clientOptions ?? ({} as never));
 
   if (
     isOpenAILike(provider) &&
