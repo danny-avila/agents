@@ -18,6 +18,13 @@ import type {
   SummarizeDeltaEvent,
 } from '@/types/summarize';
 import type {
+  RunStep,
+  RunStepDeltaEvent,
+  RunStepClosedEvent,
+  MessageDeltaEvent,
+  ReasoningDeltaEvent,
+} from '@/types/stream';
+import type {
   ToolMap,
   ToolSessionMap,
   ToolEndEvent,
@@ -25,12 +32,6 @@ import type {
   LCTool,
   ToolExecuteBatchRequest,
 } from '@/types/tools';
-import type {
-  RunStep,
-  RunStepDeltaEvent,
-  MessageDeltaEvent,
-  ReasoningDeltaEvent,
-} from '@/types/stream';
 import type {
   TokenCounter,
   StreamLimits,
@@ -134,6 +135,7 @@ export interface EventHandler {
       | ModelEndData
       | RunStep
       | RunStepDeltaEvent
+      | RunStepClosedEvent
       | MessageDeltaEvent
       | ReasoningDeltaEvent
       | SummarizeStartEvent
@@ -597,6 +599,7 @@ export type SubagentUpdatePhase =
   | 'run_step'
   | 'run_step_delta'
   | 'run_step_completed'
+  | 'run_step_closed'
   | 'message_delta'
   | 'reasoning_delta'
   | 'stop'

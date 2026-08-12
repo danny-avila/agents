@@ -908,6 +908,16 @@ interface CreateSummarizeNodeParams {
       result: t.StepCompleted,
       config?: RunnableConfig
     ) => Promise<void>;
+    /**
+     * Terminal close for a summary step that ends without a completion —
+     * an errored or empty summary would otherwise stay `in_progress` until
+     * the run-end sweep reported it as `completed`.
+     */
+    closeRunStep?: (
+      stepId: string,
+      status: Exclude<t.RunStepStatus, 'in_progress'>,
+      config?: RunnableConfig
+    ) => Promise<void>;
     /** The run's shared breaker signal, composed into every summarization
      * model attempt so a sibling branch tripping a stream limit also
      * cancels in-flight summaries. */
@@ -1342,6 +1352,7 @@ export function createSummarizeNode({
           runnableConfig
         );
       }
+      await graph.closeRunStep?.(stepId, 'failed', runnableConfig);
       return { summarizationRequest: undefined };
     }
 

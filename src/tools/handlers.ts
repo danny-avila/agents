@@ -181,6 +181,7 @@ export const handleToolCalls = async (
       const isEmpty = !details.tool_calls || details.tool_calls.length === 0;
       if (isEmpty && prevStepId !== reusedChunkStepId) {
         graph.toolCallStepIds.set(toolCallId, prevStepId);
+        graph.registerPendingToolCall(toolCallId, prevStepId);
         reusedChunkStepId = prevStepId;
         continue;
       }

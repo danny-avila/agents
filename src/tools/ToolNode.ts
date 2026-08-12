@@ -2561,6 +2561,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             index: turn,
             type: 'tool_call' as const,
             tool_call,
+            completed_at: Date.now(),
           },
         },
         config
@@ -3965,6 +3966,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             progress: 1,
             ...(outcome != null && { outcome }),
           } as t.ProcessedToolCall,
+          completed_at: Date.now(),
         },
       },
       config
