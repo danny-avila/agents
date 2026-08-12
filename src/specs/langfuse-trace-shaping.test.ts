@@ -486,6 +486,27 @@ describe('shapeLangfuseSpan', () => {
     expect(span.attributes[TRACE_OUTPUT]).toBe('Conversation title');
   });
 
+  it('marks activity-phase roots as chains even when tagged as agent work', () => {
+    const span = createSpan('summarize-activity-phase', {
+      [TRACE_TAGS]: JSON.stringify([
+        'librechat',
+        'activity-phase',
+        'agent-run-summary',
+        'agent',
+      ]),
+      [INPUT]: 'What changed?',
+      [OUTPUT]: 'Reconciled the implementation and verified the fix',
+    });
+
+    shapeLangfuseSpan(span);
+
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
+    expect(span.attributes[TRACE_INPUT]).toBe('What changed?');
+    expect(span.attributes[TRACE_OUTPUT]).toBe(
+      'Reconciled the implementation and verified the fix'
+    );
+  });
+
   it('does not classify untagged root spans as agents', () => {
     const span = createSpan('Custom root', { [INPUT]: 'input' });
 

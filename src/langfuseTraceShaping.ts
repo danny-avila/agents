@@ -14,6 +14,7 @@ const CHAIN_OBSERVATION_TYPE = 'chain';
 const TOOL_OBSERVATION_TYPE = 'tool';
 const AGENT_TRACE_TAG = 'agent';
 const TITLE_TRACE_TAG = 'title';
+const ACTIVITY_PHASE_TRACE_TAG = 'activity-phase';
 const EPHEMERAL_AGENT_SENDER_SEPARATOR = '___';
 const EPHEMERAL_AGENT_INDEX_SEPARATOR = '____';
 const OBSERVATION_METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
@@ -473,14 +474,17 @@ function shapeRootObservationType(span: MutableSpan): void {
   if (isGenerationSpan(span)) {
     return;
   }
+  if (
+    hasTraceTag(span, TITLE_TRACE_TAG) ||
+    hasTraceTag(span, ACTIVITY_PHASE_TRACE_TAG)
+  ) {
+    span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] =
+      CHAIN_OBSERVATION_TYPE;
+    return;
+  }
   if (hasTraceTag(span, AGENT_TRACE_TAG)) {
     span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] =
       ROOT_OBSERVATION_TYPE;
-    return;
-  }
-  if (hasTraceTag(span, TITLE_TRACE_TAG)) {
-    span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] =
-      CHAIN_OBSERVATION_TYPE;
   }
 }
 
@@ -497,9 +501,10 @@ function shapeRootObservationType(span: MutableSpan): void {
  * - Agent nodes become `agent` observations, while tool-dispatch nodes become
  *   stable `chain` observations whose input is scoped to the pending calls.
  *   Individual child calls remain `tool` observations (items 3 & 4).
- * - Agent trace roots become `agent` observations and title trace roots become
- *   `chain` observations. Root and trace input/output are reduced to the user
- *   question and assistant response when chat messages are available (item 2).
+ * - Agent trace roots become `agent` observations, while title and activity
+ *   summary roots become `chain` observations. Root and trace input/output are
+ *   reduced to the user question and assistant response when chat messages are
+ *   available (item 2).
  */
 export function shapeLangfuseSpan(span: ReadableSpan): void {
   const mutable = span as MutableSpan;
