@@ -147,11 +147,11 @@ describe('StandardGraph.recordStepCompletion', () => {
     graph.registerPendingToolCall('call_1', 'step_a');
     graph.registerPendingToolCall('call_2', 'step_a');
 
-    await graph.recordStepCompletion('step_a', 'call_1');
+    await graph.recordStepCompletion('step_a', { toolCallId: 'call_1' });
     expect(step.status).toBe('in_progress');
     expect(closed).toHaveLength(0);
 
-    await graph.recordStepCompletion('step_a', 'call_2');
+    await graph.recordStepCompletion('step_a', { toolCallId: 'call_2' });
     expect(step.status).toBe('completed');
     expect(typeof step.completed_at).toBe('number');
     expect(closed).toHaveLength(1);
@@ -172,8 +172,8 @@ describe('StandardGraph.recordStepCompletion', () => {
     seedStep(graph, 'step_a', StepTypes.TOOL_CALLS);
     graph.registerPendingToolCall('call_1', 'step_a');
 
-    await graph.recordStepCompletion('step_a', 'call_1');
-    await graph.recordStepCompletion('step_a', 'call_1');
+    await graph.recordStepCompletion('step_a', { toolCallId: 'call_1' });
+    await graph.recordStepCompletion('step_a', { toolCallId: 'call_1' });
     expect(closed).toHaveLength(1);
   });
 
@@ -182,14 +182,29 @@ describe('StandardGraph.recordStepCompletion', () => {
     const step = seedStep(graph, 'step_a', StepTypes.TOOL_CALLS);
     graph.registerPendingToolCall('call_1', 'step_a');
 
-    await graph.recordStepCompletion('step_a', 'call_1');
+    await graph.recordStepCompletion('step_a', { toolCallId: 'call_1' });
     expect(closed).toHaveLength(1);
     const firstClosedAt = step.completed_at;
 
     graph.registerPendingToolCall('call_2', 'step_a');
-    await graph.recordStepCompletion('step_a', 'call_2');
+    await graph.recordStepCompletion('step_a', { toolCallId: 'call_2' });
     expect(closed).toHaveLength(1);
     expect(step.completed_at).toBeGreaterThanOrEqual(firstClosedAt as number);
+  });
+  it('uses the producer\'s completion timestamp when one is supplied', async () => {
+    const { graph, closed } = createGraph();
+    const step = seedStep(graph, 'step_a', StepTypes.TOOL_CALLS);
+    graph.registerPendingToolCall('call_1', 'step_a');
+
+    await graph.recordStepCompletion('step_a', {
+      toolCallId: 'call_1',
+      at: 4_000,
+    });
+
+    /** A slow host handler must not inflate the recorded duration. */
+    expect(step.completed_at).toBe(4_000);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].closed_at).toBe(4_000);
   });
 });
 

@@ -138,6 +138,17 @@ export interface RunStepClosedEvent {
   stepIndex?: number;
 }
 
+export type RecordStepCompletionOptions = {
+  /** The completing tool call, when the step tracks pending completions. */
+  toolCallId?: string;
+  metadata?: Record<string, unknown>;
+  /**
+   * Producer-stamped completion time (epoch ms). Carried through so a slow
+   * host completion handler cannot inflate the recorded step duration.
+   */
+  at?: number;
+};
+
 export type RunStepCloseOptions = {
   /** Epoch ms for the terminal stamp; defaults to `Date.now()` at close time. */
   at?: number;

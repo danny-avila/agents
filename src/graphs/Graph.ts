@@ -1921,15 +1921,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   async recordStepCompletion(
     stepId: string,
-    toolCallId?: string,
-    metadata?: Record<string, unknown>
+    options?: t.RecordStepCompletionOptions
   ): Promise<void> {
     if (!stepId) {
       return;
     }
+    const { toolCallId, metadata, at } = options ?? {};
     const pending = this.pendingToolCallsByStep.get(stepId);
     if (pending == null) {
-      await this.closeRunStep(stepId, 'completed', { metadata });
+      await this.closeRunStep(stepId, 'completed', { metadata, at });
       return;
     }
     const removed =
@@ -1941,6 +1941,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     }
     await this.closeRunStep(stepId, 'completed', {
       metadata,
+      at,
       restamp: removed,
     });
   }
@@ -4929,6 +4930,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               nodeConfig?: RunnableConfig
             ) => {
               const resolvedConfig = nodeConfig ?? this.config;
+              const completedAt = Date.now();
               const runStep = this.getRunStep(stepId);
               const handler = this.handlerRegistry?.getHandler(
                 GraphEvents.ON_RUN_STEP_COMPLETED
@@ -4941,18 +4943,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       ...result,
                       id: stepId,
                       index: runStep?.index ?? 0,
-                      completed_at: Date.now(),
+                      completed_at: completedAt,
                     },
                   },
                   resolvedConfig?.configurable,
                   this
                 );
               }
-              await this.recordStepCompletion(
-                stepId,
-                undefined,
-                resolvedConfig?.metadata
-              );
+              await this.recordStepCompletion(stepId, {
+                metadata: resolvedConfig?.metadata,
+                at: completedAt,
+              });
             },
           },
           generateStepId: (stepKey: string) => this.generateStepId(stepKey),
@@ -5185,6 +5186,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return false;
     }
 
+    const completedAt = Date.now();
     const tool_call: t.ProcessedToolCall = {
       id: data.id,
       name: name || '',
@@ -5212,13 +5214,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           index: runStep.index,
           type: 'tool_call',
           tool_call,
-          completed_at: Date.now(),
+          completed_at: completedAt,
         } as t.ToolCompleteEvent,
       },
       metadata,
       graph
     );
-    await graph.recordStepCompletion(stepId, data.id, metadata);
+    await graph.recordStepCompletion(stepId, {
+      toolCallId: data.id,
+      metadata,
+      at: completedAt,
+    });
     return true;
   }
 

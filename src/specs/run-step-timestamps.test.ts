@@ -292,6 +292,49 @@ describe('run step timestamps', () => {
     }
   });
 
+  it('sweeps as failed when an AbortError surfaces with no signal aborted', async () => {
+    const { sequence, handlers } = createRecorder();
+    const run = await Run.create<t.IState>({
+      runId: 'test-run-step-timestamps-uncorroborated-abort',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+        instructions: 'You are a helpful assistant.',
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: {
+        ...handlers,
+        [GraphEvents.ON_MESSAGE_DELTA]: {
+          handle: (): void => {
+            /** A provider/host rejection that merely borrows the name — no
+             *  caller or construction signal was ever aborted. */
+            const error = new Error('provider stream aborted internally');
+            error.name = 'AbortError';
+            throw error;
+          },
+        },
+      },
+    });
+
+    run.Graph?.overrideTestModel(['some streamed content'], 2);
+    await expect(
+      run.processStream(
+        { messages: [new HumanMessage('hello')] },
+        createStreamConfig('run-step-timestamps-uncorroborated-abort')
+      )
+    ).rejects.toThrow();
+
+    const closed = getClosed(sequence);
+    expect(closed.length).toBeGreaterThanOrEqual(1);
+    expect(closed.every((event) => event.status === 'failed')).toBe(true);
+    for (const step of run.Graph?.contentData ?? []) {
+      expect(step.status).toBe('failed');
+      expect(typeof step.failed_at).toBe('number');
+      expect(step.cancelled_at).toBeUndefined();
+    }
+  });
+
   it('keeps steps open across a HITL interrupt and closes them on resume with the original created_at', async () => {
     jest.setTimeout(30000);
     const { sequence, handlers } = createRecorder();

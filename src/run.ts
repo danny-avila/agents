@@ -132,9 +132,9 @@ function getStepScopedEventId(data: unknown): string | undefined {
  * to the ids step closure needs. Returns undefined for malformed payloads and
  * the resume race's empty step id.
  */
-function getToolCompletionIds(
+function getToolCompletion(
   data: unknown
-): { stepId: string; toolCallId?: string } | undefined {
+): { stepId: string; toolCallId?: string; completedAt?: number } | undefined {
   if (data == null || typeof data !== 'object') {
     return undefined;
   }
@@ -142,14 +142,20 @@ function getToolCompletionIds(
   if (result == null || typeof result !== 'object') {
     return undefined;
   }
-  const candidate = result as { id?: unknown; tool_call?: { id?: unknown } };
+  const candidate = result as {
+    id?: unknown;
+    tool_call?: { id?: unknown };
+    completed_at?: unknown;
+  };
   if (typeof candidate.id !== 'string' || candidate.id === '') {
     return undefined;
   }
   const toolCallId = candidate.tool_call?.id;
+  const completedAt = candidate.completed_at;
   return {
     stepId: candidate.id,
     ...(typeof toolCallId === 'string' ? { toolCallId } : {}),
+    ...(typeof completedAt === 'number' ? { completedAt } : {}),
   };
 }
 
@@ -761,13 +767,18 @@ export class Run<_T extends t.BaseGraphState> {
           eventName === GraphEvents.ON_RUN_STEP_COMPLETED &&
           this.Graph != null
         ) {
-          const completion = getToolCompletionIds(data);
+          const completion = getToolCompletion(data);
           if (completion != null) {
-            await this.Graph.recordStepCompletion(
-              completion.stepId,
-              completion.toolCallId,
-              metadata
-            );
+            /**
+             * The producer stamped `completed_at` before dispatch. Carrying it
+             * through keeps the recorded duration the tool's, not the host
+             * handler's — this runs after an arbitrarily slow handler resolves.
+             */
+            await this.Graph.recordStepCompletion(completion.stepId, {
+              toolCallId: completion.toolCallId,
+              metadata,
+              at: completion.completedAt,
+            });
           }
         }
       }
@@ -1297,9 +1308,15 @@ export class Run<_T extends t.BaseGraphState> {
       );
     } catch (err) {
       streamThrew = true;
+      /**
+       * Corroborate cancellation against an actually-aborted signal. A
+       * provider SDK or host handler can reject with an `AbortError` while
+       * nothing was cancelled — that is an unexpected failure (it also fires
+       * `StopFailure`), and naming it `cancelled` would misreport abort
+       * forensics.
+       */
       streamAborted =
-        config.signal?.aborted === true ||
-        (err instanceof Error && err.name === 'AbortError');
+        config.signal?.aborted === true || this.Graph.signal?.aborted === true;
       if (this.hookRegistry?.hasHookFor('StopFailure', this.id) === true) {
         const runMessages = this.Graph.getRunMessages() ?? [];
         await executeHooks({
