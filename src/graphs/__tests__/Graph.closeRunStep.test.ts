@@ -270,3 +270,59 @@ describe('StandardGraph.closeUnfinishedRunSteps', () => {
     }
   });
 });
+
+describe('StandardGraph.trackDispatchedRunStep', () => {
+  it('reserves distinct content indexes when parallel lanes dispatch concurrently', async () => {
+    const graph = new StandardGraph({
+      runId: 'run_1',
+      agents: [makeAgent('agent')],
+    });
+    /** A host handler that yields — the window in which two lanes could
+     *  otherwise both read the same contentData.length. */
+    const registry = new HandlerRegistry();
+    registry.register(GraphEvents.ON_RUN_STEP_CLOSED, {
+      handle: async (): Promise<void> => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      },
+    });
+    graph.handlerRegistry = registry;
+
+    const openA = seedStep(graph, 'open_a');
+    openA.agentId = 'agent_a';
+    const openB = seedStep(graph, 'open_b');
+    openB.agentId = 'agent_b';
+    graph.openMessageStepByAgent.set('agent_a', 'open_a');
+    graph.openMessageStepByAgent.set('agent_b', 'open_b');
+
+    const makeSuccessor = (id: string, agentId: string): t.RunStep => ({
+      id,
+      agentId,
+      type: StepTypes.MESSAGE_CREATION,
+      /** Both lanes computed the same stale index before dispatching. */
+      index: graph.contentData.length,
+      stepDetails: {
+        type: StepTypes.MESSAGE_CREATION,
+        message_creation: { message_id: `msg_${id}` },
+      },
+      usage: null,
+      created_at: 1_000,
+      status: 'in_progress',
+    });
+    const successorA = makeSuccessor('next_a', 'agent_a');
+    const successorB = makeSuccessor('next_b', 'agent_b');
+
+    const track = (
+      graph as unknown as {
+        trackDispatchedRunStep: (step: t.RunStep) => Promise<void>;
+      }
+    ).trackDispatchedRunStep.bind(graph);
+    await Promise.all([track(successorA), track(successorB)]);
+
+    expect(successorA.index).not.toBe(successorB.index);
+    expect(graph.getRunStep('next_a')).toBe(successorA);
+    expect(graph.getRunStep('next_b')).toBe(successorB);
+    expect(graph.contentData.filter((s) => s.id === 'next_a')).toHaveLength(1);
+    const indexes = graph.contentData.map((step) => step.index);
+    expect(new Set(indexes).size).toBe(indexes.length);
+  });
+});

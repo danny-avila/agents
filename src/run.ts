@@ -1180,6 +1180,13 @@ export class Run<_T extends t.BaseGraphState> {
           }
         }
 
+        /**
+         * Stamped before the handler runs: the close below happens after an
+         * arbitrarily slow host handler resolves, and the step's duration
+         * should end when the model did, not when the host finished with it.
+         */
+        const modelEndAt =
+          eventName === GraphEvents.CHAT_MODEL_END ? Date.now() : undefined;
         const handler = this.handlerRegistry?.getHandler(eventName);
         if (handler) {
           await handler.handle(eventName, data, metadata, this.Graph);
@@ -1192,7 +1199,7 @@ export class Run<_T extends t.BaseGraphState> {
          * silently drop the close.
          */
         if (eventName === GraphEvents.CHAT_MODEL_END && this.Graph != null) {
-          await this.Graph.closeOpenMessageStep(metadata);
+          await this.Graph.closeOpenMessageStep(metadata, modelEndAt);
         }
 
         /**

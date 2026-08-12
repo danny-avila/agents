@@ -1794,15 +1794,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   ): Promise<void> {
     const agentKey = runStep.agentId ?? '';
     const openMessageStepId = this.openMessageStepByAgent.get(agentKey);
-    if (openMessageStepId != null && openMessageStepId !== runStep.id) {
-      await this.closeRunStep(openMessageStepId, 'completed', { metadata });
-    }
+    /**
+     * Reserve the content index and register the step SYNCHRONOUSLY, before
+     * awaiting the predecessor's closure. Parallel agent lanes dispatch
+     * successors concurrently: if both yielded here first, they would push
+     * with the same `contentData.length` and `contentIndexMap` would resolve
+     * one step id to the other lane's entry, so later deltas and completions
+     * would mutate the wrong agent's step. Assigning the index at push time
+     * also supersedes whatever the caller computed before this await point.
+     */
+    runStep.index = this.contentData.length;
     this.contentData.push(runStep);
     this.contentIndexMap.set(runStep.id, runStep.index);
     if (trackAsOpenMessageStep && runStep.type === StepTypes.MESSAGE_CREATION) {
       this.openMessageStepByAgent.set(agentKey, runStep.id);
     } else {
       this.openMessageStepByAgent.delete(agentKey);
+    }
+    /**
+     * Awaited after registration but before the caller dispatches this step's
+     * ON_RUN_STEP, so the predecessor's CLOSED event still precedes the
+     * successor's start event.
+     */
+    if (openMessageStepId != null && openMessageStepId !== runStep.id) {
+      await this.closeRunStep(openMessageStepId, 'completed', { metadata });
     }
   }
 
@@ -1953,7 +1968,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * successor-close does no work here.
    */
   async closeOpenMessageStep(
-    metadata?: Record<string, unknown>
+    metadata?: Record<string, unknown>,
+    /** Model-end time captured before host handlers ran, so a slow usage sink
+     *  cannot inflate the step's measured duration. */
+    at?: number
   ): Promise<void> {
     if (this.openMessageStepByAgent.size === 0) {
       return;
@@ -1963,7 +1981,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (openStepId == null) {
       return;
     }
-    await this.closeRunStep(openStepId, 'completed', { metadata });
+    await this.closeRunStep(openStepId, 'completed', { metadata, at });
   }
 
   /**

@@ -1385,10 +1385,14 @@ export class AgentSession {
         }
       );
     } catch (error) {
-      const aborted =
-        error instanceof Error &&
-        (error.name === 'AbortError' || error.name === 'GraphBubbleUp');
-      await graph.closeOpenSteps(aborted ? 'cancelled' : 'failed').catch(() => {
+      /**
+       * `failed`, not `cancelled`: manual compaction is invoked without a
+       * caller abort signal, so there is no cancellation source to
+       * corroborate against. An error that merely carries the `AbortError`
+       * name is an unexpected failure here, and it propagates to the caller
+       * either way.
+       */
+      await graph.closeOpenSteps('failed').catch(() => {
         /** the sweep must never mask the summarization failure */
       });
       throw error;
