@@ -71,7 +71,6 @@ describe('activity label observability', () => {
 
     await run.generateActivityLabel({
       provider: Providers.OPENAI,
-      agentId: 'agent-1',
       entries: [
         {
           toolName: 'inspect_status',

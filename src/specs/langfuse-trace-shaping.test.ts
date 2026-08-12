@@ -507,6 +507,17 @@ describe('shapeLangfuseSpan', () => {
     );
   });
 
+  it('does not treat a user-supplied activity-phase tag as an operation type', () => {
+    const span = createSpan('LibreChat Agent', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent', 'activity-phase']),
+      [INPUT]: 'Run an ordinary agent',
+    });
+
+    shapeLangfuseSpan(span);
+
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('agent');
+  });
+
   it('does not classify untagged root spans as agents', () => {
     const span = createSpan('Custom root', { [INPUT]: 'input' });
 

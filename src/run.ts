@@ -1890,6 +1890,16 @@ export class Run<_T extends t.BaseGraphState> {
     const labelIndex = labelSeq - 1;
     const labelParentMessageId =
       labelChainOptions.configurable?.requestBody?.parentMessageId;
+    /** An omitted `agentId` is attributable only when exactly one context
+     *  exists. Multi-agent callers remain unattributed instead of being
+     *  incorrectly assigned to the graph's default agent. */
+    const labelAgentId =
+      agentId ??
+      (this.Graph?.agentContexts.size === 1
+        ? this.Graph.defaultAgentId
+        : undefined);
+    const labelAgentName =
+      labelAgentId == null ? undefined : labelContext?.name;
     const labelMetadata: Record<string, unknown> = {
       sourceRunId: this.id,
       responseId: this.id,
@@ -1897,15 +1907,15 @@ export class Run<_T extends t.BaseGraphState> {
       ...(typeof labelParentMessageId === 'string'
         ? { parentMessageId: labelParentMessageId }
         : {}),
-      ...(agentId == null ? {} : { agentId }),
-      ...(labelContext?.name == null ? {} : { agentName: labelContext.name }),
+      ...(labelAgentId == null ? {} : { agentId: labelAgentId }),
+      ...(labelAgentName == null ? {} : { agentName: labelAgentName }),
     };
     const traceMetadata = {
       ...createLangfuseTraceMetadata({
         messageId: 'activity-label-' + this.id,
         parentMessageId: labelParentMessageId,
-        agentId,
-        agentName: labelContext?.name,
+        agentId: labelAgentId,
+        agentName: labelAgentName,
       }),
       sourceRunId: this.id,
       responseId: this.id,

@@ -15,6 +15,7 @@ const TOOL_OBSERVATION_TYPE = 'tool';
 const AGENT_TRACE_TAG = 'agent';
 const TITLE_TRACE_TAG = 'title';
 const ACTIVITY_PHASE_TRACE_TAG = 'activity-phase';
+const ACTIVITY_PHASE_ROOT_NAME = 'summarize-activity-phase';
 const EPHEMERAL_AGENT_SENDER_SEPARATOR = '___';
 const EPHEMERAL_AGENT_INDEX_SEPARATOR = '____';
 const OBSERVATION_METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
@@ -476,7 +477,8 @@ function shapeRootObservationType(span: MutableSpan): void {
   }
   if (
     hasTraceTag(span, TITLE_TRACE_TAG) ||
-    hasTraceTag(span, ACTIVITY_PHASE_TRACE_TAG)
+    (span.name === ACTIVITY_PHASE_ROOT_NAME &&
+      hasTraceTag(span, ACTIVITY_PHASE_TRACE_TAG))
   ) {
     span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] =
       CHAIN_OBSERVATION_TYPE;
