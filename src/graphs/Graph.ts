@@ -744,6 +744,13 @@ export abstract class Graph<
   toolCallStepIds: Map<string, string> = new Map();
   /** Step ID -> tool call IDs whose completions have not yet arrived. */
   pendingToolCallsByStep: Map<string, Set<string>> = new Map();
+  /**
+   * Step ID -> latest producer completion time seen for that step. Parallel
+   * calls sharing a step can settle out of producer order when their host
+   * handlers differ in latency, so the call that happens to drain the set is
+   * not necessarily the one that finished last.
+   */
+  latestCompletionByStep: Map<string, number> = new Map();
   /** Agent key ('' for single-agent) -> currently open MESSAGE_CREATION step ID. */
   openMessageStepByAgent: Map<string, string> = new Map();
   /**
@@ -863,6 +870,7 @@ export abstract class Graph<
     this.stepKeyIds = new Map();
     this.toolCallStepIds.clear();
     this.pendingToolCallsByStep.clear();
+    this.latestCompletionByStep.clear();
     this.openMessageStepByAgent.clear();
     this.messageIdsByStepKey = new Map();
     this.messageStepHasTextDeltas = new Set();
@@ -1472,6 +1480,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      */
     this.toolCallStepIds.clear();
     this.pendingToolCallsByStep.clear();
+    this.latestCompletionByStep.clear();
     this.openMessageStepByAgent.clear();
     this.runProducedAiMessageIds.clear();
     this.eagerEventToolExecutions.clear();
@@ -1764,6 +1773,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   private untrackRunStep(runStep: t.RunStep): void {
     this.pendingToolCallsByStep.delete(runStep.id);
+    this.latestCompletionByStep.delete(runStep.id);
     const agentKey = runStep.agentId ?? '';
     if (this.openMessageStepByAgent.get(agentKey) === runStep.id) {
       this.openMessageStepByAgent.delete(agentKey);
@@ -1829,6 +1839,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         /** Predecessor delivery must not abort the successor's lifecycle */
       }
     }
+    /**
+     * Stamped last, after the predecessor's closure has been delivered and
+     * immediately before the caller publishes this step's ON_RUN_STEP.
+     * `created_at` documents when the step was dispatched, so it must not
+     * absorb the latency of an arbitrarily slow predecessor handler.
+     */
+    runStep.created_at = Date.now();
   }
 
   /**
@@ -1933,9 +1950,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return;
     }
     const { toolCallId, metadata, at } = options ?? {};
+    if (at != null) {
+      const latest = this.latestCompletionByStep.get(stepId);
+      if (latest == null || at > latest) {
+        this.latestCompletionByStep.set(stepId, at);
+      }
+    }
+    const closeAt = this.latestCompletionByStep.get(stepId) ?? at;
     const pending = this.pendingToolCallsByStep.get(stepId);
     if (pending == null) {
-      await this.closeRunStep(stepId, 'completed', { metadata, at });
+      await this.closeRunStep(stepId, 'completed', { metadata, at: closeAt });
       return;
     }
     if (toolCallId != null && toolCallId !== '') {
@@ -1944,7 +1968,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (pending.size > 0) {
       return;
     }
-    await this.closeRunStep(stepId, 'completed', { metadata, at });
+    await this.closeRunStep(stepId, 'completed', { metadata, at: closeAt });
   }
 
   /**
@@ -1999,6 +2023,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
     }
     this.pendingToolCallsByStep.clear();
+    this.latestCompletionByStep.clear();
     this.openMessageStepByAgent.clear();
   }
 
@@ -4889,7 +4914,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   runStep.groupId = groupId;
                 }
               }
-              runStep.created_at ??= Date.now();
               runStep.status ??= 'in_progress';
               await this.trackDispatchedRunStep(
                 runStep,
@@ -5094,7 +5118,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       index: this.contentData.length,
       stepDetails,
       usage: null,
-      created_at: Date.now(),
       status: 'in_progress',
     };
 

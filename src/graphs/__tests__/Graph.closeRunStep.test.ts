@@ -185,6 +185,28 @@ describe('StandardGraph.recordStepCompletion', () => {
     expect(step.completed_at).toBe(2_000);
     expect(closed[0].closed_at).toBe(2_000);
   });
+  it('closes a multi-call step at the latest producer timestamp', async () => {
+    const { graph, closed } = createGraph();
+    const step = seedStep(graph, 'step_a', StepTypes.TOOL_CALLS);
+    graph.registerPendingToolCall('call_1', 'step_a');
+    graph.registerPendingToolCall('call_2', 'step_a');
+
+    /** call_2 finished later, but its host handler was faster, so the
+     *  earlier-finishing call_1 is what drains the pending set. */
+    await graph.recordStepCompletion('step_a', {
+      toolCallId: 'call_2',
+      at: 5_000,
+    });
+    await graph.recordStepCompletion('step_a', {
+      toolCallId: 'call_1',
+      at: 4_000,
+    });
+
+    expect(step.completed_at).toBe(5_000);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].closed_at).toBe(5_000);
+  });
+
   it('uses the producer\'s completion timestamp when one is supplied', async () => {
     const { graph, closed } = createGraph();
     const step = seedStep(graph, 'step_a', StepTypes.TOOL_CALLS);
@@ -318,5 +340,46 @@ describe('StandardGraph.trackDispatchedRunStep', () => {
     expect(graph.contentData.filter((s) => s.id === 'next_a')).toHaveLength(1);
     const indexes = graph.contentData.map((step) => step.index);
     expect(new Set(indexes).size).toBe(indexes.length);
+  });
+  it('stamps created_at after the predecessor closure is delivered', async () => {
+    const graph = new StandardGraph({
+      runId: 'run_1',
+      agents: [makeAgent('agent')],
+    });
+    let predecessorClosedAt = 0;
+    const registry = new HandlerRegistry();
+    registry.register(GraphEvents.ON_RUN_STEP_CLOSED, {
+      handle: async (): Promise<void> => {
+        /** A slow predecessor handler must not be charged to the successor. */
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        predecessorClosedAt = Date.now();
+      },
+    });
+    graph.handlerRegistry = registry;
+
+    seedStep(graph, 'open_a');
+    graph.openMessageStepByAgent.set('', 'open_a');
+
+    const successor: t.RunStep = {
+      id: 'next_a',
+      type: StepTypes.MESSAGE_CREATION,
+      index: 0,
+      stepDetails: {
+        type: StepTypes.MESSAGE_CREATION,
+        message_creation: { message_id: 'msg_next_a' },
+      },
+      usage: null,
+      status: 'in_progress',
+    };
+    await (
+      graph as unknown as {
+        trackDispatchedRunStep: (step: t.RunStep) => Promise<void>;
+      }
+    ).trackDispatchedRunStep.bind(graph)(successor);
+
+    expect(predecessorClosedAt).toBeGreaterThan(0);
+    expect(successor.created_at as number).toBeGreaterThanOrEqual(
+      predecessorClosedAt
+    );
   });
 });

@@ -1112,6 +1112,13 @@ export class Run<_T extends t.BaseGraphState> {
      */
     let streamThrew = false;
     let streamAborted = false;
+    /**
+     * When the stream itself ended — captured before the post-stream work in
+     * the `finally` (Stop/StopFailure hooks, Langfuse disposal, which can
+     * force-flush) so a slow hook cannot inflate the terminal stamps that the
+     * sweep writes onto steps that were still open.
+     */
+    let terminalAt: number | undefined;
 
     const consumeStream = async (): Promise<void> => {
       /**
@@ -1230,6 +1237,8 @@ export class Run<_T extends t.BaseGraphState> {
         }
       }
 
+      terminalAt = Date.now();
+
       if (this._interrupt != null) {
         await this.resolveInterruptResumeConfig(config);
       }
@@ -1314,6 +1323,7 @@ export class Run<_T extends t.BaseGraphState> {
         )
       );
     } catch (err) {
+      terminalAt = Date.now();
       streamThrew = true;
       /**
        * Corroborate cancellation against an actually-aborted signal. A
@@ -1372,6 +1382,29 @@ export class Run<_T extends t.BaseGraphState> {
       await disposeLangfuseHandler(langfuseHandler);
 
       /**
+       * Terminal sweep: close every step that never reached a terminal
+       * status — `completed` on a natural end, `cancelled` on caller abort
+       * or hook halt, `failed` on an unexpected stream error. Skipped on a
+       * HITL pause, where the open steps continue after `resume()`.
+       *
+       * Runs BEFORE the callback teardown below, so a caller observing
+       * lifecycle events only through `RunnableConfig.callbacks` still
+       * receives these closures rather than being left with unmatched
+       * starts, and before `getContentParts()` so terminal stamps flow into
+       * content and session serialization.
+       */
+      if (!this.isAwaitingResume(streamThrew)) {
+        try {
+          await this.Graph.closeUnfinishedRunSteps(
+            this.resolveSweepStatus(streamThrew, streamAborted),
+            terminalAt
+          );
+        } catch {
+          /* the sweep must never mask the stream outcome */
+        }
+      }
+
+      /**
        * Break the reference chain that keeps heavy data alive via
        * LangGraph's internal `__pregel_scratchpad.currentTaskInput` →
        * `@langchain/core` `RunTree.extra[lc:child_config]` →
@@ -1400,24 +1433,6 @@ export class Run<_T extends t.BaseGraphState> {
           config.configurable = undefined;
         }
         config.callbacks = undefined;
-      }
-
-      /**
-       * Terminal sweep: close every step that never reached a terminal
-       * status — `completed` on a natural end, `cancelled` on caller abort
-       * or hook halt, `failed` on an unexpected stream error. Skipped on a
-       * HITL pause, where the open steps continue after `resume()`. Runs
-       * before `getContentParts()` so terminal stamps flow into content and
-       * session serialization.
-       */
-      if (!this.isAwaitingResume(streamThrew)) {
-        try {
-          await this.Graph.closeUnfinishedRunSteps(
-            this.resolveSweepStatus(streamThrew, streamAborted)
-          );
-        } catch {
-          /* the sweep must never mask the stream outcome */
-        }
       }
 
       const result = this.returnContent

@@ -697,6 +697,15 @@ function createManualCompactGraph(params: {
           runStep
         );
       },
+      closeRunStep: async (stepId, status): Promise<void> => {
+        const stepIndex = contentIndexMap.get(stepId);
+        const runStep =
+          stepIndex === undefined ? undefined : contentData[stepIndex];
+        if (runStep == null) {
+          return;
+        }
+        await closeStep(runStep, status, Date.now());
+      },
       dispatchRunStepCompleted: async (stepId, completed): Promise<void> => {
         const completedAt = Date.now();
         const stepIndex = contentIndexMap.get(stepId);
