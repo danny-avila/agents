@@ -1736,18 +1736,24 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return undefined;
   }
 
-  /** Derives the same lane key `dispatchRunStep` stamps as `runStep.agentId`. */
+  /**
+   * Derives the same lane key `dispatchRunStep` stamps as `runStep.agentId`.
+   * The multi-agent check gates the lookup because `getAgentContext` signals
+   * a miss by throwing: single-agent graphs key every step under `''`, so
+   * resolving the context could only ever produce a thrown-and-discarded
+   * Error on a per-model-call path.
+   */
   protected getStepAgentKey(metadata?: Record<string, unknown>): string {
-    if (!metadata) {
+    if (!metadata || !this.isMultiAgentGraph()) {
       return '';
     }
     try {
       const agentContext = this.getAgentContext(metadata);
-      if (this.isMultiAgentGraph() && agentContext.agentId) {
+      if (agentContext.agentId) {
         return agentContext.agentId;
       }
     } catch (_e) {
-      /** No agent context — single-agent lane */
+      /** No agent context — fall back to the default lane */
     }
     return '';
   }
@@ -1917,10 +1923,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     });
   }
 
-  /** Closes the tracked open MESSAGE_CREATION step for the event's agent lane. */
+  /**
+   * Closes the tracked open MESSAGE_CREATION step for the event's agent lane.
+   * Fires on every model end, so the empty-map check short-circuits ahead of
+   * resolving the lane key — a turn whose message step already closed through
+   * successor-close does no work here.
+   */
   async closeOpenMessageStep(
     metadata?: Record<string, unknown>
   ): Promise<void> {
+    if (this.openMessageStepByAgent.size === 0) {
+      return;
+    }
     const agentKey = this.getStepAgentKey(metadata);
     const openStepId = this.openMessageStepByAgent.get(agentKey);
     if (openStepId == null) {
