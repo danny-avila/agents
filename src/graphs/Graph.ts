@@ -742,6 +742,17 @@ export abstract class Graph<
   stepKeyIds: Map<string, string[]> = new Map<string, string[]>();
   contentIndexMap: Map<string, number> = new Map();
   toolCallStepIds: Map<string, string> = new Map();
+  /** Step ID -> tool call IDs whose completions have not yet arrived. */
+  pendingToolCallsByStep: Map<string, Set<string>> = new Map();
+  /**
+   * Step ID -> latest producer completion time seen for that step. Parallel
+   * calls sharing a step can settle out of producer order when their host
+   * handlers differ in latency, so the call that happens to drain the set is
+   * not necessarily the one that finished last.
+   */
+  latestCompletionByStep: Map<string, number> = new Map();
+  /** Agent key ('' for single-agent) -> currently open MESSAGE_CREATION step ID. */
+  openMessageStepByAgent: Map<string, string> = new Map();
   /**
    * Step IDs dispatched through the handler registry during this run.
    * Event echo suppression is tracked separately so repeated deltas for
@@ -858,6 +869,9 @@ export abstract class Graph<
     this.contentIndexMap = new Map();
     this.stepKeyIds = new Map();
     this.toolCallStepIds.clear();
+    this.pendingToolCallsByStep.clear();
+    this.latestCompletionByStep.clear();
+    this.openMessageStepByAgent.clear();
     this.messageIdsByStepKey = new Map();
     this.messageStepHasTextDeltas = new Set();
     this.reasoningStepHasDeltas = new Set();
@@ -932,6 +946,30 @@ export abstract class Graph<
     for (const usageCount of this.eagerEventToolUsageCountsByAgentId.values()) {
       usageCount.clear();
     }
+  }
+
+  /**
+   * Tracks a tool call whose completion must arrive before its step can be
+   * considered finished. Registered wherever `toolCallStepIds` gains entries,
+   * except cross-process subagent resume restoration, where pending state
+   * cannot be faithfully rebuilt and closes fall back to completions/sweep.
+   */
+  registerPendingToolCall(toolCallId: string, stepId: string): void {
+    if (!toolCallId || !stepId) {
+      return;
+    }
+    this.getPendingToolCallSet(stepId).add(toolCallId);
+  }
+
+  /** Lazily creates a step's pending-completions set; callers registering a
+   *  batch hoist this lookup out of their per-call loop. */
+  protected getPendingToolCallSet(stepId: string): Set<string> {
+    let pending = this.pendingToolCallsByStep.get(stepId);
+    if (!pending) {
+      pending = new Set();
+      this.pendingToolCallsByStep.set(stepId, pending);
+    }
+    return pending;
   }
 
   markHandlerDispatchedEvent(eventName: string, stepId: string): () => void {
@@ -1441,6 +1479,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * a stale reference on 2nd+ processStream calls.
      */
     this.toolCallStepIds.clear();
+    this.pendingToolCallsByStep.clear();
+    this.latestCompletionByStep.clear();
+    this.openMessageStepByAgent.clear();
     this.runProducedAiMessageIds.clear();
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
@@ -1702,6 +1743,288 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return this.contentData[index];
     }
     return undefined;
+  }
+
+  /**
+   * Derives the same lane key `dispatchRunStep` stamps as `runStep.agentId`.
+   * The multi-agent check gates the lookup because `getAgentContext` signals
+   * a miss by throwing: single-agent graphs key every step under `''`, so
+   * resolving the context could only ever produce a thrown-and-discarded
+   * Error on a per-model-call path.
+   */
+  protected getStepAgentKey(metadata?: Record<string, unknown>): string {
+    if (!metadata || !this.isMultiAgentGraph()) {
+      return '';
+    }
+    try {
+      const agentContext = this.getAgentContext(metadata);
+      if (agentContext.agentId) {
+        return agentContext.agentId;
+      }
+    } catch (_e) {
+      /** No agent context — fall back to the default lane */
+    }
+    return '';
+  }
+
+  /**
+   * O(1) reverse lookup: both dispatch funnels key the open-message map by
+   * `runStep.agentId ?? ''`, so the entry is addressable without scanning.
+   */
+  private untrackRunStep(runStep: t.RunStep): void {
+    this.pendingToolCallsByStep.delete(runStep.id);
+    this.latestCompletionByStep.delete(runStep.id);
+    const agentKey = runStep.agentId ?? '';
+    if (this.openMessageStepByAgent.get(agentKey) === runStep.id) {
+      this.openMessageStepByAgent.delete(agentKey);
+    }
+  }
+
+  /**
+   * Shared step accounting for both dispatch funnels: a successor step in
+   * the same agent lane marks the previous message step as finished — its
+   * CLOSED event must precede the successor's ON_RUN_STEP so hosts observe
+   * a consistent open-step timeline — then the step is registered in the
+   * content maps and tracked as the lane's open message step when
+   * applicable.
+   */
+  protected async trackDispatchedRunStep(
+    runStep: t.RunStep,
+    metadata?: Record<string, unknown>,
+    /**
+     * Summarization steps are typed MESSAGE_CREATION but own an explicit
+     * completion, and their model call emits `CHAT_MODEL_END` well before the
+     * summary is assembled. Tracking one as the lane's open step would let
+     * model-end publish an authoritative `completed` closure early — the
+     * measured duration would exclude the remaining work and a later
+     * post-model failure could no longer change the status. They close
+     * through `recordStepCompletion` instead.
+     */
+    trackAsOpenMessageStep: boolean = true
+  ): Promise<void> {
+    const agentKey = runStep.agentId ?? '';
+    const openMessageStepId = this.openMessageStepByAgent.get(agentKey);
+    /**
+     * Reserve the content index and register the step SYNCHRONOUSLY, before
+     * awaiting the predecessor's closure. Parallel agent lanes dispatch
+     * successors concurrently: if both yielded here first, they would push
+     * with the same `contentData.length` and `contentIndexMap` would resolve
+     * one step id to the other lane's entry, so later deltas and completions
+     * would mutate the wrong agent's step. Assigning the index at push time
+     * also supersedes whatever the caller computed before this await point.
+     */
+    runStep.index = this.contentData.length;
+    this.contentData.push(runStep);
+    this.contentIndexMap.set(runStep.id, runStep.index);
+    if (trackAsOpenMessageStep && runStep.type === StepTypes.MESSAGE_CREATION) {
+      this.openMessageStepByAgent.set(agentKey, runStep.id);
+    } else {
+      this.openMessageStepByAgent.delete(agentKey);
+    }
+    /**
+     * Awaited after registration but before the caller dispatches this step's
+     * ON_RUN_STEP, so the predecessor's CLOSED event still precedes the
+     * successor's start event.
+     */
+    if (openMessageStepId != null && openMessageStepId !== runStep.id) {
+      /**
+       * Isolated: this step is already registered in `contentData`, so a
+       * predecessor delivery failure rejecting here would abort the caller
+       * before it publishes this step's ON_RUN_STEP — leaving the sweep to
+       * emit a terminal event for a step that never announced a start.
+       */
+      try {
+        await this.closeRunStep(openMessageStepId, 'completed', { metadata });
+      } catch (_e) {
+        /** Predecessor delivery must not abort the successor's lifecycle */
+      }
+    }
+    /**
+     * Stamped last, after the predecessor's closure has been delivered and
+     * immediately before the caller publishes this step's ON_RUN_STEP.
+     * `created_at` documents when the step was dispatched, so it must not
+     * absorb the latency of an arbitrarily slow predecessor handler.
+     */
+    runStep.created_at = Date.now();
+  }
+
+  /**
+   * Closes a run step: stamps its terminal status + timestamp on the stored
+   * `RunStep` and emits `ON_RUN_STEP_CLOSED`. First close wins — later calls
+   * are no-ops — except a `restamp` close, which lets a `completed`
+   * TOOL_CALLS step refresh `completed_at` when a late-registered parallel
+   * tool call finishes after the step already closed (the eager-execution
+   * race). `cancelled`/`failed` are immutable once stamped.
+   */
+  async closeRunStep(
+    stepId: string,
+    status: Exclude<t.RunStepStatus, 'in_progress'>,
+    options?: t.RunStepCloseOptions
+  ): Promise<boolean> {
+    if (!stepId) {
+      return false;
+    }
+    const runStep = this.getRunStep(stepId);
+    if (!runStep) {
+      return false;
+    }
+    if (runStep.status != null && runStep.status !== 'in_progress') {
+      this.untrackRunStep(runStep);
+      return false;
+    }
+
+    const closedAt = options?.at ?? Date.now();
+    runStep.status = status;
+    if (status === 'completed') {
+      runStep.completed_at = closedAt;
+    } else if (status === 'cancelled') {
+      runStep.cancelled_at = closedAt;
+    } else {
+      runStep.failed_at = closedAt;
+    }
+
+    const closedEvent: t.RunStepClosedEvent = {
+      id: stepId,
+      index: runStep.index,
+      type: runStep.type,
+      status,
+      closed_at: closedAt,
+    };
+    if (runStep.created_at != null) {
+      closedEvent.created_at = runStep.created_at;
+    }
+    if (runStep.runId != null) {
+      closedEvent.runId = runStep.runId;
+    }
+    if (runStep.agentId != null) {
+      closedEvent.agentId = runStep.agentId;
+    }
+    if (runStep.groupId != null) {
+      closedEvent.groupId = runStep.groupId;
+    }
+    if (runStep.stepIndex != null) {
+      closedEvent.stepIndex = runStep.stepIndex;
+    }
+    this.untrackRunStep(runStep);
+
+    const handler = this.handlerRegistry?.getHandler(
+      GraphEvents.ON_RUN_STEP_CLOSED
+    );
+    if (handler) {
+      await handler.handle(
+        GraphEvents.ON_RUN_STEP_CLOSED,
+        closedEvent,
+        options?.metadata,
+        this
+      );
+      this.handlerDispatchedStepIds.add(stepId);
+    }
+    const unmarkHandlerDispatchedEvent = handler
+      ? this.markHandlerDispatchedEvent(GraphEvents.ON_RUN_STEP_CLOSED, stepId)
+      : undefined;
+    try {
+      if (this.config) {
+        await safeDispatchCustomEvent(
+          GraphEvents.ON_RUN_STEP_CLOSED,
+          closedEvent,
+          this.config
+        );
+      }
+    } finally {
+      unmarkHandlerDispatchedEvent?.();
+    }
+    return true;
+  }
+
+  /**
+   * Observes one `ON_RUN_STEP_COMPLETED` for a step and closes the step when
+   * no registered tool calls remain pending. Steps without pending tracking
+   * (summaries, cross-process resume) close on their first completion; the
+   * terminal-status guard in `closeRunStep` absorbs duplicate echoes.
+   */
+  async recordStepCompletion(
+    stepId: string,
+    options?: t.RecordStepCompletionOptions
+  ): Promise<void> {
+    if (!stepId) {
+      return;
+    }
+    const { toolCallId, metadata, at } = options ?? {};
+    if (at != null) {
+      const latest = this.latestCompletionByStep.get(stepId);
+      if (latest == null || at > latest) {
+        this.latestCompletionByStep.set(stepId, at);
+      }
+    }
+    const closeAt = this.latestCompletionByStep.get(stepId) ?? at;
+    const pending = this.pendingToolCallsByStep.get(stepId);
+    if (pending == null) {
+      await this.closeRunStep(stepId, 'completed', { metadata, at: closeAt });
+      return;
+    }
+    if (toolCallId != null && toolCallId !== '') {
+      pending.delete(toolCallId);
+    }
+    if (pending.size > 0) {
+      return;
+    }
+    await this.closeRunStep(stepId, 'completed', { metadata, at: closeAt });
+  }
+
+  /**
+   * Closes the tracked open MESSAGE_CREATION step for the event's agent lane.
+   * Fires on every model end, so the empty-map check short-circuits ahead of
+   * resolving the lane key — a turn whose message step already closed through
+   * successor-close does no work here.
+   */
+  async closeOpenMessageStep(
+    metadata?: Record<string, unknown>,
+    /** Model-end time captured before host handlers ran, so a slow usage sink
+     *  cannot inflate the step's measured duration. */
+    at?: number
+  ): Promise<void> {
+    if (this.openMessageStepByAgent.size === 0) {
+      return;
+    }
+    const agentKey = this.getStepAgentKey(metadata);
+    const openStepId = this.openMessageStepByAgent.get(agentKey);
+    if (openStepId == null) {
+      return;
+    }
+    await this.closeRunStep(openStepId, 'completed', { metadata, at });
+  }
+
+  /**
+   * End-of-run sweep: closes every step that never reached a terminal
+   * status. Dual-dispatches like any other close — the custom-event channel
+   * is usually already torn down here and `safeDispatchCustomEvent` reports
+   * that quietly, but callback-only subscribers still receive the terminal
+   * signal whenever it is alive.
+   */
+  async closeUnfinishedRunSteps(
+    status: Exclude<t.RunStepStatus, 'in_progress'>,
+    at?: number
+  ): Promise<void> {
+    const closedAt = at ?? Date.now();
+    for (const runStep of this.contentData) {
+      if (runStep.status != null && runStep.status !== 'in_progress') {
+        continue;
+      }
+      /**
+       * Isolated per step: one host handler throwing must not strand the
+       * remaining steps `in_progress` with no terminal event. The step is
+       * stamped before dispatch either way, so a thrown handler still leaves
+       * consistent state behind.
+       */
+      try {
+        await this.closeRunStep(runStep.id, status, { at: closedAt });
+      } catch (_e) {
+        /** Delivery failure for one step must not halt the sweep */
+      }
+    }
+    this.pendingToolCallsByStep.clear();
+    this.latestCompletionByStep.clear();
+    this.openMessageStepByAgent.clear();
   }
 
   getAgentContext(metadata: Record<string, unknown> | undefined): AgentContext {
@@ -4591,8 +4914,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   runStep.groupId = groupId;
                 }
               }
-              this.contentData.push(runStep);
-              this.contentIndexMap.set(runStep.id, runStep.index);
+              runStep.status ??= 'in_progress';
+              await this.trackDispatchedRunStep(
+                runStep,
+                resolvedConfig?.metadata,
+                false
+              );
 
               const handler = this.handlerRegistry?.getHandler(
                 GraphEvents.ON_RUN_STEP
@@ -4625,13 +4952,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 unmarkHandlerDispatchedEvent?.();
               }
             },
+            closeRunStep: async (
+              stepId: string,
+              status: Exclude<t.RunStepStatus, 'in_progress'>,
+              nodeConfig?: RunnableConfig
+            ) => {
+              await this.closeRunStep(stepId, status, {
+                metadata: (nodeConfig ?? this.config)?.metadata,
+              });
+            },
             dispatchRunStepCompleted: async (
               stepId: string,
               result: t.StepCompleted,
               nodeConfig?: RunnableConfig
             ) => {
               const resolvedConfig = nodeConfig ?? this.config;
-              const runStep = this.contentData.find((s) => s.id === stepId);
+              const completedAt = Date.now();
+              const runStep = this.getRunStep(stepId);
               const handler = this.handlerRegistry?.getHandler(
                 GraphEvents.ON_RUN_STEP_COMPLETED
               );
@@ -4643,12 +4980,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       ...result,
                       id: stepId,
                       index: runStep?.index ?? 0,
+                      completed_at: completedAt,
                     },
                   },
                   resolvedConfig?.configurable,
                   this
                 );
               }
+              await this.recordStepCompletion(stepId, {
+                metadata: resolvedConfig?.metadata,
+                at: completedAt,
+              });
             },
           },
           generateStepId: (stepKey: string) => this.generateStepId(stepKey),
@@ -4757,12 +5099,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
     const [stepId, stepIndex] = this.generateStepId(stepKey);
     if (stepDetails.type === StepTypes.TOOL_CALLS && stepDetails.tool_calls) {
+      let pendingToolCalls: Set<string> | undefined;
       for (const tool_call of stepDetails.tool_calls) {
         const toolCallId = tool_call.id ?? '';
         if (!toolCallId || this.toolCallStepIds.has(toolCallId)) {
           continue;
         }
         this.toolCallStepIds.set(toolCallId, stepId);
+        pendingToolCalls ??= this.getPendingToolCallSet(stepId);
+        pendingToolCalls.add(toolCallId);
       }
     }
 
@@ -4773,6 +5118,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       index: this.contentData.length,
       stepDetails,
       usage: null,
+      status: 'in_progress',
     };
 
     const runId = this.runId ?? '';
@@ -4798,8 +5144,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
     }
 
-    this.contentData.push(runStep);
-    this.contentIndexMap.set(stepId, runStep.index);
+    await this.trackDispatchedRunStep(runStep, metadata);
 
     // Primary dispatch: handler registry (reliable, always works).
     // This mirrors how handleToolCallCompleted dispatches ON_RUN_STEP_COMPLETED
@@ -4877,6 +5222,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return false;
     }
 
+    const completedAt = Date.now();
     const tool_call: t.ProcessedToolCall = {
       id: data.id,
       name: name || '',
@@ -4904,11 +5250,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           index: runStep.index,
           type: 'tool_call',
           tool_call,
+          completed_at: completedAt,
         } as t.ToolCompleteEvent,
       },
       metadata,
       graph
     );
+    await graph.recordStepCompletion(stepId, {
+      toolCallId: data.id,
+      metadata,
+      at: completedAt,
+    });
     return true;
   }
 

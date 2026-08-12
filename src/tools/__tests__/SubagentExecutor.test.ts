@@ -1563,17 +1563,13 @@ describe('SubagentExecutor', () => {
     const selected = makeConfig('selected', {
       agentInputs: {
         ...makeChildInputs('selected-agent'),
-        initialSessions: new Map([
-          [Constants.EXECUTE_CODE, selectedSession],
-        ]),
+        initialSessions: new Map([[Constants.EXECUTE_CODE, selectedSession]]),
       },
     });
     const sibling = makeConfig('sibling', {
       agentInputs: {
         ...makeChildInputs('sibling-agent'),
-        initialSessions: new Map([
-          [Constants.EXECUTE_CODE, siblingSession],
-        ]),
+        initialSessions: new Map([[Constants.EXECUTE_CODE, siblingSession]]),
       },
     });
     const childSessions: ToolSessionMap = new Map();
@@ -1613,7 +1609,10 @@ describe('SubagentExecutor', () => {
   });
 
   it('combines member session seeds inside a selected graph child', async () => {
-    const makeSession = (storageSessionId: string, includeFileSession = true) => ({
+    const makeSession = (
+      storageSessionId: string,
+      includeFileSession = true
+    ) => ({
       session_id: storageSessionId,
       files: [
         {
@@ -1696,9 +1695,7 @@ describe('SubagentExecutor', () => {
     const hitlConfig = makeConfig('hitl-child', {
       agentInputs: {
         ...makeChildInputs('hitl-child'),
-        initialSessions: new Map([
-          [Constants.EXECUTE_CODE, seededSession],
-        ]),
+        initialSessions: new Map([[Constants.EXECUTE_CODE, seededSession]]),
       },
     });
     const childSessions: ToolSessionMap = new Map();
@@ -3623,6 +3620,51 @@ describe('sanitizeForwardedSubagentUpdateData', () => {
     expect(serialized).not.toContain('nested-secret');
     expect(serialized).not.toContain('access-secret');
     expect(serialized).not.toContain('refresh-secret');
+  });
+
+  it('forwards run step lifecycle stamps and closed events via allowlists', () => {
+    const sanitizedStep = sanitizeForwardedSubagentUpdateData(
+      GraphEvents.ON_RUN_STEP,
+      {
+        id: 'step_1',
+        type: StepTypes.MESSAGE_CREATION,
+        index: 0,
+        created_at: 1_000,
+        status: 'in_progress',
+        stepDetails: {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: { message_id: 'message_1' },
+        },
+      }
+    ) as { created_at?: number; status?: string };
+    expect(sanitizedStep.created_at).toBe(1_000);
+    expect(sanitizedStep.status).toBe('in_progress');
+
+    const sanitizedClosed = sanitizeForwardedSubagentUpdateData(
+      GraphEvents.ON_RUN_STEP_CLOSED,
+      {
+        id: 'step_1',
+        index: 0,
+        type: StepTypes.MESSAGE_CREATION,
+        status: 'completed',
+        created_at: 1_000,
+        closed_at: 2_000,
+        runId: 'run_1',
+        agentId: 'researcher',
+        futureSecret: 'top-level-secret',
+      }
+    );
+    expect(sanitizedClosed).toEqual({
+      id: 'step_1',
+      index: 0,
+      type: StepTypes.MESSAGE_CREATION,
+      status: 'completed',
+      created_at: 1_000,
+      closed_at: 2_000,
+      runId: 'run_1',
+      agentId: 'researcher',
+    });
+    expect(JSON.stringify(sanitizedClosed)).not.toContain('top-level-secret');
   });
 
   it('keeps completed tool output while stripping operational fields', () => {

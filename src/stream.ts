@@ -924,6 +924,7 @@ async function dispatchEagerToolCompletions(args: {
               progress: 1,
               ...(outcome != null && { outcome }),
             } as t.ProcessedToolCall,
+            completed_at: Date.now(),
           },
         },
         graph.config
@@ -1836,9 +1837,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
         contentGroups[0]
       ).phase;
       const phaseChanged =
-        currentPhase != null &&
-        nextPhase != null &&
-        currentPhase !== nextPhase;
+        currentPhase != null && nextPhase != null && currentPhase !== nextPhase;
       if (contentGroups.length > 1 || phaseChanged) {
         for (const contentGroup of contentGroups) {
           const currentStepId = await dispatchMessageCreationStep({

@@ -5,13 +5,13 @@ import type {
   AgentSessionUsage,
 } from './types';
 import type * as t from '@/types';
-import { ModelEndHandler, ToolEndHandler } from '@/events';
-import { toJsonValue } from './messageSerialization';
 import {
   createContentAggregator,
   dispatchesChatModelStream,
   SDK_STREAM_DISPATCH,
 } from '@/stream';
+import { ModelEndHandler, ToolEndHandler } from '@/events';
+import { toJsonValue } from './messageSerialization';
 import { createTimestamp } from './ids';
 import { GraphEvents } from '@/common';
 
@@ -216,6 +216,18 @@ export function createRunHandlers(params: {
         if (isToolCompletion(completed.result)) {
           emitEvent(createEvent('tool.completed', completed));
         }
+        await callUserHandler({
+          userHandlers: params.userHandlers,
+          event,
+          data,
+          metadata,
+          graph,
+        });
+      },
+    },
+    [GraphEvents.ON_RUN_STEP_CLOSED]: {
+      handle: async (event, data, metadata, graph): Promise<void> => {
+        emitEvent(createEvent('step.finished', data as t.RunStepClosedEvent));
         await callUserHandler({
           userHandlers: params.userHandlers,
           event,

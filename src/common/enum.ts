@@ -15,6 +15,8 @@ export enum GraphEvents {
   ON_RUN_STEP_DELTA = 'on_run_step_delta',
   /** [Custom] Completed event for run steps (tool calls) */
   ON_RUN_STEP_COMPLETED = 'on_run_step_completed',
+  /** [Custom] Terminal signal for a run step: closed with status + timestamps */
+  ON_RUN_STEP_CLOSED = 'on_run_step_closed',
   /** [Custom] Delta events for messages */
   ON_MESSAGE_DELTA = 'on_message_delta',
   /** [Custom] Reasoning Delta events for messages */
