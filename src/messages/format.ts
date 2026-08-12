@@ -339,6 +339,7 @@ interface FormatAssistantMessageOptions {
   preserveUnpairedServerToolUses?: boolean;
   preserveReasoningContent?: boolean;
   provider?: Providers;
+  sourceMessageId?: string;
 }
 
 interface FormatAgentMessagesOptions {
@@ -514,6 +515,16 @@ function formatAssistantMessage(
     | RoleBearingMessage<ToolMessage>
     | RoleBearingMessage<HumanMessage>
   > = [];
+  const appendFormattedMessage = (
+    formattedMessage: (typeof formattedMessages)[number]
+  ): void => {
+    stampSourceMessageIdentity(
+      formattedMessage,
+      options?.sourceMessageId,
+      formattedMessages.length
+    );
+    formattedMessages.push(formattedMessage);
+  };
   let currentContent: MessageContentComplex[] = [];
   let lastAIMessage: RoleBearingMessage<AIMessage> | null = null;
   let hasReasoning = false;
@@ -634,7 +645,7 @@ function formatAssistantMessage(
           ) {
             currentContent.push(part);
             lastAIMessage = createAIMessage(toLangChainContent(currentContent));
-            formattedMessages.push(lastAIMessage);
+            appendFormattedMessage(lastAIMessage);
             currentContent = [];
             continue;
           }
@@ -646,13 +657,13 @@ function formatAssistantMessage(
           }, '');
           content = `${content}\n${getTextContent(part)}`.trim();
           lastAIMessage = createAIMessage(content);
-          formattedMessages.push(lastAIMessage);
+          appendFormattedMessage(lastAIMessage);
           currentContent = [];
           continue;
         }
         // Create a new AIMessage with this text and prepare for tool calls
         lastAIMessage = createAIMessage(getTextContent(part));
-        formattedMessages.push(lastAIMessage);
+        appendFormattedMessage(lastAIMessage);
       } else if (part.type === ContentTypes.TOOL_CALL) {
         // Skip malformed tool call entries without tool_call property
         if (part.tool_call == null) {
@@ -711,7 +722,7 @@ function formatAssistantMessage(
         if (!lastAIMessage) {
           // "Heal" the payload by creating an AIMessage to precede the tool call
           lastAIMessage = createAIMessage('');
-          formattedMessages.push(lastAIMessage);
+          appendFormattedMessage(lastAIMessage);
         } else {
           attachPendingReasoningContent(lastAIMessage);
         }
@@ -749,7 +760,7 @@ function formatAssistantMessage(
           lastAIMessage.tool_calls.push(tool_call as ToolCall);
         }
 
-        formattedMessages.push(
+        appendFormattedMessage(
           withMessageRole(
             new ToolMessage({
               tool_call_id: tool_call.id ?? '',
@@ -788,14 +799,14 @@ function formatAssistantMessage(
             currentContent.some((content) => content.type !== ContentTypes.TEXT)
           ) {
             lastAIMessage = createAIMessage(toLangChainContent(currentContent));
-            formattedMessages.push(lastAIMessage);
+            appendFormattedMessage(lastAIMessage);
           } else {
             const flushed = currentContent
               .reduce((acc, curr) => `${acc}${getTextContent(curr)}\n`, '')
               .trim();
             if (flushed.length > 0) {
               lastAIMessage = createAIMessage(flushed);
-              formattedMessages.push(lastAIMessage);
+              appendFormattedMessage(lastAIMessage);
             }
           }
           currentContent = [];
@@ -808,7 +819,7 @@ function formatAssistantMessage(
            * assistant reasoning silently vanishes on replay.
            */
           lastAIMessage = createAIMessage('');
-          formattedMessages.push(lastAIMessage);
+          appendFormattedMessage(lastAIMessage);
         }
         const steerPart = part as {
           steer?: string;
@@ -818,7 +829,7 @@ function formatAssistantMessage(
           Array.isArray(steerPart.media) && steerPart.media.length > 0
             ? toLangChainContent(steerPart.media)
             : (steerPart.steer ?? '');
-        formattedMessages.push(
+        appendFormattedMessage(
           withMessageRole(
             new HumanMessage({
               content: steerContent as MessageContent,
@@ -856,7 +867,7 @@ function formatAssistantMessage(
     let content = '';
     for (const part of currentContent) {
       if (part.type !== ContentTypes.TEXT) {
-        formattedMessages.push(
+        appendFormattedMessage(
           createAIMessage(toLangChainContent(currentContent))
         );
         return formattedMessages;
@@ -866,10 +877,10 @@ function formatAssistantMessage(
     content = content.trim();
 
     if (content) {
-      formattedMessages.push(createAIMessage(content));
+      appendFormattedMessage(createAIMessage(content));
     }
   } else if (currentContent.length > 0) {
-    formattedMessages.push(createAIMessage(toLangChainContent(currentContent)));
+    appendFormattedMessage(createAIMessage(toLangChainContent(currentContent)));
   }
 
   return formattedMessages;
@@ -884,6 +895,29 @@ function getSourceMessageId(message: Partial<TMessage>): string | undefined {
   }
   const normalized = candidate.trim();
   return normalized.length > 0 ? normalized : undefined;
+}
+
+/**
+ * Keeps the first formatted message backward-compatible with its persisted
+ * source id and preserves source correlation on every derived message.
+ * Derived ids remain unset so the reducer can assign collision-free identities
+ * during its existing pass. This also prevents invented provider-shaped ids
+ * from leaking into provider request payloads.
+ */
+function stampSourceMessageIdentity(
+  message: RoleBearingMessage<BaseMessage>,
+  sourceMessageId: string | undefined,
+  derivedIndex = 0
+): void {
+  if (sourceMessageId == null) {
+    return;
+  }
+  message.additional_kwargs.sourceMessageId = sourceMessageId;
+  if (derivedIndex !== 0) {
+    return;
+  }
+  message.id = sourceMessageId;
+  message.lc_kwargs.id = sourceMessageId;
 }
 
 /**
@@ -1565,9 +1599,7 @@ export const formatAgentMessages = (
         | RoleBearingMessage<HumanMessage>
         | RoleBearingMessage<AIMessage>
         | RoleBearingMessage<SystemMessage>;
-      if (sourceMessageId != null && sourceMessageId !== '') {
-        formattedMessage.id = sourceMessageId;
-      }
+      stampSourceMessageIdentity(formattedMessage, sourceMessageId);
       flushSteerAnchor(formattedMessage);
       messages.push(formattedMessage);
 
@@ -1746,12 +1778,8 @@ export const formatAgentMessages = (
         options?.preserveReasoningContent ??
         options?.provider === Providers.DEEPSEEK,
       provider: options?.provider,
+      sourceMessageId,
     });
-    if (sourceMessageId != null && sourceMessageId !== '') {
-      for (const formattedMessage of formattedMessages) {
-        formattedMessage.id = sourceMessageId;
-      }
-    }
     /**
      * A steer that ends an assistant message leaves the replay on a
      * `HumanMessage`. The next payload message is itself a user turn, so the
@@ -1775,12 +1803,12 @@ export const formatAgentMessages = (
      * the model may simply never answer. So the intent is recorded and flushed
      * only when a message actually follows.
      *
-     * Pushed AFTER the id stamping above, deliberately. `messagesStateReducer`
-     * treats a repeated id as replace-in-place, so an anchor carrying the
-     * shared `sourceMessageId` would overwrite the steer it exists to protect.
-     * Left unstamped, it reaches the reducer with a null id and is assigned a
-     * fresh one. `endsWithSteerMessage` reads only `additional_kwargs.source`,
-     * so the deferral cannot change which messages get anchored.
+     * Pushed AFTER source identity stamping above, deliberately. The anchor is
+     * synthetic rather than derived from the persisted assistant entry, so it
+     * must not claim that entry's source metadata. Left unstamped, it reaches
+     * the reducer with a null id and is assigned a fresh one.
+     * `endsWithSteerMessage` reads only `additional_kwargs.source`, so the
+     * deferral cannot change which messages get anchored.
      */
     /**
      * Guarded on emission: an assistant entry whose blocks all filtered away

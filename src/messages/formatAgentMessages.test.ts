@@ -76,7 +76,7 @@ describe('formatAgentMessages', () => {
     expect(Object.keys(result.messages[1])).not.toContain('role');
   });
 
-  it('preserves source messageId on formatted messages', () => {
+  it('preserves source messageId correlation with unique formatted ids', () => {
     const payload: TPayload = [
       {
         role: 'assistant',
@@ -112,8 +112,13 @@ describe('formatAgentMessages', () => {
       'user',
     ]);
     expect(result.messages[0].id).toBe('msg_assistant_1');
-    expect(result.messages[1].id).toBe('msg_assistant_1');
+    expect(result.messages[1].id).toBeUndefined();
     expect(result.messages[2].id).toBe('msg_user_1');
+    expect(
+      result.messages.map(
+        (message) => message.additional_kwargs.sourceMessageId
+      )
+    ).toEqual(['msg_assistant_1', 'msg_assistant_1', 'msg_user_1']);
   });
 
   it('should handle system messages', () => {

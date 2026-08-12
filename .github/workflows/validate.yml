@@ -82,14 +82,14 @@ jobs:
           path: node_modules
           key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
-      - name: Build and check for circular dependencies
-        run: |
-          output=$(npm run build:dev 2>&1)
-          echo "$output"
-          if echo "$output" | grep -qi "Circular depend"; then
-            echo "::error title=Circular dependency detected::The bundler reported a circular dependency. See the build output above."
-            exit 1
-          fi
+      - name: Build package
+        run: npm run build:dev
+
+      - name: Test circular dependency checker
+        run: npm run test:circular-deps
+
+      - name: Check circular dependencies
+        run: npm run check:circular-deps
 
   unit-tests:
     name: 'unit tests (shard ${{ matrix.shard }}/4)'

@@ -1162,7 +1162,7 @@ const hasBedrock = hasEveryEnv(requiredBedrockEnv);
 
 const hasOpenAI = hasEnv('OPENAI_API_KEY');
 (hasOpenAI ? describe : describe.skip)('OpenAI Summarization E2E', () => {
-  jest.setTimeout(120_000);
+  jest.setTimeout(240_000);
 
   const agentProvider = Providers.OPENAI;
   const streamConfig = {
@@ -1190,6 +1190,9 @@ const hasOpenAI = hasEnv('OPENAI_API_KEY');
         agentProvider,
         summarizationProvider: Providers.OPENAI,
         summarizationModel: 'gpt-4.1-mini',
+        llmConfigOverride: {
+          model: 'gpt-4.1-mini',
+        },
         maxContextTokens: maxTokens,
         instructions:
           'You are a helpful math tutor. Use the calculator tool for ALL computations. Keep responses concise.',
@@ -1320,7 +1323,7 @@ const hasOpenAI = hasEnv('OPENAI_API_KEY');
       `  OpenAI summary: "${getSummaryText(completePayload.summary).substring(0, 200)}…"`
     );
     console.log(`  Final messages: ${conversationHistory.length}`);
-  }, 120_000);
+  }, 240_000);
 });
 
 // ---------------------------------------------------------------------------

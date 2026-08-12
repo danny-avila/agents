@@ -186,7 +186,8 @@ const getHighlights = async ({
 };
 
 const createSerperAPI = (
-  apiKey?: string
+  apiKey?: string,
+  agents?: t.HttpAgentConfig
 ): {
   getSources: (params: t.GetSourcesParams) => Promise<t.SearchResult>;
 } => {
@@ -252,6 +253,8 @@ const createSerperAPI = (
             'Content-Type': 'application/json',
           },
           timeout: config.timeout,
+          httpAgent: agents?.httpAgent,
+          httpsAgent: agents?.httpsAgent,
         }
       );
 
@@ -281,7 +284,8 @@ const createSerperAPI = (
 
 const createSearXNGAPI = (
   instanceUrl?: string,
-  apiKey?: string
+  apiKey?: string,
+  agents?: t.HttpAgentConfig
 ): {
   getSources: (params: t.GetSourcesParams) => Promise<t.SearchResult>;
 } => {
@@ -350,6 +354,8 @@ const createSearXNGAPI = (
         headers,
         params,
         timeout: config.timeout,
+        httpAgent: agents?.httpAgent,
+        httpsAgent: agents?.httpsAgent,
       });
 
       const data = response.data;
@@ -497,22 +503,34 @@ export const createSearchAPI = (
     crwApiKey,
     crwApiUrl,
     crwSearchOptions,
+    httpAgent,
+    httpsAgent,
   } = config;
 
+  const agents: t.HttpAgentConfig = { httpAgent, httpsAgent };
+
   if (searchProvider.toLowerCase() === 'serper') {
-    return createSerperAPI(serperApiKey);
+    return createSerperAPI(serperApiKey, agents);
   } else if (searchProvider.toLowerCase() === 'searxng') {
-    return createSearXNGAPI(searxngInstanceUrl, searxngApiKey);
+    return createSearXNGAPI(searxngInstanceUrl, searxngApiKey, agents);
   } else if (searchProvider.toLowerCase() === 'tavily') {
-    return createTavilyAPI(tavilyApiKey, tavilySearchUrl, tavilySearchOptions);
+    return createTavilyAPI(tavilyApiKey, tavilySearchUrl, {
+      ...tavilySearchOptions,
+      httpAgent: httpAgent ?? tavilySearchOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? tavilySearchOptions?.httpsAgent,
+    });
   } else if (searchProvider.toLowerCase() === 'keenable') {
-    return createKeenableAPI(
-      keenableApiKey,
-      keenableApiUrl,
-      keenableSearchOptions
-    );
+    return createKeenableAPI(keenableApiKey, keenableApiUrl, {
+      ...keenableSearchOptions,
+      httpAgent: httpAgent ?? keenableSearchOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? keenableSearchOptions?.httpsAgent,
+    });
   } else if (searchProvider.toLowerCase() === 'crw') {
-    return createCrwAPI(crwApiKey, crwApiUrl, crwSearchOptions);
+    return createCrwAPI(crwApiKey, crwApiUrl, {
+      ...crwSearchOptions,
+      httpAgent: httpAgent ?? crwSearchOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? crwSearchOptions?.httpsAgent,
+    });
   } else if (searchProvider.toLowerCase() === 'exa') {
     return createExaAPI(exaApiKey, exaApiUrl, exaSearchOptions);
   } else {

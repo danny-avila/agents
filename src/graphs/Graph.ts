@@ -17,6 +17,23 @@ import type {
   MessageContent,
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type {
+  ReplayableSubagentTool,
+  SubagentGraphResumeState,
+  SubagentResumeManifest,
+  SubagentToolNodeResumeState,
+  SettledSubagentToolOutput,
+} from '@/tools/subagent/SubagentReplay';
+import type {
+  ResolvedStreamLimits,
+  RunBreakerScope,
+  StreamedToolCallArgTally,
+  StreamDeltaEventTally,
+} from '@/llm/streamLimits';
+import type {
+  GraphFactory,
+  GraphFactoryDependencies,
+} from '@/graphs/graphFactory';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
 import type { FallbackErrorContext } from '@/llm/invoke';
 import type { HookRegistry } from '@/hooks';
@@ -44,6 +61,8 @@ import {
   supportsBedrockToolCache,
   isSyntheticProviderContextMessage,
   getMessageId,
+  getMessageCreationContentMetadata,
+  splitAssistantTextContentByPhase,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
   DEFAULT_RETAIN_RECENT_TURNS,
@@ -55,6 +74,17 @@ import {
   removePredecessorHandoffCue,
 } from '@/messages';
 import {
+  resetIfNotEmpty,
+  isAnthropicLike,
+  isOpenAILike,
+  isGoogleLike,
+  apportionTokenCounts,
+  calculateMaxToolResultChars,
+  composeAbortSignals,
+  joinKeys,
+  sleep,
+} from '@/utils';
+import {
   attemptInvoke,
   tryFallbackProviders,
   getFallbackErrorContext,
@@ -63,15 +93,18 @@ import {
   resolveServingModelId,
 } from '@/llm/invoke';
 import {
-  resetIfNotEmpty,
-  isAnthropicLike,
-  isOpenAILike,
-  isGoogleLike,
-  apportionTokenCounts,
-  calculateMaxToolResultChars,
-  joinKeys,
-  sleep,
-} from '@/utils';
+  resolveStreamLimits,
+  StreamLimitExceededError,
+  sweepStaleStreamLimitEntries,
+  STREAM_LIMIT_EPOCH_KEY,
+  RUN_BREAKER_SCOPE_CONFIG_KEY,
+} from '@/llm/streamLimits';
+import {
+  DEFAULT_SUBAGENT_DESCRIPTION,
+  SubagentExecutor,
+  isGraphSubagentConfig,
+  normalizeSubagentConfigEntries,
+} from '@/tools/subagent';
 import {
   Constants,
   GraphNodeKeys,
@@ -119,7 +152,8 @@ import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache'
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
-import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
+import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
+import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
@@ -154,37 +188,24 @@ const EMPTY_PREEMPT_BOUNDARY: PreemptBoundaryResult = {
   preventContinuation: false,
 };
 
-/**
- * One signal that fires when either input fires. `AbortSignal.any` is skipped
- * when the inputs collapse to a single signal — the composite is a fresh
- * object per call, and the common cases (one channel, or the host reusing the
- * same controller for both) don't need one.
- */
-function composeAbortSignals(
-  a: AbortSignal | undefined,
-  b: AbortSignal | undefined
-): AbortSignal | undefined {
-  if (a == null || a === b) {
-    return b;
-  }
-  if (b == null) {
-    return a;
-  }
-  return AbortSignal.any([a, b]);
-}
-
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
 
-function createToolHandlerRegistry(
+function createChildHandlerRegistry(
   source: HandlerRegistry | undefined
 ): HandlerRegistry | undefined {
   const toolHandler = source?.getHandler(GraphEvents.ON_TOOL_EXECUTE);
-  if (toolHandler == null) {
+  const updateHandler = source?.getHandler(GraphEvents.ON_SUBAGENT_UPDATE);
+  if (toolHandler == null && updateHandler == null) {
     return undefined;
   }
   const registry = new HandlerRegistry();
-  registry.register(GraphEvents.ON_TOOL_EXECUTE, toolHandler);
+  if (toolHandler != null) {
+    registry.register(GraphEvents.ON_TOOL_EXECUTE, toolHandler);
+  }
+  if (updateHandler != null) {
+    registry.register(GraphEvents.ON_SUBAGENT_UPDATE, updateHandler);
+  }
   return registry;
 }
 
@@ -488,18 +509,25 @@ async function dispatchMessageCreationStep({
   graph,
   stepKey,
   messageId,
+  content,
+  contentType,
   metadata,
 }: {
   graph: Graph<t.BaseGraphState>;
   stepKey: string;
   messageId: string;
+  content?: string | t.MessageContentComplex[];
+  contentType?: ContentTypes.TEXT | ContentTypes.THINK;
   metadata: Record<string, unknown>;
 }): Promise<string> {
   await graph.dispatchRunStep(
     stepKey,
     {
       type: StepTypes.MESSAGE_CREATION,
-      message_creation: { message_id: messageId },
+      message_creation: {
+        message_id: messageId,
+        ...getMessageCreationContentMetadata(content, contentType),
+      },
     },
     metadata
   );
@@ -529,6 +557,7 @@ async function dispatchTextMessageContent({
         graph,
         stepKey,
         messageId,
+        content: [contentPart],
         metadata,
       });
       await graph.dispatchMessageDelta(
@@ -539,13 +568,24 @@ async function dispatchTextMessageContent({
     }
     return true;
   }
-  const stepId = await dispatchMessageCreationStep({
-    graph,
-    stepKey,
-    messageId,
-    metadata,
-  });
-  await graph.dispatchMessageDelta(stepId, { content }, metadata);
+  const contentGroups = Array.isArray(content)
+    ? splitAssistantTextContentByPhase(content)
+    : [content];
+  for (const contentGroup of contentGroups) {
+    const stepId = await dispatchMessageCreationStep({
+      graph,
+      stepKey,
+      messageId,
+      content: contentGroup,
+      contentType: ContentTypes.TEXT,
+      metadata,
+    });
+    await graph.dispatchMessageDelta(
+      stepId,
+      { content: contentGroup },
+      metadata
+    );
+  }
   return true;
 }
 
@@ -580,7 +620,10 @@ async function dispatchReasoningContent({
     stepKey,
     {
       type: StepTypes.MESSAGE_CREATION,
-      message_creation: { message_id: messageId },
+      message_creation: {
+        message_id: messageId,
+        content_type: ContentTypes.THINK,
+      },
     },
     metadata
   );
@@ -635,6 +678,10 @@ export abstract class Graph<
   _TNodeName extends string = string,
 > {
   abstract resetValues(keepContent?: boolean, checkpointScope?: string): void;
+  restoreCheckpointMessages(
+    _messages: BaseMessage[],
+    _pendingMessages?: BaseMessage[]
+  ): void {}
   abstract initializeTools({
     currentTools,
     currentToolMap,
@@ -853,11 +900,18 @@ export abstract class Graph<
     // Flush each compiled ToolNode's direct-path turn cache so it
     // doesn't leak across Runs (Codex P2 #33). The cache survives
     // `run()` re-entry by design (resume-stable), but end-of-Run
-    // is the right point to reset it.
+    // is the right point to reset it. Retain the registrations because
+    // the compiled workflow can be reused for later Runs; compilation
+    // will not register these instances again.
     for (const node of this._compiledToolNodes) {
       node.clearDirectPathTurns();
     }
-    this._compiledToolNodes.clear();
+    // Subagent executors are likewise compiled once and reused. Clear
+    // their per-Run state without dropping the registrations needed by
+    // subsequent cleanup cycles.
+    for (const executor of this._subagentExecutors) {
+      executor.clearHeavyState();
+    }
     this.sessions.clear();
   }
 
@@ -909,8 +963,135 @@ export abstract class Graph<
    */
   protected registerCompiledToolNode(node: {
     clearDirectPathTurns(): void;
+    createSubagentResumeState(): SubagentToolNodeResumeState;
+    restoreSubagentResumeState(state: SubagentToolNodeResumeState): void;
   }): void {
     this._compiledToolNodes.add(node);
+  }
+
+  protected registerSubagentExecutor(executor: SubagentExecutor): void {
+    this._subagentExecutors.add(executor);
+  }
+
+  protected resetSubagentCheckpointThreadIds(): void {
+    for (const executor of this._subagentExecutors) {
+      executor.resetCheckpointThreadIds();
+    }
+  }
+
+  getChildCheckpointThreadIds(): string[] {
+    const threadIds = new Set<string>();
+    for (const executor of this._subagentExecutors) {
+      for (const threadId of executor.getChildCheckpointThreadIds()) {
+        threadIds.add(threadId);
+      }
+    }
+    return [...threadIds];
+  }
+
+  createSubagentResumeState(runId: string): SubagentGraphResumeState {
+    return {
+      toolCallSteps: [...this.toolCallStepIds].map(([toolCallId, stepId]) => ({
+        toolCallId,
+        stepId,
+      })),
+      toolSessions: [...this.sessions].map(([toolName, context]) => ({
+        toolName,
+        context: {
+          ...context,
+          ...(context.files == null
+            ? {}
+            : { files: context.files.map((file) => ({ ...file })) }),
+        },
+      })),
+      toolNodes: [...this._compiledToolNodes].map((node) =>
+        node.createSubagentResumeState()
+      ),
+      eagerToolUsage: [
+        {
+          agentId: '',
+          toolUsageCounts: [...this.eagerEventToolUsageCount].map(
+            ([toolName, count]) => ({ toolName, count })
+          ),
+        },
+        ...[...this.eagerEventToolUsageCountsByAgentId].map(
+          ([agentId, usageCounts]) => ({
+            agentId,
+            toolUsageCounts: [...usageCounts].map(([toolName, count]) => ({
+              toolName,
+              count,
+            })),
+          })
+        ),
+      ],
+      eagerToolSuppressions: [...this.eagerEventToolSuppressions],
+      ...(this._toolOutputRegistry == null
+        ? {}
+        : {
+          toolOutputReferences: this._toolOutputRegistry.snapshotState(runId),
+        }),
+    };
+  }
+
+  restoreSubagentResumeState(
+    state: SubagentGraphResumeState,
+    runId: string
+  ): void {
+    const toolNodesByKey = new Map(
+      [...this._compiledToolNodes].map((node) => {
+        const nodeState = node.createSubagentResumeState();
+        return [nodeState.stateKey, node] as const;
+      })
+    );
+    if (toolNodesByKey.size !== state.toolNodes.length) {
+      throw new Error('Cannot restore changed subagent tool topology.');
+    }
+    for (const nodeState of state.toolNodes) {
+      if (!toolNodesByKey.has(nodeState.stateKey)) {
+        throw new Error(
+          `Cannot restore subagent tool state for "${nodeState.stateKey}".`
+        );
+      }
+    }
+    const registry =
+      state.toolOutputReferences == null
+        ? undefined
+        : this.getOrCreateToolOutputRegistry();
+    if (state.toolOutputReferences != null && registry == null) {
+      throw new Error('Cannot restore disabled tool output references.');
+    }
+
+    this.toolCallStepIds.clear();
+    for (const { toolCallId, stepId } of state.toolCallSteps) {
+      this.toolCallStepIds.set(toolCallId, stepId);
+    }
+    this.sessions.clear();
+    for (const { toolName, context } of state.toolSessions) {
+      this.sessions.set(toolName, {
+        ...context,
+        ...(context.files == null
+          ? {}
+          : { files: context.files.map((file) => ({ ...file })) }),
+      });
+    }
+    for (const nodeState of state.toolNodes) {
+      const node = toolNodesByKey.get(nodeState.stateKey)!;
+      node.restoreSubagentResumeState(nodeState);
+    }
+    this.clearEagerEventToolUsageCounts();
+    for (const usageState of state.eagerToolUsage) {
+      const usageCounts = this.getEagerEventToolUsageCount(usageState.agentId);
+      for (const { toolName, count } of usageState.toolUsageCounts) {
+        usageCounts.set(toolName, count);
+      }
+    }
+    this.eagerEventToolSuppressions.clear();
+    for (const toolName of state.eagerToolSuppressions) {
+      this.eagerEventToolSuppressions.add(toolName);
+    }
+    if (state.toolOutputReferences != null && registry != null) {
+      registry.restoreState(runId, state.toolOutputReferences);
+    }
   }
 
   /**
@@ -962,7 +1143,10 @@ export abstract class Graph<
    */
   private _compiledToolNodes: Set<{
     clearDirectPathTurns(): void;
+    createSubagentResumeState(): SubagentToolNodeResumeState;
+    restoreSubagentResumeState(state: SubagentToolNodeResumeState): void;
   }> = new Set();
+  private _subagentExecutors = new Set<SubagentExecutor>();
   public getOrCreateFileCheckpointer(): t.LocalFileCheckpointer | undefined {
     // Return the cached instance unconditionally if one exists. The
     // toolExecution check below decides whether to *create* a new
@@ -1003,11 +1187,16 @@ export abstract class Graph<
 
 export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   overrideModel?: t.ChatModel;
+  private subagentModelOverride?: t.ChatModel;
+  private readonly graphFactory: GraphFactory;
+  private readonly supportsMultiAgentChildren: boolean;
   /** Optional compile options passed into workflow.compile() */
   compileOptions?: t.CompileOptions | undefined;
   /** Whether the workflow was actually compiled with a checkpointer. */
   hasCompiledCheckpointer: boolean = false;
   messages: BaseMessage[] = [];
+  /** Whether a rebuilt resume seeded the message baseline from its checkpoint. */
+  private hasRestoredCheckpointMessages = false;
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
   /** Per-agent discovery snapshots preserved before contexts are reset on cleanup. */
@@ -1049,8 +1238,83 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   subagentUsageSink?: t.SubagentUsageSink;
   /** See {@link t.StandardGraphInput.subagentScope}. */
   subagentScope: boolean;
+  /** See {@link t.StandardGraphInput.subagentExecutionContext}. */
+  private readonly subagentExecutionContext?: t.SubagentExecutionContext;
   /** See {@link t.StandardGraphInput.preemption}. */
   preemption?: t.StreamPreemption;
+  /**
+   * Stream circuit breakers, resolved once from
+   * {@link t.StandardGraphInput.streamLimits}. The stream handler enforces
+   * these on every streamed chunk event.
+   */
+  streamLimits: ResolvedStreamLimits;
+  /**
+   * Cumulative streamed argument bytes per in-flight tool call, keyed by
+   * generation key + chunk index (see `resolveGenerationKey`). Per-run
+   * accumulation state, cleared by both reset paths.
+   */
+  streamedToolCallArgTallies: Map<string, StreamedToolCallArgTally> = new Map();
+  /** Streamed chunk events per model generation, keyed by generation key. */
+  streamDeltaEventCounts: Map<string, StreamDeltaEventTally> = new Map();
+  /** Per-chunk-object, per-generation charge balances (lazily created; see
+   * `StreamLimitState`). Reinitialized by both reset paths: a model may
+   * retain and re-yield one mutable chunk object, whose nested map would
+   * otherwise grow by one attempt-stamped entry per model call for the
+   * graph's lifetime. */
+  streamLimitChargeCredits?: WeakMap<object, Map<string, number>>;
+  /** Run-scoped breaker abort: composed into every model invocation and
+   * every SubagentExecutor child signal, and tripped when a stream circuit
+   * breaker fires anywhere in the run, so parallel agent nodes' in-flight
+   * provider calls and subagents stop consuming quota while the rejection
+   * propagates. Recreated by both reset paths — the abort is one-way within
+   * a run, and a reused graph must start its next run unaborted. */
+  breakerAbort = new AbortController();
+
+  /** Incremented whenever `breakerAbort` is replaced. Stamped into each
+   * model attempt's metadata ({@link STREAM_LIMIT_EPOCH_KEY}) so the stream
+   * handler's consumer-side trip binds to the run that produced the event
+   * rather than whichever controller is live when a straggling chunk is
+   * finally handled. */
+  breakerEpoch = 0;
+
+  /** Immutable snapshot of the run's breaker identity (epoch + controller),
+   * replaced as ONE object whenever `resetValues` installs a fresh
+   * controller. Sites that pause across awaits capture it at entry and
+   * revalidate by REFERENCE afterwards — a single identity comparison
+   * proves no reset happened while suspended, where separate epoch and
+   * controller reads could interleave with one. */
+  runScope: RunBreakerScope = Object.freeze({
+    epoch: 0,
+    controller: this.breakerAbort,
+  });
+
+  /** Generation keys of model attempts still in flight (see
+   * `StreamLimitState.activeStreamLimitGenerations`). Lazily created by the
+   * attempt lease; spans resets on purpose. */
+  activeStreamLimitGenerations?: Set<string>;
+
+  /** The stream-limit error behind an already-fired breaker, whether this
+   * graph's own controller tripped or a parent run's breaker arrived through
+   * the composed constructor signal (child graphs own separate controllers).
+   * Providers can translate either abort into a generic error, and recovery
+   * paths must not run in that state. */
+  protected resolveTrippedBreakerReason(
+    breakerSignal: AbortSignal = this.breakerAbort.signal
+  ): StreamLimitExceededError | undefined {
+    if (
+      breakerSignal.aborted &&
+      breakerSignal.reason instanceof StreamLimitExceededError
+    ) {
+      return breakerSignal.reason;
+    }
+    if (
+      this.signal?.aborted === true &&
+      this.signal.reason instanceof StreamLimitExceededError
+    ) {
+      return this.signal.reason;
+    }
+    return undefined;
+  }
   /**
    * Seals charged against `preemption.maxSeals`. Per-turn: cleared by both
    * reset paths so a fresh turn gets a fresh budget, while a HITL resume —
@@ -1097,26 +1361,44 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   pendingPreemptReturn = new Set<string>();
 
-  constructor({
-    runId,
-    signal,
-    agents,
-    langfuse,
-    tokenCounter,
-    indexTokenCountMap,
-    calibrationRatio,
-    subagentUsageSink,
-    subagentScope,
-    preemption,
-  }: t.StandardGraphInput) {
+  constructor(
+    {
+      runId,
+      signal,
+      agents,
+      langfuse,
+      tokenCounter,
+      indexTokenCountMap,
+      calibrationRatio,
+      subagentUsageSink,
+      subagentScope,
+      subagentExecutionContext,
+      preemption,
+      streamLimits,
+    }: t.StandardGraphInput,
+    dependencies?: GraphFactoryDependencies
+  ) {
     super();
+    this.supportsMultiAgentChildren = dependencies != null;
+    this.graphFactory =
+      dependencies?.graphFactory ??
+      ((request): StandardGraph => {
+        if (request.kind !== 'standard') {
+          throw new Error(
+            'A polymorphic graph factory is required for multi-agent graph construction.'
+          );
+        }
+        return new StandardGraph(request.input);
+      });
     this.runId = runId;
     this.langfuseScopeRunId = `${runId ?? 'graph'}:${nanoid()}`;
     this.signal = signal;
     this.langfuse = langfuse;
     this.subagentUsageSink = subagentUsageSink;
     this.subagentScope = subagentScope === true;
+    this.subagentExecutionContext = subagentExecutionContext;
     this.preemption = preemption;
+    this.streamLimits = resolveStreamLimits(streamLimits);
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -1141,7 +1423,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /* Init */
 
   resetValues(keepContent?: boolean, checkpointScope?: string): void {
+    this.resetSubagentCheckpointThreadIds();
     this.messages = [];
+    this.hasRestoredCheckpointMessages = false;
     this.cachedRunMessages = undefined;
     this.cachedDiscoveredTools = undefined;
     this.config = resetIfNotEmpty(this.config, undefined);
@@ -1162,6 +1446,36 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
     this.eagerEventToolSuppressions.clear();
+    /** Grace sweep instead of a clear: producer loops of straggling
+     * attempts use these maps directly and sit outside the consumer-only
+     * epoch gate — clearing would hand a cancellation-ignoring provider a
+     * fresh allowance at every run start. Entries from the epoch that is
+     * ending survive exactly one reset so those stragglers stay on their
+     * original budgets; older entries are removed. */
+    sweepStaleStreamLimitEntries(
+      this.streamedToolCallArgTallies,
+      this.breakerEpoch,
+      this.activeStreamLimitGenerations
+    );
+    sweepStaleStreamLimitEntries(
+      this.streamDeltaEventCounts,
+      this.breakerEpoch,
+      this.activeStreamLimitGenerations
+    );
+    this.streamLimitChargeCredits = undefined;
+    /** Run-start is the only safe replacement point for the breaker:
+     * end-of-run cleanup must leave it in place so straggling parallel
+     * children from the failed run cannot start on a fresh signal.
+     * Replaced UNCONDITIONALLY here — a run that failed on an ordinary
+     * error leaves the controller un-aborted, and stragglers still settling
+     * hold their entry-time capture of it; a late stream-limit trip on that
+     * old controller must not cancel the run starting now. */
+    this.breakerAbort = new AbortController();
+    this.breakerEpoch += 1;
+    this.runScope = Object.freeze({
+      epoch: this.breakerEpoch,
+      controller: this.breakerAbort,
+    });
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
@@ -1208,6 +1522,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       : undefined;
   }
 
+  /** Seeds the sidecar message view that checkpoint restoration bypasses. */
+  override restoreCheckpointMessages(
+    messages: BaseMessage[],
+    pendingMessages?: BaseMessage[]
+  ): void {
+    if (this.messages.length > 0) {
+      return;
+    }
+    this.messages =
+      pendingMessages == null
+        ? [...messages]
+        : messagesStateReducer(messages, pendingMessages);
+    this.startIndex = this.messages.length;
+    this.hasRestoredCheckpointMessages = true;
+    this.cachedRunMessages = undefined;
+  }
+
   override clearHeavyState(): void {
     this.cachedRunMessages = this.messages.slice(this.startIndex);
     this.cachedDiscoveredTools = new Map(
@@ -1219,6 +1550,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
+    this.subagentModelOverride = undefined;
+    /** Stream-limit accounting (argument tallies, event counts, charge
+     * credits) deliberately SURVIVES cleanup: this runs in `processStream`'s
+     * finally, which an ordinary parallel-branch failure reaches while
+     * sibling attempts are still unwinding on the retained breaker — a
+     * cancellation-ignoring provider's late chunks would otherwise recreate
+     * their budgets from zero and stream another full allowance. The maps
+     * are bounded by in-flight call sizes and `resetValues` clears them at
+     * the next run start, where the epoch bump already drops stamped
+     * straggler events before accounting. */
+    /** Deliberately NOT recreating a tripped breakerAbort here: this runs in
+     * `processStream`'s cleanup, which a rejected parallel batch reaches
+     * while sibling subagents can still be pre-invoke — a fresh controller
+     * would hand them an un-aborted signal and let provider requests start
+     * after the run already failed. `resetValues` recreates it when the next
+     * run begins. */
     /**
      * Turn state only. The reported totals must outlive cleanup — this runs
      * in `processStream`'s `finally`, and the host reads `getPreemptStats()`
@@ -1501,13 +1848,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /* Misc.*/
 
   getRunMessages(): BaseMessage[] | undefined {
-    if (this.messages == null) {
+    /** Runtime-honest widening: a disposed-but-cached graph (HITL
+     * resume/reconnect through a WeakRef cache) can carry null here despite
+     * the field type. */
+    const messages = this.messages as BaseMessage[] | undefined;
+    if (messages == null) {
       return this.cachedRunMessages;
     }
-    if (this.messages.length === 0 && this.cachedRunMessages != null) {
+    if (messages.length === 0 && this.cachedRunMessages != null) {
       return this.cachedRunMessages;
     }
-    return this.messages.slice(this.startIndex);
+    return messages.slice(this.startIndex);
   }
 
   override getDiscoveredTools(agentId?: string): string[] {
@@ -1559,10 +1910,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     // `messages` can be null/undefined on a graph that has been disposed
     // (clearHeavyState) but is still reachable via a cache (e.g. RedisJobStore's
     // WeakRef) during a HITL resume/reconnect. Guard instead of dereferencing null.
-    if (this.messages == null) {
+    const messages = this.messages as BaseMessage[] | undefined;
+    if (messages == null) {
       return undefined;
     }
-    return convertMessagesToContent(this.messages.slice(this.startIndex));
+    return convertMessagesToContent(messages.slice(this.startIndex));
   }
 
   getCalibrationRatio(): number {
@@ -1597,13 +1949,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     // `contentData` can be null/undefined on a disposed-but-cached graph during a
     // HITL resume/reconnect; without this guard `[...this.contentData]` throws
     // "this.contentData is not iterable".
-    if (this.contentData == null) {
+    const contentData = this.contentData as t.RunStep[] | undefined;
+    if (contentData == null) {
       return [];
     }
     if (agentId == null || agentId === '') {
-      return [...this.contentData];
+      return [...contentData];
     }
-    return this.contentData.filter((step) => step.agentId === agentId);
+    return contentData.filter((step) => step.agentId === agentId);
   }
 
   /**
@@ -1674,6 +2027,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       runLangfuse: this.langfuse,
       agentLangfuse: agentContext?.langfuse,
     });
+    const interruptingToolNames = new Set(this.interruptingToolNames ?? []);
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      (agentContext?.subagentConfigs?.length ?? 0) > 0
+    ) {
+      interruptingToolNames.add(Constants.SUBAGENT);
+    }
+    const effectiveInterruptingToolNames =
+      interruptingToolNames.size > 0 ? interruptingToolNames : undefined;
 
     if (eventDrivenMode) {
       const schemaTools = createSchemaOnlyTools(toolDefinitions);
@@ -1725,15 +2087,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         eagerEventToolSuppressions: this.eagerEventToolSuppressions,
         toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
-        interruptingToolNames:
-          this.interruptingToolNames != null &&
-          this.interruptingToolNames.length > 0
-            ? new Set(this.interruptingToolNames)
-            : undefined,
+        interruptingToolNames: effectiveInterruptingToolNames,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
         fileCheckpointer: this.getOrCreateFileCheckpointer(),
+        getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
+        getRunScope: (): RunBreakerScope => this.runScope,
         errorHandler: (data, metadata): Promise<boolean> =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
@@ -1790,17 +2150,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       sessions: this.sessions,
       toolExecution: this.toolExecution,
       codeSessionToolNames: this.codeSessionToolNames,
-      interruptingToolNames:
-        this.interruptingToolNames != null &&
-        this.interruptingToolNames.length > 0
-          ? new Set(this.interruptingToolNames)
-          : undefined,
+      interruptingToolNames: effectiveInterruptingToolNames,
       hookRegistry: this.hookRegistry,
       humanInTheLoop: this.humanInTheLoop,
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
       fileCheckpointer: this.getOrCreateFileCheckpointer(),
+      getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
+      getRunScope: (): RunBreakerScope => this.runScope,
     });
     this.registerCompiledToolNode(node);
     return node;
@@ -1816,6 +2174,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       sleep,
       toolCalls,
     });
+  }
+
+  /** Explicitly overrides the model used by isolated descendant subagent graphs. */
+  setSubagentModelOverride(model: t.ChatModel): void {
+    this.subagentModelOverride = model;
   }
 
   getUsageMetadata(
@@ -1927,6 +2290,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       state: t.AgentSubgraphState,
       config?: RunnableConfig
     ): Promise<Partial<t.AgentSubgraphState>> => {
+      /** Captured at node ENTRY, before any host-facing await (context-usage
+       * dispatch, hooks): a sibling's trip can fail the run and a prompt
+       * next run can reset the controller while this node is paused in one
+       * of those awaits, and a later capture would bind this attempt to the
+       * fresh controller. Trips and reason reads below stay on this
+       * capture. */
+      const attemptBreaker = this.breakerAbort;
+      const attemptBreakerEpoch = this.breakerEpoch;
+      /** Already-tripped-at-entry: a parallel sibling's breach has failed
+       * the run before this node was scheduled. Rethrow before hooks or the
+       * provider call — a custom provider that doesn't synchronously reject
+       * an aborted signal would otherwise start another model request on a
+       * failed run. */
+      const entryTripReason = this.resolveTrippedBreakerReason(
+        attemptBreaker.signal
+      );
+      if (entryTripReason != null) {
+        throw entryTripReason;
+      }
       const agentContext = this.agentContexts.get(agentId);
       if (!agentContext) {
         throw new Error(`Agent context not found for agentId: ${agentId}`);
@@ -3120,6 +3502,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       let langfuseHandler: CallbackEntry | undefined;
       let invokeConfig = {
         ...config,
+        /** The run-scoped breaker composed in, so a stream-limit trip in one
+         * parallel agent node also cancels sibling nodes' in-flight model
+         * calls, not only their subagents. */
+        signal: composeAbortSignals(config.signal, attemptBreaker.signal),
         metadata: {
           ...(config.metadata ?? {}),
           ...traceMetadata,
@@ -3128,6 +3514,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
            *  length cap, but scope trust (`isForeignScope`) needs the id
            *  verbatim regardless of length. */
           agentId,
+          [STREAM_LIMIT_EPOCH_KEY]: attemptBreakerEpoch,
         },
       };
       initializeLangfuseTracing(langfuse);
@@ -3166,6 +3553,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (preInvokeContextOverflowError != null) {
           throw preInvokeContextOverflowError;
         }
+        /** Rechecked after the pre-invoke awaits (context-usage dispatch,
+         * hooks): a sibling can trip the breaker while this node is paused
+         * in one of them, and a provider that doesn't synchronously reject
+         * an aborted signal would still start the request. */
+        {
+          const preInvokeTrip = this.resolveTrippedBreakerReason(
+            attemptBreaker.signal
+          );
+          if (preInvokeTrip != null) {
+            throw preInvokeTrip;
+          }
+        }
         result = await withLangfuseRuntimeScope(
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,
@@ -3189,6 +3588,32 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           graph: this,
           metadata,
         });
+        /**
+         * A tripped stream circuit breaker is a deliberate abort, not a
+         * provider failure: entering overflow recovery or the fallback chain
+         * would spend more provider work after the safety limit fired, and a
+         * succeeding fallback would resolve a run the public contract says
+         * must reject. Rethrow before any recovery path.
+         */
+        if (primaryError instanceof StreamLimitExceededError) {
+          /** Tripped before rethrowing so parallel agent nodes' in-flight
+           * model calls and subagents stop while the rejection propagates. */
+          attemptBreaker.abort(primaryError);
+          throw primaryError;
+        }
+        /** A sibling that tripped the shared breaker aborts this branch's
+         * composed signal, and some providers surface that as a generic
+         * abort error; entering overflow planning or the fallback chain
+         * would start new provider work after the run-wide breaker fired.
+         * Rethrow the breaker's own stream-limit reason instead. */
+        {
+          const trippedReason = this.resolveTrippedBreakerReason(
+            attemptBreaker.signal
+          );
+          if (trippedReason != null) {
+            throw trippedReason;
+          }
+        }
         /**
          * A context overflow is a deterministic consequence of the payload,
          * not a provider being unavailable — so it is answered by compacting
@@ -3422,6 +3847,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               })
           );
         } catch (fallbackError) {
+          if (fallbackError instanceof StreamLimitExceededError) {
+            /** Same treatment as the primary path: a fallback stream that
+             * trips the breaker must stop parallel agent nodes' model calls
+             * and subagents before the rejection propagates. */
+            attemptBreaker.abort(fallbackError);
+            throw fallbackError;
+          }
+          {
+            /** Same sibling-abort translation guard as the primary catch. */
+            const trippedReason = this.resolveTrippedBreakerReason(
+              attemptBreaker.signal
+            );
+            if (trippedReason != null) {
+              throw trippedReason;
+            }
+          }
           const overflowCandidates =
             getFallbackOverflowCandidates(fallbackError);
           let fallbackRecovery: OverflowRecoveryPlan | null = null;
@@ -3830,16 +4271,61 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       agentContext.subagentConfigs.length > 0 &&
       effectiveSubagentDepth > 0
     ) {
-      const resolvedConfigs = resolveSubagentConfigs(
+      const executableConfigs = normalizeSubagentConfigEntries(
         agentContext.subagentConfigs,
         agentContext
       );
-      if (resolvedConfigs.length > 0) {
+      if (executableConfigs.length > 0) {
+        if (
+          !this.supportsMultiAgentChildren &&
+          executableConfigs.some(isGraphSubagentConfig)
+        ) {
+          throw new Error(
+            'Graph subagents require constructing the parent with createGraph() or an injected GraphFactory dependency.'
+          );
+        }
         const getParentHandlerRegistry = (): HandlerRegistry | undefined =>
           this.handlerRegistry ?? this.parentToolHandlerRegistry;
+        const createConfiguredChildGraph: GraphFactory = (request) => {
+          const childGraph = this.graphFactory(request);
+          if (this.subagentModelOverride != null) {
+            childGraph.overrideModel = this.subagentModelOverride;
+            childGraph.setSubagentModelOverride(this.subagentModelOverride);
+          }
+          const childHandlerRegistry = createChildHandlerRegistry(
+            getParentHandlerRegistry()
+          );
+          // Pure execution-ordering hint (unlike `humanInTheLoop`). It only
+          // reorders tools already in the child's direct group; it does not
+          // force a schema-only event tool onto the direct execution path.
+          applyGraphRuntimeConfig(childGraph, {
+            hookRegistry: this.hookRegistry,
+            humanInTheLoop: this.humanInTheLoop,
+            toolOutputReferences: this.toolOutputReferences,
+            eagerEventToolExecution: this.eagerEventToolExecution,
+            codeSessionToolNames: this.codeSessionToolNames,
+            interruptingToolNames: this.interruptingToolNames,
+            toolExecution: this.toolExecution,
+          });
+          if (this.humanInTheLoop?.enabled === true) {
+            childGraph.compileOptions = {
+              checkpointer: this.compileOptions?.checkpointer,
+            };
+          }
+          childGraph.parentToolHandlerRegistry = childHandlerRegistry;
+          childGraph.eventToolExecutionAvailable =
+            childHandlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) !=
+            null;
+          return childGraph;
+        };
         const executor = new SubagentExecutor({
-          configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
+          configs: new Map(
+            executableConfigs.map((config) => [config.type, config])
+          ),
           parentSignal: this.signal,
+          breakerScope: {
+            controller: (): AbortController => this.breakerAbort,
+          },
           hookRegistry: this.hookRegistry,
           /** Lazy — Run wires the registry onto the graph AFTER
            *  `createWorkflow()` runs, so a direct capture here would be
@@ -3847,43 +4333,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           parentHandlerRegistry: getParentHandlerRegistry,
           parentRunId: this.runId ?? '',
           parentAgentId: agentContext.agentId,
+          executionContext: this.subagentExecutionContext,
           langfuse: this.langfuse,
           tokenCounter: agentContext.tokenCounter,
           usageSink: this.subagentUsageSink,
+          streamLimits: this.streamLimits,
+          humanInTheLoop: this.humanInTheLoop,
+          checkpointer: this.compileOptions?.checkpointer,
           maxDepth: effectiveSubagentDepth,
-          createChildGraph: (input): StandardGraph => {
-            const childGraph = new StandardGraph(input);
-            const toolHandlerRegistry = createToolHandlerRegistry(
-              getParentHandlerRegistry()
-            );
-            childGraph.hookRegistry = this.hookRegistry;
-            /**
-             * Do not propagate `humanInTheLoop` into the child graph yet:
-             * nested subagent interrupts need a stable child checkpoint and
-             * resume bridge. Child hooks still fire; `ask` decisions fail
-             * closed inside the subagent until that flow is implemented.
-             */
-            childGraph.toolOutputReferences = this.toolOutputReferences;
-            childGraph.eagerEventToolExecution = this.eagerEventToolExecution;
-            childGraph.codeSessionToolNames = this.codeSessionToolNames;
-            // Pure execution-ordering hint (unlike `humanInTheLoop` above).
-            // It ONLY reorders tools already in the child's direct group;
-            // it does not force a name onto the direct path (that fold-in
-            // was removed — Codex review of #294). So for a self-spawned
-            // child that scrubs inherited `graphTools` (keeping only the
-            // event `toolDefinition` / schema-only stub for a name like
-            // `ask_user_question`), the name isn't in the child's direct
-            // group and this is a no-op — the stub is still dispatched via
-            // ON_TOOL_EXECUTE, never invoked directly. Where the child DOES
-            // have the executable graphTool, the guard correctly applies.
-            childGraph.interruptingToolNames = this.interruptingToolNames;
-            childGraph.toolExecution = this.toolExecution;
-            childGraph.parentToolHandlerRegistry = toolHandlerRegistry;
-            childGraph.eventToolExecutionAvailable =
-              toolHandlerRegistry != null;
-            return childGraph;
-          },
+          createChildGraph: (input): StandardGraph =>
+            createConfiguredChildGraph({
+              kind: 'standard',
+              input,
+            }),
+          createChildGraphByKind: createConfiguredChildGraph,
         });
+        this.registerSubagentExecutor(executor);
 
         const subagentTool = tool(async (rawInput, config) => {
           const input = rawInput as {
@@ -3894,29 +4359,40 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             typeof input.description === 'string' &&
             input.description.trim().length > 0
               ? input.description
-              : 'No task description provided';
+              : DEFAULT_SUBAGENT_DESCRIPTION;
           const subagentType =
             typeof input.subagent_type === 'string' ? input.subagent_type : '';
           const threadId = config.configurable?.thread_id as string | undefined;
-          /**
-           * When the tool is dispatched from an LLM's `tool_call`, LangChain
-           * threads the originating `ToolCall` onto the RunnableConfig as
-           * `config.toolCall` (see `ToolRunnableConfig` in
-           * `@langchain/core/tools` — internal but stable since ≥0.3.x).
-           * Surfacing its id lets hosts correlate `SubagentUpdateEvent`s
-           * back to the parent's `tool_call_id` deterministically — no
-           * temporal heuristics needed. If a future LangChain version
-           * changes the threading, the type-guarded read falls back to
-           * `undefined` and the correlation degrades gracefully.
-           */
-          const toolCall = (config as { toolCall?: { id?: string } }).toolCall;
-          const parentToolCallId =
-            typeof toolCall?.id === 'string' ? toolCall.id : undefined;
+          /** Surface the parent call id so child checkpoints, interrupts, and
+           * update events remain correlated across replay and resume. */
+          const toolRuntime = config as {
+            toolCallId?: string;
+            toolCall?: { id?: string };
+          };
+          const toolCall = toolRuntime.toolCall;
+          let parentToolCallId: string | undefined;
+          if (
+            typeof toolRuntime.toolCallId === 'string' &&
+            toolRuntime.toolCallId !== ''
+          ) {
+            parentToolCallId = toolRuntime.toolCallId;
+          } else if (typeof toolCall?.id === 'string' && toolCall.id !== '') {
+            parentToolCallId = toolCall.id;
+          }
+          /** The parent tool batch's entry-captured scope (stamped by
+           * ToolNode before PreToolUse hooks) — binds this child to the
+           * run that dispatched it, not to whatever controller a reset
+           * installed while the hooks were awaited. */
+          const batchScope = config.configurable?.[
+            RUN_BREAKER_SCOPE_CONFIG_KEY
+          ] as RunBreakerScope | undefined;
           const result = await executor.execute({
             description,
             subagentType,
             threadId,
+            signal: config.signal,
             parentToolCallId,
+            breaker: batchScope?.controller,
             /**
              * Forward the parent's `configurable` so host-set fields
              * (`requestBody`, `user`, etc.) propagate into the child
@@ -3928,7 +4404,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               | undefined,
           });
           return result.content;
-        }, buildSubagentToolParams(resolvedConfigs));
+        }, buildSubagentToolParams(executableConfigs));
+        const replayableSubagentTool = subagentTool as typeof subagentTool &
+          ReplayableSubagentTool;
+        replayableSubagentTool[SUBAGENT_REPLAY_CONTROLLER] = {
+          getResumeManifest: (
+            parentToolCallIds,
+            config
+          ): Promise<SubagentResumeManifest | undefined> =>
+            executor.getResumeManifest(parentToolCallIds, config),
+          getSettledOutput: (
+            call,
+            config
+          ): Promise<SettledSubagentToolOutput | undefined> =>
+            executor.getSettledToolOutput(call, config),
+          persistSettledOutput: (call, config, output): Promise<void> =>
+            executor.persistSettledToolOutput(call, config, output),
+        };
 
         if (!agentContext.graphTools) {
           agentContext.graphTools = [];
@@ -4002,6 +4494,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }),
     });
 
+    const readChargeCredits = ():
+      | WeakMap<object, Map<string, number>>
+      | undefined => this.streamLimitChargeCredits;
+    const readBreakerEpoch = (): number => this.breakerEpoch;
+    const readActiveGenerations = (): Set<string> | undefined =>
+      this.activeStreamLimitGenerations;
+    const writeActiveGenerations = (value: Set<string> | undefined): void => {
+      this.activeStreamLimitGenerations = value;
+    };
+    const writeChargeCredits = (
+      value: WeakMap<object, Map<string, number>> | undefined
+    ): void => {
+      this.streamLimitChargeCredits = value;
+    };
+
     const workflow = new StateGraph(StateAnnotation)
       .addNode(agentNode, this.createCallModel(agentId))
       .addNode(
@@ -4025,6 +4532,54 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             runId: this.runId,
             isMultiAgent: this.isMultiAgentGraph(),
             hookRegistry: this.hookRegistry,
+            /**
+             * Live references (both maps are cleared in place, never
+             * replaced), so summarization streams share the run's event
+             * budget accounting under their own generation key.
+             */
+            streamLimits: this.streamLimits,
+            streamDeltaEventCounts: this.streamDeltaEventCounts,
+            streamedToolCallArgTallies: this.streamedToolCallArgTallies,
+            /** Accessor pair, not a value copy: unlike the two maps above,
+             * the credit map is REPLACED by graph resets rather than cleared
+             * in place, and the guards' lazy `??=` must install onto the
+             * graph — a copy held here would survive resets and grow one
+             * attempt-stamped entry per compaction for a retained reused
+             * chunk object. */
+            get streamLimitChargeCredits() {
+              return readChargeCredits();
+            },
+            set streamLimitChargeCredits(
+              value: WeakMap<object, Map<string, number>> | undefined
+            ) {
+              writeChargeCredits(value);
+            },
+            /** Live epoch, so summary tallies are creation-tagged and the
+             * resetValues grace sweep treats them like model-attempt
+             * entries. */
+            get breakerEpoch(): number {
+              return readBreakerEpoch();
+            },
+            /** Accessor pair like the charge credits: summary attempts
+             * lease their generations on the GRAPH's active set, and the
+             * lazy `??=` in the lease helper must install there. */
+            get activeStreamLimitGenerations(): Set<string> | undefined {
+              return readActiveGenerations();
+            },
+            set activeStreamLimitGenerations(value: Set<string> | undefined) {
+              writeActiveGenerations(value);
+            },
+            /** Read per attempt: a sibling branch tripping the run breaker
+             * must also cancel in-flight summarization model calls. */
+            getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
+            /** The node captures this at entry so its own chunk handler's
+             * breach trips the run that STARTED the summarization, not a
+             * controller installed by a later reset. */
+            getBreakerController: (): AbortController => this.breakerAbort,
+            /** Captured at node entry and stamped into the summary attempt
+             * metadata, so the wire consumer epoch-gates old-run summary
+             * chunks exactly like model-attempt chunks. */
+            getBreakerEpoch: (): number => this.breakerEpoch,
             dispatchRunStep: async (runStep, nodeConfig) => {
               const resolvedConfig = nodeConfig ?? this.config;
               if (runStep.agentId != null) {
@@ -4113,7 +4668,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: (a, b) => {
-          if (!this.messages.length) {
+          if (!this.messages.length && !this.hasRestoredCheckpointMessages) {
             this.startIndex = a.length + b.length;
           }
           const result = messagesStateReducer(a, b);

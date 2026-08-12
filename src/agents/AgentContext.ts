@@ -275,7 +275,7 @@ export class AgentContext {
   /** Original AgentInputs used to create this context — used for self-spawn subagent resolution. */
   _sourceInputs?: t.AgentInputs;
   /** Subagent configurations for hierarchical delegation. */
-  subagentConfigs?: t.SubagentConfig[];
+  subagentConfigs?: t.SubagentConfigEntry[];
   /** Maximum subagent nesting depth. */
   maxSubagentDepth?: number;
   /** Instructions for this agent */

@@ -72,6 +72,9 @@ export function getLangfuseSpanProcessorParams(
       secretKey: langfuse.secretKey,
       ...(isPresent(langfuse.baseUrl) ? { baseUrl: langfuse.baseUrl } : {}),
       ...(isPresent(environment) ? { environment } : {}),
+      ...(langfuse.mediaUploadEnabled != null
+        ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
+        : {}),
     };
   }
   if (hasLangfuseEnvConfig()) {
@@ -84,6 +87,9 @@ export function getLangfuseSpanProcessorParams(
       secretKey: process.env.LANGFUSE_SECRET_KEY as string,
       ...(isPresent(baseUrl) ? { baseUrl } : {}),
       ...(isPresent(environment) ? { environment } : {}),
+      ...(langfuse?.mediaUploadEnabled != null
+        ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
+        : {}),
     };
   }
   if (isPresent(langfuse?.baseUrl) && hasLangfuseEnvCredentials()) {
@@ -92,6 +98,9 @@ export function getLangfuseSpanProcessorParams(
       secretKey: process.env.LANGFUSE_SECRET_KEY as string,
       baseUrl: langfuse.baseUrl,
       ...(isPresent(environment) ? { environment } : {}),
+      ...(langfuse.mediaUploadEnabled != null
+        ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
+        : {}),
     };
   }
   return undefined;

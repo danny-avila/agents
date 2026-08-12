@@ -8,6 +8,7 @@ import type {
   ToolDecision,
   StopDecision,
   HookCallback,
+  ToolApprovalReplayKey,
   AggregatedHookResult,
 } from './types';
 import type { HookRegistry } from './HookRegistry';
@@ -28,6 +29,10 @@ export interface ExecuteHooksOptions {
   sessionId?: string;
   /** Query string matched against each matcher's pattern (tool name, etc.). */
   matchQuery?: string;
+  /** Stable tool-call key for replaying consumed one-shot contributions. */
+  onceReplayKey?: ToolApprovalReplayKey;
+  /** Storage scope for replay state when it must outlive or branch from the hook session. */
+  onceReplaySessionId?: string;
   /** Parent AbortSignal — combined with per-hook timeout into the hook signal. */
   signal?: AbortSignal;
   /** Default per-hook timeout; overridden by `matcher.timeout` when present. */
@@ -301,12 +306,79 @@ function applyAllowedDecisions(
   agg.allowedDecisions = output.allowedDecisions;
 }
 
-function fold(outcomes: readonly HookOutcome[]): AggregatedHookResult {
-  const agg = freshResult();
+function applyAggregatedResult(
+  target: AggregatedHookResult,
+  source: AggregatedHookResult
+): void {
+  target.additionalContexts.push(...source.additionalContexts);
+  target.injectedMessages.push(...source.injectedMessages);
+  target.errors.push(...source.errors);
+  if (source.decision != null) {
+    applyToolDecision(target, source.decision, source.reason);
+  }
+  if (source.stopDecision != null) {
+    applyStopDecision(target, source.stopDecision, source.reason);
+  }
+  if (source.updatedInput != null) {
+    target.updatedInput = source.updatedInput;
+  }
+  if (source.updatedOutput !== undefined) {
+    target.updatedOutput = source.updatedOutput;
+  }
+  if (source.allowedDecisions != null) {
+    target.allowedDecisions = source.allowedDecisions;
+  }
+  if (source.preventContinuation === true) {
+    target.preventContinuation = true;
+    target.stopReason ??= source.stopReason;
+  }
+}
+
+function combineAggregatedResults(
+  first: AggregatedHookResult | undefined,
+  second: AggregatedHookResult
+): AggregatedHookResult {
+  if (first == null) {
+    return second;
+  }
+  const combined = freshResult();
+  applyAggregatedResult(combined, first);
+  applyAggregatedResult(combined, second);
+  return combined;
+}
+
+function createPendingApprovalReplay(
+  approvalResult: AggregatedHookResult,
+  pendingApproval: AggregatedHookResult | undefined,
+  onceContribution: AggregatedHookResult
+): AggregatedHookResult {
+  const replay = freshResult();
+  if (pendingApproval != null) {
+    applyAggregatedResult(replay, pendingApproval);
+  }
+  applyAggregatedResult(replay, onceContribution);
+  replay.decision = 'ask';
+  replay.reason = approvalResult.reason;
+  if (approvalResult.allowedDecisions == null) {
+    delete replay.allowedDecisions;
+  } else {
+    replay.allowedDecisions = approvalResult.allowedDecisions;
+  }
+  return replay;
+}
+
+function fold(outcomes: readonly HookOutcome[]): {
+  aggregated: AggregatedHookResult;
+  onceReplayContribution?: AggregatedHookResult;
+} {
+  const aggregated = freshResult();
+  const onceContribution = freshResult();
+  let hasOnceContribution = false;
   for (const outcome of outcomes) {
+    const isOnceMatcher = outcome.matcher.once === true;
     if (outcome.error !== null) {
       if (outcome.matcher.internal !== true) {
-        agg.errors.push(outcome.error);
+        aggregated.errors.push(outcome.error);
       }
       continue;
     }
@@ -323,15 +395,28 @@ function fold(outcomes: readonly HookOutcome[]): AggregatedHookResult {
     if (output.async === true) {
       continue;
     }
-    applyContext(agg, output);
-    applyInjectedMessages(agg, output);
-    applyStopFlag(agg, output);
-    applyDecision(agg, output);
-    applyUpdatedInput(agg, output);
-    applyUpdatedOutput(agg, output);
-    applyAllowedDecisions(agg, output);
+    const targets = isOnceMatcher
+      ? [aggregated, onceContribution]
+      : [aggregated];
+    if (isOnceMatcher) {
+      hasOnceContribution = true;
+    }
+    for (const target of targets) {
+      applyContext(target, output);
+      applyInjectedMessages(target, output);
+      applyStopFlag(target, output);
+      applyDecision(target, output);
+      applyUpdatedInput(target, output);
+      applyUpdatedOutput(target, output);
+      applyAllowedDecisions(target, output);
+    }
   }
-  return agg;
+  return {
+    aggregated,
+    ...(hasOnceContribution
+      ? { onceReplayContribution: onceContribution }
+      : {}),
+  };
 }
 
 /**
@@ -396,14 +481,21 @@ export async function executeHooks(
     input,
     sessionId,
     matchQuery,
+    onceReplayKey,
+    onceReplaySessionId,
     signal,
     timeoutMs = DEFAULT_HOOK_TIMEOUT_MS,
     logger,
   } = opts;
   const event = input.hook_event_name;
+  const replaySessionId = onceReplaySessionId ?? sessionId;
+  const pendingApproval =
+    event === 'PreToolUse' && replaySessionId != null && onceReplayKey != null
+      ? registry.getPendingToolApproval(replaySessionId, onceReplayKey)
+      : undefined;
   const matchers = registry.getMatchers(event, sessionId);
   if (matchers.length === 0) {
-    return freshResult();
+    return pendingApproval ?? freshResult();
   }
 
   // --- SYNC CRITICAL SECTION: once-matcher removal must complete before any await ---
@@ -424,12 +516,38 @@ export async function executeHooks(
   }
   // --- END SYNC CRITICAL SECTION ---
   if (tasks.length === 0) {
-    return freshResult();
+    return pendingApproval ?? freshResult();
   }
 
   const outcomes = (await Promise.all(tasks)).flat();
   reportErrors(outcomes, event, logger);
-  const aggregated = fold(outcomes);
+  const { aggregated: liveResult, onceReplayContribution } = fold(outcomes);
+  const aggregated = combineAggregatedResults(pendingApproval, liveResult);
+  if (
+    event === 'PreToolUse' &&
+    aggregated.decision === 'ask' &&
+    onceReplayContribution != null &&
+    replaySessionId != null &&
+    onceReplayKey != null
+  ) {
+    registry.setPendingToolApproval(
+      replaySessionId,
+      onceReplayKey,
+      createPendingApprovalReplay(
+        aggregated,
+        pendingApproval,
+        onceReplayContribution
+      )
+    );
+  } else if (
+    event === 'PreToolUse' &&
+    aggregated.decision !== 'ask' &&
+    pendingApproval != null &&
+    replaySessionId != null &&
+    onceReplayKey != null
+  ) {
+    registry.clearPendingToolApproval(replaySessionId, onceReplayKey);
+  }
   /**
    * Centralized `preventContinuation` propagation: when any hook (across
    * any callsite — RunStart, PreToolUse, PostToolBatch, SubagentStop,

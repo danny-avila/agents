@@ -1,7 +1,6 @@
 // src/tools/ProgrammaticToolCalling.ts
 import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
-import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ProgrammaticToolCallingJsonSchema } from './ptcTimeout';
@@ -24,6 +23,7 @@ import {
   createCodeApiRunTimeoutSchema,
   resolveCodeApiRunTimeoutMs,
 } from './ptcTimeout';
+import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
@@ -438,8 +438,9 @@ export async function fetchSessionFiles(
       },
     };
 
-    if (proxy != null && proxy !== '') {
-      fetchOptions.agent = new HttpsProxyAgent(proxy);
+    const proxyAgent = resolveFetchProxyAgent(filesEndpoint, proxy);
+    if (proxyAgent) {
+      fetchOptions.agent = proxyAgent;
     }
 
     const response = await fetch(filesEndpoint, fetchOptions);
@@ -491,8 +492,9 @@ export async function makeRequest(
       body: JSON.stringify(body),
     };
 
-    if (proxy != null && proxy !== '') {
-      fetchOptions.agent = new HttpsProxyAgent(proxy);
+    const proxyAgent = resolveFetchProxyAgent(endpoint, proxy);
+    if (proxyAgent) {
+      fetchOptions.agent = proxyAgent;
     }
 
     const response = await fetch(endpoint, fetchOptions);

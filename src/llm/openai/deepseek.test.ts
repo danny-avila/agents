@@ -557,6 +557,62 @@ describe('ChatDeepSeek', () => {
     expect(textChunks).toEqual(['alpha ', 'beta ', 'gamma']);
   });
 
+  it('does not delay tool-call and finish chunks between paced text', async () => {
+    const toolCallChunk: OpenAIChatCompletionChunk = {
+      id: 'chatcmpl-deepseek-test',
+      object: 'chat.completion.chunk',
+      created: 0,
+      model: 'deepseek-v4-pro',
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: 'assistant',
+            tool_calls: [
+              {
+                index: 0,
+                id: 'call_1',
+                type: 'function',
+                function: { name: 'lookup', arguments: '{}' },
+              },
+            ],
+          },
+          finish_reason: null,
+          logprobs: null,
+        },
+      ],
+    };
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        _lc_stream_delay: 150,
+      },
+      [createContentChunk('alpha beta'), toolCallChunk]
+    );
+    const arrivals: { text: string; hasToolCall: boolean; at: number }[] = [];
+
+    for await (const chunk of model.streamChunksWithSignal(
+      new AbortController().signal
+    )) {
+      const message = chunk.message as Partial<AIMessage>;
+      arrivals.push({
+        text: chunk.text,
+        hasToolCall: (message.tool_calls?.length ?? 0) > 0,
+        at: Date.now(),
+      });
+    }
+
+    const toolArrival = arrivals.find((entry) => entry.hasToolCall);
+    const lastText = [...arrivals].reverse().find((entry) => entry.text !== '');
+    expect(toolArrival).toBeDefined();
+    expect(lastText).toBeDefined();
+    expect(
+      (toolArrival as { at: number }).at - (lastText as { at: number }).at
+    ).toBeLessThan(100);
+  });
+
   it('keeps delayed DeepSeek logprob chunks intact', async () => {
     const logprobs = { content: [], refusal: null } as NonNullable<
       OpenAIChatCompletionChunk['choices'][number]['logprobs']

@@ -28,7 +28,13 @@ export type BaseGraphConfig = {
 };
 export type LegacyGraphConfig = BaseGraphConfig & {
   type?: 'standard';
-} & Omit<g.StandardGraphInput, 'provider' | 'clientOptions' | 'agents'> &
+} & Omit<
+    g.StandardGraphInput,
+    /** `streamLimits` is excluded because legacy graphs receive limits only
+     * via the top-level `RunConfig.streamLimits`; accepting the field here
+     * would type-check but be silently ignored by `createLegacyGraph`. */
+    'provider' | 'clientOptions' | 'agents' | 'streamLimits'
+  > &
   Omit<g.AgentInputs, 'provider' | 'clientOptions' | 'agentId'>;
 
 /* Supervised graph (opt-in) */
@@ -174,6 +180,41 @@ export type PreemptStats = {
   emptyBoundaries: number;
 };
 
+/**
+ * Circuit breakers for pathological model streams. A malformed generation
+ * can stream a single tool call's arguments for many minutes while they
+ * never become executable (observed live: one 149,923-char SQL argument
+ * streamed for 26 minutes before the 64k output-token ceiling ended the
+ * run). When a limit trips, the run aborts with a `StreamLimitExceededError`
+ * and the in-flight provider request is torn down mid-stream.
+ */
+export interface StreamLimits {
+  /**
+   * Max cumulative UTF-8 bytes a single streamed tool call's arguments may
+   * reach before the run is aborted. Defaults to
+   * `DEFAULT_MAX_TOOL_CALL_ARG_BYTES` (64 KiB); `0` disables the guard.
+   */
+  maxToolCallArgBytes?: number;
+  /**
+   * Per-tool overrides for `maxToolCallArgBytes`, keyed by the model-facing
+   * tool name. A matching entry replaces the global cap for that tool's
+   * calls (`0` disables the guard for that tool only). Tools that
+   * legitimately stream whole documents as arguments (e.g. file creation)
+   * can run with a higher cap without loosening every other tool's guard.
+   * Calls whose tool name has not yet arrived on the stream use the global
+   * cap; providers send the name in the first chunk, so this only matters
+   * for malformed streams.
+   */
+  maxToolCallArgBytesByTool?: Record<string, number>;
+  /**
+   * Max streamed chunk events a single model generation (turn) may emit
+   * before the run is aborted. Defense in depth against looping or
+   * duplicated provider streams that a byte limit cannot see (e.g. endless
+   * empty chunks). Disabled by default; `0` also disables.
+   */
+  maxDeltaEventsPerTurn?: number;
+}
+
 export type RunConfig = {
   runId: string;
   graphConfig: LegacyGraphConfig | StandardGraphConfig | MultiAgentGraphConfig;
@@ -213,6 +254,13 @@ export type RunConfig = {
    * tool boundary.
    */
   preemption?: StreamPreemption;
+  /**
+   * Circuit breakers for pathological model streams (runaway tool-call
+   * argument generation, looping delta streams). Omit for defaults: the
+   * tool-call argument byte cap is ON by default, the per-turn event cap is
+   * opt-in. See {@link StreamLimits}.
+   */
+  streamLimits?: StreamLimits;
   returnContent?: boolean;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;

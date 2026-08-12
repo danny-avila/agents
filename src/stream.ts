@@ -3,8 +3,19 @@ import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { ChatOpenAIReasoningSummary } from '@langchain/openai';
 import type { AIMessageChunk } from '@langchain/core/messages';
 import type { AgentContext } from '@/agents/AgentContext';
+import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
+import {
+  claimStreamLimitCharge,
+  combineCompleteToolCalls,
+  enforceCompleteToolCallArgLimit,
+  enforceStreamedToolCallArgLimit,
+  enforceStreamDeltaEventLimit,
+  requiresStreamLimitAccounting,
+  StreamLimitExceededError,
+  STREAM_LIMIT_EPOCH_KEY,
+} from '@/llm/streamLimits';
 import {
   getStreamedToolCallSeal,
   getStreamedToolCallAdapter,
@@ -21,6 +32,10 @@ import {
   CODE_EXECUTION_TOOLS,
   LOCAL_CODING_BUNDLE_NAMES,
 } from '@/common';
+import {
+  getMessageCreationContentMetadata,
+  splitAssistantTextContentByPhase,
+} from '@/messages/assistantPhase';
 import {
   buildToolExecutionRequestPlan,
   coerceRecordArgs,
@@ -42,6 +57,7 @@ import {
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent } from '@/utils/events';
+import { composeAbortSignals } from '@/utils/misc';
 import { isGoogleLike } from '@/utils/llm';
 import { getMessageId } from '@/messages';
 
@@ -166,7 +182,10 @@ function isEagerExecutionExcludedTool(
   // the final request ("changed after eager execution started"), stop
   // prestarting it so the model's retry executes normally instead of
   // re-diverging in a loop (LibreChat#14371).
-  if (graph.eagerEventToolSuppressions?.has(name) === true) {
+  if (
+    (graph.eagerEventToolSuppressions as Set<string> | undefined)?.has(name) ===
+    true
+  ) {
     return true;
   }
   // A code-session participant writes to the shared sandbox, so it is
@@ -506,10 +525,14 @@ function shouldStartFreshMessageStepAfterGoogleServerSideTool({
 async function dispatchMessageCreationStep({
   graph,
   stepKey,
+  content,
+  contentType,
   metadata,
 }: {
   graph: StandardGraph;
   stepKey: string;
+  content?: string | t.MessageContentComplex[];
+  contentType?: ContentTypes.TEXT | ContentTypes.THINK;
   metadata?: Record<string, unknown>;
 }): Promise<string> {
   const messageId = getMessageId(stepKey, graph, true) ?? '';
@@ -519,6 +542,7 @@ async function dispatchMessageCreationStep({
       type: StepTypes.MESSAGE_CREATION,
       message_creation: {
         message_id: messageId,
+        ...getMessageCreationContentMetadata(content, contentType),
       },
     },
     metadata
@@ -540,6 +564,7 @@ async function dispatchMessageContentParts({
     const currentStepId = await dispatchMessageCreationStep({
       graph,
       stepKey,
+      content: [contentPart],
       metadata,
     });
     if (isGoogleServerSideToolContentPart(contentPart)) {
@@ -572,6 +597,8 @@ async function dispatchReasoningContentParts({
   const currentStepId = await dispatchMessageCreationStep({
     graph,
     stepKey,
+    content,
+    contentType: ContentTypes.THINK,
     metadata,
   });
   await graph.dispatchReasoningDelta(
@@ -778,6 +805,10 @@ function startEagerToolExecutions(args: {
         | Record<string, unknown>
         | undefined,
       metadata,
+      signal: composeAbortSignals(
+        graph.config?.signal,
+        graph.breakerAbort.signal
+      ),
       resolve: (results): void => {
         resultSettled = true;
         settledResults = results;
@@ -1069,9 +1100,8 @@ function recordEagerToolCallChunks(args: {
     const sealCoversChunk =
       seal != null &&
       (seal.kind === 'all' ||
-        (seal.kind === 'single' &&
-          ((seal.id != null && seal.id === id) ||
-            (seal.index != null && seal.index === index))));
+        (seal.id != null && seal.id === id) ||
+        (seal.index != null && seal.index === index));
     const next = {
       id,
       name,
@@ -1512,9 +1542,118 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
 
-    const agentContext = graph.getAgentContext(metadata);
-
     const chunk = data.chunk as Partial<AIMessageChunk>;
+
+    /** Attempts stamp their breaker epoch into event metadata; a mismatch
+     * marks a straggling chunk from a failed run that outlived
+     * `resetValues()`. Dropped OUTRIGHT: content handling and the eager
+     * paths below compose the LIVE controller, so acting on a dead run's
+     * chunk could dispatch host tools into the run now using it. Events
+     * without a stamp (direct handler callers, partial stubs) keep the
+     * live-controller behavior. */
+    const eventEpoch = metadata?.[STREAM_LIMIT_EPOCH_KEY];
+    /** Runtime-honest widening: partial handler stubs carry neither an
+     * epoch nor a run scope despite the field types. */
+    const liveEpoch = graph.breakerEpoch as number | undefined;
+    if (eventEpoch != null && liveEpoch != null && eventEpoch !== liveEpoch) {
+      return;
+    }
+    const eventBreaker =
+      graph.breakerAbort instanceof AbortController
+        ? graph.breakerAbort
+        : undefined;
+    /** Immutable scope captured at handler entry. A reset while this
+     * handler is suspended in an await replaces the object, so ONE
+     * reference comparison proves the event still belongs to the live run
+     * before anything composes `graph.breakerAbort` or `graph.config`. */
+    const entryRunScope = graph.runScope as RunBreakerScope | undefined;
+    const runScopeInvalidated = (): boolean =>
+      entryRunScope != null && graph.runScope !== entryRunScope;
+    const throwIfRunBreakerTripped = (): void => {
+      if (
+        eventBreaker != null &&
+        eventBreaker.signal.aborted &&
+        eventBreaker.signal.reason instanceof StreamLimitExceededError
+      ) {
+        throw eventBreaker.signal.reason;
+      }
+    };
+
+    /**
+     * Enforced before every content-specific early return below
+     * (server-tool results, deferred mixed reasoning, late OpenRouter
+     * reasoning): a looping provider can flood through any of those paths,
+     * a coalesced event can carry client `tool_call_chunks` alongside a
+     * server-tool result, and the complete-call dispatch branch further
+     * down can prestart a side-effecting tool from an arrival-sealed
+     * oversized call. Charging is claim-based: the producer loop and this
+     * decoupled echo can observe the same chunk object in either order, and
+     * only the first claimer charges it. The argument guard is
+     * deliberately NOT gated on numeric chunk indices, so id-only or
+     * index-less runaway streams stay bounded, and complete parsed
+     * `tool_calls` without a raw chunk representation are judged standalone.
+     */
+    if (
+      requiresStreamLimitAccounting(graph, chunk) &&
+      claimStreamLimitCharge(graph, data.chunk, 'consumer', metadata)
+    ) {
+      try {
+        enforceStreamDeltaEventLimit({ graph, metadata });
+        /** Combined first so raw-chunk name correlation sees invalid calls
+         * too; an unnamed raw chunk twinned with a named invalid call must
+         * select that tool's override, not the global cap. */
+        const completeCalls = combineCompleteToolCalls(chunk);
+        if (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) {
+          enforceStreamedToolCallArgLimit({
+            graph,
+            metadata,
+            toolCallChunks: chunk.tool_call_chunks,
+            responseMetadata: chunk.response_metadata as
+              | Record<string, unknown>
+              | undefined,
+            parsedToolCalls: completeCalls,
+          });
+        }
+        /** Judged whenever parsed calls are present, not only when raw
+         * chunks are absent — an adapter can pair an empty or partial raw
+         * chunk with a complete parsed call; the standalone check is
+         * stateless, so the common both-present case is not double-tallied.
+         * Invalid calls are included because ToolNode processes and
+         * promotes them. */
+        if (completeCalls != null) {
+          enforceCompleteToolCallArgLimit({
+            graph,
+            metadata,
+            toolCalls: completeCalls,
+          });
+        }
+      } catch (error) {
+        /** A breach detected on this consumer path must still stop parallel
+         * fan-out work: the producer skips its own enforcement once this
+         * side has claimed the emission, so createCallModel's breaker-abort
+         * never fires for it. Trip the EVENT's run-bound breaker before the
+         * throw rejects the run — never the live controller of a newer run. */
+        if (error instanceof StreamLimitExceededError && eventBreaker != null) {
+          eventBreaker.abort(error);
+        }
+        throw error;
+      }
+    }
+
+    /** A parallel producer can trip the shared breaker while this event was
+     * already queued in `streamEvents`. Stop before content handling or the
+     * eager-tool paths below — those can dispatch a side-effecting host
+     * tool with an already-aborted signal the handler never inspects.
+     * Rechecked again immediately before each eager dispatch: the awaits in
+     * between (server-tool results, tool-call handling, content dispatch)
+     * are windows for a sibling's trip — or for a full reset, after which
+     * this event belongs to a dead run and is dropped. */
+    if (runScopeInvalidated()) {
+      return;
+    }
+    throwIfRunBreakerTripped();
+
+    const agentContext = graph.getAgentContext(metadata);
 
     const content = getChunkContent({
       chunk,
@@ -1576,6 +1715,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
     ) {
       hasToolCalls = true;
       await handleToolCalls(chunk.tool_calls, metadata, graph);
+      if (runScopeInvalidated()) {
+        return;
+      }
+      throwIfRunBreakerTripped();
       if (hasFinalToolCallSignal(chunk)) {
         startEagerToolExecutions({
           graph,
@@ -1655,6 +1798,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
         metadata,
       });
       if (canStreamEager) {
+        if (runScopeInvalidated()) {
+          return;
+        }
+        throwIfRunBreakerTripped();
         startReadyStreamedEagerToolExecutions({
           graph,
           metadata,
@@ -1676,14 +1823,53 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
 
+    if (Array.isArray(content) && content.every(isTextContentPart)) {
+      const contentGroups = splitAssistantTextContentByPhase(content);
+      const currentStepId = graph.stepKeyIds?.get(stepKey)?.at(-1);
+      const currentStep =
+        currentStepId == null ? undefined : graph.getRunStep(currentStepId);
+      const currentPhase =
+        currentStep?.stepDetails.type === StepTypes.MESSAGE_CREATION
+          ? currentStep.stepDetails.message_creation.phase
+          : undefined;
+      const nextPhase = getMessageCreationContentMetadata(
+        contentGroups[0]
+      ).phase;
+      const phaseChanged =
+        currentPhase != null &&
+        nextPhase != null &&
+        currentPhase !== nextPhase;
+      if (contentGroups.length > 1 || phaseChanged) {
+        for (const contentGroup of contentGroups) {
+          const currentStepId = await dispatchMessageCreationStep({
+            graph,
+            stepKey,
+            content: contentGroup,
+            metadata,
+          });
+          await graph.dispatchMessageDelta(
+            currentStepId,
+            { content: contentGroup },
+            metadata
+          );
+        }
+        return;
+      }
+    }
+
     const message_id = getMessageId(stepKey, graph) ?? '';
     if (message_id) {
+      const fallbackContentType =
+        agentContext.currentTokenType === ContentTypes.TEXT
+          ? ContentTypes.TEXT
+          : ContentTypes.THINK;
       await graph.dispatchRunStep(
         stepKey,
         {
           type: StepTypes.MESSAGE_CREATION,
           message_creation: {
             message_id,
+            ...getMessageCreationContentMetadata(content, fallbackContentType),
           },
         },
         metadata
@@ -1700,7 +1886,12 @@ export class ChatModelStreamHandler implements t.EventHandler {
         content,
       })
     ) {
-      stepId = await dispatchMessageCreationStep({ graph, stepKey, metadata });
+      stepId = await dispatchMessageCreationStep({
+        graph,
+        stepKey,
+        content,
+        metadata,
+      });
       runStep = graph.getRunStep(stepId);
     }
     if (!runStep) {
@@ -1771,6 +1962,7 @@ hasToolCallChunks: ${hasToolCallChunks}
               type: StepTypes.MESSAGE_CREATION,
               message_creation: {
                 message_id,
+                content_type: ContentTypes.TEXT,
               },
             },
             metadata

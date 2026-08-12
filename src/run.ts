@@ -4,21 +4,38 @@ import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import {
   Command,
   INTERRUPT,
   MemorySaver,
   isInterrupted,
 } from '@langchain/langgraph';
-import type {
-  MessageContentComplex,
+import {
+  AIMessage,
   BaseMessage,
+  HumanMessage,
+  SystemMessage,
 } from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
+import type { MessageContentComplex } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
+import type { StandardGraph } from '@/graphs/Graph';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
+import {
+  requireValidSubagentResumeManifest,
+  stripSubagentResumeManifest,
+  SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
+  SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
+} from '@/tools/subagent/SubagentReplay';
+import {
+  ACTIVITY_PHASE_LABEL_PROMPT,
+  ACTIVITY_LABEL_PROMPT,
+  buildActivityLabelPrompt,
+  buildActivityPhaseLabelPrompt,
+  normalizeActivityPhaseLabel,
+} from '@/prompts/activityLabel';
 import {
   createLangfuseTraceMetadata,
   createLangfuseHandler,
@@ -37,10 +54,6 @@ import {
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
 import {
-  ACTIVITY_LABEL_PROMPT,
-  buildActivityLabelPrompt,
-} from '@/prompts/activityLabel';
-import {
   Callback,
   GraphEvents,
   TitleMethod,
@@ -48,6 +61,7 @@ import {
 } from '@/common';
 import {
   appendCallbacks,
+  filterCallbacks,
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
@@ -55,12 +69,12 @@ import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
+import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { initializeLangfuseTracing } from './instrumentation';
-import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
+import { createGraph } from '@/graphs/createGraph';
 import { resolveMaxSeals } from '@/llm/preempt';
-import { StandardGraph } from '@/graphs/Graph';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { isOpenAILike } from '@/utils/llm';
@@ -121,18 +135,82 @@ function isLangGraphResumeMapForInterrupt(
   return Object.prototype.hasOwnProperty.call(value, interruptId);
 }
 
+function getInterruptHookSessionId(payload: unknown): string | undefined {
+  const publicPayload = stripSubagentResumeManifest(payload);
+  if (
+    publicPayload == null ||
+    typeof publicPayload !== 'object' ||
+    (publicPayload as { type?: unknown }).type !== 'tool_approval'
+  ) {
+    return undefined;
+  }
+  const sessionId = (publicPayload as { hook_session_id?: unknown })
+    .hook_session_id;
+  return typeof sessionId === 'string' && sessionId.length > 0
+    ? sessionId
+    : undefined;
+}
+
 type InterruptStateSnapshot = {
   config?: RunnableConfig;
+  values?: { messages?: BaseMessage[] };
   tasks?: Array<{
-    interrupts?: Array<{ id?: string }>;
+    interrupts?: Array<{ id?: string; value?: unknown }>;
   }>;
 };
 
 type WorkflowWithStateHistory = {
+  getState?(config: RunnableConfig): Promise<InterruptStateSnapshot>;
   getStateHistory?(
     config: RunnableConfig
   ): AsyncIterableIterator<InterruptStateSnapshot>;
 };
+
+function getFirstPersistedInterrupt(
+  snapshot: InterruptStateSnapshot
+): { id: string; value: unknown } | undefined {
+  for (const task of snapshot.tasks ?? []) {
+    for (const pendingInterrupt of task.interrupts ?? []) {
+      if (
+        typeof pendingInterrupt.id === 'string' &&
+        pendingInterrupt.id.length > 0
+      ) {
+        return { id: pendingInterrupt.id, value: pendingInterrupt.value };
+      }
+    }
+  }
+  return undefined;
+}
+
+function getPersistedMessages(
+  snapshot: InterruptStateSnapshot
+): BaseMessage[] | undefined {
+  const messages = snapshot.values?.messages;
+  if (!Array.isArray(messages) || !messages.every(BaseMessage.isInstance)) {
+    return undefined;
+  }
+  return messages;
+}
+
+type ResumeCommandUpdate = ConstructorParameters<typeof Command>[0]['update'];
+
+function getResumeUpdateMessages(
+  update: ResumeCommandUpdate
+): BaseMessage[] | undefined {
+  if (update == null) {
+    return undefined;
+  }
+  const messages = Array.isArray(update)
+    ? update.find(([key]) => key === 'messages')?.[1]
+    : update.messages;
+  if (BaseMessage.isInstance(messages)) {
+    return [messages];
+  }
+  if (!Array.isArray(messages) || !messages.every(BaseMessage.isInstance)) {
+    return undefined;
+  }
+  return messages;
+}
 
 export class Run<_T extends t.BaseGraphState> {
   id: string;
@@ -148,6 +226,7 @@ export class Run<_T extends t.BaseGraphState> {
   private toolExecution?: t.ToolExecutionConfig;
   private subagentUsageSink?: t.SubagentUsageSink;
   private preemption?: t.StreamPreemption;
+  private streamLimits?: t.StreamLimits;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
   graphRunnable?: t.CompiledStateWorkflow;
@@ -172,6 +251,10 @@ export class Run<_T extends t.BaseGraphState> {
   private _interrupt: t.RunInterruptResult<unknown> | undefined;
   /** Per-run sequence for batch-unique activity-label trace-seed fallbacks. */
   private activityLabelSeq = 0;
+  /** Per-run sequence for parent activity-phase trace and invocation ids. */
+  private activityPhaseLabelSeq = 0;
+  /** Latest user turn used to keep detached phase roots conversation-shaped. */
+  private activityPhaseTraceInput?: string;
   /** Distinguishes sibling forks started from the same explicit checkpoint. */
   private checkpointForkSeq = 0;
   private _haltedReason: string | undefined;
@@ -210,6 +293,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.toolExecution = config.toolExecution;
     this.subagentUsageSink = config.subagentUsageSink;
     this.preemption = config.preemption;
+    this.streamLimits = config.streamLimits;
 
     if (!config.graphConfig) {
       throw new Error('Graph config not provided');
@@ -225,8 +309,6 @@ export class Run<_T extends t.BaseGraphState> {
       /** Default to legacy graph for 'standard' or undefined type */
       this.graphRunnable = this.createLegacyGraph(config.graphConfig);
       if (this.Graph) {
-        this.Graph.compileOptions =
-          config.graphConfig.compileOptions ?? this.Graph.compileOptions;
         this.Graph.handlerRegistry = handlerRegistry;
       }
     }
@@ -275,29 +357,35 @@ export class Run<_T extends t.BaseGraphState> {
       signal = legacySignal;
     }
 
-    const standardGraph = new StandardGraph({
-      signal,
-      runId: this.id,
-      agents: [agentConfig],
-      langfuse: this.langfuse,
-      tokenCounter: this.tokenCounter,
-      indexTokenCountMap: this.indexTokenCountMap,
-      calibrationRatio: this.calibrationRatio,
-      subagentUsageSink: this.subagentUsageSink,
-      preemption: this.preemption,
+    const standardGraph = createGraph({
+      kind: 'standard',
+      input: {
+        signal,
+        runId: this.id,
+        agents: [agentConfig],
+        langfuse: this.langfuse,
+        tokenCounter: this.tokenCounter,
+        indexTokenCountMap: this.indexTokenCountMap,
+        calibrationRatio: this.calibrationRatio,
+        subagentUsageSink: this.subagentUsageSink,
+        preemption: this.preemption,
+        streamLimits: this.streamLimits,
+      },
     });
     /** Propagate compile options from graph config */
     standardGraph.compileOptions = this.applyHITLCheckpointerFallback(
       config.compileOptions
     );
     this.hasCheckpointer = standardGraph.compileOptions?.checkpointer != null;
-    standardGraph.hookRegistry = this.hookRegistry;
-    standardGraph.humanInTheLoop = this.humanInTheLoop;
-    standardGraph.toolOutputReferences = this.toolOutputReferences;
-    standardGraph.eagerEventToolExecution = this.eagerEventToolExecution;
-    standardGraph.codeSessionToolNames = this.codeSessionToolNames;
-    standardGraph.interruptingToolNames = this.interruptingToolNames;
-    standardGraph.toolExecution = this.toolExecution;
+    applyGraphRuntimeConfig(standardGraph, {
+      hookRegistry: this.hookRegistry,
+      humanInTheLoop: this.humanInTheLoop,
+      toolOutputReferences: this.toolOutputReferences,
+      eagerEventToolExecution: this.eagerEventToolExecution,
+      codeSessionToolNames: this.codeSessionToolNames,
+      interruptingToolNames: this.interruptingToolNames,
+      toolExecution: this.toolExecution,
+    });
     this.Graph = standardGraph;
     return standardGraph.createWorkflow();
   }
@@ -307,29 +395,35 @@ export class Run<_T extends t.BaseGraphState> {
   ): t.CompiledStateWorkflow {
     const { agents, edges, compileOptions } = config;
 
-    const multiAgentGraph = new MultiAgentGraph({
-      runId: this.id,
-      agents,
-      edges,
-      langfuse: this.langfuse,
-      tokenCounter: this.tokenCounter,
-      indexTokenCountMap: this.indexTokenCountMap,
-      calibrationRatio: this.calibrationRatio,
-      subagentUsageSink: this.subagentUsageSink,
-      preemption: this.preemption,
+    const multiAgentGraph = createGraph({
+      kind: 'multi-agent',
+      input: {
+        runId: this.id,
+        agents,
+        edges,
+        langfuse: this.langfuse,
+        tokenCounter: this.tokenCounter,
+        indexTokenCountMap: this.indexTokenCountMap,
+        calibrationRatio: this.calibrationRatio,
+        subagentUsageSink: this.subagentUsageSink,
+        preemption: this.preemption,
+        streamLimits: this.streamLimits,
+      },
     });
 
     multiAgentGraph.compileOptions =
       this.applyHITLCheckpointerFallback(compileOptions);
     this.hasCheckpointer = multiAgentGraph.compileOptions?.checkpointer != null;
 
-    multiAgentGraph.hookRegistry = this.hookRegistry;
-    multiAgentGraph.humanInTheLoop = this.humanInTheLoop;
-    multiAgentGraph.toolOutputReferences = this.toolOutputReferences;
-    multiAgentGraph.eagerEventToolExecution = this.eagerEventToolExecution;
-    multiAgentGraph.codeSessionToolNames = this.codeSessionToolNames;
-    multiAgentGraph.interruptingToolNames = this.interruptingToolNames;
-    multiAgentGraph.toolExecution = this.toolExecution;
+    applyGraphRuntimeConfig(multiAgentGraph, {
+      hookRegistry: this.hookRegistry,
+      humanInTheLoop: this.humanInTheLoop,
+      toolOutputReferences: this.toolOutputReferences,
+      eagerEventToolExecution: this.eagerEventToolExecution,
+      codeSessionToolNames: this.codeSessionToolNames,
+      interruptingToolNames: this.interruptingToolNames,
+      toolExecution: this.toolExecution,
+    });
     this.Graph = multiAgentGraph;
     return multiAgentGraph.createWorkflow();
   }
@@ -538,6 +632,10 @@ export class Run<_T extends t.BaseGraphState> {
     return this.Graph.getRunMessages();
   }
 
+  getChildCheckpointThreadIds(): string[] {
+    return this.Graph?.getChildCheckpointThreadIds() ?? [];
+  }
+
   /**
    * Returns a defensive snapshot of tools discovered by the current run.
    * Pass an agent id for that context, or omit it for the ordered union across
@@ -737,6 +835,11 @@ export class Run<_T extends t.BaseGraphState> {
      */
     const isResume = inputs instanceof Command;
     const stateInputs = isResume ? undefined : (inputs as t.IState);
+    if (stateInputs != null) {
+      this.activityPhaseTraceInput = findActivityPhaseTraceInput(
+        stateInputs.messages
+      );
+    }
 
     /**
      * Every honored seal costs one extra superstep, so a preemption-enabled
@@ -755,6 +858,10 @@ export class Run<_T extends t.BaseGraphState> {
       recursionLimit,
       configurable: { ...callerConfig.configurable },
     };
+    if (!isResume) {
+      delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
+      delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+    }
 
     /**
      * Cancellation can arrive either at graph construction or per-call through
@@ -1244,7 +1351,13 @@ export class Run<_T extends t.BaseGraphState> {
   getInterrupt<TPayload = t.HumanInterruptPayload>():
     | t.RunInterruptResult<TPayload>
     | undefined {
-    return this._interrupt as t.RunInterruptResult<TPayload> | undefined;
+    if (this._interrupt == null) {
+      return undefined;
+    }
+    return {
+      ...this._interrupt,
+      payload: stripSubagentResumeManifest(this._interrupt.payload),
+    } as t.RunInterruptResult<TPayload>;
   }
 
   /**
@@ -1327,6 +1440,10 @@ export class Run<_T extends t.BaseGraphState> {
       'update' | 'goto'
     >
   ): Promise<MessageContentComplex[] | undefined> {
+    const resumeConfig = await this.resolveInterruptResumeConfig(
+      callerConfig,
+      commandOptions?.update
+    );
     const interruptId = this._interrupt?.interruptId;
     const scopedResume =
       typeof interruptId === 'string' &&
@@ -1334,7 +1451,6 @@ export class Run<_T extends t.BaseGraphState> {
       !isLangGraphResumeMapForInterrupt(resumeValue, interruptId)
         ? { [interruptId]: resumeValue }
         : resumeValue;
-    const resumeConfig = await this.resolveInterruptResumeConfig(callerConfig);
     // langgraph 1.4.5 applies resume + state update + reroute in one superstep
     // (single checkpoint). `update`/`goto` are omitted unless the caller sets them.
     return this.processStream(
@@ -1353,9 +1469,29 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   private async resolveInterruptResumeConfig(
-    callerConfig: t.RunStreamConfig
+    callerConfig: t.RunStreamConfig,
+    resumeUpdate?: ResumeCommandUpdate
   ): Promise<t.RunStreamConfig> {
+    await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
     const interrupt = this._interrupt;
+    const resumeManifest = requireValidSubagentResumeManifest(
+      interrupt?.payload
+    );
+    const resumeConfigurable = { ...callerConfig.configurable };
+    delete resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
+    delete resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+    resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY] = nanoid();
+    if (resumeManifest != null) {
+      resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] = resumeManifest;
+    }
+    const manifestConfig = {
+      ...callerConfig,
+      configurable: resumeConfigurable,
+    };
+    const hookSessionId = getInterruptHookSessionId(interrupt?.payload);
+    if (hookSessionId != null) {
+      this.hookRegistry?.copySession(hookSessionId, this.id);
+    }
     const interruptId = interrupt?.interruptId;
     const workflow = this.graphRunnable as
       | (t.CompiledStateWorkflow & WorkflowWithStateHistory)
@@ -1363,9 +1499,9 @@ export class Run<_T extends t.BaseGraphState> {
     const stateHistory = workflow?.getStateHistory;
     if (interrupt?.checkpointId != null && interrupt.checkpointId.length > 0) {
       return {
-        ...callerConfig,
+        ...manifestConfig,
         configurable: {
-          ...callerConfig.configurable,
+          ...manifestConfig.configurable,
           checkpoint_id: interrupt.checkpointId,
           ...(typeof interrupt.checkpointNs === 'string'
             ? { checkpoint_ns: interrupt.checkpointNs }
@@ -1379,12 +1515,12 @@ export class Run<_T extends t.BaseGraphState> {
       interruptId.length === 0 ||
       typeof stateHistory !== 'function'
     ) {
-      return callerConfig;
+      return manifestConfig;
     }
 
     for await (const snapshot of stateHistory.call(
       this.graphRunnable,
-      callerConfig as RunnableConfig
+      manifestConfig as RunnableConfig
     )) {
       const hasMatchingInterrupt =
         snapshot.tasks?.some(
@@ -1407,9 +1543,9 @@ export class Run<_T extends t.BaseGraphState> {
           ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
         };
         return {
-          ...callerConfig,
+          ...manifestConfig,
           configurable: {
-            ...callerConfig.configurable,
+            ...manifestConfig.configurable,
             checkpoint_id: checkpointId,
             ...(typeof checkpointNs === 'string'
               ? { checkpoint_ns: checkpointNs }
@@ -1419,7 +1555,50 @@ export class Run<_T extends t.BaseGraphState> {
       }
     }
 
-    return callerConfig;
+    return manifestConfig;
+  }
+
+  private async restoreInterruptFromCheckpoint(
+    callerConfig: t.RunStreamConfig,
+    resumeUpdate?: ResumeCommandUpdate
+  ): Promise<void> {
+    if (this._interrupt != null || this.humanInTheLoop?.enabled !== true) {
+      return;
+    }
+    const workflow = this.graphRunnable as
+      | (t.CompiledStateWorkflow & WorkflowWithStateHistory)
+      | undefined;
+    if (typeof workflow?.getState !== 'function') {
+      return;
+    }
+
+    const snapshot = await workflow.getState(callerConfig as RunnableConfig);
+    const persistedInterrupt = getFirstPersistedInterrupt(snapshot);
+    if (persistedInterrupt == null) {
+      return;
+    }
+    const persistedMessages = getPersistedMessages(snapshot);
+    if (persistedMessages != null) {
+      const resumeMessages = getResumeUpdateMessages(resumeUpdate);
+      this.Graph?.restoreCheckpointMessages(persistedMessages, resumeMessages);
+      this.activityPhaseTraceInput = findActivityPhaseTraceInput(
+        resumeMessages == null
+          ? persistedMessages
+          : [...persistedMessages, ...resumeMessages]
+      );
+    }
+
+    const checkpointConfigurable = snapshot.config?.configurable;
+    const checkpointId = checkpointConfigurable?.checkpoint_id;
+    const checkpointNs = checkpointConfigurable?.checkpoint_ns;
+    const threadId = callerConfig.configurable?.thread_id;
+    this._interrupt = {
+      interruptId: persistedInterrupt.id,
+      payload: persistedInterrupt.value,
+      ...(typeof threadId === 'string' ? { threadId } : {}),
+      ...(typeof checkpointId === 'string' ? { checkpointId } : {}),
+      ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
+    };
   }
 
   private createSystemCallback<K extends keyof t.ClientCallbacks>(
@@ -1653,6 +1832,7 @@ export class Run<_T extends t.BaseGraphState> {
     entries,
     thinkingExcerpts,
     lastAssistantText,
+    lastAssistantPhase,
     previousLabels,
     prompt,
     charLimit = 600,
@@ -1826,7 +2006,8 @@ export class Run<_T extends t.BaseGraphState> {
       entries,
       charLimit,
       thinkingExcerpts,
-      lastAssistantText,
+      lastAssistantText:
+        lastAssistantPhase === 'final_answer' ? undefined : lastAssistantText,
       previousLabels,
       redaction,
     });
@@ -1923,9 +2104,12 @@ export class Run<_T extends t.BaseGraphState> {
           invokeConfig.callbacks,
           isLangfuseCallbackHandler
         );
-        const { callbacks: _cb, ...rest } = invokeConfig;
+        const { callbacks, ...rest } = invokeConfig;
         const safeConfig = Object.assign({}, rest, {
-          callbacks: langfuseHandler ? [langfuseHandler] : [],
+          callbacks: filterCallbacks(
+            callbacks,
+            (callback) => callback === langfuseHandler
+          ),
         });
         response = await withLangfuseRuntimeScope(labelRuntimeScope, () =>
           invokeLabel(safeConfig as Partial<RunnableConfig>)
@@ -1935,6 +2119,347 @@ export class Run<_T extends t.BaseGraphState> {
       return label.length > 0 ? { label } : {};
     } finally {
       await disposeLangfuseHandler(labelLangfuseHandler);
+    }
+  }
+
+  /**
+   * Generates one parent summary for two or more logical activities. The
+   * summary model is traced as a dedicated activity-phase agent root in the
+   * conversation session, with the model callback recorded as its generation
+   * child. No session id means no phase trace, avoiding orphan observations.
+   */
+  async generateActivityPhaseLabel({
+    provider,
+    clientOptions,
+    activities,
+    totalActivityCount,
+    assistantContext,
+    closingTextPhase,
+    prompt,
+    charLimit = 600,
+    chainOptions,
+    traceSeed,
+    sourceRunId,
+    sourceTraceId,
+    responseId,
+    phaseIndex,
+    status = 'completed',
+    agentIds,
+  }: t.RunActivityPhaseLabelOptions): Promise<{ label?: string }> {
+    if (activities.length < 2) {
+      return {};
+    }
+
+    const phaseSeq = ++this.activityPhaseLabelSeq;
+    const hasUnattributedActivity = activities.some(
+      (activity) => activity.agentId == null
+    );
+    const hasOmittedActivitiesWithoutAgentIds =
+      agentIds == null &&
+      (totalActivityCount ?? activities.length) > activities.length;
+    const contributingAgentIds = [
+      ...new Set([
+        ...(agentIds ?? []),
+        ...activities.flatMap((activity) =>
+          activity.agentId == null ? [] : [activity.agentId]
+        ),
+      ]),
+    ];
+    const agentContexts = this.Graph?.agentContexts;
+    if (
+      contributingAgentIds.some(
+        (agentId) => agentContexts?.get(agentId) == null
+      )
+    ) {
+      return {};
+    }
+    const phaseContext =
+      this.Graph == null
+        ? undefined
+        : this.Graph.agentContexts.get(this.Graph.defaultAgentId);
+    const phaseLangfuseConfig = resolveLangfuseConfig(
+      this.langfuse,
+      phaseContext?.langfuse
+    );
+
+    let redaction = hasToolOutputTracingConfig(
+      this.langfuse,
+      phaseContext?.langfuse
+    )
+      ? resolveToolOutputTracingConfig(this.langfuse, phaseContext?.langfuse)
+      : undefined;
+    const redactionContexts =
+      contributingAgentIds.length > 0 &&
+      !hasUnattributedActivity &&
+      !hasOmittedActivitiesWithoutAgentIds
+        ? contributingAgentIds.flatMap((agentId) => {
+          const context = agentContexts?.get(agentId);
+          return context == null ? [] : [context];
+        })
+        : Array.from(agentContexts?.values() ?? []);
+    for (const context of redactionContexts) {
+      if (!hasToolOutputTracingConfig(this.langfuse, context.langfuse)) {
+        continue;
+      }
+      const candidate = resolveToolOutputTracingConfig(
+        this.langfuse,
+        context.langfuse
+      );
+      if (redaction == null) {
+        redaction = candidate;
+        continue;
+      }
+      redaction = {
+        enabled: redaction.enabled === false ? false : candidate.enabled,
+        redactedToolNames: new Set([
+          ...redaction.redactedToolNames,
+          ...candidate.redactedToolNames,
+        ]),
+        redactedToolNameMatchMode:
+          redaction.redactedToolNameMatchMode === 'partial' ||
+          candidate.redactedToolNameMatchMode === 'partial'
+            ? 'partial'
+            : 'exact',
+        redactionText: redaction.redactionText,
+      };
+    }
+
+    const userPrompt = buildActivityPhaseLabelPrompt({
+      activities,
+      totalActivityCount,
+      charLimit,
+      assistantContext,
+      redaction,
+    });
+    if (userPrompt === '') {
+      return {};
+    }
+    const phaseChainOptions = {
+      ...(chainOptions ?? {}),
+    } as Partial<RunnableConfig> & {
+      configurable?: Record<string, unknown> & {
+        requestBody?: { parentMessageId?: unknown };
+      };
+    };
+    const phaseUserId =
+      typeof phaseChainOptions.configurable?.user_id === 'string'
+        ? phaseChainOptions.configurable.user_id
+        : undefined;
+    const phaseSessionId =
+      typeof phaseChainOptions.configurable?.thread_id === 'string'
+        ? phaseChainOptions.configurable.thread_id
+        : undefined;
+    const resolvedPhaseIndex = phaseIndex ?? phaseSeq - 1;
+    const phaseMessageId =
+      responseId ?? `activity-phase-${this.id}-${resolvedPhaseIndex}`;
+    const phaseAgentId = this.Graph?.defaultAgentId;
+    const phaseAgentName = phaseContext?.name;
+    const phaseParentMessageId =
+      phaseChainOptions.configurable?.requestBody?.parentMessageId;
+    const phaseMetadata: Record<string, unknown> = {
+      sourceRunId: sourceRunId ?? this.id,
+      ...(sourceTraceId == null ? {} : { sourceTraceId }),
+      responseId: phaseMessageId,
+      phaseIndex: resolvedPhaseIndex,
+      activityCount: Math.max(activities.length, totalActivityCount ?? 0),
+      status,
+      contributingAgentIds,
+      ...(typeof phaseParentMessageId === 'string'
+        ? { parentMessageId: phaseParentMessageId }
+        : {}),
+      ...(phaseAgentId == null ? {} : { agentId: phaseAgentId }),
+      ...(phaseAgentName == null ? {} : { agentName: phaseAgentName }),
+      ...(closingTextPhase == null ? {} : { closingTextPhase }),
+    };
+    const traceMetadata = {
+      ...createLangfuseTraceMetadata({
+        messageId: phaseMessageId,
+        parentMessageId: phaseParentMessageId,
+        agentId: phaseAgentId,
+        agentName: phaseAgentName,
+      }),
+      sourceRunId: String(phaseMetadata.sourceRunId),
+      ...(sourceTraceId == null ? {} : { sourceTraceId }),
+      responseId: phaseMessageId,
+      phaseIndex: String(resolvedPhaseIndex),
+      activityCount: String(phaseMetadata.activityCount),
+      status,
+      ...(contributingAgentIds.length === 0
+        ? {}
+        : { contributingAgentIds: contributingAgentIds.join(',') }),
+      ...(closingTextPhase == null ? {} : { closingTextPhase }),
+    };
+    const phaseRunName = getLangfuseTraceName(
+      traceMetadata,
+      'LibreChat Activity Phase'
+    );
+    const phaseTraceName = phaseChainOptions.runName ?? phaseRunName;
+    const phaseTags = [
+      'librechat',
+      'activity-phase',
+      'agent-run-summary',
+      'agent',
+    ];
+    initializeLangfuseTracing(phaseLangfuseConfig);
+
+    const inheritedTraceSeed = getTraceIdSeed();
+    const phaseTraceSeed =
+      phaseLangfuseConfig?.deterministicTraceId === true ||
+      inheritedTraceSeed != null
+        ? (traceSeed ?? `activity-phase-${this.id}-${resolvedPhaseIndex}`)
+        : undefined;
+    const phaseScopeRunId = `activity-phase:${this.id}:${phaseSeq}:${nanoid()}`;
+    const phaseRuntimeScope = resolveLangfuseRuntimeScope({
+      runLangfuse: this.langfuse,
+      langfuseOverlay: phaseContext?.langfuse,
+      traceIdSeed: phaseTraceSeed,
+      runId: phaseScopeRunId,
+    });
+    let phaseLangfuseHandler: CallbackEntry | undefined;
+    const sourceUserText =
+      this.activityPhaseTraceInput ??
+      findActivityPhaseTraceInput(this.Graph?.getRunMessages() ?? []);
+    if (phaseSessionId != null && sourceUserText != null) {
+      phaseLangfuseHandler = createLangfuseHandler({
+        langfuse: phaseLangfuseConfig,
+        userId: phaseUserId,
+        sessionId: phaseSessionId,
+        traceMetadata,
+        tags: phaseTags,
+        traceIdSeed:
+          phaseLangfuseConfig?.deterministicTraceId === true
+            ? phaseTraceSeed
+            : undefined,
+        runId: phaseScopeRunId,
+        toolOutputTracing: phaseRuntimeScope.toolOutputTracing,
+        traceName: phaseTraceName,
+      });
+    }
+    if (phaseLangfuseHandler != null) {
+      phaseChainOptions.callbacks = appendCallbacks(
+        phaseChainOptions.callbacks,
+        [phaseLangfuseHandler]
+      );
+    }
+
+    const model = initializeModel({
+      provider,
+      clientOptions: {
+        ...(clientOptions ?? {}),
+        streaming: false,
+      } as t.ClientOptions,
+    }) as t.ChatModelInstance;
+    const phaseRunId = `${this.id}-activity-phase-${phaseSeq}`;
+    const invokeConfig = Object.assign({}, phaseChainOptions, {
+      run_id: phaseRunId,
+      runId: phaseRunId,
+      runName: 'summarize-activity-phase',
+      tags: [...new Set([...(phaseChainOptions.tags ?? []), ...phaseTags])],
+      metadata: {
+        ...(phaseChainOptions.metadata ?? {}),
+        ...phaseMetadata,
+      },
+    }) as Partial<RunnableConfig>;
+    const invokeModel = (
+      runtimeConfig: Partial<RunnableConfig>
+    ): Promise<unknown> =>
+      model.invoke(
+        [
+          new SystemMessage(prompt ?? ACTIVITY_PHASE_LABEL_PROMPT),
+          new HumanMessage(userPrompt),
+        ],
+        runtimeConfig
+      );
+    const invokeWithCallbackFallback = async (
+      runtimeConfig: Partial<RunnableConfig>
+    ): Promise<unknown> => {
+      try {
+        return await invokeModel(runtimeConfig);
+      } catch (error) {
+        const aborted =
+          (runtimeConfig as { signal?: AbortSignal }).signal?.aborted ===
+            true || (error as Error | null)?.name === 'AbortError';
+        const callbackFailure = /callback|tracer|event.?stream/i.test(
+          String(
+            (error as Error | null)?.stack ??
+              (error as Error | null)?.message ??
+              ''
+          )
+        );
+        if (aborted || !callbackFailure) {
+          throw error;
+        }
+        const langfuseHandler = findCallback(
+          runtimeConfig.callbacks,
+          isLangfuseCallbackHandler
+        );
+        const { callbacks, ...rest } = runtimeConfig;
+        const safeConfig = Object.assign({}, rest, {
+          callbacks: filterCallbacks(
+            callbacks,
+            (callback) => callback === langfuseHandler
+          ),
+        });
+        return invokeModel(safeConfig as Partial<RunnableConfig>);
+      }
+    };
+    const extractPhaseLabel = (response: unknown): string => {
+      const content = (response as { content?: unknown } | null)?.content;
+      if (typeof content === 'string') {
+        return normalizeActivityPhaseLabel(content);
+      }
+      if (!Array.isArray(content)) {
+        return '';
+      }
+      return normalizeActivityPhaseLabel(
+        content
+          .map((block) =>
+            typeof block === 'string'
+              ? block
+              : ((block as { text?: string }).text ?? '')
+          )
+          .join('')
+      );
+    };
+    const phaseRunnable = new RunnableLambda({
+      func: async (
+        _input: { messages: BaseMessage[] },
+        runtimeConfig?: Partial<RunnableConfig>
+      ): Promise<{ label?: string; messages: BaseMessage[] }> => {
+        const response = await invokeWithCallbackFallback(runtimeConfig ?? {});
+        const label = extractPhaseLabel(response);
+        return label.length > 0
+          ? { label, messages: [new AIMessage(label)] }
+          : { messages: [] };
+      },
+    }).withConfig({ runName: 'summarize-activity-phase' });
+
+    try {
+      const result = await withLangfuseRuntimeScope(phaseRuntimeScope, () =>
+        withLangfuseAttributes(
+          {
+            langfuse: phaseLangfuseConfig,
+            userId: phaseUserId,
+            sessionId: phaseSessionId,
+            traceName: phaseTraceName,
+            traceMetadata,
+            tags: phaseTags,
+          },
+          () =>
+            phaseRunnable.invoke(
+              {
+                messages:
+                  sourceUserText == null
+                    ? []
+                    : [new HumanMessage(sourceUserText)],
+              },
+              invokeConfig
+            )
+        )
+      );
+      return result.label == null ? {} : { label: result.label };
+    } finally {
+      await disposeLangfuseHandler(phaseLangfuseHandler);
     }
   }
 }
@@ -1951,6 +2476,26 @@ function findLastMessageOfType(
   return undefined;
 }
 
+function findActivityPhaseTraceInput(
+  messages: BaseMessage[]
+): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (
+      message.getType() !== 'human' ||
+      message.additional_kwargs?.role === 'system' ||
+      message.additional_kwargs?.isMeta === true
+    ) {
+      continue;
+    }
+    const input = extractPromptText(message).trim();
+    if (input !== '') {
+      return input;
+    }
+  }
+  return undefined;
+}
+
 function extractPromptText(message: BaseMessage): string {
   const content = message.content;
   if (typeof content === 'string') {
@@ -1961,14 +2506,13 @@ function extractPromptText(message: BaseMessage): string {
   }
   const parts: string[] = [];
   for (const block of content) {
+    const textBlock = block as { type?: unknown; text?: unknown } | null;
     if (
-      typeof block === 'object' &&
-      'type' in block &&
-      block.type === 'text' &&
-      'text' in block &&
-      typeof block.text === 'string'
+      textBlock != null &&
+      (textBlock.type === 'text' || textBlock.type === 'input_text') &&
+      typeof textBlock.text === 'string'
     ) {
-      parts.push(block.text);
+      parts.push(textBlock.text);
     }
   }
   return parts.join('\n');

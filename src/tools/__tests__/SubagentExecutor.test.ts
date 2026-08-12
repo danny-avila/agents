@@ -1,25 +1,32 @@
 import { describe, it, expect, beforeEach } from '@jest/globals';
+import { GraphInterrupt, MemorySaver } from '@langchain/langgraph';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
   AgentInputs,
+  GraphSubagentConfig,
   ResolvedSubagentConfig,
+  ResolvedSingleAgentSubagentConfig,
   StandardGraphInput,
   SubagentUpdateEvent,
   SubagentUsageEvent,
+  ToolSessionMap,
   ToolExecuteBatchRequest,
   ToolExecuteResult,
 } from '@/types';
 import type { StandardGraph } from '@/graphs/Graph';
 import {
   SubagentExecutor,
+  filterGraphSubagentResult,
   filterSubagentResult,
   resolveSubagentConfigs,
   buildChildInputs,
   summarizeEvent,
 } from '../subagent';
 import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecutor';
+import { SUBAGENT_PARENT_BATCH_CONFIG_KEY } from '../subagent/SubagentReplay';
 import { Constants, Providers, GraphEvents, StepTypes } from '@/common';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { AgentContext } from '@/agents/AgentContext';
 import { HookRegistry } from '@/hooks/HookRegistry';
 import { HandlerRegistry } from '@/events';
@@ -36,8 +43,8 @@ const makeChildInputs = (agentId = 'child-agent'): AgentInputs => ({
 
 const makeConfig = (
   type = 'researcher',
-  overrides: Partial<ResolvedSubagentConfig> = {}
-): ResolvedSubagentConfig => ({
+  overrides: Partial<ResolvedSingleAgentSubagentConfig> = {}
+): ResolvedSingleAgentSubagentConfig => ({
   type,
   name: 'Test Researcher',
   description: 'Researches things',
@@ -46,6 +53,18 @@ const makeConfig = (
 });
 
 describe('filterSubagentResult', () => {
+  it('treats a result member with no new AI message as textless completion', () => {
+    expect(
+      filterGraphSubagentResult(
+        {
+          messages: [new AIMessage('worker output')],
+          subagentResult: { agentId: 'result' },
+        },
+        'result'
+      )
+    ).toBe('Task completed');
+  });
+
   it('extracts text from last AIMessage string content', () => {
     const messages: BaseMessage[] = [
       new HumanMessage('task'),
@@ -64,6 +83,50 @@ describe('filterSubagentResult', () => {
       }),
     ];
     expect(filterSubagentResult(messages)).toBe('First part.\nSecond part.');
+  });
+
+  it('prefers final text_delta blocks over earlier AI text', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage({
+        content: [
+          { type: 'text', text: 'Let me search.' },
+          { type: 'tool_use', id: 'call_1', name: 'search', input: {} },
+        ],
+      }),
+      new ToolMessage({ content: 'result', tool_call_id: 'call_1' }),
+      new AIMessage({
+        content: [
+          { type: 'text_delta', index: 0, text: 'Streamed ' },
+          { type: 'text_delta', index: 0, text: 'result.' },
+        ],
+      }),
+    ];
+    expect(filterSubagentResult(messages)).toBe('Streamed result.');
+  });
+
+  it('keeps annotation-only text blocks within a text_delta sequence', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage({
+        content: [
+          { type: 'text_delta', index: 0, text: 'Cited ' },
+          { type: 'text', index: 0, citations: [{ url: 'source' }] },
+          { type: 'text_delta', index: 0, text: 'answer.' },
+        ],
+      }),
+    ];
+    expect(filterSubagentResult(messages)).toBe('Cited answer.');
+  });
+
+  it('separates text_delta blocks with different indexes', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage({
+        content: [
+          { type: 'text_delta', index: 0, text: 'First.' },
+          { type: 'text_delta', index: 1, text: 'Second.' },
+        ],
+      }),
+    ];
+    expect(filterSubagentResult(messages)).toBe('First.\nSecond.');
   });
 
   it('strips tool_use blocks from array content', () => {
@@ -173,7 +236,8 @@ describe('resolveSubagentConfigs', () => {
     const parentContext = AgentContext.fromConfig(parentInputs);
     const resolved = resolveSubagentConfigs([config], parentContext);
     expect(resolved).toHaveLength(1);
-    expect(resolved[0].agentInputs.agentId).toBe('child-agent');
+    const resolvedConfig = resolved[0];
+    expect(resolvedConfig.agentInputs.agentId).toBe('child-agent');
   });
 
   it('resolves self-spawn from parent _sourceInputs', () => {
@@ -186,8 +250,9 @@ describe('resolveSubagentConfigs', () => {
     const parentContext = AgentContext.fromConfig(parentInputs);
     const resolved = resolveSubagentConfigs([selfConfig], parentContext);
     expect(resolved).toHaveLength(1);
-    expect(resolved[0].agentInputs.provider).toBe(Providers.OPENAI);
-    expect(resolved[0].agentInputs.instructions).toBe(
+    const resolvedConfig = resolved[0];
+    expect(resolvedConfig.agentInputs.provider).toBe(Providers.OPENAI);
+    expect(resolvedConfig.agentInputs.instructions).toBe(
       'You are a parent agent.'
     );
   });
@@ -304,8 +369,7 @@ describe('buildChildInputs', () => {
     /**
      * Self-spawn: `resolveSubagentConfigs` fills `agentInputs` as a shallow
      * spread of the parent's `_sourceInputs`, so the parent-scoped direct
-     * tool would leak into a checkpointer-less child graph and fail with
-     * `No checkpointer set` — must be scrubbed.
+     * tool would leak into the child implicitly — it must be scrubbed.
      */
     const selfConfig: ResolvedSubagentConfig = {
       type: 'self',
@@ -320,9 +384,8 @@ describe('buildChildInputs', () => {
 
     /**
      * Explicit child config: a host that deliberately attaches its own
-     * in-process direct tools to a child keeps them (Codex #289 P2 —
-     * interrupt-capable tools still fail in children, but non-interrupting
-     * direct tools are legitimate there).
+     * in-process direct tools to a child keeps them (Codex #289 P2). With
+     * HITL enabled, interrupt-capable child tools use the shared checkpointer.
      */
     const explicitConfig: ResolvedSubagentConfig = {
       type: 'researcher',
@@ -449,6 +512,409 @@ describe('SubagentExecutor', () => {
     });
     expect(result.content).toContain('Maximum subagent nesting depth');
     expect(result.messages).toEqual([]);
+  });
+
+  it('fails graph HITL before factories, hooks, events, or usage can run', async () => {
+    const graphConfig: GraphSubagentConfig = {
+      kind: 'graph',
+      type: 'graph-team',
+      name: 'Graph Team',
+      description: 'Runs a graph.',
+      agents: [makeChildInputs('graph-member')],
+      edges: [],
+      entryAgentId: 'graph-member',
+      resultAgentId: 'graph-member',
+    };
+    const createChildGraph = jest.fn(makeNoopGraphFactory());
+    const createChildGraphByKind = jest.fn(
+      (): StandardGraph => makeNoopGraphFactory()()
+    );
+    const hook = jest.fn(async (): Promise<Record<string, never>> => ({}));
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('SubagentStart', { hooks: [hook] });
+    const update = jest.fn();
+    const handlerRegistry = new HandlerRegistry();
+    handlerRegistry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+      handle: update,
+    });
+    const usageSink = jest.fn();
+    const executor = createExecutor({
+      configs: new Map([[graphConfig.type, graphConfig]]),
+      humanInTheLoop: { enabled: true },
+      createChildGraph,
+      createChildGraphByKind,
+      hookRegistry,
+      parentHandlerRegistry: handlerRegistry,
+      usageSink,
+    });
+
+    const result = await executor.execute({
+      description: 'Do not run.',
+      subagentType: graphConfig.type,
+    });
+
+    expect(result.content).toBe(
+      'Error: Human-in-the-loop execution is not yet supported for graph subagents.'
+    );
+    expect(createChildGraph).not.toHaveBeenCalled();
+    expect(createChildGraphByKind).not.toHaveBeenCalled();
+    expect(hook).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(usageSink).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when resumable execution has no parent tool call ID', async () => {
+    const createChildGraph = jest.fn(makeNoopGraphFactory());
+    const executor = createExecutor({
+      humanInTheLoop: { enabled: true },
+      createChildGraph,
+    });
+
+    const result = await executor.execute({
+      description: 'Do something',
+      subagentType: 'researcher',
+      threadId: 'durable-thread',
+    });
+
+    expect(result.content).toContain('requires a parent tool call ID');
+    expect(result.messages).toEqual([]);
+    expect(createChildGraph).not.toHaveBeenCalled();
+  });
+
+  it('persists terminal replay outcomes without an active child workflow', async () => {
+    const checkpointer = new MemorySaver();
+    const hookRegistry = new HookRegistry();
+    hookRegistry.registerSession('original-run', 'PreToolUse', {
+      hooks: [async (): Promise<Record<string, never>> => ({})],
+    });
+    const initialExecutor = createExecutor({
+      checkpointer,
+      hookRegistry,
+      humanInTheLoop: { enabled: true },
+      parentRunId: 'original-run',
+    });
+    const call = {
+      id: 'call_terminal',
+      name: Constants.SUBAGENT,
+      args: {
+        description: 'blocked before execution',
+        subagent_type: 'researcher',
+      },
+      type: 'tool_call' as const,
+    };
+    const originalConfig = {
+      configurable: {
+        thread_id: 'durable-parent',
+        checkpoint_id: 'parent-fork',
+        run_id: 'original-run',
+      },
+    };
+    const settled = {
+      output: new ToolMessage({
+        content: 'Blocked: policy',
+        status: 'error' as const,
+        name: Constants.SUBAGENT,
+        tool_call_id: call.id,
+      }),
+      additionalContexts: ['persisted context'],
+      resolvedArgs: { description: 'rewritten' },
+    };
+
+    await initialExecutor.persistSettledToolOutput(
+      call,
+      originalConfig,
+      settled
+    );
+
+    const rebuiltExecutor = createExecutor({
+      checkpointer,
+      hookRegistry,
+      humanInTheLoop: { enabled: true },
+      parentRunId: 'rebuilt-run',
+    });
+    const restored = await rebuiltExecutor.getSettledToolOutput(call, {
+      configurable: {
+        ...originalConfig.configurable,
+        run_id: 'rebuilt-run',
+      },
+    });
+
+    expect(restored?.output.content).toBe('Blocked: policy');
+    expect(restored?.additionalContexts).toEqual(['persisted context']);
+    expect(restored?.resolvedArgs).toEqual({ description: 'rewritten' });
+    expect(hookRegistry.hasHookFor('PreToolUse', 'original-run')).toBe(true);
+    expect(hookRegistry.hasHookFor('PreToolUse', 'rebuilt-run')).toBe(true);
+  });
+
+  it('persists an ordinary child error after the active workflow is released', async () => {
+    const checkpointer = new MemorySaver();
+    const invoke = jest.fn().mockRejectedValue(new Error('child failed'));
+    const executor = createExecutor({
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({
+            getState: jest.fn().mockResolvedValue({
+              values: {},
+              next: ['child-agent'],
+              tasks: [],
+            }),
+            invoke,
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    const call = {
+      id: 'call_error',
+      name: Constants.SUBAGENT,
+      args: { description: 'fail', subagent_type: 'researcher' },
+      type: 'tool_call' as const,
+    };
+    const runnableConfig = {
+      configurable: {
+        thread_id: 'durable-parent',
+        checkpoint_id: 'parent-fork',
+        run_id: 'original-run',
+      },
+    };
+    const result = await executor.execute({
+      description: 'fail',
+      subagentType: 'researcher',
+      threadId: 'durable-parent',
+      parentToolCallId: call.id,
+      parentConfigurable: runnableConfig.configurable,
+    });
+    expect(result.content).toBe('Subagent error: child failed');
+
+    await executor.persistSettledToolOutput(call, runnableConfig, {
+      output: new ToolMessage({
+        content: result.content,
+        name: Constants.SUBAGENT,
+        tool_call_id: call.id,
+      }),
+      additionalContexts: [],
+    });
+
+    const restored = await createExecutor({
+      checkpointer,
+      humanInTheLoop: { enabled: true },
+    }).getSettledToolOutput(call, runnableConfig);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(restored?.output.content).toBe('Subagent error: child failed');
+  });
+
+  it('continues a recovered in-progress child without reseeding its task', async () => {
+    const invoke = jest.fn().mockResolvedValue({
+      messages: [new AIMessage('continued')],
+    });
+    const executor = createExecutor({
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({
+            getState: jest.fn().mockResolvedValue({
+              values: {},
+              next: ['child-agent'],
+              tasks: [],
+            }),
+            invoke,
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    const result = await executor.execute({
+      description: 'Do not duplicate this task',
+      subagentType: 'researcher',
+      threadId: 'durable-parent',
+      parentToolCallId: 'call_in_progress',
+    });
+
+    expect(result.content).toBe('continued');
+    expect(invoke).toHaveBeenCalledWith(null, expect.any(Object));
+  });
+
+  it('preserves an existing nested approval scope', async () => {
+    const nestedScope = {
+      run_id: 'grandchild-run',
+      agent_id: 'grandchild-agent',
+      subagent_type: 'grandchild',
+      parent_tool_call_id: 'call_grandchild',
+    };
+    const nestedInterrupt = new GraphInterrupt([
+      {
+        id: 'nested-interrupt',
+        value: {
+          type: 'tool_approval',
+          action_requests: [],
+          review_configs: [],
+          subagent: nestedScope,
+        },
+      },
+    ]);
+    const executor = createExecutor({
+      humanInTheLoop: { enabled: true },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({
+            getState: jest.fn().mockResolvedValue({
+              values: {},
+              next: ['agent'],
+              tasks: [],
+            }),
+            invoke: jest.fn().mockRejectedValue(nestedInterrupt),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    let received: GraphInterrupt | undefined;
+    try {
+      await executor.execute({
+        description: 'Delegate again',
+        subagentType: 'researcher',
+        threadId: 'durable-thread',
+        parentToolCallId: 'call_child',
+      });
+    } catch (error) {
+      if (error instanceof GraphInterrupt) {
+        received = error;
+      }
+    }
+
+    expect(received?.interrupts[0].value).toMatchObject({
+      subagent: nestedScope,
+    });
+  });
+
+  it('rethrows a child stream-limit trip instead of converting it to a tool result', async () => {
+    const executor = createExecutor({
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockRejectedValue(
+              new StreamLimitExceededError({
+                kind: 'tool_call_args',
+                limit: 10,
+                observed: 11,
+                toolName: 'db_query',
+              })
+            ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    await expect(
+      executor.execute({
+        description: 'Do something',
+        subagentType: 'researcher',
+      })
+    ).rejects.toBeInstanceOf(StreamLimitExceededError);
+  });
+
+  it('binds the child to the batch-captured controller, not the live scope', async () => {
+    const batchBreaker = new AbortController();
+    const liveBreaker = new AbortController();
+    const executor = createExecutor({
+      breakerScope: { controller: () => liveBreaker },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockRejectedValue(
+              new StreamLimitExceededError({
+                kind: 'tool_call_args',
+                limit: 10,
+                observed: 11,
+                toolName: 'db_query',
+              })
+            ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    /** `breaker` is the controller the parent TOOL BATCH captured before
+     * PreToolUse hooks; a reset during those hooks replaced the live
+     * scope, and the child must not revive on — or trip — the new run's
+     * controller. */
+    await expect(
+      executor.execute({
+        description: 'Do something',
+        subagentType: 'researcher',
+        breaker: batchBreaker,
+      })
+    ).rejects.toBeInstanceOf(StreamLimitExceededError);
+    expect(batchBreaker.signal.aborted).toBe(true);
+    expect(liveBreaker.signal.aborted).toBe(false);
+  });
+
+  it('trips the breaker controller captured at execution start, not the current one', async () => {
+    const oldRun = new AbortController();
+    const newRun = new AbortController();
+    let current = oldRun;
+    let releaseChild: (() => void) | undefined;
+    const executor = createExecutor({
+      breakerScope: { controller: () => current },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(
+              () =>
+                new Promise((_resolve, reject) => {
+                  releaseChild = (): void =>
+                    reject(
+                      new StreamLimitExceededError({
+                        kind: 'tool_call_args',
+                        limit: 10,
+                        observed: 11,
+                        toolName: 'db_query',
+                      })
+                    );
+                })
+            ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    const pending = executor.execute({
+      description: 'Do something',
+      subagentType: 'researcher',
+    });
+    while (releaseChild == null) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    /** The failed run's reset installs a fresh controller while the child
+     * is still settling; the straggler's trip must land on the controller
+     * captured when its execution started. */
+    current = newRun;
+    releaseChild();
+    await expect(pending).rejects.toBeInstanceOf(StreamLimitExceededError);
+    expect(oldRun.signal.aborted).toBe(true);
+    expect(newRun.signal.aborted).toBe(false);
+  });
+
+  it('threads run-level streamLimits into every child graph input', async () => {
+    const childGraphInputs: StandardGraphInput[] = [];
+    const noopFactory = makeNoopGraphFactory();
+    const executor = createExecutor({
+      streamLimits: { maxToolCallArgBytes: 1234, maxDeltaEventsPerTurn: 9 },
+      createChildGraph: (input: StandardGraphInput): StandardGraph => {
+        childGraphInputs.push(input);
+        return noopFactory();
+      },
+    });
+    await executor.execute({
+      description: 'Do something',
+      subagentType: 'researcher',
+    });
+    expect(childGraphInputs).toHaveLength(1);
+    expect(childGraphInputs[0].streamLimits).toEqual({
+      maxToolCallArgBytes: 1234,
+      maxDeltaEventsPerTurn: 9,
+    });
   });
 
   it('executes child graph and returns filtered content', async () => {
@@ -1071,6 +1537,253 @@ describe('SubagentExecutor', () => {
     expect(observedChildInputs!.maxSubagentDepth).toBeUndefined();
   });
 
+  it('seeds only the selected single-agent child before its first invocation', async () => {
+    const selectedSession = {
+      session_id: 'selected-storage',
+      files: [
+        {
+          id: 'selected-file',
+          name: 'selected.txt',
+          storage_session_id: 'selected-storage',
+        },
+      ],
+      lastUpdated: 1,
+    };
+    const siblingSession = {
+      session_id: 'sibling-storage',
+      files: [
+        {
+          id: 'sibling-file',
+          name: 'sibling.txt',
+          storage_session_id: 'sibling-storage',
+        },
+      ],
+      lastUpdated: 1,
+    };
+    const selected = makeConfig('selected', {
+      agentInputs: {
+        ...makeChildInputs('selected-agent'),
+        initialSessions: new Map([
+          [Constants.EXECUTE_CODE, selectedSession],
+        ]),
+      },
+    });
+    const sibling = makeConfig('sibling', {
+      agentInputs: {
+        ...makeChildInputs('sibling-agent'),
+        initialSessions: new Map([
+          [Constants.EXECUTE_CODE, siblingSession],
+        ]),
+      },
+    });
+    const childSessions: ToolSessionMap = new Map();
+    const invoke = jest.fn(async () => {
+      expect(childSessions.get(Constants.EXECUTE_CODE)).toEqual(
+        selectedSession
+      );
+      expect(childSessions.get(Constants.EXECUTE_CODE)).not.toBe(
+        selectedSession
+      );
+      return { messages: [new AIMessage('done')] };
+    });
+    const executor = createExecutor({
+      configs: new Map([
+        [selected.type, selected],
+        [sibling.type, sibling],
+      ]),
+      createChildGraph: (): StandardGraph =>
+        ({
+          sessions: childSessions,
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    await executor.execute({
+      description: 'Use the selected file.',
+      subagentType: selected.type,
+    });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(
+      childSessions
+        .get(Constants.EXECUTE_CODE)
+        ?.files?.some((file) => file.id === 'sibling-file')
+    ).toBe(false);
+  });
+
+  it('combines member session seeds inside a selected graph child', async () => {
+    const makeSession = (storageSessionId: string, includeFileSession = true) => ({
+      session_id: storageSessionId,
+      files: [
+        {
+          id: 'shared-file-id',
+          name: `${storageSessionId}.txt`,
+          ...(includeFileSession
+            ? { storage_session_id: storageSessionId }
+            : {}),
+        },
+      ],
+      lastUpdated: 1,
+    });
+    const first = {
+      ...makeChildInputs('first'),
+      initialSessions: new Map([
+        [Constants.EXECUTE_CODE, makeSession('first-storage')],
+      ]),
+    };
+    const second = {
+      ...makeChildInputs('second'),
+      initialSessions: new Map([
+        [Constants.EXECUTE_CODE, makeSession('second-storage', false)],
+      ]),
+    };
+    const graphConfig: GraphSubagentConfig = {
+      kind: 'graph',
+      type: 'graph-team',
+      name: 'Graph Team',
+      description: 'Runs a graph.',
+      agents: [first, second],
+      edges: [{ from: 'first', to: 'second', edgeType: 'direct' }],
+      entryAgentId: 'first',
+      resultAgentId: 'second',
+    };
+    const childSessions: ToolSessionMap = new Map();
+    const invoke = jest.fn(async () => {
+      expect(
+        childSessions
+          .get(Constants.EXECUTE_CODE)
+          ?.files?.map((file) => [file.id, file.storage_session_id])
+      ).toEqual([
+        ['shared-file-id', 'first-storage'],
+        ['shared-file-id', 'second-storage'],
+      ]);
+      return {
+        messages: [new AIMessage('done')],
+        subagentResult: { agentId: 'second' },
+      };
+    });
+    const childGraph = {
+      sessions: childSessions,
+      createWorkflow: () => ({ invoke }),
+      clearHeavyState: jest.fn(),
+    } as unknown as StandardGraph;
+    const executor = createExecutor({
+      configs: new Map([[graphConfig.type, graphConfig]]),
+      createChildGraphByKind: () => childGraph,
+    });
+
+    await executor.execute({
+      description: 'Use both files.',
+      subagentType: graphConfig.type,
+    });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves the child session across an in-memory HITL resume', async () => {
+    const seededSession = {
+      session_id: 'seed-storage',
+      files: [
+        {
+          id: 'seed-file',
+          name: 'seed.txt',
+          storage_session_id: 'seed-storage',
+        },
+      ],
+      lastUpdated: 1,
+    };
+    const hitlConfig = makeConfig('hitl-child', {
+      agentInputs: {
+        ...makeChildInputs('hitl-child'),
+        initialSessions: new Map([
+          [Constants.EXECUTE_CODE, seededSession],
+        ]),
+      },
+    });
+    const childSessions: ToolSessionMap = new Map();
+    const childInterrupt = new GraphInterrupt([
+      {
+        id: 'approval-1',
+        value: {
+          type: 'tool_approval',
+          action_requests: [],
+          review_configs: [],
+        },
+      },
+    ]);
+    const invoke = jest
+      .fn()
+      .mockImplementationOnce(async () => {
+        const session = childSessions.get(Constants.EXECUTE_CODE)!;
+        childSessions.set(Constants.EXECUTE_CODE, {
+          ...session,
+          session_id: 'live-execution',
+          files: [
+            ...(session.files ?? []),
+            {
+              id: 'generated-file',
+              name: 'generated.txt',
+              storage_session_id: 'live-execution',
+            },
+          ],
+        });
+        throw childInterrupt;
+      })
+      .mockImplementationOnce(async () => {
+        expect(childSessions.get(Constants.EXECUTE_CODE)).toMatchObject({
+          session_id: 'live-execution',
+          files: [{ id: 'seed-file' }, { id: 'generated-file' }],
+        });
+        return { messages: [new AIMessage('resumed')] };
+      });
+    const executor = createExecutor({
+      configs: new Map([[hitlConfig.type, hitlConfig]]),
+      humanInTheLoop: { enabled: true },
+      checkpointer: new MemorySaver(),
+      createChildGraph: (): StandardGraph =>
+        ({
+          sessions: childSessions,
+          createWorkflow: () => ({
+            getState: jest.fn().mockResolvedValue({
+              values: {},
+              next: [],
+              tasks: [],
+            }),
+            invoke,
+          }),
+          getChildCheckpointThreadIds: jest.fn(() => []),
+          createSubagentResumeState: jest.fn(() => ({
+            toolCallSteps: [],
+            toolSessions: [],
+            toolNodes: [],
+            eagerToolUsage: [],
+            eagerToolSuppressions: [],
+          })),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    const params = {
+      description: 'Pause and resume.',
+      subagentType: hitlConfig.type,
+      threadId: 'durable-parent',
+      parentToolCallId: 'call-hitl',
+    };
+
+    await expect(executor.execute(params)).rejects.toBeInstanceOf(
+      GraphInterrupt
+    );
+    const result = await executor.execute({
+      ...params,
+      parentConfigurable: {
+        __pregel_resume_map: { 'approval-1': [] },
+      },
+    });
+
+    expect(result.content).toBe('resumed');
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
   describe('parentConfigurable inheritance', () => {
     type CapturingGraphFactory = {
       factory: () => StandardGraph;
@@ -1220,6 +1933,7 @@ describe('SubagentExecutor', () => {
           checkpoint_id: 'parent-checkpoint-id',
           checkpoint_map: { parent: 'checkpoint' },
           checkpoint_ns: 'parent-checkpoint-ns',
+          [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'assistant-batch',
           requestBody: { messageId: 'msg-1' },
           thread_id: 'parent-thread',
           user: { id: 'user_abc' },
@@ -1236,9 +1950,258 @@ describe('SubagentExecutor', () => {
       expect(configurable.checkpoint_id).toBeUndefined();
       expect(configurable.checkpoint_map).toBeUndefined();
       expect(configurable.checkpoint_ns).toBeUndefined();
+      expect(configurable[SUBAGENT_PARENT_BATCH_CONFIG_KEY]).toBeUndefined();
       expect(configurable.requestBody).toEqual({ messageId: 'msg-1' });
       expect(configurable.thread_id).toBe('parent-thread');
       expect(configurable.user).toEqual({ id: 'user_abc' });
+    });
+
+    it('isolates child checkpoints created from different parent forks', async () => {
+      const invokedConfigs: Record<string, unknown>[] = [];
+      const invoke = jest
+        .fn()
+        .mockImplementation(
+          async (
+            _input: unknown,
+            config: Record<string, unknown>
+          ): Promise<{ messages: BaseMessage[] }> => {
+            invokedConfigs.push(config);
+            return { messages: [new AIMessage('done')] };
+          }
+        );
+      const executor = createExecutor({
+        humanInTheLoop: { enabled: true },
+        createChildGraph: (): StandardGraph =>
+          ({
+            createWorkflow: () => ({
+              getState: jest.fn().mockResolvedValue({
+                values: {},
+                next: [],
+                tasks: [],
+              }),
+              invoke,
+            }),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph,
+      });
+      const common = {
+        description: 'task',
+        subagentType: 'researcher',
+        threadId: 'parent-thread',
+        parentToolCallId: 'call_shared',
+      };
+
+      await executor.execute({
+        ...common,
+        parentConfigurable: {
+          thread_id: 'parent-thread',
+          checkpoint_id: 'fork-a',
+        },
+      });
+      await executor.execute({
+        ...common,
+        parentConfigurable: {
+          thread_id: 'parent-thread',
+          checkpoint_id: 'fork-b',
+        },
+      });
+
+      expect(invoke).toHaveBeenCalledTimes(2);
+      const childThreadIds = invokedConfigs.map(
+        (config) =>
+          (config.configurable as Record<string, unknown>).thread_id as string
+      );
+      expect(childThreadIds[0]).toMatch(/^subagent:/);
+      expect(childThreadIds[1]).toMatch(/^subagent:/);
+      expect(childThreadIds[0]).not.toBe(childThreadIds[1]);
+    });
+
+    it('isolates reused tool-call IDs across assistant batches', async () => {
+      const invokedThreadIds: string[] = [];
+      const executor = createExecutor({
+        humanInTheLoop: { enabled: true },
+        createChildGraph: (): StandardGraph =>
+          ({
+            createWorkflow: () => ({
+              getState: jest.fn().mockResolvedValue({
+                values: {},
+                next: [],
+                tasks: [],
+              }),
+              invoke: jest
+                .fn()
+                .mockImplementation(
+                  async (
+                    _input: unknown,
+                    invokeConfig: Record<string, unknown>
+                  ): Promise<{ messages: BaseMessage[] }> => {
+                    invokedThreadIds.push(
+                      (invokeConfig.configurable as Record<string, unknown>)
+                        .thread_id as string
+                    );
+                    return { messages: [new AIMessage('done')] };
+                  }
+                ),
+            }),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph,
+      });
+      const common = {
+        description: 'task',
+        subagentType: 'researcher',
+        threadId: 'parent-thread',
+        parentToolCallId: 'call_reused',
+      };
+
+      await executor.execute({
+        ...common,
+        parentConfigurable: {
+          thread_id: 'parent-thread',
+          [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'assistant-batch-1',
+        },
+      });
+      await executor.execute({
+        ...common,
+        parentConfigurable: {
+          thread_id: 'parent-thread',
+          [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'assistant-batch-2',
+        },
+      });
+
+      expect(invokedThreadIds).toHaveLength(2);
+      expect(invokedThreadIds[0]).not.toBe(invokedThreadIds[1]);
+    });
+
+    it('keeps ambiguous parent agent and tool-call components collision-free', async () => {
+      const invokedThreadIds: string[] = [];
+      const createChildGraph = (): StandardGraph =>
+        ({
+          createWorkflow: () => ({
+            getState: jest.fn().mockResolvedValue({
+              values: {},
+              next: [],
+              tasks: [],
+            }),
+            invoke: jest
+              .fn()
+              .mockImplementation(
+                async (
+                  _input: unknown,
+                  invokeConfig: Record<string, unknown>
+                ): Promise<{ messages: BaseMessage[] }> => {
+                  invokedThreadIds.push(
+                    (invokeConfig.configurable as Record<string, unknown>)
+                      .thread_id as string
+                  );
+                  return { messages: [new AIMessage('done')] };
+                }
+              ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+      const common = {
+        description: 'task',
+        subagentType: 'researcher',
+        threadId: 'parent',
+        parentConfigurable: { thread_id: 'parent' },
+      };
+
+      await createExecutor({
+        checkpointer: new MemorySaver(),
+        humanInTheLoop: { enabled: true },
+        parentAgentId: 'a_b',
+        createChildGraph,
+      }).execute({ ...common, parentToolCallId: 'c' });
+      await createExecutor({
+        checkpointer: new MemorySaver(),
+        humanInTheLoop: { enabled: true },
+        parentAgentId: 'a',
+        createChildGraph,
+      }).execute({ ...common, parentToolCallId: 'b_c' });
+
+      expect(invokedThreadIds).toHaveLength(2);
+      expect(invokedThreadIds[0]).not.toBe(invokedThreadIds[1]);
+    });
+
+    it('retains owned child checkpoint threads after heavy-state cleanup', async () => {
+      const executor = createExecutor({
+        checkpointer: new MemorySaver(),
+        humanInTheLoop: { enabled: true },
+        createChildGraph: (): StandardGraph =>
+          ({
+            createWorkflow: () => ({
+              getState: jest.fn().mockResolvedValue({
+                values: {},
+                next: [],
+                tasks: [],
+              }),
+              invoke: jest.fn().mockResolvedValue({
+                messages: [new AIMessage('done')],
+              }),
+            }),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph,
+      });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+        threadId: 'parent',
+        parentToolCallId: 'call_owned',
+      });
+      const beforeCleanup = executor.getChildCheckpointThreadIds();
+      executor.clearHeavyState();
+
+      expect(beforeCleanup).toHaveLength(1);
+      expect(executor.getChildCheckpointThreadIds()).toEqual(beforeCleanup);
+
+      executor.resetCheckpointThreadIds();
+      expect(executor.getChildCheckpointThreadIds()).toEqual([]);
+    });
+
+    it('includes checkpoint threads from active descendant graphs', async () => {
+      const grandchildThreadId = 'subagent:grandchild';
+      const executor = createExecutor({
+        checkpointer: new MemorySaver(),
+        humanInTheLoop: { enabled: true },
+        createChildGraph: (): StandardGraph =>
+          ({
+            createWorkflow: () => ({
+              getState: jest.fn().mockResolvedValue({
+                values: {},
+                next: ['child-agent'],
+                tasks: [],
+              }),
+              invoke: jest.fn().mockRejectedValue(
+                new GraphInterrupt([
+                  {
+                    id: 'grandchild-interrupt',
+                    value: {
+                      type: 'tool_approval',
+                      action_requests: [],
+                      review_configs: [],
+                    },
+                  },
+                ])
+              ),
+            }),
+            getChildCheckpointThreadIds: jest.fn(() => [grandchildThreadId]),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph,
+      });
+
+      await expect(
+        executor.execute({
+          description: 'nested task',
+          subagentType: 'researcher',
+          threadId: 'parent',
+          parentToolCallId: 'call_child',
+        })
+      ).rejects.toBeInstanceOf(GraphInterrupt);
+
+      expect(executor.getChildCheckpointThreadIds()).toEqual(
+        expect.arrayContaining([grandchildThreadId])
+      );
     });
 
     it('does not require parentConfigurable (back-compat with hosts that omit it)', async () => {
@@ -1254,7 +2217,6 @@ describe('SubagentExecutor', () => {
         string,
         unknown
       >;
-      // Only thread_id (childRunId fallback) is set when no parent context is supplied.
       expect(Object.keys(configurable)).toEqual(['thread_id']);
     });
   });
@@ -1329,6 +2291,67 @@ describe('SubagentExecutor', () => {
       expect(input.agentType).toBe('researcher');
     });
 
+    it('finishes missing child lifecycle after recovering a completed checkpoint', async () => {
+      const stopHook = jest.fn().mockResolvedValue({});
+      const hookRegistry = new HookRegistry();
+      hookRegistry.register('SubagentStop', { hooks: [stopHook] });
+      const updates: SubagentUpdateEvent[] = [];
+      const handlerRegistry = new HandlerRegistry();
+      handlerRegistry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: (_event, data): void => {
+          updates.push(data as SubagentUpdateEvent);
+        },
+      });
+      const invoke = jest.fn();
+      const updateState = jest.fn().mockResolvedValue({});
+      const executor = createExecutor({
+        humanInTheLoop: { enabled: true },
+        hookRegistry,
+        parentHandlerRegistry: handlerRegistry,
+        createChildGraph: (): StandardGraph =>
+          ({
+            createWorkflow: () => ({
+              getState: jest.fn().mockResolvedValue({
+                values: { messages: [new AIMessage('persisted result')] },
+                next: [],
+                tasks: [],
+              }),
+              invoke,
+              updateState,
+            }),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph,
+      });
+
+      const result = await executor.execute({
+        description: 'recover me',
+        subagentType: 'researcher',
+        threadId: 'durable-thread',
+        parentToolCallId: 'call_recovered',
+      });
+
+      expect(result.content).toBe('persisted result');
+      expect(invoke).not.toHaveBeenCalled();
+      expect(stopHook).toHaveBeenCalledTimes(1);
+      expect(updates.filter((update) => update.phase === 'stop')).toHaveLength(
+        1
+      );
+      expect(updateState).toHaveBeenCalledTimes(1);
+      expect(updateState.mock.calls[0][1]).toMatchObject({
+        messages: [
+          {
+            additional_kwargs: {
+              __librechat_subagent_checkpoint: {
+                version: 1,
+                parentToolCallId: 'call_recovered',
+                lifecycleComplete: true,
+              },
+            },
+          },
+        ],
+      });
+    });
+
     it('SubagentStart deny blocks execution', async () => {
       const registry = new HookRegistry();
       registry.register('SubagentStart', {
@@ -1377,6 +2400,146 @@ describe('SubagentExecutor', () => {
       const phases = events.map((e) => (e as { phase: string }).phase);
       expect(phases[0]).toBe('start');
       expect(phases[phases.length - 1]).toBe('stop');
+    });
+
+    it('attributes graph updates to validated payload and step-local member identities', async () => {
+      const updates: SubagentUpdateEvent[] = [];
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: (_event, data): void => {
+          updates.push(data as SubagentUpdateEvent);
+        },
+      });
+      const graphConfig: GraphSubagentConfig = {
+        kind: 'graph',
+        type: 'graph-team',
+        name: 'Graph Team',
+        description: 'Runs a graph.',
+        agents: [
+          makeChildInputs('entry'),
+          makeChildInputs('worker'),
+          makeChildInputs('result'),
+        ],
+        edges: [
+          { from: 'entry', to: 'worker', edgeType: 'direct' },
+          { from: 'worker', to: 'result', edgeType: 'direct' },
+        ],
+        entryAgentId: 'entry',
+        resultAgentId: 'result',
+      };
+      const graphFactory = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(async (_state, options) => {
+              const opts = options as { callbacks?: unknown[] };
+              const forwarder = (opts.callbacks ?? [])[0] as {
+                handleCustomEvent?: (
+                  eventName: string,
+                  data: unknown,
+                  runId: string,
+                  tags?: string[],
+                  metadata?: Record<string, unknown>
+                ) => Promise<void> | void;
+              };
+              const emit = async (
+                eventName: string,
+                data: unknown,
+                agentId: string
+              ): Promise<void> => {
+                await forwarder.handleCustomEvent?.(
+                  eventName,
+                  data,
+                  'child-run',
+                  [],
+                  { agentId }
+                );
+              };
+
+              await emit(
+                GraphEvents.ON_RUN_STEP,
+                {
+                  id: 'step_entry',
+                  type: StepTypes.MESSAGE_CREATION,
+                  agentId: 'entry',
+                },
+                'parent-agent'
+              );
+              await emit(
+                GraphEvents.ON_MESSAGE_DELTA,
+                { id: 'step_entry', delta: { content: 'entry' } },
+                'parent-agent'
+              );
+              await emit(
+                GraphEvents.ON_REASONING_DELTA,
+                { id: 'step_entry', delta: { content: [] } },
+                'parent-agent'
+              );
+              await emit(
+                GraphEvents.ON_RUN_STEP,
+                {
+                  id: 'step_worker',
+                  type: StepTypes.MESSAGE_CREATION,
+                  agentId: 'worker',
+                },
+                'entry'
+              );
+              await emit(
+                GraphEvents.ON_RUN_STEP,
+                {
+                  id: 'step_spoofed',
+                  type: StepTypes.MESSAGE_CREATION,
+                  agentId: 'unknown-member',
+                },
+                'worker'
+              );
+              await emit(
+                GraphEvents.ON_RUN_STEP_COMPLETED,
+                { result: { id: 'step_result', agentId: 'result' } },
+                'parent-agent'
+              );
+              await emit(
+                GraphEvents.ON_MESSAGE_DELTA,
+                { id: 'step_metadata', delta: { content: 'worker' } },
+                'worker'
+              );
+              return {
+                messages: [new AIMessage('ok')],
+                subagentResult: { agentId: 'result' },
+              };
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+      const executor = createExecutor({
+        configs: new Map([[graphConfig.type, graphConfig]]),
+        createChildGraphByKind: graphFactory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Run the graph.',
+        subagentType: graphConfig.type,
+      });
+
+      const activity = updates.filter(
+        (update) => update.phase !== 'start' && update.phase !== 'stop'
+      );
+      expect(
+        activity.map(({ phase, memberAgentId }) => ({
+          phase,
+          memberAgentId,
+        }))
+      ).toEqual([
+        { phase: 'run_step', memberAgentId: 'entry' },
+        { phase: 'message_delta', memberAgentId: 'entry' },
+        { phase: 'reasoning_delta', memberAgentId: 'entry' },
+        { phase: 'run_step', memberAgentId: 'worker' },
+        { phase: 'run_step', memberAgentId: undefined },
+        { phase: 'run_step_completed', memberAgentId: 'result' },
+        { phase: 'message_delta', memberAgentId: 'worker' },
+      ]);
+      expect(updates[0].memberAgentId).toBeUndefined();
+      expect(updates[updates.length - 1].memberAgentId).toBeUndefined();
     });
 
     it('keeps toolDefinitions on child when registry has ON_TOOL_EXECUTE handler', async () => {
@@ -1849,6 +3012,107 @@ describe('SubagentExecutor', () => {
       expect(phases[phases.length - 1]).toBe('stop');
     });
 
+    it('does not let a stalled observational update handler block child completion', async () => {
+      jest.useFakeTimers();
+      try {
+        const registry = new HandlerRegistry();
+        const updateHandler = jest.fn(
+          (): Promise<void> => new Promise<void>(() => {})
+        );
+        registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+          handle: updateHandler,
+        });
+        const { factory } = makeStubGraphFactory({
+          messages: [new AIMessage('ok')],
+        });
+        const executor = createExecutor({
+          createChildGraph: factory,
+          parentHandlerRegistry: registry,
+        });
+
+        const execution = executor.execute({
+          description: 'Task',
+          subagentType: 'researcher',
+        });
+        const outcome = Promise.race([
+          execution.then(({ content }) => content),
+          new Promise<string>((resolve) =>
+            setTimeout(() => resolve('stalled'), 20_000)
+          ),
+        ]);
+
+        await jest.advanceTimersByTimeAsync(20_000);
+
+        await expect(outcome).resolves.toBe('ok');
+        expect(updateHandler).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not let a stalled queued update block the terminal stop envelope', async () => {
+      jest.useFakeTimers();
+      try {
+        const phases: SubagentUpdateEvent['phase'][] = [];
+        const registry = new HandlerRegistry();
+        registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+          handle: (_event, rawData): void | Promise<void> => {
+            const update = rawData as SubagentUpdateEvent;
+            phases.push(update.phase);
+            if (update.phase === 'run_step') {
+              return new Promise<void>(() => {});
+            }
+          },
+        });
+        const factory: () => StandardGraph = (): StandardGraph =>
+          ({
+            createWorkflow: (): { invoke: jest.Mock } => ({
+              invoke: jest.fn().mockImplementation(async (_state, options) => {
+                const opts = options as { callbacks?: unknown[] };
+                const forwarder = (opts.callbacks ?? [])[0] as {
+                  handleCustomEvent?: (
+                    eventName: string,
+                    data: unknown
+                  ) => Promise<void> | void;
+                };
+                for (let index = 0; index < 80; index++) {
+                  await forwarder.handleCustomEvent?.(GraphEvents.ON_RUN_STEP, {
+                    id: `step_${index}`,
+                    type: StepTypes.MESSAGE_CREATION,
+                    agentId: 'researcher',
+                    index,
+                  });
+                }
+                return { messages: [new AIMessage('ok')] };
+              }),
+            }),
+            clearHeavyState: jest.fn(),
+          }) as unknown as StandardGraph;
+        const executor = createExecutor({
+          createChildGraph: factory,
+          parentHandlerRegistry: registry,
+        });
+
+        const execution = executor.execute({
+          description: 'Task',
+          subagentType: 'researcher',
+        });
+        const outcome = Promise.race([
+          execution.then(({ content }) => content),
+          new Promise<string>((resolve) =>
+            setTimeout(() => resolve('stalled'), 20_000)
+          ),
+        ]);
+
+        await jest.advanceTimersByTimeAsync(20_000);
+
+        await expect(outcome).resolves.toBe('ok');
+        expect(phases).toEqual(['start', 'run_step', 'stop']);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     it('allowlists forwarded run step payloads before wrapping them in ON_SUBAGENT_UPDATE', async () => {
       const subagentUpdates: SubagentUpdateEvent[] = [];
       const registry = new HandlerRegistry();
@@ -1976,18 +3240,32 @@ describe('SubagentExecutor', () => {
       expect(serialized).not.toContain('nested-completed-secret');
     });
 
-    it('does not drop non-droppable updates when the forwarding queue overflows', async () => {
+    it('bounds queued updates under overload while preserving lifecycle envelopes', async () => {
+      const phases: SubagentUpdateEvent['phase'][] = [];
       const completedIds: string[] = [];
+      let releaseFirstCompleted!: () => void;
+      const firstCompletedBlocked = new Promise<void>((resolve) => {
+        releaseFirstCompleted = resolve;
+      });
+      let markAllEmitted!: () => void;
+      const allEmitted = new Promise<void>((resolve) => {
+        markAllEmitted = resolve;
+      });
+      let blockedFirstCompleted = false;
       const registry = new HandlerRegistry();
       registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
         handle: async (_event, rawData): Promise<void> => {
           const update = rawData as SubagentUpdateEvent;
+          phases.push(update.phase);
           if (update.phase === 'run_step_completed') {
             const data = update.data as { result?: { id?: string } };
             if (data.result?.id != null) {
               completedIds.push(data.result.id);
             }
-            await new Promise((resolve) => setTimeout(resolve, 1));
+            if (!blockedFirstCompleted) {
+              blockedFirstCompleted = true;
+              await firstCompletedBlocked;
+            }
           }
         },
       });
@@ -2022,6 +3300,7 @@ describe('SubagentExecutor', () => {
                   }
                 );
               }
+              markAllEmitted();
               return { messages: [new AIMessage('ok')] };
             }),
           }),
@@ -2033,14 +3312,21 @@ describe('SubagentExecutor', () => {
         parentHandlerRegistry: registry,
       });
 
-      await executor.execute({
+      const execution = executor.execute({
         description: 'Task',
         subagentType: 'researcher',
       });
+      await allEmitted;
+      releaseFirstCompleted();
+      await execution;
 
-      expect(completedIds).toHaveLength(80);
+      expect(completedIds).toHaveLength(65);
       expect(completedIds[0]).toBe('step_0');
+      expect(completedIds).not.toContain('step_1');
+      expect(completedIds).toContain('step_16');
       expect(completedIds[completedIds.length - 1]).toBe('step_79');
+      expect(phases[0]).toBe('start');
+      expect(phases[phases.length - 1]).toBe('stop');
     });
 
     it('does NOT forward ON_TOOL_EXECUTE when the parent registry has no handler (safe fallback)', async () => {
@@ -2240,6 +3526,54 @@ describe('summarizeEvent', () => {
 });
 
 describe('sanitizeForwardedSubagentUpdateData', () => {
+  it('preserves bounded assistant phase metadata on message-creation steps', () => {
+    const sanitized = sanitizeForwardedSubagentUpdateData(
+      GraphEvents.ON_RUN_STEP,
+      {
+        id: 'step_1',
+        stepDetails: {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: {
+            message_id: 'message_1',
+            content_type: 'text',
+            phase: 'commentary',
+            futureSecret: 'nested-secret',
+          },
+        },
+      }
+    );
+
+    expect(sanitized).toEqual({
+      id: 'step_1',
+      stepDetails: {
+        type: StepTypes.MESSAGE_CREATION,
+        message_creation: {
+          message_id: 'message_1',
+          content_type: 'text',
+          phase: 'commentary',
+        },
+      },
+    });
+
+    expect(
+      sanitizeForwardedSubagentUpdateData(GraphEvents.ON_RUN_STEP, {
+        stepDetails: {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: {
+            message_id: 'message_2',
+            content_type: 'image',
+            phase: 'internal',
+          },
+        },
+      })
+    ).toEqual({
+      stepDetails: {
+        type: StepTypes.MESSAGE_CREATION,
+        message_creation: { message_id: 'message_2' },
+      },
+    });
+  });
+
   it('uses an allowlist for run step payloads', () => {
     const sanitized = sanitizeForwardedSubagentUpdateData(
       GraphEvents.ON_RUN_STEP,

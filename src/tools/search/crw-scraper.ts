@@ -27,6 +27,8 @@ export class CrwScraper implements t.BaseScraper {
   private xpath?: string;
   private proxy?: string;
   private stealth?: boolean;
+  private httpAgent?: t.HttpAgent;
+  private httpsAgent?: t.HttpsAgent;
 
   constructor(config: t.CrwScraperConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.CRW_API_KEY ?? '';
@@ -49,6 +51,8 @@ export class CrwScraper implements t.BaseScraper {
     this.xpath = config.xpath;
     this.proxy = config.proxy;
     this.stealth = config.stealth;
+    this.httpAgent = config.httpAgent;
+    this.httpsAgent = config.httpsAgent;
 
     // Self-host fastCRW may run without auth, so a missing key is only a
     // warning — unlike Firecrawl/Tavily, scrapeUrl does NOT early-return on it.
@@ -96,6 +100,8 @@ export class CrwScraper implements t.BaseScraper {
         {
           headers,
           timeout: payloadTimeout + CRW_TIMEOUT_BUFFER,
+          httpAgent: this.httpAgent,
+          httpsAgent: this.httpsAgent,
         }
       );
 

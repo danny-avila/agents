@@ -320,6 +320,32 @@ describe('Langfuse instrumentation', () => {
     });
   });
 
+  it('does not reuse processors across different media upload policies', async () => {
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-media',
+      secretKey: 'sk-media',
+      baseUrl: 'https://langfuse.media',
+      mediaUploadEnabled: false,
+    });
+    initializeLangfuseTracing({
+      publicKey: 'pk-media',
+      secretKey: 'sk-media',
+      baseUrl: 'https://langfuse.media',
+      mediaUploadEnabled: true,
+    });
+
+    expect(mockLangfuseSpanProcessor).toHaveBeenCalledTimes(2);
+    expect(mockLangfuseSpanProcessor).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ mediaUploadEnabled: false })
+    );
+    expect(mockLangfuseSpanProcessor).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ mediaUploadEnabled: true })
+    );
+  });
+
   it('reuses the isolated provider after initialization', async () => {
     process.env.LANGFUSE_SECRET_KEY = 'sk-test';
     process.env.LANGFUSE_PUBLIC_KEY = 'pk-test';

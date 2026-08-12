@@ -29,6 +29,8 @@ export class FirecrawlScraper implements t.BaseScraper {
   private location?: { country?: string; languages?: string[] };
   private onlyMainContent?: boolean;
   private changeTrackingOptions?: object;
+  private httpAgent?: t.HttpAgent;
+  private httpsAgent?: t.HttpsAgent;
 
   constructor(config: t.FirecrawlScraperConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.FIRECRAWL_API_KEY ?? '';
@@ -61,6 +63,8 @@ export class FirecrawlScraper implements t.BaseScraper {
     this.location = config.location;
     this.onlyMainContent = config.onlyMainContent;
     this.changeTrackingOptions = config.changeTrackingOptions;
+    this.httpAgent = config.httpAgent;
+    this.httpsAgent = config.httpsAgent;
 
     if (!this.apiKey) {
       this.logger.warn('FIRECRAWL_API_KEY is not set. Scraping will not work.');
@@ -121,6 +125,8 @@ export class FirecrawlScraper implements t.BaseScraper {
           Authorization: `Bearer ${this.apiKey}`,
         },
         timeout: this.timeout,
+        httpAgent: this.httpAgent,
+        httpsAgent: this.httpsAgent,
       });
 
       return [url, response.data];

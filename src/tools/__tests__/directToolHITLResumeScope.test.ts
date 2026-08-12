@@ -7,15 +7,27 @@ import {
   START,
   StateGraph,
   MemorySaver,
+  GraphInterrupt,
   isInterrupted,
   MessagesAnnotation,
   Command,
 } from '@langchain/langgraph';
 import type { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
+import type {
+  ReplayableSubagentTool,
+  SettledSubagentToolOutput,
+} from '@/tools/subagent/SubagentReplay';
 import type { PreToolUseHookOutput } from '@/hooks';
 import type * as t from '@/types';
+import {
+  getSubagentResumeManifest,
+  stripSubagentResumeManifest,
+  SUBAGENT_PARENT_BATCH_CONFIG_KEY,
+  SUBAGENT_REPLAY_CONTROLLER,
+} from '@/tools/subagent/SubagentReplay';
 import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
 
@@ -36,7 +48,7 @@ import { ToolNode } from '../ToolNode';
  */
 
 function aiCall(
-  callId: string,
+  callId: string | undefined,
   name: string,
   args: Record<string, unknown>
 ): AIMessage {
@@ -53,7 +65,11 @@ type CompiledMessagesGraph = Runnable<unknown, { messages: BaseMessage[] }> & {
 
 function buildGraph(
   toolNode: ToolNode,
-  toolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }>
+  toolCalls: Array<{
+    id: string | undefined;
+    name: string;
+    args: Record<string, unknown>;
+  }>
 ): CompiledMessagesGraph {
   let agentInvocations = 0;
   const builder = new StateGraph(MessagesAnnotation)
@@ -80,6 +96,422 @@ function buildGraph(
 describe('direct-path HITL: resume scope', () => {
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('persists a resume manifest beside a primitive child interrupt', async () => {
+    const directTool = tool(
+      async () => {
+        throw new GraphInterrupt([
+          { id: 'primitive-interrupt', value: 'confirm child' },
+        ]);
+      },
+      {
+        name: 'subagent',
+        description: 'primitive interrupt subagent',
+        schema: z.object({ description: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    const manifest = {
+      version: 1 as const,
+      executions: [
+        {
+          parentToolCallId: 'call_primitive',
+          childRunId: 'child-run',
+          approvalExecutionScope: 'child-approval-attempt',
+          checkpoints: [
+            {
+              threadId: 'child-thread',
+              checkpointId: 'child-checkpoint',
+              checkpointNs: '',
+            },
+          ],
+          graphState: {
+            toolCallSteps: [],
+            toolSessions: [],
+            toolNodes: [],
+            eagerToolUsage: [],
+            eagerToolSuppressions: [],
+          },
+          approvalReplays: [],
+        },
+      ],
+    };
+    const replayableTool = directTool as StructuredToolInterface &
+      ReplayableSubagentTool;
+    const getResumeManifest = jest.fn(
+      async (
+        _parentToolCallIds?: ReadonlySet<string>,
+        _config?: RunnableConfig
+      ) => manifest
+    );
+    const getSettledOutput = jest.fn(
+      async (
+        _call: ToolCall,
+        _config: RunnableConfig
+      ): Promise<SettledSubagentToolOutput | undefined> => undefined
+    );
+    replayableTool[SUBAGENT_REPLAY_CONTROLLER] = {
+      getResumeManifest,
+      getSettledOutput,
+      persistSettledOutput: async () => {},
+    };
+    const node = new ToolNode({
+      tools: [directTool],
+      directToolNames: new Set(['subagent']),
+      interruptingToolNames: new Set(['subagent']),
+    });
+    const graph = buildGraph(node, [
+      {
+        id: 'call_primitive',
+        name: 'subagent',
+        args: { description: 'pause with primitive data' },
+      },
+    ]);
+
+    const interrupted = await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'parent-thread' } }
+    );
+
+    expect(isInterrupted(interrupted)).toBe(true);
+    if (!isInterrupted(interrupted)) {
+      throw new Error('expected primitive child interrupt');
+    }
+    const internalPayload = interrupted.__interrupt__[0].value;
+    const replayBatchKey =
+      getSettledOutput.mock.calls[0]?.[1].configurable?.[
+        SUBAGENT_PARENT_BATCH_CONFIG_KEY
+      ];
+    expect(replayBatchKey).toEqual(expect.any(String));
+    expect(getResumeManifest).toHaveBeenCalledWith(
+      new Set(['call_primitive']),
+      expect.objectContaining({
+        configurable: expect.objectContaining({
+          thread_id: 'parent-thread',
+          [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: replayBatchKey,
+        }),
+      })
+    );
+    expect(getSubagentResumeManifest(internalPayload)).toEqual(manifest);
+    expect(stripSubagentResumeManifest(internalPayload)).toBe('confirm child');
+  });
+
+  it('preserves a one-shot approval until a reject decision is applied', async () => {
+    const sideEffect = jest.fn(() => 'must not execute');
+    const directTool = tool(async () => sideEffect(), {
+      name: 'echo',
+      description: 'one-shot approval tool',
+      schema: z.object({ command: z.string() }),
+    }) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    let hookInvocations = 0;
+    registry.register('PreToolUse', {
+      once: true,
+      pattern: '^echo$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          hookInvocations += 1;
+          return { decision: 'ask', reason: 'review once' };
+        },
+      ],
+    });
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildGraph(node, [
+      { id: 'call_once', name: 'echo', args: { command: 'go' } },
+    ]);
+    const config = { configurable: { thread_id: 'thread-once-reject' } };
+
+    const first = await graph.invoke({ messages: [] }, config);
+    expect(isInterrupted<t.HumanInterruptPayload>(first)).toBe(true);
+
+    const resumed = await graph.invoke(
+      new Command({
+        resume: [{ type: 'reject', reason: 'rejected once' }],
+      }),
+      config
+    );
+
+    expect(hookInvocations).toBe(1);
+    expect(sideEffect).not.toHaveBeenCalled();
+    const messages = (resumed as { messages: ToolMessage[] }).messages;
+    const toolMessage = messages.find(
+      (message) => message instanceof ToolMessage
+    );
+    expect(toolMessage?.status).toBe('error');
+    expect(String(toolMessage?.content)).toContain('rejected once');
+  });
+
+  it('truncates direct respond decisions before returning them', async () => {
+    const executeTool = jest.fn(async () => 'must not execute');
+    const directTool = tool(executeTool, {
+      name: 'echo',
+      description: 'approval response tool',
+      schema: z.object({ command: z.string() }),
+    }) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [async (): Promise<PreToolUseHookOutput> => ({ decision: 'ask' })],
+    });
+    const node = new ToolNode({
+      tools: [directTool],
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+      humanInTheLoop: { enabled: true },
+      maxToolResultChars: 50,
+    });
+    const graph = buildGraph(node, [
+      { id: 'call_respond', name: 'echo', args: { command: 'go' } },
+    ]);
+    const config = { configurable: { thread_id: 'thread-respond-truncate' } };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+    expect(isInterrupted(interrupted)).toBe(true);
+
+    const oversized = 'A'.repeat(200);
+    const resumed = await graph.invoke(
+      new Command({
+        resume: [{ type: 'respond', responseText: oversized }],
+      }),
+      config
+    );
+
+    const messages = (resumed as { messages: ToolMessage[] }).messages;
+    const toolMessage = messages.find(
+      (message) => message instanceof ToolMessage
+    );
+    expect(String(toolMessage?.content).length).toBeLessThan(oversized.length);
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
+  it('stamps distinct assistant batches into subagent replay configs', async () => {
+    const invokedBatchKeys: unknown[] = [];
+    const directTool = tool(
+      async (_input, config) => {
+        invokedBatchKeys.push(
+          config.configurable?.[SUBAGENT_PARENT_BATCH_CONFIG_KEY]
+        );
+        return 'done';
+      },
+      {
+        name: 'subagent',
+        description: 'replayable direct tool',
+        schema: z.object({ description: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    const replayConfigKeys: unknown[] = [];
+    const replayableTool = directTool as StructuredToolInterface &
+      ReplayableSubagentTool;
+    replayableTool[SUBAGENT_REPLAY_CONTROLLER] = {
+      getSettledOutput: async (_call, config) => {
+        replayConfigKeys.push(
+          config.configurable?.[SUBAGENT_PARENT_BATCH_CONFIG_KEY]
+        );
+        return undefined;
+      },
+      persistSettledOutput: async () => {},
+    };
+    const node = new ToolNode({
+      tools: [directTool],
+      directToolNames: new Set(['subagent']),
+    });
+    const config = {
+      configurable: { run_id: 'run-shared', thread_id: 'thread-shared' },
+    };
+    const input = (assistantMessageId: string): { messages: AIMessage[] } => ({
+      messages: [
+        new AIMessage({
+          id: assistantMessageId,
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_reused',
+              name: 'subagent',
+              args: { description: assistantMessageId },
+            },
+          ],
+        }),
+      ],
+    });
+
+    await node.invoke(input('assistant-1'), config);
+    await node.invoke(input('assistant-2'), config);
+
+    expect(replayConfigKeys).toHaveLength(2);
+    expect(replayConfigKeys[0]).not.toBe(replayConfigKeys[1]);
+    expect(invokedBatchKeys).toEqual(replayConfigKeys);
+  });
+
+  it('stamps the assistant batch into Send-input subagent configs', async () => {
+    const invokedBatchKeys: unknown[] = [];
+    const directTool = tool(
+      async (_input, config) => {
+        invokedBatchKeys.push(
+          config.configurable?.[SUBAGENT_PARENT_BATCH_CONFIG_KEY]
+        );
+        return 'done';
+      },
+      {
+        name: 'subagent',
+        description: 'replayable direct tool',
+        schema: z.object({ description: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+    const replayConfigKeys: unknown[] = [];
+    const replayableTool = directTool as StructuredToolInterface &
+      ReplayableSubagentTool;
+    replayableTool[SUBAGENT_REPLAY_CONTROLLER] = {
+      getSettledOutput: async (_call, config) => {
+        replayConfigKeys.push(
+          config.configurable?.[SUBAGENT_PARENT_BATCH_CONFIG_KEY]
+        );
+        return undefined;
+      },
+      persistSettledOutput: async () => {},
+    };
+    const node = new ToolNode({
+      tools: [directTool],
+      directToolNames: new Set(['subagent']),
+    });
+    const toolCall = {
+      id: 'call_send',
+      name: 'subagent',
+      args: { description: 'send task' },
+    };
+
+    await node.invoke(
+      {
+        messages: [
+          new AIMessage({
+            id: 'assistant-send',
+            content: '',
+            tool_calls: [toolCall],
+          }),
+        ],
+        lg_tool_call: toolCall,
+      },
+      {
+        configurable: {
+          run_id: 'run-send',
+          thread_id: 'thread-send',
+        },
+      }
+    );
+
+    expect(replayConfigKeys).toHaveLength(1);
+    expect(replayConfigKeys[0]).toBeDefined();
+    expect(invokedBatchKeys).toEqual(replayConfigKeys);
+  });
+
+  it('fails closed when an id-less direct call requires approval', async () => {
+    const sideEffect = jest.fn(() => 'must not execute');
+    const directTool = tool(async () => sideEffect(), {
+      name: 'echo',
+      description: 'id-less approval tool',
+      schema: z.object({ command: z.string() }),
+    }) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      pattern: '^echo$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review id-less call',
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildGraph(node, [
+      { id: undefined, name: 'echo', args: { command: 'go' } },
+    ]);
+
+    const result = await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'thread-id-less-approval' } }
+    );
+
+    expect(isInterrupted(result)).toBe(false);
+    expect(sideEffect).not.toHaveBeenCalled();
+    const messages = (result as { messages: ToolMessage[] }).messages;
+    const toolMessage = messages.find(
+      (message) => message instanceof ToolMessage
+    );
+    expect(toolMessage?.status).toBe('error');
+    expect(String(toolMessage?.content)).toContain(
+      'requires a non-empty tool call ID'
+    );
+  });
+
+  it('reruns ordinary hooks while replaying a consumed one-shot approval', async () => {
+    const sideEffect = jest.fn(() => 'must not execute');
+    const directTool = tool(async () => sideEffect(), {
+      name: 'echo',
+      description: 'mixed replay hook tool',
+      schema: z.object({ command: z.string() }),
+    }) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    let onceCalls = 0;
+    let ordinaryCalls = 0;
+    registry.register('PreToolUse', {
+      once: true,
+      pattern: '^echo$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          onceCalls += 1;
+          return { decision: 'ask', reason: 'review once' };
+        },
+      ],
+    });
+    registry.register('PreToolUse', {
+      pattern: '^echo$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          ordinaryCalls += 1;
+          return ordinaryCalls === 1
+            ? { decision: 'allow' }
+            : { decision: 'deny', reason: 'policy changed on resume' };
+        },
+      ],
+    });
+    const node = new ToolNode({
+      tools: [directTool],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildGraph(node, [
+      { id: 'call_mixed_hooks', name: 'echo', args: { command: 'go' } },
+    ]);
+    const config = { configurable: { thread_id: 'thread-mixed-hooks' } };
+
+    const first = await graph.invoke({ messages: [] }, config);
+    expect(isInterrupted(first)).toBe(true);
+    const resumed = await graph.invoke(
+      new Command({ resume: [{ type: 'approve' }] }),
+      config
+    );
+
+    expect(onceCalls).toBe(1);
+    expect(ordinaryCalls).toBe(2);
+    expect(sideEffect).not.toHaveBeenCalled();
+    const messages = (resumed as { messages: ToolMessage[] }).messages;
+    const toolMessage = messages.find(
+      (message) => message instanceof ToolMessage
+    );
+    expect(toolMessage?.status).toBe('error');
+    expect(String(toolMessage?.content)).toContain('policy changed on resume');
   });
 
   it('re-executes the direct tool body on resume when interrupt() fires from the direct path', async () => {
@@ -373,6 +805,84 @@ describe('direct-path HITL: resume scope', () => {
       );
       expect(String(toolMsg.content)).not.toContain('should-not-execute');
     });
+  });
+
+  describe('untrusted resume decisions', () => {
+    it.each([
+      [
+        { type: 'respond' },
+        'Approval payload `respond` was missing a string `responseText`',
+      ],
+      [
+        { type: 'aproved' },
+        'Unknown approval decision type "aproved" — failing closed',
+      ],
+    ])(
+      'blocks and persists malformed direct decision %#',
+      async (rawDecision, expectedError) => {
+        const executeTool = jest.fn(async () => 'should-not-execute');
+        const directTool = tool(executeTool, {
+          name: 'subagent',
+          description: 'replayable direct tool',
+          schema: z.object({ description: z.string() }),
+        }) as unknown as StructuredToolInterface;
+        const persistSettledOutput = jest.fn(
+          async (
+            _call: ToolCall,
+            _config: RunnableConfig,
+            _settled: SettledSubagentToolOutput
+          ): Promise<void> => {}
+        );
+        const replayableTool = directTool as StructuredToolInterface &
+          ReplayableSubagentTool;
+        replayableTool[SUBAGENT_REPLAY_CONTROLLER] = {
+          getSettledOutput: async () => undefined,
+          persistSettledOutput,
+        };
+        const registry = new HookRegistry();
+        registry.register('PreToolUse', {
+          hooks: [
+            async (): Promise<PreToolUseHookOutput> => ({ decision: 'ask' }),
+          ],
+        });
+        const node = new ToolNode({
+          tools: [directTool],
+          hookRegistry: registry,
+          directToolNames: new Set(['subagent']),
+          humanInTheLoop: { enabled: true },
+        });
+        const graph = buildGraph(node, [
+          {
+            id: 'call_malformed',
+            name: 'subagent',
+            args: { description: 'inspect' },
+          },
+        ]);
+        const config = {
+          configurable: { thread_id: `thread-malformed-${rawDecision.type}` },
+        };
+
+        await graph.invoke({ messages: [] }, config);
+        const resumed = await graph.invoke(
+          new Command({
+            resume: [rawDecision as unknown as t.ToolApprovalDecision],
+          }),
+          config
+        );
+
+        const messages = (resumed as { messages: ToolMessage[] }).messages;
+        const toolMessage = messages.find(
+          (message) => message instanceof ToolMessage
+        );
+        expect(toolMessage?.status).toBe('error');
+        expect(String(toolMessage?.content)).toContain(expectedError);
+        expect(executeTool).not.toHaveBeenCalled();
+        expect(persistSettledOutput).toHaveBeenCalledTimes(1);
+        expect(persistSettledOutput.mock.calls[0]?.[2].output.status).toBe(
+          'error'
+        );
+      }
+    );
   });
 
   describe('usage counter stability across resume (Codex P2 #30)', () => {

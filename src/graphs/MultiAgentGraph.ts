@@ -17,6 +17,7 @@ import {
 import type { BaseMessage, AIMessageChunk } from '@langchain/core/messages';
 import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type { ToolRuntime } from '@langchain/core/tools';
+import type { GraphFactoryDependencies } from '@/graphs/graphFactory';
 import type * as t from '@/types';
 import { serializeToolContentBounded } from '@/utils/toolContent';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
@@ -124,6 +125,30 @@ function isValidHandoffGroupId(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 }
 
+function getLastNewAiMessage(
+  messages: BaseMessage[],
+  previousMessages: BaseMessage[]
+): BaseMessage | undefined {
+  const previousMessageObjects = new Set(previousMessages);
+  const previousMessageIds = new Set<string>();
+  for (const message of previousMessages) {
+    if (message.id != null) {
+      previousMessageIds.add(message.id);
+    }
+  }
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (
+      message.getType() === 'ai' &&
+      !previousMessageObjects.has(message) &&
+      (message.id == null || !previousMessageIds.has(message.id))
+    ) {
+      return message;
+    }
+  }
+  return undefined;
+}
+
 function withHandoffGroupMetadata(
   config: LangGraphRunnableConfig | undefined,
   groupId: number | undefined
@@ -156,6 +181,9 @@ export class MultiAgentGraph extends StandardGraph {
   private startingNodes: Set<string> = new Set();
   private directEdges: t.GraphEdge[] = [];
   private handoffEdges: t.GraphEdge[] = [];
+  private handoffSourceIds = new Set<string>();
+  private readonly resultAgentId?: string;
+  private readonly memberRecursionLimit?: number;
   private handoffPromptLabels: Map<string, Set<string>> = new Map();
   /**
    * Map of agentId to parallel group info.
@@ -169,11 +197,34 @@ export class MultiAgentGraph extends StandardGraph {
    */
   private agentParallelGroups: Map<string, number> = new Map();
 
-  constructor(input: t.MultiAgentGraphInput) {
-    super(input);
+  constructor(
+    input: t.MultiAgentGraphInput,
+    dependencies?: GraphFactoryDependencies
+  ) {
+    super(input, dependencies);
     this.edges = input.edges;
+    this.resultAgentId = input.resultAgentId;
+    this.memberRecursionLimit = input.memberRecursionLimit;
+    if (
+      this.memberRecursionLimit != null &&
+      (!Number.isSafeInteger(this.memberRecursionLimit) ||
+        this.memberRecursionLimit <= 0)
+    ) {
+      throw new Error(
+        'MultiAgentGraph: memberRecursionLimit must be a positive safe integer.'
+      );
+    }
+    if (
+      this.resultAgentId != null &&
+      !this.agentContexts.has(this.resultAgentId)
+    ) {
+      throw new Error(
+        `MultiAgentGraph: resultAgentId "${this.resultAgentId}" is not present in agents.`
+      );
+    }
     this.validateEdgeAgents();
     this.categorizeEdges();
+    this.validateCommandRoutedDirectEdges();
     this.analyzeGraph();
     this.createHandoffTools();
   }
@@ -221,25 +272,60 @@ export class MultiAgentGraph extends StandardGraph {
    */
   private categorizeEdges(): void {
     for (const edge of this.edges) {
-      // Default behavior: edges with conditions or explicit 'handoff' type are handoff edges
-      // Edges with explicit 'direct' type or multi-destination without conditions are direct edges
-      if (edge.edgeType === 'direct') {
+      const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
+      const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
+      const isDefaultDirect =
+        edge.edgeType == null &&
+        edge.condition == null &&
+        sources.length === 1 &&
+        destinations.length > 1;
+      if (edge.edgeType === 'direct' || isDefaultDirect) {
         this.directEdges.push(edge);
-      } else if (edge.edgeType === 'handoff' || edge.condition != null) {
-        this.handoffEdges.push(edge);
-      } else {
-        // Default: single-to-single edges are handoff, single-to-multiple are direct
-        const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
-        const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
-
-        if (sources.length === 1 && destinations.length > 1) {
-          // Fan-out pattern defaults to direct
-          this.directEdges.push(edge);
-        } else {
-          // Everything else defaults to handoff
-          this.handoffEdges.push(edge);
-        }
+        continue;
       }
+      this.handoffEdges.push(edge);
+      for (const source of sources) {
+        this.handoffSourceIds.add(source);
+      }
+    }
+  }
+
+  /** Static waiting/prompt edges cannot also be driven by Command routing. */
+  private validateCommandRoutedDirectEdges(): void {
+    const destinationGroups = new Map<
+      string,
+      { hasPrompt: boolean; commandSource?: string }
+    >();
+    for (const edge of this.directEdges) {
+      const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
+      const commandSource = sources.find((source) =>
+        this.handoffSourceIds.has(source)
+      );
+      if (commandSource != null && sources.length > 1) {
+        throw new Error(
+          'MultiAgentGraph: grouped direct edge cannot include command-routed ' +
+            `source "${commandSource}". Split handoff routing from all-of fan-in.`
+        );
+      }
+      const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
+      const hasPrompt = edge.prompt != null && edge.prompt !== '';
+      for (const destination of destinations) {
+        const group = destinationGroups.get(destination) ?? {
+          hasPrompt: false,
+        };
+        group.hasPrompt ||= hasPrompt;
+        group.commandSource ??= commandSource;
+        destinationGroups.set(destination, group);
+      }
+    }
+    for (const { hasPrompt, commandSource } of destinationGroups.values()) {
+      if (!hasPrompt || commandSource == null) {
+        continue;
+      }
+      throw new Error(
+        'MultiAgentGraph: prompted direct edge cannot include command-routed ' +
+          `source "${commandSource}". Move the prompt into the routed node.`
+      );
     }
   }
 
@@ -582,7 +668,7 @@ export class MultiAgentGraph extends StandardGraph {
                * 3. Include all messages before the AIMessage plus the filtered pair
                */
               const messages = state.messages;
-              let filteredMessages = messages;
+              let filteredMessages: BaseMessage[];
               let aiMessageIndex = -1;
 
               /** Find the AIMessage containing this tool call */
@@ -946,9 +1032,22 @@ export class MultiAgentGraph extends StandardGraph {
         reducer: (a, b) => b,
         default: () => [],
       }),
+      subagentResult: Annotation<t.SubagentGraphResult | undefined>({
+        reducer: (_current, update) => update,
+        default: () => undefined,
+      }),
     });
 
     const builder = new StateGraph(StateAnnotation);
+    const addDirectEdge = (sources: string[], destination: string): void => {
+      if (sources.length === 0) {
+        return;
+      }
+      const source = sources.length === 1 ? sources[0] : sources;
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+      /** @ts-ignore */
+      builder.addEdge(source, destination);
+    };
 
     // Add all agents as complete subgraphs
     for (const [agentId] of this.agentContexts) {
@@ -997,6 +1096,11 @@ export class MultiAgentGraph extends StandardGraph {
         config?: LangGraphRunnableConfig
       ): Promise<t.MultiAgentGraphState | Command> => {
         let result: t.MultiAgentGraphState;
+        let inputMessages = state.messages;
+        const memberConfig =
+          this.memberRecursionLimit == null
+            ? config
+            : { ...config, recursionLimit: this.memberRecursionLimit };
 
         /**
          * Check if this agent is receiving a handoff.
@@ -1092,9 +1196,10 @@ export class MultiAgentGraph extends StandardGraph {
             ...state,
             messages: messagesForAgent,
           };
+          inputMessages = messagesForAgent;
           result = await agentSubgraph.invoke(
             transformedState,
-            withHandoffGroupMetadata(config, parallelGroupId)
+            withHandoffGroupMetadata(memberConfig, parallelGroupId)
           );
           result = {
             ...result,
@@ -1140,14 +1245,25 @@ export class MultiAgentGraph extends StandardGraph {
             ...state,
             messages: state.agentMessages,
           };
-          result = await agentSubgraph.invoke(transformedState, config);
+          inputMessages = state.agentMessages;
+          result = await agentSubgraph.invoke(transformedState, memberConfig);
           result = {
             ...result,
             /** Clear agentMessages for next agent */
             agentMessages: [],
           };
         } else {
-          result = await agentSubgraph.invoke(state, config);
+          result = await agentSubgraph.invoke(state, memberConfig);
+        }
+
+        if (this.resultAgentId === agentId) {
+          result = {
+            ...result,
+            subagentResult: {
+              agentId,
+              message: getLastNewAiMessage(result.messages, inputMessages),
+            },
+          };
         }
 
         /** If agent has both handoff and direct edges, use Command for exclusive routing */
@@ -1296,11 +1412,7 @@ export class MultiAgentGraph extends StandardGraph {
         /** Add edges from all sources to the wrapper, then wrapper to destination */
         for (const edge of edges) {
           const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
-          for (const source of sources) {
-            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-            /** @ts-ignore */
-            builder.addEdge(source, wrapperNodeId);
-          }
+          addDirectEdge(sources, wrapperNodeId);
         }
 
         /** Single edge from wrapper to destination */
@@ -1311,26 +1423,16 @@ export class MultiAgentGraph extends StandardGraph {
         /** No prompt instructions, add direct edges (skip if source uses Command routing) */
         for (const edge of edges) {
           const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
-          for (const source of sources) {
-            /** Check if this source node has both handoff and direct edges */
-            const sourceHandoffEdges = this.handoffEdges.filter((e) => {
-              const eSources = Array.isArray(e.from) ? e.from : [e.from];
-              return eSources.includes(source);
-            });
-            const sourceDirectEdges = this.directEdges.filter((e) => {
-              const eSources = Array.isArray(e.from) ? e.from : [e.from];
-              return eSources.includes(source);
-            });
-
-            /** Skip adding edge if source uses Command routing (has both types) */
-            if (sourceHandoffEdges.length > 0 && sourceDirectEdges.length > 0) {
-              continue;
-            }
-
-            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-            /** @ts-ignore */
-            builder.addEdge(source, destination);
-          }
+          const staticSources = sources.filter(
+            (source) =>
+              !this.handoffEdges.some((handoffEdge) => {
+                const handoffSources = Array.isArray(handoffEdge.from)
+                  ? handoffEdge.from
+                  : [handoffEdge.from];
+                return handoffSources.includes(source);
+              })
+          );
+          addDirectEdge(staticSources, destination);
         }
       }
     }

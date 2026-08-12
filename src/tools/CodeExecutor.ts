@@ -1,10 +1,10 @@
 import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
-import { HttpsProxyAgent } from 'https-proxy-agent';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
+import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { EnvVar, Constants } from '@/common';
 
@@ -23,7 +23,7 @@ export const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
 
 export const CODE_ARTIFACT_PATH_GUIDANCE =
-  'Persist handoff artifacts in `/mnt/data` with standard extensions (.json/.txt/.csv/.tsv/.log/.parquet/.png/.jpg/.pdf/.xlsx); failed executions do not register new files; `/tmp` and odd extensions are same-call scratch only, not later-call storage.';
+  'Anything a later call needs (data, helper scripts/modules, partial results) MUST be written under `/mnt/data` in the same call that produces it; `/tmp` never survives the call. `/mnt/data` keeps files with recognized extensions, covering common source, text, data, document, image, and archive formats (.py/.sh/.sql/.md/.json/.csv/.parquet/.png/.pdf/.zip and similar); extensionless or unusual extensions are not kept. Failed executions register nothing; fix the error and rerun before relying on new files.';
 
 export const BASH_SHELL_GUIDANCE =
   'Bash: multi-line files use heredoc/printf; run Python via python3 -c/heredoc, not bare Python.';
@@ -426,8 +426,9 @@ function createCodeExecutionTool(
           body: JSON.stringify(postData),
         };
 
-        if (process.env.PROXY != null && process.env.PROXY !== '') {
-          fetchOptions.agent = new HttpsProxyAgent(process.env.PROXY);
+        const proxyAgent = resolveFetchProxyAgent(EXEC_ENDPOINT);
+        if (proxyAgent) {
+          fetchOptions.agent = proxyAgent;
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {

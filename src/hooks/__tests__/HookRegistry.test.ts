@@ -164,6 +164,102 @@ describe('HookRegistry', () => {
       expect(registry.hasHookFor('PreToolUse', 'run-a')).toBe(true);
       expect(registry.hasHookFor('PreToolUse', 'run-b')).toBe(false);
     });
+
+    it('copies session policy without consuming the source or sibling branches', () => {
+      const registry = new HookRegistry();
+      const matcher = makePreToolUseMatcher('subagent');
+      registry.registerSession('source', 'PreToolUse', matcher);
+
+      registry.copySession('source', 'branch-a');
+      registry.copySession('source', 'branch-b');
+
+      expect(registry.getMatchers('PreToolUse', 'source')).toEqual([matcher]);
+      expect(registry.getMatchers('PreToolUse', 'branch-a')).toEqual([matcher]);
+      expect(registry.getMatchers('PreToolUse', 'branch-b')).toEqual([matcher]);
+
+      registry.clearSession('branch-a');
+      expect(registry.getMatchers('PreToolUse', 'source')).toEqual([matcher]);
+      expect(registry.getMatchers('PreToolUse', 'branch-b')).toEqual([matcher]);
+    });
+
+    it('copies pending one-shot approvals and clears them with the target session', () => {
+      const registry = new HookRegistry();
+      const approval = {
+        decision: 'ask' as const,
+        reason: 'review tool',
+        additionalContexts: [],
+        injectedMessages: [],
+        errors: [],
+      };
+      const key = {
+        executionScope: 'child-a',
+        agentId: 'researcher',
+        toolUseId: 'call_1',
+      };
+      const siblingKey = { ...key, executionScope: 'child-b' };
+      registry.setPendingToolApproval('source', key, approval);
+      registry.setPendingToolApproval('source', siblingKey, {
+        ...approval,
+        reason: 'review sibling',
+      });
+
+      registry.copySession('source', 'branch');
+
+      expect(registry.getPendingToolApproval('source', key)).toBe(approval);
+      expect(registry.getPendingToolApproval('branch', key)).toBe(approval);
+      expect(
+        registry.getPendingToolApproval('branch', siblingKey)?.reason
+      ).toBe('review sibling');
+      registry.clearPendingToolApproval('branch', key);
+      expect(registry.getPendingToolApproval('branch', key)).toBeUndefined();
+      expect(
+        registry.getPendingToolApproval('branch', siblingKey)?.reason
+      ).toBe('review sibling');
+      const checkpointSnapshot = registry.snapshotPendingToolApprovals(
+        'source',
+        'child-a'
+      );
+      expect(checkpointSnapshot).toEqual([{ key, result: approval }]);
+      registry.clearSession('branch');
+      expect(
+        registry.getPendingToolApproval('branch', siblingKey)
+      ).toBeUndefined();
+      expect(registry.getPendingToolApproval('source', key)).toBe(approval);
+      registry.setPendingToolApproval('restored', key, {
+        ...approval,
+        reason: 'stale approval',
+      });
+      registry.setPendingToolApproval('restored', siblingKey, {
+        ...approval,
+        reason: 'preserved sibling',
+      });
+      registry.restorePendingToolApprovals(
+        'restored',
+        'child-a',
+        checkpointSnapshot
+      );
+      expect(registry.getPendingToolApproval('restored', key)).toBe(approval);
+      expect(
+        registry.getPendingToolApproval('restored', siblingKey)?.reason
+      ).toBe('preserved sibling');
+      registry.restorePendingToolApprovals('restored', 'child-b', []);
+      expect(
+        registry.getPendingToolApproval('restored', siblingKey)
+      ).toBeUndefined();
+
+      const branchKey = { ...key, executionScope: 'child-a-attempt-2' };
+      registry.restorePendingToolApprovals(
+        'restored',
+        branchKey.executionScope,
+        checkpointSnapshot
+      );
+      expect(registry.getPendingToolApproval('restored', branchKey)).toBe(
+        approval
+      );
+      expect(registry.getPendingToolApproval('restored', key)).toBe(approval);
+      registry.clearPendingToolApproval('restored', branchKey);
+      expect(registry.getPendingToolApproval('restored', key)).toBe(approval);
+    });
   });
 
   describe('session isolation under parallel registration', () => {

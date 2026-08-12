@@ -25,6 +25,7 @@ import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import { deserializeMessage } from './messageSerialization';
 import { createSummarizeNode } from '@/summarization/node';
+import { resolveStreamLimits } from '@/llm/streamLimits';
 import { JsonlSessionStore } from './JsonlSessionStore';
 import { AgentContext } from '@/agents/AgentContext';
 import { ContentTypes, GraphEvents } from '@/common';
@@ -610,6 +611,8 @@ function createManualCompactGraph(params: {
   runId: string;
   customHandlers?: Record<string, t.EventHandler>;
   hooks?: HookRegistry;
+  /** Session run-level stream limits, so manual compaction honors them. */
+  streamLimits?: t.StreamLimits;
 }): {
   graph: Parameters<typeof createSummarizeNode>[0]['graph'];
   completedSummary?: t.SummaryContentBlock;
@@ -626,6 +629,7 @@ function createManualCompactGraph(params: {
       runId: params.runId,
       isMultiAgent: false,
       hookRegistry: params.hooks,
+      streamLimits: resolveStreamLimits(params.streamLimits),
       dispatchRunStep: async (runStep): Promise<void> => {
         contentData.push(runStep);
         contentIndexMap.set(runStep.id, runStep.index);
@@ -930,6 +934,30 @@ export class AgentSession {
     });
   }
 
+  private async recordChildCheckpointThreads(params: {
+    source: 'run' | 'resume';
+    runId: string;
+    run: Run<t.IState>;
+  }): Promise<void> {
+    if (!this.checkpointing.enabled || this.store == null) {
+      return;
+    }
+    const recordedThreadIds = new Set(
+      this.store.getCheckpoints().map((checkpoint) => checkpoint.data.threadId)
+    );
+    for (const threadId of params.run.getChildCheckpointThreadIds()) {
+      if (recordedThreadIds.has(threadId)) {
+        continue;
+      }
+      recordedThreadIds.add(threadId);
+      await this.store.appendCheckpoint({
+        source: params.source,
+        runId: params.runId,
+        threadId,
+      });
+    }
+  }
+
   private getCheckpointThreadIds(): string[] {
     const threadIds = new Set<string>([this.threadId]);
     for (const checkpoint of this.store?.getCheckpoints() ?? []) {
@@ -1002,6 +1030,7 @@ export class AgentSession {
     const sessionState = createSessionRunState(
       isSessionThread ? (this.store?.getPath() ?? []) : []
     );
+    let run: Run<t.IState> | undefined;
     try {
       const runConfig: t.RunConfig = {
         ...this.runConfig,
@@ -1020,7 +1049,7 @@ export class AgentSession {
           ...handlerResult.handlers,
         },
       };
-      const run = await Run.create<t.IState>(runConfig);
+      run = await Run.create<t.IState>(runConfig);
       let messages = inputMessages;
       if (!useCheckpointState && sessionState.messages.length > 0) {
         messages = sessionState.messages;
@@ -1066,6 +1095,11 @@ export class AgentSession {
         checkpointId: interrupt?.checkpointId,
         checkpointNs: interrupt?.checkpointNs,
       });
+      await this.recordChildCheckpointThreads({
+        source: 'run',
+        runId,
+        run,
+      });
       const contentParts = (content ?? handlerResult.contentParts).filter(
         (part): part is t.MessageContentComplex => part != null
       );
@@ -1095,6 +1129,13 @@ export class AgentSession {
         threadId,
         config: callerConfig,
       });
+      if (run != null) {
+        await this.recordChildCheckpointThreads({
+          source: 'run',
+          runId,
+          run,
+        });
+      }
       throw error;
     }
   }
@@ -1251,6 +1292,7 @@ export class AgentSession {
       runId: compactRunId,
       customHandlers: this.runConfig.customHandlers,
       hooks: this.runConfig.hooks,
+      streamLimits: this.runConfig.streamLimits,
     });
     const summarizeNode = createSummarizeNode({
       agentContext,
@@ -1343,8 +1385,9 @@ export class AgentSession {
     const sessionState = createSessionRunState(
       isSessionThread ? (this.store?.getPath() ?? []) : []
     );
+    let run: Run<t.IState> | undefined;
     try {
-      const run = await Run.create<t.IState>({
+      run = await Run.create<t.IState>({
         ...this.runConfig,
         runId,
         graphConfig: applyCheckpointingToGraphConfig(
@@ -1395,6 +1438,11 @@ export class AgentSession {
         checkpointId: interrupt?.checkpointId,
         checkpointNs: interrupt?.checkpointNs,
       });
+      await this.recordChildCheckpointThreads({
+        source: 'resume',
+        runId,
+        run,
+      });
       const contentParts = (content ?? handlerResult.contentParts).filter(
         (part): part is t.MessageContentComplex => part != null
       );
@@ -1420,6 +1468,13 @@ export class AgentSession {
         threadId,
         config: callerConfig,
       });
+      if (run != null) {
+        await this.recordChildCheckpointThreads({
+          source: 'resume',
+          runId,
+          run,
+        });
+      }
       throw error;
     }
   }

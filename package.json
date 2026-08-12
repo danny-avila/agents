@@ -1,6 +1,10 @@
 {
   "name": "@librechat/agents",
-  "version": "3.3.11",
+  "version": "3.4.5",
+  "reova": {
+    "enabled": true,
+    "endpoint": "https://telemetry.reo.dev/data"
+  },
   "main": "./dist/cjs/main.cjs",
   "module": "./dist/esm/main.mjs",
   "types": "./dist/types/index.d.ts",
@@ -116,6 +120,8 @@
     "prepublishOnly": "npm run build",
     "build": "tsdown && tsc -p tsconfig.build.json",
     "build:dev": "tsdown",
+    "check:circular-deps": "node config/circular-deps.mjs",
+    "test:circular-deps": "node --test config/circular-deps.test.mjs",
     "sort-imports": "node scripts/sort-imports.ts",
     "sort-imports:check": "node scripts/sort-imports.ts --check",
     "start": "node dist/esm/main.js",
@@ -193,6 +199,7 @@
     "supervised": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/supervised.ts --provider anthropic --name Jo --location \"New York, NY\"",
     "test": "NODE_OPTIONS='--experimental-vm-modules' jest",
     "test:live:handoffs": "RUN_HANDOFF_LIVE_TESTS=1 NODE_OPTIONS='--experimental-vm-modules' jest src/specs/agent-handoffs.live.test.ts --runInBand",
+    "test:live:ask-user-questions": "RUN_ASK_USER_QUESTIONS_LIVE_TESTS=1 NODE_OPTIONS='--experimental-vm-modules' jest src/specs/ask-user-questions.live.test.ts --runInBand",
     "test:memory": "NODE_OPTIONS='--expose-gc' npx jest src/specs/title.memory-leak.test.ts",
     "test:all": "npm test -- --testPathIgnorePatterns=title.memory-leak.test.ts && npm run test:memory",
     "reinstall": "npm run clean && npm ci && rm -rf ./dist && npm run build",
@@ -211,7 +218,7 @@
     "uuid": "$uuid",
     "ajv": "6.14.0",
     "@opentelemetry/core": "^2.9.0",
-    "js-yaml": "^4.3.0",
+    "js-yaml": "^4.3.1",
     "minimatch": "^10.2.2",
     "test-exclude": "^8.0.0"
   },
@@ -245,10 +252,11 @@
     "dotenv": "^16.4.7",
     "https-proxy-agent": "^7.0.6",
     "mathjs": "^15.2.0",
-    "nanoid": "^3.3.7",
+    "nanoid": "^3.3.18",
     "okapibm25": "^1.4.1",
     "openai": "^6.46.0",
-    "reo-census": "^1.2.9",
+    "reova": "^0.4.1",
+    "socks-proxy-agent": "^8.0.5",
     "uuid": "^11.1.1"
   },
   "peerDependencies": {

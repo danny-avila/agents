@@ -32,9 +32,9 @@ import type {
   UserPromptSubmitHookOutput,
 } from '@/hooks';
 import type * as t from '@/types';
-import { Providers as providers, GraphEvents } from '@/common';
-import * as events from '@/utils/events';
+import { Constants, Providers as providers, GraphEvents } from '@/common';
 import { HookRegistry, createToolPolicyHook } from '@/hooks';
+import * as events from '@/utils/events';
 import { askUserQuestion } from '@/hitl';
 import { ToolNode } from '../ToolNode';
 
@@ -1015,13 +1015,13 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
           },
         ],
         // Caller compileOptions without a checkpointer: HITL adds a MemorySaver
-        // fallback to the compiled graph, but the constructor restores this raw
-        // metadata (no checkpointer) onto Graph.compileOptions.
+        // fallback while preserving the caller's remaining compile options.
         compileOptions: { interruptBefore: [] },
       },
       humanInTheLoop: { enabled: true },
     });
-    expect(run.Graph?.compileOptions?.checkpointer).toBeUndefined();
+    expect(run.Graph?.compileOptions?.checkpointer).toBeInstanceOf(MemorySaver);
+    expect(run.Graph?.compileOptions?.interruptBefore).toEqual([]);
 
     const graph = new StateGraph(MessagesAnnotation)
       .addNode('noop', (): MessagesUpdate => ({ messages: [] }))
@@ -1088,6 +1088,99 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     const cmd2 = spy.mock.calls[1]?.[0] as Command;
     expect(cmd2.update).toBeUndefined();
     expect(cmd2.goto).toEqual([]);
+  });
+
+  it('Run.resume restores a persisted interrupt before scoping a rebuilt resume', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+
+    const registry = new HookRegistry();
+    const persistedMatcher = {
+      hooks: [async (): Promise<PreToolUseHookOutput> => ({ decision: 'ask' })],
+    };
+    registry.registerSession(
+      'persisted-hook-session',
+      'PreToolUse',
+      persistedMatcher
+    );
+
+    const run = await Run.create<t.IState>({
+      runId: 'hitl-rebuilt-scope',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: {
+              modelName: 'gpt-4o-mini',
+              apiKey: 'test-key',
+            },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const persistedState = {
+      config: {
+        configurable: {
+          thread_id: 'durable-thread',
+          checkpoint_id: 'interrupted-checkpoint',
+          checkpoint_ns: '',
+        },
+      },
+      tasks: [
+        {
+          interrupts: [
+            {
+              id: 'persisted-interrupt',
+              value: {
+                type: 'tool_approval',
+                hook_session_id: 'persisted-hook-session',
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const getState = jest.fn(async (_config: RunnableConfig) => persistedState);
+    run.graphRunnable = { getState } as unknown as t.CompiledStateWorkflow;
+    const processSpy = jest
+      .spyOn(run, 'processStream')
+      .mockResolvedValue(undefined);
+    const callerConfig = {
+      version: 'v2' as const,
+      configurable: { thread_id: 'durable-thread' },
+    };
+    const decision = [{ type: 'approve' as const }];
+
+    await run.resume(decision, callerConfig);
+
+    expect(getState).toHaveBeenCalledWith(callerConfig);
+    const command = processSpy.mock.calls[0]?.[0] as Command;
+    expect(command.resume).toEqual({ 'persisted-interrupt': decision });
+    expect(processSpy.mock.calls[0]?.[1].configurable).toMatchObject({
+      thread_id: 'durable-thread',
+      checkpoint_id: 'interrupted-checkpoint',
+      checkpoint_ns: '',
+    });
+    expect(run.getInterrupt()).toMatchObject({
+      interruptId: 'persisted-interrupt',
+      threadId: 'durable-thread',
+      payload: {
+        type: 'tool_approval',
+        hook_session_id: 'persisted-hook-session',
+      },
+    });
+    expect(
+      registry.getMatchers('PreToolUse', 'persisted-hook-session')
+    ).toEqual([persistedMatcher]);
+    expect(registry.getMatchers('PreToolUse', run.id)).toEqual([
+      persistedMatcher,
+    ]);
   });
 
   it('re-exports langgraph HITL primitives from the SDK barrel for host use', async () => {
@@ -2194,6 +2287,81 @@ describe('Codex review fixes', () => {
     jest.restoreAllMocks();
   });
 
+  it('reruns live hooks while replaying a consumed event-tool approval', async () => {
+    let dispatchCalls = 0;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        dispatchCalls += 1;
+        const request = data as {
+          resolve: (results: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve([
+          { toolCallId: 'call_event', content: 'ran', status: 'success' },
+        ]);
+      });
+
+    const registry = new HookRegistry();
+    let onceCalls = 0;
+    let liveCalls = 0;
+    registry.register('PreToolUse', {
+      once: true,
+      pattern: '^echo$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          onceCalls += 1;
+          return { decision: 'ask', reason: 'review once' };
+        },
+      ],
+    });
+    registry.register('PreToolUse', {
+      pattern: '^echo$',
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          liveCalls += 1;
+          return liveCalls === 1
+            ? { decision: 'allow' }
+            : { decision: 'deny', reason: 'policy changed before resume' };
+        },
+      ],
+    });
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-event-replay',
+      toolCallStepIds: new Map([['call_event', 'step_event']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_event', name: 'echo', args: { command: 'run' } },
+    ]);
+    const config = {
+      configurable: { thread_id: 'thread-event-hook-replay' },
+    };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+    expect(isInterrupted(interrupted)).toBe(true);
+    const resumed = await graph.invoke(
+      new Command({ resume: [{ type: 'approve' }] }),
+      config
+    );
+
+    expect(onceCalls).toBe(1);
+    expect(liveCalls).toBe(2);
+    expect(dispatchCalls).toBe(0);
+    const messages = (resumed as { messages: ToolMessage[] }).messages;
+    const result = messages.find(
+      (message) =>
+        message instanceof ToolMessage && message.tool_call_id === 'call_event'
+    );
+    expect(result?.status).toBe('error');
+    expect(String(result?.content)).toContain('policy changed before resume');
+  });
+
   it('preserves session-scoped hooks across HITL interrupt so the policy still fires on resume', async () => {
     let dispatchCalls = 0;
     jest
@@ -2295,6 +2463,10 @@ describe('Codex review fixes', () => {
      * MUST still be present — the regression was that finally cleared
      * it, leaving the resume to bypass the policy entirely. */
     expect(run.getInterrupt()).toBeDefined();
+    expect(run.getInterrupt()?.payload).toMatchObject({
+      type: 'tool_approval',
+      hook_session_id: runId,
+    });
     expect(preCallCount).toBe(1);
     expect(registry.hasHookFor('PreToolUse', runId)).toBe(true);
     expect(dispatchCalls).toBe(0);
@@ -2308,6 +2480,63 @@ describe('Codex review fixes', () => {
     /** After natural completion, session matchers ARE cleared so the
      * next run on this registry starts clean. */
     expect(registry.hasHookFor('PreToolUse', runId)).toBe(false);
+  });
+
+  it('persists the parent hook session when a direct subagent approval interrupts', async () => {
+    const runId = 'parent-subagent-policy';
+    const executeSubagent = jest.fn(async () => 'child result');
+    const subagentTool = tool(executeSubagent, {
+      name: Constants.SUBAGENT,
+      description: 'execute a child agent',
+      schema: z.object({
+        description: z.string(),
+        subagent_type: z.string(),
+      }),
+    }) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    registry.registerSession(runId, 'PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'approve child delegation',
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [subagentTool],
+      hookRegistry: registry,
+      directToolNames: new Set([Constants.SUBAGENT]),
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_subagent',
+        name: Constants.SUBAGENT,
+        args: { description: 'inspect logs', subagent_type: 'researcher' },
+      },
+    ]);
+
+    const interrupted = await graph.invoke(
+      { messages: [] },
+      {
+        configurable: {
+          thread_id: 'parent-subagent-thread',
+          run_id: runId,
+        },
+      }
+    );
+
+    if (!isInterrupted<t.ToolApprovalInterruptPayload>(interrupted)) {
+      throw new Error('expected a subagent approval interrupt');
+    }
+    expect(interrupted.__interrupt__[0].value).toMatchObject({
+      type: 'tool_approval',
+      hook_session_id: runId,
+      action_requests: [
+        { tool_call_id: 'call_subagent', name: Constants.SUBAGENT },
+      ],
+    });
+    expect(executeSubagent).not.toHaveBeenCalled();
   });
 
   it('denied tool in a deny+ask batch dispatches ON_RUN_STEP_COMPLETED exactly once across interrupt + resume', async () => {
