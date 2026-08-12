@@ -8,6 +8,7 @@ import type {
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { LLMResult, Generation } from '@langchain/core/outputs';
 import type { Command } from '@langchain/langgraph';
+import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
 import type { AssistantTextPhase } from '@/types/assistantPhase';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
@@ -285,6 +286,8 @@ export type MessageDeltaUpdate = {
   type: ContentTypes.TEXT;
   text: string;
   tool_call_ids?: string[];
+  /** Provider-supplied source citations, accumulated across deltas. */
+  citations?: Anthropic.TextCitation[];
 };
 export type ReasoningDeltaUpdate = { type: ContentTypes.THINK; think: string };
 

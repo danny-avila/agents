@@ -1085,3 +1085,130 @@ describe('ContentAggregator multi-entry deltas', () => {
     });
   });
 });
+
+describe('ContentAggregator citation deltas', () => {
+  const citation = (url: string, cited_text: string) => ({
+    type: 'web_search_result_location',
+    url,
+    title: 'Example',
+    cited_text,
+    encrypted_index: 'enc',
+  });
+
+  /**
+   * Anthropic emits a search turn's citations as their own `citations_delta`,
+   * which `_makeMessageChunkFromAnthropicEvent` normalizes into a `text` part
+   * carrying `citations` and **no** `text` key.
+   */
+  const citationDelta = (id: string, ...citations: unknown[]) => ({
+    event: GraphEvents.ON_MESSAGE_DELTA,
+    data: {
+      id,
+      delta: { content: [{ type: ContentTypes.TEXT, citations }] },
+    } as t.MessageDeltaEvent,
+  });
+
+  const textDelta = (id: string, text: string) => ({
+    event: GraphEvents.ON_MESSAGE_DELTA,
+    data: {
+      id,
+      delta: { content: [{ type: ContentTypes.TEXT, text }] },
+    } as t.MessageDeltaEvent,
+  });
+
+  it('keeps citations that arrive without accompanying text', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_citations'),
+    });
+
+    aggregateContent(textDelta('step_citations', 'Answer.'));
+    aggregateContent(
+      citationDelta('step_citations', citation('https://a.example', 'quoted a'))
+    );
+
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Answer.',
+      citations: [citation('https://a.example', 'quoted a')],
+    });
+  });
+
+  it('accumulates citations across successive deltas', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_multi'),
+    });
+
+    aggregateContent(textDelta('step_multi', 'Part one. '));
+    aggregateContent(
+      citationDelta('step_multi', citation('https://a.example', 'quoted a'))
+    );
+    aggregateContent(textDelta('step_multi', 'Part two.'));
+    aggregateContent(
+      citationDelta('step_multi', citation('https://b.example', 'quoted b'))
+    );
+
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Part one. Part two.',
+      citations: [
+        citation('https://a.example', 'quoted a'),
+        citation('https://b.example', 'quoted b'),
+      ],
+    });
+  });
+
+  it('leaves parts without citations untouched', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_plain'),
+    });
+
+    aggregateContent(textDelta('step_plain', 'Hello '));
+    aggregateContent(textDelta('step_plain', 'world.'));
+
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Hello world.',
+    });
+    expect(contentParts[0]).not.toHaveProperty('citations');
+  });
+
+  it('preserves tool_call_ids when a citations-only delta follows', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_tool_ids'),
+    });
+
+    aggregateContent({
+      event: GraphEvents.ON_MESSAGE_DELTA,
+      data: {
+        id: 'step_tool_ids',
+        delta: {
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              text: 'Answer.',
+              tool_call_ids: ['call_1'],
+            },
+          ],
+        },
+      } as t.MessageDeltaEvent,
+    });
+    aggregateContent(
+      citationDelta('step_tool_ids', citation('https://a.example', 'quoted a'))
+    );
+
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Answer.',
+      tool_call_ids: ['call_1'],
+      citations: [citation('https://a.example', 'quoted a')],
+    });
+  });
+});

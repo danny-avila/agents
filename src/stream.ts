@@ -2299,20 +2299,44 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       return;
     }
 
+    const incomingText =
+      ContentTypes.TEXT in contentPart && typeof contentPart.text === 'string'
+        ? contentPart.text
+        : undefined;
+    /**
+     * Anthropic emits a search turn's citations as their own `citations_delta`,
+     * which arrives here as a text part carrying `citations` and no `text`.
+     */
+    const { citations } = contentPart as {
+      citations?: t.MessageDeltaUpdate['citations'];
+    };
+    const incomingCitations = Array.isArray(citations) ? citations : undefined;
+
     if (
       partType.startsWith(ContentTypes.TEXT) &&
-      ContentTypes.TEXT in contentPart &&
-      typeof contentPart.text === 'string'
+      (incomingText !== undefined || incomingCitations !== undefined)
     ) {
       // TODO: update this!!
       const currentContent = contentParts[index] as t.MessageDeltaUpdate;
       const update: t.MessageDeltaUpdate = {
         type: ContentTypes.TEXT,
-        text: (currentContent.text || '') + contentPart.text,
+        text: (currentContent.text || '') + (incomingText ?? ''),
       };
 
       if (contentPart.tool_call_ids) {
         update.tool_call_ids = contentPart.tool_call_ids;
+      } else if (incomingText === undefined && currentContent.tool_call_ids) {
+        /** A citations-only delta must not drop ids already accumulated */
+        update.tool_call_ids = currentContent.tool_call_ids;
+      }
+
+      if (incomingCitations !== undefined) {
+        update.citations =
+          currentContent.citations !== undefined
+            ? [...currentContent.citations, ...incomingCitations]
+            : [...incomingCitations];
+      } else if (currentContent.citations !== undefined) {
+        update.citations = currentContent.citations;
       }
       contentParts[index] = update;
     } else if (
