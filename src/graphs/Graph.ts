@@ -1779,9 +1779,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const agentKey = runStep.agentId ?? '';
     const openMessageStepId = this.openMessageStepByAgent.get(agentKey);
     if (openMessageStepId != null && openMessageStepId !== runStep.id) {
-      await this.closeRunStep(openMessageStepId, 'completed', undefined, {
-        metadata,
-      });
+      await this.closeRunStep(openMessageStepId, 'completed', { metadata });
     }
     this.contentData.push(runStep);
     this.contentIndexMap.set(runStep.id, runStep.index);
@@ -1803,7 +1801,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   async closeRunStep(
     stepId: string,
     status: Exclude<t.RunStepStatus, 'in_progress'>,
-    at?: number,
     options?: t.RunStepCloseOptions
   ): Promise<boolean> {
     if (!stepId) {
@@ -1825,7 +1822,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return false;
     }
 
-    const closedAt = at ?? Date.now();
+    const closedAt = options?.at ?? Date.now();
     runStep.status = status;
     if (status === 'completed') {
       runStep.completed_at = closedAt;
@@ -1904,7 +1901,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     }
     const pending = this.pendingToolCallsByStep.get(stepId);
     if (pending == null) {
-      await this.closeRunStep(stepId, 'completed', undefined, { metadata });
+      await this.closeRunStep(stepId, 'completed', { metadata });
       return;
     }
     const removed =
@@ -1914,7 +1911,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (pending.size > 0) {
       return;
     }
-    await this.closeRunStep(stepId, 'completed', undefined, {
+    await this.closeRunStep(stepId, 'completed', {
       metadata,
       restamp: removed,
     });
@@ -1929,7 +1926,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (openStepId == null) {
       return;
     }
-    await this.closeRunStep(openStepId, 'completed', undefined, { metadata });
+    await this.closeRunStep(openStepId, 'completed', { metadata });
   }
 
   /**
@@ -1946,7 +1943,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (runStep.status != null && runStep.status !== 'in_progress') {
         continue;
       }
-      await this.closeRunStep(runStep.id, status, closedAt, {
+      await this.closeRunStep(runStep.id, status, {
+        at: closedAt,
         registryOnly: true,
       });
     }

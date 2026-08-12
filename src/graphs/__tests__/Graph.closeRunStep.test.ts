@@ -62,7 +62,9 @@ describe('StandardGraph.closeRunStep', () => {
     const { graph, closed } = createGraph();
     const step = seedStep(graph, 'step_a');
 
-    const first = await graph.closeRunStep('step_a', 'completed', 2_000);
+    const first = await graph.closeRunStep('step_a', 'completed', {
+      at: 2_000,
+    });
     expect(first).toBe(true);
     expect(step.status).toBe('completed');
     expect(step.completed_at).toBe(2_000);
@@ -76,7 +78,9 @@ describe('StandardGraph.closeRunStep', () => {
       closed_at: 2_000,
     });
 
-    const second = await graph.closeRunStep('step_a', 'completed', 3_000);
+    const second = await graph.closeRunStep('step_a', 'completed', {
+      at: 3_000,
+    });
     expect(second).toBe(false);
     expect(step.completed_at).toBe(2_000);
     expect(closed).toHaveLength(1);
@@ -86,8 +90,9 @@ describe('StandardGraph.closeRunStep', () => {
     const { graph, closed } = createGraph();
     const step = seedStep(graph, 'step_a', StepTypes.TOOL_CALLS);
 
-    await graph.closeRunStep('step_a', 'cancelled', 2_000);
-    const restamped = await graph.closeRunStep('step_a', 'completed', 3_000, {
+    await graph.closeRunStep('step_a', 'cancelled', { at: 2_000 });
+    const restamped = await graph.closeRunStep('step_a', 'completed', {
+      at: 3_000,
       restamp: true,
     });
     expect(restamped).toBe(false);
@@ -101,8 +106,9 @@ describe('StandardGraph.closeRunStep', () => {
     const { graph, closed } = createGraph();
     const step = seedStep(graph, 'step_a', StepTypes.TOOL_CALLS);
 
-    await graph.closeRunStep('step_a', 'completed', 2_000);
-    const restamped = await graph.closeRunStep('step_a', 'completed', 3_000, {
+    await graph.closeRunStep('step_a', 'completed', { at: 2_000 });
+    const restamped = await graph.closeRunStep('step_a', 'completed', {
+      at: 3_000,
       restamp: true,
     });
     expect(restamped).toBe(true);
@@ -115,8 +121,9 @@ describe('StandardGraph.closeRunStep', () => {
     const { graph, closed } = createGraph();
     const step = seedStep(graph, 'step_a');
 
-    await graph.closeRunStep('step_a', 'completed', 2_000);
-    const restamped = await graph.closeRunStep('step_a', 'completed', 3_000, {
+    await graph.closeRunStep('step_a', 'completed', { at: 2_000 });
+    const restamped = await graph.closeRunStep('step_a', 'completed', {
+      at: 3_000,
       restamp: true,
     });
     expect(restamped).toBe(false);
@@ -192,7 +199,7 @@ describe('StandardGraph.closeUnfinishedRunSteps', () => {
     const done = seedStep(graph, 'step_done', StepTypes.TOOL_CALLS);
     const openMessage = seedStep(graph, 'step_msg');
     const openTool = seedStep(graph, 'step_tool', StepTypes.TOOL_CALLS);
-    await graph.closeRunStep('step_done', 'completed', 2_000);
+    await graph.closeRunStep('step_done', 'completed', { at: 2_000 });
     closed.length = 0;
 
     await graph.closeUnfinishedRunSteps('cancelled', 5_000);

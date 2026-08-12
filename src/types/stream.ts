@@ -60,7 +60,13 @@ export type RunStep = {
   type: StepTypes;
   /** Epoch ms when the step was dispatched. */
   created_at?: number;
-  /** Lifecycle status; terminal values are stamped when the step closes. */
+  /**
+   * Lifecycle status; terminal values are stamped when the step closes.
+   * Invariant (enforced by `closeRunStep`, not the type, to stay wire-compatible
+   * with the OpenAI Assistants shape): a terminal status sets exactly one
+   * matching `*_at` field; first close wins and `cancelled`/`failed` are
+   * immutable once stamped.
+   */
   status?: RunStepStatus;
   /** Epoch ms when the step closed with status `completed`. */
   completed_at?: number;
@@ -133,6 +139,8 @@ export interface RunStepClosedEvent {
 }
 
 export type RunStepCloseOptions = {
+  /** Epoch ms for the terminal stamp; defaults to `Date.now()` at close time. */
+  at?: number;
   metadata?: Record<string, unknown>;
   /** Allow a completed TOOL_CALLS step to refresh `completed_at` on a late completion. */
   restamp?: boolean;

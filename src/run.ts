@@ -127,6 +127,32 @@ function getStepScopedEventId(data: unknown): string | undefined {
   return typeof candidate.id === 'string' ? candidate.id : undefined;
 }
 
+/**
+ * Narrows an ON_RUN_STEP_COMPLETED payload (`{ result: ToolCompleteEvent }`)
+ * to the ids step closure needs. Returns undefined for malformed payloads and
+ * the resume race's empty step id.
+ */
+function getToolCompletionIds(
+  data: unknown
+): { stepId: string; toolCallId?: string } | undefined {
+  if (data == null || typeof data !== 'object') {
+    return undefined;
+  }
+  const { result } = data as { result?: unknown };
+  if (result == null || typeof result !== 'object') {
+    return undefined;
+  }
+  const candidate = result as { id?: unknown; tool_call?: { id?: unknown } };
+  if (typeof candidate.id !== 'string' || candidate.id === '') {
+    return undefined;
+  }
+  const toolCallId = candidate.tool_call?.id;
+  return {
+    stepId: candidate.id,
+    ...(typeof toolCallId === 'string' ? { toolCallId } : {}),
+  };
+}
+
 function isLangGraphResumeMapForInterrupt(
   value: unknown,
   interruptId: string
@@ -735,15 +761,11 @@ export class Run<_T extends t.BaseGraphState> {
           eventName === GraphEvents.ON_RUN_STEP_COMPLETED &&
           this.Graph != null
         ) {
-          const completed = (
-            data as
-              | { result?: { id?: string; tool_call?: { id?: string } } }
-              | undefined
-          )?.result;
-          if (completed?.id != null && completed.id !== '') {
+          const completion = getToolCompletionIds(data);
+          if (completion != null) {
             await this.Graph.recordStepCompletion(
-              completed.id,
-              completed.tool_call?.id,
+              completion.stepId,
+              completion.toolCallId,
               metadata
             );
           }
