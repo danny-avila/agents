@@ -642,7 +642,9 @@ function createManualCompactGraph(params: {
       },
       dispatchRunStepCompleted: async (stepId, completed): Promise<void> => {
         const completedAt = Date.now();
-        const runStep = contentData.find((step) => step.id === stepId);
+        const stepIndex = contentIndexMap.get(stepId);
+        const runStep =
+          stepIndex === undefined ? undefined : contentData[stepIndex];
         const resultWithStep = {
           ...completed,
           id: stepId,
