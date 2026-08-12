@@ -631,6 +631,8 @@ function createManualCompactGraph(params: {
       hookRegistry: params.hooks,
       streamLimits: resolveStreamLimits(params.streamLimits),
       dispatchRunStep: async (runStep): Promise<void> => {
+        runStep.created_at ??= Date.now();
+        runStep.status ??= 'in_progress';
         contentData.push(runStep);
         contentIndexMap.set(runStep.id, runStep.index);
         await params.customHandlers?.[GraphEvents.ON_RUN_STEP]?.handle(
@@ -639,11 +641,13 @@ function createManualCompactGraph(params: {
         );
       },
       dispatchRunStepCompleted: async (stepId, completed): Promise<void> => {
+        const completedAt = Date.now();
         const runStep = contentData.find((step) => step.id === stepId);
         const resultWithStep = {
           ...completed,
           id: stepId,
           index: runStep?.index ?? 0,
+          completed_at: completedAt,
         };
         if (completed.type === 'summary') {
           result.completedSummary = completed.summary;
@@ -653,6 +657,28 @@ function createManualCompactGraph(params: {
         ]?.handle(GraphEvents.ON_RUN_STEP_COMPLETED, {
           result: resultWithStep,
         } as unknown as Parameters<t.EventHandler['handle']>[1]);
+        if (runStep == null || runStep.status !== 'in_progress') {
+          return;
+        }
+        runStep.status = 'completed';
+        runStep.completed_at = completedAt;
+        const closedEvent: t.RunStepClosedEvent = {
+          id: stepId,
+          index: runStep.index,
+          type: runStep.type,
+          status: 'completed',
+          closed_at: completedAt,
+        };
+        if (runStep.created_at != null) {
+          closedEvent.created_at = runStep.created_at;
+        }
+        if (runStep.runId != null) {
+          closedEvent.runId = runStep.runId;
+        }
+        await params.customHandlers?.[GraphEvents.ON_RUN_STEP_CLOSED]?.handle(
+          GraphEvents.ON_RUN_STEP_CLOSED,
+          closedEvent
+        );
       },
     },
   };

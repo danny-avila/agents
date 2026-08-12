@@ -16,6 +16,7 @@ type MockGraph = {
   getRunStep: jest.Mock;
   dispatchRunStep: jest.Mock;
   dispatchRunStepDelta: jest.Mock;
+  registerPendingToolCall: jest.Mock;
   toolCallStepIds: Map<string, string>;
   messageStepHasToolCalls: Map<string, boolean>;
   messageIdsByStepKey: Map<string, string>;
@@ -40,6 +41,7 @@ function createMockGraph(overrides?: Partial<MockGraph>): MockGraph {
     dispatchRunStepDelta: jest
       .fn<() => Promise<void>>()
       .mockResolvedValue(undefined),
+    registerPendingToolCall: jest.fn<() => void>(),
     toolCallStepIds: new Map(),
     messageStepHasToolCalls: new Map(),
     messageIdsByStepKey: new Map(),

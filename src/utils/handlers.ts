@@ -30,6 +30,10 @@ interface HandlerCallbacks {
     event: GraphEvents.ON_RUN_STEP_DELTA,
     data: t.StreamEventData
   ) => void;
+  onRunStepClosed?: (
+    event: GraphEvents.ON_RUN_STEP_CLOSED,
+    data: t.RunStepClosedEvent
+  ) => void;
   onMessageDelta?: (
     event: GraphEvents.ON_MESSAGE_DELTA,
     data: t.StreamEventData
@@ -85,6 +89,15 @@ export function createHandlers(callbacks?: HandlerCallbacks): {
       ): void => {
         aggregateContent({ event, data: data as t.RunStepDeltaEvent });
         callbacks?.onRunStepDelta?.(event, data);
+      },
+    },
+
+    [GraphEvents.ON_RUN_STEP_CLOSED]: {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP_CLOSED,
+        data: t.StreamEventData
+      ): void => {
+        callbacks?.onRunStepClosed?.(event, data as t.RunStepClosedEvent);
       },
     },
 

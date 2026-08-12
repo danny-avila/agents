@@ -50,6 +50,12 @@ import {
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import {
+  appendCallbacks,
+  filterCallbacks,
+  findCallback,
+  type CallbackEntry,
+} from '@/utils/callbacks';
+import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
@@ -59,12 +65,6 @@ import {
   TitleMethod,
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
-import {
-  appendCallbacks,
-  filterCallbacks,
-  findCallback,
-  type CallbackEntry,
-} from '@/utils/callbacks';
 import {
   createCompletionTitleRunnable,
   createTitleRunnable,
@@ -98,6 +98,7 @@ const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_RUN_STEP,
   GraphEvents.ON_RUN_STEP_DELTA,
   GraphEvents.ON_RUN_STEP_COMPLETED,
+  GraphEvents.ON_RUN_STEP_CLOSED,
   GraphEvents.ON_MESSAGE_DELTA,
   GraphEvents.ON_REASONING_DELTA,
   GraphEvents.ON_TOOL_EXECUTE,
@@ -113,6 +114,7 @@ const CUSTOM_GRAPH_EVENTS = new Set<string>([
 const DIRECT_DISPATCHED_STEP_EVENTS = new Set<string>([
   GraphEvents.ON_RUN_STEP,
   GraphEvents.ON_RUN_STEP_DELTA,
+  GraphEvents.ON_RUN_STEP_CLOSED,
   GraphEvents.ON_MESSAGE_DELTA,
   GraphEvents.ON_REASONING_DELTA,
 ]);
@@ -703,20 +705,49 @@ export class Run<_T extends t.BaseGraphState> {
         return;
       }
       const handler = this.handlerRegistry?.getHandler(eventName);
-      if (handler && this.Graph) {
-        return await handler.handle(
-          eventName,
-          data as
-            | t.StreamEventData
-            | t.ModelEndData
-            | t.RunStep
-            | t.RunStepDeltaEvent
-            | t.MessageDeltaEvent
-            | t.ReasoningDeltaEvent
-            | { result: t.ToolEndEvent },
-          metadata,
-          this.Graph
-        );
+      /**
+       * Tool completions arriving over the custom-event channel are the only
+       * signal ToolNode (which holds no graph reference) emits — observe them
+       * here to drive step closure. Runs in `finally`, independent of handler
+       * registration, so an absent or throwing host handler cannot lose the
+       * close; duplicate callback echoes are absorbed by the terminal-status
+       * guard in `closeRunStep`.
+       */
+      try {
+        if (handler && this.Graph) {
+          return await handler.handle(
+            eventName,
+            data as
+              | t.StreamEventData
+              | t.ModelEndData
+              | t.RunStep
+              | t.RunStepDeltaEvent
+              | t.RunStepClosedEvent
+              | t.MessageDeltaEvent
+              | t.ReasoningDeltaEvent
+              | { result: t.ToolEndEvent },
+            metadata,
+            this.Graph
+          );
+        }
+      } finally {
+        if (
+          eventName === GraphEvents.ON_RUN_STEP_COMPLETED &&
+          this.Graph != null
+        ) {
+          const completed = (
+            data as
+              | { result?: { id?: string; tool_call?: { id?: string } } }
+              | undefined
+          )?.result;
+          if (completed?.id != null && completed.id !== '') {
+            await this.Graph.recordStepCompletion(
+              completed.id,
+              completed.tool_call?.id,
+              metadata
+            );
+          }
+        }
       }
     };
   }
@@ -729,6 +760,26 @@ export class Run<_T extends t.BaseGraphState> {
     return (
       this._interrupt != null && this._haltedReason == null && !streamThrew
     );
+  }
+
+  /**
+   * Terminal status for steps still open at end-of-run: `cancelled` for
+   * intentional stops (caller abort, hook halt), `failed` for unexpected
+   * stream errors, `completed` for a natural finish. Reads `_haltedReason`
+   * behind a method boundary on purpose — it is assigned inside the
+   * `consumeStream` closure, which control-flow narrowing cannot see.
+   */
+  private resolveSweepStatus(
+    streamThrew: boolean,
+    streamAborted: boolean
+  ): Exclude<t.RunStepStatus, 'in_progress'> {
+    if (streamThrew) {
+      return streamAborted ? 'cancelled' : 'failed';
+    }
+    if (this._haltedReason != null) {
+      return 'cancelled';
+    }
+    return 'completed';
   }
 
   private getStreamLangfuseConfig(
@@ -1027,6 +1078,7 @@ export class Run<_T extends t.BaseGraphState> {
      * preserving session hooks would leak them into the next run.
      */
     let streamThrew = false;
+    let streamAborted = false;
 
     const consumeStream = async (): Promise<void> => {
       /**
@@ -1098,6 +1150,16 @@ export class Run<_T extends t.BaseGraphState> {
         const handler = this.handlerRegistry?.getHandler(eventName);
         if (handler) {
           await handler.handle(eventName, data, metadata, this.Graph);
+        }
+
+        /**
+         * A finished model call ends its lane's open message step. Placed
+         * here — not in `ModelEndHandler` — because hosts replace the
+         * CHAT_MODEL_END handler with their own instance, which would
+         * silently drop the close.
+         */
+        if (eventName === GraphEvents.CHAT_MODEL_END && this.Graph != null) {
+          await this.Graph.closeOpenMessageStep(metadata);
         }
 
         /**
@@ -1213,6 +1275,9 @@ export class Run<_T extends t.BaseGraphState> {
       );
     } catch (err) {
       streamThrew = true;
+      streamAborted =
+        config.signal?.aborted === true ||
+        (err instanceof Error && err.name === 'AbortError');
       if (this.hookRegistry?.hasHookFor('StopFailure', this.id) === true) {
         const runMessages = this.Graph.getRunMessages() ?? [];
         await executeHooks({
@@ -1289,6 +1354,24 @@ export class Run<_T extends t.BaseGraphState> {
           config.configurable = undefined;
         }
         config.callbacks = undefined;
+      }
+
+      /**
+       * Terminal sweep: close every step that never reached a terminal
+       * status — `completed` on a natural end, `cancelled` on caller abort
+       * or hook halt, `failed` on an unexpected stream error. Skipped on a
+       * HITL pause, where the open steps continue after `resume()`. Runs
+       * before `getContentParts()` so terminal stamps flow into content and
+       * session serialization.
+       */
+      if (!this.isAwaitingResume(streamThrew)) {
+        try {
+          await this.Graph.closeUnfinishedRunSteps(
+            this.resolveSweepStatus(streamThrew, streamAborted)
+          );
+        } catch {
+          /* the sweep must never mask the stream outcome */
+        }
       }
 
       const result = this.returnContent

@@ -45,6 +45,7 @@ import type {
   ReasoningDeltaEvent,
   RunStep,
   RunStepDeltaEvent,
+  RunStepClosedEvent,
   StandardGraphInput,
   ExecutableSubagentConfigEntry,
   ResolvedSubagentConfig,
@@ -156,8 +157,7 @@ function cloneToolSessionContext(
       : {
         files: context.files.map((file) => ({
           ...file,
-          storage_session_id:
-              file.storage_session_id ?? context.session_id,
+          storage_session_id: file.storage_session_id ?? context.session_id,
         })),
       }),
   };
@@ -200,8 +200,7 @@ function seedChildGraphSessions(
         );
       const files = existing.files == null ? [] : [...existing.files];
       for (const file of context.files) {
-        const storageSessionId =
-          file.storage_session_id ?? context.session_id;
+        const storageSessionId = file.storage_session_id ?? context.session_id;
         const key = `${storageSessionId}\0${file.id}`;
         if (seenFiles.has(key)) {
           continue;
@@ -263,10 +262,12 @@ type SanitizedRunStep = Partial<
   Pick<
     RunStep,
     | 'agentId'
+    | 'created_at'
     | 'groupId'
     | 'id'
     | 'index'
     | 'runId'
+    | 'status'
     | 'stepIndex'
     | 'summary'
     | 'type'
@@ -275,6 +276,8 @@ type SanitizedRunStep = Partial<
 > & {
   stepDetails?: SanitizedStepDetails;
 };
+
+type SanitizedRunStepClosed = Partial<RunStepClosedEvent>;
 
 type SanitizedStepDetails =
   | {
@@ -313,6 +316,7 @@ type SanitizedStepCompleted =
       index?: number;
       type: 'tool_call';
       tool_call?: SanitizedProcessedToolCall;
+      completed_at?: number;
     }
   | {
       type: 'summary';
@@ -2825,6 +2829,10 @@ export class SubagentExecutor {
           scheduleWrap(eventName, 'run_step_completed', data, memberAgentId);
           return;
         }
+        if (eventName === GraphEvents.ON_RUN_STEP_CLOSED) {
+          scheduleWrap(eventName, 'run_step_closed', data, memberAgentId);
+          return;
+        }
         if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
           scheduleWrap(eventName, 'message_delta', data, memberAgentId);
           return;
@@ -3179,6 +3187,9 @@ export function sanitizeForwardedSubagentUpdateData(
   if (eventName === GraphEvents.ON_RUN_STEP_COMPLETED) {
     return sanitizeRunStepCompletedUpdateData(data);
   }
+  if (eventName === GraphEvents.ON_RUN_STEP_CLOSED) {
+    return sanitizeRunStepClosedUpdateData(data);
+  }
   if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
     return sanitizeMessageDeltaUpdateData(data);
   }
@@ -3230,10 +3241,12 @@ function sanitizeRunStepUpdateData(
   const step = data as Partial<RunStep>;
   const sanitized: SanitizedRunStep = {};
   assignString(sanitized, 'agentId', step.agentId);
+  assignNumber(sanitized, 'created_at', step.created_at);
   assignNumber(sanitized, 'groupId', step.groupId);
   assignString(sanitized, 'id', step.id);
   assignNumber(sanitized, 'index', step.index);
   assignString(sanitized, 'runId', step.runId);
+  assignString(sanitized, 'status', step.status);
   assignNumber(sanitized, 'stepIndex', step.stepIndex);
   assignString(sanitized, 'type', step.type);
   if (step.summary !== undefined) {
@@ -3243,6 +3256,27 @@ function sanitizeRunStepUpdateData(
     sanitized.usage = step.usage;
   }
   sanitized.stepDetails = sanitizeStepDetails(step.stepDetails);
+  return sanitized;
+}
+
+function sanitizeRunStepClosedUpdateData(
+  data: unknown
+): SanitizedRunStepClosed | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const event = data as Partial<RunStepClosedEvent>;
+  const sanitized: SanitizedRunStepClosed = {};
+  assignString(sanitized, 'agentId', event.agentId);
+  assignNumber(sanitized, 'closed_at', event.closed_at);
+  assignNumber(sanitized, 'created_at', event.created_at);
+  assignNumber(sanitized, 'groupId', event.groupId);
+  assignString(sanitized, 'id', event.id);
+  assignNumber(sanitized, 'index', event.index);
+  assignString(sanitized, 'runId', event.runId);
+  assignString(sanitized, 'status', event.status);
+  assignNumber(sanitized, 'stepIndex', event.stepIndex);
+  assignString(sanitized, 'type', event.type);
   return sanitized;
 }
 
@@ -3389,6 +3423,7 @@ function sanitizeStepCompleted(
     id?: unknown;
     index?: unknown;
     tool_call?: unknown;
+    completed_at?: unknown;
   };
   if (completed.type === 'summary') {
     return {
@@ -3402,6 +3437,7 @@ function sanitizeStepCompleted(
   const sanitized: SanitizedStepCompleted = { type: 'tool_call' };
   assignString(sanitized, 'id', completed.id);
   assignNumber(sanitized, 'index', completed.index);
+  assignNumber(sanitized, 'completed_at', completed.completed_at);
   sanitized.tool_call = sanitizeProcessedToolCall(completed.tool_call);
   return sanitized;
 }
@@ -3519,6 +3555,12 @@ export function summarizeEvent(eventName: string, data: unknown): string {
       return `Tool ${tool.name} complete`;
     }
     return 'Step complete';
+  }
+  if (eventName === GraphEvents.ON_RUN_STEP_CLOSED) {
+    const closed = data as { status?: string };
+    return closed.status != null && closed.status !== ''
+      ? `Step ${closed.status}`
+      : 'Step closed';
   }
   if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
     return 'Streaming…';
