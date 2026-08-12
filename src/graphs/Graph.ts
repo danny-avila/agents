@@ -1817,7 +1817,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * successor's start event.
      */
     if (openMessageStepId != null && openMessageStepId !== runStep.id) {
-      await this.closeRunStep(openMessageStepId, 'completed', { metadata });
+      /**
+       * Isolated: this step is already registered in `contentData`, so a
+       * predecessor delivery failure rejecting here would abort the caller
+       * before it publishes this step's ON_RUN_STEP — leaving the sweep to
+       * emit a terminal event for a step that never announced a start.
+       */
+      try {
+        await this.closeRunStep(openMessageStepId, 'completed', { metadata });
+      } catch (_e) {
+        /** Predecessor delivery must not abort the successor's lifecycle */
+      }
     }
   }
 
@@ -1841,14 +1851,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (!runStep) {
       return false;
     }
-    const isTerminal =
-      runStep.status != null && runStep.status !== 'in_progress';
-    const canRestamp =
-      options?.restamp === true &&
-      status === 'completed' &&
-      runStep.status === 'completed' &&
-      runStep.type === StepTypes.TOOL_CALLS;
-    if (isTerminal && !canRestamp) {
+    if (runStep.status != null && runStep.status !== 'in_progress') {
       this.untrackRunStep(runStep);
       return false;
     }
@@ -1861,18 +1864,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       runStep.cancelled_at = closedAt;
     } else {
       runStep.failed_at = closedAt;
-    }
-
-    /**
-     * A restamp corrects the stored `completed_at` for a parallel tool call
-     * that completed after its step already closed. The terminal event stays
-     * single-shot — re-emitting would break the exactly-once contract and
-     * double-count downstream (duplicate session `step.finished`, doubled
-     * step analytics).
-     */
-    if (isTerminal) {
-      this.untrackRunStep(runStep);
-      return true;
     }
 
     const closedEvent: t.RunStepClosedEvent = {
@@ -1947,18 +1938,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       await this.closeRunStep(stepId, 'completed', { metadata, at });
       return;
     }
-    const removed =
-      toolCallId != null && toolCallId !== ''
-        ? pending.delete(toolCallId)
-        : false;
+    if (toolCallId != null && toolCallId !== '') {
+      pending.delete(toolCallId);
+    }
     if (pending.size > 0) {
       return;
     }
-    await this.closeRunStep(stepId, 'completed', {
-      metadata,
-      at,
-      restamp: removed,
-    });
+    await this.closeRunStep(stepId, 'completed', { metadata, at });
   }
 
   /**
@@ -4941,6 +4927,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               } finally {
                 unmarkHandlerDispatchedEvent?.();
               }
+            },
+            closeRunStep: async (
+              stepId: string,
+              status: Exclude<t.RunStepStatus, 'in_progress'>,
+              nodeConfig?: RunnableConfig
+            ) => {
+              await this.closeRunStep(stepId, status, {
+                metadata: (nodeConfig ?? this.config)?.metadata,
+              });
             },
             dispatchRunStepCompleted: async (
               stepId: string,

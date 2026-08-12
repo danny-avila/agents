@@ -86,50 +86,36 @@ describe('StandardGraph.closeRunStep', () => {
     expect(closed).toHaveLength(1);
   });
 
-  it('keeps cancelled and failed immutable, even with restamp', async () => {
+  it('keeps a terminal status immutable across later close attempts', async () => {
     const { graph, closed } = createGraph();
     const step = seedStep(graph, 'step_a', StepTypes.TOOL_CALLS);
 
     await graph.closeRunStep('step_a', 'cancelled', { at: 2_000 });
-    const restamped = await graph.closeRunStep('step_a', 'completed', {
+    const reclosed = await graph.closeRunStep('step_a', 'completed', {
       at: 3_000,
-      restamp: true,
     });
-    expect(restamped).toBe(false);
+    expect(reclosed).toBe(false);
     expect(step.status).toBe('cancelled');
     expect(step.cancelled_at).toBe(2_000);
     expect(step.completed_at).toBeUndefined();
     expect(closed).toHaveLength(1);
   });
 
-  it('restamps a completed TOOL_CALLS step on a late completion', async () => {
+  it('keeps the stored stamp and the emitted event in agreement', async () => {
     const { graph, closed } = createGraph();
     const step = seedStep(graph, 'step_a', StepTypes.TOOL_CALLS);
 
     await graph.closeRunStep('step_a', 'completed', { at: 2_000 });
-    const restamped = await graph.closeRunStep('step_a', 'completed', {
+    const reclosed = await graph.closeRunStep('step_a', 'completed', {
       at: 3_000,
-      restamp: true,
     });
-    expect(restamped).toBe(true);
-    expect(step.completed_at).toBe(3_000);
-    /** The stamp moves, the terminal event stays single-shot. */
-    expect(closed).toHaveLength(1);
-    expect(closed[0].closed_at).toBe(2_000);
-  });
 
-  it('does not restamp completed MESSAGE_CREATION steps', async () => {
-    const { graph, closed } = createGraph();
-    const step = seedStep(graph, 'step_a');
-
-    await graph.closeRunStep('step_a', 'completed', { at: 2_000 });
-    const restamped = await graph.closeRunStep('step_a', 'completed', {
-      at: 3_000,
-      restamp: true,
-    });
-    expect(restamped).toBe(false);
+    /** No silent correction: RunStep.completed_at can never disagree with the
+     *  closed_at already delivered to subscribers. */
+    expect(reclosed).toBe(false);
     expect(step.completed_at).toBe(2_000);
     expect(closed).toHaveLength(1);
+    expect(closed[0].closed_at).toBe(2_000);
   });
 
   it('tolerates empty and unknown step ids', async () => {
@@ -177,19 +163,27 @@ describe('StandardGraph.recordStepCompletion', () => {
     expect(closed).toHaveLength(1);
   });
 
-  it('restamps when a late-registered call completes after the step closed', async () => {
+  it('leaves a closed step untouched if a late call registers and completes', async () => {
     const { graph, closed } = createGraph();
     const step = seedStep(graph, 'step_a', StepTypes.TOOL_CALLS);
     graph.registerPendingToolCall('call_1', 'step_a');
 
-    await graph.recordStepCompletion('step_a', { toolCallId: 'call_1' });
+    await graph.recordStepCompletion('step_a', {
+      toolCallId: 'call_1',
+      at: 2_000,
+    });
     expect(closed).toHaveLength(1);
-    const firstClosedAt = step.completed_at;
 
     graph.registerPendingToolCall('call_2', 'step_a');
-    await graph.recordStepCompletion('step_a', { toolCallId: 'call_2' });
+    await graph.recordStepCompletion('step_a', {
+      toolCallId: 'call_2',
+      at: 3_000,
+    });
+    /** First close wins outright — no second event and no divergence between
+     *  the stored stamp and what subscribers were told. */
     expect(closed).toHaveLength(1);
-    expect(step.completed_at).toBeGreaterThanOrEqual(firstClosedAt as number);
+    expect(step.completed_at).toBe(2_000);
+    expect(closed[0].closed_at).toBe(2_000);
   });
   it('uses the producer\'s completion timestamp when one is supplied', async () => {
     const { graph, closed } = createGraph();

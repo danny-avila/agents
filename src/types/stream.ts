@@ -153,12 +153,6 @@ export type RunStepCloseOptions = {
   /** Epoch ms for the terminal stamp; defaults to `Date.now()` at close time. */
   at?: number;
   metadata?: Record<string, unknown>;
-  /**
-   * Allow a completed TOOL_CALLS step to refresh `completed_at` for a late
-   * parallel completion. Updates the stored stamp only — the terminal event
-   * is never re-emitted.
-   */
-  restamp?: boolean;
 };
 
 export type StepDetails = MessageCreationDetails | ToolCallsDetails;
