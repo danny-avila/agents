@@ -93,6 +93,9 @@ export const defaultOmitOptions = new Set([
   'additionalModelRequestFields',
 ]);
 
+const ACTIVITY_LABEL_TRACE_NAME = 'LibreChat Activity Label';
+const ACTIVITY_PHASE_TRACE_NAME = 'LibreChat Activity Phase';
+
 const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_AGENT_UPDATE,
   GraphEvents.ON_RUN_STEP,
@@ -1866,22 +1869,15 @@ export class Run<_T extends t.BaseGraphState> {
         ? undefined
         : (requestedContext ??
           this.Graph.agentContexts.get(this.Graph.defaultAgentId));
-    const traceMetadata = createLangfuseTraceMetadata({
-      messageId: 'activity-label-' + this.id,
-      agentName: labelContext?.name,
-    });
-    const labelRunName = getLangfuseTraceName(
-      traceMetadata,
-      'LibreChat Activity Label'
-    );
-
     /** Shallow-cloned: activity labels run once per tool batch, and writing
      *  the Langfuse handler back onto a host-reused `chainOptions` would
      *  accumulate duplicate callbacks across batches. */
     const labelChainOptions = {
       ...(chainOptions ?? {}),
     } as Partial<RunnableConfig> & {
-      configurable?: Record<string, unknown>;
+      configurable?: Record<string, unknown> & {
+        requestBody?: { parentMessageId?: unknown };
+      };
     };
     const labelUserId =
       typeof labelChainOptions.configurable?.user_id === 'string'
@@ -1891,6 +1887,42 @@ export class Run<_T extends t.BaseGraphState> {
       typeof labelChainOptions.configurable?.thread_id === 'string'
         ? (labelChainOptions.configurable.thread_id as string)
         : undefined;
+    const labelIndex = labelSeq - 1;
+    const labelParentMessageId =
+      labelChainOptions.configurable?.requestBody?.parentMessageId;
+    /** An omitted `agentId` is attributable only when exactly one context
+     *  exists. Multi-agent callers remain unattributed instead of being
+     *  incorrectly assigned to the graph's default agent. */
+    const labelAgentId =
+      agentId ??
+      (this.Graph?.agentContexts.size === 1
+        ? this.Graph.defaultAgentId
+        : undefined);
+    const labelAgentName =
+      labelAgentId == null ? undefined : labelContext?.name;
+    const labelMetadata: Record<string, unknown> = {
+      sourceRunId: this.id,
+      responseId: this.id,
+      activityIndex: labelIndex,
+      ...(typeof labelParentMessageId === 'string'
+        ? { parentMessageId: labelParentMessageId }
+        : {}),
+      ...(labelAgentId == null ? {} : { agentId: labelAgentId }),
+      ...(labelAgentName == null ? {} : { agentName: labelAgentName }),
+    };
+    const traceMetadata = {
+      ...createLangfuseTraceMetadata({
+        messageId: 'activity-label-' + this.id,
+        parentMessageId: labelParentMessageId,
+        agentId: labelAgentId,
+        agentName: labelAgentName,
+      }),
+      sourceRunId: this.id,
+      responseId: this.id,
+      activityIndex: String(labelIndex),
+    };
+    const labelRunName = labelChainOptions.runName ?? ACTIVITY_LABEL_TRACE_NAME;
+    const labelTags = ['librechat', 'activity-label'];
     const labelLangfuseConfig = resolveLangfuseConfig(
       this.langfuse,
       labelContext?.langfuse
@@ -1934,14 +1966,14 @@ export class Run<_T extends t.BaseGraphState> {
         userId: labelUserId,
         sessionId: labelSessionId,
         traceMetadata,
-        tags: ['librechat', 'activity-label'],
+        tags: labelTags,
         traceIdSeed:
           labelLangfuseConfig?.deterministicTraceId === true
             ? labelTraceSeed
             : undefined,
         runId: labelScopeRunId,
         toolOutputTracing: labelRuntimeScope.toolOutputTracing,
-        traceName: labelChainOptions.runName ?? labelRunName,
+        traceName: labelRunName,
       });
     }
     if (labelLangfuseHandler != null) {
@@ -2027,7 +2059,12 @@ export class Run<_T extends t.BaseGraphState> {
     const invokeConfig = Object.assign({}, labelChainOptions, {
       run_id: labelRunId,
       runId: labelRunId,
-      runName: labelChainOptions.runName ?? labelRunName,
+      runName: labelRunName,
+      tags: [...new Set([...(labelChainOptions.tags ?? []), ...labelTags])],
+      metadata: {
+        ...(labelChainOptions.metadata ?? {}),
+        ...labelMetadata,
+      },
     }) as Partial<RunnableConfig>;
 
     const invokeLabel = (
@@ -2038,9 +2075,9 @@ export class Run<_T extends t.BaseGraphState> {
           langfuse: labelLangfuseConfig,
           userId: labelUserId,
           sessionId: labelSessionId,
-          traceName: runtimeConfig.runName ?? labelRunName,
+          traceName: labelRunName,
           traceMetadata,
-          tags: ['librechat', 'activity-label'],
+          tags: labelTags,
         },
         () =>
           model.invoke(
@@ -2124,7 +2161,7 @@ export class Run<_T extends t.BaseGraphState> {
 
   /**
    * Generates one parent summary for two or more logical activities. The
-   * summary model is traced as a dedicated activity-phase agent root in the
+   * summary model is traced as a dedicated activity-phase chain root in the
    * conversation session, with the model callback recorded as its generation
    * child. No session id means no phase trace, avoiding orphan observations.
    */
@@ -2289,11 +2326,8 @@ export class Run<_T extends t.BaseGraphState> {
         : { contributingAgentIds: contributingAgentIds.join(',') }),
       ...(closingTextPhase == null ? {} : { closingTextPhase }),
     };
-    const phaseRunName = getLangfuseTraceName(
-      traceMetadata,
-      'LibreChat Activity Phase'
-    );
-    const phaseTraceName = phaseChainOptions.runName ?? phaseRunName;
+    const phaseTraceName =
+      phaseChainOptions.runName ?? ACTIVITY_PHASE_TRACE_NAME;
     const phaseTags = [
       'librechat',
       'activity-phase',
