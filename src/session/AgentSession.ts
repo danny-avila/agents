@@ -616,13 +616,70 @@ function createManualCompactGraph(params: {
 }): {
   graph: Parameters<typeof createSummarizeNode>[0]['graph'];
   completedSummary?: t.SummaryContentBlock;
+  closeOpenSteps: (
+    status: Exclude<t.RunStepStatus, 'in_progress'>
+  ) => Promise<void>;
 } {
   const contentData: t.RunStep[] = [];
   const contentIndexMap = new Map<string, number>();
+  /** Stamps the terminal state and publishes the single terminal event. */
+  const closeStep = async (
+    runStep: t.RunStep,
+    status: Exclude<t.RunStepStatus, 'in_progress'>,
+    at: number
+  ): Promise<void> => {
+    if (runStep.status !== 'in_progress') {
+      return;
+    }
+    runStep.status = status;
+    if (status === 'completed') {
+      runStep.completed_at = at;
+    } else if (status === 'cancelled') {
+      runStep.cancelled_at = at;
+    } else {
+      runStep.failed_at = at;
+    }
+    const closedEvent: t.RunStepClosedEvent = {
+      id: runStep.id,
+      index: runStep.index,
+      type: runStep.type,
+      status,
+      closed_at: at,
+    };
+    if (runStep.created_at != null) {
+      closedEvent.created_at = runStep.created_at;
+    }
+    if (runStep.runId != null) {
+      closedEvent.runId = runStep.runId;
+    }
+    await params.customHandlers?.[GraphEvents.ON_RUN_STEP_CLOSED]?.handle(
+      GraphEvents.ON_RUN_STEP_CLOSED,
+      closedEvent
+    );
+  };
   const result: {
     graph: Parameters<typeof createSummarizeNode>[0]['graph'];
     completedSummary?: t.SummaryContentBlock;
+    closeOpenSteps: (
+      status: Exclude<t.RunStepStatus, 'in_progress'>
+    ) => Promise<void>;
   } = {
+    /**
+     * Terminal sweep for compaction, which runs outside `Run.processStream`
+     * and so has no stream-level equivalent: a summarization model that
+     * rejects, aborts, or trips a stream limit after the step was published
+     * would otherwise strand observers with a permanently open step.
+     */
+    closeOpenSteps: async (status): Promise<void> => {
+      const closedAt = Date.now();
+      for (const runStep of contentData) {
+        try {
+          await closeStep(runStep, status, closedAt);
+        } catch (_e) {
+          /** Delivery failure for one step must not halt the sweep */
+        }
+      }
+    },
     graph: {
       contentData,
       contentIndexMap,
@@ -659,28 +716,10 @@ function createManualCompactGraph(params: {
         ]?.handle(GraphEvents.ON_RUN_STEP_COMPLETED, {
           result: resultWithStep,
         } as unknown as Parameters<t.EventHandler['handle']>[1]);
-        if (runStep == null || runStep.status !== 'in_progress') {
+        if (runStep == null) {
           return;
         }
-        runStep.status = 'completed';
-        runStep.completed_at = completedAt;
-        const closedEvent: t.RunStepClosedEvent = {
-          id: stepId,
-          index: runStep.index,
-          type: runStep.type,
-          status: 'completed',
-          closed_at: completedAt,
-        };
-        if (runStep.created_at != null) {
-          closedEvent.created_at = runStep.created_at;
-        }
-        if (runStep.runId != null) {
-          closedEvent.runId = runStep.runId;
-        }
-        await params.customHandlers?.[GraphEvents.ON_RUN_STEP_CLOSED]?.handle(
-          GraphEvents.ON_RUN_STEP_CLOSED,
-          closedEvent
-        );
+        await closeStep(runStep, 'completed', completedAt);
       },
     },
   };
@@ -1330,19 +1369,31 @@ export class AgentSession {
         graph.graph.contentData.length,
       ],
     });
-    const summarizedState = await summarizeNode(
-      {
-        messages: sessionState.messages,
-        summarizationRequest: {
-          remainingContextTokens: agentContext.maxContextTokens ?? 0,
-          agentId: agentContext.agentId,
+    let summarizedState;
+    try {
+      summarizedState = await summarizeNode(
+        {
+          messages: sessionState.messages,
+          summarizationRequest: {
+            remainingContextTokens: agentContext.maxContextTokens ?? 0,
+            agentId: agentContext.agentId,
+          },
         },
-      },
-      {
-        configurable: { thread_id: this.threadId },
-        metadata: { run_id: compactRunId },
-      }
-    );
+        {
+          configurable: { thread_id: this.threadId },
+          metadata: { run_id: compactRunId },
+        }
+      );
+    } catch (error) {
+      const aborted =
+        error instanceof Error &&
+        (error.name === 'AbortError' || error.name === 'GraphBubbleUp');
+      await graph.closeOpenSteps(aborted ? 'cancelled' : 'failed').catch(() => {
+        /** the sweep must never mask the summarization failure */
+      });
+      throw error;
+    }
+    await graph.closeOpenSteps('completed');
     const completedSummaryText = getSummaryText(graph.completedSummary);
     const contextSummaryText = agentContext.getSummaryText();
     let summaryText = completedSummaryText;

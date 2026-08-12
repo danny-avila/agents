@@ -1780,7 +1780,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   protected async trackDispatchedRunStep(
     runStep: t.RunStep,
-    metadata?: Record<string, unknown>
+    metadata?: Record<string, unknown>,
+    /**
+     * Summarization steps are typed MESSAGE_CREATION but own an explicit
+     * completion, and their model call emits `CHAT_MODEL_END` well before the
+     * summary is assembled. Tracking one as the lane's open step would let
+     * model-end publish an authoritative `completed` closure early — the
+     * measured duration would exclude the remaining work and a later
+     * post-model failure could no longer change the status. They close
+     * through `recordStepCompletion` instead.
+     */
+    trackAsOpenMessageStep: boolean = true
   ): Promise<void> {
     const agentKey = runStep.agentId ?? '';
     const openMessageStepId = this.openMessageStepByAgent.get(agentKey);
@@ -1789,7 +1799,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     }
     this.contentData.push(runStep);
     this.contentIndexMap.set(runStep.id, runStep.index);
-    if (runStep.type === StepTypes.MESSAGE_CREATION) {
+    if (trackAsOpenMessageStep && runStep.type === StepTypes.MESSAGE_CREATION) {
       this.openMessageStepByAgent.set(agentKey, runStep.id);
     } else {
       this.openMessageStepByAgent.delete(agentKey);
@@ -1838,6 +1848,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       runStep.failed_at = closedAt;
     }
 
+    /**
+     * A restamp corrects the stored `completed_at` for a parallel tool call
+     * that completed after its step already closed. The terminal event stays
+     * single-shot — re-emitting would break the exactly-once contract and
+     * double-count downstream (duplicate session `step.finished`, doubled
+     * step analytics).
+     */
+    if (isTerminal) {
+      this.untrackRunStep(runStep);
+      return true;
+    }
+
     const closedEvent: t.RunStepClosedEvent = {
       id: stepId,
       index: runStep.index,
@@ -1878,7 +1900,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       ? this.markHandlerDispatchedEvent(GraphEvents.ON_RUN_STEP_CLOSED, stepId)
       : undefined;
     try {
-      if (options?.registryOnly !== true && this.config) {
+      if (this.config) {
         await safeDispatchCustomEvent(
           GraphEvents.ON_RUN_STEP_CLOSED,
           closedEvent,
@@ -1945,8 +1967,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   /**
    * End-of-run sweep: closes every step that never reached a terminal
-   * status. Runs after the LangGraph stream has ended, so dispatch is
-   * registry-only — the custom-event channel is already dead there.
+   * status. Dual-dispatches like any other close — the custom-event channel
+   * is usually already torn down here and `safeDispatchCustomEvent` reports
+   * that quietly, but callback-only subscribers still receive the terminal
+   * signal whenever it is alive.
    */
   async closeUnfinishedRunSteps(
     status: Exclude<t.RunStepStatus, 'in_progress'>,
@@ -1957,10 +1981,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (runStep.status != null && runStep.status !== 'in_progress') {
         continue;
       }
-      await this.closeRunStep(runStep.id, status, {
-        at: closedAt,
-        registryOnly: true,
-      });
+      /**
+       * Isolated per step: one host handler throwing must not strand the
+       * remaining steps `in_progress` with no terminal event. The step is
+       * stamped before dispatch either way, so a thrown handler still leaves
+       * consistent state behind.
+       */
+      try {
+        await this.closeRunStep(runStep.id, status, { at: closedAt });
+      } catch (_e) {
+        /** Delivery failure for one step must not halt the sweep */
+      }
     }
     this.pendingToolCallsByStep.clear();
     this.openMessageStepByAgent.clear();
@@ -4857,7 +4888,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               runStep.status ??= 'in_progress';
               await this.trackDispatchedRunStep(
                 runStep,
-                resolvedConfig?.metadata
+                resolvedConfig?.metadata,
+                false
               );
 
               const handler = this.handlerRegistry?.getHandler(

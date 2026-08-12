@@ -113,8 +113,9 @@ describe('StandardGraph.closeRunStep', () => {
     });
     expect(restamped).toBe(true);
     expect(step.completed_at).toBe(3_000);
-    expect(closed).toHaveLength(2);
-    expect(closed[1].closed_at).toBe(3_000);
+    /** The stamp moves, the terminal event stays single-shot. */
+    expect(closed).toHaveLength(1);
+    expect(closed[0].closed_at).toBe(2_000);
   });
 
   it('does not restamp completed MESSAGE_CREATION steps', async () => {
@@ -187,9 +188,8 @@ describe('StandardGraph.recordStepCompletion', () => {
 
     graph.registerPendingToolCall('call_2', 'step_a');
     await graph.recordStepCompletion('step_a', 'call_2');
-    expect(closed).toHaveLength(2);
+    expect(closed).toHaveLength(1);
     expect(step.completed_at).toBeGreaterThanOrEqual(firstClosedAt as number);
-    expect(closed[1].status).toBe('completed');
   });
 });
 
@@ -224,5 +224,34 @@ describe('StandardGraph.closeUnfinishedRunSteps', () => {
     expect(step.failed_at).toBe(5_000);
     expect(step.cancelled_at).toBeUndefined();
     expect(step.completed_at).toBeUndefined();
+  });
+  it('keeps sweeping when a closure handler throws', async () => {
+    const graph = new StandardGraph({
+      runId: 'run_1',
+      agents: [makeAgent('agent')],
+    });
+    const seen: string[] = [];
+    const registry = new HandlerRegistry();
+    registry.register(GraphEvents.ON_RUN_STEP_CLOSED, {
+      handle: (_event, data): void => {
+        const event = data as t.RunStepClosedEvent;
+        seen.push(event.id);
+        if (event.id === 'step_1') {
+          throw new Error('host handler blew up');
+        }
+      },
+    });
+    graph.handlerRegistry = registry;
+    const first = seedStep(graph, 'step_1');
+    const second = seedStep(graph, 'step_2');
+    const third = seedStep(graph, 'step_3');
+
+    await graph.closeUnfinishedRunSteps('cancelled', 5_000);
+
+    expect(seen).toEqual(['step_1', 'step_2', 'step_3']);
+    for (const step of [first, second, third]) {
+      expect(step.status).toBe('cancelled');
+      expect(step.cancelled_at).toBe(5_000);
+    }
   });
 });
