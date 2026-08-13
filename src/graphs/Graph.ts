@@ -5126,10 +5126,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       runStep.runId = runId;
     }
 
-    if (metadata) {
+    /**
+     * `agentId`/`groupId` are multi-agent-only, and `getAgentContext` signals a
+     * miss by throwing — so for a single-agent graph the lookup could only ever
+     * build and discard an Error while producing the same undefined fields.
+     * The constant-time check gates it out of the per-step dispatch path.
+     */
+    if (metadata && this.isMultiAgentGraph()) {
       try {
         const agentContext = this.getAgentContext(metadata);
-        if (this.isMultiAgentGraph() && agentContext.agentId) {
+        if (agentContext.agentId) {
           runStep.agentId = agentContext.agentId;
           const groupId = this.resolveParallelGroupId(
             agentContext.agentId,
