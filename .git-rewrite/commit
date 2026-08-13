@@ -1,0 +1,22 @@
+tree e80bee85687b71902fc32968c78dffd84035a3b1
+parent 7200b803aa3aa12d473184fff26f943de78d400c
+author Danny Avila <danny@librechat.ai> 1740675857 -0500
+committer Danny Avila <danny@librechat.ai> 1740675857 -0500
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ iQIzBAABCgAdFiEEugGgKVZjq5SByBoOvzHussXKCVYFAmfAmxEACgkQvzHussXK
+ CVamoQ//f8YWVvS1ZQOzVscXbzbYBFuq2R0YHjhfbkhO8yod7qyzo4hgbr25zuyW
+ daozUnDEy96UgWjEPAGt7Rc4qAc9rYQxaghut0O9I7yHojYUItr8vaq/YLfr+5YC
+ oG9qPCEo2ELKQa5MyTwdsbVEYoE3cJsIGpFgmh1qMe7RwevsavqC9q33J0J3/VkV
+ Xfhmh1FK6J+WHR3XnL7FZKU3pZiTQMymi1mKBHyIVxwzPCpul78pKo9SIMo04cIr
+ wL1vgRlRMBZ7ssXWxeQKQ4ScOkhxGWSxac4Qj6NUHiy4vzz+rt7MNw3hG4Oew1E5
+ ozUJ9LJgUXD9bIlwQ8XQtSWPMppvATxUnkEAj7g+7OMqwetpzZIjxgl6REbPj3XM
+ x2IFKdSiUQ6zTrvpajrb1eo1uVSo1DVkdEO/s3tqA58Nbod8LtWm1eA6na9GUv7u
+ rOZYWBo097KuRJkEKKuDpUC3Jv1J7u6i3FmuNwb4vekqiZuidr6zTkLwlsgUaVol
+ R9xbziXkCi7puOfi4wAcJ9FQUsRYYP4p1Zxrj3RzQwcaV4YI+oWAwCg+EmGoR6C5
+ Bm4Y1UDkgV4vDZnyoPV0LpuUCgWVwj3FPAqGggiHsJ1mRsCDIi/fibk3aR4j5Eql
+ kXZ+9gkddpHT0yeEIFTaKbLCsMaxbxqhXXAS6PrIGyKZ5MIDnUE=
+ =Ru35
+ -----END PGP SIGNATURE-----
+
+fix: alibaba edge case, no previous step ID for tool call chunk
