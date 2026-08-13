@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "3.4.5",
+  "version": "3.4.6",
   "reova": {
     "enabled": true,
     "endpoint": "https://telemetry.reo.dev/data"
