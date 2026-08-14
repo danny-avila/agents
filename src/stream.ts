@@ -258,7 +258,8 @@ function toCodeEnvFile(file: t.FileRef, execSessionId: string): t.CodeEnvFile {
 
 function getCodeSessionContext(
   graph: StandardGraph,
-  name: string
+  name: string,
+  agentContext?: AgentContext
 ): t.ToolCallRequest['codeSessionContext'] | undefined {
   if (
     !CODE_EXECUTION_TOOLS.has(name) &&
@@ -269,9 +270,9 @@ function getCodeSessionContext(
     return undefined;
   }
 
-  const codeSession = graph.sessions.get(Constants.EXECUTE_CODE) as
-    | t.CodeSessionContext
-    | undefined;
+  const codeSession = graph.sessions.get(
+    agentContext?.codeSessionKey ?? Constants.EXECUTE_CODE
+  ) as t.CodeSessionContext | undefined;
   if (codeSession?.session_id == null || codeSession.session_id === '') {
     return undefined;
   }
@@ -748,7 +749,11 @@ function createEagerToolExecutionPlan(args: {
       name: toolCall.name,
       args: toolCall.args,
       stepId: graph.toolCallStepIds.get(toolCall.id!) ?? '',
-      codeSessionContext: getCodeSessionContext(graph, toolCall.name),
+      codeSessionContext: getCodeSessionContext(
+        graph,
+        toolCall.name,
+        agentContext
+      ),
     })),
     usageCount: graph.getEagerEventToolUsageCount(agentContext?.agentId),
   });

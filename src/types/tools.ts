@@ -128,6 +128,8 @@ export type ToolNodeOptions = {
   toolRegistry?: LCToolRegistry;
   /** Reference to Graph's sessions map for automatic session injection */
   sessions?: ToolSessionMap;
+  /** Partition within `sessions` used by this agent's code tools. */
+  codeSessionKey?: string;
   /** When true, dispatches ON_TOOL_EXECUTE events instead of invoking tools directly */
   eventDrivenMode?: boolean;
   /** Tool definitions for event-driven mode (used for context, not invocation) */

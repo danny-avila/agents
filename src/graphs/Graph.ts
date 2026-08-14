@@ -2391,6 +2391,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentLangfuse: agentContext?.langfuse,
         eventDrivenMode: true,
         sessions: this.sessions,
+        codeSessionKey: agentContext?.codeSessionKey,
         toolDefinitions: toolDefMap,
         // `agentId` is the subagent-scope marker — set ONLY for child-run
         // graphs (hooks fire for child scopes too, via the inherited
@@ -2471,6 +2472,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
+      codeSessionKey: agentContext?.codeSessionKey,
       toolExecution: this.toolExecution,
       codeSessionToolNames: this.codeSessionToolNames,
       interruptingToolNames: effectiveInterruptingToolNames,

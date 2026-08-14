@@ -803,6 +803,12 @@ export interface LangfuseConfig {
 
 export interface AgentInputs {
   agentId: string;
+  /**
+   * Partition key for transient code-session ids and file refs. Agents with
+   * the same key share those refs; different execution profiles/scopes must
+   * use different keys. Defaults to the legacy shared `execute_code` slot.
+   */
+  codeSessionKey?: string;
   /** Human-readable name for the agent (used in handoff context). Defaults to agentId if not provided. */
   name?: string;
   toolEnd?: boolean;
