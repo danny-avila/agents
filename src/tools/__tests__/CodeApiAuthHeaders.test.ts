@@ -252,6 +252,37 @@ describe('CodeAPI auth header injection', () => {
     expect(requestBodyAt(1).runtime_session_hint).toBe('user-123');
   });
 
+  it('normalizes profile URLs and falls back from empty factory hints', async () => {
+    const codeTool = createCodeExecutionTool({
+      baseUrl: 'https://code-stateful.example.com/',
+      executionProfile: 'stateful',
+      runtimeSessionHint: '',
+      statefulSessions: true,
+    });
+    const bashTool = createBashExecutionTool({
+      baseUrl: 'https://code-stateful.example.com///',
+      executionProfile: 'stateful',
+      runtimeSessionHint: '',
+      statefulSessions: true,
+    });
+
+    await codeTool.invoke({ lang: 'py', code: 'print(1)' }, {
+      toolCall: { _runtime_session_hint: 'thread-fallback' },
+    } as unknown as RunnableConfig);
+    await bashTool.invoke({ command: 'echo 1' }, {
+      toolCall: { _runtime_session_hint: 'thread-fallback' },
+    } as unknown as RunnableConfig);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      'https://code-stateful.example.com/exec'
+    );
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      'https://code-stateful.example.com/exec'
+    );
+    expect(requestBodyAt(0).runtime_session_hint).toBe('thread-fallback');
+    expect(requestBodyAt(1).runtime_session_hint).toBe('thread-fallback');
+  });
+
   it('tolerates null params for direct code execution', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ session_id: 'session_123', stdout: '1\n' })
@@ -655,6 +686,38 @@ describe('CodeAPI auth header injection', () => {
     );
     expect(requestBodyAt(0)).not.toHaveProperty('runtime_session_hint');
   });
+
+  it.each([
+    ['python', createProgrammaticToolCallingTool],
+    ['bash', createBashProgrammaticToolCallingTool],
+  ] as const)(
+    'normalizes %s PTC URLs and falls back from empty factory hints',
+    async (_name, createTool) => {
+      const tool = createTool({
+        baseUrl: 'https://code-stateful.example.com/',
+        executionProfile: 'stateful',
+        runtimeSessionHint: '',
+      });
+
+      await tool.invoke(
+        { code: 'print("ok")' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+            _runtime_session_hint: 'thread-fallback',
+          },
+        }
+      );
+
+      expect(fetchMock.mock.calls[0]?.[0]).toBe(
+        'https://code-stateful.example.com/exec/programmatic'
+      );
+      expect(requestBodyAt(0).runtime_session_hint).toBe('thread-fallback');
+    }
+  );
 
   it('defaults programmatic timeout to the configured CodeAPI run cap', async () => {
     const tool = createProgrammaticToolCallingTool({

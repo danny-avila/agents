@@ -12,9 +12,11 @@ import {
   emptyOutputMessage,
   buildCodeApiHttpErrorMessage,
   CodeApiRequestError,
+  buildCodeApiEndpoint,
   getCodeBaseURL,
   normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
+  selectRuntimeSessionHint,
 } from './CodeExecutor';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
@@ -175,7 +177,10 @@ export const BashExecutionToolDefinition = {
 function createBashExecutionTool(
   params: t.BashExecutionToolParams | null = {}
 ): DynamicStructuredTool {
-  const execEndpoint = `${params?.baseUrl ?? getCodeBaseURL()}/exec`;
+  const execEndpoint = buildCodeApiEndpoint(
+    params?.baseUrl ?? getCodeBaseURL(),
+    'exec'
+  );
 
   return tool(
     async (rawInput, config) => {
@@ -221,8 +226,10 @@ function createBashExecutionTool(
         ...executionParams,
       };
 
-      const effectiveRuntimeSessionHint =
-        runtimeSessionHint ?? _runtime_session_hint;
+      const effectiveRuntimeSessionHint = selectRuntimeSessionHint(
+        runtimeSessionHint,
+        _runtime_session_hint
+      );
       if (
         statefulSessions === true &&
         executionProfile !== 'default' &&
@@ -292,22 +299,22 @@ function createBashExecutionTool(
         const runtimeEcho =
           result.runtime_session_id != null
             ? {
-              runtime_session_id: result.runtime_session_id,
-              runtime_status: result.runtime_status,
-            }
+                runtime_session_id: result.runtime_session_id,
+                runtime_status: result.runtime_status,
+              }
             : {};
         return [
           appendCodeSessionFileSummary(outputWithReminder, result.files),
           (hasFiles
             ? {
-              session_id: result.session_id,
-              files: result.files,
-              ...runtimeEcho,
-            }
+                session_id: result.session_id,
+                files: result.files,
+                ...runtimeEcho,
+              }
             : {
-              session_id: result.session_id,
-              ...runtimeEcho,
-            }) satisfies t.CodeExecutionArtifact,
+                session_id: result.session_id,
+                ...runtimeEcho,
+              }) satisfies t.CodeExecutionArtifact,
         ];
       } catch (error) {
         const messageWithReminder = appendFailedExecutionFileReminder(

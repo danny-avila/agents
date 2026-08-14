@@ -13,11 +13,13 @@ import {
   buildCodeApiExecutionErrorMessage,
   buildCodeApiHttpErrorMessage,
   CodeApiRequestError,
+  buildCodeApiEndpoint,
   emptyOutputMessage,
   getCodeBaseURL,
   appendTmpScratchReminder,
   normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
+  selectRuntimeSessionHint,
 } from './CodeExecutor';
 import {
   clampCodeApiRunTimeoutMs,
@@ -848,9 +850,9 @@ export function formatCompletedResponse(
       files: response.files,
       ...(response.runtime_session_id != null
         ? {
-          runtime_session_id: response.runtime_session_id,
-          runtime_status: response.runtime_status,
-        }
+            runtime_session_id: response.runtime_session_id,
+            runtime_status: response.runtime_status,
+          }
         : {}),
     } satisfies t.ProgrammaticExecutionArtifact,
   ];
@@ -887,7 +889,7 @@ export function createProgrammaticToolCallingTool(
   const maxRunTimeoutMs = resolveCodeApiRunTimeoutMs(initParams.runTimeoutMs);
   const proxy = initParams.proxy ?? process.env.PROXY;
   const debug = initParams.debug ?? process.env.PTC_DEBUG === 'true';
-  const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
+  const EXEC_ENDPOINT = buildCodeApiEndpoint(baseUrl, 'exec/programmatic');
 
   return tool(
     async (rawParams, config) => {
@@ -961,8 +963,10 @@ export function createProgrammaticToolCallingTool(
          * later round-trips. Prefer trusted per-agent factory context over
          * legacy ToolNode injection. Explicit default profiles always drop it.
          * PTC keeps its stateless runtime prompt in v1. */
-        const selectedRuntimeSessionHint =
-          initParams.runtimeSessionHint ?? _runtime_session_hint;
+        const selectedRuntimeSessionHint = selectRuntimeSessionHint(
+          initParams.runtimeSessionHint,
+          _runtime_session_hint
+        );
         const runtimeSessionHint =
           initParams.executionProfile !== 'default' &&
           typeof selectedRuntimeSessionHint === 'string' &&

@@ -106,4 +106,30 @@ describe('tool session partition seeding', () => {
       }),
     ]);
   });
+
+  it('keeps an explicit child partition seed instead of merging the legacy fallback', () => {
+    const key = 'execute_code:stateful:user-1';
+    const explicit = session('stateful-storage', 'stateful-input');
+    const sessions: t.ToolSessionMap = new Map();
+
+    seedAgentInitialSessions(sessions, [
+      {
+        codeSessionKey: key,
+        initialSessions: new Map([
+          [Constants.EXECUTE_CODE, session('legacy-storage', 'legacy-input')],
+          [key, explicit],
+        ]),
+      },
+    ]);
+
+    expect(sessions.get(key)).toEqual({
+      ...explicit,
+      files: [
+        {
+          ...explicit.files![0],
+          storage_session_id: 'stateful-storage',
+        },
+      ],
+    });
+  });
 });

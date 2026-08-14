@@ -8,8 +8,10 @@ import {
   CODE_ARTIFACT_PATH_GUIDANCE,
   appendFailedExecutionFileReminder,
   buildCodeApiExecutionErrorMessage,
+  buildCodeApiEndpoint,
   CodeApiRequestError,
   getCodeBaseURL,
+  selectRuntimeSessionHint,
 } from './CodeExecutor';
 import {
   clampCodeApiRunTimeoutMs,
@@ -296,7 +298,7 @@ export function createBashProgrammaticToolCallingTool(
   const maxRunTimeoutMs = resolveCodeApiRunTimeoutMs(initParams.runTimeoutMs);
   const proxy = initParams.proxy ?? process.env.PROXY;
   const debug = initParams.debug ?? process.env.BASH_PTC_DEBUG === 'true';
-  const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
+  const EXEC_ENDPOINT = buildCodeApiEndpoint(baseUrl, 'exec/programmatic');
 
   return tool(
     async (rawParams, config) => {
@@ -366,8 +368,10 @@ export function createBashProgrammaticToolCallingTool(
          * later round-trips. Prefer trusted per-agent factory context over
          * legacy ToolNode injection. Explicit default profiles always drop it.
          * BashPTC keeps its stateless runtime prompt in v1. */
-        const selectedRuntimeSessionHint =
-          initParams.runtimeSessionHint ?? _runtime_session_hint;
+        const selectedRuntimeSessionHint = selectRuntimeSessionHint(
+          initParams.runtimeSessionHint,
+          _runtime_session_hint
+        );
         const runtimeSessionHint =
           initParams.executionProfile !== 'default' &&
           typeof selectedRuntimeSessionHint === 'string' &&

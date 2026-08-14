@@ -11,12 +11,12 @@ function cloneToolSessionContext(
     ...(context.files == null
       ? {}
       : {
-        files: context.files.map((file) => ({
-          ...file,
+          files: context.files.map((file) => ({
+            ...file,
           storage_session_id:
             file.storage_session_id ?? context.session_id,
-        })),
-      }),
+          })),
+        }),
   };
 }
 
@@ -97,11 +97,16 @@ export function seedAgentInitialSessions(
     if (agent.initialSessions == null) {
       continue;
     }
+    const codeSessionKey = agent.codeSessionKey ?? Constants.EXECUTE_CODE;
+    const hasExplicitCodeSession =
+      codeSessionKey !== Constants.EXECUTE_CODE &&
+      agent.initialSessions.has(codeSessionKey);
     for (const [toolName, context] of agent.initialSessions) {
+      if (toolName === Constants.EXECUTE_CODE && hasExplicitCodeSession) {
+        continue;
+      }
       const key =
-        toolName === Constants.EXECUTE_CODE
-          ? (agent.codeSessionKey ?? Constants.EXECUTE_CODE)
-          : toolName;
+        toolName === Constants.EXECUTE_CODE ? codeSessionKey : toolName;
       mergeToolSessionContext(sessions, key, context);
     }
   }

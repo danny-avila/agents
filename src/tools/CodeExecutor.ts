@@ -19,6 +19,17 @@ export const getCodeBaseURL = (): string =>
   getEnvironmentVariable(EnvVar.CODE_BASEURL) ??
   Constants.OFFICIAL_CODE_BASEURL;
 
+export function buildCodeApiEndpoint(baseUrl: string, route: string): string {
+  return `${baseUrl.replace(/\/+$/, '')}/${route.replace(/^\/+/, '')}`;
+}
+
+export function selectRuntimeSessionHint(
+  factoryHint?: string,
+  injectedHint?: string
+): string | undefined {
+  return factoryHint != null && factoryHint !== '' ? factoryHint : injectedHint;
+}
+
 export const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
 
@@ -346,7 +357,10 @@ export const CodeExecutionToolDefinition = {
 function createCodeExecutionTool(
   params: t.CodeExecutionToolParams | null = {}
 ): DynamicStructuredTool {
-  const execEndpoint = `${params?.baseUrl ?? getCodeBaseURL()}/exec`;
+  const execEndpoint = buildCodeApiEndpoint(
+    params?.baseUrl ?? getCodeBaseURL(),
+    'exec'
+  );
 
   return tool(
     async (rawInput, config) => {
@@ -404,8 +418,10 @@ function createCodeExecutionTool(
       /* Stateful sessions: prefer the per-agent factory hint, falling back to
        * legacy ToolNode injection. Explicit default-profile tools always drop
        * the hint so a mixed graph cannot promote them to the stateful path. */
-      const effectiveRuntimeSessionHint =
-        runtimeSessionHint ?? _runtime_session_hint;
+      const effectiveRuntimeSessionHint = selectRuntimeSessionHint(
+        runtimeSessionHint,
+        _runtime_session_hint
+      );
       if (
         statefulSessions === true &&
         executionProfile !== 'default' &&
@@ -482,22 +498,22 @@ function createCodeExecutionTool(
         const runtimeEcho =
           result.runtime_session_id != null
             ? {
-              runtime_session_id: result.runtime_session_id,
-              runtime_status: result.runtime_status,
-            }
+                runtime_session_id: result.runtime_session_id,
+                runtime_status: result.runtime_status,
+              }
             : {};
         return [
           appendCodeSessionFileSummary(outputWithReminder, result.files),
           (hasFiles
             ? {
-              session_id: result.session_id,
-              files: result.files,
-              ...runtimeEcho,
-            }
+                session_id: result.session_id,
+                files: result.files,
+                ...runtimeEcho,
+              }
             : {
-              session_id: result.session_id,
-              ...runtimeEcho,
-            }) satisfies t.CodeExecutionArtifact,
+                session_id: result.session_id,
+                ...runtimeEcho,
+              }) satisfies t.CodeExecutionArtifact,
         ];
       } catch (error) {
         const messageWithReminder = appendFailedExecutionFileReminder(
