@@ -1620,16 +1620,28 @@ export class SubagentExecutor {
    *
    * Must run BEFORE `forwarding.drain()`: closures reach the parent only as
    * child custom events through the forwarder, which stops relaying once
-   * drained. Deliberately not called on the interrupt path — that mirrors the
-   * parent's `isAwaitingResume` guard, since a paused child resumes into the
-   * same steps and closing them here would strand the resumed run.
+   * drained.
+   *
+   * Deliberately not called on the interrupt path, mirroring the parent's
+   * `isAwaitingResume` guard: an in-process resume continues into these same
+   * steps, so closing them would strand the resumed run. A resume that
+   * crosses a process boundary is a known gap either way — the child rebuilds
+   * from `SubagentGraphResumeState`, which carries tool-call identity but not
+   * `contentData`, so pre-interrupt steps are unreachable from the new graph
+   * and stay open. That is the child-level instance of the same cross-process
+   * orphan the parent graph has, and it needs persisted lifecycle state to
+   * fix rather than a sweep here.
+   *
+   * `at` is the moment execution actually ended, threaded through so
+   * observational work between then and the sweep cannot inflate the stamps.
    */
   private async closeChildRunSteps(
     graph: StandardGraph,
-    status: Exclude<RunStepStatus, 'in_progress'>
+    status: Exclude<RunStepStatus, 'in_progress'>,
+    at?: number
   ): Promise<void> {
     try {
-      await graph.closeUnfinishedRunSteps(status);
+      await graph.closeUnfinishedRunSteps(status, at);
     } catch (_e) {
       /** A failed sweep must never mask the subagent's own outcome */
     }
@@ -2495,6 +2507,8 @@ export class SubagentExecutor {
         result = childResult;
       }
     } catch (error) {
+      /** Stamped at failure, not after the error-envelope work below. */
+      const childTerminalAt = Date.now();
       if (isGraphInterrupt(error)) {
         const activeChildRun = execution.activeRun;
         if (activeChildRun != null) {
@@ -2537,7 +2551,8 @@ export class SubagentExecutor {
        */
       await this.closeChildRunSteps(
         childGraph,
-        childSignal.aborted ? 'cancelled' : 'failed'
+        childSignal.aborted ? 'cancelled' : 'failed',
+        childTerminalAt
       );
       if (forwarding) {
         await forwarding.drain();
@@ -2570,6 +2585,14 @@ export class SubagentExecutor {
         messages: [],
       };
     }
+
+    /**
+     * Child execution ended here. Captured before the observational work
+     * below — an awaited `SubagentStop` hook, then the forwarder drain — so a
+     * slow hook cannot inflate the closure stamps with its own latency.
+     * Mirrors the parent's `terminalAt` capture in `Run.processStream`.
+     */
+    const childTerminalAt = Date.now();
 
     if (result == null) {
       throw new Error('Subagent completed without producing graph state.');
@@ -2608,7 +2631,7 @@ export class SubagentExecutor {
     }
 
     if (!childAlreadyCompleted) {
-      await this.closeChildRunSteps(childGraph, 'completed');
+      await this.closeChildRunSteps(childGraph, 'completed', childTerminalAt);
     }
 
     if (forwarding && !childAlreadyCompleted) {

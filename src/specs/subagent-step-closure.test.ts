@@ -10,6 +10,7 @@ import {
   ToolEndHandler,
   ModelEndHandler,
 } from '@/index';
+import { HookRegistry } from '@/hooks/HookRegistry';
 import * as providers from '@/llm/providers';
 import { Run } from '@/run';
 
@@ -61,6 +62,20 @@ type CapturedUpdate = {
   data?: unknown;
 };
 
+/**
+ * Derived from the real factory so a change to the provider constructor
+ * signature breaks this stub instead of being absorbed by an `any`.
+ */
+type OpenAIModelClass = ReturnType<
+  typeof providers.getChatModelClass<Providers.OPENAI>
+>;
+
+class FakeOpenAIChatModel extends FakeListChatModel {
+  constructor(_config: ConstructorParameters<OpenAIModelClass>[0]) {
+    super({ responses: [CHILD_RESPONSE] });
+  }
+}
+
 type UpdateCapture = {
   updates: CapturedUpdate[];
   handlers: Record<string, t.EventHandler>;
@@ -97,13 +112,12 @@ describe('Subagent child-graph run step closure', () => {
       .spyOn(providers, 'getChatModelClass')
       .mockImplementation(((provider: Providers) => {
         if (provider === Providers.OPENAI) {
-          return class extends FakeListChatModel {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            constructor(_options: any) {
-              super({ responses: [CHILD_RESPONSE] });
-            }
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          } as any;
+          /**
+           * A fake is not a `ChatOpenAI`, so the class identity cannot be
+           * satisfied structurally; the constructor contract above is what
+           * this test actually depends on.
+           */
+          return FakeOpenAIChatModel as unknown as OpenAIModelClass;
         }
         return originalGetChatModelClass(provider);
       }) as typeof providers.getChatModelClass);
@@ -206,5 +220,64 @@ describe('Subagent child-graph run step closure', () => {
           'cancelled'
       )
     ).toBe(true);
+  });
+
+  it('stamps closure at child termination, not after a slow stop hook', async () => {
+    const HOOK_DELAY_MS = 200;
+    const { updates, handlers } = createUpdateCapture();
+    const registry = new HookRegistry();
+    let hookFinishedAt = 0;
+
+    registry.register('SubagentStop', {
+      hooks: [
+        async (): Promise<Record<string, never>> => {
+          await new Promise((resolve) => setTimeout(resolve, HOOK_DELAY_MS));
+          hookFinishedAt = Date.now();
+          return {};
+        },
+      ],
+    });
+
+    const run = await Run.create<t.IState>({
+      runId: `subagent-closure-hook-${Date.now()}`,
+      graphConfig: { type: 'standard', agents: [createParentAgent()] },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: handlers,
+      hooks: registry,
+    });
+
+    run.Graph?.overrideTestModel(
+      ['Delegating this research.', `Based on the research: ${CHILD_RESPONSE}`],
+      10,
+      [subagentToolCall]
+    );
+
+    await run.processStream(
+      { messages: [new HumanMessage('What is the capital of France?')] },
+      {
+        ...callerConfig,
+        configurable: { thread_id: 'subagent-step-closure-hook' },
+      }
+    );
+
+    expect(hookFinishedAt).toBeGreaterThan(0);
+
+    const closedAts = updates
+      .filter((update) => update.phase === 'run_step_closed')
+      .map((update) => (update.data as { closed_at?: number }).closed_at);
+
+    expect(closedAts.length).toBeGreaterThan(0);
+    /**
+     * Sweeping after the awaited hook would push every stamp to at or beyond
+     * `hookFinishedAt`; the margin keeps the assertion honest without making
+     * it sensitive to scheduler jitter.
+     */
+    for (const closedAt of closedAts) {
+      expect(closedAt).toBeDefined();
+      expect(closedAt as number).toBeLessThan(
+        hookFinishedAt - HOOK_DELAY_MS / 2
+      );
+    }
   });
 });
