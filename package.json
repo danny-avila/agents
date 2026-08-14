@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "3.4.7",
+  "version": "3.5.0",
   "reova": {
     "enabled": true,
     "endpoint": "https://telemetry.reo.dev/data"
@@ -111,14 +111,21 @@
   },
   "files": [
     "dist",
-    "src",
+    "src/**/*.ts",
+    "!src/**/*.test.ts",
+    "!src/**/*.spec.ts",
+    "!src/**/__tests__/**",
+    "!src/specs/**",
+    "!src/scripts/**",
+    "!src/proto/**",
+    "!src/test/**",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
     "prepare": "node husky-setup.js",
     "prepublishOnly": "npm run build",
-    "build": "tsdown && tsc -p tsconfig.build.json",
+    "build": "tsdown && tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
     "build:dev": "tsdown",
     "check:circular-deps": "node config/circular-deps.mjs",
     "test:circular-deps": "node --test config/circular-deps.test.mjs",
