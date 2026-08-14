@@ -1608,6 +1608,53 @@ describe('SubagentExecutor', () => {
     ).toBe(false);
   });
 
+  it('remaps a selected child legacy code seed into its agent partition', async () => {
+    const codeSessionKey = 'execute_code:stateful:user-1';
+    const seededSession = {
+      session_id: 'selected-storage',
+      files: [
+        {
+          id: 'selected-file',
+          name: 'selected.txt',
+          storage_session_id: 'selected-storage',
+        },
+      ],
+      lastUpdated: 1,
+    };
+    const selected = makeConfig('selected-partition', {
+      agentInputs: {
+        ...makeChildInputs('selected-agent'),
+        codeSessionKey,
+        initialSessions: new Map([
+          [Constants.EXECUTE_CODE, seededSession],
+        ]),
+      },
+    });
+    const childSessions: ToolSessionMap = new Map();
+    const invoke = jest.fn(async () => {
+      expect(childSessions.has(Constants.EXECUTE_CODE)).toBe(false);
+      expect(childSessions.get(codeSessionKey)).toEqual(seededSession);
+      expect(childSessions.get(codeSessionKey)).not.toBe(seededSession);
+      return { messages: [new AIMessage('done')] };
+    });
+    const executor = createExecutor({
+      configs: new Map([[selected.type, selected]]),
+      createChildGraph: (): StandardGraph =>
+        ({
+          sessions: childSessions,
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    await executor.execute({
+      description: 'Use the selected file.',
+      subagentType: selected.type,
+    });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
   it('combines member session seeds inside a selected graph child', async () => {
     const makeSession = (
       storageSessionId: string,

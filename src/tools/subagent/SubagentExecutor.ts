@@ -62,7 +62,6 @@ import type {
   ToolApprovalInterruptPayload,
   ToolExecuteBatchRequest,
   ToolCallDelta,
-  ToolSessionContext,
   TokenCounter,
   ToolApprovalDecision,
   ToolApprovalDecisionMap,
@@ -125,6 +124,7 @@ import {
   createChildGraphPlan,
   isGraphSubagentConfig,
 } from './childGraphConfig';
+import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { composeAbortSignals } from '@/utils/misc';
 
@@ -148,71 +148,11 @@ const SUBAGENT_CONFIG_CHANGED_MESSAGE =
 const SUBAGENT_INVOCATION_CHANGED_MESSAGE =
   'Subagent error: Subagent invocation changed for this execution.';
 
-function cloneToolSessionContext(
-  context: ToolSessionContext
-): ToolSessionContext {
-  return {
-    ...context,
-    ...(context.files == null
-      ? {}
-      : {
-        files: context.files.map((file) => ({
-          ...file,
-          storage_session_id: file.storage_session_id ?? context.session_id,
-        })),
-      }),
-  };
-}
-
 function seedChildGraphSessions(
   childGraph: StandardGraph,
   agents: AgentInputs[]
 ): void {
-  const seenFilesByTool = new Map<string, Set<string>>();
-  for (const agent of agents) {
-    if (agent.initialSessions == null) {
-      continue;
-    }
-    for (const [toolName, context] of agent.initialSessions) {
-      const existing = childGraph.sessions.get(toolName);
-      if (existing == null) {
-        const cloned = cloneToolSessionContext(context);
-        childGraph.sessions.set(toolName, cloned);
-        seenFilesByTool.set(
-          toolName,
-          new Set(
-            cloned.files?.map(
-              (file) => `${file.storage_session_id ?? ''}\0${file.id}`
-            ) ?? []
-          )
-        );
-        continue;
-      }
-      if (context.files == null || context.files.length === 0) {
-        continue;
-      }
-      const seenFiles =
-        seenFilesByTool.get(toolName) ??
-        new Set(
-          existing.files?.map(
-            (file) =>
-              `${file.storage_session_id ?? existing.session_id}\0${file.id}`
-          ) ?? []
-        );
-      const files = existing.files == null ? [] : [...existing.files];
-      for (const file of context.files) {
-        const storageSessionId = file.storage_session_id ?? context.session_id;
-        const key = `${storageSessionId}\0${file.id}`;
-        if (seenFiles.has(key)) {
-          continue;
-        }
-        seenFiles.add(key);
-        files.push({ ...file, storage_session_id: storageSessionId });
-      }
-      seenFilesByTool.set(toolName, seenFiles);
-      childGraph.sessions.set(toolName, { ...existing, files });
-    }
-  }
+  seedAgentInitialSessions(childGraph.sessions, agents);
 }
 
 async function dispatchObservationalSubagentUpdate(

@@ -807,6 +807,8 @@ export interface AgentInputs {
    * Partition key for transient code-session ids and file refs. Agents with
    * the same key share those refs; different execution profiles/scopes must
    * use different keys. Defaults to the legacy shared `execute_code` slot.
+   * Non-default partitions also disable speculative eager execution of code
+   * tools because their factory may target a durable backend.
    */
   codeSessionKey?: string;
   /** Human-readable name for the agent (used in handoff context). Defaults to agentId if not provided. */
