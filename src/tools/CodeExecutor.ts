@@ -108,8 +108,8 @@ export const CodeExecutionToolSchema = {
   required: ['lang', 'code'],
 } as const;
 
-const baseEndpoint = getCodeBaseURL();
-const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
+export const CODE_API_EXPECTED_PROFILE_HEADER =
+  'X-CodeAPI-Expected-Profile';
 
 type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
@@ -226,6 +226,19 @@ export async function resolveCodeApiAuthHeaders(
   return authHeaders;
 }
 
+export function addCodeApiExecutionProfileHeader(
+  headers: t.CodeApiAuthHeaderMap,
+  executionProfile?: t.CodeApiExecutionProfile
+): t.CodeApiAuthHeaderMap {
+  if (executionProfile == null) {
+    return headers;
+  }
+  return {
+    ...headers,
+    [CODE_API_EXPECTED_PROFILE_HEADER]: executionProfile,
+  };
+}
+
 export async function buildCodeApiHttpErrorMessage(
   _method: string,
   _endpoint: string,
@@ -333,16 +346,21 @@ export const CodeExecutionToolDefinition = {
 function createCodeExecutionTool(
   params: t.CodeExecutionToolParams | null = {}
 ): DynamicStructuredTool {
+  const execEndpoint = `${params?.baseUrl ?? getCodeBaseURL()}/exec`;
+
   return tool(
     async (rawInput, config) => {
-      /* `statefulSessions` is a prompt-only flag (drives the description);
-       * keep it out of the wire body. */
+      /* `statefulSessions` drives the description and gates trusted runtime
+       * affinity hints. Keep the flag itself out of the wire body. */
       const {
         authHeaders,
-        statefulSessions: _statefulSessions,
+        baseUrl: _baseUrl,
+        executionProfile,
+        runtimeSessionHint,
+        statefulSessions,
         ...executionParams
       } = params ?? {};
-      void _statefulSessions;
+      void _baseUrl;
       /* Drop any model-supplied `runtime_session_hint` from the raw args: the
        * hint is host-controlled and must only ever come from ToolNode's
        * injected `_runtime_session_hint` (below). Spreading `...rest` into
@@ -383,14 +401,18 @@ function createCodeExecutionTool(
         ...executionParams,
       };
 
-      /* Stateful sessions: forward the hint so the Code API can route this
-       * execution to a warm per-session runtime. Additive — stateless
-       * servers ignore the unknown field. */
+      /* Stateful sessions: prefer the per-agent factory hint, falling back to
+       * legacy ToolNode injection. Explicit default-profile tools always drop
+       * the hint so a mixed graph cannot promote them to the stateful path. */
+      const effectiveRuntimeSessionHint =
+        runtimeSessionHint ?? _runtime_session_hint;
       if (
-        typeof _runtime_session_hint === 'string' &&
-        _runtime_session_hint !== ''
+        statefulSessions === true &&
+        executionProfile !== 'default' &&
+        typeof effectiveRuntimeSessionHint === 'string' &&
+        effectiveRuntimeSessionHint !== ''
       ) {
-        postData.runtime_session_hint = _runtime_session_hint;
+        postData.runtime_session_hint = effectiveRuntimeSessionHint;
       }
 
       /* File injection: `_injected_files` from ToolNode (set when host
@@ -421,19 +443,22 @@ function createCodeExecutionTool(
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
-            ...resolvedAuthHeaders,
+            ...addCodeApiExecutionProfileHeader(
+              resolvedAuthHeaders,
+              executionProfile
+            ),
           },
           body: JSON.stringify(postData),
         };
 
-        const proxyAgent = resolveFetchProxyAgent(EXEC_ENDPOINT);
+        const proxyAgent = resolveFetchProxyAgent(execEndpoint);
         if (proxyAgent) {
           fetchOptions.agent = proxyAgent;
         }
-        const response = await fetch(EXEC_ENDPOINT, fetchOptions);
+        const response = await fetch(execEndpoint, fetchOptions);
         if (!response.ok) {
           throw new CodeApiRequestError(
-            await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
+            await buildCodeApiHttpErrorMessage('POST', execEndpoint, response)
           );
         }
 

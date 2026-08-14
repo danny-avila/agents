@@ -8,6 +8,7 @@ import {
   appendFailedExecutionFileReminder,
   appendTmpScratchReminder,
   appendCodeSessionFileSummary,
+  addCodeApiExecutionProfileHeader,
   emptyOutputMessage,
   buildCodeApiHttpErrorMessage,
   CodeApiRequestError,
@@ -20,9 +21,6 @@ import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 config();
-
-const baseEndpoint = getCodeBaseURL();
-const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 
 export const BashExecutionToolSchema = {
   type: 'object',
@@ -177,15 +175,21 @@ export const BashExecutionToolDefinition = {
 function createBashExecutionTool(
   params: t.BashExecutionToolParams | null = {}
 ): DynamicStructuredTool {
+  const execEndpoint = `${params?.baseUrl ?? getCodeBaseURL()}/exec`;
+
   return tool(
     async (rawInput, config) => {
-      /* `statefulSessions` is prompt-only — keep it out of the wire body. */
+      /* `statefulSessions` drives the prompt and gates runtime affinity hints;
+       * keep the flag itself out of the wire body. */
       const {
         authHeaders,
-        statefulSessions: _statefulSessions,
+        baseUrl: _baseUrl,
+        executionProfile,
+        runtimeSessionHint,
+        statefulSessions,
         ...executionParams
       } = params ?? {};
-      void _statefulSessions;
+      void _baseUrl;
       /* Drop any model-supplied `runtime_session_hint` from the raw args: the
        * hint must only come from ToolNode's injected `_runtime_session_hint`
        * (below), never from the tool call itself. */
@@ -217,11 +221,15 @@ function createBashExecutionTool(
         ...executionParams,
       };
 
+      const effectiveRuntimeSessionHint =
+        runtimeSessionHint ?? _runtime_session_hint;
       if (
-        typeof _runtime_session_hint === 'string' &&
-        _runtime_session_hint !== ''
+        statefulSessions === true &&
+        executionProfile !== 'default' &&
+        typeof effectiveRuntimeSessionHint === 'string' &&
+        effectiveRuntimeSessionHint !== ''
       ) {
-        postData.runtime_session_hint = _runtime_session_hint;
+        postData.runtime_session_hint = effectiveRuntimeSessionHint;
       }
 
       /* See `CodeExecutor.ts` for the rationale — `/files/<session_id>`
@@ -248,19 +256,22 @@ function createBashExecutionTool(
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
-            ...resolvedAuthHeaders,
+            ...addCodeApiExecutionProfileHeader(
+              resolvedAuthHeaders,
+              executionProfile
+            ),
           },
           body: JSON.stringify(postData),
         };
 
-        const proxyAgent = resolveFetchProxyAgent(EXEC_ENDPOINT);
+        const proxyAgent = resolveFetchProxyAgent(execEndpoint);
         if (proxyAgent) {
           fetchOptions.agent = proxyAgent;
         }
-        const response = await fetch(EXEC_ENDPOINT, fetchOptions);
+        const response = await fetch(execEndpoint, fetchOptions);
         if (!response.ok) {
           throw new CodeApiRequestError(
-            await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
+            await buildCodeApiHttpErrorMessage('POST', execEndpoint, response)
           );
         }
 

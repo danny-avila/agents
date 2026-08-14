@@ -362,13 +362,17 @@ export function createBashProgrammaticToolCallingTool(
           );
         }
 
-        /* Stateful sessions: hint on the INITIAL request only (continuations
-         * bind via continuation_token). Wire-only in v1 — BashPTC keeps its
-         * stateless prompt. */
+        /* The hint rides the INITIAL request only; continuation_token binds
+         * later round-trips. Prefer trusted per-agent factory context over
+         * legacy ToolNode injection. Explicit default profiles always drop it.
+         * BashPTC keeps its stateless runtime prompt in v1. */
+        const selectedRuntimeSessionHint =
+          initParams.runtimeSessionHint ?? _runtime_session_hint;
         const runtimeSessionHint =
-          typeof _runtime_session_hint === 'string' &&
-          _runtime_session_hint !== ''
-            ? _runtime_session_hint
+          initParams.executionProfile !== 'default' &&
+          typeof selectedRuntimeSessionHint === 'string' &&
+          selectedRuntimeSessionHint !== ''
+            ? selectedRuntimeSessionHint
             : undefined;
 
         let response = await makeRequest(
@@ -385,7 +389,8 @@ export function createBashProgrammaticToolCallingTool(
               : {}),
           },
           proxy,
-          initParams.authHeaders
+          initParams.authHeaders,
+          initParams.executionProfile
         );
 
         // ====================================================================
@@ -425,7 +430,8 @@ export function createBashProgrammaticToolCallingTool(
               tool_results: toolResults,
             },
             proxy,
-            initParams.authHeaders
+            initParams.authHeaders,
+            initParams.executionProfile
           );
         }
 
