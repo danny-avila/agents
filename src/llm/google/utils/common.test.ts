@@ -116,9 +116,11 @@ describe('convertResponseContentToChatGenerationChunk seal metadata', () => {
 
 describe('rejectsModelTurnPrefill', () => {
   test('is true for models that reject a trailing model turn', () => {
+    expect(rejectsModelTurnPrefill('gemini-3.7-flash')).toBe(true);
     expect(rejectsModelTurnPrefill('gemini-3.6-flash')).toBe(true);
     expect(rejectsModelTurnPrefill('gemini-3.5-flash-lite')).toBe(true);
     expect(rejectsModelTurnPrefill('models/gemini-3.6-flash')).toBe(true);
+    expect(rejectsModelTurnPrefill('models/gemini-3.7-flash-latest')).toBe(true);
     expect(rejectsModelTurnPrefill('google/gemini-3.5-flash-lite-latest')).toBe(
       true
     );
@@ -145,6 +147,15 @@ describe('dropUnsupportedModelTurnPrefill', () => {
     const result = dropUnsupportedModelTurnPrefill(
       contents,
       'gemini-3.6-flash'
+    );
+    expect(result).toEqual([userTurn]);
+  });
+
+  test('drops a trailing model turn for Gemini 3.7 Flash', () => {
+    const contents: Content[] = [userTurn, modelTurn];
+    const result = dropUnsupportedModelTurnPrefill(
+      contents,
+      'gemini-3.7-flash'
     );
     expect(result).toEqual([userTurn]);
   });
