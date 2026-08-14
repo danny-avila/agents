@@ -57,15 +57,16 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
-import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
-import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
-import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
 import {
   hasReasoningKwargs,
   hasToolCallChunks,
   getReasoningKwargsText,
 } from '@/llm/stream/chunkAdapters';
+import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
+import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
+import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
+import { withRateLimitRetry } from '@/utils/rateLimit';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 const iife = <T>(fn: () => T) => fn();
@@ -2393,7 +2394,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
 function withLibreChatOpenAIFields(
   fields?: LibreChatOpenAIFields
 ): LibreChatOpenAIFields {
-  const nextFields = fields ?? {};
+  const nextFields = withRateLimitRetry(fields ?? {});
   return {
     ...nextFields,
     completions:
@@ -2503,7 +2504,7 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   _lc_stream_delay: number;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
-    super(fields);
+    super(withRateLimitRetry(fields));
     this.completions = new LibreChatAzureOpenAICompletions(fields);
     this.responses = new LibreChatAzureOpenAIResponses(fields);
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
@@ -2619,7 +2620,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
       _lc_stream_delay?: number;
     }
   ) {
-    super(fields);
+    super(withRateLimitRetry(fields));
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
   }
 
@@ -3142,7 +3143,7 @@ export class ChatXAI extends OriginalChatXAI {
       _lc_stream_delay?: number;
     }
   ) {
-    super(fields);
+    super(withRateLimitRetry(fields));
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     const customBaseURL =
       fields?.configuration?.baseURL ?? fields?.clientConfig?.baseURL;
