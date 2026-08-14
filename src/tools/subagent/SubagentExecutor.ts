@@ -46,6 +46,7 @@ import type {
   RunStep,
   RunStepDeltaEvent,
   RunStepClosedEvent,
+  RunStepStatus,
   StandardGraphInput,
   ExecutableSubagentConfigEntry,
   ResolvedSubagentConfig,
@@ -1610,6 +1611,30 @@ export class SubagentExecutor {
     graph.clearHeavyState();
   }
 
+  /**
+   * Terminal sweep for a child graph's run steps. `Run.processStream` sweeps
+   * only the graph it owns, and a child executes through `workflow.invoke()`
+   * outside that loop — so without this, a child's last message step (no
+   * successor step ever opens to close it) and every step of an aborted child
+   * stay `in_progress` forever, leaving hosts with unmatched starts.
+   *
+   * Must run BEFORE `forwarding.drain()`: closures reach the parent only as
+   * child custom events through the forwarder, which stops relaying once
+   * drained. Deliberately not called on the interrupt path — that mirrors the
+   * parent's `isAwaitingResume` guard, since a paused child resumes into the
+   * same steps and closing them here would strand the resumed run.
+   */
+  private async closeChildRunSteps(
+    graph: StandardGraph,
+    status: Exclude<RunStepStatus, 'in_progress'>
+  ): Promise<void> {
+    try {
+      await graph.closeUnfinishedRunSteps(status);
+    } catch (_e) {
+      /** A failed sweep must never mask the subagent's own outcome */
+    }
+  }
+
   clearHeavyState(): void {
     this.executions.clear((record) => {
       if (record.activeRun != null) {
@@ -2505,6 +2530,15 @@ export class SubagentExecutor {
         childBreaker.abort(error);
       }
       const errorMessage = truncateErrorMessage(error);
+      /**
+       * `cancelled` vs `failed` mirrors `Run.resolveSweepStatus`: an aborted
+       * child was stopped on purpose (caller abort, or a breaker trip from a
+       * parallel sibling), anything else died of an unexpected error.
+       */
+      await this.closeChildRunSteps(
+        childGraph,
+        childSignal.aborted ? 'cancelled' : 'failed'
+      );
       if (forwarding) {
         await forwarding.drain();
         await this.emitSubagentUpdate(parentRegistry!, {
@@ -2571,6 +2605,10 @@ export class SubagentExecutor {
       }).catch(() => {
         /* SubagentStop is observational — swallow errors */
       });
+    }
+
+    if (!childAlreadyCompleted) {
+      await this.closeChildRunSteps(childGraph, 'completed');
     }
 
     if (forwarding && !childAlreadyCompleted) {
