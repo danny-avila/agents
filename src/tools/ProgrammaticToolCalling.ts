@@ -850,9 +850,9 @@ export function formatCompletedResponse(
       files: response.files,
       ...(response.runtime_session_id != null
         ? {
-            runtime_session_id: response.runtime_session_id,
-            runtime_status: response.runtime_status,
-          }
+          runtime_session_id: response.runtime_session_id,
+          runtime_status: response.runtime_status,
+        }
         : {}),
     } satisfies t.ProgrammaticExecutionArtifact,
   ];

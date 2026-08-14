@@ -11,12 +11,12 @@ function cloneToolSessionContext(
     ...(context.files == null
       ? {}
       : {
-          files: context.files.map((file) => ({
-            ...file,
+        files: context.files.map((file) => ({
+          ...file,
           storage_session_id:
             file.storage_session_id ?? context.session_id,
-          })),
-        }),
+        })),
+      }),
   };
 }
 
