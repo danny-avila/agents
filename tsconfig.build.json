@@ -12,10 +12,12 @@
   "exclude": [
     "**/*.test.ts",
     "**/*.spec.ts",
+    "**/__tests__/**",
     "node_modules",
     "dist",
     "src/proto/**/*",
     "src/scripts/**/*",
-    "src/specs/**/*"
+    "src/specs/**/*",
+    "src/test/**/*"
   ]
 }

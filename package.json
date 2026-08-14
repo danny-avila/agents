@@ -10,69 +10,69 @@
   "types": "./dist/types/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/types/index.d.ts",
       "import": "./dist/esm/main.mjs",
-      "require": "./dist/cjs/main.cjs",
-      "types": "./dist/types/index.d.ts"
+      "require": "./dist/cjs/main.cjs"
     },
     "./openai": {
+      "types": "./dist/types/openai/index.d.ts",
       "import": "./dist/esm/openai/index.mjs",
-      "require": "./dist/cjs/openai/index.cjs",
-      "types": "./dist/types/openai/index.d.ts"
+      "require": "./dist/cjs/openai/index.cjs"
     },
     "./responses": {
+      "types": "./dist/types/responses/index.d.ts",
       "import": "./dist/esm/responses/index.mjs",
-      "require": "./dist/cjs/responses/index.cjs",
-      "types": "./dist/types/responses/index.d.ts"
+      "require": "./dist/cjs/responses/index.cjs"
     },
     "./langchain": {
+      "types": "./dist/types/langchain/index.d.ts",
       "import": "./dist/esm/langchain/index.mjs",
-      "require": "./dist/cjs/langchain/index.cjs",
-      "types": "./dist/types/langchain/index.d.ts"
+      "require": "./dist/cjs/langchain/index.cjs"
     },
     "./langchain/language_models/chat_models": {
+      "types": "./dist/types/langchain/language_models/chat_models.d.ts",
       "import": "./dist/esm/langchain/language_models/chat_models.mjs",
-      "require": "./dist/cjs/langchain/language_models/chat_models.cjs",
-      "types": "./dist/types/langchain/language_models/chat_models.d.ts"
+      "require": "./dist/cjs/langchain/language_models/chat_models.cjs"
     },
     "./langchain/messages": {
+      "types": "./dist/types/langchain/messages.d.ts",
       "import": "./dist/esm/langchain/messages.mjs",
-      "require": "./dist/cjs/langchain/messages.cjs",
-      "types": "./dist/types/langchain/messages.d.ts"
+      "require": "./dist/cjs/langchain/messages.cjs"
     },
     "./langchain/messages/tool": {
+      "types": "./dist/types/langchain/messages/tool.d.ts",
       "import": "./dist/esm/langchain/messages/tool.mjs",
-      "require": "./dist/cjs/langchain/messages/tool.cjs",
-      "types": "./dist/types/langchain/messages/tool.d.ts"
+      "require": "./dist/cjs/langchain/messages/tool.cjs"
     },
     "./langchain/google-common": {
+      "types": "./dist/types/langchain/google-common.d.ts",
       "import": "./dist/esm/langchain/google-common.mjs",
-      "require": "./dist/cjs/langchain/google-common.cjs",
-      "types": "./dist/types/langchain/google-common.d.ts"
+      "require": "./dist/cjs/langchain/google-common.cjs"
     },
     "./langchain/openai": {
+      "types": "./dist/types/langchain/openai.d.ts",
       "import": "./dist/esm/langchain/openai.mjs",
-      "require": "./dist/cjs/langchain/openai.cjs",
-      "types": "./dist/types/langchain/openai.d.ts"
+      "require": "./dist/cjs/langchain/openai.cjs"
     },
     "./langchain/prompts": {
+      "types": "./dist/types/langchain/prompts.d.ts",
       "import": "./dist/esm/langchain/prompts.mjs",
-      "require": "./dist/cjs/langchain/prompts.cjs",
-      "types": "./dist/types/langchain/prompts.d.ts"
+      "require": "./dist/cjs/langchain/prompts.cjs"
     },
     "./langchain/runnables": {
+      "types": "./dist/types/langchain/runnables.d.ts",
       "import": "./dist/esm/langchain/runnables.mjs",
-      "require": "./dist/cjs/langchain/runnables.cjs",
-      "types": "./dist/types/langchain/runnables.d.ts"
+      "require": "./dist/cjs/langchain/runnables.cjs"
     },
     "./langchain/tools": {
+      "types": "./dist/types/langchain/tools.d.ts",
       "import": "./dist/esm/langchain/tools.mjs",
-      "require": "./dist/cjs/langchain/tools.cjs",
-      "types": "./dist/types/langchain/tools.d.ts"
+      "require": "./dist/cjs/langchain/tools.cjs"
     },
     "./langchain/utils/env": {
+      "types": "./dist/types/langchain/utils/env.d.ts",
       "import": "./dist/esm/langchain/utils/env.mjs",
-      "require": "./dist/cjs/langchain/utils/env.cjs",
-      "types": "./dist/types/langchain/utils/env.d.ts"
+      "require": "./dist/cjs/langchain/utils/env.cjs"
     }
   },
   "typesVersions": {
@@ -273,10 +273,6 @@
     "@anthropic-ai/sandbox-runtime": {
       "optional": true
     }
-  },
-  "imports": {
-    "@/*": "./src/*",
-    "~/*": "./*"
   },
   "devDependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.67",
