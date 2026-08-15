@@ -103,6 +103,23 @@ export type RunStep = {
   // };
 };
 
+/** Minimal durable lifecycle state needed to continue open run steps. */
+export interface RunStepResumeEntry {
+  step: RunStep;
+  pendingToolCallIds: string[];
+  latestCompletionAt?: number;
+  openMessageStep: boolean;
+}
+
+/** SDK-private state persisted in LangGraph checkpoints for process-safe resume. */
+export interface RunStepResumeState {
+  version: 1;
+  revision: number;
+  nextIndex: number;
+  toolCallSteps: Array<{ toolCallId: string; stepId: string }>;
+  steps: RunStepResumeEntry[];
+}
+
 /**
  * Represents a run step delta i.e. any changed fields on a run step during
  * streaming.

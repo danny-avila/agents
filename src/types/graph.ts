@@ -20,6 +20,7 @@ import type {
 import type {
   RunStep,
   RunStepDeltaEvent,
+  RunStepResumeState,
   RunStepClosedEvent,
   MessageDeltaEvent,
   ReasoningDeltaEvent,
@@ -76,6 +77,7 @@ export type SystemCallbacks = {
 
 export type BaseGraphState = {
   messages: BaseMessage[];
+  runStepState?: RunStepResumeState;
 };
 
 export type AgentSubgraphState = BaseGraphState & {

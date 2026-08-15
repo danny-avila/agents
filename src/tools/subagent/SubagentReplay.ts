@@ -2,7 +2,11 @@ import type { ToolCall, ToolMessage } from '@langchain/core/messages/tool';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import type { ToolApprovalReplaySnapshot } from '@/hooks';
-import type { ToolSessionContext } from '@/types';
+import type { RunStepResumeState, ToolSessionContext } from '@/types';
+import {
+  isRunStepResumeState,
+  stripRunStepResumeState,
+} from '@/tools/runStepResume';
 
 export const SUBAGENT_RESUME_MANIFEST_CONFIG_KEY =
   '__librechat_subagent_resume_manifest';
@@ -57,6 +61,7 @@ export interface SubagentGraphResumeState {
   toolNodes: SubagentToolNodeResumeState[];
   eagerToolUsage: SubagentEagerToolUsageState[];
   eagerToolSuppressions: string[];
+  runStepState?: RunStepResumeState;
   toolOutputReferences?: ToolOutputReferenceState;
 }
 
@@ -291,6 +296,8 @@ function isGraphResumeState(value: unknown): value is SubagentGraphResumeState {
     !state.eagerToolUsage.every(isEagerToolUsageState) ||
     !Array.isArray(state.eagerToolSuppressions) ||
     !state.eagerToolSuppressions.every(isString) ||
+    (state.runStepState != null &&
+      !isRunStepResumeState(state.runStepState)) ||
     (state.toolOutputReferences != null &&
       !isToolOutputReferenceState(state.toolOutputReferences))
   ) {
@@ -412,6 +419,7 @@ function isSubagentResumeManifest(
 export function getSubagentResumeManifest(
   payload: unknown
 ): SubagentResumeManifest | undefined {
+  payload = stripRunStepResumeState(payload);
   if (payload == null || typeof payload !== 'object') {
     return undefined;
   }
@@ -512,6 +520,7 @@ export function attachSubagentResumeManifest(
 }
 
 export function stripSubagentResumeManifest(payload: unknown): unknown {
+  payload = stripRunStepResumeState(payload);
   if (isWrappedSubagentResumePayload(payload)) {
     return payload[SUBAGENT_RESUME_WRAPPED_PAYLOAD_KEY];
   }
