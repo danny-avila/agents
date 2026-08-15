@@ -1,5 +1,6 @@
 import fetch from 'node-fetch';
 import { beforeEach, describe, expect, it, jest } from '@jest/globals';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { RequestInit } from 'node-fetch';
 import type * as t from '@/types';
 import {
@@ -35,6 +36,7 @@ type FetchMock = jest.MockedFunction<
 type CodeApiRequestBody = {
   timeout?: number;
   continuation_token?: string;
+  runtime_session_hint?: string;
   tool_results?: t.PTCToolResult[];
 };
 
@@ -55,6 +57,11 @@ const fetchMock = fetch as unknown as FetchMock;
 function requestBodyAt(callIndex: number): CodeApiRequestBody {
   const init = fetchMock.mock.calls[callIndex]?.[1] as RequestInit;
   return JSON.parse(init.body as string) as CodeApiRequestBody;
+}
+
+function requestHeadersAt(callIndex: number): Record<string, string> {
+  const init = fetchMock.mock.calls[callIndex]?.[1] as RequestInit;
+  return init.headers as Record<string, string>;
 }
 
 function timeoutSchemaForTest(toolSchema: unknown): TimeoutSchemaForTest {
@@ -200,6 +207,82 @@ describe('CodeAPI auth header injection', () => {
     ).not.toHaveProperty('authHeaders');
   });
 
+  it('routes direct code tools by trusted per-agent profile', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ session_id: 'session_123', stdout: '1\n' })
+    );
+    const defaultTool = createCodeExecutionTool({
+      baseUrl: 'https://code-default.example.com',
+      executionProfile: 'default',
+      statefulSessions: false,
+    });
+    const statefulTool = createCodeExecutionTool({
+      baseUrl: 'https://code-stateful.example.com',
+      executionProfile: 'stateful',
+      runtimeSessionHint: 'user-123',
+      statefulSessions: true,
+    });
+
+    await defaultTool.invoke(
+      { lang: 'py', code: 'print(1)' },
+      {
+        toolCall: { _runtime_session_hint: 'graph-wide-hint' },
+      } as unknown as RunnableConfig
+    );
+    await statefulTool.invoke(
+      { lang: 'py', code: 'print(1)' },
+      {
+        toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
+      } as unknown as RunnableConfig
+    );
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      'https://code-default.example.com/exec'
+    );
+    expect(requestHeadersAt(0)).toEqual(
+      expect.objectContaining({ 'X-CodeAPI-Expected-Profile': 'default' })
+    );
+    expect(requestBodyAt(0)).not.toHaveProperty('runtime_session_hint');
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      'https://code-stateful.example.com/exec'
+    );
+    expect(requestHeadersAt(1)).toEqual(
+      expect.objectContaining({ 'X-CodeAPI-Expected-Profile': 'stateful' })
+    );
+    expect(requestBodyAt(1).runtime_session_hint).toBe('user-123');
+  });
+
+  it('normalizes profile URLs and falls back from empty factory hints', async () => {
+    const codeTool = createCodeExecutionTool({
+      baseUrl: 'https://code-stateful.example.com/',
+      executionProfile: 'stateful',
+      runtimeSessionHint: '',
+      statefulSessions: true,
+    });
+    const bashTool = createBashExecutionTool({
+      baseUrl: 'https://code-stateful.example.com///',
+      executionProfile: 'stateful',
+      runtimeSessionHint: '',
+      statefulSessions: true,
+    });
+
+    await codeTool.invoke({ lang: 'py', code: 'print(1)' }, {
+      toolCall: { _runtime_session_hint: 'thread-fallback' },
+    } as unknown as RunnableConfig);
+    await bashTool.invoke({ command: 'echo 1' }, {
+      toolCall: { _runtime_session_hint: 'thread-fallback' },
+    } as unknown as RunnableConfig);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      'https://code-stateful.example.com/exec'
+    );
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      'https://code-stateful.example.com/exec'
+    );
+    expect(requestBodyAt(0).runtime_session_hint).toBe('thread-fallback');
+    expect(requestBodyAt(1).runtime_session_hint).toBe('thread-fallback');
+  });
+
   it('tolerates null params for direct code execution', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ session_id: 'session_123', stdout: '1\n' })
@@ -232,6 +315,33 @@ describe('CodeAPI auth header injection', () => {
     expect(
       JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)
     ).not.toHaveProperty('authHeaders');
+  });
+
+  it('routes bash tools by trusted per-agent profile', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ session_id: 'session_123', stdout: '1\n' })
+    );
+    const tool = createBashExecutionTool({
+      baseUrl: 'https://code-stateful.example.com',
+      executionProfile: 'stateful',
+      runtimeSessionHint: 'user-123',
+      statefulSessions: true,
+    });
+
+    await tool.invoke(
+      { command: 'echo 1' },
+      {
+        toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
+      } as unknown as RunnableConfig
+    );
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      'https://code-stateful.example.com/exec'
+    );
+    expect(requestHeadersAt(0)).toEqual(
+      expect.objectContaining({ 'X-CodeAPI-Expected-Profile': 'stateful' })
+    );
+    expect(requestBodyAt(0).runtime_session_hint).toBe('user-123');
   });
 
   it('redacts the CodeAPI endpoint and response body on direct execution failures', async () => {
@@ -518,6 +628,8 @@ describe('CodeAPI auth header injection', () => {
 
     const tool = createProgrammaticToolCallingTool({
       authHeaders: () => ({ Authorization: 'Bearer ptc-token' }),
+      executionProfile: 'stateful',
+      runtimeSessionHint: 'user-123',
     });
 
     await tool.invoke(
@@ -538,11 +650,74 @@ describe('CodeAPI auth header injection', () => {
         expect.objectContaining({
           headers: expect.objectContaining({
             Authorization: 'Bearer ptc-token',
+            'X-CodeAPI-Expected-Profile': 'stateful',
           }),
         })
       );
     }
+    expect(requestBodyAt(0).runtime_session_hint).toBe('user-123');
+    expect(requestBodyAt(1)).not.toHaveProperty('runtime_session_hint');
   });
+
+  it('keeps explicit default PTC stateless despite a graph-wide hint', async () => {
+    const tool = createProgrammaticToolCallingTool({
+      baseUrl: 'https://code-default.example.com',
+      executionProfile: 'default',
+    });
+
+    await tool.invoke(
+      { code: 'result = await lookup_user()\nprint(result)' },
+      {
+        toolCall: {
+          name: 'programmatic_code_execution',
+          args: {},
+          toolMap: toolMap(),
+          toolDefs,
+          _runtime_session_hint: 'graph-wide-hint',
+        },
+      }
+    );
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      'https://code-default.example.com/exec/programmatic'
+    );
+    expect(requestHeadersAt(0)).toEqual(
+      expect.objectContaining({ 'X-CodeAPI-Expected-Profile': 'default' })
+    );
+    expect(requestBodyAt(0)).not.toHaveProperty('runtime_session_hint');
+  });
+
+  it.each([
+    ['python', createProgrammaticToolCallingTool],
+    ['bash', createBashProgrammaticToolCallingTool],
+  ] as const)(
+    'normalizes %s PTC URLs and falls back from empty factory hints',
+    async (_name, createTool) => {
+      const tool = createTool({
+        baseUrl: 'https://code-stateful.example.com/',
+        executionProfile: 'stateful',
+        runtimeSessionHint: '',
+      });
+
+      await tool.invoke(
+        { code: 'print("ok")' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+            _runtime_session_hint: 'thread-fallback',
+          },
+        }
+      );
+
+      expect(fetchMock.mock.calls[0]?.[0]).toBe(
+        'https://code-stateful.example.com/exec/programmatic'
+      );
+      expect(requestBodyAt(0).runtime_session_hint).toBe('thread-fallback');
+    }
+  );
 
   it('defaults programmatic timeout to the configured CodeAPI run cap', async () => {
     const tool = createProgrammaticToolCallingTool({
@@ -659,6 +834,9 @@ describe('CodeAPI auth header injection', () => {
   it('forwards Authorization for bash programmatic requests', async () => {
     const tool = createBashProgrammaticToolCallingTool({
       authHeaders: { Authorization: 'Bearer bash-ptc-token' },
+      baseUrl: 'https://code-stateful.example.com',
+      executionProfile: 'stateful',
+      runtimeSessionHint: 'user-123',
     });
 
     await tool.invoke(
@@ -678,9 +856,14 @@ describe('CodeAPI auth header injection', () => {
       expect.objectContaining({
         headers: expect.objectContaining({
           Authorization: 'Bearer bash-ptc-token',
+          'X-CodeAPI-Expected-Profile': 'stateful',
         }),
       })
     );
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      'https://code-stateful.example.com/exec/programmatic'
+    );
+    expect(requestBodyAt(0).runtime_session_hint).toBe('user-123');
   });
 
   it('normalizes JSON-looking bash programmatic tool results before continuation', async () => {

@@ -125,6 +125,74 @@ describe('ToolNode code execution session management', () => {
       expect(capturedConfigs[0]._injected_files).toBeUndefined();
     });
 
+    it('isolates session injection and updates by the agent codeSessionKey', async () => {
+      const capturedConfigs: Record<string, unknown>[] = [];
+      const sessions: t.ToolSessionMap = new Map();
+      const statefulKey = 'execute_code:stateful:v1:user';
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'stateless-session',
+        files: [
+          {
+            id: 's1',
+            name: 'stateless.txt',
+            storage_session_id: 'stateless-storage',
+          },
+        ],
+        lastUpdated: Date.now(),
+      });
+      sessions.set(statefulKey, {
+        session_id: 'stateful-session',
+        files: [
+          {
+            id: 'w1',
+            name: 'stateful.txt',
+            storage_session_id: 'stateful-storage',
+          },
+        ],
+        lastUpdated: Date.now(),
+      });
+
+      const mockTool = createMockCodeTool({
+        capturedConfigs,
+        artifact: {
+          session_id: 'new-stateful-session',
+          files: [
+            {
+              id: 'w2',
+              name: 'new-stateful.txt',
+              storage_session_id: 'stateful-storage',
+            },
+          ],
+        },
+      });
+      const toolNode = new ToolNode({
+        tools: [mockTool],
+        sessions,
+        codeSessionKey: statefulKey,
+      });
+
+      await toolNode.invoke({
+        messages: [createAIMessageWithCodeCall('call_partitioned')],
+      });
+
+      expect(capturedConfigs[0].session_id).toBe('stateful-session');
+      expect(
+        (capturedConfigs[0]._injected_files as t.CodeEnvFile[]).map(
+          (file) => file.id
+        )
+      ).toEqual(['w1']);
+      expect(sessions.get(Constants.EXECUTE_CODE)?.session_id).toBe(
+        'stateless-session'
+      );
+      expect(sessions.get(statefulKey)?.session_id).toBe(
+        'new-stateful-session'
+      );
+      expect(sessions.get(statefulKey)?.files?.map((file) => file.id)).toEqual([
+        'w1',
+        'w2',
+      ]);
+    });
+
     it('does not inject session context when no session exists', async () => {
       const capturedConfigs: Record<string, unknown>[] = [];
       const sessions: t.ToolSessionMap = new Map();
@@ -1162,6 +1230,65 @@ describe('ToolNode code execution session management', () => {
           },
         ],
       });
+    });
+
+    it('attaches only the selected profile partition to host file requests', async () => {
+      const sessions: t.ToolSessionMap = new Map();
+      const statefulKey = 'execute_code:stateful:v1:user';
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'stateless-session',
+        files: [
+          {
+            id: 's1',
+            name: 'stateless.txt',
+            storage_session_id: 'stateless-storage',
+          },
+        ],
+        lastUpdated: Date.now(),
+      });
+      sessions.set(statefulKey, {
+        session_id: 'stateful-session',
+        files: [
+          {
+            id: 'w1',
+            name: 'stateful.txt',
+            storage_session_id: 'stateful-storage',
+          },
+        ],
+        lastUpdated: Date.now(),
+      });
+      const { capturedRequests } = captureBatchRequests();
+      const toolNode = new ToolNode({
+        tools: [createDummyTool(Constants.READ_FILE)],
+        sessions,
+        codeSessionKey: statefulKey,
+        eventDrivenMode: true,
+        toolCallStepIds: new Map([
+          ['call_partitioned_read', 'step_partitioned_read'],
+        ]),
+      });
+
+      await toolNode.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_partitioned_read',
+                name: Constants.READ_FILE,
+                args: { path: '/mnt/data/stateful.txt' },
+              },
+            ],
+          }),
+        ],
+      });
+
+      expect(capturedRequests[0].codeSessionContext?.session_id).toBe(
+        'stateful-session'
+      );
+      expect(
+        capturedRequests[0].codeSessionContext?.files?.map((file) => file.id)
+      ).toEqual(['w1']);
     });
 
     it('does not attach codeSessionContext to read_file when no session exists yet', async () => {

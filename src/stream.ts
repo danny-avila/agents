@@ -169,7 +169,8 @@ function hasToolOutputReference(value: unknown): boolean {
 
 function isEagerExecutionExcludedTool(
   name: string,
-  graph: StandardGraph
+  graph: StandardGraph,
+  agentContext?: AgentContext
 ): boolean {
   if (name === '') {
     return false;
@@ -200,9 +201,21 @@ function isEagerExecutionExcludedTool(
   // args, ToolNode discards the eager result but the mutation has already
   // landed in the session workspace, corrupting later runs. Stateless mode
   // uses a throwaway VM per call, so eager prestart stays safe there.
+  if (!CODE_EXECUTION_TOOLS.has(name)) {
+    return false;
+  }
+  if (graph.toolExecution?.sandbox?.statefulSessions === true) {
+    return true;
+  }
+  // A non-default code-session partition is the trusted per-agent signal that
+  // this call must remain isolated from the graph-wide stateless session. The
+  // actual tool factory may route it to a durable backend, which the stream
+  // layer cannot inspect in event-driven mode. Conservatively avoid speculative
+  // execution for these calls so discarded eager results cannot mutate that
+  // agent's workspace.
   return (
-    graph.toolExecution?.sandbox?.statefulSessions === true &&
-    CODE_EXECUTION_TOOLS.has(name)
+    agentContext?.codeSessionKey != null &&
+    agentContext.codeSessionKey !== Constants.EXECUTE_CODE
   );
 }
 
@@ -258,7 +271,8 @@ function toCodeEnvFile(file: t.FileRef, execSessionId: string): t.CodeEnvFile {
 
 function getCodeSessionContext(
   graph: StandardGraph,
-  name: string
+  name: string,
+  agentContext?: AgentContext
 ): t.ToolCallRequest['codeSessionContext'] | undefined {
   if (
     !CODE_EXECUTION_TOOLS.has(name) &&
@@ -269,9 +283,9 @@ function getCodeSessionContext(
     return undefined;
   }
 
-  const codeSession = graph.sessions.get(Constants.EXECUTE_CODE) as
-    | t.CodeSessionContext
-    | undefined;
+  const codeSession = graph.sessions.get(
+    agentContext?.codeSessionKey ?? Constants.EXECUTE_CODE
+  ) as t.CodeSessionContext | undefined;
   if (codeSession?.session_id == null || codeSession.session_id === '') {
     return undefined;
   }
@@ -716,7 +730,8 @@ function createEagerToolExecutionPlan(args: {
   // tool from `hasDirectToolCallInBatch`. Excluded calls fall through to normal
   // ToolNode execution; siblings may still eager-execute.
   const candidateToolCalls = unstartedToolCalls.filter(
-    (toolCall) => !isEagerExecutionExcludedTool(toolCall.name, graph)
+    (toolCall) =>
+      !isEagerExecutionExcludedTool(toolCall.name, graph, agentContext)
   );
   if (candidateToolCalls.length === 0) {
     return [];
@@ -748,7 +763,11 @@ function createEagerToolExecutionPlan(args: {
       name: toolCall.name,
       args: toolCall.args,
       stepId: graph.toolCallStepIds.get(toolCall.id!) ?? '',
-      codeSessionContext: getCodeSessionContext(graph, toolCall.name),
+      codeSessionContext: getCodeSessionContext(
+        graph,
+        toolCall.name,
+        agentContext
+      ),
     })),
     usageCount: graph.getEagerEventToolUsageCount(agentContext?.agentId),
   });

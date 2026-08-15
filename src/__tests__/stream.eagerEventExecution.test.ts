@@ -4945,6 +4945,50 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolExecutions.has('call_file')).toBe(false);
   });
 
+  it('does not prestart code execution for a custom agent session partition', async () => {
+    const graph = createGraph({
+      eagerEventToolExecution: { enabled: true },
+      getAgentContext: jest.fn(() => ({
+        provider: Providers.ANTHROPIC,
+        reasoningKey: 'reasoning',
+        toolDefinitions: [{ name: Constants.EXECUTE_CODE }],
+        graphTools: [],
+        agentId: 'stateful-agent',
+        codeSessionKey: 'execute_code:stateful:user-1',
+      })) as unknown as StandardGraph['getAgentContext'],
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_TOOL_EXECUTE) {
+          toolExecuteCalls.push(data as t.ToolExecuteBatchRequest);
+        }
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_code',
+              name: Constants.EXECUTE_CODE,
+              args: { lang: 'python', code: 'print(1)' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.has('call_code')).toBe(false);
+  });
+
   it('does not prestart codeSessionToolNames tools even without excludeToolNames', async () => {
     // A declared session-writing host tool is side-effecting, so it must not be
     // eagerly prestarted even when the host didn't also list it in excludeToolNames.

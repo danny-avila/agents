@@ -25,7 +25,7 @@ import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
-import { getCodeBaseURL } from './CodeExecutor';
+import { buildCodeApiEndpoint, getCodeBaseURL } from './CodeExecutor';
 import { Constants } from '@/common';
 
 config();
@@ -914,7 +914,7 @@ function createToolSearch(
   const schema = createToolSearchSchema(mode);
 
   const baseEndpoint = initParams.baseUrl ?? getCodeBaseURL();
-  const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
+  const EXEC_ENDPOINT = buildCodeApiEndpoint(baseEndpoint, 'exec');
 
   const deferredToolsListing = getDeferredToolsListing(
     initParams.toolRegistry,

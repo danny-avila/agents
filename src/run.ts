@@ -72,6 +72,7 @@ import {
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { initializeLangfuseTracing } from './instrumentation';
+import { seedRunInitialSessions } from '@/utils/toolSessions';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 import { createGraph } from '@/graphs/createGraph';
 import { resolveMaxSeals } from '@/llm/preempt';
@@ -351,9 +352,25 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     if (config.initialSessions && this.Graph) {
-      for (const [key, value] of config.initialSessions) {
-        this.Graph.sessions.set(key, value);
-      }
+      const configuredAgents =
+        'agents' in config.graphConfig &&
+        Array.isArray(config.graphConfig.agents)
+          ? config.graphConfig.agents
+          : undefined;
+      const agents: Array<Pick<t.AgentInputs, 'codeSessionKey'>> =
+        configuredAgents ?? [
+          {
+            codeSessionKey:
+              'codeSessionKey' in config.graphConfig
+                ? config.graphConfig.codeSessionKey
+                : undefined,
+          },
+        ];
+      seedRunInitialSessions({
+        sessions: this.Graph.sessions,
+        initialSessions: config.initialSessions,
+        agents,
+      });
     }
 
     this.returnContent = config.returnContent ?? false;
