@@ -95,7 +95,7 @@ function isRunStepResumePayload(value: unknown): value is RunStepResumePayload {
 export function attachRunStepResumeState(
   payload: unknown,
   state: RunStepResumeState
-): unknown {
+): object {
   const publicPayload = isRunStepResumePayload(payload)
     ? payload[RUN_STEP_RESUME_PAYLOAD_KEY]
     : payload;

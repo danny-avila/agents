@@ -4,6 +4,8 @@ import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import type { ToolApprovalReplaySnapshot } from '@/hooks';
 import type { RunStepResumeState, ToolSessionContext } from '@/types';
 import {
+  attachRunStepResumeState,
+  getRunStepResumeState,
   isRunStepResumeState,
   stripRunStepResumeState,
 } from '@/tools/runStepResume';
@@ -497,6 +499,16 @@ export function attachSubagentResumeManifest(
   payload: unknown,
   manifest: SubagentResumeManifest
 ): object {
+  const runStepState = getRunStepResumeState(payload);
+  if (runStepState != null) {
+    return attachRunStepResumeState(
+      attachSubagentResumeManifest(
+        stripRunStepResumeState(payload),
+        manifest
+      ),
+      runStepState
+    );
+  }
   if (
     isWrappedSubagentResumePayload(payload) ||
     isInlineSubagentResumePayload(payload)

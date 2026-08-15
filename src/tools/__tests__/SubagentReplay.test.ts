@@ -4,6 +4,12 @@ import {
   requireValidSubagentResumeManifest,
   stripSubagentResumeManifest,
 } from '@/tools/subagent/SubagentReplay';
+import {
+  attachRunStepResumeState,
+  getRunStepResumeState,
+  stripRunStepResumeState,
+} from '@/tools/runStepResume';
+import type { RunStepResumeState } from '@/types';
 
 describe('SubagentReplay manifest', () => {
   const execution = {
@@ -82,6 +88,32 @@ describe('SubagentReplay manifest', () => {
       type: 'tool_approval',
       visible: true,
     });
+  });
+
+  it('composes with private run-step state without changing the public payload', () => {
+    const manifest = { version: 1 as const, executions: [execution] };
+    const runStepState: RunStepResumeState = {
+      version: 1,
+      revision: 1,
+      nextIndex: 0,
+      toolCallSteps: [],
+      steps: [],
+    };
+    const visiblePayload = {
+      type: 'tool_approval',
+      subagent: { parent_tool_call_id: 'call_parent' },
+    };
+    const payload = attachSubagentResumeManifest(
+      attachRunStepResumeState(visiblePayload, runStepState),
+      manifest
+    );
+    const manifestPayload = stripRunStepResumeState(payload);
+
+    expect(getRunStepResumeState(payload)).toEqual(runStepState);
+    expect(getSubagentResumeManifest(manifestPayload)).toEqual(manifest);
+    expect(stripSubagentResumeManifest(manifestPayload)).toEqual(
+      visiblePayload
+    );
   });
 
   it('accepts legacy executions without a bound subagent type', () => {
