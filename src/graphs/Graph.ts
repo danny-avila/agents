@@ -161,6 +161,7 @@ import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { initializeLangfuseTracing } from '@/instrumentation';
 import { shouldTriggerSummarization } from '@/summarization';
+import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
@@ -168,7 +169,6 @@ import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
-import { isRunStepResumeState } from '@/tools/runStepResume';
 import { isThinkingEnabled } from '@/llm/request';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
@@ -1800,9 +1800,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       version: 1,
       revision: this.runStepStateRevision,
       nextIndex: this.nextContentIndex,
-      toolCallSteps: [...this.toolCallStepIds].map(
-        ([toolCallId, stepId]) => ({ toolCallId, stepId })
-      ),
+      toolCallSteps: [...this.toolCallStepIds].map(([toolCallId, stepId]) => ({
+        toolCallId,
+        stepId,
+      })),
       steps,
     };
   }
@@ -1836,10 +1837,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         this.pendingToolCallsByStep.set(runStep.id, pending);
       }
       if (entry.latestCompletionAt != null) {
-        this.latestCompletionByStep.set(
-          runStep.id,
-          entry.latestCompletionAt
-        );
+        this.latestCompletionByStep.set(runStep.id, entry.latestCompletionAt);
       }
       if (entry.openMessageStep) {
         this.openMessageStepByAgent.set(runStep.agentId ?? '', runStep.id);
@@ -1964,10 +1962,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /**
    * Closes a run step: stamps its terminal status + timestamp on the stored
    * `RunStep` and emits `ON_RUN_STEP_CLOSED`. First close wins — later calls
-   * are no-ops — except a `restamp` close, which lets a `completed`
-   * TOOL_CALLS step refresh `completed_at` when a late-registered parallel
-   * tool call finishes after the step already closed (the eager-execution
-   * race). `cancelled`/`failed` are immutable once stamped.
+   * are no-ops with no exceptions; every terminal status is immutable once
+   * stamped. (A `restamp` option once let a completed TOOL_CALLS step
+   * refresh `completed_at` for the eager-execution race, but that race is
+   * unreachable — each step registers its calls before any completion can
+   * reference it — and the mechanism was removed.)
    */
   async closeRunStep(
     stepId: string,
@@ -4990,10 +4989,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       .addNode(agentNode, (state, config) =>
         invokeWithRunStepState(state, config, () => callModel(state, config))
       )
-      .addNode(
-        toolNode,
-        callTools
-      )
+      .addNode(toolNode, callTools)
       .addNode(
         summarizeNode,
         createSummarizeNode({
