@@ -411,4 +411,95 @@ describe('run step timestamps', () => {
       expect(step.status).toBe('completed');
     }
   });
+
+  it('rehydrates and closes open steps when HITL resumes in a fresh process', async () => {
+    const { sequence, handlers } = createRecorder();
+    const saver = new MemorySaver();
+    const createRun = async (resume: boolean): Promise<Run<t.IState>> => {
+      const run = await Run.create<t.IState>({
+        runId: 'test-run-step-timestamps-cross-process',
+        graphConfig: {
+          type: 'standard',
+          agents: [
+            {
+              agentId: 'timestamps-cross-process-agent',
+              provider: Providers.OPENAI,
+              clientOptions: {
+                model: 'gpt-4o-mini',
+                streaming: true,
+                streamUsage: false,
+              },
+              instructions: 'You are a helpful assistant.',
+              maxContextTokens: 8000,
+              graphTools: [askTool],
+            },
+          ],
+          compileOptions: { checkpointer: saver },
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers: handlers,
+      });
+      run.Graph!.overrideModel = new FakeChatModel(
+        resume
+          ? { responses: ['done after resume'] }
+          : {
+            responses: ['asking the user'],
+            toolCalls: [
+              {
+                name: 'ask_user_question',
+                args: { question: 'pick one' },
+                id: 'call_ask_cross_process',
+                type: 'tool_call',
+              },
+            ],
+          }
+      );
+      return run;
+    };
+
+    const streamConfig = createStreamConfig(
+      'run-step-timestamps-cross-process'
+    );
+    const firstRun = await createRun(false);
+    await firstRun.processStream(
+      { messages: [new HumanMessage('go')] },
+      streamConfig
+    );
+
+    const openStep = firstRun.Graph?.contentData.find(
+      (step) => step.type === StepTypes.TOOL_CALLS
+    ) as t.RunStep;
+    expect(firstRun.getInterrupt()?.payload).toMatchObject({
+      type: 'ask_user_question',
+    });
+    expect(openStep.status).toBe('in_progress');
+    expect(getClosed(sequence).map((event) => event.id)).not.toContain(
+      openStep.id
+    );
+
+    const resumedRun = await createRun(true);
+    await resumedRun.resume({ answer: 'blue' }, streamConfig);
+
+    const restoredStep = resumedRun.Graph?.getRunStep(openStep.id);
+    expect(restoredStep).toMatchObject({
+      id: openStep.id,
+      index: openStep.index,
+      created_at: openStep.created_at,
+      status: 'completed',
+    });
+    expect(
+      getSteps(sequence).filter((step) => step.id === openStep.id)
+    ).toHaveLength(1);
+    expect(
+      getClosed(sequence).filter((event) => event.id === openStep.id)
+    ).toEqual([
+      expect.objectContaining({
+        id: openStep.id,
+        index: openStep.index,
+        created_at: openStep.created_at,
+        status: 'completed',
+      }),
+    ]);
+  });
 });

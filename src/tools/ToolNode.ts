@@ -62,6 +62,7 @@ import {
   SUBAGENT_PARENT_BATCH_CONFIG_KEY,
   SUBAGENT_REPLAY_CONTROLLER,
 } from '@/tools/subagent/SubagentReplay';
+import { attachRunStepResumeState } from '@/tools/runStepResume';
 import {
   INTENT_ARG,
   readOutcomeFields,
@@ -818,11 +819,45 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     fileCheckpointer,
     getBreakerSignal,
     getRunScope,
+    restoreRunStepResumeState,
+    createRunStepResumeState,
   }: t.ToolNodeConstructorParams) {
     super({
       name: name ?? TOOL_NODE_RUN_NAME,
       tags,
-      func: (input, config) => this.run(input, config),
+      func: async (input, config) => {
+        const state = input as T & Pick<t.BaseGraphState, 'runStepState'>;
+        restoreRunStepResumeState?.(state.runStepState, config);
+        let result: T;
+        try {
+          result = await this.run(input, config);
+        } catch (error) {
+          if (!isGraphInterrupt(error) || createRunStepResumeState == null) {
+            throw error;
+          }
+          const resumeState = createRunStepResumeState();
+          throw new GraphInterrupt(
+            error.interrupts.map((pendingInterrupt) => ({
+              ...pendingInterrupt,
+              value: attachRunStepResumeState(
+                pendingInterrupt.value,
+                resumeState
+              ),
+            }))
+          );
+        }
+        if (createRunStepResumeState == null) {
+          return result;
+        }
+        const runStepState = createRunStepResumeState();
+        if (Array.isArray(result)) {
+          return [...result, { runStepState }] as T;
+        }
+        return {
+          ...result,
+          runStepState,
+        };
+      },
     });
     this.trace = trace ?? this.trace;
     this.runLangfuse = runLangfuse;

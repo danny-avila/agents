@@ -30,6 +30,10 @@ import {
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from '@/tools/subagent/SubagentReplay';
 import {
+  getRunStepResumeState,
+  stripRunStepResumeState,
+} from '@/tools/runStepResume';
+import {
   ACTIVITY_PHASE_LABEL_PROMPT,
   ACTIVITY_LABEL_PROMPT,
   buildActivityLabelPrompt,
@@ -174,7 +178,9 @@ function isLangGraphResumeMapForInterrupt(
 }
 
 function getInterruptHookSessionId(payload: unknown): string | undefined {
-  const publicPayload = stripSubagentResumeManifest(payload);
+  const publicPayload = stripSubagentResumeManifest(
+    stripRunStepResumeState(payload)
+  );
   if (
     publicPayload == null ||
     typeof publicPayload !== 'object' ||
@@ -194,11 +200,15 @@ type InterruptStateSnapshot = {
   values?: { messages?: BaseMessage[] };
   tasks?: Array<{
     interrupts?: Array<{ id?: string; value?: unknown }>;
+    state?: RunnableConfig | InterruptStateSnapshot;
   }>;
 };
 
 type WorkflowWithStateHistory = {
-  getState?(config: RunnableConfig): Promise<InterruptStateSnapshot>;
+  getState?(
+    config: RunnableConfig,
+    options?: { subgraphs?: boolean }
+  ): Promise<InterruptStateSnapshot>;
   getStateHistory?(
     config: RunnableConfig
   ): AsyncIterableIterator<InterruptStateSnapshot>;
@@ -214,6 +224,17 @@ function getFirstPersistedInterrupt(
         pendingInterrupt.id.length > 0
       ) {
         return { id: pendingInterrupt.id, value: pendingInterrupt.value };
+      }
+    }
+    const nestedState = task.state;
+    if (
+      nestedState != null &&
+      'tasks' in nestedState &&
+      Array.isArray(nestedState.tasks)
+    ) {
+      const nestedInterrupt = getFirstPersistedInterrupt(nestedState);
+      if (nestedInterrupt != null) {
+        return nestedInterrupt;
       }
     }
   }
@@ -966,6 +987,12 @@ export class Run<_T extends t.BaseGraphState> {
       delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
       delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
     }
+    if (isResume) {
+      await this.restoreInterruptFromCheckpoint(
+        config,
+        (inputs as Command).update
+      );
+    }
 
     /**
      * Cancellation can arrive either at graph construction or per-call through
@@ -1520,7 +1547,9 @@ export class Run<_T extends t.BaseGraphState> {
     }
     return {
       ...this._interrupt,
-      payload: stripSubagentResumeManifest(this._interrupt.payload),
+      payload: stripSubagentResumeManifest(
+        stripRunStepResumeState(this._interrupt.payload)
+      ),
     } as t.RunInterruptResult<TPayload>;
   }
 
@@ -1639,7 +1668,7 @@ export class Run<_T extends t.BaseGraphState> {
     await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
     const interrupt = this._interrupt;
     const resumeManifest = requireValidSubagentResumeManifest(
-      interrupt?.payload
+      stripRunStepResumeState(interrupt?.payload)
     );
     const resumeConfigurable = { ...callerConfig.configurable };
     delete resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
@@ -1726,7 +1755,7 @@ export class Run<_T extends t.BaseGraphState> {
     callerConfig: t.RunStreamConfig,
     resumeUpdate?: ResumeCommandUpdate
   ): Promise<void> {
-    if (this._interrupt != null || this.humanInTheLoop?.enabled !== true) {
+    if (this._interrupt != null || !this.hasCheckpointer) {
       return;
     }
     const workflow = this.graphRunnable as
@@ -1736,11 +1765,16 @@ export class Run<_T extends t.BaseGraphState> {
       return;
     }
 
-    const snapshot = await workflow.getState(callerConfig as RunnableConfig);
+    const snapshot = await workflow.getState(callerConfig as RunnableConfig, {
+      subgraphs: true,
+    });
     const persistedInterrupt = getFirstPersistedInterrupt(snapshot);
     if (persistedInterrupt == null) {
       return;
     }
+    this.Graph?.restoreRunStepResumeState(
+      getRunStepResumeState(persistedInterrupt.value)
+    );
     const persistedMessages = getPersistedMessages(snapshot);
     if (persistedMessages != null) {
       const resumeMessages = getResumeUpdateMessages(resumeUpdate);
@@ -2678,8 +2712,8 @@ function findActivityPhaseTraceInput(
     const message = messages[i];
     if (
       message.getType() !== 'human' ||
-      message.additional_kwargs?.role === 'system' ||
-      message.additional_kwargs?.isMeta === true
+      message.additional_kwargs.role === 'system' ||
+      message.additional_kwargs.isMeta === true
     ) {
       continue;
     }

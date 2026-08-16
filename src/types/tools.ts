@@ -1,10 +1,17 @@
 // src/types/tools.ts
 import type { StructuredToolInterface } from '@langchain/core/tools';
-import type { RunnableToolLike } from '@langchain/core/runnables';
+import type {
+  RunnableConfig,
+  RunnableToolLike,
+} from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { RunBreakerScope } from '@/llm/streamLimits';
-import type { MessageContentComplex, ToolErrorData } from './stream';
+import type {
+  MessageContentComplex,
+  RunStepResumeState,
+  ToolErrorData,
+} from './stream';
 import type { HumanInTheLoopConfig } from './hitl';
 import type { LangfuseConfig } from './graph';
 import type { HookRegistry } from '@/hooks';
@@ -276,6 +283,13 @@ export type ToolNodeOptions = {
    * controller.
    */
   getRunScope?: () => RunBreakerScope;
+  /** SDK-owned checkpoint bridge for open run-step lifecycle state. */
+  restoreRunStepResumeState?: (
+    state?: RunStepResumeState,
+    config?: RunnableConfig
+  ) => void;
+  /** SDK-owned checkpoint snapshot for open run-step lifecycle state. */
+  createRunStepResumeState?: () => RunStepResumeState;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;

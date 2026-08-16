@@ -87,6 +87,7 @@ import type {
 import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
 import type { HandlerRegistry } from '@/events';
+import { stripRunStepResumeState } from '@/tools/runStepResume';
 import {
   getSubagentApprovalExecutionScope,
   SubagentDefinitionBindingError,
@@ -654,11 +655,11 @@ function addSubagentScope(
   resumeManifest?: SubagentResumeManifest
 ): Interrupt[] {
   return interrupts.map((childInterrupt) => {
-    let payload = childInterrupt.value;
+    let payload = stripRunStepResumeState(childInterrupt.value);
     if (isToolApprovalPayload(payload)) {
       payload = {
-        ...childInterrupt.value,
-        subagent: childInterrupt.value.subagent ?? scope,
+        ...payload,
+        subagent: payload.subagent ?? scope,
       };
     }
     return {

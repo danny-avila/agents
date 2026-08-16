@@ -1036,6 +1036,7 @@ export class MultiAgentGraph extends StandardGraph {
         reducer: (_current, update) => update,
         default: () => undefined,
       }),
+      runStepState: this.createRunStepStateAnnotation(),
     });
 
     const builder = new StateGraph(StateAnnotation);
