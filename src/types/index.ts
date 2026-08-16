@@ -10,3 +10,4 @@ export * from './tools';
 export * from './summarize';
 export * from './activityLabel';
 export * from './assistantPhase';
+export * from './reasoningLabel';

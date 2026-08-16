@@ -16,8 +16,11 @@ import {
   HumanMessage,
   SystemMessage,
 } from '@langchain/core/messages';
+import type {
+  MessageContentComplex,
+  UsageMetadata,
+} from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
-import type { MessageContentComplex } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import type { StandardGraph } from '@/graphs/Graph';
@@ -29,10 +32,6 @@ import {
   SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from '@/tools/subagent/SubagentReplay';
-import {
-  getRunStepResumeState,
-  stripRunStepResumeState,
-} from '@/tools/runStepResume';
 import {
   ACTIVITY_PHASE_LABEL_PROMPT,
   ACTIVITY_LABEL_PROMPT,
@@ -49,6 +48,12 @@ import {
   withLangfuseAttributes,
 } from '@/langfuse';
 import {
+  REASONING_LABEL_PROMPT,
+  buildReasoningLabelTraceSeed,
+  buildReasoningLabelPrompt,
+  normalizeReasoningLabel,
+} from '@/prompts/reasoningLabel';
+import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
@@ -63,6 +68,10 @@ import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
+import {
+  getRunStepResumeState,
+  stripRunStepResumeState,
+} from '@/tools/runStepResume';
 import {
   Callback,
   GraphEvents,
@@ -100,6 +109,7 @@ export const defaultOmitOptions = new Set([
 
 const ACTIVITY_LABEL_TRACE_NAME = 'LibreChat Activity Label';
 const ACTIVITY_PHASE_TRACE_NAME = 'LibreChat Activity Phase';
+const REASONING_LABEL_TRACE_NAME = 'LibreChat Reasoning Label';
 
 const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_AGENT_UPDATE,
@@ -312,6 +322,8 @@ export class Run<_T extends t.BaseGraphState> {
   private activityLabelSeq = 0;
   /** Per-run sequence for parent activity-phase trace and invocation ids. */
   private activityPhaseLabelSeq = 0;
+  /** Per-run sequence for reasoning-label trace and invocation ids. */
+  private reasoningLabelSeq = 0;
   /** Latest user turn used to keep detached phase roots conversation-shaped. */
   private activityPhaseTraceInput?: string;
   /** Distinguishes sibling forks started from the same explicit checkpoint. */
@@ -2351,6 +2363,261 @@ export class Run<_T extends t.BaseGraphState> {
       return label.length > 0 ? { label } : {};
     } finally {
       await disposeLangfuseHandler(labelLangfuseHandler);
+    }
+  }
+
+  /**
+   * Generates one replacement title for a user-visible reasoning step. Hosts
+   * own accumulation, scheduling, revision ordering, durable delivery, and
+   * billing; the SDK only performs one bounded, redaction-aware generation.
+   */
+  async generateReasoningLabel({
+    provider,
+    clientOptions,
+    visibleReasoning,
+    reasoningStepId,
+    revision,
+    status = 'streaming',
+    previousLabel,
+    agentId,
+    prompt,
+    charLimit = 6_000,
+    chainOptions,
+    traceSeed,
+    sourceRunId,
+    sourceTraceId,
+    responseId,
+  }: t.RunReasoningLabelOptions): Promise<t.ReasoningLabelResult> {
+    const normalizedStepId = reasoningStepId.trim();
+    const snapshotChars = visibleReasoning.trim().length;
+    if (
+      normalizedStepId === '' ||
+      snapshotChars === 0 ||
+      !Number.isInteger(revision) ||
+      revision < 0
+    ) {
+      return {};
+    }
+
+    const reasoningSeq = ++this.reasoningLabelSeq;
+    const requestedContext =
+      this.Graph == null || agentId == null
+        ? undefined
+        : this.Graph.agentContexts.get(agentId);
+    if (agentId != null && requestedContext == null) {
+      return {};
+    }
+    if (agentId == null && (this.Graph?.agentContexts.size ?? 0) > 1) {
+      return {};
+    }
+    const reasoningContext =
+      this.Graph == null
+        ? undefined
+        : (requestedContext ??
+          this.Graph.agentContexts.get(this.Graph.defaultAgentId));
+    const reasoningChainOptions = {
+      ...(chainOptions ?? {}),
+    } as Partial<RunnableConfig> & {
+      configurable?: Record<string, unknown> & {
+        requestBody?: { parentMessageId?: unknown };
+      };
+    };
+    const reasoningUserId =
+      typeof reasoningChainOptions.configurable?.user_id === 'string'
+        ? reasoningChainOptions.configurable.user_id
+        : undefined;
+    const reasoningSessionId =
+      typeof reasoningChainOptions.configurable?.thread_id === 'string'
+        ? reasoningChainOptions.configurable.thread_id
+        : undefined;
+    const reasoningParentMessageId =
+      reasoningChainOptions.configurable?.requestBody?.parentMessageId;
+    const reasoningAgentId =
+      agentId ??
+      (this.Graph?.agentContexts.size === 1
+        ? this.Graph.defaultAgentId
+        : undefined);
+    const reasoningAgentName =
+      reasoningAgentId == null ? undefined : reasoningContext?.name;
+    const resolvedSourceRunId = sourceRunId ?? this.id;
+    const reasoningResponseId = responseId ?? this.id;
+    const reasoningMetadata: Record<string, unknown> = {
+      sourceRunId: resolvedSourceRunId,
+      ...(sourceTraceId == null ? {} : { sourceTraceId }),
+      responseId: reasoningResponseId,
+      reasoningStepId: normalizedStepId,
+      revision,
+      status,
+      snapshotChars,
+      ...(typeof reasoningParentMessageId === 'string'
+        ? { parentMessageId: reasoningParentMessageId }
+        : {}),
+      ...(reasoningAgentId == null ? {} : { agentId: reasoningAgentId }),
+      ...(reasoningAgentName == null ? {} : { agentName: reasoningAgentName }),
+    };
+    const traceMetadata = {
+      ...createLangfuseTraceMetadata({
+        messageId: `reasoning-label-${reasoningResponseId}`,
+        parentMessageId: reasoningParentMessageId,
+        agentId: reasoningAgentId,
+        agentName: reasoningAgentName,
+      }),
+      sourceRunId: resolvedSourceRunId,
+      ...(sourceTraceId == null ? {} : { sourceTraceId }),
+      responseId: reasoningResponseId,
+      reasoningStepId: normalizedStepId,
+      revision: String(revision),
+      status,
+      snapshotChars: String(snapshotChars),
+    };
+    const reasoningRunName =
+      reasoningChainOptions.runName ?? REASONING_LABEL_TRACE_NAME;
+    const reasoningTags = ['librechat', 'reasoning-label', 'reasoning-step'];
+    const reasoningLangfuseConfig = resolveLangfuseConfig(
+      this.langfuse,
+      reasoningContext?.langfuse
+    );
+    initializeLangfuseTracing(reasoningLangfuseConfig);
+
+    const inheritedTraceSeed = getTraceIdSeed();
+    const reasoningTraceSeed =
+      reasoningLangfuseConfig?.deterministicTraceId === true ||
+      inheritedTraceSeed != null
+        ? (traceSeed ??
+          buildReasoningLabelTraceSeed(
+            resolvedSourceRunId,
+            normalizedStepId,
+            revision
+          ))
+        : undefined;
+    const reasoningScopeRunId = `reasoning-label:${this.id}:${reasoningSeq}:${nanoid()}`;
+    const reasoningRuntimeScope = resolveLangfuseRuntimeScope({
+      runLangfuse: this.langfuse,
+      langfuseOverlay: reasoningContext?.langfuse,
+      traceIdSeed: reasoningTraceSeed,
+      runId: reasoningScopeRunId,
+    });
+    let reasoningLangfuseHandler: CallbackEntry | undefined;
+    if (reasoningSessionId != null) {
+      reasoningLangfuseHandler = createLangfuseHandler({
+        langfuse: reasoningLangfuseConfig,
+        userId: reasoningUserId,
+        sessionId: reasoningSessionId,
+        traceMetadata,
+        tags: reasoningTags,
+        traceIdSeed:
+          reasoningLangfuseConfig?.deterministicTraceId === true
+            ? reasoningTraceSeed
+            : undefined,
+        runId: reasoningScopeRunId,
+        toolOutputTracing: reasoningRuntimeScope.toolOutputTracing,
+        traceName: reasoningRunName,
+      });
+    }
+    if (reasoningLangfuseHandler != null) {
+      reasoningChainOptions.callbacks = appendCallbacks(
+        reasoningChainOptions.callbacks,
+        [reasoningLangfuseHandler]
+      );
+    }
+
+    const redaction = hasToolOutputTracingConfig(
+      this.langfuse,
+      reasoningContext?.langfuse
+    )
+      ? resolveToolOutputTracingConfig(
+        this.langfuse,
+        reasoningContext?.langfuse
+      )
+      : undefined;
+    const userPrompt = buildReasoningLabelPrompt({
+      visibleReasoning,
+      status,
+      charLimit,
+      previousLabel,
+      redaction,
+    });
+    if (userPrompt === '') {
+      await disposeLangfuseHandler(reasoningLangfuseHandler);
+      return {};
+    }
+
+    const model = initializeModel({
+      provider,
+      clientOptions: {
+        ...(clientOptions ?? {}),
+        streaming: false,
+      } as t.ClientOptions,
+    }) as t.ChatModelInstance;
+    const reasoningRunId = `${this.id}-reasoning-${reasoningSeq}`;
+    const invokeConfig = Object.assign({}, reasoningChainOptions, {
+      run_id: reasoningRunId,
+      runId: reasoningRunId,
+      runName: reasoningRunName,
+      tags: [
+        ...new Set([...(reasoningChainOptions.tags ?? []), ...reasoningTags]),
+      ],
+      metadata: {
+        ...(reasoningChainOptions.metadata ?? {}),
+        ...reasoningMetadata,
+      },
+    }) as Partial<RunnableConfig>;
+    const invokeLabel = (
+      runtimeConfig: Partial<RunnableConfig>
+    ): Promise<unknown> =>
+      withLangfuseAttributes(
+        {
+          langfuse: reasoningLangfuseConfig,
+          userId: reasoningUserId,
+          sessionId: reasoningSessionId,
+          traceName: reasoningRunName,
+          traceMetadata,
+          tags: reasoningTags,
+        },
+        () =>
+          model.invoke(
+            [
+              new SystemMessage(prompt ?? REASONING_LABEL_PROMPT),
+              new HumanMessage(userPrompt),
+            ],
+            runtimeConfig
+          )
+      );
+    const extractResult = (response: unknown): t.ReasoningLabelResult => {
+      const result = response as {
+        content?: unknown;
+        usage_metadata?: UsageMetadata;
+      } | null;
+      const content = result?.content;
+      let text = '';
+      if (typeof content === 'string') {
+        text = content;
+      } else if (Array.isArray(content)) {
+        text = content
+          .map((block) =>
+            typeof block === 'string'
+              ? block
+              : ((block as { text?: string }).text ?? '')
+          )
+          .join('');
+      }
+      const label = normalizeReasoningLabel(text);
+      return {
+        ...(label === '' ? {} : { label }),
+        ...(result?.usage_metadata == null
+          ? {}
+          : { usage: result.usage_metadata }),
+      };
+    };
+
+    try {
+      const response = await withLangfuseRuntimeScope(
+        reasoningRuntimeScope,
+        () => invokeLabel(invokeConfig)
+      );
+      return extractResult(response);
+    } finally {
+      await disposeLangfuseHandler(reasoningLangfuseHandler);
     }
   }
 
