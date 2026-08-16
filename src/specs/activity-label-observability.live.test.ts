@@ -21,6 +21,8 @@ type LangfuseMetadata = {
   activityIndex?: string | number;
   phaseIndex?: string | number;
   activityCount?: string | number;
+  reasoningStepId?: string;
+  revision?: string | number;
 };
 
 type LangfuseObservation = {
@@ -89,7 +91,11 @@ async function getJsonIfPresent<T>(path: string): Promise<T | undefined> {
 async function findExportedTraces(
   sourceRunId: string,
   fromTimestamp: string
-): Promise<{ label: LangfuseTrace; phase: LangfuseTrace }> {
+): Promise<{
+  label: LangfuseTrace;
+  phase: LangfuseTrace;
+  reasoning: LangfuseTrace;
+}> {
   const query = new URLSearchParams({
     limit: '100',
     fromTimestamp,
@@ -107,16 +113,26 @@ async function findExportedTraces(
     const phaseSummary = candidates.find(
       (trace) => trace.tags?.includes('activity-phase') === true
     );
-    if (labelSummary != null && phaseSummary != null) {
-      const [label, phase] = await Promise.all([
+    const reasoningSummary = candidates.find(
+      (trace) => trace.tags?.includes('reasoning-label') === true
+    );
+    if (
+      labelSummary != null &&
+      phaseSummary != null &&
+      reasoningSummary != null
+    ) {
+      const [label, phase, reasoning] = await Promise.all([
         getJsonIfPresent<LangfuseTrace>(
           `/api/public/traces/${labelSummary.id}`
         ),
         getJsonIfPresent<LangfuseTrace>(
           `/api/public/traces/${phaseSummary.id}`
         ),
+        getJsonIfPresent<LangfuseTrace>(
+          `/api/public/traces/${reasoningSummary.id}`
+        ),
       ]);
-      if (label != null && phase != null) {
+      if (label != null && phase != null && reasoning != null) {
         const labelReady =
           label.observations?.some(
             (observation) => observation.type === 'GENERATION'
@@ -131,8 +147,17 @@ async function findExportedTraces(
           phase.observations?.some(
             (observation) => observation.type === 'GENERATION'
           ) === true;
-        if (labelReady && phaseRootReady && phaseGenerationReady) {
-          return { label, phase };
+        const reasoningReady =
+          reasoning.observations?.some(
+            (observation) => observation.type === 'GENERATION'
+          ) === true;
+        if (
+          labelReady &&
+          phaseRootReady &&
+          phaseGenerationReady &&
+          reasoningReady
+        ) {
+          return { label, phase, reasoning };
         }
       }
     }
@@ -212,8 +237,26 @@ describeIfLive('activity label Langfuse export (live)', () => {
       phaseIndex: 0,
       chainOptions,
     });
+    await run.generateReasoningLabel({
+      provider: Providers.OPENAI,
+      agentId: 'activity-label-live-agent',
+      clientOptions: {
+        apiKey: process.env.OPENAI_API_KEY,
+        model,
+      },
+      visibleReasoning:
+        'I am verifying that reasoning revisions remain correlated in Langfuse.',
+      reasoningStepId: 'reasoning-step-live-1',
+      revision: 0,
+      sourceRunId,
+      responseId: sourceRunId,
+      chainOptions,
+    });
 
-    const { label, phase } = await findExportedTraces(sourceRunId, startedAt);
+    const { label, phase, reasoning } = await findExportedTraces(
+      sourceRunId,
+      startedAt
+    );
     expect(label).toMatchObject({
       name: 'LibreChat Activity Label',
       metadata: {
@@ -229,6 +272,15 @@ describeIfLive('activity label Langfuse export (live)', () => {
         responseId: sourceRunId,
         phaseIndex: 0,
         activityCount: 2,
+      },
+    });
+    expect(reasoning).toMatchObject({
+      name: 'LibreChat Reasoning Label',
+      metadata: {
+        sourceRunId,
+        responseId: sourceRunId,
+        reasoningStepId: 'reasoning-step-live-1',
+        revision: 0,
       },
     });
 
@@ -258,5 +310,15 @@ describeIfLive('activity label Langfuse export (live)', () => {
       model: expect.stringContaining(model),
     });
     expect(phaseGeneration?.usage?.total).toBeGreaterThan(0);
+
+    const reasoningGeneration = reasoning.observations?.find(
+      (observation) => observation.type === 'GENERATION'
+    );
+    expect(reasoningGeneration).toMatchObject({
+      parentObservationId: null,
+      name: 'llm',
+      model: expect.stringContaining(model),
+    });
+    expect(reasoningGeneration?.usage?.total).toBeGreaterThan(0);
   });
 });
