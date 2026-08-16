@@ -62,6 +62,7 @@ import {
   SUBAGENT_PARENT_BATCH_CONFIG_KEY,
   SUBAGENT_REPLAY_CONTROLLER,
 } from '@/tools/subagent/SubagentReplay';
+import { attachRunStepResumeState } from '@/tools/runStepResume';
 import {
   INTENT_ARG,
   readOutcomeFields,
@@ -595,17 +596,18 @@ function fileIdentityKey(file: {
 
 function updateCodeSession(
   sessions: t.ToolSessionMap,
+  sessionKey: string,
   execSessionId: string,
   files: t.FileRefs | undefined
 ): void {
   const newFiles = files ?? [];
-  const existingSession = sessions.get(Constants.EXECUTE_CODE) as
+  const existingSession = sessions.get(sessionKey) as
     | t.CodeSessionContext
     | undefined;
   const existingFiles = existingSession?.files ?? [];
 
   if (newFiles.length === 0) {
-    sessions.set(Constants.EXECUTE_CODE, {
+    sessions.set(sessionKey, {
       session_id: execSessionId,
       files: existingFiles,
       lastUpdated: Date.now(),
@@ -643,7 +645,7 @@ function updateCodeSession(
     }
   }
 
-  sessions.set(Constants.EXECUTE_CODE, {
+  sessions.set(sessionKey, {
     session_id: execSessionId,
     files: [...filteredExisting, ...filesWithSession],
     lastUpdated: Date.now(),
@@ -694,6 +696,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private programmaticCache?: t.ProgrammaticCache;
   /** Reference to Graph's sessions map for automatic session injection */
   private sessions?: t.ToolSessionMap;
+  /** Partition within `sessions` owned by this agent's execution profile. */
+  private codeSessionKey: string;
   /** When true, dispatches ON_TOOL_EXECUTE events instead of invoking tools directly */
   private eventDrivenMode: boolean = false;
   /** Opt-in stream-layer prestart config for event-driven tools. */
@@ -794,6 +798,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     loadRuntimeTools,
     toolRegistry,
     sessions,
+    codeSessionKey,
     eventDrivenMode,
     eagerEventToolExecution,
     eagerEventToolExecutions,
@@ -814,11 +819,45 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     fileCheckpointer,
     getBreakerSignal,
     getRunScope,
+    restoreRunStepResumeState,
+    createRunStepResumeState,
   }: t.ToolNodeConstructorParams) {
     super({
       name: name ?? TOOL_NODE_RUN_NAME,
       tags,
-      func: (input, config) => this.run(input, config),
+      func: async (input, config) => {
+        const state = input as T & Pick<t.BaseGraphState, 'runStepState'>;
+        restoreRunStepResumeState?.(state.runStepState, config);
+        let result: T;
+        try {
+          result = await this.run(input, config);
+        } catch (error) {
+          if (!isGraphInterrupt(error) || createRunStepResumeState == null) {
+            throw error;
+          }
+          const resumeState = createRunStepResumeState();
+          throw new GraphInterrupt(
+            error.interrupts.map((pendingInterrupt) => ({
+              ...pendingInterrupt,
+              value: attachRunStepResumeState(
+                pendingInterrupt.value,
+                resumeState
+              ),
+            }))
+          );
+        }
+        if (createRunStepResumeState == null) {
+          return result;
+        }
+        const runStepState = createRunStepResumeState();
+        if (Array.isArray(result)) {
+          return [...result, { runStepState }] as T;
+        }
+        return {
+          ...result,
+          runStepState,
+        };
+      },
     });
     this.trace = trace ?? this.trace;
     this.runLangfuse = runLangfuse;
@@ -834,6 +873,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       toolExecution,
     });
     this.sessions = sessions;
+    this.codeSessionKey = codeSessionKey ?? Constants.EXECUTE_CODE;
     this.eventDrivenMode = eventDrivenMode ?? false;
     this.eagerEventToolExecution = eagerEventToolExecution;
     this.eagerEventToolExecutions = eagerEventToolExecutions;
@@ -1328,7 +1368,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * `/files/<session_id>` fallback was removed from the executors.
        */
       if (this.participatesInCodeSession(call.name)) {
-        const codeSession = this.sessions?.get(Constants.EXECUTE_CODE) as
+        const codeSession = this.sessions?.get(this.codeSessionKey) as
           | t.CodeSessionContext
           | undefined;
         const execSessionId = codeSession?.session_id;
@@ -2356,7 +2396,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return undefined;
     }
 
-    const codeSession = this.sessions.get(Constants.EXECUTE_CODE) as
+    const codeSession = this.sessions.get(this.codeSessionKey) as
       | t.CodeSessionContext
       | undefined;
     if (!codeSession) {
@@ -2439,7 +2479,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         continue;
       }
 
-      updateCodeSession(this.sessions, execSessionId, artifact?.files);
+      updateCodeSession(
+        this.sessions,
+        this.codeSessionKey,
+        execSessionId,
+        artifact?.files
+      );
     }
   }
 
@@ -2502,7 +2547,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           | undefined;
         const execSessionId = artifact?.session_id;
         if (execSessionId != null && execSessionId !== '') {
-          updateCodeSession(this.sessions, execSessionId, artifact?.files);
+          updateCodeSession(
+            this.sessions,
+            this.codeSessionKey,
+            execSessionId,
+            artifact?.files
+          );
         }
       }
 
@@ -2561,6 +2611,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             index: turn,
             type: 'tool_call' as const,
             tool_call,
+            completed_at: Date.now(),
           },
         },
         config
@@ -3965,6 +4016,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             progress: 1,
             ...(outcome != null && { outcome }),
           } as t.ProcessedToolCall,
+          completed_at: Date.now(),
         },
       },
       config

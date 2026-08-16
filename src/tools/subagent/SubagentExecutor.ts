@@ -45,6 +45,8 @@ import type {
   ReasoningDeltaEvent,
   RunStep,
   RunStepDeltaEvent,
+  RunStepClosedEvent,
+  RunStepStatus,
   StandardGraphInput,
   ExecutableSubagentConfigEntry,
   ResolvedSubagentConfig,
@@ -60,7 +62,6 @@ import type {
   ToolApprovalInterruptPayload,
   ToolExecuteBatchRequest,
   ToolCallDelta,
-  ToolSessionContext,
   TokenCounter,
   ToolApprovalDecision,
   ToolApprovalDecisionMap,
@@ -123,6 +124,8 @@ import {
   createChildGraphPlan,
   isGraphSubagentConfig,
 } from './childGraphConfig';
+import { stripRunStepResumeState } from '@/tools/runStepResume';
+import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { composeAbortSignals } from '@/utils/misc';
 
@@ -146,73 +149,11 @@ const SUBAGENT_CONFIG_CHANGED_MESSAGE =
 const SUBAGENT_INVOCATION_CHANGED_MESSAGE =
   'Subagent error: Subagent invocation changed for this execution.';
 
-function cloneToolSessionContext(
-  context: ToolSessionContext
-): ToolSessionContext {
-  return {
-    ...context,
-    ...(context.files == null
-      ? {}
-      : {
-        files: context.files.map((file) => ({
-          ...file,
-          storage_session_id:
-              file.storage_session_id ?? context.session_id,
-        })),
-      }),
-  };
-}
-
 function seedChildGraphSessions(
   childGraph: StandardGraph,
   agents: AgentInputs[]
 ): void {
-  const seenFilesByTool = new Map<string, Set<string>>();
-  for (const agent of agents) {
-    if (agent.initialSessions == null) {
-      continue;
-    }
-    for (const [toolName, context] of agent.initialSessions) {
-      const existing = childGraph.sessions.get(toolName);
-      if (existing == null) {
-        const cloned = cloneToolSessionContext(context);
-        childGraph.sessions.set(toolName, cloned);
-        seenFilesByTool.set(
-          toolName,
-          new Set(
-            cloned.files?.map(
-              (file) => `${file.storage_session_id ?? ''}\0${file.id}`
-            ) ?? []
-          )
-        );
-        continue;
-      }
-      if (context.files == null || context.files.length === 0) {
-        continue;
-      }
-      const seenFiles =
-        seenFilesByTool.get(toolName) ??
-        new Set(
-          existing.files?.map(
-            (file) =>
-              `${file.storage_session_id ?? existing.session_id}\0${file.id}`
-          ) ?? []
-        );
-      const files = existing.files == null ? [] : [...existing.files];
-      for (const file of context.files) {
-        const storageSessionId =
-          file.storage_session_id ?? context.session_id;
-        const key = `${storageSessionId}\0${file.id}`;
-        if (seenFiles.has(key)) {
-          continue;
-        }
-        seenFiles.add(key);
-        files.push({ ...file, storage_session_id: storageSessionId });
-      }
-      seenFilesByTool.set(toolName, seenFiles);
-      childGraph.sessions.set(toolName, { ...existing, files });
-    }
-  }
+  seedAgentInitialSessions(childGraph.sessions, agents);
 }
 
 async function dispatchObservationalSubagentUpdate(
@@ -263,10 +204,12 @@ type SanitizedRunStep = Partial<
   Pick<
     RunStep,
     | 'agentId'
+    | 'created_at'
     | 'groupId'
     | 'id'
     | 'index'
     | 'runId'
+    | 'status'
     | 'stepIndex'
     | 'summary'
     | 'type'
@@ -275,6 +218,8 @@ type SanitizedRunStep = Partial<
 > & {
   stepDetails?: SanitizedStepDetails;
 };
+
+type SanitizedRunStepClosed = Partial<RunStepClosedEvent>;
 
 type SanitizedStepDetails =
   | {
@@ -313,6 +258,7 @@ type SanitizedStepCompleted =
       index?: number;
       type: 'tool_call';
       tool_call?: SanitizedProcessedToolCall;
+      completed_at?: number;
     }
   | {
       type: 'summary';
@@ -709,11 +655,11 @@ function addSubagentScope(
   resumeManifest?: SubagentResumeManifest
 ): Interrupt[] {
   return interrupts.map((childInterrupt) => {
-    let payload = childInterrupt.value;
+    let payload = stripRunStepResumeState(childInterrupt.value);
     if (isToolApprovalPayload(payload)) {
       payload = {
-        ...childInterrupt.value,
-        subagent: childInterrupt.value.subagent ?? scope,
+        ...payload,
+        subagent: payload.subagent ?? scope,
       };
     }
     return {
@@ -1606,6 +1552,42 @@ export class SubagentExecutor {
     graph.clearHeavyState();
   }
 
+  /**
+   * Terminal sweep for a child graph's run steps. `Run.processStream` sweeps
+   * only the graph it owns, and a child executes through `workflow.invoke()`
+   * outside that loop — so without this, a child's last message step (no
+   * successor step ever opens to close it) and every step of an aborted child
+   * stay `in_progress` forever, leaving hosts with unmatched starts.
+   *
+   * Must run BEFORE `forwarding.drain()`: closures reach the parent only as
+   * child custom events through the forwarder, which stops relaying once
+   * drained.
+   *
+   * Deliberately not called on the interrupt path, mirroring the parent's
+   * `isAwaitingResume` guard: an in-process resume continues into these same
+   * steps, so closing them would strand the resumed run. A resume that
+   * crosses a process boundary is a known gap either way — the child rebuilds
+   * from `SubagentGraphResumeState`, which carries tool-call identity but not
+   * `contentData`, so pre-interrupt steps are unreachable from the new graph
+   * and stay open. That is the child-level instance of the same cross-process
+   * orphan the parent graph has, and it needs persisted lifecycle state to
+   * fix rather than a sweep here.
+   *
+   * `at` is the moment execution actually ended, threaded through so
+   * observational work between then and the sweep cannot inflate the stamps.
+   */
+  private async closeChildRunSteps(
+    graph: StandardGraph,
+    status: Exclude<RunStepStatus, 'in_progress'>,
+    at?: number
+  ): Promise<void> {
+    try {
+      await graph.closeUnfinishedRunSteps(status, at);
+    } catch (_e) {
+      /** A failed sweep must never mask the subagent's own outcome */
+    }
+  }
+
   clearHeavyState(): void {
     this.executions.clear((record) => {
       if (record.activeRun != null) {
@@ -2466,6 +2448,20 @@ export class SubagentExecutor {
         result = childResult;
       }
     } catch (error) {
+      /** Stamped at failure, not after the error-envelope work below. */
+      const childTerminalAt = Date.now();
+      /**
+       * Captured at catch entry, BEFORE the self-abort below flips it. The
+       * closure sweep distinguishes "stopped on purpose" from "died of this
+       * error" by whether the child was already aborted when the error
+       * arrived — reading the signal after `childBreaker.abort(error)` would
+       * relabel the child's own stream-limit failure as an intentional stop
+       * (`cancelled`), while the parent stamps `failed` for the same
+       * incident. A trip that arrived from a parallel sibling has already
+       * aborted the composed signal by this point, so it still reads as
+       * `cancelled` here.
+       */
+      const abortedBeforeError = childSignal.aborted;
       if (isGraphInterrupt(error)) {
         const activeChildRun = execution.activeRun;
         if (activeChildRun != null) {
@@ -2501,6 +2497,18 @@ export class SubagentExecutor {
         childBreaker.abort(error);
       }
       const errorMessage = truncateErrorMessage(error);
+      /**
+       * `cancelled` vs `failed` mirrors `Run.resolveSweepStatus`: an aborted
+       * child was stopped on purpose (caller abort, or a breaker trip from a
+       * parallel sibling), anything else died of an unexpected error. Uses
+       * the pre-error snapshot, not the live signal — the self-abort above
+       * has already tripped it for the child's own limit error.
+       */
+      await this.closeChildRunSteps(
+        childGraph,
+        abortedBeforeError ? 'cancelled' : 'failed',
+        childTerminalAt
+      );
       if (forwarding) {
         await forwarding.drain();
         await this.emitSubagentUpdate(parentRegistry!, {
@@ -2532,6 +2540,14 @@ export class SubagentExecutor {
         messages: [],
       };
     }
+
+    /**
+     * Child execution ended here. Captured before the observational work
+     * below — an awaited `SubagentStop` hook, then the forwarder drain — so a
+     * slow hook cannot inflate the closure stamps with its own latency.
+     * Mirrors the parent's `terminalAt` capture in `Run.processStream`.
+     */
+    const childTerminalAt = Date.now();
 
     if (result == null) {
       throw new Error('Subagent completed without producing graph state.');
@@ -2567,6 +2583,10 @@ export class SubagentExecutor {
       }).catch(() => {
         /* SubagentStop is observational — swallow errors */
       });
+    }
+
+    if (!childAlreadyCompleted) {
+      await this.closeChildRunSteps(childGraph, 'completed', childTerminalAt);
     }
 
     if (forwarding && !childAlreadyCompleted) {
@@ -2823,6 +2843,10 @@ export class SubagentExecutor {
         }
         if (eventName === GraphEvents.ON_RUN_STEP_COMPLETED) {
           scheduleWrap(eventName, 'run_step_completed', data, memberAgentId);
+          return;
+        }
+        if (eventName === GraphEvents.ON_RUN_STEP_CLOSED) {
+          scheduleWrap(eventName, 'run_step_closed', data, memberAgentId);
           return;
         }
         if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
@@ -3179,6 +3203,9 @@ export function sanitizeForwardedSubagentUpdateData(
   if (eventName === GraphEvents.ON_RUN_STEP_COMPLETED) {
     return sanitizeRunStepCompletedUpdateData(data);
   }
+  if (eventName === GraphEvents.ON_RUN_STEP_CLOSED) {
+    return sanitizeRunStepClosedUpdateData(data);
+  }
   if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
     return sanitizeMessageDeltaUpdateData(data);
   }
@@ -3230,10 +3257,12 @@ function sanitizeRunStepUpdateData(
   const step = data as Partial<RunStep>;
   const sanitized: SanitizedRunStep = {};
   assignString(sanitized, 'agentId', step.agentId);
+  assignNumber(sanitized, 'created_at', step.created_at);
   assignNumber(sanitized, 'groupId', step.groupId);
   assignString(sanitized, 'id', step.id);
   assignNumber(sanitized, 'index', step.index);
   assignString(sanitized, 'runId', step.runId);
+  assignString(sanitized, 'status', step.status);
   assignNumber(sanitized, 'stepIndex', step.stepIndex);
   assignString(sanitized, 'type', step.type);
   if (step.summary !== undefined) {
@@ -3243,6 +3272,27 @@ function sanitizeRunStepUpdateData(
     sanitized.usage = step.usage;
   }
   sanitized.stepDetails = sanitizeStepDetails(step.stepDetails);
+  return sanitized;
+}
+
+function sanitizeRunStepClosedUpdateData(
+  data: unknown
+): SanitizedRunStepClosed | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const event = data as Partial<RunStepClosedEvent>;
+  const sanitized: SanitizedRunStepClosed = {};
+  assignString(sanitized, 'agentId', event.agentId);
+  assignNumber(sanitized, 'closed_at', event.closed_at);
+  assignNumber(sanitized, 'created_at', event.created_at);
+  assignNumber(sanitized, 'groupId', event.groupId);
+  assignString(sanitized, 'id', event.id);
+  assignNumber(sanitized, 'index', event.index);
+  assignString(sanitized, 'runId', event.runId);
+  assignString(sanitized, 'status', event.status);
+  assignNumber(sanitized, 'stepIndex', event.stepIndex);
+  assignString(sanitized, 'type', event.type);
   return sanitized;
 }
 
@@ -3389,6 +3439,7 @@ function sanitizeStepCompleted(
     id?: unknown;
     index?: unknown;
     tool_call?: unknown;
+    completed_at?: unknown;
   };
   if (completed.type === 'summary') {
     return {
@@ -3402,6 +3453,7 @@ function sanitizeStepCompleted(
   const sanitized: SanitizedStepCompleted = { type: 'tool_call' };
   assignString(sanitized, 'id', completed.id);
   assignNumber(sanitized, 'index', completed.index);
+  assignNumber(sanitized, 'completed_at', completed.completed_at);
   sanitized.tool_call = sanitizeProcessedToolCall(completed.tool_call);
   return sanitized;
 }
@@ -3519,6 +3571,12 @@ export function summarizeEvent(eventName: string, data: unknown): string {
       return `Tool ${tool.name} complete`;
     }
     return 'Step complete';
+  }
+  if (eventName === GraphEvents.ON_RUN_STEP_CLOSED) {
+    const closed = data as { status?: string };
+    return closed.status != null && closed.status !== ''
+      ? `Step ${closed.status}`
+      : 'Step closed';
   }
   if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
     return 'Streaming…';

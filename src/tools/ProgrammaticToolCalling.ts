@@ -7,16 +7,19 @@ import type { ProgrammaticToolCallingJsonSchema } from './ptcTimeout';
 import type * as t from '@/types';
 import {
   CODE_ARTIFACT_PATH_GUIDANCE,
+  addCodeApiExecutionProfileHeader,
   appendCodeSessionFileSummary,
   appendFailedExecutionFileReminder,
   buildCodeApiExecutionErrorMessage,
   buildCodeApiHttpErrorMessage,
   CodeApiRequestError,
+  buildCodeApiEndpoint,
   emptyOutputMessage,
   getCodeBaseURL,
   appendTmpScratchReminder,
   normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
+  selectRuntimeSessionHint,
 } from './CodeExecutor';
 import {
   clampCodeApiRunTimeoutMs,
@@ -478,7 +481,8 @@ export async function makeRequest(
   endpoint: string,
   body: Record<string, unknown>,
   proxy?: string,
-  authHeaders?: t.CodeApiAuthHeaders
+  authHeaders?: t.CodeApiAuthHeaders,
+  executionProfile?: t.CodeApiExecutionProfile
 ): Promise<t.ProgrammaticExecutionResponse> {
   try {
     const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
@@ -487,7 +491,10 @@ export async function makeRequest(
       headers: {
         'Content-Type': 'application/json',
         'User-Agent': 'LibreChat/1.0',
-        ...resolvedAuthHeaders,
+        ...addCodeApiExecutionProfileHeader(
+          resolvedAuthHeaders,
+          executionProfile
+        ),
       },
       body: JSON.stringify(body),
     };
@@ -882,7 +889,7 @@ export function createProgrammaticToolCallingTool(
   const maxRunTimeoutMs = resolveCodeApiRunTimeoutMs(initParams.runTimeoutMs);
   const proxy = initParams.proxy ?? process.env.PROXY;
   const debug = initParams.debug ?? process.env.PTC_DEBUG === 'true';
-  const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
+  const EXEC_ENDPOINT = buildCodeApiEndpoint(baseUrl, 'exec/programmatic');
 
   return tool(
     async (rawParams, config) => {
@@ -952,14 +959,19 @@ export function createProgrammaticToolCallingTool(
           );
         }
 
-        /* Stateful sessions: hint rides the INITIAL request only; the server
-         * binds continuation round-trips to the same runtime via the
-         * continuation_token. Additive — ignored by stateless servers. PTC
-         * keeps its stateless prompt in v1; only the wire hint plumbs here. */
+        /* The hint rides the INITIAL request only; continuation_token binds
+         * later round-trips. Prefer trusted per-agent factory context over
+         * legacy ToolNode injection. Explicit default profiles always drop it.
+         * PTC keeps its stateless runtime prompt in v1. */
+        const selectedRuntimeSessionHint = selectRuntimeSessionHint(
+          initParams.runtimeSessionHint,
+          _runtime_session_hint
+        );
         const runtimeSessionHint =
-          typeof _runtime_session_hint === 'string' &&
-          _runtime_session_hint !== ''
-            ? _runtime_session_hint
+          initParams.executionProfile !== 'default' &&
+          typeof selectedRuntimeSessionHint === 'string' &&
+          selectedRuntimeSessionHint !== ''
+            ? selectedRuntimeSessionHint
             : undefined;
 
         let response = await makeRequest(
@@ -975,7 +987,8 @@ export function createProgrammaticToolCallingTool(
               : {}),
           },
           proxy,
-          initParams.authHeaders
+          initParams.authHeaders,
+          initParams.executionProfile
         );
 
         // ====================================================================
@@ -1012,7 +1025,8 @@ export function createProgrammaticToolCallingTool(
               tool_results: toolResults,
             },
             proxy,
-            initParams.authHeaders
+            initParams.authHeaders,
+            initParams.executionProfile
           );
         }
 

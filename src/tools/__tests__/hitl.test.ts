@@ -1146,7 +1146,12 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
         },
       ],
     };
-    const getState = jest.fn(async (_config: RunnableConfig) => persistedState);
+    const getState = jest.fn(
+      async (
+        _config: RunnableConfig,
+        _options?: { subgraphs?: boolean }
+      ) => persistedState
+    );
     run.graphRunnable = { getState } as unknown as t.CompiledStateWorkflow;
     const processSpy = jest
       .spyOn(run, 'processStream')
@@ -1159,7 +1164,7 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
 
     await run.resume(decision, callerConfig);
 
-    expect(getState).toHaveBeenCalledWith(callerConfig);
+    expect(getState).toHaveBeenCalledWith(callerConfig, { subgraphs: true });
     const command = processSpy.mock.calls[0]?.[0] as Command;
     expect(command.resume).toEqual({ 'persisted-interrupt': decision });
     expect(processSpy.mock.calls[0]?.[1].configurable).toMatchObject({

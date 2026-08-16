@@ -16,8 +16,11 @@ import {
   HumanMessage,
   SystemMessage,
 } from '@langchain/core/messages';
+import type {
+  MessageContentComplex,
+  UsageMetadata,
+} from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
-import type { MessageContentComplex } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import type { StandardGraph } from '@/graphs/Graph';
@@ -45,20 +48,16 @@ import {
   withLangfuseAttributes,
 } from '@/langfuse';
 import {
+  REASONING_LABEL_PROMPT,
+  buildReasoningLabelTraceSeed,
+  buildReasoningLabelPrompt,
+  normalizeReasoningLabel,
+} from '@/prompts/reasoningLabel';
+import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
-import {
-  resolveLangfuseRuntimeScope,
-  withLangfuseRuntimeScope,
-} from '@/langfuseRuntimeScope';
-import {
-  Callback,
-  GraphEvents,
-  TitleMethod,
-  DEFAULT_RECURSION_LIMIT,
-} from '@/common';
 import {
   appendCallbacks,
   filterCallbacks,
@@ -66,12 +65,27 @@ import {
   type CallbackEntry,
 } from '@/utils/callbacks';
 import {
+  resolveLangfuseRuntimeScope,
+  withLangfuseRuntimeScope,
+} from '@/langfuseRuntimeScope';
+import {
+  getRunStepResumeState,
+  stripRunStepResumeState,
+} from '@/tools/runStepResume';
+import {
+  Callback,
+  GraphEvents,
+  TitleMethod,
+  DEFAULT_RECURSION_LIMIT,
+} from '@/common';
+import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { initializeLangfuseTracing } from './instrumentation';
+import { seedRunInitialSessions } from '@/utils/toolSessions';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 import { createGraph } from '@/graphs/createGraph';
 import { resolveMaxSeals } from '@/llm/preempt';
@@ -93,11 +107,16 @@ export const defaultOmitOptions = new Set([
   'additionalModelRequestFields',
 ]);
 
+const ACTIVITY_LABEL_TRACE_NAME = 'LibreChat Activity Label';
+const ACTIVITY_PHASE_TRACE_NAME = 'LibreChat Activity Phase';
+const REASONING_LABEL_TRACE_NAME = 'LibreChat Reasoning Label';
+
 const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_AGENT_UPDATE,
   GraphEvents.ON_RUN_STEP,
   GraphEvents.ON_RUN_STEP_DELTA,
   GraphEvents.ON_RUN_STEP_COMPLETED,
+  GraphEvents.ON_RUN_STEP_CLOSED,
   GraphEvents.ON_MESSAGE_DELTA,
   GraphEvents.ON_REASONING_DELTA,
   GraphEvents.ON_TOOL_EXECUTE,
@@ -113,6 +132,7 @@ const CUSTOM_GRAPH_EVENTS = new Set<string>([
 const DIRECT_DISPATCHED_STEP_EVENTS = new Set<string>([
   GraphEvents.ON_RUN_STEP,
   GraphEvents.ON_RUN_STEP_DELTA,
+  GraphEvents.ON_RUN_STEP_CLOSED,
   GraphEvents.ON_MESSAGE_DELTA,
   GraphEvents.ON_REASONING_DELTA,
 ]);
@@ -123,6 +143,38 @@ function getStepScopedEventId(data: unknown): string | undefined {
   }
   const candidate = data as { id?: unknown };
   return typeof candidate.id === 'string' ? candidate.id : undefined;
+}
+
+/**
+ * Narrows an ON_RUN_STEP_COMPLETED payload (`{ result: ToolCompleteEvent }`)
+ * to the ids step closure needs. Returns undefined for malformed payloads and
+ * the resume race's empty step id.
+ */
+function getToolCompletion(
+  data: unknown
+): { stepId: string; toolCallId?: string; completedAt?: number } | undefined {
+  if (data == null || typeof data !== 'object') {
+    return undefined;
+  }
+  const { result } = data as { result?: unknown };
+  if (result == null || typeof result !== 'object') {
+    return undefined;
+  }
+  const candidate = result as {
+    id?: unknown;
+    tool_call?: { id?: unknown };
+    completed_at?: unknown;
+  };
+  if (typeof candidate.id !== 'string' || candidate.id === '') {
+    return undefined;
+  }
+  const toolCallId = candidate.tool_call?.id;
+  const completedAt = candidate.completed_at;
+  return {
+    stepId: candidate.id,
+    ...(typeof toolCallId === 'string' ? { toolCallId } : {}),
+    ...(typeof completedAt === 'number' ? { completedAt } : {}),
+  };
 }
 
 function isLangGraphResumeMapForInterrupt(
@@ -136,7 +188,9 @@ function isLangGraphResumeMapForInterrupt(
 }
 
 function getInterruptHookSessionId(payload: unknown): string | undefined {
-  const publicPayload = stripSubagentResumeManifest(payload);
+  const publicPayload = stripSubagentResumeManifest(
+    stripRunStepResumeState(payload)
+  );
   if (
     publicPayload == null ||
     typeof publicPayload !== 'object' ||
@@ -156,11 +210,15 @@ type InterruptStateSnapshot = {
   values?: { messages?: BaseMessage[] };
   tasks?: Array<{
     interrupts?: Array<{ id?: string; value?: unknown }>;
+    state?: RunnableConfig | InterruptStateSnapshot;
   }>;
 };
 
 type WorkflowWithStateHistory = {
-  getState?(config: RunnableConfig): Promise<InterruptStateSnapshot>;
+  getState?(
+    config: RunnableConfig,
+    options?: { subgraphs?: boolean }
+  ): Promise<InterruptStateSnapshot>;
   getStateHistory?(
     config: RunnableConfig
   ): AsyncIterableIterator<InterruptStateSnapshot>;
@@ -176,6 +234,17 @@ function getFirstPersistedInterrupt(
         pendingInterrupt.id.length > 0
       ) {
         return { id: pendingInterrupt.id, value: pendingInterrupt.value };
+      }
+    }
+    const nestedState = task.state;
+    if (
+      nestedState != null &&
+      'tasks' in nestedState &&
+      Array.isArray(nestedState.tasks)
+    ) {
+      const nestedInterrupt = getFirstPersistedInterrupt(nestedState);
+      if (nestedInterrupt != null) {
+        return nestedInterrupt;
       }
     }
   }
@@ -253,6 +322,8 @@ export class Run<_T extends t.BaseGraphState> {
   private activityLabelSeq = 0;
   /** Per-run sequence for parent activity-phase trace and invocation ids. */
   private activityPhaseLabelSeq = 0;
+  /** Per-run sequence for reasoning-label trace and invocation ids. */
+  private reasoningLabelSeq = 0;
   /** Latest user turn used to keep detached phase roots conversation-shaped. */
   private activityPhaseTraceInput?: string;
   /** Distinguishes sibling forks started from the same explicit checkpoint. */
@@ -314,9 +385,25 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     if (config.initialSessions && this.Graph) {
-      for (const [key, value] of config.initialSessions) {
-        this.Graph.sessions.set(key, value);
-      }
+      const configuredAgents =
+        'agents' in config.graphConfig &&
+        Array.isArray(config.graphConfig.agents)
+          ? config.graphConfig.agents
+          : undefined;
+      const agents: Array<Pick<t.AgentInputs, 'codeSessionKey'>> =
+        configuredAgents ?? [
+          {
+            codeSessionKey:
+              'codeSessionKey' in config.graphConfig
+                ? config.graphConfig.codeSessionKey
+                : undefined,
+          },
+        ];
+      seedRunInitialSessions({
+        sessions: this.Graph.sessions,
+        initialSessions: config.initialSessions,
+        agents,
+      });
     }
 
     this.returnContent = config.returnContent ?? false;
@@ -703,20 +790,50 @@ export class Run<_T extends t.BaseGraphState> {
         return;
       }
       const handler = this.handlerRegistry?.getHandler(eventName);
-      if (handler && this.Graph) {
-        return await handler.handle(
-          eventName,
-          data as
-            | t.StreamEventData
-            | t.ModelEndData
-            | t.RunStep
-            | t.RunStepDeltaEvent
-            | t.MessageDeltaEvent
-            | t.ReasoningDeltaEvent
-            | { result: t.ToolEndEvent },
-          metadata,
-          this.Graph
-        );
+      /**
+       * Tool completions arriving over the custom-event channel are the only
+       * signal ToolNode (which holds no graph reference) emits — observe them
+       * here to drive step closure. Runs in `finally`, independent of handler
+       * registration, so an absent or throwing host handler cannot lose the
+       * close; duplicate callback echoes are absorbed by the terminal-status
+       * guard in `closeRunStep`.
+       */
+      try {
+        if (handler && this.Graph) {
+          return await handler.handle(
+            eventName,
+            data as
+              | t.StreamEventData
+              | t.ModelEndData
+              | t.RunStep
+              | t.RunStepDeltaEvent
+              | t.RunStepClosedEvent
+              | t.MessageDeltaEvent
+              | t.ReasoningDeltaEvent
+              | { result: t.ToolEndEvent },
+            metadata,
+            this.Graph
+          );
+        }
+      } finally {
+        if (
+          eventName === GraphEvents.ON_RUN_STEP_COMPLETED &&
+          this.Graph != null
+        ) {
+          const completion = getToolCompletion(data);
+          if (completion != null) {
+            /**
+             * The producer stamped `completed_at` before dispatch. Carrying it
+             * through keeps the recorded duration the tool's, not the host
+             * handler's — this runs after an arbitrarily slow handler resolves.
+             */
+            await this.Graph.recordStepCompletion(completion.stepId, {
+              toolCallId: completion.toolCallId,
+              metadata,
+              at: completion.completedAt,
+            });
+          }
+        }
       }
     };
   }
@@ -729,6 +846,26 @@ export class Run<_T extends t.BaseGraphState> {
     return (
       this._interrupt != null && this._haltedReason == null && !streamThrew
     );
+  }
+
+  /**
+   * Terminal status for steps still open at end-of-run: `cancelled` for
+   * intentional stops (caller abort, hook halt), `failed` for unexpected
+   * stream errors, `completed` for a natural finish. Reads `_haltedReason`
+   * behind a method boundary on purpose — it is assigned inside the
+   * `consumeStream` closure, which control-flow narrowing cannot see.
+   */
+  private resolveSweepStatus(
+    streamThrew: boolean,
+    streamAborted: boolean
+  ): Exclude<t.RunStepStatus, 'in_progress'> {
+    if (streamThrew) {
+      return streamAborted ? 'cancelled' : 'failed';
+    }
+    if (this._haltedReason != null) {
+      return 'cancelled';
+    }
+    return 'completed';
   }
 
   private getStreamLangfuseConfig(
@@ -861,6 +998,12 @@ export class Run<_T extends t.BaseGraphState> {
     if (!isResume) {
       delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
       delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+    }
+    if (isResume) {
+      await this.restoreInterruptFromCheckpoint(
+        config,
+        (inputs as Command).update
+      );
     }
 
     /**
@@ -1027,6 +1170,14 @@ export class Run<_T extends t.BaseGraphState> {
      * preserving session hooks would leak them into the next run.
      */
     let streamThrew = false;
+    let streamAborted = false;
+    /**
+     * When the stream itself ended — captured before the post-stream work in
+     * the `finally` (Stop/StopFailure hooks, Langfuse disposal, which can
+     * force-flush) so a slow hook cannot inflate the terminal stamps that the
+     * sweep writes onto steps that were still open.
+     */
+    let terminalAt: number | undefined;
 
     const consumeStream = async (): Promise<void> => {
       /**
@@ -1095,9 +1246,26 @@ export class Run<_T extends t.BaseGraphState> {
           }
         }
 
+        /**
+         * Stamped before the handler runs: the close below happens after an
+         * arbitrarily slow host handler resolves, and the step's duration
+         * should end when the model did, not when the host finished with it.
+         */
+        const modelEndAt =
+          eventName === GraphEvents.CHAT_MODEL_END ? Date.now() : undefined;
         const handler = this.handlerRegistry?.getHandler(eventName);
         if (handler) {
           await handler.handle(eventName, data, metadata, this.Graph);
+        }
+
+        /**
+         * A finished model call ends its lane's open message step. Placed
+         * here — not in `ModelEndHandler` — because hosts replace the
+         * CHAT_MODEL_END handler with their own instance, which would
+         * silently drop the close.
+         */
+        if (eventName === GraphEvents.CHAT_MODEL_END && this.Graph != null) {
+          await this.Graph.closeOpenMessageStep(metadata, modelEndAt);
         }
 
         /**
@@ -1127,6 +1295,8 @@ export class Run<_T extends t.BaseGraphState> {
           break;
         }
       }
+
+      terminalAt = Date.now();
 
       if (this._interrupt != null) {
         await this.resolveInterruptResumeConfig(config);
@@ -1212,7 +1382,17 @@ export class Run<_T extends t.BaseGraphState> {
         )
       );
     } catch (err) {
+      terminalAt = Date.now();
       streamThrew = true;
+      /**
+       * Corroborate cancellation against an actually-aborted signal. A
+       * provider SDK or host handler can reject with an `AbortError` while
+       * nothing was cancelled — that is an unexpected failure (it also fires
+       * `StopFailure`), and naming it `cancelled` would misreport abort
+       * forensics.
+       */
+      streamAborted =
+        config.signal?.aborted === true || this.Graph.signal?.aborted === true;
       if (this.hookRegistry?.hasHookFor('StopFailure', this.id) === true) {
         const runMessages = this.Graph.getRunMessages() ?? [];
         await executeHooks({
@@ -1259,6 +1439,29 @@ export class Run<_T extends t.BaseGraphState> {
        */
       this.hookRegistry?.clearHaltSignal(this.id);
       await disposeLangfuseHandler(langfuseHandler);
+
+      /**
+       * Terminal sweep: close every step that never reached a terminal
+       * status — `completed` on a natural end, `cancelled` on caller abort
+       * or hook halt, `failed` on an unexpected stream error. Skipped on a
+       * HITL pause, where the open steps continue after `resume()`.
+       *
+       * Runs BEFORE the callback teardown below, so a caller observing
+       * lifecycle events only through `RunnableConfig.callbacks` still
+       * receives these closures rather than being left with unmatched
+       * starts, and before `getContentParts()` so terminal stamps flow into
+       * content and session serialization.
+       */
+      if (!this.isAwaitingResume(streamThrew)) {
+        try {
+          await this.Graph.closeUnfinishedRunSteps(
+            this.resolveSweepStatus(streamThrew, streamAborted),
+            terminalAt
+          );
+        } catch {
+          /* the sweep must never mask the stream outcome */
+        }
+      }
 
       /**
        * Break the reference chain that keeps heavy data alive via
@@ -1356,7 +1559,9 @@ export class Run<_T extends t.BaseGraphState> {
     }
     return {
       ...this._interrupt,
-      payload: stripSubagentResumeManifest(this._interrupt.payload),
+      payload: stripSubagentResumeManifest(
+        stripRunStepResumeState(this._interrupt.payload)
+      ),
     } as t.RunInterruptResult<TPayload>;
   }
 
@@ -1475,7 +1680,7 @@ export class Run<_T extends t.BaseGraphState> {
     await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
     const interrupt = this._interrupt;
     const resumeManifest = requireValidSubagentResumeManifest(
-      interrupt?.payload
+      stripRunStepResumeState(interrupt?.payload)
     );
     const resumeConfigurable = { ...callerConfig.configurable };
     delete resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
@@ -1562,7 +1767,7 @@ export class Run<_T extends t.BaseGraphState> {
     callerConfig: t.RunStreamConfig,
     resumeUpdate?: ResumeCommandUpdate
   ): Promise<void> {
-    if (this._interrupt != null || this.humanInTheLoop?.enabled !== true) {
+    if (this._interrupt != null || !this.hasCheckpointer) {
       return;
     }
     const workflow = this.graphRunnable as
@@ -1572,11 +1777,16 @@ export class Run<_T extends t.BaseGraphState> {
       return;
     }
 
-    const snapshot = await workflow.getState(callerConfig as RunnableConfig);
+    const snapshot = await workflow.getState(callerConfig as RunnableConfig, {
+      subgraphs: true,
+    });
     const persistedInterrupt = getFirstPersistedInterrupt(snapshot);
     if (persistedInterrupt == null) {
       return;
     }
+    this.Graph?.restoreRunStepResumeState(
+      getRunStepResumeState(persistedInterrupt.value)
+    );
     const persistedMessages = getPersistedMessages(snapshot);
     if (persistedMessages != null) {
       const resumeMessages = getResumeUpdateMessages(resumeUpdate);
@@ -1866,22 +2076,15 @@ export class Run<_T extends t.BaseGraphState> {
         ? undefined
         : (requestedContext ??
           this.Graph.agentContexts.get(this.Graph.defaultAgentId));
-    const traceMetadata = createLangfuseTraceMetadata({
-      messageId: 'activity-label-' + this.id,
-      agentName: labelContext?.name,
-    });
-    const labelRunName = getLangfuseTraceName(
-      traceMetadata,
-      'LibreChat Activity Label'
-    );
-
     /** Shallow-cloned: activity labels run once per tool batch, and writing
      *  the Langfuse handler back onto a host-reused `chainOptions` would
      *  accumulate duplicate callbacks across batches. */
     const labelChainOptions = {
       ...(chainOptions ?? {}),
     } as Partial<RunnableConfig> & {
-      configurable?: Record<string, unknown>;
+      configurable?: Record<string, unknown> & {
+        requestBody?: { parentMessageId?: unknown };
+      };
     };
     const labelUserId =
       typeof labelChainOptions.configurable?.user_id === 'string'
@@ -1891,6 +2094,42 @@ export class Run<_T extends t.BaseGraphState> {
       typeof labelChainOptions.configurable?.thread_id === 'string'
         ? (labelChainOptions.configurable.thread_id as string)
         : undefined;
+    const labelIndex = labelSeq - 1;
+    const labelParentMessageId =
+      labelChainOptions.configurable?.requestBody?.parentMessageId;
+    /** An omitted `agentId` is attributable only when exactly one context
+     *  exists. Multi-agent callers remain unattributed instead of being
+     *  incorrectly assigned to the graph's default agent. */
+    const labelAgentId =
+      agentId ??
+      (this.Graph?.agentContexts.size === 1
+        ? this.Graph.defaultAgentId
+        : undefined);
+    const labelAgentName =
+      labelAgentId == null ? undefined : labelContext?.name;
+    const labelMetadata: Record<string, unknown> = {
+      sourceRunId: this.id,
+      responseId: this.id,
+      activityIndex: labelIndex,
+      ...(typeof labelParentMessageId === 'string'
+        ? { parentMessageId: labelParentMessageId }
+        : {}),
+      ...(labelAgentId == null ? {} : { agentId: labelAgentId }),
+      ...(labelAgentName == null ? {} : { agentName: labelAgentName }),
+    };
+    const traceMetadata = {
+      ...createLangfuseTraceMetadata({
+        messageId: 'activity-label-' + this.id,
+        parentMessageId: labelParentMessageId,
+        agentId: labelAgentId,
+        agentName: labelAgentName,
+      }),
+      sourceRunId: this.id,
+      responseId: this.id,
+      activityIndex: String(labelIndex),
+    };
+    const labelRunName = labelChainOptions.runName ?? ACTIVITY_LABEL_TRACE_NAME;
+    const labelTags = ['librechat', 'activity-label'];
     const labelLangfuseConfig = resolveLangfuseConfig(
       this.langfuse,
       labelContext?.langfuse
@@ -1934,14 +2173,14 @@ export class Run<_T extends t.BaseGraphState> {
         userId: labelUserId,
         sessionId: labelSessionId,
         traceMetadata,
-        tags: ['librechat', 'activity-label'],
+        tags: labelTags,
         traceIdSeed:
           labelLangfuseConfig?.deterministicTraceId === true
             ? labelTraceSeed
             : undefined,
         runId: labelScopeRunId,
         toolOutputTracing: labelRuntimeScope.toolOutputTracing,
-        traceName: labelChainOptions.runName ?? labelRunName,
+        traceName: labelRunName,
       });
     }
     if (labelLangfuseHandler != null) {
@@ -2027,7 +2266,12 @@ export class Run<_T extends t.BaseGraphState> {
     const invokeConfig = Object.assign({}, labelChainOptions, {
       run_id: labelRunId,
       runId: labelRunId,
-      runName: labelChainOptions.runName ?? labelRunName,
+      runName: labelRunName,
+      tags: [...new Set([...(labelChainOptions.tags ?? []), ...labelTags])],
+      metadata: {
+        ...(labelChainOptions.metadata ?? {}),
+        ...labelMetadata,
+      },
     }) as Partial<RunnableConfig>;
 
     const invokeLabel = (
@@ -2038,9 +2282,9 @@ export class Run<_T extends t.BaseGraphState> {
           langfuse: labelLangfuseConfig,
           userId: labelUserId,
           sessionId: labelSessionId,
-          traceName: runtimeConfig.runName ?? labelRunName,
+          traceName: labelRunName,
           traceMetadata,
-          tags: ['librechat', 'activity-label'],
+          tags: labelTags,
         },
         () =>
           model.invoke(
@@ -2123,8 +2367,263 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   /**
+   * Generates one replacement title for a user-visible reasoning step. Hosts
+   * own accumulation, scheduling, revision ordering, durable delivery, and
+   * billing; the SDK only performs one bounded, redaction-aware generation.
+   */
+  async generateReasoningLabel({
+    provider,
+    clientOptions,
+    visibleReasoning,
+    reasoningStepId,
+    revision,
+    status = 'streaming',
+    previousLabel,
+    agentId,
+    prompt,
+    charLimit = 6_000,
+    chainOptions,
+    traceSeed,
+    sourceRunId,
+    sourceTraceId,
+    responseId,
+  }: t.RunReasoningLabelOptions): Promise<t.ReasoningLabelResult> {
+    const normalizedStepId = reasoningStepId.trim();
+    const snapshotChars = visibleReasoning.trim().length;
+    if (
+      normalizedStepId === '' ||
+      snapshotChars === 0 ||
+      !Number.isInteger(revision) ||
+      revision < 0
+    ) {
+      return {};
+    }
+
+    const reasoningSeq = ++this.reasoningLabelSeq;
+    const requestedContext =
+      this.Graph == null || agentId == null
+        ? undefined
+        : this.Graph.agentContexts.get(agentId);
+    if (agentId != null && requestedContext == null) {
+      return {};
+    }
+    if (agentId == null && (this.Graph?.agentContexts.size ?? 0) > 1) {
+      return {};
+    }
+    const reasoningContext =
+      this.Graph == null
+        ? undefined
+        : (requestedContext ??
+          this.Graph.agentContexts.get(this.Graph.defaultAgentId));
+    const reasoningChainOptions = {
+      ...(chainOptions ?? {}),
+    } as Partial<RunnableConfig> & {
+      configurable?: Record<string, unknown> & {
+        requestBody?: { parentMessageId?: unknown };
+      };
+    };
+    const reasoningUserId =
+      typeof reasoningChainOptions.configurable?.user_id === 'string'
+        ? reasoningChainOptions.configurable.user_id
+        : undefined;
+    const reasoningSessionId =
+      typeof reasoningChainOptions.configurable?.thread_id === 'string'
+        ? reasoningChainOptions.configurable.thread_id
+        : undefined;
+    const reasoningParentMessageId =
+      reasoningChainOptions.configurable?.requestBody?.parentMessageId;
+    const reasoningAgentId =
+      agentId ??
+      (this.Graph?.agentContexts.size === 1
+        ? this.Graph.defaultAgentId
+        : undefined);
+    const reasoningAgentName =
+      reasoningAgentId == null ? undefined : reasoningContext?.name;
+    const resolvedSourceRunId = sourceRunId ?? this.id;
+    const reasoningResponseId = responseId ?? this.id;
+    const reasoningMetadata: Record<string, unknown> = {
+      sourceRunId: resolvedSourceRunId,
+      ...(sourceTraceId == null ? {} : { sourceTraceId }),
+      responseId: reasoningResponseId,
+      reasoningStepId: normalizedStepId,
+      revision,
+      status,
+      snapshotChars,
+      ...(typeof reasoningParentMessageId === 'string'
+        ? { parentMessageId: reasoningParentMessageId }
+        : {}),
+      ...(reasoningAgentId == null ? {} : { agentId: reasoningAgentId }),
+      ...(reasoningAgentName == null ? {} : { agentName: reasoningAgentName }),
+    };
+    const traceMetadata = {
+      ...createLangfuseTraceMetadata({
+        messageId: `reasoning-label-${reasoningResponseId}`,
+        parentMessageId: reasoningParentMessageId,
+        agentId: reasoningAgentId,
+        agentName: reasoningAgentName,
+      }),
+      sourceRunId: resolvedSourceRunId,
+      ...(sourceTraceId == null ? {} : { sourceTraceId }),
+      responseId: reasoningResponseId,
+      reasoningStepId: normalizedStepId,
+      revision: String(revision),
+      status,
+      snapshotChars: String(snapshotChars),
+    };
+    const reasoningRunName =
+      reasoningChainOptions.runName ?? REASONING_LABEL_TRACE_NAME;
+    const reasoningTags = ['librechat', 'reasoning-label', 'reasoning-step'];
+    const reasoningLangfuseConfig = resolveLangfuseConfig(
+      this.langfuse,
+      reasoningContext?.langfuse
+    );
+    initializeLangfuseTracing(reasoningLangfuseConfig);
+
+    const inheritedTraceSeed = getTraceIdSeed();
+    const reasoningTraceSeed =
+      reasoningLangfuseConfig?.deterministicTraceId === true ||
+      inheritedTraceSeed != null
+        ? (traceSeed ??
+          buildReasoningLabelTraceSeed(
+            resolvedSourceRunId,
+            normalizedStepId,
+            revision
+          ))
+        : undefined;
+    const reasoningScopeRunId = `reasoning-label:${this.id}:${reasoningSeq}:${nanoid()}`;
+    const reasoningRuntimeScope = resolveLangfuseRuntimeScope({
+      runLangfuse: this.langfuse,
+      langfuseOverlay: reasoningContext?.langfuse,
+      traceIdSeed: reasoningTraceSeed,
+      runId: reasoningScopeRunId,
+    });
+    let reasoningLangfuseHandler: CallbackEntry | undefined;
+    if (reasoningSessionId != null) {
+      reasoningLangfuseHandler = createLangfuseHandler({
+        langfuse: reasoningLangfuseConfig,
+        userId: reasoningUserId,
+        sessionId: reasoningSessionId,
+        traceMetadata,
+        tags: reasoningTags,
+        traceIdSeed:
+          reasoningLangfuseConfig?.deterministicTraceId === true
+            ? reasoningTraceSeed
+            : undefined,
+        runId: reasoningScopeRunId,
+        toolOutputTracing: reasoningRuntimeScope.toolOutputTracing,
+        traceName: reasoningRunName,
+      });
+    }
+    if (reasoningLangfuseHandler != null) {
+      reasoningChainOptions.callbacks = appendCallbacks(
+        reasoningChainOptions.callbacks,
+        [reasoningLangfuseHandler]
+      );
+    }
+
+    const redaction = hasToolOutputTracingConfig(
+      this.langfuse,
+      reasoningContext?.langfuse
+    )
+      ? resolveToolOutputTracingConfig(
+        this.langfuse,
+        reasoningContext?.langfuse
+      )
+      : undefined;
+    const userPrompt = buildReasoningLabelPrompt({
+      visibleReasoning,
+      status,
+      charLimit,
+      previousLabel,
+      redaction,
+    });
+    if (userPrompt === '') {
+      await disposeLangfuseHandler(reasoningLangfuseHandler);
+      return {};
+    }
+
+    const model = initializeModel({
+      provider,
+      clientOptions: {
+        ...(clientOptions ?? {}),
+        streaming: false,
+      } as t.ClientOptions,
+    }) as t.ChatModelInstance;
+    const reasoningRunId = `${this.id}-reasoning-${reasoningSeq}`;
+    const invokeConfig = Object.assign({}, reasoningChainOptions, {
+      run_id: reasoningRunId,
+      runId: reasoningRunId,
+      runName: reasoningRunName,
+      tags: [
+        ...new Set([...(reasoningChainOptions.tags ?? []), ...reasoningTags]),
+      ],
+      metadata: {
+        ...(reasoningChainOptions.metadata ?? {}),
+        ...reasoningMetadata,
+      },
+    }) as Partial<RunnableConfig>;
+    const invokeLabel = (
+      runtimeConfig: Partial<RunnableConfig>
+    ): Promise<unknown> =>
+      withLangfuseAttributes(
+        {
+          langfuse: reasoningLangfuseConfig,
+          userId: reasoningUserId,
+          sessionId: reasoningSessionId,
+          traceName: reasoningRunName,
+          traceMetadata,
+          tags: reasoningTags,
+        },
+        () =>
+          model.invoke(
+            [
+              new SystemMessage(prompt ?? REASONING_LABEL_PROMPT),
+              new HumanMessage(userPrompt),
+            ],
+            runtimeConfig
+          )
+      );
+    const extractResult = (response: unknown): t.ReasoningLabelResult => {
+      const result = response as {
+        content?: unknown;
+        usage_metadata?: UsageMetadata;
+      } | null;
+      const content = result?.content;
+      let text = '';
+      if (typeof content === 'string') {
+        text = content;
+      } else if (Array.isArray(content)) {
+        text = content
+          .map((block) =>
+            typeof block === 'string'
+              ? block
+              : ((block as { text?: string }).text ?? '')
+          )
+          .join('');
+      }
+      const label = normalizeReasoningLabel(text);
+      return {
+        ...(label === '' ? {} : { label }),
+        ...(result?.usage_metadata == null
+          ? {}
+          : { usage: result.usage_metadata }),
+      };
+    };
+
+    try {
+      const response = await withLangfuseRuntimeScope(
+        reasoningRuntimeScope,
+        () => invokeLabel(invokeConfig)
+      );
+      return extractResult(response);
+    } finally {
+      await disposeLangfuseHandler(reasoningLangfuseHandler);
+    }
+  }
+
+  /**
    * Generates one parent summary for two or more logical activities. The
-   * summary model is traced as a dedicated activity-phase agent root in the
+   * summary model is traced as a dedicated activity-phase chain root in the
    * conversation session, with the model callback recorded as its generation
    * child. No session id means no phase trace, avoiding orphan observations.
    */
@@ -2289,11 +2788,8 @@ export class Run<_T extends t.BaseGraphState> {
         : { contributingAgentIds: contributingAgentIds.join(',') }),
       ...(closingTextPhase == null ? {} : { closingTextPhase }),
     };
-    const phaseRunName = getLangfuseTraceName(
-      traceMetadata,
-      'LibreChat Activity Phase'
-    );
-    const phaseTraceName = phaseChainOptions.runName ?? phaseRunName;
+    const phaseTraceName =
+      phaseChainOptions.runName ?? ACTIVITY_PHASE_TRACE_NAME;
     const phaseTags = [
       'librechat',
       'activity-phase',
@@ -2483,8 +2979,8 @@ function findActivityPhaseTraceInput(
     const message = messages[i];
     if (
       message.getType() !== 'human' ||
-      message.additional_kwargs?.role === 'system' ||
-      message.additional_kwargs?.isMeta === true
+      message.additional_kwargs.role === 'system' ||
+      message.additional_kwargs.isMeta === true
     ) {
       continue;
     }

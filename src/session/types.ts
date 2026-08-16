@@ -225,6 +225,7 @@ export interface AgentSessionStreamEvent {
     | 'tool.started'
     | 'tool.delta'
     | 'tool.completed'
+    | 'step.finished'
     | 'usage.updated'
     | 'run.completed'
     | 'run.failed'

@@ -5,6 +5,7 @@
     "module": "ESNext",
     "target": "ESNext",
     "skipLibCheck": true,
+    "isolatedModules": true,
     "strict": true,
     "types": ["node", "jest"],
     "allowSyntheticDefaultImports": true,

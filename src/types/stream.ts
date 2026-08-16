@@ -8,6 +8,7 @@ import type {
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { LLMResult, Generation } from '@langchain/core/outputs';
 import type { Command } from '@langchain/langgraph';
+import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
 import type { AssistantTextPhase } from '@/types/assistantPhase';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
@@ -50,20 +51,30 @@ start, stream and end are associated with slightly different data payload.
 Please see the documentation for EventData for more details. */
 export type EventName = string;
 
+export type RunStepStatus =
+  | 'in_progress'
+  | 'completed'
+  | 'cancelled'
+  | 'failed';
+
 export type RunStep = {
-  // id: string;
-  // object: 'thread.run.step'; // Updated from 'run.step' # missing
-  // created_at: number;
-  // run_id: string;
-  // assistant_id: string;
-  // thread_id: string;
   type: StepTypes;
-  // status: 'in_progress' | 'completed' | 'failed' | 'cancelled'; // Add other possible status values if needed
-  // cancelled_at: number | null;
-  // completed_at: number | null;
-  // expires_at: number;
-  // failed_at: number | null;
-  // last_error: string | null;
+  /** Epoch ms when the step was dispatched. */
+  created_at?: number;
+  /**
+   * Lifecycle status; terminal values are stamped when the step closes.
+   * Invariant (enforced by `closeRunStep`, not the type, to stay wire-compatible
+   * with the OpenAI Assistants shape): a terminal status sets exactly one
+   * matching `*_at` field; first close wins and `cancelled`/`failed` are
+   * immutable once stamped.
+   */
+  status?: RunStepStatus;
+  /** Epoch ms when the step closed with status `completed`. */
+  completed_at?: number;
+  /** Epoch ms when the step closed with status `cancelled` (abort/halt). */
+  cancelled_at?: number;
+  /** Epoch ms when the step closed with status `failed`. */
+  failed_at?: number;
   id: string; // #new
   runId?: string; // #new
   agentId?: string; // #new - tracks which agent this step belongs to
@@ -92,6 +103,23 @@ export type RunStep = {
   // };
 };
 
+/** Minimal durable lifecycle state needed to continue open run steps. */
+export interface RunStepResumeEntry {
+  step: RunStep;
+  pendingToolCallIds: string[];
+  latestCompletionAt?: number;
+  openMessageStep: boolean;
+}
+
+/** SDK-private state persisted in LangGraph checkpoints for process-safe resume. */
+export interface RunStepResumeState {
+  version: 1;
+  revision: number;
+  nextIndex: number;
+  toolCallSteps: Array<{ toolCallId: string; stepId: string }>;
+  steps: RunStepResumeEntry[];
+}
+
 /**
  * Represents a run step delta i.e. any changed fields on a run step during
  * streaming.
@@ -106,6 +134,44 @@ export interface RunStepDeltaEvent {
    */
   delta: ToolCallDelta;
 }
+
+/**
+ * Terminal signal for a run step, emitted exactly once per step when it
+ * finishes (`completed`), is aborted/halted (`cancelled`), or the run errors
+ * (`failed`). The `id` is top-level so callback echoes dedupe like other
+ * step-scoped events.
+ */
+export interface RunStepClosedEvent {
+  id: string;
+  index: number;
+  type: StepTypes;
+  status: Exclude<RunStepStatus, 'in_progress'>;
+  /** Epoch ms when the step was dispatched, when known. */
+  created_at?: number;
+  /** Epoch ms when the step reached its terminal status. */
+  closed_at: number;
+  runId?: string;
+  agentId?: string;
+  groupId?: number;
+  stepIndex?: number;
+}
+
+export type RecordStepCompletionOptions = {
+  /** The completing tool call, when the step tracks pending completions. */
+  toolCallId?: string;
+  metadata?: Record<string, unknown>;
+  /**
+   * Producer-stamped completion time (epoch ms). Carried through so a slow
+   * host completion handler cannot inflate the recorded step duration.
+   */
+  at?: number;
+};
+
+export type RunStepCloseOptions = {
+  /** Epoch ms for the terminal stamp; defaults to `Date.now()` at close time. */
+  at?: number;
+  metadata?: Record<string, unknown>;
+};
 
 export type StepDetails = MessageCreationDetails | ToolCallsDetails;
 
@@ -179,6 +245,8 @@ export type ToolCompleteEvent = ToolCallCompleted & {
   /** The content index of the tool call */
   index: number;
   type: 'tool_call';
+  /** Epoch ms when this tool call's completion was dispatched. */
+  completed_at?: number;
 };
 
 export type ToolCallsDetails = {
@@ -285,6 +353,8 @@ export type MessageDeltaUpdate = {
   type: ContentTypes.TEXT;
   text: string;
   tool_call_ids?: string[];
+  /** Provider-supplied source citations, accumulated across deltas. */
+  citations?: Anthropic.TextCitation[];
 };
 export type ReasoningDeltaUpdate = { type: ContentTypes.THINK; think: string };
 

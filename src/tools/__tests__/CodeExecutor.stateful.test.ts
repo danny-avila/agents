@@ -87,9 +87,17 @@ describe('CodeExecutor runtime_session_hint wire field', () => {
     return fetchCalls;
   }
 
-  it('sends runtime_session_hint when ToolNode injected it', async () => {
-    const calls = await run({ _runtime_session_hint: 'conv-42' });
+  it('sends runtime_session_hint when a stateful tool receives it', async () => {
+    const calls = await run(
+      { _runtime_session_hint: 'conv-42' },
+      { statefulSessions: true }
+    );
     expect(calls[0].runtime_session_hint).toBe('conv-42');
+  });
+
+  it('ignores an injected hint when the tool is stateless', async () => {
+    const calls = await run({ _runtime_session_hint: 'conv-42' });
+    expect('runtime_session_hint' in calls[0]).toBe(false);
   });
 
   it('omits runtime_session_hint when not injected', async () => {
@@ -103,7 +111,7 @@ describe('CodeExecutor runtime_session_hint wire field', () => {
   });
 
   it('strips a model-supplied runtime_session_hint from the raw args', async () => {
-    const codeTool = createCodeExecutionTool({});
+    const codeTool = createCodeExecutionTool({ statefulSessions: true });
     await codeTool.invoke(
       { lang: 'py', code: 'print(1)', runtime_session_hint: 'model-picked' },
       { toolCall: {} } as unknown as RunnableConfig
@@ -112,7 +120,7 @@ describe('CodeExecutor runtime_session_hint wire field', () => {
   });
 
   it('lets only the ToolNode-injected hint reach the wire, ignoring model args', async () => {
-    const codeTool = createCodeExecutionTool({});
+    const codeTool = createCodeExecutionTool({ statefulSessions: true });
     await codeTool.invoke(
       { lang: 'py', code: 'print(1)', runtime_session_hint: 'model-picked' },
       {

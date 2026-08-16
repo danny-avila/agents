@@ -18,6 +18,14 @@ import type {
   SummarizeDeltaEvent,
 } from '@/types/summarize';
 import type {
+  RunStep,
+  RunStepDeltaEvent,
+  RunStepResumeState,
+  RunStepClosedEvent,
+  MessageDeltaEvent,
+  ReasoningDeltaEvent,
+} from '@/types/stream';
+import type {
   ToolMap,
   ToolSessionMap,
   ToolEndEvent,
@@ -25,12 +33,6 @@ import type {
   LCTool,
   ToolExecuteBatchRequest,
 } from '@/types/tools';
-import type {
-  RunStep,
-  RunStepDeltaEvent,
-  MessageDeltaEvent,
-  ReasoningDeltaEvent,
-} from '@/types/stream';
 import type {
   TokenCounter,
   StreamLimits,
@@ -75,6 +77,7 @@ export type SystemCallbacks = {
 
 export type BaseGraphState = {
   messages: BaseMessage[];
+  runStepState?: RunStepResumeState;
 };
 
 export type AgentSubgraphState = BaseGraphState & {
@@ -134,6 +137,7 @@ export interface EventHandler {
       | ModelEndData
       | RunStep
       | RunStepDeltaEvent
+      | RunStepClosedEvent
       | MessageDeltaEvent
       | ReasoningDeltaEvent
       | SummarizeStartEvent
@@ -597,6 +601,7 @@ export type SubagentUpdatePhase =
   | 'run_step'
   | 'run_step_delta'
   | 'run_step_completed'
+  | 'run_step_closed'
   | 'message_delta'
   | 'reasoning_delta'
   | 'stop'
@@ -800,6 +805,14 @@ export interface LangfuseConfig {
 
 export interface AgentInputs {
   agentId: string;
+  /**
+   * Partition key for transient code-session ids and file refs. Agents with
+   * the same key share those refs; different execution profiles/scopes must
+   * use different keys. Defaults to the legacy shared `execute_code` slot.
+   * Non-default partitions also disable speculative eager execution of code
+   * tools because their factory may target a durable backend.
+   */
+  codeSessionKey?: string;
   /** Human-readable name for the agent (used in handoff context). Defaults to agentId if not provided. */
   name?: string;
   toolEnd?: boolean;

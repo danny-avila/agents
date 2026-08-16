@@ -1,10 +1,17 @@
 // src/types/tools.ts
 import type { StructuredToolInterface } from '@langchain/core/tools';
-import type { RunnableToolLike } from '@langchain/core/runnables';
+import type {
+  RunnableConfig,
+  RunnableToolLike,
+} from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { RunBreakerScope } from '@/llm/streamLimits';
-import type { MessageContentComplex, ToolErrorData } from './stream';
+import type {
+  MessageContentComplex,
+  RunStepResumeState,
+  ToolErrorData,
+} from './stream';
 import type { HumanInTheLoopConfig } from './hitl';
 import type { LangfuseConfig } from './graph';
 import type { HookRegistry } from '@/hooks';
@@ -128,6 +135,8 @@ export type ToolNodeOptions = {
   toolRegistry?: LCToolRegistry;
   /** Reference to Graph's sessions map for automatic session injection */
   sessions?: ToolSessionMap;
+  /** Partition within `sessions` used by this agent's code tools. */
+  codeSessionKey?: string;
   /** When true, dispatches ON_TOOL_EXECUTE events instead of invoking tools directly */
   eventDrivenMode?: boolean;
   /** Tool definitions for event-driven mode (used for context, not invocation) */
@@ -274,6 +283,13 @@ export type ToolNodeOptions = {
    * controller.
    */
   getRunScope?: () => RunBreakerScope;
+  /** SDK-owned checkpoint bridge for open run-step lifecycle state. */
+  restoreRunStepResumeState?: (
+    state?: RunStepResumeState,
+    config?: RunnableConfig
+  ) => void;
+  /** SDK-owned checkpoint snapshot for open run-step lifecycle state. */
+  createRunStepResumeState?: () => RunStepResumeState;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -375,6 +391,19 @@ export type CodeEnvFile =
 export type CodeExecutionToolParams =
   | undefined
   | {
+      /** Trusted Code API endpoint selected by the host for this agent. */
+      baseUrl?: string;
+      /**
+       * Expected Code API execution profile. Sent as a request assertion so
+       * endpoint/configuration drift fails closed instead of silently using
+       * the wrong sandbox backend.
+       */
+      executionProfile?: CodeApiExecutionProfile;
+      /**
+       * Trusted warm-runtime affinity hint selected by the host for this
+       * agent invocation. This overrides the legacy ToolNode-injected hint.
+       */
+      runtimeSessionHint?: string;
       /** Execution session — see `CodeSessionContext.session_id`. */
       session_id?: string;
       user_id?: string;
@@ -382,15 +411,15 @@ export type CodeExecutionToolParams =
       /** Optional host-supplied Code API auth headers. */
       authHeaders?: CodeApiAuthHeaders;
       /**
-       * Advertise best-effort stateful sessions in the tool description
-       * (variables/files may persist between calls, may reset). Prompt text
-       * only, and it must be set here because the description is bound to the
-       * LLM at construction time. Pair it with the run-scoped
-       * `toolExecution.sandbox.statefulSessions` gate, which drives the wire
-       * hint — set both from one flag so the prompt and the backend agree.
+       * Advertise filesystem-tier stateful sessions in the tool description
+       * and allow a trusted runtime affinity hint onto the wire. Resolve this,
+       * `baseUrl`, `executionProfile`, and `runtimeSessionHint` together from
+       * the executing agent so the prompt and backend agree.
        */
       statefulSessions?: boolean;
     };
+
+export type CodeApiExecutionProfile = 'default' | 'stateful';
 
 export type CodeApiAuthHeaderMap = Record<string, string>;
 
@@ -1106,19 +1135,17 @@ export type CloudflareSandboxExecutionConfig = {
 
 export type SandboxExecutionConfig = {
   /**
-   * Opt into best-effort stateful runtime sessions on the remote Code API
-   * (its warm per-session MicroVM backend). This gate is run-scoped: it only
-   * controls the wire behavior (ToolNode injecting the session hint on
-   * execute_code/bash calls). The transport is otherwise unchanged.
+   * Legacy run-scoped opt-in for warm runtime hint injection. New hosts that
+   * need mixed execution profiles should resolve `statefulSessions`,
+   * `baseUrl`, `executionProfile`, and `runtimeSessionHint` on each executing
+   * agent's tool factories instead. Direct executors ignore this injected hint
+   * unless their own factory has `statefulSessions: true`.
    *
    * It does NOT change the model-facing tool description. Tool descriptions are
    * bound to the LLM at construction time (`createCodeExecutionTool` /
    * `createBashExecutionTool`), before this run config is applied inside the
    * graph, so they can only be adjusted via the tools' own `statefulSessions`
-   * factory param. Set BOTH from one flag (as LibreChat does): with this on but
-   * the factory param off, the backend runs statefully while the model is still
-   * told the environment is stateless (non-corrupting — the model just won't
-   * exploit persistence).
+   * factory param.
    */
   statefulSessions?: boolean;
   /**
@@ -1294,6 +1321,10 @@ export type BashProgrammaticToolCallingParams = ProgrammaticToolCallingParams;
 export type ProgrammaticToolCallingParams = {
   /** Code API base URL (or use CODE_BASEURL env var) */
   baseUrl?: string;
+  /** Expected Code API execution profile (host-controlled). */
+  executionProfile?: CodeApiExecutionProfile;
+  /** Trusted warm-runtime affinity hint for this agent invocation. */
+  runtimeSessionHint?: string;
   /** Safety limit for round-trips (default: 20) */
   maxRoundTrips?: number;
   /** Maximum per-sandbox-run timeout for PTC's legacy `timeout` field. */
@@ -1304,11 +1335,9 @@ export type ProgrammaticToolCallingParams = {
   debug?: boolean;
   /** Optional host-supplied Code API auth headers. */
   authHeaders?: CodeApiAuthHeaders;
-  /* No `statefulSessions` here: PTC is stateless in v1. The initial
-   * /exec/programmatic request still forwards a ToolNode-injected
-   * `_runtime_session_hint` when present, but there is no factory-level opt-in
-   * to advertise (it would be a no-op). Re-add with real behavior when PTC
-   * stateful prompting lands. */
+  /* No `statefulSessions` here: PTC keeps a stateless runtime prompt in v1.
+   * An explicit stateful execution profile may still use a warm filesystem;
+   * runtime/in-memory state never carries across calls. */
 };
 
 // ============================================================================

@@ -814,6 +814,85 @@ describe('SubagentExecutor', () => {
     ).rejects.toBeInstanceOf(StreamLimitExceededError);
   });
 
+  it('closes child steps as \'failed\' when the child trips its own stream limit', async () => {
+    /**
+     * The closure sweep runs AFTER the catch block self-aborts the child
+     * breaker, so deriving the status from the live signal relabels the
+     * child's own limit failure as an intentional stop — while the parent
+     * stamps 'failed' for the same incident. The status must come from the
+     * pre-error snapshot.
+     */
+    const closeUnfinishedRunSteps = jest.fn();
+    const executor = createExecutor({
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockRejectedValue(
+              new StreamLimitExceededError({
+                kind: 'tool_call_args',
+                limit: 10,
+                observed: 11,
+                toolName: 'db_query',
+              })
+            ),
+          }),
+          closeUnfinishedRunSteps,
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    await expect(
+      executor.execute({
+        description: 'Do something',
+        subagentType: 'researcher',
+      })
+    ).rejects.toBeInstanceOf(StreamLimitExceededError);
+    expect(closeUnfinishedRunSteps).toHaveBeenCalledWith(
+      'failed',
+      expect.any(Number)
+    );
+  });
+
+  it('closes child steps as \'cancelled\' when the abort preceded the error', async () => {
+    /** The counterpart bound: a child that dies BECAUSE it was already
+     * aborted (caller abort, sibling breaker trip) is an intentional stop,
+     * and must keep reading as 'cancelled' under the snapshot. */
+    const closeUnfinishedRunSteps = jest.fn();
+    const batchBreaker = new AbortController();
+    let releaseChild: (() => void) | undefined;
+    const executor = createExecutor({
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(
+              () =>
+                new Promise((_resolve, reject) => {
+                  releaseChild = (): void =>
+                    reject(new Error('aborted mid-flight'));
+                })
+            ),
+          }),
+          closeUnfinishedRunSteps,
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    const pending = executor.execute({
+      description: 'Do something',
+      subagentType: 'researcher',
+      breaker: batchBreaker,
+    });
+    while (releaseChild == null) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    batchBreaker.abort();
+    releaseChild();
+    const result = await pending;
+    expect(result.content).toContain('Subagent error');
+    expect(closeUnfinishedRunSteps).toHaveBeenCalledWith(
+      'cancelled',
+      expect.any(Number)
+    );
+  });
+
   it('binds the child to the batch-captured controller, not the live scope', async () => {
     const batchBreaker = new AbortController();
     const liveBreaker = new AbortController();
@@ -1563,17 +1642,13 @@ describe('SubagentExecutor', () => {
     const selected = makeConfig('selected', {
       agentInputs: {
         ...makeChildInputs('selected-agent'),
-        initialSessions: new Map([
-          [Constants.EXECUTE_CODE, selectedSession],
-        ]),
+        initialSessions: new Map([[Constants.EXECUTE_CODE, selectedSession]]),
       },
     });
     const sibling = makeConfig('sibling', {
       agentInputs: {
         ...makeChildInputs('sibling-agent'),
-        initialSessions: new Map([
-          [Constants.EXECUTE_CODE, siblingSession],
-        ]),
+        initialSessions: new Map([[Constants.EXECUTE_CODE, siblingSession]]),
       },
     });
     const childSessions: ToolSessionMap = new Map();
@@ -1612,8 +1687,56 @@ describe('SubagentExecutor', () => {
     ).toBe(false);
   });
 
+  it('remaps a selected child legacy code seed into its agent partition', async () => {
+    const codeSessionKey = 'execute_code:stateful:user-1';
+    const seededSession = {
+      session_id: 'selected-storage',
+      files: [
+        {
+          id: 'selected-file',
+          name: 'selected.txt',
+          storage_session_id: 'selected-storage',
+        },
+      ],
+      lastUpdated: 1,
+    };
+    const selected = makeConfig('selected-partition', {
+      agentInputs: {
+        ...makeChildInputs('selected-agent'),
+        codeSessionKey,
+        initialSessions: new Map([[Constants.EXECUTE_CODE, seededSession]]),
+      },
+    });
+    const childSessions: ToolSessionMap = new Map();
+    const invoke = jest.fn(async () => {
+      expect(childSessions.has(Constants.EXECUTE_CODE)).toBe(false);
+      expect(childSessions.get(codeSessionKey)).toEqual(seededSession);
+      expect(childSessions.get(codeSessionKey)).not.toBe(seededSession);
+      return { messages: [new AIMessage('done')] };
+    });
+    const executor = createExecutor({
+      configs: new Map([[selected.type, selected]]),
+      createChildGraph: (): StandardGraph =>
+        ({
+          sessions: childSessions,
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    await executor.execute({
+      description: 'Use the selected file.',
+      subagentType: selected.type,
+    });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
   it('combines member session seeds inside a selected graph child', async () => {
-    const makeSession = (storageSessionId: string, includeFileSession = true) => ({
+    const makeSession = (
+      storageSessionId: string,
+      includeFileSession = true
+    ) => ({
       session_id: storageSessionId,
       files: [
         {
@@ -1696,9 +1819,7 @@ describe('SubagentExecutor', () => {
     const hitlConfig = makeConfig('hitl-child', {
       agentInputs: {
         ...makeChildInputs('hitl-child'),
-        initialSessions: new Map([
-          [Constants.EXECUTE_CODE, seededSession],
-        ]),
+        initialSessions: new Map([[Constants.EXECUTE_CODE, seededSession]]),
       },
     });
     const childSessions: ToolSessionMap = new Map();
@@ -3623,6 +3744,51 @@ describe('sanitizeForwardedSubagentUpdateData', () => {
     expect(serialized).not.toContain('nested-secret');
     expect(serialized).not.toContain('access-secret');
     expect(serialized).not.toContain('refresh-secret');
+  });
+
+  it('forwards run step lifecycle stamps and closed events via allowlists', () => {
+    const sanitizedStep = sanitizeForwardedSubagentUpdateData(
+      GraphEvents.ON_RUN_STEP,
+      {
+        id: 'step_1',
+        type: StepTypes.MESSAGE_CREATION,
+        index: 0,
+        created_at: 1_000,
+        status: 'in_progress',
+        stepDetails: {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: { message_id: 'message_1' },
+        },
+      }
+    ) as { created_at?: number; status?: string };
+    expect(sanitizedStep.created_at).toBe(1_000);
+    expect(sanitizedStep.status).toBe('in_progress');
+
+    const sanitizedClosed = sanitizeForwardedSubagentUpdateData(
+      GraphEvents.ON_RUN_STEP_CLOSED,
+      {
+        id: 'step_1',
+        index: 0,
+        type: StepTypes.MESSAGE_CREATION,
+        status: 'completed',
+        created_at: 1_000,
+        closed_at: 2_000,
+        runId: 'run_1',
+        agentId: 'researcher',
+        futureSecret: 'top-level-secret',
+      }
+    );
+    expect(sanitizedClosed).toEqual({
+      id: 'step_1',
+      index: 0,
+      type: StepTypes.MESSAGE_CREATION,
+      status: 'completed',
+      created_at: 1_000,
+      closed_at: 2_000,
+      runId: 'run_1',
+      agentId: 'researcher',
+    });
+    expect(JSON.stringify(sanitizedClosed)).not.toContain('top-level-secret');
   });
 
   it('keeps completed tool output while stripping operational fields', () => {

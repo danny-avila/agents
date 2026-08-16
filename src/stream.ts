@@ -169,7 +169,8 @@ function hasToolOutputReference(value: unknown): boolean {
 
 function isEagerExecutionExcludedTool(
   name: string,
-  graph: StandardGraph
+  graph: StandardGraph,
+  agentContext?: AgentContext
 ): boolean {
   if (name === '') {
     return false;
@@ -200,9 +201,21 @@ function isEagerExecutionExcludedTool(
   // args, ToolNode discards the eager result but the mutation has already
   // landed in the session workspace, corrupting later runs. Stateless mode
   // uses a throwaway VM per call, so eager prestart stays safe there.
+  if (!CODE_EXECUTION_TOOLS.has(name)) {
+    return false;
+  }
+  if (graph.toolExecution?.sandbox?.statefulSessions === true) {
+    return true;
+  }
+  // A non-default code-session partition is the trusted per-agent signal that
+  // this call must remain isolated from the graph-wide stateless session. The
+  // actual tool factory may route it to a durable backend, which the stream
+  // layer cannot inspect in event-driven mode. Conservatively avoid speculative
+  // execution for these calls so discarded eager results cannot mutate that
+  // agent's workspace.
   return (
-    graph.toolExecution?.sandbox?.statefulSessions === true &&
-    CODE_EXECUTION_TOOLS.has(name)
+    agentContext?.codeSessionKey != null &&
+    agentContext.codeSessionKey !== Constants.EXECUTE_CODE
   );
 }
 
@@ -258,7 +271,8 @@ function toCodeEnvFile(file: t.FileRef, execSessionId: string): t.CodeEnvFile {
 
 function getCodeSessionContext(
   graph: StandardGraph,
-  name: string
+  name: string,
+  agentContext?: AgentContext
 ): t.ToolCallRequest['codeSessionContext'] | undefined {
   if (
     !CODE_EXECUTION_TOOLS.has(name) &&
@@ -269,9 +283,9 @@ function getCodeSessionContext(
     return undefined;
   }
 
-  const codeSession = graph.sessions.get(Constants.EXECUTE_CODE) as
-    | t.CodeSessionContext
-    | undefined;
+  const codeSession = graph.sessions.get(
+    agentContext?.codeSessionKey ?? Constants.EXECUTE_CODE
+  ) as t.CodeSessionContext | undefined;
   if (codeSession?.session_id == null || codeSession.session_id === '') {
     return undefined;
   }
@@ -716,7 +730,8 @@ function createEagerToolExecutionPlan(args: {
   // tool from `hasDirectToolCallInBatch`. Excluded calls fall through to normal
   // ToolNode execution; siblings may still eager-execute.
   const candidateToolCalls = unstartedToolCalls.filter(
-    (toolCall) => !isEagerExecutionExcludedTool(toolCall.name, graph)
+    (toolCall) =>
+      !isEagerExecutionExcludedTool(toolCall.name, graph, agentContext)
   );
   if (candidateToolCalls.length === 0) {
     return [];
@@ -748,7 +763,11 @@ function createEagerToolExecutionPlan(args: {
       name: toolCall.name,
       args: toolCall.args,
       stepId: graph.toolCallStepIds.get(toolCall.id!) ?? '',
-      codeSessionContext: getCodeSessionContext(graph, toolCall.name),
+      codeSessionContext: getCodeSessionContext(
+        graph,
+        toolCall.name,
+        agentContext
+      ),
     })),
     usageCount: graph.getEagerEventToolUsageCount(agentContext?.agentId),
   });
@@ -924,6 +943,7 @@ async function dispatchEagerToolCompletions(args: {
               progress: 1,
               ...(outcome != null && { outcome }),
             } as t.ProcessedToolCall,
+            completed_at: Date.now(),
           },
         },
         graph.config
@@ -1836,9 +1856,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
         contentGroups[0]
       ).phase;
       const phaseChanged =
-        currentPhase != null &&
-        nextPhase != null &&
-        currentPhase !== nextPhase;
+        currentPhase != null && nextPhase != null && currentPhase !== nextPhase;
       if (contentGroups.length > 1 || phaseChanged) {
         for (const contentGroup of contentGroups) {
           const currentStepId = await dispatchMessageCreationStep({
@@ -2299,20 +2317,44 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       return;
     }
 
+    const incomingText =
+      ContentTypes.TEXT in contentPart && typeof contentPart.text === 'string'
+        ? contentPart.text
+        : undefined;
+    /**
+     * Anthropic emits a search turn's citations as their own `citations_delta`,
+     * which arrives here as a text part carrying `citations` and no `text`.
+     */
+    const { citations } = contentPart as {
+      citations?: t.MessageDeltaUpdate['citations'];
+    };
+    const incomingCitations = Array.isArray(citations) ? citations : undefined;
+
     if (
       partType.startsWith(ContentTypes.TEXT) &&
-      ContentTypes.TEXT in contentPart &&
-      typeof contentPart.text === 'string'
+      (incomingText !== undefined || incomingCitations !== undefined)
     ) {
       // TODO: update this!!
       const currentContent = contentParts[index] as t.MessageDeltaUpdate;
       const update: t.MessageDeltaUpdate = {
         type: ContentTypes.TEXT,
-        text: (currentContent.text || '') + contentPart.text,
+        text: (currentContent.text || '') + (incomingText ?? ''),
       };
 
       if (contentPart.tool_call_ids) {
         update.tool_call_ids = contentPart.tool_call_ids;
+      } else if (incomingText === undefined && currentContent.tool_call_ids) {
+        /** A citations-only delta must not drop ids already accumulated */
+        update.tool_call_ids = currentContent.tool_call_ids;
+      }
+
+      if (incomingCitations !== undefined) {
+        update.citations =
+          currentContent.citations !== undefined
+            ? [...currentContent.citations, ...incomingCitations]
+            : [...incomingCitations];
+      } else if (currentContent.citations !== undefined) {
+        update.citations = currentContent.citations;
       }
       contentParts[index] = update;
     } else if (

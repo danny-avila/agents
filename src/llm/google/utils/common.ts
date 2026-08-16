@@ -660,13 +660,15 @@ export function convertBaseMessagesToContent(
 
 /**
  * Gemini models that reject a request whose `contents` end with a `model`-role
- * turn (a "prefill"). Google enforces this on newer generations (Gemini 3.6
- * Flash, Gemini 3.5 Flash-Lite) while older/sibling models still accept a
- * trailing model turn, so the rule is model-scoped rather than version-wide.
- * Extend this list as Google applies the restriction to further models.
+ * turn (a "prefill"). Google enforces this on newer generations (Gemini 3.7
+ * Flash, Gemini 3.6 Flash, Gemini 3.5 Flash-Lite) while older/sibling models
+ * still accept a trailing model turn, so the rule is model-scoped rather than
+ * version-wide. Extend this list as Google applies the restriction to further
+ * models.
  * @see https://ai.google.dev/gemini-api/docs/latest-model#api-changes-and-parameter-updates
  */
 const NO_PREFILL_GEMINI_MODELS = [
+  'gemini-3.7-flash',
   'gemini-3.6-flash',
   'gemini-3.5-flash-lite',
 ] as const;
