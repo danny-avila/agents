@@ -87,7 +87,6 @@ import type {
 import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
 import type { HandlerRegistry } from '@/events';
-import { stripRunStepResumeState } from '@/tools/runStepResume';
 import {
   getSubagentApprovalExecutionScope,
   SubagentDefinitionBindingError,
@@ -125,6 +124,7 @@ import {
   createChildGraphPlan,
   isGraphSubagentConfig,
 } from './childGraphConfig';
+import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { composeAbortSignals } from '@/utils/misc';
@@ -2450,6 +2450,18 @@ export class SubagentExecutor {
     } catch (error) {
       /** Stamped at failure, not after the error-envelope work below. */
       const childTerminalAt = Date.now();
+      /**
+       * Captured at catch entry, BEFORE the self-abort below flips it. The
+       * closure sweep distinguishes "stopped on purpose" from "died of this
+       * error" by whether the child was already aborted when the error
+       * arrived — reading the signal after `childBreaker.abort(error)` would
+       * relabel the child's own stream-limit failure as an intentional stop
+       * (`cancelled`), while the parent stamps `failed` for the same
+       * incident. A trip that arrived from a parallel sibling has already
+       * aborted the composed signal by this point, so it still reads as
+       * `cancelled` here.
+       */
+      const abortedBeforeError = childSignal.aborted;
       if (isGraphInterrupt(error)) {
         const activeChildRun = execution.activeRun;
         if (activeChildRun != null) {
@@ -2488,11 +2500,13 @@ export class SubagentExecutor {
       /**
        * `cancelled` vs `failed` mirrors `Run.resolveSweepStatus`: an aborted
        * child was stopped on purpose (caller abort, or a breaker trip from a
-       * parallel sibling), anything else died of an unexpected error.
+       * parallel sibling), anything else died of an unexpected error. Uses
+       * the pre-error snapshot, not the live signal — the self-abort above
+       * has already tripped it for the child's own limit error.
        */
       await this.closeChildRunSteps(
         childGraph,
-        childSignal.aborted ? 'cancelled' : 'failed',
+        abortedBeforeError ? 'cancelled' : 'failed',
         childTerminalAt
       );
       if (forwarding) {

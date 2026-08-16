@@ -814,6 +814,85 @@ describe('SubagentExecutor', () => {
     ).rejects.toBeInstanceOf(StreamLimitExceededError);
   });
 
+  it('closes child steps as \'failed\' when the child trips its own stream limit', async () => {
+    /**
+     * The closure sweep runs AFTER the catch block self-aborts the child
+     * breaker, so deriving the status from the live signal relabels the
+     * child's own limit failure as an intentional stop — while the parent
+     * stamps 'failed' for the same incident. The status must come from the
+     * pre-error snapshot.
+     */
+    const closeUnfinishedRunSteps = jest.fn();
+    const executor = createExecutor({
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockRejectedValue(
+              new StreamLimitExceededError({
+                kind: 'tool_call_args',
+                limit: 10,
+                observed: 11,
+                toolName: 'db_query',
+              })
+            ),
+          }),
+          closeUnfinishedRunSteps,
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    await expect(
+      executor.execute({
+        description: 'Do something',
+        subagentType: 'researcher',
+      })
+    ).rejects.toBeInstanceOf(StreamLimitExceededError);
+    expect(closeUnfinishedRunSteps).toHaveBeenCalledWith(
+      'failed',
+      expect.any(Number)
+    );
+  });
+
+  it('closes child steps as \'cancelled\' when the abort preceded the error', async () => {
+    /** The counterpart bound: a child that dies BECAUSE it was already
+     * aborted (caller abort, sibling breaker trip) is an intentional stop,
+     * and must keep reading as 'cancelled' under the snapshot. */
+    const closeUnfinishedRunSteps = jest.fn();
+    const batchBreaker = new AbortController();
+    let releaseChild: (() => void) | undefined;
+    const executor = createExecutor({
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(
+              () =>
+                new Promise((_resolve, reject) => {
+                  releaseChild = (): void =>
+                    reject(new Error('aborted mid-flight'));
+                })
+            ),
+          }),
+          closeUnfinishedRunSteps,
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    const pending = executor.execute({
+      description: 'Do something',
+      subagentType: 'researcher',
+      breaker: batchBreaker,
+    });
+    while (releaseChild == null) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    batchBreaker.abort();
+    releaseChild();
+    const result = await pending;
+    expect(result.content).toContain('Subagent error');
+    expect(closeUnfinishedRunSteps).toHaveBeenCalledWith(
+      'cancelled',
+      expect.any(Number)
+    );
+  });
+
   it('binds the child to the batch-captured controller, not the live scope', async () => {
     const batchBreaker = new AbortController();
     const liveBreaker = new AbortController();
@@ -1625,9 +1704,7 @@ describe('SubagentExecutor', () => {
       agentInputs: {
         ...makeChildInputs('selected-agent'),
         codeSessionKey,
-        initialSessions: new Map([
-          [Constants.EXECUTE_CODE, seededSession],
-        ]),
+        initialSessions: new Map([[Constants.EXECUTE_CODE, seededSession]]),
       },
     });
     const childSessions: ToolSessionMap = new Map();
