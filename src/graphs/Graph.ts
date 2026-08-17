@@ -4854,6 +4854,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const input = rawInput as {
             description?: string;
             subagent_type?: string;
+            subagent_thread_id?: string;
             run_in_background?: boolean;
           };
           const description =
@@ -4863,6 +4864,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               : DEFAULT_SUBAGENT_DESCRIPTION;
           const subagentType =
             typeof input.subagent_type === 'string' ? input.subagent_type : '';
+          const subagentThreadId =
+            typeof input.subagent_thread_id === 'string' &&
+            input.subagent_thread_id.trim() !== ''
+              ? input.subagent_thread_id.trim()
+              : undefined;
           const threadId = config.configurable?.thread_id as string | undefined;
           /** Surface the parent call id so child checkpoints, interrupts, and
            * update events remain correlated across replay and resume. */
@@ -4905,12 +4911,27 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               | undefined,
           };
           if (input.run_in_background === true) {
-            return executor.executeInBackground(executeParams);
+            return executor.executeInBackground({
+              ...executeParams,
+              ...(subagentThreadId == null
+                ? {}
+                : { subagentThreadId }),
+            });
+          }
+          if (subagentThreadId != null) {
+            return JSON.stringify({
+              status: 'rejected',
+              tool: Constants.SUBAGENT,
+              message:
+                'Child-thread continuation requires run_in_background.',
+            });
           }
           const result = await executor.execute(executeParams);
           return result.content;
         }, buildSubagentToolParams(executableConfigs, {
           background: this.subagentTasks != null,
+          threadContinuation:
+            this.subagentTasks?.store.supportsThreadContinuation === true,
         }));
         const replayableSubagentTool = subagentTool as typeof subagentTool &
           ReplayableSubagentTool;

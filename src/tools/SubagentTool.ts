@@ -13,7 +13,7 @@ WHEN TO USE:
 - A specialized subagent is available for the task domain.
 
 WHAT HAPPENS:
-- A fresh agent or configured agent graph is created with the task description as its only input.
+- A fresh agent or configured agent graph is created with the task description as its only input, unless the host enables child-thread continuation and you provide a saved thread id.
 - The delegated agent or team runs to completion using isolated tools and context.
 - Only the single agent's final response or the graph's designated result-agent response is returned to you.
 
@@ -29,6 +29,9 @@ const SUBAGENT_TYPE_PROP_DESCRIPTION =
 
 const RUN_IN_BACKGROUND_PROP_DESCRIPTION =
   'Set true to start the subagent as a detached process-local task and return a background_task_id immediately. Poll the host background-task tool to collect its result. The task can outlive this turn but does not survive a process restart.';
+
+const SUBAGENT_THREAD_PROP_DESCRIPTION =
+  'Continue a host-owned child thread using a fresh execution lease. The saved thread must belong to this scope and subagent type. Only available with run_in_background.';
 
 export const SubagentToolSchema = {
   type: 'object',
@@ -59,7 +62,7 @@ export const SubagentToolDefinition: LCTool = {
  */
 export function buildSubagentToolParams(
   configs: SubagentConfig[],
-  options: { background?: boolean } = {}
+  options: { background?: boolean; threadContinuation?: boolean } = {}
 ): {
   name: string;
   schema: JsonSchemaType;
@@ -93,12 +96,25 @@ export function buildSubagentToolParams(
             },
           }
           : {}),
+        ...(options.background === true &&
+        options.threadContinuation === true
+          ? {
+            subagent_thread_id: {
+              type: 'string',
+              description: SUBAGENT_THREAD_PROP_DESCRIPTION,
+            },
+          }
+          : {}),
       },
       required: ['description', 'subagent_type'],
     },
     description: `${SubagentToolDescription}${
       options.background === true
         ? '\n\nBACKGROUND EXECUTION:\n- Set run_in_background to true when you do not need the result immediately. The call returns a background_task_id; use the host background-task tools to poll, steer, queue, interrupt, or cancel it.'
+        : ''
+    }${
+      options.background === true && options.threadContinuation === true
+        ? '\n- To continue a completed child later, set run_in_background and pass its subagent_thread_id. The host starts a fresh execution from saved history; it does not restore a completed runtime.'
         : ''
     }\n\nAvailable types:\n${typeDescriptions}`,
   };

@@ -27,8 +27,10 @@ export interface SubagentTaskProgress {
 }
 /** Read-only task metadata. Results are exposed only through `claim`. */
 export interface SubagentTaskSnapshot {
-  /** Handle for this child-conversation execution within its trusted scope. */
+  /** Handle for this child-thread execution lease within its trusted scope. */
   taskId: string;
+  /** Stable logical child-thread identity shared by fresh execution leases. */
+  threadId: string;
   subagentType: string;
   status: SubagentTaskStatus;
   createdAt: number;
@@ -77,15 +79,34 @@ export interface SubagentTaskRuntime {
 export interface SubagentTaskStartRequest {
   scopeId: string;
   idempotencyKey: string;
+  /** Host/SDK-owned parent run identity for durable lineage. */
+  parentRunId: string;
+  /** Executing parent agent, when the graph has a stable agent identity. */
+  parentAgentId?: string;
+  /** Provider tool-call identity that created this execution lease. */
+  parentToolCallId: string;
+  /**
+   * Untrusted child-thread selector supplied by the parent model. A
+   * continuation-capable store MUST validate ownership, scope, lineage, and
+   * `subagentType` before loading any saved messages.
+   */
+  threadId?: string;
+  /** Untrusted new user-turn text for host persistence and audit. */
+  input: string;
   /** Stable hash of model-writable inputs used to reject conflicting replays. */
   requestFingerprint?: string;
+  /** Execution shape selected from the host-provided subagent catalog. */
+  subagentKind: SubagentUpdateEvent['subagentKind'];
   subagentType: string;
   /**
    * Starts one ephemeral execution lease. The canonical child transcript is
    * returned so a host-owned store may persist it for a later fresh run;
    * retaining a graph/checkpoint after terminal completion is unnecessary.
    */
-  run(runtime: SubagentTaskRuntime): Promise<{
+  run(
+    runtime: SubagentTaskRuntime,
+    initialMessages?: BaseMessage[]
+  ): Promise<{
     content: string;
     messages?: BaseMessage[];
   }>;
@@ -107,10 +128,17 @@ export type SubagentTaskStartResult =
 /**
  * Host-replaceable store contract used by the SDK's subagent tool. The store
  * should normally outlive individual `Run` instances. Durable hosts may
- * persist the transcript returned by `run` under the task/conversation
+ * persist the transcript returned by `run` under the task/thread
  * lineage and start a fresh execution for a later turn.
  */
 export interface SubagentTaskStore {
+  /**
+   * True only when `start` authorizes an existing `threadId`, loads its
+   * saved transcript, and supplies that transcript to `run`. The flag exposes
+   * the model-facing continuation field, so a store must fail closed for an
+   * unknown or unauthorized id rather than starting an empty child.
+   */
+  readonly supportsThreadContinuation?: boolean;
   start(request: SubagentTaskStartRequest): SubagentTaskStartResult;
   get(scopeId: string, taskId: string): SubagentTaskSnapshot | undefined;
   list(scopeId: string): SubagentTaskSnapshot[];

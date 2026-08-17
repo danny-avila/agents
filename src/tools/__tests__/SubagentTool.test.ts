@@ -143,11 +143,19 @@ describe('SubagentTool', () => {
       const background = buildSubagentToolParams(configs, {
         background: true,
       });
+      const continuable = buildSubagentToolParams(configs, {
+        background: true,
+        threadContinuation: true,
+      });
       const foregroundProperties = foreground.schema.properties as Record<
         string,
         Record<string, unknown>
       >;
       const backgroundProperties = background.schema.properties as Record<
+        string,
+        Record<string, unknown>
+      >;
+      const continuableProperties = continuable.schema.properties as Record<
         string,
         Record<string, unknown>
       >;
@@ -157,7 +165,14 @@ describe('SubagentTool', () => {
       expect(backgroundProperties.run_in_background).toMatchObject({
         type: 'boolean',
       });
+      expect(backgroundProperties.subagent_thread_id).toBeUndefined();
       expect(background.description).toContain('BACKGROUND EXECUTION');
+      expect(continuableProperties.subagent_thread_id).toMatchObject({
+        type: 'string',
+      });
+      expect(continuable.description).toContain(
+        'fresh execution from saved history'
+      );
     });
 
     it('produces same schema as createSubagentToolDefinition', () => {

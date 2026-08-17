@@ -50,6 +50,7 @@ type StoredTask = {
   idempotencyKey: string;
   requestFingerprint?: string;
   scopeId: string;
+  threadId: string;
   subagentType: string;
   status: SubagentTaskStatus;
   createdAt: number;
@@ -167,6 +168,7 @@ function toInjectedMessage(control: PendingControl): InjectedMessage {
 function snapshot(task: StoredTask): SubagentTaskSnapshot {
   return {
     taskId: task.id,
+    threadId: task.threadId,
     subagentType: task.subagentType,
     status: task.status,
     createdAt: task.createdAt,
@@ -251,13 +253,19 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
       this.dropEmptyBucket(scopeId, bucket);
       return { accepted: false, reason: 'capacity' };
     }
+    const taskId = nanoid();
+    const requestedThreadId = request.threadId?.trim();
     const task: StoredTask = {
-      id: nanoid(),
+      id: taskId,
       idempotencyKey,
       ...(requestFingerprint == null || requestFingerprint === ''
         ? {}
         : { requestFingerprint }),
       scopeId,
+      threadId:
+        requestedThreadId != null && requestedThreadId !== ''
+          ? requestedThreadId
+          : taskId,
       subagentType: request.subagentType,
       status: 'running',
       createdAt: now,

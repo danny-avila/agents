@@ -623,10 +623,17 @@ function getSettlementFingerprint(output: PersistedToolOutput): string {
 
 function getBackgroundTaskFingerprint(
   description: string,
-  subagentType: string
+  subagentType: string,
+  threadId?: string
 ): string {
   return createHash('sha256')
-    .update(stableStringify({ description, subagentType }))
+    .update(
+      stableStringify({
+        description,
+        subagentType,
+        ...(threadId == null || threadId === '' ? {} : { threadId }),
+      })
+    )
     .digest('hex');
 }
 
@@ -758,6 +765,8 @@ function createReplayCheckpointWorkflow(
 export type SubagentExecuteParams = {
   description: string;
   subagentType: string;
+  /** Saved logical child thread selected by the parent model. */
+  subagentThreadId?: string;
   threadId?: string;
   /** Signal attached to this specific parent tool invocation. */
   signal?: AbortSignal;
@@ -812,6 +821,8 @@ export type SubagentExecuteParams = {
   hookSessionId?: string;
   /** Process-local task controls consumed by the child graph. @internal */
   taskRuntime?: SubagentTaskRuntime;
+  /** Host-restored child transcript for a fresh continuation run. @internal */
+  initialMessages?: BaseMessage[];
 };
 
 export type SubagentExecuteResult = {
@@ -1071,6 +1082,19 @@ export class SubagentExecutor {
           'Background subagent execution requires a parent tool call ID.',
       });
     }
+    const subagentThreadId = params.subagentThreadId?.trim();
+    if (
+      subagentThreadId != null &&
+      subagentThreadId !== '' &&
+      this.taskConfig.store.supportsThreadContinuation !== true
+    ) {
+      return JSON.stringify({
+        status: 'rejected',
+        tool: Constants.SUBAGENT,
+        message:
+          'Child-thread continuation is not enabled by this host.',
+      });
+    }
     const detachedHandlers = new HandlerRegistry();
     const sourceHookSessionId =
       asNonEmptyString(params.parentConfigurable?.run_id) ??
@@ -1092,14 +1116,31 @@ export class SubagentExecutor {
         this.parentAgentId ?? '',
         parentToolCallId,
       ]),
+      parentRunId: this.parentRunId,
+      ...(this.parentAgentId == null
+        ? {}
+        : { parentAgentId: this.parentAgentId }),
+      parentToolCallId,
       requestFingerprint: getBackgroundTaskFingerprint(
         params.description,
-        params.subagentType
+        params.subagentType,
+        subagentThreadId
       ),
+      ...(subagentThreadId == null || subagentThreadId === ''
+        ? {}
+        : { threadId: subagentThreadId }),
+      input: params.description,
+      subagentKind:
+        'kind' in executableConfig && executableConfig.kind === 'graph'
+          ? 'graph'
+          : 'agent',
       subagentType: params.subagentType,
-      run: (runtime) =>
+      run: (runtime, initialMessages) =>
         this.executeDetached(
-          params,
+          {
+            ...params,
+            ...(initialMessages == null ? {} : { initialMessages }),
+          },
           runtime,
           detachedHandlers,
           taskHookRegistry,
@@ -1124,6 +1165,9 @@ export class SubagentExecutor {
     }
     return JSON.stringify({
       background_task_id: started.task.taskId,
+      ...(this.taskConfig.store.supportsThreadContinuation === true
+        ? { subagent_thread_id: started.task.threadId }
+        : {}),
       tool: Constants.SUBAGENT,
       subagent_type: params.subagentType,
       status: started.task.status,
@@ -2615,6 +2659,7 @@ export class SubagentExecutor {
         } else {
           childInput = {
             messages: [
+              ...(params.initialMessages ?? []),
               new HumanMessage({
                 content: description,
                 additional_kwargs: {
