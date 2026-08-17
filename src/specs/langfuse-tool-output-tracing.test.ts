@@ -1555,6 +1555,48 @@ describe('Langfuse tool output tracing redaction', () => {
     });
   });
 
+  it('merges run and agent custom headers with the agent winning collisions', () => {
+    const resolved = resolveLangfuseConfig(
+      {
+        enabled: true,
+        publicKey: 'pk-run',
+        secretKey: 'sk-run',
+        additionalHeaders: {
+          'X-Proxy-Token': 'run-token',
+          'X-Shared': 'run',
+        },
+      },
+      {
+        additionalHeaders: {
+          'X-Shared': 'agent',
+          'X-Agent-Only': 'agent',
+        },
+      }
+    );
+
+    expect(resolved).toMatchObject({
+      additionalHeaders: {
+        'X-Proxy-Token': 'run-token',
+        'X-Shared': 'agent',
+        'X-Agent-Only': 'agent',
+      },
+    });
+  });
+
+  it('leaves custom headers untouched when only one side sets them', () => {
+    expect(
+      resolveLangfuseConfig(
+        { additionalHeaders: { 'X-Proxy-Token': 'run-token' } },
+        { publicKey: 'pk-agent' }
+      )
+    ).toMatchObject({
+      additionalHeaders: { 'X-Proxy-Token': 'run-token' },
+    });
+    expect(
+      resolveLangfuseConfig({ publicKey: 'pk-run' }, { publicKey: 'pk-agent' })
+    ).not.toHaveProperty('additionalHeaders');
+  });
+
   it('inherits deterministic trace ids when tenant config only supplies connection settings', () => {
     const resolved = resolveLangfuseConfig(
       {

@@ -208,6 +208,14 @@ export function resolveLangfuseConfig(
         ...agentLangfuse.metadata,
       }
       : undefined;
+  const additionalHeaders =
+    runLangfuse.additionalHeaders != null ||
+    agentLangfuse.additionalHeaders != null
+      ? {
+        ...runLangfuse.additionalHeaders,
+        ...agentLangfuse.additionalHeaders,
+      }
+      : undefined;
   const librechatTraceAttributes =
     runLangfuse.librechatTraceAttributes != null ||
     agentLangfuse.librechatTraceAttributes != null
@@ -230,6 +238,7 @@ export function resolveLangfuseConfig(
     ...runLangfuse,
     ...agentLangfuse,
     ...(metadata != null ? { metadata } : {}),
+    ...(additionalHeaders != null ? { additionalHeaders } : {}),
     ...(librechatTraceAttributes != null ? { librechatTraceAttributes } : {}),
     ...(tags != null ? { tags } : {}),
     ...(toolNodeTracing != null ? { toolNodeTracing } : {}),
