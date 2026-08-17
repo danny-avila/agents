@@ -175,6 +175,44 @@ export function resolveToolOutputTracingConfig(
   };
 }
 
+/**
+ * Merges header maps case-insensitively, keeping the override's casing.
+ *
+ * A plain spread would keep both `X-Proxy-Token` and `x-proxy-token`, and
+ * filling a fetch `Headers` from that record *appends* rather than replaces —
+ * the exporter would send one comma-joined `run-token, agent-token` value, so
+ * the agent override never cleanly wins and a gateway sees a malformed
+ * credential. Matches the case-insensitive identity already used for the
+ * destination key.
+ */
+function mergeAdditionalHeaders(
+  base?: Record<string, string>,
+  override?: Record<string, string>
+): Record<string, string> | undefined {
+  if (base == null && override == null) {
+    return undefined;
+  }
+
+  const merged: Record<string, string> = { ...base };
+  if (override == null) {
+    return merged;
+  }
+
+  const baseKeyByLower = new Map<string, string>(
+    Object.keys(merged).map((key) => [key.toLowerCase(), key])
+  );
+  for (const [key, value] of Object.entries(override)) {
+    const lower = key.toLowerCase();
+    const existingKey = baseKeyByLower.get(lower);
+    if (existingKey != null && existingKey !== key) {
+      delete merged[existingKey];
+    }
+    merged[key] = value;
+    baseKeyByLower.set(lower, key);
+  }
+  return merged;
+}
+
 export function resolveLangfuseConfig(
   runLangfuse?: t.LangfuseConfig,
   agentLangfuse?: t.LangfuseConfig
@@ -208,14 +246,10 @@ export function resolveLangfuseConfig(
         ...agentLangfuse.metadata,
       }
       : undefined;
-  const additionalHeaders =
-    runLangfuse.additionalHeaders != null ||
-    agentLangfuse.additionalHeaders != null
-      ? {
-        ...runLangfuse.additionalHeaders,
-        ...agentLangfuse.additionalHeaders,
-      }
-      : undefined;
+  const additionalHeaders = mergeAdditionalHeaders(
+    runLangfuse.additionalHeaders,
+    agentLangfuse.additionalHeaders
+  );
   const librechatTraceAttributes =
     runLangfuse.librechatTraceAttributes != null ||
     agentLangfuse.librechatTraceAttributes != null

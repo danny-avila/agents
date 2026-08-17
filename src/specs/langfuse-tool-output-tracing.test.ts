@@ -1583,6 +1583,25 @@ describe('Langfuse tool output tracing redaction', () => {
     });
   });
 
+  it('lets an agent header override a differently cased run header', () => {
+    const resolved = resolveLangfuseConfig(
+      {
+        additionalHeaders: {
+          'X-Proxy-Token': 'run-token',
+          'CF-Access-Client-Id': 'run-client',
+        },
+      },
+      { additionalHeaders: { 'x-proxy-token': 'agent-token' } }
+    );
+
+    /** Both casings surviving would make fetch send a combined
+     *  "run-token, agent-token" value instead of the agent's. */
+    expect(resolved?.additionalHeaders).toEqual({
+      'CF-Access-Client-Id': 'run-client',
+      'x-proxy-token': 'agent-token',
+    });
+  });
+
   it('leaves custom headers untouched when only one side sets them', () => {
     expect(
       resolveLangfuseConfig(
