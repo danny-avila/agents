@@ -1148,6 +1148,14 @@ export class SubagentExecutor {
         ),
     });
     if (!started.accepted) {
+      if (started.reason === 'thread_unavailable') {
+        return JSON.stringify({
+          status: 'rejected',
+          tool: Constants.SUBAGENT,
+          message:
+            'The requested subagent thread is unavailable in this parent scope. Start a new subagent thread or choose one created by this parent for the same subagent type.',
+        });
+      }
       if (started.reason === 'conflict') {
         return JSON.stringify({
           status: 'rejected',
@@ -1163,10 +1171,27 @@ export class SubagentExecutor {
           'Too many background subagent tasks are already running in this scope or process. Poll or cancel an existing task, or run this call in the foreground.',
       });
     }
+    const startedThreadId = started.task.threadId?.trim();
+    if (
+      this.taskConfig.store.supportsThreadContinuation === true &&
+      (startedThreadId == null || startedThreadId === '')
+    ) {
+      this.taskConfig.store.control(
+        this.taskConfig.scopeId,
+        started.task.taskId,
+        { action: 'cancel' }
+      );
+      return JSON.stringify({
+        status: 'rejected',
+        tool: Constants.SUBAGENT,
+        message:
+          'The host accepted the subagent task without assigning its required thread ID.',
+      });
+    }
     return JSON.stringify({
       background_task_id: started.task.taskId,
       ...(this.taskConfig.store.supportsThreadContinuation === true
-        ? { subagent_thread_id: started.task.threadId }
+        ? { subagent_thread_id: startedThreadId }
         : {}),
       tool: Constants.SUBAGENT,
       subagent_type: params.subagentType,
