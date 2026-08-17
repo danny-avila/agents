@@ -1568,6 +1568,14 @@ describe('formatAgentMessages', () => {
     expect((result.messages[3] as ToolMessage).tool_call_id).toBe('call_2');
   });
 
+  /**
+   * Empty-string content rather than a forced `undefined`: `@langchain/core`
+   * 1.2.6 made `instanceof` structural, so a message whose `content` was
+   * overwritten with `undefined` stops registering as a `ToolMessage` and
+   * never reaches the merge. The constructor normalizes `undefined` to `[]`,
+   * so that state is no longer representable; `''` covers the same non-array
+   * branch through `stringifyToolMessageContent`.
+   */
   it('keeps absent tool content empty when merging Anthropic artifacts', () => {
     const toolMessage = new ToolMessage({
       content: '',
@@ -1576,11 +1584,6 @@ describe('formatAgentMessages', () => {
       artifact: {
         content: [{ type: ContentTypes.TEXT, text: 'artifact text' }],
       },
-    });
-    Object.defineProperty(toolMessage, 'content', {
-      value: undefined,
-      writable: true,
-      configurable: true,
     });
 
     const originalMessages = [
@@ -1604,7 +1607,7 @@ describe('formatAgentMessages', () => {
       { type: ContentTypes.TEXT, text: '' },
       { type: ContentTypes.TEXT, text: 'artifact text' },
     ]);
-    expect(toolMessage.content).toBeUndefined();
+    expect(toolMessage.content).toBe('');
     expect(formattedMessages).not.toBe(originalMessages);
   });
 
