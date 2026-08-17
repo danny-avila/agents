@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, it, expect, beforeEach } from '@jest/globals';
 import { GraphInterrupt, MemorySaver } from '@langchain/langgraph';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
@@ -8,6 +9,8 @@ import type {
   ResolvedSubagentConfig,
   ResolvedSingleAgentSubagentConfig,
   StandardGraphInput,
+  SubagentTaskStartRequest,
+  SubagentTaskStartResult,
   SubagentUpdateEvent,
   SubagentUsageEvent,
   ToolSessionMap,
@@ -28,6 +31,7 @@ import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecuto
 import { SUBAGENT_PARENT_BATCH_CONFIG_KEY } from '../subagent/SubagentReplay';
 import { Constants, Providers, GraphEvents, StepTypes } from '@/common';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
+import { stableStringify } from '../eagerEventExecution';
 import { AgentContext } from '@/agents/AgentContext';
 import { HookRegistry } from '@/hooks/HookRegistry';
 import { HandlerRegistry } from '@/events';
@@ -439,6 +443,38 @@ describe('buildChildInputs', () => {
 describe('SubagentExecutor', () => {
   const config = makeConfig();
 
+  class ContinuationTaskStore extends InMemorySubagentTaskStore {
+    readonly supportsThreadContinuation = true;
+    readonly inputs: string[] = [];
+    readonly fingerprints: string[] = [];
+    readonly lineage: Array<{
+      parentRunId: string;
+      parentAgentId?: string;
+      parentToolCallId: string;
+      subagentKind: SubagentTaskStartRequest['subagentKind'];
+    }> = [];
+
+    start(request: SubagentTaskStartRequest): SubagentTaskStartResult {
+      this.inputs.push(request.input);
+      this.fingerprints.push(request.requestFingerprint ?? '');
+      this.lineage.push({
+        parentRunId: request.parentRunId,
+        ...(request.parentAgentId == null
+          ? {}
+          : { parentAgentId: request.parentAgentId }),
+        parentToolCallId: request.parentToolCallId,
+        subagentKind: request.subagentKind,
+      });
+      const threadId = request.threadId ?? 'new-child-thread';
+      return super.start({
+        ...request,
+        threadId,
+        run: (runtime) =>
+          request.run(runtime, [new HumanMessage('Saved child turn.')]),
+      });
+    }
+  }
+
   /**
    * Build a stub `createChildGraph` factory that returns a minimal
    * `StandardGraph`-shaped object whose `createWorkflow().invoke()`
@@ -654,6 +690,77 @@ describe('SubagentExecutor', () => {
     expect(
       store.claim('owner:conversation', response.background_task_id)
     ).toMatchObject({ status: 'completed', result: 'second answer' });
+  });
+
+  it('starts a fresh execution from a host-restored child thread', async () => {
+    const store = new ContinuationTaskStore();
+    const invoke = jest.fn().mockResolvedValue({
+      messages: [new AIMessage('continued answer')],
+    });
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Continue with the new evidence.',
+        subagentType: 'researcher',
+        subagentThreadId: 'child-thread',
+        parentToolCallId: 'call_continuation',
+      })
+    ) as {
+      background_task_id: string;
+      subagent_thread_id: string;
+    };
+
+    expect(response.subagent_thread_id).toBe('child-thread');
+    expect(store.inputs).toEqual(['Continue with the new evidence.']);
+    expect(store.lineage).toEqual([
+      {
+        parentRunId: 'test-run',
+        parentAgentId: 'parent-agent',
+        parentToolCallId: 'call_continuation',
+        subagentKind: 'agent',
+      },
+    ]);
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'completed'
+    );
+    const childInput = invoke.mock.calls[0][0] as { messages: BaseMessage[] };
+    expect(childInput.messages.map((message) => message.content)).toEqual([
+      'Saved child turn.',
+      'Continue with the new evidence.',
+    ]);
+  });
+
+  it('preserves the legacy fingerprint when no child thread is selected', () => {
+    const store = new ContinuationTaskStore();
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+    });
+
+    executor.executeInBackground({
+      description: 'Legacy detached task.',
+      subagentType: 'researcher',
+      parentToolCallId: 'call_legacy_fingerprint',
+    });
+
+    expect(store.fingerprints).toEqual([
+      createHash('sha256')
+        .update(
+          stableStringify({
+            description: 'Legacy detached task.',
+            subagentType: 'researcher',
+          })
+        )
+        .digest('hex'),
+    ]);
   });
 
   it('drains interrupt and steer controls through child-safe hook boundaries', async () => {
@@ -895,6 +1002,38 @@ describe('SubagentExecutor', () => {
     });
   });
 
+  it('rejects a different child thread under the same parent tool call', () => {
+    const store = new ContinuationTaskStore();
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+    });
+    const first = JSON.parse(
+      executor.executeInBackground({
+        description: 'Continue the child.',
+        subagentType: 'researcher',
+        subagentThreadId: 'child-a',
+        parentToolCallId: 'call_thread_conflict',
+      })
+    ) as { background_task_id: string };
+    const conflict = JSON.parse(
+      executor.executeInBackground({
+        description: 'Continue the child.',
+        subagentType: 'researcher',
+        subagentThreadId: 'child-b',
+        parentToolCallId: 'call_thread_conflict',
+      })
+    ) as { status: string; message: string };
+
+    expect(conflict).toMatchObject({
+      status: 'rejected',
+      message:
+        'The same parent tool call ID was already used with different background subagent arguments.',
+    });
+    store.control('owner:conversation', first.background_task_id, {
+      action: 'cancel',
+    });
+  });
+
   it('fails closed when detached execution is unavailable or not attributable', () => {
     const disabled = JSON.parse(
       createExecutor().executeInBackground({
@@ -920,6 +1059,26 @@ describe('SubagentExecutor', () => {
     expect(unattributed).toMatchObject({
       status: 'rejected',
       message: 'Background subagent execution requires a parent tool call ID.',
+    });
+    expect(store.list('owner:conversation')).toEqual([]);
+  });
+
+  it('fails closed when the host cannot restore child threads', () => {
+    const store = new InMemorySubagentTaskStore();
+    const result = JSON.parse(
+      createExecutor({
+        taskConfig: { store, scopeId: 'owner:conversation' },
+      }).executeInBackground({
+        description: 'Continue this child.',
+        subagentType: 'researcher',
+        subagentThreadId: 'child-thread',
+        parentToolCallId: 'call_unsupported_continuation',
+      })
+    ) as { status: string; message: string };
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      message: 'Child-thread continuation is not enabled by this host.',
     });
     expect(store.list('owner:conversation')).toEqual([]);
   });

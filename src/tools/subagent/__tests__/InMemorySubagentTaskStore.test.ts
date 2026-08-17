@@ -15,15 +15,24 @@ const start = (
     scopeId: string;
     idempotencyKey: string;
     requestFingerprint: string;
+    threadId: string;
     subagentType: string;
   }> = {}
 ) =>
   store.start({
     scopeId: overrides.scopeId ?? 'user:conversation',
     idempotencyKey: overrides.idempotencyKey ?? 'run:agent:call',
+    parentRunId: 'run',
+    parentAgentId: 'parent-agent',
+    parentToolCallId: 'call',
     ...(overrides.requestFingerprint == null
       ? {}
       : { requestFingerprint: overrides.requestFingerprint }),
+    ...(overrides.threadId == null
+      ? {}
+      : { threadId: overrides.threadId }),
+    input: 'Research the question.',
+    subagentKind: 'agent',
     subagentType: overrides.subagentType ?? 'researcher',
     run,
   });
@@ -50,6 +59,7 @@ describe('InMemorySubagentTaskStore', () => {
       throw new Error('Expected task dispatch to be accepted.');
     }
     expect(duplicate.task.taskId).toBe(first.task.taskId);
+    expect(first.task.threadId).toBe(first.task.taskId);
     expect(run).not.toHaveBeenCalled();
 
     await settle();
@@ -63,6 +73,23 @@ describe('InMemorySubagentTaskStore', () => {
     });
     expect(store.claim('user:conversation', first.task.taskId)).toMatchObject({
       status: 'claimed',
+    });
+  });
+
+  it('carries a host-owned thread identity without retaining its transcript', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const started = start(store, async () => ({ content: 'continued' }), {
+      threadId: 'child-thread',
+    });
+    if (!started.accepted) {
+      throw new Error('Expected task dispatch to be accepted.');
+    }
+
+    expect(started.task.threadId).toBe('child-thread');
+    await settle();
+    expect(store.get('user:conversation', started.task.taskId)).toMatchObject({
+      threadId: 'child-thread',
+      status: 'completed',
     });
   });
 
