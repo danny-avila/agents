@@ -1,24 +1,10 @@
 // src/graphs/__tests__/Graph.closeRunStep.test.ts
-import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
+import { CallbackManager } from '@langchain/core/callbacks/manager';
 import type * as t from '@/types';
 import { GraphEvents, StepTypes, Providers } from '@/common';
 import { HandlerRegistry } from '@/events';
 import { StandardGraph } from '../Graph';
-
-/** The secondary dual-dispatch channel needs a real callback manager to run
- *  for real, which these unit graphs do not have; mocking the SDK entry point
- *  lets the tests observe whether it was reached. */
-jest.mock('@langchain/core/callbacks/dispatch', () => ({
-  dispatchCustomEvent: jest.fn(),
-}));
-
-const dispatchCustomEventMock = dispatchCustomEvent as jest.MockedFunction<
-  typeof dispatchCustomEvent
->;
-
-beforeEach(() => {
-  dispatchCustomEventMock.mockClear();
-});
 
 const makeAgent = (agentId: string): t.AgentInputs => ({
   agentId,
@@ -367,20 +353,38 @@ describe('StandardGraph.closeUnfinishedRunSteps', () => {
     it('still dispatches the secondary custom event after the handler throws', async () => {
       const { graph } = createThrowingGraph();
       seedStep(graph, 'step_b');
-      graph.config = { configurable: { thread_id: 'test' } };
+      /**
+       * A real subscriber on the real dispatch path. Asserting that
+       * `dispatchCustomEvent` was merely called would still pass if the
+       * config or the callback propagation dropped the event — the exact
+       * failure this test exists to catch — so the assertion is that a
+       * handler actually received it.
+       *
+       * The manager needs a parent run id: `dispatchCustomEvent` reads it
+       * from `getParentRunId()`, not from the config, and silently skips the
+       * dispatch when there is none.
+       */
+      const received: Array<{ name: string; payload: unknown }> = [];
+      const callbacks = new CallbackManager('parent-run-1');
+      callbacks.addHandler(
+        BaseCallbackHandler.fromMethods({
+          handleCustomEvent(name: string, payload: unknown): void {
+            received.push({ name, payload });
+          },
+        }),
+        true,
+      );
+      graph.config = { configurable: { thread_id: 'test' }, callbacks };
 
       await graph.closeRunStep('step_b', 'failed', { at: 4_000 });
 
-      expect(dispatchCustomEventMock).toHaveBeenCalledTimes(1);
-      expect(dispatchCustomEventMock).toHaveBeenCalledWith(
-        GraphEvents.ON_RUN_STEP_CLOSED,
-        expect.objectContaining({
-          id: 'step_b',
-          status: 'failed',
-          closed_at: 4_000,
-        }),
-        graph.config
-      );
+      expect(received).toHaveLength(1);
+      expect(received[0].name).toBe(GraphEvents.ON_RUN_STEP_CLOSED);
+      expect(received[0].payload).toMatchObject({
+        id: 'step_b',
+        status: 'failed',
+        closed_at: 4_000,
+      });
     });
 
     /** A terminal status stays immutable even when delivery failed. */
