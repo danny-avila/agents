@@ -787,6 +787,17 @@ export interface LangfuseConfig {
    * payloads. Defaults to the Langfuse SDK behavior.
    */
   mediaUploadEnabled?: boolean;
+  /**
+   * Extra HTTP headers sent on every Langfuse export request (OTLP trace
+   * export and media uploads), for self-hosted instances behind an
+   * authenticating proxy or gateway.
+   *
+   * Deployment-level only: one exporter is shared by every span routed to a
+   * destination, so these cannot carry per-request or per-user identity.
+   * Headers participate in destination identity — see
+   * `getLangfuseDestinationKey`.
+   */
+  additionalHeaders?: Record<string, string>;
   metadata?: Record<string, string | number | boolean | null | undefined>;
   /**
    * Internal OTLP span attributes to attach to Langfuse observations before

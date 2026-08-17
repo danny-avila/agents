@@ -59,6 +59,12 @@ function resolveLangfuseEnvironment(
   return undefined;
 }
 
+function hasAdditionalHeaders(
+  headers?: Record<string, string>
+): headers is Record<string, string> {
+  return headers != null && Object.keys(headers).length > 0;
+}
+
 export function getLangfuseSpanProcessorParams(
   langfuse?: t.LangfuseConfig
 ): LangfuseSpanProcessorParams | undefined {
@@ -66,6 +72,9 @@ export function getLangfuseSpanProcessorParams(
     return undefined;
   }
   const environment = resolveLangfuseEnvironment(langfuse);
+  const additionalHeaders = hasAdditionalHeaders(langfuse?.additionalHeaders)
+    ? { additionalHeaders: langfuse.additionalHeaders }
+    : {};
   if (hasLangfuseConfigCredentials(langfuse)) {
     return {
       publicKey: langfuse.publicKey,
@@ -75,6 +84,7 @@ export function getLangfuseSpanProcessorParams(
       ...(langfuse.mediaUploadEnabled != null
         ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
         : {}),
+      ...additionalHeaders,
     };
   }
   if (hasLangfuseEnvConfig()) {
@@ -90,6 +100,7 @@ export function getLangfuseSpanProcessorParams(
       ...(langfuse?.mediaUploadEnabled != null
         ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
         : {}),
+      ...additionalHeaders,
     };
   }
   if (isPresent(langfuse?.baseUrl) && hasLangfuseEnvCredentials()) {
@@ -101,6 +112,7 @@ export function getLangfuseSpanProcessorParams(
       ...(langfuse.mediaUploadEnabled != null
         ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
         : {}),
+      ...additionalHeaders,
     };
   }
   return undefined;
@@ -113,11 +125,36 @@ function hashCacheKeyValue(value: string | undefined): string | undefined {
 }
 
 /**
+ * Order- and case-insensitive digest of the custom headers sent to a
+ * destination, so header maps that differ only in key order or header-name
+ * casing resolve to one destination instead of duplicating its exporter.
+ * Hashed because these values are credentials (proxy tokens, gateway keys).
+ * Absent and empty both yield `undefined`, keeping keys stable for the
+ * overwhelmingly common no-headers case.
+ */
+function hashAdditionalHeaders(
+  headers: Record<string, string> | undefined
+): string | undefined {
+  if (!hasAdditionalHeaders(headers)) {
+    return undefined;
+  }
+  const normalized = Object.entries(headers)
+    .map(([name, value]) => JSON.stringify([name.trim().toLowerCase(), value]))
+    .sort();
+  return hashCacheKeyValue(normalized.join('\n'));
+}
+
+/**
  * Identity of an export destination (project credentials + endpoint +
- * environment) only. Processor-level policies like `toolOutputTracing` are
- * deliberately excluded: two spans exporting to the same project under
- * different redaction settings still share a destination and may parent one
- * another.
+ * environment + custom headers) only. Processor-level policies like
+ * `toolOutputTracing` are deliberately excluded: two spans exporting to the
+ * same project under different redaction settings still share a destination
+ * and may parent one another.
+ *
+ * Custom headers are included because a gateway may route on them, making two
+ * otherwise-identical configs different projects. Treating them as part of the
+ * destination keeps a run from inheriting a parent span bound elsewhere, and
+ * keeps a rotated proxy credential from reusing the stale exporter.
  */
 export function getLangfuseDestinationKey(
   params: LangfuseSpanProcessorParams
@@ -127,6 +164,7 @@ export function getLangfuseDestinationKey(
     secretKeyHash: hashCacheKeyValue(params.secretKey),
     baseUrl: params.baseUrl,
     environment: params.environment,
+    additionalHeadersHash: hashAdditionalHeaders(params.additionalHeaders),
   });
 }
 
