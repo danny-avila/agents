@@ -826,12 +826,23 @@ export class Run<_T extends t.BaseGraphState> {
              * The producer stamped `completed_at` before dispatch. Carrying it
              * through keeps the recorded duration the tool's, not the host
              * handler's — this runs after an arbitrarily slow handler resolves.
+             *
+             * Isolated because this is a `finally`: a throw here would
+             * REPLACE an in-flight error from the handler above, so the
+             * host's original failure would be reported as whatever went
+             * wrong during closure instead. Closing is best-effort at this
+             * point either way — the end-of-run sweep still stamps any step
+             * this misses.
              */
-            await this.Graph.recordStepCompletion(completion.stepId, {
-              toolCallId: completion.toolCallId,
-              metadata,
-              at: completion.completedAt,
-            });
+            try {
+              await this.Graph.recordStepCompletion(completion.stepId, {
+                toolCallId: completion.toolCallId,
+                metadata,
+                at: completion.completedAt,
+              });
+            } catch (_e) {
+              /** Never mask the handler's error with a closure failure */
+            }
           }
         }
       }
