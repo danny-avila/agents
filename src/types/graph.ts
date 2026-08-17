@@ -40,6 +40,7 @@ import type {
   TokenBudgetBreakdown,
 } from '@/types/run';
 import type { Providers, Callback, GraphNodeKeys } from '@/common';
+import type { SubagentTaskConfig } from '@/types/subagentTasks';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
 
@@ -353,6 +354,12 @@ export type StandardGraphInput = {
    */
   subagentUsageSink?: SubagentUsageSink;
   /**
+   * Optional host-owned process-local task namespace for detached subagents.
+   * Presence enables `run_in_background` on the subagent tool. Child graphs
+   * do not inherit it, keeping background nesting disabled for the MVP.
+   */
+  subagentTasks?: SubagentTaskConfig;
+  /**
    * True when this graph IS a subagent child run (set by `SubagentExecutor`
    * when it constructs the child graph). Drives the hook-input `agentId`
    * subagent-scope marker: hook dispatches from this graph's tool nodes
@@ -363,10 +370,10 @@ export type StandardGraphInput = {
    */
   subagentScope?: boolean;
   /**
-   * Cooperative preemption, forwarded from `RunConfig.preemption`. Only ever
-   * set on the top-level graph: a steer targets the conversation, so subagent
-   * children must run to completion and `buildChildInputs` does not propagate
-   * this field.
+   * Cooperative preemption, forwarded from `RunConfig.preemption`. Ordinary
+   * child graphs do not inherit it. Detached subagent tasks may receive their
+   * own internal parent-control source so an interrupt can reuse the same
+   * provider-safe sealing path without targeting the top-level conversation.
    */
   preemption?: StreamPreemption;
   /**

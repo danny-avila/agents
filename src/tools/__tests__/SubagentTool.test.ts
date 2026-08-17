@@ -138,6 +138,28 @@ describe('SubagentTool', () => {
       expect(params.description).toContain('"coder" (Coding Agent)');
     });
 
+    it('only advertises detached execution when the host enables it', () => {
+      const foreground = buildSubagentToolParams(configs);
+      const background = buildSubagentToolParams(configs, {
+        background: true,
+      });
+      const foregroundProperties = foreground.schema.properties as Record<
+        string,
+        Record<string, unknown>
+      >;
+      const backgroundProperties = background.schema.properties as Record<
+        string,
+        Record<string, unknown>
+      >;
+
+      expect(foregroundProperties.run_in_background).toBeUndefined();
+      expect(foreground.description).not.toContain('BACKGROUND EXECUTION');
+      expect(backgroundProperties.run_in_background).toMatchObject({
+        type: 'boolean',
+      });
+      expect(background.description).toContain('BACKGROUND EXECUTION');
+    });
+
     it('produces same schema as createSubagentToolDefinition', () => {
       const params = buildSubagentToolParams(configs);
       const def = createSubagentToolDefinition(configs);

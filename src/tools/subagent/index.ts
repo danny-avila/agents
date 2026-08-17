@@ -17,3 +17,5 @@ export type {
   SubagentExecutorOptions,
   ChildGraphFactory,
 } from './SubagentExecutor';
+export { InMemorySubagentTaskStore } from './InMemorySubagentTaskStore';
+export type { InMemorySubagentTaskStoreOptions } from './InMemorySubagentTaskStore';
