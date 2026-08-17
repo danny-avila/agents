@@ -675,4 +675,133 @@ describe('cooperative seal (end-to-end via Run)', () => {
     expect(resumedInput).not.toContain('rs_interrupted');
     expect(run.getHaltReason()).toBeUndefined();
   });
+
+  /**
+   * A reasoning turn can seal one item and be interrupted inside the next.
+   * Both items share the single `additional_kwargs.reasoning` slot, so the
+   * merge used to hand the steered request the second item's id carrying the
+   * first item's ciphertext — accepted by every local guard and rejected by
+   * the provider as "Encrypted content could not be decrypted or parsed".
+   */
+  it('steers a multi-item reasoning turn without welding ciphertexts together', async () => {
+    const run = await createSealRun({
+      runId: 'seal-openai-responses-multi-reasoning',
+      hook: async () => ({
+        injectedMessages: [
+          { role: 'user' as const, content: 'what inspired you', source: 'steer' },
+        ],
+      }),
+      responses: [],
+    });
+    const model = new ChatOpenAI({
+      model: 'gpt-5.6',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = (
+      model as unknown as { responses: StreamingResponsesDelegate }
+    ).responses;
+    const requests: OpenAIClient.Responses.ResponseCreateParamsStreaming[] = [];
+    responses.completionWithRetry = async (request) => {
+      requests.push(request);
+      const invocation = requests.length;
+      return (async function* () {
+        if (invocation !== 1) {
+          yield {
+            type: 'response.output_text.delta',
+            sequence_number: 0,
+            output_index: 0,
+            content_index: 0,
+            item_id: 'msg_resumed',
+            delta: RESUMED_RESPONSE,
+            logprobs: [],
+          } as OpenAIClient.Responses.ResponseStreamEvent;
+          return;
+        }
+        yield {
+          type: 'response.output_item.added',
+          sequence_number: 0,
+          output_index: 0,
+          item: {
+            id: 'rs_sealed',
+            type: 'reasoning',
+            status: 'in_progress',
+            summary: [],
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_item.done',
+          sequence_number: 1,
+          output_index: 0,
+          item: {
+            id: 'rs_sealed',
+            type: 'reasoning',
+            status: 'completed',
+            summary: [],
+            encrypted_content: 'CIPHERTEXT_SEALED',
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_item.added',
+          sequence_number: 2,
+          output_index: 1,
+          item: {
+            id: 'rs_inflight',
+            type: 'reasoning',
+            status: 'in_progress',
+            summary: [],
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_item.added',
+          sequence_number: 3,
+          output_index: 2,
+          item: {
+            id: 'msg_interrupted',
+            type: 'message',
+            role: 'assistant',
+            status: 'in_progress',
+            content: [],
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+        yield {
+          type: 'response.output_text.delta',
+          sequence_number: 4,
+          output_index: 2,
+          content_index: 0,
+          item_id: 'msg_interrupted',
+          delta: 'Partial answer.',
+          logprobs: [],
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+    };
+    run.Graph!.overrideModel = model;
+
+    await run.processStream(
+      { messages: [new HumanMessage('tell me a long story')] },
+      streamConfig
+    );
+
+    expect(requests).toHaveLength(2);
+    const resumedInput = requests[1].input;
+    if (resumedInput == null || typeof resumedInput === 'string') {
+      throw new Error('Expected a structured Responses input on resume');
+    }
+    const replayedReasoning = resumedInput.filter(
+      (item): item is OpenAIClient.Responses.ResponseReasoningItem =>
+        typeof item === 'object' && item.type === 'reasoning'
+    );
+
+    expect(replayedReasoning).not.toHaveLength(0);
+    for (const item of replayedReasoning) {
+      if (item.encrypted_content == null) {
+        continue;
+      }
+      expect(item.id).toBe('rs_sealed');
+      expect(item.encrypted_content).toBe('CIPHERTEXT_SEALED');
+    }
+    /** The interrupted item never completed, so its id is unresolvable. */
+    expect(JSON.stringify(resumedInput)).not.toContain('rs_inflight');
+    expect(run.getHaltReason()).toBeUndefined();
+  });
 });

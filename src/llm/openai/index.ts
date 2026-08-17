@@ -43,6 +43,7 @@ import type { SeenScalarMetadata } from './streamMetadata';
 import type { HeaderValue, HeadersLike } from './types';
 import type { PromptCacheTtl } from '@/messages/cache';
 import {
+  OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY,
   OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
   projectOpenAIResponsesToolMessageContent,
   projectToolStreamContentForProvider,
@@ -606,6 +607,85 @@ function isResponsesReplayOutputItem(item: unknown): boolean {
   );
 }
 
+type ResponsesReasoningSlot = {
+  encrypted_content?: string;
+  id?: string;
+  status?: string;
+};
+
+function getResponsesReasoningSlot(
+  reasoning: unknown
+): ResponsesReasoningSlot | undefined {
+  return typeof reasoning === 'object' && reasoning != null
+    ? (reasoning as ResponsesReasoningSlot)
+    : undefined;
+}
+
+function isSealedReasoningSlot(
+  slot: ResponsesReasoningSlot | undefined
+): slot is ResponsesReasoningSlot & { encrypted_content: string } {
+  return (
+    typeof slot?.encrypted_content === 'string' &&
+    slot.encrypted_content.length > 0
+  );
+}
+
+function resolveActiveReasoningItemId(
+  incoming: ResponsesReasoningSlot | undefined,
+  carried: unknown
+): string | undefined {
+  if (typeof incoming?.id === 'string' && incoming.id.length > 0) {
+    return incoming.id;
+  }
+  return typeof carried === 'string' ? carried : undefined;
+}
+
+/**
+ * A single `additional_kwargs.reasoning` slot has to stand in for a turn that
+ * can emit many reasoning items, and the chunk merge folds it field by field:
+ * `encrypted_content` and `status` are strings, so they concatenate, while
+ * `id` takes whichever item arrived last. An interrupted turn replays from
+ * that slot, handing the provider one item id welded to every item's
+ * ciphertext — rejected as "Encrypted content could not be decrypted or
+ * parsed". Keep the slot describing whichever item most recently sealed, so
+ * the id, its ciphertext, and its status always come from the same item.
+ *
+ * `activeItemId` tracks the item currently streaming, which is the one a
+ * terminal `encrypted_content` belongs to: the slot's own id has already been
+ * pinned back to the last sealed item by an earlier merge.
+ */
+function resealReasoningItemBoundary(
+  combined: AIMessageChunk,
+  accumulated: ResponsesReasoningSlot | undefined,
+  incoming: ResponsesReasoningSlot | undefined,
+  activeItemId: string | undefined
+): void {
+  const merged = getResponsesReasoningSlot(
+    combined.additional_kwargs.reasoning
+  );
+  if (merged == null || incoming == null) {
+    return;
+  }
+  if (isSealedReasoningSlot(incoming)) {
+    combined.additional_kwargs.reasoning = {
+      ...merged,
+      id: activeItemId ?? merged.id,
+      encrypted_content: incoming.encrypted_content,
+      status: incoming.status,
+    };
+    return;
+  }
+  if (!isSealedReasoningSlot(accumulated)) {
+    return;
+  }
+  combined.additional_kwargs.reasoning = {
+    ...merged,
+    id: accumulated.id,
+    encrypted_content: accumulated.encrypted_content,
+    status: accumulated.status,
+  };
+}
+
 /**
  * LangChain's Responses converter places the authoritative terminal output in
  * response_metadata.output. Its chunk merge has no way to delete provisional
@@ -619,10 +699,26 @@ class ResponsesReplayAIMessageChunk extends AIMessageChunk {
   }
 
   override concat(chunk: AIMessageChunk): this {
+    const accumulated = getResponsesReasoningSlot(
+      this.additional_kwargs.reasoning
+    );
+    const incoming = getResponsesReasoningSlot(
+      chunk.additional_kwargs.reasoning
+    );
+    const activeItemId = resolveActiveReasoningItemId(
+      incoming,
+      this.additional_kwargs[OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY]
+    );
     const combined = super.concat(chunk);
+    resealReasoningItemBoundary(combined, accumulated, incoming, activeItemId);
+    if (activeItemId != null) {
+      combined.additional_kwargs[OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY] =
+        activeItemId;
+    }
     if (!Array.isArray(chunk.response_metadata.output)) {
       return combined;
     }
+    delete combined.additional_kwargs[OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY];
     delete combined.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY];
     const toolOutputs = combined.additional_kwargs.tool_outputs;
     if (!Array.isArray(toolOutputs)) {
