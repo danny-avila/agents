@@ -10,6 +10,7 @@ import type {
   ToolOutputReferencesConfig,
   EagerEventToolExecutionConfig,
 } from '@/types/tools';
+import type { SubagentTaskConfig } from '@/types/subagentTasks';
 import type { HumanInTheLoopConfig } from '@/types/hitl';
 import type { HookRegistry } from '@/hooks';
 import type * as s from '@/types/stream';
@@ -234,6 +235,11 @@ export type RunConfig = {
    * the registered `CHAT_MODEL_END` handler as usual.
    */
   subagentUsageSink?: g.SubagentUsageSink;
+  /**
+   * Trusted process-local task namespace for detached subagent execution.
+   * Omit to preserve foreground-only subagent behavior.
+   */
+  subagentTasks?: SubagentTaskConfig;
   /**
    * Pre-constructed hook registry for this run. Hooks fire at lifecycle
    * points in `processStream` (RunStart, UserPromptSubmit, Stop,

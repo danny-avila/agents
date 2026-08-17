@@ -296,6 +296,7 @@ export class Run<_T extends t.BaseGraphState> {
   private subagentUsageSink?: t.SubagentUsageSink;
   private preemption?: t.StreamPreemption;
   private streamLimits?: t.StreamLimits;
+  private subagentTasks?: t.SubagentTaskConfig;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
   graphRunnable?: t.CompiledStateWorkflow;
@@ -363,6 +364,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.interruptingToolNames = config.interruptingToolNames;
     this.toolExecution = config.toolExecution;
     this.subagentUsageSink = config.subagentUsageSink;
+    this.subagentTasks = config.subagentTasks;
     this.preemption = config.preemption;
     this.streamLimits = config.streamLimits;
 
@@ -455,6 +457,7 @@ export class Run<_T extends t.BaseGraphState> {
         indexTokenCountMap: this.indexTokenCountMap,
         calibrationRatio: this.calibrationRatio,
         subagentUsageSink: this.subagentUsageSink,
+        subagentTasks: this.subagentTasks,
         preemption: this.preemption,
         streamLimits: this.streamLimits,
       },
@@ -493,6 +496,7 @@ export class Run<_T extends t.BaseGraphState> {
         indexTokenCountMap: this.indexTokenCountMap,
         calibrationRatio: this.calibrationRatio,
         subagentUsageSink: this.subagentUsageSink,
+        subagentTasks: this.subagentTasks,
         preemption: this.preemption,
         streamLimits: this.streamLimits,
       },

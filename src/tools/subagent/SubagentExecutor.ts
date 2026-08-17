@@ -52,6 +52,8 @@ import type {
   ResolvedSubagentConfig,
   ResolvedSubagentConfigEntry,
   SubagentExecutionContext,
+  SubagentTaskConfig,
+  SubagentTaskRuntime,
   SubagentResolveConfigurable,
   SubagentResolveRequestContext,
   SubagentResolveUserContext,
@@ -74,19 +76,20 @@ import type {
   SubagentExecutionRecord,
 } from './SubagentExecutionRegistry';
 import type {
+  AggregatedHookResult,
+  HookRegistry,
+  PostToolBatchHookOutput,
+  PreemptBoundaryHookOutput,
+  ToolApprovalReplaySnapshot,
+} from '@/hooks';
+import type {
   SubagentResumeExecution,
   SubagentResumeManifest,
   SubagentCheckpointReference,
   SettledSubagentToolOutput,
 } from './SubagentReplay';
-import type {
-  AggregatedHookResult,
-  HookRegistry,
-  ToolApprovalReplaySnapshot,
-} from '@/hooks';
 import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
-import type { HandlerRegistry } from '@/events';
 import {
   getSubagentApprovalExecutionScope,
   SubagentDefinitionBindingError,
@@ -127,7 +130,9 @@ import {
 import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
+import { convertInjectedMessages } from '@/messages/injected';
 import { composeAbortSignals } from '@/utils/misc';
+import { HandlerRegistry } from '@/events';
 
 export {
   buildChildInputs,
@@ -140,6 +145,7 @@ export {
 
 const ERROR_MESSAGE_MAX_CHARS = 200;
 const MAX_QUEUED_SUBAGENT_UPDATES = 64;
+const MAX_BACKGROUND_SUBAGENT_SEALS = 32;
 const SUBAGENT_UPDATE_HANDLER_TIMEOUT_MS = 5_000;
 const TEXT_DELTA_CONTENT_TYPE = `${ContentTypes.TEXT}_delta`;
 const SUBAGENT_RESOLUTION_ERROR_MESSAGE =
@@ -615,6 +621,22 @@ function getSettlementFingerprint(output: PersistedToolOutput): string {
   return createHash('sha256').update(stableStringify(output)).digest('hex');
 }
 
+function getBackgroundTaskFingerprint(
+  description: string,
+  subagentType: string
+): string {
+  return createHash('sha256')
+    .update(stableStringify({ description, subagentType }))
+    .digest('hex');
+}
+
+function getBackgroundTaskHookSessionId(
+  sourceHookSessionId: string,
+  taskId: string
+): string {
+  return `${sourceHookSessionId}:subagent-task:${taskId}`;
+}
+
 function deserializeToolOutput(
   output: PersistedToolOutput
 ): SettledSubagentToolOutput {
@@ -786,6 +808,10 @@ export type SubagentExecuteParams = {
    * rather than sharing parent's host context.
    */
   parentConfigurable?: Record<string, unknown>;
+  /** Dedicated hook session used by a detached task. @internal */
+  hookSessionId?: string;
+  /** Process-local task controls consumed by the child graph. @internal */
+  taskRuntime?: SubagentTaskRuntime;
 };
 
 export type SubagentExecuteResult = {
@@ -849,6 +875,13 @@ export type SubagentExecutorOptions = {
    * factory remains required for source compatibility. */
   createChildGraphByKind?: GraphFactory;
   /**
+   * Captures a child-graph factory and its run-scoped host dependencies
+   * synchronously, before a detached task can outlive parent cleanup.
+   */
+  createDetachedChildGraphFactory?: (
+    parentHandlerRegistry: HandlerRegistry
+  ) => GraphFactory;
+  /**
    * Parent's event handler registry. When provided, child-graph events are
    * forwarded through this registry so hosts can:
    *   (a) execute event-driven tools (`ON_TOOL_EXECUTE` routed to parent's handler),
@@ -870,6 +903,8 @@ export type SubagentExecutorOptions = {
    * nested subagents report through the same sink.
    */
   usageSink?: SubagentUsageSink;
+  /** Host-owned process-local task namespace for detached execution. */
+  taskConfig?: SubagentTaskConfig;
 };
 
 type DurableExecutionRecord = SubagentExecutionRecord<
@@ -902,7 +937,11 @@ export class SubagentExecutor {
   private readonly maxDepth: number;
   private readonly createChildGraph: ChildGraphFactory;
   private readonly createChildGraphByKind?: GraphFactory;
+  private readonly createDetachedChildGraphFactory?: (
+    parentHandlerRegistry: HandlerRegistry
+  ) => GraphFactory;
   private readonly usageSink?: SubagentUsageSink;
+  private readonly taskConfig?: SubagentTaskConfig;
   private readonly executions: SubagentExecutionRegistry<
     SubagentExecuteResult,
     ResolvedSubagentConfig,
@@ -943,7 +982,10 @@ export class SubagentExecutor {
     this.maxDepth = options.maxDepth ?? 1;
     this.createChildGraph = options.createChildGraph;
     this.createChildGraphByKind = options.createChildGraphByKind;
+    this.createDetachedChildGraphFactory =
+      options.createDetachedChildGraphFactory;
     this.usageSink = options.usageSink;
+    this.taskConfig = options.taskConfig;
     const rawRegistry = options.parentHandlerRegistry;
     if (typeof rawRegistry === 'function') {
       this.resolveParentHandlerRegistry = rawRegistry;
@@ -977,6 +1019,203 @@ export class SubagentExecutor {
   /** Snapshot of the parent's registry at the moment a subagent is dispatched. */
   private getParentHandlerRegistry(): HandlerRegistry | undefined {
     return this.resolveParentHandlerRegistry?.();
+  }
+
+  /**
+   * Starts one independently-owned executor behind the configured task store.
+   * The parent ToolNode receives the handle synchronously; the detached clone
+   * is not registered on the parent graph, so end-of-turn cleanup cannot
+   * invalidate or clear a child that intentionally outlives that turn.
+   */
+  executeInBackground(params: SubagentExecuteParams): string {
+    if (this.taskConfig == null) {
+      return JSON.stringify({
+        status: 'rejected',
+        message: 'Background subagent execution is not enabled for this run.',
+      });
+    }
+    const executableConfig = this.configs.get(params.subagentType);
+    if (executableConfig == null) {
+      return JSON.stringify({
+        status: 'rejected',
+        message: `Unknown subagent type "${params.subagentType}".`,
+      });
+    }
+    if (this.maxDepth <= 0) {
+      return JSON.stringify({
+        status: 'rejected',
+        message: 'Maximum subagent nesting depth exceeded.',
+      });
+    }
+    if (this.humanInTheLoop?.enabled === true) {
+      return JSON.stringify({
+        status: 'rejected',
+        message:
+          'Background subagent execution does not support human-in-the-loop pauses.',
+      });
+    }
+    const parentToolCallId = params.parentToolCallId?.trim();
+    if (parentToolCallId == null || parentToolCallId === '') {
+      return JSON.stringify({
+        status: 'rejected',
+        message: 'Background subagent execution requires a parent tool call ID.',
+      });
+    }
+    const detachedHandlers = new HandlerRegistry();
+    const toolHandler = this.getParentHandlerRegistry()?.getHandler(
+      GraphEvents.ON_TOOL_EXECUTE
+    );
+    if (toolHandler != null) {
+      detachedHandlers.register(GraphEvents.ON_TOOL_EXECUTE, toolHandler);
+    }
+    const detachedGraphFactory =
+      this.createDetachedChildGraphFactory?.(detachedHandlers);
+    const sourceHookSessionId =
+      asNonEmptyString(params.parentConfigurable?.run_id) ??
+      this.executionContext.hookSessionId;
+    const started = this.taskConfig.store.start({
+      scopeId: this.taskConfig.scopeId,
+      idempotencyKey: JSON.stringify([
+        this.parentRunId,
+        this.parentAgentId ?? '',
+        parentToolCallId,
+      ]),
+      requestFingerprint: getBackgroundTaskFingerprint(
+        params.description,
+        params.subagentType
+      ),
+      subagentType: params.subagentType,
+      run: (runtime) =>
+        this.executeDetached(
+          params,
+          runtime,
+          detachedHandlers,
+          detachedGraphFactory
+        ),
+    });
+    if (!started.accepted) {
+      if (started.reason === 'conflict') {
+        return JSON.stringify({
+          status: 'rejected',
+          tool: Constants.SUBAGENT,
+          message:
+            'The same parent tool call ID was already used with different background subagent arguments.',
+        });
+      }
+      return JSON.stringify({
+        status: 'rejected',
+        tool: Constants.SUBAGENT,
+        message:
+          'Too many background subagent tasks are already running in this scope. Poll or cancel an existing task, or run this call in the foreground.',
+      });
+    }
+    if (started.isNew) {
+      this.hookRegistry?.copySession(
+        sourceHookSessionId,
+        getBackgroundTaskHookSessionId(
+          sourceHookSessionId,
+          started.task.taskId
+        )
+      );
+    }
+    return JSON.stringify({
+      background_task_id: started.task.taskId,
+      tool: Constants.SUBAGENT,
+      subagent_type: params.subagentType,
+      status: started.task.status,
+      message: `Started subagent "${params.subagentType}" in the background. Poll the host background-task tool with background_task_id "${started.task.taskId}" to check progress or collect its result.`,
+    });
+  }
+
+  private async executeDetached(
+    params: SubagentExecuteParams,
+    runtime: SubagentTaskRuntime,
+    detachedHandlers: HandlerRegistry,
+    detachedGraphFactory?: GraphFactory
+  ): Promise<SubagentExecuteResult> {
+    const sourceHookSessionId =
+      asNonEmptyString(params.parentConfigurable?.run_id) ??
+      this.executionContext.hookSessionId;
+    const taskHookSessionId = getBackgroundTaskHookSessionId(
+      sourceHookSessionId,
+      runtime.taskId
+    );
+    const unregisterHooks: Array<() => void> = [];
+    if (this.hookRegistry != null) {
+      this.hookRegistry.copySession(sourceHookSessionId, taskHookSessionId);
+      unregisterHooks.push(
+        this.hookRegistry.registerSession(taskHookSessionId, 'PostToolBatch', {
+          hooks: [
+            (): PostToolBatchHookOutput => ({
+              injectedMessages: runtime.drain('tool'),
+            }),
+          ],
+        }),
+        this.hookRegistry.registerSession(taskHookSessionId, 'PreemptBoundary', {
+          hooks: [
+            (): PreemptBoundaryHookOutput => ({
+              injectedMessages: runtime.drain('preempt'),
+            }),
+          ],
+        })
+      );
+    }
+
+    detachedHandlers.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+      handle: (_event, data): void => {
+        runtime.reportProgress(data as SubagentUpdateEvent);
+      },
+    });
+
+    const detached = new SubagentExecutor({
+      configs: this.configs,
+      parentSignal: runtime.signal,
+      hookRegistry: this.hookRegistry,
+      parentHandlerRegistry: detachedHandlers,
+      parentRunId: this.parentRunId,
+      parentAgentId: this.parentAgentId,
+      executionContext: {
+        ...this.executionContext,
+        hookSessionId: taskHookSessionId,
+      },
+      langfuse: this.langfuse,
+      tokenCounter: this.tokenCounter,
+      usageSink: this.usageSink,
+      streamLimits: this.streamLimits,
+      maxDepth: this.maxDepth,
+      createChildGraph:
+        detachedGraphFactory == null
+          ? this.createChildGraph
+          : (input): StandardGraph =>
+            detachedGraphFactory({ kind: 'standard', input }),
+      createChildGraphByKind:
+        detachedGraphFactory ?? this.createChildGraphByKind,
+    });
+    try {
+      const result = await detached.execute({
+        ...params,
+        signal: undefined,
+        breaker: undefined,
+        hookSessionId: taskHookSessionId,
+        taskRuntime: runtime,
+        parentConfigurable: {
+          ...params.parentConfigurable,
+          run_id: taskHookSessionId,
+        },
+      });
+      if (runtime.signal.aborted) {
+        throw runtime.signal.reason instanceof Error
+          ? runtime.signal.reason
+          : new Error('Detached subagent task cancelled.');
+      }
+      return result;
+    } finally {
+      detached.clearHeavyState();
+      for (const unregister of unregisterHooks) {
+        unregister();
+      }
+      this.hookRegistry?.clearSession(taskHookSessionId);
+    }
   }
 
   private bindExecutionDefinition(
@@ -2109,6 +2348,7 @@ export class SubagentExecutor {
     });
     const childAgentId = childPlan.subjectAgentId;
     const currentHookSessionId =
+      asNonEmptyString(params.hookSessionId) ??
       asNonEmptyString(params.parentConfigurable?.run_id) ??
       this.executionContext.hookSessionId;
     const childExecutionContext: SubagentExecutionContext = {
@@ -2162,6 +2402,15 @@ export class SubagentExecutor {
        * never see grandchild model calls.
        */
       subagentUsageSink,
+      ...(params.taskRuntime == null
+        ? {}
+        : {
+          preemption: {
+            shouldPreempt: (): boolean =>
+              params.taskRuntime?.shouldPreempt() === true,
+            maxSeals: MAX_BACKGROUND_SUBAGENT_SEALS,
+          },
+        }),
     };
     let childGraph = cachedChildRun?.graph;
     if (childGraph == null && childPlan.kind === 'graph') {
@@ -2426,26 +2675,46 @@ export class SubagentExecutor {
           });
         }
 
-        let childResult: MultiAgentGraphState;
-        if (this.humanInTheLoop?.enabled === true) {
-          /** Execute as an independently checkpointed root instead of inheriting
-           * the parent's Pregel namespace. Parent decisions are routed explicitly
-           * by interrupt id, so concurrent children keep isolated resume state. */
-          childResult = await AsyncLocalStorageProviderSingleton.runWithConfig(
-            childInvokeConfig,
-            (): Promise<MultiAgentGraphState> =>
-              workflow.invoke(childInput, childInvokeConfig)
-          );
-        } else {
-          childResult = await workflow.invoke(childInput, childInvokeConfig);
+        for (;;) {
+          let childResult: MultiAgentGraphState;
+          if (this.humanInTheLoop?.enabled === true) {
+            /** Execute as an independently checkpointed root instead of inheriting
+             * the parent's Pregel namespace. Parent decisions are routed explicitly
+             * by interrupt id, so concurrent children keep isolated resume state. */
+            childResult =
+              await AsyncLocalStorageProviderSingleton.runWithConfig(
+                childInvokeConfig,
+                (): Promise<MultiAgentGraphState> =>
+                  workflow.invoke(childInput, childInvokeConfig)
+              );
+          } else {
+            childResult = await workflow.invoke(childInput, childInvokeConfig);
+          }
+          const childInterrupts = isInterrupted(childResult)
+            ? childResult[INTERRUPT]
+            : undefined;
+          if (childInterrupts != null && childInterrupts.length > 0) {
+            throw new GraphInterrupt(childInterrupts);
+          }
+          result = childResult;
+          const continuation = params.taskRuntime?.closeTurn();
+          if (continuation == null || continuation.closed) {
+            break;
+          }
+          /**
+           * A queued control becomes the next user turn inside the same
+           * detached task. Reset graph sidecars while carrying the complete
+           * child transcript forward, preserving one task/trace identity and
+           * avoiding a second subagent lifecycle or duplicate billing path.
+           */
+          childGraph.resetValues(true);
+          childInput = {
+            messages: [
+              ...childResult.messages,
+              ...convertInjectedMessages(continuation.messages),
+            ],
+          };
         }
-        const childInterrupts = isInterrupted(childResult)
-          ? childResult[INTERRUPT]
-          : undefined;
-        if (childInterrupts != null && childInterrupts.length > 0) {
-          throw new GraphInterrupt(childInterrupts);
-        }
-        result = childResult;
       }
     } catch (error) {
       /** Stamped at failure, not after the error-envelope work below. */

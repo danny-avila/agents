@@ -1312,6 +1312,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   subagentUsageSink?: t.SubagentUsageSink;
   /** See {@link t.StandardGraphInput.subagentScope}. */
   subagentScope: boolean;
+  /** See {@link t.StandardGraphInput.subagentTasks}. */
+  subagentTasks: t.SubagentTaskConfig | undefined;
   /** See {@link t.StandardGraphInput.subagentExecutionContext}. */
   private readonly subagentExecutionContext?: t.SubagentExecutionContext;
   /** See {@link t.StandardGraphInput.preemption}. */
@@ -1445,6 +1447,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       indexTokenCountMap,
       calibrationRatio,
       subagentUsageSink,
+      subagentTasks,
       subagentScope,
       subagentExecutionContext,
       preemption,
@@ -1469,6 +1472,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.signal = signal;
     this.langfuse = langfuse;
     this.subagentUsageSink = subagentUsageSink;
+    this.subagentTasks = subagentTasks;
     this.subagentScope = subagentScope === true;
     this.subagentExecutionContext = subagentExecutionContext;
     this.preemption = preemption;
@@ -1695,8 +1699,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * budget is taken by {@link claimPreemptSeal} once the accumulated chunk is
    * known to be safe, so a chunk that cannot seal never spends budget.
    *
-   * Subagent scopes never seal: a steer targets the top-level conversation,
-   * and a child run must finish so its parent sees a complete result.
+   * Ordinary subagent scopes never receive `preemption`. A detached child may
+   * receive a dedicated parent-control preemption source, in which case the
+   * same provider-safe seal path is intentionally reused inside that child.
    */
   /** Internal seal preconditions only — no host callback, no side effects. */
   private canClaimPreemptSeal(): boolean {
@@ -1710,7 +1715,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const runId =
       (this.config?.configurable?.run_id as string | undefined) ?? this.runId;
     return (
-      !this.subagentScope &&
       this.preemption != null &&
       !this.preemptSealInFlight &&
       this.preemptSealBudgetUsed < resolveMaxSeals(this.preemption.maxSeals) &&
@@ -4769,19 +4773,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
         const getParentHandlerRegistry = (): HandlerRegistry | undefined =>
           this.handlerRegistry ?? this.parentToolHandlerRegistry;
-        const createConfiguredChildGraph: GraphFactory = (request) => {
-          const childGraph = this.graphFactory(request);
-          if (this.subagentModelOverride != null) {
-            childGraph.overrideModel = this.subagentModelOverride;
-            childGraph.setSubagentModelOverride(this.subagentModelOverride);
-          }
-          const childHandlerRegistry = createChildHandlerRegistry(
-            getParentHandlerRegistry()
-          );
-          // Pure execution-ordering hint (unlike `humanInTheLoop`). It only
-          // reorders tools already in the child's direct group; it does not
-          // force a schema-only event tool onto the direct execution path.
-          applyGraphRuntimeConfig(childGraph, {
+        const snapshotChildGraphFactory = (
+          parentHandlerRegistry: HandlerRegistry | undefined
+        ): GraphFactory => {
+          const graphFactory = this.graphFactory;
+          const subagentModelOverride = this.subagentModelOverride;
+          const runtimeConfig = {
             hookRegistry: this.hookRegistry,
             humanInTheLoop: this.humanInTheLoop,
             toolOutputReferences: this.toolOutputReferences,
@@ -4789,18 +4786,33 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             codeSessionToolNames: this.codeSessionToolNames,
             interruptingToolNames: this.interruptingToolNames,
             toolExecution: this.toolExecution,
-          });
-          if (this.humanInTheLoop?.enabled === true) {
-            childGraph.compileOptions = {
-              checkpointer: this.compileOptions?.checkpointer,
-            };
-          }
-          childGraph.parentToolHandlerRegistry = childHandlerRegistry;
-          childGraph.eventToolExecutionAvailable =
-            childHandlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) !=
-            null;
-          return childGraph;
+          };
+          const checkpointer = this.compileOptions?.checkpointer;
+          return (request): StandardGraph => {
+            const childGraph = graphFactory(request);
+            if (subagentModelOverride != null) {
+              childGraph.overrideModel = subagentModelOverride;
+              childGraph.setSubagentModelOverride(subagentModelOverride);
+            }
+            const childHandlerRegistry = createChildHandlerRegistry(
+              parentHandlerRegistry
+            );
+            // Pure execution-ordering hint (unlike `humanInTheLoop`). It only
+            // reorders tools already in the child's direct group; it does not
+            // force a schema-only event tool onto the direct execution path.
+            applyGraphRuntimeConfig(childGraph, runtimeConfig);
+            if (runtimeConfig.humanInTheLoop?.enabled === true) {
+              childGraph.compileOptions = { checkpointer };
+            }
+            childGraph.parentToolHandlerRegistry = childHandlerRegistry;
+            childGraph.eventToolExecutionAvailable =
+              childHandlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) !=
+              null;
+            return childGraph;
+          };
         };
+        const createConfiguredChildGraph: GraphFactory = (request) =>
+          snapshotChildGraphFactory(getParentHandlerRegistry())(request);
         const executor = new SubagentExecutor({
           configs: new Map(
             executableConfigs.map((config) => [config.type, config])
@@ -4820,6 +4832,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           langfuse: this.langfuse,
           tokenCounter: agentContext.tokenCounter,
           usageSink: this.subagentUsageSink,
+          taskConfig: this.subagentTasks,
           streamLimits: this.streamLimits,
           humanInTheLoop: this.humanInTheLoop,
           checkpointer: this.compileOptions?.checkpointer,
@@ -4830,6 +4843,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               input,
             }),
           createChildGraphByKind: createConfiguredChildGraph,
+          createDetachedChildGraphFactory: (
+            parentHandlerRegistry
+          ): GraphFactory =>
+            snapshotChildGraphFactory(parentHandlerRegistry),
         });
         this.registerSubagentExecutor(executor);
 
@@ -4837,6 +4854,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const input = rawInput as {
             description?: string;
             subagent_type?: string;
+            run_in_background?: boolean;
           };
           const description =
             typeof input.description === 'string' &&
@@ -4869,7 +4887,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const batchScope = config.configurable?.[
             RUN_BREAKER_SCOPE_CONFIG_KEY
           ] as RunBreakerScope | undefined;
-          const result = await executor.execute({
+          const executeParams = {
             description,
             subagentType,
             threadId,
@@ -4885,9 +4903,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             parentConfigurable: config.configurable as
               | Record<string, unknown>
               | undefined,
-          });
+          };
+          if (input.run_in_background === true) {
+            return executor.executeInBackground(executeParams);
+          }
+          const result = await executor.execute(executeParams);
           return result.content;
-        }, buildSubagentToolParams(executableConfigs));
+        }, buildSubagentToolParams(executableConfigs, {
+          background: this.subagentTasks != null,
+        }));
         const replayableSubagentTool = subagentTool as typeof subagentTool &
           ReplayableSubagentTool;
         replayableSubagentTool[SUBAGENT_REPLAY_CONTROLLER] = {

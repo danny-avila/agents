@@ -27,6 +27,9 @@ const DESCRIPTION_PROP_DESCRIPTION =
 const SUBAGENT_TYPE_PROP_DESCRIPTION =
   'Which subagent type to delegate to. Must be one of the available types.';
 
+const RUN_IN_BACKGROUND_PROP_DESCRIPTION =
+  'Set true to start the subagent as a detached process-local task and return a background_task_id immediately. Poll the host background-task tool to collect its result. The task can outlive this turn but does not survive a process restart.';
+
 export const SubagentToolSchema = {
   type: 'object',
   properties: {
@@ -54,7 +57,10 @@ export const SubagentToolDefinition: LCTool = {
  * Used by `Graph.createAgentNode()` when constructing the runtime tool instance.
  * Extends `SubagentToolSchema` by populating `subagent_type.enum` dynamically.
  */
-export function buildSubagentToolParams(configs: SubagentConfig[]): {
+export function buildSubagentToolParams(
+  configs: SubagentConfig[],
+  options: { background?: boolean } = {}
+): {
   name: string;
   schema: JsonSchemaType;
   description: string;
@@ -79,10 +85,22 @@ export function buildSubagentToolParams(configs: SubagentConfig[]): {
           enum: types,
           description: `${SUBAGENT_TYPE_PROP_DESCRIPTION} Available: ${types.join(', ')}.`,
         },
+        ...(options.background === true
+          ? {
+            run_in_background: {
+              type: 'boolean',
+              description: RUN_IN_BACKGROUND_PROP_DESCRIPTION,
+            },
+          }
+          : {}),
       },
       required: ['description', 'subagent_type'],
     },
-    description: `${SubagentToolDescription}\n\nAvailable types:\n${typeDescriptions}`,
+    description: `${SubagentToolDescription}${
+      options.background === true
+        ? '\n\nBACKGROUND EXECUTION:\n- Set run_in_background to true when you do not need the result immediately. The call returns a background_task_id; use the host background-task tools to poll, steer, queue, interrupt, or cancel it.'
+        : ''
+    }\n\nAvailable types:\n${typeDescriptions}`,
   };
 }
 
