@@ -1,8 +1,24 @@
 // src/graphs/__tests__/Graph.closeRunStep.test.ts
+import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
 import type * as t from '@/types';
 import { GraphEvents, StepTypes, Providers } from '@/common';
 import { HandlerRegistry } from '@/events';
 import { StandardGraph } from '../Graph';
+
+/** The secondary dual-dispatch channel needs a real callback manager to run
+ *  for real, which these unit graphs do not have; mocking the SDK entry point
+ *  lets the tests observe whether it was reached. */
+jest.mock('@langchain/core/callbacks/dispatch', () => ({
+  dispatchCustomEvent: jest.fn(),
+}));
+
+const dispatchCustomEventMock = dispatchCustomEvent as jest.MockedFunction<
+  typeof dispatchCustomEvent
+>;
+
+beforeEach(() => {
+  dispatchCustomEventMock.mockClear();
+});
 
 const makeAgent = (agentId: string): t.AgentInputs => ({
   agentId,
@@ -284,6 +300,105 @@ describe('StandardGraph.closeUnfinishedRunSteps', () => {
       expect(step.status).toBe('cancelled');
       expect(step.cancelled_at).toBe(5_000);
     }
+  });
+
+  describe('host handler isolation', () => {
+    function createThrowingGraph(): {
+      graph: StandardGraph;
+      seen: string[];
+      } {
+      const graph = new StandardGraph({
+        runId: 'run_1',
+        agents: [makeAgent('agent')],
+      });
+      const seen: string[] = [];
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_RUN_STEP_CLOSED, {
+        handle: (_event, data): void => {
+          seen.push((data as t.RunStepClosedEvent).id);
+          throw new Error('host handler blew up');
+        },
+      });
+      graph.handlerRegistry = registry;
+      return { graph, seen };
+    }
+
+    /**
+     * The step is stamped terminal before dispatch, so a delivery failure
+     * reports on state that is already committed. Propagating would fail the
+     * whole run over an observational event — `closeOpenMessageStep` awaits
+     * this inside the stream loop on every CHAT_MODEL_END.
+     */
+    it('does not propagate a throwing host handler', async () => {
+      const { graph, seen } = createThrowingGraph();
+      const step = seedStep(graph, 'step_a');
+
+      await expect(
+        graph.closeRunStep('step_a', 'completed', { at: 2_000 })
+      ).resolves.toBe(true);
+
+      expect(seen).toEqual(['step_a']);
+      expect(step.status).toBe('completed');
+      expect(step.completed_at).toBe(2_000);
+    });
+
+    /**
+     * The hot path from `run.ts`: a rejection here sets `streamThrew` and
+     * fires the StopFailure hooks for a response that fully delivered.
+     */
+    it('does not fail the stream loop when closing the open message step', async () => {
+      const { graph, seen } = createThrowingGraph();
+      const step = seedStep(graph, 'step_msg');
+      graph.openMessageStepByAgent.set('', 'step_msg');
+
+      await expect(
+        graph.closeOpenMessageStep(undefined, 3_000)
+      ).resolves.toBeUndefined();
+
+      expect(seen).toEqual(['step_msg']);
+      expect(step.status).toBe('completed');
+    });
+
+    /**
+     * The secondary channel is the documented fallback for when the primary
+     * dispatch does not deliver, so a throwing primary must not suppress it —
+     * that would remove the redundancy exactly when it is needed.
+     */
+    it('still dispatches the secondary custom event after the handler throws', async () => {
+      const { graph } = createThrowingGraph();
+      seedStep(graph, 'step_b');
+      graph.config = { configurable: { thread_id: 'test' } };
+
+      await graph.closeRunStep('step_b', 'failed', { at: 4_000 });
+
+      expect(dispatchCustomEventMock).toHaveBeenCalledTimes(1);
+      expect(dispatchCustomEventMock).toHaveBeenCalledWith(
+        GraphEvents.ON_RUN_STEP_CLOSED,
+        expect.objectContaining({
+          id: 'step_b',
+          status: 'failed',
+          closed_at: 4_000,
+        }),
+        graph.config
+      );
+    });
+
+    /** A terminal status stays immutable even when delivery failed. */
+    it('keeps the close authoritative despite the delivery failure', async () => {
+      const { graph, seen } = createThrowingGraph();
+      const step = seedStep(graph, 'step_c');
+
+      await graph.closeRunStep('step_c', 'cancelled', { at: 5_000 });
+      const second = await graph.closeRunStep('step_c', 'completed', {
+        at: 6_000,
+      });
+
+      expect(second).toBe(false);
+      expect(seen).toEqual(['step_c']);
+      expect(step.status).toBe('cancelled');
+      expect(step.cancelled_at).toBe(5_000);
+      expect(step.completed_at).toBeUndefined();
+    });
   });
 });
 

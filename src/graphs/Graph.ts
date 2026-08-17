@@ -2024,12 +2024,36 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       GraphEvents.ON_RUN_STEP_CLOSED
     );
     if (handler) {
-      await handler.handle(
-        GraphEvents.ON_RUN_STEP_CLOSED,
-        closedEvent,
-        options?.metadata,
-        this
-      );
+      /**
+       * Isolated, unlike the other dual-dispatch sites, because this one
+       * reports state that is already committed: the step was stamped
+       * terminal and untracked above, and nothing a failed delivery can do
+       * will undo that. Propagating instead costs two things.
+       *
+       * First, it fails an entire run over an observational event —
+       * `closeOpenMessageStep` awaits this inside the stream loop on every
+       * CHAT_MODEL_END, where a rejection sets `streamThrew` and fires the
+       * StopFailure hooks for a response that was fully delivered.
+       *
+       * Second, and worse, it skips the secondary custom-event dispatch
+       * below. That channel exists precisely as the fallback for when the
+       * primary path does not deliver, so letting the primary's failure
+       * suppress it removes the redundancy exactly when it is needed.
+       *
+       * `closeUnfinishedRunSteps` and `dispatchRunStep` already wrap their
+       * own calls for the same reason; this closes the gap inside, which
+       * those wrappers cannot reach.
+       */
+      try {
+        await handler.handle(
+          GraphEvents.ON_RUN_STEP_CLOSED,
+          closedEvent,
+          options?.metadata,
+          this
+        );
+      } catch (_e) {
+        /** Host delivery failure must not fail the run or block the echo */
+      }
       this.handlerDispatchedStepIds.add(stepId);
     }
     const unmarkHandlerDispatchedEvent = handler
