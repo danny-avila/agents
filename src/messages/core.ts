@@ -671,6 +671,10 @@ type ResponsesReplayProjection = 'fallback' | 'native';
 export const OPENAI_RESPONSES_REPLAY_POSITIONS_KEY =
   '__openai_responses_replay_positions__';
 
+/** Reasoning item currently streaming, so a terminal ciphertext seals against its own id. */
+export const OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY =
+  '__openai_responses_active_reasoning_id__';
+
 export type ResponsesReplayPosition = {
   contentIndex?: number;
   itemId: string;
@@ -1813,6 +1817,7 @@ function projectPreemptedOpenAIResponsesMessage(
   }
   delete additionalKwargs.tool_outputs;
   delete additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY];
+  delete additionalKwargs[OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY];
   delete additionalKwargs.__openai_function_call_ids__;
   delete additionalKwargs.__openai_custom_tool_call_ids__;
 
