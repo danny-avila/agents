@@ -1083,6 +1083,70 @@ describe('SubagentExecutor', () => {
     expect(store.list('owner:conversation')).toEqual([]);
   });
 
+  it('reports an unavailable child thread without misclassifying it as capacity', () => {
+    class RejectingContinuationStore extends ContinuationTaskStore {
+      override start(
+        request: SubagentTaskStartRequest
+      ): SubagentTaskStartResult {
+        if (request.threadId === 'missing-child') {
+          return { accepted: false, reason: 'thread_unavailable' };
+        }
+        return super.start(request);
+      }
+    }
+    const store = new RejectingContinuationStore();
+    const result = JSON.parse(
+      createExecutor({
+        taskConfig: { store, scopeId: 'owner:conversation' },
+      }).executeInBackground({
+        description: 'Continue this child.',
+        subagentType: 'researcher',
+        subagentThreadId: 'missing-child',
+        parentToolCallId: 'call_missing_continuation',
+      })
+    ) as { status: string; message: string };
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      message:
+        'The requested subagent thread is unavailable in this parent scope. Start a new subagent thread or choose one created by this parent for the same subagent type.',
+    });
+    expect(store.list('owner:conversation')).toEqual([]);
+  });
+
+  it('cancels a continuation task when its host omits the required thread ID', async () => {
+    class InvalidContinuationStore extends ContinuationTaskStore {
+      override start(
+        request: SubagentTaskStartRequest
+      ): SubagentTaskStartResult {
+        const started = super.start(request);
+        return started.accepted
+          ? { ...started, task: { ...started.task, threadId: undefined } }
+          : started;
+      }
+    }
+    const store = new InvalidContinuationStore();
+    const result = JSON.parse(
+      createExecutor({
+        taskConfig: { store, scopeId: 'owner:conversation' },
+      }).executeInBackground({
+        description: 'Start this child.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_missing_host_thread',
+      })
+    ) as { status: string; message: string };
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      message:
+        'The host accepted the subagent task without assigning its required thread ID.',
+    });
+    await Promise.resolve();
+    expect(store.list('owner:conversation')).toEqual([
+      expect.objectContaining({ status: 'cancelled' }),
+    ]);
+  });
+
   it('returns error for unknown subagent type', async () => {
     const executor = createExecutor();
     const result = await executor.execute({

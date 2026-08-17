@@ -29,8 +29,12 @@ export interface SubagentTaskProgress {
 export interface SubagentTaskSnapshot {
   /** Handle for this child-thread execution lease within its trusted scope. */
   taskId: string;
-  /** Stable logical child-thread identity shared by fresh execution leases. */
-  threadId: string;
+  /**
+   * Stable logical thread identity shared by fresh execution leases. Required
+   * from stores that advertise `supportsThreadContinuation`; optional for
+   * legacy/process-local stores that do not expose a durable conversation.
+   */
+  threadId?: string;
   subagentType: string;
   status: SubagentTaskStatus;
   createdAt: number;
@@ -119,6 +123,7 @@ export type SubagentTaskStartResult =
       task: SubagentTaskSnapshot;
     }
   | { accepted: false; reason: 'capacity' }
+  | { accepted: false; reason: 'thread_unavailable' }
   | {
       accepted: false;
       reason: 'conflict';
