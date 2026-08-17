@@ -517,13 +517,15 @@ describe('SubagentExecutor', () => {
     });
     const invoke = jest.fn(() => invocation);
     const clearHeavyState = jest.fn();
+    let detachedGraph: StandardGraph | undefined;
     const createDetachedChildGraphFactory = jest.fn(
-      () =>
-        (): StandardGraph =>
-          ({
-            createWorkflow: () => ({ invoke }),
-            clearHeavyState,
-          }) as unknown as StandardGraph
+      () => (): StandardGraph => {
+        detachedGraph = {
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState,
+        } as unknown as StandardGraph;
+        return detachedGraph;
+      }
     );
     const fallbackFactory = jest.fn(
       (): StandardGraph =>
@@ -554,11 +556,20 @@ describe('SubagentExecutor', () => {
     expect(response.status).toBe('running');
     expect(createDetachedChildGraphFactory).toHaveBeenCalledTimes(1);
     const taskHookSessionId = `test-run:subagent-task:${response.background_task_id}`;
-    expect(hookRegistry.hasHookFor('PreToolUse', taskHookSessionId)).toBe(true);
+    await waitForTask(
+      store,
+      response.background_task_id,
+      () => invoke.mock.calls.length > 0
+    );
+    const taskHookRegistry = detachedGraph?.hookRegistry;
+    expect(taskHookRegistry).toBeDefined();
+    expect(taskHookRegistry).not.toBe(hookRegistry);
+    expect(taskHookRegistry?.hasHookFor('PreToolUse', taskHookSessionId)).toBe(
+      true
+    );
     hookRegistry.clearSession('test-run');
-    expect(hookRegistry.hasHookFor('PreToolUse', taskHookSessionId)).toBe(true);
-    await waitForTask(store, response.background_task_id, () =>
-      invoke.mock.calls.length > 0
+    expect(taskHookRegistry?.hasHookFor('PreToolUse', taskHookSessionId)).toBe(
+      true
     );
     executor.clearHeavyState();
     finish({ messages: [new AIMessage('detached result')] });
@@ -576,7 +587,7 @@ describe('SubagentExecutor', () => {
     ).toMatchObject({ status: 'claimed' });
     expect(fallbackFactory).not.toHaveBeenCalled();
     expect(clearHeavyState).toHaveBeenCalled();
-    expect(hookRegistry.hasHookFor('PreToolUse', taskHookSessionId)).toBe(false);
+    expect(hookRegistry.hasHookFor('PreToolUse', 'test-run')).toBe(false);
   });
 
   it('continues the same detached child for a queued parent message', async () => {
@@ -611,8 +622,10 @@ describe('SubagentExecutor', () => {
         parentToolCallId: 'call_queued',
       })
     ) as { background_task_id: string };
-    await waitForTask(store, response.background_task_id, () =>
-      invoke.mock.calls.length > 0
+    await waitForTask(
+      store,
+      response.background_task_id,
+      () => invoke.mock.calls.length > 0
     );
 
     expect(
@@ -645,7 +658,8 @@ describe('SubagentExecutor', () => {
 
   it('drains interrupt and steer controls through child-safe hook boundaries', async () => {
     const store = new InMemorySubagentTaskStore();
-    const hookRegistry = new HookRegistry();
+    let taskHookRegistry: HookRegistry | undefined;
+    let childGraph: StandardGraph | undefined;
     let release = (): void => undefined;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -657,10 +671,14 @@ describe('SubagentExecutor', () => {
         runnableConfig: { configurable?: Record<string, unknown> }
       ): Promise<{ messages: BaseMessage[] }> => {
         await gate;
+        taskHookRegistry = childGraph?.hookRegistry;
         const runId = runnableConfig.configurable?.run_id as string;
         expect(childInput?.preemption?.shouldPreempt()).toBe(true);
+        if (taskHookRegistry == null) {
+          throw new Error('Expected a task-local hook registry.');
+        }
         const interrupted = await executeHooks({
-          registry: hookRegistry,
+          registry: taskHookRegistry,
           input: {
             hook_event_name: 'PreemptBoundary',
             runId,
@@ -671,7 +689,7 @@ describe('SubagentExecutor', () => {
           sessionId: runId,
         });
         const steered = await executeHooks({
-          registry: hookRegistry,
+          registry: taskHookRegistry,
           input: {
             hook_event_name: 'PostToolBatch',
             runId,
@@ -693,14 +711,14 @@ describe('SubagentExecutor', () => {
       }
     );
     const executor = createExecutor({
-      hookRegistry,
       taskConfig: { store, scopeId: 'owner:conversation' },
       createChildGraph: (input): StandardGraph => {
         childInput = input;
-        return {
+        childGraph = {
           createWorkflow: () => ({ invoke }),
           clearHeavyState: jest.fn(),
         } as unknown as StandardGraph;
+        return childGraph;
       },
     });
     const response = JSON.parse(
@@ -710,8 +728,10 @@ describe('SubagentExecutor', () => {
         parentToolCallId: 'call_controlled',
       })
     ) as { background_task_id: string };
-    await waitForTask(store, response.background_task_id, () =>
-      invoke.mock.calls.length > 0
+    await waitForTask(
+      store,
+      response.background_task_id,
+      () => invoke.mock.calls.length > 0
     );
 
     store.control('owner:conversation', response.background_task_id, {
@@ -734,6 +754,66 @@ describe('SubagentExecutor', () => {
     ).toMatchObject({
       status: 'completed',
       result: 'Summarize immediately.|Include the primary source.',
+    });
+  });
+
+  it('marks ordinary detached child failures as task errors', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: makeThrowingGraphFactory(new Error('provider failed')),
+    });
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Try the provider.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_failure',
+      })
+    ) as { background_task_id: string };
+
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'error'
+    );
+
+    expect(
+      store.claim('owner:conversation', response.background_task_id)
+    ).toMatchObject({ status: 'error', error: 'provider failed' });
+  });
+
+  it('reserves recursion headroom for every detached preemption seal', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const invoke = jest.fn().mockResolvedValue({
+      messages: [new AIMessage('done')],
+    });
+    const executor = createExecutor({
+      configs: new Map([
+        [config.type, makeConfig(config.type, { maxTurns: 2 })],
+      ]),
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Finish after interrupts.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_recursion_headroom',
+      })
+    ) as { background_task_id: string };
+
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'completed'
+    );
+
+    expect(invoke.mock.calls[0][1]).toMatchObject({
+      recursionLimit: 2 * 3 + 32,
     });
   });
 
@@ -764,8 +844,10 @@ describe('SubagentExecutor', () => {
         parentToolCallId: 'call_cancelled',
       })
     ) as { background_task_id: string };
-    await waitForTask(store, response.background_task_id, () =>
-      invoke.mock.calls.length > 0
+    await waitForTask(
+      store,
+      response.background_task_id,
+      () => invoke.mock.calls.length > 0
     );
 
     expect(
@@ -778,9 +860,9 @@ describe('SubagentExecutor', () => {
       response.background_task_id,
       (status) => status === 'cancelled'
     );
-    expect(store.get('owner:conversation', response.background_task_id)).toMatchObject(
-      { status: 'cancelled' }
-    );
+    expect(
+      store.get('owner:conversation', response.background_task_id)
+    ).toMatchObject({ status: 'cancelled' });
   });
 
   it('rejects changed arguments replayed under the same parent tool call', async () => {

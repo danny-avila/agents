@@ -172,9 +172,7 @@ function snapshot(task: StoredTask): SubagentTaskSnapshot {
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     resultAvailable:
-      task.status === 'completed' &&
-      task.result != null &&
-      !task.resultClaimed,
+      task.status === 'completed' && task.result != null && !task.resultClaimed,
     resultClaimed: task.resultClaimed,
     pendingControls: task.controls.length,
     ...(task.progress == null ? {} : { progress: { ...task.progress } }),
@@ -189,9 +187,12 @@ function abortReason(signal: AbortSignal): Error {
 }
 
 /**
- * Bounded process-local task ownership for detached subagents. Hosts may
- * replace this store without changing the executor; this default deliberately
- * makes no restart or cross-replica durability claim.
+ * Bounded process-local task ownership for detached subagents. Terminal tasks
+ * keep only a bounded claimable result: the child graph, checkpoint, and full
+ * transcript are released. Hosts that need later child-chat continuation may
+ * replace this store and persist the canonical messages returned by `run`.
+ * This default deliberately makes no restart or cross-replica durability
+ * claim.
  */
 export class InMemorySubagentTaskStore implements SubagentTaskStore {
   private readonly buckets = new Map<string, TaskBucket>();
@@ -282,10 +283,15 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
     task.timeout.unref();
     const runtime = this.createRuntime(task);
     void Promise.resolve()
-      .then(() => request.run(runtime))
+      .then(() => {
+        if (task.status !== 'running' || task.controller.signal.aborted) {
+          return undefined;
+        }
+        return request.run(runtime);
+      })
       .then(
         (result) => {
-          if (task.status !== 'running') {
+          if (task.status !== 'running' || result == null) {
             return;
           }
           if (task.controller.signal.aborted) {
@@ -308,9 +314,7 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
           this.scheduleExpiry(task);
         },
         (error: unknown) => {
-          const status = task.controller.signal.aborted
-            ? 'cancelled'
-            : 'error';
+          const status = task.controller.signal.aborted ? 'cancelled' : 'error';
           this.finishWithError(task, status, error);
         }
       );
@@ -497,9 +501,7 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
     }
     bucket.tasks.delete(task.id);
     this.totalTasks -= 1;
-    if (
-      bucket.taskIdByIdempotencyKey.get(task.idempotencyKey) === task.id
-    ) {
+    if (bucket.taskIdByIdempotencyKey.get(task.idempotencyKey) === task.id) {
       bucket.taskIdByIdempotencyKey.delete(task.idempotencyKey);
     }
     if (bucket.tasks.size === 0) {

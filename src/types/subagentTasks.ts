@@ -1,3 +1,4 @@
+import type { BaseMessage } from '@langchain/core/messages';
 import type { SubagentUpdateEvent } from './graph';
 import type { InjectedMessage } from './tools';
 
@@ -26,6 +27,7 @@ export interface SubagentTaskProgress {
 }
 /** Read-only task metadata. Results are exposed only through `claim`. */
 export interface SubagentTaskSnapshot {
+  /** Handle for this child-conversation execution within its trusted scope. */
   taskId: string;
   subagentType: string;
   status: SubagentTaskStatus;
@@ -78,7 +80,15 @@ export interface SubagentTaskStartRequest {
   /** Stable hash of model-writable inputs used to reject conflicting replays. */
   requestFingerprint?: string;
   subagentType: string;
-  run(runtime: SubagentTaskRuntime): Promise<{ content: string }>;
+  /**
+   * Starts one ephemeral execution lease. The canonical child transcript is
+   * returned so a host-owned store may persist it for a later fresh run;
+   * retaining a graph/checkpoint after terminal completion is unnecessary.
+   */
+  run(runtime: SubagentTaskRuntime): Promise<{
+    content: string;
+    messages?: BaseMessage[];
+  }>;
 }
 
 export type SubagentTaskStartResult =
@@ -94,7 +104,12 @@ export type SubagentTaskStartResult =
       task: SubagentTaskSnapshot;
     };
 
-/** Host-replaceable store contract used by the SDK's subagent tool. */
+/**
+ * Host-replaceable store contract used by the SDK's subagent tool. The store
+ * should normally outlive individual `Run` instances. Durable hosts may
+ * persist the transcript returned by `run` under the task/conversation
+ * lineage and start a fresh execution for a later turn.
+ */
 export interface SubagentTaskStore {
   start(request: SubagentTaskStartRequest): SubagentTaskStartResult;
   get(scopeId: string, taskId: string): SubagentTaskSnapshot | undefined;

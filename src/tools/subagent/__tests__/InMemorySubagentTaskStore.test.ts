@@ -79,9 +79,32 @@ describe('InMemorySubagentTaskStore', () => {
     await settle();
   });
 
+  it('does not launch work cancelled before its dispatch microtask', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const run = jest.fn(async () => ({ content: 'should not run' }));
+    const started = start(store, run);
+    if (!started.accepted) {
+      throw new Error('Expected task dispatch to be accepted.');
+    }
+
+    expect(
+      store.control('user:conversation', started.task.taskId, {
+        action: 'cancel',
+      })
+    ).toMatchObject({ status: 'cancelled' });
+    await settle();
+
+    expect(run).not.toHaveBeenCalled();
+    expect(store.get('user:conversation', started.task.taskId)).toMatchObject({
+      status: 'cancelled',
+    });
+  });
+
   it('keeps scopes isolated and enforces running capacity', async () => {
     const store = new InMemorySubagentTaskStore({ maxRunningPerScope: 1 });
-    const never = async (runtime: SubagentTaskRuntime): Promise<{ content: string }> =>
+    const never = async (
+      runtime: SubagentTaskRuntime
+    ): Promise<{ content: string }> =>
       new Promise((_resolve, reject) => {
         runtime.signal.addEventListener(
           'abort',
@@ -101,7 +124,9 @@ describe('InMemorySubagentTaskStore', () => {
     if (!first.accepted || !anotherScope.accepted) {
       throw new Error('Expected tasks to be accepted.');
     }
-    expect(store.get('other-user:conversation', first.task.taskId)).toBeUndefined();
+    expect(
+      store.get('other-user:conversation', first.task.taskId)
+    ).toBeUndefined();
     expect(
       store.control('user:conversation', first.task.taskId, {
         action: 'cancel',
@@ -117,7 +142,9 @@ describe('InMemorySubagentTaskStore', () => {
 
   it('enforces total capacity across independent scopes', async () => {
     const store = new InMemorySubagentTaskStore({ maxRunningTotal: 1 });
-    const never = async (runtime: SubagentTaskRuntime): Promise<{ content: string }> =>
+    const never = async (
+      runtime: SubagentTaskRuntime
+    ): Promise<{ content: string }> =>
       new Promise((_resolve, reject) => {
         runtime.signal.addEventListener(
           'abort',
@@ -192,9 +219,9 @@ describe('InMemorySubagentTaskStore', () => {
     expect(interrupt).toMatchObject({ status: 'accepted' });
     expect(steer).toMatchObject({ status: 'accepted' });
     expect(runtime?.shouldPreempt()).toBe(true);
-    expect(runtime?.drain('preempt').map((message) => message.content)).toEqual([
-      'Stop searching and summarize now.',
-    ]);
+    expect(runtime?.drain('preempt').map((message) => message.content)).toEqual(
+      ['Stop searching and summarize now.']
+    );
     expect(runtime?.shouldPreempt()).toBe(false);
     expect(runtime?.drain('tool').map((message) => message.content)).toEqual([
       'Also check the primary source.',

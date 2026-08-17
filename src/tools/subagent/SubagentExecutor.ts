@@ -76,18 +76,17 @@ import type {
   SubagentExecutionRecord,
 } from './SubagentExecutionRegistry';
 import type {
-  AggregatedHookResult,
-  HookRegistry,
-  PostToolBatchHookOutput,
-  PreemptBoundaryHookOutput,
-  ToolApprovalReplaySnapshot,
-} from '@/hooks';
-import type {
   SubagentResumeExecution,
   SubagentResumeManifest,
   SubagentCheckpointReference,
   SettledSubagentToolOutput,
 } from './SubagentReplay';
+import type {
+  AggregatedHookResult,
+  PostToolBatchHookOutput,
+  PreemptBoundaryHookOutput,
+  ToolApprovalReplaySnapshot,
+} from '@/hooks';
 import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
 import {
@@ -105,6 +104,11 @@ import {
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from './SubagentReplay';
 import {
+  executeHooks,
+  HookRegistry,
+  TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY,
+} from '@/hooks';
+import {
   StreamLimitExceededError,
   RUN_BREAKER_SCOPE_CONFIG_KEY,
 } from '@/llm/streamLimits';
@@ -119,10 +123,6 @@ import {
   Callback,
   StepTypes,
 } from '@/common';
-import {
-  executeHooks,
-  TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY,
-} from '@/hooks';
 import {
   createChildGraphPlan,
   isGraphSubagentConfig,
@@ -817,7 +817,16 @@ export type SubagentExecuteParams = {
 export type SubagentExecuteResult = {
   content: string;
   messages: BaseMessage[];
+  /** Tagged internal failure; foreground callers retain the legacy content. */
+  error?: string;
 };
+
+function createSubagentFailure(
+  content: string,
+  error = content
+): SubagentExecuteResult {
+  return { content, messages: [], error };
+}
 
 /**
  * Factory that constructs a child graph for subagent execution. Injected
@@ -1058,10 +1067,16 @@ export class SubagentExecutor {
     if (parentToolCallId == null || parentToolCallId === '') {
       return JSON.stringify({
         status: 'rejected',
-        message: 'Background subagent execution requires a parent tool call ID.',
+        message:
+          'Background subagent execution requires a parent tool call ID.',
       });
     }
     const detachedHandlers = new HandlerRegistry();
+    const sourceHookSessionId =
+      asNonEmptyString(params.parentConfigurable?.run_id) ??
+      this.executionContext.hookSessionId;
+    const taskHookRegistry =
+      this.hookRegistry?.forkSession(sourceHookSessionId) ?? new HookRegistry();
     const toolHandler = this.getParentHandlerRegistry()?.getHandler(
       GraphEvents.ON_TOOL_EXECUTE
     );
@@ -1070,9 +1085,6 @@ export class SubagentExecutor {
     }
     const detachedGraphFactory =
       this.createDetachedChildGraphFactory?.(detachedHandlers);
-    const sourceHookSessionId =
-      asNonEmptyString(params.parentConfigurable?.run_id) ??
-      this.executionContext.hookSessionId;
     const started = this.taskConfig.store.start({
       scopeId: this.taskConfig.scopeId,
       idempotencyKey: JSON.stringify([
@@ -1090,6 +1102,7 @@ export class SubagentExecutor {
           params,
           runtime,
           detachedHandlers,
+          taskHookRegistry,
           detachedGraphFactory
         ),
     });
@@ -1106,24 +1119,15 @@ export class SubagentExecutor {
         status: 'rejected',
         tool: Constants.SUBAGENT,
         message:
-          'Too many background subagent tasks are already running in this scope. Poll or cancel an existing task, or run this call in the foreground.',
+          'Too many background subagent tasks are already running in this scope or process. Poll or cancel an existing task, or run this call in the foreground.',
       });
-    }
-    if (started.isNew) {
-      this.hookRegistry?.copySession(
-        sourceHookSessionId,
-        getBackgroundTaskHookSessionId(
-          sourceHookSessionId,
-          started.task.taskId
-        )
-      );
     }
     return JSON.stringify({
       background_task_id: started.task.taskId,
       tool: Constants.SUBAGENT,
       subagent_type: params.subagentType,
       status: started.task.status,
-      message: `Started subagent "${params.subagentType}" in the background. Poll the host background-task tool with background_task_id "${started.task.taskId}" to check progress or collect its result.`,
+      message: `${started.isNew ? 'Started' : 'Reused'} subagent "${params.subagentType}" background task. Poll the host background-task tool with background_task_id "${started.task.taskId}" to check progress or collect its result.`,
     });
   }
 
@@ -1131,6 +1135,7 @@ export class SubagentExecutor {
     params: SubagentExecuteParams,
     runtime: SubagentTaskRuntime,
     detachedHandlers: HandlerRegistry,
+    taskHookRegistry: HookRegistry,
     detachedGraphFactory?: GraphFactory
   ): Promise<SubagentExecuteResult> {
     const sourceHookSessionId =
@@ -1141,25 +1146,22 @@ export class SubagentExecutor {
       runtime.taskId
     );
     const unregisterHooks: Array<() => void> = [];
-    if (this.hookRegistry != null) {
-      this.hookRegistry.copySession(sourceHookSessionId, taskHookSessionId);
-      unregisterHooks.push(
-        this.hookRegistry.registerSession(taskHookSessionId, 'PostToolBatch', {
-          hooks: [
-            (): PostToolBatchHookOutput => ({
-              injectedMessages: runtime.drain('tool'),
-            }),
-          ],
-        }),
-        this.hookRegistry.registerSession(taskHookSessionId, 'PreemptBoundary', {
-          hooks: [
-            (): PreemptBoundaryHookOutput => ({
-              injectedMessages: runtime.drain('preempt'),
-            }),
-          ],
-        })
-      );
-    }
+    unregisterHooks.push(
+      taskHookRegistry.registerSession(taskHookSessionId, 'PostToolBatch', {
+        hooks: [
+          (): PostToolBatchHookOutput => ({
+            injectedMessages: runtime.drain('tool'),
+          }),
+        ],
+      }),
+      taskHookRegistry.registerSession(taskHookSessionId, 'PreemptBoundary', {
+        hooks: [
+          (): PreemptBoundaryHookOutput => ({
+            injectedMessages: runtime.drain('preempt'),
+          }),
+        ],
+      })
+    );
 
     detachedHandlers.register(GraphEvents.ON_SUBAGENT_UPDATE, {
       handle: (_event, data): void => {
@@ -1170,7 +1172,7 @@ export class SubagentExecutor {
     const detached = new SubagentExecutor({
       configs: this.configs,
       parentSignal: runtime.signal,
-      hookRegistry: this.hookRegistry,
+      hookRegistry: taskHookRegistry,
       parentHandlerRegistry: detachedHandlers,
       parentRunId: this.parentRunId,
       parentAgentId: this.parentAgentId,
@@ -1208,13 +1210,16 @@ export class SubagentExecutor {
           ? runtime.signal.reason
           : new Error('Detached subagent task cancelled.');
       }
+      if (result.error != null) {
+        throw new Error(result.error);
+      }
       return result;
     } finally {
       detached.clearHeavyState();
       for (const unregister of unregisterHooks) {
         unregister();
       }
-      this.hookRegistry?.clearSession(taskHookSessionId);
+      taskHookRegistry.clearSession(taskHookSessionId);
     }
   }
 
@@ -2179,36 +2184,38 @@ export class SubagentExecutor {
     const executableConfig = this.configs.get(params.subagentType);
     if (executableConfig == null) {
       const available = [...this.configs.keys()].join(', ');
-      return Promise.resolve({
-        content: `Error: Unknown subagent type "${params.subagentType}". Available types: ${available}`,
-        messages: [],
-      });
+      return Promise.resolve(
+        createSubagentFailure(
+          `Error: Unknown subagent type "${params.subagentType}". Available types: ${available}`
+        )
+      );
     }
     if (this.maxDepth <= 0) {
-      return Promise.resolve({
-        content: 'Error: Maximum subagent nesting depth exceeded.',
-        messages: [],
-      });
+      return Promise.resolve(
+        createSubagentFailure(
+          'Error: Maximum subagent nesting depth exceeded.'
+        )
+      );
     }
     if (
       isGraphSubagentConfig(executableConfig) &&
       this.humanInTheLoop?.enabled === true
     ) {
-      return Promise.resolve({
-        content:
-          'Error: Human-in-the-loop execution is not yet supported for graph subagents.',
-        messages: [],
-      });
+      return Promise.resolve(
+        createSubagentFailure(
+          'Error: Human-in-the-loop execution is not yet supported for graph subagents.'
+        )
+      );
     }
     if (
       this.humanInTheLoop?.enabled === true &&
       (params.parentToolCallId == null || params.parentToolCallId === '')
     ) {
-      return Promise.resolve({
-        content:
-          'Error: Resumable subagent execution requires a parent tool call ID.',
-        messages: [],
-      });
+      return Promise.resolve(
+        createSubagentFailure(
+          'Error: Resumable subagent execution requires a parent tool call ID.'
+        )
+      );
     }
     const execution = this.executions.open({
       threadId: params.threadId,
@@ -2228,16 +2235,14 @@ export class SubagentExecutor {
       );
     } catch (error) {
       if (error instanceof SubagentDefinitionBindingError) {
-        return Promise.resolve({
-          content: SUBAGENT_CONFIG_CHANGED_MESSAGE,
-          messages: [],
-        });
+        return Promise.resolve(
+          createSubagentFailure(SUBAGENT_CONFIG_CHANGED_MESSAGE)
+        );
       }
       if (error instanceof SubagentInvocationBindingError) {
-        return Promise.resolve({
-          content: SUBAGENT_INVOCATION_CHANGED_MESSAGE,
-          messages: [],
-        });
+        return Promise.resolve(
+          createSubagentFailure(SUBAGENT_INVOCATION_CHANGED_MESSAGE)
+        );
       }
       throw error;
     }
@@ -2269,10 +2274,7 @@ export class SubagentExecutor {
       )
     ) {
       this.executions.remove(execution);
-      return {
-        content: SUBAGENT_CONFIG_CHANGED_MESSAGE,
-        messages: [],
-      };
+      return createSubagentFailure(SUBAGENT_CONFIG_CHANGED_MESSAGE);
     }
     let identity: SubagentExecutionIdentity;
     try {
@@ -2282,10 +2284,7 @@ export class SubagentExecutor {
       if (error instanceof StreamLimitExceededError) {
         throw error;
       }
-      return {
-        content: SUBAGENT_RESOLUTION_ERROR_MESSAGE,
-        messages: [],
-      };
+      return createSubagentFailure(SUBAGENT_RESOLUTION_ERROR_MESSAGE);
     }
     const { childRunId, childThreadId, approvalExecutionScope } = identity;
     const bound = this.bindExecutionDefinition(
@@ -2299,7 +2298,7 @@ export class SubagentExecutor {
       'effective'
     );
     if (!bound) {
-      return { content: SUBAGENT_CONFIG_CHANGED_MESSAGE, messages: [] };
+      return createSubagentFailure(SUBAGENT_CONFIG_CHANGED_MESSAGE);
     }
     const completedChildResult = execution.completedResult;
     if (completedChildResult != null) {
@@ -2320,10 +2319,7 @@ export class SubagentExecutor {
       if (error instanceof StreamLimitExceededError) {
         throw error;
       }
-      return {
-        content: SUBAGENT_RESOLUTION_ERROR_MESSAGE,
-        messages: [],
-      };
+      return createSubagentFailure(SUBAGENT_RESOLUTION_ERROR_MESSAGE);
     }
 
     const parentRegistry = this.getParentHandlerRegistry();
@@ -2372,7 +2368,8 @@ export class SubagentExecutor {
     const memberRecursionLimit = maxTurns * SUBAGENT_RECURSION_MULTIPLIER;
     const recursionLimit =
       memberRecursionLimit *
-      (childPlan.kind === 'graph' ? childPlan.agents.length : 1);
+        (childPlan.kind === 'graph' ? childPlan.agents.length : 1) +
+      (params.taskRuntime == null ? 0 : MAX_BACKGROUND_SUBAGENT_SEALS);
 
     const hostUsageSink = this.usageSink;
     let subagentUsageSink: SubagentUsageSink | undefined;
@@ -2415,11 +2412,9 @@ export class SubagentExecutor {
     let childGraph = cachedChildRun?.graph;
     if (childGraph == null && childPlan.kind === 'graph') {
       if (this.createChildGraphByKind == null) {
-        return {
-          content:
-            'Error: Graph subagent execution requires a polymorphic child graph factory.',
-          messages: [],
-        };
+        return createSubagentFailure(
+          'Error: Graph subagent execution requires a polymorphic child graph factory.'
+        );
       }
       childGraph = this.createChildGraphByKind({
         kind: 'multi-agent',
@@ -2432,6 +2427,9 @@ export class SubagentExecutor {
       });
     }
     childGraph ??= this.createChildGraph(childGraphInput);
+    if (params.taskRuntime != null) {
+      childGraph.hookRegistry = this.hookRegistry;
+    }
     if (cachedChildRun == null) {
       seedChildGraphSessions(childGraph, childPlan.agents);
     }
@@ -2804,10 +2802,10 @@ export class SubagentExecutor {
       if (error instanceof StreamLimitExceededError) {
         throw error;
       }
-      return {
-        content: `Subagent error: ${errorMessage}`,
-        messages: [],
-      };
+      return createSubagentFailure(
+        `Subagent error: ${errorMessage}`,
+        errorMessage
+      );
     }
 
     /**

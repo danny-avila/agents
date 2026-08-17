@@ -6,6 +6,7 @@ import type {
   ToolApprovalReplaySnapshot,
   AggregatedHookResult,
 } from './types';
+import { HOOK_EVENTS } from './types';
 
 function serializeApprovalKey(key: ToolApprovalReplayKey): string {
   return JSON.stringify([key.executionScope, key.agentId, key.toolUseId]);
@@ -225,6 +226,23 @@ export class HookRegistry {
         targetPending.set(toolUseId, result);
       }
     }
+  }
+
+  /**
+   * Takes an isolated policy snapshot for work that may outlive the source
+   * run. Global and source-session matchers become global to the returned
+   * task-local registry, so parent cleanup and one-shot hook consumption
+   * cannot mutate the detached child (or vice versa). Runtime halt signals
+   * and pending approvals are intentionally not copied.
+   */
+  forkSession(sourceSessionId: string): HookRegistry {
+    const fork = new HookRegistry();
+    for (const event of HOOK_EVENTS) {
+      for (const matcher of this.getMatchers(event, sourceSessionId)) {
+        fork.register(event, matcher);
+      }
+    }
+    return fork;
   }
 
   getPendingToolApproval(
