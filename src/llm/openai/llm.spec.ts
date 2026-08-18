@@ -1094,7 +1094,80 @@ describe('ChatOpenAICompletions streaming usage_metadata callback', () => {
   });
 });
 
-describe('ChatOpenAIResponses streaming callback dispatch', () => {
+describe('ChatOpenAIResponses streaming', () => {
+  it('propagates response.failed provider errors', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = responsesOf<ResponsesStreamDelegate>(model);
+    const providerError = {
+      type: 'service_unavailable_error',
+      code: 'server_is_overloaded',
+      message: 'Our servers are currently overloaded. Please try again later.',
+      param: null,
+    };
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield {
+          type: 'response.failed',
+          sequence_number: 0,
+          response: {
+            id: 'resp_failed',
+            status: 'failed',
+            error: providerError,
+          },
+        } as OpenAIClient.Responses.ResponseStreamEvent;
+      })();
+
+    const stream = responses._streamResponseChunks(
+      [new HumanMessage('test')],
+      {}
+    );
+
+    await expect(stream.next()).rejects.toMatchObject({
+      message: providerError.message,
+      error: providerError,
+      type: providerError.type,
+      code: providerError.code,
+      param: providerError.param,
+    });
+  });
+
+  it('propagates Responses error events', async () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+    });
+    const responses = responsesOf<ResponsesStreamDelegate>(model);
+    const errorEvent: OpenAIClient.Responses.ResponseErrorEvent = {
+      type: 'error',
+      sequence_number: 0,
+      code: 'server_error',
+      message: 'The provider terminated the stream.',
+      param: null,
+    };
+    responses.completionWithRetry = async () =>
+      (async function* () {
+        yield errorEvent;
+      })();
+
+    const stream = responses._streamResponseChunks(
+      [new HumanMessage('test')],
+      {}
+    );
+
+    await expect(stream.next()).rejects.toMatchObject({
+      message: errorEvent.message,
+      error: errorEvent,
+      type: errorEvent.type,
+      code: errorEvent.code,
+      param: errorEvent.param,
+    });
+  });
+
   it('emits the callback before a consumer stops at the yielded chunk', async () => {
     const model = new ChatOpenAI({
       model: 'gpt-5',
