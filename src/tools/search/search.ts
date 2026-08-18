@@ -7,6 +7,9 @@ import { createTavilyAPI } from './tavily-search';
 import { createCrwAPI } from './crw-search';
 import { BaseReranker } from './rerankers';
 
+/** Engines queried when `searxngSearchOptions.engines` is not configured. */
+const DEFAULT_SEARXNG_ENGINES = 'google,bing,duckduckgo';
+
 const chunker = {
   cleanText: (text: string): string => {
     if (!text) return '';
@@ -284,15 +287,20 @@ const createSerperAPI = (
 const createSearXNGAPI = (
   instanceUrl?: string,
   apiKey?: string,
-  agents?: t.HttpAgentConfig
+  options?: t.SearxNGSearchOptions
 ): {
   getSources: (params: t.GetSourcesParams) => Promise<t.SearchResult>;
 } => {
+  const engines = options?.engines?.trim();
+  const language = options?.language?.trim();
   const config = {
     instanceUrl: instanceUrl ?? process.env.SEARXNG_INSTANCE_URL,
     apiKey: apiKey ?? process.env.SEARXNG_API_KEY,
-    defaultLocation: 'all',
-    timeout: 10000,
+    engines:
+      engines != null && engines !== '' ? engines : DEFAULT_SEARXNG_ENGINES,
+    language: language != null && language !== '' ? language : 'all',
+    timeRange: options?.timeRange,
+    timeout: options?.timeout ?? 10000,
   };
 
   if (config.instanceUrl == null || config.instanceUrl === '') {
@@ -336,10 +344,14 @@ const createSearXNGAPI = (
         format: 'json',
         pageno: 1,
         categories: category,
-        language: 'all',
+        language: config.language,
         safesearch: safeSearch,
-        engines: 'google,bing,duckduckgo',
+        engines: config.engines,
       };
+
+      if (config.timeRange != null) {
+        params.time_range = config.timeRange;
+      }
 
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -353,8 +365,8 @@ const createSearXNGAPI = (
         headers,
         params,
         timeout: config.timeout,
-        httpAgent: agents?.httpAgent,
-        httpsAgent: agents?.httpsAgent,
+        httpAgent: options?.httpAgent,
+        httpsAgent: options?.httpsAgent,
       });
 
       const data = response.data;
@@ -490,6 +502,7 @@ export const createSearchAPI = (
     serperApiKey,
     searxngInstanceUrl,
     searxngApiKey,
+    searxngSearchOptions,
     tavilyApiKey,
     tavilySearchUrl,
     tavilySearchOptions,
@@ -508,7 +521,11 @@ export const createSearchAPI = (
   if (searchProvider.toLowerCase() === 'serper') {
     return createSerperAPI(serperApiKey, agents);
   } else if (searchProvider.toLowerCase() === 'searxng') {
-    return createSearXNGAPI(searxngInstanceUrl, searxngApiKey, agents);
+    return createSearXNGAPI(searxngInstanceUrl, searxngApiKey, {
+      ...searxngSearchOptions,
+      httpAgent: httpAgent ?? searxngSearchOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? searxngSearchOptions?.httpsAgent,
+    });
   } else if (searchProvider.toLowerCase() === 'tavily') {
     return createTavilyAPI(tavilyApiKey, tavilySearchUrl, {
       ...tavilySearchOptions,

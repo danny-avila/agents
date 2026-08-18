@@ -181,11 +181,27 @@ export interface CrwSearchResponse {
   error_code?: string;
 }
 
+export interface SearxNGSearchOptions extends HttpAgentConfig {
+  /**
+   * Comma-separated list of engines to query, e.g. "google,bing,startpage".
+   * Defaults to "google,bing,duckduckgo". Engines not enabled on the target
+   * instance are ignored by SearXNG.
+   */
+  engines?: string;
+  /** Code of the language for search results. Defaults to "all". */
+  language?: string;
+  /** Time range filter, sent to SearXNG as `time_range`. Omitted when unset. */
+  timeRange?: SearxNGSearchPayload['time_range'];
+  /** HTTP request timeout in ms. Defaults to 10000. */
+  timeout?: number;
+}
+
 export interface SearchConfig extends HttpAgentConfig {
   searchProvider?: SearchProvider;
   serperApiKey?: string;
   searxngInstanceUrl?: string;
   searxngApiKey?: string;
+  searxngSearchOptions?: SearxNGSearchOptions;
   tavilyApiKey?: string;
   tavilySearchUrl?: string;
   tavilyExtractUrl?: string;
