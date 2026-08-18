@@ -120,6 +120,10 @@ const MAX_STRUCTURED_TOKENIZATION_CHARS = 200_000;
 /** One UTF-16 character can encode to several tokenizer pieces. */
 const MAX_TOKENS_PER_OMITTED_STRUCTURED_CHAR = 4;
 const MAX_STRUCTURED_SAFETY_INSPECTION_WORK = 10_000;
+/** Bounds BPE work per plain-text segment without omitting any text. */
+const MAX_TEXT_TOKENIZATION_CHARS = 8_192;
+/** Covers tokenizer segmentation changes on both sides of a chunk boundary. */
+const TEXT_TOKEN_CHUNK_BOUNDARY_SAFETY_TOKENS = 4;
 
 /**
  * Extracts image dimensions from the first bytes of a base64-encoded
@@ -886,22 +890,24 @@ function getBoundedTextTokenCount(
   value: string,
   getTokenCount: (text: string) => number
 ): number {
-  const preview =
-    value.length > MAX_STRUCTURED_TOKENIZATION_CHARS
-      ? value.slice(0, MAX_STRUCTURED_TOKENIZATION_CHARS)
-      : value;
-  const previewTokens = ensureSafeTokenMeasurement(
-    getTokenCount(preview),
-    'tokenizer'
-  );
-  const omittedChars = value.length - preview.length;
-  if (omittedChars <= 0) {
-    return previewTokens;
+  let numTokens = 0;
+  for (
+    let offset = 0;
+    offset < value.length;
+    offset += MAX_TEXT_TOKENIZATION_CHARS
+  ) {
+    const chunkTokens = ensureSafeTokenMeasurement(
+      getTokenCount(value.slice(offset, offset + MAX_TEXT_TOKENIZATION_CHARS)),
+      'tokenizer'
+    );
+    const boundaryTokens =
+      offset > 0 ? TEXT_TOKEN_CHUNK_BOUNDARY_SAFETY_TOKENS : 0;
+    numTokens = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      numTokens + chunkTokens + boundaryTokens
+    );
   }
-  return Math.min(
-    Number.MAX_SAFE_INTEGER,
-    previewTokens + omittedChars * MAX_TOKENS_PER_OMITTED_STRUCTURED_CHAR
-  );
+  return numTokens;
 }
 
 function getBoundedStructuredTokenCount(
