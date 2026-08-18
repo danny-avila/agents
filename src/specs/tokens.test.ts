@@ -1,7 +1,10 @@
+import { Tokenizer } from 'ai-tokenizer';
+import * as claudeEncoding from 'ai-tokenizer/encoding/claude';
 import {
   AIMessage,
   ChatMessage,
   HumanMessage,
+  SystemMessage,
   ToolMessage,
 } from '@langchain/core/messages';
 import {
@@ -124,17 +127,83 @@ describe('getTokenCountForMessage', () => {
       getType: () => 'ai',
     }) as unknown as AIMessage;
 
-  test('bounds direct message strings before tokenization and charges omitted characters', () => {
-    const callbackLengths: number[] = [];
-    const content = 'x'.repeat(300_000);
+  test('counts long plain-text messages close to the real Claude tokenizer result', () => {
+    const tokenizer = new Tokenizer(claudeEncoding);
+    const phrase = 'The quick brown fox jumps over the lazy dog. ';
+    const content = phrase
+      .repeat(Math.ceil(361_473 / phrase.length))
+      .slice(0, 361_473);
+    const exactCount = tokenizer.count(content) + 3;
 
-    const count = getTokenCountForMessage(new HumanMessage(content), (text) => {
-      callbackLengths.push(text.length);
-      return text.length;
-    });
+    const count = getTokenCountForMessage(
+      new HumanMessage(content),
+      (text) => tokenizer.count(text),
+      'claude'
+    );
 
-    expect(Math.max(...callbackLengths)).toBe(200_000);
-    expect(count).toBe(600_003);
+    expect(count).toBeGreaterThanOrEqual(exactCount);
+    expect(count / exactCount).toBeLessThan(1.005);
+  });
+
+  test('counts a high-density suffix instead of extrapolating from low-density text', () => {
+    const tokenizer = new Tokenizer(claudeEncoding);
+    const phrase = 'The quick brown fox jumps over the lazy dog. ';
+    const prose = phrase
+      .repeat(Math.ceil(200_000 / phrase.length))
+      .slice(0, 200_000);
+    const content = `${prose}${'😀'.repeat(8_000)}`;
+    const exactCount = tokenizer.count(content) + 3;
+
+    const count = getTokenCountForMessage(
+      new HumanMessage(content),
+      (text) => tokenizer.count(text),
+      'claude'
+    );
+
+    expect(count).toBeGreaterThanOrEqual(exactCount);
+    expect(count / exactCount).toBeLessThan(1.005);
+  });
+
+  test('stays conservative when a chunk boundary changes tokenizer segmentation', () => {
+    const tokenizer = new Tokenizer(claudeEncoding);
+    const boundaryPrefix = '\n\n \n\n ';
+    const boundarySuffix = '😀é a0é0漢,\n0.AAaA,Aééé0\n.😀.A😀,.aéa';
+    const padding = 'word '
+      .repeat(2_000)
+      .slice(0, 8_192 - boundaryPrefix.length);
+    const content = `${padding}${boundaryPrefix}${boundarySuffix}`;
+    const exactCount = tokenizer.count(content) + 3;
+
+    const count = getTokenCountForMessage(
+      new HumanMessage(content),
+      (text) => tokenizer.count(text),
+      'claude'
+    );
+
+    expect(count).toBeGreaterThanOrEqual(exactCount);
+  });
+
+  test('keeps long instruction counts stable across prompt-cache placement', () => {
+    const tokenizer = new Tokenizer(claudeEncoding);
+    const phrase = 'The quick brown fox jumps over the lazy dog. ';
+    const stable = phrase
+      .repeat(Math.ceil(118_315 / phrase.length))
+      .slice(0, 118_315);
+    const dynamic = phrase
+      .repeat(Math.ceil(361_473 / phrase.length))
+      .slice(0, 361_473);
+    const count = (message: HumanMessage | SystemMessage): number =>
+      getTokenCountForMessage(
+        message,
+        (text) => tokenizer.count(text),
+        'claude'
+      );
+
+    const splitCount =
+      count(new SystemMessage(stable)) + count(new HumanMessage(dynamic));
+    const joinedCount = count(new SystemMessage(`${stable}\n\n${dynamic}`));
+
+    expect(Math.abs(splitCount - joinedCount)).toBeLessThanOrEqual(100);
   });
 
   test.each([
@@ -153,7 +222,7 @@ describe('getTokenCountForMessage', () => {
     ).toThrow(UnsafeTokenMeasurementError);
   });
 
-  test('bounds direct string tool args before tokenization and charges omitted characters', () => {
+  test('bounds tokenizer input while fully counting direct string tool args', () => {
     const callbackLengths: number[] = [];
     const args = 'x'.repeat(300_000);
 
@@ -162,7 +231,7 @@ describe('getTokenCountForMessage', () => {
       return text.length;
     });
 
-    expect(Math.max(...callbackLengths)).toBe(200_000);
+    expect(Math.max(...callbackLengths)).toBe(8_192);
     expect(count).toBeGreaterThan(args.length);
   });
 
@@ -317,9 +386,9 @@ describe('getTokenCountForMessage', () => {
       getType: () => 'tool',
     } as unknown as ToolMessage;
 
-    expect(() => getTokenCountForMessage(message, (text) => text.length)).toThrow(
-      UnsafeTokenMeasurementError
-    );
+    expect(() =>
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toThrow(UnsafeTokenMeasurementError);
     try {
       getTokenCountForMessage(message, (text) => text.length);
     } catch (error) {
