@@ -16,7 +16,7 @@ import { isPresent } from '@/utils/misc';
  *
  * - Foreign spans (a host's own OpenTelemetry instrumentation, e.g. HTTP
  *   server spans on the global provider) are never exported to Langfuse —
- *   inheriting one orphans the trace root (its root/trace input-output
+ *   inheriting one orphans the trace root (its root-observation input/output
  *   shaping is skipped), collapses concurrent runs inside one request
  *   context into a single merged trace, and bypasses the seeded
  *   deterministic trace id generator.

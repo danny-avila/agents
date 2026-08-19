@@ -1037,22 +1037,21 @@ describe('Langfuse tool output tracing redaction', () => {
 
     prepareLangfuseSpanForExport(span, createConfig({ enabled: false }));
 
-    for (const key of [
-      LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT,
-      LangfuseOtelSpanAttributes.TRACE_OUTPUT,
-    ]) {
-      const output = span.attributes[key] as string;
-      expect(output).toContain('Partial answer.');
-      expect(output).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
-      expect(output).not.toContain(rootSecret);
-    }
+    const output = span.attributes[
+      LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT
+    ] as string;
+    expect(output).toContain('Partial answer.');
+    expect(output).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+    expect(output).not.toContain(rootSecret);
+    expect(span.attributes['langfuse.trace.output']).toBeUndefined();
   });
 
-  it('redacts a root tool output before deriving trace output', () => {
+  it('redacts a root tool output without deriving deprecated trace output', () => {
     const rootSecret = 'private root tool result';
     const span = createSpan('shell', {
       [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
       [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: rootSecret,
+      'langfuse.trace.output': rootSecret,
     });
 
     prepareLangfuseSpanForExport(span, createConfig({ enabled: false }));
@@ -1060,9 +1059,7 @@ describe('Langfuse tool output tracing redaction', () => {
     expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]).toBe(
       LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
     );
-    expect(span.attributes[LangfuseOtelSpanAttributes.TRACE_OUTPUT]).toBe(
-      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
-    );
+    expect(span.attributes['langfuse.trace.output']).toBeUndefined();
     expect(JSON.stringify(span.attributes)).not.toContain(rootSecret);
   });
 

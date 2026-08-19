@@ -779,8 +779,6 @@ export function redactLangfuseSpanToolOutputs(
   for (const key of [
     LangfuseOtelSpanAttributes.OBSERVATION_INPUT,
     LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT,
-    LangfuseOtelSpanAttributes.TRACE_INPUT,
-    LangfuseOtelSpanAttributes.TRACE_OUTPUT,
   ]) {
     redactAttribute(attributes, key, config);
   }

@@ -27,23 +27,30 @@ type LangfuseMetadata = {
 
 type LangfuseObservation = {
   id: string;
+  traceId: string | null;
   parentObservationId?: string | null;
   type: string;
-  name: string;
-  model?: string | null;
-  usage?: { input?: number; output?: number; total?: number };
+  name?: string | null;
+  traceName?: string | null;
+  tags?: string[];
+  metadata?: LangfuseMetadata;
+  input?: unknown;
+  output?: unknown;
+  providedModelName?: string | null;
+  usageDetails?: Record<string, number>;
 };
 
 type LangfuseTrace = {
   id: string;
-  name: string;
+  name?: string | null;
   tags?: string[];
   metadata?: LangfuseMetadata;
-  observations?: LangfuseObservation[];
+  observations: LangfuseObservation[];
 };
 
-type LangfuseTraceList = {
-  data: LangfuseTrace[];
+type LangfuseObservationList = {
+  data: LangfuseObservation[];
+  meta?: { cursor?: string | null };
 };
 
 const shouldRunLive =
@@ -77,15 +84,44 @@ async function getJson<T>(path: string): Promise<T> {
   return (await response.json()) as T;
 }
 
-async function getJsonIfPresent<T>(path: string): Promise<T | undefined> {
-  const response = await requestLangfuse(path);
-  if (response.status === 404) {
-    return undefined;
+async function listObservations(query: URLSearchParams): Promise<LangfuseObservation[]> {
+  const observations: LangfuseObservation[] = [];
+  let cursor: string | undefined;
+  do {
+    if (cursor != null) {
+      query.set('cursor', cursor);
+    }
+    const page = await getJson<LangfuseObservationList>(
+      `/api/public/v2/observations?${query.toString()}`
+    );
+    observations.push(...page.data);
+    cursor = page.meta?.cursor ?? undefined;
+  } while (cursor != null);
+  return observations;
+}
+
+function groupObservationsByTrace(
+  observations: LangfuseObservation[]
+): LangfuseTrace[] {
+  const traces = new Map<string, LangfuseTrace>();
+  for (const observation of observations) {
+    if (observation.traceId == null) {
+      continue;
+    }
+    const existing = traces.get(observation.traceId);
+    if (existing != null) {
+      existing.observations.push(observation);
+      continue;
+    }
+    traces.set(observation.traceId, {
+      id: observation.traceId,
+      name: observation.traceName,
+      tags: observation.tags,
+      metadata: observation.metadata,
+      observations: [observation],
+    });
   }
-  if (!response.ok) {
-    throw new Error(`Langfuse request failed: ${response.status}`);
-  }
-  return (await response.json()) as T;
+  return [...traces.values()];
 }
 
 async function findExportedTraces(
@@ -97,14 +133,16 @@ async function findExportedTraces(
   reasoning: LangfuseTrace;
 }> {
   const query = new URLSearchParams({
-    limit: '100',
-    fromTimestamp,
+    limit: '1000',
+    fields: 'core,basic,io,metadata,model,usage,trace_context',
+    fromStartTime: fromTimestamp,
   });
   for (let attempt = 0; attempt < 20; attempt += 1) {
-    const list = await getJson<LangfuseTraceList>(
-      `/api/public/traces?${query.toString()}`
-    );
-    const candidates = list.data.filter(
+    query.set('toStartTime', new Date(Date.now() + 60_000).toISOString());
+    query.delete('cursor');
+    const candidates = groupObservationsByTrace(
+      await listObservations(query)
+    ).filter(
       (trace) => trace.metadata?.sourceRunId === sourceRunId
     );
     const labelSummary = candidates.find(
@@ -121,44 +159,30 @@ async function findExportedTraces(
       phaseSummary != null &&
       reasoningSummary != null
     ) {
-      const [label, phase, reasoning] = await Promise.all([
-        getJsonIfPresent<LangfuseTrace>(
-          `/api/public/traces/${labelSummary.id}`
-        ),
-        getJsonIfPresent<LangfuseTrace>(
-          `/api/public/traces/${phaseSummary.id}`
-        ),
-        getJsonIfPresent<LangfuseTrace>(
-          `/api/public/traces/${reasoningSummary.id}`
-        ),
-      ]);
-      if (label != null && phase != null && reasoning != null) {
-        const labelReady =
-          label.observations?.some(
-            (observation) => observation.type === 'GENERATION'
-          ) === true;
-        const phaseRootReady =
-          phase.observations?.some(
-            (observation) =>
-              observation.parentObservationId == null &&
-              observation.type === 'CHAIN'
-          ) === true;
-        const phaseGenerationReady =
-          phase.observations?.some(
-            (observation) => observation.type === 'GENERATION'
-          ) === true;
-        const reasoningReady =
-          reasoning.observations?.some(
-            (observation) => observation.type === 'GENERATION'
-          ) === true;
-        if (
-          labelReady &&
-          phaseRootReady &&
-          phaseGenerationReady &&
-          reasoningReady
-        ) {
-          return { label, phase, reasoning };
-        }
+      const labelReady = labelSummary.observations.some(
+        (observation) => observation.type === 'GENERATION'
+      );
+      const phaseRootReady = phaseSummary.observations.some(
+        (observation) =>
+          observation.parentObservationId == null && observation.type === 'SPAN'
+      );
+      const phaseGenerationReady = phaseSummary.observations.some(
+        (observation) => observation.type === 'GENERATION'
+      );
+      const reasoningReady = reasoningSummary.observations.some(
+        (observation) => observation.type === 'GENERATION'
+      );
+      if (
+        labelReady &&
+        phaseRootReady &&
+        phaseGenerationReady &&
+        reasoningReady
+      ) {
+        return {
+          label: labelSummary,
+          phase: phaseSummary,
+          reasoning: reasoningSummary,
+        };
       }
     }
     await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -169,7 +193,7 @@ async function findExportedTraces(
 describeIfLive('activity label Langfuse export (live)', () => {
   jest.setTimeout(120_000);
 
-  it('exports stable, correlated traces with correct observation types', async () => {
+  it('exports stable, correlated traces with the expected observation hierarchy', async () => {
     const startedAt = new Date(Date.now() - 5000).toISOString();
     const sourceRunId = `activity-label-live-${Date.now()}`;
     const sessionId = `${sourceRunId}-session`;
@@ -284,41 +308,57 @@ describeIfLive('activity label Langfuse export (live)', () => {
       },
     });
 
-    const labelGeneration = label.observations?.find(
+    for (const [trace, tag] of [
+      [label, 'activity-label'],
+      [phase, 'activity-phase'],
+      [reasoning, 'reasoning-label'],
+    ] as const) {
+      for (const observation of trace.observations) {
+        expect(observation.metadata).toMatchObject({ sourceRunId });
+        expect(observation.tags).toContain(tag);
+      }
+      const root = trace.observations.find(
+        (observation) => observation.parentObservationId == null
+      );
+      expect(root?.input).toBeDefined();
+      expect(root?.output).toBeDefined();
+    }
+
+    const labelGeneration = label.observations.find(
       (observation) => observation.type === 'GENERATION'
     );
     expect(labelGeneration).toMatchObject({
       parentObservationId: null,
       name: 'llm',
-      model: expect.stringContaining(model),
+      providedModelName: expect.stringContaining(model),
     });
-    expect(labelGeneration?.usage?.total).toBeGreaterThan(0);
+    expect(labelGeneration?.usageDetails?.total).toBeGreaterThan(0);
 
-    const phaseRoot = phase.observations?.find(
+    const phaseRoot = phase.observations.find(
       (observation) => observation.parentObservationId == null
     );
     expect(phaseRoot).toMatchObject({
-      type: 'CHAIN',
+      type: 'SPAN',
       name: 'summarize-activity-phase',
     });
-    const phaseGeneration = phase.observations?.find(
+    const phaseGeneration = phase.observations.find(
       (observation) => observation.type === 'GENERATION'
     );
     expect(phaseGeneration).toMatchObject({
       parentObservationId: phaseRoot?.id,
       name: 'llm',
-      model: expect.stringContaining(model),
+      providedModelName: expect.stringContaining(model),
     });
-    expect(phaseGeneration?.usage?.total).toBeGreaterThan(0);
+    expect(phaseGeneration?.usageDetails?.total).toBeGreaterThan(0);
 
-    const reasoningGeneration = reasoning.observations?.find(
+    const reasoningGeneration = reasoning.observations.find(
       (observation) => observation.type === 'GENERATION'
     );
     expect(reasoningGeneration).toMatchObject({
       parentObservationId: null,
       name: 'llm',
-      model: expect.stringContaining(model),
+      providedModelName: expect.stringContaining(model),
     });
-    expect(reasoningGeneration?.usage?.total).toBeGreaterThan(0);
+    expect(reasoningGeneration?.usageDetails?.total).toBeGreaterThan(0);
   });
 });
