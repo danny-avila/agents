@@ -3,6 +3,8 @@ import type * as t from '@/types';
 import {
   getLangfuseSpanProcessorParams,
   getLangfuseManagedSpanDestination,
+  registerLangfuseTraceAnchorSpan,
+  resolveLangfuseTraceAnchorParent,
   registerLangfuseManagedSpan,
   resolveLangfuseDestinationKey,
 } from '@/langfuseSpanRegistry';
@@ -35,6 +37,28 @@ describe('Langfuse span registry', () => {
 
     const untracked = { name: 'foreign' } as unknown as Span;
     expect(getLangfuseManagedSpanDestination(untracked)).toBeUndefined();
+  });
+
+  it('resolves run anchors only for their export destination', () => {
+    const anchor = {};
+    const spanContext = {
+      traceId: '0123456789abcdef0123456789abcdef',
+      spanId: '0123456789abcdef',
+      traceFlags: 1,
+    };
+    const span = {
+      spanContext: () => spanContext,
+    } as unknown as Span;
+    const destinationKey = resolveLangfuseDestinationKey(tenantConfig());
+
+    registerLangfuseTraceAnchorSpan(anchor, span, destinationKey as string);
+
+    expect(resolveLangfuseTraceAnchorParent(anchor, destinationKey)).toEqual(
+      spanContext
+    );
+    expect(
+      resolveLangfuseTraceAnchorParent(anchor, 'another-destination')
+    ).toBeUndefined();
   });
 
   it('treats processor policy as irrelevant to destination identity', () => {

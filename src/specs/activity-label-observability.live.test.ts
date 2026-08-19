@@ -84,7 +84,9 @@ async function getJson<T>(path: string): Promise<T> {
   return (await response.json()) as T;
 }
 
-async function listObservations(query: URLSearchParams): Promise<LangfuseObservation[]> {
+async function listObservations(
+  query: URLSearchParams
+): Promise<LangfuseObservation[]> {
   const observations: LangfuseObservation[] = [];
   let cursor: string | undefined;
   do {
@@ -142,9 +144,7 @@ async function findExportedTraces(
     query.delete('cursor');
     const candidates = groupObservationsByTrace(
       await listObservations(query)
-    ).filter(
-      (trace) => trace.metadata?.sourceRunId === sourceRunId
-    );
+    ).filter((trace) => trace.metadata?.sourceRunId === sourceRunId);
     const labelSummary = candidates.find(
       (trace) => trace.tags?.includes('activity-label') === true
     );
@@ -329,7 +329,7 @@ describeIfLive('activity label Langfuse export (live)', () => {
     );
     expect(labelGeneration).toMatchObject({
       parentObservationId: null,
-      name: 'llm',
+      name: 'StepLabel',
       providedModelName: expect.stringContaining(model),
     });
     expect(labelGeneration?.usageDetails?.total).toBeGreaterThan(0);
@@ -339,14 +339,14 @@ describeIfLive('activity label Langfuse export (live)', () => {
     );
     expect(phaseRoot).toMatchObject({
       type: 'SPAN',
-      name: 'summarize-activity-phase',
+      name: 'MultiStepLabel',
     });
     const phaseGeneration = phase.observations.find(
       (observation) => observation.type === 'GENERATION'
     );
     expect(phaseGeneration).toMatchObject({
       parentObservationId: phaseRoot?.id,
-      name: 'llm',
+      name: 'MultiStepLabelGeneration',
       providedModelName: expect.stringContaining(model),
     });
     expect(phaseGeneration?.usageDetails?.total).toBeGreaterThan(0);
@@ -356,7 +356,7 @@ describeIfLive('activity label Langfuse export (live)', () => {
     );
     expect(reasoningGeneration).toMatchObject({
       parentObservationId: null,
-      name: 'llm',
+      name: 'ReasoningLabel',
       providedModelName: expect.stringContaining(model),
     });
     expect(reasoningGeneration?.usageDetails?.total).toBeGreaterThan(0);

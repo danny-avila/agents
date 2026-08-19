@@ -12,6 +12,8 @@ export type ResolvedLangfuseToolOutputTracingConfig = {
 export type LangfuseRuntimeContext = {
   langfuse?: t.LangfuseConfig;
   traceIdSeed?: string;
+  /** Opaque run-owned key used to recover the exported trace parent. */
+  traceAnchor?: object;
   toolOutputTracing?: ResolvedLangfuseToolOutputTracingConfig;
   /**
    * Identity of the run this scope belongs to. LangChain executes
@@ -44,6 +46,7 @@ export function hasLangfuseRuntimeContextValue(
   return (
     context.langfuse != null ||
     hasText(context.traceIdSeed) ||
+    context.traceAnchor != null ||
     hasText(context.runId) ||
     hasText(context.agentId) ||
     context.toolOutputTracing != null
@@ -99,6 +102,9 @@ export function runWithLangfuseRuntimeContext<T>(
     ...(context.langfuse !== undefined ? { langfuse: context.langfuse } : {}),
     ...(hasText(context.traceIdSeed)
       ? { traceIdSeed: context.traceIdSeed }
+      : {}),
+    ...(context.traceAnchor != null
+      ? { traceAnchor: context.traceAnchor }
       : {}),
     ...(hasText(context.runId) ? { runId: context.runId } : {}),
     ...(hasText(context.agentId) ? { agentId: context.agentId } : {}),
