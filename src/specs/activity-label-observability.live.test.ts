@@ -289,7 +289,7 @@ describeIfLive('activity label Langfuse export (live)', () => {
     );
     expect(labelGeneration).toMatchObject({
       parentObservationId: null,
-      name: 'llm',
+      name: 'StepLabel',
       model: expect.stringContaining(model),
     });
     expect(labelGeneration?.usage?.total).toBeGreaterThan(0);
@@ -299,14 +299,14 @@ describeIfLive('activity label Langfuse export (live)', () => {
     );
     expect(phaseRoot).toMatchObject({
       type: 'CHAIN',
-      name: 'summarize-activity-phase',
+      name: 'MultiStepLabel',
     });
     const phaseGeneration = phase.observations?.find(
       (observation) => observation.type === 'GENERATION'
     );
     expect(phaseGeneration).toMatchObject({
       parentObservationId: phaseRoot?.id,
-      name: 'llm',
+      name: 'MultiStepLabelGeneration',
       model: expect.stringContaining(model),
     });
     expect(phaseGeneration?.usage?.total).toBeGreaterThan(0);
@@ -316,7 +316,7 @@ describeIfLive('activity label Langfuse export (live)', () => {
     );
     expect(reasoningGeneration).toMatchObject({
       parentObservationId: null,
-      name: 'llm',
+      name: 'ReasoningLabel',
       model: expect.stringContaining(model),
     });
     expect(reasoningGeneration?.usage?.total).toBeGreaterThan(0);

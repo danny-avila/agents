@@ -1,11 +1,17 @@
+import { MemorySaver } from '@langchain/langgraph';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { GraphFactory, GraphFactoryRequest } from '@/graphs/graphFactory';
 import type * as t from '@/types';
+import {
+  Constants,
+  Providers,
+  STANDARD_GRAPH_RUN_NAME,
+  MULTI_AGENT_GRAPH_RUN_NAME,
+} from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { createGraph } from '@/graphs/createGraph';
-import { Constants, Providers } from '@/common';
 import { StandardGraph } from '@/graphs/Graph';
 
 const invokeConfig: RunnableConfig = {
@@ -53,6 +59,42 @@ describe('graph factory', () => {
     expect(standard).toBeInstanceOf(StandardGraph);
     expect(standard).not.toBeInstanceOf(MultiAgentGraph);
     expect(multiAgent).toBeInstanceOf(MultiAgentGraph);
+  });
+
+  it('keeps graph names and checkpoint methods on compiled workflows', () => {
+    const standard = createGraph({
+      kind: 'standard',
+      input: { runId: 'standard-compiled', agents: [makeAgent('standard')] },
+    });
+    const multiAgent = createGraph({
+      kind: 'multi-agent',
+      input: {
+        runId: 'multi-agent-compiled',
+        agents: [makeAgent('multi')],
+        edges: [],
+      },
+    });
+    standard.compileOptions = { checkpointer: new MemorySaver() };
+    multiAgent.compileOptions = { checkpointer: new MemorySaver() };
+
+    const standardWorkflow = standard.createWorkflow();
+    const multiAgentWorkflow = multiAgent.createWorkflow();
+
+    expect(standardWorkflow).toHaveProperty('name', STANDARD_GRAPH_RUN_NAME);
+    expect(standardWorkflow).toHaveProperty('getState', expect.any(Function));
+    expect(standardWorkflow).toHaveProperty(
+      'getStateHistory',
+      expect.any(Function)
+    );
+    expect(multiAgentWorkflow).toHaveProperty(
+      'name',
+      MULTI_AGENT_GRAPH_RUN_NAME
+    );
+    expect(multiAgentWorkflow).toHaveProperty('getState', expect.any(Function));
+    expect(multiAgentWorkflow).toHaveProperty(
+      'getStateHistory',
+      expect.any(Function)
+    );
   });
 
   it('accepts a union-typed graph factory request', () => {

@@ -18,7 +18,7 @@ import type {
   LLMResult,
 } from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
-import type { Context } from '@opentelemetry/api';
+import type { Context, SpanContext } from '@opentelemetry/api';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
 import {
@@ -36,6 +36,7 @@ import {
 } from '@/langfuseConfig';
 import {
   getLangfuseManagedSpanDestination,
+  registerLangfuseManagedSpan,
   resolveLangfuseDestinationKey,
 } from '@/langfuseSpanRegistry';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
@@ -66,6 +67,14 @@ type LangfuseHandlerParams = {
   traceMetadata?: LangfuseTraceMetadata;
   tags?: string[];
   traceIdSeed?: string;
+  /** Opaque key used by the span processor to capture this run's parents. */
+  traceAnchor?: object;
+  /** Agent lane this handler owns when ambient callback scope is unavailable. */
+  agentId?: string;
+  /** Exported observation that auxiliary work should be nested beneath. */
+  parentSpanContext?: SpanContext;
+  /** Keep an existing parent trace's user, session, name, and metadata. */
+  inheritTraceIdentity?: boolean;
   /** Identity of the run this handler traces; ambient runtime scopes are
    *  only adopted when stamped with the same run (see
    *  `LangfuseRuntimeContext.runId`). */
@@ -280,6 +289,9 @@ function detachForeignAmbientSpan(
 class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private readonly langfuse?: t.LangfuseConfig;
   private readonly traceIdSeed?: string;
+  private readonly traceAnchor?: object;
+  private readonly agentId?: string;
+  private readonly parentSpanContext?: SpanContext;
   private readonly runId?: string;
   private readonly identity: HandlerIdentity;
   private readonly toolOutputTracing?: ResolvedLangfuseToolOutputTracingConfig;
@@ -289,22 +301,40 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     const {
       langfuse,
       traceIdSeed,
+      traceAnchor,
+      agentId,
+      parentSpanContext,
+      inheritTraceIdentity,
       runId,
       toolOutputTracing,
       traceName,
       ...handlerParams
     } = params ?? {};
-    super(handlerParams);
+    super({
+      ...handlerParams,
+      ...(inheritTraceIdentity === true
+        ? {
+          userId: undefined,
+          sessionId: undefined,
+          traceMetadata: undefined,
+        }
+        : {}),
+    });
     this.langfuse = langfuse;
     this.traceIdSeed = traceIdSeed;
+    this.traceAnchor = traceAnchor;
+    this.agentId = agentId;
+    this.parentSpanContext = parentSpanContext;
     this.runId = runId;
     this.toolOutputTracing = toolOutputTracing;
     this.identity = {
-      userId: handlerParams.userId,
-      sessionId: handlerParams.sessionId,
+      userId: inheritTraceIdentity === true ? undefined : handlerParams.userId,
+      sessionId:
+        inheritTraceIdentity === true ? undefined : handlerParams.sessionId,
       tags: handlerParams.tags,
-      metadata: handlerParams.traceMetadata,
-      traceName,
+      metadata:
+        inheritTraceIdentity === true ? undefined : handlerParams.traceMetadata,
+      traceName: inheritTraceIdentity === true ? undefined : traceName,
     };
   }
 
@@ -312,6 +342,22 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     return this.langfuse?.deterministicTraceId === true
       ? this.traceIdSeed
       : undefined;
+  }
+
+  private applyExplicitParent(
+    activeContext: Context,
+    langfuse?: t.LangfuseConfig
+  ): Context {
+    if (this.parentSpanContext == null) {
+      return activeContext;
+    }
+    const destinationKey = resolveLangfuseDestinationKey(langfuse);
+    if (destinationKey == null) {
+      return activeContext;
+    }
+    const parentSpan = otelTrace.wrapSpanContext(this.parentSpanContext);
+    registerLangfuseManagedSpan(parentSpan, destinationKey);
+    return otelTrace.setSpan(activeContext, parentSpan);
   }
 
   /**
@@ -401,12 +447,15 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     }
     const langfuse =
       resolveLangfuseConfigForSpan(currentContext) ?? this.langfuse;
+    const parentedContext = isDetachedRun
+      ? this.applyExplicitParent(currentContext, langfuse)
+      : currentContext;
     const activeContext = isDetachedRun
       ? detachForeignAmbientSpan(
-        currentContext,
+        parentedContext,
         resolveLangfuseDestinationKey(langfuse)
       )
-      : currentContext;
+      : parentedContext;
     const scoped = (): T =>
       withLangfuseRuntimeScope(
         {
@@ -414,7 +463,9 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
           traceIdSeed:
             resolveTraceIdSeedForSpan(activeContext) ??
             this.getDeterministicTraceSeed(),
+          traceAnchor: this.traceAnchor,
           runId: scopeRunId ?? this.runId,
+          agentId: scopeAgentId ?? this.agentId,
         },
         action
       );
@@ -438,12 +489,15 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     for (const key of Object.values(LangfuseOtelContextKeys)) {
       cleanContext = cleanContext.deleteValue(key);
     }
+    cleanContext = this.applyExplicitParent(cleanContext, this.langfuse);
     const scoped = (): T =>
       withLangfuseRuntimeScope(
         {
           langfuse: this.langfuse,
           traceIdSeed: this.getDeterministicTraceSeed(),
+          traceAnchor: this.traceAnchor,
           runId: this.runId,
+          agentId: this.agentId,
           toolOutputTracing:
             this.toolOutputTracing ??
             resolveToolOutputTracingConfig(this.langfuse),
@@ -733,6 +787,10 @@ export function createLangfuseHandler({
   traceMetadata,
   tags,
   traceIdSeed,
+  traceAnchor,
+  agentId,
+  parentSpanContext,
+  inheritTraceIdentity,
   runId,
   toolOutputTracing,
   traceName,
@@ -743,13 +801,17 @@ export function createLangfuseHandler({
   return new ScopedLangfuseCallbackHandler({
     userId,
     sessionId,
-    traceMetadata: mergeLangfuseTraceMetadata(
-      traceMetadata,
-      langfuse?.metadata
-    ),
+    traceMetadata:
+      inheritTraceIdentity === true
+        ? undefined
+        : mergeLangfuseTraceMetadata(traceMetadata, langfuse?.metadata),
     tags: mergeLangfuseTags(tags, langfuse?.tags),
     langfuse,
     traceIdSeed,
+    traceAnchor,
+    agentId,
+    parentSpanContext,
+    inheritTraceIdentity,
     runId,
     toolOutputTracing,
     traceName,
@@ -763,13 +825,17 @@ function createPropagateAttributeParams({
   traceMetadata,
   traceName,
   tags,
+  inheritTraceIdentity,
 }: LangfuseAttributeParams): PropagateAttributesParams {
   return {
-    userId,
-    sessionId,
-    traceName,
+    userId: inheritTraceIdentity === true ? undefined : userId,
+    sessionId: inheritTraceIdentity === true ? undefined : sessionId,
+    traceName: inheritTraceIdentity === true ? undefined : traceName,
     tags: mergeLangfuseTags(tags, langfuse?.tags),
-    metadata: mergeLangfuseTraceMetadata(traceMetadata, langfuse?.metadata),
+    metadata:
+      inheritTraceIdentity === true
+        ? undefined
+        : mergeLangfuseTraceMetadata(traceMetadata, langfuse?.metadata),
   };
 }
 

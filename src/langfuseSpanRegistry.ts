@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
+import { context, trace } from '@opentelemetry/api';
 import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
-import type { Span } from '@opentelemetry/api';
+import type { Span, SpanContext } from '@opentelemetry/api';
 import type * as t from '@/types';
 import {
   hasLangfuseConfigCredentials,
@@ -30,6 +31,19 @@ import { isPresent } from '@/utils/misc';
  */
 const managedSpanDestinations = new WeakMap<Span, string>();
 
+type AnchoredSpan = {
+  destinationKey: string;
+  spanContext: SpanContext;
+};
+
+type TraceAnchorState = {
+  spans: Map<string, AnchoredSpan>;
+  spanIds: Set<string>;
+};
+
+const ROOT_TRACE_ANCHOR = '';
+const traceAnchorStates = new WeakMap<object, TraceAnchorState>();
+
 export function registerLangfuseManagedSpan(
   span: Span,
   destinationKey: string
@@ -41,6 +55,68 @@ export function getLangfuseManagedSpanDestination(
   span: Span
 ): string | undefined {
   return managedSpanDestinations.get(span);
+}
+
+/** Captures the first exported observation for a run and for each agent lane. */
+export function registerLangfuseTraceAnchorSpan(
+  anchor: object,
+  span: Span,
+  destinationKey: string,
+  agentId?: string
+): void {
+  let state = traceAnchorStates.get(anchor);
+  if (state == null) {
+    state = { spans: new Map<string, AnchoredSpan>(), spanIds: new Set() };
+    traceAnchorStates.set(anchor, state);
+  }
+  const spanContext = span.spanContext();
+  state.spanIds.add(spanContext.spanId);
+  const key = agentId ?? ROOT_TRACE_ANCHOR;
+  if (state.spans.has(key)) {
+    return;
+  }
+  state.spans.set(key, { destinationKey, spanContext });
+}
+
+/**
+ * Resolves the most specific safe parent available for auxiliary work. An
+ * active observation wins so labels emitted inside a tool or reasoning step
+ * stay beside their source; otherwise the run root anchors the label in the
+ * same trace. An agent lane is the fallback when its overlay exports to a
+ * different destination. Cross-destination parents are never returned.
+ */
+export function resolveLangfuseTraceAnchorParent(
+  anchor: object | undefined,
+  destinationKey: string | undefined,
+  agentId?: string
+): SpanContext | undefined {
+  if (anchor == null || destinationKey == null) {
+    return undefined;
+  }
+  const state = traceAnchorStates.get(anchor);
+  if (state == null) {
+    return undefined;
+  }
+  const agentSpan = agentId == null ? undefined : state.spans.get(agentId);
+  const rootSpan = state.spans.get(ROOT_TRACE_ANCHOR);
+  let anchoredSpan = rootSpan;
+  if (anchoredSpan?.destinationKey !== destinationKey) {
+    anchoredSpan = agentSpan;
+  }
+  if (anchoredSpan?.destinationKey !== destinationKey) {
+    return undefined;
+  }
+
+  const activeSpan = trace.getSpan(context.active());
+  if (
+    activeSpan != null &&
+    getLangfuseManagedSpanDestination(activeSpan) === destinationKey &&
+    activeSpan.spanContext().traceId === anchoredSpan.spanContext.traceId &&
+    state.spanIds.has(activeSpan.spanContext().spanId)
+  ) {
+    return activeSpan.spanContext();
+  }
+  return anchoredSpan.spanContext;
 }
 
 function resolveLangfuseEnvironment(
