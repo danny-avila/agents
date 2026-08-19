@@ -58,14 +58,14 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
-import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
-import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
-import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
 import {
   hasReasoningKwargs,
   hasToolCallChunks,
   getReasoningKwargsText,
 } from '@/llm/stream/chunkAdapters';
+import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
+import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
+import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
@@ -919,6 +919,33 @@ function attachResponsesReplayPosition(
   chunk.message.lc_kwargs.additional_kwargs = additionalKwargs;
 }
 
+function getResponsesStreamError(
+  event: OpenAIClient.Responses.ResponseStreamEvent
+): Error | undefined {
+  if (event.type === 'error') {
+    return new OpenAIClient.APIError(
+      undefined,
+      event,
+      event.message,
+      undefined
+    );
+  }
+  if (event.type !== 'response.failed') {
+    return;
+  }
+  if (event.response.error != null) {
+    return new OpenAIClient.APIError(
+      undefined,
+      event.response.error,
+      event.response.error.message,
+      undefined
+    );
+  }
+  return new OpenAIClient.OpenAIError(
+    `Response ${event.response.id} failed without error details.`
+  );
+}
+
 async function* convertLibreChatResponsesStream(
   stream: AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>,
   options: ResponsesStreamChunkOptions,
@@ -929,6 +956,10 @@ async function* convertLibreChatResponsesStream(
   try {
     for await (const event of stream) {
       options.signal?.throwIfAborted();
+      const streamError = getResponsesStreamError(event);
+      if (streamError != null) {
+        throw streamError;
+      }
       const convertedChunk =
         convertResponsesDeltaToChatGenerationChunk(event) ??
         convertDroppedResponsesReplayOutput(event);
