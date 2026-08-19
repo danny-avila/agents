@@ -2745,10 +2745,14 @@ export class SubagentExecutor {
 
         for (;;) {
           let childResult: MultiAgentGraphState;
-          if (this.humanInTheLoop?.enabled === true) {
-            /** Execute as an independently checkpointed root instead of inheriting
-             * the parent's Pregel namespace. Parent decisions are routed explicitly
-             * by interrupt id, so concurrent children keep isolated resume state. */
+          if (
+            this.humanInTheLoop?.enabled === true ||
+            params.taskRuntime != null
+          ) {
+            /** Execute as an independent LangGraph root. HITL children need an
+             * isolated Pregel namespace, while detached children must replace the
+             * parent ToolNode's ambient runnable config so its AbortSignal cannot
+             * cancel task-owned work when the parent stream settles. */
             childResult =
               await AsyncLocalStorageProviderSingleton.runWithConfig(
                 childInvokeConfig,
