@@ -260,7 +260,7 @@ function callbackNodeMatchesAgent(node: string, agentId: string): boolean {
  * Hosts often execute agent code inside their own OpenTelemetry spans (HTTP
  * server auto-instrumentation on the global provider). Root observations must
  * not inherit that ambient identity: the foreign parent is never exported to
- * Langfuse, which orphans the trace root (root/trace input-output shaping is
+ * Langfuse, which orphans the trace root (root-observation input/output shaping is
  * skipped because the span no longer looks like a root), collapses concurrent
  * runs inside one request context — an agent run and the previous turn's
  * title run — into a single merged trace with racing names and unioned tags,

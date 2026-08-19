@@ -30,8 +30,8 @@ function createSpan(
 
 const INPUT = LangfuseOtelSpanAttributes.OBSERVATION_INPUT;
 const OUTPUT = LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT;
-const TRACE_INPUT = LangfuseOtelSpanAttributes.TRACE_INPUT;
-const TRACE_OUTPUT = LangfuseOtelSpanAttributes.TRACE_OUTPUT;
+const DEPRECATED_TRACE_INPUT = 'langfuse.trace.input';
+const DEPRECATED_TRACE_OUTPUT = 'langfuse.trace.output';
 const OBSERVATION_TYPE = LangfuseOtelSpanAttributes.OBSERVATION_TYPE;
 const TRACE_TAGS = LangfuseOtelSpanAttributes.TRACE_TAGS;
 const METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
@@ -108,8 +108,8 @@ describe('shapeLangfuseSpan', () => {
     expect(standard.attributes[OBSERVATION_TYPE]).toBe('agent');
     expect(standard.attributes[INPUT]).toBe('Inspect the nested run');
     expect(standard.attributes[OUTPUT]).toBe('Nested run complete');
-    expect(standard.attributes[TRACE_INPUT]).toBeUndefined();
-    expect(standard.attributes[TRACE_OUTPUT]).toBeUndefined();
+    expect(standard.attributes[DEPRECATED_TRACE_INPUT]).toBeUndefined();
+    expect(standard.attributes[DEPRECATED_TRACE_OUTPUT]).toBeUndefined();
   });
 
   it('names the agent prompt-to-model sequence as an SDK operation', () => {
@@ -469,7 +469,7 @@ describe('shapeLangfuseSpan', () => {
     expect(span.name).toBe('bedrock__claude-sonnet-5___ClickHouse Agent');
   });
 
-  it('sets root span and trace input/output to the question and answer', () => {
+  it('sets root-observation input/output without deprecated trace input/output', () => {
     const span = createSpan('LibreChat Agent', {
       [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
       [INPUT]: JSON.stringify({
@@ -484,12 +484,14 @@ describe('shapeLangfuseSpan', () => {
           { type: 'ai', content: 'A columnar OLAP database.' },
         ],
       }),
+      [DEPRECATED_TRACE_INPUT]: 'legacy question',
+      [DEPRECATED_TRACE_OUTPUT]: 'legacy answer',
     });
     shapeLangfuseSpan(span);
     expect(span.attributes[INPUT]).toBe('What is ClickHouse?');
-    expect(span.attributes[TRACE_INPUT]).toBe('What is ClickHouse?');
     expect(span.attributes[OUTPUT]).toBe('A columnar OLAP database.');
-    expect(span.attributes[TRACE_OUTPUT]).toBe('A columnar OLAP database.');
+    expect(span.attributes[DEPRECATED_TRACE_INPUT]).toBeUndefined();
+    expect(span.attributes[DEPRECATED_TRACE_OUTPUT]).toBeUndefined();
   });
 
   it('extracts answer text from content part arrays', () => {
@@ -528,7 +530,7 @@ describe('shapeLangfuseSpan', () => {
     const span = createSpan('LibreChat Agent', { [INPUT]: 'plain text' });
     shapeLangfuseSpan(span);
     expect(span.attributes[INPUT]).toBe('plain text');
-    expect(span.attributes[TRACE_INPUT]).toBe('plain text');
+    expect(span.attributes[DEPRECATED_TRACE_INPUT]).toBeUndefined();
   });
 
   it('renames generation spans to a provider-agnostic name', () => {
@@ -562,8 +564,8 @@ describe('shapeLangfuseSpan', () => {
     shapeLangfuseSpan(span);
 
     expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
-    expect(span.attributes[TRACE_INPUT]).toBe('Conversation text');
-    expect(span.attributes[TRACE_OUTPUT]).toBe('Conversation title');
+    expect(span.attributes[INPUT]).toBe('Conversation text');
+    expect(span.attributes[OUTPUT]).toBe('Conversation title');
   });
 
   it('marks activity-phase roots as chains even when tagged as agent work', () => {
@@ -582,8 +584,8 @@ describe('shapeLangfuseSpan', () => {
 
     expect(span.name).toBe('MultiStepLabel');
     expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
-    expect(span.attributes[TRACE_INPUT]).toBe('What changed?');
-    expect(span.attributes[TRACE_OUTPUT]).toBe(
+    expect(span.attributes[INPUT]).toBe('What changed?');
+    expect(span.attributes[OUTPUT]).toBe(
       'Reconciled the implementation and verified the fix'
     );
   });
@@ -619,11 +621,11 @@ describe('shapeLangfuseSpan', () => {
 
     expect(span.name).toBe('llm');
     expect(span.attributes[OBSERVATION_TYPE]).toBe('generation');
-    expect(span.attributes[TRACE_INPUT]).toBe('Generate a title');
-    expect(span.attributes[TRACE_OUTPUT]).toBe('A useful title');
+    expect(span.attributes[INPUT]).toBe('Generate a title');
+    expect(span.attributes[OUTPUT]).toBe('A useful title');
   });
 
-  it('keeps a generation root\'s full observation input while reducing trace input', () => {
+  it('keeps a generation root\'s full observation input/output', () => {
     /** The activity-label path: a bare model.invoke traces the generation
      *  as its own root, so the observation input is the ONLY record of
      *  the system prompt. The exact shape @langfuse/langchain exports. */
@@ -648,10 +650,8 @@ describe('shapeLangfuseSpan', () => {
     expect(span.name).toBe('StepLabel');
     expect(span.attributes[INPUT]).toBe(originalInput);
     expect(span.attributes[OUTPUT]).toBe(originalOutput);
-    expect(span.attributes[TRACE_INPUT]).toBe(
-      'Tool calls:\n- bash(ls) → ok\n\nLabel:'
-    );
-    expect(span.attributes[TRACE_OUTPUT]).toBe(originalOutput);
+    expect(span.attributes[DEPRECATED_TRACE_INPUT]).toBeUndefined();
+    expect(span.attributes[DEPRECATED_TRACE_OUTPUT]).toBeUndefined();
   });
 
   it('names reasoning and phase-label generations by their role', () => {
@@ -714,6 +714,6 @@ describe('shapeLangfuseSpan', () => {
     shapeLangfuseSpan(span);
 
     expect(span.attributes[INPUT]).toBe('What is ClickHouse?');
-    expect(span.attributes[TRACE_INPUT]).toBe('What is ClickHouse?');
+    expect(span.attributes[DEPRECATED_TRACE_INPUT]).toBeUndefined();
   });
 });

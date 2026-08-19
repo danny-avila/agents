@@ -31,6 +31,8 @@ const REASONING_LABEL_TRACE_TAG = 'reasoning-label';
 const ACTIVITY_PHASE_TRACE_TAG = 'activity-phase';
 const EPHEMERAL_AGENT_SENDER_SEPARATOR = '___';
 const EPHEMERAL_AGENT_INDEX_SEPARATOR = '____';
+const DEPRECATED_TRACE_INPUT_ATTRIBUTE = 'langfuse.trace.input';
+const DEPRECATED_TRACE_OUTPUT_ATTRIBUTE = 'langfuse.trace.output';
 const OBSERVATION_METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
 const OBSERVATION_METADATA_OPERATION = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${LANGFUSE_OPERATION_METADATA_KEY}`;
 
@@ -432,10 +434,7 @@ function isGraphSpan(span: MutableSpan): boolean {
   );
 }
 
-function shapeConversationPayload(
-  span: MutableSpan,
-  includeTracePayload: boolean
-): void {
+function shapeConversationPayload(span: MutableSpan): void {
   const inputKey = LangfuseOtelSpanAttributes.OBSERVATION_INPUT;
   const outputKey = LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT;
   const question = findLastMessageText(
@@ -451,8 +450,7 @@ function shapeConversationPayload(
    *  observation carrying its own prompt: reducing its observation input
    *  would discard the SystemMessage from the one place it is traced.
    *  Chain/agent roots keep the full reduction; their child generations
-   *  still record the complete prompt. Trace-level input/output reduce
-   *  either way, so the trace list keeps showing question and answer. */
+   *  still record the complete prompt. */
   if (!isGenerationSpan(span)) {
     if (question != null) {
       span.attributes[inputKey] = question;
@@ -460,17 +458,6 @@ function shapeConversationPayload(
     if (answer != null) {
       span.attributes[outputKey] = answer;
     }
-  }
-  if (!includeTracePayload) {
-    return;
-  }
-  const traceInput = question ?? span.attributes[inputKey];
-  const traceOutput = answer ?? span.attributes[outputKey];
-  if (traceInput != null) {
-    span.attributes[LangfuseOtelSpanAttributes.TRACE_INPUT] = traceInput;
-  }
-  if (traceOutput != null) {
-    span.attributes[LangfuseOtelSpanAttributes.TRACE_OUTPUT] = traceOutput;
   }
 }
 
@@ -599,12 +586,14 @@ function shapeRootObservationType(span: MutableSpan): void {
  *   stable `chain` observations whose input is scoped to the pending calls.
  *   Individual child calls remain `tool` observations (items 3 & 4).
  * - Agent trace roots become `agent` observations, while title and activity
- *   summary operations become `chain` observations. Root and trace
+ *   summary operations become `chain` observations. Root-observation
  *   input/output are reduced to the user question and assistant response when
  *   chat messages are available (item 2).
  */
 export function shapeLangfuseSpan(span: ReadableSpan): void {
   const mutable = span as MutableSpan;
+  delete mutable.attributes[DEPRECATED_TRACE_INPUT_ATTRIBUTE];
+  delete mutable.attributes[DEPRECATED_TRACE_OUTPUT_ATTRIBUTE];
   const isGraphObservation = isGraphSpan(mutable);
   if (mutable.name.startsWith(LANGGRAPH_AGENT_NODE_PREFIX)) {
     shapeAgentNodeSpan(mutable);
@@ -623,10 +612,10 @@ export function shapeLangfuseSpan(span: ReadableSpan): void {
   }
   if (!isRootSpan(span)) {
     if (isGraphObservation) {
-      shapeConversationPayload(mutable, false);
+      shapeConversationPayload(mutable);
     }
     return;
   }
   shapeRootObservationType(mutable);
-  shapeConversationPayload(mutable, true);
+  shapeConversationPayload(mutable);
 }
