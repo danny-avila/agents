@@ -1288,12 +1288,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * component: public run ids are unrestricted and may repeat across
    * concurrently executing runs (retries, duplicate submissions,
    * tenant-local message ids), and equal stamps would let those runs adopt
-   * each other's scopes. One graph instance = one execution's stamp, shared
-   * by the stream handler and every graph-level scope of that execution.
+   * each other's scopes. Fresh stream executions rotate this stamp; resumes
+   * retain it so the continuation stays in the interrupted execution.
    */
-  readonly langfuseScopeRunId: string;
+  langfuseScopeRunId: string;
   /** Opaque key for parenting post-processing observations to this run. */
-  readonly langfuseTraceAnchor: object = {};
+  langfuseTraceAnchor: object = {};
   /**
    * Boundary between historical messages (loaded from conversation state)
    * and messages produced during the current run.  Set once in the state
@@ -1500,6 +1500,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     }
 
     this.defaultAgentId = agents[0].agentId;
+  }
+
+  /** Rotates the Langfuse identities that must never cross fresh executions. */
+  startFreshLangfuseExecution(): void {
+    this.langfuseTraceAnchor = {};
+    this.langfuseScopeRunId = `${this.runId ?? 'graph'}:${nanoid()}`;
   }
 
   /* Init */

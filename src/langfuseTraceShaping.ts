@@ -10,6 +10,7 @@ import {
   ACTIVITY_PHASE_RUN_NAME,
   ACTIVITY_PHASE_LABEL_RUN_NAME,
 } from '@/common';
+import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 
 const LANGGRAPH_START_NODE = '__start__';
 const LANGGRAPH_RUN_NAME = 'LangGraph';
@@ -31,6 +32,7 @@ const ACTIVITY_PHASE_TRACE_TAG = 'activity-phase';
 const EPHEMERAL_AGENT_SENDER_SEPARATOR = '___';
 const EPHEMERAL_AGENT_INDEX_SEPARATOR = '____';
 const OBSERVATION_METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
+const OBSERVATION_METADATA_OPERATION = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${LANGFUSE_OPERATION_METADATA_KEY}`;
 
 type MutableSpan = ReadableSpan & {
   name: string;
@@ -390,15 +392,25 @@ function shapeActivityPhaseSpan(span: MutableSpan): void {
 }
 
 function shapeGenerationSpan(span: MutableSpan): void {
-  if (hasTraceTag(span, ACTIVITY_LABEL_TRACE_TAG)) {
+  if (
+    hasTraceTag(span, ACTIVITY_LABEL_TRACE_TAG) &&
+    span.attributes[OBSERVATION_METADATA_OPERATION] === ACTIVITY_LABEL_RUN_NAME
+  ) {
     span.name = ACTIVITY_LABEL_RUN_NAME;
     return;
   }
-  if (hasTraceTag(span, REASONING_LABEL_TRACE_TAG)) {
+  if (
+    hasTraceTag(span, REASONING_LABEL_TRACE_TAG) &&
+    span.attributes[OBSERVATION_METADATA_OPERATION] === REASONING_LABEL_RUN_NAME
+  ) {
     span.name = REASONING_LABEL_RUN_NAME;
     return;
   }
-  if (hasTraceTag(span, ACTIVITY_PHASE_TRACE_TAG)) {
+  if (
+    hasTraceTag(span, ACTIVITY_PHASE_TRACE_TAG) &&
+    span.attributes[OBSERVATION_METADATA_OPERATION] ===
+      ACTIVITY_PHASE_LABEL_RUN_NAME
+  ) {
     span.name = ACTIVITY_PHASE_LABEL_RUN_NAME;
     return;
   }
@@ -420,7 +432,10 @@ function isGraphSpan(span: MutableSpan): boolean {
   );
 }
 
-function shapeRootSpan(span: MutableSpan): void {
+function shapeConversationPayload(
+  span: MutableSpan,
+  includeTracePayload: boolean
+): void {
   const inputKey = LangfuseOtelSpanAttributes.OBSERVATION_INPUT;
   const outputKey = LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT;
   const question = findLastMessageText(
@@ -445,6 +460,9 @@ function shapeRootSpan(span: MutableSpan): void {
     if (answer != null) {
       span.attributes[outputKey] = answer;
     }
+  }
+  if (!includeTracePayload) {
+    return;
   }
   const traceInput = question ?? span.attributes[inputKey];
   const traceOutput = answer ?? span.attributes[outputKey];
@@ -587,11 +605,12 @@ function shapeRootObservationType(span: MutableSpan): void {
  */
 export function shapeLangfuseSpan(span: ReadableSpan): void {
   const mutable = span as MutableSpan;
+  const isGraphObservation = isGraphSpan(mutable);
   if (mutable.name.startsWith(LANGGRAPH_AGENT_NODE_PREFIX)) {
     shapeAgentNodeSpan(mutable);
   } else if (mutable.name.startsWith(LANGGRAPH_TOOL_NODE_PREFIX)) {
     shapeToolNodeSpan(mutable);
-  } else if (isGraphSpan(mutable)) {
+  } else if (isGraphObservation) {
     shapeGraphSpan(mutable);
   } else if (isAgentModelCallSpan(mutable)) {
     shapeAgentModelCallSpan(mutable);
@@ -603,8 +622,11 @@ export function shapeLangfuseSpan(span: ReadableSpan): void {
     shapeEphemeralAgentNodeSpan(mutable);
   }
   if (!isRootSpan(span)) {
+    if (isGraphObservation) {
+      shapeConversationPayload(mutable, false);
+    }
     return;
   }
   shapeRootObservationType(mutable);
-  shapeRootSpan(mutable);
+  shapeConversationPayload(mutable, true);
 }

@@ -3,10 +3,16 @@ import { propagateAttributes } from '@langfuse/tracing';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import type { Span } from '@opentelemetry/api';
 import {
+  Providers,
+  ACTIVITY_LABEL_RUN_NAME,
+  REASONING_LABEL_RUN_NAME,
+  ACTIVITY_PHASE_LABEL_RUN_NAME,
+} from '@/common';
+import {
   registerLangfuseTraceAnchorSpan,
   resolveLangfuseDestinationKey,
 } from '@/langfuseSpanRegistry';
-import { Providers } from '@/common';
+import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { Run } from '@/run';
 
 const invoke = jest.fn();
@@ -128,6 +134,7 @@ describe('activity label observability', () => {
       runName: 'LibreChat Activity Label',
       tags: ['librechat', 'activity-label'],
       metadata: {
+        [LANGFUSE_OPERATION_METADATA_KEY]: ACTIVITY_LABEL_RUN_NAME,
         sourceRunId: 'response-1',
         sourceTraceId,
         responseId: 'response-1',
@@ -192,6 +199,7 @@ describe('activity label observability', () => {
       runName: 'LibreChat Reasoning Label',
       tags: ['librechat', 'reasoning-label', 'reasoning-step'],
       metadata: {
+        [LANGFUSE_OPERATION_METADATA_KEY]: REASONING_LABEL_RUN_NAME,
         sourceRunId: 'response-1',
         sourceTraceId: 'source-trace-1',
         responseId: 'response-1',
@@ -286,6 +294,11 @@ describe('activity label observability', () => {
         responseId: 'response-1',
         phaseIndex: '0',
         activityCount: '2',
+      },
+    });
+    expect(invoke.mock.calls[0][1]).toMatchObject({
+      metadata: {
+        [LANGFUSE_OPERATION_METADATA_KEY]: ACTIVITY_PHASE_LABEL_RUN_NAME,
       },
     });
   });

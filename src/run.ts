@@ -27,6 +27,16 @@ import type { StandardGraph } from '@/graphs/Graph';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import {
+  Callback,
+  GraphEvents,
+  TitleMethod,
+  ACTIVITY_LABEL_RUN_NAME,
+  REASONING_LABEL_RUN_NAME,
+  ACTIVITY_PHASE_RUN_NAME,
+  ACTIVITY_PHASE_LABEL_RUN_NAME,
+  DEFAULT_RECURSION_LIMIT,
+} from '@/common';
+import {
   requireValidSubagentResumeManifest,
   stripSubagentResumeManifest,
   SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
@@ -54,22 +64,14 @@ import {
   normalizeReasoningLabel,
 } from '@/prompts/reasoningLabel';
 import {
-  resetLangfuseTraceAnchorSpans,
-  resolveLangfuseDestinationKey,
-  resolveLangfuseTraceAnchorParent,
-} from '@/langfuseSpanRegistry';
-import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import {
-  Callback,
-  GraphEvents,
-  TitleMethod,
-  ACTIVITY_PHASE_RUN_NAME,
-  DEFAULT_RECURSION_LIMIT,
-} from '@/common';
+  resolveLangfuseDestinationKey,
+  resolveLangfuseTraceAnchorParent,
+} from '@/langfuseSpanRegistry';
 import {
   appendCallbacks,
   filterCallbacks,
@@ -89,6 +91,7 @@ import {
   createTitleRunnable,
 } from '@/utils/title';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
+import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { initializeLangfuseTracing } from './instrumentation';
 import { seedRunInitialSessions } from '@/utils/toolSessions';
@@ -993,7 +996,7 @@ export class Run<_T extends t.BaseGraphState> {
      */
     const isResume = inputs instanceof Command;
     if (!isResume) {
-      resetLangfuseTraceAnchorSpans(graph.langfuseTraceAnchor);
+      graph.startFreshLangfuseExecution();
     }
     const stateInputs = isResume ? undefined : (inputs as t.IState);
     if (stateInputs != null) {
@@ -2133,6 +2136,7 @@ export class Run<_T extends t.BaseGraphState> {
     const labelAgentName =
       labelAgentId == null ? undefined : labelContext?.name;
     const labelMetadata: Record<string, unknown> = {
+      [LANGFUSE_OPERATION_METADATA_KEY]: ACTIVITY_LABEL_RUN_NAME,
       sourceRunId: this.id,
       responseId: this.id,
       activityIndex: labelIndex,
@@ -2474,6 +2478,7 @@ export class Run<_T extends t.BaseGraphState> {
     const resolvedSourceRunId = sourceRunId ?? this.id;
     const reasoningResponseId = responseId ?? this.id;
     const reasoningMetadata: Record<string, unknown> = {
+      [LANGFUSE_OPERATION_METADATA_KEY]: REASONING_LABEL_RUN_NAME,
       sourceRunId: resolvedSourceRunId,
       ...(sourceTraceId == null ? {} : { sourceTraceId }),
       responseId: reasoningResponseId,
@@ -2811,6 +2816,7 @@ export class Run<_T extends t.BaseGraphState> {
     const phaseParentMessageId =
       phaseChainOptions.configurable?.requestBody?.parentMessageId;
     const phaseMetadata: Record<string, unknown> = {
+      [LANGFUSE_OPERATION_METADATA_KEY]: ACTIVITY_PHASE_LABEL_RUN_NAME,
       sourceRunId: sourceRunId ?? this.id,
       ...(sourceTraceId == null ? {} : { sourceTraceId }),
       responseId: phaseMessageId,

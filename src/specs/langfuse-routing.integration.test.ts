@@ -918,13 +918,29 @@ describe('Langfuse per-run routing integration', () => {
     };
 
     await execute('first execution');
+    const firstTraceAnchor = run.Graph?.langfuseTraceAnchor;
+    const firstScopeRunId = run.Graph?.langfuseScopeRunId;
     const firstParent = resolveLangfuseTraceAnchorParent(
       run.Graph?.langfuseTraceAnchor,
       resolveLangfuseDestinationKey(langfuse)
     );
     await execute('second execution');
+    const secondTraceAnchor = run.Graph?.langfuseTraceAnchor;
+    const secondScopeRunId = run.Graph?.langfuseScopeRunId;
     const secondParent = resolveLangfuseTraceAnchorParent(
       run.Graph?.langfuseTraceAnchor,
+      resolveLangfuseDestinationKey(langfuse)
+    );
+    withLangfuseRuntimeScope(
+      {
+        langfuse,
+        traceAnchor: firstTraceAnchor,
+        runId: firstScopeRunId,
+      },
+      () => createMockSpan('late-first-execution-callback')
+    );
+    const secondParentAfterLateCallback = resolveLangfuseTraceAnchorParent(
+      secondTraceAnchor,
       resolveLangfuseDestinationKey(langfuse)
     );
     const roots = startsForTenant(tenantId).filter(
@@ -934,7 +950,10 @@ describe('Langfuse per-run routing integration', () => {
     expect(roots).toHaveLength(2);
     expect(firstParent?.spanId).toBe(roots[0].spanId);
     expect(secondParent?.spanId).toBe(roots[1].spanId);
+    expect(secondParentAfterLateCallback?.spanId).toBe(roots[1].spanId);
     expect(secondParent?.spanId).not.toBe(firstParent?.spanId);
+    expect(secondTraceAnchor).not.toBe(firstTraceAnchor);
+    expect(secondScopeRunId).not.toBe(firstScopeRunId);
   });
 
   it('generates a scope stamp for directly-constructed graphs without a run id', async () => {

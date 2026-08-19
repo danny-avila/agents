@@ -1,9 +1,15 @@
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import {
+  ACTIVITY_LABEL_RUN_NAME,
+  REASONING_LABEL_RUN_NAME,
+  ACTIVITY_PHASE_LABEL_RUN_NAME,
+} from '@/common';
+import {
   shapeLangfuseSpan,
   shouldDropLangfuseSpan,
 } from '@/langfuseTraceShaping';
+import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 
 type TestSpan = ReadableSpan & {
   name: string;
@@ -29,6 +35,7 @@ const TRACE_OUTPUT = LangfuseOtelSpanAttributes.TRACE_OUTPUT;
 const OBSERVATION_TYPE = LangfuseOtelSpanAttributes.OBSERVATION_TYPE;
 const TRACE_TAGS = LangfuseOtelSpanAttributes.TRACE_TAGS;
 const METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
+const METADATA_OPERATION = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${LANGFUSE_OPERATION_METADATA_KEY}`;
 
 /** The outer workflow node: a non-root LangGraph node span whose
  *  `langgraph_node` metadata equals its name. */
@@ -83,7 +90,15 @@ describe('shapeLangfuseSpan', () => {
   it('types agent-tagged graph roots nested beneath managed hosts', () => {
     const standard = createSpan(
       'StandardGraph',
-      { [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']) },
+      {
+        [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+        [INPUT]: JSON.stringify({
+          messages: [{ type: 'human', content: 'Inspect the nested run' }],
+        }),
+        [OUTPUT]: JSON.stringify({
+          messages: [{ type: 'ai', content: 'Nested run complete' }],
+        }),
+      },
       'managed-host-span'
     );
 
@@ -91,6 +106,10 @@ describe('shapeLangfuseSpan', () => {
 
     expect(standard.name).toBe('StandardGraph');
     expect(standard.attributes[OBSERVATION_TYPE]).toBe('agent');
+    expect(standard.attributes[INPUT]).toBe('Inspect the nested run');
+    expect(standard.attributes[OUTPUT]).toBe('Nested run complete');
+    expect(standard.attributes[TRACE_INPUT]).toBeUndefined();
+    expect(standard.attributes[TRACE_OUTPUT]).toBeUndefined();
   });
 
   it('names the agent prompt-to-model sequence as an SDK operation', () => {
@@ -619,6 +638,7 @@ describe('shapeLangfuseSpan', () => {
     const span = createSpan('LibreChat Activity Label', {
       [OBSERVATION_TYPE]: 'generation',
       [TRACE_TAGS]: JSON.stringify(['librechat', 'activity-label']),
+      [METADATA_OPERATION]: ACTIVITY_LABEL_RUN_NAME,
       [INPUT]: originalInput,
       [OUTPUT]: originalOutput,
     });
@@ -640,6 +660,7 @@ describe('shapeLangfuseSpan', () => {
       {
         [OBSERVATION_TYPE]: 'generation',
         [TRACE_TAGS]: JSON.stringify(['librechat', 'reasoning-label']),
+        [METADATA_OPERATION]: REASONING_LABEL_RUN_NAME,
       },
       'parent-1'
     );
@@ -648,6 +669,7 @@ describe('shapeLangfuseSpan', () => {
       {
         [OBSERVATION_TYPE]: 'generation',
         [TRACE_TAGS]: JSON.stringify(['librechat', 'activity-phase']),
+        [METADATA_OPERATION]: ACTIVITY_PHASE_LABEL_RUN_NAME,
       },
       'parent-1'
     );
@@ -657,6 +679,25 @@ describe('shapeLangfuseSpan', () => {
 
     expect(reasoning.name).toBe('ReasoningLabel');
     expect(phase.name).toBe('ActivityPhaseLabel');
+  });
+
+  it('does not derive generation operation names from public tags alone', () => {
+    const tags = ['activity-label', 'reasoning-label', 'activity-phase'];
+
+    for (const tag of tags) {
+      const span = createSpan(
+        'ChatOpenAI',
+        {
+          [OBSERVATION_TYPE]: 'generation',
+          [TRACE_TAGS]: JSON.stringify(['librechat', 'agent', tag]),
+        },
+        'parent-1'
+      );
+
+      shapeLangfuseSpan(span);
+
+      expect(span.name).toBe('llm');
+    }
   });
 
   it('still reduces observation input on non-generation roots', () => {

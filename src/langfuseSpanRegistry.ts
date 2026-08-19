@@ -78,11 +78,6 @@ export function registerLangfuseTraceAnchorSpan(
   state.spans.set(key, { destinationKey, spanContext });
 }
 
-/** Starts a fresh execution while retaining the anchor object held by handlers. */
-export function resetLangfuseTraceAnchorSpans(anchor: object): void {
-  traceAnchorStates.delete(anchor);
-}
-
 /**
  * Resolves the most specific safe parent available for auxiliary work. An
  * active observation wins so labels emitted inside a tool or reasoning step
