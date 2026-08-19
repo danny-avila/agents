@@ -16,9 +16,12 @@ import {
   getLangfuseDestinationKey,
   getLangfuseSpanProcessorParams,
   registerLangfuseManagedSpan,
+  registerLangfuseTraceAnchorSpan,
 } from '@/langfuseSpanRegistry';
 import {
   resolveLangfuseConfigForSpan,
+  resolveLangfuseScopeAgentId,
+  resolveLangfuseTraceAnchor,
   resolveTraceIdSeedForSpan,
 } from '@/langfuseRuntimeScope';
 import { createLangfuseSpanProcessor } from '@/langfuseToolOutputTracing';
@@ -137,6 +140,15 @@ class RoutingLangfuseSpanProcessor implements SpanProcessor {
       langfuse
     );
     registerLangfuseManagedSpan(span, destinationKey);
+    const traceAnchor = resolveLangfuseTraceAnchor(parentContext);
+    if (traceAnchor != null) {
+      registerLangfuseTraceAnchorSpan(
+        traceAnchor,
+        span,
+        destinationKey,
+        resolveLangfuseScopeAgentId(parentContext)
+      );
+    }
 
     const librechatTraceAttributes = createLibreChatTraceAttributes(
       langfuse?.librechatTraceAttributes ?? {}

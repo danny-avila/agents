@@ -59,6 +59,17 @@ import {
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import {
+  Callback,
+  GraphEvents,
+  TitleMethod,
+  ACTIVITY_PHASE_RUN_NAME,
+  DEFAULT_RECURSION_LIMIT,
+} from '@/common';
+import {
+  resolveLangfuseDestinationKey,
+  resolveLangfuseTraceAnchorParent,
+} from '@/langfuseSpanRegistry';
+import {
   appendCallbacks,
   filterCallbacks,
   findCallback,
@@ -72,12 +83,6 @@ import {
   getRunStepResumeState,
   stripRunStepResumeState,
 } from '@/tools/runStepResume';
-import {
-  Callback,
-  GraphEvents,
-  TitleMethod,
-  DEFAULT_RECURSION_LIMIT,
-} from '@/common';
 import {
   createCompletionTitleRunnable,
   createTitleRunnable,
@@ -1116,6 +1121,7 @@ export class Run<_T extends t.BaseGraphState> {
         streamLangfuseConfig?.deterministicTraceId === true
           ? this.id
           : undefined,
+      traceAnchor: graph.langfuseTraceAnchor,
       // The graph's per-execution stamp, NOT the public run id: public ids
       // may repeat across concurrent executions (retries, tenant-local
       // message ids), and equal stamps defeat foreign-scope rejection.
@@ -1131,6 +1137,7 @@ export class Run<_T extends t.BaseGraphState> {
         streamLangfuseConfig?.deterministicTraceId === true
           ? this.id
           : undefined,
+      traceAnchor: graph.langfuseTraceAnchor,
       runId: graph.langfuseScopeRunId,
       // The aggregate multi-agent policy from the runtime scope — the
       // handler must restore THIS (not the primary agent's config-derived
@@ -1139,7 +1146,6 @@ export class Run<_T extends t.BaseGraphState> {
       traceName,
     });
     if (langfuseHandler != null) {
-      config.runName = traceName;
       config.callbacks = appendCallbacks(config.callbacks, [langfuseHandler]);
     }
 
@@ -2132,7 +2138,7 @@ export class Run<_T extends t.BaseGraphState> {
       ...(labelAgentId == null ? {} : { agentId: labelAgentId }),
       ...(labelAgentName == null ? {} : { agentName: labelAgentName }),
     };
-    const traceMetadata = {
+    const traceMetadata: Record<string, string> = {
       ...createLangfuseTraceMetadata({
         messageId: 'activity-label-' + this.id,
         parentMessageId: labelParentMessageId,
@@ -2150,16 +2156,9 @@ export class Run<_T extends t.BaseGraphState> {
       labelContext?.langfuse
     );
     initializeLangfuseTracing(labelLangfuseConfig);
-    /** Seed policy, threading two constraints:
-     *  1. `runWithLangfuseRuntimeContext` SPREADS the surrounding context, so
-     *     an absent seed INHERITS the parent run's and collapses every label
-     *     into that trace. When a parent seed is active we must override it
-     *     with a per-label one.
-     *  2. Without deterministic tracing there is no parent seed, and forcing
-     *     one here would make label trace ids deterministic when neither
-     *     `processStream` nor `generateTitle` are — so leave it unset.
-     *  Seeded when determinism is opted into OR a parent seed is live;
-     *  otherwise unseeded, matching the other generation paths. */
+    /** A captured source observation parents the label in the agent trace.
+     *  The distinct seed remains the standalone fallback when labeling runs
+     *  before tracing starts or against another Langfuse destination. */
     const inheritedTraceSeed = getTraceIdSeed();
     const labelTraceSeed =
       labelLangfuseConfig?.deterministicTraceId === true ||
@@ -2174,6 +2173,15 @@ export class Run<_T extends t.BaseGraphState> {
       traceIdSeed: labelTraceSeed,
       runId: labelScopeRunId,
     });
+    const labelParentSpanContext = resolveLangfuseTraceAnchorParent(
+      this.Graph?.langfuseTraceAnchor,
+      resolveLangfuseDestinationKey(labelLangfuseConfig),
+      labelAgentId
+    );
+    if (labelParentSpanContext != null) {
+      labelMetadata.sourceTraceId = labelParentSpanContext.traceId;
+      traceMetadata.sourceTraceId = labelParentSpanContext.traceId;
+    }
     /** Handler only when a session id resolved from
      *  `chainOptions.configurable.thread_id`: without it the label call has
      *  no conversation identity, and tracing it would create an orphan
@@ -2187,15 +2195,17 @@ export class Run<_T extends t.BaseGraphState> {
         langfuse: labelLangfuseConfig,
         userId: labelUserId,
         sessionId: labelSessionId,
-        traceMetadata,
+        traceMetadata:
+          labelParentSpanContext == null ? traceMetadata : undefined,
         tags: labelTags,
         traceIdSeed:
           labelLangfuseConfig?.deterministicTraceId === true
             ? labelTraceSeed
             : undefined,
+        parentSpanContext: labelParentSpanContext,
         runId: labelScopeRunId,
         toolOutputTracing: labelRuntimeScope.toolOutputTracing,
-        traceName: labelRunName,
+        traceName: labelParentSpanContext == null ? labelRunName : undefined,
       });
     }
     if (labelLangfuseHandler != null) {
@@ -2297,8 +2307,9 @@ export class Run<_T extends t.BaseGraphState> {
           langfuse: labelLangfuseConfig,
           userId: labelUserId,
           sessionId: labelSessionId,
-          traceName: labelRunName,
-          traceMetadata,
+          traceName: labelParentSpanContext == null ? labelRunName : undefined,
+          traceMetadata:
+            labelParentSpanContext == null ? traceMetadata : undefined,
           tags: labelTags,
         },
         () =>
@@ -2470,7 +2481,7 @@ export class Run<_T extends t.BaseGraphState> {
       ...(reasoningAgentId == null ? {} : { agentId: reasoningAgentId }),
       ...(reasoningAgentName == null ? {} : { agentName: reasoningAgentName }),
     };
-    const traceMetadata = {
+    const traceMetadata: Record<string, string> = {
       ...createLangfuseTraceMetadata({
         messageId: `reasoning-label-${reasoningResponseId}`,
         parentMessageId: reasoningParentMessageId,
@@ -2512,21 +2523,39 @@ export class Run<_T extends t.BaseGraphState> {
       traceIdSeed: reasoningTraceSeed,
       runId: reasoningScopeRunId,
     });
+    const candidateReasoningParent = resolveLangfuseTraceAnchorParent(
+      this.Graph?.langfuseTraceAnchor,
+      resolveLangfuseDestinationKey(reasoningLangfuseConfig),
+      reasoningAgentId
+    );
+    const reasoningParentSpanContext =
+      resolvedSourceRunId === this.id &&
+      (sourceTraceId == null ||
+        sourceTraceId === candidateReasoningParent?.traceId)
+        ? candidateReasoningParent
+        : undefined;
+    if (reasoningParentSpanContext != null) {
+      reasoningMetadata.sourceTraceId = reasoningParentSpanContext.traceId;
+      traceMetadata.sourceTraceId = reasoningParentSpanContext.traceId;
+    }
     let reasoningLangfuseHandler: CallbackEntry | undefined;
     if (reasoningSessionId != null) {
       reasoningLangfuseHandler = createLangfuseHandler({
         langfuse: reasoningLangfuseConfig,
         userId: reasoningUserId,
         sessionId: reasoningSessionId,
-        traceMetadata,
+        traceMetadata:
+          reasoningParentSpanContext == null ? traceMetadata : undefined,
         tags: reasoningTags,
         traceIdSeed:
           reasoningLangfuseConfig?.deterministicTraceId === true
             ? reasoningTraceSeed
             : undefined,
+        parentSpanContext: reasoningParentSpanContext,
         runId: reasoningScopeRunId,
         toolOutputTracing: reasoningRuntimeScope.toolOutputTracing,
-        traceName: reasoningRunName,
+        traceName:
+          reasoningParentSpanContext == null ? reasoningRunName : undefined,
       });
     }
     if (reasoningLangfuseHandler != null) {
@@ -2585,8 +2614,10 @@ export class Run<_T extends t.BaseGraphState> {
           langfuse: reasoningLangfuseConfig,
           userId: reasoningUserId,
           sessionId: reasoningSessionId,
-          traceName: reasoningRunName,
-          traceMetadata,
+          traceName:
+            reasoningParentSpanContext == null ? reasoningRunName : undefined,
+          traceMetadata:
+            reasoningParentSpanContext == null ? traceMetadata : undefined,
           tags: reasoningTags,
         },
         () =>
@@ -2638,9 +2669,10 @@ export class Run<_T extends t.BaseGraphState> {
 
   /**
    * Generates one parent summary for two or more logical activities. The
-   * summary model is traced as a dedicated activity-phase chain root in the
-   * conversation session, with the model callback recorded as its generation
-   * child. No session id means no phase trace, avoiding orphan observations.
+   * summary model is traced as an activity-phase chain beneath the source
+   * agent run, with the model callback recorded as its generation child. It
+   * falls back to a dedicated trace when no source observation is available.
+   * No session id means no phase trace, avoiding orphan observations.
    */
   async generateActivityPhaseLabel({
     provider,
@@ -2785,7 +2817,7 @@ export class Run<_T extends t.BaseGraphState> {
       ...(phaseAgentName == null ? {} : { agentName: phaseAgentName }),
       ...(closingTextPhase == null ? {} : { closingTextPhase }),
     };
-    const traceMetadata = {
+    const traceMetadata: Record<string, string> = {
       ...createLangfuseTraceMetadata({
         messageId: phaseMessageId,
         parentMessageId: phaseParentMessageId,
@@ -2826,6 +2858,19 @@ export class Run<_T extends t.BaseGraphState> {
       traceIdSeed: phaseTraceSeed,
       runId: phaseScopeRunId,
     });
+    const candidatePhaseParent = resolveLangfuseTraceAnchorParent(
+      this.Graph?.langfuseTraceAnchor,
+      resolveLangfuseDestinationKey(phaseLangfuseConfig)
+    );
+    const phaseParentSpanContext =
+      (sourceRunId == null || sourceRunId === this.id) &&
+      (sourceTraceId == null || sourceTraceId === candidatePhaseParent?.traceId)
+        ? candidatePhaseParent
+        : undefined;
+    if (phaseParentSpanContext != null) {
+      phaseMetadata.sourceTraceId = phaseParentSpanContext.traceId;
+      traceMetadata.sourceTraceId = phaseParentSpanContext.traceId;
+    }
     let phaseLangfuseHandler: CallbackEntry | undefined;
     const sourceUserText =
       this.activityPhaseTraceInput ??
@@ -2835,15 +2880,17 @@ export class Run<_T extends t.BaseGraphState> {
         langfuse: phaseLangfuseConfig,
         userId: phaseUserId,
         sessionId: phaseSessionId,
-        traceMetadata,
+        traceMetadata:
+          phaseParentSpanContext == null ? traceMetadata : undefined,
         tags: phaseTags,
         traceIdSeed:
           phaseLangfuseConfig?.deterministicTraceId === true
             ? phaseTraceSeed
             : undefined,
+        parentSpanContext: phaseParentSpanContext,
         runId: phaseScopeRunId,
         toolOutputTracing: phaseRuntimeScope.toolOutputTracing,
-        traceName: phaseTraceName,
+        traceName: phaseParentSpanContext == null ? phaseTraceName : undefined,
       });
     }
     if (phaseLangfuseHandler != null) {
@@ -2864,7 +2911,7 @@ export class Run<_T extends t.BaseGraphState> {
     const invokeConfig = Object.assign({}, phaseChainOptions, {
       run_id: phaseRunId,
       runId: phaseRunId,
-      runName: 'summarize-activity-phase',
+      runName: ACTIVITY_PHASE_RUN_NAME,
       tags: [...new Set([...(phaseChainOptions.tags ?? []), ...phaseTags])],
       metadata: {
         ...(phaseChainOptions.metadata ?? {}),
@@ -2943,7 +2990,7 @@ export class Run<_T extends t.BaseGraphState> {
           ? { label, messages: [new AIMessage(label)] }
           : { messages: [] };
       },
-    }).withConfig({ runName: 'summarize-activity-phase' });
+    }).withConfig({ runName: ACTIVITY_PHASE_RUN_NAME });
 
     try {
       const result = await withLangfuseRuntimeScope(phaseRuntimeScope, () =>
@@ -2952,8 +2999,10 @@ export class Run<_T extends t.BaseGraphState> {
             langfuse: phaseLangfuseConfig,
             userId: phaseUserId,
             sessionId: phaseSessionId,
-            traceName: phaseTraceName,
-            traceMetadata,
+            traceName:
+              phaseParentSpanContext == null ? phaseTraceName : undefined,
+            traceMetadata:
+              phaseParentSpanContext == null ? traceMetadata : undefined,
             tags: phaseTags,
           },
           () =>

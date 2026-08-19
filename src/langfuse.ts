@@ -18,7 +18,7 @@ import type {
   LLMResult,
 } from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
-import type { Context } from '@opentelemetry/api';
+import type { Context, SpanContext } from '@opentelemetry/api';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
 import {
@@ -36,6 +36,7 @@ import {
 } from '@/langfuseConfig';
 import {
   getLangfuseManagedSpanDestination,
+  registerLangfuseManagedSpan,
   resolveLangfuseDestinationKey,
 } from '@/langfuseSpanRegistry';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
@@ -66,6 +67,10 @@ type LangfuseHandlerParams = {
   traceMetadata?: LangfuseTraceMetadata;
   tags?: string[];
   traceIdSeed?: string;
+  /** Opaque key used by the span processor to capture this run's parents. */
+  traceAnchor?: object;
+  /** Exported observation that auxiliary work should be nested beneath. */
+  parentSpanContext?: SpanContext;
   /** Identity of the run this handler traces; ambient runtime scopes are
    *  only adopted when stamped with the same run (see
    *  `LangfuseRuntimeContext.runId`). */
@@ -280,6 +285,8 @@ function detachForeignAmbientSpan(
 class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private readonly langfuse?: t.LangfuseConfig;
   private readonly traceIdSeed?: string;
+  private readonly traceAnchor?: object;
+  private readonly parentSpanContext?: SpanContext;
   private readonly runId?: string;
   private readonly identity: HandlerIdentity;
   private readonly toolOutputTracing?: ResolvedLangfuseToolOutputTracingConfig;
@@ -289,6 +296,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     const {
       langfuse,
       traceIdSeed,
+      traceAnchor,
+      parentSpanContext,
       runId,
       toolOutputTracing,
       traceName,
@@ -297,6 +306,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     super(handlerParams);
     this.langfuse = langfuse;
     this.traceIdSeed = traceIdSeed;
+    this.traceAnchor = traceAnchor;
+    this.parentSpanContext = parentSpanContext;
     this.runId = runId;
     this.toolOutputTracing = toolOutputTracing;
     this.identity = {
@@ -312,6 +323,22 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     return this.langfuse?.deterministicTraceId === true
       ? this.traceIdSeed
       : undefined;
+  }
+
+  private applyExplicitParent(
+    activeContext: Context,
+    langfuse?: t.LangfuseConfig
+  ): Context {
+    if (this.parentSpanContext == null) {
+      return activeContext;
+    }
+    const destinationKey = resolveLangfuseDestinationKey(langfuse);
+    if (destinationKey == null) {
+      return activeContext;
+    }
+    const parentSpan = otelTrace.wrapSpanContext(this.parentSpanContext);
+    registerLangfuseManagedSpan(parentSpan, destinationKey);
+    return otelTrace.setSpan(activeContext, parentSpan);
   }
 
   /**
@@ -401,12 +428,15 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     }
     const langfuse =
       resolveLangfuseConfigForSpan(currentContext) ?? this.langfuse;
+    const parentedContext = isDetachedRun
+      ? this.applyExplicitParent(currentContext, langfuse)
+      : currentContext;
     const activeContext = isDetachedRun
       ? detachForeignAmbientSpan(
-        currentContext,
+        parentedContext,
         resolveLangfuseDestinationKey(langfuse)
       )
-      : currentContext;
+      : parentedContext;
     const scoped = (): T =>
       withLangfuseRuntimeScope(
         {
@@ -414,6 +444,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
           traceIdSeed:
             resolveTraceIdSeedForSpan(activeContext) ??
             this.getDeterministicTraceSeed(),
+          traceAnchor: this.traceAnchor,
           runId: scopeRunId ?? this.runId,
         },
         action
@@ -438,11 +469,13 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     for (const key of Object.values(LangfuseOtelContextKeys)) {
       cleanContext = cleanContext.deleteValue(key);
     }
+    cleanContext = this.applyExplicitParent(cleanContext, this.langfuse);
     const scoped = (): T =>
       withLangfuseRuntimeScope(
         {
           langfuse: this.langfuse,
           traceIdSeed: this.getDeterministicTraceSeed(),
+          traceAnchor: this.traceAnchor,
           runId: this.runId,
           toolOutputTracing:
             this.toolOutputTracing ??
@@ -733,6 +766,8 @@ export function createLangfuseHandler({
   traceMetadata,
   tags,
   traceIdSeed,
+  traceAnchor,
+  parentSpanContext,
   runId,
   toolOutputTracing,
   traceName,
@@ -750,6 +785,8 @@ export function createLangfuseHandler({
     tags: mergeLangfuseTags(tags, langfuse?.tags),
     langfuse,
     traceIdSeed,
+    traceAnchor,
+    parentSpanContext,
     runId,
     toolOutputTracing,
     traceName,

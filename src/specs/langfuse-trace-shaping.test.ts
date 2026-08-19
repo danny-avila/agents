@@ -61,6 +61,47 @@ describe('shapeLangfuseSpan', () => {
     expect(span.attributes[OBSERVATION_TYPE]).toBe('agent');
   });
 
+  it('names graph observations for the SDK runtime pattern', () => {
+    const standard = createSpan(
+      'LangGraph',
+      { [METADATA_LANGGRAPH_NODE]: 'agent_primary' },
+      'parent-1'
+    );
+    const multiAgent = createSpan('MultiAgentGraph', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+    });
+
+    shapeLangfuseSpan(standard);
+    shapeLangfuseSpan(multiAgent);
+
+    expect(standard.name).toBe('StandardGraph');
+    expect(standard.attributes[OBSERVATION_TYPE]).toBe('agent');
+    expect(multiAgent.name).toBe('MultiAgentGraph');
+    expect(multiAgent.attributes[OBSERVATION_TYPE]).toBe('agent');
+  });
+
+  it('names the agent prompt-to-model sequence as an SDK operation', () => {
+    const span = createSpan(
+      'RunnableSequence',
+      { [METADATA_LANGGRAPH_NODE]: 'agent=openAI__gpt-5.4' },
+      'parent-1'
+    );
+
+    shapeLangfuseSpan(span);
+
+    expect(span.name).toBe('AgentModelCall');
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
+  });
+
+  it('does not rename unrelated runnable sequences', () => {
+    const span = createSpan('RunnableSequence', {}, 'parent-1');
+
+    shapeLangfuseSpan(span);
+
+    expect(span.name).toBe('RunnableSequence');
+    expect(span.attributes[OBSERVATION_TYPE]).toBeUndefined();
+  });
+
   it('shapes tool nodes as stable dispatch chains with scoped call inputs', () => {
     const messages = [
       { type: 'human', content: 'hello' },
@@ -182,7 +223,10 @@ describe('shapeLangfuseSpan', () => {
     expect(JSON.parse(mixedSpan.attributes[INPUT] as string)).toEqual([
       { name: 'echo', args: { command: 'hi' } },
       { name: 'echo', args: '"raw unparsed' },
-      { name: 'unknown', args: 'nameless — included with the unknown fallback' },
+      {
+        name: 'unknown',
+        args: 'nameless — included with the unknown fallback',
+      },
     ]);
 
     const invalidOnly = [
@@ -231,7 +275,9 @@ describe('shapeLangfuseSpan', () => {
           {
             type: 'ai',
             id: 'ai_array_span',
-            tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+            tool_calls: [
+              { name: 'echo', args: { command: 'hi' }, id: 'tc_ok' },
+            ],
             invalid_tool_calls: [invalidCall],
           },
         ]),
@@ -250,7 +296,9 @@ describe('shapeLangfuseSpan', () => {
           messages: [
             {
               type: 'ai',
-              tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+              tool_calls: [
+                { name: 'echo', args: { command: 'hi' }, id: 'tc_ok' },
+              ],
               invalid_tool_calls: [invalidCall],
             },
           ],
@@ -487,7 +535,7 @@ describe('shapeLangfuseSpan', () => {
   });
 
   it('marks activity-phase roots as chains even when tagged as agent work', () => {
-    const span = createSpan('summarize-activity-phase', {
+    const span = createSpan('ActivityPhase', {
       [TRACE_TAGS]: JSON.stringify([
         'librechat',
         'activity-phase',
@@ -500,6 +548,7 @@ describe('shapeLangfuseSpan', () => {
 
     shapeLangfuseSpan(span);
 
+    expect(span.name).toBe('ActivityPhase');
     expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
     expect(span.attributes[TRACE_INPUT]).toBe('What changed?');
     expect(span.attributes[TRACE_OUTPUT]).toBe(
@@ -563,13 +612,38 @@ describe('shapeLangfuseSpan', () => {
 
     shapeLangfuseSpan(span);
 
-    expect(span.name).toBe('llm');
+    expect(span.name).toBe('ActivityLabel');
     expect(span.attributes[INPUT]).toBe(originalInput);
     expect(span.attributes[OUTPUT]).toBe(originalOutput);
     expect(span.attributes[TRACE_INPUT]).toBe(
       'Tool calls:\n- bash(ls) → ok\n\nLabel:'
     );
     expect(span.attributes[TRACE_OUTPUT]).toBe(originalOutput);
+  });
+
+  it('names reasoning and phase-label generations by their role', () => {
+    const reasoning = createSpan(
+      'ChatOpenAI',
+      {
+        [OBSERVATION_TYPE]: 'generation',
+        [TRACE_TAGS]: JSON.stringify(['librechat', 'reasoning-label']),
+      },
+      'parent-1'
+    );
+    const phase = createSpan(
+      'ChatOpenAI',
+      {
+        [OBSERVATION_TYPE]: 'generation',
+        [TRACE_TAGS]: JSON.stringify(['librechat', 'activity-phase']),
+      },
+      'parent-1'
+    );
+
+    shapeLangfuseSpan(reasoning);
+    shapeLangfuseSpan(phase);
+
+    expect(reasoning.name).toBe('ReasoningLabel');
+    expect(phase.name).toBe('ActivityPhaseLabel');
   });
 
   it('still reduces observation input on non-generation roots', () => {

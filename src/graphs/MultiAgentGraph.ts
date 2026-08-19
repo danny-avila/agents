@@ -20,9 +20,9 @@ import type { ToolRuntime } from '@langchain/core/tools';
 import type { GraphFactoryDependencies } from '@/graphs/graphFactory';
 import type * as t from '@/types';
 import { serializeToolContentBounded } from '@/utils/toolContent';
+import { Constants, MULTI_AGENT_GRAPH_RUN_NAME } from '@/common';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { StandardGraph } from './Graph';
-import { Constants } from '@/common';
 
 /** Pattern to extract instructions from transfer ToolMessage content */
 const HANDOFF_INSTRUCTIONS_PATTERN = /(?:Instructions?|Context):\s*(.+)/is;
@@ -1438,6 +1438,8 @@ export class MultiAgentGraph extends StandardGraph {
       }
     }
 
-    return builder.compile(this.compileOptions as unknown as never);
+    return builder
+      .compile(this.compileOptions as unknown as never)
+      .withConfig({ runName: MULTI_AGENT_GRAPH_RUN_NAME });
   }
 }

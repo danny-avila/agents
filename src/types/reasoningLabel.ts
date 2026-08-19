@@ -52,7 +52,7 @@ export type RunReasoningLabelOptions = {
   traceSeed?: string;
   /** Stable source run identifier recorded on the observation. */
   sourceRunId?: string;
-  /** Source Langfuse trace id for linking this detached label trace. */
+  /** Source Langfuse trace id retained as correlation metadata. */
   sourceTraceId?: string;
   /** Host response/message identifier recorded on the observation. */
   responseId?: string;

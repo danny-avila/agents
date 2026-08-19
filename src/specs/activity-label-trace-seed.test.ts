@@ -5,11 +5,10 @@ import {
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 
 /**
- * `generateActivityLabel` passes one label seed to both the Langfuse handler
- * and the runtime scope it invokes under. This proves the mechanism: a label
- * scope's seed must override an inherited (parent run) seed for the duration
- * of the label call, then restore — otherwise per-batch label generations
- * collapse into the main run trace under deterministic tracing.
+ * `generateActivityLabel` keeps a label-specific seed for its standalone
+ * fallback when no source observation can be captured. An explicit source
+ * parent wins during normal traced runs; this proves fallback seed scoping
+ * does not leak into the surrounding agent run.
  *
  * Asserted through the ALS runtime-context channel (`getTraceIdSeed`), which
  * the trace id generator consults alongside OTel context; tests run without

@@ -75,6 +75,17 @@ import {
   removePredecessorHandoffCue,
 } from '@/messages';
 import {
+  Constants,
+  GraphNodeKeys,
+  ContentTypes,
+  GraphEvents,
+  Providers,
+  StepTypes,
+  STANDARD_GRAPH_RUN_NAME,
+  AGENT_MODEL_CALL_RUN_NAME,
+  PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
+} from '@/common';
+import {
   resetIfNotEmpty,
   isAnthropicLike,
   isOpenAILike,
@@ -106,15 +117,6 @@ import {
   isGraphSubagentConfig,
   normalizeSubagentConfigEntries,
 } from '@/tools/subagent';
-import {
-  Constants,
-  GraphNodeKeys,
-  ContentTypes,
-  GraphEvents,
-  Providers,
-  StepTypes,
-  PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
-} from '@/common';
 import {
   createLangfuseHandler,
   createLangfuseTraceMetadata,
@@ -1290,6 +1292,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * by the stream handler and every graph-level scope of that execution.
    */
   readonly langfuseScopeRunId: string;
+  /** Opaque key for parenting post-processing observations to this run. */
+  readonly langfuseTraceAnchor: object = {};
   /**
    * Boundary between historical messages (loaded from conversation state)
    * and messages produced during the current run.  Set once in the state
@@ -2913,7 +2917,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         });
 
       if (agentContext.systemRunnable) {
-        model = agentContext.systemRunnable.pipe(model as Runnable);
+        model = agentContext.systemRunnable
+          .pipe(model as Runnable)
+          .withConfig({ runName: AGENT_MODEL_CALL_RUN_NAME });
       }
 
       if (agentContext.tokenCalculationPromise) {
@@ -4010,6 +4016,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           tags: ['librechat', 'agent'],
           traceIdSeed:
             langfuse?.deterministicTraceId === true ? this.runId : undefined,
+          traceAnchor: this.langfuseTraceAnchor,
           runId: this.langfuseScopeRunId,
           toolOutputTracing: hasToolOutputTracingConfig(
             this.langfuse,
@@ -4052,6 +4059,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,
             langfuseOverlay: agentContext.langfuse,
+            traceAnchor: this.langfuseTraceAnchor,
             runId: this.langfuseScopeRunId,
             agentId,
           }),
@@ -4845,94 +4853,98 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           createChildGraphByKind: createConfiguredChildGraph,
           createDetachedChildGraphFactory: (
             parentHandlerRegistry
-          ): GraphFactory =>
-            snapshotChildGraphFactory(parentHandlerRegistry),
+          ): GraphFactory => snapshotChildGraphFactory(parentHandlerRegistry),
         });
         this.registerSubagentExecutor(executor);
 
-        const subagentTool = tool(async (rawInput, config) => {
-          const input = rawInput as {
-            description?: string;
-            subagent_type?: string;
-            subagent_thread_id?: string;
-            run_in_background?: boolean;
-          };
-          const description =
-            typeof input.description === 'string' &&
-            input.description.trim().length > 0
-              ? input.description
-              : DEFAULT_SUBAGENT_DESCRIPTION;
-          const subagentType =
-            typeof input.subagent_type === 'string' ? input.subagent_type : '';
-          const subagentThreadId =
-            typeof input.subagent_thread_id === 'string' &&
-            input.subagent_thread_id.trim() !== ''
-              ? input.subagent_thread_id.trim()
-              : undefined;
-          const threadId = config.configurable?.thread_id as string | undefined;
-          /** Surface the parent call id so child checkpoints, interrupts, and
-           * update events remain correlated across replay and resume. */
-          const toolRuntime = config as {
-            toolCallId?: string;
-            toolCall?: { id?: string };
-          };
-          const toolCall = toolRuntime.toolCall;
-          let parentToolCallId: string | undefined;
-          if (
-            typeof toolRuntime.toolCallId === 'string' &&
-            toolRuntime.toolCallId !== ''
-          ) {
-            parentToolCallId = toolRuntime.toolCallId;
-          } else if (typeof toolCall?.id === 'string' && toolCall.id !== '') {
-            parentToolCallId = toolCall.id;
-          }
-          /** The parent tool batch's entry-captured scope (stamped by
-           * ToolNode before PreToolUse hooks) — binds this child to the
-           * run that dispatched it, not to whatever controller a reset
-           * installed while the hooks were awaited. */
-          const batchScope = config.configurable?.[
-            RUN_BREAKER_SCOPE_CONFIG_KEY
-          ] as RunBreakerScope | undefined;
-          const executeParams = {
-            description,
-            subagentType,
-            threadId,
-            signal: config.signal,
-            parentToolCallId,
-            breaker: batchScope?.controller,
-            /**
-             * Forward the parent's `configurable` so host-set fields
-             * (`requestBody`, `user`, etc.) propagate into the child
-             * workflow. The executor scrubs run-identity fields before
-             * forwarding — see `SubagentExecuteParams.parentConfigurable`.
-             */
-            parentConfigurable: config.configurable as
-              | Record<string, unknown>
-              | undefined,
-          };
-          if (input.run_in_background === true) {
-            return executor.executeInBackground({
-              ...executeParams,
-              ...(subagentThreadId == null
-                ? {}
-                : { subagentThreadId }),
-            });
-          }
-          if (subagentThreadId != null) {
-            return JSON.stringify({
-              status: 'rejected',
-              tool: Constants.SUBAGENT,
-              message:
-                'Child-thread continuation requires run_in_background.',
-            });
-          }
-          const result = await executor.execute(executeParams);
-          return result.content;
-        }, buildSubagentToolParams(executableConfigs, {
-          background: this.subagentTasks != null,
-          threadContinuation:
-            this.subagentTasks?.store.supportsThreadContinuation === true,
-        }));
+        const subagentTool = tool(
+          async (rawInput, config) => {
+            const input = rawInput as {
+              description?: string;
+              subagent_type?: string;
+              subagent_thread_id?: string;
+              run_in_background?: boolean;
+            };
+            const description =
+              typeof input.description === 'string' &&
+              input.description.trim().length > 0
+                ? input.description
+                : DEFAULT_SUBAGENT_DESCRIPTION;
+            const subagentType =
+              typeof input.subagent_type === 'string'
+                ? input.subagent_type
+                : '';
+            const subagentThreadId =
+              typeof input.subagent_thread_id === 'string' &&
+              input.subagent_thread_id.trim() !== ''
+                ? input.subagent_thread_id.trim()
+                : undefined;
+            const threadId = config.configurable?.thread_id as
+              | string
+              | undefined;
+            /** Surface the parent call id so child checkpoints, interrupts, and
+             * update events remain correlated across replay and resume. */
+            const toolRuntime = config as {
+              toolCallId?: string;
+              toolCall?: { id?: string };
+            };
+            const toolCall = toolRuntime.toolCall;
+            let parentToolCallId: string | undefined;
+            if (
+              typeof toolRuntime.toolCallId === 'string' &&
+              toolRuntime.toolCallId !== ''
+            ) {
+              parentToolCallId = toolRuntime.toolCallId;
+            } else if (typeof toolCall?.id === 'string' && toolCall.id !== '') {
+              parentToolCallId = toolCall.id;
+            }
+            /** The parent tool batch's entry-captured scope (stamped by
+             * ToolNode before PreToolUse hooks) — binds this child to the
+             * run that dispatched it, not to whatever controller a reset
+             * installed while the hooks were awaited. */
+            const batchScope = config.configurable?.[
+              RUN_BREAKER_SCOPE_CONFIG_KEY
+            ] as RunBreakerScope | undefined;
+            const executeParams = {
+              description,
+              subagentType,
+              threadId,
+              signal: config.signal,
+              parentToolCallId,
+              breaker: batchScope?.controller,
+              /**
+               * Forward the parent's `configurable` so host-set fields
+               * (`requestBody`, `user`, etc.) propagate into the child
+               * workflow. The executor scrubs run-identity fields before
+               * forwarding — see `SubagentExecuteParams.parentConfigurable`.
+               */
+              parentConfigurable: config.configurable as
+                | Record<string, unknown>
+                | undefined,
+            };
+            if (input.run_in_background === true) {
+              return executor.executeInBackground({
+                ...executeParams,
+                ...(subagentThreadId == null ? {} : { subagentThreadId }),
+              });
+            }
+            if (subagentThreadId != null) {
+              return JSON.stringify({
+                status: 'rejected',
+                tool: Constants.SUBAGENT,
+                message:
+                  'Child-thread continuation requires run_in_background.',
+              });
+            }
+            const result = await executor.execute(executeParams);
+            return result.content;
+          },
+          buildSubagentToolParams(executableConfigs, {
+            background: this.subagentTasks != null,
+            threadContinuation:
+              this.subagentTasks?.store.supportsThreadContinuation === true,
+          })
+        );
         const replayableSubagentTool = subagentTool as typeof subagentTool &
           ReplayableSubagentTool;
         replayableSubagentTool[SUBAGENT_REPLAY_CONTROLLER] = {
@@ -5218,7 +5230,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       .addEdge(summarizeNode, agentNode)
       .addEdge(toolNode, agentContext.toolEnd ? END : agentNode);
 
-    return workflow.compile();
+    return workflow.compile().withConfig({ runName: STANDARD_GRAPH_RUN_NAME });
   }
 
   createWorkflow(): t.CompiledStateWorkflow {
@@ -5251,7 +5263,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       // LangGraph compile() types are overly strict for opt-in options
       .compile(this.compileOptions as unknown as never);
 
-    return workflow;
+    return workflow.withConfig({ runName: STANDARD_GRAPH_RUN_NAME });
   }
 
   /**

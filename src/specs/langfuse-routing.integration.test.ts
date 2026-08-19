@@ -8,10 +8,15 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { Context } from '@opentelemetry/api';
 import type * as t from '@/types';
+import {
+  resolveLangfuseDestinationKey,
+  resolveLangfuseTraceAnchorParent,
+} from '@/langfuseSpanRegistry';
 import { Constants, ContentTypes, Providers, TitleMethod } from '@/common';
 import { withLangfuseRuntimeScope } from '@/langfuseRuntimeScope';
 import { initializeLangfuseTracing } from '@/instrumentation';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
+import { createLangfuseHandler } from '@/langfuse';
 import * as providers from '@/llm/providers';
 import { Run } from '@/run';
 
@@ -588,7 +593,8 @@ describe('Langfuse per-run routing integration', () => {
         starts,
         traceId: runTraceId,
         names: [
-          `LibreChat Agent: Parent ${tenantId}`,
+          'StandardGraph',
+          'AgentModelCall',
           'FakeChatModel',
           'echo',
           'subagent',
@@ -635,11 +641,7 @@ describe('Langfuse per-run routing integration', () => {
       expectNamedSpansUseTraceId({
         starts,
         traceId,
-        names: [
-          `LibreChat Agent: parent ${tenantId}`,
-          'FakeChatModel',
-          'subagent',
-        ],
+        names: ['StandardGraph', 'AgentModelCall', 'FakeChatModel', 'subagent'],
       });
       expect(
         starts.filter(
@@ -667,7 +669,7 @@ describe('Langfuse per-run routing integration', () => {
         starts,
         traceId: summaryTraceId,
         names: [
-          `LibreChat Agent: Parent ${tenantId}`,
+          'StandardGraph',
           'summarize=parent',
           'summarization:cache_hit_compaction',
           'FakeChatModel',
@@ -712,9 +714,7 @@ describe('Langfuse per-run routing integration', () => {
       )
     ).toHaveLength(0);
 
-    const agentRoot = starts.find(
-      (record) => record.name === `LibreChat Agent: Parent ${tenantId}`
-    );
+    const agentRoot = starts.find((record) => record.name === 'StandardGraph');
     expect(agentRoot?.traceId).toBe(traceIdFromSeed(`routing-${tenantId}`));
     expect(agentRoot?.parentSpanId).toBeUndefined();
 
@@ -746,7 +746,7 @@ describe('Langfuse per-run routing integration', () => {
       spanId: string;
     };
     const agentRoot = startsForTenant(tenantId).find(
-      (record) => record.name === `LibreChat Agent: Parent ${tenantId}`
+      (record) => record.name === 'StandardGraph'
     );
     expect(agentRoot?.traceId).toBe(hostSpanContext.traceId);
     expect(agentRoot?.parentSpanId).toBe(hostSpanContext.spanId);
@@ -777,11 +777,56 @@ describe('Langfuse per-run routing integration', () => {
       spanId: string;
     };
     const agentRoot = startsForTenant(runTenantId).find(
-      (record) => record.name === `LibreChat Agent: Parent ${runTenantId}`
+      (record) => record.name === 'StandardGraph'
     );
     expect(agentRoot?.traceId).toBe(traceIdFromSeed(`routing-${runTenantId}`));
     expect(agentRoot?.traceId).not.toBe(hostSpanContext.traceId);
     expect(agentRoot?.parentSpanId).toBeUndefined();
+  });
+
+  it('parents auxiliary label callbacks beneath the captured agent run', async () => {
+    const tenantId = 'tenant-label-parent';
+    const langfuse = tenantLangfuse(tenantId);
+    const traceAnchor = {};
+    initializeLangfuseTracing(langfuse);
+
+    let agentRoot: MockSpan | undefined;
+    withLangfuseRuntimeScope(
+      { langfuse, traceAnchor, runId: 'source-run' },
+      () => {
+        agentRoot = createMockSpan('StandardGraph');
+      }
+    );
+    const parentSpanContext = resolveLangfuseTraceAnchorParent(
+      traceAnchor,
+      resolveLangfuseDestinationKey(langfuse)
+    );
+    const labelHandler = createLangfuseHandler({
+      langfuse,
+      runId: 'label-run',
+      parentSpanContext,
+      tags: ['librechat', 'activity-label'],
+    });
+
+    await withLangfuseRuntimeScope(
+      { langfuse, runId: 'foreign-background-run' },
+      () =>
+        labelHandler?.handleChainStart(
+          { id: ['ActivityLabel'] } as never,
+          {},
+          'label-chain'
+        )
+    );
+
+    const label = startsForTenant(tenantId).find(
+      (record) => record.name === 'ActivityLabel'
+    );
+    const rootContext = agentRoot?.spanContext() as {
+      traceId: string;
+      spanId: string;
+    };
+    expect(label?.traceId).toBe(rootContext.traceId);
+    expect(label?.parentSpanId).toBe(rootContext.spanId);
   });
 
   it('generates a scope stamp for directly-constructed graphs without a run id', async () => {

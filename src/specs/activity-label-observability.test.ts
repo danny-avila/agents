@@ -1,6 +1,11 @@
 import { CallbackHandler } from '@langfuse/langchain';
 import { propagateAttributes } from '@langfuse/tracing';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
+import type { Span } from '@opentelemetry/api';
+import {
+  registerLangfuseTraceAnchorSpan,
+  resolveLangfuseDestinationKey,
+} from '@/langfuseSpanRegistry';
 import { Providers } from '@/common';
 import { Run } from '@/run';
 
@@ -68,6 +73,21 @@ describe('activity label observability', () => {
 
   it('uses a stable trace name and source-run metadata for batch labels', async () => {
     const run = await createRun();
+    const sourceTraceId = '0123456789abcdef0123456789abcdef';
+    const destinationKey = resolveLangfuseDestinationKey();
+    const sourceSpan = {
+      spanContext: () => ({
+        traceId: sourceTraceId,
+        spanId: '0123456789abcdef',
+        traceFlags: 1,
+      }),
+    } as unknown as Span;
+    registerLangfuseTraceAnchorSpan(
+      run.Graph?.langfuseTraceAnchor as object,
+      sourceSpan,
+      destinationKey as string,
+      'agent-1'
+    );
 
     await run.generateActivityLabel({
       provider: Providers.OPENAI,
@@ -90,30 +110,19 @@ describe('activity label observability', () => {
 
     expect(MockedCallbackHandler).toHaveBeenCalledTimes(1);
     expect(MockedCallbackHandler.mock.calls[0][0]).toMatchObject({
-      traceMetadata: {
-        messageId: 'activity-label-response-1',
-        parentMessageId: 'parent-1',
-        agentId: 'agent-1',
-        agentName: 'Changing Model Name',
-        sourceRunId: 'response-1',
-        responseId: 'response-1',
-        activityIndex: '0',
-      },
+      traceMetadata: undefined,
       tags: ['librechat', 'activity-label'],
     });
     expect(MockedPropagateAttributes.mock.calls[0][0]).toMatchObject({
-      traceName: 'LibreChat Activity Label',
-      metadata: {
-        sourceRunId: 'response-1',
-        responseId: 'response-1',
-        activityIndex: '0',
-      },
+      traceName: undefined,
+      metadata: undefined,
     });
     expect(invoke.mock.calls[0][1]).toMatchObject({
       runName: 'LibreChat Activity Label',
       tags: ['librechat', 'activity-label'],
       metadata: {
         sourceRunId: 'response-1',
+        sourceTraceId,
         responseId: 'response-1',
         activityIndex: 0,
         parentMessageId: 'parent-1',

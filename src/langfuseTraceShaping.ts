@@ -1,9 +1,20 @@
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
-import { Constants } from '@/common';
+import {
+  Constants,
+  STANDARD_GRAPH_RUN_NAME,
+  MULTI_AGENT_GRAPH_RUN_NAME,
+  AGENT_MODEL_CALL_RUN_NAME,
+  ACTIVITY_LABEL_RUN_NAME,
+  REASONING_LABEL_RUN_NAME,
+  ACTIVITY_PHASE_RUN_NAME,
+  ACTIVITY_PHASE_LABEL_RUN_NAME,
+} from '@/common';
 
 const LANGGRAPH_START_NODE = '__start__';
+const LANGGRAPH_RUN_NAME = 'LangGraph';
 const ANONYMOUS_LAMBDA_NAME = 'RunnableLambda';
+const RUNNABLE_SEQUENCE_NAME = 'RunnableSequence';
 const LANGGRAPH_AGENT_NODE_PREFIX = 'agent=';
 const LANGGRAPH_TOOL_NODE_PREFIX = 'tools=';
 const AGENT_NODE_SPAN_NAME = 'agent';
@@ -14,8 +25,9 @@ const CHAIN_OBSERVATION_TYPE = 'chain';
 const TOOL_OBSERVATION_TYPE = 'tool';
 const AGENT_TRACE_TAG = 'agent';
 const TITLE_TRACE_TAG = 'title';
+const ACTIVITY_LABEL_TRACE_TAG = 'activity-label';
+const REASONING_LABEL_TRACE_TAG = 'reasoning-label';
 const ACTIVITY_PHASE_TRACE_TAG = 'activity-phase';
-const ACTIVITY_PHASE_ROOT_NAME = 'summarize-activity-phase';
 const EPHEMERAL_AGENT_SENDER_SEPARATOR = '___';
 const EPHEMERAL_AGENT_INDEX_SEPARATOR = '____';
 const OBSERVATION_METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
@@ -192,9 +204,7 @@ function getMessageToolCalls(
  */
 /** Tool-result ids present in the serialized state — ToolNode's
  *  `!toolMessageIds.has(id)` execution filter, mirrored for the span. */
-function getToolResultIds(
-  messages: Record<string, unknown>[]
-): Set<string> {
+function getToolResultIds(messages: Record<string, unknown>[]): Set<string> {
   const ids = new Set<string>();
   for (const message of messages) {
     if (getMessageRole(message) !== 'tool') {
@@ -217,7 +227,9 @@ function getMessageInvalidToolCalls(
 ): SerializedToolCall[] {
   const rawCalls =
     message.invalid_tool_calls ??
-    (isRecord(message.kwargs) ? message.kwargs.invalid_tool_calls : undefined) ??
+    (isRecord(message.kwargs)
+      ? message.kwargs.invalid_tool_calls
+      : undefined) ??
     (isRecord(message.data) ? message.data.invalid_tool_calls : undefined);
   if (!Array.isArray(rawCalls)) {
     return [];
@@ -343,6 +355,68 @@ function shapeAgentNodeSpan(span: MutableSpan): void {
   span.name = AGENT_NODE_SPAN_NAME;
   span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] =
     ROOT_OBSERVATION_TYPE;
+}
+
+function shapeGraphSpan(span: MutableSpan): void {
+  if (span.name === LANGGRAPH_RUN_NAME) {
+    span.name = STANDARD_GRAPH_RUN_NAME;
+  }
+  span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] =
+    ROOT_OBSERVATION_TYPE;
+}
+
+function isAgentModelCallSpan(span: MutableSpan): boolean {
+  if (
+    span.name !== RUNNABLE_SEQUENCE_NAME &&
+    span.name !== AGENT_MODEL_CALL_RUN_NAME
+  ) {
+    return false;
+  }
+  const node = span.attributes[OBSERVATION_METADATA_LANGGRAPH_NODE];
+  return (
+    typeof node === 'string' && node.startsWith(LANGGRAPH_AGENT_NODE_PREFIX)
+  );
+}
+
+function shapeAgentModelCallSpan(span: MutableSpan): void {
+  span.name = AGENT_MODEL_CALL_RUN_NAME;
+  span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] =
+    CHAIN_OBSERVATION_TYPE;
+}
+
+function shapeActivityPhaseSpan(span: MutableSpan): void {
+  span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] =
+    CHAIN_OBSERVATION_TYPE;
+}
+
+function shapeGenerationSpan(span: MutableSpan): void {
+  if (hasTraceTag(span, ACTIVITY_LABEL_TRACE_TAG)) {
+    span.name = ACTIVITY_LABEL_RUN_NAME;
+    return;
+  }
+  if (hasTraceTag(span, REASONING_LABEL_TRACE_TAG)) {
+    span.name = REASONING_LABEL_RUN_NAME;
+    return;
+  }
+  if (hasTraceTag(span, ACTIVITY_PHASE_TRACE_TAG)) {
+    span.name = ACTIVITY_PHASE_LABEL_RUN_NAME;
+    return;
+  }
+  span.name = GENERATION_SPAN_NAME;
+}
+
+function isGraphSpan(span: MutableSpan): boolean {
+  if (
+    span.name !== LANGGRAPH_RUN_NAME &&
+    span.name !== STANDARD_GRAPH_RUN_NAME &&
+    span.name !== MULTI_AGENT_GRAPH_RUN_NAME
+  ) {
+    return false;
+  }
+  return (
+    isRootSpan(span) ||
+    typeof span.attributes[OBSERVATION_METADATA_LANGGRAPH_NODE] === 'string'
+  );
 }
 
 function shapeRootSpan(span: MutableSpan): void {
@@ -477,7 +551,7 @@ function shapeRootObservationType(span: MutableSpan): void {
   }
   if (
     hasTraceTag(span, TITLE_TRACE_TAG) ||
-    (span.name === ACTIVITY_PHASE_ROOT_NAME &&
+    (span.name === ACTIVITY_PHASE_RUN_NAME &&
       hasTraceTag(span, ACTIVITY_PHASE_TRACE_TAG))
   ) {
     span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] =
@@ -496,17 +570,19 @@ function shapeRootObservationType(span: MutableSpan): void {
  *   (`provider__model`) — strip it so switching models doesn't break
  *   name-based logic (item 1). The outer workflow node is named with the
  *   bare agent id; ephemeral ids reduce to their stable sender name.
+ * - Graph and prompt-to-model framework names become stable SDK operations:
+ *   `StandardGraph` / `MultiAgentGraph` and `AgentModelCall`.
  * - LLM generation spans keep the provider client class name (`ChatOpenAI`,
- *   `AzureChatOpenAI`, …); rename them to a provider-agnostic `llm` so the
- *   name reflects the operation, not the model (the model stays on the
- *   generation's model attribute).
+ *   `AzureChatOpenAI`, …); rename ordinary calls to a provider-agnostic `llm`
+ *   and label calls by their activity/reasoning role. The model stays on the
+ *   generation's model attribute.
  * - Agent nodes become `agent` observations, while tool-dispatch nodes become
  *   stable `chain` observations whose input is scoped to the pending calls.
  *   Individual child calls remain `tool` observations (items 3 & 4).
  * - Agent trace roots become `agent` observations, while title and activity
- *   summary roots become `chain` observations. Root and trace input/output are
- *   reduced to the user question and assistant response when chat messages are
- *   available (item 2).
+ *   summary operations become `chain` observations. Root and trace
+ *   input/output are reduced to the user question and assistant response when
+ *   chat messages are available (item 2).
  */
 export function shapeLangfuseSpan(span: ReadableSpan): void {
   const mutable = span as MutableSpan;
@@ -514,8 +590,14 @@ export function shapeLangfuseSpan(span: ReadableSpan): void {
     shapeAgentNodeSpan(mutable);
   } else if (mutable.name.startsWith(LANGGRAPH_TOOL_NODE_PREFIX)) {
     shapeToolNodeSpan(mutable);
+  } else if (isGraphSpan(mutable)) {
+    shapeGraphSpan(mutable);
+  } else if (isAgentModelCallSpan(mutable)) {
+    shapeAgentModelCallSpan(mutable);
+  } else if (mutable.name === ACTIVITY_PHASE_RUN_NAME) {
+    shapeActivityPhaseSpan(mutable);
   } else if (isGenerationSpan(mutable)) {
-    mutable.name = GENERATION_SPAN_NAME;
+    shapeGenerationSpan(mutable);
   } else {
     shapeEphemeralAgentNodeSpan(mutable);
   }
