@@ -35,10 +35,10 @@ export const PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS = 120_000;
 export const DEFAULT_RECURSION_LIMIT = 50;
 
 /** Stable runtime names used for agent workflow observations. */
-export const STANDARD_GRAPH_RUN_NAME = 'StandardGraph';
+export const STANDARD_GRAPH_RUN_NAME = 'AgentGraph';
 export const MULTI_AGENT_GRAPH_RUN_NAME = 'MultiAgentGraph';
 export const AGENT_MODEL_CALL_RUN_NAME = 'AgentModelCall';
-export const ACTIVITY_LABEL_RUN_NAME = 'ActivityLabel';
+export const ACTIVITY_LABEL_RUN_NAME = 'StepLabel';
 export const REASONING_LABEL_RUN_NAME = 'ReasoningLabel';
-export const ACTIVITY_PHASE_RUN_NAME = 'ActivityPhase';
-export const ACTIVITY_PHASE_LABEL_RUN_NAME = 'ActivityPhaseLabel';
+export const ACTIVITY_PHASE_RUN_NAME = 'MultiStepLabel';
+export const ACTIVITY_PHASE_LABEL_RUN_NAME = 'MultiStepLabelGeneration';

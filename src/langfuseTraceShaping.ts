@@ -590,7 +590,7 @@ function shapeRootObservationType(span: MutableSpan): void {
  *   name-based logic (item 1). The outer workflow node is named with the
  *   bare agent id; ephemeral ids reduce to their stable sender name.
  * - Graph and prompt-to-model framework names become stable SDK operations:
- *   `StandardGraph` / `MultiAgentGraph` and `AgentModelCall`.
+ *   `AgentGraph` / `MultiAgentGraph` and `AgentModelCall`.
  * - LLM generation spans keep the provider client class name (`ChatOpenAI`,
  *   `AzureChatOpenAI`, …); rename ordinary calls to a provider-agnostic `llm`
  *   and label calls by their activity/reasoning role. The model stays on the

@@ -81,7 +81,7 @@ describe('shapeLangfuseSpan', () => {
     shapeLangfuseSpan(standard);
     shapeLangfuseSpan(multiAgent);
 
-    expect(standard.name).toBe('StandardGraph');
+    expect(standard.name).toBe('AgentGraph');
     expect(standard.attributes[OBSERVATION_TYPE]).toBe('agent');
     expect(multiAgent.name).toBe('MultiAgentGraph');
     expect(multiAgent.attributes[OBSERVATION_TYPE]).toBe('agent');
@@ -89,7 +89,7 @@ describe('shapeLangfuseSpan', () => {
 
   it('types agent-tagged graph roots nested beneath managed hosts', () => {
     const standard = createSpan(
-      'StandardGraph',
+      'AgentGraph',
       {
         [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
         [INPUT]: JSON.stringify({
@@ -104,7 +104,7 @@ describe('shapeLangfuseSpan', () => {
 
     shapeLangfuseSpan(standard);
 
-    expect(standard.name).toBe('StandardGraph');
+    expect(standard.name).toBe('AgentGraph');
     expect(standard.attributes[OBSERVATION_TYPE]).toBe('agent');
     expect(standard.attributes[INPUT]).toBe('Inspect the nested run');
     expect(standard.attributes[OUTPUT]).toBe('Nested run complete');
@@ -567,7 +567,7 @@ describe('shapeLangfuseSpan', () => {
   });
 
   it('marks activity-phase roots as chains even when tagged as agent work', () => {
-    const span = createSpan('ActivityPhase', {
+    const span = createSpan('MultiStepLabel', {
       [TRACE_TAGS]: JSON.stringify([
         'librechat',
         'activity-phase',
@@ -580,7 +580,7 @@ describe('shapeLangfuseSpan', () => {
 
     shapeLangfuseSpan(span);
 
-    expect(span.name).toBe('ActivityPhase');
+    expect(span.name).toBe('MultiStepLabel');
     expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
     expect(span.attributes[TRACE_INPUT]).toBe('What changed?');
     expect(span.attributes[TRACE_OUTPUT]).toBe(
@@ -645,7 +645,7 @@ describe('shapeLangfuseSpan', () => {
 
     shapeLangfuseSpan(span);
 
-    expect(span.name).toBe('ActivityLabel');
+    expect(span.name).toBe('StepLabel');
     expect(span.attributes[INPUT]).toBe(originalInput);
     expect(span.attributes[OUTPUT]).toBe(originalOutput);
     expect(span.attributes[TRACE_INPUT]).toBe(
@@ -678,7 +678,7 @@ describe('shapeLangfuseSpan', () => {
     shapeLangfuseSpan(phase);
 
     expect(reasoning.name).toBe('ReasoningLabel');
-    expect(phase.name).toBe('ActivityPhaseLabel');
+    expect(phase.name).toBe('MultiStepLabelGeneration');
   });
 
   it('does not derive generation operation names from public tags alone', () => {

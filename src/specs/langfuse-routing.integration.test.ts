@@ -594,7 +594,7 @@ describe('Langfuse per-run routing integration', () => {
         starts,
         traceId: runTraceId,
         names: [
-          'StandardGraph',
+          'AgentGraph',
           'AgentModelCall',
           'FakeChatModel',
           'echo',
@@ -642,7 +642,7 @@ describe('Langfuse per-run routing integration', () => {
       expectNamedSpansUseTraceId({
         starts,
         traceId,
-        names: ['StandardGraph', 'AgentModelCall', 'FakeChatModel', 'subagent'],
+        names: ['AgentGraph', 'AgentModelCall', 'FakeChatModel', 'subagent'],
       });
       expect(
         starts.filter(
@@ -670,7 +670,7 @@ describe('Langfuse per-run routing integration', () => {
         starts,
         traceId: summaryTraceId,
         names: [
-          'StandardGraph',
+          'AgentGraph',
           'summarize=parent',
           'summarization:cache_hit_compaction',
           'FakeChatModel',
@@ -715,7 +715,7 @@ describe('Langfuse per-run routing integration', () => {
       )
     ).toHaveLength(0);
 
-    const agentRoot = starts.find((record) => record.name === 'StandardGraph');
+    const agentRoot = starts.find((record) => record.name === 'AgentGraph');
     expect(agentRoot?.traceId).toBe(traceIdFromSeed(`routing-${tenantId}`));
     expect(agentRoot?.parentSpanId).toBeUndefined();
 
@@ -747,7 +747,7 @@ describe('Langfuse per-run routing integration', () => {
       spanId: string;
     };
     const agentRoot = startsForTenant(tenantId).find(
-      (record) => record.name === 'StandardGraph'
+      (record) => record.name === 'AgentGraph'
     );
     expect(agentRoot?.traceId).toBe(hostSpanContext.traceId);
     expect(agentRoot?.parentSpanId).toBe(hostSpanContext.spanId);
@@ -778,7 +778,7 @@ describe('Langfuse per-run routing integration', () => {
       spanId: string;
     };
     const agentRoot = startsForTenant(runTenantId).find(
-      (record) => record.name === 'StandardGraph'
+      (record) => record.name === 'AgentGraph'
     );
     expect(agentRoot?.traceId).toBe(traceIdFromSeed(`routing-${runTenantId}`));
     expect(agentRoot?.traceId).not.toBe(hostSpanContext.traceId);
@@ -795,7 +795,7 @@ describe('Langfuse per-run routing integration', () => {
     withLangfuseRuntimeScope(
       { langfuse, traceAnchor, runId: 'source-run' },
       () => {
-        agentRoot = createMockSpan('StandardGraph');
+        agentRoot = createMockSpan('AgentGraph');
       }
     );
     const destinationKey = resolveLangfuseDestinationKey(langfuse) as string;
@@ -838,14 +838,14 @@ describe('Langfuse per-run routing integration', () => {
       { langfuse, runId: 'foreign-background-run' },
       () =>
         labelHandler?.handleChainStart(
-          { id: ['ActivityLabel'] } as never,
+          { id: ['StepLabel'] } as never,
           {},
           'label-chain'
         )
     );
 
     const label = startsForTenant(tenantId).find(
-      (record) => record.name === 'ActivityLabel'
+      (record) => record.name === 'StepLabel'
     );
     const rootContext = agentRoot?.spanContext() as {
       traceId: string;
@@ -864,7 +864,7 @@ describe('Langfuse per-run routing integration', () => {
 
     withLangfuseRuntimeScope(
       { langfuse: rootLangfuse, traceAnchor, runId: 'source-run' },
-      () => createMockSpan('StandardGraph')
+      () => createMockSpan('AgentGraph')
     );
     const overlayHandler = createLangfuseHandler({
       langfuse: overlayLangfuse,
@@ -944,7 +944,7 @@ describe('Langfuse per-run routing integration', () => {
       resolveLangfuseDestinationKey(langfuse)
     );
     const roots = startsForTenant(tenantId).filter(
-      (record) => record.name === 'StandardGraph' && record.parentSpanId == null
+      (record) => record.name === 'AgentGraph' && record.parentSpanId == null
     );
 
     expect(roots).toHaveLength(2);
