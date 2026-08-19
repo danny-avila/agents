@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { describe, it, expect, beforeEach } from '@jest/globals';
 import { GraphInterrupt, MemorySaver } from '@langchain/langgraph';
+import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
@@ -624,6 +625,58 @@ describe('SubagentExecutor', () => {
     expect(fallbackFactory).not.toHaveBeenCalled();
     expect(clearHeavyState).toHaveBeenCalled();
     expect(hookRegistry.hasHookFor('PreToolUse', 'test-run')).toBe(false);
+  });
+
+  it('replaces the ambient parent run config for detached child execution', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const parentController = new AbortController();
+    let observedSignal: AbortSignal | undefined;
+    let finish = (_value: { messages: BaseMessage[] }): void => undefined;
+    const invocation = new Promise<{ messages: BaseMessage[] }>((resolve) => {
+      finish = resolve;
+    });
+    const invoke = jest.fn(async () => {
+      observedSignal = AsyncLocalStorageProviderSingleton.getRunnableConfig()
+        ?.signal as AbortSignal | undefined;
+      return invocation;
+    });
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    const response = await AsyncLocalStorageProviderSingleton.runWithConfig(
+      { signal: parentController.signal },
+      async () =>
+        JSON.parse(
+          executor.executeInBackground({
+            description: 'Outlive the parent turn.',
+            subagentType: 'researcher',
+            parentToolCallId: 'call_detached_signal',
+          })
+        ) as { background_task_id: string }
+    );
+    await waitForTask(
+      store,
+      response.background_task_id,
+      () => invoke.mock.calls.length > 0
+    );
+
+    parentController.abort();
+    expect(observedSignal).toBeDefined();
+    expect(observedSignal).not.toBe(parentController.signal);
+    expect(observedSignal?.aborted).toBe(false);
+
+    finish({ messages: [new AIMessage('detached result')] });
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'completed'
+    );
   });
 
   it('continues the same detached child for a queued parent message', async () => {
