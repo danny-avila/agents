@@ -177,6 +177,7 @@ function withHandoffGroupMetadata(
  * OR continues its workflow (direct edges), but not both simultaneously.
  */
 export class MultiAgentGraph extends StandardGraph {
+  override readonly runName = MULTI_AGENT_GRAPH_RUN_NAME;
   private edges: t.GraphEdge[];
   private startingNodes: Set<string> = new Set();
   private directEdges: t.GraphEdge[] = [];
@@ -1438,8 +1439,9 @@ export class MultiAgentGraph extends StandardGraph {
       }
     }
 
-    return builder
-      .compile(this.compileOptions as unknown as never)
-      .withConfig({ runName: MULTI_AGENT_GRAPH_RUN_NAME });
+    return builder.compile({
+      ...this.compileOptions,
+      name: MULTI_AGENT_GRAPH_RUN_NAME,
+    } as unknown as never);
   }
 }

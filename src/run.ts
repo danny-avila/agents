@@ -1214,18 +1214,22 @@ export class Run<_T extends t.BaseGraphState> {
        * arg to `BaseGraphState`. Cast on the call so the resume path
        * type-checks without widening the wrapper for every caller.
        */
-      const stream = graphRunnable.streamEvents(inputs as t.IState, config, {
-        raiseError: true,
-        /**
-         * Prevent EventStreamCallbackHandler from processing custom events.
-         * Custom events are already handled via our createCustomEventCallback()
-         * which routes them through the handlerRegistry.
-         * Without this flag, EventStreamCallbackHandler throws errors when
-         * custom events are dispatched for run IDs not in its internal map
-         * (due to timing issues in parallel execution or after run cleanup).
-         */
-        ignoreCustomEvent: true,
-      });
+      const stream = graphRunnable.streamEvents(
+        inputs as t.IState,
+        { ...config, runName: graph.runName },
+        {
+          raiseError: true,
+          /**
+           * Prevent EventStreamCallbackHandler from processing custom events.
+           * Custom events are already handled via our createCustomEventCallback()
+           * which routes them through the handlerRegistry.
+           * Without this flag, EventStreamCallbackHandler throws errors when
+           * custom events are dispatched for run IDs not in its internal map
+           * (due to timing issues in parallel execution or after run cleanup).
+           */
+          ignoreCustomEvent: true,
+        }
+      );
 
       for await (const event of stream) {
         const { data, metadata, ...info } = event;

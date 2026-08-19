@@ -580,6 +580,37 @@ describe('Langfuse per-run routing integration', () => {
     });
   });
 
+  it('keeps caller run names from replacing the graph operation name', async () => {
+    const tenantId = 'tenant-caller-run-name';
+    const run = await Run.create<t.IState>({
+      runId: `routing-${tenantId}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [createAgent(tenantId)],
+      },
+      langfuse: tenantLangfuse(tenantId),
+      returnContent: true,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel(['Caller name preserved.'], 1);
+
+    await run.processStream(
+      { messages: [new HumanMessage('Keep the operation name stable.')] },
+      {
+        ...callerConfig,
+        runName: 'Host Agent Trace',
+        configurable: {
+          thread_id: `thread-${tenantId}`,
+          user_id: `user-${tenantId}`,
+        },
+      }
+    );
+
+    const starts = startsForTenant(tenantId);
+    expect(starts.some(({ name }) => name === 'AgentGraph')).toBe(true);
+    expect(starts.some(({ name }) => name === 'Host Agent Trace')).toBe(false);
+  });
+
   it('routes parallel root, model, tool, subagent, and title spans to each run config', async () => {
     await Promise.all([runTenantFlow('tenant-a'), runTenantFlow('tenant-b')]);
 

@@ -1262,6 +1262,7 @@ export abstract class Graph<
 }
 
 export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
+  readonly runName: string = STANDARD_GRAPH_RUN_NAME;
   overrideModel?: t.ChatModel;
   private subagentModelOverride?: t.ChatModel;
   private readonly graphFactory: GraphFactory;
@@ -5237,7 +5238,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       .addEdge(summarizeNode, agentNode)
       .addEdge(toolNode, agentContext.toolEnd ? END : agentNode);
 
-    return workflow.compile().withConfig({ runName: STANDARD_GRAPH_RUN_NAME });
+    return workflow.compile({ name: STANDARD_GRAPH_RUN_NAME });
   }
 
   createWorkflow(): t.CompiledStateWorkflow {
@@ -5266,11 +5267,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         >,
         { ends: [END] }
       )
-      .addEdge(START, this.defaultAgentId)
-      // LangGraph compile() types are overly strict for opt-in options
-      .compile(this.compileOptions as unknown as never);
+      .addEdge(START, this.defaultAgentId);
 
-    return workflow.withConfig({ runName: STANDARD_GRAPH_RUN_NAME });
+    // LangGraph compile() types are overly strict for opt-in options
+    return workflow.compile({
+      ...this.compileOptions,
+      name: STANDARD_GRAPH_RUN_NAME,
+    } as unknown as never);
   }
 
   /**
