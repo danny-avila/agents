@@ -4017,6 +4017,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           traceIdSeed:
             langfuse?.deterministicTraceId === true ? this.runId : undefined,
           traceAnchor: this.langfuseTraceAnchor,
+          agentId,
           runId: this.langfuseScopeRunId,
           toolOutputTracing: hasToolOutputTracingConfig(
             this.langfuse,

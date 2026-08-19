@@ -54,6 +54,11 @@ import {
   normalizeReasoningLabel,
 } from '@/prompts/reasoningLabel';
 import {
+  resetLangfuseTraceAnchorSpans,
+  resolveLangfuseDestinationKey,
+  resolveLangfuseTraceAnchorParent,
+} from '@/langfuseSpanRegistry';
+import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
@@ -65,10 +70,6 @@ import {
   ACTIVITY_PHASE_RUN_NAME,
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
-import {
-  resolveLangfuseDestinationKey,
-  resolveLangfuseTraceAnchorParent,
-} from '@/langfuseSpanRegistry';
 import {
   appendCallbacks,
   filterCallbacks,
@@ -991,6 +992,9 @@ export class Run<_T extends t.BaseGraphState> {
      * instead of `inputs.messages`.
      */
     const isResume = inputs instanceof Command;
+    if (!isResume) {
+      resetLangfuseTraceAnchorSpans(graph.langfuseTraceAnchor);
+    }
     const stateInputs = isResume ? undefined : (inputs as t.IState);
     if (stateInputs != null) {
       this.activityPhaseTraceInput = findActivityPhaseTraceInput(
@@ -2203,6 +2207,7 @@ export class Run<_T extends t.BaseGraphState> {
             ? labelTraceSeed
             : undefined,
         parentSpanContext: labelParentSpanContext,
+        inheritTraceIdentity: labelParentSpanContext != null,
         runId: labelScopeRunId,
         toolOutputTracing: labelRuntimeScope.toolOutputTracing,
         traceName: labelParentSpanContext == null ? labelRunName : undefined,
@@ -2311,6 +2316,7 @@ export class Run<_T extends t.BaseGraphState> {
           traceMetadata:
             labelParentSpanContext == null ? traceMetadata : undefined,
           tags: labelTags,
+          inheritTraceIdentity: labelParentSpanContext != null,
         },
         () =>
           model.invoke(
@@ -2552,6 +2558,7 @@ export class Run<_T extends t.BaseGraphState> {
             ? reasoningTraceSeed
             : undefined,
         parentSpanContext: reasoningParentSpanContext,
+        inheritTraceIdentity: reasoningParentSpanContext != null,
         runId: reasoningScopeRunId,
         toolOutputTracing: reasoningRuntimeScope.toolOutputTracing,
         traceName:
@@ -2619,6 +2626,7 @@ export class Run<_T extends t.BaseGraphState> {
           traceMetadata:
             reasoningParentSpanContext == null ? traceMetadata : undefined,
           tags: reasoningTags,
+          inheritTraceIdentity: reasoningParentSpanContext != null,
         },
         () =>
           model.invoke(
@@ -2888,6 +2896,7 @@ export class Run<_T extends t.BaseGraphState> {
             ? phaseTraceSeed
             : undefined,
         parentSpanContext: phaseParentSpanContext,
+        inheritTraceIdentity: phaseParentSpanContext != null,
         runId: phaseScopeRunId,
         toolOutputTracing: phaseRuntimeScope.toolOutputTracing,
         traceName: phaseParentSpanContext == null ? phaseTraceName : undefined,
@@ -3004,6 +3013,7 @@ export class Run<_T extends t.BaseGraphState> {
             traceMetadata:
               phaseParentSpanContext == null ? traceMetadata : undefined,
             tags: phaseTags,
+            inheritTraceIdentity: phaseParentSpanContext != null,
           },
           () =>
             phaseRunnable.invoke(

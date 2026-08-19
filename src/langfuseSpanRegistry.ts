@@ -36,8 +36,13 @@ type AnchoredSpan = {
   spanContext: SpanContext;
 };
 
+type TraceAnchorState = {
+  spans: Map<string, AnchoredSpan>;
+  spanIds: Set<string>;
+};
+
 const ROOT_TRACE_ANCHOR = '';
-const traceAnchorSpans = new WeakMap<object, Map<string, AnchoredSpan>>();
+const traceAnchorStates = new WeakMap<object, TraceAnchorState>();
 
 export function registerLangfuseManagedSpan(
   span: Span,
@@ -59,16 +64,23 @@ export function registerLangfuseTraceAnchorSpan(
   destinationKey: string,
   agentId?: string
 ): void {
-  let spans = traceAnchorSpans.get(anchor);
-  if (spans == null) {
-    spans = new Map<string, AnchoredSpan>();
-    traceAnchorSpans.set(anchor, spans);
+  let state = traceAnchorStates.get(anchor);
+  if (state == null) {
+    state = { spans: new Map<string, AnchoredSpan>(), spanIds: new Set() };
+    traceAnchorStates.set(anchor, state);
   }
+  const spanContext = span.spanContext();
+  state.spanIds.add(spanContext.spanId);
   const key = agentId ?? ROOT_TRACE_ANCHOR;
-  if (spans.has(key)) {
+  if (state.spans.has(key)) {
     return;
   }
-  spans.set(key, { destinationKey, spanContext: span.spanContext() });
+  state.spans.set(key, { destinationKey, spanContext });
+}
+
+/** Starts a fresh execution while retaining the anchor object held by handlers. */
+export function resetLangfuseTraceAnchorSpans(anchor: object): void {
+  traceAnchorStates.delete(anchor);
 }
 
 /**
@@ -86,12 +98,12 @@ export function resolveLangfuseTraceAnchorParent(
   if (anchor == null || destinationKey == null) {
     return undefined;
   }
-  const spans = traceAnchorSpans.get(anchor);
-  if (spans == null) {
+  const state = traceAnchorStates.get(anchor);
+  if (state == null) {
     return undefined;
   }
-  const agentSpan = agentId == null ? undefined : spans.get(agentId);
-  const rootSpan = spans.get(ROOT_TRACE_ANCHOR);
+  const agentSpan = agentId == null ? undefined : state.spans.get(agentId);
+  const rootSpan = state.spans.get(ROOT_TRACE_ANCHOR);
   let anchoredSpan = rootSpan;
   if (anchoredSpan?.destinationKey !== destinationKey) {
     anchoredSpan = agentSpan;
@@ -104,7 +116,8 @@ export function resolveLangfuseTraceAnchorParent(
   if (
     activeSpan != null &&
     getLangfuseManagedSpanDestination(activeSpan) === destinationKey &&
-    activeSpan.spanContext().traceId === anchoredSpan.spanContext.traceId
+    activeSpan.spanContext().traceId === anchoredSpan.spanContext.traceId &&
+    state.spanIds.has(activeSpan.spanContext().spanId)
   ) {
     return activeSpan.spanContext();
   }

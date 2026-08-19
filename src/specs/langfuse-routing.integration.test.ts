@@ -9,6 +9,7 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type { Context } from '@opentelemetry/api';
 import type * as t from '@/types';
 import {
+  registerLangfuseManagedSpan,
   resolveLangfuseDestinationKey,
   resolveLangfuseTraceAnchorParent,
 } from '@/langfuseSpanRegistry';
@@ -797,9 +798,34 @@ describe('Langfuse per-run routing integration', () => {
         agentRoot = createMockSpan('StandardGraph');
       }
     );
+    const destinationKey = resolveLangfuseDestinationKey(langfuse) as string;
+    const rootActiveContext = otelTrace.setSpan(
+      otelContext.active(),
+      agentRoot as never
+    );
+    const hostSpan = createMockSpan('managed-host', rootActiveContext);
+    registerLangfuseManagedSpan(hostSpan as never, destinationKey);
+    let graphChild: MockSpan | undefined;
+    withLangfuseRuntimeScope(
+      { langfuse, traceAnchor, runId: 'source-run' },
+      () =>
+        otelContext.with(rootActiveContext, () => {
+          graphChild = createMockSpan('agent-child');
+        })
+    );
+    const hostParent = otelContext.with(
+      otelTrace.setSpan(otelContext.active(), hostSpan as never),
+      () => resolveLangfuseTraceAnchorParent(traceAnchor, destinationKey)
+    );
+    const childParent = otelContext.with(
+      otelTrace.setSpan(otelContext.active(), graphChild as never),
+      () => resolveLangfuseTraceAnchorParent(traceAnchor, destinationKey)
+    );
+    expect(hostParent?.spanId).toBe(agentRoot?.spanContext().spanId);
+    expect(childParent?.spanId).toBe(graphChild?.spanContext().spanId);
     const parentSpanContext = resolveLangfuseTraceAnchorParent(
       traceAnchor,
-      resolveLangfuseDestinationKey(langfuse)
+      destinationKey
     );
     const labelHandler = createLangfuseHandler({
       langfuse,
@@ -827,6 +853,88 @@ describe('Langfuse per-run routing integration', () => {
     };
     expect(label?.traceId).toBe(rootContext.traceId);
     expect(label?.parentSpanId).toBe(rootContext.spanId);
+  });
+
+  it('restores an overlay agent lane after rejecting a foreign scope', async () => {
+    const rootLangfuse = tenantLangfuse('tenant-anchor-root');
+    const overlayLangfuse = tenantLangfuse('tenant-anchor-overlay');
+    const traceAnchor = {};
+    initializeLangfuseTracing(rootLangfuse);
+    initializeLangfuseTracing(overlayLangfuse);
+
+    withLangfuseRuntimeScope(
+      { langfuse: rootLangfuse, traceAnchor, runId: 'source-run' },
+      () => createMockSpan('StandardGraph')
+    );
+    const overlayHandler = createLangfuseHandler({
+      langfuse: overlayLangfuse,
+      traceAnchor,
+      agentId: 'overlay-agent',
+      runId: 'source-run',
+      tags: ['librechat', 'agent'],
+    });
+
+    await withLangfuseRuntimeScope(
+      { langfuse: rootLangfuse, runId: 'foreign-run' },
+      () =>
+        overlayHandler?.handleChainStart(
+          { id: ['AgentModelCall'] } as never,
+          {},
+          'overlay-chain'
+        )
+    );
+
+    const overlayParent = resolveLangfuseTraceAnchorParent(
+      traceAnchor,
+      resolveLangfuseDestinationKey(overlayLangfuse),
+      'overlay-agent'
+    );
+    const overlayStart = startsForTenant('tenant-anchor-overlay').find(
+      (record) => record.name === 'AgentModelCall'
+    );
+    expect(overlayParent?.spanId).toBe(overlayStart?.spanId);
+    expect(overlayParent?.traceId).toBe(overlayStart?.traceId);
+  });
+
+  it('rotates the captured root between fresh executions of one run', async () => {
+    const tenantId = 'tenant-anchor-rotation';
+    const langfuse = tenantLangfuse(tenantId);
+    const run = await Run.create<t.IState>({
+      runId: `routing-${tenantId}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [createAgent(tenantId)],
+      },
+      langfuse,
+      returnContent: true,
+      skipCleanup: true,
+    });
+    const execute = async (response: string): Promise<void> => {
+      run.Graph?.overrideTestModel([response]);
+      await run.processStream(
+        { messages: [new HumanMessage(response)] },
+        callerConfig
+      );
+    };
+
+    await execute('first execution');
+    const firstParent = resolveLangfuseTraceAnchorParent(
+      run.Graph?.langfuseTraceAnchor,
+      resolveLangfuseDestinationKey(langfuse)
+    );
+    await execute('second execution');
+    const secondParent = resolveLangfuseTraceAnchorParent(
+      run.Graph?.langfuseTraceAnchor,
+      resolveLangfuseDestinationKey(langfuse)
+    );
+    const roots = startsForTenant(tenantId).filter(
+      (record) => record.name === 'StandardGraph' && record.parentSpanId == null
+    );
+
+    expect(roots).toHaveLength(2);
+    expect(firstParent?.spanId).toBe(roots[0].spanId);
+    expect(secondParent?.spanId).toBe(roots[1].spanId);
+    expect(secondParent?.spanId).not.toBe(firstParent?.spanId);
   });
 
   it('generates a scope stamp for directly-constructed graphs without a run id', async () => {

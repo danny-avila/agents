@@ -4,6 +4,7 @@ import {
   getLangfuseSpanProcessorParams,
   getLangfuseManagedSpanDestination,
   registerLangfuseTraceAnchorSpan,
+  resetLangfuseTraceAnchorSpans,
   resolveLangfuseTraceAnchorParent,
   registerLangfuseManagedSpan,
   resolveLangfuseDestinationKey,
@@ -59,6 +60,39 @@ describe('Langfuse span registry', () => {
     expect(
       resolveLangfuseTraceAnchorParent(anchor, 'another-destination')
     ).toBeUndefined();
+  });
+
+  it('rotates captured spans between fresh executions', () => {
+    const anchor = {};
+    const destinationKey = resolveLangfuseDestinationKey(tenantConfig());
+    const firstContext = {
+      traceId: '11111111111111111111111111111111',
+      spanId: '1111111111111111',
+      traceFlags: 1,
+    };
+    const secondContext = {
+      traceId: '22222222222222222222222222222222',
+      spanId: '2222222222222222',
+      traceFlags: 1,
+    };
+    const createSpan = (spanContext: typeof firstContext): Span =>
+      ({ spanContext: () => spanContext }) as unknown as Span;
+
+    registerLangfuseTraceAnchorSpan(
+      anchor,
+      createSpan(firstContext),
+      destinationKey as string
+    );
+    resetLangfuseTraceAnchorSpans(anchor);
+    registerLangfuseTraceAnchorSpan(
+      anchor,
+      createSpan(secondContext),
+      destinationKey as string
+    );
+
+    expect(resolveLangfuseTraceAnchorParent(anchor, destinationKey)).toEqual(
+      secondContext
+    );
   });
 
   it('treats processor policy as irrelevant to destination identity', () => {

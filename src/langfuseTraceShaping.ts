@@ -415,7 +415,8 @@ function isGraphSpan(span: MutableSpan): boolean {
   }
   return (
     isRootSpan(span) ||
-    typeof span.attributes[OBSERVATION_METADATA_LANGGRAPH_NODE] === 'string'
+    typeof span.attributes[OBSERVATION_METADATA_LANGGRAPH_NODE] === 'string' ||
+    hasTraceTag(span, AGENT_TRACE_TAG)
   );
 }
 

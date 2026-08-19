@@ -43,6 +43,9 @@ async function createRun(): Promise<Run<never>> {
           provider: Providers.OPENAI,
           clientOptions: { model: 'gpt-4.1-mini' },
           tools: [],
+          langfuse: {
+            metadata: { overlay: 'must-not-replace-source-identity' },
+          },
         },
       ],
     },
@@ -110,10 +113,14 @@ describe('activity label observability', () => {
 
     expect(MockedCallbackHandler).toHaveBeenCalledTimes(1);
     expect(MockedCallbackHandler.mock.calls[0][0]).toMatchObject({
+      userId: undefined,
+      sessionId: undefined,
       traceMetadata: undefined,
       tags: ['librechat', 'activity-label'],
     });
     expect(MockedPropagateAttributes.mock.calls[0][0]).toMatchObject({
+      userId: undefined,
+      sessionId: undefined,
       traceName: undefined,
       metadata: undefined,
     });

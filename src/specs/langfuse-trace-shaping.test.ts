@@ -80,6 +80,19 @@ describe('shapeLangfuseSpan', () => {
     expect(multiAgent.attributes[OBSERVATION_TYPE]).toBe('agent');
   });
 
+  it('types agent-tagged graph roots nested beneath managed hosts', () => {
+    const standard = createSpan(
+      'StandardGraph',
+      { [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']) },
+      'managed-host-span'
+    );
+
+    shapeLangfuseSpan(standard);
+
+    expect(standard.name).toBe('StandardGraph');
+    expect(standard.attributes[OBSERVATION_TYPE]).toBe('agent');
+  });
+
   it('names the agent prompt-to-model sequence as an SDK operation', () => {
     const span = createSpan(
       'RunnableSequence',
