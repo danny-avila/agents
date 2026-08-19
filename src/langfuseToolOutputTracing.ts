@@ -24,6 +24,9 @@ import { resolveToolOutputTracingConfigForSpan } from '@/langfuseRuntimeScope';
 
 export { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, resolveLangfuseConfig };
 
+export const LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY =
+  'librechatLangfuseObservationMetadata';
+
 const LANGGRAPH_TOOL_NODE_PREFIX = 'tools=';
 const SERVER_TOOL_RESULT_PREFIX = '{"serverToolResult":';
 const SERVER_TOOL_RESULT_REPLAY_MARKER_KEY = 'librechatResponsesReplay';
@@ -52,6 +55,9 @@ type RedactionContext = {
 };
 
 const TOOL_OUTPUT_FIELD_KEYS = ['content', 'artifact'];
+const MAX_OBSERVATION_METADATA_FIELDS = 32;
+const MAX_OBSERVATION_METADATA_STRING_LENGTH = 200;
+const OBSERVATION_METADATA_KEY_PATTERN = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
 
 type ResponsesReplayOutputDescriptor = {
   nestedOutputFields?: Readonly<Record<string, readonly string[]>>;
@@ -744,6 +750,75 @@ export function classifyLangfuseToolNodeSpan(span: ReadableSpan): void {
   classifyLangGraphToolNodeSpan((span as SpanWithAttributes).attributes);
 }
 
+function parseSerializedValue(value: unknown): unknown {
+  if (typeof value !== 'string') {
+    return value;
+  }
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function getToolMessageArtifact(
+  value: unknown
+): Record<string, unknown> | undefined {
+  const parsed = parseSerializedValue(value);
+  if (!isRecord(parsed)) {
+    return undefined;
+  }
+  if (isRecord(parsed.artifact)) {
+    return parsed.artifact;
+  }
+  if (isRecord(parsed.kwargs) && isRecord(parsed.kwargs.artifact)) {
+    return parsed.kwargs.artifact;
+  }
+  return undefined;
+}
+
+function promoteToolObservationMetadata(
+  span: ReadableSpan,
+  attributes: Record<string, unknown>,
+  config: ResolvedLangfuseToolOutputTracingConfig
+): void {
+  if (!isToolObservation(attributes) || !shouldRedactTool(span.name, config)) {
+    return;
+  }
+
+  const artifact = getToolMessageArtifact(
+    attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]
+  );
+  // This reserved artifact field is for trusted host adapters. Never copy
+  // arbitrary tool or model output into it without an explicit allowlist.
+  const metadata = artifact?.[LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY];
+  if (!isRecord(metadata)) {
+    return;
+  }
+
+  let promoted = 0;
+  for (const [key, value] of Object.entries(metadata)) {
+    if (
+      promoted >= MAX_OBSERVATION_METADATA_FIELDS ||
+      !OBSERVATION_METADATA_KEY_PATTERN.test(key) ||
+      !(
+        typeof value === 'number' ||
+        typeof value === 'boolean' ||
+        (typeof value === 'string' &&
+          value.length <= MAX_OBSERVATION_METADATA_STRING_LENGTH)
+      )
+    ) {
+      continue;
+    }
+    if (typeof value === 'number' && !Number.isFinite(value)) {
+      continue;
+    }
+    attributes[`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${key}`] =
+      value;
+    promoted += 1;
+  }
+}
+
 function redactToolObservationOutput(
   span: ReadableSpan,
   attributes: Record<string, unknown>,
@@ -774,6 +849,7 @@ export function redactLangfuseSpanToolOutputs(
     return;
   }
 
+  promoteToolObservationMetadata(span, attributes, config);
   redactToolObservationOutput(span, attributes, config);
 
   for (const key of [

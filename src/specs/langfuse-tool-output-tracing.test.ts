@@ -7,6 +7,7 @@ import type { Context } from '@opentelemetry/api';
 import type { TPayload } from '@/types';
 import {
   LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+  LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY,
   classifyLangfuseToolNodeSpan,
   prepareLangfuseSpanForExport,
   redactLangfuseSpanToolOutputs,
@@ -1495,6 +1496,76 @@ describe('Langfuse tool output tracing redaction', () => {
       LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
     );
     expect(JSON.stringify(redacted)).not.toContain('artifact secret row');
+  });
+
+  it('promotes trusted artifact fields before redacting a tool observation', () => {
+    const output = new ToolMessage({
+      name: 'run_select_query_mcp_ClickHouse',
+      tool_call_id: 'call_query',
+      content: 'customer row data',
+      artifact: {
+        [LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]: {
+          query_database_system: 'clickhouse',
+          query_status: 'success',
+          query_returned_rows: 3,
+          query_rows_read: 100,
+          query_bytes_read: 2048,
+        },
+      },
+    });
+    const span = createSpan('run_select_query_mcp_ClickHouse', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify(output),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({
+        redactedToolNames: new Set(['run_select_query']),
+        redactedToolNameMatchMode: 'partial',
+      })
+    );
+
+    expect(span.attributes).toMatchObject({
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_database_system`]:
+        'clickhouse',
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_status`]:
+        'success',
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_returned_rows`]: 3,
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_rows_read`]: 100,
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_bytes_read`]: 2048,
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]:
+        LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+    });
+    expect(JSON.stringify(span.attributes)).not.toContain('customer row data');
+  });
+
+  it('does not promote metadata from an unredacted tool', () => {
+    const output = new ToolMessage({
+      name: 'untrusted_tool',
+      tool_call_id: 'call_untrusted',
+      content: 'output',
+      artifact: {
+        [LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]: {
+          query_status: 'forged',
+        },
+      },
+    });
+    const span = createSpan('untrusted_tool', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify(output),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({ redactedToolNames: new Set(['run_select_query']) })
+    );
+
+    expect(
+      span.attributes[
+        `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_status`
+      ]
+    ).toBeUndefined();
   });
 
   it('merges run Langfuse defaults with agent redaction overrides', () => {
