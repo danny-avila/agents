@@ -1552,6 +1552,34 @@ describe('Langfuse tool output tracing redaction', () => {
     });
   });
 
+  it('merges privacy policy with the stricter mode winning', () => {
+    const credentials = {
+      publicKey: 'pk-run',
+      secretKey: 'sk-run',
+      baseUrl: 'https://langfuse.test',
+    };
+    expect(
+      resolveLangfuseConfig(
+        {
+          ...credentials,
+          privacy: { mode: 'metricsOnly', redactionText: '[run]' },
+        },
+        { privacy: { mode: 'full' } }
+      )?.privacy
+    ).toEqual({ mode: 'metricsOnly', redactionText: '[run]' });
+    expect(
+      resolveLangfuseConfig(credentials, {
+        privacy: { mode: 'metricsOnly', redactionText: '[agent]' },
+      })?.privacy
+    ).toEqual({ mode: 'metricsOnly', redactionText: '[agent]' });
+    expect(
+      resolveLangfuseConfig(
+        { privacy: { mode: 'full' } },
+        { privacy: { mode: 'full' } }
+      )?.privacy
+    ).toEqual({ mode: 'full' });
+  });
+
   it('merges run and agent custom headers with the agent winning collisions', () => {
     const resolved = resolveLangfuseConfig(
       {
