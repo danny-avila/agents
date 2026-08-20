@@ -679,6 +679,136 @@ describe('SubagentExecutor', () => {
     );
   });
 
+  it('keeps detached siblings alive after their parent aborts', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const parentController = new AbortController();
+    const started = new Set<string>();
+    const createInvocation = (): {
+      promise: Promise<{ messages: BaseMessage[] }>;
+      finish: (value: { messages: BaseMessage[] }) => void;
+      signal?: AbortSignal;
+    } => {
+      let finish = (_value: { messages: BaseMessage[] }): void => undefined;
+      const promise = new Promise<{ messages: BaseMessage[] }>((resolve) => {
+        finish = resolve;
+      });
+      return { promise, finish };
+    };
+    const invocationByCall = new Map([
+      ['call_detached_first', createInvocation()],
+      ['call_detached_second', createInvocation()],
+    ]);
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (input): StandardGraph => {
+        const parentToolCallId =
+          input.subagentExecutionContext?.ancestry.at(-1)?.parentToolCallId;
+        if (parentToolCallId == null) {
+          throw new Error('Detached child invocation was not attributed.');
+        }
+        const invocation = invocationByCall.get(parentToolCallId);
+        if (invocation == null) {
+          throw new Error('Detached child invocation was not attributed.');
+        }
+        const attributedCallId = parentToolCallId;
+        const invoke = jest.fn(async () => {
+          invocation.signal =
+            AsyncLocalStorageProviderSingleton.getRunnableConfig()?.signal as
+              | AbortSignal
+              | undefined;
+          if (invocation.signal == null) {
+            throw new Error(
+              'Detached child did not receive a runnable signal.'
+            );
+          }
+          started.add(attributedCallId);
+          return invocation.promise;
+        });
+        return {
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        } as unknown as StandardGraph;
+      },
+    });
+
+    const responses = await AsyncLocalStorageProviderSingleton.runWithConfig(
+      { signal: parentController.signal },
+      async () =>
+        ['call_detached_first', 'call_detached_second'].map(
+          (parentToolCallId) =>
+            JSON.parse(
+              executor.executeInBackground({
+                description: 'Finish independently after the parent.',
+                subagentType: 'researcher',
+                parentToolCallId,
+              })
+            ) as { background_task_id: string }
+        )
+    );
+    await Promise.all(
+      responses.map((response) =>
+        waitForTask(
+          store,
+          response.background_task_id,
+          () => started.size === 2
+        )
+      )
+    );
+
+    parentController.abort();
+    const firstInvocation = invocationByCall.get('call_detached_first');
+    const secondInvocation = invocationByCall.get('call_detached_second');
+    if (firstInvocation == null || secondInvocation == null) {
+      throw new Error('Detached child invocation fixture is incomplete.');
+    }
+    if (firstInvocation.signal == null || secondInvocation.signal == null) {
+      throw new Error('Detached child runnable signal was not captured.');
+    }
+    const observedSignals = [firstInvocation.signal, secondInvocation.signal];
+    expect(observedSignals).toHaveLength(2);
+    expect(observedSignals).not.toContain(parentController.signal);
+    expect(new Set(observedSignals).size).toBe(2);
+    expect(observedSignals.every((signal) => signal.aborted === false)).toBe(
+      true
+    );
+
+    firstInvocation.finish({
+      messages: [new AIMessage('first detached result')],
+    });
+    await waitForTask(
+      store,
+      responses[0].background_task_id,
+      (status) => status === 'completed'
+    );
+    expect(secondInvocation.signal?.aborted).toBe(false);
+    expect(
+      store.get('owner:conversation', responses[1].background_task_id)
+    ).toMatchObject({
+      status: 'running',
+    });
+    secondInvocation.finish({
+      messages: [new AIMessage('second detached result')],
+    });
+    await waitForTask(
+      store,
+      responses[1].background_task_id,
+      (status) => status === 'completed'
+    );
+
+    expect(
+      store.claim('owner:conversation', responses[0].background_task_id)
+    ).toMatchObject({
+      status: 'completed',
+      result: 'first detached result',
+    });
+    expect(
+      store.claim('owner:conversation', responses[1].background_task_id)
+    ).toMatchObject({
+      status: 'completed',
+      result: 'second detached result',
+    });
+  });
+
   it('continues the same detached child for a queued parent message', async () => {
     const store = new InMemorySubagentTaskStore();
     let finishFirst = (_value: { messages: BaseMessage[] }): void => undefined;
