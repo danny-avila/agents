@@ -44,9 +44,9 @@ export const ACTIVITY_PHASE_RUN_NAME = 'MultiStepLabel';
 export const ACTIVITY_PHASE_LABEL_RUN_NAME = 'MultiStepLabelGeneration';
 
 /**
- * Whether this build enforces `LangfuseConfig.privacy` (content masking and
- * media suppression on exported traces). Hosts gate on it to fail closed:
- * with an older runtime that ignores the field, a privacy mode must disable
- * export rather than silently send unmasked content.
+ * Whether this build enforces `LangfuseConfig.privacy` (content redaction
+ * and media suppression on exported traces). Hosts gate on it to fail
+ * closed: with an older runtime that ignores the field, a privacy mode must
+ * disable export rather than silently send unmasked content.
  */
-export const LANGFUSE_PRIVACY_MASKING_SUPPORTED = true;
+export const LANGFUSE_PRIVACY_ENFORCEMENT_SUPPORTED = true;
