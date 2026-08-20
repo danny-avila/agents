@@ -101,6 +101,28 @@ describe('Keenable search API', () => {
     ]);
   });
 
+  it('falls back to the description when the snippet is present but empty', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        results: [
+          {
+            title: 'Empty snippet',
+            url: 'https://example.com/empty',
+            description: 'The meta description carries the text here.',
+            snippet: '',
+          },
+        ],
+      },
+    });
+
+    const searchAPI = createSearchAPI({ searchProvider: 'keenable' });
+    const result = await searchAPI.getSources({ query: 'typescript' });
+
+    expect(result.data?.organic?.[0].snippet).toBe(
+      'The meta description carries the text here.'
+    );
+  });
+
   it('caps the page text Keenable returns on every result', async () => {
     mockedAxios.post.mockResolvedValueOnce({
       data: {

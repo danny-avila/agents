@@ -23,10 +23,13 @@ const SNIPPET_MAX_LENGTH = 500;
 
 /** Keenable sends both `description` and `snippet` on every result: `snippet`
  * carries the page text and `description` is the page's meta description, which
- * is empty for most pages. `??` is deliberately not used here, since the empty
- * string is present rather than nullish and would win. */
+ * is empty for most pages. Either field can arrive as an empty string, so the
+ * pick is on emptiness rather than nullishness: a `??` chain would keep an empty
+ * `snippet` over a `description` that does carry text. */
 function toSnippet(result: t.KeenableSearchResult): string {
-  const text = result.snippet ?? result.description ?? '';
+  const snippet = result.snippet ?? '';
+  const description = result.description ?? '';
+  const text = snippet !== '' ? snippet : description;
   return text.replace(/\s+/g, ' ').trim().slice(0, SNIPPET_MAX_LENGTH);
 }
 
