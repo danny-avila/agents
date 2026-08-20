@@ -59,16 +59,17 @@ import {
   withLangfuseAttributes,
 } from '@/langfuse';
 import {
+  hasToolOutputTracingConfig,
+  resolveLangfuseConfig,
+  resolveStrictestLangfusePrivacy,
+  resolveToolOutputTracingConfig,
+} from '@/langfuseConfig';
+import {
   REASONING_LABEL_PROMPT,
   buildReasoningLabelTraceSeed,
   buildReasoningLabelPrompt,
   normalizeReasoningLabel,
 } from '@/prompts/reasoningLabel';
-import {
-  hasToolOutputTracingConfig,
-  resolveLangfuseConfig,
-  resolveToolOutputTracingConfig,
-} from '@/langfuseConfig';
 import {
   resolveLangfuseDestinationKey,
   resolveLangfuseTraceAnchorParent,
@@ -1084,17 +1085,39 @@ export class Run<_T extends t.BaseGraphState> {
     graph: StandardGraph | MultiAgentGraph
   ): t.LangfuseConfig | undefined {
     const primaryContext = graph.agentContexts.get(graph.defaultAgentId);
-    if (primaryContext != null) {
-      return resolveLangfuseConfig(this.langfuse, primaryContext.langfuse);
-    }
+    const base =
+      primaryContext != null
+        ? resolveLangfuseConfig(this.langfuse, primaryContext.langfuse)
+        : this.resolveFirstAgentLangfuseConfig(graph);
 
+    // The stream config owns the shared root trace, whose conversation
+    // payload carries every agent's content. Its privacy policy must be at
+    // least as strict as each agent overlay's, so resolve across all of
+    // them rather than only the default agent's.
+    const privacy = resolveStrictestLangfusePrivacy([
+      base?.privacy,
+      ...Array.from(graph.agentContexts.values(), (context) => {
+        return resolveLangfuseConfig(this.langfuse, context.langfuse)?.privacy;
+      }),
+    ]);
+    if (base == null) {
+      return privacy == null ? undefined : { privacy };
+    }
+    if (privacy == null || base.privacy === privacy) {
+      return base;
+    }
+    return { ...base, privacy };
+  }
+
+  private resolveFirstAgentLangfuseConfig(
+    graph: StandardGraph | MultiAgentGraph
+  ): t.LangfuseConfig | undefined {
     for (const context of graph.agentContexts.values()) {
       const langfuse = resolveLangfuseConfig(this.langfuse, context.langfuse);
       if (langfuse != null) {
         return langfuse;
       }
     }
-
     return this.langfuse;
   }
 
