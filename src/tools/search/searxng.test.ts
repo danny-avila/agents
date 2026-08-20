@@ -1,4 +1,6 @@
 import axios from 'axios';
+import { Agent as HttpAgent } from 'http';
+import { Agent as HttpsAgent } from 'https';
 import type * as t from './types';
 import { createSearchAPI } from './search';
 
@@ -154,8 +156,8 @@ describe('SearXNG search options', () => {
   });
 
   it('still threads http agents supplied alongside the options block', async () => {
-    const httpAgent = { name: 'http' } as unknown as t.HttpAgent;
-    const httpsAgent = { name: 'https' } as unknown as t.HttpsAgent;
+    const httpAgent = new HttpAgent();
+    const httpsAgent = new HttpsAgent();
 
     const searchAPI = createSearchAPI({
       searchProvider: 'searxng',
