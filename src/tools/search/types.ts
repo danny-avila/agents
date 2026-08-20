@@ -25,7 +25,8 @@ export type SearchProvider =
   | 'searxng'
   | 'tavily'
   | 'keenable'
-  | 'crw';
+  | 'crw'
+  | 'you';
 export type ScraperProvider =
   | 'firecrawl'
   | 'serper'
@@ -212,6 +213,43 @@ export interface SearchConfig extends HttpAgentConfig {
   crwApiKey?: string;
   crwApiUrl?: string;
   crwSearchOptions?: CrwSearchOptions;
+  youApiKey?: string;
+  youApiUrl?: string;
+  youSearchOptions?: YouSearchOptions;
+}
+
+export interface YouSearchOptions extends HttpAgentConfig {
+  maxResults?: number;
+  /** Sent as the User-Agent alongside the You.com attribution token. Defaults
+   * to "LibreChat". */
+  attributionTitle?: string;
+  timeout?: number;
+}
+
+export interface YouSearchParams {
+  query: string;
+  count: number;
+  freshness?: string;
+  country?: string;
+  safesearch?: string;
+}
+
+export interface YouSearchResult {
+  title?: string;
+  url?: string;
+  description?: string;
+  /** Extracted passages from the page body. Web hits carry these; news hits
+   * carry only `description`. */
+  snippets?: string[];
+  page_age?: string;
+  thumbnail_url?: string;
+}
+
+export interface YouSearchResponse {
+  results?: {
+    web?: YouSearchResult[];
+    news?: YouSearchResult[];
+  };
 }
 
 export interface KeenableSearchOptions extends HttpAgentConfig {

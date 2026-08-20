@@ -449,6 +449,9 @@ export const createSearchTool = (
     crwApiUrl,
     crwSearchOptions,
     crwScraperOptions,
+    youApiKey,
+    youApiUrl,
+    youSearchOptions,
     scraperTimeout,
     jinaApiKey,
     jinaApiUrl,
@@ -480,7 +483,11 @@ export const createSearchTool = (
     news: newsSchema,
   };
 
-  if (searchProvider === 'serper' || searchProvider === 'tavily') {
+  if (
+    searchProvider === 'serper' ||
+    searchProvider === 'tavily' ||
+    searchProvider === 'you'
+  ) {
     schemaProperties.country = countrySchema;
   }
 
@@ -505,6 +512,9 @@ export const createSearchTool = (
     crwApiKey,
     crwApiUrl,
     crwSearchOptions,
+    youApiKey,
+    youApiUrl,
+    youSearchOptions,
     httpAgent,
     httpsAgent,
   });
