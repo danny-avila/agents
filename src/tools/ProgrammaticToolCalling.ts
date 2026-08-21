@@ -418,10 +418,50 @@ function isPythonBindingTarget(
 ): boolean {
   const suffix = skipPythonCallWhitespace(code, nameEnd);
   if (code[suffix] === '=' && code[suffix + 1] !== '=') {
-    return true;
+    return !isPythonKeywordArgument(code, nameStart);
   }
   const prefix = code.slice(0, nameStart).match(/([A-Za-z_][A-Za-z0-9_]*)\s*$/);
   return ['as', 'class', 'def', 'for', 'import'].includes(prefix?.[1] ?? '');
+}
+
+function isPythonKeywordArgument(code: string, nameStart: number): boolean {
+  let nestedDepth = 0;
+  let argumentStart = nameStart;
+  let openParen = -1;
+
+  for (let index = nameStart - 1; index >= 0; index--) {
+    const char = code[index];
+    if (char === ')' || char === ']' || char === '}') {
+      nestedDepth += 1;
+      continue;
+    }
+    if (char === '(' || char === '[' || char === '{') {
+      if (nestedDepth > 0) {
+        nestedDepth -= 1;
+        continue;
+      }
+      if (char === '(') {
+        openParen = index;
+      }
+      break;
+    }
+    if (char === ',' && nestedDepth === 0) {
+      argumentStart = index + 1;
+    }
+  }
+
+  if (
+    openParen < 0 ||
+    code.slice(argumentStart, nameStart).trim() !== ''
+  ) {
+    return false;
+  }
+
+  const beforeParen = code.slice(0, openParen).trimEnd();
+  if (/(?:^|\W)(?:(?:async\s+)?def|class)\s+[A-Za-z_][A-Za-z0-9_]*$/.test(beforeParen)) {
+    return false;
+  }
+  return /[A-Za-z0-9_\])}]$/.test(beforeParen);
 }
 
 function isPythonCallableValueReference(

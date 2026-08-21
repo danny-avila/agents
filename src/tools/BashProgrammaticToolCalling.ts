@@ -259,6 +259,14 @@ const COMMAND_START_WORDS = new Set([
   'while',
 ]);
 
+const DECLARATION_BUILTINS = new Set([
+  'declare',
+  'export',
+  'local',
+  'readonly',
+  'typeset',
+]);
+
 type BashToken =
   | { type: 'word'; value: string }
   | { type: 'separator' }
@@ -296,6 +304,7 @@ function collectBashCommandNames(
   let commandPrefix: string | undefined;
   let skipPrefixOptionOperand = false;
   let expectsTrapAction = false;
+  let readsDeclarationOperands = false;
   const caseModes: Array<'subject' | 'awaitIn' | 'pattern' | 'body'> = [];
 
   const flushEval = (): void => {
@@ -322,6 +331,7 @@ function collectBashCommandNames(
       commandPrefix = undefined;
       skipPrefixOptionOperand = false;
       expectsTrapAction = false;
+      readsDeclarationOperands = false;
       if (pendingCoprocWord != null) {
         commands.add(pendingCoprocWord);
         pendingCoprocWord = undefined;
@@ -376,6 +386,15 @@ function collectBashCommandNames(
         commands.add(pendingCoprocWord);
         pendingCoprocWord = undefined;
         expectsCommand = false;
+      }
+      continue;
+    }
+    if (readsDeclarationOperands) {
+      const assignment = token.value.match(
+        /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/
+      );
+      if (assignment != null) {
+        assignments.set(assignment[1], assignment[2]);
       }
       continue;
     }
@@ -445,6 +464,13 @@ function collectBashCommandNames(
     }
     if (word === 'trap') {
       expectsTrapAction = true;
+      continue;
+    }
+    if (DECLARATION_BUILTINS.has(word)) {
+      readsDeclarationOperands = true;
+      pendingAssignments.clear();
+      commandPrefix = undefined;
+      expectsCommand = false;
       continue;
     }
     if (COMMAND_PREFIXES.has(word)) {

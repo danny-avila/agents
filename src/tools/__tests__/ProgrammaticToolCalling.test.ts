@@ -873,6 +873,16 @@ await search_docs()`;
       );
     });
 
+    it('does not treat Python keyword arguments as bindings', () => {
+      const code = `dict(search_docs=lambda: None)
+await get_weather()
+await search_docs()`;
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(
+        new Set(['get_weather', 'search_docs'])
+      );
+    });
+
     it('masks Python string literal prefixes', () => {
       const prefixedTools = createToolMap(['f', 'r', 'b', 'fr']);
       const code = `print(f"value={value}")
@@ -1253,6 +1263,36 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       );
 
       expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('tracks assignments made by shell declaration builtins', () => {
+      const declarationTools = new Map(
+        [
+          'get_weather',
+          'search_docs',
+          'calculator',
+          'get_expenses',
+          'get_team_members',
+        ].map((name) => [normalizeToBashIdentifier(name), name])
+      );
+      const used = extractUsedBashToolNames(
+        `get_weather '{}'
+export first=search_docs; "$first" '{}'
+declare second=calculator; "$second" '{}'
+typeset third=get_expenses; "$third" '{}'
+readonly fourth=get_team_members; "$fourth" '{}'`,
+        declarationTools
+      );
+
+      expect(used).toEqual(
+        new Set([
+          'get_weather',
+          'search_docs',
+          'calculator',
+          'get_expenses',
+          'get_team_members',
+        ])
+      );
     });
 
     it('keeps every tool available when sourcing a shell script', () => {
