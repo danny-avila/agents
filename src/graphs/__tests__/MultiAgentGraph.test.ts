@@ -1,7 +1,29 @@
 // src/graphs/__tests__/MultiAgentGraph.test.ts
+import { Command } from '@langchain/langgraph';
+import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import type { RunnableConfig } from '@langchain/core/runnables';
+import type { ToolCall } from '@langchain/core/messages/tool';
+import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
+import {
+  getProviderMessageProvenance,
+  getProviderSourceMessageIds,
+  setProviderMessageProvenance,
+} from '@/messages/provenance';
 import { MultiAgentGraph } from '../MultiAgentGraph';
-import { Providers } from '@/common';
+import { Constants, Providers } from '@/common';
+
+type HandoffReception = {
+  processHandoffReception(
+    messages: BaseMessage[],
+    agentId: string
+  ): { filteredMessages: BaseMessage[] } | null;
+};
+
+type InvocableGraphTool = {
+  name?: string;
+  invoke(input: ToolCall, config?: RunnableConfig): Promise<unknown>;
+};
 
 describe('MultiAgentGraph.validateEdgeAgents', () => {
   const makeAgent = (agentId: string): t.AgentInputs => ({
@@ -87,6 +109,148 @@ describe('MultiAgentGraph.validateEdgeAgents', () => {
       edges: [],
     };
     expect(() => new MultiAgentGraph(input)).not.toThrow();
+  });
+
+  it('projects retained content provenance when filtering handoff calls', () => {
+    const graph = new MultiAgentGraph({
+      runId: 'handoff-provenance',
+      agents: [makeAgent('A'), makeAgent('B')],
+      edges: [{ from: 'A', to: 'B', edgeType: 'handoff' }],
+    });
+    const transferName = `${Constants.LC_TRANSFER_TO_}B`;
+    const assistant = new AIMessage({
+      id: 'assistant-source',
+      content: [
+        { type: 'text', text: 'model answer' },
+        { type: 'text', text: 'retained server result' },
+        {
+          type: 'tool_use',
+          id: 'transfer-call',
+          name: transferName,
+          input: {},
+        },
+      ],
+      tool_calls: [
+        { id: 'lookup-call', name: 'lookup', args: {} },
+        { id: 'transfer-call', name: transferName, args: {} },
+      ],
+    });
+    setProviderMessageProvenance(assistant, [
+      {
+        attribution: 'model',
+        sourceMessageId: 'assistant-source',
+        sourceContentPartIndices: [0],
+      },
+      {
+        attribution: 'tool',
+        sourceMessageId: 'server-result-source',
+        sourceContentPartIndices: [1],
+      },
+      {
+        attribution: 'model',
+        sourceMessageId: 'assistant-source',
+        sourceContentPartIndices: [2],
+      },
+    ]);
+    const transferResult = new ToolMessage({
+      content: 'Successfully transferred to B',
+      name: transferName,
+      tool_call_id: 'transfer-call',
+    });
+
+    const reception = (
+      graph as unknown as HandoffReception
+    ).processHandoffReception([assistant, transferResult], 'B');
+    const filteredAssistant = reception?.filteredMessages[0] as AIMessage;
+
+    expect(filteredAssistant).not.toBe(assistant);
+    expect(filteredAssistant.content).toEqual([
+      { type: 'text', text: 'model answer' },
+      { type: 'text', text: 'retained server result' },
+    ]);
+    expect(filteredAssistant.tool_calls).toEqual([
+      { id: 'lookup-call', name: 'lookup', args: {} },
+    ]);
+    expect(getProviderMessageProvenance(filteredAssistant)?.parts).toEqual([
+      {
+        attribution: 'model',
+        sourceMessageId: 'assistant-source',
+        sourceContentPartIndices: [0],
+      },
+      {
+        attribution: 'tool',
+        sourceMessageId: 'server-result-source',
+        sourceContentPartIndices: [1],
+      },
+    ]);
+    expect(getProviderSourceMessageIds(filteredAssistant)).toEqual([
+      'assistant-source',
+      'server-result-source',
+    ]);
+    expect(getProviderMessageProvenance(assistant)?.parts).toHaveLength(3);
+  });
+
+  it('copies provenance into a parallel handoff tool-call projection', async () => {
+    const graph = new MultiAgentGraph({
+      runId: 'parallel-handoff-provenance',
+      agents: [makeAgent('A'), makeAgent('B')],
+      edges: [{ from: 'A', to: 'B', edgeType: 'handoff' }],
+    });
+    const transferName = `${Constants.LC_TRANSFER_TO_}B`;
+    const transferCall: ToolCall = {
+      id: 'transfer-call',
+      name: transferName,
+      args: {},
+      type: 'tool_call',
+    };
+    const assistant = new AIMessage({
+      id: 'parallel-assistant-source',
+      content: 'routing with retained model text',
+      tool_calls: [
+        transferCall,
+        { id: 'parallel-call', name: 'lookup', args: {} },
+      ],
+    });
+    setProviderMessageProvenance(assistant, [
+      {
+        attribution: 'model',
+        sourceMessageId: 'parallel-assistant-source',
+      },
+    ]);
+    const graphTools = graph.agentContexts.get('A')?.graphTools as
+      | InvocableGraphTool[]
+      | undefined;
+    const handoffTool = graphTools?.find(
+      (candidate) => candidate.name === transferName
+    );
+    if (handoffTool == null) {
+      throw new Error('Expected handoff tool');
+    }
+
+    const output = await handoffTool.invoke(transferCall, {
+      state: { messages: [assistant] },
+    } as unknown as RunnableConfig);
+    const command = output as Command<unknown, { messages: BaseMessage[] }>;
+    const update = command.update;
+    if (update == null || Array.isArray(update)) {
+      throw new Error('Expected handoff command update');
+    }
+    const filteredAssistant = update.messages[0] as AIMessage;
+
+    expect(filteredAssistant).not.toBe(assistant);
+    expect(filteredAssistant.tool_calls).toEqual([transferCall]);
+    expect(getProviderMessageProvenance(filteredAssistant)?.parts).toEqual([
+      {
+        attribution: 'model',
+        sourceMessageId: 'parallel-assistant-source',
+      },
+    ]);
+    expect(getProviderMessageProvenance(assistant)?.parts).toEqual([
+      {
+        attribution: 'model',
+        sourceMessageId: 'parallel-assistant-source',
+      },
+    ]);
   });
 
   it('rejects grouped fan-in containing a command-routed source', () => {

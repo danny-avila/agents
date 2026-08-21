@@ -117,13 +117,13 @@ function normalizeSourceContentPartIndices(
   if (indices == null) {
     return undefined;
   }
-  if (!Array.isArray(indices)) {
+  if (isProxy(indices) || !Array.isArray(indices)) {
     throw new TypeError(
       'Provider source content part indices must be a non-empty array'
     );
   }
   const length = indices.length;
-  if (length === 0) {
+  if (!Number.isSafeInteger(length) || length === 0) {
     throw new TypeError(
       'Provider source content part indices must be a non-empty array'
     );
@@ -215,11 +215,11 @@ function normalizeProvenanceParts(
   requireCanonicalSourceMessageId = false,
   enforceTrustBounds = false
 ): readonly ProviderMessageProvenancePart[] {
-  if (!Array.isArray(parts)) {
+  if (isProxy(parts) || !Array.isArray(parts)) {
     throw new TypeError('Provider message provenance parts must be an array');
   }
   const length = parts.length;
-  if (length === 0) {
+  if (!Number.isSafeInteger(length) || length === 0) {
     throw new TypeError('Provider message provenance parts cannot be empty');
   }
   if (
@@ -320,12 +320,17 @@ function collectProviderSourceMessageIds(
    * no longer a trusted combined lineage, so the public bounds apply to both
    * sides and oversized inputs fail before any per-item work. */
   let plural: readonly unknown[] | undefined;
+  let pluralLength = 0;
   try {
     if (pluralInput !== undefined) {
-      if (!Array.isArray(pluralInput)) {
+      if (isProxy(pluralInput) || !Array.isArray(pluralInput)) {
         return undefined;
       }
       plural = pluralInput;
+      pluralLength = pluralInput.length;
+      if (!Number.isSafeInteger(pluralLength)) {
+        return undefined;
+      }
       trustedPlural = immutableProviderSourceMessageIds.has(pluralInput);
       const bindingMismatch = trustedProvenance && boundPlural !== pluralInput;
       if (bindingMismatch) {
@@ -346,6 +351,13 @@ function collectProviderSourceMessageIds(
    * cannot force work over an otherwise trusted oversized lineage. */
   const trustedSingularSourceIds =
     boundPlural ?? (trustedPlural ? plural : undefined);
+  let trustedSingularSourceIdsLength = 0;
+  if (trustedSingularSourceIds != null) {
+    trustedSingularSourceIdsLength =
+      trustedSingularSourceIds === plural
+        ? pluralLength
+        : trustedSingularSourceIds.length;
+  }
   const unboundedSingular =
     singularInput === undefined
       ? undefined
@@ -355,8 +367,8 @@ function collectProviderSourceMessageIds(
     typeof singularInput === 'string' &&
     singularInput === unboundedSingular &&
     trustedSingularSourceIds != null &&
-    trustedSingularSourceIds.length > 0 &&
-    trustedSingularSourceIds[trustedSingularSourceIds.length - 1] ===
+    trustedSingularSourceIdsLength > 0 &&
+    trustedSingularSourceIds[trustedSingularSourceIdsLength - 1] ===
       singularInput;
   if (singularInput !== undefined && !trustedSingularDuplicate) {
     hasUntrustedSourceMetadata = true;
@@ -378,7 +390,7 @@ function collectProviderSourceMessageIds(
       }
       if (
         plural != null &&
-        plural.length > PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxSourceMessageIds
+        pluralLength > PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxSourceMessageIds
       ) {
         return undefined;
       }
@@ -408,8 +420,7 @@ function collectProviderSourceMessageIds(
 
   try {
     if (plural != null) {
-      const length = plural.length;
-      for (let index = 0; index < length; index++) {
+      for (let index = 0; index < pluralLength; index++) {
         if (
           !appendSourceMessageId(
             result,

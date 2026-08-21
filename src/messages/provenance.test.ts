@@ -455,6 +455,25 @@ describe('provider message provenance', () => {
     expect(elementReads).toBe(0);
   });
 
+  it('fails closed when a proxied plural array reports a non-finite length', () => {
+    const sourceMessageIds = new Proxy(['hidden-user-source'], {
+      get(target, property, receiver) {
+        return property === 'length'
+          ? Number.NaN
+          : Reflect.get(target, property, receiver);
+      },
+    });
+    const message = new HumanMessage({
+      content: 'external',
+      additional_kwargs: {
+        sourceMessageId: 'visible-tool-source',
+        sourceMessageIds,
+      },
+    });
+
+    expect(getProviderSourceMessageIds(message)).toEqual([]);
+  });
+
   it('fails closed when untrusted plural lineage is not an array', () => {
     const message = new HumanMessage({
       content: 'external',
@@ -552,6 +571,25 @@ describe('provider message provenance', () => {
     expect(partReads).toBe(0);
   });
 
+  it('rejects proxied provenance arrays that report a non-finite length', () => {
+    const parts = new Proxy([{ attribution: 'tool' as const }], {
+      get(target, property, receiver) {
+        return property === 'length'
+          ? Number.NaN
+          : Reflect.get(target, property, receiver);
+      },
+    });
+    const message = new HumanMessage({
+      content: 'external',
+      additional_kwargs: { provenance: { version: 1, parts } },
+    });
+
+    expect(getProviderMessageProvenance(message)).toBeUndefined();
+    expect(() => setProviderMessageProvenance(message, parts)).toThrow(
+      'Provider message provenance parts must be an array'
+    );
+  });
+
   it('fails closed before walking oversized sparse part-index arrays', () => {
     let indexReads = 0;
     const sourceContentPartIndices = new Array(
@@ -575,6 +613,32 @@ describe('provider message provenance', () => {
 
     expect(getProviderMessageProvenance(message)).toBeUndefined();
     expect(indexReads).toBe(0);
+  });
+
+  it('does not broaden proxied part indices into whole-message tool attribution', () => {
+    const sourceContentPartIndices = new Proxy([0], {
+      get(target, property, receiver) {
+        return property === 'length'
+          ? Number.NaN
+          : Reflect.get(target, property, receiver);
+      },
+    });
+    const message = new HumanMessage({
+      content: 'external',
+      additional_kwargs: {
+        provenance: {
+          version: 1,
+          parts: [{ attribution: 'tool', sourceContentPartIndices }],
+        },
+      },
+    });
+
+    expect(getProviderMessageProvenance(message)).toBeUndefined();
+    expect(() =>
+      setProviderMessageProvenance(message, [
+        { attribution: 'tool', sourceContentPartIndices },
+      ])
+    ).toThrow('Provider source content part indices must be a non-empty array');
   });
 
   it('fails closed on excessive total refs, source indices, and id lengths', () => {

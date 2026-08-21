@@ -29,9 +29,12 @@ import {
   _convertMessagesToOpenAIParams,
   _convertMessagesToOpenAIResponsesParams,
 } from '@/llm/openai/utils';
+import {
+  getProviderMessageProvenance,
+  setProviderMessageProvenance,
+} from './provenance';
 import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { Constants, ContentTypes, Providers } from '@/common';
-import { getProviderMessageProvenance } from './provenance';
 import { serializeToolContent } from '@/utils/toolContent';
 import { formatAgentMessages } from './format';
 
@@ -4946,6 +4949,39 @@ describe('formatAgentMessages', () => {
         tool_call_id: 'call_computer_stream',
         content: '[Computer screenshot omitted for this provider]',
       }),
+    ]);
+  });
+
+  it('marks a provider-only computer screenshot omission as synthetic', () => {
+    const computerOutput = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_computer_omitted',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    setProviderMessageProvenance(computerOutput, [
+      {
+        attribution: 'tool',
+        sourceMessageId: 'computer-output-row',
+        sourceContentPartIndices: [0],
+      },
+    ]);
+
+    const messages = [computerOutput];
+    const projected = projectComputerCallOutputsToText(messages);
+
+    expect(projected).not.toBe(messages);
+    expect(projected[0].content).toBe(
+      '[Computer screenshot omitted for this provider]'
+    );
+    expect(getProviderMessageProvenance(projected[0])?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
+    expect(getProviderMessageProvenance(computerOutput)?.parts).toEqual([
+      {
+        attribution: 'tool',
+        sourceMessageId: 'computer-output-row',
+        sourceContentPartIndices: [0],
+      },
     ]);
   });
 

@@ -26,6 +26,7 @@ import {
   getProviderMessageProvenance,
   getProviderSourceMessageIds,
   setProviderMessageProvenance,
+  stampSyntheticProviderMessage,
 } from './provenance';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { stripAnthropicCacheControl } from './cache';
@@ -2388,9 +2389,11 @@ export function projectComputerCallOutputsToText(
       continue;
     }
     projected ??= [...messages];
-    projected[i] = cloneToolMessageWithContent(
-      message,
-      '[Computer screenshot omitted for this provider]'
+    projected[i] = stampSyntheticProviderMessage(
+      cloneToolMessageWithContent(
+        message,
+        '[Computer screenshot omitted for this provider]'
+      )
     );
   }
   return projected ?? messages;
