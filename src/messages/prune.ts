@@ -43,6 +43,28 @@ function sumTokenCounts(
   return total;
 }
 
+function appendItems<T>(target: T[], source: readonly T[]): void {
+  for (const item of source) {
+    target.push(item);
+  }
+}
+
+/** Prepends in stable order without turning a large array into call arguments. */
+function prependItems<T>(target: T[], prefix: readonly T[]): void {
+  const prefixLength = prefix.length;
+  if (prefixLength === 0) {
+    return;
+  }
+  const originalLength = target.length;
+  target.length = prefixLength + originalLength;
+  for (let index = originalLength - 1; index >= 0; index--) {
+    target[prefixLength + index] = target[index];
+  }
+  for (let index = 0; index < prefixLength; index++) {
+    target[index] = prefix[index];
+  }
+}
+
 /** Default fraction of the token budget reserved as headroom (5 %). */
 export const DEFAULT_RESERVE_RATIO = 0.05;
 
@@ -953,7 +975,7 @@ export function getMessagesWithinTokenLimit({
   prunedMemory.reverse();
 
   if (messages.length > 0) {
-    prunedMemory.unshift(...messages);
+    prependItems(prunedMemory, messages);
   }
 
   remainingContextTokens -= currentTokenCount;
@@ -1070,7 +1092,6 @@ export function getMessagesWithinTokenLimit({
   if (startType != null && startType.length > 0 && newContext.length > 0) {
     let requiredTypeIndex = -1;
 
-    let totalTokens = 0;
     for (let i = newContext.length - 1; i >= 0; i--) {
       const currentType = newContext[i]?.getType() ?? '';
       if (
@@ -1081,12 +1102,9 @@ export function getMessagesWithinTokenLimit({
         requiredTypeIndex = i + 1;
         break;
       }
-      const originalIndex = originalLength - 1 - i;
-      totalTokens += indexTokenCountMap[originalIndex] ?? 0;
     }
 
     if (requiredTypeIndex > 0) {
-      currentTokenCount -= totalTokens;
       newContext = newContext.slice(0, requiredTypeIndex);
     }
   }
@@ -2753,7 +2771,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // tool results (otherwise the summary says "in progress" for a tool
     // call that already completed, causing the model to repeat it).
     if (droppedMessages.length > 0) {
-      messagesToRefine.push(...droppedMessages);
+      appendItems(messagesToRefine, droppedMessages);
     }
 
     // ---------------------------------------------------------------
@@ -2828,9 +2846,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       if (fadingRepaired.context.length > 0) {
         context = fadingRepaired.context;
         reclaimedTokens = fadingRepaired.reclaimedTokens;
-        messagesToRefine.push(...fadingRetry.messagesToRefine);
+        appendItems(messagesToRefine, fadingRetry.messagesToRefine);
         if (fadingRepaired.droppedMessages.length > 0) {
-          messagesToRefine.push(...fadingRepaired.droppedMessages);
+          appendItems(messagesToRefine, fadingRepaired.droppedMessages);
         }
 
         factoryParams.log?.('debug', 'Fallback fading recovered context', {
@@ -2964,9 +2982,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
         context = repaired.context;
         reclaimedTokens = repaired.reclaimedTokens;
-        messagesToRefine.push(...retryResult.messagesToRefine);
+        appendItems(messagesToRefine, retryResult.messagesToRefine);
         if (repaired.droppedMessages.length > 0) {
-          messagesToRefine.push(...repaired.droppedMessages);
+          appendItems(messagesToRefine, repaired.droppedMessages);
         }
 
         factoryParams.log?.('debug', 'Emergency truncation retry result', {

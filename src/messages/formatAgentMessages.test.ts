@@ -137,6 +137,7 @@ describe('formatAgentMessages', () => {
       { role: 'user', content: 'Old user message' },
       { role: 'assistant', content: 'Old assistant message' },
       {
+        messageId: 'summary-boundary-row',
         role: 'assistant',
         content: [
           { type: ContentTypes.TEXT, text: 'Covered by summary' },
@@ -169,6 +170,16 @@ describe('formatAgentMessages', () => {
     ).toMatchObject({
       type: ContentTypes.TEXT,
       text: 'Preserved tail',
+    });
+    expect(result.messages[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'model',
+          sourceMessageId: 'summary-boundary-row',
+          sourceContentPartIndices: [2],
+        },
+      ],
     });
     expect(result.indexTokenCountMap?.[0]).toBeLessThan(18);
     expect(result.indexTokenCountMap?.[0]).toBeGreaterThan(0);
@@ -751,6 +762,7 @@ describe('formatAgentMessages', () => {
         content: 'Search first, then calculate 19 * 23.',
       },
       {
+        messageId: 'server-tool-row',
         role: 'assistant',
         content: [
           {
@@ -834,6 +846,34 @@ describe('formatAgentMessages', () => {
     expect(serverToolUseIndex).toBeGreaterThanOrEqual(0);
     expect(serverResultIndex).toBeGreaterThan(serverToolUseIndex);
     expect(calculatorToolUseIndex).toBeGreaterThan(serverResultIndex);
+    const serverResultMessage = messages.find(
+      (message) =>
+        message instanceof AIMessage &&
+        Array.isArray(message.content) &&
+        (message.content as MessageContentComplex[]).some(
+          (block) => block.type === 'web_search_tool_result'
+        )
+    );
+    expect(serverResultMessage?.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'model',
+          sourceMessageId: 'server-tool-row',
+          sourceContentPartIndices: [0, 1],
+        },
+        {
+          attribution: 'tool',
+          sourceMessageId: 'server-tool-row',
+          sourceContentPartIndices: [2],
+        },
+        {
+          attribution: 'model',
+          sourceMessageId: 'server-tool-row',
+          sourceContentPartIndices: [3, 4],
+        },
+      ],
+    });
     expect(
       messages.some(
         (message) =>
@@ -1662,6 +1702,20 @@ describe('formatAgentMessages', () => {
       new ToolMessage({
         content: 'short result',
         tool_call_id: 'call_artifact_payload',
+        additional_kwargs: {
+          sourceMessageId: 'stored-tool-row',
+          sourceMessageIds: ['stored-tool-row'],
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'tool',
+                sourceMessageId: 'stored-tool-row',
+                sourceContentPartIndices: [3],
+              },
+            ],
+          },
+        },
         artifact: {
           content: [
             { type: ContentTypes.TEXT, text: 'artifact'.repeat(1_000) },
@@ -1679,7 +1733,218 @@ describe('formatAgentMessages', () => {
     );
     expect(messages).toHaveLength(2);
     expect((messages[1] as ToolMessage).content).toBe('short result');
+    expect(formatted[1].additional_kwargs).not.toBe(
+      messages[1].additional_kwargs
+    );
+    expect(messages[1].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'tool',
+          sourceMessageId: 'stored-tool-row',
+          sourceContentPartIndices: [3],
+        },
+      ],
+    });
+    expect(payload.additional_kwargs.sourceMessageIds).toEqual([
+      'stored-tool-row',
+    ]);
+    expect(payload.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'tool',
+          sourceMessageId: 'stored-tool-row',
+          sourceContentPartIndices: [3],
+        },
+        {
+          attribution: 'tool',
+          sourceMessageId: 'stored-tool-row',
+        },
+      ],
+    });
     expect(projectArtifactPayload(formatted, 200)).toBe(formatted);
+  });
+
+  it('stamps only artifact source parts that survive the aggregate cap', () => {
+    const createToolMessage = (
+      toolCallId: string,
+      sourceMessageId: string,
+      content: ToolMessage['content'],
+      artifact: string,
+      sourceContentPartIndices: number[]
+    ): ToolMessage =>
+      new ToolMessage({
+        content,
+        tool_call_id: toolCallId,
+        artifact: { content: artifact },
+        additional_kwargs: {
+          sourceMessageId,
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'tool',
+                sourceMessageId,
+                sourceContentPartIndices,
+              },
+            ],
+          },
+        },
+      });
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          { id: 'first', name: 'render', args: {}, type: 'tool_call' },
+          { id: 'second', name: 'render', args: {}, type: 'tool_call' },
+        ],
+      }),
+      createToolMessage(
+        'first',
+        'first-row',
+        [
+          { type: ContentTypes.TEXT, text: 'A'.repeat(1_000) },
+          { type: ContentTypes.TEXT, text: 'OMITTED-FIRST-PART' },
+        ],
+        'omitted first artifact',
+        [0, 1]
+      ),
+      createToolMessage(
+        'second',
+        'second-row',
+        'OMITTED-SECOND-RESULT',
+        'omitted second artifact',
+        [0]
+      ),
+    ];
+
+    const formatted = projectArtifactPayload(messages, 80);
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+    const payloadText = serializeToolContent(payload.content);
+
+    expect(payloadText).not.toContain('OMITTED-FIRST-PART');
+    expect(payloadText).not.toContain('OMITTED-SECOND-RESULT');
+    expect(payload.additional_kwargs.sourceMessageIds).toEqual(['first-row']);
+    expect(payload.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'tool',
+          sourceMessageId: 'first-row',
+          sourceContentPartIndices: [0],
+        },
+      ],
+    });
+  });
+
+  it('skips empty artifact blocks without dropping later visible blocks', () => {
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          { id: 'empty-first', name: 'render', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: [
+          { type: ContentTypes.TEXT, text: '' },
+          { type: ContentTypes.TEXT, text: 'SECOND-BLOCK' },
+        ],
+        tool_call_id: 'empty-first',
+        artifact: { content: 'ARTIFACT' },
+        additional_kwargs: {
+          sourceMessageId: 'tool-row',
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'tool',
+                sourceMessageId: 'tool-row',
+                sourceContentPartIndices: [0, 1],
+              },
+            ],
+          },
+        },
+      }),
+    ];
+
+    const formatted = projectArtifactPayload(messages, 1_000);
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+
+    expect(serializeToolContent(payload.content)).toContain('SECOND-BLOCK');
+    expect(serializeToolContent(payload.content)).toContain('ARTIFACT');
+    expect(payload.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'tool',
+          sourceMessageId: 'tool-row',
+          sourceContentPartIndices: [1],
+        },
+        { attribution: 'tool', sourceMessageId: 'tool-row' },
+      ],
+    });
+  });
+
+  it('drops ambiguous legacy source ids after partial artifact compaction', () => {
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          { id: 'legacy', name: 'render', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: [
+          { type: ContentTypes.TEXT, text: 'A'.repeat(1_000) },
+          { type: ContentTypes.TEXT, text: 'OMITTED-SECOND' },
+        ],
+        tool_call_id: 'legacy',
+        artifact: { content: 'omitted artifact' },
+        additional_kwargs: { sourceMessageIds: ['first-row', 'second-row'] },
+      }),
+    ];
+
+    const formatted = projectArtifactPayload(messages, 80);
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+
+    expect(serializeToolContent(payload.content)).not.toContain(
+      'OMITTED-SECOND'
+    );
+    expect(payload.additional_kwargs.sourceMessageIds).toBeUndefined();
+    expect(payload.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [{ attribution: 'tool' }],
+    });
+  });
+
+  it('drops ambiguous source ids after partial scalar artifact projection', () => {
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          { id: 'scalar', name: 'render', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'A'.repeat(1_000),
+        tool_call_id: 'scalar',
+        artifact: { content: 'omitted artifact' },
+        additional_kwargs: {
+          sourceMessageIds: ['first-row', 'second-row'],
+        },
+      }),
+    ];
+
+    const formatted = projectArtifactPayload(messages, 80);
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+
+    expect(payload.additional_kwargs.sourceMessageIds).toBeUndefined();
+    expect(payload.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [{ attribution: 'tool' }],
+    });
   });
 
   it('bounds artifact block arrays without spreading them into call arguments', () => {
@@ -5029,6 +5294,7 @@ describe('formatAgentMessages', () => {
     const tools = new Set(['calculator']);
     const payload = [
       {
+        messageId: 'filtered-tool-row',
         role: 'assistant',
         content: [
           {
@@ -5078,6 +5344,36 @@ describe('formatAgentMessages', () => {
       typeof aiContent === 'string' ? aiContent : JSON.stringify(aiContent);
     expect(aiContentStr).toContain('some_unknown_tool');
     expect(aiContentStr).toContain('This is the result from unknown tool');
+    expect(result.messages[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'model',
+          sourceMessageId: 'filtered-tool-row',
+          sourceContentPartIndices: [0],
+        },
+        {
+          attribution: 'tool',
+          sourceMessageId: 'filtered-tool-row',
+          sourceContentPartIndices: [2],
+        },
+        {
+          attribution: 'model',
+          sourceMessageId: 'filtered-tool-row',
+          sourceContentPartIndices: [1],
+        },
+      ],
+    });
+    expect(result.messages[1].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'tool',
+          sourceMessageId: 'filtered-tool-row',
+          sourceContentPartIndices: [1],
+        },
+      ],
+    });
   });
 
   it('should simulate realistic deferred tools flow with tool_search', () => {

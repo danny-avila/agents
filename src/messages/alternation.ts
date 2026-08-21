@@ -1,6 +1,13 @@
 // src/messages/alternation.ts
 import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage, MessageContent } from '@langchain/core/messages';
+import type { ProviderMessageProvenancePart } from './provenance';
+import {
+  getProviderMessageProvenance,
+  getProviderSourceMessageIds,
+  setProviderMessageProvenance,
+} from './provenance';
+import { isProviderToolResultPart } from './toolResultTypes';
 import { Providers } from '@/common';
 
 /**
@@ -19,8 +26,6 @@ export const strictAlternationProviders: ReadonlySet<Providers> = new Set([
   Providers.MISTRALAI,
 ]);
 
-const TOOL_RESULT_TYPES = new Set(['tool_result', 'toolResult']);
-
 /**
  * True when every block is a tool result. Both vendored converters already
  * merge adjacent runs of these, and folding one into a text turn would break
@@ -31,10 +36,7 @@ function isToolResultMessage(message: BaseMessage): boolean {
   if (typeof content === 'string' || content.length === 0) {
     return false;
   }
-  return content.every(
-    (block) =>
-      typeof block.type === 'string' && TOOL_RESULT_TYPES.has(block.type)
-  );
+  return content.every(isProviderToolResultPart);
 }
 
 function toBlocks(content: MessageContent): Exclude<MessageContent, string> {
@@ -44,14 +46,112 @@ function toBlocks(content: MessageContent): Exclude<MessageContent, string> {
   return content;
 }
 
-function joinContent(
-  left: MessageContent,
-  right: MessageContent
-): MessageContent {
-  if (typeof left === 'string' && typeof right === 'string') {
-    return left === '' ? right : `${left}\n\n${right}`;
+function joinStringContents(
+  messages: readonly BaseMessage[],
+  endIndex = messages.length
+): string {
+  const contents: string[] = [];
+  for (let index = 0; index < endIndex; index++) {
+    const content = messages[index].content as string;
+    if (contents.length === 0 && content === '') {
+      continue;
+    }
+    contents.push(content);
   }
-  return [...toBlocks(left), ...toBlocks(right)];
+  return contents.join('\n\n');
+}
+
+function joinContents(messages: readonly BaseMessage[]): MessageContent {
+  const firstArrayIndex = messages.findIndex((message) =>
+    Array.isArray(message.content)
+  );
+  if (firstArrayIndex === -1) {
+    return joinStringContents(messages);
+  }
+
+  const prefix = joinStringContents(messages, firstArrayIndex);
+  const blocks: Exclude<MessageContent, string> = [];
+  const appendBlocks = (content: MessageContent): void => {
+    for (const block of toBlocks(content)) {
+      blocks.push(block);
+    }
+  };
+  appendBlocks(prefix);
+  for (let index = firstArrayIndex; index < messages.length; index++) {
+    appendBlocks(messages[index].content);
+  }
+  return blocks;
+}
+
+function inferHumanMessageAttribution(
+  message: BaseMessage
+): ProviderMessageProvenancePart['attribution'] {
+  const additionalKwargs = message.additional_kwargs as {
+    injected?: unknown;
+    isMeta?: unknown;
+    source?: unknown;
+  };
+  const source =
+    typeof additionalKwargs.source === 'string'
+      ? additionalKwargs.source
+      : undefined;
+  if (source === 'steer') {
+    return 'user';
+  }
+  const isKnownSyntheticSource =
+    source === 'skill' || source === 'hook' || source === 'system';
+  return additionalKwargs.isMeta === true ||
+    isKnownSyntheticSource ||
+    additionalKwargs.injected === true
+    ? 'synthetic'
+    : 'user';
+}
+
+function getHumanMessageProvenanceParts(
+  message: BaseMessage
+): ProviderMessageProvenancePart[] {
+  const explicit = getProviderMessageProvenance(message);
+  if (explicit != null && explicit.parts.length > 0) {
+    const parts = [...explicit.parts];
+    const representedSourceIds = new Set<string>();
+    for (const part of parts) {
+      if (part.sourceMessageId != null) {
+        representedSourceIds.add(part.sourceMessageId);
+      }
+    }
+    const missingSourceIds = getProviderSourceMessageIds(message).filter(
+      (sourceMessageId) => !representedSourceIds.has(sourceMessageId)
+    );
+    if (
+      parts.length === 1 &&
+      parts[0].sourceMessageId == null &&
+      missingSourceIds.length === 1
+    ) {
+      return missingSourceIds.map((sourceMessageId) => ({
+        ...parts[0],
+        sourceMessageId,
+      }));
+    }
+    const attribution = inferHumanMessageAttribution(message);
+    for (const sourceMessageId of missingSourceIds) {
+      parts.push({ attribution, sourceMessageId });
+    }
+    return parts;
+  }
+  const attribution = inferHumanMessageAttribution(message);
+  const sourceMessageIds = getProviderSourceMessageIds(message);
+  return sourceMessageIds.length > 0
+    ? sourceMessageIds.map((sourceMessageId) => ({
+      attribution,
+      sourceMessageId,
+    }))
+    : [{ attribution }];
+}
+
+function hasProviderVisibleContent(message: BaseMessage): boolean {
+  return typeof message.content === 'string'
+    ? message.content.length > 0
+    : message.content.length > 0;
 }
 
 /**
@@ -66,25 +166,53 @@ function joinContent(
 export function coalesceAdjacentUserTurns(
   messages: BaseMessage[]
 ): BaseMessage[] {
-  const result: BaseMessage[] = [];
-  let mergedAny = false;
-  for (const message of messages) {
-    const previous = result[result.length - 1];
-    const mergeable =
-      result.length > 0 &&
-      previous.getType() === 'human' &&
-      message.getType() === 'human' &&
-      !isToolResultMessage(previous) &&
-      !isToolResultMessage(message);
-
-    if (!mergeable) {
-      result.push(message);
+  let result: BaseMessage[] | null = null;
+  let index = 0;
+  while (index < messages.length) {
+    const first = messages[index];
+    if (first.getType() !== 'human' || isToolResultMessage(first)) {
+      result?.push(first);
+      index++;
       continue;
     }
-    mergedAny = true;
 
-    result[result.length - 1] = new HumanMessage({
-      content: joinContent(previous.content, message.content),
+    let endIndex = index + 1;
+    while (
+      endIndex < messages.length &&
+      messages[endIndex].getType() === 'human' &&
+      !isToolResultMessage(messages[endIndex])
+    ) {
+      endIndex++;
+    }
+    if (endIndex === index + 1) {
+      result?.push(first);
+      index = endIndex;
+      continue;
+    }
+    result ??= messages.slice(0, index);
+    const run = messages.slice(index, endIndex);
+    const last = run[run.length - 1];
+    const provenanceParts: ProviderMessageProvenancePart[] = [];
+    for (const message of run) {
+      if (!hasProviderVisibleContent(message)) {
+        continue;
+      }
+      for (const part of getHumanMessageProvenanceParts(message)) {
+        provenanceParts.push(part);
+      }
+    }
+    if (provenanceParts.length === 0) {
+      provenanceParts.push({
+        attribution: run.some(
+          (message) => inferHumanMessageAttribution(message) === 'user'
+        )
+          ? 'user'
+          : 'synthetic',
+      });
+    }
+
+    const mergedMessage = new HumanMessage({
+      content: joinContents(run),
       /**
        * The LATER turn's kwargs, deliberately. The one provider-path consumer
        * of these flags is the prompt-cache tail anchor, and it reasons
@@ -96,9 +224,12 @@ export function coalesceAdjacentUserTurns(
        * skill body must not pin the cache to the volatile body. The first
        * turn's id is kept so origin tracking can re-attach by key.
        */
-      additional_kwargs: message.additional_kwargs,
-      ...(previous.id != null && { id: previous.id }),
+      additional_kwargs: { ...last.additional_kwargs },
+      ...(first.id != null && { id: first.id }),
     });
+    setProviderMessageProvenance(mergedMessage, provenanceParts);
+    result.push(mergedMessage);
+    index = endIndex;
   }
   /**
    * Identity on the no-merge path. The pass runs twice for a primary
@@ -108,5 +239,5 @@ export function coalesceAdjacentUserTurns(
    * the SAME array rather than reallocating a context-sized copy, and
    * callers can cheaply detect "nothing changed" by identity.
    */
-  return mergedAny ? result : messages;
+  return result ?? messages;
 }

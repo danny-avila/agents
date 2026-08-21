@@ -502,15 +502,22 @@ export class MultiAgentGraph extends StandardGraph {
       const handoffTools: t.GenericTool[] = [];
       const sourceAgentName = agentContext.name ?? agentId;
       for (const edge of edges) {
-        handoffTools.push(
-          ...this.createHandoffToolsForEdge(edge, agentId, sourceAgentName)
+        const edgeTools = this.createHandoffToolsForEdge(
+          edge,
+          agentId,
+          sourceAgentName
         );
+        for (const edgeTool of edgeTools) {
+          handoffTools.push(edgeTool);
+        }
       }
 
       if (!agentContext.graphTools) {
         agentContext.graphTools = [];
       }
-      agentContext.graphTools.push(...handoffTools);
+      for (const handoffTool of handoffTools) {
+        agentContext.graphTools.push(handoffTool);
+      }
     }
   }
 

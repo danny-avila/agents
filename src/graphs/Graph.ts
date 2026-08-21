@@ -61,6 +61,7 @@ import {
   resolveBedrockPromptCacheTtl,
   supportsBedrockToolCache,
   isSyntheticProviderContextMessage,
+  compactSyntheticProviderContextMessage,
   getMessageId,
   getMessageCreationContentMetadata,
   splitAssistantTextContentByPhase,
@@ -134,11 +135,6 @@ import {
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import {
-  compactToolContent,
-  getToolContentCharLength,
-  serializeToolContentBounded,
-} from '@/utils/toolContent';
-import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
@@ -146,6 +142,10 @@ import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
+import {
+  getToolContentCharLength,
+  serializeToolContentBounded,
+} from '@/utils/toolContent';
 import {
   appendCallbacks,
   findCallback,
@@ -412,7 +412,9 @@ function getCurrentStepIds({
     if (stepKey !== baseStepKey && !stepKey.startsWith(`${baseStepKey}_`)) {
       continue;
     }
-    currentStepIds.push(...stepIds);
+    for (const stepId of stepIds) {
+      currentStepIds.push(stepId);
+    }
   }
   return currentStepIds;
 }
@@ -3553,17 +3555,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const buildCandidate = (scale: number): BaseMessage[] => {
           const compacted = [...candidate];
           for (const { index, message, chars } of synthetic) {
-            const content = compactToolContent(
-              message.content,
+            compacted[index] = compactSyntheticProviderContextMessage(
+              message,
               Math.floor(chars * scale)
-            ).content;
-            compacted[index] = new HumanMessage({
-              content,
-              id: message.id,
-              name: message.name,
-              additional_kwargs: message.additional_kwargs,
-              response_metadata: message.response_metadata,
-            });
+            );
           }
           return compacted;
         };
@@ -4733,7 +4728,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     }
     if (result.injectedMessages.length > 0) {
       try {
-        injected.push(...convertInjectedMessages(result.injectedMessages));
+        const convertedMessages = convertInjectedMessages(
+          result.injectedMessages
+        );
+        for (const convertedMessage of convertedMessages) {
+          injected.push(convertedMessage);
+        }
       } catch (e) {
         console.warn(
           '[StandardGraph] Failed to convert PreemptBoundary injectedMessages:',

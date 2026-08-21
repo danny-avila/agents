@@ -9,10 +9,12 @@ import {
 } from '@langchain/core/messages';
 import type { ContentBlock as LangChainContentBlock } from '@langchain/core/messages';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
+import type { ProviderMessageProvenancePart } from './provenance';
 import type * as t from '@/types';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
+  getToolContentCharLength,
   getBoundedCacheControlledTextToolContent,
   getBoundedSingleTextToolContent,
   getComputerCallOutputScreenshot,
@@ -20,6 +22,11 @@ import {
   isComputerCallOutputMessage,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
+import {
+  getProviderMessageProvenance,
+  getProviderSourceMessageIds,
+  setProviderMessageProvenance,
+} from './provenance';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { stripAnthropicCacheControl } from './cache';
 import { ContentTypes, Providers } from '@/common';
@@ -516,6 +523,164 @@ function appendBoundedContent(
   appendContentBlocks(combined, current);
   appendContentBlocks(combined, boundedNext);
   return compactToolContent(toLangChainContent(combined), maxChars).content;
+}
+
+interface BoundedContentAccumulator {
+  readonly blocks: t.MessageContentComplex[];
+  hasContent: boolean;
+  remainingChars: number;
+}
+
+function createBoundedContentAccumulator(
+  maxChars: number
+): BoundedContentAccumulator {
+  return {
+    blocks: [],
+    hasContent: false,
+    remainingChars: Number.isFinite(maxChars)
+      ? Math.max(0, Math.floor(maxChars))
+      : Number.MAX_SAFE_INTEGER,
+  };
+}
+
+/** Appends a segment only when at least one of its provider-visible bytes fits.
+ * Each segment is compacted against the remaining budget before combination,
+ * so a later segment cannot be credited merely because recompression replaced
+ * earlier bytes with a truncation notice. */
+function appendBoundedContentSegment(
+  accumulator: BoundedContentAccumulator,
+  next: unknown
+): { contributed: boolean; complete: boolean } {
+  const separatorChars = accumulator.hasContent ? 1 : 0;
+  const availableChars = accumulator.remainingChars - separatorChars;
+  const originalChars = getToolContentCharLength(next);
+  if (originalChars <= 0) {
+    return { contributed: false, complete: true };
+  }
+  if (availableChars <= 0) {
+    return { contributed: false, complete: false };
+  }
+  const compactedNext = compactToolContent(next, availableChars);
+  const boundedNext = compactedNext.content;
+  const appendedChars = Math.min(
+    availableChars,
+    getToolContentCharLength(boundedNext)
+  );
+  if (appendedChars <= 0) {
+    return { contributed: false, complete: false };
+  }
+  appendContentBlocks(accumulator.blocks, boundedNext);
+  accumulator.hasContent = true;
+  accumulator.remainingChars -= separatorChars + appendedChars;
+  return {
+    contributed: true,
+    complete: !compactedNext.changed && originalChars <= availableChars,
+  };
+}
+
+function appendBoundedContentContribution(
+  accumulator: BoundedContentAccumulator,
+  next: unknown
+): {
+  contributed: boolean;
+  complete: boolean;
+  retainedContentPartIndices?: ReadonlySet<number>;
+} {
+  if (!Array.isArray(next)) {
+    return appendBoundedContentSegment(accumulator, next);
+  }
+  const retainedContentPartIndices = new Set<number>();
+  let complete = true;
+  for (let index = 0; index < next.length; index++) {
+    const projection = appendBoundedContentSegment(accumulator, [next[index]]);
+    if (!projection.complete) {
+      complete = false;
+    }
+    if (!projection.contributed) {
+      const separatorChars = accumulator.hasContent ? 1 : 0;
+      if (accumulator.remainingChars <= separatorChars) {
+        if (index < next.length - 1) {
+          complete = false;
+        }
+        break;
+      }
+      continue;
+    }
+    retainedContentPartIndices.add(index);
+  }
+  return {
+    contributed: retainedContentPartIndices.size > 0,
+    complete,
+    retainedContentPartIndices,
+  };
+}
+
+function retainProjectedContentPartProvenance(
+  message: BaseMessage,
+  parts: readonly ProviderMessageProvenancePart[],
+  retainedContentPartIndices: ReadonlySet<number> | undefined,
+  complete: boolean
+): ProviderMessageProvenancePart[] {
+  if (
+    complete &&
+    (retainedContentPartIndices == null ||
+      !Array.isArray(message.content) ||
+      retainedContentPartIndices.size === message.content.length)
+  ) {
+    return [...parts];
+  }
+  const sourceIndexRefCount = parts.reduce(
+    (total, part) => total + (part.sourceContentPartIndices?.length ?? 0),
+    0
+  );
+  const mapsOneToOne = sourceIndexRefCount === message.content.length;
+  const distinctSourceMessageIds = new Set<string>();
+  for (const part of parts) {
+    if (part.sourceMessageId != null) {
+      distinctSourceMessageIds.add(part.sourceMessageId);
+    }
+  }
+  if (!Array.isArray(message.content)) {
+    const soleSourceMessageId =
+      distinctSourceMessageIds.size === 1
+        ? distinctSourceMessageIds.values().next().value
+        : undefined;
+    return [
+      {
+        attribution: parts[0]?.attribution ?? 'tool',
+        ...(soleSourceMessageId != null && {
+          sourceMessageId: soleSourceMessageId,
+        }),
+      },
+    ];
+  }
+  const retained: ProviderMessageProvenancePart[] = [];
+  let sourceIndexOrdinal = 0;
+  for (const part of parts) {
+    if (part.sourceContentPartIndices == null) {
+      if (distinctSourceMessageIds.size <= 1) {
+        retained.push(part);
+      }
+      continue;
+    }
+    if (!mapsOneToOne || retainedContentPartIndices == null) {
+      sourceIndexOrdinal += part.sourceContentPartIndices.length;
+      continue;
+    }
+    const sourceContentPartIndices: number[] = [];
+    for (const sourceContentPartIndex of part.sourceContentPartIndices) {
+      if (retainedContentPartIndices.has(sourceIndexOrdinal)) {
+        sourceContentPartIndices.push(sourceContentPartIndex);
+      }
+      sourceIndexOrdinal++;
+    }
+    if (sourceContentPartIndices.length > 0) {
+      retained.push({ ...part, sourceContentPartIndices });
+    }
+  }
+  return retained.length > 0
+    ? retained
+    : [{ attribution: parts[0]?.attribution ?? 'tool' }];
 }
 
 function cloneAIMessageWithToolCalls(
@@ -2323,6 +2488,61 @@ export function projectAnthropicArtifactContent(
   return formattedMessages ?? messages;
 }
 
+function projectProviderMessageAttribution(
+  message: BaseMessage,
+  attribution: ProviderMessageProvenancePart['attribution']
+): ProviderMessageProvenancePart[] {
+  const explicit = getProviderMessageProvenance(message);
+  const sourceMessageIds = getProviderSourceMessageIds(message);
+  const explicitSourceIds = new Set<string>();
+  for (const part of explicit?.parts ?? []) {
+    if (part.sourceMessageId != null) {
+      explicitSourceIds.add(part.sourceMessageId);
+    }
+  }
+  const soleSourceFallback =
+    explicitSourceIds.size === 0 && sourceMessageIds.length === 1
+      ? sourceMessageIds[0]
+      : undefined;
+  const parts: ProviderMessageProvenancePart[] = [];
+  const representedSourceIds = new Set<string>();
+  for (const part of explicit?.parts ?? []) {
+    const sourceMessageId = part.sourceMessageId ?? soleSourceFallback;
+    if (sourceMessageId != null) {
+      representedSourceIds.add(sourceMessageId);
+    }
+    parts.push({
+      attribution,
+      ...(sourceMessageId != null && { sourceMessageId }),
+      ...(part.sourceContentPartIndices != null && {
+        sourceContentPartIndices: part.sourceContentPartIndices,
+      }),
+    });
+  }
+  for (const sourceMessageId of sourceMessageIds) {
+    if (!representedSourceIds.has(sourceMessageId)) {
+      parts.push({ attribution, sourceMessageId });
+    }
+  }
+  return parts.length > 0 ? parts : [{ attribution }];
+}
+
+/** Artifacts are attached to a tool message rather than one of its content
+ * positions. Retain the source row only when it is unambiguous, but never
+ * claim a raw content-part index for artifact-only bytes. */
+function projectUnindexedProviderMessageAttribution(
+  message: BaseMessage,
+  attribution: ProviderMessageProvenancePart['attribution']
+): ProviderMessageProvenancePart {
+  const sourceMessageIds = getProviderSourceMessageIds(message);
+  return {
+    attribution,
+    ...(sourceMessageIds.length === 1 && {
+      sourceMessageId: sourceMessageIds[0],
+    }),
+  };
+}
+
 /**
  * Mutating compatibility wrapper retained for existing package consumers.
  * New provider-call paths should use `projectAnthropicArtifactContent`.
@@ -2363,8 +2583,9 @@ export function projectArtifactPayload(
   if (latestAIParentIndex === -1) return messages;
 
   // Single pass: collect relevant tool messages with artifacts and aggregate
-  let aggregatedContent: BaseMessage['content'] | undefined;
+  const aggregate = createBoundedContentAccumulator(maxChars);
   let formattedMessages: BaseMessage[] | undefined;
+  const artifactProvenanceParts: ProviderMessageProvenancePart[] = [];
 
   for (let i = latestAIParentIndex + 1; i < messages.length; i++) {
     const msg = messages[i];
@@ -2380,13 +2601,12 @@ export function projectArtifactPayload(
     ) {
       continue;
     }
-    aggregatedContent = appendBoundedContent(
-      aggregatedContent,
-      msg.content,
-      maxChars
+    const contentProjection = appendBoundedContentContribution(
+      aggregate,
+      msg.content
     );
     formattedMessages ??= [...messages];
-    formattedMessages[i] = cloneToolMessageWithContent(
+    const placeholder = cloneToolMessageWithContent(
       msg,
       'Tool response is included in the next message as a Human message',
       {
@@ -2394,15 +2614,54 @@ export function projectArtifactPayload(
         content: [],
       }
     );
-    aggregatedContent = appendBoundedContent(
-      aggregatedContent,
-      msg.artifact.content,
-      maxChars
+    const toolProvenanceParts = projectProviderMessageAttribution(msg, 'tool');
+    setProviderMessageProvenance(
+      placeholder,
+      toolProvenanceParts.map((part) => ({
+        ...part,
+        attribution: 'synthetic',
+      }))
     );
+    formattedMessages[i] = placeholder;
+    const artifactProjection = appendBoundedContentContribution(
+      aggregate,
+      msg.artifact.content
+    );
+    if (contentProjection.contributed) {
+      const retainedParts = retainProjectedContentPartProvenance(
+        msg,
+        toolProvenanceParts,
+        contentProjection.retainedContentPartIndices,
+        contentProjection.complete
+      );
+      for (const part of retainedParts) {
+        artifactProvenanceParts.push(part);
+      }
+    }
+    if (artifactProjection.contributed) {
+      const artifactPart = projectUnindexedProviderMessageAttribution(
+        msg,
+        'tool'
+      );
+      const previousPart =
+        artifactProvenanceParts[artifactProvenanceParts.length - 1];
+      if (
+        artifactProvenanceParts.length === 0 ||
+        previousPart.attribution !== artifactPart.attribution ||
+        previousPart.sourceMessageId !== artifactPart.sourceMessageId ||
+        previousPart.sourceContentPartIndices != null
+      ) {
+        artifactProvenanceParts.push(artifactPart);
+      }
+    }
   }
 
-  if (aggregatedContent != null) {
-    formattedMessages?.push(new HumanMessage({ content: aggregatedContent }));
+  if (aggregate.hasContent && artifactProvenanceParts.length > 0) {
+    const artifactPayload = new HumanMessage({
+      content: toLangChainContent(aggregate.blocks),
+    });
+    setProviderMessageProvenance(artifactPayload, artifactProvenanceParts);
+    formattedMessages?.push(artifactPayload);
   }
   return formattedMessages ?? messages;
 }
@@ -2424,9 +2683,15 @@ export function formatArtifactPayload(messages: BaseMessage[]): void {
       projected[i] !== messages[i]
     ) {
       messages[i].content = projected[i].content;
+      const provenance = getProviderMessageProvenance(projected[i]);
+      if (provenance != null) {
+        setProviderMessageProvenance(messages[i], provenance.parts);
+      }
     }
   }
-  messages.push(...projected.slice(originalLength));
+  for (let i = originalLength; i < projected.length; i++) {
+    messages.push(projected[i]);
+  }
 }
 
 export function findLastIndex<T>(
