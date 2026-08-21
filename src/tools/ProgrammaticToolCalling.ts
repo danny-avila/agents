@@ -323,8 +323,12 @@ export function extractUsedToolNames(
     const escapedName = pythonName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pattern = new RegExp(`\\b${escapedName}\\b`, 'g');
 
-    let shadowed = false;
+    const shadowedScopes = new Set<string>();
     for (const match of executableCode.matchAll(pattern)) {
+      const lexicalScope = getPythonLexicalScopeKey(
+        executableCode,
+        match.index
+      );
       if (
         isPythonBindingTarget(
           executableCode,
@@ -332,10 +336,10 @@ export function extractUsedToolNames(
           match.index + pythonName.length
         )
       ) {
-        shadowed = true;
+        shadowedScopes.add(lexicalScope);
         continue;
       }
-      if (shadowed) {
+      if (shadowedScopes.has(lexicalScope)) {
         continue;
       }
       let prefix = match.index - 1;
@@ -362,6 +366,40 @@ export function extractUsedToolNames(
   }
 
   return usedTools;
+}
+
+function getPythonLexicalScopeKey(code: string, position: number): string {
+  const lines = code.slice(0, position).split('\n');
+  const scopes: Array<{ indent: number; key: string }> = [];
+
+  for (let lineIndex = 0; lineIndex < lines.length - 1; lineIndex++) {
+    const line = lines[lineIndex];
+    const content = line.trim();
+    if (content === '') continue;
+    const indent = line.length - line.trimStart().length;
+    while (
+      scopes.length > 0 &&
+      indent <= scopes[scopes.length - 1].indent
+    ) {
+      scopes.pop();
+    }
+    if (/^(?:async\s+)?def\s+|^class\s+/.test(content)) {
+      scopes.push({ indent, key: `${lineIndex}:${indent}` });
+    }
+  }
+
+  const currentLine = lines[lines.length - 1];
+  const currentIndent = currentLine.length - currentLine.trimStart().length;
+  while (
+    scopes.length > 0 &&
+    currentIndent <= scopes[scopes.length - 1].indent
+  ) {
+    scopes.pop();
+  }
+
+  return scopes.length === 0
+    ? 'module'
+    : scopes.map((scope) => scope.key).join('/');
 }
 
 function isPythonBindingTarget(

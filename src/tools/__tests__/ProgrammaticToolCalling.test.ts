@@ -851,6 +851,17 @@ for search_docs in callbacks:
       expect(extractUsedToolNames(code, availableTools)).toEqual(new Set());
     });
 
+    it('keeps Python shadowing scoped to its lexical block', () => {
+      const code = `await get_weather()
+def helper():
+    search_docs = lambda: None
+await search_docs()`;
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(
+        new Set(['get_weather', 'search_docs'])
+      );
+    });
+
     it('preserves executable calls inside f-string expressions', () => {
       const code = `await get_weather(city="SF")
 value = f"result: {await search_docs(query='forecast')}"`;
@@ -1194,6 +1205,24 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       );
 
       expect(used).toEqual(new Set());
+    });
+
+    it('tracks nested Bash case statements independently', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; case x in x) case y in y) :;; esac;; search_docs) :;; esac',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather']));
+    });
+
+    it('does not treat bare arithmetic expressions as commands', () => {
+      const used = extractUsedBashToolNames(
+        '(( get_weather += 1 )); search_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['search_docs']));
     });
   });
 

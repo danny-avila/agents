@@ -289,7 +289,7 @@ function collectBashCommandNames(
   const pendingAssignments = new Map<string, string>();
   let commandPrefix: string | undefined;
   let skipPrefixOptionOperand = false;
-  let caseMode: 'subject' | 'awaitIn' | 'pattern' | 'body' | undefined;
+  const caseModes: Array<'subject' | 'awaitIn' | 'pattern' | 'body'> = [];
 
   const flushEval = (): void => {
     if (evalWords != null && evalWords.length > 0) {
@@ -321,16 +321,19 @@ function collectBashCommandNames(
       expectsCoprocWord = false;
       expectsCommand = true;
       skipRedirectTarget = false;
-      if (token.type === 'caseArmEnd' && caseMode === 'body') {
-        caseMode = 'pattern';
+      if (
+        token.type === 'caseArmEnd' &&
+        caseModes[caseModes.length - 1] === 'body'
+      ) {
+        caseModes[caseModes.length - 1] = 'pattern';
       }
       continue;
     }
     if (token.type === 'closeParen') {
       expectsCommand = true;
       skipRedirectTarget = false;
-      if (caseMode === 'pattern') {
-        caseMode = 'body';
+      if (caseModes[caseModes.length - 1] === 'pattern') {
+        caseModes[caseModes.length - 1] = 'body';
       }
       continue;
     }
@@ -367,20 +370,21 @@ function collectBashCommandNames(
     }
 
     const word = token.value;
+    const caseMode = caseModes[caseModes.length - 1];
     if (caseMode === 'subject') {
-      caseMode = 'awaitIn';
+      caseModes[caseModes.length - 1] = 'awaitIn';
       continue;
     }
     if (caseMode === 'awaitIn') {
-      if (word === 'in') caseMode = 'pattern';
+      if (word === 'in') caseModes[caseModes.length - 1] = 'pattern';
       continue;
     }
     if (caseMode === 'pattern') {
-      if (word === 'esac') caseMode = undefined;
+      if (word === 'esac') caseModes.pop();
       continue;
     }
-    if (caseMode === 'body' && word === 'esac') {
-      caseMode = undefined;
+    if (word === 'esac') {
+      if (caseMode != null) caseModes.pop();
       continue;
     }
     if (expectsFunctionName) {
@@ -409,7 +413,7 @@ function collectBashCommandNames(
       continue;
     }
     if (COMMAND_START_WORDS.has(word) || word === '!' || word === '{') {
-      if (word === 'case') caseMode = 'subject';
+      if (word === 'case') caseModes.push('subject');
       continue;
     }
     if (word === 'function') {
@@ -511,6 +515,18 @@ function tokenizeBash(code: string): BashToken[] {
           tokens: tokenizeBash(code.slice(bodyStart, bodyEnd)),
         });
         index = bodyEnd + 1;
+      }
+      continue;
+    }
+    if (code.slice(index, index + 2) === '((') {
+      const arithmeticEnd = findBashArithmeticExpansionEnd(code, index + 2);
+      if (arithmeticEnd == null) {
+        index = code.length;
+      } else {
+        tokens.push(
+          ...tokenizeBashArithmeticSubstitutions(code, index + 2, arithmeticEnd)
+        );
+        index = arithmeticEnd + 1;
       }
       continue;
     }
