@@ -39,9 +39,26 @@ export interface ProviderMessageProvenance {
   readonly parts: readonly ProviderMessageProvenancePart[];
 }
 
+/** Inert marker used only when a derived message must retain invalidity. */
+export interface InvalidProviderMessageProvenance {
+  readonly version: typeof PROVIDER_MESSAGE_PROVENANCE_VERSION;
+  readonly parts: null;
+}
+
+/** Distinguishes absent metadata from an explicitly malformed envelope. */
+export type ProviderMessageProvenanceState =
+  | { readonly status: 'absent' }
+  | { readonly status: 'invalid' }
+  | {
+    readonly status: 'valid';
+    readonly provenance: ProviderMessageProvenance;
+  };
+
 /** Typed subset of `additional_kwargs` exposed at provider callbacks. */
 export interface ProviderMessageProvenanceAdditionalKwargs {
-  readonly provenance?: ProviderMessageProvenance;
+  readonly provenance?:
+    | ProviderMessageProvenance
+    | InvalidProviderMessageProvenance;
   readonly sourceMessageId?: string;
   readonly sourceMessageIds?: readonly string[];
 }
@@ -70,6 +87,19 @@ const immutableProviderMessageSourceIds = new WeakMap<
   object,
   readonly string[]
 >();
+const absentProviderMessageProvenanceState = Object.freeze({
+  status: 'absent' as const,
+});
+const invalidProviderMessageProvenanceState = Object.freeze({
+  status: 'invalid' as const,
+});
+/** Fresh projections use this inert envelope to preserve explicit invalidity
+ * without retaining any hostile caller-owned object or array. */
+const invalidProviderMessageProvenanceSentinel: InvalidProviderMessageProvenance =
+  Object.freeze({
+    version: PROVIDER_MESSAGE_PROVENANCE_VERSION,
+    parts: null,
+  });
 
 function normalizeSourceMessageId(
   candidate: unknown,
@@ -509,6 +539,35 @@ export function getProviderMessageProvenance(
   return normalizeProviderMessageProvenance(provenanceInput);
 }
 
+/** Safely preserves the semantic difference between absent and invalid input. */
+export function inspectProviderMessageProvenance(
+  message: BaseMessage
+): ProviderMessageProvenanceState {
+  let additionalKwargs: unknown;
+  try {
+    additionalKwargs = message.additional_kwargs;
+  } catch {
+    return invalidProviderMessageProvenanceState;
+  }
+  if (additionalKwargs == null || typeof additionalKwargs !== 'object') {
+    return absentProviderMessageProvenanceState;
+  }
+  let provenanceInput: unknown;
+  try {
+    provenanceInput = (additionalKwargs as { provenance?: unknown })
+      .provenance;
+  } catch {
+    return invalidProviderMessageProvenanceState;
+  }
+  if (provenanceInput == null) {
+    return absentProviderMessageProvenanceState;
+  }
+  const provenance = normalizeProviderMessageProvenance(provenanceInput);
+  return provenance == null
+    ? invalidProviderMessageProvenanceState
+    : { status: 'valid', provenance };
+}
+
 /**
  * Returns every explicit persisted source id in stable content order.
  * Typed parts, plural lineage, and the legacy singular id are unioned in that
@@ -531,10 +590,10 @@ export function getProviderSourceMessageIds(message: BaseMessage): string[] {
   );
 }
 
-/** Replaces typed provenance and synchronizes its stable plural source ids. */
-export function setProviderMessageProvenance(
+function publishProviderMessageProvenance(
   message: BaseMessage,
-  parts: readonly ProviderMessageProvenancePart[]
+  provenance: unknown,
+  sourceMessageIds?: readonly string[]
 ): void {
   if (isProxy(message)) {
     throw new TypeError('Invalid provider message serialization kwargs');
@@ -582,26 +641,9 @@ export function setProviderMessageProvenance(
   } catch {
     throw new TypeError('Invalid provider message serialization kwargs');
   }
-  const normalizedParts = normalizeProvenanceParts(parts);
-  const provenance: ProviderMessageProvenance = Object.freeze({
-    version: PROVIDER_MESSAGE_PROVENANCE_VERSION,
-    parts: normalizedParts,
-  });
-  immutableProviderMessageProvenance.add(provenance);
-  const sourceMessageIds: string[] = [];
-  const seen = new Set<string>();
-  for (const part of normalizedParts) {
-    appendSourceMessageId(sourceMessageIds, seen, part.sourceMessageId);
-  }
   replacement.provenance = provenance;
-  if (sourceMessageIds.length > 0) {
-    const immutableSourceMessageIds = Object.freeze(sourceMessageIds);
-    immutableProviderSourceMessageIds.add(immutableSourceMessageIds);
-    immutableProviderMessageSourceIds.set(
-      provenance,
-      immutableSourceMessageIds
-    );
-    replacement.sourceMessageIds = immutableSourceMessageIds;
+  if (sourceMessageIds != null && sourceMessageIds.length > 0) {
+    replacement.sourceMessageIds = sourceMessageIds;
     replacement.sourceMessageId = sourceMessageIds[sourceMessageIds.length - 1];
   } else {
     delete replacement.sourceMessageIds;
@@ -618,6 +660,49 @@ export function setProviderMessageProvenance(
   } catch {
     throw new TypeError('Invalid provider message serialization kwargs');
   }
+}
+
+/** Replaces typed provenance and synchronizes its stable plural source ids. */
+export function setProviderMessageProvenance(
+  message: BaseMessage,
+  parts: readonly ProviderMessageProvenancePart[]
+): void {
+  const normalizedParts = normalizeProvenanceParts(parts);
+  const provenance: ProviderMessageProvenance = Object.freeze({
+    version: PROVIDER_MESSAGE_PROVENANCE_VERSION,
+    parts: normalizedParts,
+  });
+  immutableProviderMessageProvenance.add(provenance);
+  const sourceMessageIds: string[] = [];
+  const seen = new Set<string>();
+  for (const part of normalizedParts) {
+    appendSourceMessageId(sourceMessageIds, seen, part.sourceMessageId);
+  }
+  if (sourceMessageIds.length > 0) {
+    const immutableSourceMessageIds = Object.freeze(sourceMessageIds);
+    immutableProviderSourceMessageIds.add(immutableSourceMessageIds);
+    immutableProviderMessageSourceIds.set(
+      provenance,
+      immutableSourceMessageIds
+    );
+    publishProviderMessageProvenance(
+      message,
+      provenance,
+      immutableSourceMessageIds
+    );
+    return;
+  }
+  publishProviderMessageProvenance(message, provenance);
+}
+
+/** Publishes the canonical fail-closed marker for malformed provenance. */
+export function setInvalidProviderMessageProvenance(
+  message: BaseMessage
+): void {
+  publishProviderMessageProvenance(
+    message,
+    invalidProviderMessageProvenanceSentinel
+  );
 }
 
 /** Marks a provider-visible runtime message as host-generated context. */

@@ -21,7 +21,8 @@ import type { ProviderMessageProvenancePart } from '@/messages/provenance';
 import type { GraphFactoryDependencies } from '@/graphs/graphFactory';
 import type * as t from '@/types';
 import {
-  getProviderMessageProvenance,
+  inspectProviderMessageProvenance,
+  setInvalidProviderMessageProvenance,
   setProviderMessageProvenance,
   stampSyntheticProviderMessage,
 } from '@/messages/provenance';
@@ -145,10 +146,15 @@ function copyFilteredAIMessageProvenance(
   target: AIMessage,
   retainedContentPartIndices?: readonly number[]
 ): AIMessage {
-  const provenance = getProviderMessageProvenance(source);
-  if (provenance == null) {
+  const provenanceState = inspectProviderMessageProvenance(source);
+  if (provenanceState.status === 'absent') {
     return target;
   }
+  if (provenanceState.status === 'invalid') {
+    setInvalidProviderMessageProvenance(target);
+    return target;
+  }
+  const provenance = provenanceState.provenance;
   if (
     retainedContentPartIndices == null ||
     !Array.isArray(source.content) ||

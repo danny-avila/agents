@@ -4,7 +4,9 @@ import {
   appendProviderMessageProvenance,
   getProviderMessageProvenance,
   getProviderSourceMessageIds,
+  inspectProviderMessageProvenance,
   PROVIDER_MESSAGE_PROVENANCE_LIMITS,
+  setInvalidProviderMessageProvenance,
   setProviderMessageProvenance,
 } from './provenance';
 
@@ -28,6 +30,37 @@ describe('provider message provenance', () => {
       'last',
     ]);
     expect(getProviderSourceMessageIds(message)).toEqual(['first', 'last']);
+    expect(message.lc_kwargs.additional_kwargs).toBe(message.additional_kwargs);
+    const serialized = message.toJSON() as unknown as {
+      kwargs: { additional_kwargs: unknown };
+    };
+    expect(serialized.kwargs.additional_kwargs).toEqual(
+      message.additional_kwargs
+    );
+  });
+
+  it('publishes a canonical invalid marker through live and serialized kwargs', () => {
+    const message = new HumanMessage({
+      content: 'projected',
+      additional_kwargs: {
+        provenance: { hostile: true },
+        sourceMessageId: 'must-not-survive',
+        sourceMessageIds: ['must-not-survive'],
+      },
+    });
+
+    setInvalidProviderMessageProvenance(message);
+
+    expect(message.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: null,
+    });
+    expect(Object.isFrozen(message.additional_kwargs.provenance)).toBe(true);
+    expect(message.additional_kwargs.sourceMessageId).toBeUndefined();
+    expect(message.additional_kwargs.sourceMessageIds).toBeUndefined();
+    expect(inspectProviderMessageProvenance(message)).toEqual({
+      status: 'invalid',
+    });
     expect(message.lc_kwargs.additional_kwargs).toBe(message.additional_kwargs);
     const serialized = message.toJSON() as unknown as {
       kwargs: { additional_kwargs: unknown };
