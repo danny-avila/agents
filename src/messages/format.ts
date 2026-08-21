@@ -42,16 +42,17 @@ import {
   hasStructurallyValidAnthropicWebSearchResultContent,
 } from './toolResultTypes';
 import {
+  inspectProviderMessageProvenance,
+  inspectProviderSourceMessageIds,
+  setInvalidProviderMessageProvenance,
+  setProviderMessageProvenance,
+} from './provenance';
+import {
   compactToolContent,
   getToolContentCharLength,
   isAtomicToolContentBlock,
   serializeStructuredValueBounded,
 } from '@/utils/toolContent';
-import {
-  getProviderMessageProvenance,
-  getProviderSourceMessageIds,
-  setProviderMessageProvenance,
-} from './provenance';
 import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
@@ -2736,18 +2737,55 @@ interface FoldedSourceMessage {
   readonly mappingAmbiguous?: boolean;
 }
 
+function getFoldedSourceAttribution(
+  message: BaseMessage
+): ProviderMessageAttribution {
+  const messageType = message.getType();
+  if (messageType === 'ai') {
+    return 'model';
+  }
+  if (messageType === 'tool') {
+    return 'tool';
+  }
+  if (messageType === 'system') {
+    return 'synthetic';
+  }
+  return 'user';
+}
+
 function getSyntheticProviderContextProvenanceParts(
   sourceMessages: readonly FoldedSourceMessage[]
-): ProviderMessageProvenancePart[] {
-  const parts: ProviderMessageProvenancePart[] = [];
+): ProviderMessageProvenancePart[] | null {
+  /** Fold labels are generated context, while retained source bytes keep their
+   * original attribution so downstream policy can still route them exactly. */
+  const parts: ProviderMessageProvenancePart[] = [
+    { attribution: 'synthetic' },
+  ];
   for (const source of sourceMessages) {
     const {
       message: sourceMessage,
       retainedContentPartIndices,
       mappingAmbiguous,
     } = source;
-    const explicit = getProviderMessageProvenance(sourceMessage);
-    const sourceMessageIds = getProviderSourceMessageIds(sourceMessage);
+    const provenanceState = inspectProviderMessageProvenance(sourceMessage);
+    const sourceMessageIdsState =
+      inspectProviderSourceMessageIds(sourceMessage);
+    if (
+      provenanceState.status === 'invalid' ||
+      sourceMessageIdsState.status === 'invalid'
+    ) {
+      return null;
+    }
+    const explicit =
+      provenanceState.status === 'valid'
+        ? provenanceState.provenance
+        : undefined;
+    const sourceMessageIds =
+      sourceMessageIdsState.status === 'valid'
+        ? sourceMessageIdsState.sourceMessageIds
+        : [];
+    const fallbackAttribution = getFoldedSourceAttribution(sourceMessage);
+    const sourcePartStart = parts.length;
     const retainedSourceIds = new Set<string>();
     const contentLength = Array.isArray(sourceMessage.content)
       ? sourceMessage.content.length
@@ -2775,7 +2813,7 @@ function getSyntheticProviderContextProvenanceParts(
       let sourceContentPartIndices = part.sourceContentPartIndices;
       if (mappingAmbiguous === true && sourceContentPartIndices != null) {
         sourceIndexOrdinal += sourceContentPartIndices.length;
-        continue;
+        sourceContentPartIndices = undefined;
       }
       if (
         retainedContentPartIndices != null &&
@@ -2784,40 +2822,38 @@ function getSyntheticProviderContextProvenanceParts(
       ) {
         if (!mapsOneToOne) {
           sourceIndexOrdinal += sourceContentPartIndices.length;
-          continue;
-        }
-        const retainedSourceContentPartIndices: number[] = [];
-        for (const sourceContentPartIndex of sourceContentPartIndices) {
-          if (retainedContentPartIndices.has(sourceIndexOrdinal)) {
-            retainedSourceContentPartIndices.push(sourceContentPartIndex);
+          sourceContentPartIndices = undefined;
+        } else {
+          const retainedSourceContentPartIndices: number[] = [];
+          for (const sourceContentPartIndex of sourceContentPartIndices) {
+            if (retainedContentPartIndices.has(sourceIndexOrdinal)) {
+              retainedSourceContentPartIndices.push(sourceContentPartIndex);
+            }
+            sourceIndexOrdinal++;
           }
-          sourceIndexOrdinal++;
+          if (retainedSourceContentPartIndices.length === 0) {
+            continue;
+          }
+          sourceContentPartIndices = retainedSourceContentPartIndices;
         }
-        if (retainedSourceContentPartIndices.length === 0) {
-          continue;
-        }
-        sourceContentPartIndices = retainedSourceContentPartIndices;
       } else {
         sourceIndexOrdinal += sourceContentPartIndices?.length ?? 0;
       }
-      if (
-        sourceContentPartIndices == null &&
-        part.sourceMessageId != null &&
-        !retainUnindexedSourceIds
-      ) {
-        continue;
-      }
+      const sourceMessageId =
+        sourceContentPartIndices != null || retainUnindexedSourceIds
+          ? part.sourceMessageId
+          : undefined;
       parts.push({
-        attribution: 'synthetic',
-        ...(part.sourceMessageId != null && {
-          sourceMessageId: part.sourceMessageId,
+        attribution: part.attribution,
+        ...(sourceMessageId != null && {
+          sourceMessageId,
         }),
         ...(sourceContentPartIndices != null && {
           sourceContentPartIndices,
         }),
       });
-      if (part.sourceMessageId != null) {
-        retainedSourceIds.add(part.sourceMessageId);
+      if (sourceMessageId != null) {
+        retainedSourceIds.add(sourceMessageId);
       }
     }
     for (const sourceMessageId of sourceMessageIds) {
@@ -2825,8 +2861,11 @@ function getSyntheticProviderContextProvenanceParts(
         break;
       }
       if (!retainedSourceIds.has(sourceMessageId)) {
-        parts.push({ attribution: 'synthetic', sourceMessageId });
+        parts.push({ attribution: fallbackAttribution, sourceMessageId });
       }
+    }
+    if (parts.length === sourcePartStart) {
+      parts.push({ attribution: fallbackAttribution });
     }
   }
   return mergeAdjacentProviderProvenanceParts(parts);
@@ -2838,6 +2877,10 @@ function markSyntheticProviderContext<T extends BaseMessage>(
 ): T {
   syntheticProviderContextMessages.add(message);
   const parts = getSyntheticProviderContextProvenanceParts(sourceMessages);
+  if (parts == null) {
+    setInvalidProviderMessageProvenance(message);
+    return message;
+  }
   setProviderMessageProvenance(
     message,
     parts.length > 0 ? parts : [{ attribution: 'synthetic' }]

@@ -133,8 +133,14 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(result[1].additional_kwargs.provenance).toEqual({
       version: 1,
       parts: [
+        { attribution: 'synthetic' },
         {
-          attribution: 'synthetic',
+          attribution: 'model',
+          sourceMessageId: 'assistant-row',
+          sourceContentPartIndices: [0],
+        },
+        {
+          attribution: 'tool',
           sourceMessageId: 'assistant-row',
           sourceContentPartIndices: [0],
         },
@@ -146,6 +152,91 @@ describe('foldToolBlocksForToollessAgent', () => {
         new HumanMessage('[Previous tool interaction] user-authored text')
       )
     ).toBe(false);
+  });
+
+  test('attributes unstamped retained sources by message role without ids', () => {
+    const result = foldToolBlocksForToollessAgent([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call', name: 'lookup', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'legacy tool bytes',
+        tool_call_id: 'call',
+      }),
+    ]);
+
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'model' },
+        { attribution: 'tool' },
+      ],
+    });
+  });
+
+  test('attributes validated legacy folded lineage by message role', () => {
+    const result = foldToolBlocksForToollessAgent([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call', name: 'lookup', args: {}, type: 'tool_call' },
+        ],
+        additional_kwargs: { sourceMessageId: 'assistant-row' },
+      }),
+      new ToolMessage({
+        content: 'legacy tool bytes',
+        tool_call_id: 'call',
+        additional_kwargs: { sourceMessageId: 'tool-row' },
+      }),
+    ]);
+
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'model', sourceMessageId: 'assistant-row' },
+        { attribution: 'tool', sourceMessageId: 'tool-row' },
+      ],
+    });
+  });
+
+  test.each([
+    ['malformed provenance', { provenance: { version: 1, parts: [null] } }],
+    [
+      'malformed legacy lineage',
+      { sourceMessageIds: { 0: 'forged', length: 1 } },
+    ],
+  ])('preserves %s invalidity when folding retained bytes', (_, additional_kwargs) => {
+    const sourceProvenance = (additional_kwargs as { provenance?: unknown })
+      .provenance;
+    const result = foldToolBlocksForToollessAgent([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call', name: 'lookup', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'untrusted tool bytes',
+        tool_call_id: 'call',
+        additional_kwargs,
+      }),
+    ]);
+
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: null,
+    });
+    expect(result[0].additional_kwargs.provenance).not.toBe(
+      sourceProvenance
+    );
+    expect(result[0].lc_kwargs.additional_kwargs).toBe(
+      result[0].additional_kwargs
+    );
   });
 
   test('folds historical tool content that precedes the last human turn (the reported bug)', () => {
@@ -710,8 +801,9 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(folded.additional_kwargs.provenance).toEqual({
       version: 1,
       parts: [
+        { attribution: 'synthetic' },
         {
-          attribution: 'synthetic',
+          attribution: 'model',
           sourceMessageId: 'assistant-row',
           sourceContentPartIndices: [0],
         },
@@ -754,7 +846,10 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(getTextContent(folded)).toContain('[tool_call] query');
     expect(folded.additional_kwargs.provenance).toEqual({
       version: 1,
-      parts: [{ attribution: 'synthetic', sourceMessageId: 'assistant-row' }],
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'model', sourceMessageId: 'assistant-row' },
+      ],
     });
   });
 
@@ -795,7 +890,10 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(folded.additional_kwargs.sourceMessageIds).toBeUndefined();
     expect(folded.additional_kwargs.provenance).toEqual({
       version: 1,
-      parts: [{ attribution: 'synthetic' }],
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'model' },
+      ],
     });
   });
 
@@ -823,7 +921,11 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(folded.additional_kwargs.sourceMessageIds).toBeUndefined();
     expect(folded.additional_kwargs.provenance).toEqual({
       version: 1,
-      parts: [{ attribution: 'synthetic' }],
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'model' },
+        { attribution: 'tool' },
+      ],
     });
   });
 

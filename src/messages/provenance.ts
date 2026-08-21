@@ -54,6 +54,15 @@ export type ProviderMessageProvenanceState =
     readonly provenance: ProviderMessageProvenance;
   };
 
+/** Distinguishes absent lineage from validated ids and malformed metadata. */
+export type ProviderSourceMessageIdsState =
+  | { readonly status: 'absent' }
+  | { readonly status: 'invalid' }
+  | {
+    readonly status: 'valid';
+    readonly sourceMessageIds: readonly string[];
+  };
+
 /** Typed subset of `additional_kwargs` exposed at provider callbacks. */
 export interface ProviderMessageProvenanceAdditionalKwargs {
   readonly provenance?:
@@ -91,6 +100,12 @@ const absentProviderMessageProvenanceState = Object.freeze({
   status: 'absent' as const,
 });
 const invalidProviderMessageProvenanceState = Object.freeze({
+  status: 'invalid' as const,
+});
+const absentProviderSourceMessageIdsState = Object.freeze({
+  status: 'absent' as const,
+});
+const invalidProviderSourceMessageIdsState = Object.freeze({
   status: 'invalid' as const,
 });
 /** Fresh projections use this inert envelope to preserve explicit invalidity
@@ -358,7 +373,7 @@ function collectProviderSourceMessageIds(
       }
       plural = pluralInput;
       pluralLength = pluralInput.length;
-      if (!Number.isSafeInteger(pluralLength)) {
+      if (!Number.isSafeInteger(pluralLength) || pluralLength === 0) {
         return undefined;
       }
       trustedPlural = immutableProviderSourceMessageIds.has(pluralInput);
@@ -566,6 +581,66 @@ export function inspectProviderMessageProvenance(
   return provenance == null
     ? invalidProviderMessageProvenanceState
     : { status: 'valid', provenance };
+}
+
+function readProviderSourceMessageIds(
+  message: BaseMessage
+): string[] | null | undefined {
+  let additionalKwargs: unknown;
+  try {
+    additionalKwargs = message.additional_kwargs;
+  } catch {
+    return null;
+  }
+  if (additionalKwargs == null || typeof additionalKwargs !== 'object') {
+    return undefined;
+  }
+  if (isProxy(additionalKwargs)) {
+    return null;
+  }
+  let provenanceInput: unknown;
+  let pluralInput: unknown;
+  let singularInput: unknown;
+  try {
+    const sourceMetadata =
+      additionalKwargs as UntrustedProviderMessageAdditionalKwargs;
+    provenanceInput = sourceMetadata.provenance;
+    pluralInput = sourceMetadata.sourceMessageIds;
+    singularInput = sourceMetadata.sourceMessageId;
+  } catch {
+    return null;
+  }
+  const hasProvenanceInput = provenanceInput != null;
+  const hasLegacyInput =
+    pluralInput !== undefined || singularInput !== undefined;
+  if (!hasProvenanceInput && !hasLegacyInput) {
+    return undefined;
+  }
+  const provenance = normalizeProviderMessageProvenance(provenanceInput);
+  if (hasProvenanceInput && provenance == null) {
+    return null;
+  }
+  return (
+    collectProviderSourceMessageIds(
+      provenance,
+      pluralInput,
+      singularInput
+    ) ?? null
+  );
+}
+
+/** Safely distinguishes missing source lineage from malformed metadata. */
+export function inspectProviderSourceMessageIds(
+  message: BaseMessage
+): ProviderSourceMessageIdsState {
+  const sourceMessageIds = readProviderSourceMessageIds(message);
+  if (sourceMessageIds === undefined) {
+    return absentProviderSourceMessageIdsState;
+  }
+  if (sourceMessageIds === null) {
+    return invalidProviderSourceMessageIdsState;
+  }
+  return { status: 'valid', sourceMessageIds };
 }
 
 /**

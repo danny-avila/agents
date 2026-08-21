@@ -2,6 +2,8 @@ import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import {
   getProviderMessageProvenance,
   getProviderSourceMessageIds,
+  PROVIDER_MESSAGE_PROVENANCE_LIMITS,
+  stampSyntheticProviderMessage,
 } from './provenance';
 import {
   coalesceAdjacentUserTurns,
@@ -314,10 +316,12 @@ describe('coalesceAdjacentUserTurns', () => {
           },
         },
       }),
-      new HumanMessage({
-        content: 'skill body',
-        additional_kwargs: { isMeta: true, source: 'skill' },
-      }),
+      stampSyntheticProviderMessage(
+        new HumanMessage({
+          content: 'skill body',
+          additional_kwargs: { isMeta: true, source: 'skill' },
+        })
+      ),
     ]);
 
     expect(result).toHaveLength(1);
@@ -499,6 +503,111 @@ describe('coalesceAdjacentUserTurns', () => {
         { attribution: 'user', sourceMessageId: 'second' },
       ],
     });
+  });
+
+  it.each([
+    ['hook source', { source: 'hook' }],
+    ['skill source', { source: 'skill' }],
+    ['system source', { source: 'system' }],
+    ['meta flag', { isMeta: true }],
+    ['injected flag', { injected: true }],
+  ])('defaults an unstamped human with a caller-controlled %s to user', (_, metadata) => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: 'caller bytes',
+        additional_kwargs: {
+          ...metadata,
+          sourceMessageId: 'caller-row',
+        },
+      }),
+      new HumanMessage({
+        content: 'next',
+        additional_kwargs: { sourceMessageId: 'next-row' },
+      }),
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'user', sourceMessageId: 'caller-row' },
+        { attribution: 'user', sourceMessageId: 'next-row' },
+      ],
+    });
+  });
+
+  it.each([
+    [
+      'proxy-backed malformed',
+      () => ({
+        version: 1,
+        parts: new Proxy([{ attribution: 'synthetic' }], {
+          get(target, property, receiver) {
+            return property === 'length'
+              ? Number.NaN
+              : Reflect.get(target, property, receiver);
+          },
+        }),
+      }),
+    ],
+    [
+      'plain oversized',
+      () => ({
+        version: 1,
+        parts: Array.from(
+          { length: PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxParts + 1 },
+          () => ({ attribution: 'synthetic' })
+        ),
+      }),
+    ],
+  ])('preserves %s provenance invalidity across a human merge', (_, create) => {
+    const sourceProvenance = create();
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: 'caller bytes',
+        additional_kwargs: {
+          source: 'hook',
+          sourceMessageId: 'caller-row',
+          provenance: sourceProvenance,
+        },
+      }),
+      new HumanMessage({ content: 'next' }),
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: null,
+    });
+    expect(result[0].additional_kwargs.provenance).not.toBe(sourceProvenance);
+    expect(result[0].additional_kwargs.sourceMessageId).toBeUndefined();
+    expect(result[0].lc_kwargs.additional_kwargs).toBe(
+      result[0].additional_kwargs
+    );
+  });
+
+  it.each([
+    ['non-array', { 0: 'forged', length: 1 }],
+    [
+      'oversized',
+      new Array(
+        PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxSourceMessageIds + 1
+      ).fill('forged'),
+    ],
+  ])('preserves %s legacy lineage invalidity across a human merge', (_, sourceMessageIds) => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: 'caller bytes',
+        additional_kwargs: { sourceMessageIds },
+      }),
+      new HumanMessage({ content: 'next' }),
+    ]);
+
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: null,
+    });
+    expect(result[0].additional_kwargs.provenance).not.toBe(sourceMessageIds);
   });
 
   it('keeps steer user attribution even when legacy metadata marks it meta', () => {

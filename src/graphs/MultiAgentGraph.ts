@@ -22,6 +22,7 @@ import type { GraphFactoryDependencies } from '@/graphs/graphFactory';
 import type * as t from '@/types';
 import {
   inspectProviderMessageProvenance,
+  inspectProviderSourceMessageIds,
   setInvalidProviderMessageProvenance,
   setProviderMessageProvenance,
   stampSyntheticProviderMessage,
@@ -146,21 +147,63 @@ function copyFilteredAIMessageProvenance(
   target: AIMessage,
   retainedContentPartIndices?: readonly number[]
 ): AIMessage {
+  const sourceMessageIdsState = inspectProviderSourceMessageIds(source);
   const provenanceState = inspectProviderMessageProvenance(source);
-  if (provenanceState.status === 'absent') {
-    return target;
-  }
-  if (provenanceState.status === 'invalid') {
+  if (
+    provenanceState.status === 'invalid' ||
+    sourceMessageIdsState.status === 'invalid'
+  ) {
     setInvalidProviderMessageProvenance(target);
     return target;
   }
+  const sourceMessageIds =
+    sourceMessageIdsState.status === 'valid'
+      ? sourceMessageIdsState.sourceMessageIds
+      : [];
+  if (provenanceState.status === 'absent') {
+    if (sourceMessageIds.length > 0) {
+      setProviderMessageProvenance(
+        target,
+        sourceMessageIds.map((sourceMessageId) => ({
+          attribution: 'model',
+          sourceMessageId,
+        }))
+      );
+    }
+    return target;
+  }
   const provenance = provenanceState.provenance;
+  const typedSourceMessageIds = new Set<string>();
+  for (const part of provenance.parts) {
+    if (part.sourceMessageId != null) {
+      typedSourceMessageIds.add(part.sourceMessageId);
+    }
+  }
+  const legacyParts: ProviderMessageProvenancePart[] = [];
+  for (const sourceMessageId of sourceMessageIds) {
+    if (!typedSourceMessageIds.has(sourceMessageId)) {
+      legacyParts.push({ attribution: 'model', sourceMessageId });
+    }
+  }
+  const setFilteredProvenance = (
+    parts: readonly ProviderMessageProvenancePart[]
+  ): void => {
+    if (legacyParts.length === 0) {
+      setProviderMessageProvenance(target, parts);
+      return;
+    }
+    const combinedParts = parts.slice();
+    for (const part of legacyParts) {
+      combinedParts.push(part);
+    }
+    setProviderMessageProvenance(target, combinedParts);
+  };
   if (
     retainedContentPartIndices == null ||
     !Array.isArray(source.content) ||
     retainedContentPartIndices.length === source.content.length
   ) {
-    setProviderMessageProvenance(target, provenance.parts);
+    setFilteredProvenance(provenance.parts);
     return target;
   }
 
@@ -176,7 +219,7 @@ function copyFilteredAIMessageProvenance(
   if (hasUnindexedPart || sourceIndexRefCount !== source.content.length) {
     /** An older or aggregate envelope cannot be mapped to current blocks.
      * Preserve its conservative attribution instead of dropping tool lineage. */
-    setProviderMessageProvenance(target, provenance.parts);
+    setFilteredProvenance(provenance.parts);
     return target;
   }
 
@@ -203,8 +246,7 @@ function copyFilteredAIMessageProvenance(
       });
     }
   }
-  setProviderMessageProvenance(
-    target,
+  setFilteredProvenance(
     retainedParts.length > 0 ? retainedParts : [{ attribution: 'model' }]
   );
   return target;

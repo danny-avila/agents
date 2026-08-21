@@ -5,6 +5,7 @@ import {
   getProviderMessageProvenance,
   getProviderSourceMessageIds,
   inspectProviderMessageProvenance,
+  inspectProviderSourceMessageIds,
   PROVIDER_MESSAGE_PROVENANCE_LIMITS,
   setInvalidProviderMessageProvenance,
   setProviderMessageProvenance,
@@ -209,6 +210,65 @@ describe('provider message provenance', () => {
 
     expect(getProviderMessageProvenance(message)).toBeUndefined();
     expect(getProviderSourceMessageIds(message)).toEqual(['safe-fallback']);
+    expect(inspectProviderSourceMessageIds(message)).toEqual({
+      status: 'invalid',
+    });
+  });
+
+  it('distinguishes absent and validated legacy source lineage', () => {
+    expect(
+      inspectProviderSourceMessageIds(new HumanMessage('absent'))
+    ).toEqual({ status: 'absent' });
+    expect(
+      inspectProviderSourceMessageIds(
+        new HumanMessage({
+          content: 'legacy',
+          additional_kwargs: {
+            sourceMessageId: 'second',
+            sourceMessageIds: ['first', 'second'],
+          },
+        })
+      )
+    ).toEqual({
+      status: 'valid',
+      sourceMessageIds: ['first', 'second'],
+    });
+  });
+
+  it.each([
+    ['non-array plural', { 0: 'forged', length: 1 }],
+    ['empty plural', []],
+    [
+      'oversized plural',
+      new Array(
+        PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxSourceMessageIds + 1
+      ).fill('forged'),
+    ],
+  ])('reports a %s as invalid legacy source lineage', (_, sourceMessageIds) => {
+    const message = new HumanMessage({
+      content: 'external',
+      additional_kwargs: { sourceMessageIds },
+    });
+
+    expect(inspectProviderSourceMessageIds(message)).toEqual({
+      status: 'invalid',
+    });
+  });
+
+  it('reports a throwing legacy source accessor as invalid', () => {
+    const message = new HumanMessage('external');
+    Object.defineProperty(message.additional_kwargs, 'sourceMessageIds', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        throw new Error('hostile source lineage');
+      },
+    });
+
+    expect(() => inspectProviderSourceMessageIds(message)).not.toThrow();
+    expect(inspectProviderSourceMessageIds(message)).toEqual({
+      status: 'invalid',
+    });
   });
 
   it('publishes deeply immutable metadata and rejects invalid setter attribution', () => {

@@ -12,8 +12,9 @@ import {
   getProviderToolResultPartDescriptor,
 } from './toolResultTypes';
 import {
-  getProviderMessageProvenance,
-  getProviderSourceMessageIds,
+  inspectProviderMessageProvenance,
+  inspectProviderSourceMessageIds,
+  setInvalidProviderMessageProvenance,
   setProviderMessageProvenance,
 } from './provenance';
 import { Providers } from '@/common';
@@ -132,43 +133,30 @@ function joinContents(messages: readonly BaseMessage[]): MessageContent {
   return blocks;
 }
 
-function inferHumanMessageAttribution(
-  message: BaseMessage
-): ProviderMessageProvenancePart['attribution'] {
-  const additionalKwargs = message.additional_kwargs as {
-    injected?: unknown;
-    isMeta?: unknown;
-    source?: unknown;
-  };
-  const source =
-    typeof additionalKwargs.source === 'string'
-      ? additionalKwargs.source
-      : undefined;
-  if (source === 'steer') {
-    return 'user';
-  }
-  const isKnownSyntheticSource =
-    source === 'skill' || source === 'hook' || source === 'system';
-  return additionalKwargs.isMeta === true ||
-    isKnownSyntheticSource ||
-    additionalKwargs.injected === true
-    ? 'synthetic'
-    : 'user';
-}
-
 function getHumanMessageProvenanceParts(
   message: BaseMessage
-): ProviderMessageProvenancePart[] {
-  const explicit = getProviderMessageProvenance(message);
-  if (explicit != null && explicit.parts.length > 0) {
-    const parts = [...explicit.parts];
+): ProviderMessageProvenancePart[] | null {
+  const provenanceState = inspectProviderMessageProvenance(message);
+  const sourceMessageIdsState = inspectProviderSourceMessageIds(message);
+  if (
+    provenanceState.status === 'invalid' ||
+    sourceMessageIdsState.status === 'invalid'
+  ) {
+    return null;
+  }
+  const sourceMessageIds =
+    sourceMessageIdsState.status === 'valid'
+      ? sourceMessageIdsState.sourceMessageIds
+      : [];
+  if (provenanceState.status === 'valid') {
+    const parts = [...provenanceState.provenance.parts];
     const representedSourceIds = new Set<string>();
     for (const part of parts) {
       if (part.sourceMessageId != null) {
         representedSourceIds.add(part.sourceMessageId);
       }
     }
-    const missingSourceIds = getProviderSourceMessageIds(message).filter(
+    const missingSourceIds = sourceMessageIds.filter(
       (sourceMessageId) => !representedSourceIds.has(sourceMessageId)
     );
     if (
@@ -181,20 +169,17 @@ function getHumanMessageProvenanceParts(
         sourceMessageId,
       }));
     }
-    const attribution = inferHumanMessageAttribution(message);
     for (const sourceMessageId of missingSourceIds) {
-      parts.push({ attribution, sourceMessageId });
+      parts.push({ attribution: 'user', sourceMessageId });
     }
     return parts;
   }
-  const attribution = inferHumanMessageAttribution(message);
-  const sourceMessageIds = getProviderSourceMessageIds(message);
   return sourceMessageIds.length > 0
     ? sourceMessageIds.map((sourceMessageId) => ({
-      attribution,
+      attribution: 'user' as const,
       sourceMessageId,
     }))
-    : [{ attribution }];
+    : [{ attribution: 'user' }];
 }
 
 function hasProviderVisibleContent(message: BaseMessage): boolean {
@@ -255,22 +240,22 @@ export function coalesceAdjacentUserTurns(
     const run = messages.slice(index, endIndex);
     const last = run[run.length - 1];
     const provenanceParts: ProviderMessageProvenancePart[] = [];
+    let hasInvalidProvenance = false;
     for (const message of run) {
       if (!hasProviderVisibleContent(message)) {
         continue;
       }
-      for (const part of getHumanMessageProvenanceParts(message)) {
+      const messageProvenanceParts = getHumanMessageProvenanceParts(message);
+      if (messageProvenanceParts == null) {
+        hasInvalidProvenance = true;
+        continue;
+      }
+      for (const part of messageProvenanceParts) {
         provenanceParts.push(part);
       }
     }
     if (provenanceParts.length === 0) {
-      provenanceParts.push({
-        attribution: run.some(
-          (message) => inferHumanMessageAttribution(message) === 'user'
-        )
-          ? 'user'
-          : 'synthetic',
-      });
+      provenanceParts.push({ attribution: 'user' });
     }
 
     const mergedMessage = new HumanMessage({
@@ -289,7 +274,11 @@ export function coalesceAdjacentUserTurns(
       additional_kwargs: { ...last.additional_kwargs },
       ...(first.id != null && { id: first.id }),
     });
-    setProviderMessageProvenance(mergedMessage, provenanceParts);
+    if (hasInvalidProvenance) {
+      setInvalidProviderMessageProvenance(mergedMessage);
+    } else {
+      setProviderMessageProvenance(mergedMessage, provenanceParts);
+    }
     result.push(mergedMessage);
     pairedToolCalls = new Map();
     index = endIndex;

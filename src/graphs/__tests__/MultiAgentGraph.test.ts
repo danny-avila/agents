@@ -278,6 +278,91 @@ describe('MultiAgentGraph.validateEdgeAgents', () => {
     }
   );
 
+  it('preserves validated legacy lineage while filtering handoff content', () => {
+    const graph = new MultiAgentGraph({
+      runId: 'legacy-handoff-provenance',
+      agents: [makeAgent('A'), makeAgent('B')],
+      edges: [{ from: 'A', to: 'B', edgeType: 'handoff' }],
+    });
+    const transferName = `${Constants.LC_TRANSFER_TO_}B`;
+    const assistant = new AIMessage({
+      content: [
+        { type: 'text', text: 'retained model bytes' },
+        {
+          type: 'tool_use',
+          id: 'transfer-call',
+          name: transferName,
+          input: {},
+        },
+      ],
+      tool_calls: [
+        { id: 'lookup-call', name: 'lookup', args: {} },
+        { id: 'transfer-call', name: transferName, args: {} },
+      ],
+      additional_kwargs: {
+        sourceMessageId: 'legacy-last',
+        sourceMessageIds: ['legacy-first', 'legacy-last'],
+      },
+    });
+    const transferResult = new ToolMessage({
+      content: 'Successfully transferred to B',
+      name: transferName,
+      tool_call_id: 'transfer-call',
+    });
+
+    const reception = (
+      graph as unknown as HandoffReception
+    ).processHandoffReception([assistant, transferResult], 'B');
+    const filteredAssistant = reception?.filteredMessages[0] as AIMessage;
+
+    expect(getProviderMessageProvenance(filteredAssistant)?.parts).toEqual([
+      { attribution: 'model', sourceMessageId: 'legacy-first' },
+      { attribution: 'model', sourceMessageId: 'legacy-last' },
+    ]);
+    expect(getProviderSourceMessageIds(filteredAssistant)).toEqual([
+      'legacy-first',
+      'legacy-last',
+    ]);
+  });
+
+  it('preserves invalid legacy lineage while filtering handoff content', () => {
+    const graph = new MultiAgentGraph({
+      runId: 'invalid-legacy-handoff-provenance',
+      agents: [makeAgent('A'), makeAgent('B')],
+      edges: [{ from: 'A', to: 'B', edgeType: 'handoff' }],
+    });
+    const transferName = `${Constants.LC_TRANSFER_TO_}B`;
+    const sourceMessageIds = { 0: 'forged', length: 1 };
+    const assistant = new AIMessage({
+      content: [
+        { type: 'text', text: 'retained bytes' },
+        {
+          type: 'tool_use',
+          id: 'transfer-call',
+          name: transferName,
+          input: {},
+        },
+      ],
+      tool_calls: [
+        { id: 'lookup-call', name: 'lookup', args: {} },
+        { id: 'transfer-call', name: transferName, args: {} },
+      ],
+      additional_kwargs: { sourceMessageIds },
+    });
+    const transferResult = new ToolMessage({
+      content: 'Successfully transferred to B',
+      name: transferName,
+      tool_call_id: 'transfer-call',
+    });
+
+    const reception = (
+      graph as unknown as HandoffReception
+    ).processHandoffReception([assistant, transferResult], 'B');
+    const filteredAssistant = reception?.filteredMessages[0] as AIMessage;
+
+    expectCanonicalInvalidProvenance(filteredAssistant, sourceMessageIds);
+  });
+
   it('copies provenance into a parallel handoff tool-call projection', async () => {
     const graph = new MultiAgentGraph({
       runId: 'parallel-handoff-provenance',
@@ -393,6 +478,106 @@ describe('MultiAgentGraph.validateEdgeAgents', () => {
       expect(assistant.additional_kwargs.provenance).toBe(sourceProvenance);
     }
   );
+
+  it('preserves validated legacy lineage in a parallel handoff projection', async () => {
+    const graph = new MultiAgentGraph({
+      runId: 'legacy-parallel-handoff-provenance',
+      agents: [makeAgent('A'), makeAgent('B')],
+      edges: [{ from: 'A', to: 'B', edgeType: 'handoff' }],
+    });
+    const transferName = `${Constants.LC_TRANSFER_TO_}B`;
+    const transferCall: ToolCall = {
+      id: 'transfer-call',
+      name: transferName,
+      args: {},
+      type: 'tool_call',
+    };
+    const assistant = new AIMessage({
+      content: 'retained model bytes',
+      tool_calls: [
+        transferCall,
+        { id: 'parallel-call', name: 'lookup', args: {} },
+      ],
+      additional_kwargs: {
+        sourceMessageId: 'legacy-last',
+        sourceMessageIds: ['legacy-first', 'legacy-last'],
+      },
+    });
+    const graphTools = graph.agentContexts.get('A')?.graphTools as
+      | InvocableGraphTool[]
+      | undefined;
+    const handoffTool = graphTools?.find(
+      (candidate) => candidate.name === transferName
+    );
+    if (handoffTool == null) {
+      throw new Error('Expected handoff tool');
+    }
+
+    const output = await handoffTool.invoke(transferCall, {
+      state: { messages: [assistant] },
+    } as unknown as RunnableConfig);
+    const command = output as Command<unknown, { messages: BaseMessage[] }>;
+    const update = command.update;
+    if (update == null || Array.isArray(update)) {
+      throw new Error('Expected handoff command update');
+    }
+    const filteredAssistant = update.messages[0] as AIMessage;
+
+    expect(getProviderMessageProvenance(filteredAssistant)?.parts).toEqual([
+      { attribution: 'model', sourceMessageId: 'legacy-first' },
+      { attribution: 'model', sourceMessageId: 'legacy-last' },
+    ]);
+    expect(getProviderSourceMessageIds(filteredAssistant)).toEqual([
+      'legacy-first',
+      'legacy-last',
+    ]);
+  });
+
+  it('preserves invalid legacy lineage in a parallel handoff projection', async () => {
+    const graph = new MultiAgentGraph({
+      runId: 'invalid-legacy-parallel-handoff-provenance',
+      agents: [makeAgent('A'), makeAgent('B')],
+      edges: [{ from: 'A', to: 'B', edgeType: 'handoff' }],
+    });
+    const transferName = `${Constants.LC_TRANSFER_TO_}B`;
+    const transferCall: ToolCall = {
+      id: 'transfer-call',
+      name: transferName,
+      args: {},
+      type: 'tool_call',
+    };
+    const sourceMessageIds = new Array(
+      PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxSourceMessageIds + 1
+    ).fill('forged');
+    const assistant = new AIMessage({
+      content: 'retained bytes',
+      tool_calls: [
+        transferCall,
+        { id: 'parallel-call', name: 'lookup', args: {} },
+      ],
+      additional_kwargs: { sourceMessageIds },
+    });
+    const graphTools = graph.agentContexts.get('A')?.graphTools as
+      | InvocableGraphTool[]
+      | undefined;
+    const handoffTool = graphTools?.find(
+      (candidate) => candidate.name === transferName
+    );
+    if (handoffTool == null) {
+      throw new Error('Expected handoff tool');
+    }
+
+    const output = await handoffTool.invoke(transferCall, {
+      state: { messages: [assistant] },
+    } as unknown as RunnableConfig);
+    const command = output as Command<unknown, { messages: BaseMessage[] }>;
+    const update = command.update;
+    if (update == null || Array.isArray(update)) {
+      throw new Error('Expected handoff command update');
+    }
+
+    expectCanonicalInvalidProvenance(update.messages[0], sourceMessageIds);
+  });
 
   it('rejects grouped fan-in containing a command-routed source', () => {
     const input: t.MultiAgentGraphInput = {

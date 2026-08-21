@@ -1,5 +1,9 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { ExtendedMessageContent } from '@/types';
+import {
+  getProviderMessageProvenance,
+  setProviderMessageProvenance,
+} from './provenance';
 import { ensureThinkingBlockInMessages } from './format';
 import { Providers, ContentTypes } from '@/common';
 
@@ -242,6 +246,36 @@ describe('ensureThinkingBlockInMessages', () => {
       expect(result[3]).toBeInstanceOf(HumanMessage); // user message
       expect(result[4]).toBeInstanceOf(HumanMessage); // converted — no thinking in this chain
       expect(getTextContent(result[4])).toContain('[Previous agent context]');
+    });
+
+    test('preserves model and tool attribution when folding prior agent context', () => {
+      const assistant = new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'c1', name: 'lookup', args: {}, type: 'tool_call' as const },
+        ],
+      });
+      setProviderMessageProvenance(assistant, [
+        { attribution: 'model', sourceMessageId: 'assistant-row' },
+      ]);
+      const toolResult = new ToolMessage({
+        content: 'trusted tool bytes',
+        tool_call_id: 'c1',
+      });
+      setProviderMessageProvenance(toolResult, [
+        { attribution: 'tool', sourceMessageId: 'tool-row' },
+      ]);
+
+      const result = ensureThinkingBlockInMessages(
+        [new HumanMessage('run lookup'), assistant, toolResult],
+        Providers.BEDROCK
+      );
+
+      expect(getProviderMessageProvenance(result[1])?.parts).toEqual([
+        { attribution: 'synthetic' },
+        { attribution: 'model', sourceMessageId: 'assistant-row' },
+        { attribution: 'tool', sourceMessageId: 'tool-row' },
+      ]);
     });
 
     test('should detect thinking via additional_kwargs.reasoning_content in chain', () => {
