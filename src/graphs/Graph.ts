@@ -74,6 +74,7 @@ import {
   strictAlternationProviders,
   appendPredecessorHandoffCue,
   removePredecessorHandoffCue,
+  stampSyntheticProviderMessage,
 } from '@/messages';
 import {
   Constants,
@@ -4720,10 +4721,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     );
     if (contexts.length > 0) {
       injected.push(
-        new HumanMessage({
-          content: contexts.join('\n\n'),
-          additional_kwargs: { role: 'system', isMeta: true, source: 'hook' },
-        })
+        stampSyntheticProviderMessage(
+          new HumanMessage({
+            content: contexts.join('\n\n'),
+            additional_kwargs: {
+              role: 'system',
+              isMeta: true,
+              source: 'hook',
+            },
+          })
+        )
       );
     }
     if (result.injectedMessages.length > 0) {

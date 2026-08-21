@@ -21,6 +21,7 @@ import {
 } from 'fs/promises';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { WorkspaceFS } from '../local/workspaceFS';
 import type * as t from '@/types';
 import {
   executeLocalBash,
@@ -37,9 +38,9 @@ import {
   _resetSyntaxCheckProbeCacheForTests,
 } from '../local/syntaxCheck';
 import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
-import { WorkspaceClientTimeoutError } from '../local/workspaceFS';
-import type { WorkspaceFS } from '../local/workspaceFS';
 import { LocalFileCheckpointerImpl } from '../local/FileCheckpointer';
+import { getProviderMessageProvenance } from '@/messages/provenance';
+import { WorkspaceClientTimeoutError } from '../local/workspaceFS';
 import { createCompileCheckTool } from '../local/CompileCheckTool';
 import { runBashAstChecks } from '../local/bashAst';
 import { Constants, Providers } from '@/common';
@@ -2467,6 +2468,9 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
           m.content.includes('SEND-CTX')
       );
       expect(found).toBeDefined();
+      expect(getProviderMessageProvenance(found!)?.parts).toEqual([
+        { attribution: 'synthetic' },
+      ]);
     });
   });
 
@@ -2576,6 +2580,9 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
         role: 'system',
         source: 'hook',
       });
+      expect(getProviderMessageProvenance(human!)?.parts).toEqual([
+        { attribution: 'synthetic' },
+      ]);
     });
   });
 

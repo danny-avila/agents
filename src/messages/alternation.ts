@@ -2,12 +2,20 @@
 import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage, MessageContent } from '@langchain/core/messages';
 import type { ProviderMessageProvenancePart } from './provenance';
+import type { ProviderToolCallIndex } from './toolResultTypes';
+import {
+  appendProviderToolCallDescriptor,
+  consumeProviderToolResultPair,
+  getBoundedProviderPairingArrayProperty,
+  getProviderAIMessageToolCallDescriptor,
+  getProviderToolCallPartDescriptor,
+  getProviderToolResultPartDescriptor,
+} from './toolResultTypes';
 import {
   getProviderMessageProvenance,
   getProviderSourceMessageIds,
   setProviderMessageProvenance,
 } from './provenance';
-import { isProviderToolResultPart } from './toolResultTypes';
 import { Providers } from '@/common';
 
 /**
@@ -31,12 +39,52 @@ export const strictAlternationProviders: ReadonlySet<Providers> = new Set([
  * merge adjacent runs of these, and folding one into a text turn would break
  * the tool pairing they depend on — so they are left alone here.
  */
-function isToolResultMessage(message: BaseMessage): boolean {
-  const { content } = message;
-  if (typeof content === 'string' || content.length === 0) {
+function collectProviderToolCalls(message: BaseMessage): ProviderToolCallIndex {
+  const calls: ProviderToolCallIndex = new Map();
+  const content = getBoundedProviderPairingArrayProperty(message, 'content');
+  if (content != null) {
+    for (let index = 0; index < content.length; index++) {
+      const descriptor = getProviderToolCallPartDescriptor(content[index]);
+      if (descriptor != null) {
+        appendProviderToolCallDescriptor(calls, descriptor);
+      }
+    }
+  }
+  const toolCalls = getBoundedProviderPairingArrayProperty(
+    message,
+    'tool_calls'
+  );
+  if (toolCalls != null) {
+    for (let index = 0; index < toolCalls.length; index++) {
+      const descriptor = getProviderAIMessageToolCallDescriptor(
+        toolCalls[index]
+      );
+      if (descriptor != null) {
+        appendProviderToolCallDescriptor(calls, descriptor);
+      }
+    }
+  }
+  return calls;
+}
+
+function isToolResultMessage(
+  message: BaseMessage,
+  pairedToolCalls: ProviderToolCallIndex
+): boolean {
+  const content = getBoundedProviderPairingArrayProperty(message, 'content');
+  if (content == null || content.length === 0) {
     return false;
   }
-  return content.every(isProviderToolResultPart);
+  for (let index = 0; index < content.length; index++) {
+    const descriptor = getProviderToolResultPartDescriptor(content[index]);
+    if (
+      descriptor?.allowHumanMessagePairing !== true ||
+      !consumeProviderToolResultPair(descriptor, pairedToolCalls)
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function toBlocks(content: MessageContent): Exclude<MessageContent, string> {
@@ -72,8 +120,9 @@ function joinContents(messages: readonly BaseMessage[]): MessageContent {
   const prefix = joinStringContents(messages, firstArrayIndex);
   const blocks: Exclude<MessageContent, string> = [];
   const appendBlocks = (content: MessageContent): void => {
-    for (const block of toBlocks(content)) {
-      blocks.push(block);
+    const contentBlocks = toBlocks(content);
+    for (let index = 0; index < contentBlocks.length; index++) {
+      blocks.push(contentBlocks[index]);
     }
   };
   appendBlocks(prefix);
@@ -167,10 +216,22 @@ export function coalesceAdjacentUserTurns(
   messages: BaseMessage[]
 ): BaseMessage[] {
   let result: BaseMessage[] | null = null;
+  let pairedToolCalls: ProviderToolCallIndex = new Map();
   let index = 0;
   while (index < messages.length) {
     const first = messages[index];
-    if (first.getType() !== 'human' || isToolResultMessage(first)) {
+    if (first.getType() === 'ai') {
+      pairedToolCalls = collectProviderToolCalls(first);
+      result?.push(first);
+      index++;
+      continue;
+    }
+    if (first.getType() !== 'human') {
+      result?.push(first);
+      index++;
+      continue;
+    }
+    if (isToolResultMessage(first, pairedToolCalls)) {
       result?.push(first);
       index++;
       continue;
@@ -180,12 +241,13 @@ export function coalesceAdjacentUserTurns(
     while (
       endIndex < messages.length &&
       messages[endIndex].getType() === 'human' &&
-      !isToolResultMessage(messages[endIndex])
+      !isToolResultMessage(messages[endIndex], pairedToolCalls)
     ) {
       endIndex++;
     }
     if (endIndex === index + 1) {
       result?.push(first);
+      pairedToolCalls = new Map();
       index = endIndex;
       continue;
     }
@@ -229,6 +291,7 @@ export function coalesceAdjacentUserTurns(
     });
     setProviderMessageProvenance(mergedMessage, provenanceParts);
     result.push(mergedMessage);
+    pairedToolCalls = new Map();
     index = endIndex;
   }
   /**

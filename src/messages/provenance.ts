@@ -1,3 +1,4 @@
+import { isProxy } from 'node:util/types';
 import type { BaseMessage } from '@langchain/core/messages';
 
 export const PROVIDER_MESSAGE_PROVENANCE_VERSION = 1 as const;
@@ -58,9 +59,30 @@ const PROVIDER_MESSAGE_ATTRIBUTIONS: ReadonlySet<ProviderMessageAttribution> =
  * identity set. It avoids repeated O(n) canonicalization without trusting a
  * message or caller-owned envelope identity. */
 const immutableProviderMessageProvenance = new WeakSet<object>();
+/** Plural source-id arrays minted by the setter are copied and frozen before
+ * entering this set. Their complete lineage may intentionally exceed the
+ * public trust bounds without forcing repeated validation on reads. */
+const immutableProviderSourceMessageIds = new WeakSet<object>();
+/** Binds the two immutable objects produced by one setter call. Independently
+ * valid envelopes from different messages must not be combined into a new
+ * oversized lineage that no setter ever published. */
+const immutableProviderMessageSourceIds = new WeakMap<
+  object,
+  readonly string[]
+>();
 
-function normalizeSourceMessageId(candidate: unknown): string | undefined {
+function normalizeSourceMessageId(
+  candidate: unknown,
+  enforceTrustBounds = false
+): string | undefined {
   if (typeof candidate !== 'string') {
+    return undefined;
+  }
+  if (
+    enforceTrustBounds &&
+    candidate.length >
+      PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxSourceMessageIdLength
+  ) {
     return undefined;
   }
   const normalized = candidate.trim();
@@ -70,18 +92,27 @@ function normalizeSourceMessageId(candidate: unknown): string | undefined {
 function appendSourceMessageId(
   result: string[],
   seen: Set<string>,
-  candidate: unknown
-): void {
-  const sourceMessageId = normalizeSourceMessageId(candidate);
-  if (sourceMessageId == null || seen.has(sourceMessageId)) {
-    return;
+  candidate: unknown,
+  enforceTrustBounds = false
+): boolean {
+  const sourceMessageId = normalizeSourceMessageId(
+    candidate,
+    enforceTrustBounds
+  );
+  if (sourceMessageId == null) {
+    return candidate === undefined;
+  }
+  if (seen.has(sourceMessageId)) {
+    return true;
   }
   seen.add(sourceMessageId);
   result.push(sourceMessageId);
+  return true;
 }
 
 function normalizeSourceContentPartIndices(
-  indices: readonly number[] | undefined
+  indices: readonly number[] | undefined,
+  trustState?: { totalIndexRefs: number }
 ): number[] | undefined {
   if (indices == null) {
     return undefined;
@@ -97,11 +128,27 @@ function normalizeSourceContentPartIndices(
       'Provider source content part indices must be a non-empty array'
     );
   }
+  if (
+    trustState != null &&
+    (length > PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxIndicesPerPart ||
+      trustState.totalIndexRefs + length >
+        PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxTotalIndexRefs)
+  ) {
+    throw new TypeError('Provider source content part indices exceed limits');
+  }
+  if (trustState != null) {
+    trustState.totalIndexRefs += length;
+  }
   const normalized: number[] = [];
   const seen = new Set<number>();
   for (let position = 0; position < length; position++) {
     const index = indices[position];
-    if (!Number.isSafeInteger(index) || index < 0) {
+    if (
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      (trustState != null &&
+        index > PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxSourceContentPartIndex)
+    ) {
       throw new TypeError('Invalid provider source content part index');
     }
     if (seen.has(index)) {
@@ -115,7 +162,8 @@ function normalizeSourceContentPartIndices(
 
 function normalizeProvenancePart(
   part: ProviderMessageProvenancePart | null | undefined,
-  requireCanonicalSourceMessageId = false
+  requireCanonicalSourceMessageId = false,
+  trustState?: { totalIndexRefs: number; sourceMessageIdRefs: number }
 ): ProviderMessageProvenancePart {
   if (part == null || typeof part !== 'object') {
     throw new TypeError('Invalid provider message provenance attribution');
@@ -128,7 +176,10 @@ function normalizeProvenancePart(
   if (!PROVIDER_MESSAGE_ATTRIBUTIONS.has(attribution)) {
     throw new TypeError('Invalid provider message provenance attribution');
   }
-  const sourceMessageId = normalizeSourceMessageId(sourceMessageIdInput);
+  const sourceMessageId = normalizeSourceMessageId(
+    sourceMessageIdInput,
+    trustState != null
+  );
   if (
     sourceMessageIdInput !== undefined &&
     (sourceMessageId == null ||
@@ -137,8 +188,18 @@ function normalizeProvenancePart(
   ) {
     throw new TypeError('Invalid provider source message id');
   }
+  if (sourceMessageId != null && trustState != null) {
+    trustState.sourceMessageIdRefs++;
+    if (
+      trustState.sourceMessageIdRefs >
+      PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxSourceMessageIds
+    ) {
+      throw new TypeError('Provider source message ids exceed limits');
+    }
+  }
   const sourceContentPartIndices = normalizeSourceContentPartIndices(
-    sourceContentPartIndicesInput
+    sourceContentPartIndicesInput,
+    trustState
   );
   return Object.freeze({
     attribution,
@@ -151,7 +212,8 @@ function normalizeProvenancePart(
 
 function normalizeProvenanceParts(
   parts: unknown,
-  requireCanonicalSourceMessageId = false
+  requireCanonicalSourceMessageId = false,
+  enforceTrustBounds = false
 ): readonly ProviderMessageProvenancePart[] {
   if (!Array.isArray(parts)) {
     throw new TypeError('Provider message provenance parts must be an array');
@@ -160,6 +222,15 @@ function normalizeProvenanceParts(
   if (length === 0) {
     throw new TypeError('Provider message provenance parts cannot be empty');
   }
+  if (
+    enforceTrustBounds &&
+    length > PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxParts
+  ) {
+    throw new TypeError('Provider message provenance parts exceed limits');
+  }
+  const trustState = enforceTrustBounds
+    ? { totalIndexRefs: 0, sourceMessageIdRefs: 0 }
+    : undefined;
   const normalizedParts: ProviderMessageProvenancePart[] = [];
   for (let index = 0; index < length; index++) {
     const part = parts[index] as
@@ -167,7 +238,7 @@ function normalizeProvenanceParts(
       | null
       | undefined;
     normalizedParts.push(
-      normalizeProvenancePart(part, requireCanonicalSourceMessageId)
+      normalizeProvenancePart(part, requireCanonicalSourceMessageId, trustState)
     );
   }
   return Object.freeze(normalizedParts);
@@ -194,7 +265,7 @@ function normalizeProviderMessageProvenance(
     if (version !== PROVIDER_MESSAGE_PROVENANCE_VERSION) {
       return undefined;
     }
-    const parts = normalizeProvenanceParts(partsInput, true);
+    const parts = normalizeProvenanceParts(partsInput, true, true);
     return Object.freeze({
       version: PROVIDER_MESSAGE_PROVENANCE_VERSION,
       parts,
@@ -232,29 +303,171 @@ function collectProviderSourceMessageIds(
   provenance: ProviderMessageProvenance | undefined,
   pluralInput: unknown,
   singularInput: unknown
-): string[] {
+): string[] | undefined {
   const result: string[] = [];
   const seen = new Set<string>();
-  for (const part of provenance?.parts ?? []) {
-    appendSourceMessageId(result, seen, part.sourceMessageId);
-  }
+  const trustedProvenance =
+    provenance != null && immutableProviderMessageProvenance.has(provenance);
+  const boundPlural = trustedProvenance
+    ? immutableProviderMessageSourceIds.get(provenance!)
+    : undefined;
+  let hasUntrustedSourceMetadata = provenance != null && !trustedProvenance;
+  let trustedPlural = false;
+  const provenanceParts = provenance?.parts;
 
-  let pluralCandidates: unknown[] | undefined;
+  /** Resolve trust across the setter-minted envelope/id pair before walking
+   * either collection. A trusted object spliced from another setter call is
+   * no longer a trusted combined lineage, so the public bounds apply to both
+   * sides and oversized inputs fail before any per-item work. */
+  let plural: readonly unknown[] | undefined;
   try {
-    if (Array.isArray(pluralInput)) {
-      const length = pluralInput.length;
-      pluralCandidates = [];
-      for (let index = 0; index < length; index++) {
-        pluralCandidates.push(pluralInput[index]);
+    if (pluralInput !== undefined) {
+      if (!Array.isArray(pluralInput)) {
+        return undefined;
+      }
+      plural = pluralInput;
+      trustedPlural = immutableProviderSourceMessageIds.has(pluralInput);
+      const bindingMismatch = trustedProvenance && boundPlural !== pluralInput;
+      if (bindingMismatch) {
+        trustedPlural = false;
+      }
+      if (!trustedPlural) {
+        hasUntrustedSourceMetadata = true;
       }
     }
   } catch {
-    pluralCandidates = undefined;
+    return undefined;
   }
-  for (const candidate of pluralCandidates ?? []) {
-    appendSourceMessageId(result, seen, candidate);
+
+  /** A primitive singular id has no identity of its own. Treat it as the
+   * setter's compatibility duplicate only when it exactly matches the last id
+   * of an immutable plural array published by that setter. This classification
+   * happens before either collection is walked so malformed singular metadata
+   * cannot force work over an otherwise trusted oversized lineage. */
+  const trustedSingularSourceIds =
+    boundPlural ?? (trustedPlural ? plural : undefined);
+  const unboundedSingular =
+    singularInput === undefined
+      ? undefined
+      : normalizeSourceMessageId(singularInput);
+  const trustedSingularDuplicate =
+    singularInput !== undefined &&
+    typeof singularInput === 'string' &&
+    singularInput === unboundedSingular &&
+    trustedSingularSourceIds != null &&
+    trustedSingularSourceIds.length > 0 &&
+    trustedSingularSourceIds[trustedSingularSourceIds.length - 1] ===
+      singularInput;
+  if (singularInput !== undefined && !trustedSingularDuplicate) {
+    hasUntrustedSourceMetadata = true;
+    if (normalizeSourceMessageId(singularInput, true) == null) {
+      return undefined;
+    }
   }
-  appendSourceMessageId(result, seen, singularInput);
+
+  /** Any untrusted lineage field revokes the setter-only size exemption for
+   * every collection participating in the union. Preflight all public bounds
+   * before reading a part or plural element. */
+  if (hasUntrustedSourceMetadata) {
+    try {
+      if (
+        provenanceParts != null &&
+        provenanceParts.length > PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxParts
+      ) {
+        return undefined;
+      }
+      if (
+        plural != null &&
+        plural.length > PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxSourceMessageIds
+      ) {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+  const provenanceRequiresValidation =
+    !trustedProvenance || hasUntrustedSourceMetadata;
+  const pluralRequiresValidation = !trustedPlural || hasUntrustedSourceMetadata;
+
+  if (provenanceParts != null) {
+    const length = provenanceParts.length;
+    for (let index = 0; index < length; index++) {
+      if (
+        !appendSourceMessageId(
+          result,
+          seen,
+          provenanceParts[index].sourceMessageId,
+          provenanceRequiresValidation
+        )
+      ) {
+        return undefined;
+      }
+    }
+  }
+
+  try {
+    if (plural != null) {
+      const length = plural.length;
+      for (let index = 0; index < length; index++) {
+        if (
+          !appendSourceMessageId(
+            result,
+            seen,
+            plural[index],
+            pluralRequiresValidation
+          )
+        ) {
+          return undefined;
+        }
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  if (singularInput !== undefined) {
+    if (trustedSingularDuplicate) {
+      if (!seen.has(singularInput)) {
+        return undefined;
+      }
+    } else {
+      if (!appendSourceMessageId(result, seen, singularInput, true)) {
+        return undefined;
+      }
+    }
+  }
+  if (
+    hasUntrustedSourceMetadata &&
+    result.length > PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxSourceMessageIds
+  ) {
+    return undefined;
+  }
+  return result;
+}
+
+function copyOwnEnumerableDataProperties(
+  input: object
+): Record<PropertyKey, unknown> {
+  if (isProxy(input)) {
+    throw new TypeError('Invalid provider message serialization kwargs');
+  }
+  const result: Record<PropertyKey, unknown> = {};
+  const descriptors = Object.getOwnPropertyDescriptors(input);
+  for (const key of Reflect.ownKeys(descriptors)) {
+    const descriptor = Reflect.get(descriptors, key) as PropertyDescriptor;
+    if (descriptor.enumerable !== true) {
+      continue;
+    }
+    if (!('value' in descriptor)) {
+      throw new TypeError('Invalid provider message serialization kwargs');
+    }
+    Object.defineProperty(result, key, {
+      configurable: true,
+      enumerable: true,
+      value: descriptor.value,
+      writable: true,
+    });
+  }
   return result;
 }
 
@@ -281,10 +494,7 @@ export function getProviderMessageProvenance(
   message: BaseMessage
 ): ProviderMessageProvenance | undefined {
   const additionalKwargs = getUntrustedAdditionalKwargs(message);
-  const provenanceInput = readAdditionalKwarg(
-    additionalKwargs,
-    'provenance'
-  );
+  const provenanceInput = readAdditionalKwarg(additionalKwargs, 'provenance');
   return normalizeProviderMessageProvenance(provenanceInput);
 }
 
@@ -295,22 +505,18 @@ export function getProviderMessageProvenance(
  */
 export function getProviderSourceMessageIds(message: BaseMessage): string[] {
   const additionalKwargs = getUntrustedAdditionalKwargs(message);
-  const provenanceInput = readAdditionalKwarg(
-    additionalKwargs,
-    'provenance'
-  );
-  const pluralInput = readAdditionalKwarg(
-    additionalKwargs,
-    'sourceMessageIds'
-  );
+  const provenanceInput = readAdditionalKwarg(additionalKwargs, 'provenance');
+  const pluralInput = readAdditionalKwarg(additionalKwargs, 'sourceMessageIds');
   const singularInput = readAdditionalKwarg(
     additionalKwargs,
     'sourceMessageId'
   );
-  return collectProviderSourceMessageIds(
-    normalizeProviderMessageProvenance(provenanceInput),
-    pluralInput,
-    singularInput
+  return (
+    collectProviderSourceMessageIds(
+      normalizeProviderMessageProvenance(provenanceInput),
+      pluralInput,
+      singularInput
+    ) ?? []
   );
 }
 
@@ -319,6 +525,52 @@ export function setProviderMessageProvenance(
   message: BaseMessage,
   parts: readonly ProviderMessageProvenancePart[]
 ): void {
+  if (isProxy(message)) {
+    throw new TypeError('Invalid provider message serialization kwargs');
+  }
+  const liveDescriptor = Object.getOwnPropertyDescriptor(
+    message,
+    'additional_kwargs'
+  );
+  const lcKwargsDescriptor = Object.getOwnPropertyDescriptor(
+    message,
+    'lc_kwargs'
+  );
+  if (
+    liveDescriptor == null ||
+    !('value' in liveDescriptor) ||
+    liveDescriptor.writable !== true ||
+    lcKwargsDescriptor == null ||
+    !('value' in lcKwargsDescriptor) ||
+    lcKwargsDescriptor.writable !== true
+  ) {
+    throw new TypeError('Invalid provider message serialization kwargs');
+  }
+  const currentAdditionalKwargsInput: unknown = liveDescriptor.value;
+  if (
+    currentAdditionalKwargsInput == null ||
+    typeof currentAdditionalKwargsInput !== 'object'
+  ) {
+    throw new TypeError('Invalid provider message additional kwargs');
+  }
+  let replacement: UntrustedProviderMessageAdditionalKwargs;
+  try {
+    replacement = copyOwnEnumerableDataProperties(
+      currentAdditionalKwargsInput
+    ) as UntrustedProviderMessageAdditionalKwargs;
+  } catch {
+    throw new TypeError('Invalid provider message additional kwargs');
+  }
+  const lcKwargsInput: unknown = lcKwargsDescriptor.value;
+  if (lcKwargsInput == null || typeof lcKwargsInput !== 'object') {
+    throw new TypeError('Invalid provider message serialization kwargs');
+  }
+  let serializedReplacement: Record<PropertyKey, unknown>;
+  try {
+    serializedReplacement = copyOwnEnumerableDataProperties(lcKwargsInput);
+  } catch {
+    throw new TypeError('Invalid provider message serialization kwargs');
+  }
   const normalizedParts = normalizeProvenanceParts(parts);
   const provenance: ProviderMessageProvenance = Object.freeze({
     version: PROVIDER_MESSAGE_PROVENANCE_VERSION,
@@ -330,23 +582,39 @@ export function setProviderMessageProvenance(
   for (const part of normalizedParts) {
     appendSourceMessageId(sourceMessageIds, seen, part.sourceMessageId);
   }
-  const currentAdditionalKwargs = getUntrustedAdditionalKwargs(message);
-  let replacement: UntrustedProviderMessageAdditionalKwargs;
-  try {
-    replacement = { ...(currentAdditionalKwargs ?? {}) };
-  } catch {
-    throw new TypeError('Invalid provider message additional kwargs');
-  }
   replacement.provenance = provenance;
   if (sourceMessageIds.length > 0) {
-    replacement.sourceMessageIds = Object.freeze(sourceMessageIds);
-    replacement.sourceMessageId =
-      sourceMessageIds[sourceMessageIds.length - 1];
+    const immutableSourceMessageIds = Object.freeze(sourceMessageIds);
+    immutableProviderSourceMessageIds.add(immutableSourceMessageIds);
+    immutableProviderMessageSourceIds.set(
+      provenance,
+      immutableSourceMessageIds
+    );
+    replacement.sourceMessageIds = immutableSourceMessageIds;
+    replacement.sourceMessageId = sourceMessageIds[sourceMessageIds.length - 1];
   } else {
     delete replacement.sourceMessageIds;
     delete replacement.sourceMessageId;
   }
-  message.additional_kwargs = replacement;
+  serializedReplacement.additional_kwargs = replacement;
+  try {
+    /** Both own data properties are prevalidated before one descriptor batch,
+     * so custom accessors cannot observe or create a split publication. */
+    Object.defineProperties(message, {
+      additional_kwargs: { ...liveDescriptor, value: replacement },
+      lc_kwargs: { ...lcKwargsDescriptor, value: serializedReplacement },
+    });
+  } catch {
+    throw new TypeError('Invalid provider message serialization kwargs');
+  }
+}
+
+/** Marks a provider-visible runtime message as host-generated context. */
+export function stampSyntheticProviderMessage<T extends BaseMessage>(
+  message: T
+): T {
+  setProviderMessageProvenance(message, [{ attribution: 'synthetic' }]);
+  return message;
 }
 
 /**
@@ -360,14 +628,8 @@ export function appendProviderMessageProvenance(
 ): void {
   let normalizedPart = normalizeProvenancePart(part);
   const additionalKwargs = getUntrustedAdditionalKwargs(message);
-  const provenanceInput = readAdditionalKwarg(
-    additionalKwargs,
-    'provenance'
-  );
-  const pluralInput = readAdditionalKwarg(
-    additionalKwargs,
-    'sourceMessageIds'
-  );
+  const provenanceInput = readAdditionalKwarg(additionalKwargs, 'provenance');
+  const pluralInput = readAdditionalKwarg(additionalKwargs, 'sourceMessageIds');
   const singularInput = readAdditionalKwarg(
     additionalKwargs,
     'sourceMessageId'
@@ -380,11 +642,9 @@ export function appendProviderMessageProvenance(
       representedSourceIds.add(existingPart.sourceMessageId);
     }
   }
-  const sourceMessageIds = collectProviderSourceMessageIds(
-    provenance,
-    pluralInput,
-    singularInput
-  );
+  const sourceMessageIds =
+    collectProviderSourceMessageIds(provenance, pluralInput, singularInput) ??
+    [];
   const missingLegacySourceIds = sourceMessageIds.filter(
     (sourceMessageId) => !representedSourceIds.has(sourceMessageId)
   );

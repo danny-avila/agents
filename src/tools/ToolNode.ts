@@ -62,7 +62,6 @@ import {
   SUBAGENT_PARENT_BATCH_CONFIG_KEY,
   SUBAGENT_REPLAY_CONTROLLER,
 } from '@/tools/subagent/SubagentReplay';
-import { attachRunStepResumeState } from '@/tools/runStepResume';
 import {
   INTENT_ARG,
   readOutcomeFields,
@@ -97,6 +96,7 @@ import {
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
+import { attachRunStepResumeState } from '@/tools/runStepResume';
 
 /** Host-facing batch requests must not carry the batch's breaker scope —
  * hosts spread `configurable` into their own run configs. */
@@ -110,6 +110,7 @@ function stripRunBreakerScope(
   return rest;
 }
 import { convertInjectedMessages } from '@/messages/injected';
+import { stampSyntheticProviderMessage } from '@/messages/provenance';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { RunnableCallable, composeAbortSignals } from '@/utils';
 import {
@@ -3927,10 +3928,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * a user message; `role` is metadata only.
        */
       injected.push(
-        new HumanMessage({
-          content: batchAdditionalContexts.join('\n\n'),
-          additional_kwargs: { role: 'system', source: 'hook' },
-        })
+        stampSyntheticProviderMessage(
+          new HumanMessage({
+            content: batchAdditionalContexts.join('\n\n'),
+            additional_kwargs: { role: 'system', source: 'hook' },
+          })
+        )
       );
     }
 
@@ -4423,13 +4426,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         directAdditionalContexts.length > 0
           ? [
             sendOutput,
-            new HumanMessage({
-              content: directAdditionalContexts.join('\n\n'),
-              // Match the event-driven path's marker so hosts /
-              // model-side annotators treat this as system intent
-              // rather than ordinary user text. Codex P2 [46].
-              additional_kwargs: { role: 'system', source: 'hook' },
-            }),
+            stampSyntheticProviderMessage(
+              new HumanMessage({
+                content: directAdditionalContexts.join('\n\n'),
+                // Match the event-driven path's marker so hosts /
+                // model-side annotators treat this as system intent
+                // rather than ordinary user text. Codex P2 [46].
+                additional_kwargs: { role: 'system', source: 'hook' },
+              })
+            ),
           ]
           : [sendOutput];
       await this.handleRunToolCompletions(
@@ -4721,14 +4726,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const directInjected: BaseMessage[] =
           directAdditionalContexts.length > 0
             ? [
-              new HumanMessage({
-                content: directAdditionalContexts.join('\n\n'),
-                // System-role metadata to match the event-driven
-                // path so policy/recovery guidance is treated
-                // consistently regardless of whether the tool ran
-                // direct or dispatched. Codex P2 [46].
-                additional_kwargs: { role: 'system', source: 'hook' },
-              }),
+              stampSyntheticProviderMessage(
+                new HumanMessage({
+                  content: directAdditionalContexts.join('\n\n'),
+                  // System-role metadata to match the event-driven
+                  // path so policy/recovery guidance is treated
+                  // consistently regardless of whether the tool ran
+                  // direct or dispatched. Codex P2 [46].
+                  additional_kwargs: { role: 'system', source: 'hook' },
+                })
+              ),
             ]
             : [];
         outputs = [
@@ -4782,13 +4789,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               ...promotedPrefix,
               ...toolOutputs,
               ...invalidCallResults,
-              new HumanMessage({
-                content: directAdditionalContexts.join('\n\n'),
-                // Same system-role marker the event-driven path
-                // uses so direct vs dispatched is invisible to
-                // downstream consumers. Codex P2 [46].
-                additional_kwargs: { role: 'system', source: 'hook' },
-              }),
+              stampSyntheticProviderMessage(
+                new HumanMessage({
+                  content: directAdditionalContexts.join('\n\n'),
+                  // Same system-role marker the event-driven path
+                  // uses so direct vs dispatched is invisible to
+                  // downstream consumers. Codex P2 [46].
+                  additional_kwargs: { role: 'system', source: 'hook' },
+                })
+              ),
             ]
             : [...promotedPrefix, ...toolOutputs, ...invalidCallResults];
       }

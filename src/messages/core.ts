@@ -503,28 +503,6 @@ function appendContentBlocks(
   }
 }
 
-/**
- * Appends one artifact/tool-content segment without retaining an unbounded
- * intermediate block array. Both operands are compacted before they are
- * combined, and the combined result is compacted again under the aggregate
- * cap.
- */
-function appendBoundedContent(
-  current: BaseMessage['content'] | undefined,
-  next: unknown,
-  maxChars: number
-): BaseMessage['content'] {
-  const boundedNext = compactToolContent(next, maxChars).content;
-  if (current == null) {
-    return boundedNext;
-  }
-
-  const combined: t.MessageContentComplex[] = [];
-  appendContentBlocks(combined, current);
-  appendContentBlocks(combined, boundedNext);
-  return compactToolContent(toLangChainContent(combined), maxChars).content;
-}
-
 interface BoundedContentAccumulator {
   readonly blocks: t.MessageContentComplex[];
   hasContent: boolean;
@@ -2473,16 +2451,70 @@ export function projectAnthropicArtifactContent(
       const baseContent = Array.isArray(msg.content)
         ? msg.content
         : stringifyToolMessageContent(msg.content);
-      const content = appendBoundedContent(
-        compactToolContent(baseContent, maxChars).content,
-        artifactContent,
-        maxChars
+      const aggregate = createBoundedContentAccumulator(maxChars);
+      let contentProjection: ReturnType<
+        typeof appendBoundedContentContribution
+      > = { contributed: false, complete: true };
+      /** Preserve the established empty-result text block shape without
+       * crediting it as a provider-visible source contribution. */
+      if (baseContent === '') {
+        aggregate.blocks.push({ type: ContentTypes.TEXT, text: '' });
+        aggregate.hasContent = true;
+      } else {
+        contentProjection = appendBoundedContentContribution(
+          aggregate,
+          baseContent
+        );
+      }
+      const artifactProjection = appendBoundedContentContribution(
+        aggregate,
+        artifactContent
       );
+      const content = toLangChainContent(aggregate.blocks);
       formattedMessages ??= [...messages];
-      formattedMessages[j] = cloneToolMessageWithContent(msg, content, {
+      const projectedMessage = cloneToolMessageWithContent(msg, content, {
         ...msg.artifact,
         content: [],
       });
+      const toolProvenanceParts = projectProviderMessageAttribution(
+        msg,
+        'tool'
+      );
+      const projectedProvenanceParts: ProviderMessageProvenancePart[] = [];
+      if (contentProjection.contributed) {
+        const retainedParts = retainProjectedContentPartProvenance(
+          msg,
+          toolProvenanceParts,
+          contentProjection.retainedContentPartIndices,
+          contentProjection.complete
+        );
+        for (const part of retainedParts) {
+          projectedProvenanceParts.push(part);
+        }
+      }
+      if (artifactProjection.contributed) {
+        const artifactPart = projectUnindexedProviderMessageAttribution(
+          msg,
+          'tool'
+        );
+        const previousPart =
+          projectedProvenanceParts[projectedProvenanceParts.length - 1];
+        if (
+          projectedProvenanceParts.length === 0 ||
+          previousPart.attribution !== artifactPart.attribution ||
+          previousPart.sourceMessageId !== artifactPart.sourceMessageId ||
+          previousPart.sourceContentPartIndices != null
+        ) {
+          projectedProvenanceParts.push(artifactPart);
+        }
+      }
+      if (projectedProvenanceParts.length > 0) {
+        setProviderMessageProvenance(
+          projectedMessage,
+          projectedProvenanceParts
+        );
+      }
+      formattedMessages[j] = projectedMessage;
     }
   }
   return formattedMessages ?? messages;
@@ -2559,6 +2591,10 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
       projected[i] !== messages[i]
     ) {
       messages[i].content = projected[i].content;
+      const provenance = getProviderMessageProvenance(projected[i]);
+      if (provenance != null) {
+        setProviderMessageProvenance(messages[i], provenance.parts);
+      }
     }
   }
 }

@@ -5,6 +5,7 @@ import {
   removePredecessorHandoffCue,
   PREDECESSOR_HANDOFF_CUE,
 } from './handoffCue';
+import { getProviderMessageProvenance } from './provenance';
 
 const runAi = new AIMessage({ content: 'predecessor output', id: 'run-ai-1' });
 const producedIds = new Set(['run-ai-1']);
@@ -17,11 +18,14 @@ describe('appendPredecessorHandoffCue', () => {
     const result = appendPredecessorHandoffCue(payload, isRunProduced);
     expect(result).toHaveLength(3);
     expect(result[2].content).toBe(PREDECESSOR_HANDOFF_CUE);
-    expect(result[2].additional_kwargs).toEqual({
+    expect(result[2].additional_kwargs).toMatchObject({
       role: 'user',
       isMeta: true,
       source: 'handoff',
     });
+    expect(getProviderMessageProvenance(result[2])?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
     /** Non-mutating: the input array is untouched. */
     expect(payload).toHaveLength(2);
   });

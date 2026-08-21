@@ -31,6 +31,7 @@ import {
 } from '@/llm/openai/utils';
 import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { Constants, ContentTypes, Providers } from '@/common';
+import { getProviderMessageProvenance } from './provenance';
 import { serializeToolContent } from '@/utils/toolContent';
 import { formatAgentMessages } from './format';
 
@@ -1092,6 +1093,19 @@ describe('formatAgentMessages', () => {
     expect(serverToolUseIndex).toBeGreaterThanOrEqual(0);
     expect(serverResultIndex).toBeGreaterThan(serverToolUseIndex);
     expect(
+      messages.flatMap(
+        (message) =>
+          getProviderMessageProvenance(message)?.parts.filter((part) =>
+            part.sourceContentPartIndices?.includes(1) === true
+          ) ?? []
+      )
+    ).toEqual([
+      {
+        attribution: 'model',
+        sourceContentPartIndices: [0, 1, 2],
+      },
+    ]);
+    expect(
       messages.some(
         (message) =>
           message instanceof ToolMessage &&
@@ -1649,6 +1663,89 @@ describe('formatAgentMessages', () => {
     ]);
     expect(toolMessage.content).toBe('');
     expect(formattedMessages).not.toBe(originalMessages);
+  });
+
+  it('adds unindexed tool lineage only when Anthropic artifact bytes survive projection', () => {
+    const toolMessage = new ToolMessage({
+      content: [{ type: ContentTypes.TEXT, text: 'base' }],
+      tool_call_id: 'call_artifact_lineage',
+      name: 'render',
+      additional_kwargs: {
+        provenance: {
+          version: 1,
+          parts: [
+            {
+              attribution: 'tool',
+              sourceMessageId: 'stored-tool-row',
+              sourceContentPartIndices: [3],
+            },
+          ],
+        },
+        sourceMessageId: 'stored-tool-row',
+        sourceMessageIds: ['stored-tool-row'],
+      },
+      artifact: {
+        content: [{ type: ContentTypes.TEXT, text: 'artifact' }],
+      },
+    });
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_artifact_lineage',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+
+    const projected = projectAnthropicArtifactContent(messages, 100);
+    const projectedTool = projected[1] as ToolMessage;
+
+    expect(getProviderMessageProvenance(projectedTool)?.parts).toEqual([
+      {
+        attribution: 'tool',
+        sourceMessageId: 'stored-tool-row',
+        sourceContentPartIndices: [3],
+      },
+      { attribution: 'tool', sourceMessageId: 'stored-tool-row' },
+    ]);
+    expect(projectedTool.lc_kwargs.additional_kwargs).toBe(
+      projectedTool.additional_kwargs
+    );
+    expect(getProviderMessageProvenance(toolMessage)?.parts).toEqual([
+      {
+        attribution: 'tool',
+        sourceMessageId: 'stored-tool-row',
+        sourceContentPartIndices: [3],
+      },
+    ]);
+
+    const capped = projectAnthropicArtifactContent(messages, 4)[1];
+    expect(getProviderMessageProvenance(capped)?.parts).toEqual([
+      {
+        attribution: 'tool',
+        sourceMessageId: 'stored-tool-row',
+        sourceContentPartIndices: [3],
+      },
+    ]);
+
+    formatAnthropicArtifactContent(messages);
+    expect(getProviderMessageProvenance(toolMessage)?.parts).toEqual([
+      {
+        attribution: 'tool',
+        sourceMessageId: 'stored-tool-row',
+        sourceContentPartIndices: [3],
+      },
+      { attribution: 'tool', sourceMessageId: 'stored-tool-row' },
+    ]);
+    expect(toolMessage.lc_kwargs.additional_kwargs).toBe(
+      toolMessage.additional_kwargs
+    );
   });
 
   it('caps Anthropic artifact expansion after pruning', () => {
@@ -5350,17 +5447,7 @@ describe('formatAgentMessages', () => {
         {
           attribution: 'model',
           sourceMessageId: 'filtered-tool-row',
-          sourceContentPartIndices: [0],
-        },
-        {
-          attribution: 'tool',
-          sourceMessageId: 'filtered-tool-row',
-          sourceContentPartIndices: [2],
-        },
-        {
-          attribution: 'model',
-          sourceMessageId: 'filtered-tool-row',
-          sourceContentPartIndices: [1],
+          sourceContentPartIndices: [0, 2, 1],
         },
       ],
     });
@@ -5374,6 +5461,42 @@ describe('formatAgentMessages', () => {
         },
       ],
     });
+  });
+
+  it('keeps an output-less unavailable tool call model-attributed when flattened', () => {
+    const { messages } = formatAgentMessages(
+      [
+        {
+          role: 'assistant',
+          messageId: 'output-less-filtered-tool-row',
+          content: [
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'unavailable-tool',
+                name: 'unavailable_tool',
+                args: '{}',
+                output: '',
+              },
+            },
+          ],
+        },
+      ],
+      undefined,
+      new Set(['available_tool'])
+    );
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'Tool: unavailable_tool, ' },
+    ]);
+    expect(getProviderMessageProvenance(messages[0])?.parts).toEqual([
+      {
+        attribution: 'model',
+        sourceMessageId: 'output-less-filtered-tool-row',
+        sourceContentPartIndices: [0],
+      },
+    ]);
   });
 
   it('should simulate realistic deferred tools flow with tool_search', () => {

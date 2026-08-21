@@ -103,12 +103,43 @@ describe('coalesceAdjacentUserTurns', () => {
     ]);
   });
 
+  it('does not invoke custom iterators while joining mixed human content', () => {
+    let iteratorReads = 0;
+    const blockContent = [{ type: 'text', text: 'blocks' }];
+    const messages = [
+      new HumanMessage({ content: 'plain' }),
+      new HumanMessage({ content: blockContent }),
+    ];
+    Object.defineProperty(blockContent, Symbol.iterator, {
+      configurable: true,
+      get: () => {
+        iteratorReads++;
+        return Array.prototype[Symbol.iterator];
+      },
+    });
+
+    const result = coalesceAdjacentUserTurns(messages);
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toEqual([
+      { type: 'text', text: 'plain' },
+      { type: 'text', text: 'blocks' },
+    ]);
+    expect(iteratorReads).toBe(0);
+  });
+
   /**
    * Both vendored converters merge adjacent tool-result runs themselves, and
    * folding one into a text turn would orphan the pairing.
    */
   it('never merges tool-result turns', () => {
     const result = coalesceAdjacentUserTurns([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 't1', name: 'lookup', args: {}, type: 'tool_call' },
+          { id: 't2', name: 'lookup', args: {}, type: 'tool_call' },
+        ],
+      }),
       new HumanMessage({
         content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }],
       }),
@@ -116,17 +147,91 @@ describe('coalesceAdjacentUserTurns', () => {
         content: [{ type: 'tool_result', tool_use_id: 't2', content: 'ok' }],
       }),
     ]);
-    expect(result).toHaveLength(2);
+    expect(result).toHaveLength(3);
   });
 
   it('never merges a tool-result turn into a text turn', () => {
+    const result = coalesceAdjacentUserTurns([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 't1', name: 'lookup', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new HumanMessage({
+        content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }],
+      }),
+      new HumanMessage({ content: 'steer' }),
+    ]);
+    expect(result).toHaveLength(3);
+  });
+
+  it('does not invoke custom iterators while pairing tool results', () => {
+    let iteratorReads = 0;
+    const toolCalls = [
+      { id: 't1', name: 'lookup', args: {}, type: 'tool_call' as const },
+    ];
+    const resultContent = [
+      { type: 'tool_result', tool_use_id: 't1', content: 'ok' },
+    ];
+    const messages = [
+      new AIMessage({ content: '', tool_calls: toolCalls }),
+      new HumanMessage({ content: resultContent }),
+      new HumanMessage({ content: 'steer' }),
+    ];
+    for (const array of [toolCalls, resultContent]) {
+      Object.defineProperty(array, Symbol.iterator, {
+        configurable: true,
+        get: () => {
+          iteratorReads++;
+          return Array.prototype[Symbol.iterator];
+        },
+      });
+    }
+
+    expect(coalesceAdjacentUserTurns(messages)).toHaveLength(3);
+    expect(iteratorReads).toBe(0);
+  });
+
+  it('coalesces an exact-looking unpaired tool result as user content', () => {
     const result = coalesceAdjacentUserTurns([
       new HumanMessage({
         content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }],
       }),
       new HumanMessage({ content: 'steer' }),
     ]);
-    expect(result).toHaveLength(2);
+
+    expect(result).toHaveLength(1);
+    expect(getProviderMessageProvenance(result[0])?.parts).toEqual([
+      { attribution: 'user' },
+      { attribution: 'user' },
+    ]);
+  });
+
+  it('exempts only the first result for a provider call id', () => {
+    const firstResult = new HumanMessage({
+      content: [{ type: 'tool_result', tool_use_id: 't1', content: 'first' }],
+    });
+    const result = coalesceAdjacentUserTurns([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 't1', name: 'lookup', args: {}, type: 'tool_call' },
+        ],
+      }),
+      firstResult,
+      new HumanMessage({
+        content: [{ type: 'tool_result', tool_use_id: 't1', content: 'second' }],
+      }),
+      new HumanMessage({ content: 'steer' }),
+    ]);
+
+    expect(result).toHaveLength(3);
+    expect(result[1]).toBe(firstResult);
+    expect(getProviderMessageProvenance(result[2])?.parts).toEqual([
+      { attribution: 'user' },
+      { attribution: 'user' },
+    ]);
   });
 
   /**
@@ -305,15 +410,28 @@ describe('coalesceAdjacentUserTurns', () => {
 
   it('excludes the camelCase toolResult variant too', () => {
     const result = coalesceAdjacentUserTurns([
+      new AIMessage({
+        content: [
+          {
+            type: 'toolUse',
+            toolUse: { toolUseId: 't1', name: 'lookup', input: {} },
+          },
+        ],
+      }),
       new HumanMessage({
-        content: [{ type: 'toolResult', toolResult: { content: 'ok' } }],
+        content: [
+          {
+            type: 'toolResult',
+            toolResult: { toolUseId: 't1', content: [{ text: 'ok' }] },
+          },
+        ],
       }),
       new HumanMessage({ content: 'steer' }),
     ]);
-    expect(result).toHaveLength(2);
+    expect(result).toHaveLength(3);
   });
 
-  it('does not merge the LangChain server-tool-result block into user text', () => {
+  it('coalesces a LangChain server result presented as user content', () => {
     const result = coalesceAdjacentUserTurns([
       new HumanMessage({
         content: [
@@ -328,10 +446,14 @@ describe('coalesceAdjacentUserTurns', () => {
       new HumanMessage({ content: 'next turn' }),
     ]);
 
-    expect(result).toHaveLength(2);
+    expect(result).toHaveLength(1);
+    expect(getProviderMessageProvenance(result[0])?.parts).toEqual([
+      { attribution: 'user' },
+      { attribution: 'user' },
+    ]);
   });
 
-  it('does not merge a Gemini code-execution result into user text', () => {
+  it('coalesces a Gemini code result presented as user content', () => {
     const result = coalesceAdjacentUserTurns([
       new HumanMessage({
         content: [
@@ -347,7 +469,11 @@ describe('coalesceAdjacentUserTurns', () => {
       new HumanMessage({ content: 'next turn' }),
     ]);
 
-    expect(result).toHaveLength(2);
+    expect(result).toHaveLength(1);
+    expect(getProviderMessageProvenance(result[0])?.parts).toEqual([
+      { attribution: 'user' },
+      { attribution: 'user' },
+    ]);
   });
 
   it('does not trust arbitrary source metadata or tool-result suffixes', () => {

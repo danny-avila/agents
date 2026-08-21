@@ -33,6 +33,7 @@ import type {
 } from '@/hooks';
 import type * as t from '@/types';
 import { Constants, Providers as providers, GraphEvents } from '@/common';
+import { getProviderMessageProvenance } from '@/messages/provenance';
 import { HookRegistry, createToolPolicyHook } from '@/hooks';
 import * as events from '@/utils/events';
 import { askUserQuestion } from '@/hitl';
@@ -1147,10 +1148,8 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
       ],
     };
     const getState = jest.fn(
-      async (
-        _config: RunnableConfig,
-        _options?: { subgraphs?: boolean }
-      ) => persistedState
+      async (_config: RunnableConfig, _options?: { subgraphs?: boolean }) =>
+        persistedState
     );
     run.graphRunnable = { getState } as unknown as t.CompiledStateWorkflow;
     const processSpy = jest
@@ -1667,6 +1666,59 @@ describe('ToolNode HITL — additionalContext injection from hooks', () => {
     );
     expect(injected).toBeUndefined();
   });
+
+  it('marks mixed direct/event batch context as synthetic provenance', async () => {
+    mockEventDispatch([
+      { toolCallId: 'event_1', content: 'host-result', status: 'success' },
+    ]);
+    const direct = tool(async () => 'direct-result', {
+      name: 'direct_echo',
+      description: 'direct echo',
+      schema: z.object({ command: z.string() }),
+    }) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> => ({
+          decision: 'allow',
+          ...(input.toolName === 'direct_echo' && {
+            additionalContext: 'direct policy context',
+          }),
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [direct, createSchemaStub('event_echo')],
+      eventDrivenMode: true,
+      directToolNames: new Set(['direct_echo']),
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([
+        ['direct_1', 'step_direct_1'],
+        ['event_1', 'step_event_1'],
+      ]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: false },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'direct_1', name: 'direct_echo', args: { command: 'a' } },
+      { id: 'event_1', name: 'event_echo', args: { command: 'b' } },
+    ]);
+
+    const result = (await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'mixed-context-thread' } }
+    )) as { messages: BaseMessage[] };
+    const context = result.messages.find(
+      (message) =>
+        message.getType() === 'human' &&
+        String(message.content).includes('direct policy context')
+    );
+
+    expect(context).toBeDefined();
+    expect(getProviderMessageProvenance(context!)?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
+  });
 });
 
 describe('ToolNode HITL — PostToolBatch hook', () => {
@@ -1777,6 +1829,9 @@ describe('ToolNode HITL — PostToolBatch hook', () => {
     );
     expect(injected).toBeDefined();
     expect(String(injected!.content)).toContain('format the response as JSON');
+    expect(getProviderMessageProvenance(injected!)?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
   });
 
   it('PostToolBatch injectedMessages land as individual HumanMessages after the consolidated context', async () => {
@@ -1944,6 +1999,55 @@ describe('Run — preventContinuation honored for pre-stream hooks', () => {
   });
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('marks consolidated pre-stream hook context as synthetic provenance', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+    const { HumanMessage: HM } = await import('@langchain/core/messages');
+    const registry = new HookRegistry();
+    registry.register('RunStart', {
+      hooks: [
+        async (): Promise<RunStartHookOutput> => ({
+          additionalContext: 'runtime policy context',
+        }),
+      ],
+    });
+    const run = await Run.create<t.IState>({
+      runId: 'prestream-provenance',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: false },
+    });
+    const stateInputs = {
+      messages: [new HM('hello')],
+    } as t.IState;
+    const halted = await (
+      run as unknown as {
+        runPreStreamHooks: (
+          state: t.IState,
+          threadId: string,
+          config: Record<string, unknown>
+        ) => Promise<boolean>;
+      }
+    ).runPreStreamHooks(stateInputs, 'prestream-thread', {});
+
+    expect(halted).toBe(false);
+    expect(stateInputs.messages).toHaveLength(2);
+    expect(
+      getProviderMessageProvenance(stateInputs.messages[1])?.parts
+    ).toEqual([{ attribution: 'synthetic' }]);
   });
 
   it('returns undefined without invoking the graph when RunStart hook returns preventContinuation', async () => {

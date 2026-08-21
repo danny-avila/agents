@@ -19,6 +19,7 @@ import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type { ToolRuntime } from '@langchain/core/tools';
 import type { GraphFactoryDependencies } from '@/graphs/graphFactory';
 import type * as t from '@/types';
+import { stampSyntheticProviderMessage } from '@/messages/provenance';
 import { serializeToolContentBounded } from '@/utils/toolContent';
 import { Constants, MULTI_AGENT_GRAPH_RUN_NAME } from '@/common';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
@@ -36,10 +37,12 @@ const HANDOFF_INSTRUCTIONS_KEY = 'handoff_instructions';
  * message replayed out of the payload.
  */
 function buildRoutingPrompt(content: string): HumanMessage {
-  return new HumanMessage({
-    content,
-    additional_kwargs: { role: 'user', isMeta: true, source: 'routing' },
-  });
+  return stampSyntheticProviderMessage(
+    new HumanMessage({
+      content,
+      additional_kwargs: { role: 'user', isMeta: true, source: 'routing' },
+    })
+  );
 }
 
 function getHandoffInstructions(
@@ -1164,8 +1167,10 @@ export class MultiAgentGraph extends StandardGraph {
             if (lastMsg != null && lastMsg.getType() === 'tool') {
               messagesForAgent = [
                 ...filteredMessages,
-                new AIMessage(
-                  `[Processed tool result and transferring to ${agentId}]`
+                stampSyntheticProviderMessage(
+                  new AIMessage(
+                    `[Processed tool result and transferring to ${agentId}]`
+                  )
                 ),
                 buildRoutingPrompt(instructions),
               ];

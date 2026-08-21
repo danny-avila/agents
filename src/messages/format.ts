@@ -32,6 +32,15 @@ import type {
   ProviderMessageAttribution,
   ProviderMessageProvenancePart,
 } from './provenance';
+import type { ProviderToolCallIndex } from './toolResultTypes';
+import {
+  appendProviderToolCallDescriptor,
+  consumeProviderToolResultPair,
+  getBoundedProviderPairingArrayProperty,
+  getProviderToolCallPartDescriptor,
+  getProviderToolResultPartDescriptor,
+  hasStructurallyValidAnthropicWebSearchResultContent,
+} from './toolResultTypes';
 import {
   compactToolContent,
   getToolContentCharLength,
@@ -47,7 +56,6 @@ import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inpu
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { Providers, ContentTypes, Constants } from '@/common';
-import { isProviderToolResultPart } from './toolResultTypes';
 import { emitAgentLog } from '@/utils/events';
 
 interface MediaMessageParams {
@@ -457,21 +465,81 @@ function getToolUseId(part: MessageContentComplex): string | undefined {
   return part.tool_use_id;
 }
 
-function isValidServerToolResult(part: MessageContentComplex): boolean {
-  const toolUseId = getToolUseId(part);
-  if (
-    toolUseId?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) !== true ||
-    !('content' in part)
-  ) {
+function collectTrustedToolResultSourceContentPartIndices(
+  content: readonly unknown[] | undefined,
+  sourceContentPartOffset: number
+): Set<number> | undefined {
+  if (content == null) {
+    return undefined;
+  }
+  let calls: ProviderToolCallIndex | undefined;
+  let trusted: Set<number> | undefined;
+  let previousPart: MessageContentComplex | null | undefined;
+  for (let index = 0; index < content.length; index++) {
+    const part = content[index] as
+      | MessageContentComplex
+      | null
+      | undefined;
+    if (part == null) {
+      previousPart = part;
+      continue;
+    }
+    const call = getProviderToolCallPartDescriptor(part);
+    if (call != null) {
+      calls ??= new Map();
+      appendProviderToolCallDescriptor(calls, call);
+    }
+    const result = getProviderToolResultPartDescriptor(part);
+    if (result != null) {
+      calls ??= new Map();
+      if (consumeProviderToolResultPair(result, calls, previousPart)) {
+        trusted ??= new Set();
+        trusted.add(sourceContentPartOffset + index);
+      }
+    }
+    previousPart = part;
+  }
+  return trusted;
+}
+
+function sourceContentPartIndicesAreTrustedToolResult(
+  sourceContentPartIndices: SourceContentPartIndices,
+  trustedToolSourceContentPartIndices: ReadonlySet<number> | undefined
+): boolean {
+  if (typeof sourceContentPartIndices === 'number') {
+    return trustedToolSourceContentPartIndices?.has(sourceContentPartIndices) === true;
+  }
+  if (sourceContentPartIndices.length === 0) {
     return false;
   }
-  const { content } = part as { content?: unknown };
+  for (const sourceContentPartIndex of sourceContentPartIndices) {
+    if (trustedToolSourceContentPartIndices?.has(sourceContentPartIndex) !== true) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isTrustedServerToolResult(
+  part: MessageContentComplex,
+  sourceContentPartIndices: SourceContentPartIndices,
+  trustedToolSourceContentPartIndices: ReadonlySet<number> | undefined
+): boolean {
+  const toolUseId = getToolUseId(part);
   return (
-    Array.isArray(content) ||
-    (content != null &&
-      typeof content === 'object' &&
-      'type' in content &&
-      (content as { type?: unknown }).type === 'web_search_tool_result_error')
+    toolUseId?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) === true &&
+    sourceContentPartIndicesAreTrustedToolResult(
+      sourceContentPartIndices,
+      trustedToolSourceContentPartIndices
+    )
+  );
+}
+
+function isServerToolResultForWire(part: MessageContentComplex): boolean {
+  const toolUseId = getToolUseId(part);
+  return (
+    toolUseId?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) === true &&
+    hasStructurallyValidAnthropicWebSearchResultContent(part)
   );
 }
 
@@ -658,12 +726,9 @@ function createProviderContentProvenanceParts(
     if (part == null) {
       continue;
     }
-    const attribution = isProviderToolResultPart(part)
-      ? 'tool'
-      : defaultAttribution;
     appendProviderProvenanceContribution(
       builder,
-      attribution,
+      defaultAttribution,
       sourceMessageId,
       sourceContentPartOffset + index
     );
@@ -890,12 +955,26 @@ function formatAssistantMessage(
     const contentParts = message.content as Array<
       MessageContentComplex | undefined | null
     >;
+    let trustedServerToolResultPartIndices: Set<number> | undefined;
+    let wireServerToolResultPartIndices: Set<number> | undefined;
 
-    for (const part of contentParts) {
+    for (let partIndex = 0; partIndex < contentParts.length; partIndex++) {
+      const part = contentParts[partIndex];
       if (part == null) {
         continue;
       }
-      if (isValidServerToolResult(part)) {
+      const isTrustedResult = isTrustedServerToolResult(
+        part,
+        getSourcePartIndices(partIndex),
+        options?.toolSourceContentPartIndices
+      );
+      if (isTrustedResult) {
+        trustedServerToolResultPartIndices ??= new Set();
+        trustedServerToolResultPartIndices.add(partIndex);
+      }
+      if (isTrustedResult || isServerToolResultForWire(part)) {
+        wireServerToolResultPartIndices ??= new Set();
+        wireServerToolResultPartIndices.add(partIndex);
         serverToolResultIds.add(getToolUseId(part) ?? '');
       }
       if (options?.provider === Providers.ANTHROPIC) {
@@ -921,17 +1000,18 @@ function formatAssistantMessage(
       const sourcePartIndices = getSourcePartIndices(partIndex);
       const toolUseId = getToolUseId(part);
       if (toolUseId != null) {
-        const isServerToolResult = isValidServerToolResult(part);
-        if (
-          toolUseId.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) &&
-          !isServerToolResult
-        ) {
-          continue;
-        }
+        const isServerToolResult =
+          trustedServerToolResultPartIndices?.has(partIndex) === true;
+        const isWireServerToolResult =
+          wireServerToolResultPartIndices?.has(partIndex) === true;
         flushPendingServerToolUse(toolUseId);
-        if (isServerToolResult) {
+        if (isWireServerToolResult) {
           currentContent.push(part);
-          appendCurrentContentProvenance(sourcePartIndices, 'tool');
+          appendCurrentContentProvenance(
+            sourcePartIndices,
+            isServerToolResult ? 'tool' : 'model',
+            !isServerToolResult
+          );
           continue;
         }
       } else if (hasMeaningfulAssistantContent(part)) {
@@ -1186,12 +1266,7 @@ function formatAssistantMessage(
           continue;
         }
         currentContent.push(part);
-        const attribution = isProviderToolResultPart(part) ? 'tool' : 'model';
-        appendCurrentContentProvenance(
-          sourcePartIndices,
-          attribution,
-          attribution === 'model'
-        );
+        appendCurrentContentProvenance(sourcePartIndices, 'model', true);
       }
     }
     for (const pending of pendingServerToolUses.values()) {
@@ -2041,7 +2116,11 @@ export const formatAgentMessages = (
     let processedSourceContentPartIndices:
       | SourceContentPartIndices[]
       | undefined;
-    const processedToolSourceContentPartIndices = new Set<number>();
+    const processedToolSourceContentPartIndices =
+      collectTrustedToolResultSourceContentPartIndices(
+        getBoundedProviderPairingArrayProperty(message, 'content'),
+        sourceContentPartOffset
+      );
     let pendingSkillNames: Set<string> | undefined;
     if (discoveredTools) {
       const content = message.content;
@@ -2060,9 +2139,6 @@ export const formatAgentMessages = (
           const partSourceContentIndices = sourceContentPartOffset + partIndex;
           if (part == null || typeof part !== 'object') {
             continue;
-          }
-          if (isValidServerToolResult(part)) {
-            processedToolSourceContentPartIndices.add(partSourceContentIndices);
           }
           if (part.type !== ContentTypes.TOOL_CALL) {
             filteredContent.push(part);
@@ -2131,7 +2207,6 @@ export const formatAgentMessages = (
               invalidToolSourceContentPartIndices,
               partSourceContentIndices
             );
-            processedToolSourceContentPartIndices.add(partSourceContentIndices);
           }
         }
 
