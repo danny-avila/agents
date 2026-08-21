@@ -835,6 +835,14 @@ print(example)`;
       );
     });
 
+    it('finds injected tools referenced through callable aliases', () => {
+      const code = 'await get_weather(); fn = search_docs; await fn()';
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(
+        new Set(['get_weather', 'search_docs'])
+      );
+    });
+
     it('preserves executable calls inside f-string expressions', () => {
       const code = `await get_weather(city="SF")
 value = f"result: {await search_docs(query='forecast')}"`;
@@ -1129,6 +1137,33 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
     it('removes escaped newlines while lexing command words', () => {
       const used = extractUsedBashToolNames(
         'get_weather \'{}\'; search_docs\\\n \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('does not persist temporary command-prefix assignments', () => {
+      const used = extractUsedBashToolNames(
+        'cmd=search_docs; cmd=printf env true; get_weather \'{}\'; "$cmd" \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('consumes env option operands before selecting the command', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; env -u HOME search_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('does not interpret arithmetic shifts as heredocs', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; n=$((1 << 2))\nsearch_docs \'{}\'',
         availableTools
       );
 

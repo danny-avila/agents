@@ -284,6 +284,9 @@ function collectBashCommandNames(
   let pendingCoprocWord: string | undefined;
   let evalWords: string[] | undefined;
   const assignments = new Map<string, string>();
+  const pendingAssignments = new Map<string, string>();
+  let commandPrefix: string | undefined;
+  let skipPrefixOptionOperand = false;
 
   const flushEval = (): void => {
     if (evalWords != null && evalWords.length > 0) {
@@ -302,6 +305,12 @@ function collectBashCommandNames(
     }
     if (token.type === 'separator') {
       flushEval();
+      for (const [name, value] of pendingAssignments) {
+        assignments.set(name, value);
+      }
+      pendingAssignments.clear();
+      commandPrefix = undefined;
+      skipPrefixOptionOperand = false;
       if (pendingCoprocWord != null) {
         commands.add(pendingCoprocWord);
         pendingCoprocWord = undefined;
@@ -350,10 +359,20 @@ function collectBashCommandNames(
     }
     const assignment = word.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
     if (assignment != null) {
-      assignments.set(assignment[1], assignment[2]);
+      if (commandPrefix == null) {
+        pendingAssignments.set(assignment[1], assignment[2]);
+      }
       continue;
     }
     if (/^[A-Za-z_][A-Za-z0-9_]*\+=/.test(word)) {
+      continue;
+    }
+    if (skipPrefixOptionOperand) {
+      skipPrefixOptionOperand = false;
+      continue;
+    }
+    if (commandPrefix === 'env' && (word === '-u' || word === '--unset')) {
+      skipPrefixOptionOperand = true;
       continue;
     }
     if (word.startsWith('-')) {
@@ -376,25 +395,31 @@ function collectBashCommandNames(
       continue;
     }
     if (COMMAND_PREFIXES.has(word)) {
+      commandPrefix = word;
       continue;
     }
 
     const variable = word.match(/^\$(?:{([A-Za-z_][A-Za-z0-9_]*)}|([A-Za-z_][A-Za-z0-9_]*))$/);
-    const variableName =
-      variable == null
-        ? undefined
-        : word.startsWith('${')
-          ? word.slice(2, -1)
-          : word.slice(1);
+    let variableName: string | undefined;
+    if (variable != null) {
+      variableName = word.startsWith('${')
+        ? word.slice(2, -1)
+        : word.slice(1);
+    }
     const resolvedWord =
       variableName == null ? word : (assignments.get(variableName) ?? word);
     commands.add(resolvedWord);
+    pendingAssignments.clear();
+    commandPrefix = undefined;
     expectsCommand = false;
   }
 
   flushEval();
   if (pendingCoprocWord != null) {
     commands.add(pendingCoprocWord);
+  }
+  for (const [name, value] of pendingAssignments) {
+    assignments.set(name, value);
   }
 }
 
@@ -909,6 +934,14 @@ function findBashHeredocDeclarations(
     }
     if (char === '\'' || char === '"') {
       quote = char;
+      continue;
+    }
+    if (line.slice(index, index + 3) === '$((') {
+      const arithmeticEnd = findBashArithmeticExpansionEnd(line, index + 3);
+      if (arithmeticEnd == null) {
+        break;
+      }
+      index = arithmeticEnd;
       continue;
     }
     if (char === '#' && (index === 0 || /\s/.test(line[index - 1]))) {

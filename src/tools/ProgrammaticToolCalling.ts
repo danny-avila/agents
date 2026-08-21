@@ -330,11 +330,16 @@ export function extractUsedToolNames(
       }
       if (
         executableCode[prefix] !== '.' &&
-        isPythonCallableInvocation(
+        (isPythonCallableInvocation(
           executableCode,
           match.index,
           match.index + pythonName.length
-        )
+        ) ||
+          isPythonCallableValueReference(
+            executableCode,
+            match.index,
+            match.index + pythonName.length
+          ))
       ) {
         usedTools.add(originalName);
         break;
@@ -343,6 +348,20 @@ export function extractUsedToolNames(
   }
 
   return usedTools;
+}
+
+function isPythonCallableValueReference(
+  code: string,
+  nameStart: number,
+  nameEnd: number
+): boolean {
+  const suffix = skipPythonCallWhitespace(code, nameEnd);
+  if (code[suffix] === '=' && code[suffix + 1] !== '=') {
+    return false;
+  }
+
+  const prefix = code.slice(0, nameStart).match(/([A-Za-z_][A-Za-z0-9_]*)\s*$/);
+  return !['as', 'class', 'def', 'import'].includes(prefix?.[1] ?? '');
 }
 
 function isPythonCallableInvocation(
