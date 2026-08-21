@@ -941,7 +941,7 @@ export function ensureResponsesOutputAnnotations(
       continue;
     }
     for (const part of item.content) {
-      if (part.type === 'output_text' && part.annotations == null) {
+      if (part.type === 'output_text' && !Array.isArray(part.annotations)) {
         part.annotations = [];
       }
     }
