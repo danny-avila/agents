@@ -325,7 +325,7 @@ function collectBashCommandNames(
 
 /** Minimal shell lexer for locating command positions without executing code. */
 function tokenizeBash(code: string): BashToken[] {
-  code = maskQuotedBashHeredocBodies(code);
+  code = maskBashHeredocBodies(code);
   const tokens: BashToken[] = [];
   let index = 0;
 
@@ -620,15 +620,15 @@ function findBashBacktickEnd(
   return undefined;
 }
 
-/** Masks quoted heredoc bodies, where shell expansion is disabled. */
-function maskQuotedBashHeredocBodies(code: string): string {
+/** Masks heredoc literals while preserving executable unquoted substitutions. */
+function maskBashHeredocBodies(code: string): string {
   const masked = [...code];
   let lineStart = 0;
 
   while (lineStart < code.length) {
     const lineEnd = code.indexOf('\n', lineStart);
     const contentEnd = lineEnd === -1 ? code.length : lineEnd;
-    const declaration = findQuotedBashHeredocDeclaration(
+    const declaration = findBashHeredocDeclaration(
       code.slice(lineStart, contentEnd)
     );
     if (declaration == null || lineEnd === -1) {
@@ -636,32 +636,71 @@ function maskQuotedBashHeredocBodies(code: string): string {
       continue;
     }
 
-    let bodyStart = lineEnd + 1;
-    while (bodyStart <= code.length) {
-      const bodyLineEnd = code.indexOf('\n', bodyStart);
+    const bodyStart = lineEnd + 1;
+    let bodyLineStart = bodyStart;
+    let delimiterStart = code.length;
+    let afterDelimiter = code.length;
+    while (bodyLineStart <= code.length) {
+      const bodyLineEnd = code.indexOf('\n', bodyLineStart);
       const bodyContentEnd =
         bodyLineEnd === -1 ? code.length : bodyLineEnd;
-      const bodyLine = code.slice(bodyStart, bodyContentEnd);
+      const bodyLine = code.slice(bodyLineStart, bodyContentEnd);
       const comparableLine = declaration.stripTabs
         ? bodyLine.replace(/^\t+/, '')
         : bodyLine;
-      for (let index = bodyStart; index < bodyContentEnd; index++) {
-        masked[index] = ' ';
-      }
-      bodyStart = bodyLineEnd === -1 ? code.length + 1 : bodyLineEnd + 1;
       if (comparableLine === declaration.delimiter) {
+        delimiterStart = bodyLineStart;
+        afterDelimiter = bodyLineEnd === -1 ? code.length : bodyLineEnd + 1;
         break;
       }
+      bodyLineStart = bodyLineEnd === -1 ? code.length + 1 : bodyLineEnd + 1;
     }
-    lineStart = bodyStart;
+
+    for (let index = bodyStart; index < afterDelimiter; index++) {
+      if (masked[index] !== '\n' && masked[index] !== '\r') {
+        masked[index] = ' ';
+      }
+    }
+    if (!declaration.quoted) {
+      restoreBashHeredocSubstitutions(
+        code,
+        masked,
+        bodyStart,
+        delimiterStart
+      );
+    }
+    lineStart = afterDelimiter;
   }
 
   return masked.join('');
 }
 
-function findQuotedBashHeredocDeclaration(
+function restoreBashHeredocSubstitutions(
+  code: string,
+  masked: string[],
+  bodyStart: number,
+  bodyEnd: number
+): void {
+  for (let index = bodyStart; index < bodyEnd; index++) {
+    let substitutionEnd: number | undefined;
+    if (code.slice(index, index + 2) === '$(') {
+      substitutionEnd = findBashCommandSubstitutionEnd(code, index + 2);
+    } else if (code[index] === '`') {
+      substitutionEnd = findBashBacktickEnd(code, index + 1);
+    }
+    if (substitutionEnd == null || substitutionEnd >= bodyEnd) {
+      continue;
+    }
+    for (let restore = index; restore <= substitutionEnd; restore++) {
+      masked[restore] = code[restore];
+    }
+    index = substitutionEnd;
+  }
+}
+
+function findBashHeredocDeclaration(
   line: string
-): { delimiter: string; stripTabs: boolean } | undefined {
+): { delimiter: string; stripTabs: boolean; quoted: boolean } | undefined {
   let quote: '\'' | '"' | undefined;
 
   for (let index = 0; index < line.length; index++) {
@@ -694,14 +733,29 @@ function findQuotedBashHeredocDeclaration(
       targetStart += 1;
     }
     const delimiterQuote = line[targetStart];
-    if (delimiterQuote !== '\'' && delimiterQuote !== '"') {
-      continue;
-    }
-    const targetEnd = line.indexOf(delimiterQuote, targetStart + 1);
-    if (targetEnd !== -1) {
+    if (delimiterQuote === '\'' || delimiterQuote === '"') {
+      const targetEnd = line.indexOf(delimiterQuote, targetStart + 1);
+      if (targetEnd === -1) {
+        continue;
+      }
       return {
         delimiter: line.slice(targetStart + 1, targetEnd),
         stripTabs,
+        quoted: true,
+      };
+    }
+    let targetEnd = targetStart;
+    while (
+      targetEnd < line.length &&
+      !/[ \t;&|()<>]/.test(line[targetEnd])
+    ) {
+      targetEnd += 1;
+    }
+    if (targetEnd > targetStart) {
+      return {
+        delimiter: line.slice(targetStart, targetEnd),
+        stripTabs,
+        quoted: false,
       };
     }
   }

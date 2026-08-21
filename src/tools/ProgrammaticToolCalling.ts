@@ -321,14 +321,21 @@ export function extractUsedToolNames(
 
   for (const [pythonName, originalName] of toolNameMap) {
     const escapedName = pythonName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp(`\\b${escapedName}\\s*\\(`, 'g');
+    const pattern = new RegExp(`\\b${escapedName}\\b`, 'g');
 
     for (const match of executableCode.matchAll(pattern)) {
       let prefix = match.index - 1;
       while (prefix >= 0 && /\s/.test(executableCode[prefix])) {
         prefix -= 1;
       }
-      if (executableCode[prefix] !== '.') {
+      if (
+        executableCode[prefix] !== '.' &&
+        isPythonCallableInvocation(
+          executableCode,
+          match.index,
+          match.index + pythonName.length
+        )
+      ) {
         usedTools.add(originalName);
         break;
       }
@@ -336,6 +343,35 @@ export function extractUsedToolNames(
   }
 
   return usedTools;
+}
+
+function isPythonCallableInvocation(
+  code: string,
+  nameStart: number,
+  nameEnd: number
+): boolean {
+  let suffix = nameEnd;
+  while (/\s/.test(code[suffix] ?? '')) {
+    suffix += 1;
+  }
+  if (code[suffix] === '(') {
+    return true;
+  }
+
+  let prefix = nameStart - 1;
+  while (/\s/.test(code[prefix] ?? '')) {
+    prefix -= 1;
+  }
+  if (code[prefix] !== ')' && code[prefix] !== '(') {
+    return false;
+  }
+  while (code[suffix] === ')') {
+    suffix += 1;
+    while (/\s/.test(code[suffix] ?? '')) {
+      suffix += 1;
+    }
+  }
+  return code[suffix] === '(';
 }
 
 /**

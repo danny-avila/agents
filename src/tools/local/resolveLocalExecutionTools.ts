@@ -273,7 +273,13 @@ export function resolveLocalToolRegistry(args: {
       registry.delete(definition.name);
       continue;
     }
-    registry.set(definition.name, definition);
+    const existingDefinition = registry.get(definition.name);
+    registry.set(
+      definition.name,
+      existingDefinition == null
+        ? definition
+        : { ...definition, ...existingDefinition }
+    );
   }
   return registry;
 }

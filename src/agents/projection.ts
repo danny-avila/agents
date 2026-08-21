@@ -13,6 +13,8 @@ export interface ProjectAgentContextUsageParams {
   indexTokenCountMap?: Record<string, number>;
   /** Provider-calibrated ratio from a prior snapshot, applied as a static seed. */
   calibrationRatio?: number;
+  /** Execution backend used to synthesize the live effective tool registry. */
+  toolExecution?: t.ToolExecutionConfig;
   runId?: string;
   agentId?: string;
 }
@@ -32,10 +34,16 @@ export async function projectAgentContextUsage({
   tokenCounter,
   indexTokenCountMap,
   calibrationRatio,
+  toolExecution,
   runId,
   agentId,
 }: ProjectAgentContextUsageParams): Promise<t.ContextUsageEvent | null> {
-  const context = AgentContext.fromConfig(agent, tokenCounter, indexTokenCountMap);
+  const context = AgentContext.fromConfig(
+    agent,
+    tokenCounter,
+    indexTokenCountMap,
+    toolExecution
+  );
   await context.tokenCalculationPromise;
   return context.projectContextUsage(messages, {
     runId,

@@ -31,6 +31,10 @@ import {
   _resetLocalEngineWarningsForTests,
 } from '../local/LocalExecutionEngine';
 import {
+  resolveLocalToolRegistry,
+  resolveLocalToolsForBinding,
+} from '../local/resolveLocalExecutionTools';
+import {
   createLocalCodingToolBundle,
   _resetRipgrepCacheForTests,
 } from '../local/LocalCodingTools';
@@ -39,7 +43,6 @@ import {
   _resetSyntaxCheckProbeCacheForTests,
 } from '../local/syntaxCheck';
 import { createLocalProgrammaticToolCallingTool } from '../local/LocalProgrammaticToolCalling';
-import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
 import { LocalFileCheckpointerImpl } from '../local/FileCheckpointer';
 import { WorkspaceClientTimeoutError } from '../local/workspaceFS';
 import { createCompileCheckTool } from '../local/CompileCheckTool';
@@ -163,6 +166,20 @@ describe('local execution tools', () => {
         'list_directory',
       ])
     );
+  });
+
+  it('preserves host caller restrictions for synthesized coding tools', () => {
+    const registry = resolveLocalToolRegistry({
+      toolRegistry: new Map([
+        [
+          'write_file',
+          { name: 'write_file', allowed_callers: ['direct'] },
+        ],
+      ]),
+      toolExecution: { engine: 'local' },
+    });
+
+    expect(registry?.get('write_file')?.allowed_callers).toEqual(['direct']);
   });
 
   it('updates existing code tool bindings when auto-binding is disabled', () => {

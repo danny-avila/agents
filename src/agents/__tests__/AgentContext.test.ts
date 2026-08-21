@@ -1067,6 +1067,53 @@ describe('AgentContext', () => {
       expect(content).toContain('`host_code_tool`');
     });
 
+    it('describes the Bash default for an auto-bound code runner', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry: new Map([
+            [
+              'host_code_tool',
+              {
+                name: 'host_code_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+        toolExecution: {
+          engine: 'local',
+          local: { includeCodingTools: false },
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain('Bash code by default');
+      expect(content).toContain('`lang: "py"`');
+    });
+
+    it('emits direct-only guidance when the allowlist is empty', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry: new Map([
+            [
+              'direct_tool',
+              { name: 'direct_tool', allowed_callers: ['direct'] },
+            ],
+          ]),
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: none.'
+      );
+      expect(content).toContain('`direct_tool`');
+    });
+
     it('excludes deferred code_execution-only tools until discovered', () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [

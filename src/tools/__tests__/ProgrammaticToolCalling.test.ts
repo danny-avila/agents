@@ -819,6 +819,14 @@ print(example)`;
       expect(extractUsedToolNames(code, availableTools)).toEqual(new Set());
     });
 
+    it('finds parenthesized callable tool expressions', () => {
+      const code = 'await get_weather(); await (search_docs)()';
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(
+        new Set(['get_weather', 'search_docs'])
+      );
+    });
+
     it('preserves executable calls inside f-string expressions', () => {
       const code = `await get_weather(city="SF")
 value = f"result: {await search_docs(query='forecast')}"`;
@@ -996,6 +1004,15 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
     it('ignores tool-like commands in quoted heredoc bodies', () => {
       const used = extractUsedBashToolNames(
         'cat <<\'EOF\'\nget_weather \'{}\'\nEOF\nsearch_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['search_docs']));
+    });
+
+    it('masks unquoted heredoc literals but preserves command substitutions', () => {
+      const used = extractUsedBashToolNames(
+        'cat <<EOF\nget_weather \'{}\'\n$(search_docs \'{}\')\nEOF',
         availableTools
       );
 

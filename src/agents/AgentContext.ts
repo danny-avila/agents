@@ -509,13 +509,12 @@ export class AgentContext {
       }
     }
 
-    if (programmaticToolNames.length === 0) return '';
-
     const programmaticTool = this.getProgrammaticToolInstructionTarget();
     if (programmaticTool == null) return '';
-    const quotedProgrammaticNames = programmaticToolNames
-      .map((name) => `\`${name}\``)
-      .join(', ');
+    const quotedProgrammaticNames =
+      programmaticToolNames.length > 0
+        ? programmaticToolNames.map((name) => `\`${name}\``).join(', ')
+        : 'none';
     const directOnlyBoundary =
       directOnlyToolNames.length > 0
         ? `\nCall these tools directly; never reference them inside \`${programmaticTool.name}\`: ${directOnlyToolNames
@@ -548,14 +547,14 @@ export class AgentContext {
       boundary +
       '\n\n### Programmatic-Only Tools\n\n' +
       `The following tools are available exclusively through the \`${programmaticTool.name}\` tool. ` +
-      `You cannot call these tools directly; instead, use \`${programmaticTool.name}\` with ${programmaticTool.language} code that invokes them.\n\n` +
+      `You cannot call these tools directly; instead, use \`${programmaticTool.name}\` with ${programmaticTool.codeGuidance} that invokes them.\n\n` +
       toolDescriptions
     );
   }
 
   private getProgrammaticToolInstructionTarget(): {
     name: string;
-    language: 'bash' | 'Python';
+    codeGuidance: string;
   } | undefined {
     if (
       this.hasAvailableTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING) ||
@@ -566,7 +565,7 @@ export class AgentContext {
     ) {
       return {
         name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
-        language: 'bash',
+        codeGuidance: 'Bash code',
       };
     }
 
@@ -577,7 +576,15 @@ export class AgentContext {
         this.toolExecution
       )
     ) {
-      return { name: Constants.PROGRAMMATIC_TOOL_CALLING, language: 'Python' };
+      const localDefault =
+        this.toolExecution?.engine === 'local' ||
+        this.toolExecution?.engine === 'cloudflare-sandbox';
+      return {
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        codeGuidance: localDefault
+          ? 'Bash code by default, or set `lang: "py"` to use Python code'
+          : 'Python code',
+      };
     }
 
     return undefined;
