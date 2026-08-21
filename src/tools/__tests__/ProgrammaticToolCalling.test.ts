@@ -827,6 +827,14 @@ print(example)`;
       );
     });
 
+    it('finds calls after explicit line continuations', () => {
+      const code = 'await get_weather(); await search_docs\\\n()';
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(
+        new Set(['get_weather', 'search_docs'])
+      );
+    });
+
     it('preserves executable calls inside f-string expressions', () => {
       const code = `await get_weather(city="SF")
 value = f"result: {await search_docs(query='forecast')}"`;
@@ -1017,6 +1025,33 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       );
 
       expect(used).toEqual(new Set(['search_docs']));
+    });
+
+    it('leaves escaped unquoted-heredoc substitutions masked', () => {
+      const used = extractUsedBashToolNames(
+        'cat <<EOF\n\\$(get_weather \'{}\')\n$(search_docs \'{}\')\nEOF',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['search_docs']));
+    });
+
+    it('finds commands launched by coproc', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; coproc search_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('treats combined output redirects as redirects, not separators', () => {
+      const used = extractUsedBashToolNames(
+        'printf \'%s\' data &>/tmp/out get_weather',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set());
     });
   });
 

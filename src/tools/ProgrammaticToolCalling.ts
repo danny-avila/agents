@@ -350,10 +350,7 @@ function isPythonCallableInvocation(
   nameStart: number,
   nameEnd: number
 ): boolean {
-  let suffix = nameEnd;
-  while (/\s/.test(code[suffix] ?? '')) {
-    suffix += 1;
-  }
+  let suffix = skipPythonCallWhitespace(code, nameEnd);
   if (code[suffix] === '(') {
     return true;
   }
@@ -366,12 +363,33 @@ function isPythonCallableInvocation(
     return false;
   }
   while (code[suffix] === ')') {
-    suffix += 1;
-    while (/\s/.test(code[suffix] ?? '')) {
-      suffix += 1;
-    }
+    suffix = skipPythonCallWhitespace(code, suffix + 1);
   }
   return code[suffix] === '(';
+}
+
+function skipPythonCallWhitespace(code: string, start: number): number {
+  let index = start;
+  while (index < code.length) {
+    if (/\s/.test(code[index])) {
+      index += 1;
+      continue;
+    }
+    if (code[index] === '\\' && code[index + 1] === '\n') {
+      index += 2;
+      continue;
+    }
+    if (
+      code[index] === '\\' &&
+      code[index + 1] === '\r' &&
+      code[index + 2] === '\n'
+    ) {
+      index += 3;
+      continue;
+    }
+    break;
+  }
+  return index;
 }
 
 /**

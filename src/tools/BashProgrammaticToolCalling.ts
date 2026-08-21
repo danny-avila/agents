@@ -239,6 +239,7 @@ export function extractUsedBashToolNames(
 const COMMAND_PREFIXES = new Set([
   'builtin',
   'command',
+  'coproc',
   'env',
   'exec',
   'nohup',
@@ -333,6 +334,11 @@ function tokenizeBash(code: string): BashToken[] {
     const char = code[index];
     if (char === ' ' || char === '\t' || char === '\r') {
       index += 1;
+      continue;
+    }
+    if (code.slice(index, index + 2) === '&>') {
+      tokens.push({ type: 'redirect' });
+      index += code[index + 2] === '>' ? 3 : 2;
       continue;
     }
     if (char === '\n' || char === ';' || char === '|' || char === '&') {
@@ -682,6 +688,9 @@ function restoreBashHeredocSubstitutions(
   bodyEnd: number
 ): void {
   for (let index = bodyStart; index < bodyEnd; index++) {
+    if (isBashCharacterEscaped(code, index, bodyStart)) {
+      continue;
+    }
     let substitutionEnd: number | undefined;
     if (code.slice(index, index + 2) === '$(') {
       substitutionEnd = findBashCommandSubstitutionEnd(code, index + 2);
@@ -696,6 +705,21 @@ function restoreBashHeredocSubstitutions(
     }
     index = substitutionEnd;
   }
+}
+
+function isBashCharacterEscaped(
+  code: string,
+  index: number,
+  lowerBound: number
+): boolean {
+  let backslashes = 0;
+  for (let cursor = index - 1; cursor >= lowerBound; cursor--) {
+    if (code[cursor] !== '\\') {
+      break;
+    }
+    backslashes += 1;
+  }
+  return backslashes % 2 === 1;
 }
 
 function findBashHeredocDeclaration(
