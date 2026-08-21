@@ -279,6 +279,17 @@ function collectBashCommandNames(
 ): void {
   let expectsCommand = true;
   let skipRedirectTarget = false;
+  let expectsFunctionName = false;
+  let expectsCoprocWord = false;
+  let pendingCoprocWord: string | undefined;
+  let evalWords: string[] | undefined;
+
+  const flushEval = (): void => {
+    if (evalWords != null && evalWords.length > 0) {
+      collectBashCommandNames(tokenizeBash(evalWords.join(' ')), commands);
+    }
+    evalWords = undefined;
+  };
 
   for (const token of tokens) {
     if (token.type === 'nested') {
@@ -289,6 +300,12 @@ function collectBashCommandNames(
       continue;
     }
     if (token.type === 'separator') {
+      flushEval();
+      if (pendingCoprocWord != null) {
+        commands.add(pendingCoprocWord);
+        pendingCoprocWord = undefined;
+      }
+      expectsCoprocWord = false;
       expectsCommand = true;
       skipRedirectTarget = false;
       continue;
@@ -301,11 +318,35 @@ function collectBashCommandNames(
       skipRedirectTarget = false;
       continue;
     }
+    if (evalWords != null) {
+      evalWords.push(token.value);
+      continue;
+    }
+    if (expectsCoprocWord) {
+      pendingCoprocWord = token.value;
+      expectsCoprocWord = false;
+      continue;
+    }
+    if (pendingCoprocWord != null) {
+      if (token.value === '{') {
+        pendingCoprocWord = undefined;
+        expectsCommand = true;
+      } else {
+        commands.add(pendingCoprocWord);
+        pendingCoprocWord = undefined;
+        expectsCommand = false;
+      }
+      continue;
+    }
     if (!expectsCommand) {
       continue;
     }
 
     const word = token.value;
+    if (expectsFunctionName) {
+      expectsFunctionName = false;
+      continue;
+    }
     if (/^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(word)) {
       continue;
     }
@@ -315,12 +356,30 @@ function collectBashCommandNames(
     if (COMMAND_START_WORDS.has(word) || word === '!' || word === '{') {
       continue;
     }
+    if (word === 'function') {
+      expectsFunctionName = true;
+      continue;
+    }
+    if (word === 'coproc') {
+      expectsCoprocWord = true;
+      continue;
+    }
+    if (word === 'eval') {
+      evalWords = [];
+      expectsCommand = false;
+      continue;
+    }
     if (COMMAND_PREFIXES.has(word)) {
       continue;
     }
 
     commands.add(word);
     expectsCommand = false;
+  }
+
+  flushEval();
+  if (pendingCoprocWord != null) {
+    commands.add(pendingCoprocWord);
   }
 }
 
@@ -396,6 +455,22 @@ function tokenizeBash(code: string): BashToken[] {
       continue;
     }
     if (char === '(') {
+      const previousToken = tokens.at(-1);
+      if (
+        previousToken?.type === 'word' &&
+        /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(previousToken.value)
+      ) {
+        const arrayEnd = findBashArrayLiteralEnd(code, index + 1);
+        if (arrayEnd == null) {
+          index = code.length;
+        } else {
+          tokens.push(
+            ...tokenizeBashSubstitutions(code, index + 1, arrayEnd)
+          );
+          index = arrayEnd + 1;
+        }
+        continue;
+      }
       tokens.push({ type: 'separator' });
       index += 1;
       continue;
@@ -626,6 +701,58 @@ function findBashBacktickEnd(
   return undefined;
 }
 
+/** Finds the close parenthesis for a Bash array assignment literal. */
+function findBashArrayLiteralEnd(
+  code: string,
+  bodyStart: number
+): number | undefined {
+  let depth = 0;
+  let quote: '\'' | '"' | undefined;
+
+  for (let index = bodyStart; index < code.length; index++) {
+    const char = code[index];
+    if (char === '\\') {
+      index += 1;
+      continue;
+    }
+    if (quote != null) {
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === '\'' || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (code.slice(index, index + 3) === '$((') {
+      const arithmeticEnd = findBashArithmeticExpansionEnd(code, index + 3);
+      if (arithmeticEnd == null) return undefined;
+      index = arithmeticEnd;
+      continue;
+    }
+    if (code.slice(index, index + 2) === '$(') {
+      const substitutionEnd = findBashCommandSubstitutionEnd(code, index + 2);
+      if (substitutionEnd == null) return undefined;
+      index = substitutionEnd;
+      continue;
+    }
+    if (char === '`') {
+      const backtickEnd = findBashBacktickEnd(code, index + 1);
+      if (backtickEnd == null) return undefined;
+      index = backtickEnd;
+      continue;
+    }
+    if (char === '(') {
+      depth += 1;
+    } else if (char === ')' && depth > 0) {
+      depth -= 1;
+    } else if (char === ')') {
+      return index;
+    }
+  }
+
+  return undefined;
+}
+
 /** Masks heredoc literals while preserving executable unquoted substitutions. */
 function maskBashHeredocBodies(code: string): string {
   const masked = [...code];
@@ -749,6 +876,10 @@ function findBashHeredocDeclaration(
     if (line.slice(index, index + 2) !== '<<') {
       continue;
     }
+    if (line.slice(index, index + 3) === '<<<') {
+      index += 2;
+      continue;
+    }
 
     let targetStart = index + 2;
     const stripTabs = line[targetStart] === '-';
@@ -818,8 +949,15 @@ function tokenizeBashArithmeticSubstitutions(
   bodyStart: number,
   arithmeticEnd: number
 ): BashToken[] {
+  return tokenizeBashSubstitutions(code, bodyStart, arithmeticEnd - 1);
+}
+
+function tokenizeBashSubstitutions(
+  code: string,
+  bodyStart: number,
+  bodyEnd: number
+): BashToken[] {
   const tokens: BashToken[] = [];
-  const bodyEnd = arithmeticEnd - 1;
   let quote: '\'' | '"' | undefined;
 
   for (let index = bodyStart; index < bodyEnd; index++) {
@@ -851,7 +989,7 @@ function tokenizeBashArithmeticSubstitutions(
         code,
         index + 3
       );
-      if (nestedArithmeticEnd == null || nestedArithmeticEnd > arithmeticEnd) {
+      if (nestedArithmeticEnd == null || nestedArithmeticEnd > bodyEnd) {
         break;
       }
       tokens.push(
@@ -864,12 +1002,24 @@ function tokenizeBashArithmeticSubstitutions(
       index = nestedArithmeticEnd;
       continue;
     }
+    if (code[index] === '`') {
+      const backtickEnd = findBashBacktickEnd(code, index + 1);
+      if (backtickEnd == null || backtickEnd >= bodyEnd) {
+        break;
+      }
+      tokens.push({
+        type: 'nested',
+        tokens: tokenizeBash(code.slice(index + 1, backtickEnd)),
+      });
+      index = backtickEnd;
+      continue;
+    }
     if (code.slice(index, index + 2) !== '$(') {
       continue;
     }
 
     const nestedEnd = findBashCommandSubstitutionEnd(code, index + 2);
-    if (nestedEnd == null || nestedEnd >= arithmeticEnd) {
+    if (nestedEnd == null || nestedEnd >= bodyEnd) {
       break;
     }
     tokens.push({

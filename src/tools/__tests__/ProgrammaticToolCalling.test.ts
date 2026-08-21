@@ -1053,6 +1053,60 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
 
       expect(used).toEqual(new Set());
     });
+
+    it('does not treat here-strings as heredoc declarations', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; cat <<< payload\nsearch_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('does not treat Bash array values as commands', () => {
+      const used = extractUsedBashToolNames(
+        'values=(get_weather); search_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['search_docs']));
+    });
+
+    it('preserves command substitutions inside Bash array values', () => {
+      const used = extractUsedBashToolNames(
+        'values=($(get_weather \'{}\')); search_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('finds tools in one-line function declarations', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; function wrapper { search_docs \'{}\'; }; wrapper',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('finds tools in literal eval input', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; eval "search_docs \'{}\'"',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('finds tools in named compound coprocesses', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; coproc WORKER { search_docs \'{}\'; }',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
   });
 
   describe('caller-policy normalization collisions', () => {
