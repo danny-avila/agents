@@ -1,6 +1,7 @@
 // src/messages/handoffCue.ts
 import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
+import { stampSyntheticProviderMessage } from './provenance';
 
 /**
  * Bracketed-meta convention, like the handoff path's
@@ -48,10 +49,12 @@ export function appendPredecessorHandoffCue(
   }
   return [
     ...messages,
-    new HumanMessage({
-      content: PREDECESSOR_HANDOFF_CUE,
-      additional_kwargs: { role: 'user', isMeta: true, source: 'handoff' },
-    }),
+    stampSyntheticProviderMessage(
+      new HumanMessage({
+        content: PREDECESSOR_HANDOFF_CUE,
+        additional_kwargs: { role: 'user', isMeta: true, source: 'handoff' },
+      })
+    ),
   ];
 }
 

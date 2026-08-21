@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { tool } from '@langchain/core/tools';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { HumanMessage, getBufferString } from '@langchain/core/messages';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
@@ -6,6 +8,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
+import { getProviderMessageProvenance } from '@/messages/provenance';
 import { MultiAgentGraph } from '../MultiAgentGraph';
 import { Constants, Providers } from '@/common';
 import { FakeChatModel } from '@/llm/fake';
@@ -92,6 +95,45 @@ class GatedMessageCountChatModel extends FakeChatModel {
     const output = `response-${this.responseIndex++}`;
     yield this._createResponseChunk(output);
     void runManager?.handleLLMNewToken(output);
+  }
+}
+
+class HandoffBridgeChatModel extends FakeChatModel {
+  readonly invocations: BaseMessage[][] = [];
+  private invocationIndex = 0;
+
+  constructor() {
+    super({ responses: ['unused'] });
+  }
+
+  override async *_streamResponseChunks(
+    messages: BaseMessage[],
+    _options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    this.invocations.push(messages);
+    const invocationIndex = this.invocationIndex++;
+    if (invocationIndex < 2) {
+      const call =
+        invocationIndex === 0
+          ? { id: 'lookup_1', name: 'lookup', args: '{}' }
+          : {
+            id: 'transfer_1',
+            name: `${Constants.LC_TRANSFER_TO_}B`,
+            args: JSON.stringify({ instructions: 'Take over.' }),
+          };
+      yield this._createResponseChunk('', [
+        {
+          ...call,
+          index: 0,
+          type: 'tool_call_chunk',
+        },
+      ]);
+      void runManager?.handleLLMNewToken('');
+      return;
+    }
+    yield this._createResponseChunk('handoff complete');
+    void runManager?.handleLLMNewToken('handoff complete');
   }
 }
 
@@ -321,6 +363,13 @@ describe('LangGraph composition smoke tests', () => {
     const previousPromptCount =
       downstreamPrompt.match(/Human: Previous context:/g)?.length ?? 0;
     expect(previousPromptCount).toBe(1);
+    const routingPrompt = model.invocations[2].find(
+      (message) => message.additional_kwargs.source === 'routing'
+    );
+    expect(routingPrompt).toBeDefined();
+    expect(getProviderMessageProvenance(routingPrompt!)?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
   });
 
   it('compiles and invokes a handoff edge using graph-managed transfer tools', async () => {
@@ -348,6 +397,61 @@ describe('LangGraph composition smoke tests', () => {
     );
 
     expect(getAiContents(result.messages)).toContain('handoff complete');
+  });
+
+  it('marks handoff routing prompts and tool-tail assistant bridges as synthetic', async () => {
+    const lookup = tool(async () => 'lookup result', {
+      name: 'lookup',
+      description: 'lookup',
+      schema: z.object({}),
+    });
+    const model = new HandoffBridgeChatModel();
+    const graph = new MultiAgentGraph({
+      runId: 'handoff-provenance-smoke',
+      agents: [
+        { ...makeAgent('A'), graphTools: [lookup] },
+        makeAgent('B'),
+      ],
+      edges: [
+        {
+          from: 'A',
+          to: 'B',
+          edgeType: 'handoff',
+          prompt: 'Provide transfer instructions.',
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('handoff-provenance-smoke')
+      );
+
+    const recipientMessages = model.invocations.find((messages) =>
+      messages.some(
+        (message) => message.additional_kwargs.source === 'routing'
+      )
+    );
+    const routingPrompt = recipientMessages?.find(
+      (message) => message.additional_kwargs.source === 'routing'
+    );
+    const bridge = recipientMessages?.find(
+      (message) =>
+        message.getType() === 'ai' &&
+        String(message.content).startsWith('[Processed tool result')
+    );
+
+    expect(routingPrompt).toBeDefined();
+    expect(bridge).toBeDefined();
+    expect(getProviderMessageProvenance(routingPrompt!)?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
+    expect(getProviderMessageProvenance(bridge!)?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
   });
 
   it('compiles fan-out/fan-in direct composition with prompt wrapping', () => {
