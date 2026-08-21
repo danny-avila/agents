@@ -58,6 +58,25 @@ function shouldIncludeCodingTools(config?: t.ToolExecutionConfig): boolean {
   );
 }
 
+export function isProgrammaticRunnerAutoBound(
+  name: string,
+  config?: t.ToolExecutionConfig
+): boolean {
+  if (
+    !shouldIncludeCodingTools(config) ||
+    (name !== Constants.PROGRAMMATIC_TOOL_CALLING &&
+      name !== Constants.BASH_PROGRAMMATIC_TOOL_CALLING)
+  ) {
+    return false;
+  }
+  if (shouldUseCloudflareSandboxExecution(config)) {
+    return getSelectedCloudflareCodingToolNames(
+      getCloudflareConfig(config)
+    ).has(name);
+  }
+  return shouldUseLocalExecution(config);
+}
+
 function getCloudflareConfig(
   config?: t.ToolExecutionConfig
 ): t.CloudflareSandboxExecutionConfig {

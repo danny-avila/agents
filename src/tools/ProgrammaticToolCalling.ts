@@ -362,12 +362,42 @@ function maskPythonStringsAndComments(code: string): string {
 
     const triple = code.slice(index, index + 3) === quote.repeat(3);
     const delimiterLength = triple ? 3 : 1;
+    const isFString = hasPythonFStringPrefix(code, index);
     for (let offset = 0; offset < delimiterLength; offset++) {
       mask(index + offset);
     }
     index += delimiterLength;
 
     while (index < code.length) {
+      if (isFString && code[index] === '{') {
+        if (code[index + 1] === '{') {
+          mask(index++);
+          mask(index++);
+          continue;
+        }
+        const expressionEnd = findPythonFStringExpressionEnd(code, index + 1);
+        if (expressionEnd != null) {
+          mask(index);
+          const expression = maskPythonStringsAndComments(
+            code.slice(index + 1, expressionEnd)
+          );
+          for (let offset = 0; offset < expression.length; offset++) {
+            masked[index + 1 + offset] = expression[offset];
+          }
+          mask(expressionEnd);
+          index = expressionEnd + 1;
+          continue;
+        }
+      }
+      if (
+        isFString &&
+        code[index] === '}' &&
+        code[index + 1] === '}'
+      ) {
+        mask(index++);
+        mask(index++);
+        continue;
+      }
       if (code[index] === '\\') {
         mask(index++);
         if (index < code.length) {
@@ -391,6 +421,77 @@ function maskPythonStringsAndComments(code: string): string {
   }
 
   return masked.join('');
+}
+
+function hasPythonFStringPrefix(code: string, quoteIndex: number): boolean {
+  let prefixStart = quoteIndex;
+  while (prefixStart > 0 && /[A-Za-z]/.test(code[prefixStart - 1])) {
+    prefixStart -= 1;
+  }
+  if (
+    prefixStart > 0 &&
+    /[A-Za-z0-9_]/.test(code[prefixStart - 1])
+  ) {
+    return false;
+  }
+  const prefix = code.slice(prefixStart, quoteIndex);
+  return /^[rRuUbBfF]*[fF][rRuUbBfF]*$/.test(prefix);
+}
+
+/** Finds the matching brace for an executable Python f-string expression. */
+function findPythonFStringExpressionEnd(
+  code: string,
+  expressionStart: number
+): number | undefined {
+  let depth = 1;
+  let quote: '\'' | '"' | undefined;
+  let triple = false;
+
+  for (let index = expressionStart; index < code.length; index++) {
+    const char = code[index];
+    if (quote != null) {
+      if (char === '\\') {
+        index += 1;
+        continue;
+      }
+      if (
+        triple
+          ? code.slice(index, index + 3) === quote.repeat(3)
+          : char === quote
+      ) {
+        index += triple ? 2 : 0;
+        quote = undefined;
+        triple = false;
+      }
+      continue;
+    }
+    if (char === '#') {
+      while (index < code.length && code[index] !== '\n') {
+        index += 1;
+      }
+      continue;
+    }
+    if (char === '\'' || char === '"') {
+      quote = char;
+      triple = code.slice(index, index + 3) === char.repeat(3);
+      if (triple) {
+        index += 2;
+      }
+      continue;
+    }
+    if (char === '{') {
+      depth += 1;
+      continue;
+    }
+    if (char === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+
+  return undefined;
 }
 
 /** Throws a caller-policy error for tools referenced by programmatic code. */

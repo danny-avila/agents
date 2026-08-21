@@ -32,7 +32,10 @@ import {
   Constants,
   Providers,
 } from '@/common';
-import { resolveLocalToolRegistry } from '@/tools/local/resolveLocalExecutionTools';
+import {
+  isProgrammaticRunnerAutoBound,
+  resolveLocalToolRegistry,
+} from '@/tools/local/resolveLocalExecutionTools';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
@@ -272,6 +275,8 @@ export class AgentContext {
    * Used for tool search and programmatic tool calling.
    */
   toolRegistry?: t.LCToolRegistry;
+  /** Run-scoped backend used to identify auto-bound programmatic runners. */
+  private toolExecution?: t.ToolExecutionConfig;
   /**
    * Serializable tool definitions for event-driven execution.
    * When provided, ToolNode operates in event-driven mode.
@@ -443,6 +448,7 @@ export class AgentContext {
       toolRegistry,
       toolExecution,
     });
+    this.toolExecution = toolExecution;
     this.toolDefinitions = toolDefinitions;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
@@ -551,14 +557,26 @@ export class AgentContext {
     name: string;
     language: 'bash' | 'Python';
   } | undefined {
-    if (this.hasAvailableTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING)) {
+    if (
+      this.hasAvailableTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING) ||
+      isProgrammaticRunnerAutoBound(
+        Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+        this.toolExecution
+      )
+    ) {
       return {
         name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
         language: 'bash',
       };
     }
 
-    if (this.hasAvailableTool(Constants.PROGRAMMATIC_TOOL_CALLING)) {
+    if (
+      this.hasAvailableTool(Constants.PROGRAMMATIC_TOOL_CALLING) ||
+      isProgrammaticRunnerAutoBound(
+        Constants.PROGRAMMATIC_TOOL_CALLING,
+        this.toolExecution
+      )
+    ) {
       return { name: Constants.PROGRAMMATIC_TOOL_CALLING, language: 'Python' };
     }
 

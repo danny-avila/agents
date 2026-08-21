@@ -811,6 +811,15 @@ print(example)`;
       expect(extractUsedToolNames(code, availableTools)).toEqual(new Set());
     });
 
+    it('preserves executable calls inside f-string expressions', () => {
+      const code = `await get_weather(city="SF")
+value = f"result: {await search_docs(query='forecast')}"`;
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(
+        new Set(['get_weather', 'search_docs'])
+      );
+    });
+
     it('handles tool names with special characters via normalization', () => {
       const specialTools = createToolMap(['get_data.v2', 'calc+plus']);
       const code = `await get_datav2()
@@ -850,6 +859,15 @@ print(result)`;
         `weather=$(get_weather '{}')
 search_docs '{"query":"forecast"}'
 printf '%s' "$(get_weather '{}')"`,
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('tokenizes commands and arguments inside quoted substitutions', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; value="$(search_docs \'{"query":"forecast"}\')"',
         availableTools
       );
 

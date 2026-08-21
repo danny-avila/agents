@@ -359,7 +359,6 @@ function tokenizeBash(code: string): BashToken[] {
       }
       if (current === '\'' || current === '"') {
         const quote = current;
-        let commandSubstitutionDepth = 0;
         index += 1;
         while (index < code.length && code[index] !== quote) {
           if (quote === '"' && code.slice(index, index + 2) === '$(') {
@@ -368,21 +367,14 @@ function tokenizeBash(code: string): BashToken[] {
               value = '';
             }
             tokens.push({ type: 'separator' });
-            commandSubstitutionDepth += 1;
-            index += 2;
-            continue;
-          }
-          if (
-            quote === '"' &&
-            commandSubstitutionDepth > 0 &&
-            code[index] === ')'
-          ) {
-            if (value !== '') {
-              tokens.push({ type: 'word', value });
-              value = '';
+            const bodyStart = index + 2;
+            const bodyEnd = findBashCommandSubstitutionEnd(code, bodyStart);
+            if (bodyEnd == null) {
+              index = bodyStart;
+            } else {
+              tokens.push(...tokenizeBash(code.slice(bodyStart, bodyEnd)));
+              index = bodyEnd + 1;
             }
-            commandSubstitutionDepth -= 1;
-            index += 1;
             continue;
           }
           if (
@@ -410,6 +402,56 @@ function tokenizeBash(code: string): BashToken[] {
   }
 
   return tokens;
+}
+
+/** Finds the matching close parenthesis for a `$(` command substitution. */
+function findBashCommandSubstitutionEnd(
+  code: string,
+  bodyStart: number
+): number | undefined {
+  let depth = 1;
+  let quote: '\'' | '"' | undefined;
+
+  for (let index = bodyStart; index < code.length; index++) {
+    const char = code[index];
+    if (char === '\\') {
+      index += 1;
+      continue;
+    }
+    if (quote != null) {
+      if (char === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (char === '\'' || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (char === '#') {
+      while (index < code.length && code[index] !== '\n') {
+        index += 1;
+      }
+      continue;
+    }
+    if (code.slice(index, index + 2) === '$(') {
+      depth += 1;
+      index += 1;
+      continue;
+    }
+    if (char === '(') {
+      depth += 1;
+      continue;
+    }
+    if (char === ')') {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+
+  return undefined;
 }
 
 /** Rejects direct-only tools before any bash sandbox request is made. */

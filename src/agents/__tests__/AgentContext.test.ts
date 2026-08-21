@@ -1013,7 +1013,6 @@ describe('AgentContext', () => {
       const ctx = createBasicContext({
         agentConfig: {
           instructions: 'Base',
-          toolDefinitions: [{ name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING }],
           toolRegistry: new Map([
             [
               'host_code_tool',
@@ -1043,6 +1042,29 @@ describe('AgentContext', () => {
       const content = String(result[0].content);
       expect(content).toContain('`read_file`');
       expect(content).not.toContain('`host_code_tool`');
+    });
+
+    it('recognizes auto-bound local programmatic runners', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolRegistry: new Map([
+            [
+              'host_code_tool',
+              {
+                name: 'host_code_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+        toolExecution: { engine: 'local' },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = String(result[0].content);
+      expect(content).toContain('inside `run_tools_with_bash`');
+      expect(content).toContain('`host_code_tool`');
     });
 
     it('excludes deferred code_execution-only tools until discovered', () => {
