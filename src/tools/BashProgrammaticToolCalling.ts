@@ -22,6 +22,7 @@ import {
   makeRequest,
   executeTools,
   formatCompletedResponse,
+  assertDisallowedToolUsage,
 } from './ProgrammaticToolCalling';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
@@ -236,6 +237,27 @@ export function extractUsedBashToolNames(
   return usedTools;
 }
 
+/** Rejects direct-only tools before any bash sandbox request is made. */
+export function assertBashToolsAllowProgrammaticCalling(
+  toolDefs: t.LCTool[] | undefined,
+  code: string,
+  programmaticToolName: string = Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+): void {
+  if (toolDefs == null || toolDefs.length === 0) {
+    return;
+  }
+
+  const toolNameMap = new Map<string, string>();
+  for (const toolDef of toolDefs) {
+    toolNameMap.set(normalizeToBashIdentifier(toolDef.name), toolDef.name);
+  }
+
+  assertDisallowedToolUsage(
+    extractUsedBashToolNames(code, toolNameMap),
+    programmaticToolName
+  );
+}
+
 /**
  * Filters tool definitions to only include tools actually used in the bash code.
  */
@@ -315,10 +337,19 @@ export function createBashProgrammaticToolCallingTool(
       const {
         toolMap,
         toolDefs,
+        disallowedToolDefs,
         session_id,
         _injected_files,
         _runtime_session_hint,
       } = toolCall;
+
+      assertBashToolsAllowProgrammaticCalling(
+        disallowedToolDefs,
+        code,
+        typeof toolCall.name === 'string' && toolCall.name !== ''
+          ? toolCall.name
+          : Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+      );
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(

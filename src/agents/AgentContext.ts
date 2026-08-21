@@ -461,37 +461,61 @@ export class AgentContext {
     }
   }
 
-  /**
-   * Builds instructions text for tools that are ONLY callable via programmatic code execution.
-   * These tools cannot be called directly by the LLM but are available through the
-   * configured programmatic tool.
-   *
-   * Includes:
-   * - Code_execution-only tools that are NOT deferred
-   * - Code_execution-only tools that ARE deferred but have been discovered via tool search
-   */
+  /** Builds the caller boundary and schemas for programmatic-only tools. */
   private buildProgrammaticOnlyToolsInstructions(): string {
     if (!this.toolRegistry) return '';
 
     const programmaticOnlyTools: t.LCTool[] = [];
+    const programmaticToolNames: string[] = [];
+    const directOnlyToolNames: string[] = [];
     for (const [name, toolDef] of this.toolRegistry) {
       const allowedCallers = toolDef.allowed_callers ?? ['direct'];
-      const isCodeExecutionOnly =
-        allowedCallers.includes('code_execution') &&
-        !allowedCallers.includes('direct');
-
-      if (!isCodeExecutionOnly) continue;
-
       const isDeferred = toolDef.defer_loading === true;
       const isDiscovered = this.discoveredToolNames.has(name);
-      if (!isDeferred || isDiscovered) {
+      if (isDeferred && !isDiscovered) {
+        continue;
+      }
+
+      const allowsProgrammatic = allowedCallers.includes('code_execution');
+      const allowsDirect = allowedCallers.includes('direct');
+      if (allowsProgrammatic) {
+        programmaticToolNames.push(name);
+      }
+      if (allowsProgrammatic && !allowsDirect) {
         programmaticOnlyTools.push(toolDef);
+      }
+      if (
+        allowsDirect &&
+        !allowsProgrammatic &&
+        name !== Constants.PROGRAMMATIC_TOOL_CALLING &&
+        name !== Constants.BASH_PROGRAMMATIC_TOOL_CALLING &&
+        name !== Constants.TOOL_SEARCH
+      ) {
+        directOnlyToolNames.push(name);
       }
     }
 
-    if (programmaticOnlyTools.length === 0) return '';
+    if (programmaticToolNames.length === 0) return '';
 
     const programmaticTool = this.getProgrammaticToolInstructionTarget();
+    const quotedProgrammaticNames = programmaticToolNames
+      .map((name) => `\`${name}\``)
+      .join(', ');
+    const directOnlyBoundary =
+      directOnlyToolNames.length > 0
+        ? `\nCall these tools directly; never reference them inside \`${programmaticTool.name}\`: ${directOnlyToolNames
+          .map((name) => `\`${name}\``)
+          .join(', ')}.`
+        : '';
+    const boundary =
+      '\n\n## Programmatic Tool Calling\n\n' +
+      `Only these tools may be invoked inside \`${programmaticTool.name}\`: ${quotedProgrammaticNames}.` +
+      directOnlyBoundary;
+
+    if (programmaticOnlyTools.length === 0) {
+      return boundary;
+    }
+
     const toolDescriptions = programmaticOnlyTools
       .map((tool) => {
         let desc = `- **${tool.name}**`;
@@ -506,7 +530,8 @@ export class AgentContext {
       .join('\n\n');
 
     return (
-      '\n\n## Programmatic-Only Tools\n\n' +
+      boundary +
+      '\n\n### Programmatic-Only Tools\n\n' +
       `The following tools are available exclusively through the \`${programmaticTool.name}\` tool. ` +
       `You cannot call these tools directly; instead, use \`${programmaticTool.name}\` with ${programmaticTool.language} code that invokes them.\n\n` +
       toolDescriptions

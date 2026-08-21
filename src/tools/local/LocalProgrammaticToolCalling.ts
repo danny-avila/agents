@@ -7,6 +7,7 @@ import type { AddressInfo } from 'net';
 import type * as t from '@/types';
 import {
   executeTools,
+  assertPythonToolsAllowProgrammaticCalling,
   filterToolsByUsage,
   formatCompletedResponse,
   normalizeToPythonIdentifier,
@@ -18,6 +19,7 @@ import {
   BashProgrammaticToolCallingSchema,
   BashProgrammaticToolCallingDescription,
   filterBashToolsByUsage,
+  assertBashToolsAllowProgrammaticCalling,
   normalizeToBashIdentifier,
 } from '@/tools/BashProgrammaticToolCalling';
 import {
@@ -578,9 +580,22 @@ async function runLocalProgrammaticTool(args: {
   localConfig: t.LocalExecutionConfig;
   runtime: LocalProgrammaticRuntime;
 }): Promise<[string, t.ProgrammaticExecutionArtifact]> {
-  const { toolMap, toolDefs, hookContext } = getProgrammaticContext(
-    args.config
-  );
+  const { toolMap, toolDefs, disallowedToolDefs, hookContext } =
+    getProgrammaticContext(args.config);
+
+  if (args.runtime === 'bash') {
+    assertBashToolsAllowProgrammaticCalling(
+      disallowedToolDefs,
+      args.params.code,
+      Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+    );
+  } else {
+    assertPythonToolsAllowProgrammaticCalling(
+      disallowedToolDefs,
+      args.params.code,
+      Constants.PROGRAMMATIC_TOOL_CALLING
+    );
+  }
 
   if (toolMap == null || toolMap.size === 0) {
     throw new Error('No toolMap provided for local programmatic execution.');

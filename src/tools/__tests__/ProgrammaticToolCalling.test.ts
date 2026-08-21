@@ -4,6 +4,7 @@
  * Tests manual invocation with mock tools and Code API responses.
  */
 import { describe, it, expect, jest, beforeEach } from '@jest/globals';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
   createProgrammaticToolCallingTool,
@@ -23,6 +24,7 @@ import {
   createCalculatorTool,
 } from '@/test/mockTools';
 import {
+  createBashProgrammaticToolCallingTool,
   createBashProgrammaticToolCallingSchema,
   normalizeBashToolResultsForReplay,
 } from '../BashProgrammaticToolCalling';
@@ -1131,6 +1133,56 @@ for member in team:
     beforeEach(() => {
       const tools = [createGetWeatherTool()];
       toolMap = new Map(tools.map((t) => [t.name, t]));
+    });
+
+    it('rejects a direct-only Python tool before requiring sandbox context', async () => {
+      const tool = createProgrammaticToolCallingTool();
+      const toolCall = {
+        id: 'ptc-python',
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        args: {},
+        type: 'tool_call' as const,
+        disallowedToolDefs: [
+          {
+            name: 'direct-only-tool',
+            allowed_callers: ['direct'],
+          },
+        ],
+      } satisfies ToolCall & Partial<t.ProgrammaticCache>;
+
+      await expect(
+        tool.invoke(
+          { code: 'await direct_only_tool(query="test")' },
+          { toolCall }
+        )
+      ).rejects.toThrow(
+        'Tool "direct-only-tool" cannot be called from "run_tools_with_code" because the tool is not marked for code_execution'
+      );
+    });
+
+    it('rejects a direct-only bash tool before requiring sandbox context', async () => {
+      const tool = createBashProgrammaticToolCallingTool();
+      const toolCall = {
+        id: 'ptc-bash',
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        args: {},
+        type: 'tool_call' as const,
+        disallowedToolDefs: [
+          {
+            name: 'direct-only-tool',
+            allowed_callers: ['direct'],
+          },
+        ],
+      } satisfies ToolCall & Partial<t.ProgrammaticCache>;
+
+      await expect(
+        tool.invoke(
+          { code: 'direct_only_tool \'{"query":"test"}\'' },
+          { toolCall }
+        )
+      ).rejects.toThrow(
+        'Tool "direct-only-tool" cannot be called from "run_tools_with_code" because the tool is not marked for code_execution'
+      );
     });
 
     it('returns error for invalid city without throwing', async () => {

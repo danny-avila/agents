@@ -5,6 +5,7 @@ import type * as t from '@/types';
 /* eslint-disable no-useless-escape -- generated sandbox helper source needs escapes for emitted JS/Python string literals. */
 import {
   formatCompletedResponse,
+  assertPythonToolsAllowProgrammaticCalling,
   normalizeToPythonIdentifier,
   ProgrammaticToolCallingDescription,
   ProgrammaticToolCallingName,
@@ -15,6 +16,7 @@ import {
   BashProgrammaticToolCallingDescription,
   BashProgrammaticToolCallingSchema,
   filterBashToolsByUsage,
+  assertBashToolsAllowProgrammaticCalling,
   normalizeToBashIdentifier,
 } from '@/tools/BashProgrammaticToolCalling';
 import { Constants } from '@/common';
@@ -1062,6 +1064,19 @@ async function runProgrammatic(args: {
 }): Promise<[string, t.ProgrammaticExecutionArtifact]> {
   const toolCall = (args.config?.toolCall ??
     {}) as Partial<t.ProgrammaticCache>;
+  if (args.runtime === 'bash') {
+    assertBashToolsAllowProgrammaticCalling(
+      toolCall.disallowedToolDefs,
+      args.params.code,
+      Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+    );
+  } else {
+    assertPythonToolsAllowProgrammaticCalling(
+      toolCall.disallowedToolDefs,
+      args.params.code,
+      Constants.PROGRAMMATIC_TOOL_CALLING
+    );
+  }
   const toolDefs = toolCall.toolDefs ?? [];
   const effectiveTools = filterNativeTools(
     toolDefs,

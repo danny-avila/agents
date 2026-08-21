@@ -1172,6 +1172,12 @@ export type ProgrammaticCache = {
   toolMap: ToolMap;
   toolDefs: LCTool[];
   /**
+   * Known tools that cannot be invoked from programmatic execution. This is
+   * kept separate from `toolDefs` so the sandbox never receives their schemas,
+   * while the runner can still reject invalid code before starting a sandbox.
+   */
+  disallowedToolDefs?: LCTool[];
+  /**
    * Hook context plumbed through by ToolNode for the local
    * programmatic-tool path so the in-process bridge can run
    * `PreToolUse` hooks (deny / updatedInput) for inner tool calls.

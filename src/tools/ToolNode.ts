@@ -1101,25 +1101,27 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * Returns cached programmatic tools, computing once on first access.
    * Single iteration builds both toolMap and toolDefs simultaneously.
    */
-  private getProgrammaticTools(): { toolMap: t.ToolMap; toolDefs: t.LCTool[] } {
+  private getProgrammaticTools(): t.ProgrammaticCache {
     if (this.programmaticCache) return this.programmaticCache;
 
     const toolMap: t.ToolMap = new Map();
     const toolDefs: t.LCTool[] = [];
+    const disallowedToolDefs: t.LCTool[] = [];
 
     if (this.toolRegistry) {
       for (const [name, toolDef] of this.toolRegistry) {
-        if (
-          (toolDef.allowed_callers ?? ['direct']).includes('code_execution')
-        ) {
+        const allowedCallers = toolDef.allowed_callers ?? ['direct'];
+        if (allowedCallers.includes('code_execution')) {
           toolDefs.push(toolDef);
           const tool = this.toolMap.get(name);
           if (tool) toolMap.set(name, tool);
+        } else {
+          disallowedToolDefs.push({ name });
         }
       }
     }
 
-    this.programmaticCache = { toolMap, toolDefs };
+    this.programmaticCache = { toolMap, toolDefs, disallowedToolDefs };
     return this.programmaticCache;
   }
 
@@ -1331,11 +1333,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
         call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING
       ) {
-        const { toolMap, toolDefs } = this.getProgrammaticTools();
+        const { toolMap, toolDefs, disallowedToolDefs } =
+          this.getProgrammaticTools();
         invokeParams = {
           ...invokeParams,
           toolMap,
           toolDefs,
+          disallowedToolDefs,
           // Plumb the hook context into the programmatic-tool path so
           // inner tool calls made via the in-process bridge can run
           // through `PreToolUse` (deny / updatedInput) before reaching

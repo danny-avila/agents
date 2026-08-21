@@ -935,7 +935,7 @@ describe('AgentContext', () => {
       expect(result[0].content).not.toContain('run_tools_with_bash');
     });
 
-    it('excludes direct-callable tools from programmatic section', () => {
+    it('makes mixed direct and programmatic caller boundaries explicit', async () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [
           'direct_tool',
@@ -953,13 +953,33 @@ describe('AgentContext', () => {
             allowed_callers: ['direct', 'code_execution'],
           },
         ],
+        [
+          'programmatic_only_tool',
+          {
+            name: 'programmatic_only_tool',
+            description: 'Programmatic only',
+            allowed_callers: ['code_execution'],
+          },
+        ],
       ]);
 
       const ctx = createBasicContext({
-        agentConfig: { instructions: 'Base', toolRegistry },
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry,
+        },
       });
 
-      expect(ctx.systemRunnable).toBeDefined();
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = String(result[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_bash`: `both_tool`, `programmatic_only_tool`.'
+      );
+      expect(content).toContain(
+        'Call these tools directly; never reference them inside `run_tools_with_bash`: `direct_tool`.'
+      );
+      expect(content).toContain('### Programmatic-Only Tools');
     });
 
     it('excludes deferred code_execution-only tools until discovered', () => {

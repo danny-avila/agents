@@ -330,6 +330,46 @@ export function extractUsedToolNames(
   return usedTools;
 }
 
+/** Throws a caller-policy error for tools referenced by programmatic code. */
+export function assertDisallowedToolUsage(
+  disallowedNames: ReadonlySet<string>,
+  programmaticToolName: string
+): void {
+  if (disallowedNames.size === 0) {
+    return;
+  }
+
+  const names = [...disallowedNames];
+  throw new Error(
+    `Tool${names.length === 1 ? '' : 's'} ${names
+      .map((name) => `"${name}"`)
+      .join(', ')} cannot be called from "${programmaticToolName}" because ` +
+      `the${names.length === 1 ? ' tool is' : 'se tools are'} not marked for code_execution. ` +
+      `Call ${names.length === 1 ? 'it' : 'them'} directly instead.`
+  );
+}
+
+/** Rejects direct-only tools before any Python sandbox request is made. */
+export function assertPythonToolsAllowProgrammaticCalling(
+  toolDefs: t.LCTool[] | undefined,
+  code: string,
+  programmaticToolName: string = Constants.PROGRAMMATIC_TOOL_CALLING
+): void {
+  if (toolDefs == null || toolDefs.length === 0) {
+    return;
+  }
+
+  const toolNameMap = new Map<string, string>();
+  for (const toolDef of toolDefs) {
+    toolNameMap.set(normalizeToPythonIdentifier(toolDef.name), toolDef.name);
+  }
+
+  assertDisallowedToolUsage(
+    extractUsedToolNames(code, toolNameMap),
+    programmaticToolName
+  );
+}
+
 /**
  * Filters tool definitions to only include tools actually used in the code.
  * Handles the hyphen-to-underscore conversion for Python compatibility.
@@ -907,10 +947,19 @@ export function createProgrammaticToolCallingTool(
       const {
         toolMap,
         toolDefs,
+        disallowedToolDefs,
         session_id,
         _injected_files,
         _runtime_session_hint,
       } = toolCall;
+
+      assertPythonToolsAllowProgrammaticCalling(
+        disallowedToolDefs,
+        code,
+        typeof toolCall.name === 'string' && toolCall.name !== ''
+          ? toolCall.name
+          : Constants.PROGRAMMATIC_TOOL_CALLING
+      );
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(
