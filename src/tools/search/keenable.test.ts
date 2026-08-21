@@ -12,13 +12,14 @@ const sampleResponse = {
       {
         title: 'TypeScript Best Practices 2026',
         url: 'https://example.com/ts',
-        description: 'A comprehensive guide to TypeScript.',
+        description: '',
+        snippet: 'A comprehensive guide\n\nto TypeScript.',
         published_at: '2026-01-15T10:30:00Z',
       },
       {
         title: 'Second result',
         url: 'https://example.com/second',
-        snippet: 'Snippet fallback when description is absent.',
+        description: 'Description fallback when snippet is absent.',
       },
     ],
   },
@@ -78,7 +79,7 @@ describe('Keenable search API', () => {
     );
   });
 
-  it('maps results into organic sources (description and snippet fallback)', async () => {
+  it('maps results into organic sources, reading page text from snippet', async () => {
     mockedAxios.post.mockResolvedValueOnce(sampleResponse);
 
     const searchAPI = createSearchAPI({ searchProvider: 'keenable' });
@@ -94,10 +95,52 @@ describe('Keenable search API', () => {
       {
         title: 'Second result',
         link: 'https://example.com/second',
-        snippet: 'Snippet fallback when description is absent.',
+        snippet: 'Description fallback when snippet is absent.',
         date: undefined,
       },
     ]);
+  });
+
+  it('falls back to the description when the snippet is present but empty', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        results: [
+          {
+            title: 'Empty snippet',
+            url: 'https://example.com/empty',
+            description: 'The meta description carries the text here.',
+            snippet: '',
+          },
+        ],
+      },
+    });
+
+    const searchAPI = createSearchAPI({ searchProvider: 'keenable' });
+    const result = await searchAPI.getSources({ query: 'typescript' });
+
+    expect(result.data?.organic?.[0].snippet).toBe(
+      'The meta description carries the text here.'
+    );
+  });
+
+  it('caps the page text Keenable returns on every result', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        results: [
+          {
+            title: 'Long page',
+            url: 'https://example.com/long',
+            description: '',
+            snippet: 'word '.repeat(400),
+          },
+        ],
+      },
+    });
+
+    const searchAPI = createSearchAPI({ searchProvider: 'keenable' });
+    const result = await searchAPI.getSources({ query: 'typescript' });
+
+    expect(result.data?.organic?.[0].snippet).toHaveLength(500);
   });
 
   it('applies the site filter and limits results client-side', async () => {
