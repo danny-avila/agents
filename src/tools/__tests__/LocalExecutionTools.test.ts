@@ -44,6 +44,7 @@ import {
 } from '../local/syntaxCheck';
 import { createLocalProgrammaticToolCallingTool } from '../local/LocalProgrammaticToolCalling';
 import { LocalFileCheckpointerImpl } from '../local/FileCheckpointer';
+import { getProviderMessageProvenance } from '@/messages/provenance';
 import { WorkspaceClientTimeoutError } from '../local/workspaceFS';
 import { createCompileCheckTool } from '../local/CompileCheckTool';
 import { runBashAstChecks } from '../local/bashAst';
@@ -2504,6 +2505,9 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
           m.content.includes('SEND-CTX')
       );
       expect(found).toBeDefined();
+      expect(getProviderMessageProvenance(found!)?.parts).toEqual([
+        { attribution: 'synthetic' },
+      ]);
     });
   });
 
@@ -2613,6 +2617,9 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
         role: 'system',
         source: 'hook',
       });
+      expect(getProviderMessageProvenance(human!)?.parts).toEqual([
+        { attribution: 'synthetic' },
+      ]);
     });
   });
 

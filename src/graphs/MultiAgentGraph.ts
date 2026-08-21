@@ -17,8 +17,17 @@ import {
 import type { BaseMessage, AIMessageChunk } from '@langchain/core/messages';
 import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type { ToolRuntime } from '@langchain/core/tools';
+import type { ProviderMessageProvenancePart } from '@/messages/provenance';
 import type { GraphFactoryDependencies } from '@/graphs/graphFactory';
 import type * as t from '@/types';
+import {
+  hasBijectiveProviderContentPartMapping,
+  inspectProviderMessageProvenance,
+  inspectProviderSourceMessageIds,
+  setInvalidProviderMessageProvenance,
+  setProviderMessageProvenance,
+  stampSyntheticProviderMessage,
+} from '@/messages/provenance';
 import { serializeToolContentBounded } from '@/utils/toolContent';
 import { Constants, MULTI_AGENT_GRAPH_RUN_NAME } from '@/common';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
@@ -36,10 +45,12 @@ const HANDOFF_INSTRUCTIONS_KEY = 'handoff_instructions';
  * message replayed out of the payload.
  */
 function buildRoutingPrompt(content: string): HumanMessage {
-  return new HumanMessage({
-    content,
-    additional_kwargs: { role: 'user', isMeta: true, source: 'routing' },
-  });
+  return stampSyntheticProviderMessage(
+    new HumanMessage({
+      content,
+      additional_kwargs: { role: 'user', isMeta: true, source: 'routing' },
+    })
+  );
 }
 
 function getHandoffInstructions(
@@ -102,23 +113,137 @@ function isTransferToolName(name: unknown): boolean {
 function filterTransferToolUseBlocks(
   content: AIMessage['content'],
   transferToolCallIds: ReadonlySet<string>
-): AIMessage['content'] {
+): {
+  content: AIMessage['content'];
+  retainedContentPartIndices?: readonly number[];
+} {
   if (!Array.isArray(content)) {
-    return content;
+    return { content };
   }
-  return content.filter((block) => {
+  const filteredContent: typeof content = [];
+  const retainedContentPartIndices: number[] = [];
+  for (let index = 0; index < content.length; index++) {
+    const block = content[index];
     if (
-      typeof block !== 'object' ||
-      (block as { type?: string } | null)?.type !== 'tool_use'
+      typeof block === 'object' &&
+      (block as { type?: string } | null)?.type === 'tool_use'
     ) {
-      return true;
+      const toolUse = block as { id?: string; name?: string };
+      if (
+        (toolUse.id != null && transferToolCallIds.has(toolUse.id)) ||
+        isTransferToolName(toolUse.name)
+      ) {
+        continue;
+      }
     }
-    const toolUse = block as { id?: string; name?: string };
-    if (toolUse.id != null && transferToolCallIds.has(toolUse.id)) {
-      return false;
+    filteredContent.push(block);
+    retainedContentPartIndices.push(index);
+  }
+  return { content: filteredContent, retainedContentPartIndices };
+}
+
+/** Rebuild a handoff AI message without losing authorship for retained bytes. */
+function copyFilteredAIMessageProvenance(
+  source: AIMessage | AIMessageChunk,
+  target: AIMessage,
+  retainedContentPartIndices?: readonly number[]
+): AIMessage {
+  const sourceMessageIdsState = inspectProviderSourceMessageIds(source);
+  const provenanceState = inspectProviderMessageProvenance(source);
+  if (
+    provenanceState.status === 'invalid' ||
+    sourceMessageIdsState.status === 'invalid'
+  ) {
+    setInvalidProviderMessageProvenance(target);
+    return target;
+  }
+  const sourceMessageIds =
+    sourceMessageIdsState.status === 'valid'
+      ? sourceMessageIdsState.sourceMessageIds
+      : [];
+  if (provenanceState.status === 'absent') {
+    if (sourceMessageIds.length > 0) {
+      setProviderMessageProvenance(
+        target,
+        sourceMessageIds.map((sourceMessageId) => ({
+          attribution: 'model',
+          sourceMessageId,
+        }))
+      );
     }
-    return !isTransferToolName(toolUse.name);
-  });
+    return target;
+  }
+  const provenance = provenanceState.provenance;
+  const typedSourceMessageIds = new Set<string>();
+  for (const part of provenance.parts) {
+    if (part.sourceMessageId != null) {
+      typedSourceMessageIds.add(part.sourceMessageId);
+    }
+  }
+  const legacyParts: ProviderMessageProvenancePart[] = [];
+  for (const sourceMessageId of sourceMessageIds) {
+    if (!typedSourceMessageIds.has(sourceMessageId)) {
+      legacyParts.push({ attribution: 'model', sourceMessageId });
+    }
+  }
+  const setFilteredProvenance = (
+    parts: readonly ProviderMessageProvenancePart[]
+  ): void => {
+    if (legacyParts.length === 0) {
+      setProviderMessageProvenance(target, parts);
+      return;
+    }
+    const combinedParts = parts.slice();
+    for (const part of legacyParts) {
+      combinedParts.push(part);
+    }
+    setProviderMessageProvenance(target, combinedParts);
+  };
+  if (
+    retainedContentPartIndices == null ||
+    !Array.isArray(source.content) ||
+    retainedContentPartIndices.length === source.content.length
+  ) {
+    setFilteredProvenance(provenance.parts);
+    return target;
+  }
+
+  if (
+    !hasBijectiveProviderContentPartMapping(
+      provenance.parts,
+      source.content.length
+    )
+  ) {
+    /** An older or aggregate envelope cannot be mapped to current blocks.
+     * Preserve its conservative attribution instead of dropping tool lineage. */
+    setFilteredProvenance(provenance.parts);
+    return target;
+  }
+
+  const retainedParts: ProviderMessageProvenancePart[] = [];
+  const retainedContentPartIndexSet = new Set(retainedContentPartIndices);
+  for (const part of provenance.parts) {
+    if (part.sourceContentPartIndices == null) {
+      retainedParts.push(part);
+      continue;
+    }
+    const retainedSourceContentPartIndices: number[] = [];
+    for (const sourceContentPartIndex of part.sourceContentPartIndices) {
+      if (retainedContentPartIndexSet.has(sourceContentPartIndex)) {
+        retainedSourceContentPartIndices.push(sourceContentPartIndex);
+      }
+    }
+    if (retainedSourceContentPartIndices.length > 0) {
+      retainedParts.push({
+        ...part,
+        sourceContentPartIndices: retainedSourceContentPartIndices,
+      });
+    }
+  }
+  setFilteredProvenance(
+    retainedParts.length > 0 ? retainedParts : [{ attribution: 'model' }]
+  );
+  return target;
 }
 
 function isValidHandoffGroupId(value: unknown): value is number {
@@ -502,15 +627,22 @@ export class MultiAgentGraph extends StandardGraph {
       const handoffTools: t.GenericTool[] = [];
       const sourceAgentName = agentContext.name ?? agentId;
       for (const edge of edges) {
-        handoffTools.push(
-          ...this.createHandoffToolsForEdge(edge, agentId, sourceAgentName)
+        const edgeTools = this.createHandoffToolsForEdge(
+          edge,
+          agentId,
+          sourceAgentName
         );
+        for (const edgeTool of edgeTools) {
+          handoffTools.push(edgeTool);
+        }
       }
 
       if (!agentContext.graphTools) {
         agentContext.graphTools = [];
       }
-      agentContext.graphTools.push(...handoffTools);
+      for (const handoffTool of handoffTools) {
+        agentContext.graphTools.push(handoffTool);
+      }
     }
   }
 
@@ -701,11 +833,14 @@ export class MultiAgentGraph extends StandardGraph {
                    * Multiple tool calls - create filtered AIMessage with ONLY this call.
                    * This ensures valid message structure for parallel handoffs.
                    */
-                  const filteredAiMsg = new AIMessage({
-                    content: originalAiMsg.content,
-                    tool_calls: [thisToolCall],
-                    id: originalAiMsg.id,
-                  });
+                  const filteredAiMsg = copyFilteredAIMessageProvenance(
+                    originalAiMsg,
+                    new AIMessage({
+                      content: originalAiMsg.content,
+                      tool_calls: [thisToolCall],
+                      id: originalAiMsg.id,
+                    })
+                  );
 
                   filteredMessages = [
                     ...messages.slice(0, aiMessageIndex),
@@ -981,14 +1116,19 @@ export class MultiAgentGraph extends StandardGraph {
                * result in THIS recipient's state, so its id is never
                * collected, but its name still marks it.
                */
-              const filteredAiMsg = new AIMessage({
-                content: filterTransferToolUseBlocks(
-                  aiMsg.content,
-                  transferToolCallIds
-                ),
-                tool_calls: remainingToolCalls,
-                id: aiMsg.id,
-              });
+              const filteredContent = filterTransferToolUseBlocks(
+                aiMsg.content,
+                transferToolCallIds
+              );
+              const filteredAiMsg = copyFilteredAIMessageProvenance(
+                aiMsg,
+                new AIMessage({
+                  content: filteredContent.content,
+                  tool_calls: remainingToolCalls,
+                  id: aiMsg.id,
+                }),
+                filteredContent.retainedContentPartIndices
+              );
               filteredMessages.push(filteredAiMsg);
             }
             /** If no remaining content or tool calls, skip this message entirely */
@@ -1157,8 +1297,10 @@ export class MultiAgentGraph extends StandardGraph {
             if (lastMsg != null && lastMsg.getType() === 'tool') {
               messagesForAgent = [
                 ...filteredMessages,
-                new AIMessage(
-                  `[Processed tool result and transferring to ${agentId}]`
+                stampSyntheticProviderMessage(
+                  new AIMessage(
+                    `[Processed tool result and transferring to ${agentId}]`
+                  )
                 ),
                 buildRoutingPrompt(instructions),
               ];

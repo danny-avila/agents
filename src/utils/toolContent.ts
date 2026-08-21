@@ -1818,7 +1818,7 @@ function classifyToolContentBlock(
     }
   }
   const remaining = { value: MAX_ATOMIC_VALIDATION_WORK };
-  let kind = TOOL_BLOCK_OPAQUE;
+  let kind: number;
   try {
     if (
       hasUnsafeCallableToJSON(
@@ -2701,7 +2701,7 @@ export function cloneToolMessageWithContent(
     status: message.status,
     artifact,
     metadata: message.metadata,
-    additional_kwargs: message.additional_kwargs,
+    additional_kwargs: { ...message.additional_kwargs },
     response_metadata: message.response_metadata,
   });
 }

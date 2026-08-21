@@ -34,7 +34,14 @@ describe('convertInjectedMessages', () => {
 
   it('carries isMeta, source and skillName only when set', () => {
     const [bare] = convertInjectedMessages([{ role: 'user', content: 'x' }]);
-    expect(bare.additional_kwargs).toEqual({ role: 'user', injected: true });
+    expect(bare.additional_kwargs).toEqual({
+      role: 'user',
+      injected: true,
+      provenance: {
+        version: 1,
+        parts: [{ attribution: 'synthetic' }],
+      },
+    });
 
     const [full] = convertInjectedMessages([
       {
@@ -51,6 +58,10 @@ describe('convertInjectedMessages', () => {
       isMeta: true,
       source: 'steer',
       skillName: 'writing',
+      provenance: {
+        version: 1,
+        parts: [{ attribution: 'user' }],
+      },
     });
   });
 

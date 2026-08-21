@@ -93,6 +93,7 @@ import {
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
+import { stampSyntheticProviderMessage } from '@/messages/provenance';
 import { initializeLangfuseTracing } from './instrumentation';
 import { seedRunInitialSessions } from '@/utils/toolSessions';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
@@ -701,10 +702,12 @@ export class Run<_T extends t.BaseGraphState> {
        * it into the agent's `instructions` config instead.
        */
       stateInputs.messages.push(
-        new HumanMessage({
-          content: preStreamContexts.join('\n\n'),
-          additional_kwargs: { role: 'system', source: 'hook' },
-        })
+        stampSyntheticProviderMessage(
+          new HumanMessage({
+            content: preStreamContexts.join('\n\n'),
+            additional_kwargs: { role: 'system', source: 'hook' },
+          })
+        )
       );
     }
 
