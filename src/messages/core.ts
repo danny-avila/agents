@@ -25,6 +25,7 @@ import {
 import {
   getProviderMessageProvenance,
   getProviderSourceMessageIds,
+  hasBijectiveProviderContentPartMapping,
   setProviderMessageProvenance,
   stampSyntheticProviderMessage,
 } from './provenance';
@@ -608,11 +609,10 @@ function retainProjectedContentPartProvenance(
   ) {
     return [...parts];
   }
-  const sourceIndexRefCount = parts.reduce(
-    (total, part) => total + (part.sourceContentPartIndices?.length ?? 0),
-    0
+  const mapsOneToOne = hasBijectiveProviderContentPartMapping(
+    parts,
+    message.content.length
   );
-  const mapsOneToOne = sourceIndexRefCount === message.content.length;
   const distinctSourceMessageIds = new Set<string>();
   for (const part of parts) {
     if (part.sourceMessageId != null) {
@@ -634,24 +634,40 @@ function retainProjectedContentPartProvenance(
     ];
   }
   const retained: ProviderMessageProvenancePart[] = [];
-  let sourceIndexOrdinal = 0;
+  const appendUnindexedAttribution = (
+    part: ProviderMessageProvenancePart
+  ): void => {
+    const sourceMessageId =
+      distinctSourceMessageIds.size <= 1 ? part.sourceMessageId : undefined;
+    if (retained.length > 0) {
+      const previous = retained[retained.length - 1];
+      if (
+        previous.attribution === part.attribution &&
+        previous.sourceMessageId === sourceMessageId &&
+        previous.sourceContentPartIndices == null
+      ) {
+        return;
+      }
+    }
+    retained.push({
+      attribution: part.attribution,
+      ...(sourceMessageId != null && { sourceMessageId }),
+    });
+  };
   for (const part of parts) {
     if (part.sourceContentPartIndices == null) {
-      if (distinctSourceMessageIds.size <= 1) {
-        retained.push(part);
-      }
+      appendUnindexedAttribution(part);
       continue;
     }
     if (!mapsOneToOne || retainedContentPartIndices == null) {
-      sourceIndexOrdinal += part.sourceContentPartIndices.length;
+      appendUnindexedAttribution(part);
       continue;
     }
     const sourceContentPartIndices: number[] = [];
     for (const sourceContentPartIndex of part.sourceContentPartIndices) {
-      if (retainedContentPartIndices.has(sourceIndexOrdinal)) {
+      if (retainedContentPartIndices.has(sourceContentPartIndex)) {
         sourceContentPartIndices.push(sourceContentPartIndex);
       }
-      sourceIndexOrdinal++;
     }
     if (sourceContentPartIndices.length > 0) {
       retained.push({ ...part, sourceContentPartIndices });

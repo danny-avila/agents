@@ -42,6 +42,7 @@ import {
   hasStructurallyValidAnthropicWebSearchResultContent,
 } from './toolResultTypes';
 import {
+  hasBijectiveProviderContentPartMapping,
   inspectProviderMessageProvenance,
   inspectProviderSourceMessageIds,
   setInvalidProviderMessageProvenance,
@@ -2790,15 +2791,12 @@ function getSyntheticProviderContextProvenanceParts(
     const contentLength = Array.isArray(sourceMessage.content)
       ? sourceMessage.content.length
       : undefined;
-    const explicitIndexRefCount = (explicit?.parts ?? []).reduce(
-      (total, part) => total + (part.sourceContentPartIndices?.length ?? 0),
-      0
-    );
     const mapsOneToOne =
       mappingAmbiguous !== true &&
       retainedContentPartIndices != null &&
       contentLength != null &&
-      explicitIndexRefCount === contentLength;
+      explicit != null &&
+      hasBijectiveProviderContentPartMapping(explicit.parts, contentLength);
     const retainedAllContentParts =
       mappingAmbiguous !== true &&
       retainedContentPartIndices != null &&
@@ -2808,11 +2806,9 @@ function getSyntheticProviderContextProvenanceParts(
       (mappingAmbiguous !== true && retainedContentPartIndices == null) ||
       retainedAllContentParts ||
       sourceMessageIds.length <= 1;
-    let sourceIndexOrdinal = 0;
     for (const part of explicit?.parts ?? []) {
       let sourceContentPartIndices = part.sourceContentPartIndices;
       if (mappingAmbiguous === true && sourceContentPartIndices != null) {
-        sourceIndexOrdinal += sourceContentPartIndices.length;
         sourceContentPartIndices = undefined;
       }
       if (
@@ -2821,23 +2817,19 @@ function getSyntheticProviderContextProvenanceParts(
         !retainedAllContentParts
       ) {
         if (!mapsOneToOne) {
-          sourceIndexOrdinal += sourceContentPartIndices.length;
           sourceContentPartIndices = undefined;
         } else {
           const retainedSourceContentPartIndices: number[] = [];
           for (const sourceContentPartIndex of sourceContentPartIndices) {
-            if (retainedContentPartIndices.has(sourceIndexOrdinal)) {
+            if (retainedContentPartIndices.has(sourceContentPartIndex)) {
               retainedSourceContentPartIndices.push(sourceContentPartIndex);
             }
-            sourceIndexOrdinal++;
           }
           if (retainedSourceContentPartIndices.length === 0) {
             continue;
           }
           sourceContentPartIndices = retainedSourceContentPartIndices;
         }
-      } else {
-        sourceIndexOrdinal += sourceContentPartIndices?.length ?? 0;
       }
       const sourceMessageId =
         sourceContentPartIndices != null || retainUnindexedSourceIds

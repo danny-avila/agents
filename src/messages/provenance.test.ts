@@ -4,6 +4,7 @@ import {
   appendProviderMessageProvenance,
   getProviderMessageProvenance,
   getProviderSourceMessageIds,
+  hasBijectiveProviderContentPartMapping,
   inspectProviderMessageProvenance,
   inspectProviderSourceMessageIds,
   PROVIDER_MESSAGE_PROVENANCE_LIMITS,
@@ -12,6 +13,57 @@ import {
 } from './provenance';
 
 describe('provider message provenance', () => {
+  it('requires unique in-range indices covering every current content part', () => {
+    expect(
+      hasBijectiveProviderContentPartMapping(
+        [
+          { attribution: 'model', sourceContentPartIndices: [0] },
+          { attribution: 'tool', sourceContentPartIndices: [1] },
+        ],
+        2
+      )
+    ).toBe(true);
+    expect(
+      hasBijectiveProviderContentPartMapping(
+        [
+          { attribution: 'model', sourceContentPartIndices: [1] },
+          { attribution: 'tool', sourceContentPartIndices: [0] },
+        ],
+        2
+      )
+    ).toBe(true);
+    expect(
+      hasBijectiveProviderContentPartMapping(
+        [
+          { attribution: 'model', sourceContentPartIndices: [0] },
+          { attribution: 'user', sourceContentPartIndices: [0] },
+        ],
+        2
+      )
+    ).toBe(false);
+    expect(
+      hasBijectiveProviderContentPartMapping(
+        [
+          { attribution: 'model', sourceContentPartIndices: [0] },
+          { attribution: 'user', sourceContentPartIndices: [2] },
+        ],
+        2
+      )
+    ).toBe(false);
+    expect(
+      hasBijectiveProviderContentPartMapping(
+        [{ attribution: 'model', sourceContentPartIndices: [0, 2] }],
+        3
+      )
+    ).toBe(false);
+    expect(
+      hasBijectiveProviderContentPartMapping(
+        [{ attribution: 'model' }, { attribution: 'user' }],
+        2
+      )
+    ).toBe(false);
+  });
+
   it('synchronizes stable plural ids from ordered lineage', () => {
     const message = new HumanMessage({
       content: 'merged',

@@ -811,6 +811,82 @@ describe('foldToolBlocksForToollessAgent', () => {
     });
   });
 
+  test.each([
+    ['duplicate', [[0], [0]]],
+    ['gapped/out-of-range', [[0], [2]]],
+    ['reordered', [[1], [0]]],
+  ])(
+    'handles a %s folded content mapping without ordinal attribution loss',
+    (mappingKind, sourceContentPartIndices) => {
+      const messages = [
+        new HumanMessage('Run'),
+        new AIMessage({
+          content: [
+            {
+              type: 'tool_call',
+              tool_call: {
+                id: 'first',
+                name: 'query',
+                args: {},
+                output: 'x'.repeat(HARD_MAX_TOOL_RESULT_CHARS * 2),
+              },
+            },
+            {
+              type: 'tool_call',
+              tool_call: {
+                id: 'second',
+                name: 'query',
+                args: {},
+                output: 'OMITTED-SECOND-PART',
+              },
+            },
+          ],
+          additional_kwargs: {
+            sourceMessageId: 'source-row',
+            provenance: {
+              version: 1,
+              parts: [
+                {
+                  attribution: 'model',
+                  sourceMessageId: 'source-row',
+                  sourceContentPartIndices: sourceContentPartIndices[0],
+                },
+                {
+                  attribution: 'user',
+                  sourceMessageId: 'source-row',
+                  sourceContentPartIndices: sourceContentPartIndices[1],
+                },
+              ],
+            },
+          },
+        }),
+      ];
+
+      const result = foldToolBlocksForToollessAgent(messages);
+      const folded = result.find(isSyntheticProviderContextMessage)!;
+
+      expect(getTextContent(folded)).not.toContain('OMITTED-SECOND-PART');
+      expect(folded.additional_kwargs.provenance).toEqual({
+        version: 1,
+        parts:
+          mappingKind === 'reordered'
+            ? [
+              { attribution: 'synthetic' },
+              {
+                attribution: 'user',
+                sourceMessageId: 'source-row',
+                sourceContentPartIndices: [0],
+              },
+            ]
+            : [
+              { attribution: 'synthetic' },
+              { attribution: 'model', sourceMessageId: 'source-row' },
+              { attribution: 'user', sourceMessageId: 'source-row' },
+            ],
+      });
+    }
+  );
+
   test('drops indexed claims when parsed tool calls omit malformed raw entries', () => {
     const messages = [
       new HumanMessage('Run'),

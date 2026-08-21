@@ -230,6 +230,67 @@ describe('MultiAgentGraph.validateEdgeAgents', () => {
     expect(getProviderMessageProvenance(assistant)?.parts).toHaveLength(3);
   });
 
+  it.each([
+    ['duplicate', [[0], [0]], [0, 1]],
+    ['gapped/out-of-range', [[0], [2]], [0, 1]],
+    ['reordered', [[1], [0]], [1]],
+  ])(
+    'handles a %s handoff content mapping without ordinal attribution loss',
+    (_, sourceContentPartIndices, expectedPartIndices) => {
+      const graph = new MultiAgentGraph({
+        runId: 'ambiguous-handoff-provenance',
+        agents: [makeAgent('A'), makeAgent('B')],
+        edges: [{ from: 'A', to: 'B', edgeType: 'handoff' }],
+      });
+      const transferName = `${Constants.LC_TRANSFER_TO_}B`;
+      const assistant = new AIMessage({
+        content: [
+          { type: 'text', text: 'retained bytes' },
+          {
+            type: 'tool_use',
+            id: 'transfer-call',
+            name: transferName,
+            input: {},
+          },
+        ],
+        tool_calls: [
+          { id: 'lookup-call', name: 'lookup', args: {} },
+          { id: 'transfer-call', name: transferName, args: {} },
+        ],
+      });
+      const provenanceParts = [
+        {
+          attribution: 'model' as const,
+          sourceMessageId: 'source-row',
+          sourceContentPartIndices: sourceContentPartIndices[0],
+        },
+        {
+          attribution: 'user' as const,
+          sourceMessageId: 'source-row',
+          sourceContentPartIndices: sourceContentPartIndices[1],
+        },
+      ];
+      setProviderMessageProvenance(assistant, provenanceParts);
+      const transferResult = new ToolMessage({
+        content: 'Successfully transferred to B',
+        name: transferName,
+        tool_call_id: 'transfer-call',
+      });
+
+      const reception = (
+        graph as unknown as HandoffReception
+      ).processHandoffReception([assistant, transferResult], 'B');
+      const filteredAssistant = reception?.filteredMessages[0] as AIMessage;
+
+      expect(filteredAssistant.content).toEqual([
+        { type: 'text', text: 'retained bytes' },
+      ]);
+      expect(getProviderMessageProvenance(filteredAssistant)?.parts).toEqual(
+        expectedPartIndices.map((index) => provenanceParts[index])
+      );
+    }
+  );
+
   it.each(INVALID_PROVENANCE_CASES)(
     'preserves $label provenance invalidity while filtering handoff content',
     ({ create }) => {

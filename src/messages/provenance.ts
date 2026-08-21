@@ -643,6 +643,35 @@ export function inspectProviderSourceMessageIds(
   return { status: 'valid', sourceMessageIds };
 }
 
+/** True when indexed contributions uniquely cover every current content part. */
+export function hasBijectiveProviderContentPartMapping(
+  parts: readonly ProviderMessageProvenancePart[],
+  contentPartCount: number
+): boolean {
+  if (!Number.isSafeInteger(contentPartCount) || contentPartCount <= 0) {
+    return false;
+  }
+  const seen = new Set<number>();
+  for (const part of parts) {
+    const indices = part.sourceContentPartIndices;
+    if (indices == null) {
+      return false;
+    }
+    for (const index of indices) {
+      if (
+        !Number.isSafeInteger(index) ||
+        index < 0 ||
+        index >= contentPartCount ||
+        seen.has(index)
+      ) {
+        return false;
+      }
+      seen.add(index);
+    }
+  }
+  return seen.size === contentPartCount;
+}
+
 /**
  * Returns every explicit persisted source id in stable content order.
  * Typed parts, plural lineage, and the legacy singular id are unioned in that

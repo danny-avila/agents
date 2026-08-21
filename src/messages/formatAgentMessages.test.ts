@@ -1938,6 +1938,73 @@ describe('formatAgentMessages', () => {
     });
   });
 
+  it.each([
+    ['duplicate', [[0], [0]]],
+    ['gapped/out-of-range', [[0], [2]]],
+    ['reordered', [[1], [0]]],
+  ])(
+    'handles a %s artifact mapping without ordinal lineage loss',
+    (mappingKind, sourceContentPartIndices) => {
+      const messages = [
+        new AIMessageChunk({
+          content: '',
+          tool_calls: [
+            { id: 'ambiguous', name: 'render', args: {}, type: 'tool_call' },
+          ],
+        }),
+        new ToolMessage({
+          content: [
+            { type: ContentTypes.TEXT, text: 'A'.repeat(1_000) },
+            { type: ContentTypes.TEXT, text: 'OMITTED-SECOND' },
+          ],
+          tool_call_id: 'ambiguous',
+          artifact: { content: 'omitted artifact' },
+          additional_kwargs: {
+            sourceMessageIds: ['first-row', 'second-row'],
+            provenance: {
+              version: 1,
+              parts: [
+                {
+                  attribution: 'model',
+                  sourceMessageId: 'first-row',
+                  sourceContentPartIndices: sourceContentPartIndices[0],
+                },
+                {
+                  attribution: 'user',
+                  sourceMessageId: 'second-row',
+                  sourceContentPartIndices: sourceContentPartIndices[1],
+                },
+              ],
+            },
+          },
+        }),
+      ];
+
+      const formatted = projectArtifactPayload(messages, 80);
+      const payload = formatted[formatted.length - 1] as HumanMessage;
+
+      expect(serializeToolContent(payload.content)).not.toContain(
+        'OMITTED-SECOND'
+      );
+      expect(payload.additional_kwargs.sourceMessageIds).toEqual(
+        mappingKind === 'reordered' ? ['second-row'] : undefined
+      );
+      expect(payload.additional_kwargs.provenance).toEqual({
+        version: 1,
+        parts:
+          mappingKind === 'reordered'
+            ? [
+              {
+                attribution: 'tool',
+                sourceMessageId: 'second-row',
+                sourceContentPartIndices: [0],
+              },
+            ]
+            : [{ attribution: 'tool' }],
+      });
+    }
+  );
+
   it('skips empty artifact blocks without dropping later visible blocks', () => {
     const messages = [
       new AIMessageChunk({

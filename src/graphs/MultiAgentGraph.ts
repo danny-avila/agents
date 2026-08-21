@@ -21,6 +21,7 @@ import type { ProviderMessageProvenancePart } from '@/messages/provenance';
 import type { GraphFactoryDependencies } from '@/graphs/graphFactory';
 import type * as t from '@/types';
 import {
+  hasBijectiveProviderContentPartMapping,
   inspectProviderMessageProvenance,
   inspectProviderSourceMessageIds,
   setInvalidProviderMessageProvenance,
@@ -207,16 +208,12 @@ function copyFilteredAIMessageProvenance(
     return target;
   }
 
-  let sourceIndexRefCount = 0;
-  let hasUnindexedPart = false;
-  for (const part of provenance.parts) {
-    if (part.sourceContentPartIndices == null) {
-      hasUnindexedPart = true;
-    } else {
-      sourceIndexRefCount += part.sourceContentPartIndices.length;
-    }
-  }
-  if (hasUnindexedPart || sourceIndexRefCount !== source.content.length) {
+  if (
+    !hasBijectiveProviderContentPartMapping(
+      provenance.parts,
+      source.content.length
+    )
+  ) {
     /** An older or aggregate envelope cannot be mapped to current blocks.
      * Preserve its conservative attribution instead of dropping tool lineage. */
     setFilteredProvenance(provenance.parts);
@@ -224,8 +221,7 @@ function copyFilteredAIMessageProvenance(
   }
 
   const retainedParts: ProviderMessageProvenancePart[] = [];
-  let contentPartOrdinal = 0;
-  let retainedOrdinal = 0;
+  const retainedContentPartIndexSet = new Set(retainedContentPartIndices);
   for (const part of provenance.parts) {
     if (part.sourceContentPartIndices == null) {
       retainedParts.push(part);
@@ -233,11 +229,9 @@ function copyFilteredAIMessageProvenance(
     }
     const retainedSourceContentPartIndices: number[] = [];
     for (const sourceContentPartIndex of part.sourceContentPartIndices) {
-      if (retainedContentPartIndices[retainedOrdinal] === contentPartOrdinal) {
+      if (retainedContentPartIndexSet.has(sourceContentPartIndex)) {
         retainedSourceContentPartIndices.push(sourceContentPartIndex);
-        retainedOrdinal++;
       }
-      contentPartOrdinal++;
     }
     if (retainedSourceContentPartIndices.length > 0) {
       retainedParts.push({
