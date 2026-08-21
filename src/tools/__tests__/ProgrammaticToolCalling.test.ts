@@ -1107,6 +1107,33 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
 
       expect(used).toEqual(new Set(['get_weather', 'search_docs']));
     });
+
+    it('masks every heredoc body declared on one command', () => {
+      const used = extractUsedBashToolNames(
+        'cat <<\'A\' <<\'B\'\nget_weather \'{}\'\nA\nget_weather \'{}\'\nB\nsearch_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['search_docs']));
+    });
+
+    it('resolves simple assignments used as command names', () => {
+      const used = extractUsedBashToolNames(
+        'cmd=search_docs; get_weather \'{}\'; "$cmd" \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('removes escaped newlines while lexing command words', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; search_docs\\\n \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
   });
 
   describe('caller-policy normalization collisions', () => {

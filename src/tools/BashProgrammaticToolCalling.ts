@@ -283,6 +283,7 @@ function collectBashCommandNames(
   let expectsCoprocWord = false;
   let pendingCoprocWord: string | undefined;
   let evalWords: string[] | undefined;
+  const assignments = new Map<string, string>();
 
   const flushEval = (): void => {
     if (evalWords != null && evalWords.length > 0) {
@@ -347,7 +348,12 @@ function collectBashCommandNames(
       expectsFunctionName = false;
       continue;
     }
-    if (/^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(word)) {
+    const assignment = word.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (assignment != null) {
+      assignments.set(assignment[1], assignment[2]);
+      continue;
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*\+=/.test(word)) {
       continue;
     }
     if (word.startsWith('-')) {
@@ -373,7 +379,16 @@ function collectBashCommandNames(
       continue;
     }
 
-    commands.add(word);
+    const variable = word.match(/^\$(?:{([A-Za-z_][A-Za-z0-9_]*)}|([A-Za-z_][A-Za-z0-9_]*))$/);
+    const variableName =
+      variable == null
+        ? undefined
+        : word.startsWith('${')
+          ? word.slice(2, -1)
+          : word.slice(1);
+    const resolvedWord =
+      variableName == null ? word : (assignments.get(variableName) ?? word);
+    commands.add(resolvedWord);
     expectsCommand = false;
   }
 
@@ -505,6 +520,14 @@ function tokenizeBash(code: string): BashToken[] {
         break;
       }
       if (current === '\\' && index + 1 < code.length) {
+        if (code[index + 1] === '\n') {
+          index += 2;
+          continue;
+        }
+        if (code[index + 1] === '\r' && code[index + 2] === '\n') {
+          index += 3;
+          continue;
+        }
         value += code[index + 1];
         index += 2;
         continue;
@@ -572,6 +595,14 @@ function tokenizeBash(code: string): BashToken[] {
             code[index] === '\\' &&
             index + 1 < code.length
           ) {
+            if (code[index + 1] === '\n') {
+              index += 2;
+              continue;
+            }
+            if (code[index + 1] === '\r' && code[index + 2] === '\n') {
+              index += 3;
+              continue;
+            }
             value += code[index + 1];
             index += 2;
           } else {
@@ -761,48 +792,53 @@ function maskBashHeredocBodies(code: string): string {
   while (lineStart < code.length) {
     const lineEnd = code.indexOf('\n', lineStart);
     const contentEnd = lineEnd === -1 ? code.length : lineEnd;
-    const declaration = findBashHeredocDeclaration(
+    const declarations = findBashHeredocDeclarations(
       code.slice(lineStart, contentEnd)
     );
-    if (declaration == null || lineEnd === -1) {
+    if (declarations.length === 0 || lineEnd === -1) {
       lineStart = lineEnd === -1 ? code.length : lineEnd + 1;
       continue;
     }
 
-    const bodyStart = lineEnd + 1;
-    let bodyLineStart = bodyStart;
-    let delimiterStart = code.length;
-    let afterDelimiter = code.length;
-    while (bodyLineStart <= code.length) {
-      const bodyLineEnd = code.indexOf('\n', bodyLineStart);
-      const bodyContentEnd =
-        bodyLineEnd === -1 ? code.length : bodyLineEnd;
-      const bodyLine = code.slice(bodyLineStart, bodyContentEnd);
-      const comparableLine = declaration.stripTabs
-        ? bodyLine.replace(/^\t+/, '')
-        : bodyLine;
-      if (comparableLine === declaration.delimiter) {
-        delimiterStart = bodyLineStart;
-        afterDelimiter = bodyLineEnd === -1 ? code.length : bodyLineEnd + 1;
-        break;
+    let nextBodyStart = lineEnd + 1;
+    for (const declaration of declarations) {
+      const bodyStart = nextBodyStart;
+      let bodyLineStart = bodyStart;
+      let delimiterStart = code.length;
+      let afterDelimiter = code.length;
+      while (bodyLineStart <= code.length) {
+        const bodyLineEnd = code.indexOf('\n', bodyLineStart);
+        const bodyContentEnd =
+          bodyLineEnd === -1 ? code.length : bodyLineEnd;
+        const bodyLine = code.slice(bodyLineStart, bodyContentEnd);
+        const comparableLine = declaration.stripTabs
+          ? bodyLine.replace(/^\t+/, '')
+          : bodyLine;
+        if (comparableLine === declaration.delimiter) {
+          delimiterStart = bodyLineStart;
+          afterDelimiter = bodyLineEnd === -1 ? code.length : bodyLineEnd + 1;
+          break;
+        }
+        bodyLineStart =
+          bodyLineEnd === -1 ? code.length + 1 : bodyLineEnd + 1;
       }
-      bodyLineStart = bodyLineEnd === -1 ? code.length + 1 : bodyLineEnd + 1;
-    }
 
-    for (let index = bodyStart; index < afterDelimiter; index++) {
-      if (masked[index] !== '\n' && masked[index] !== '\r') {
-        masked[index] = ' ';
+      for (let index = bodyStart; index < afterDelimiter; index++) {
+        if (masked[index] !== '\n' && masked[index] !== '\r') {
+          masked[index] = ' ';
+        }
       }
+      if (!declaration.quoted) {
+        restoreBashHeredocSubstitutions(
+          code,
+          masked,
+          bodyStart,
+          delimiterStart
+        );
+      }
+      nextBodyStart = afterDelimiter;
     }
-    if (!declaration.quoted) {
-      restoreBashHeredocSubstitutions(
-        code,
-        masked,
-        bodyStart,
-        delimiterStart
-      );
-    }
-    lineStart = afterDelimiter;
+    lineStart = nextBodyStart;
   }
 
   return masked.join('');
@@ -849,9 +885,14 @@ function isBashCharacterEscaped(
   return backslashes % 2 === 1;
 }
 
-function findBashHeredocDeclaration(
+function findBashHeredocDeclarations(
   line: string
-): { delimiter: string; stripTabs: boolean; quoted: boolean } | undefined {
+): Array<{ delimiter: string; stripTabs: boolean; quoted: boolean }> {
+  const declarations: Array<{
+    delimiter: string;
+    stripTabs: boolean;
+    quoted: boolean;
+  }> = [];
   let quote: '\'' | '"' | undefined;
 
   for (let index = 0; index < line.length; index++) {
@@ -871,7 +912,7 @@ function findBashHeredocDeclaration(
       continue;
     }
     if (char === '#' && (index === 0 || /\s/.test(line[index - 1]))) {
-      return undefined;
+      break;
     }
     if (line.slice(index, index + 2) !== '<<') {
       continue;
@@ -893,11 +934,13 @@ function findBashHeredocDeclaration(
       if (targetEnd === -1) {
         continue;
       }
-      return {
+      declarations.push({
         delimiter: line.slice(targetStart + 1, targetEnd),
         stripTabs,
         quoted: true,
-      };
+      });
+      index = targetEnd;
+      continue;
     }
     let targetEnd = targetStart;
     while (
@@ -907,15 +950,16 @@ function findBashHeredocDeclaration(
       targetEnd += 1;
     }
     if (targetEnd > targetStart) {
-      return {
+      declarations.push({
         delimiter: line.slice(targetStart, targetEnd),
         stripTabs,
         quoted: false,
-      };
+      });
+      index = targetEnd - 1;
     }
   }
 
-  return undefined;
+  return declarations;
 }
 
 /** Returns whether a reserved word begins where a shell command may begin. */
