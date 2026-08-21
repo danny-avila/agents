@@ -479,19 +479,28 @@ function findPythonFStringFormatStart(
 ): { separator: number; spec?: number } | undefined {
   const closers: string[] = [];
   let quote: '\'' | '"' | undefined;
+  let triple = false;
 
   for (let index = 0; index < field.length; index++) {
     const char = field[index];
     if (quote != null) {
       if (char === '\\') {
         index += 1;
-      } else if (char === quote) {
+      } else if (
+        triple
+          ? field.slice(index, index + 3) === quote.repeat(3)
+          : char === quote
+      ) {
+        index += triple ? 2 : 0;
         quote = undefined;
+        triple = false;
       }
       continue;
     }
     if (char === '\'' || char === '"') {
       quote = char;
+      triple = field.slice(index, index + 3) === char.repeat(3);
+      index += triple ? 2 : 0;
       continue;
     }
     if (char === '(') closers.push(')');
@@ -500,7 +509,11 @@ function findPythonFStringFormatStart(
     else if (char === closers[closers.length - 1]) closers.pop();
     else if (closers.length === 0 && char === ':') {
       return { separator: index, spec: index + 1 };
-    } else if (closers.length === 0 && char === '!') {
+    } else if (
+      closers.length === 0 &&
+      char === '!' &&
+      /[ars]/i.test(field[index + 1] ?? '')
+    ) {
       const colon = field.indexOf(':', index + 1);
       return {
         separator: index,

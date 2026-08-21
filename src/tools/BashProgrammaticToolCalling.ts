@@ -282,6 +282,9 @@ function collectBashCommandNames(
   for (const token of tokens) {
     if (token.type === 'nested') {
       collectBashCommandNames(token.tokens, commands);
+      if (skipRedirectTarget) {
+        skipRedirectTarget = false;
+      }
       continue;
     }
     if (token.type === 'separator') {
@@ -338,7 +341,14 @@ function tokenizeBash(code: string): BashToken[] {
     }
     if (code.slice(index, index + 3) === '$((') {
       const arithmeticEnd = findBashArithmeticExpansionEnd(code, index + 3);
-      index = arithmeticEnd == null ? code.length : arithmeticEnd + 1;
+      if (arithmeticEnd == null) {
+        index = code.length;
+      } else {
+        tokens.push(
+          ...tokenizeBashArithmeticSubstitutions(code, index + 3, arithmeticEnd)
+        );
+        index = arithmeticEnd + 1;
+      }
       continue;
     }
     if (code.slice(index, index + 2) === '$(') {
@@ -400,7 +410,18 @@ function tokenizeBash(code: string): BashToken[] {
               code,
               index + 3
             );
-            index = arithmeticEnd == null ? code.length : arithmeticEnd + 1;
+            if (arithmeticEnd == null) {
+              index = code.length;
+            } else {
+              tokens.push(
+                ...tokenizeBashArithmeticSubstitutions(
+                  code,
+                  index + 3,
+                  arithmeticEnd
+                )
+              );
+              index = arithmeticEnd + 1;
+            }
             continue;
           }
           if (quote === '"' && code.slice(index, index + 2) === '$(') {
@@ -475,7 +496,7 @@ function findBashCommandSubstitutionEnd(
     }
     if (
       char === '#' &&
-      (index === bodyStart || /[\s;|&(]/.test(code[index - 1]))
+      (index === bodyStart || /[\s;|&()]/.test(code[index - 1]))
     ) {
       while (index < code.length && code[index] !== '\n') {
         index += 1;
@@ -504,9 +525,13 @@ function findBashCommandSubstitutionEnd(
         wordEnd += 1;
       }
       const word = code.slice(index, wordEnd);
-      if (word === 'case') {
+      if (word === 'case' && isBashKeywordPosition(code, index, bodyStart)) {
         caseDepth += 1;
-      } else if (word === 'esac' && caseDepth > 0) {
+      } else if (
+        word === 'esac' &&
+        caseDepth > 0 &&
+        isBashKeywordPosition(code, index, bodyStart)
+      ) {
         caseDepth -= 1;
       }
       index = wordEnd - 1;
@@ -526,6 +551,101 @@ function findBashCommandSubstitutionEnd(
   }
 
   return undefined;
+}
+
+/** Returns whether a reserved word begins where a shell command may begin. */
+function isBashKeywordPosition(
+  code: string,
+  wordStart: number,
+  bodyStart: number
+): boolean {
+  let index = wordStart - 1;
+  while (index >= bodyStart && /[ \t\r]/.test(code[index])) {
+    index -= 1;
+  }
+
+  if (index < bodyStart || /[\n;|&(){}]/.test(code[index])) {
+    return true;
+  }
+
+  if (!/[A-Za-z0-9_]/.test(code[index])) {
+    return false;
+  }
+  const wordEnd = index + 1;
+  while (index >= bodyStart && /[A-Za-z0-9_]/.test(code[index])) {
+    index -= 1;
+  }
+  return COMMAND_START_WORDS.has(code.slice(index + 1, wordEnd));
+}
+
+/** Extracts command substitutions nested inside a `$((...))` expansion. */
+function tokenizeBashArithmeticSubstitutions(
+  code: string,
+  bodyStart: number,
+  arithmeticEnd: number
+): BashToken[] {
+  const tokens: BashToken[] = [];
+  const bodyEnd = arithmeticEnd - 1;
+  let quote: '\'' | '"' | undefined;
+
+  for (let index = bodyStart; index < bodyEnd; index++) {
+    const char = code[index];
+    if (char === '\\') {
+      index += 1;
+      continue;
+    }
+    if (quote === '\'') {
+      if (char === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (quote === '"' && char === '"') {
+      quote = undefined;
+      continue;
+    }
+    if (quote == null && char === '\'') {
+      quote = char;
+      continue;
+    }
+    if (quote == null && char === '"') {
+      quote = '"';
+      continue;
+    }
+    if (code.slice(index, index + 3) === '$((') {
+      const nestedArithmeticEnd = findBashArithmeticExpansionEnd(
+        code,
+        index + 3
+      );
+      if (nestedArithmeticEnd == null || nestedArithmeticEnd > arithmeticEnd) {
+        break;
+      }
+      tokens.push(
+        ...tokenizeBashArithmeticSubstitutions(
+          code,
+          index + 3,
+          nestedArithmeticEnd
+        )
+      );
+      index = nestedArithmeticEnd;
+      continue;
+    }
+    if (code.slice(index, index + 2) !== '$(') {
+      continue;
+    }
+
+    const nestedEnd = findBashCommandSubstitutionEnd(code, index + 2);
+    if (nestedEnd == null || nestedEnd >= arithmeticEnd) {
+      break;
+    }
+    tokens.push({
+      type: 'nested',
+      tokens: tokenizeBash(code.slice(index + 2, nestedEnd)),
+    });
+    index = nestedEnd;
+  }
+
+  return tokens;
 }
 
 /** Finds the second close parenthesis terminating a `$((...))` expansion. */

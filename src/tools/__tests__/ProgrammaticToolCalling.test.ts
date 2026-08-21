@@ -829,6 +829,22 @@ value = f"{value:calculator()} {value:{search_docs(query='width')}}"`;
       );
     });
 
+    it('preserves calls after inequality operators in f-string fields', () => {
+      const code = 'value = f"{x != await search_docs(query=\'forecast\')}"';
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(
+        new Set(['search_docs'])
+      );
+    });
+
+    it('ignores colons in triple-quoted strings inside f-string fields', () => {
+      const code = 'value = f"{\'\'\'it\'s: literal\'\'\' + search_docs(query=\'forecast\')}"';
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(
+        new Set(['search_docs'])
+      );
+    });
+
     it('handles tool names with special characters via normalization', () => {
       const specialTools = createToolMap(['get_data.v2', 'calc+plus']);
       const code = `await get_datav2()
@@ -913,6 +929,42 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       );
 
       expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('finds command substitutions nested in arithmetic expansions', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; n=$(( $(search_docs \'{}\') + 1 ))',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('does not treat case arguments as case statements', () => {
+      const used = extractUsedBashToolNames(
+        'value=$(printf \'%s\' case); search_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['search_docs']));
+    });
+
+    it('consumes substitution-only redirect targets', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; > "$(printf target;)" search_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('starts comments immediately after closing parentheses', () => {
+      const used = extractUsedBashToolNames(
+        'value="$( (printf nested)# comment with )\nsearch_docs \'{}\')"',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['search_docs']));
     });
   });
 
