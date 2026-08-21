@@ -843,6 +843,14 @@ print(example)`;
       );
     });
 
+    it('ignores tool names shadowed by loop bindings', () => {
+      const code = `callbacks = [lambda: "ok"]
+for search_docs in callbacks:
+    print(search_docs())`;
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(new Set());
+    });
+
     it('preserves executable calls inside f-string expressions', () => {
       const code = `await get_weather(city="SF")
 value = f"result: {await search_docs(query='forecast')}"`;
@@ -1168,6 +1176,24 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       );
 
       expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('keeps assignments inside subshells scoped to the subshell', () => {
+      const used = extractUsedBashToolNames(
+        'cmd=search_docs; (cmd=printf); get_weather \'{}\'; "$cmd" \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('does not treat case arm patterns as commands', () => {
+      const used = extractUsedBashToolNames(
+        'case "$kind" in other) echo x;; search_docs) echo y;; esac',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set());
     });
   });
 

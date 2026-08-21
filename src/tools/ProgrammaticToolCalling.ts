@@ -323,7 +323,21 @@ export function extractUsedToolNames(
     const escapedName = pythonName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pattern = new RegExp(`\\b${escapedName}\\b`, 'g');
 
+    let shadowed = false;
     for (const match of executableCode.matchAll(pattern)) {
+      if (
+        isPythonBindingTarget(
+          executableCode,
+          match.index,
+          match.index + pythonName.length
+        )
+      ) {
+        shadowed = true;
+        continue;
+      }
+      if (shadowed) {
+        continue;
+      }
       let prefix = match.index - 1;
       while (prefix >= 0 && /\s/.test(executableCode[prefix])) {
         prefix -= 1;
@@ -348,6 +362,19 @@ export function extractUsedToolNames(
   }
 
   return usedTools;
+}
+
+function isPythonBindingTarget(
+  code: string,
+  nameStart: number,
+  nameEnd: number
+): boolean {
+  const suffix = skipPythonCallWhitespace(code, nameEnd);
+  if (code[suffix] === '=' && code[suffix + 1] !== '=') {
+    return true;
+  }
+  const prefix = code.slice(0, nameStart).match(/([A-Za-z_][A-Za-z0-9_]*)\s*$/);
+  return ['as', 'class', 'def', 'for', 'import'].includes(prefix?.[1] ?? '');
 }
 
 function isPythonCallableValueReference(

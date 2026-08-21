@@ -262,6 +262,8 @@ const COMMAND_START_WORDS = new Set([
 type BashToken =
   | { type: 'word'; value: string }
   | { type: 'separator' }
+  | { type: 'closeParen' }
+  | { type: 'caseArmEnd' }
   | { type: 'redirect' }
   | { type: 'nested'; tokens: BashToken[] };
 
@@ -287,6 +289,7 @@ function collectBashCommandNames(
   const pendingAssignments = new Map<string, string>();
   let commandPrefix: string | undefined;
   let skipPrefixOptionOperand = false;
+  let caseMode: 'subject' | 'awaitIn' | 'pattern' | 'body' | undefined;
 
   const flushEval = (): void => {
     if (evalWords != null && evalWords.length > 0) {
@@ -303,7 +306,7 @@ function collectBashCommandNames(
       }
       continue;
     }
-    if (token.type === 'separator') {
+    if (token.type === 'separator' || token.type === 'caseArmEnd') {
       flushEval();
       for (const [name, value] of pendingAssignments) {
         assignments.set(name, value);
@@ -318,6 +321,17 @@ function collectBashCommandNames(
       expectsCoprocWord = false;
       expectsCommand = true;
       skipRedirectTarget = false;
+      if (token.type === 'caseArmEnd' && caseMode === 'body') {
+        caseMode = 'pattern';
+      }
+      continue;
+    }
+    if (token.type === 'closeParen') {
+      expectsCommand = true;
+      skipRedirectTarget = false;
+      if (caseMode === 'pattern') {
+        caseMode = 'body';
+      }
       continue;
     }
     if (token.type === 'redirect') {
@@ -353,6 +367,22 @@ function collectBashCommandNames(
     }
 
     const word = token.value;
+    if (caseMode === 'subject') {
+      caseMode = 'awaitIn';
+      continue;
+    }
+    if (caseMode === 'awaitIn') {
+      if (word === 'in') caseMode = 'pattern';
+      continue;
+    }
+    if (caseMode === 'pattern') {
+      if (word === 'esac') caseMode = undefined;
+      continue;
+    }
+    if (caseMode === 'body' && word === 'esac') {
+      caseMode = undefined;
+      continue;
+    }
     if (expectsFunctionName) {
       expectsFunctionName = false;
       continue;
@@ -379,6 +409,7 @@ function collectBashCommandNames(
       continue;
     }
     if (COMMAND_START_WORDS.has(word) || word === '!' || word === '{') {
+      if (word === 'case') caseMode = 'subject';
       continue;
     }
     if (word === 'function') {
@@ -441,7 +472,9 @@ function tokenizeBash(code: string): BashToken[] {
       continue;
     }
     if (char === '\n' || char === ';' || char === '|' || char === '&') {
-      tokens.push({ type: 'separator' });
+      tokens.push({
+        type: char === ';' && code[index + 1] === ';' ? 'caseArmEnd' : 'separator',
+      });
       index += code[index + 1] === char ? 2 : 1;
       continue;
     }
@@ -511,12 +544,21 @@ function tokenizeBash(code: string): BashToken[] {
         }
         continue;
       }
-      tokens.push({ type: 'separator' });
-      index += 1;
+      const groupEnd = findBashArrayLiteralEnd(code, index + 1);
+      if (groupEnd == null) {
+        index = code.length;
+      } else {
+        tokens.push({
+          type: 'nested',
+          tokens: tokenizeBash(code.slice(index + 1, groupEnd)),
+        });
+        tokens.push({ type: 'separator' });
+        index = groupEnd + 1;
+      }
       continue;
     }
     if (char === ')') {
-      tokens.push({ type: 'separator' });
+      tokens.push({ type: 'closeParen' });
       index += 1;
       continue;
     }
