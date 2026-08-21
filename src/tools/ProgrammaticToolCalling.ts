@@ -396,6 +396,15 @@ function getPythonLexicalScopeKey(code: string, position: number): string {
   ) {
     scopes.pop();
   }
+  const inlineScope = currentLine.match(
+    /(?:^|;)\s*(?:(?:async\s+)?def\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)|class\s+[A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?)\s*:\s*$/
+  );
+  if (inlineScope != null) {
+    scopes.push({
+      indent: currentIndent,
+      key: `inline:${lines.length - 1}:${inlineScope.index ?? 0}`,
+    });
+  }
 
   return scopes.length === 0
     ? 'module'
@@ -507,7 +516,17 @@ function maskPythonStringsAndComments(code: string): string {
 
     const triple = code.slice(index, index + 3) === quote.repeat(3);
     const delimiterLength = triple ? 3 : 1;
-    const isFString = hasPythonFStringPrefix(code, index);
+    const stringPrefix = getPythonStringPrefix(code, index);
+    const isFString = stringPrefix?.isFString === true;
+    if (stringPrefix != null) {
+      for (
+        let prefixIndex = stringPrefix.start;
+        prefixIndex < index;
+        prefixIndex++
+      ) {
+        mask(prefixIndex);
+      }
+    }
     for (let offset = 0; offset < delimiterLength; offset++) {
       mask(index + offset);
     }
@@ -568,7 +587,10 @@ function maskPythonStringsAndComments(code: string): string {
   return masked.join('');
 }
 
-function hasPythonFStringPrefix(code: string, quoteIndex: number): boolean {
+function getPythonStringPrefix(
+  code: string,
+  quoteIndex: number
+): { start: number; isFString: boolean } | undefined {
   let prefixStart = quoteIndex;
   while (prefixStart > 0 && /[A-Za-z]/.test(code[prefixStart - 1])) {
     prefixStart -= 1;
@@ -577,10 +599,13 @@ function hasPythonFStringPrefix(code: string, quoteIndex: number): boolean {
     prefixStart > 0 &&
     /[A-Za-z0-9_]/.test(code[prefixStart - 1])
   ) {
-    return false;
+    return undefined;
   }
   const prefix = code.slice(prefixStart, quoteIndex);
-  return /^[rRuUbBfF]*[fF][rRuUbBfF]*$/.test(prefix);
+  if (!/^[rRuUbBfF]*$/.test(prefix)) {
+    return undefined;
+  }
+  return { start: prefixStart, isFString: /[fF]/.test(prefix) };
 }
 
 /** Keeps executable field expressions while masking literal format specs. */

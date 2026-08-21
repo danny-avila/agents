@@ -862,6 +862,26 @@ await search_docs()`;
       );
     });
 
+    it('scopes bindings in one-line Python function suites', () => {
+      const code = `await get_weather()
+def helper(): search_docs = lambda: None
+await search_docs()`;
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(
+        new Set(['get_weather', 'search_docs'])
+      );
+    });
+
+    it('masks Python string literal prefixes', () => {
+      const prefixedTools = createToolMap(['f', 'r', 'b', 'fr']);
+      const code = `print(f"value={value}")
+print(r"raw")
+print(b"bytes")
+print(fr"both={value}")`;
+
+      expect(extractUsedToolNames(code, prefixedTools)).toEqual(new Set());
+    });
+
     it('preserves executable calls inside f-string expressions', () => {
       const code = `await get_weather(city="SF")
 value = f"result: {await search_docs(query='forecast')}"`;
@@ -1223,6 +1243,15 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       );
 
       expect(used).toEqual(new Set(['search_docs']));
+    });
+
+    it('finds tools executed by static trap handlers', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; trap "search_docs \'{}\'" EXIT',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
     });
   });
 

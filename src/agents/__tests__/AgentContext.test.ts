@@ -1064,6 +1064,7 @@ describe('AgentContext', () => {
       const result = await ctx.systemRunnable!.invoke([]);
       const content = String(result[0].content);
       expect(content).toContain('inside `run_tools_with_bash`');
+      expect(content).toContain('or `run_tools_with_code`');
       expect(content).toContain('`host_code_tool`');
     });
 

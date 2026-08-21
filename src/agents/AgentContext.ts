@@ -509,21 +509,24 @@ export class AgentContext {
       }
     }
 
-    const programmaticTool = this.getProgrammaticToolInstructionTarget();
-    if (programmaticTool == null) return '';
+    const programmaticTools = this.getProgrammaticToolInstructionTargets();
+    if (programmaticTools.length === 0) return '';
+    const programmaticRunnerNames = programmaticTools
+      .map((tool) => `\`${tool.name}\``)
+      .join(' or ');
     const quotedProgrammaticNames =
       programmaticToolNames.length > 0
         ? programmaticToolNames.map((name) => `\`${name}\``).join(', ')
         : 'none';
     const directOnlyBoundary =
       directOnlyToolNames.length > 0
-        ? `\nCall these tools directly; never reference them inside \`${programmaticTool.name}\`: ${directOnlyToolNames
+        ? `\nCall these tools directly; never reference them inside ${programmaticRunnerNames}: ${directOnlyToolNames
           .map((name) => `\`${name}\``)
           .join(', ')}.`
         : '';
     const boundary =
       '\n\n## Programmatic Tool Calling\n\n' +
-      `Only these tools may be invoked inside \`${programmaticTool.name}\`: ${quotedProgrammaticNames}.` +
+      `Only these tools may be invoked inside ${programmaticRunnerNames}: ${quotedProgrammaticNames}.` +
       directOnlyBoundary;
 
     if (programmaticOnlyTools.length === 0) {
@@ -546,16 +549,22 @@ export class AgentContext {
     return (
       boundary +
       '\n\n### Programmatic-Only Tools\n\n' +
-      `The following tools are available exclusively through the \`${programmaticTool.name}\` tool. ` +
-      `You cannot call these tools directly; instead, use \`${programmaticTool.name}\` with ${programmaticTool.codeGuidance} that invokes them.\n\n` +
+      `The following tools are available exclusively through ${programmaticRunnerNames}. ` +
+      `You cannot call these tools directly; instead, ${programmaticTools
+        .map(
+          (tool) =>
+            `use \`${tool.name}\` with ${tool.codeGuidance} that invokes them`
+        )
+        .join(', or ')}.\n\n` +
       toolDescriptions
     );
   }
 
-  private getProgrammaticToolInstructionTarget(): {
+  private getProgrammaticToolInstructionTargets(): Array<{
     name: string;
     codeGuidance: string;
-  } | undefined {
+  }> {
+    const targets: Array<{ name: string; codeGuidance: string }> = [];
     if (
       this.hasAvailableTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING) ||
       isProgrammaticRunnerAutoBound(
@@ -563,10 +572,10 @@ export class AgentContext {
         this.toolExecution
       )
     ) {
-      return {
+      targets.push({
         name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
         codeGuidance: 'Bash code',
-      };
+      });
     }
 
     if (
@@ -579,15 +588,15 @@ export class AgentContext {
       const localDefault =
         this.toolExecution?.engine === 'local' ||
         this.toolExecution?.engine === 'cloudflare-sandbox';
-      return {
+      targets.push({
         name: Constants.PROGRAMMATIC_TOOL_CALLING,
         codeGuidance: localDefault
           ? 'Bash code by default, or set `lang: "py"` to use Python code'
           : 'Python code',
-      };
+      });
     }
 
-    return undefined;
+    return targets;
   }
 
   private hasAvailableTool(name: string): boolean {

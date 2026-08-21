@@ -289,6 +289,7 @@ function collectBashCommandNames(
   const pendingAssignments = new Map<string, string>();
   let commandPrefix: string | undefined;
   let skipPrefixOptionOperand = false;
+  let expectsTrapAction = false;
   const caseModes: Array<'subject' | 'awaitIn' | 'pattern' | 'body'> = [];
 
   const flushEval = (): void => {
@@ -314,6 +315,7 @@ function collectBashCommandNames(
       pendingAssignments.clear();
       commandPrefix = undefined;
       skipPrefixOptionOperand = false;
+      expectsTrapAction = false;
       if (pendingCoprocWord != null) {
         commands.add(pendingCoprocWord);
         pendingCoprocWord = undefined;
@@ -347,6 +349,12 @@ function collectBashCommandNames(
     }
     if (evalWords != null) {
       evalWords.push(token.value);
+      continue;
+    }
+    if (expectsTrapAction) {
+      collectBashCommandNames(tokenizeBash(token.value), commands);
+      expectsTrapAction = false;
+      expectsCommand = false;
       continue;
     }
     if (expectsCoprocWord) {
@@ -427,6 +435,10 @@ function collectBashCommandNames(
     if (word === 'eval') {
       evalWords = [];
       expectsCommand = false;
+      continue;
+    }
+    if (word === 'trap') {
+      expectsTrapAction = true;
       continue;
     }
     if (COMMAND_PREFIXES.has(word)) {
