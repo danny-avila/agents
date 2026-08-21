@@ -249,7 +249,9 @@ const COMMAND_START_WORDS = new Set([
   'do',
   'elif',
   'else',
+  'case',
   'if',
+  'in',
   'then',
   'time',
   'until',
@@ -259,15 +261,29 @@ const COMMAND_START_WORDS = new Set([
 type BashToken =
   | { type: 'word'; value: string }
   | { type: 'separator' }
-  | { type: 'redirect' };
+  | { type: 'redirect' }
+  | { type: 'nested'; tokens: BashToken[] };
 
 /** Returns shell words at command position, excluding arguments and comments. */
 function extractBashCommandNames(code: string): Set<string> {
   const commands = new Set<string>();
+
+  collectBashCommandNames(tokenizeBash(code), commands);
+  return commands;
+}
+
+function collectBashCommandNames(
+  tokens: BashToken[],
+  commands: Set<string>
+): void {
   let expectsCommand = true;
   let skipRedirectTarget = false;
 
-  for (const token of tokenizeBash(code)) {
+  for (const token of tokens) {
+    if (token.type === 'nested') {
+      collectBashCommandNames(token.tokens, commands);
+      continue;
+    }
     if (token.type === 'separator') {
       expectsCommand = true;
       skipRedirectTarget = false;
@@ -302,8 +318,6 @@ function extractBashCommandNames(code: string): Set<string> {
     commands.add(word);
     expectsCommand = false;
   }
-
-  return commands;
 }
 
 /** Minimal shell lexer for locating command positions without executing code. */
@@ -322,12 +336,32 @@ function tokenizeBash(code: string): BashToken[] {
       index += code[index + 1] === char ? 2 : 1;
       continue;
     }
-    if (char === '(' || code.slice(index, index + 2) === '$(') {
+    if (code.slice(index, index + 3) === '$((') {
+      const arithmeticEnd = findBashArithmeticExpansionEnd(code, index + 3);
+      index = arithmeticEnd == null ? code.length : arithmeticEnd + 1;
+      continue;
+    }
+    if (code.slice(index, index + 2) === '$(') {
+      const bodyStart = index + 2;
+      const bodyEnd = findBashCommandSubstitutionEnd(code, bodyStart);
+      if (bodyEnd == null) {
+        index = code.length;
+      } else {
+        tokens.push({
+          type: 'nested',
+          tokens: tokenizeBash(code.slice(bodyStart, bodyEnd)),
+        });
+        index = bodyEnd + 1;
+      }
+      continue;
+    }
+    if (char === '(') {
       tokens.push({ type: 'separator' });
-      index += char === '(' ? 1 : 2;
+      index += 1;
       continue;
     }
     if (char === ')') {
+      tokens.push({ type: 'separator' });
       index += 1;
       continue;
     }
@@ -361,18 +395,28 @@ function tokenizeBash(code: string): BashToken[] {
         const quote = current;
         index += 1;
         while (index < code.length && code[index] !== quote) {
+          if (quote === '"' && code.slice(index, index + 3) === '$((') {
+            const arithmeticEnd = findBashArithmeticExpansionEnd(
+              code,
+              index + 3
+            );
+            index = arithmeticEnd == null ? code.length : arithmeticEnd + 1;
+            continue;
+          }
           if (quote === '"' && code.slice(index, index + 2) === '$(') {
             if (value !== '') {
               tokens.push({ type: 'word', value });
               value = '';
             }
-            tokens.push({ type: 'separator' });
             const bodyStart = index + 2;
             const bodyEnd = findBashCommandSubstitutionEnd(code, bodyStart);
             if (bodyEnd == null) {
-              index = bodyStart;
+              index = code.length;
             } else {
-              tokens.push(...tokenizeBash(code.slice(bodyStart, bodyEnd)));
+              tokens.push({
+                type: 'nested',
+                tokens: tokenizeBash(code.slice(bodyStart, bodyEnd)),
+              });
               index = bodyEnd + 1;
             }
             continue;
@@ -409,7 +453,8 @@ function findBashCommandSubstitutionEnd(
   code: string,
   bodyStart: number
 ): number | undefined {
-  let depth = 1;
+  let groupedParentheses = 0;
+  let caseDepth = 0;
   let quote: '\'' | '"' | undefined;
 
   for (let index = bodyStart; index < code.length; index++) {
@@ -428,26 +473,87 @@ function findBashCommandSubstitutionEnd(
       quote = char;
       continue;
     }
-    if (char === '#') {
+    if (
+      char === '#' &&
+      (index === bodyStart || /[\s;|&(]/.test(code[index - 1]))
+    ) {
       while (index < code.length && code[index] !== '\n') {
         index += 1;
       }
       continue;
     }
+    if (code.slice(index, index + 3) === '$((') {
+      const arithmeticEnd = findBashArithmeticExpansionEnd(code, index + 3);
+      if (arithmeticEnd == null) {
+        return undefined;
+      }
+      index = arithmeticEnd;
+      continue;
+    }
     if (code.slice(index, index + 2) === '$(') {
-      depth += 1;
+      const nestedEnd = findBashCommandSubstitutionEnd(code, index + 2);
+      if (nestedEnd == null) {
+        return undefined;
+      }
+      index = nestedEnd;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(char)) {
+      let wordEnd = index + 1;
+      while (wordEnd < code.length && /[A-Za-z0-9_]/.test(code[wordEnd])) {
+        wordEnd += 1;
+      }
+      const word = code.slice(index, wordEnd);
+      if (word === 'case') {
+        caseDepth += 1;
+      } else if (word === 'esac' && caseDepth > 0) {
+        caseDepth -= 1;
+      }
+      index = wordEnd - 1;
+      continue;
+    }
+    if (char === '(') {
+      groupedParentheses += 1;
+      continue;
+    }
+    if (char === ')') {
+      if (groupedParentheses > 0) {
+        groupedParentheses -= 1;
+      } else if (caseDepth === 0) {
+        return index;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+/** Finds the second close parenthesis terminating a `$((...))` expansion. */
+function findBashArithmeticExpansionEnd(
+  code: string,
+  bodyStart: number
+): number | undefined {
+  let groupedParentheses = 0;
+
+  for (let index = bodyStart; index < code.length; index++) {
+    const char = code[index];
+    if (char === '\\') {
       index += 1;
       continue;
     }
     if (char === '(') {
-      depth += 1;
+      groupedParentheses += 1;
       continue;
     }
-    if (char === ')') {
-      depth -= 1;
-      if (depth === 0) {
-        return index;
-      }
+    if (char !== ')') {
+      continue;
+    }
+    if (groupedParentheses > 0) {
+      groupedParentheses -= 1;
+      continue;
+    }
+    if (code[index + 1] === ')') {
+      return index + 1;
     }
   }
 

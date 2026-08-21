@@ -378,7 +378,7 @@ function maskPythonStringsAndComments(code: string): string {
         const expressionEnd = findPythonFStringExpressionEnd(code, index + 1);
         if (expressionEnd != null) {
           mask(index);
-          const expression = maskPythonStringsAndComments(
+          const expression = maskPythonFStringField(
             code.slice(index + 1, expressionEnd)
           );
           for (let offset = 0; offset < expression.length; offset++) {
@@ -436,6 +436,80 @@ function hasPythonFStringPrefix(code: string, quoteIndex: number): boolean {
   }
   const prefix = code.slice(prefixStart, quoteIndex);
   return /^[rRuUbBfF]*[fF][rRuUbBfF]*$/.test(prefix);
+}
+
+/** Keeps executable field expressions while masking literal format specs. */
+function maskPythonFStringField(field: string): string {
+  const masked: string[] = field.split('').map((char) =>
+    char === '\n' || char === '\r' ? char : ' '
+  );
+  const formatStart = findPythonFStringFormatStart(field);
+  const valueEnd = formatStart?.separator ?? field.length;
+  const value = maskPythonStringsAndComments(field.slice(0, valueEnd));
+  for (let index = 0; index < value.length; index++) {
+    masked[index] = value[index];
+  }
+
+  if (formatStart?.spec == null) {
+    return masked.join('');
+  }
+
+  let index = formatStart.spec;
+  while (index < field.length) {
+    if (field[index] !== '{' || field[index + 1] === '{') {
+      index += field[index] === '{' ? 2 : 1;
+      continue;
+    }
+    const nestedEnd = findPythonFStringExpressionEnd(field, index + 1);
+    if (nestedEnd == null) {
+      break;
+    }
+    const nested = maskPythonFStringField(field.slice(index + 1, nestedEnd));
+    for (let offset = 0; offset < nested.length; offset++) {
+      masked[index + 1 + offset] = nested[offset];
+    }
+    index = nestedEnd + 1;
+  }
+
+  return masked.join('');
+}
+
+function findPythonFStringFormatStart(
+  field: string
+): { separator: number; spec?: number } | undefined {
+  const closers: string[] = [];
+  let quote: '\'' | '"' | undefined;
+
+  for (let index = 0; index < field.length; index++) {
+    const char = field[index];
+    if (quote != null) {
+      if (char === '\\') {
+        index += 1;
+      } else if (char === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (char === '\'' || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (char === '(') closers.push(')');
+    else if (char === '[') closers.push(']');
+    else if (char === '{') closers.push('}');
+    else if (char === closers[closers.length - 1]) closers.pop();
+    else if (closers.length === 0 && char === ':') {
+      return { separator: index, spec: index + 1 };
+    } else if (closers.length === 0 && char === '!') {
+      const colon = field.indexOf(':', index + 1);
+      return {
+        separator: index,
+        spec: colon === -1 ? undefined : colon + 1,
+      };
+    }
+  }
+
+  return undefined;
 }
 
 /** Finds the matching brace for an executable Python f-string expression. */

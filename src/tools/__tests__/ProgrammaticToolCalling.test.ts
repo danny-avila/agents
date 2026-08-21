@@ -820,6 +820,15 @@ value = f"result: {await search_docs(query='forecast')}"`;
       );
     });
 
+    it('masks literal format specs but preserves nested format fields', () => {
+      const code = `await get_weather(city="SF")
+value = f"{value:calculator()} {value:{search_docs(query='width')}}"`;
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(
+        new Set(['get_weather', 'search_docs'])
+      );
+    });
+
     it('handles tool names with special characters via normalization', () => {
       const specialTools = createToolMap(['get_data.v2', 'calc+plus']);
       const code = `await get_datav2()
@@ -883,6 +892,27 @@ printf '%s' search_docs
       );
 
       expect(used).toEqual(new Set());
+    });
+
+    it('ignores arithmetic variables and preserves the outer command state', () => {
+      const used = extractUsedBashToolNames(
+        `echo "$((search_docs + 1))"
+echo "$(get_weather '{}';)" search_docs`,
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather']));
+    });
+
+    it('handles case patterns and literal hashes inside substitutions', () => {
+      const used = extractUsedBashToolNames(
+        `printf '%s' start
+result="$(case "$x" in yes) get_weather '{}';; esac)"
+value="$(printf '%s' value#fragment; search_docs '{}')"`,
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
     });
   });
 
