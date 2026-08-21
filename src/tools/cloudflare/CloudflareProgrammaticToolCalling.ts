@@ -1068,13 +1068,15 @@ async function runProgrammatic(args: {
     assertBashToolsAllowProgrammaticCalling(
       toolCall.disallowedToolDefs,
       args.params.code,
-      toolCall.programmaticToolName ?? Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+      toolCall.programmaticToolName ?? Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+      toolCall.toolDefs
     );
   } else {
     assertPythonToolsAllowProgrammaticCalling(
       toolCall.disallowedToolDefs,
       args.params.code,
-      toolCall.programmaticToolName ?? Constants.PROGRAMMATIC_TOOL_CALLING
+      toolCall.programmaticToolName ?? Constants.PROGRAMMATIC_TOOL_CALLING,
+      toolCall.toolDefs
     );
   }
   const toolDefs = toolCall.toolDefs ?? [];

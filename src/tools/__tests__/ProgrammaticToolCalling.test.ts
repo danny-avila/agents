@@ -12,6 +12,7 @@ import {
   formatCompletedResponse,
   extractUsedToolNames,
   filterToolsByUsage,
+  assertPythonToolsAllowProgrammaticCalling,
   executeTools,
   normalizeToPythonIdentifier,
   unwrapToolResponse,
@@ -20,6 +21,7 @@ import {
   createBashProgrammaticToolCallingTool,
   createBashProgrammaticToolCallingSchema,
   extractUsedBashToolNames,
+  assertBashToolsAllowProgrammaticCalling,
   normalizeBashToolResultsForReplay,
   normalizeToBashIdentifier,
 } from '../BashProgrammaticToolCalling';
@@ -811,6 +813,12 @@ print(example)`;
       expect(extractUsedToolNames(code, availableTools)).toEqual(new Set());
     });
 
+    it('ignores matching attribute method calls', () => {
+      const code = 'client . get_weather(city="SF")';
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(new Set());
+    });
+
     it('preserves executable calls inside f-string expressions', () => {
       const code = `await get_weather(city="SF")
 value = f"result: {await search_docs(query='forecast')}"`;
@@ -965,6 +973,60 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       );
 
       expect(used).toEqual(new Set(['search_docs']));
+    });
+
+    it('finds tools in legacy backtick command substitutions', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; result=`search_docs \'{}\'`',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('treats IO numbers as part of redirects', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; 2>/dev/null search_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('ignores tool-like commands in quoted heredoc bodies', () => {
+      const used = extractUsedBashToolNames(
+        'cat <<\'EOF\'\nget_weather \'{}\'\nEOF\nsearch_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['search_docs']));
+    });
+  });
+
+  describe('caller-policy normalization collisions', () => {
+    const allowed = [{ name: 'foo_bar' }] as t.LCTool[];
+    const disallowed = [{ name: 'foo-bar' }] as t.LCTool[];
+
+    it('prefers an allowed Python tool with the same normalized name', () => {
+      expect(() =>
+        assertPythonToolsAllowProgrammaticCalling(
+          disallowed,
+          'await foo_bar()',
+          Constants.PROGRAMMATIC_TOOL_CALLING,
+          allowed
+        )
+      ).not.toThrow();
+    });
+
+    it('prefers an allowed Bash tool with the same normalized name', () => {
+      expect(() =>
+        assertBashToolsAllowProgrammaticCalling(
+          disallowed,
+          'foo_bar \'{}\'',
+          Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+          allowed
+        )
+      ).not.toThrow();
     });
   });
 

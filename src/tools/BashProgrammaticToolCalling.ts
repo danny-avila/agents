@@ -325,6 +325,7 @@ function collectBashCommandNames(
 
 /** Minimal shell lexer for locating command positions without executing code. */
 function tokenizeBash(code: string): BashToken[] {
+  code = maskQuotedBashHeredocBodies(code);
   const tokens: BashToken[] = [];
   let index = 0;
 
@@ -338,6 +339,16 @@ function tokenizeBash(code: string): BashToken[] {
       tokens.push({ type: 'separator' });
       index += code[index + 1] === char ? 2 : 1;
       continue;
+    }
+    if (/[0-9]/.test(char)) {
+      let redirectIndex = index + 1;
+      while (/[0-9]/.test(code[redirectIndex] ?? '')) {
+        redirectIndex += 1;
+      }
+      if (code[redirectIndex] === '<' || code[redirectIndex] === '>') {
+        index = redirectIndex;
+        continue;
+      }
     }
     if (code.slice(index, index + 3) === '$((') {
       const arithmeticEnd = findBashArithmeticExpansionEnd(code, index + 3);
@@ -360,6 +371,19 @@ function tokenizeBash(code: string): BashToken[] {
         tokens.push({
           type: 'nested',
           tokens: tokenizeBash(code.slice(bodyStart, bodyEnd)),
+        });
+        index = bodyEnd + 1;
+      }
+      continue;
+    }
+    if (char === '`') {
+      const bodyEnd = findBashBacktickEnd(code, index + 1);
+      if (bodyEnd == null) {
+        index = code.length;
+      } else {
+        tokens.push({
+          type: 'nested',
+          tokens: tokenizeBash(code.slice(index + 1, bodyEnd)),
         });
         index = bodyEnd + 1;
       }
@@ -394,6 +418,9 @@ function tokenizeBash(code: string): BashToken[] {
         break;
       }
       if (code.slice(index, index + 2) === '$(') {
+        break;
+      }
+      if (current === '`') {
         break;
       }
       if (current === '\\' && index + 1 < code.length) {
@@ -437,6 +464,23 @@ function tokenizeBash(code: string): BashToken[] {
               tokens.push({
                 type: 'nested',
                 tokens: tokenizeBash(code.slice(bodyStart, bodyEnd)),
+              });
+              index = bodyEnd + 1;
+            }
+            continue;
+          }
+          if (quote === '"' && code[index] === '`') {
+            if (value !== '') {
+              tokens.push({ type: 'word', value });
+              value = '';
+            }
+            const bodyEnd = findBashBacktickEnd(code, index + 1);
+            if (bodyEnd == null) {
+              index = code.length;
+            } else {
+              tokens.push({
+                type: 'nested',
+                tokens: tokenizeBash(code.slice(index + 1, bodyEnd)),
               });
               index = bodyEnd + 1;
             }
@@ -494,6 +538,14 @@ function findBashCommandSubstitutionEnd(
       quote = char;
       continue;
     }
+    if (char === '`') {
+      const backtickEnd = findBashBacktickEnd(code, index + 1);
+      if (backtickEnd == null) {
+        return undefined;
+      }
+      index = backtickEnd;
+      continue;
+    }
     if (
       char === '#' &&
       (index === bodyStart || /[\s;|&()]/.test(code[index - 1]))
@@ -547,6 +599,110 @@ function findBashCommandSubstitutionEnd(
       } else if (caseDepth === 0) {
         return index;
       }
+    }
+  }
+
+  return undefined;
+}
+
+/** Finds the closing delimiter for a legacy backtick command substitution. */
+function findBashBacktickEnd(
+  code: string,
+  bodyStart: number
+): number | undefined {
+  for (let index = bodyStart; index < code.length; index++) {
+    if (code[index] === '\\') {
+      index += 1;
+    } else if (code[index] === '`') {
+      return index;
+    }
+  }
+  return undefined;
+}
+
+/** Masks quoted heredoc bodies, where shell expansion is disabled. */
+function maskQuotedBashHeredocBodies(code: string): string {
+  const masked = [...code];
+  let lineStart = 0;
+
+  while (lineStart < code.length) {
+    const lineEnd = code.indexOf('\n', lineStart);
+    const contentEnd = lineEnd === -1 ? code.length : lineEnd;
+    const declaration = findQuotedBashHeredocDeclaration(
+      code.slice(lineStart, contentEnd)
+    );
+    if (declaration == null || lineEnd === -1) {
+      lineStart = lineEnd === -1 ? code.length : lineEnd + 1;
+      continue;
+    }
+
+    let bodyStart = lineEnd + 1;
+    while (bodyStart <= code.length) {
+      const bodyLineEnd = code.indexOf('\n', bodyStart);
+      const bodyContentEnd =
+        bodyLineEnd === -1 ? code.length : bodyLineEnd;
+      const bodyLine = code.slice(bodyStart, bodyContentEnd);
+      const comparableLine = declaration.stripTabs
+        ? bodyLine.replace(/^\t+/, '')
+        : bodyLine;
+      for (let index = bodyStart; index < bodyContentEnd; index++) {
+        masked[index] = ' ';
+      }
+      bodyStart = bodyLineEnd === -1 ? code.length + 1 : bodyLineEnd + 1;
+      if (comparableLine === declaration.delimiter) {
+        break;
+      }
+    }
+    lineStart = bodyStart;
+  }
+
+  return masked.join('');
+}
+
+function findQuotedBashHeredocDeclaration(
+  line: string
+): { delimiter: string; stripTabs: boolean } | undefined {
+  let quote: '\'' | '"' | undefined;
+
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index];
+    if (char === '\\') {
+      index += 1;
+      continue;
+    }
+    if (quote != null) {
+      if (char === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (char === '\'' || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (char === '#' && (index === 0 || /\s/.test(line[index - 1]))) {
+      return undefined;
+    }
+    if (line.slice(index, index + 2) !== '<<') {
+      continue;
+    }
+
+    let targetStart = index + 2;
+    const stripTabs = line[targetStart] === '-';
+    targetStart += stripTabs ? 1 : 0;
+    while (/[ \t]/.test(line[targetStart] ?? '')) {
+      targetStart += 1;
+    }
+    const delimiterQuote = line[targetStart];
+    if (delimiterQuote !== '\'' && delimiterQuote !== '"') {
+      continue;
+    }
+    const targetEnd = line.indexOf(delimiterQuote, targetStart + 1);
+    if (targetEnd !== -1) {
+      return {
+        delimiter: line.slice(targetStart + 1, targetEnd),
+        stripTabs,
+      };
     }
   }
 
@@ -684,15 +840,23 @@ function findBashArithmeticExpansionEnd(
 export function assertBashToolsAllowProgrammaticCalling(
   toolDefs: t.LCTool[] | undefined,
   code: string,
-  programmaticToolName: string = Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+  programmaticToolName: string = Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+  allowedToolDefs?: t.LCTool[]
 ): void {
   if (toolDefs == null || toolDefs.length === 0) {
     return;
   }
 
   const toolNameMap = new Map<string, string>();
+  const allowedNames = new Set(
+    allowedToolDefs?.map((toolDef) => normalizeToBashIdentifier(toolDef.name)) ??
+      []
+  );
   for (const toolDef of toolDefs) {
-    toolNameMap.set(normalizeToBashIdentifier(toolDef.name), toolDef.name);
+    const normalizedName = normalizeToBashIdentifier(toolDef.name);
+    if (!allowedNames.has(normalizedName)) {
+      toolNameMap.set(normalizedName, toolDef.name);
+    }
   }
 
   assertDisallowedToolUsage(
@@ -792,7 +956,8 @@ export function createBashProgrammaticToolCallingTool(
         toolCall.programmaticToolName ??
           (typeof toolCall.name === 'string' && toolCall.name !== ''
             ? toolCall.name
-            : Constants.BASH_PROGRAMMATIC_TOOL_CALLING)
+            : Constants.BASH_PROGRAMMATIC_TOOL_CALLING),
+        toolDefs
       );
 
       if (toolMap == null || toolMap.size === 0) {

@@ -592,13 +592,15 @@ async function runLocalProgrammaticTool(args: {
     assertBashToolsAllowProgrammaticCalling(
       disallowedToolDefs,
       args.params.code,
-      programmaticToolName ?? Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+      programmaticToolName ?? Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+      toolDefs
     );
   } else {
     assertPythonToolsAllowProgrammaticCalling(
       disallowedToolDefs,
       args.params.code,
-      programmaticToolName ?? Constants.PROGRAMMATIC_TOOL_CALLING
+      programmaticToolName ?? Constants.PROGRAMMATIC_TOOL_CALLING,
+      toolDefs
     );
   }
 

@@ -323,8 +323,15 @@ export function extractUsedToolNames(
     const escapedName = pythonName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pattern = new RegExp(`\\b${escapedName}\\s*\\(`, 'g');
 
-    if (pattern.test(executableCode)) {
-      usedTools.add(originalName);
+    for (const match of executableCode.matchAll(pattern)) {
+      let prefix = match.index - 1;
+      while (prefix >= 0 && /\s/.test(executableCode[prefix])) {
+        prefix -= 1;
+      }
+      if (executableCode[prefix] !== '.') {
+        usedTools.add(originalName);
+        break;
+      }
     }
   }
 
@@ -604,15 +611,24 @@ export function assertDisallowedToolUsage(
 export function assertPythonToolsAllowProgrammaticCalling(
   toolDefs: t.LCTool[] | undefined,
   code: string,
-  programmaticToolName: string = Constants.PROGRAMMATIC_TOOL_CALLING
+  programmaticToolName: string = Constants.PROGRAMMATIC_TOOL_CALLING,
+  allowedToolDefs?: t.LCTool[]
 ): void {
   if (toolDefs == null || toolDefs.length === 0) {
     return;
   }
 
   const toolNameMap = new Map<string, string>();
+  const allowedNames = new Set(
+    allowedToolDefs?.map((toolDef) =>
+      normalizeToPythonIdentifier(toolDef.name)
+    ) ?? []
+  );
   for (const toolDef of toolDefs) {
-    toolNameMap.set(normalizeToPythonIdentifier(toolDef.name), toolDef.name);
+    const normalizedName = normalizeToPythonIdentifier(toolDef.name);
+    if (!allowedNames.has(normalizedName)) {
+      toolNameMap.set(normalizedName, toolDef.name);
+    }
   }
 
   assertDisallowedToolUsage(
@@ -1210,7 +1226,8 @@ export function createProgrammaticToolCallingTool(
         toolCall.programmaticToolName ??
           (typeof toolCall.name === 'string' && toolCall.name !== ''
             ? toolCall.name
-            : Constants.PROGRAMMATIC_TOOL_CALLING)
+            : Constants.PROGRAMMATIC_TOOL_CALLING),
+        toolDefs
       );
 
       if (toolMap == null || toolMap.size === 0) {
