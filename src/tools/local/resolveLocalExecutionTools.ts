@@ -228,6 +228,27 @@ export function resolveLocalToolRegistry(args: {
       getCloudflareConfig(args.toolExecution)
     )
     : undefined;
+
+  if (selectedNames != null) {
+    const callableInsideCloudflare = new Set(selectedNames);
+    callableInsideCloudflare.delete(Constants.PROGRAMMATIC_TOOL_CALLING);
+    callableInsideCloudflare.delete(Constants.BASH_PROGRAMMATIC_TOOL_CALLING);
+    for (const [name, definition] of registry) {
+      if (callableInsideCloudflare.has(name)) {
+        continue;
+      }
+      const allowedCallers = definition.allowed_callers ?? ['direct'];
+      if (allowedCallers.includes('code_execution')) {
+        registry.set(name, {
+          ...definition,
+          allowed_callers: allowedCallers.filter(
+            (caller) => caller !== 'code_execution'
+          ),
+        });
+      }
+    }
+  }
+
   for (const definition of createLocalCodingToolDefinitions()) {
     if (selectedNames != null && !selectedNames.has(definition.name)) {
       registry.delete(definition.name);

@@ -317,17 +317,80 @@ export function extractUsedToolNames(
   toolNameMap: Map<string, string>
 ): Set<string> {
   const usedTools = new Set<string>();
+  const executableCode = maskPythonStringsAndComments(code);
 
   for (const [pythonName, originalName] of toolNameMap) {
     const escapedName = pythonName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pattern = new RegExp(`\\b${escapedName}\\s*\\(`, 'g');
 
-    if (pattern.test(code)) {
+    if (pattern.test(executableCode)) {
       usedTools.add(originalName);
     }
   }
 
   return usedTools;
+}
+
+/**
+ * Replaces Python comments and string literal contents with spaces while
+ * preserving newlines and source offsets. Tool-name preflight checks should
+ * inspect executable syntax, not examples or prose embedded in the program.
+ */
+function maskPythonStringsAndComments(code: string): string {
+  const masked = [...code];
+  let index = 0;
+
+  const mask = (position: number): void => {
+    if (masked[position] !== '\n' && masked[position] !== '\r') {
+      masked[position] = ' ';
+    }
+  };
+
+  while (index < code.length) {
+    if (code[index] === '#') {
+      while (index < code.length && code[index] !== '\n') {
+        mask(index++);
+      }
+      continue;
+    }
+
+    const quote = code[index];
+    if (quote !== '\'' && quote !== '"') {
+      index += 1;
+      continue;
+    }
+
+    const triple = code.slice(index, index + 3) === quote.repeat(3);
+    const delimiterLength = triple ? 3 : 1;
+    for (let offset = 0; offset < delimiterLength; offset++) {
+      mask(index + offset);
+    }
+    index += delimiterLength;
+
+    while (index < code.length) {
+      if (code[index] === '\\') {
+        mask(index++);
+        if (index < code.length) {
+          mask(index++);
+        }
+        continue;
+      }
+      if (
+        triple
+          ? code.slice(index, index + 3) === quote.repeat(3)
+          : code[index] === quote
+      ) {
+        for (let offset = 0; offset < delimiterLength; offset++) {
+          mask(index + offset);
+        }
+        index += delimiterLength;
+        break;
+      }
+      mask(index++);
+    }
+  }
+
+  return masked.join('');
 }
 
 /** Throws a caller-policy error for tools referenced by programmatic code. */
@@ -956,9 +1019,10 @@ export function createProgrammaticToolCallingTool(
       assertPythonToolsAllowProgrammaticCalling(
         disallowedToolDefs,
         code,
-        typeof toolCall.name === 'string' && toolCall.name !== ''
-          ? toolCall.name
-          : Constants.PROGRAMMATIC_TOOL_CALLING
+        toolCall.programmaticToolName ??
+          (typeof toolCall.name === 'string' && toolCall.name !== ''
+            ? toolCall.name
+            : Constants.PROGRAMMATIC_TOOL_CALLING)
       );
 
       if (toolMap == null || toolMap.size === 0) {

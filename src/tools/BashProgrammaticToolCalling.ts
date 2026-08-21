@@ -14,16 +14,16 @@ import {
   selectRuntimeSessionHint,
 } from './CodeExecutor';
 import {
-  clampCodeApiRunTimeoutMs,
-  createCodeApiRunTimeoutSchema,
-  resolveCodeApiRunTimeoutMs,
-} from './ptcTimeout';
-import {
   makeRequest,
   executeTools,
   formatCompletedResponse,
   assertDisallowedToolUsage,
 } from './ProgrammaticToolCalling';
+import {
+  clampCodeApiRunTimeoutMs,
+  createCodeApiRunTimeoutSchema,
+  resolveCodeApiRunTimeoutMs,
+} from './ptcTimeout';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
@@ -224,17 +224,192 @@ export function extractUsedBashToolNames(
   toolNameMap: Map<string, string>
 ): Set<string> {
   const usedTools = new Set<string>();
+  const commandNames = extractBashCommandNames(code);
 
-  for (const [bashName, originalName] of toolNameMap) {
-    const escapedName = bashName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp(`\\b${escapedName}\\b`, 'g');
-
-    if (pattern.test(code)) {
+  for (const commandName of commandNames) {
+    const originalName = toolNameMap.get(commandName);
+    if (originalName != null) {
       usedTools.add(originalName);
     }
   }
 
   return usedTools;
+}
+
+const COMMAND_PREFIXES = new Set([
+  'builtin',
+  'command',
+  'env',
+  'exec',
+  'nohup',
+  'sudo',
+]);
+
+const COMMAND_START_WORDS = new Set([
+  'do',
+  'elif',
+  'else',
+  'if',
+  'then',
+  'time',
+  'until',
+  'while',
+]);
+
+type BashToken =
+  | { type: 'word'; value: string }
+  | { type: 'separator' }
+  | { type: 'redirect' };
+
+/** Returns shell words at command position, excluding arguments and comments. */
+function extractBashCommandNames(code: string): Set<string> {
+  const commands = new Set<string>();
+  let expectsCommand = true;
+  let skipRedirectTarget = false;
+
+  for (const token of tokenizeBash(code)) {
+    if (token.type === 'separator') {
+      expectsCommand = true;
+      skipRedirectTarget = false;
+      continue;
+    }
+    if (token.type === 'redirect') {
+      skipRedirectTarget = true;
+      continue;
+    }
+    if (skipRedirectTarget) {
+      skipRedirectTarget = false;
+      continue;
+    }
+    if (!expectsCommand) {
+      continue;
+    }
+
+    const word = token.value;
+    if (/^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(word)) {
+      continue;
+    }
+    if (word.startsWith('-')) {
+      continue;
+    }
+    if (COMMAND_START_WORDS.has(word) || word === '!' || word === '{') {
+      continue;
+    }
+    if (COMMAND_PREFIXES.has(word)) {
+      continue;
+    }
+
+    commands.add(word);
+    expectsCommand = false;
+  }
+
+  return commands;
+}
+
+/** Minimal shell lexer for locating command positions without executing code. */
+function tokenizeBash(code: string): BashToken[] {
+  const tokens: BashToken[] = [];
+  let index = 0;
+
+  while (index < code.length) {
+    const char = code[index];
+    if (char === ' ' || char === '\t' || char === '\r') {
+      index += 1;
+      continue;
+    }
+    if (char === '\n' || char === ';' || char === '|' || char === '&') {
+      tokens.push({ type: 'separator' });
+      index += code[index + 1] === char ? 2 : 1;
+      continue;
+    }
+    if (char === '(' || code.slice(index, index + 2) === '$(') {
+      tokens.push({ type: 'separator' });
+      index += char === '(' ? 1 : 2;
+      continue;
+    }
+    if (char === ')') {
+      index += 1;
+      continue;
+    }
+    if (char === '<' || char === '>') {
+      tokens.push({ type: 'redirect' });
+      index += code[index + 1] === char ? 2 : 1;
+      continue;
+    }
+    if (char === '#') {
+      while (index < code.length && code[index] !== '\n') {
+        index += 1;
+      }
+      continue;
+    }
+
+    let value = '';
+    while (index < code.length) {
+      const current = code[index];
+      if (/\s/.test(current) || ';|&()<>'.includes(current)) {
+        break;
+      }
+      if (code.slice(index, index + 2) === '$(') {
+        break;
+      }
+      if (current === '\\' && index + 1 < code.length) {
+        value += code[index + 1];
+        index += 2;
+        continue;
+      }
+      if (current === '\'' || current === '"') {
+        const quote = current;
+        let commandSubstitutionDepth = 0;
+        index += 1;
+        while (index < code.length && code[index] !== quote) {
+          if (quote === '"' && code.slice(index, index + 2) === '$(') {
+            if (value !== '') {
+              tokens.push({ type: 'word', value });
+              value = '';
+            }
+            tokens.push({ type: 'separator' });
+            commandSubstitutionDepth += 1;
+            index += 2;
+            continue;
+          }
+          if (
+            quote === '"' &&
+            commandSubstitutionDepth > 0 &&
+            code[index] === ')'
+          ) {
+            if (value !== '') {
+              tokens.push({ type: 'word', value });
+              value = '';
+            }
+            commandSubstitutionDepth -= 1;
+            index += 1;
+            continue;
+          }
+          if (
+            quote === '"' &&
+            code[index] === '\\' &&
+            index + 1 < code.length
+          ) {
+            value += code[index + 1];
+            index += 2;
+          } else {
+            value += code[index++];
+          }
+        }
+        if (code[index] === quote) {
+          index += 1;
+        }
+        continue;
+      }
+      value += current;
+      index += 1;
+    }
+    if (value !== '') {
+      tokens.push({ type: 'word', value });
+    }
+  }
+
+  return tokens;
 }
 
 /** Rejects direct-only tools before any bash sandbox request is made. */
@@ -346,9 +521,10 @@ export function createBashProgrammaticToolCallingTool(
       assertBashToolsAllowProgrammaticCalling(
         disallowedToolDefs,
         code,
-        typeof toolCall.name === 'string' && toolCall.name !== ''
-          ? toolCall.name
-          : Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+        toolCall.programmaticToolName ??
+          (typeof toolCall.name === 'string' && toolCall.name !== ''
+            ? toolCall.name
+            : Constants.BASH_PROGRAMMATIC_TOOL_CALLING)
       );
 
       if (toolMap == null || toolMap.size === 0) {

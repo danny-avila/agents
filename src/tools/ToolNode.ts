@@ -62,7 +62,6 @@ import {
   SUBAGENT_PARENT_BATCH_CONFIG_KEY,
   SUBAGENT_REPLAY_CONTROLLER,
 } from '@/tools/subagent/SubagentReplay';
-import { attachRunStepResumeState } from '@/tools/runStepResume';
 import {
   INTENT_ARG,
   readOutcomeFields,
@@ -97,6 +96,7 @@ import {
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
+import { attachRunStepResumeState } from '@/tools/runStepResume';
 
 /** Host-facing batch requests must not carry the batch's breaker scope —
  * hosts spread `configurable` into their own run configs. */
@@ -1340,6 +1340,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           toolMap,
           toolDefs,
           disallowedToolDefs,
+          programmaticToolName: call.name,
           // Plumb the hook context into the programmatic-tool path so
           // inner tool calls made via the in-process bridge can run
           // through `PreToolUse` (deny / updatedInput) before reaching

@@ -2,17 +2,19 @@ import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { AIMessage } from '@langchain/core/messages';
 import { describe, it, expect } from '@jest/globals';
-import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { ToolNode } from '../ToolNode';
 import { Constants } from '@/common';
 
 describe('ToolNode programmatic caller policy', () => {
   it('separates programmatic tools from direct-only preflight definitions', async () => {
-    const capturedConfigs: Record<string, unknown>[] = [];
+    const capturedConfigs: Array<ToolCall & Partial<t.ProgrammaticCache>> = [];
     const ptcTool = tool(
       async (_args, config) => {
-        capturedConfigs.push({ ...(config.toolCall ?? {}) });
+        capturedConfigs.push(
+          config.toolCall as ToolCall & Partial<t.ProgrammaticCache>
+        );
         return 'done';
       },
       {
@@ -20,17 +22,17 @@ describe('ToolNode programmatic caller policy', () => {
         description: 'Run tools with code',
         schema: z.object({ code: z.string() }),
       }
-    ) as unknown as StructuredToolInterface;
+    );
     const programmaticTool = tool(async () => 'programmatic', {
       name: 'programmatic_tool',
       description: 'Programmatic tool',
       schema: z.object({}),
-    }) as unknown as StructuredToolInterface;
+    });
     const directTool = tool(async () => 'direct', {
       name: 'direct_tool',
       description: 'Direct tool',
       schema: z.object({}),
-    }) as unknown as StructuredToolInterface;
+    });
     const toolRegistry: t.LCToolRegistry = new Map([
       [
         programmaticTool.name,
@@ -70,6 +72,9 @@ describe('ToolNode programmatic caller policy', () => {
     ]);
     expect(capturedConfigs[0].toolMap).toEqual(
       new Map([['programmatic_tool', programmaticTool]])
+    );
+    expect(capturedConfigs[0].programmaticToolName).toBe(
+      Constants.PROGRAMMATIC_TOOL_CALLING
     );
   });
 });

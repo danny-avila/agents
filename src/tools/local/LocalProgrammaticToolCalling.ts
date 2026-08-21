@@ -580,20 +580,25 @@ async function runLocalProgrammaticTool(args: {
   localConfig: t.LocalExecutionConfig;
   runtime: LocalProgrammaticRuntime;
 }): Promise<[string, t.ProgrammaticExecutionArtifact]> {
-  const { toolMap, toolDefs, disallowedToolDefs, hookContext } =
-    getProgrammaticContext(args.config);
+  const {
+    toolMap,
+    toolDefs,
+    disallowedToolDefs,
+    programmaticToolName,
+    hookContext,
+  } = getProgrammaticContext(args.config);
 
   if (args.runtime === 'bash') {
     assertBashToolsAllowProgrammaticCalling(
       disallowedToolDefs,
       args.params.code,
-      Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+      programmaticToolName ?? Constants.BASH_PROGRAMMATIC_TOOL_CALLING
     );
   } else {
     assertPythonToolsAllowProgrammaticCalling(
       disallowedToolDefs,
       args.params.code,
-      Constants.PROGRAMMATIC_TOOL_CALLING
+      programmaticToolName ?? Constants.PROGRAMMATIC_TOOL_CALLING
     );
   }
 

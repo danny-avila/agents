@@ -17,17 +17,19 @@ import {
   unwrapToolResponse,
 } from '../ProgrammaticToolCalling';
 import {
+  createBashProgrammaticToolCallingTool,
+  createBashProgrammaticToolCallingSchema,
+  extractUsedBashToolNames,
+  normalizeBashToolResultsForReplay,
+  normalizeToBashIdentifier,
+} from '../BashProgrammaticToolCalling';
+import {
   createProgrammaticToolRegistry,
   createGetTeamMembersTool,
   createGetExpensesTool,
   createGetWeatherTool,
   createCalculatorTool,
 } from '@/test/mockTools';
-import {
-  createBashProgrammaticToolCallingTool,
-  createBashProgrammaticToolCallingSchema,
-  normalizeBashToolResultsForReplay,
-} from '../BashProgrammaticToolCalling';
 import { Constants } from '@/common';
 
 describe('ProgrammaticToolCalling', () => {
@@ -800,6 +802,15 @@ x = 1 + 2`;
       expect(used.size).toBe(0);
     });
 
+    it('ignores tool-like calls in strings and comments', () => {
+      const code = `# await get_weather(city="SF")
+example = "get_expenses(user_id='u1')"
+documentation = '''calculator(expression="1+1")'''
+print(example)`;
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(new Set());
+    });
+
     it('handles tool names with special characters via normalization', () => {
       const specialTools = createToolMap(['get_data.v2', 'calc+plus']);
       const code = `await get_datav2()
@@ -823,6 +834,37 @@ print(result)`;
 
       expect(used.size).toBe(1);
       expect(used.has('create_spreadsheet_mcp_Google-Workspace')).toBe(true);
+    });
+  });
+
+  describe('extractUsedBashToolNames', () => {
+    const availableTools = new Map(
+      ['get_weather', 'search_docs'].map((name) => [
+        normalizeToBashIdentifier(name),
+        name,
+      ])
+    );
+
+    it('finds tools invoked as commands and in command substitutions', () => {
+      const used = extractUsedBashToolNames(
+        `weather=$(get_weather '{}')
+search_docs '{"query":"forecast"}'
+printf '%s' "$(get_weather '{}')"`,
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('ignores tool names passed as arguments or written in comments', () => {
+      const used = extractUsedBashToolNames(
+        `echo "get_weather"
+printf '%s' search_docs
+# get_weather '{}'`,
+        availableTools
+      );
+
+      expect(used).toEqual(new Set());
     });
   });
 

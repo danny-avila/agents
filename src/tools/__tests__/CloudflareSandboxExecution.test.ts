@@ -1,3 +1,4 @@
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
   createCloudflareWorkspaceFS,
@@ -10,9 +11,9 @@ import {
   createCloudflareBashProgrammaticToolCallingTool,
   createCloudflareProgrammaticToolCallingTool,
 } from '../cloudflare/CloudflareProgrammaticToolCalling';
-import { isWorkspaceClientTimeoutError } from '../local/workspaceFS';
 import { createCloudflareBridgeRuntime } from '../cloudflare/CloudflareBridgeRuntime';
 import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
+import { isWorkspaceClientTimeoutError } from '../local/workspaceFS';
 import { spawnLocalProcess } from '../local/LocalExecutionEngine';
 import { Constants } from '@/common';
 
@@ -57,6 +58,26 @@ function createRuntime(
     ...overrides,
   };
 }
+
+it('reports the invoked runner name for Cloudflare caller-policy failures', async () => {
+  const programmatic = createCloudflareProgrammaticToolCallingTool({
+    sandbox: createRuntime(),
+  });
+  const toolCall = {
+    id: 'cloudflare-ptc',
+    name: Constants.PROGRAMMATIC_TOOL_CALLING,
+    type: 'tool_call' as const,
+    args: {},
+    programmaticToolName: Constants.PROGRAMMATIC_TOOL_CALLING,
+    disallowedToolDefs: [{ name: 'direct_only_tool' }],
+  } satisfies ToolCall & Partial<t.ProgrammaticCache>;
+
+  await expect(
+    programmatic.invoke({ code: 'direct_only_tool \'{}\'' }, { toolCall })
+  ).rejects.toThrow(
+    'Tool "direct_only_tool" cannot be called from "run_tools_with_code"'
+  );
+});
 
 describe('Cloudflare sandbox execution backend', () => {
   it('normalizes trailing workspace slashes before clamping paths', async () => {

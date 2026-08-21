@@ -469,6 +469,7 @@ export class Run<_T extends t.BaseGraphState> {
         subagentTasks: this.subagentTasks,
         preemption: this.preemption,
         streamLimits: this.streamLimits,
+        toolExecution: this.toolExecution,
       },
     });
     /** Propagate compile options from graph config */
@@ -508,6 +509,7 @@ export class Run<_T extends t.BaseGraphState> {
         subagentTasks: this.subagentTasks,
         preemption: this.preemption,
         streamLimits: this.streamLimits,
+        toolExecution: this.toolExecution,
       },
     });
 

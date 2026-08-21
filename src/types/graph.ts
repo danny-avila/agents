@@ -31,6 +31,7 @@ import type {
   ToolEndEvent,
   GenericTool,
   LCTool,
+  ToolExecutionConfig,
   ToolExecuteBatchRequest,
 } from '@/types/tools';
 import type {
@@ -338,6 +339,8 @@ export type StandardGraphInput = {
   runId?: string;
   signal?: AbortSignal;
   agents: AgentInputs[];
+  /** Execution backend used to resolve the effective tool registry. */
+  toolExecution?: ToolExecutionConfig;
   langfuse?: LangfuseConfig;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;

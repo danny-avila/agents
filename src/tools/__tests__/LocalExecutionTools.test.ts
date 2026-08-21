@@ -20,7 +20,9 @@ import {
   readFile as fsReadFile,
 } from 'fs/promises';
 import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { WorkspaceFS } from '../local/workspaceFS';
 import type * as t from '@/types';
 import {
   executeLocalBash,
@@ -36,10 +38,10 @@ import {
   runPostEditSyntaxCheck,
   _resetSyntaxCheckProbeCacheForTests,
 } from '../local/syntaxCheck';
+import { createLocalProgrammaticToolCallingTool } from '../local/LocalProgrammaticToolCalling';
 import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
-import { WorkspaceClientTimeoutError } from '../local/workspaceFS';
-import type { WorkspaceFS } from '../local/workspaceFS';
 import { LocalFileCheckpointerImpl } from '../local/FileCheckpointer';
+import { WorkspaceClientTimeoutError } from '../local/workspaceFS';
 import { createCompileCheckTool } from '../local/CompileCheckTool';
 import { runBashAstChecks } from '../local/bashAst';
 import { Constants, Providers } from '@/common';
@@ -48,6 +50,24 @@ import { ToolNode } from '../ToolNode';
 const hasPython3 = spawnSync('python3', ['--version']).status === 0;
 
 const tempDirs: string[] = [];
+
+it('reports the invoked runner name for local caller-policy failures', async () => {
+  const programmatic = createLocalProgrammaticToolCallingTool();
+  const toolCall = {
+    id: 'local-ptc',
+    name: Constants.PROGRAMMATIC_TOOL_CALLING,
+    type: 'tool_call' as const,
+    args: {},
+    programmaticToolName: Constants.PROGRAMMATIC_TOOL_CALLING,
+    disallowedToolDefs: [{ name: 'direct_only_tool' }],
+  } satisfies ToolCall & Partial<t.ProgrammaticCache>;
+
+  await expect(
+    programmatic.invoke({ code: 'direct_only_tool \'{}\'' }, { toolCall })
+  ).rejects.toThrow(
+    'Tool "direct_only_tool" cannot be called from "run_tools_with_code"'
+  );
+});
 
 async function createTempDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'lc-local-tools-'));

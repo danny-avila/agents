@@ -32,6 +32,7 @@ import {
   Constants,
   Providers,
 } from '@/common';
+import { resolveLocalToolRegistry } from '@/tools/local/resolveLocalExecutionTools';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
@@ -59,7 +60,8 @@ export class AgentContext {
   static fromConfig(
     agentConfig: t.AgentInputs,
     tokenCounter?: t.TokenCounter,
-    indexTokenCountMap?: Record<string, number>
+    indexTokenCountMap?: Record<string, number>,
+    toolExecution?: t.ToolExecutionConfig
   ): AgentContext {
     const {
       agentId,
@@ -103,6 +105,7 @@ export class AgentContext {
       tools,
       toolMap,
       toolRegistry,
+      toolExecution,
       toolDefinitions,
       instructions,
       additionalInstructions: additional_instructions,
@@ -385,6 +388,7 @@ export class AgentContext {
     tools,
     toolMap,
     toolRegistry,
+    toolExecution,
     toolDefinitions,
     instructions,
     additionalInstructions,
@@ -410,6 +414,7 @@ export class AgentContext {
     tools?: t.GraphTools;
     toolMap?: t.ToolMap;
     toolRegistry?: t.LCToolRegistry;
+    toolExecution?: t.ToolExecutionConfig;
     toolDefinitions?: t.LCTool[];
     instructions?: string;
     additionalInstructions?: string;
@@ -434,7 +439,10 @@ export class AgentContext {
     this.tokenCounter = tokenCounter;
     this.tools = tools;
     this.toolMap = toolMap;
-    this.toolRegistry = toolRegistry;
+    this.toolRegistry = resolveLocalToolRegistry({
+      toolRegistry,
+      toolExecution,
+    });
     this.toolDefinitions = toolDefinitions;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
@@ -498,6 +506,7 @@ export class AgentContext {
     if (programmaticToolNames.length === 0) return '';
 
     const programmaticTool = this.getProgrammaticToolInstructionTarget();
+    if (programmaticTool == null) return '';
     const quotedProgrammaticNames = programmaticToolNames
       .map((name) => `\`${name}\``)
       .join(', ');
@@ -541,7 +550,7 @@ export class AgentContext {
   private getProgrammaticToolInstructionTarget(): {
     name: string;
     language: 'bash' | 'Python';
-    } {
+  } | undefined {
     if (this.hasAvailableTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING)) {
       return {
         name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
@@ -553,7 +562,7 @@ export class AgentContext {
       return { name: Constants.PROGRAMMATIC_TOOL_CALLING, language: 'Python' };
     }
 
-    return { name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING, language: 'bash' };
+    return undefined;
   }
 
   private hasAvailableTool(name: string): boolean {
