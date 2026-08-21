@@ -21,6 +21,7 @@ import {
   createBashProgrammaticToolCallingTool,
   createBashProgrammaticToolCallingSchema,
   extractUsedBashToolNames,
+  filterBashToolsByUsage,
   assertBashToolsAllowProgrammaticCalling,
   normalizeBashToolResultsForReplay,
   normalizeToBashIdentifier,
@@ -1252,6 +1253,34 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       );
 
       expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('keeps every tool available when sourcing a shell script', () => {
+      const toolDefs = [
+        { name: 'get_weather' },
+        { name: 'search_docs' },
+      ] as t.LCTool[];
+
+      expect(
+        filterBashToolsByUsage(
+          toolDefs,
+          'get_weather \'{}\'; source ./calls.sh'
+        )
+      ).toEqual(toolDefs);
+      expect(
+        filterBashToolsByUsage(toolDefs, 'get_weather \'{}\'; . ./calls.sh')
+      ).toEqual(toolDefs);
+    });
+
+    it('rejects sourced scripts when direct-only tools could be hidden', () => {
+      expect(() =>
+        assertBashToolsAllowProgrammaticCalling(
+          [{ name: 'search_docs' }],
+          'get_weather \'{}\'; source ./calls.sh',
+          Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+          [{ name: 'get_weather' }]
+        )
+      ).toThrow('Tool "search_docs" cannot be called');
     });
   });
 

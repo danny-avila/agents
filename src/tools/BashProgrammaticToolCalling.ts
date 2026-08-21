@@ -275,6 +275,12 @@ function extractBashCommandNames(code: string): Set<string> {
   return commands;
 }
 
+/** Sourced files can invoke any injected function outside the visible code. */
+function requiresAllBashTools(code: string): boolean {
+  const commandNames = extractBashCommandNames(code);
+  return commandNames.has('source') || commandNames.has('.');
+}
+
 function collectBashCommandNames(
   tokens: BashToken[],
   commands: Set<string>
@@ -1234,10 +1240,10 @@ export function assertBashToolsAllowProgrammaticCalling(
     }
   }
 
-  assertDisallowedToolUsage(
-    extractUsedBashToolNames(code, toolNameMap),
-    programmaticToolName
-  );
+  const disallowedUsage = requiresAllBashTools(code)
+    ? new Set(toolNameMap.values())
+    : extractUsedBashToolNames(code, toolNameMap);
+  assertDisallowedToolUsage(disallowedUsage, programmaticToolName);
 }
 
 /**
@@ -1248,6 +1254,16 @@ export function filterBashToolsByUsage(
   code: string,
   debug = false
 ): t.LCTool[] {
+  if (requiresAllBashTools(code)) {
+    if (debug) {
+      // eslint-disable-next-line no-console
+      console.log(
+        '[BashPTC Debug] Sourced script detected - sending all tools as fallback'
+      );
+    }
+    return toolDefs;
+  }
+
   const toolNameMap = new Map<string, string>();
   for (const def of toolDefs) {
     const bashName = normalizeToBashIdentifier(def.name);

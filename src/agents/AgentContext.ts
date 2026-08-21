@@ -566,7 +566,7 @@ export class AgentContext {
   }> {
     const targets: Array<{ name: string; codeGuidance: string }> = [];
     if (
-      this.hasAvailableTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING) ||
+      this.hasBoundTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING) ||
       isProgrammaticRunnerAutoBound(
         Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
         this.toolExecution
@@ -579,7 +579,7 @@ export class AgentContext {
     }
 
     if (
-      this.hasAvailableTool(Constants.PROGRAMMATIC_TOOL_CALLING) ||
+      this.hasBoundTool(Constants.PROGRAMMATIC_TOOL_CALLING) ||
       isProgrammaticRunnerAutoBound(
         Constants.PROGRAMMATIC_TOOL_CALLING,
         this.toolExecution
@@ -599,16 +599,12 @@ export class AgentContext {
     return targets;
   }
 
-  private hasAvailableTool(name: string): boolean {
-    if (this.toolDefinitions?.some((tool) => tool.name === name) === true)
-      return true;
-    if (
-      this.tools?.some((tool) => 'name' in tool && tool.name === name) === true
-    ) {
-      return true;
-    }
-    if (this.toolMap?.has(name) === true) return true;
-    return this.toolRegistry?.has(name) === true;
+  private hasBoundTool(name: string): boolean {
+    return (
+      this.getToolsForBinding()?.some(
+        (tool) => 'name' in tool && tool.name === name
+      ) === true
+    );
   }
 
   /**

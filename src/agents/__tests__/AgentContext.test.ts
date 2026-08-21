@@ -1115,6 +1115,60 @@ describe('AgentContext', () => {
       expect(content).toContain('`direct_tool`');
     });
 
+    it('omits deferred programmatic runners until discovery', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            {
+              name: Constants.PROGRAMMATIC_TOOL_CALLING,
+              defer_loading: true,
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'direct_tool',
+              { name: 'direct_tool', allowed_callers: ['direct'] },
+            ],
+          ]),
+        },
+      });
+
+      expect(String((await ctx.systemRunnable!.invoke([]))[0].content)).toBe(
+        'Base'
+      );
+
+      ctx.markToolsAsDiscovered([Constants.PROGRAMMATIC_TOOL_CALLING]);
+
+      expect(
+        String((await ctx.systemRunnable!.invoke([]))[0].content)
+      ).toContain('inside `run_tools_with_code`');
+    });
+
+    it('omits programmatic runners that are not direct-callable', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            {
+              name: Constants.PROGRAMMATIC_TOOL_CALLING,
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'direct_tool',
+              { name: 'direct_tool', allowed_callers: ['direct'] },
+            ],
+          ]),
+        },
+      });
+
+      expect(String((await ctx.systemRunnable!.invoke([]))[0].content)).toBe(
+        'Base'
+      );
+    });
+
     it('excludes deferred code_execution-only tools until discovered', () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [
