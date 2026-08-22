@@ -95,8 +95,11 @@ import {
   resolveLocalExecutionTools,
 } from '@/tools/local';
 import {
+  type CallerCapabilityProjection,
+  createCallerCapabilityProjectionSnapshot,
   isToolDefinitionActive,
   isProgrammaticControlTool,
+  mergeCallerCapabilityDefinitions,
   resolveCallerCapabilityProjection,
 } from '@/tools/CallerCapabilities';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
@@ -698,6 +701,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   >();
   /** Tool registry for filtering (lazy computation of programmatic maps) */
   private toolRegistry?: t.LCToolRegistry;
+  /** Schema-only definitions used when event mode has no runtime registry. */
+  private toolDefinitions?: t.LCToolRegistry;
+  /** Tool-map entries created or replaced by the local execution resolver. */
+  private localImplementationNames = new Set<string>();
   /** Reads deferred-tool discovery state from the owning agent context. */
   private getDiscoveredToolNames?: () => readonly string[];
   /** Reference to Graph's sessions map for automatic session injection */
@@ -803,6 +810,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     handleToolErrors,
     loadRuntimeTools,
     toolRegistry,
+    toolDefinitions,
     getDiscoveredToolNames,
     sessions,
     codeSessionKey,
@@ -879,6 +887,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       toolRegistry,
       toolExecution,
     });
+    this.toolDefinitions = toolDefinitions;
     this.getDiscoveredToolNames = getDiscoveredToolNames;
     this.sessions = sessions;
     this.codeSessionKey = codeSessionKey ?? Constants.EXECUTE_CODE;
@@ -999,6 +1008,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     });
 
     this.toolMap = resolved.toolMap;
+    this.localImplementationNames = resolved.localImplementationNames;
     if (resolved.fileCheckpointer != null) {
       this.fileCheckpointer = resolved.fileCheckpointer;
     }
@@ -1105,27 +1115,58 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.settledInterruptingResults.clear();
   }
 
-  /** Returns active tools projected by their effective caller capabilities. */
-  private getProgrammaticTools(): t.ProgrammaticCache {
-    const toolMap: t.ToolMap = new Map();
+  /** Returns the live caller projection used by direct and event execution. */
+  private getCallerCapabilityProjection(): CallerCapabilityProjection {
     const discoveredToolNames = new Set(
       this.getDiscoveredToolNames?.() ?? []
     );
-    const capabilities = resolveCallerCapabilityProjection(
+    return resolveCallerCapabilityProjection(
+      mergeCallerCapabilityDefinitions(
+        this.toolDefinitions?.values(),
+        this.toolRegistry?.values()
+      ),
+      (toolDef) => isToolDefinitionActive(toolDef, discoveredToolNames)
+    );
+  }
+
+  /** Serializes the live caller projection for event-driven hosts. */
+  private getCallerCapabilityProjectionSnapshot(): t.CallerCapabilityProjectionSnapshot {
+    return createCallerCapabilityProjectionSnapshot(
+      this.getCallerCapabilityProjection()
+    );
+  }
+
+  /** Returns active tools projected by their effective caller capabilities. */
+  private getProgrammaticTools(): t.ProgrammaticCache {
+    const toolMap: t.ToolMap = new Map();
+    const toolDefs: t.LCTool[] = [];
+    const discoveredToolNames = new Set(
+      this.getDiscoveredToolNames?.() ?? []
+    );
+    const executableCapabilities = resolveCallerCapabilityProjection(
       this.toolRegistry?.values() ?? [],
       (toolDef) => isToolDefinitionActive(toolDef, discoveredToolNames)
     );
-    for (const toolDef of capabilities.codeExecutionTools) {
+    for (const toolDef of executableCapabilities.codeExecutionTools) {
+      if (
+        this.eventDrivenMode &&
+        this.directToolNames?.has(toolDef.name) !== true &&
+        !this.localImplementationNames.has(toolDef.name)
+      ) {
+        continue;
+      }
       const tool = this.toolMap.get(toolDef.name);
       if (tool != null) {
         toolMap.set(toolDef.name, tool);
+        toolDefs.push(toolDef);
       }
     }
+    const activeCapabilities = this.getCallerCapabilityProjection();
 
     return {
       toolMap,
-      toolDefs: capabilities.codeExecutionTools,
-      disallowedToolDefs: capabilities.directOnlyTools
+      toolDefs,
+      disallowedToolDefs: activeCapabilities.directOnlyTools
         .filter((toolDef) => !isProgrammaticControlTool(toolDef.name))
         .map((toolDef) => ({ name: toolDef.name })),
     };
@@ -3455,6 +3496,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               // the eager path sends `agentContext.agentId` — this must
               // match it at the top level too.
               agentId: this.executingAgentId,
+              callerCapabilityProjection:
+                this.getCallerCapabilityProjectionSnapshot(),
               configurable: stripRunBreakerScope(
                   config.configurable as Record<string, unknown> | undefined
               ),

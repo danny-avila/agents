@@ -2868,6 +2868,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * the breakpoint and don't invalidate the prefix.
        */
       let toolsForBinding = rawToolsForBinding;
+      const isDeferredTool = makeIsDeferred(
+        agentContext.getEffectiveToolDefinitions()
+      );
       if (
         agentContext.provider === Providers.ANTHROPIC &&
         (agentContext.clientOptions as t.AnthropicClientOptions | undefined)
@@ -2876,7 +2879,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolsForBinding =
           partitionAndMarkAnthropicToolCache(
             rawToolsForBinding,
-            makeIsDeferred(agentContext.toolDefinitions),
+            isDeferredTool,
             resolvePromptCacheTtl(
               (
                 agentContext.clientOptions as
@@ -2896,7 +2899,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolsForBinding =
           partitionAndMarkOpenRouterToolCache(
             rawToolsForBinding,
-            makeIsDeferred(agentContext.toolDefinitions),
+            isDeferredTool,
             resolvePromptCacheTtl(
               (
                 agentContext.clientOptions as
@@ -2923,7 +2926,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           toolsForBinding =
             partitionAndMarkBedrockToolCache(
               rawToolsForBinding,
-              makeIsDeferred(agentContext.toolDefinitions)
+              isDeferredTool
             ) ?? rawToolsForBinding;
         }
       }

@@ -820,6 +820,12 @@ function startEagerToolExecutions(args: {
       toolCalls: entries.map((entry) => entry.request),
       userId: graph.config?.configurable?.user_id as string | undefined,
       agentId: agentContext?.agentId,
+      callerCapabilityProjection:
+        (
+          agentContext as
+            | Partial<Pick<AgentContext, 'getCallerCapabilityProjectionSnapshot'>>
+            | undefined
+        )?.getCallerCapabilityProjectionSnapshot?.(),
       configurable: graph.config?.configurable as
         | Record<string, unknown>
         | undefined,

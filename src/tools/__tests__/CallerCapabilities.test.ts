@@ -2,6 +2,8 @@ import { describe, expect, it } from '@jest/globals';
 import type * as t from '@/types';
 import {
   allowsToolCaller,
+  applyCallerCapabilityDefinitionOverrides,
+  mergeCallerCapabilityDefinitions,
   resolveCallerCapabilityProjection,
 } from '../CallerCapabilities';
 
@@ -55,5 +57,66 @@ describe('Caller Capability Projection', () => {
   it('defaults omitted caller metadata to direct-only', () => {
     expect(allowsToolCaller(toolDefs[0], 'direct')).toBe(true);
     expect(allowsToolCaller(toolDefs[0], 'code_execution')).toBe(false);
+  });
+
+  it('preserves event schemas while applying runtime capability metadata', () => {
+    expect(
+      mergeCallerCapabilityDefinitions(
+        [
+          {
+            name: 'shared',
+            description: 'Model-facing schema',
+            parameters: { type: 'object', properties: {} },
+          },
+          { name: 'schema_only' },
+        ],
+        [
+          {
+            name: 'shared',
+            allowed_callers: ['code_execution'],
+            defer_loading: true,
+          },
+          { name: 'runtime_only' },
+        ]
+      )
+    ).toEqual([
+      {
+        name: 'shared',
+        description: 'Model-facing schema',
+        parameters: { type: 'object', properties: {} },
+        allowed_callers: ['code_execution'],
+        defer_loading: true,
+      },
+      { name: 'schema_only' },
+      { name: 'runtime_only' },
+    ]);
+  });
+
+  it('overrides caller metadata without adding registry-only definitions', () => {
+    expect(
+      applyCallerCapabilityDefinitionOverrides(
+        [
+          {
+            name: 'event_tool',
+            description: 'Model-facing schema',
+          },
+        ],
+        [
+          {
+            name: 'event_tool',
+            allowed_callers: ['code_execution'],
+            defer_loading: true,
+          },
+          { name: 'registry_only' },
+        ]
+      )
+    ).toEqual([
+      {
+        name: 'event_tool',
+        description: 'Model-facing schema',
+        allowed_callers: ['code_execution'],
+        defer_loading: true,
+      },
+    ]);
   });
 });

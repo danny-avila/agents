@@ -1047,6 +1047,144 @@ describe('AgentContext', () => {
       expect(content).not.toContain('`host_code_tool`');
     });
 
+    it('uses executable registry guidance for a directly bound graph runner', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          graphTools: [
+            createMockTool(Constants.PROGRAMMATIC_TOOL_CALLING),
+            createMockTool('executable_tool'),
+          ],
+          toolDefinitions: [
+            {
+              name: 'event_schema_tool',
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'executable_tool',
+              {
+                name: 'executable_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain('`executable_tool`');
+      expect(content).not.toContain('`event_schema_tool`');
+    });
+
+    it('uses executable guidance for an explicitly overridden local runner', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            { name: Constants.PROGRAMMATIC_TOOL_CALLING },
+            {
+              name: 'event_schema_tool',
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'executable_tool',
+              {
+                name: 'executable_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+        toolExecution: {
+          engine: 'local',
+          local: { includeCodingTools: false },
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: none.'
+      );
+      expect(content).not.toContain('`executable_tool`');
+      expect(content).not.toContain('`event_schema_tool`');
+    });
+
+    it('keeps a Cloudflare runner outside the coding allowlist event-dispatched', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            { name: Constants.PROGRAMMATIC_TOOL_CALLING },
+            {
+              name: 'event_schema_tool',
+              allowed_callers: ['code_execution'],
+            },
+          ],
+        },
+        toolExecution: {
+          engine: 'cloudflare-sandbox',
+          cloudflare: {
+            codingToolNames: [Constants.BASH_TOOL],
+            sandbox: {
+              exec: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+              readFile: async () => '',
+              writeFile: async () => undefined,
+              mkdir: async () => undefined,
+              listFiles: async () => [],
+              deleteFile: async () => undefined,
+            },
+          },
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: `event_schema_tool`.'
+      );
+    });
+
+    it('keeps direct and event runner capability guidance separate', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          graphTools: [
+            createMockTool(Constants.PROGRAMMATIC_TOOL_CALLING),
+            createMockTool('executable_tool'),
+          ],
+          toolDefinitions: [
+            { name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING },
+            {
+              name: 'event_schema_tool',
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'executable_tool',
+              {
+                name: 'executable_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain('### Direct programmatic runners');
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: `executable_tool`.'
+      );
+      expect(content).toContain('### Event-dispatched programmatic runners');
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_bash`: `event_schema_tool`, `executable_tool`.'
+      );
+    });
+
     it('recognizes auto-bound local programmatic runners', async () => {
       const ctx = createBasicContext({
         agentConfig: {
@@ -1068,19 +1206,26 @@ describe('AgentContext', () => {
       const content = String(result[0].content);
       expect(content).toContain('inside `run_tools_with_bash`');
       expect(content).toContain('or `run_tools_with_code`');
-      expect(content).toContain('`host_code_tool`');
+      expect(content).toContain('`write_file`');
+      expect(content).not.toContain('`host_code_tool`');
     });
 
     it('describes the Bash default for an auto-bound code runner', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           instructions: 'Base',
-          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+          toolDefinitions: [
+            { name: Constants.PROGRAMMATIC_TOOL_CALLING },
+            {
+              name: Constants.BASH_TOOL,
+              allowed_callers: ['code_execution'],
+            },
+          ],
           toolRegistry: new Map([
             [
-              'host_code_tool',
+              Constants.BASH_TOOL,
               {
-                name: 'host_code_tool',
+                name: Constants.BASH_TOOL,
                 allowed_callers: ['code_execution'],
               },
             ],
@@ -1116,6 +1261,31 @@ describe('AgentContext', () => {
         'Only these tools may be invoked inside `run_tools_with_code`: none.'
       );
       expect(content).toContain('`direct_tool`');
+    });
+
+    it('preserves definition-only boundaries for a locally replaced runner', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            { name: Constants.PROGRAMMATIC_TOOL_CALLING },
+            { name: 'event_direct_tool', allowed_callers: ['direct'] },
+          ],
+        },
+        toolExecution: {
+          engine: 'local',
+          local: { includeCodingTools: false },
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: none.'
+      );
+      expect(content).toContain(
+        'Call these tools directly; never list them in the `tool_manifest`'
+      );
+      expect(content).toContain('`event_direct_tool`');
     });
 
     it('omits deferred programmatic runners until discovery', async () => {
@@ -1296,6 +1466,64 @@ describe('AgentContext', () => {
       const ctx = createBasicContext({ agentConfig: { tools, toolRegistry } });
       const result = ctx.getToolsForBinding();
       expect(result?.length).toBe(1);
+    });
+
+    it('applies registry caller overrides to event-driven model binding', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [
+            {
+              name: 'event_tool',
+              description: 'Model-facing schema',
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'event_tool',
+              {
+                name: 'event_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+      });
+
+      expect(ctx.getToolsForBinding()).toEqual([]);
+      expect(ctx.getCallerCapabilityProjectionSnapshot()).toMatchObject({
+        directToolNames: [],
+        codeExecutionToolNames: ['event_tool'],
+      });
+    });
+
+    it('exposes effective defer metadata for provider cache partitioning', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [
+            {
+              name: 'event_tool',
+              defer_loading: true,
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'event_tool',
+              {
+                name: 'event_tool',
+                defer_loading: false,
+              },
+            ],
+          ]),
+        },
+      });
+
+      expect(ctx.getEffectiveToolDefinitions()).toEqual([
+        {
+          name: 'event_tool',
+          allowed_callers: undefined,
+          defer_loading: false,
+        },
+      ]);
     });
   });
 

@@ -14,6 +14,74 @@ export type CallerCapabilityProjection = {
   codeExecutionOnlyTools: t.LCTool[];
 };
 
+/**
+ * Combines event schemas with runtime capability metadata. Matching runtime
+ * entries override caller/defer policy without replacing the event schema;
+ * runtime-only definitions are appended intact.
+ */
+export function mergeCallerCapabilityDefinitions(
+  toolDefs: Iterable<t.LCTool> | null | undefined,
+  overrides: Iterable<t.LCTool> | null | undefined
+): t.LCTool[] {
+  const runtimeDefinitions = Array.from(overrides ?? []);
+  const merged = new Map(
+    applyCallerCapabilityDefinitionOverrides(
+      toolDefs ?? [],
+      runtimeDefinitions
+    ).map((toolDef) => [toolDef.name, toolDef])
+  );
+  for (const override of runtimeDefinitions) {
+    if (!merged.has(override.name)) {
+      merged.set(override.name, override);
+    }
+  }
+  return Array.from(merged.values());
+}
+
+/**
+ * Applies runtime caller metadata to schema-only event definitions without
+ * adding registry-only tools or replacing their model-facing schemas.
+ */
+export function applyCallerCapabilityDefinitionOverrides(
+  toolDefs: Iterable<t.LCTool>,
+  overrides: Iterable<t.LCTool> | null | undefined
+): t.LCTool[] {
+  const overridesByName = new Map<string, t.LCTool>();
+  for (const override of overrides ?? []) {
+    overridesByName.set(override.name, override);
+  }
+  return Array.from(toolDefs, (toolDef) => {
+    const override = overridesByName.get(toolDef.name);
+    if (override == null) {
+      return toolDef;
+    }
+    return {
+      ...toolDef,
+      allowed_callers: override.allowed_callers,
+      defer_loading: override.defer_loading,
+    };
+  });
+}
+
+/** Converts the live projection into the versioned event transport shape. */
+export function createCallerCapabilityProjectionSnapshot(
+  projection: CallerCapabilityProjection
+): t.CallerCapabilityProjectionSnapshot {
+  return {
+    version: 1,
+    directToolNames: projection.directTools.map((toolDef) => toolDef.name),
+    codeExecutionToolNames: projection.codeExecutionTools.map(
+      (toolDef) => toolDef.name
+    ),
+    directOnlyToolNames: projection.directOnlyTools.map(
+      (toolDef) => toolDef.name
+    ),
+    codeExecutionOnlyToolNames: projection.codeExecutionOnlyTools.map(
+      (toolDef) => toolDef.name
+    ),
+  };
+}
+
 export function getAllowedCallers(
   toolDef: t.LCTool
 ): readonly t.AllowedCaller[] {
