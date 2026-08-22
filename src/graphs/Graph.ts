@@ -50,8 +50,8 @@ import {
   addBedrockTailCacheControl,
   projectArtifactPayload,
   formatContentStrings,
+  cloneMessage,
   CALIBRATION_RATIO_MAX,
-  REPLY_PRIMER_TOKENS,
   createPruneMessages,
   projectToolCallInputs,
   calculateMaxToolCallInputChars,
@@ -105,6 +105,7 @@ import {
   getFallbackOverflowCandidates,
 } from '@/llm/invoke';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
+import { createContextPressureMeter } from '@/llm/contextPressureMeter';
 import {
   resolveStreamLimits,
   StreamLimitExceededError,
@@ -3152,105 +3153,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * baseline, then attribute it across retained messages. Provider
        * transforms can shrink one message while expanding or adding another;
        * per-origin accounting prevents that unrelated shrink from canceling
-       * the expansion. Raw counts are frozen before in-place formatters run.
+       * the expansion. Exact counts are memoized across repeated projections.
        */
-      let providerMessageBaseline:
-        | Array<{ rawTokens: number; accountingWeight: number }>
-        | undefined;
-      const providerMessageOrigins = new WeakMap<BaseMessage, number>();
-      if (contextUsage != null && agentContext.tokenCounter != null) {
-        const sourceIndices = new WeakMap<BaseMessage, number>();
-        for (let i = 0; i < messages.length; i++) {
-          sourceIndices.set(messages[i], i);
-        }
-        providerMessageBaseline = messagesToUse.map((message, index) => {
-          const rawTokens = agentContext.tokenCounter!(message);
-          const sourceIndex = sourceIndices.get(message);
-          const indexedTokens =
-            sourceIndex != null
-              ? agentContext.indexTokenCountMap[sourceIndex]
-              : undefined;
-          const accountingWeight =
-            indexedTokens != null &&
-            Number.isFinite(indexedTokens) &&
-            indexedTokens >= 0
-              ? indexedTokens
-              : rawTokens;
-          if (!providerMessageOrigins.has(message)) {
-            providerMessageOrigins.set(message, index);
-          }
-          return { rawTokens, accountingWeight };
-        });
-      }
-
-      const getProviderMessageOriginKey = (
-        message: BaseMessage
-      ): string | undefined => {
-        const type = message.getType();
-        if (
-          message instanceof ToolMessage &&
-          typeof message.tool_call_id === 'string' &&
-          message.tool_call_id.length > 0
-        ) {
-          return `tool:call:${message.tool_call_id}`;
-        }
-        if (typeof message.id === 'string' && message.id.length > 0) {
-          return `${type}:id:${message.id}`;
-        }
-        return undefined;
-      };
-
-      /**
-       * Provider projections clone messages. Preserve their baseline origin
-       * without writing tracking metadata onto the wire. Synthetic fold
-       * messages intentionally remain unattributed and are charged in full.
-       */
-      const trackProviderMessageOrigins = (
-        before: BaseMessage[],
-        after: BaseMessage[]
-      ): BaseMessage[] => {
-        if (providerMessageBaseline == null || before === after) {
-          return after;
-        }
-        if (before.length === after.length) {
-          for (let i = 0; i < after.length; i++) {
-            const origin = providerMessageOrigins.get(before[i]);
-            if (
-              origin != null &&
-              !providerMessageOrigins.has(after[i]) &&
-              before[i].getType() === after[i].getType() &&
-              !isSyntheticProviderContextMessage(after[i])
-            ) {
-              providerMessageOrigins.set(after[i], origin);
-            }
-          }
-          return after;
-        }
-
-        const keyedOrigins = new Map<string, number | null>();
-        for (const message of before) {
-          const origin = providerMessageOrigins.get(message);
-          const key = getProviderMessageOriginKey(message);
-          if (origin == null || key == null) {
-            continue;
-          }
-          keyedOrigins.set(key, keyedOrigins.has(key) ? null : origin);
-        }
-        for (const message of after) {
-          if (
-            providerMessageOrigins.has(message) ||
-            isSyntheticProviderContextMessage(message)
-          ) {
-            continue;
-          }
-          const key = getProviderMessageOriginKey(message);
-          const origin = key != null ? keyedOrigins.get(key) : undefined;
-          if (origin != null) {
-            providerMessageOrigins.set(message, origin);
-          }
-        }
-        return after;
-      };
+      const contextPressure = createContextPressureMeter({
+        tokenCounter: agentContext.tokenCounter,
+        sourceMessages: messages,
+        retainedMessages: messagesToUse,
+        indexTokenCountMap: agentContext.indexTokenCountMap,
+        contextUsage,
+        instructionTokens: agentContext.instructionTokens,
+        calibrationRatio: agentContext.calibrationRatio,
+      });
+      const trackProviderMessageOrigins = contextPressure.trackProjection;
 
       if (agentContext.useLegacyContent) {
         const before = finalMessages;
@@ -3298,8 +3212,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         typeof lastMessageX.content === 'string'
       ) {
         const trimmed = lastMessageX.content.trim();
-        finalMessages[finalMessages.length - 2].content =
-          trimmed.length > 0 ? [{ type: 'text' as const, text: trimmed }] : '';
+        const before = finalMessages;
+        finalMessages = [...before];
+        finalMessages[finalMessages.length - 2] = cloneMessage(
+          lastMessageX,
+          trimmed.length > 0 ? [{ type: 'text' as const, text: trimmed }] : ''
+        );
+        finalMessages = trackProviderMessageOrigins(before, finalMessages);
       }
 
       const localProviderOverflowMeasurements = new WeakMap<
@@ -3309,123 +3228,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           estimatedPromptTokens: number;
         }
       >();
-      const measureProviderPayload = (
-        candidate: BaseMessage[],
-        contextBudgetOverride?: number,
-        forceRawRecount = false
-      ): {
-        fits: boolean;
-        projectedMessageTokens?: number;
-        availableMessageTokens?: number;
-        contextBudget?: number;
-        effectiveInstructionTokens?: number;
-      } => {
-        const contextBudget =
-          contextBudgetOverride ?? contextUsage?.contextBudget;
-        const effectiveInstructionTokens =
-          contextUsage?.effectiveInstructionTokens ??
-          (forceRawRecount ? agentContext.instructionTokens : undefined);
-        if (
-          agentContext.tokenCounter == null ||
-          contextBudget == null ||
-          effectiveInstructionTokens == null
-        ) {
-          return { fits: true };
-        }
-        const availableMessageTokens = Math.max(
-          0,
-          contextBudget - effectiveInstructionTokens
-        );
-        let usageRatio =
-          agentContext.calibrationRatio > 0 ? agentContext.calibrationRatio : 1;
-        if (
-          contextUsage?.calibrationRatio != null &&
-          contextUsage.calibrationRatio > 0
-        ) {
-          usageRatio = contextUsage.calibrationRatio;
-        }
-        if (forceRawRecount) {
-          usageRatio = Math.max(1, usageRatio);
-        }
-        const baselineRemaining = contextUsage?.remainingContextTokens;
-        const accountedMessageTokens =
-          !forceRawRecount &&
-          providerMessageBaseline != null &&
-          baselineRemaining != null &&
-          Number.isFinite(baselineRemaining)
-            ? availableMessageTokens -
-              Math.min(availableMessageTokens, Math.max(0, baselineRemaining))
-            : undefined;
-
-        let projectedMessageTokens: number;
-        if (accountedMessageTokens != null && providerMessageBaseline != null) {
-          const replyPrimerTokens = Math.round(
-            REPLY_PRIMER_TOKENS * usageRatio
-          );
-          const rawWeights: Record<string, number> = {};
-          let totalWeight = 0;
-          for (let i = 0; i < providerMessageBaseline.length; i++) {
-            const weight = providerMessageBaseline[i].accountingWeight;
-            rawWeights[i] = weight;
-            totalWeight += weight;
-          }
-          const attributableTokens =
-            totalWeight > 0
-              ? Math.min(
-                Math.max(0, accountedMessageTokens - replyPrimerTokens),
-                Math.round(totalWeight * usageRatio)
-              )
-              : 0;
-          const apportionedTokens =
-            totalWeight > 0
-              ? apportionTokenCounts(
-                rawWeights,
-                attributableTokens / totalWeight,
-                attributableTokens
-              )
-              : {};
-          const attributedByOrigin = providerMessageBaseline.map(
-            (_, origin) => apportionedTokens[origin] || 0
-          );
-          projectedMessageTokens = Math.max(
-            replyPrimerTokens,
-            accountedMessageTokens - attributableTokens
-          );
-          let newRawTokens = 0;
-          const usedOrigins = new Set<number>();
-          for (const message of candidate) {
-            const rawTokens = agentContext.tokenCounter(message);
-            const origin = providerMessageOrigins.get(message);
-            if (origin == null || usedOrigins.has(origin)) {
-              newRawTokens += rawTokens;
-              continue;
-            }
-            usedOrigins.add(origin);
-            projectedMessageTokens += Math.max(
-              0,
-              attributedByOrigin[origin] +
-                Math.round(
-                  (rawTokens - providerMessageBaseline[origin].rawTokens) *
-                    usageRatio
-                )
-            );
-          }
-          projectedMessageTokens += Math.round(newRawTokens * usageRatio);
-        } else {
-          let rawTokens = REPLY_PRIMER_TOKENS;
-          for (const message of candidate) {
-            rawTokens += agentContext.tokenCounter(message);
-          }
-          projectedMessageTokens = Math.round(rawTokens * usageRatio);
-        }
-        return {
-          fits: projectedMessageTokens <= availableMessageTokens,
-          projectedMessageTokens,
-          availableMessageTokens,
-          contextBudget,
-          effectiveInstructionTokens,
-        };
-      };
+      const measureProviderPayload = contextPressure.measure;
 
       const createProviderPayloadOverflowError = ({
         projection,
@@ -3780,10 +3583,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         finalMessages = trackProviderMessageOrigins(
           beforeSanitizeMessages,
           sanitizeOrphanToolBlocks(beforeSanitizeMessages, (source, clone) => {
-            const origin = providerMessageOrigins.get(source);
-            if (origin != null) {
-              providerMessageOrigins.set(clone, origin);
-            }
+            contextPressure.trackClone(source, clone);
           })
         );
         if (finalMessages.length !== beforeSanitize) {
@@ -4324,17 +4124,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                           fallbackMessages,
                           preparedMessages
                         ),
-                        fallbackContextBudget,
-                        true
+                        {
+                          contextBudget: fallbackContextBudget,
+                          forceRawRecount: true,
+                        }
                       ),
                   });
                   const projection =
                     preparedFallbackRequest.measurement ??
-                    measureProviderPayload(
-                      preparedFallbackRequest.messages,
-                      fallbackContextBudget,
-                      true
-                    );
+                    measureProviderPayload(preparedFallbackRequest.messages, {
+                      contextBudget: fallbackContextBudget,
+                      forceRawRecount: true,
+                    });
                   if (!projection.fits) {
                     throw createProviderPayloadOverflowError({
                       projection,

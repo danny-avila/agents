@@ -3,6 +3,7 @@ import type {
   MessageContentComplex,
 } from '@langchain/core/messages';
 import { ContentTypes } from '@/common';
+import { cloneMessage } from './cache';
 
 /**
  * Whether {@link formatContentStrings} will flatten this message's content:
@@ -42,13 +43,12 @@ export const formatContentStrings = (
     const blocks = message.content as MessageContentComplex[];
     const content = blocks.reduce((acc, curr) => {
       if (curr.type === ContentTypes.TEXT) {
-        return `${acc}${curr[ContentTypes.TEXT] || ''}\n`;
+        return `${acc}${curr[ContentTypes.TEXT] ?? ''}\n`;
       }
       return acc;
     }, '');
 
-    message.content = content.trim();
-    result.push(message);
+    result.push(cloneMessage(message, content.trim()));
   }
 
   return result;
