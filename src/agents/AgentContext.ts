@@ -487,9 +487,11 @@ export class AgentContext {
 
   /** Builds the caller boundary and schemas for programmatic-only tools. */
   private buildProgrammaticOnlyToolsInstructions(): string {
-    const isDirectProgrammaticRunner =
-      this.toolExecution?.engine === 'local' ||
-      this.toolExecution?.engine === 'cloudflare-sandbox';
+    const programmaticTools = this.getProgrammaticToolInstructionTargets();
+    if (programmaticTools.length === 0) return '';
+    const isDirectProgrammaticRunner = programmaticTools.some(
+      (tool) => tool.executesDirectly
+    );
     if (isDirectProgrammaticRunner && !this.toolRegistry) {
       return '';
     }
@@ -508,8 +510,6 @@ export class AgentContext {
       .map((toolDef) => toolDef.name)
       .filter((name) => !isProgrammaticControlTool(name));
 
-    const programmaticTools = this.getProgrammaticToolInstructionTargets();
-    if (programmaticTools.length === 0) return '';
     const programmaticRunnerNames = programmaticTools
       .map((tool) => `\`${tool.name}\``)
       .join(' or ');
@@ -562,8 +562,13 @@ export class AgentContext {
   private getProgrammaticToolInstructionTargets(): Array<{
     name: string;
     codeGuidance: string;
+    executesDirectly: boolean;
   }> {
-    const targets: Array<{ name: string; codeGuidance: string }> = [];
+    const targets: Array<{
+      name: string;
+      codeGuidance: string;
+      executesDirectly: boolean;
+    }> = [];
     if (
       this.hasBoundTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING) ||
       isProgrammaticRunnerAutoBound(
@@ -574,6 +579,9 @@ export class AgentContext {
       targets.push({
         name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
         codeGuidance: 'Bash code',
+        executesDirectly: this.isProgrammaticRunnerDirectlyBound(
+          Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+        ),
       });
     }
 
@@ -592,10 +600,23 @@ export class AgentContext {
         codeGuidance: localDefault
           ? 'Bash code by default, or set `lang: "py"` to use Python code'
           : 'Python code',
+        executesDirectly: this.isProgrammaticRunnerDirectlyBound(
+          Constants.PROGRAMMATIC_TOOL_CALLING
+        ),
       });
     }
 
     return targets;
+  }
+
+  /** Whether ToolNode executes this runner in-process instead of via an event. */
+  private isProgrammaticRunnerDirectlyBound(name: string): boolean {
+    return (
+      isProgrammaticRunnerAutoBound(name, this.toolExecution) ||
+      this.graphTools?.some(
+        (tool) => 'name' in tool && tool.name === name
+      ) === true
+    );
   }
 
   private hasBoundTool(name: string): boolean {
@@ -1134,9 +1155,21 @@ export class AgentContext {
     this.indexTokenCountMap = { ...baseTokenMap };
   }
 
+  /** Event definitions with matching runtime caller/defer metadata applied. */
+  getEffectiveToolDefinitions(): t.LCTool[] | undefined {
+    if (!this.toolDefinitions) {
+      return undefined;
+    }
+    return applyCallerCapabilityDefinitionOverrides(
+      this.toolDefinitions,
+      this.toolRegistry?.values()
+    );
+  }
+
   /** Active tool definitions for token accounting (excludes deferred-and-undiscovered entries). */
   private getActiveToolDefinitions(): t.LCTool[] {
-    if (!this.toolDefinitions) {
+    const effectiveToolDefinitions = this.getEffectiveToolDefinitions();
+    if (!effectiveToolDefinitions) {
       return [];
     }
     /**
@@ -1147,10 +1180,7 @@ export class AgentContext {
      * `toolSchemaTokens` even though they were never bound.
      */
     return resolveCallerCapabilityProjection(
-      applyCallerCapabilityDefinitionOverrides(
-        this.toolDefinitions,
-        this.toolRegistry?.values()
-      ),
+      effectiveToolDefinitions,
       (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
     ).directTools;
   }

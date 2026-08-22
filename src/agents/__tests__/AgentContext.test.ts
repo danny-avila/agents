@@ -1047,6 +1047,34 @@ describe('AgentContext', () => {
       expect(content).not.toContain('`host_code_tool`');
     });
 
+    it('uses executable registry guidance for a directly bound graph runner', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          graphTools: [createMockTool(Constants.PROGRAMMATIC_TOOL_CALLING)],
+          toolDefinitions: [
+            {
+              name: 'event_schema_tool',
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'executable_tool',
+              {
+                name: 'executable_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain('`executable_tool`');
+      expect(content).not.toContain('`event_schema_tool`');
+    });
+
     it('recognizes auto-bound local programmatic runners', async () => {
       const ctx = createBasicContext({
         agentConfig: {
@@ -1324,6 +1352,36 @@ describe('AgentContext', () => {
         directToolNames: [],
         codeExecutionToolNames: ['event_tool'],
       });
+    });
+
+    it('exposes effective defer metadata for provider cache partitioning', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [
+            {
+              name: 'event_tool',
+              defer_loading: true,
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'event_tool',
+              {
+                name: 'event_tool',
+                defer_loading: false,
+              },
+            ],
+          ]),
+        },
+      });
+
+      expect(ctx.getEffectiveToolDefinitions()).toEqual([
+        {
+          name: 'event_tool',
+          allowed_callers: undefined,
+          defer_loading: false,
+        },
+      ]);
     });
   });
 
