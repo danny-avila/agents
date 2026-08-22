@@ -1,13 +1,66 @@
 import OpenAI from 'openai';
 
 import {
+  AzureChatOpenAI,
+  ChatOpenAI,
   addChatCacheBreakpoints,
   addResponseCacheBreakpoints,
   shouldIncludeEncryptedReasoning,
 } from './index';
 
+type ManagedRequestDelegate = {
+  invocationParams(options?: Record<string, unknown>): Record<string, unknown>;
+};
+
+function managedRequestDelegates(model: unknown): ManagedRequestDelegate[] {
+  const delegates = model as {
+    completions: ManagedRequestDelegate;
+    responses: ManagedRequestDelegate;
+  };
+  return [delegates.completions, delegates.responses];
+}
+
 describe('managed GPT-5.6 request fields', () => {
-  it('places cache breakpoints after instructions and the prior history prefix', () => {
+  it('forwards prompt cache keys through OpenAI Chat and Responses requests', () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5.6',
+      apiKey: 'test-key',
+      promptCacheExplicit: true,
+      promptCacheKey: 'cache-key',
+      safety_identifier: 'safety-id',
+    });
+
+    for (const delegate of managedRequestDelegates(model)) {
+      expect(delegate.invocationParams()).toMatchObject({
+        prompt_cache_key: 'cache-key',
+        prompt_cache_options: { mode: 'explicit', ttl: '30m' },
+        safety_identifier: 'safety-id',
+      });
+    }
+  });
+
+  it('forwards prompt cache keys through Azure Chat and Responses requests', () => {
+    const model = new AzureChatOpenAI({
+      azureOpenAIApiKey: 'test-key',
+      azureOpenAIApiInstanceName: 'test-instance',
+      azureOpenAIApiDeploymentName: 'test-deployment',
+      azureOpenAIApiVersion: '2024-10-21',
+      promptCacheKey: 'cache-key',
+      safety_identifier: 'safety-id',
+    });
+
+    for (const delegate of managedRequestDelegates(model)) {
+      expect(delegate.invocationParams()).toMatchObject({
+        prompt_cache_key: 'cache-key',
+        safety_identifier: 'safety-id',
+      });
+      expect(delegate.invocationParams()).not.toHaveProperty(
+        'prompt_cache_options'
+      );
+    }
+  });
+
+  it('keeps the two latest history breakpoints alongside instructions', () => {
     const messages = addChatCacheBreakpoints([
       { role: 'system', content: 'Stable instructions.' },
       { role: 'user', content: 'First question.' },
@@ -33,12 +86,61 @@ describe('managed GPT-5.6 request fields', () => {
         },
       ],
     });
+    expect(messages[1]).toMatchObject({
+      content: [
+        {
+          type: 'text',
+          text: 'First question.',
+          prompt_cache_breakpoint: { mode: 'explicit' },
+        },
+      ],
+    });
+    expect(JSON.stringify(messages[3])).not.toContain(
+      'prompt_cache_breakpoint'
+    );
+  });
+
+  it('preserves the prior assistant breakpoint during chat rollover', () => {
+    const messages = addChatCacheBreakpoints([
+      { role: 'system', content: 'Stable instructions.' },
+      { role: 'user', content: 'First question.' },
+      { role: 'assistant', content: 'First answer.' },
+      { role: 'user', content: 'Second question.' },
+      { role: 'assistant', content: 'Second answer.' },
+      { role: 'user', content: 'Current question.' },
+    ]);
+
+    expect(JSON.stringify(messages[0])).toContain('prompt_cache_breakpoint');
+    expect(JSON.stringify(messages[2])).toContain('prompt_cache_breakpoint');
+    expect(JSON.stringify(messages[4])).toContain('prompt_cache_breakpoint');
     expect(JSON.stringify(messages[1])).not.toContain(
       'prompt_cache_breakpoint'
     );
     expect(JSON.stringify(messages[3])).not.toContain(
       'prompt_cache_breakpoint'
     );
+    expect(JSON.stringify(messages[5])).not.toContain(
+      'prompt_cache_breakpoint'
+    );
+  });
+
+  it('keeps the two newest completion breakpoints in long chat histories', () => {
+    const messages = addChatCacheBreakpoints([
+      { role: 'system', content: 'Stable instructions.' },
+      { role: 'user', content: 'First question.' },
+      { role: 'assistant', content: 'First answer.' },
+      { role: 'user', content: 'Second question.' },
+      { role: 'assistant', content: 'Second answer.' },
+      { role: 'user', content: 'Third question.' },
+      { role: 'assistant', content: 'Third answer.' },
+      { role: 'user', content: 'Current question.' },
+    ]);
+
+    expect(JSON.stringify(messages[2])).not.toContain(
+      'prompt_cache_breakpoint'
+    );
+    expect(JSON.stringify(messages[4])).toContain('prompt_cache_breakpoint');
+    expect(JSON.stringify(messages[6])).toContain('prompt_cache_breakpoint');
   });
 
   it('uses supported Responses content blocks for the same stable prefixes', () => {
@@ -80,6 +182,43 @@ describe('managed GPT-5.6 request fields', () => {
         content: [{ type: 'input_text', text: 'Current question.' }],
       },
     ]);
+  });
+
+  it('retains the previous Responses breakpoint while adding the latest one', () => {
+    const input = [
+      { type: 'message', role: 'developer', content: 'Stable instructions.' },
+      { type: 'message', role: 'user', content: 'First question.' },
+      { type: 'message', role: 'assistant', content: 'First answer.' },
+      { type: 'message', role: 'user', content: 'Second question.' },
+      { type: 'message', role: 'assistant', content: 'Second answer.' },
+      { type: 'message', role: 'user', content: 'Current question.' },
+    ] as unknown as OpenAI.Responses.ResponseInput;
+    const result = addResponseCacheBreakpoints(input) as unknown as Array<{
+      content: unknown;
+    }>;
+
+    expect(result[0].content).toEqual([
+      {
+        type: 'input_text',
+        text: 'Stable instructions.',
+        prompt_cache_breakpoint: { mode: 'explicit' },
+      },
+    ]);
+    expect(result[1].content).toEqual([
+      {
+        type: 'input_text',
+        text: 'First question.',
+        prompt_cache_breakpoint: { mode: 'explicit' },
+      },
+    ]);
+    expect(result[3].content).toEqual([
+      {
+        type: 'input_text',
+        text: 'Second question.',
+        prompt_cache_breakpoint: { mode: 'explicit' },
+      },
+    ]);
+    expect(result[5].content).toBe('Current question.');
   });
 
   it('does not mark replayed assistant output blocks as breakpoints', () => {
