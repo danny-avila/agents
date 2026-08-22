@@ -12,30 +12,13 @@ import type { ChatGeneration } from '@langchain/core/outputs';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { PreparedProviderRequest } from '@/llm/prepareProviderRequest';
 import type { StreamLimitState } from '@/llm/streamLimits';
 import type { ContextOverflowContext } from '@/utils/errors';
 import type * as t from '@/types';
 import {
-  projectCacheControlledToolOutputsToText,
-  projectComputerCallOutputsToText,
-  projectOpenAIChatToolMessageContent,
-  projectOpenAIResponsesToolMessageContent,
-  projectOpenRouterToolMessageContent,
-  projectSingleTextToolOutputsToText,
-  projectStructuredToolOutputsToText,
-  projectToolStreamContentForProvider,
-} from '@/messages/core';
-import {
   modifyDeltaProperties,
-  coalesceAdjacentUserTurns,
-  strictAlternationProviders,
-  appendPredecessorHandoffCue,
-  removePredecessorHandoffCue,
 } from '@/messages';
-import {
-  stripAnthropicCacheControl,
-  stripBedrockCacheControl,
-} from '@/messages/cache';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import {
@@ -48,23 +31,37 @@ import {
   STREAM_LIMIT_REDISPATCH_KEY,
   STREAM_LIMIT_ATTEMPT_KEY,
 } from '@/llm/streamLimits';
-import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
+import {
+  assertPreparedProviderRequestFor,
+  prepareProviderRequest,
+} from '@/llm/prepareProviderRequest';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { manualToolStreamProviders } from '@/llm/providers';
-import { isAnthropicLike, isOpenAILike } from '@/utils/llm';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
 import { appendCallbacks } from '@/utils/callbacks';
 import { canSealPreempt } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 
+export {
+  projectMessagesForProvider,
+  resolveServingModelId,
+  usesNativeOpenAIResponses,
+} from '@/llm/prepareProviderRequest';
+export type {
+  PreparedProviderRequest,
+  PrepareProviderRequestParams,
+  ProviderPayloadMeasurement,
+  ProviderRequestContext,
+} from '@/llm/prepareProviderRequest';
+
 /**
  * Context passed to `attemptInvoke`. Matches the subset of Graph that
  * `ChatModelStreamHandler.handle` needs *plus* the explicit
- * `getOrCreateToolOutputRegistry()` accessor that `attemptInvoke`
- * itself calls to pull the run-scoped tool-output registry off the
- * graph and project each relevant ToolMessage into a transient
- * annotated copy before the provider call.
+ * `getOrCreateToolOutputRegistry()` accessor used while preparing a
+ * provider request. Raw callers prepare inside `attemptInvoke`; Graph
+ * callers prepare before final payload measurement and pass the exact
+ * artifact through.
  *
  * The intersection is intentional: `Parameters<...>[3]` resolves
  * indirectly through the stream handler's signature (which returns
@@ -106,161 +103,6 @@ export type OnChunk = (
 
 /** Unique per-model-attempt sequence; see the stamp in `attemptInvoke`. */
 let streamLimitAttemptSeq = 0;
-
-export function usesNativeOpenAIResponses(
-  model: t.ChatModel,
-  provider: Providers,
-  callOptions?: unknown
-): boolean {
-  if (!isOpenAILike(provider)) {
-    return false;
-  }
-  let candidate: unknown = model;
-  let effectiveCallOptions = callOptions;
-  const seen = new Set<object>();
-  for (let depth = 0; depth < 20; depth++) {
-    if (candidate == null || typeof candidate !== 'object') {
-      return false;
-    }
-    if (seen.has(candidate)) {
-      return false;
-    }
-    seen.add(candidate);
-    const runnable = candidate as {
-      _useResponsesApi?: (options?: unknown) => boolean;
-      bound?: unknown;
-      defaultOptions?: unknown;
-      last?: unknown;
-      constructor?: { name?: unknown };
-    };
-    try {
-      if (
-        runnable.defaultOptions != null &&
-        typeof runnable.defaultOptions === 'object' &&
-        !Array.isArray(runnable.defaultOptions) &&
-        effectiveCallOptions != null &&
-        typeof effectiveCallOptions === 'object' &&
-        !Array.isArray(effectiveCallOptions)
-      ) {
-        effectiveCallOptions = {
-          ...(runnable.defaultOptions as Record<string, unknown>),
-          ...(effectiveCallOptions as Record<string, unknown>),
-        };
-      } else if (effectiveCallOptions == null) {
-        effectiveCallOptions = runnable.defaultOptions;
-      }
-      if (
-        runnable._useResponsesApi?.(effectiveCallOptions) === true ||
-        runnable._useResponsesApi?.(undefined) === true
-      ) {
-        return true;
-      }
-    } catch {
-      // Continue through RunnableSequence/RunnableBinding wrappers.
-    }
-    if (
-      typeof runnable.constructor?.name === 'string' &&
-      runnable.constructor.name.includes('Responses')
-    ) {
-      return true;
-    }
-    if (runnable.last != null && typeof runnable.last === 'object') {
-      candidate = runnable.last;
-      continue;
-    }
-    if (runnable.bound != null && typeof runnable.bound === 'object') {
-      candidate = runnable.bound;
-      continue;
-    }
-    return false;
-  }
-  return false;
-}
-
-/**
- * Produces the exact provider-facing message representation before a model
- * adapter serializes it. This is shared by invocation and Graph's final budget
- * guard so structured tool output cannot grow after the payload was measured.
- */
-export function projectMessagesForProvider({
-  model,
-  messages,
-  provider,
-  maxToolResultChars,
-  callOptions,
-}: {
-  model: t.ChatModel;
-  messages: BaseMessage[];
-  provider: Providers;
-  maxToolResultChars?: number;
-  callOptions?: unknown;
-}): BaseMessage[] {
-  const nativeOpenAIResponses = usesNativeOpenAIResponses(
-    model,
-    provider,
-    callOptions
-  );
-  const providerInputMessages = projectToolStreamContentForProvider(
-    messages,
-    nativeOpenAIResponses ? 'native' : 'fallback',
-    maxToolResultChars
-  );
-  if (nativeOpenAIResponses) {
-    return projectOpenAIResponsesToolMessageContent(
-      stripAnthropicCacheControl(
-        stripBedrockCacheControl(providerInputMessages)
-      ),
-      maxToolResultChars
-    );
-  }
-  if (provider === Providers.OPENROUTER) {
-    return projectComputerCallOutputsToText(
-      projectOpenRouterToolMessageContent(
-        stripBedrockCacheControl(providerInputMessages),
-        maxToolResultChars
-      )
-    );
-  }
-  if (isOpenAILike(provider)) {
-    return projectComputerCallOutputsToText(
-      projectOpenAIChatToolMessageContent(
-        stripAnthropicCacheControl(
-          stripBedrockCacheControl(providerInputMessages)
-        ),
-        maxToolResultChars
-      )
-    );
-  }
-  if (provider === Providers.ANTHROPIC) {
-    return projectComputerCallOutputsToText(
-      projectSingleTextToolOutputsToText(
-        stripBedrockCacheControl(providerInputMessages),
-        maxToolResultChars
-      )
-    );
-  }
-  if (provider === Providers.BEDROCK) {
-    return stripAnthropicCacheControl(
-      projectComputerCallOutputsToText(
-        projectCacheControlledToolOutputsToText(
-          providerInputMessages,
-          maxToolResultChars
-        )
-      )
-    );
-  }
-  return projectComputerCallOutputsToText(
-    projectStructuredToolOutputsToText(
-      projectSingleTextToolOutputsToText(
-        stripAnthropicCacheControl(
-          stripBedrockCacheControl(providerInputMessages)
-        ),
-        maxToolResultChars
-      ),
-      maxToolResultChars
-    )
-  );
-}
 
 /**
  * The registered handler that owns content-part dispatch, if any.
@@ -554,36 +396,6 @@ function collectModelCallbackSources(model: unknown): Callbacks[] {
   return sources;
 }
 
-/**
- * The serving model's id, read through the same wrapper stack
- * `collectModelCallbackSources` walks — `bindTools` returns a
- * `RunnableBinding` and a system runnable pipes a `RunnableSequence`, and
- * neither exposes the chat model's `model` at the top level.
- */
-export function resolveServingModelId(model: unknown): string | undefined {
-  const seen = new Set<unknown>();
-  let current: unknown = model;
-  while (current != null && typeof current === 'object' && !seen.has(current)) {
-    seen.add(current);
-    const wrapper = current as {
-      model?: unknown;
-      bound?: unknown;
-      last?: unknown;
-      steps?: unknown[];
-    };
-    if (typeof wrapper.model === 'string' && wrapper.model !== '') {
-      return wrapper.model;
-    }
-    current =
-      wrapper.bound ??
-      wrapper.last ??
-      (Array.isArray(wrapper.steps)
-        ? wrapper.steps[wrapper.steps.length - 1]
-        : undefined);
-  }
-  return undefined;
-}
-
 async function endSealedModelRun(
   context: InvokeContext | undefined,
   chunk: AIMessageChunk,
@@ -680,16 +492,57 @@ function appendStreamChunk({
  * Pass an `onChunk` callback to override this with custom chunk processing
  * (e.g. summarization delta events).
  */
-interface AttemptInvokeParams {
-  model: t.ChatModel;
-  messages: BaseMessage[];
-  provider: Providers;
+interface AttemptInvokeCommonParams {
   context?: InvokeContext;
   onChunk?: OnChunk;
   /** Accounting owner for callers that deliberately pass no `context`
    * (summarization) — used ONLY for the attempt's accounting lease, never
    * for charge claims. */
   streamLimitState?: StreamLimitState;
+}
+
+type AttemptInvokeParams = AttemptInvokeCommonParams &
+  (
+    | {
+        request: PreparedProviderRequest;
+        model?: never;
+        messages?: never;
+        provider?: never;
+      }
+    | {
+        request?: never;
+        model: t.ChatModel;
+        messages: BaseMessage[];
+        provider: Providers;
+      }
+  );
+
+function resolveAttemptProvider(params: AttemptInvokeParams): Providers {
+  if (params.request != null) {
+    return params.request.provider;
+  }
+  return params.provider;
+}
+
+function resolveAttemptRequest(
+  params: AttemptInvokeParams,
+  config: RunnableConfig
+): PreparedProviderRequest {
+  if (params.request != null) {
+    assertPreparedProviderRequestFor(
+      params.request,
+      params.request.model,
+      params.request.provider
+    );
+    return params.request;
+  }
+  return prepareProviderRequest({
+    model: params.model,
+    messages: params.messages,
+    provider: params.provider,
+    context: params.context,
+    config,
+  });
 }
 
 /**
@@ -703,11 +556,12 @@ export async function attemptInvoke(
   params: AttemptInvokeParams,
   config?: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
+  const provider = resolveAttemptProvider(params);
   const stampedConfig: RunnableConfig = {
     ...config,
     metadata: {
       ...(config?.metadata ?? {}),
-      [Constants.INVOKED_PROVIDER]: params.provider,
+      [Constants.INVOKED_PROVIDER]: provider,
       /**
        * One `attemptInvoke` call is one model attempt; primary, fallback,
        * and retry attempts within a node otherwise share the same langgraph
@@ -738,7 +592,14 @@ export async function attemptInvoke(
     registerActiveStreamLimitGeneration(leaseTarget, generationKey);
   }
   try {
-    return await attemptInvokeBody(params, stampedConfig);
+    return await attemptInvokeBody(
+      {
+        request: resolveAttemptRequest(params, stampedConfig),
+        context: params.context,
+        onChunk: params.onChunk,
+      },
+      stampedConfig
+    );
   } finally {
     if (leaseTarget != null && generationKey != null) {
       releaseStreamLimitGeneration(leaseTarget, generationKey);
@@ -748,77 +609,15 @@ export async function attemptInvoke(
 
 async function attemptInvokeBody(
   {
-    model,
-    messages,
-    provider,
+    request,
     context,
     onChunk,
-  }: AttemptInvokeParams,
+  }: Pick<AttemptInvokeCommonParams, 'context' | 'onChunk'> & {
+    request: PreparedProviderRequest;
+  },
   config: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
-  /**
-   * Pull the run-scoped tool output registry off the graph (when one
-   * exists) and project ToolMessages carrying ref metadata into a
-   * transient annotated copy. The original `messages` array stays
-   * untouched so the graph state never sees `[ref: …]` / `_ref`
-   * payload.
-   */
-  const invocationMessages = projectMessagesForProvider({
-    model,
-    messages,
-    provider,
-    callOptions: config,
-  });
-  const registry = context?.getOrCreateToolOutputRegistry();
-  const runId = config.configurable?.run_id as string | undefined;
-  const annotated = annotateMessagesForLLM(invocationMessages, registry, runId);
-  /**
-   * Keyed on the provider ACTUALLY serving this call, not the agent's primary.
-   * `createCallModel` normalizes for the primary, but `tryFallbackProviders`
-   * re-sends the same array — so an OpenAI primary that fails after a boundary
-   * injected two human turns would hand a Bedrock or Mistral fallback the
-   * consecutive user turns those APIs reject, and the recovery request would
-   * fail for a reason unrelated to the original failure.
-   *
-   * `attemptInvoke` is the single funnel for primary, fallback and
-   * summarization calls, so applying it here covers all three. Idempotent, so
-   * the primary simply re-runs a no-op over already-coalesced messages.
-   */
-  /**
-   * Serving-provider re-keying for the predecessor handoff cue (#345). The
-   * PRIMARY's cue is baked in createCallModel's measured transform stage —
-   * appending after measurement could push a just-fits prompt over budget —
-   * so this funnel only corrects for fallbacks crossing provider families:
-   * a tolerant primary falling back to a Claude surface gains the cue here,
-   * and an Anthropic primary falling back to OpenAI/Mistral/Nova has the
-   * Claude-only synthetic turn stripped. Both helpers are identity on their
-   * no-op paths, so the primary's own pass re-runs for free.
-   *
-   * The serving model id is read through the wrapper stack (`bindTools`'
-   * binding, a system runnable's sequence) — a wrapper's top-level `.model`
-   * is undefined, and `isAnthropicLike` would otherwise default a wrapped
-   * Bedrock-Nova model to Claude. The context cast is widened deliberately:
-   * the type says every context is a full Graph, but summarization passes
-   * none and long-standing tests pass partial stubs.
-   */
-  const isRunProduced = (
-    context as
-      | { isRunProducedMessage?: (message: BaseMessage) => boolean }
-      | undefined
-  )?.isRunProducedMessage;
-  const cued = isAnthropicLike(provider, {
-    model: resolveServingModelId(model),
-  })
-    ? appendPredecessorHandoffCue(
-      annotated,
-      isRunProduced == null
-        ? undefined
-        : (message): boolean => isRunProduced.call(context, message)
-    )
-    : removePredecessorHandoffCue(annotated);
-  const messagesForProvider = strictAlternationProviders.has(provider)
-    ? coalesceAdjacentUserTurns(cued)
-    : cued;
+  const { model, messages: messagesForProvider, provider } = request;
 
   /**
    * Stamp the provider that is ACTUALLY serving this invocation onto the
@@ -1140,6 +939,7 @@ export async function tryFallbackProviders({
   onChunk,
   streamLimitState,
   overflowContext,
+  prepareProviderRequest: prepareFallbackRequest,
   prepareProviderMessages,
 }: {
   fallbacks: t.FallbackConfig[];
@@ -1160,10 +960,18 @@ export async function tryFallbackProviders({
    */
   overflowContext?: ContextOverflowContext;
   /**
-   * Optional final payload guard used by Graph. It receives the initialized,
-   * tool-bound fallback model so Responses-vs-Chat projection is exact before
-   * the fallback request is measured and sent.
+   * Optional exact-payload preparation used by Graph. The returned request is
+   * measured and sent without another provider projection.
    */
+  prepareProviderRequest?: (input: {
+    model: t.ChatModel;
+    messages: BaseMessage[];
+    provider: Providers;
+    clientOptions?: t.ClientOptions;
+    maxContextTokens?: number;
+    config?: RunnableConfig;
+  }) => PreparedProviderRequest | Promise<PreparedProviderRequest>;
+  /** @deprecated Return a `PreparedProviderRequest` instead. */
   prepareProviderMessages?: (input: {
     model: t.ChatModel;
     messages: BaseMessage[];
@@ -1213,15 +1021,34 @@ export async function tryFallbackProviders({
               [Constants.INVOKED_MODEL]: fbModelName,
             },
           };
-      const fallbackMessages =
-        (await prepareProviderMessages?.({
-          model: fbModel as t.ChatModel,
-          messages,
-          provider: fb.provider,
-          clientOptions: fb.clientOptions,
-          maxContextTokens: fb.maxContextTokens,
-          config: fbConfig,
-        })) ?? messages;
+      const preparationInput = {
+        model: fbModel as t.ChatModel,
+        messages,
+        provider: fb.provider,
+        clientOptions: fb.clientOptions,
+        maxContextTokens: fb.maxContextTokens,
+        config: fbConfig,
+      };
+      const preparedRequest = await prepareFallbackRequest?.(preparationInput);
+      if (preparedRequest != null) {
+        assertPreparedProviderRequestFor(
+          preparedRequest,
+          fbModel as t.ChatModel,
+          fb.provider
+        );
+      }
+      let fallbackMessages = messages;
+      if (preparedRequest == null) {
+        fallbackMessages =
+          (await prepareProviderMessages?.({
+            model: fbModel as t.ChatModel,
+            messages,
+            provider: fb.provider,
+            clientOptions: fb.clientOptions,
+            maxContextTokens: fb.maxContextTokens,
+            config: fbConfig,
+          })) ?? messages;
+      }
       /** A sibling can trip the breaker while the preparation above is
        * awaited — and the catch below only sees attempts that THROW, so a
        * provider that ignores an aborted signal and succeeds would resolve
@@ -1232,7 +1059,18 @@ export async function tryFallbackProviders({
       ) {
         throw config.signal.reason;
       }
-      const result = await attemptInvoke(
+      if (preparedRequest != null) {
+        return await attemptInvoke(
+          {
+            request: preparedRequest,
+            context,
+            onChunk,
+            streamLimitState,
+          },
+          fbConfig
+        );
+      }
+      return await attemptInvoke(
         {
           model: fbModel as t.ChatModel,
           messages: fallbackMessages,
@@ -1243,7 +1081,6 @@ export async function tryFallbackProviders({
         },
         fbConfig
       );
-      return result;
     } catch (e) {
       /**
        * A tripped stream circuit breaker is a deliberate abort, not a

@@ -88,6 +88,13 @@ export type { SmoothItem, SmoothPiece } from './llm/stream/smoother';
 export { FakeChatModel, createFakeStreamingLLM } from './llm/fake';
 export { initializeModel } from './llm/init';
 export { attemptInvoke, tryFallbackProviders } from './llm/invoke';
+export { prepareProviderRequest } from './llm/prepareProviderRequest';
+export type {
+  PreparedProviderRequest,
+  PrepareProviderRequestParams,
+  ProviderPayloadMeasurement,
+  ProviderRequestContext,
+} from './llm/prepareProviderRequest';
 export { canSealPreempt } from './llm/preempt';
 export { isThinkingEnabled, getMaxOutputTokensKey } from './llm/request';
 export {

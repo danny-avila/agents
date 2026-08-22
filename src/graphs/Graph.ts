@@ -74,7 +74,6 @@ import {
   coalesceAdjacentUserTurns,
   strictAlternationProviders,
   appendPredecessorHandoffCue,
-  removePredecessorHandoffCue,
   stampSyntheticProviderMessage,
 } from '@/messages';
 import {
@@ -104,9 +103,8 @@ import {
   tryFallbackProviders,
   getFallbackErrorContext,
   getFallbackOverflowCandidates,
-  projectMessagesForProvider,
-  resolveServingModelId,
 } from '@/llm/invoke';
+import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import {
   resolveStreamLimits,
   StreamLimitExceededError,
@@ -3858,23 +3856,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       const fallbackBaseMessages = finalMessages;
       const beforeFinalProviderProjection = fallbackBaseMessages;
-      finalMessages = trackProviderMessageOrigins(
-        beforeFinalProviderProjection,
-        projectMessagesForProvider({
-          model: (this.overrideModel ?? model) as t.ChatModel,
-          messages: beforeFinalProviderProjection,
-          provider: agentContext.provider,
-          maxToolResultChars: maxProviderToolResultChars,
-          callOptions: config,
-        })
-      );
+      const preparedRequest = prepareProviderRequest({
+        model: (this.overrideModel ?? model) as t.ChatModel,
+        messages: beforeFinalProviderProjection,
+        provider: agentContext.provider,
+        context: this,
+        config,
+        maxToolResultChars: maxProviderToolResultChars,
+        measure: (preparedMessages) =>
+          measureProviderPayload(
+            trackProviderMessageOrigins(
+              beforeFinalProviderProjection,
+              preparedMessages
+            )
+          ),
+      });
+      finalMessages = preparedRequest.messages;
 
       /**
        * Prompt-cache placement and orphan sanitization are provider-wire
        * transforms too. Re-measure after both so no content added after the
        * earlier artifact/synthetic compaction decision can bypass the guard.
        */
-      finalProjection = measureProviderPayload(finalMessages);
+      finalProjection =
+        preparedRequest.measurement ?? measureProviderPayload(finalMessages);
       const preInvokeContextOverflowError = !finalProjection.fits
         ? createProviderPayloadOverflowError({
           projection: finalProjection,
@@ -4083,9 +4088,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           () =>
             attemptInvoke(
               {
-                model: (this.overrideModel ?? model) as t.ChatModel,
-                messages: finalMessages,
-                provider: agentContext.provider,
+                request: preparedRequest,
                 context: this,
               },
               invokeConfig
@@ -4288,7 +4291,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
                   maxContextTokens: agentContext.maxContextTokens,
                 },
-                prepareProviderMessages: ({
+                prepareProviderRequest: ({
                   model: fallbackModel,
                   messages: fallbackMessages,
                   provider: fallbackProvider,
@@ -4300,36 +4303,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                     calculateMaxToolResultChars(
                       fallbackMaxContextTokens ?? agentContext.maxContextTokens
                     );
-                  /**
-                   * Serving-provider cue shaping BEFORE the fallback payload
-                   * is measured: a Claude fallback behind a tolerant primary
-                   * gains the cue inside the guarded projection (a prompt
-                   * within the cue's cost of the fallback budget must take
-                   * the recovery path, not ship oversized), and a tolerant
-                   * fallback behind an Anthropic primary sheds the baked cue
-                   * before it is measured against the tighter budget. The
-                   * attemptInvoke funnel pass then finds nothing to change.
-                   */
-                  const cueShapedFallbackMessages = trackProviderMessageOrigins(
-                    fallbackMessages,
-                    isAnthropicLike(fallbackProvider, {
-                      model: resolveServingModelId(fallbackModel),
-                    })
-                      ? appendPredecessorHandoffCue(fallbackMessages, (m) =>
-                        this.isRunProducedMessage(m)
-                      )
-                      : removePredecessorHandoffCue(fallbackMessages)
-                  );
-                  const projectedFallbackMessages = trackProviderMessageOrigins(
-                    cueShapedFallbackMessages,
-                    projectMessagesForProvider({
-                      model: fallbackModel,
-                      messages: cueShapedFallbackMessages,
-                      provider: fallbackProvider,
-                      maxToolResultChars: fallbackToolResultChars,
-                      callOptions: fallbackConfig,
-                    })
-                  );
                   const primaryContextBudget = contextUsage?.contextBudget;
                   const fallbackContextBudget =
                     fallbackMaxContextTokens == null
@@ -4338,11 +4311,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                         primaryContextBudget ?? fallbackMaxContextTokens,
                         fallbackMaxContextTokens
                       );
-                  const projection = measureProviderPayload(
-                    projectedFallbackMessages,
-                    fallbackContextBudget,
-                    true
-                  );
+                  const preparedFallbackRequest = prepareProviderRequest({
+                    model: fallbackModel,
+                    messages: fallbackMessages,
+                    provider: fallbackProvider,
+                    context: this,
+                    config: fallbackConfig,
+                    maxToolResultChars: fallbackToolResultChars,
+                    measure: (preparedMessages) =>
+                      measureProviderPayload(
+                        trackProviderMessageOrigins(
+                          fallbackMessages,
+                          preparedMessages
+                        ),
+                        fallbackContextBudget,
+                        true
+                      ),
+                  });
+                  const projection =
+                    preparedFallbackRequest.measurement ??
+                    measureProviderPayload(
+                      preparedFallbackRequest.messages,
+                      fallbackContextBudget,
+                      true
+                    );
                   if (!projection.fits) {
                     throw createProviderPayloadOverflowError({
                       projection,
@@ -4350,7 +4342,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       info: 'Fallback provider message formatting exceeded the context budget before invocation.',
                     });
                   }
-                  return projectedFallbackMessages;
+                  return preparedFallbackRequest;
                 },
               })
           );
