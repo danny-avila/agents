@@ -39,6 +39,7 @@ import {
 import {
   type CallerCapabilityProjection,
   allowsToolCaller,
+  applyCallerCapabilityDefinitionOverrides,
   createCallerCapabilityProjectionSnapshot,
   isToolDefinitionActive,
   isProgrammaticControlTool,
@@ -486,7 +487,19 @@ export class AgentContext {
 
   /** Builds the caller boundary and schemas for programmatic-only tools. */
   private buildProgrammaticOnlyToolsInstructions(): string {
-    const capabilities = this.getCallerCapabilityProjection();
+    const isDirectProgrammaticRunner =
+      this.toolExecution?.engine === 'local' ||
+      this.toolExecution?.engine === 'cloudflare-sandbox';
+    if (isDirectProgrammaticRunner && !this.toolRegistry) {
+      return '';
+    }
+    const capabilities = isDirectProgrammaticRunner
+      ? resolveCallerCapabilityProjection(
+        this.toolRegistry?.values() ?? [],
+        (toolDef) =>
+          isToolDefinitionActive(toolDef, this.discoveredToolNames)
+      )
+      : this.getCallerCapabilityProjection();
     const programmaticOnlyTools = capabilities.codeExecutionOnlyTools;
     const programmaticToolNames = capabilities.codeExecutionTools.map(
       (toolDef) => toolDef.name
@@ -1134,7 +1147,10 @@ export class AgentContext {
      * `toolSchemaTokens` even though they were never bound.
      */
     return resolveCallerCapabilityProjection(
-      this.toolDefinitions,
+      applyCallerCapabilityDefinitionOverrides(
+        this.toolDefinitions,
+        this.toolRegistry?.values()
+      ),
       (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
     ).directTools;
   }

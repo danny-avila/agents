@@ -235,4 +235,59 @@ describe('ToolNode programmatic caller policy', () => {
       },
     ]);
   });
+
+  it('keeps schema-only event definitions out of a direct runner cache', async () => {
+    const capturedConfigs: Array<ToolCall & Partial<t.ProgrammaticCache>> = [];
+    const ptcTool = tool(
+      async (_args, config) => {
+        capturedConfigs.push(
+          config.toolCall as ToolCall & Partial<t.ProgrammaticCache>
+        );
+        return 'done';
+      },
+      {
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        description: 'Run tools with code',
+        schema: z.object({ code: z.string() }),
+      }
+    );
+    const eventStub = tool(async () => 'schema stub should not run', {
+      name: 'event_programmatic_tool',
+      description: 'Event programmatic tool',
+      schema: z.object({}),
+    });
+    const node = new ToolNode({
+      tools: [ptcTool, eventStub],
+      eventDrivenMode: true,
+      directToolNames: new Set([Constants.PROGRAMMATIC_TOOL_CALLING]),
+      toolDefinitions: new Map([
+        [
+          eventStub.name,
+          {
+            name: eventStub.name,
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]),
+    });
+
+    await node.invoke({
+      messages: [
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'local-ptc',
+              name: Constants.PROGRAMMATIC_TOOL_CALLING,
+              args: { code: 'event_programmatic_tool "{}"' },
+            },
+          ],
+        }),
+      ],
+    });
+
+    expect(capturedConfigs).toHaveLength(1);
+    expect(capturedConfigs[0].toolDefs).toEqual([]);
+    expect(capturedConfigs[0].toolMap).toEqual(new Map());
+  });
 });

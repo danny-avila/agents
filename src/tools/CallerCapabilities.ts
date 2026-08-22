@@ -33,6 +33,31 @@ export function mergeCallerCapabilityDefinitions(
   return Array.from(merged.values());
 }
 
+/**
+ * Applies runtime caller metadata to schema-only event definitions without
+ * adding registry-only tools or replacing their model-facing schemas.
+ */
+export function applyCallerCapabilityDefinitionOverrides(
+  toolDefs: Iterable<t.LCTool>,
+  overrides: Iterable<t.LCTool> | null | undefined
+): t.LCTool[] {
+  const overridesByName = new Map<string, t.LCTool>();
+  for (const override of overrides ?? []) {
+    overridesByName.set(override.name, override);
+  }
+  return Array.from(toolDefs, (toolDef) => {
+    const override = overridesByName.get(toolDef.name);
+    if (override == null) {
+      return toolDef;
+    }
+    return {
+      ...toolDef,
+      allowed_callers: override.allowed_callers,
+      defer_loading: override.defer_loading,
+    };
+  });
+}
+
 /** Converts the live projection into the versioned event transport shape. */
 export function createCallerCapabilityProjectionSnapshot(
   projection: CallerCapabilityProjection

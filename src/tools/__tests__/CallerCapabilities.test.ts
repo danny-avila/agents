@@ -2,6 +2,7 @@ import { describe, expect, it } from '@jest/globals';
 import type * as t from '@/types';
 import {
   allowsToolCaller,
+  applyCallerCapabilityDefinitionOverrides,
   mergeCallerCapabilityDefinitions,
   resolveCallerCapabilityProjection,
 } from '../CallerCapabilities';
@@ -71,6 +72,34 @@ describe('Caller Capability Projection', () => {
       { name: 'shared', allowed_callers: ['code_execution'] },
       { name: 'schema_only' },
       { name: 'runtime_only' },
+    ]);
+  });
+
+  it('overrides caller metadata without adding registry-only definitions', () => {
+    expect(
+      applyCallerCapabilityDefinitionOverrides(
+        [
+          {
+            name: 'event_tool',
+            description: 'Model-facing schema',
+          },
+        ],
+        [
+          {
+            name: 'event_tool',
+            allowed_callers: ['code_execution'],
+            defer_loading: true,
+          },
+          { name: 'registry_only' },
+        ]
+      )
+    ).toEqual([
+      {
+        name: 'event_tool',
+        description: 'Model-facing schema',
+        allowed_callers: ['code_execution'],
+        defer_loading: true,
+      },
     ]);
   });
 });

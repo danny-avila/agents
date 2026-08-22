@@ -1297,6 +1297,34 @@ describe('AgentContext', () => {
       const result = ctx.getToolsForBinding();
       expect(result?.length).toBe(1);
     });
+
+    it('applies registry caller overrides to event-driven model binding', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [
+            {
+              name: 'event_tool',
+              description: 'Model-facing schema',
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'event_tool',
+              {
+                name: 'event_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+      });
+
+      expect(ctx.getToolsForBinding()).toEqual([]);
+      expect(ctx.getCallerCapabilityProjectionSnapshot()).toMatchObject({
+        directToolNames: [],
+        codeExecutionToolNames: ['event_tool'],
+      });
+    });
   });
 
   describe('Token Accounting', () => {
