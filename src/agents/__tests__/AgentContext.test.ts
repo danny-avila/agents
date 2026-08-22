@@ -1263,6 +1263,37 @@ describe('AgentContext', () => {
       expect(content).toContain('`direct_tool`');
     });
 
+    it('preserves direct-only boundaries for a locally replaced runner', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            { name: Constants.PROGRAMMATIC_TOOL_CALLING },
+            { name: 'event_direct_tool', allowed_callers: ['direct'] },
+          ],
+          toolRegistry: new Map([
+            [
+              'event_direct_tool',
+              { name: 'event_direct_tool', allowed_callers: ['direct'] },
+            ],
+          ]),
+        },
+        toolExecution: {
+          engine: 'local',
+          local: { includeCodingTools: false },
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: none.'
+      );
+      expect(content).toContain(
+        'Call these tools directly; never list them in the `tool_manifest`'
+      );
+      expect(content).toContain('`event_direct_tool`');
+    });
+
     it('omits deferred programmatic runners until discovery', async () => {
       const ctx = createBasicContext({
         agentConfig: {

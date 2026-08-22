@@ -684,12 +684,23 @@ export class AgentContext {
     )) {
       implementationNames.add(name);
     }
-    return resolveCallerCapabilityProjection(
+    const activeCapabilities = resolveCallerCapabilityProjection(
+      this.toolRegistry?.values() ?? [],
+      (toolDef) =>
+        isToolDefinitionActive(toolDef, this.discoveredToolNames)
+    );
+    const executableCapabilities = resolveCallerCapabilityProjection(
       this.toolRegistry?.values() ?? [],
       (toolDef) =>
         implementationNames.has(toolDef.name) &&
         isToolDefinitionActive(toolDef, this.discoveredToolNames)
     );
+    return {
+      directTools: activeCapabilities.directTools,
+      directOnlyTools: activeCapabilities.directOnlyTools,
+      codeExecutionTools: executableCapabilities.codeExecutionTools,
+      codeExecutionOnlyTools: executableCapabilities.codeExecutionOnlyTools,
+    };
   }
 
   private hasBoundTool(name: string): boolean {
