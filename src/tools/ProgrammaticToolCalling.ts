@@ -396,14 +396,29 @@ function getPythonLexicalScopeKey(code: string, position: number): string {
   ) {
     scopes.pop();
   }
-  const inlineScope = currentLine.match(
-    /(?:^|;)\s*(?:(?:async\s+)?def\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)|class\s+[A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?)\s*:\s*$/
-  );
-  if (inlineScope != null) {
+  const inlineDefinitions = [
+    ...currentLine.matchAll(
+      /(?:^|;)\s*(?:async\s+)?def\s+[A-Za-z_][A-Za-z0-9_]*\s*\(/g
+    ),
+  ];
+  const inlineDefinition = inlineDefinitions[inlineDefinitions.length - 1];
+  if (inlineDefinition != null) {
     scopes.push({
       indent: currentIndent,
-      key: `inline:${lines.length - 1}:${inlineScope.index ?? 0}`,
+      key: `${lines.length - 1}:${currentIndent}`,
     });
+  } else {
+    const statementStart = currentLine.lastIndexOf(';') + 1;
+    const lambdaIndex = currentLine.lastIndexOf('lambda');
+    if (
+      lambdaIndex >= statementStart &&
+      /\blambda\b/.test(currentLine.slice(lambdaIndex, lambdaIndex + 6))
+    ) {
+      scopes.push({
+        indent: currentIndent,
+        key: `lambda:${lines.length - 1}:${lambdaIndex}`,
+      });
+    }
   }
 
   return scopes.length === 0
@@ -416,12 +431,25 @@ function isPythonBindingTarget(
   nameStart: number,
   nameEnd: number
 ): boolean {
+  if (isPythonParameterBinding(code, nameStart)) {
+    return true;
+  }
   const suffix = skipPythonCallWhitespace(code, nameEnd);
   if (code[suffix] === '=' && code[suffix + 1] !== '=') {
     return !isPythonKeywordArgument(code, nameStart);
   }
   const prefix = code.slice(0, nameStart).match(/([A-Za-z_][A-Za-z0-9_]*)\s*$/);
   return ['as', 'class', 'def', 'for', 'import'].includes(prefix?.[1] ?? '');
+}
+
+function isPythonParameterBinding(code: string, nameStart: number): boolean {
+  const lineStart = code.lastIndexOf('\n', nameStart - 1) + 1;
+  const prefix = code.slice(lineStart, nameStart);
+  return (
+    /(?:^|;)\s*(?:async\s+)?def\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*$/.test(
+      prefix
+    ) || /\blambda\s+[^:]*$/.test(prefix)
+  );
 }
 
 function isPythonKeywordArgument(code: string, nameStart: number): boolean {
@@ -796,7 +824,7 @@ function requiresAllPythonTools(
   knownToolNames?: { has(name: string): boolean }
 ): boolean {
   const executableCode = maskPythonStringsAndComments(code);
-  const dynamicCall = /\b(eval|exec)\s*\(/g;
+  const dynamicCall = /\b(eval|exec|globals)\s*\(/g;
   for (const match of executableCode.matchAll(dynamicCall)) {
     const name = match[1];
     if (knownToolNames?.has(name) === true) {
@@ -805,6 +833,12 @@ function requiresAllPythonTools(
     let prefix = (match.index ?? 0) - 1;
     while (prefix >= 0 && /\s/.test(executableCode[prefix])) {
       prefix -= 1;
+    }
+    const prefixWord = executableCode
+      .slice(0, (match.index ?? 0))
+      .match(/([A-Za-z_][A-Za-z0-9_]*)\s*$/)?.[1];
+    if (prefixWord === 'def' || prefixWord === 'class') {
+      continue;
     }
     if (executableCode[prefix] !== '.') {
       return true;

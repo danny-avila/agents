@@ -873,6 +873,20 @@ await search_docs()`;
       );
     });
 
+    it('treats function and lambda parameters as scoped bindings', () => {
+      const functionCode = `def helper(search_docs): return search_docs()
+helper(lambda: "ok")`;
+      const lambdaCode = `helper = lambda search_docs: search_docs()
+helper(lambda: "ok")`;
+
+      expect(extractUsedToolNames(functionCode, availableTools)).toEqual(
+        new Set()
+      );
+      expect(extractUsedToolNames(lambdaCode, availableTools)).toEqual(
+        new Set()
+      );
+    });
+
     it('does not treat Python keyword arguments as bindings', () => {
       const code = `dict(search_docs=lambda: None)
 await get_weather()
@@ -1246,6 +1260,24 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       expect(used).toEqual(new Set(['env', 'command', 'eval', 'trap']));
     });
 
+    it('does not execute command lookup operands', () => {
+      expect(
+        extractUsedBashToolNames(
+          'command -v search_docs; command -V get_weather',
+          availableTools
+        )
+      ).toEqual(new Set());
+    });
+
+    it('preserves backslashes inside single-quoted substitutions', () => {
+      const used = extractUsedBashToolNames(
+        String.raw`get_weather '{}'; printf '%s\n' "$(printf '%s' '\')"; search_docs '{}'`,
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
     it('does not interpret arithmetic shifts as heredocs', () => {
       const used = extractUsedBashToolNames(
         'get_weather \'{}\'; n=$((1 << 2))\nsearch_docs \'{}\'',
@@ -1479,6 +1511,12 @@ for member in team:
         filterToolsByUsage(
           allToolDefs,
           'await get_weather(); exec(dynamic_code)'
+        )
+      ).toEqual(allToolDefs);
+      expect(
+        filterToolsByUsage(
+          allToolDefs,
+          'await get_weather(); globals()["calculator"]()'
         )
       ).toEqual(allToolDefs);
     });

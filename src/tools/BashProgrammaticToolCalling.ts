@@ -315,6 +315,7 @@ function collectBashCommandNames(
   let skipPrefixOptionOperand = false;
   let expectsTrapAction = false;
   let readsDeclarationOperands = false;
+  let readsCommandLookupOperands = false;
   const caseModes: Array<'subject' | 'awaitIn' | 'pattern' | 'body'> = [];
 
   const flushEval = (): void => {
@@ -346,6 +347,7 @@ function collectBashCommandNames(
       skipPrefixOptionOperand = false;
       expectsTrapAction = false;
       readsDeclarationOperands = false;
+      readsCommandLookupOperands = false;
       if (pendingCoprocWord != null) {
         commands.add(pendingCoprocWord);
         pendingCoprocWord = undefined;
@@ -416,6 +418,9 @@ function collectBashCommandNames(
       }
       continue;
     }
+    if (readsCommandLookupOperands) {
+      continue;
+    }
     if (!expectsCommand) {
       continue;
     }
@@ -465,6 +470,12 @@ function collectBashCommandNames(
     }
     if (commandPrefix === 'env' && (word === '-u' || word === '--unset')) {
       skipPrefixOptionOperand = true;
+      continue;
+    }
+    if (commandPrefix === 'command' && (word === '-v' || word === '-V')) {
+      readsCommandLookupOperands = true;
+      commandPrefix = undefined;
+      expectsCommand = false;
       continue;
     }
     if (word.startsWith('-')) {
@@ -788,7 +799,7 @@ function findBashCommandSubstitutionEnd(
 
   for (let index = bodyStart; index < code.length; index++) {
     const char = code[index];
-    if (char === '\\') {
+    if (char === '\\' && quote !== '\'') {
       index += 1;
       continue;
     }
