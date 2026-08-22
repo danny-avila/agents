@@ -95,6 +95,8 @@ import {
   resolveLocalExecutionTools,
 } from '@/tools/local';
 import {
+  type CallerCapabilityProjection,
+  createCallerCapabilityProjectionSnapshot,
   isToolDefinitionActive,
   isProgrammaticControlTool,
   resolveCallerCapabilityProjection,
@@ -1105,16 +1107,28 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.settledInterruptingResults.clear();
   }
 
-  /** Returns active tools projected by their effective caller capabilities. */
-  private getProgrammaticTools(): t.ProgrammaticCache {
-    const toolMap: t.ToolMap = new Map();
+  /** Returns the live caller projection used by direct and event execution. */
+  private getCallerCapabilityProjection(): CallerCapabilityProjection {
     const discoveredToolNames = new Set(
       this.getDiscoveredToolNames?.() ?? []
     );
-    const capabilities = resolveCallerCapabilityProjection(
+    return resolveCallerCapabilityProjection(
       this.toolRegistry?.values() ?? [],
       (toolDef) => isToolDefinitionActive(toolDef, discoveredToolNames)
     );
+  }
+
+  /** Serializes the live caller projection for event-driven hosts. */
+  private getCallerCapabilityProjectionSnapshot(): t.CallerCapabilityProjectionSnapshot {
+    return createCallerCapabilityProjectionSnapshot(
+      this.getCallerCapabilityProjection()
+    );
+  }
+
+  /** Returns active tools projected by their effective caller capabilities. */
+  private getProgrammaticTools(): t.ProgrammaticCache {
+    const toolMap: t.ToolMap = new Map();
+    const capabilities = this.getCallerCapabilityProjection();
     for (const toolDef of capabilities.codeExecutionTools) {
       const tool = this.toolMap.get(toolDef.name);
       if (tool != null) {
@@ -3455,6 +3469,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               // the eager path sends `agentContext.agentId` — this must
               // match it at the top level too.
               agentId: this.executingAgentId,
+              callerCapabilityProjection:
+                this.getCallerCapabilityProjectionSnapshot(),
               configurable: stripRunBreakerScope(
                   config.configurable as Record<string, unknown> | undefined
               ),

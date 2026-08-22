@@ -38,6 +38,7 @@ import {
 } from '@/tools/local/resolveLocalExecutionTools';
 import {
   allowsToolCaller,
+  createCallerCapabilityProjectionSnapshot,
   isToolDefinitionActive,
   isProgrammaticControlTool,
   resolveCallerCapabilityProjection,
@@ -1765,6 +1766,15 @@ export class AgentContext {
   /** Returns a snapshot of the deferred tools discovered in this context. */
   getDiscoveredTools(): string[] {
     return Array.from(this.discoveredToolNames);
+  }
+
+  /** Returns the SDK-owned active caller projection for event-driven hosts. */
+  getCallerCapabilityProjectionSnapshot(): t.CallerCapabilityProjectionSnapshot {
+    const capabilities = resolveCallerCapabilityProjection(
+      this.toolRegistry?.values() ?? this.toolDefinitions ?? [],
+      (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
+    );
+    return createCallerCapabilityProjectionSnapshot(capabilities);
   }
 
   /**

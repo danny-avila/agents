@@ -1,13 +1,18 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { AIMessage } from '@langchain/core/messages';
-import { describe, it, expect } from '@jest/globals';
+import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { ToolNode } from '../ToolNode';
-import { Constants } from '@/common';
+import * as events from '@/utils/events';
+import { Constants, GraphEvents } from '@/common';
 
 describe('ToolNode programmatic caller policy', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   it('separates programmatic tools from direct-only preflight definitions', async () => {
     const capturedConfigs: Array<ToolCall & Partial<t.ProgrammaticCache>> = [];
     const ptcTool = tool(
@@ -137,6 +142,94 @@ describe('ToolNode programmatic caller policy', () => {
     expect(capturedConfigs[0].disallowedToolDefs).toEqual([]);
     expect(capturedConfigs[1].disallowedToolDefs).toEqual([
       { name: directTool.name },
+    ]);
+  });
+
+  it('dispatches the same live caller projection in event-driven mode', async () => {
+    const discovered = new Set<string>();
+    const snapshots: t.CallerCapabilityProjectionSnapshot[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        snapshots.push(batch.callerCapabilityProjection!);
+        batch.resolve(
+          batch.toolCalls.map((toolCall) => ({
+            toolCallId: toolCall.id,
+            status: 'success',
+            content: 'done',
+          }))
+        );
+      });
+
+    const eventTool = tool(async () => 'should dispatch', {
+      name: 'event_tool',
+      description: 'Event tool',
+      schema: z.object({}),
+    });
+    const toolRegistry: t.LCToolRegistry = new Map([
+      [eventTool.name, { name: eventTool.name }],
+      [
+        'deferred_programmatic_tool',
+        {
+          name: 'deferred_programmatic_tool',
+          allowed_callers: ['code_execution'],
+          defer_loading: true,
+        },
+      ],
+      [
+        'deferred_direct_tool',
+        {
+          name: 'deferred_direct_tool',
+          allowed_callers: ['direct'],
+          defer_loading: true,
+        },
+      ],
+    ]);
+    const node = new ToolNode({
+      tools: [eventTool],
+      toolRegistry,
+      eventDrivenMode: true,
+      getDiscoveredToolNames: () => [...discovered],
+      toolCallStepIds: new Map([
+        ['before-discovery', 'step-before'],
+        ['after-discovery', 'step-after'],
+      ]),
+    });
+    const invoke = async (id: string): Promise<void> => {
+      await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id, name: eventTool.name, args: {} }],
+          }),
+        ],
+      });
+    };
+
+    await invoke('before-discovery');
+    discovered.add('deferred_programmatic_tool');
+    discovered.add('deferred_direct_tool');
+    await invoke('after-discovery');
+
+    expect(snapshots).toEqual([
+      {
+        version: 1,
+        directToolNames: ['event_tool'],
+        codeExecutionToolNames: [],
+        directOnlyToolNames: ['event_tool'],
+        codeExecutionOnlyToolNames: [],
+      },
+      {
+        version: 1,
+        directToolNames: ['event_tool', 'deferred_direct_tool'],
+        codeExecutionToolNames: ['deferred_programmatic_tool'],
+        directOnlyToolNames: ['event_tool', 'deferred_direct_tool'],
+        codeExecutionOnlyToolNames: ['deferred_programmatic_tool'],
+      },
     ]);
   });
 });

@@ -66,6 +66,13 @@ function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
         toolDefinitions: [{ name: 'weather' }],
         graphTools: [],
         agentId: 'agent_1',
+        getCallerCapabilityProjectionSnapshot: jest.fn(() => ({
+          version: 1,
+          directToolNames: ['weather'],
+          codeExecutionToolNames: [],
+          directOnlyToolNames: ['weather'],
+          codeExecutionOnlyToolNames: [],
+        })),
       })
     ),
     getStepKey: jest.fn(() => 'step-key'),
@@ -214,6 +221,13 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       args: { city: 'NYC' },
       stepId: expect.stringMatching(/^step_/),
       turn: 0,
+    });
+    expect(toolExecuteCalls[0].callerCapabilityProjection).toEqual({
+      version: 1,
+      directToolNames: ['weather'],
+      codeExecutionToolNames: [],
+      directOnlyToolNames: ['weather'],
+      codeExecutionOnlyToolNames: [],
     });
     expect(graph.eagerEventToolExecutions.get('call_weather')).toMatchObject({
       toolCallId: 'call_weather',

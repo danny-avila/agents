@@ -14,6 +14,25 @@ export type CallerCapabilityProjection = {
   codeExecutionOnlyTools: t.LCTool[];
 };
 
+/** Converts the live projection into the versioned event transport shape. */
+export function createCallerCapabilityProjectionSnapshot(
+  projection: CallerCapabilityProjection
+): t.CallerCapabilityProjectionSnapshot {
+  return {
+    version: 1,
+    directToolNames: projection.directTools.map((toolDef) => toolDef.name),
+    codeExecutionToolNames: projection.codeExecutionTools.map(
+      (toolDef) => toolDef.name
+    ),
+    directOnlyToolNames: projection.directOnlyTools.map(
+      (toolDef) => toolDef.name
+    ),
+    codeExecutionOnlyToolNames: projection.codeExecutionOnlyTools.map(
+      (toolDef) => toolDef.name
+    ),
+  };
+}
+
 export function getAllowedCallers(
   toolDef: t.LCTool
 ): readonly t.AllowedCaller[] {

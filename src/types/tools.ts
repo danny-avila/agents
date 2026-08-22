@@ -557,6 +557,19 @@ export type ToolCallRequest = {
   runtimeSessionHint?: string;
 };
 
+/**
+ * Serializable view of the active tools grouped by their effective caller
+ * capabilities. Event-driven hosts use this snapshot to preserve the SDK's
+ * live deferred-tool discovery state without reimplementing its policy.
+ */
+export type CallerCapabilityProjectionSnapshot = {
+  version: 1;
+  directToolNames: string[];
+  codeExecutionToolNames: string[];
+  directOnlyToolNames: string[];
+  codeExecutionOnlyToolNames: string[];
+};
+
 /** Batch request containing ALL tool calls for a graph step */
 export type ToolExecuteBatchRequest = {
   /** All tool calls from the AIMessage */
@@ -565,6 +578,11 @@ export type ToolExecuteBatchRequest = {
   userId?: string;
   /** Agent ID for context */
   agentId?: string;
+  /**
+   * SDK-owned snapshot of the active caller capability projection. Optional
+   * so older event handlers remain compatible with newer SDKs.
+   */
+  callerCapabilityProjection?: CallerCapabilityProjectionSnapshot;
   /** Runtime configurable from RunnableConfig (includes user, userMCPAuthMap, etc.) */
   configurable?: Record<string, unknown>;
   /** Runtime metadata from RunnableConfig (includes thread_id, run_id, provider, etc.) */
