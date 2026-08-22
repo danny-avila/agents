@@ -791,6 +791,28 @@ function findPythonFStringExpressionEnd(
   return undefined;
 }
 
+function requiresAllPythonTools(
+  code: string,
+  knownToolNames?: { has(name: string): boolean }
+): boolean {
+  const executableCode = maskPythonStringsAndComments(code);
+  const dynamicCall = /\b(eval|exec)\s*\(/g;
+  for (const match of executableCode.matchAll(dynamicCall)) {
+    const name = match[1];
+    if (knownToolNames?.has(name) === true) {
+      continue;
+    }
+    let prefix = (match.index ?? 0) - 1;
+    while (prefix >= 0 && /\s/.test(executableCode[prefix])) {
+      prefix -= 1;
+    }
+    if (executableCode[prefix] !== '.') {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Throws a caller-policy error for tools referenced by programmatic code. */
 export function assertDisallowedToolUsage(
   disallowedNames: ReadonlySet<string>,
@@ -834,10 +856,11 @@ export function assertPythonToolsAllowProgrammaticCalling(
     }
   }
 
-  assertDisallowedToolUsage(
-    extractUsedToolNames(code, toolNameMap),
-    programmaticToolName
-  );
+  const knownNames = new Set([...allowedNames, ...toolNameMap.keys()]);
+  const disallowedUsage = requiresAllPythonTools(code, knownNames)
+    ? new Set(toolNameMap.values())
+    : extractUsedToolNames(code, toolNameMap);
+  assertDisallowedToolUsage(disallowedUsage, programmaticToolName);
 }
 
 /**
@@ -857,6 +880,16 @@ export function filterToolsByUsage(
   for (const tool of toolDefs) {
     const pythonName = normalizeToPythonIdentifier(tool.name);
     toolNameMap.set(pythonName, tool.name);
+  }
+
+  if (requiresAllPythonTools(code, toolNameMap)) {
+    if (debug) {
+      // eslint-disable-next-line no-console
+      console.log(
+        '[PTC Debug] Dynamic eval/exec detected - sending all tools as fallback'
+      );
+    }
+    return toolDefs;
   }
 
   const usedToolNames = extractUsedToolNames(code, toolNameMap);

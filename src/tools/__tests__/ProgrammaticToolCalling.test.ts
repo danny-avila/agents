@@ -1099,6 +1099,15 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       expect(mixedQuoted).toEqual(new Set(['search_docs']));
     });
 
+    it('joins continued heredoc delimiter words', () => {
+      const used = extractUsedBashToolNames(
+        'get_weather \'{}\'; cat <<E\\\nOF\nget_weather \'{}\'\nEOF\nsearch_docs \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
     it('leaves escaped unquoted-heredoc substitutions masked', () => {
       const used = extractUsedBashToolNames(
         'cat <<EOF\n\\$(get_weather \'{}\')\n$(search_docs \'{}\')\nEOF',
@@ -1348,6 +1357,23 @@ readonly fourth=get_team_members; "$fourth" '{}'`,
         )
       ).toThrow('Tool "search_docs" cannot be called');
     });
+
+    it('distinguishes a registered source tool from the shell builtin', () => {
+      const sourceTool = [{ name: 'source' }] as t.LCTool[];
+      const directOnly = [{ name: 'search_docs' }] as t.LCTool[];
+
+      expect(() =>
+        assertBashToolsAllowProgrammaticCalling(
+          directOnly,
+          'source \'{}\'',
+          Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+          sourceTool
+        )
+      ).not.toThrow();
+      expect(
+        filterBashToolsByUsage([...sourceTool, ...directOnly], 'source \'{}\'')
+      ).toEqual(sourceTool);
+    });
   });
 
   describe('caller-policy normalization collisions', () => {
@@ -1440,6 +1466,32 @@ for member in team:
       const filtered = filterToolsByUsage(allToolDefs, code);
 
       expect(filtered).toHaveLength(4);
+    });
+
+    it('returns all tools for builtin Python eval or exec', () => {
+      expect(
+        filterToolsByUsage(
+          allToolDefs,
+          'await get_weather(); eval("calculator()")'
+        )
+      ).toEqual(allToolDefs);
+      expect(
+        filterToolsByUsage(
+          allToolDefs,
+          'await get_weather(); exec(dynamic_code)'
+        )
+      ).toEqual(allToolDefs);
+    });
+
+    it('rejects dynamic Python evaluation when direct-only tools exist', () => {
+      expect(() =>
+        assertPythonToolsAllowProgrammaticCalling(
+          [{ name: 'calculator' }],
+          'await get_weather(); eval("calculator()")',
+          Constants.PROGRAMMATIC_TOOL_CALLING,
+          [{ name: 'get_weather' }]
+        )
+      ).toThrow('Tool "calculator" cannot be called');
     });
 
     it('preserves tool definition structure', () => {

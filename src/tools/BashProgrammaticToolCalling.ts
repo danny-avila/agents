@@ -287,9 +287,15 @@ function extractBashCommandNames(
 }
 
 /** Sourced files can invoke any injected function outside the visible code. */
-function requiresAllBashTools(code: string): boolean {
-  const commandNames = extractBashCommandNames(code);
-  return commandNames.has('source') || commandNames.has('.');
+function requiresAllBashTools(
+  code: string,
+  knownToolNames?: { has(name: string): boolean }
+): boolean {
+  const commandNames = extractBashCommandNames(code, knownToolNames);
+  return (
+    commandNames.has('.') ||
+    (commandNames.has('source') && knownToolNames?.has('source') !== true)
+  );
 }
 
 function collectBashCommandNames(
@@ -936,11 +942,17 @@ function maskBashHeredocBodies(code: string): string {
   let lineStart = 0;
 
   while (lineStart < code.length) {
-    const lineEnd = code.indexOf('\n', lineStart);
-    const contentEnd = lineEnd === -1 ? code.length : lineEnd;
-    const declarations = findBashHeredocDeclarations(
-      code.slice(lineStart, contentEnd)
-    );
+    let lineEnd = code.indexOf('\n', lineStart);
+    let contentEnd = lineEnd === -1 ? code.length : lineEnd;
+    let logicalLine = code.slice(lineStart, contentEnd);
+    while (lineEnd !== -1 && hasBashLineContinuation(logicalLine)) {
+      const continuedStart = lineEnd + 1;
+      lineEnd = code.indexOf('\n', continuedStart);
+      contentEnd = lineEnd === -1 ? code.length : lineEnd;
+      logicalLine =
+        logicalLine.slice(0, -1) + code.slice(continuedStart, contentEnd);
+    }
+    const declarations = findBashHeredocDeclarations(logicalLine);
     if (declarations.length === 0 || lineEnd === -1) {
       lineStart = lineEnd === -1 ? code.length : lineEnd + 1;
       continue;
@@ -988,6 +1000,28 @@ function maskBashHeredocBodies(code: string): string {
   }
 
   return masked.join('');
+}
+
+function hasBashLineContinuation(line: string): boolean {
+  let quote: '\'' | '"' | undefined;
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index];
+    if (char === '\\' && quote !== '\'') {
+      if (index === line.length - 1) {
+        return true;
+      }
+      index += 1;
+      continue;
+    }
+    if (char === '\'' || char === '"') {
+      if (quote == null) {
+        quote = char;
+      } else if (quote === char) {
+        quote = undefined;
+      }
+    }
+  }
+  return false;
 }
 
 function restoreBashHeredocSubstitutions(
@@ -1311,7 +1345,8 @@ export function assertBashToolsAllowProgrammaticCalling(
     }
   }
 
-  const disallowedUsage = requiresAllBashTools(code)
+  const knownNames = new Set([...allowedNames, ...toolNameMap.keys()]);
+  const disallowedUsage = requiresAllBashTools(code, knownNames)
     ? new Set(toolNameMap.values())
     : extractUsedBashToolNames(code, toolNameMap);
   assertDisallowedToolUsage(disallowedUsage, programmaticToolName);
@@ -1325,7 +1360,13 @@ export function filterBashToolsByUsage(
   code: string,
   debug = false
 ): t.LCTool[] {
-  if (requiresAllBashTools(code)) {
+  const toolNameMap = new Map<string, string>();
+  for (const def of toolDefs) {
+    const bashName = normalizeToBashIdentifier(def.name);
+    toolNameMap.set(bashName, def.name);
+  }
+
+  if (requiresAllBashTools(code, toolNameMap)) {
     if (debug) {
       // eslint-disable-next-line no-console
       console.log(
@@ -1333,12 +1374,6 @@ export function filterBashToolsByUsage(
       );
     }
     return toolDefs;
-  }
-
-  const toolNameMap = new Map<string, string>();
-  for (const def of toolDefs) {
-    const bashName = normalizeToBashIdentifier(def.name);
-    toolNameMap.set(bashName, def.name);
   }
 
   const usedToolNames = extractUsedBashToolNames(code, toolNameMap);
