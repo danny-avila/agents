@@ -334,4 +334,61 @@ describe('ToolNode programmatic caller policy', () => {
       Constants.WRITE_FILE
     );
   });
+
+  it('does not treat unsupported Cloudflare allowlist names as implementations', () => {
+    const unsupportedName = 'unsupported_cloudflare_tool';
+    const unsupportedStub = tool(async () => 'schema stub should not run', {
+      name: unsupportedName,
+      description: 'Unsupported Cloudflare tool',
+      schema: z.object({}),
+    });
+    const node = new ToolNode({
+      tools: [unsupportedStub],
+      eventDrivenMode: true,
+      toolExecution: {
+        engine: 'cloudflare-sandbox',
+        cloudflare: {
+          codingToolNames: [
+            Constants.PROGRAMMATIC_TOOL_CALLING,
+            unsupportedName,
+          ],
+          sandbox: {
+            exec: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+            readFile: async () => '',
+            writeFile: async () => undefined,
+            mkdir: async () => undefined,
+            listFiles: async () => [],
+            deleteFile: async () => undefined,
+          },
+        },
+      },
+      toolRegistry: new Map([
+        [
+          unsupportedName,
+          {
+            name: unsupportedName,
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]),
+      toolDefinitions: new Map([
+        [
+          unsupportedName,
+          {
+            name: unsupportedName,
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]),
+    });
+
+    const cache = (
+      node as unknown as {
+        getProgrammaticTools(): t.ProgrammaticCache;
+      }
+    ).getProgrammaticTools();
+
+    expect(cache.toolDefs).toEqual([]);
+    expect(cache.toolMap).toEqual(new Map());
+  });
 });

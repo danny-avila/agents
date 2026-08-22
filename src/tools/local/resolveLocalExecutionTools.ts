@@ -4,6 +4,7 @@ import {
   createLocalProgrammaticToolCallingTool,
 } from './LocalProgrammaticToolCalling';
 import {
+  CLOUDFLARE_CODING_TOOL_NAMES,
   createCloudflareCodingToolBundle,
   createCloudflareCodingTools,
   createCloudflareExecutionTool,
@@ -120,7 +121,12 @@ function getCloudflareConfig(
 function getSelectedCloudflareCodingToolNames(
   config: t.CloudflareSandboxExecutionConfig
 ): Set<string> {
-  return new Set(config.codingToolNames ?? LOCAL_CODING_BUNDLE_NAMES);
+  const requestedNames = new Set(
+    config.codingToolNames ?? CLOUDFLARE_CODING_TOOL_NAMES
+  );
+  return new Set(
+    CLOUDFLARE_CODING_TOOL_NAMES.filter((name) => requestedNames.has(name))
+  );
 }
 
 function filterCloudflareCodingToolAllowlist(
