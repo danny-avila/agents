@@ -1075,6 +1075,73 @@ describe('AgentContext', () => {
       expect(content).not.toContain('`event_schema_tool`');
     });
 
+    it('uses executable guidance for an explicitly overridden local runner', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            { name: Constants.PROGRAMMATIC_TOOL_CALLING },
+            {
+              name: 'event_schema_tool',
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'executable_tool',
+              {
+                name: 'executable_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+        toolExecution: {
+          engine: 'local',
+          local: { includeCodingTools: false },
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain('`executable_tool`');
+      expect(content).not.toContain('`event_schema_tool`');
+    });
+
+    it('keeps direct and event runner capability guidance separate', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          graphTools: [createMockTool(Constants.PROGRAMMATIC_TOOL_CALLING)],
+          toolDefinitions: [
+            { name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING },
+            {
+              name: 'event_schema_tool',
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'executable_tool',
+              {
+                name: 'executable_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain('### Direct programmatic runners');
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: `executable_tool`.'
+      );
+      expect(content).toContain('### Event-dispatched programmatic runners');
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_bash`: `event_schema_tool`, `executable_tool`.'
+      );
+    });
+
     it('recognizes auto-bound local programmatic runners', async () => {
       const ctx = createBasicContext({
         agentConfig: {

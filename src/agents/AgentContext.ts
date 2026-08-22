@@ -63,6 +63,12 @@ type AgentSystemContentBlock =
 
 type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
 
+type ProgrammaticToolInstructionTarget = {
+  name: string;
+  codeGuidance: string;
+  executesDirectly: boolean;
+};
+
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
  */
@@ -489,19 +495,55 @@ export class AgentContext {
   private buildProgrammaticOnlyToolsInstructions(): string {
     const programmaticTools = this.getProgrammaticToolInstructionTargets();
     if (programmaticTools.length === 0) return '';
-    const isDirectProgrammaticRunner = programmaticTools.some(
+    const directProgrammaticTools = programmaticTools.filter(
       (tool) => tool.executesDirectly
     );
-    if (isDirectProgrammaticRunner && !this.toolRegistry) {
+    const eventProgrammaticTools = programmaticTools.filter(
+      (tool) => !tool.executesDirectly
+    );
+    const groups: Array<{
+      tools: ProgrammaticToolInstructionTarget[];
+      capabilities: CallerCapabilityProjection;
+      label: string;
+    }> = [];
+    if (directProgrammaticTools.length > 0 && this.toolRegistry) {
+      groups.push({
+        tools: directProgrammaticTools,
+        capabilities: resolveCallerCapabilityProjection(
+          this.toolRegistry.values(),
+          (toolDef) =>
+            isToolDefinitionActive(toolDef, this.discoveredToolNames)
+        ),
+        label: 'Direct programmatic runners',
+      });
+    }
+    if (eventProgrammaticTools.length > 0) {
+      groups.push({
+        tools: eventProgrammaticTools,
+        capabilities: this.getCallerCapabilityProjection(),
+        label: 'Event-dispatched programmatic runners',
+      });
+    }
+    if (groups.length === 0) {
       return '';
     }
-    const capabilities = isDirectProgrammaticRunner
-      ? resolveCallerCapabilityProjection(
-        this.toolRegistry?.values() ?? [],
-        (toolDef) =>
-          isToolDefinitionActive(toolDef, this.discoveredToolNames)
-      )
-      : this.getCallerCapabilityProjection();
+    const showGroupLabels = groups.length > 1;
+    return (
+      '\n\n## Programmatic Tool Calling' +
+      groups
+        .map(
+          ({ tools, capabilities, label }) =>
+            (showGroupLabels ? `\n\n### ${label}` : '') +
+            this.buildProgrammaticToolGroupInstructions(tools, capabilities)
+        )
+        .join('')
+    );
+  }
+
+  private buildProgrammaticToolGroupInstructions(
+    programmaticTools: ProgrammaticToolInstructionTarget[],
+    capabilities: CallerCapabilityProjection
+  ): string {
     const programmaticOnlyTools = capabilities.codeExecutionOnlyTools;
     const programmaticToolNames = capabilities.codeExecutionTools.map(
       (toolDef) => toolDef.name
@@ -524,7 +566,7 @@ export class AgentContext {
           .join(', ')}. Every ${programmaticRunnerNames} call must include a \`tool_manifest\` containing the exact registered names used by its code; the manifest is validated before execution starts.`
         : '';
     const boundary =
-      '\n\n## Programmatic Tool Calling\n\n' +
+      '\n\n' +
       `Only these tools may be invoked inside ${programmaticRunnerNames}: ${quotedProgrammaticNames}.` +
       directOnlyBoundary;
 
@@ -559,16 +601,8 @@ export class AgentContext {
     );
   }
 
-  private getProgrammaticToolInstructionTargets(): Array<{
-    name: string;
-    codeGuidance: string;
-    executesDirectly: boolean;
-  }> {
-    const targets: Array<{
-      name: string;
-      codeGuidance: string;
-      executesDirectly: boolean;
-    }> = [];
+  private getProgrammaticToolInstructionTargets(): ProgrammaticToolInstructionTarget[] {
+    const targets: ProgrammaticToolInstructionTarget[] = [];
     if (
       this.hasBoundTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING) ||
       isProgrammaticRunnerAutoBound(
@@ -611,8 +645,14 @@ export class AgentContext {
 
   /** Whether ToolNode executes this runner in-process instead of via an event. */
   private isProgrammaticRunnerDirectlyBound(name: string): boolean {
+    const usesDirectExecutionEngine =
+      this.toolExecution?.engine === 'local' ||
+      this.toolExecution?.engine === 'cloudflare-sandbox';
     return (
       isProgrammaticRunnerAutoBound(name, this.toolExecution) ||
+      (usesDirectExecutionEngine &&
+        this.toolDefinitions?.some((toolDef) => toolDef.name === name) ===
+          true) ||
       this.graphTools?.some(
         (tool) => 'name' in tool && tool.name === name
       ) === true
