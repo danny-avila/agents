@@ -35,6 +35,7 @@ import {
 import {
   isProgrammaticRunnerAutoBound,
   isProgrammaticRunnerResolvedDirectly,
+  resolveLocalImplementationNames,
   resolveLocalToolRegistry,
 } from '@/tools/local/resolveLocalExecutionTools';
 import {
@@ -510,11 +511,7 @@ export class AgentContext {
     if (directProgrammaticTools.length > 0 && this.toolRegistry) {
       groups.push({
         tools: directProgrammaticTools,
-        capabilities: resolveCallerCapabilityProjection(
-          this.toolRegistry.values(),
-          (toolDef) =>
-            isToolDefinitionActive(toolDef, this.discoveredToolNames)
-        ),
+        capabilities: this.getDirectProgrammaticCapabilityProjection(),
         label: 'Direct programmatic runners',
       });
     }
@@ -655,6 +652,43 @@ export class AgentContext {
       this.graphTools?.some(
         (tool) => 'name' in tool && tool.name === name
       ) === true
+    );
+  }
+
+  /** Mirrors ToolNode's executable implementation gate for direct runners. */
+  private getDirectProgrammaticCapabilityProjection(): CallerCapabilityProjection {
+    const implementationNames = new Set<string>();
+    const isEventDriven = (this.toolDefinitions?.length ?? 0) > 0;
+    const resolverInputNames = new Set<string>();
+    if (isEventDriven) {
+      for (const toolDef of this.toolDefinitions ?? []) {
+        resolverInputNames.add(toolDef.name);
+      }
+    } else {
+      for (const tool of (this.tools as t.GenericTool[] | undefined) ?? []) {
+        if ('name' in tool && typeof tool.name === 'string') {
+          implementationNames.add(tool.name);
+          resolverInputNames.add(tool.name);
+        }
+      }
+    }
+    for (const tool of (this.graphTools as t.GenericTool[] | undefined) ?? []) {
+      if ('name' in tool && typeof tool.name === 'string') {
+        implementationNames.add(tool.name);
+        resolverInputNames.add(tool.name);
+      }
+    }
+    for (const name of resolveLocalImplementationNames(
+      resolverInputNames,
+      this.toolExecution
+    )) {
+      implementationNames.add(name);
+    }
+    return resolveCallerCapabilityProjection(
+      this.toolRegistry?.values() ?? [],
+      (toolDef) =>
+        implementationNames.has(toolDef.name) &&
+        isToolDefinitionActive(toolDef, this.discoveredToolNames)
     );
   }
 

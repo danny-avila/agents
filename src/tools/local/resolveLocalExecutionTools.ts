@@ -365,6 +365,28 @@ export function resolveLocalToolRegistry(args: {
   return registry;
 }
 
+/** Names that this execution config creates or replaces in the local tool map. */
+export function resolveLocalImplementationNames(
+  toolNames: Iterable<string>,
+  toolExecution?: t.ToolExecutionConfig
+): Set<string> {
+  if (
+    !shouldUseLocalExecution(toolExecution) &&
+    !shouldUseCloudflareSandboxExecution(toolExecution)
+  ) {
+    return new Set();
+  }
+  if (shouldIncludeCodingTools(toolExecution)) {
+    return shouldUseCloudflareSandboxExecution(toolExecution)
+      ? getSelectedCloudflareCodingToolNames(getCloudflareConfig(toolExecution))
+      : new Set(LOCAL_CODING_BUNDLE_NAMES);
+  }
+  const existingNames = new Set(toolNames);
+  return new Set(
+    [...CODE_EXECUTION_TOOLS].filter((name) => existingNames.has(name))
+  );
+}
+
 export function resolveLocalExecutionTools(args: {
   toolMap: t.ToolMap;
   toolExecution?: t.ToolExecutionConfig;
@@ -380,7 +402,10 @@ export function resolveLocalExecutionTools(args: {
   fileCheckpointer?: t.LocalFileCheckpointer;
 }): ResolveLocalToolsResult {
   const directToolNames = new Set<string>();
-  const localImplementationNames = new Set<string>();
+  const localImplementationNames = resolveLocalImplementationNames(
+    args.toolMap.keys(),
+    args.toolExecution
+  );
   if (
     !shouldUseLocalExecution(args.toolExecution) &&
     !shouldUseCloudflareSandboxExecution(args.toolExecution)

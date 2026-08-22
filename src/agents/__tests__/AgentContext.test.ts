@@ -1051,7 +1051,10 @@ describe('AgentContext', () => {
       const ctx = createBasicContext({
         agentConfig: {
           instructions: 'Base',
-          graphTools: [createMockTool(Constants.PROGRAMMATIC_TOOL_CALLING)],
+          graphTools: [
+            createMockTool(Constants.PROGRAMMATIC_TOOL_CALLING),
+            createMockTool('executable_tool'),
+          ],
           toolDefinitions: [
             {
               name: 'event_schema_tool',
@@ -1103,7 +1106,10 @@ describe('AgentContext', () => {
       });
 
       const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
-      expect(content).toContain('`executable_tool`');
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: none.'
+      );
+      expect(content).not.toContain('`executable_tool`');
       expect(content).not.toContain('`event_schema_tool`');
     });
 
@@ -1145,7 +1151,10 @@ describe('AgentContext', () => {
       const ctx = createBasicContext({
         agentConfig: {
           instructions: 'Base',
-          graphTools: [createMockTool(Constants.PROGRAMMATIC_TOOL_CALLING)],
+          graphTools: [
+            createMockTool(Constants.PROGRAMMATIC_TOOL_CALLING),
+            createMockTool('executable_tool'),
+          ],
           toolDefinitions: [
             { name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING },
             {
@@ -1197,19 +1206,26 @@ describe('AgentContext', () => {
       const content = String(result[0].content);
       expect(content).toContain('inside `run_tools_with_bash`');
       expect(content).toContain('or `run_tools_with_code`');
-      expect(content).toContain('`host_code_tool`');
+      expect(content).toContain('`write_file`');
+      expect(content).not.toContain('`host_code_tool`');
     });
 
     it('describes the Bash default for an auto-bound code runner', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           instructions: 'Base',
-          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+          toolDefinitions: [
+            { name: Constants.PROGRAMMATIC_TOOL_CALLING },
+            {
+              name: Constants.BASH_TOOL,
+              allowed_callers: ['code_execution'],
+            },
+          ],
           toolRegistry: new Map([
             [
-              'host_code_tool',
+              Constants.BASH_TOOL,
               {
-                name: 'host_code_tool',
+                name: Constants.BASH_TOOL,
                 allowed_callers: ['code_execution'],
               },
             ],
