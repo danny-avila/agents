@@ -1263,7 +1263,7 @@ describe('AgentContext', () => {
       expect(content).toContain('`direct_tool`');
     });
 
-    it('preserves direct-only boundaries for a locally replaced runner', async () => {
+    it('preserves definition-only boundaries for a locally replaced runner', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           instructions: 'Base',
@@ -1271,12 +1271,6 @@ describe('AgentContext', () => {
             { name: Constants.PROGRAMMATIC_TOOL_CALLING },
             { name: 'event_direct_tool', allowed_callers: ['direct'] },
           ],
-          toolRegistry: new Map([
-            [
-              'event_direct_tool',
-              { name: 'event_direct_tool', allowed_callers: ['direct'] },
-            ],
-          ]),
         },
         toolExecution: {
           engine: 'local',

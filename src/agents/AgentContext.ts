@@ -508,7 +508,7 @@ export class AgentContext {
       capabilities: CallerCapabilityProjection;
       label: string;
     }> = [];
-    if (directProgrammaticTools.length > 0 && this.toolRegistry) {
+    if (directProgrammaticTools.length > 0) {
       groups.push({
         tools: directProgrammaticTools,
         capabilities: this.getDirectProgrammaticCapabilityProjection(),
@@ -684,11 +684,7 @@ export class AgentContext {
     )) {
       implementationNames.add(name);
     }
-    const activeCapabilities = resolveCallerCapabilityProjection(
-      this.toolRegistry?.values() ?? [],
-      (toolDef) =>
-        isToolDefinitionActive(toolDef, this.discoveredToolNames)
-    );
+    const activeCapabilities = this.getCallerCapabilityProjection();
     const executableCapabilities = resolveCallerCapabilityProjection(
       this.toolRegistry?.values() ?? [],
       (toolDef) =>
