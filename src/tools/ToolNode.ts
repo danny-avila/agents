@@ -703,6 +703,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private toolRegistry?: t.LCToolRegistry;
   /** Schema-only definitions used when event mode has no runtime registry. */
   private toolDefinitions?: t.LCToolRegistry;
+  /** Tool-map entries created or replaced by the local execution resolver. */
+  private localImplementationNames = new Set<string>();
   /** Reads deferred-tool discovery state from the owning agent context. */
   private getDiscoveredToolNames?: () => readonly string[];
   /** Reference to Graph's sessions map for automatic session injection */
@@ -1006,6 +1008,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     });
 
     this.toolMap = resolved.toolMap;
+    this.localImplementationNames = resolved.localImplementationNames;
     if (resolved.fileCheckpointer != null) {
       this.fileCheckpointer = resolved.fileCheckpointer;
     }
@@ -1147,7 +1150,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     for (const toolDef of executableCapabilities.codeExecutionTools) {
       if (
         this.eventDrivenMode &&
-        this.directToolNames?.has(toolDef.name) !== true
+        this.directToolNames?.has(toolDef.name) !== true &&
+        !this.localImplementationNames.has(toolDef.name)
       ) {
         continue;
       }

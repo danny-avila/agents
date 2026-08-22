@@ -299,4 +299,39 @@ describe('ToolNode programmatic caller policy', () => {
     expect(capturedConfigs[0].toolDefs).toEqual([]);
     expect(capturedConfigs[0].toolMap).toEqual(new Map());
   });
+
+  it('keeps synthesized code-only implementations in the runner cache', () => {
+    const node = new ToolNode({
+      tools: [],
+      eventDrivenMode: true,
+      toolExecution: { engine: 'local' },
+      toolRegistry: new Map([
+        [
+          Constants.WRITE_FILE,
+          {
+            name: Constants.WRITE_FILE,
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]),
+    });
+
+    const cache = (
+      node as unknown as {
+        getProgrammaticTools(): t.ProgrammaticCache;
+      }
+    ).getProgrammaticTools();
+
+    expect(cache.toolDefs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: Constants.WRITE_FILE,
+          allowed_callers: ['code_execution'],
+        }),
+      ])
+    );
+    expect(cache.toolMap.get(Constants.WRITE_FILE)?.name).toBe(
+      Constants.WRITE_FILE
+    );
+  });
 });

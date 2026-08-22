@@ -30,6 +30,8 @@ import {
 type ResolveLocalToolsResult = {
   toolMap: t.ToolMap;
   directToolNames: Set<string>;
+  /** Names whose toolMap entries were created or replaced by this resolver. */
+  localImplementationNames: Set<string>;
   /**
    * Set when `local.fileCheckpointing === true` AND the auto-bind
    * coding suite is in use. ToolNode stashes this on the node and
@@ -378,6 +380,7 @@ export function resolveLocalExecutionTools(args: {
   fileCheckpointer?: t.LocalFileCheckpointer;
 }): ResolveLocalToolsResult {
   const directToolNames = new Set<string>();
+  const localImplementationNames = new Set<string>();
   if (
     !shouldUseLocalExecution(args.toolExecution) &&
     !shouldUseCloudflareSandboxExecution(args.toolExecution)
@@ -385,6 +388,7 @@ export function resolveLocalExecutionTools(args: {
     return {
       toolMap: args.toolMap,
       directToolNames,
+      localImplementationNames,
     };
   }
 
@@ -407,6 +411,7 @@ export function resolveLocalExecutionTools(args: {
         fileCheckpointer = bundle.checkpointer;
         for (const cloudflareTool of bundle.tools) {
           toolMap.set(cloudflareTool.name, cloudflareTool);
+          localImplementationNames.add(cloudflareTool.name);
           addDirectToolName(
             directToolNames,
             cloudflareTool.name,
@@ -418,6 +423,7 @@ export function resolveLocalExecutionTools(args: {
           cloudflareConfig
         )) {
           toolMap.set(cloudflareTool.name, cloudflareTool);
+          localImplementationNames.add(cloudflareTool.name);
           addDirectToolName(
             directToolNames,
             cloudflareTool.name,
@@ -441,10 +447,16 @@ export function resolveLocalExecutionTools(args: {
       }
 
       toolMap.set(name, cloudflareTool);
+      localImplementationNames.add(name);
       addDirectToolName(directToolNames, name, args.toolRegistry);
     }
 
-    return { toolMap, directToolNames, fileCheckpointer };
+    return {
+      toolMap,
+      directToolNames,
+      localImplementationNames,
+      fileCheckpointer,
+    };
   }
 
   const localConfig = args.toolExecution?.local ?? {};
@@ -466,6 +478,7 @@ export function resolveLocalExecutionTools(args: {
       fileCheckpointer = bundle.checkpointer;
       for (const localTool of bundle.tools) {
         toolMap.set(localTool.name, localTool);
+        localImplementationNames.add(localTool.name);
         addDirectToolName(
           directToolNames,
           localTool.name,
@@ -475,6 +488,7 @@ export function resolveLocalExecutionTools(args: {
     } else {
       for (const localTool of createLocalCodingTools(localConfig)) {
         toolMap.set(localTool.name, localTool);
+        localImplementationNames.add(localTool.name);
         addDirectToolName(
           directToolNames,
           localTool.name,
@@ -505,8 +519,14 @@ export function resolveLocalExecutionTools(args: {
     }
 
     toolMap.set(name, localTool);
+    localImplementationNames.add(name);
     addDirectToolName(directToolNames, name, args.toolRegistry);
   }
 
-  return { toolMap, directToolNames, fileCheckpointer };
+  return {
+    toolMap,
+    directToolNames,
+    localImplementationNames,
+    fileCheckpointer,
+  };
 }
