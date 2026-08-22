@@ -32,6 +32,15 @@ import {
   Constants,
   Providers,
 } from '@/common';
+import {
+  isProgrammaticRunnerAutoBound,
+  resolveLocalToolRegistry,
+} from '@/tools/local/resolveLocalExecutionTools';
+import {
+  allowsToolCaller,
+  isProgrammaticControlTool,
+  resolveCallerCapabilityProjection,
+} from '@/tools/CallerCapabilities';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
@@ -59,7 +68,8 @@ export class AgentContext {
   static fromConfig(
     agentConfig: t.AgentInputs,
     tokenCounter?: t.TokenCounter,
-    indexTokenCountMap?: Record<string, number>
+    indexTokenCountMap?: Record<string, number>,
+    toolExecution?: t.ToolExecutionConfig
   ): AgentContext {
     const {
       agentId,
@@ -103,6 +113,7 @@ export class AgentContext {
       tools,
       toolMap,
       toolRegistry,
+      toolExecution,
       toolDefinitions,
       instructions,
       additionalInstructions: additional_instructions,
@@ -269,6 +280,8 @@ export class AgentContext {
    * Used for tool search and programmatic tool calling.
    */
   toolRegistry?: t.LCToolRegistry;
+  /** Run-scoped backend used to identify auto-bound programmatic runners. */
+  private toolExecution?: t.ToolExecutionConfig;
   /**
    * Serializable tool definitions for event-driven execution.
    * When provided, ToolNode operates in event-driven mode.
@@ -385,6 +398,7 @@ export class AgentContext {
     tools,
     toolMap,
     toolRegistry,
+    toolExecution,
     toolDefinitions,
     instructions,
     additionalInstructions,
@@ -410,6 +424,7 @@ export class AgentContext {
     tools?: t.GraphTools;
     toolMap?: t.ToolMap;
     toolRegistry?: t.LCToolRegistry;
+    toolExecution?: t.ToolExecutionConfig;
     toolDefinitions?: t.LCTool[];
     instructions?: string;
     additionalInstructions?: string;
@@ -434,7 +449,11 @@ export class AgentContext {
     this.tokenCounter = tokenCounter;
     this.tools = tools;
     this.toolMap = toolMap;
-    this.toolRegistry = toolRegistry;
+    this.toolRegistry = resolveLocalToolRegistry({
+      toolRegistry,
+      toolExecution,
+    });
+    this.toolExecution = toolExecution;
     this.toolDefinitions = toolDefinitions;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
@@ -461,37 +480,48 @@ export class AgentContext {
     }
   }
 
-  /**
-   * Builds instructions text for tools that are ONLY callable via programmatic code execution.
-   * These tools cannot be called directly by the LLM but are available through the
-   * configured programmatic tool.
-   *
-   * Includes:
-   * - Code_execution-only tools that are NOT deferred
-   * - Code_execution-only tools that ARE deferred but have been discovered via tool search
-   */
+  /** Builds the caller boundary and schemas for programmatic-only tools. */
   private buildProgrammaticOnlyToolsInstructions(): string {
     if (!this.toolRegistry) return '';
 
-    const programmaticOnlyTools: t.LCTool[] = [];
-    for (const [name, toolDef] of this.toolRegistry) {
-      const allowedCallers = toolDef.allowed_callers ?? ['direct'];
-      const isCodeExecutionOnly =
-        allowedCallers.includes('code_execution') &&
-        !allowedCallers.includes('direct');
+    const capabilities = resolveCallerCapabilityProjection(
+      this.toolRegistry.values(),
+      (toolDef) =>
+        toolDef.defer_loading !== true ||
+        this.discoveredToolNames.has(toolDef.name)
+    );
+    const programmaticOnlyTools = capabilities.codeExecutionOnlyTools;
+    const programmaticToolNames = capabilities.codeExecutionTools.map(
+      (toolDef) => toolDef.name
+    );
+    const directOnlyToolNames = capabilities.directOnlyTools
+      .map((toolDef) => toolDef.name)
+      .filter((name) => !isProgrammaticControlTool(name));
 
-      if (!isCodeExecutionOnly) continue;
+    const programmaticTools = this.getProgrammaticToolInstructionTargets();
+    if (programmaticTools.length === 0) return '';
+    const programmaticRunnerNames = programmaticTools
+      .map((tool) => `\`${tool.name}\``)
+      .join(' or ');
+    const quotedProgrammaticNames =
+      programmaticToolNames.length > 0
+        ? programmaticToolNames.map((name) => `\`${name}\``).join(', ')
+        : 'none';
+    const directOnlyBoundary =
+      directOnlyToolNames.length > 0
+        ? `\nCall these tools directly; never list them in the \`tools\` manifest or reference them inside ${programmaticRunnerNames}: ${directOnlyToolNames
+          .map((name) => `\`${name}\``)
+          .join(', ')}. Every ${programmaticRunnerNames} call must include a \`tools\` manifest containing the exact registered names used by its code; the manifest is validated before execution starts.`
+        : '';
+    const boundary =
+      '\n\n## Programmatic Tool Calling\n\n' +
+      `Only these tools may be invoked inside ${programmaticRunnerNames}: ${quotedProgrammaticNames}.` +
+      directOnlyBoundary;
 
-      const isDeferred = toolDef.defer_loading === true;
-      const isDiscovered = this.discoveredToolNames.has(name);
-      if (!isDeferred || isDiscovered) {
-        programmaticOnlyTools.push(toolDef);
-      }
+    if (programmaticOnlyTools.length === 0) {
+      return boundary;
     }
 
-    if (programmaticOnlyTools.length === 0) return '';
-
-    const programmaticTool = this.getProgrammaticToolInstructionTarget();
     const toolDescriptions = programmaticOnlyTools
       .map((tool) => {
         let desc = `- **${tool.name}**`;
@@ -506,41 +536,64 @@ export class AgentContext {
       .join('\n\n');
 
     return (
-      '\n\n## Programmatic-Only Tools\n\n' +
-      `The following tools are available exclusively through the \`${programmaticTool.name}\` tool. ` +
-      `You cannot call these tools directly; instead, use \`${programmaticTool.name}\` with ${programmaticTool.language} code that invokes them.\n\n` +
+      boundary +
+      '\n\n### Programmatic-Only Tools\n\n' +
+      `The following tools are available exclusively through ${programmaticRunnerNames}. ` +
+      `You cannot call these tools directly; instead, ${programmaticTools
+        .map(
+          (tool) =>
+            `use \`${tool.name}\` with ${tool.codeGuidance} that invokes them`
+        )
+        .join(', or ')}.\n\n` +
       toolDescriptions
     );
   }
 
-  private getProgrammaticToolInstructionTarget(): {
+  private getProgrammaticToolInstructionTargets(): Array<{
     name: string;
-    language: 'bash' | 'Python';
-    } {
-    if (this.hasAvailableTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING)) {
-      return {
+    codeGuidance: string;
+  }> {
+    const targets: Array<{ name: string; codeGuidance: string }> = [];
+    if (
+      this.hasBoundTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING) ||
+      isProgrammaticRunnerAutoBound(
+        Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+        this.toolExecution
+      )
+    ) {
+      targets.push({
         name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
-        language: 'bash',
-      };
+        codeGuidance: 'Bash code',
+      });
     }
 
-    if (this.hasAvailableTool(Constants.PROGRAMMATIC_TOOL_CALLING)) {
-      return { name: Constants.PROGRAMMATIC_TOOL_CALLING, language: 'Python' };
+    if (
+      this.hasBoundTool(Constants.PROGRAMMATIC_TOOL_CALLING) ||
+      isProgrammaticRunnerAutoBound(
+        Constants.PROGRAMMATIC_TOOL_CALLING,
+        this.toolExecution
+      )
+    ) {
+      const localDefault =
+        this.toolExecution?.engine === 'local' ||
+        this.toolExecution?.engine === 'cloudflare-sandbox';
+      targets.push({
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        codeGuidance: localDefault
+          ? 'Bash code by default, or set `lang: "py"` to use Python code'
+          : 'Python code',
+      });
     }
 
-    return { name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING, language: 'bash' };
+    return targets;
   }
 
-  private hasAvailableTool(name: string): boolean {
-    if (this.toolDefinitions?.some((tool) => tool.name === name) === true)
-      return true;
-    if (
-      this.tools?.some((tool) => 'name' in tool && tool.name === name) === true
-    ) {
-      return true;
-    }
-    if (this.toolMap?.has(name) === true) return true;
-    return this.toolRegistry?.has(name) === true;
+  private hasBoundTool(name: string): boolean {
+    return (
+      this.getToolsForBinding()?.some(
+        (tool) => 'name' in tool && tool.name === name
+      ) === true
+    );
   }
 
   /**
@@ -1083,15 +1136,12 @@ export class AgentContext {
      * alone left programmatic-only definitions counted in
      * `toolSchemaTokens` even though they were never bound.
      */
-    return this.toolDefinitions.filter((def) => {
-      const allowedCallers = def.allowed_callers ?? ['direct'];
-      if (!allowedCallers.includes('direct')) {
-        return false;
-      }
-      return (
-        def.defer_loading !== true || this.discoveredToolNames.has(def.name)
-      );
-    });
+    return resolveCallerCapabilityProjection(
+      this.toolDefinitions,
+      (toolDef) =>
+        toolDef.defer_loading !== true ||
+        this.discoveredToolNames.has(toolDef.name)
+    ).directTools;
   }
 
   /**
@@ -1807,14 +1857,10 @@ export class AgentContext {
         return true;
       }
 
-      if (this.discoveredToolNames.has(tool.name)) {
-        const allowedCallers = toolDef.allowed_callers ?? ['direct'];
-        return allowedCallers.includes('direct');
-      }
-
-      const allowedCallers = toolDef.allowed_callers ?? ['direct'];
       return (
-        allowedCallers.includes('direct') && toolDef.defer_loading !== true
+        allowsToolCaller(toolDef, 'direct') &&
+        (toolDef.defer_loading !== true ||
+          this.discoveredToolNames.has(tool.name))
       );
     });
   }

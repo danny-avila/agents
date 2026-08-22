@@ -94,6 +94,10 @@ import {
   resolveLocalToolRegistry,
   resolveLocalExecutionTools,
 } from '@/tools/local';
+import {
+  isProgrammaticControlTool,
+  resolveCallerCapabilityProjection,
+} from '@/tools/CallerCapabilities';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import { attachRunStepResumeState } from '@/tools/runStepResume';
@@ -987,6 +991,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const resolved = resolveLocalExecutionTools({
       toolMap: this.toolMap,
       toolExecution: this.toolExecution,
+      toolRegistry: this.toolRegistry,
       fileCheckpointer: this.fileCheckpointer,
     });
 
@@ -1098,29 +1103,28 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.settledInterruptingResults.clear();
   }
 
-  /**
-   * Returns cached programmatic tools, computing once on first access.
-   * Single iteration builds both toolMap and toolDefs simultaneously.
-   */
-  private getProgrammaticTools(): { toolMap: t.ToolMap; toolDefs: t.LCTool[] } {
+  /** Returns cached tools projected by their effective caller capabilities. */
+  private getProgrammaticTools(): t.ProgrammaticCache {
     if (this.programmaticCache) return this.programmaticCache;
 
     const toolMap: t.ToolMap = new Map();
-    const toolDefs: t.LCTool[] = [];
-
-    if (this.toolRegistry) {
-      for (const [name, toolDef] of this.toolRegistry) {
-        if (
-          (toolDef.allowed_callers ?? ['direct']).includes('code_execution')
-        ) {
-          toolDefs.push(toolDef);
-          const tool = this.toolMap.get(name);
-          if (tool) toolMap.set(name, tool);
-        }
+    const capabilities = resolveCallerCapabilityProjection(
+      this.toolRegistry?.values() ?? []
+    );
+    for (const toolDef of capabilities.codeExecutionTools) {
+      const tool = this.toolMap.get(toolDef.name);
+      if (tool != null) {
+        toolMap.set(toolDef.name, tool);
       }
     }
 
-    this.programmaticCache = { toolMap, toolDefs };
+    this.programmaticCache = {
+      toolMap,
+      toolDefs: capabilities.codeExecutionTools,
+      disallowedToolDefs: capabilities.directOnlyTools
+        .filter((toolDef) => !isProgrammaticControlTool(toolDef.name))
+        .map((toolDef) => ({ name: toolDef.name })),
+    };
     return this.programmaticCache;
   }
 
@@ -1332,11 +1336,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
         call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING
       ) {
-        const { toolMap, toolDefs } = this.getProgrammaticTools();
+        const { toolMap, toolDefs, disallowedToolDefs } =
+          this.getProgrammaticTools();
         invokeParams = {
           ...invokeParams,
           toolMap,
           toolDefs,
+          disallowedToolDefs,
+          programmaticToolName: call.name,
           // Plumb the hook context into the programmatic-tool path so
           // inner tool calls made via the in-process bridge can run
           // through `PreToolUse` (deny / updatedInput) before reaching

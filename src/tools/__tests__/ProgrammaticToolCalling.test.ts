@@ -4,6 +4,7 @@
  * Tests manual invocation with mock tools and Code API responses.
  */
 import { describe, it, expect, jest, beforeEach } from '@jest/globals';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
   createProgrammaticToolCallingTool,
@@ -16,16 +17,18 @@ import {
   unwrapToolResponse,
 } from '../ProgrammaticToolCalling';
 import {
+  createBashProgrammaticToolCallingTool,
+  createBashProgrammaticToolCallingSchema,
+  normalizeBashToolResultsForReplay,
+} from '../BashProgrammaticToolCalling';
+import { selectProgrammaticTools } from '../ProgrammaticCallerPolicy';
+import {
   createProgrammaticToolRegistry,
   createGetTeamMembersTool,
   createGetExpensesTool,
   createGetWeatherTool,
   createCalculatorTool,
 } from '@/test/mockTools';
-import {
-  createBashProgrammaticToolCallingSchema,
-  normalizeBashToolResultsForReplay,
-} from '../BashProgrammaticToolCalling';
 import { Constants } from '@/common';
 
 describe('ProgrammaticToolCalling', () => {
@@ -37,6 +40,9 @@ describe('ProgrammaticToolCalling', () => {
       expect(description).toContain('keyword args only');
       expect(description).toContain('never pass a dict');
       expect(description).toContain('Tool results are decoded Python values');
+      expect(schema.properties.tools.description).toContain(
+        'validated before execution starts'
+      );
     });
 
     it('explains bash inner-tool stdout shape', () => {
@@ -53,6 +59,7 @@ describe('ProgrammaticToolCalling', () => {
       expect(description).toContain('/mnt/data/sf.json');
       expect(description).toContain('Failed executions register nothing');
       expect(description).toContain('`/tmp` never survives the call');
+      expect(schema.properties.tools.uniqueItems).toBe(true);
     });
   });
 
@@ -908,6 +915,58 @@ for member in team:
     });
   });
 
+  describe('Programmatic Tool Manifest', () => {
+    const allowedToolDefs: t.LCTool[] = [
+      { name: 'search', allowed_callers: ['code_execution'] },
+      {
+        name: 'calculate',
+        allowed_callers: ['direct', 'code_execution'],
+      },
+    ];
+    const disallowedToolDefs = [{ name: 'send_email' }];
+
+    it('requires a manifest for mixed caller configurations', () => {
+      expect(() =>
+        selectProgrammaticTools({
+          allowedToolDefs,
+          disallowedToolDefs,
+          programmaticToolName: 'run_tools_with_code',
+        })
+      ).toThrow('requires a tools manifest');
+    });
+
+    it('rejects direct-only manifest entries before execution', () => {
+      expect(() =>
+        selectProgrammaticTools({
+          requestedToolNames: ['send_email'],
+          allowedToolDefs,
+          disallowedToolDefs,
+          programmaticToolName: 'run_tools_with_code',
+        })
+      ).toThrow('not marked for code_execution');
+    });
+
+    it('selects declared allowed tools without parsing code', () => {
+      expect(
+        selectProgrammaticTools({
+          requestedToolNames: ['calculate', 'search', 'search'],
+          allowedToolDefs,
+          disallowedToolDefs,
+          programmaticToolName: 'run_tools_with_code',
+        })
+      ).toEqual([allowedToolDefs[1], allowedToolDefs[0]]);
+    });
+
+    it('preserves the all-tools fallback when no direct-only tools exist', () => {
+      expect(
+        selectProgrammaticTools({
+          allowedToolDefs,
+          programmaticToolName: 'run_tools_with_code',
+        })
+      ).toBe(allowedToolDefs);
+    });
+  });
+
   describe('formatCompletedResponse', () => {
     it('formats response with stdout', () => {
       const response: t.ProgrammaticExecutionResponse = {
@@ -1031,7 +1090,6 @@ for member in team:
   describe('createProgrammaticToolCallingTool - Manual Invocation', () => {
     let ptcTool: ReturnType<typeof createProgrammaticToolCallingTool>;
     let toolMap: t.ToolMap;
-    let toolDefinitions: t.LCTool[];
 
     beforeEach(() => {
       const tools = [
@@ -1040,11 +1098,6 @@ for member in team:
         createGetWeatherTool(),
       ];
       toolMap = new Map(tools.map((t) => [t.name, t]));
-      toolDefinitions = Array.from(
-        createProgrammaticToolRegistry().values()
-      ).filter((t) =>
-        ['get_team_members', 'get_expenses', 'get_weather'].includes(t.name)
-      );
 
       ptcTool = createProgrammaticToolCallingTool({
         baseUrl: 'http://mock-api',
@@ -1055,8 +1108,6 @@ for member in team:
       await expect(
         ptcTool.invoke({
           code: 'result = await get_weather(city="SF")\nprint(result)',
-          tools: toolDefinitions,
-          toolMap,
         })
       ).rejects.toThrow('No toolMap provided');
     });
@@ -1064,8 +1115,6 @@ for member in team:
     it('throws error when toolMap is empty', async () => {
       const args = {
         code: 'result = await get_weather(city="SF")\nprint(result)',
-        tools: toolDefinitions,
-        toolMap: new Map(),
       };
       const toolCall = {
         name: 'programmatic_tool_calling',
@@ -1131,6 +1180,62 @@ for member in team:
     beforeEach(() => {
       const tools = [createGetWeatherTool()];
       toolMap = new Map(tools.map((t) => [t.name, t]));
+    });
+
+    it('rejects a direct-only Python tool before requiring sandbox context', async () => {
+      const tool = createProgrammaticToolCallingTool();
+      const toolCall = {
+        id: 'ptc-python',
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        args: {},
+        type: 'tool_call' as const,
+        disallowedToolDefs: [
+          {
+            name: 'direct-only-tool',
+            allowed_callers: ['direct'],
+          },
+        ],
+      } satisfies ToolCall & Partial<t.ProgrammaticCache>;
+
+      await expect(
+        tool.invoke(
+          {
+            code: 'await direct_only_tool(query="test")',
+            tools: ['direct-only-tool'],
+          },
+          { toolCall }
+        )
+      ).rejects.toThrow(
+        'Tool "direct-only-tool" cannot be called from "run_tools_with_code" because the tool is not marked for code_execution'
+      );
+    });
+
+    it('rejects a direct-only bash tool before requiring sandbox context', async () => {
+      const tool = createBashProgrammaticToolCallingTool();
+      const toolCall = {
+        id: 'ptc-bash',
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        args: {},
+        type: 'tool_call' as const,
+        disallowedToolDefs: [
+          {
+            name: 'direct-only-tool',
+            allowed_callers: ['direct'],
+          },
+        ],
+      } satisfies ToolCall & Partial<t.ProgrammaticCache>;
+
+      await expect(
+        tool.invoke(
+          {
+            code: 'direct_only_tool \'{"query":"test"}\'',
+            tools: ['direct-only-tool'],
+          },
+          { toolCall }
+        )
+      ).rejects.toThrow(
+        'Tool "direct-only-tool" cannot be called from "run_tools_with_code" because the tool is not marked for code_execution'
+      );
     });
 
     it('returns error for invalid city without throwing', async () => {
@@ -1350,11 +1455,9 @@ for member in team:
   });
 
   describe('bash bridge script does not require python3 (Codex P2 #19)', () => {
-    /* eslint-disable @typescript-eslint/no-require-imports */
     const {
       _createBashProgramForTests,
     } = require('../local/LocalProgrammaticToolCalling');
-    /* eslint-enable @typescript-eslint/no-require-imports */
 
     it('uses curl as the primary HTTP helper with python3 only as fallback', () => {
       const script: string = _createBashProgramForTests(
@@ -1399,7 +1502,7 @@ for member in team:
       const { tool } = await import('@langchain/core/tools');
       const { z } = await import('zod');
       const { HookRegistry } = await import('@/hooks');
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+
       const ptcMod = require('../local/LocalProgrammaticToolCalling');
 
       let callsMade = 0;
@@ -1418,7 +1521,6 @@ for member in team:
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
         hooks: [
-          // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
           async (input) => {
             if (input.toolName === 'write_file') {
               return { decision: 'deny', reason: 'no writes from bridge' };
@@ -1431,7 +1533,7 @@ for member in team:
       // Internal createToolBridge isn't exported, but exercising it via
       // a synthetic HTTP request mirrors the real path. We use a tiny
       // helper to access the (testing-internal) bridge factory.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+
       const http = require('http') as typeof import('http');
 
       // Use the same internal factory the production path uses by
@@ -1464,13 +1566,12 @@ for member in team:
 
     it('threads executingAgentId from the hook context to bridge PreToolUse hooks', async () => {
       const { HookRegistry } = await import('@/hooks');
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+
       const ptcMod = require('../local/LocalProgrammaticToolCalling');
       const registry = new HookRegistry();
       let seen: string | undefined = 'UNSET';
       registry.register('PreToolUse', {
         hooks: [
-          // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
           async (input) => {
             seen = input.executingAgentId;
             return { decision: 'allow' };
@@ -1488,12 +1589,11 @@ for member in team:
 
     it('passes through when no hook denies (allow path)', async () => {
       const { HookRegistry } = await import('@/hooks');
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+
       const ptcMod = require('../local/LocalProgrammaticToolCalling');
 
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
-        // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
         hooks: [async () => ({ decision: 'allow' })],
       });
 
@@ -1509,13 +1609,12 @@ for member in team:
 
     it('applies updatedInput to the inner tool args', async () => {
       const { HookRegistry } = await import('@/hooks');
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+
       const ptcMod = require('../local/LocalProgrammaticToolCalling');
 
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
         hooks: [
-          // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
           async () => ({
             decision: 'allow',
             updatedInput: { path: '/tmp/rewritten' },
@@ -1535,12 +1634,11 @@ for member in team:
 
     it('treats `ask` as fail-closed deny (HITL not reachable from bridge)', async () => {
       const { HookRegistry } = await import('@/hooks');
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+
       const ptcMod = require('../local/LocalProgrammaticToolCalling');
 
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
-        // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
         hooks: [async () => ({ decision: 'ask' })],
       });
 

@@ -26,6 +26,10 @@ import {
   createCodeApiRunTimeoutSchema,
   resolveCodeApiRunTimeoutMs,
 } from './ptcTimeout';
+import {
+  selectProgrammaticTools,
+  type ProgrammaticInvocationParams,
+} from './ProgrammaticCallerPolicy';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
@@ -87,6 +91,10 @@ ${EXAMPLES}
 
 ${CORE_RULES}`;
 
+const TOOL_MANIFEST_DESCRIPTION =
+  'Exact registered tool names used by the code. Required when direct-only tools are configured; ' +
+  'validated before execution starts.';
+
 export function createProgrammaticToolCallingSchema(
   maxRunTimeoutMs = DEFAULT_RUN_TIMEOUT_MS
 ): ProgrammaticToolCallingJsonSchema {
@@ -98,6 +106,12 @@ export function createProgrammaticToolCallingSchema(
         type: 'string',
         minLength: 1,
         description: CODE_PARAM_DESCRIPTION,
+      },
+      tools: {
+        type: 'array',
+        items: { type: 'string' },
+        uniqueItems: true,
+        description: TOOL_MANIFEST_DESCRIPTION,
       },
       timeout: createCodeApiRunTimeoutSchema(maxRunTimeoutMs),
     },
@@ -893,7 +907,7 @@ export function createProgrammaticToolCallingTool(
 
   return tool(
     async (rawParams, config) => {
-      const params = rawParams as { code: string; timeout?: number };
+      const params = rawParams as ProgrammaticInvocationParams;
       const { code } = params;
       const timeout = clampCodeApiRunTimeoutMs(params.timeout, maxRunTimeoutMs);
 
@@ -907,10 +921,23 @@ export function createProgrammaticToolCallingTool(
       const {
         toolMap,
         toolDefs,
+        disallowedToolDefs,
         session_id,
         _injected_files,
         _runtime_session_hint,
       } = toolCall;
+
+      const programmaticToolName =
+        toolCall.programmaticToolName ??
+        (typeof toolCall.name === 'string' && toolCall.name !== ''
+          ? toolCall.name
+          : Constants.PROGRAMMATIC_TOOL_CALLING);
+      const effectiveTools = selectProgrammaticTools({
+        requestedToolNames: params.tools,
+        allowedToolDefs: toolDefs,
+        disallowedToolDefs,
+        programmaticToolName,
+      });
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(
@@ -930,16 +957,14 @@ export function createProgrammaticToolCallingTool(
 
       try {
         // ====================================================================
-        // Phase 1: Filter tools and make initial request
+        // Phase 1: Send the validated tool manifest with the initial request
         // ====================================================================
-
-        const effectiveTools = filterToolsByUsage(toolDefs, code, debug);
 
         if (debug) {
           // eslint-disable-next-line no-console
           console.log(
             `[PTC Debug] Sending ${effectiveTools.length} tools to API ` +
-              `(filtered from ${toolDefs.length})`
+              `(selected from ${toolDefs.length})`
           );
         }
 

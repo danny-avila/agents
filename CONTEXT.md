@@ -41,3 +41,17 @@ call.
 A **Resume Projection** is the durable manifest view produced from an
 Execution Record. A projection is scoped to one exact fork and resume attempt;
 an unscoped projection fails closed when a parent tool-call ID is ambiguous.
+
+## Tool Caller Capabilities
+
+A **Caller Capability Projection** is the effective classification of tool
+definitions by the contexts permitted by `allowed_callers`: direct model calls,
+programmatic code execution, both, or neither. Prompt guidance, model binding,
+and runtime dispatch derive from this projection rather than recomputing caller
+rules independently.
+
+A **Programmatic Tool Manifest** is the exact list of registered tool names a
+programmatic invocation declares that its code depends on. Mixed direct and
+code-execution configurations require the manifest so caller policy can reject
+direct-only dependencies before starting an execution runtime without parsing
+the submitted programming language.

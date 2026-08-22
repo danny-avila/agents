@@ -1,17 +1,17 @@
 // src/types/tools.ts
-import type { StructuredToolInterface } from '@langchain/core/tools';
 import type {
   RunnableConfig,
   RunnableToolLike,
 } from '@langchain/core/runnables';
+import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
-import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
-import type { RunBreakerScope } from '@/llm/streamLimits';
 import type {
   MessageContentComplex,
   RunStepResumeState,
   ToolErrorData,
 } from './stream';
+import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { HumanInTheLoopConfig } from './hitl';
 import type { LangfuseConfig } from './graph';
 import type { HookRegistry } from '@/hooks';
@@ -1171,6 +1171,15 @@ export type ToolExecutionConfig = {
 export type ProgrammaticCache = {
   toolMap: ToolMap;
   toolDefs: LCTool[];
+  /** Actual outer runner name used for caller-policy diagnostics. */
+  programmaticToolName?: string;
+  /**
+   * Known tools that cannot be invoked from programmatic execution. Kept
+   * separate from `toolDefs` so the Programmatic Tool Manifest can be
+   * validated before the execution runtime starts without exposing their
+   * schemas to that runtime.
+   */
+  disallowedToolDefs?: LCTool[];
   /**
    * Hook context plumbed through by ToolNode for the local
    * programmatic-tool path so the in-process bridge can run

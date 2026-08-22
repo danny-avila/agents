@@ -9,14 +9,16 @@ import {
   ProgrammaticToolCallingDescription,
   ProgrammaticToolCallingName,
   ProgrammaticToolCallingSchema,
-  filterToolsByUsage,
 } from '@/tools/ProgrammaticToolCalling';
 import {
   BashProgrammaticToolCallingDescription,
   BashProgrammaticToolCallingSchema,
-  filterBashToolsByUsage,
   normalizeToBashIdentifier,
 } from '@/tools/BashProgrammaticToolCalling';
+import {
+  selectProgrammaticTools,
+  type ProgrammaticInvocationParams,
+} from '@/tools/ProgrammaticCallerPolicy';
 import { Constants } from '@/common';
 import {
   clientExecTimeoutMs,
@@ -27,13 +29,7 @@ import {
   validateCloudflareBashCommand,
 } from './CloudflareSandboxExecutionEngine';
 
-type ProgrammaticParams = {
-  code: string;
-  timeout?: number;
-  lang?: string;
-  runtime?: string;
-  language?: string;
-};
+type ProgrammaticParams = ProgrammaticInvocationParams;
 
 const DEFAULT_TIMEOUT = 60000;
 const MIN_TIMEOUT = 1000;
@@ -224,15 +220,8 @@ function resolveRuntime(params: ProgrammaticParams): 'python' | 'bash' {
   return raw === 'py' || raw === 'python' ? 'python' : 'bash';
 }
 
-function filterNativeTools(
-  toolDefs: t.LCTool[],
-  code: string,
-  runtime: 'python' | 'bash'
-): t.LCTool[] {
-  const nativeDefs = toolDefs.filter((def) => NATIVE_TOOL_NAMES.has(def.name));
-  const filter =
-    runtime === 'bash' ? filterBashToolsByUsage : filterToolsByUsage;
-  return filter(nativeDefs, code);
+function filterNativeTools(toolDefs: t.LCTool[]): t.LCTool[] {
+  return toolDefs.filter((def) => NATIVE_TOOL_NAMES.has(def.name));
 }
 
 function indent(code: string, spaces = 4): string {
@@ -1062,12 +1051,18 @@ async function runProgrammatic(args: {
 }): Promise<[string, t.ProgrammaticExecutionArtifact]> {
   const toolCall = (args.config?.toolCall ??
     {}) as Partial<t.ProgrammaticCache>;
-  const toolDefs = toolCall.toolDefs ?? [];
-  const effectiveTools = filterNativeTools(
-    toolDefs,
-    args.params.code,
-    args.runtime
-  );
+  const programmaticToolName =
+    toolCall.programmaticToolName ??
+    (args.runtime === 'bash'
+      ? Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+      : Constants.PROGRAMMATIC_TOOL_CALLING);
+  const selectedTools = selectProgrammaticTools({
+    requestedToolNames: args.params.tools,
+    allowedToolDefs: toolCall.toolDefs,
+    disallowedToolDefs: toolCall.disallowedToolDefs,
+    programmaticToolName,
+  });
+  const effectiveTools = filterNativeTools(selectedTools);
   const timeoutMs = clampExecutionTimeout(
     args.params.timeout,
     args.cloudflareConfig.timeoutMs

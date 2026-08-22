@@ -34,6 +34,7 @@ import type {
 import type {
   GraphFactory,
   GraphFactoryDependencies,
+  GraphFactoryRequest,
 } from '@/graphs/graphFactory';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
 import type { FallbackErrorContext } from '@/llm/invoke';
@@ -1460,6 +1461,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       subagentExecutionContext,
       preemption,
       streamLimits,
+      toolExecution,
     }: t.StandardGraphInput,
     dependencies?: GraphFactoryDependencies
   ) {
@@ -1485,6 +1487,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.subagentExecutionContext = subagentExecutionContext;
     this.preemption = preemption;
     this.streamLimits = resolveStreamLimits(streamLimits);
+    this.toolExecution = toolExecution;
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -1494,7 +1497,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const agentContext = AgentContext.fromConfig(
         agentConfig,
         tokenCounter,
-        indexTokenCountMap
+        indexTokenCountMap,
+        toolExecution
       );
       if (calibrationRatio != null && calibrationRatio > 0) {
         agentContext.calibrationRatio = calibrationRatio;
@@ -2842,6 +2846,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const rawToolsForBinding = resolveLocalToolsForBinding({
         tools: agentContext.getToolsForBinding(),
         toolExecution: this.toolExecution,
+        toolRegistry: agentContext.toolRegistry,
       });
 
       /**
@@ -4812,7 +4817,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           };
           const checkpointer = this.compileOptions?.checkpointer;
           return (request): StandardGraph => {
-            const childGraph = graphFactory(request);
+            const configuredRequest: GraphFactoryRequest =
+              request.kind === 'multi-agent'
+                ? {
+                  kind: 'multi-agent',
+                  input: {
+                    ...request.input,
+                    toolExecution: runtimeConfig.toolExecution,
+                  },
+                }
+                : {
+                  kind: 'standard',
+                  input: {
+                    ...request.input,
+                    toolExecution: runtimeConfig.toolExecution,
+                  },
+                };
+            const childGraph = graphFactory(configuredRequest);
             if (subagentModelOverride != null) {
               childGraph.overrideModel = subagentModelOverride;
               childGraph.setSubagentModelOverride(subagentModelOverride);
