@@ -67,7 +67,7 @@ function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
         graphTools: [],
         agentId: 'agent_1',
         getCallerCapabilityProjectionSnapshot: jest.fn(() => ({
-          version: 1,
+          version: 1 as const,
           directToolNames: ['weather'],
           codeExecutionToolNames: [],
           directOnlyToolNames: ['weather'],

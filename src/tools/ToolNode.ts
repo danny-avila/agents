@@ -99,6 +99,7 @@ import {
   createCallerCapabilityProjectionSnapshot,
   isToolDefinitionActive,
   isProgrammaticControlTool,
+  mergeCallerCapabilityDefinitions,
   resolveCallerCapabilityProjection,
 } from '@/tools/CallerCapabilities';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
@@ -700,6 +701,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   >();
   /** Tool registry for filtering (lazy computation of programmatic maps) */
   private toolRegistry?: t.LCToolRegistry;
+  /** Schema-only definitions used when event mode has no runtime registry. */
+  private toolDefinitions?: t.LCToolRegistry;
   /** Reads deferred-tool discovery state from the owning agent context. */
   private getDiscoveredToolNames?: () => readonly string[];
   /** Reference to Graph's sessions map for automatic session injection */
@@ -805,6 +808,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     handleToolErrors,
     loadRuntimeTools,
     toolRegistry,
+    toolDefinitions,
     getDiscoveredToolNames,
     sessions,
     codeSessionKey,
@@ -881,6 +885,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       toolRegistry,
       toolExecution,
     });
+    this.toolDefinitions = toolDefinitions;
     this.getDiscoveredToolNames = getDiscoveredToolNames;
     this.sessions = sessions;
     this.codeSessionKey = codeSessionKey ?? Constants.EXECUTE_CODE;
@@ -1113,7 +1118,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       this.getDiscoveredToolNames?.() ?? []
     );
     return resolveCallerCapabilityProjection(
-      this.toolRegistry?.values() ?? [],
+      mergeCallerCapabilityDefinitions(
+        this.toolDefinitions?.values(),
+        this.toolRegistry?.values()
+      ),
       (toolDef) => isToolDefinitionActive(toolDef, discoveredToolNames)
     );
   }

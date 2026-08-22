@@ -37,10 +37,12 @@ import {
   resolveLocalToolRegistry,
 } from '@/tools/local/resolveLocalExecutionTools';
 import {
+  type CallerCapabilityProjection,
   allowsToolCaller,
   createCallerCapabilityProjectionSnapshot,
   isToolDefinitionActive,
   isProgrammaticControlTool,
+  mergeCallerCapabilityDefinitions,
   resolveCallerCapabilityProjection,
 } from '@/tools/CallerCapabilities';
 import { createSchemaOnlyTools } from '@/tools/schema';
@@ -484,12 +486,7 @@ export class AgentContext {
 
   /** Builds the caller boundary and schemas for programmatic-only tools. */
   private buildProgrammaticOnlyToolsInstructions(): string {
-    if (!this.toolRegistry) return '';
-
-    const capabilities = resolveCallerCapabilityProjection(
-      this.toolRegistry.values(),
-      (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
-    );
+    const capabilities = this.getCallerCapabilityProjection();
     const programmaticOnlyTools = capabilities.codeExecutionOnlyTools;
     const programmaticToolNames = capabilities.codeExecutionTools.map(
       (toolDef) => toolDef.name
@@ -1768,13 +1765,22 @@ export class AgentContext {
     return Array.from(this.discoveredToolNames);
   }
 
-  /** Returns the SDK-owned active caller projection for event-driven hosts. */
-  getCallerCapabilityProjectionSnapshot(): t.CallerCapabilityProjectionSnapshot {
-    const capabilities = resolveCallerCapabilityProjection(
-      this.toolRegistry?.values() ?? this.toolDefinitions ?? [],
+  /** Returns the live projection shared by prompt and event execution. */
+  private getCallerCapabilityProjection(): CallerCapabilityProjection {
+    return resolveCallerCapabilityProjection(
+      mergeCallerCapabilityDefinitions(
+        this.toolDefinitions,
+        this.toolRegistry?.values()
+      ),
       (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
     );
-    return createCallerCapabilityProjectionSnapshot(capabilities);
+  }
+
+  /** Returns the SDK-owned active caller projection for event-driven hosts. */
+  getCallerCapabilityProjectionSnapshot(): t.CallerCapabilityProjectionSnapshot {
+    return createCallerCapabilityProjectionSnapshot(
+      this.getCallerCapabilityProjection()
+    );
   }
 
   /**

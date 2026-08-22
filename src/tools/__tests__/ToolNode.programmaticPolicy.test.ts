@@ -170,7 +170,7 @@ describe('ToolNode programmatic caller policy', () => {
       description: 'Event tool',
       schema: z.object({}),
     });
-    const toolRegistry: t.LCToolRegistry = new Map([
+    const toolDefinitions: t.LCToolRegistry = new Map([
       [eventTool.name, { name: eventTool.name }],
       [
         'deferred_programmatic_tool',
@@ -180,6 +180,8 @@ describe('ToolNode programmatic caller policy', () => {
           defer_loading: true,
         },
       ],
+    ]);
+    const toolRegistry: t.LCToolRegistry = new Map([
       [
         'deferred_direct_tool',
         {
@@ -192,6 +194,7 @@ describe('ToolNode programmatic caller policy', () => {
     const node = new ToolNode({
       tools: [eventTool],
       toolRegistry,
+      toolDefinitions,
       eventDrivenMode: true,
       getDiscoveredToolNames: () => [...discovered],
       toolCallStepIds: new Map([

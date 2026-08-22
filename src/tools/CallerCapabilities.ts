@@ -14,6 +14,25 @@ export type CallerCapabilityProjection = {
   codeExecutionOnlyTools: t.LCTool[];
 };
 
+/**
+ * Combines definition sources by name. Later sources win so the resolved
+ * runtime registry can override a schema-only event definition.
+ */
+export function mergeCallerCapabilityDefinitions(
+  ...sources: Array<Iterable<t.LCTool> | null | undefined>
+): t.LCTool[] {
+  const merged = new Map<string, t.LCTool>();
+  for (const source of sources) {
+    if (source == null) {
+      continue;
+    }
+    for (const toolDef of source) {
+      merged.set(toolDef.name, toolDef);
+    }
+  }
+  return Array.from(merged.values());
+}
+
 /** Converts the live projection into the versioned event transport shape. */
 export function createCallerCapabilityProjectionSnapshot(
   projection: CallerCapabilityProjection

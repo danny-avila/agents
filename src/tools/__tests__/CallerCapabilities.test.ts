@@ -2,6 +2,7 @@ import { describe, expect, it } from '@jest/globals';
 import type * as t from '@/types';
 import {
   allowsToolCaller,
+  mergeCallerCapabilityDefinitions,
   resolveCallerCapabilityProjection,
 } from '../CallerCapabilities';
 
@@ -55,5 +56,21 @@ describe('Caller Capability Projection', () => {
   it('defaults omitted caller metadata to direct-only', () => {
     expect(allowsToolCaller(toolDefs[0], 'direct')).toBe(true);
     expect(allowsToolCaller(toolDefs[0], 'code_execution')).toBe(false);
+  });
+
+  it('merges schema-only and runtime definitions with runtime precedence', () => {
+    expect(
+      mergeCallerCapabilityDefinitions(
+        [{ name: 'shared' }, { name: 'schema_only' }],
+        [
+          { name: 'shared', allowed_callers: ['code_execution'] },
+          { name: 'runtime_only' },
+        ]
+      )
+    ).toEqual([
+      { name: 'shared', allowed_callers: ['code_execution'] },
+      { name: 'schema_only' },
+      { name: 'runtime_only' },
+    ]);
   });
 });
