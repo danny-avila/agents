@@ -45,6 +45,11 @@ export interface PreparedProviderRequest {
   readonly [preparedProviderRequestBrand]: true;
 }
 
+type PreparedProviderRequestData = Omit<
+  PreparedProviderRequest,
+  typeof preparedProviderRequestBrand
+>;
+
 export interface ProviderRequestContext {
   getOrCreateToolOutputRegistry?(): ToolOutputReferenceRegistry | undefined;
   isRunProducedMessage?(message: BaseMessage): boolean;
@@ -275,14 +280,18 @@ export function prepareProviderRequest({
     ? coalesceAdjacentUserTurns(cued)
     : cued;
 
-  return Object.freeze({
+  const request: PreparedProviderRequestData = {
     model,
     modelId,
     provider,
     messages: preparedMessages,
     measurement: measure?.(preparedMessages),
-    [preparedProviderRequestBrand]: true as const,
+  };
+  Object.defineProperty(request, preparedProviderRequestBrand, {
+    value: true,
+    enumerable: false,
   });
+  return Object.freeze(request) as PreparedProviderRequest;
 }
 
 export function assertPreparedProviderRequestFor(

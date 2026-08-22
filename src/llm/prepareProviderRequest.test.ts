@@ -58,6 +58,14 @@ describe('prepareProviderRequest', () => {
     });
 
     expect(Object.isFrozen(request)).toBe(true);
+    const [brand] = Object.getOwnPropertySymbols(request);
+    expect(Object.getOwnPropertyDescriptor(request, brand)).toMatchObject({
+      configurable: false,
+      enumerable: false,
+      value: true,
+      writable: false,
+    });
+    expect(Object.getOwnPropertySymbols({ ...request })).toHaveLength(0);
     expect(request.modelId).toBe('prepared-model');
     expect(request.messages).toHaveLength(1);
     expect(request.measurement).toEqual({
