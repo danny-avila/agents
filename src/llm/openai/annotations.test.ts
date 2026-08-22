@@ -1,6 +1,8 @@
-import type { OpenAIClient } from '@langchain/openai';
-
 import { ensureResponsesOutputAnnotations } from './index';
+
+type ResponsesAnnotationsBoundaryEvent = Parameters<
+  typeof ensureResponsesOutputAnnotations
+>[0];
 
 /**
  * Regression coverage for a crash against OpenAI-compatible Responses API
@@ -12,71 +14,60 @@ import { ensureResponsesOutputAnnotations } from './index';
  */
 describe('missing annotations on terminal responses events', () => {
   it('defaults annotations to [] on output_text parts without the field', () => {
-    const event = {
+    const event: ResponsesAnnotationsBoundaryEvent = {
       type: 'response.completed',
       response: {
-        id: 'resp_test',
         output: [
           {
             type: 'message',
-            role: 'assistant',
-            content: [{ type: 'output_text', text: 'Hello' }],
+            content: [{ type: 'output_text' }],
           },
         ],
       },
-    } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
+    };
 
     ensureResponsesOutputAnnotations(event);
 
-    const part = (event as unknown as {
-      response: { output: Array<{ content: Array<{ annotations?: unknown }> }> };
-    }).response.output[0].content[0];
-    expect(part.annotations).toEqual([]);
+    const part = event.response?.output?.[0]?.content?.[0];
+    expect(part?.annotations).toEqual([]);
   });
 
   it('leaves existing annotations untouched', () => {
-    const event = {
+    const event: ResponsesAnnotationsBoundaryEvent = {
       type: 'response.completed',
       response: {
-        id: 'resp_test',
         output: [
           {
             type: 'message',
-            role: 'assistant',
             content: [
               {
                 type: 'output_text',
-                text: 'Hello',
                 annotations: [{ type: 'url_citation', url: 'https://example.com' }],
               },
             ],
           },
         ],
       },
-    } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
+    };
 
     ensureResponsesOutputAnnotations(event);
 
-    const part = (event as unknown as {
-      response: { output: Array<{ content: Array<{ annotations: unknown }> }> };
-    }).response.output[0].content[0];
-    expect(part.annotations).toEqual([
+    const part = event.response?.output?.[0]?.content?.[0];
+    expect(part?.annotations).toEqual([
       { type: 'url_citation', url: 'https://example.com' },
     ]);
   });
 
   it('does not throw on non-terminal or non-message events', () => {
-    const textDelta = {
+    const textDelta: ResponsesAnnotationsBoundaryEvent = {
       type: 'response.output_text.delta',
-      delta: 'Hi',
-    } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
-    const toolCall = {
+    };
+    const toolCall: ResponsesAnnotationsBoundaryEvent = {
       type: 'response.completed',
       response: {
-        id: 'resp_test',
-        output: [{ type: 'function_call', call_id: 'call_1', name: 'f', arguments: '{}' }],
+        output: [{ type: 'function_call' }],
       },
-    } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
+    };
 
     expect(() => ensureResponsesOutputAnnotations(textDelta)).not.toThrow();
     expect(() => ensureResponsesOutputAnnotations(toolCall)).not.toThrow();

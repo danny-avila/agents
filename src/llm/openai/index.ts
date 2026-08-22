@@ -919,6 +919,19 @@ function attachResponsesReplayPosition(
   chunk.message.lc_kwargs.additional_kwargs = additionalKwargs;
 }
 
+type ResponsesAnnotationsBoundaryEvent = {
+  type: OpenAIClient.Responses.ResponseStreamEvent['type'];
+  response?: {
+    output?: Array<{
+      type: string;
+      content?: Array<{
+        type: string;
+        annotations?: object[] | null;
+      }>;
+    }>;
+  };
+};
+
 /**
  * The Responses API spec declares `annotations` required on `output_text`
  * content parts, but some OpenAI-compatible gateways omit the field on the
@@ -927,17 +940,17 @@ function attachResponsesReplayPosition(
  * field crashes the whole stream. Default it to `[]` before conversion.
  */
 export function ensureResponsesOutputAnnotations(
-  event: OpenAIClient.Responses.ResponseStreamEvent
+  event: ResponsesAnnotationsBoundaryEvent
 ): void {
   if (event.type !== 'response.completed' && event.type !== 'response.incomplete') {
     return;
   }
-  const output = event.response.output;
+  const output = event.response?.output;
   if (!Array.isArray(output)) {
     return;
   }
   for (const item of output) {
-    if (item.type !== 'message') {
+    if (item.type !== 'message' || !Array.isArray(item.content)) {
       continue;
     }
     for (const part of item.content) {
