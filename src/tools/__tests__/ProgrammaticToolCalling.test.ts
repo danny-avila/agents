@@ -887,6 +887,15 @@ helper(lambda: "ok")`;
       );
     });
 
+    it('honors bindings inherited by nested Python scopes', () => {
+      const code = `def outer(search_docs):
+    def inner():
+        return search_docs()
+    return inner()`;
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(new Set());
+    });
+
     it('does not treat Python keyword arguments as bindings', () => {
       const code = `dict(search_docs=lambda: None)
 await get_weather()
@@ -910,6 +919,15 @@ print(fr"both={value}")`;
     it('preserves executable calls inside f-string expressions', () => {
       const code = `await get_weather(city="SF")
 value = f"result: {await search_docs(query='forecast')}"`;
+
+      expect(extractUsedToolNames(code, availableTools)).toEqual(
+        new Set(['get_weather', 'search_docs'])
+      );
+    });
+
+    it('preserves tool references in f-string debug expressions', () => {
+      const code = `await get_weather()
+print(f"{search_docs=}")`;
 
       expect(extractUsedToolNames(code, availableTools)).toEqual(
         new Set(['get_weather', 'search_docs'])
@@ -1185,6 +1203,15 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       expect(used).toEqual(new Set(['get_weather', 'search_docs']));
     });
 
+    it('does not treat matching function declarations as tool calls', () => {
+      const used = extractUsedBashToolNames(
+        'search_docs() { printf ok; }; get_weather \'{}\'',
+        availableTools
+      );
+
+      expect(used).toEqual(new Set(['get_weather']));
+    });
+
     it('finds tools in literal eval input', () => {
       const used = extractUsedBashToolNames(
         'get_weather \'{}\'; eval "search_docs \'{}\'"',
@@ -1419,6 +1446,16 @@ readonly fourth=get_team_members; "$fourth" '{}'`,
           'await foo_bar()',
           Constants.PROGRAMMATIC_TOOL_CALLING,
           allowed
+        )
+      ).not.toThrow();
+    });
+
+    it('allows Python builtins that share direct-only tool names', () => {
+      expect(() =>
+        assertPythonToolsAllowProgrammaticCalling(
+          [{ name: 'open' }, { name: 'print' }],
+          'with open("/tmp/data", "w") as file: print(file)',
+          Constants.PROGRAMMATIC_TOOL_CALLING
         )
       ).not.toThrow();
     });

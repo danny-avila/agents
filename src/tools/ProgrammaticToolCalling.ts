@@ -172,6 +172,81 @@ const PYTHON_KEYWORDS = new Set([
   'yield',
 ]);
 
+/** Callable builtins remain available when a direct-only tool has the same name. */
+const PYTHON_CALLABLE_BUILTINS = new Set([
+  '__import__',
+  'abs',
+  'aiter',
+  'all',
+  'anext',
+  'any',
+  'ascii',
+  'bin',
+  'bool',
+  'breakpoint',
+  'bytearray',
+  'bytes',
+  'callable',
+  'chr',
+  'classmethod',
+  'compile',
+  'complex',
+  'delattr',
+  'dict',
+  'dir',
+  'divmod',
+  'enumerate',
+  'eval',
+  'exec',
+  'filter',
+  'float',
+  'format',
+  'frozenset',
+  'getattr',
+  'globals',
+  'hasattr',
+  'hash',
+  'help',
+  'hex',
+  'id',
+  'input',
+  'int',
+  'isinstance',
+  'issubclass',
+  'iter',
+  'len',
+  'list',
+  'locals',
+  'map',
+  'max',
+  'memoryview',
+  'min',
+  'next',
+  'object',
+  'oct',
+  'open',
+  'ord',
+  'pow',
+  'print',
+  'property',
+  'range',
+  'repr',
+  'reversed',
+  'round',
+  'set',
+  'setattr',
+  'slice',
+  'sorted',
+  'staticmethod',
+  'str',
+  'sum',
+  'super',
+  'tuple',
+  'type',
+  'vars',
+  'zip',
+]);
+
 export type FetchSessionFilesScope =
   | { kind: 'skill'; id: string; version: number }
   | { kind: 'agent' | 'user'; id: string; version?: never };
@@ -339,7 +414,12 @@ export function extractUsedToolNames(
         shadowedScopes.add(lexicalScope);
         continue;
       }
-      if (shadowedScopes.has(lexicalScope)) {
+      if (
+        [...shadowedScopes].some(
+          (scope) =>
+            lexicalScope === scope || lexicalScope.startsWith(`${scope}/`)
+        )
+      ) {
         continue;
       }
       let prefix = match.index - 1;
@@ -436,6 +516,9 @@ function isPythonBindingTarget(
   }
   const suffix = skipPythonCallWhitespace(code, nameEnd);
   if (code[suffix] === '=' && code[suffix + 1] !== '=') {
+    if (isPythonFStringDebugMarker(code, suffix)) {
+      return false;
+    }
     return !isPythonKeywordArgument(code, nameStart);
   }
   const prefix = code.slice(0, nameStart).match(/([A-Za-z_][A-Za-z0-9_]*)\s*$/);
@@ -498,12 +581,24 @@ function isPythonCallableValueReference(
   nameEnd: number
 ): boolean {
   const suffix = skipPythonCallWhitespace(code, nameEnd);
-  if (code[suffix] === '=' && code[suffix + 1] !== '=') {
+  if (
+    code[suffix] === '=' &&
+    code[suffix + 1] !== '=' &&
+    !isPythonFStringDebugMarker(code, suffix)
+  ) {
     return false;
   }
 
   const prefix = code.slice(0, nameStart).match(/([A-Za-z_][A-Za-z0-9_]*)\s*$/);
   return !['as', 'class', 'def', 'import'].includes(prefix?.[1] ?? '');
+}
+
+function isPythonFStringDebugMarker(
+  code: string,
+  equalsIndex: number
+): boolean {
+  const next = skipPythonCallWhitespace(code, equalsIndex + 1);
+  return code[next] === '}' || code[next] === '!' || code[next] === ':';
 }
 
 function isPythonCallableInvocation(
@@ -745,7 +840,18 @@ function findPythonFStringFormatStart(
     else if (char === '[') closers.push(']');
     else if (char === '{') closers.push('}');
     else if (char === closers[closers.length - 1]) closers.pop();
-    else if (closers.length === 0 && char === ':') {
+    else if (
+      closers.length === 0 &&
+      char === '=' &&
+      !/[=!<>:]/.test(field[index - 1] ?? '') &&
+      field[index + 1] !== '='
+    ) {
+      const colon = field.indexOf(':', index + 1);
+      return {
+        separator: index,
+        spec: colon === -1 ? undefined : colon + 1,
+      };
+    } else if (closers.length === 0 && char === ':') {
       return { separator: index, spec: index + 1 };
     } else if (
       closers.length === 0 &&
@@ -885,7 +991,10 @@ export function assertPythonToolsAllowProgrammaticCalling(
   );
   for (const toolDef of toolDefs) {
     const normalizedName = normalizeToPythonIdentifier(toolDef.name);
-    if (!allowedNames.has(normalizedName)) {
+    if (
+      !allowedNames.has(normalizedName) &&
+      !PYTHON_CALLABLE_BUILTINS.has(normalizedName)
+    ) {
       toolNameMap.set(normalizedName, toolDef.name);
     }
   }

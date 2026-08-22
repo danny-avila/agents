@@ -269,6 +269,7 @@ const DECLARATION_BUILTINS = new Set([
 
 type BashToken =
   | { type: 'word'; value: string }
+  | { type: 'functionName' }
   | { type: 'separator' }
   | { type: 'closeParen' }
   | { type: 'caseArmEnd' }
@@ -330,6 +331,10 @@ function collectBashCommandNames(
   };
 
   for (const token of tokens) {
+    if (token.type === 'functionName') {
+      expectsCommand = false;
+      continue;
+    }
     if (token.type === 'nested') {
       collectBashCommandNames(token.tokens, commands, knownToolNames);
       if (skipRedirectTarget) {
@@ -625,6 +630,12 @@ function tokenizeBash(code: string): BashToken[] {
     }
     if (char === '(') {
       const previousToken = tokens.at(-1);
+      if (previousToken?.type === 'word' && code[index + 1] === ')') {
+        tokens.pop();
+        tokens.push({ type: 'functionName' });
+        index += 2;
+        continue;
+      }
       if (
         previousToken?.type === 'word' &&
         /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(previousToken.value)
