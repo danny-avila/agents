@@ -92,6 +92,7 @@ export { prepareProviderRequest } from './llm/prepareProviderRequest';
 export type {
   PreparedProviderRequest,
   PrepareProviderRequestParams,
+  ProviderMessageProjectionMode,
   ProviderPayloadMeasurement,
   ProviderRequestContext,
 } from './llm/prepareProviderRequest';

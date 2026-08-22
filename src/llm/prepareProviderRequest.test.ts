@@ -16,6 +16,7 @@ import { Providers } from '@/common';
 
 type StubModel = {
   model?: string;
+  _useResponsesApi?: (options?: unknown) => boolean;
   invoke: (messages: BaseMessage[]) => Promise<AIMessage>;
 };
 
@@ -156,5 +157,27 @@ describe('prepareProviderRequest', () => {
         Providers.ANTHROPIC
       )
     ).toThrow('does not match serving provider');
+  });
+
+  it('rejects when invocation options switch the prepared OpenAI projection mode', async () => {
+    const { model, invocations } = createCapturingModel();
+    model._useResponsesApi = (options?: unknown): boolean =>
+      (options as { configurable?: { apiMode?: string } } | undefined)
+        ?.configurable?.apiMode === 'responses';
+    const request = prepareProviderRequest({
+      model: model as t.ChatModel,
+      messages: [new HumanMessage('hello')],
+      provider: Providers.OPENAI,
+      config: { configurable: { apiMode: 'responses' } },
+    });
+
+    expect(request.projectionMode).toBe('openai-responses');
+    await expect(
+      attemptInvoke(
+        { request },
+        { configurable: { apiMode: 'chat-completions' } }
+      )
+    ).rejects.toThrow('does not match invocation options');
+    expect(invocations).toHaveLength(0);
   });
 });

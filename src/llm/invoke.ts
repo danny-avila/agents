@@ -51,6 +51,7 @@ export {
 export type {
   PreparedProviderRequest,
   PrepareProviderRequestParams,
+  ProviderMessageProjectionMode,
   ProviderPayloadMeasurement,
   ProviderRequestContext,
 } from '@/llm/prepareProviderRequest';
@@ -532,7 +533,8 @@ function resolveAttemptRequest(
     assertPreparedProviderRequestFor(
       params.request,
       params.request.model,
-      params.request.provider
+      params.request.provider,
+      config
     );
     return params.request;
   }
@@ -1034,7 +1036,8 @@ export async function tryFallbackProviders({
         assertPreparedProviderRequestFor(
           preparedRequest,
           fbModel as t.ChatModel,
-          fb.provider
+          fb.provider,
+          fbConfig
         );
       }
       let fallbackMessages = messages;

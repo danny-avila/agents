@@ -28,6 +28,10 @@ import { isAnthropicLike, isOpenAILike } from '@/utils/llm';
 
 const preparedProviderRequestBrand = Symbol('PreparedProviderRequest');
 
+export type ProviderMessageProjectionMode =
+  | 'chat-messages'
+  | 'openai-responses';
+
 export interface ProviderPayloadMeasurement {
   readonly fits: boolean;
   readonly projectedMessageTokens?: number;
@@ -40,6 +44,7 @@ export interface PreparedProviderRequest {
   readonly model: t.ChatModel;
   readonly modelId?: string;
   readonly provider: Providers;
+  readonly projectionMode: ProviderMessageProjectionMode;
   readonly messages: BaseMessage[];
   readonly measurement?: ProviderPayloadMeasurement;
   readonly [preparedProviderRequestBrand]: true;
@@ -135,25 +140,32 @@ export function usesNativeOpenAIResponses(
   return false;
 }
 
-/** Produces the provider-facing representation before adapter serialization. */
-export function projectMessagesForProvider({
-  model,
-  messages,
-  provider,
-  maxToolResultChars,
-  callOptions,
-}: {
+function resolveProviderMessageProjectionMode(
+  model: t.ChatModel,
+  provider: Providers,
+  callOptions?: unknown
+): ProviderMessageProjectionMode {
+  return usesNativeOpenAIResponses(model, provider, callOptions)
+    ? 'openai-responses'
+    : 'chat-messages';
+}
+
+interface ProjectMessagesForProviderParams {
   model: t.ChatModel;
   messages: BaseMessage[];
   provider: Providers;
   maxToolResultChars?: number;
   callOptions?: unknown;
-}): BaseMessage[] {
-  const nativeOpenAIResponses = usesNativeOpenAIResponses(
-    model,
-    provider,
-    callOptions
-  );
+}
+
+function projectMessagesForProviderMode({
+  messages,
+  provider,
+  maxToolResultChars,
+}: ProjectMessagesForProviderParams,
+projectionMode: ProviderMessageProjectionMode
+): BaseMessage[] {
+  const nativeOpenAIResponses = projectionMode === 'openai-responses';
   const providerInputMessages = projectToolStreamContentForProvider(
     messages,
     nativeOpenAIResponses ? 'native' : 'fallback',
@@ -216,6 +228,20 @@ export function projectMessagesForProvider({
   );
 }
 
+/** Produces the provider-facing representation before adapter serialization. */
+export function projectMessagesForProvider(
+  params: ProjectMessagesForProviderParams
+): BaseMessage[] {
+  return projectMessagesForProviderMode(
+    params,
+    resolveProviderMessageProjectionMode(
+      params.model,
+      params.provider,
+      params.callOptions
+    )
+  );
+}
+
 /** Reads the serving model id through LangChain binding/sequence wrappers. */
 export function resolveServingModelId(model: unknown): string | undefined {
   const seen = new Set<unknown>();
@@ -254,13 +280,21 @@ export function prepareProviderRequest({
   maxToolResultChars,
   measure,
 }: PrepareProviderRequestParams): PreparedProviderRequest {
-  const projected = projectMessagesForProvider({
+  const projectionMode = resolveProviderMessageProjectionMode(
     model,
-    messages,
     provider,
-    maxToolResultChars,
-    callOptions: config,
-  });
+    config
+  );
+  const projected = projectMessagesForProviderMode(
+    {
+      model,
+      messages,
+      provider,
+      maxToolResultChars,
+      callOptions: config,
+    },
+    projectionMode
+  );
   const registry = context?.getOrCreateToolOutputRegistry?.();
   const runId = config?.configurable?.run_id as string | undefined;
   const annotated = annotateMessagesForLLM(projected, registry, runId);
@@ -284,6 +318,7 @@ export function prepareProviderRequest({
     model,
     modelId,
     provider,
+    projectionMode,
     messages: preparedMessages,
     measurement: measure?.(preparedMessages),
   };
@@ -297,7 +332,8 @@ export function prepareProviderRequest({
 export function assertPreparedProviderRequestFor(
   request: PreparedProviderRequest,
   model: t.ChatModel,
-  provider: Providers
+  provider: Providers,
+  config?: RunnableConfig
 ): void {
   if (
     !Object.prototype.hasOwnProperty.call(request, preparedProviderRequestBrand)
@@ -309,5 +345,13 @@ export function assertPreparedProviderRequestFor(
   }
   if (request.provider !== provider) {
     throw new Error('Prepared provider request does not match serving provider');
+  }
+  if (
+    request.projectionMode !==
+    resolveProviderMessageProjectionMode(model, provider, config)
+  ) {
+    throw new Error(
+      'Prepared provider request does not match invocation options'
+    );
   }
 }
