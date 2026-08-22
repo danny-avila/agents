@@ -260,6 +260,15 @@ describe('ToolNode programmatic caller policy', () => {
       tools: [ptcTool, eventStub],
       eventDrivenMode: true,
       directToolNames: new Set([Constants.PROGRAMMATIC_TOOL_CALLING]),
+      toolRegistry: new Map([
+        [
+          eventStub.name,
+          {
+            name: eventStub.name,
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]),
       toolDefinitions: new Map([
         [
           eventStub.name,

@@ -59,17 +59,34 @@ describe('Caller Capability Projection', () => {
     expect(allowsToolCaller(toolDefs[0], 'code_execution')).toBe(false);
   });
 
-  it('merges schema-only and runtime definitions with runtime precedence', () => {
+  it('preserves event schemas while applying runtime capability metadata', () => {
     expect(
       mergeCallerCapabilityDefinitions(
-        [{ name: 'shared' }, { name: 'schema_only' }],
         [
-          { name: 'shared', allowed_callers: ['code_execution'] },
+          {
+            name: 'shared',
+            description: 'Model-facing schema',
+            parameters: { type: 'object', properties: {} },
+          },
+          { name: 'schema_only' },
+        ],
+        [
+          {
+            name: 'shared',
+            allowed_callers: ['code_execution'],
+            defer_loading: true,
+          },
           { name: 'runtime_only' },
         ]
       )
     ).toEqual([
-      { name: 'shared', allowed_callers: ['code_execution'] },
+      {
+        name: 'shared',
+        description: 'Model-facing schema',
+        parameters: { type: 'object', properties: {} },
+        allowed_callers: ['code_execution'],
+        defer_loading: true,
+      },
       { name: 'schema_only' },
       { name: 'runtime_only' },
     ]);

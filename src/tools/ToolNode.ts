@@ -1136,6 +1136,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   /** Returns active tools projected by their effective caller capabilities. */
   private getProgrammaticTools(): t.ProgrammaticCache {
     const toolMap: t.ToolMap = new Map();
+    const toolDefs: t.LCTool[] = [];
     const discoveredToolNames = new Set(
       this.getDiscoveredToolNames?.() ?? []
     );
@@ -1144,16 +1145,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       (toolDef) => isToolDefinitionActive(toolDef, discoveredToolNames)
     );
     for (const toolDef of executableCapabilities.codeExecutionTools) {
+      if (
+        this.eventDrivenMode &&
+        this.directToolNames?.has(toolDef.name) !== true
+      ) {
+        continue;
+      }
       const tool = this.toolMap.get(toolDef.name);
       if (tool != null) {
         toolMap.set(toolDef.name, tool);
+        toolDefs.push(toolDef);
       }
     }
     const activeCapabilities = this.getCallerCapabilityProjection();
 
     return {
       toolMap,
-      toolDefs: executableCapabilities.codeExecutionTools,
+      toolDefs,
       disallowedToolDefs: activeCapabilities.directOnlyTools
         .filter((toolDef) => !isProgrammaticControlTool(toolDef.name))
         .map((toolDef) => ({ name: toolDef.name })),

@@ -15,19 +15,24 @@ export type CallerCapabilityProjection = {
 };
 
 /**
- * Combines definition sources by name. Later sources win so the resolved
- * runtime registry can override a schema-only event definition.
+ * Combines event schemas with runtime capability metadata. Matching runtime
+ * entries override caller/defer policy without replacing the event schema;
+ * runtime-only definitions are appended intact.
  */
 export function mergeCallerCapabilityDefinitions(
-  ...sources: Array<Iterable<t.LCTool> | null | undefined>
+  toolDefs: Iterable<t.LCTool> | null | undefined,
+  overrides: Iterable<t.LCTool> | null | undefined
 ): t.LCTool[] {
-  const merged = new Map<string, t.LCTool>();
-  for (const source of sources) {
-    if (source == null) {
-      continue;
-    }
-    for (const toolDef of source) {
-      merged.set(toolDef.name, toolDef);
+  const runtimeDefinitions = Array.from(overrides ?? []);
+  const merged = new Map(
+    applyCallerCapabilityDefinitionOverrides(
+      toolDefs ?? [],
+      runtimeDefinitions
+    ).map((toolDef) => [toolDef.name, toolDef])
+  );
+  for (const override of runtimeDefinitions) {
+    if (!merged.has(override.name)) {
+      merged.set(override.name, override);
     }
   }
   return Array.from(merged.values());

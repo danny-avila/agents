@@ -1107,6 +1107,40 @@ describe('AgentContext', () => {
       expect(content).not.toContain('`event_schema_tool`');
     });
 
+    it('keeps a Cloudflare runner outside the coding allowlist event-dispatched', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            { name: Constants.PROGRAMMATIC_TOOL_CALLING },
+            {
+              name: 'event_schema_tool',
+              allowed_callers: ['code_execution'],
+            },
+          ],
+        },
+        toolExecution: {
+          engine: 'cloudflare-sandbox',
+          cloudflare: {
+            codingToolNames: [Constants.BASH_TOOL],
+            sandbox: {
+              exec: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+              readFile: async () => '',
+              writeFile: async () => undefined,
+              mkdir: async () => undefined,
+              listFiles: async () => [],
+              deleteFile: async () => undefined,
+            },
+          },
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: `event_schema_tool`.'
+      );
+    });
+
     it('keeps direct and event runner capability guidance separate', async () => {
       const ctx = createBasicContext({
         agentConfig: {

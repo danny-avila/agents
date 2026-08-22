@@ -34,6 +34,7 @@ import {
 } from '@/common';
 import {
   isProgrammaticRunnerAutoBound,
+  isProgrammaticRunnerResolvedDirectly,
   resolveLocalToolRegistry,
 } from '@/tools/local/resolveLocalExecutionTools';
 import {
@@ -645,14 +646,12 @@ export class AgentContext {
 
   /** Whether ToolNode executes this runner in-process instead of via an event. */
   private isProgrammaticRunnerDirectlyBound(name: string): boolean {
-    const usesDirectExecutionEngine =
-      this.toolExecution?.engine === 'local' ||
-      this.toolExecution?.engine === 'cloudflare-sandbox';
     return (
-      isProgrammaticRunnerAutoBound(name, this.toolExecution) ||
-      (usesDirectExecutionEngine &&
-        this.toolDefinitions?.some((toolDef) => toolDef.name === name) ===
-          true) ||
+      isProgrammaticRunnerResolvedDirectly(
+        name,
+        this.toolExecution,
+        this.toolDefinitions?.some((toolDef) => toolDef.name === name) === true
+      ) ||
       this.graphTools?.some(
         (tool) => 'name' in tool && tool.name === name
       ) === true

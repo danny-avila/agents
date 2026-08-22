@@ -81,6 +81,29 @@ export function isProgrammaticRunnerAutoBound(
   return shouldUseLocalExecution(config);
 }
 
+/** Mirrors whether resolver policy creates or replaces this runner locally. */
+export function isProgrammaticRunnerResolvedDirectly(
+  name: string,
+  config?: t.ToolExecutionConfig,
+  hasExplicitBinding: boolean = false
+): boolean {
+  if (isProgrammaticRunnerAutoBound(name, config)) {
+    return true;
+  }
+  if (
+    !hasExplicitBinding ||
+    (name !== Constants.PROGRAMMATIC_TOOL_CALLING &&
+      name !== Constants.BASH_PROGRAMMATIC_TOOL_CALLING)
+  ) {
+    return false;
+  }
+  return (
+    (shouldUseLocalExecution(config) ||
+      shouldUseCloudflareSandboxExecution(config)) &&
+    !shouldIncludeCodingTools(config)
+  );
+}
+
 function getCloudflareConfig(
   config?: t.ToolExecutionConfig
 ): t.CloudflareSandboxExecutionConfig {
