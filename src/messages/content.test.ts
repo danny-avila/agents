@@ -22,6 +22,11 @@ describe('formatContentStrings', () => {
 
       expect(result).toHaveLength(1);
       expect(result[0].content).toBe('Hello\nWorld');
+      expect(result[0]).not.toBe(messages[0]);
+      expect(messages[0].content).toEqual([
+        { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Hello' },
+        { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'World' },
+      ]);
     });
 
     it('should not convert human message with mixed content types (text + image)', () => {

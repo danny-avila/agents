@@ -55,3 +55,15 @@ programmatic invocation declares that its code depends on. Mixed direct and
 code-execution configurations require the manifest so caller policy can reject
 direct-only dependencies before starting an execution runtime without parsing
 the submitted programming language.
+
+## Context Pressure Measurement
+
+A **Context Pressure Meter** is the request-scoped projection of retained
+conversation messages into the provider's available context budget. It keeps
+provider-grounded attribution and exact token counts together so repeated
+artifact, compaction, prepared-request, and fallback probes tokenize only new
+message objects. Provider projections must clone changed messages; mutating a
+measured message would invalidate its exact cached count.
+
+The meter's estimates decide overflow and recovery only. Provider-reported
+usage remains the source of truth for billing and Langfuse observations.
