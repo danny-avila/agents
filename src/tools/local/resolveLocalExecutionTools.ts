@@ -17,7 +17,10 @@ import {
   createLocalBashExecutionTool,
   createLocalCodeExecutionTool,
 } from './LocalExecutionTools';
-import { allowsToolCaller } from '@/tools/CallerCapabilities';
+import {
+  allowsToolCaller,
+  isToolDefinitionActive,
+} from '@/tools/CallerCapabilities';
 import {
   Constants,
   CODE_EXECUTION_TOOLS,
@@ -172,7 +175,8 @@ function mergeToolsByName(
 
 function filterToolsForDirectCaller(
   tools: t.GraphTools | undefined,
-  toolRegistry?: t.LCToolRegistry
+  toolRegistry?: t.LCToolRegistry,
+  discoveredToolNames: ReadonlySet<string> = new Set()
 ): t.GraphTools | undefined {
   if (tools == null || toolRegistry == null) {
     return tools;
@@ -182,7 +186,11 @@ function filterToolsForDirectCaller(
       return true;
     }
     const toolDef = toolRegistry.get(tool.name);
-    return toolDef == null || allowsToolCaller(toolDef, 'direct');
+    return (
+      toolDef == null ||
+      (allowsToolCaller(toolDef, 'direct') &&
+        isToolDefinitionActive(toolDef, discoveredToolNames))
+    );
   });
 }
 
@@ -201,6 +209,7 @@ export function resolveLocalToolsForBinding(args: {
   tools?: t.GraphTools;
   toolExecution?: t.ToolExecutionConfig;
   toolRegistry?: t.LCToolRegistry;
+  discoveredToolNames?: ReadonlySet<string>;
 }): t.GraphTools | undefined {
   if (
     !shouldUseLocalExecution(args.toolExecution) &&
@@ -219,7 +228,8 @@ export function resolveLocalToolsForBinding(args: {
           filterCloudflareCodingToolAllowlist(args.tools, selectedNames),
           createCloudflareCodingTools(cloudflareConfig)
         ),
-        args.toolRegistry
+        args.toolRegistry,
+        args.discoveredToolNames
       );
     }
 
@@ -241,14 +251,19 @@ export function resolveLocalToolsForBinding(args: {
     const resolvedTools = replacements.length === 0
       ? args.tools
       : mergeToolsByName(args.tools, replacements);
-    return filterToolsForDirectCaller(resolvedTools, args.toolRegistry);
+    return filterToolsForDirectCaller(
+      resolvedTools,
+      args.toolRegistry,
+      args.discoveredToolNames
+    );
   }
 
   const localConfig = args.toolExecution?.local ?? {};
   if (shouldIncludeCodingTools(args.toolExecution)) {
     return filterToolsForDirectCaller(
       mergeToolsByName(args.tools, createLocalCodingTools(localConfig)),
-      args.toolRegistry
+      args.toolRegistry,
+      args.discoveredToolNames
     );
   }
 
@@ -267,7 +282,11 @@ export function resolveLocalToolsForBinding(args: {
   const resolvedTools = replacements.length === 0
     ? args.tools
     : mergeToolsByName(args.tools, replacements);
-  return filterToolsForDirectCaller(resolvedTools, args.toolRegistry);
+  return filterToolsForDirectCaller(
+    resolvedTools,
+    args.toolRegistry,
+    args.discoveredToolNames
+  );
 }
 
 export function resolveLocalToolRegistry(args: {

@@ -2564,6 +2564,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         executingAgentId: agentContext?.agentId,
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
+        getDiscoveredToolNames: (): readonly string[] =>
+          agentContext?.getDiscoveredTools() ?? [],
         hookRegistry: this.hookRegistry,
         humanInTheLoop: this.humanInTheLoop,
         eagerEventToolExecution: this.eagerEventToolExecution,
@@ -2641,6 +2643,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       errorHandler: (data, metadata): Promise<boolean> =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
+      getDiscoveredToolNames: (): readonly string[] =>
+        agentContext?.getDiscoveredTools() ?? [],
       sessions: this.sessions,
       codeSessionKey: agentContext?.codeSessionKey,
       toolExecution: this.toolExecution,
@@ -2847,6 +2851,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         tools: agentContext.getToolsForBinding(),
         toolExecution: this.toolExecution,
         toolRegistry: agentContext.toolRegistry,
+        discoveredToolNames: new Set(agentContext.getDiscoveredTools()),
       });
 
       /**

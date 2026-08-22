@@ -27,6 +27,8 @@ import {
   resolveCodeApiRunTimeoutMs,
 } from './ptcTimeout';
 import {
+  projectProgrammaticToolMap,
+  resolveProgrammaticToolDefinitions,
   selectProgrammaticTools,
   type ProgrammaticInvocationParams,
 } from './ProgrammaticCallerPolicy';
@@ -107,7 +109,7 @@ export function createProgrammaticToolCallingSchema(
         minLength: 1,
         description: CODE_PARAM_DESCRIPTION,
       },
-      tools: {
+      tool_manifest: {
         type: 'array',
         items: { type: 'string' },
         uniqueItems: true,
@@ -920,12 +922,14 @@ export function createProgrammaticToolCallingTool(
         };
       const {
         toolMap,
-        toolDefs,
         disallowedToolDefs,
         session_id,
         _injected_files,
         _runtime_session_hint,
       } = toolCall;
+      const toolDefs = resolveProgrammaticToolDefinitions(
+        toolCall as typeof toolCall & { tools?: t.LCTool[] }
+      );
 
       const programmaticToolName =
         toolCall.programmaticToolName ??
@@ -933,7 +937,7 @@ export function createProgrammaticToolCallingTool(
           ? toolCall.name
           : Constants.PROGRAMMATIC_TOOL_CALLING);
       const effectiveTools = selectProgrammaticTools({
-        requestedToolNames: params.tools,
+        requestedToolNames: params.tool_manifest,
         allowedToolDefs: toolDefs,
         disallowedToolDefs,
         programmaticToolName,
@@ -952,6 +956,11 @@ export function createProgrammaticToolCallingTool(
             'Either pass tools in the input or ensure ToolNode injects toolDefs.'
         );
       }
+
+      const effectiveToolMap = projectProgrammaticToolMap(
+        toolMap,
+        effectiveTools
+      );
 
       let roundTrip = 0;
 
@@ -1040,7 +1049,7 @@ export function createProgrammaticToolCallingTool(
 
           const toolResults = await executeTools(
             response.tool_calls ?? [],
-            toolMap
+            effectiveToolMap
           );
 
           response = await makeRequest(

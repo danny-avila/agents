@@ -2,12 +2,28 @@ import type * as t from '@/types';
 
 export type ProgrammaticInvocationParams = {
   code: string;
-  tools?: string[];
+  tool_manifest?: string[];
   timeout?: number;
   lang?: string;
   runtime?: string;
   language?: string;
 };
+
+export function resolveProgrammaticToolDefinitions(
+  context: Partial<t.ProgrammaticCache> & { tools?: t.LCTool[] }
+): t.LCTool[] | undefined {
+  return context.toolDefs ?? context.tools;
+}
+
+export function projectProgrammaticToolMap(
+  toolMap: t.ToolMap,
+  selectedToolDefs: readonly t.LCTool[]
+): t.ToolMap {
+  const selectedNames = new Set(selectedToolDefs.map((toolDef) => toolDef.name));
+  return new Map(
+    [...toolMap].filter(([name]) => selectedNames.has(name))
+  );
+}
 
 export function assertDisallowedToolUsage(
   disallowedNames: ReadonlySet<string>,
@@ -40,8 +56,8 @@ export function selectProgrammaticTools(args: {
   if (requestedToolNames == null) {
     if (disallowedToolDefs.length > 0) {
       throw new Error(
-        `"${args.programmaticToolName}" requires a tools manifest when direct-only tools are configured. ` +
-          'List every registered tool name used by the submitted code in the tools field.'
+        `"${args.programmaticToolName}" requires a tool_manifest when direct-only tools are configured. ` +
+          'List every registered tool name used by the submitted code in the tool_manifest field.'
       );
     }
     return allowedToolDefs;

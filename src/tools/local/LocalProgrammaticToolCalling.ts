@@ -19,6 +19,7 @@ import {
   normalizeToBashIdentifier,
 } from '@/tools/BashProgrammaticToolCalling';
 import {
+  resolveProgrammaticToolDefinitions,
   selectProgrammaticTools,
   type ProgrammaticInvocationParams,
 } from '@/tools/ProgrammaticCallerPolicy';
@@ -541,8 +542,10 @@ ${code}
 
 function getProgrammaticContext(config?: {
   toolCall?: unknown;
-}): Partial<t.ProgrammaticCache> {
-  return (config?.toolCall ?? {}) as Partial<t.ProgrammaticCache>;
+}): Partial<t.ProgrammaticCache> & { tools?: t.LCTool[] } {
+  return (config?.toolCall ?? {}) as Partial<t.ProgrammaticCache> & {
+    tools?: t.LCTool[];
+  };
 }
 
 function createEffectiveToolMap(
@@ -569,13 +572,10 @@ async function runLocalProgrammaticTool(args: {
   localConfig: t.LocalExecutionConfig;
   runtime: LocalProgrammaticRuntime;
 }): Promise<[string, t.ProgrammaticExecutionArtifact]> {
-  const {
-    toolMap,
-    toolDefs,
-    disallowedToolDefs,
-    programmaticToolName,
-    hookContext,
-  } = getProgrammaticContext(args.config);
+  const context = getProgrammaticContext(args.config);
+  const { toolMap, disallowedToolDefs, programmaticToolName, hookContext } =
+    context;
+  const toolDefs = resolveProgrammaticToolDefinitions(context);
 
   const runnerName =
     programmaticToolName ??
@@ -583,7 +583,7 @@ async function runLocalProgrammaticTool(args: {
       ? Constants.BASH_PROGRAMMATIC_TOOL_CALLING
       : Constants.PROGRAMMATIC_TOOL_CALLING);
   const selectedTools = selectProgrammaticTools({
-    requestedToolNames: args.params.tools,
+    requestedToolNames: args.params.tool_manifest,
     allowedToolDefs: toolDefs,
     disallowedToolDefs,
     programmaticToolName: runnerName,

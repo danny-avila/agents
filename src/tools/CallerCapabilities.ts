@@ -31,6 +31,15 @@ export function isProgrammaticControlTool(name: string): boolean {
   return PROGRAMMATIC_CONTROL_TOOL_NAMES.has(name);
 }
 
+export function isToolDefinitionActive(
+  toolDef: t.LCTool,
+  discoveredToolNames: ReadonlySet<string>
+): boolean {
+  return (
+    toolDef.defer_loading !== true || discoveredToolNames.has(toolDef.name)
+  );
+}
+
 export function resolveCallerCapabilityProjection(
   toolDefs: Iterable<t.LCTool>,
   isActive: (toolDef: t.LCTool) => boolean = () => true

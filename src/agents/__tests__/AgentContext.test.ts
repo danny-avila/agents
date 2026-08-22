@@ -1004,7 +1004,7 @@ describe('AgentContext', () => {
         'Only these tools may be invoked inside `run_tools_with_bash`: `both_tool`, `programmatic_only_tool`.'
       );
       expect(content).toContain(
-        'Call these tools directly; never list them in the `tools` manifest or reference them inside `run_tools_with_bash`: `direct_tool`.'
+        'Call these tools directly; never list them in the `tool_manifest` or reference them inside `run_tools_with_bash`: `direct_tool`.'
       );
       expect(content).toContain(
         'the manifest is validated before execution starts'

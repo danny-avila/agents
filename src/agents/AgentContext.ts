@@ -38,6 +38,7 @@ import {
 } from '@/tools/local/resolveLocalExecutionTools';
 import {
   allowsToolCaller,
+  isToolDefinitionActive,
   isProgrammaticControlTool,
   resolveCallerCapabilityProjection,
 } from '@/tools/CallerCapabilities';
@@ -486,9 +487,7 @@ export class AgentContext {
 
     const capabilities = resolveCallerCapabilityProjection(
       this.toolRegistry.values(),
-      (toolDef) =>
-        toolDef.defer_loading !== true ||
-        this.discoveredToolNames.has(toolDef.name)
+      (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
     );
     const programmaticOnlyTools = capabilities.codeExecutionOnlyTools;
     const programmaticToolNames = capabilities.codeExecutionTools.map(
@@ -509,9 +508,9 @@ export class AgentContext {
         : 'none';
     const directOnlyBoundary =
       directOnlyToolNames.length > 0
-        ? `\nCall these tools directly; never list them in the \`tools\` manifest or reference them inside ${programmaticRunnerNames}: ${directOnlyToolNames
+        ? `\nCall these tools directly; never list them in the \`tool_manifest\` or reference them inside ${programmaticRunnerNames}: ${directOnlyToolNames
           .map((name) => `\`${name}\``)
-          .join(', ')}. Every ${programmaticRunnerNames} call must include a \`tools\` manifest containing the exact registered names used by its code; the manifest is validated before execution starts.`
+          .join(', ')}. Every ${programmaticRunnerNames} call must include a \`tool_manifest\` containing the exact registered names used by its code; the manifest is validated before execution starts.`
         : '';
     const boundary =
       '\n\n## Programmatic Tool Calling\n\n' +
@@ -1138,9 +1137,7 @@ export class AgentContext {
      */
     return resolveCallerCapabilityProjection(
       this.toolDefinitions,
-      (toolDef) =>
-        toolDef.defer_loading !== true ||
-        this.discoveredToolNames.has(toolDef.name)
+      (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
     ).directTools;
   }
 
@@ -1859,8 +1856,7 @@ export class AgentContext {
 
       return (
         allowsToolCaller(toolDef, 'direct') &&
-        (toolDef.defer_loading !== true ||
-          this.discoveredToolNames.has(tool.name))
+        isToolDefinitionActive(toolDef, this.discoveredToolNames)
       );
     });
   }

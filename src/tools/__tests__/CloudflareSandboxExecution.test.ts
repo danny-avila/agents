@@ -74,7 +74,10 @@ it('reports the invoked runner name for Cloudflare caller-policy failures', asyn
 
   await expect(
     programmatic.invoke(
-      { code: 'direct_only_tool \'{}\'', tools: ['direct_only_tool'] },
+      {
+        code: 'direct_only_tool \'{}\'',
+        tool_manifest: ['direct_only_tool'],
+      },
       { toolCall }
     )
   ).rejects.toThrow(

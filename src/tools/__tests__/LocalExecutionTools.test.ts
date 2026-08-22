@@ -68,7 +68,10 @@ it('reports the invoked runner name for local caller-policy failures', async () 
 
   await expect(
     programmatic.invoke(
-      { code: 'direct_only_tool \'{}\'', tools: ['direct_only_tool'] },
+      {
+        code: 'direct_only_tool \'{}\'',
+        tool_manifest: ['direct_only_tool'],
+      },
       { toolCall }
     )
   ).rejects.toThrow(
@@ -204,6 +207,36 @@ describe('local execution tools', () => {
     expect(tools.map((localTool) => localTool.name)).not.toContain(
       'write_file'
     );
+  });
+
+  it('binds a deferred synthesized tool only after discovery', () => {
+    const registry = resolveLocalToolRegistry({
+      toolRegistry: new Map([
+        [
+          'write_file',
+          {
+            name: 'write_file',
+            allowed_callers: ['direct', 'code_execution'],
+            defer_loading: true,
+          },
+        ],
+      ]),
+      toolExecution: { engine: 'local' },
+    });
+    const undiscovered = resolveLocalToolsForBinding({
+      toolExecution: { engine: 'local' },
+      toolRegistry: registry,
+    }) as t.GenericTool[];
+    const discovered = resolveLocalToolsForBinding({
+      toolExecution: { engine: 'local' },
+      toolRegistry: registry,
+      discoveredToolNames: new Set(['write_file']),
+    }) as t.GenericTool[];
+
+    expect(undiscovered.map((toolDef) => toolDef.name)).not.toContain(
+      'write_file'
+    );
+    expect(discovered.map((toolDef) => toolDef.name)).toContain('write_file');
   });
 
   it('updates existing code tool bindings when auto-binding is disabled', () => {

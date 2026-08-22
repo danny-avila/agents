@@ -22,7 +22,7 @@ export type ProgrammaticToolCallingJsonSchema = {
       minLength: number;
       description: string;
     };
-    tools: {
+    tool_manifest: {
       type: 'array';
       items: { type: 'string' };
       uniqueItems: true;

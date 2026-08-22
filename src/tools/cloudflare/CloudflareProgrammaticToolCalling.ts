@@ -16,6 +16,7 @@ import {
   normalizeToBashIdentifier,
 } from '@/tools/BashProgrammaticToolCalling';
 import {
+  resolveProgrammaticToolDefinitions,
   selectProgrammaticTools,
   type ProgrammaticInvocationParams,
 } from '@/tools/ProgrammaticCallerPolicy';
@@ -1049,16 +1050,18 @@ async function runProgrammatic(args: {
   cloudflareConfig: t.CloudflareSandboxExecutionConfig;
   runtime: 'python' | 'bash';
 }): Promise<[string, t.ProgrammaticExecutionArtifact]> {
-  const toolCall = (args.config?.toolCall ??
-    {}) as Partial<t.ProgrammaticCache>;
+  const toolCall = (args.config?.toolCall ?? {}) as Partial<
+    t.ProgrammaticCache
+  > & { tools?: t.LCTool[] };
+  const toolDefs = resolveProgrammaticToolDefinitions(toolCall);
   const programmaticToolName =
     toolCall.programmaticToolName ??
     (args.runtime === 'bash'
       ? Constants.BASH_PROGRAMMATIC_TOOL_CALLING
       : Constants.PROGRAMMATIC_TOOL_CALLING);
   const selectedTools = selectProgrammaticTools({
-    requestedToolNames: args.params.tools,
-    allowedToolDefs: toolCall.toolDefs,
+    requestedToolNames: args.params.tool_manifest,
+    allowedToolDefs: toolDefs,
     disallowedToolDefs: toolCall.disallowedToolDefs,
     programmaticToolName,
   });

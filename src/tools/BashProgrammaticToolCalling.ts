@@ -19,6 +19,8 @@ import {
   formatCompletedResponse,
 } from './ProgrammaticToolCalling';
 import {
+  projectProgrammaticToolMap,
+  resolveProgrammaticToolDefinitions,
   selectProgrammaticTools,
   type ProgrammaticInvocationParams,
 } from './ProgrammaticCallerPolicy';
@@ -132,7 +134,7 @@ export function createBashProgrammaticToolCallingSchema(
         minLength: 1,
         description: CODE_PARAM_DESCRIPTION,
       },
-      tools: {
+      tool_manifest: {
         type: 'array',
         items: { type: 'string' },
         uniqueItems: true,
@@ -328,12 +330,14 @@ export function createBashProgrammaticToolCallingTool(
         };
       const {
         toolMap,
-        toolDefs,
         disallowedToolDefs,
         session_id,
         _injected_files,
         _runtime_session_hint,
       } = toolCall;
+      const toolDefs = resolveProgrammaticToolDefinitions(
+        toolCall as typeof toolCall & { tools?: t.LCTool[] }
+      );
 
       const programmaticToolName =
         toolCall.programmaticToolName ??
@@ -341,7 +345,7 @@ export function createBashProgrammaticToolCallingTool(
           ? toolCall.name
           : Constants.BASH_PROGRAMMATIC_TOOL_CALLING);
       const effectiveTools = selectProgrammaticTools({
-        requestedToolNames: params.tools,
+        requestedToolNames: params.tool_manifest,
         allowedToolDefs: toolDefs,
         disallowedToolDefs,
         programmaticToolName,
@@ -360,6 +364,11 @@ export function createBashProgrammaticToolCallingTool(
             'Either pass tools in the input or ensure ToolNode injects toolDefs.'
         );
       }
+
+      const effectiveToolMap = projectProgrammaticToolMap(
+        toolMap,
+        effectiveTools
+      );
 
       let roundTrip = 0;
 
@@ -447,7 +456,7 @@ export function createBashProgrammaticToolCallingTool(
           const toolResults = normalizeBashToolResultsForReplay(
             await executeTools(
               response.tool_calls ?? [],
-              toolMap,
+              effectiveToolMap,
               Constants.BASH_PROGRAMMATIC_TOOL_CALLING
             )
           );

@@ -77,4 +77,66 @@ describe('ToolNode programmatic caller policy', () => {
       Constants.PROGRAMMATIC_TOOL_CALLING
     );
   });
+
+  it('projects deferred policy definitions only after discovery', async () => {
+    const capturedConfigs: Array<ToolCall & Partial<t.ProgrammaticCache>> = [];
+    const discovered = new Set<string>();
+    const ptcTool = tool(
+      async (_args, config) => {
+        capturedConfigs.push(
+          config.toolCall as ToolCall & Partial<t.ProgrammaticCache>
+        );
+        return 'done';
+      },
+      {
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        description: 'Run tools with code',
+        schema: z.object({ code: z.string() }),
+      }
+    );
+    const directTool = tool(async () => 'direct', {
+      name: 'deferred_direct_tool',
+      description: 'Deferred direct tool',
+      schema: z.object({}),
+    });
+    const node = new ToolNode({
+      tools: [ptcTool, directTool],
+      toolRegistry: new Map([
+        [
+          directTool.name,
+          {
+            name: directTool.name,
+            allowed_callers: ['direct'],
+            defer_loading: true,
+          },
+        ],
+      ]),
+      getDiscoveredToolNames: () => [...discovered],
+    });
+    const invoke = async (id: string): Promise<void> => {
+      await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              {
+                id,
+                name: Constants.PROGRAMMATIC_TOOL_CALLING,
+                args: { code: 'print("done")' },
+              },
+            ],
+          }),
+        ],
+      });
+    };
+
+    await invoke('before-discovery');
+    discovered.add(directTool.name);
+    await invoke('after-discovery');
+
+    expect(capturedConfigs[0].disallowedToolDefs).toEqual([]);
+    expect(capturedConfigs[1].disallowedToolDefs).toEqual([
+      { name: directTool.name },
+    ]);
+  });
 });

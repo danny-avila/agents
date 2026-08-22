@@ -133,6 +133,8 @@ export type ToolNodeOptions = {
   ) => Promise<boolean | void>;
   /** Tool registry for lazy computation of programmatic tools and tool search */
   toolRegistry?: LCToolRegistry;
+  /** Returns the owning agent's currently discovered deferred tool names. */
+  getDiscoveredToolNames?: () => readonly string[];
   /** Reference to Graph's sessions map for automatic session injection */
   sessions?: ToolSessionMap;
   /** Partition within `sessions` used by this agent's code tools. */

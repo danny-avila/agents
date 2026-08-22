@@ -21,7 +21,11 @@ import {
   createBashProgrammaticToolCallingSchema,
   normalizeBashToolResultsForReplay,
 } from '../BashProgrammaticToolCalling';
-import { selectProgrammaticTools } from '../ProgrammaticCallerPolicy';
+import {
+  projectProgrammaticToolMap,
+  resolveProgrammaticToolDefinitions,
+  selectProgrammaticTools,
+} from '../ProgrammaticCallerPolicy';
 import {
   createProgrammaticToolRegistry,
   createGetTeamMembersTool,
@@ -40,7 +44,7 @@ describe('ProgrammaticToolCalling', () => {
       expect(description).toContain('keyword args only');
       expect(description).toContain('never pass a dict');
       expect(description).toContain('Tool results are decoded Python values');
-      expect(schema.properties.tools.description).toContain(
+      expect(schema.properties.tool_manifest.description).toContain(
         'validated before execution starts'
       );
     });
@@ -59,7 +63,7 @@ describe('ProgrammaticToolCalling', () => {
       expect(description).toContain('/mnt/data/sf.json');
       expect(description).toContain('Failed executions register nothing');
       expect(description).toContain('`/tmp` never survives the call');
-      expect(schema.properties.tools.uniqueItems).toBe(true);
+      expect(schema.properties.tool_manifest.uniqueItems).toBe(true);
     });
   });
 
@@ -932,7 +936,7 @@ for member in team:
           disallowedToolDefs,
           programmaticToolName: 'run_tools_with_code',
         })
-      ).toThrow('requires a tools manifest');
+      ).toThrow('requires a tool_manifest');
     });
 
     it('rejects direct-only manifest entries before execution', () => {
@@ -964,6 +968,25 @@ for member in team:
           programmaticToolName: 'run_tools_with_code',
         })
       ).toBe(allowedToolDefs);
+    });
+
+    it('preserves legacy manual tool-definition injection', () => {
+      expect(
+        resolveProgrammaticToolDefinitions({ tools: allowedToolDefs })
+      ).toBe(allowedToolDefs);
+    });
+
+    it('restricts callback execution to the selected manifest', () => {
+      const searchTool = createGetTeamMembersTool();
+      const emailTool = createGetExpensesTool();
+      const toolMap: t.ToolMap = new Map([
+        ['search', searchTool],
+        ['send_email', emailTool],
+      ]);
+
+      expect(
+        projectProgrammaticToolMap(toolMap, [{ name: 'search' }])
+      ).toEqual(new Map([['search', searchTool]]));
     });
   });
 
@@ -1201,7 +1224,7 @@ for member in team:
         tool.invoke(
           {
             code: 'await direct_only_tool(query="test")',
-            tools: ['direct-only-tool'],
+            tool_manifest: ['direct-only-tool'],
           },
           { toolCall }
         )
@@ -1229,7 +1252,7 @@ for member in team:
         tool.invoke(
           {
             code: 'direct_only_tool \'{"query":"test"}\'',
-            tools: ['direct-only-tool'],
+            tool_manifest: ['direct-only-tool'],
           },
           { toolCall }
         )
