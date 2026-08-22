@@ -47,8 +47,18 @@ import { getMaxOutputTokensKey } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 import { executeHooks } from '@/hooks';
+import {
+  SUMMARY_WRAPPER_OVERHEAD_TOKENS,
+  DEFAULT_SUMMARIZATION_PROMPT,
+  DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
+  separateSummarizationParameters,
+  buildSummarizationInstruction,
+} from './shared';
 
-const SUMMARIZATION_PARAM_KEYS = new Set(['maxSummaryTokens']);
+export {
+  DEFAULT_SUMMARIZATION_PROMPT,
+  DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
+} from './shared';
 
 /**
  * Default number of recent user-led turns preserved verbatim during
@@ -60,89 +70,6 @@ const SUMMARIZATION_PARAM_KEYS = new Set(['maxSummaryTokens']);
  * `retainRecent.turns` to `0` reverts to the legacy "summarize every
  * message" behavior.
  */
-/**
- * Token overhead of the XML wrapper + instruction text added around the
- * summary at injection time in AgentContext.buildSystemRunnable:
- * `<summary>\n${text}\n</summary>\n\nYour context window was compacted...`
- * ~33 tokens on Anthropic, ~24-27 on OpenAI.  Using 33 as a safe ceiling.
- */
-const SUMMARY_WRAPPER_OVERHEAD_TOKENS = 33;
-
-/** Structured checkpoint prompt for fresh summarization (no prior summary). */
-export const DEFAULT_SUMMARIZATION_PROMPT = `Hold on, before you continue I need you to write me a checkpoint of everything so far. Your context window is filling up and this checkpoint replaces the messages above, so capture everything you need to pick right back up.
-
-Don't second-guess or fact-check anything you did, your tool results reflect exactly what happened. If a tool result appears truncated, that's just a display artifact from context management: the tool executed fully. Just record what you did and what you observed. Only the checkpoint, don't respond to me or continue the conversation.
-
-## Checkpoint
-
-## Goal
-What I asked you to do and any sub-goals you identified.
-
-## Constraints & Preferences
-Any rules, preferences, or configuration I established.
-
-## Progress
-### Done
-- What you completed and the outcomes
-
-### In Progress
-- What you're currently working on
-
-## Key Decisions
-Decisions you made and why.
-
-## Next Steps
-Concrete task actions remaining, in priority order.
-
-## Critical Context
-Exact identifiers, names, error messages, URLs, and details you need to preserve verbatim.
-
-Rules:
-- Record what you did and observed, don't judge or re-evaluate it
-- For each tool call: the tool name, key inputs, and the outcome
-- Preserve exact identifiers, names, errors, and references verbatim
-- Short declarative sentences
-- Skip empty sections`;
-
-/** Prompt for re-compaction when a prior summary exists. */
-export const DEFAULT_UPDATE_SUMMARIZATION_PROMPT = `Hold on again, update your checkpoint. Merge the new messages into your existing checkpoint and give me a single consolidated replacement.
-
-Keep it roughly the same length as your last checkpoint. Compress older details to make room for what's new, don't just append. Give recent actions more detail, compress older items to one-liners.
-
-Don't fact-check or second-guess anything, your tool results are ground truth. If a tool result appears truncated, that's just a display artifact: the tool executed fully. Only the checkpoint, don't respond to me or continue the conversation.
-
-Rules:
-- Merge new progress into existing sections, don't duplicate headers
-- Compress older completed items into one-line entries
-- Move items from "In Progress" to "Done" when you completed them
-- Update "Next Steps" to reflect current task priorities.
-- For each new tool call: the tool name, key inputs, and the outcome
-- Preserve exact identifiers, names, errors, and references verbatim
-- Skip empty sections`;
-
-function separateParameters(parameters: Record<string, unknown>): {
-  llmParams: Record<string, unknown>;
-  maxSummaryTokens?: number;
-} {
-  const llmParams: Record<string, unknown> = {};
-  let maxSummaryTokens: number | undefined;
-
-  for (const [key, value] of Object.entries(parameters)) {
-    if (SUMMARIZATION_PARAM_KEYS.has(key)) {
-      if (
-        key === 'maxSummaryTokens' &&
-        typeof value === 'number' &&
-        value > 0
-      ) {
-        maxSummaryTokens = value;
-      }
-    } else {
-      llmParams[key] = value;
-    }
-  }
-
-  return { llmParams, maxSummaryTokens };
-}
 
 /**
  * Generates a structural metadata summary without making an LLM call.
@@ -334,7 +261,7 @@ function buildSummarizationClientConfig(
     summarizationConfig?.updatePrompt ?? DEFAULT_UPDATE_SUMMARIZATION_PROMPT;
 
   const { llmParams, maxSummaryTokens: paramMaxSummaryTokens } =
-    separateParameters(parameters);
+    separateSummarizationParameters(parameters);
 
   const isSelfSummarize = provider === (agentContext.provider as string);
   const baseOptions =
@@ -1501,23 +1428,6 @@ function extractResponseText(response: { content: string | object }): string {
     }
   }
   return parts.join('').trim();
-}
-
-function buildSummarizationInstruction(
-  promptText: string,
-  updatePromptText: string | undefined,
-  priorSummaryText: string
-): string {
-  const effectivePrompt = priorSummaryText
-    ? (updatePromptText ?? promptText)
-    : promptText;
-  const parts = [effectivePrompt];
-  if (priorSummaryText) {
-    parts.push(
-      `\n\n<previous-summary>\n${priorSummaryText}\n</previous-summary>`
-    );
-  }
-  return parts.join('');
 }
 
 /** Creates an `onChunk` callback that dispatches `ON_SUMMARIZE_DELTA` events for streaming. */

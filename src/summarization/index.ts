@@ -1,5 +1,7 @@
 import type { SummarizationTrigger } from '@/types';
 
+export * from './shared';
+
 const VALID_TRIGGER_TYPES = [
   'token_ratio',
   'remaining_tokens',
