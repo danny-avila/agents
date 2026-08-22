@@ -18,6 +18,10 @@ import {
   createLocalCodeExecutionTool,
 } from './LocalExecutionTools';
 import {
+  allowsToolCaller,
+  isToolDefinitionActive,
+} from '@/tools/CallerCapabilities';
+import {
   Constants,
   CODE_EXECUTION_TOOLS,
   LOCAL_CODING_BUNDLE_NAMES,
@@ -56,6 +60,25 @@ function shouldIncludeCodingTools(config?: t.ToolExecutionConfig): boolean {
     (shouldUseCloudflareSandboxExecution(config) &&
       config?.cloudflare?.includeCodingTools !== false)
   );
+}
+
+export function isProgrammaticRunnerAutoBound(
+  name: string,
+  config?: t.ToolExecutionConfig
+): boolean {
+  if (
+    !shouldIncludeCodingTools(config) ||
+    (name !== Constants.PROGRAMMATIC_TOOL_CALLING &&
+      name !== Constants.BASH_PROGRAMMATIC_TOOL_CALLING)
+  ) {
+    return false;
+  }
+  if (shouldUseCloudflareSandboxExecution(config)) {
+    return getSelectedCloudflareCodingToolNames(
+      getCloudflareConfig(config)
+    ).has(name);
+  }
+  return shouldUseLocalExecution(config);
 }
 
 function getCloudflareConfig(
@@ -150,9 +173,43 @@ function mergeToolsByName(
   return orderedTools;
 }
 
+function filterToolsForDirectCaller(
+  tools: t.GraphTools | undefined,
+  toolRegistry?: t.LCToolRegistry,
+  discoveredToolNames: ReadonlySet<string> = new Set()
+): t.GraphTools | undefined {
+  if (tools == null || toolRegistry == null) {
+    return tools;
+  }
+  return tools.filter((tool) => {
+    if (!('name' in tool) || typeof tool.name !== 'string') {
+      return true;
+    }
+    const toolDef = toolRegistry.get(tool.name);
+    return (
+      toolDef == null ||
+      (allowsToolCaller(toolDef, 'direct') &&
+        isToolDefinitionActive(toolDef, discoveredToolNames))
+    );
+  });
+}
+
+function addDirectToolName(
+  directToolNames: Set<string>,
+  name: string,
+  toolRegistry?: t.LCToolRegistry
+): void {
+  const toolDef = toolRegistry?.get(name);
+  if (toolDef == null || allowsToolCaller(toolDef, 'direct')) {
+    directToolNames.add(name);
+  }
+}
+
 export function resolveLocalToolsForBinding(args: {
   tools?: t.GraphTools;
   toolExecution?: t.ToolExecutionConfig;
+  toolRegistry?: t.LCToolRegistry;
+  discoveredToolNames?: ReadonlySet<string>;
 }): t.GraphTools | undefined {
   if (
     !shouldUseLocalExecution(args.toolExecution) &&
@@ -166,9 +223,13 @@ export function resolveLocalToolsForBinding(args: {
     if (shouldIncludeCodingTools(args.toolExecution)) {
       const selectedNames =
         getSelectedCloudflareCodingToolNames(cloudflareConfig);
-      return mergeToolsByName(
-        filterCloudflareCodingToolAllowlist(args.tools, selectedNames),
-        createCloudflareCodingTools(cloudflareConfig)
+      return filterToolsForDirectCaller(
+        mergeToolsByName(
+          filterCloudflareCodingToolAllowlist(args.tools, selectedNames),
+          createCloudflareCodingTools(cloudflareConfig)
+        ),
+        args.toolRegistry,
+        args.discoveredToolNames
       );
     }
 
@@ -187,14 +248,23 @@ export function resolveLocalToolsForBinding(args: {
           cloudflareTool != null
       );
 
-    return replacements.length === 0
+    const resolvedTools = replacements.length === 0
       ? args.tools
       : mergeToolsByName(args.tools, replacements);
+    return filterToolsForDirectCaller(
+      resolvedTools,
+      args.toolRegistry,
+      args.discoveredToolNames
+    );
   }
 
   const localConfig = args.toolExecution?.local ?? {};
   if (shouldIncludeCodingTools(args.toolExecution)) {
-    return mergeToolsByName(args.tools, createLocalCodingTools(localConfig));
+    return filterToolsForDirectCaller(
+      mergeToolsByName(args.tools, createLocalCodingTools(localConfig)),
+      args.toolRegistry,
+      args.discoveredToolNames
+    );
   }
 
   const replacements = ((args.tools as t.GenericTool[] | undefined) ?? [])
@@ -209,9 +279,14 @@ export function resolveLocalToolsForBinding(args: {
     )
     .filter((localTool): localTool is t.GenericTool => localTool != null);
 
-  return replacements.length === 0
+  const resolvedTools = replacements.length === 0
     ? args.tools
     : mergeToolsByName(args.tools, replacements);
+  return filterToolsForDirectCaller(
+    resolvedTools,
+    args.toolRegistry,
+    args.discoveredToolNames
+  );
 }
 
 export function resolveLocalToolRegistry(args: {
@@ -228,12 +303,39 @@ export function resolveLocalToolRegistry(args: {
       getCloudflareConfig(args.toolExecution)
     )
     : undefined;
+
+  if (selectedNames != null) {
+    const callableInsideCloudflare = new Set(selectedNames);
+    callableInsideCloudflare.delete(Constants.PROGRAMMATIC_TOOL_CALLING);
+    callableInsideCloudflare.delete(Constants.BASH_PROGRAMMATIC_TOOL_CALLING);
+    for (const [name, definition] of registry) {
+      if (callableInsideCloudflare.has(name)) {
+        continue;
+      }
+      const allowedCallers = definition.allowed_callers ?? ['direct'];
+      if (allowedCallers.includes('code_execution')) {
+        registry.set(name, {
+          ...definition,
+          allowed_callers: allowedCallers.filter(
+            (caller) => caller !== 'code_execution'
+          ),
+        });
+      }
+    }
+  }
+
   for (const definition of createLocalCodingToolDefinitions()) {
     if (selectedNames != null && !selectedNames.has(definition.name)) {
       registry.delete(definition.name);
       continue;
     }
-    registry.set(definition.name, definition);
+    const existingDefinition = registry.get(definition.name);
+    registry.set(
+      definition.name,
+      existingDefinition == null
+        ? definition
+        : { ...definition, ...existingDefinition }
+    );
   }
   return registry;
 }
@@ -241,6 +343,7 @@ export function resolveLocalToolRegistry(args: {
 export function resolveLocalExecutionTools(args: {
   toolMap: t.ToolMap;
   toolExecution?: t.ToolExecutionConfig;
+  toolRegistry?: t.LCToolRegistry;
   /**
    * Caller-provided checkpointer that overrides the bundle's
    * auto-created one. The Graph layer threads a single per-Run
@@ -281,14 +384,22 @@ export function resolveLocalExecutionTools(args: {
         fileCheckpointer = bundle.checkpointer;
         for (const cloudflareTool of bundle.tools) {
           toolMap.set(cloudflareTool.name, cloudflareTool);
-          directToolNames.add(cloudflareTool.name);
+          addDirectToolName(
+            directToolNames,
+            cloudflareTool.name,
+            args.toolRegistry
+          );
         }
       } else {
         for (const cloudflareTool of createCloudflareCodingTools(
           cloudflareConfig
         )) {
           toolMap.set(cloudflareTool.name, cloudflareTool);
-          directToolNames.add(cloudflareTool.name);
+          addDirectToolName(
+            directToolNames,
+            cloudflareTool.name,
+            args.toolRegistry
+          );
         }
       }
     }
@@ -307,7 +418,7 @@ export function resolveLocalExecutionTools(args: {
       }
 
       toolMap.set(name, cloudflareTool);
-      directToolNames.add(name);
+      addDirectToolName(directToolNames, name, args.toolRegistry);
     }
 
     return { toolMap, directToolNames, fileCheckpointer };
@@ -332,12 +443,20 @@ export function resolveLocalExecutionTools(args: {
       fileCheckpointer = bundle.checkpointer;
       for (const localTool of bundle.tools) {
         toolMap.set(localTool.name, localTool);
-        directToolNames.add(localTool.name);
+        addDirectToolName(
+          directToolNames,
+          localTool.name,
+          args.toolRegistry
+        );
       }
     } else {
       for (const localTool of createLocalCodingTools(localConfig)) {
         toolMap.set(localTool.name, localTool);
-        directToolNames.add(localTool.name);
+        addDirectToolName(
+          directToolNames,
+          localTool.name,
+          args.toolRegistry
+        );
       }
     }
   }
@@ -363,7 +482,7 @@ export function resolveLocalExecutionTools(args: {
     }
 
     toolMap.set(name, localTool);
-    directToolNames.add(name);
+    addDirectToolName(directToolNames, name, args.toolRegistry);
   }
 
   return { toolMap, directToolNames, fileCheckpointer };

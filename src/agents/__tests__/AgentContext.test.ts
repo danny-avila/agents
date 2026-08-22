@@ -18,10 +18,16 @@ describe('AgentContext', () => {
     agentConfig?: Partial<t.AgentInputs>;
     tokenCounter?: t.TokenCounter;
     indexTokenCountMap?: Record<string, number>;
+    toolExecution?: t.ToolExecutionConfig;
   };
 
   const createBasicContext = (options: ContextOptions = {}): AgentContext => {
-    const { agentConfig = {}, tokenCounter, indexTokenCountMap } = options;
+    const {
+      agentConfig = {},
+      tokenCounter,
+      indexTokenCountMap,
+      toolExecution,
+    } = options;
     return AgentContext.fromConfig(
       {
         agentId: 'test-agent',
@@ -30,7 +36,8 @@ describe('AgentContext', () => {
         ...agentConfig,
       },
       tokenCounter,
-      indexTokenCountMap
+      indexTokenCountMap,
+      toolExecution
     );
   };
 
@@ -882,6 +889,26 @@ describe('AgentContext', () => {
   });
 
   describe('buildProgrammaticOnlyToolsInstructions', () => {
+    it('omits programmatic guidance when no runner is available', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolRegistry: new Map([
+            [
+              'programmatic_tool',
+              {
+                name: 'programmatic_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toBe('Base');
+    });
+
     it('includes code_execution-only tools in system message', async () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [
@@ -935,7 +962,7 @@ describe('AgentContext', () => {
       expect(result[0].content).not.toContain('run_tools_with_bash');
     });
 
-    it('excludes direct-callable tools from programmatic section', () => {
+    it('makes mixed direct and programmatic caller boundaries explicit', async () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [
           'direct_tool',
@@ -953,13 +980,196 @@ describe('AgentContext', () => {
             allowed_callers: ['direct', 'code_execution'],
           },
         ],
+        [
+          'programmatic_only_tool',
+          {
+            name: 'programmatic_only_tool',
+            description: 'Programmatic only',
+            allowed_callers: ['code_execution'],
+          },
+        ],
       ]);
 
       const ctx = createBasicContext({
-        agentConfig: { instructions: 'Base', toolRegistry },
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry,
+        },
       });
 
-      expect(ctx.systemRunnable).toBeDefined();
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = String(result[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_bash`: `both_tool`, `programmatic_only_tool`.'
+      );
+      expect(content).toContain(
+        'Call these tools directly; never list them in the `tool_manifest` or reference them inside `run_tools_with_bash`: `direct_tool`.'
+      );
+      expect(content).toContain(
+        'the manifest is validated before execution starts'
+      );
+      expect(content).toContain('### Programmatic-Only Tools');
+    });
+
+    it('uses the Cloudflare runner effective registry in guidance', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolRegistry: new Map([
+            [
+              'host_code_tool',
+              {
+                name: 'host_code_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+        toolExecution: {
+          engine: 'cloudflare-sandbox',
+          cloudflare: {
+            sandbox: {
+              exec: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+              readFile: async () => '',
+              writeFile: async () => undefined,
+              mkdir: async () => undefined,
+              listFiles: async () => [],
+              deleteFile: async () => undefined,
+            },
+          },
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = String(result[0].content);
+      expect(content).toContain('`read_file`');
+      expect(content).not.toContain('`host_code_tool`');
+    });
+
+    it('recognizes auto-bound local programmatic runners', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolRegistry: new Map([
+            [
+              'host_code_tool',
+              {
+                name: 'host_code_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+        toolExecution: { engine: 'local' },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = String(result[0].content);
+      expect(content).toContain('inside `run_tools_with_bash`');
+      expect(content).toContain('or `run_tools_with_code`');
+      expect(content).toContain('`host_code_tool`');
+    });
+
+    it('describes the Bash default for an auto-bound code runner', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry: new Map([
+            [
+              'host_code_tool',
+              {
+                name: 'host_code_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+        toolExecution: {
+          engine: 'local',
+          local: { includeCodingTools: false },
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain('Bash code by default');
+      expect(content).toContain('`lang: "py"`');
+    });
+
+    it('emits direct-only guidance when the allowlist is empty', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry: new Map([
+            [
+              'direct_tool',
+              { name: 'direct_tool', allowed_callers: ['direct'] },
+            ],
+          ]),
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: none.'
+      );
+      expect(content).toContain('`direct_tool`');
+    });
+
+    it('omits deferred programmatic runners until discovery', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            {
+              name: Constants.PROGRAMMATIC_TOOL_CALLING,
+              defer_loading: true,
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'direct_tool',
+              { name: 'direct_tool', allowed_callers: ['direct'] },
+            ],
+          ]),
+        },
+      });
+
+      expect(String((await ctx.systemRunnable!.invoke([]))[0].content)).toBe(
+        'Base'
+      );
+
+      ctx.markToolsAsDiscovered([Constants.PROGRAMMATIC_TOOL_CALLING]);
+
+      expect(
+        String((await ctx.systemRunnable!.invoke([]))[0].content)
+      ).toContain('inside `run_tools_with_code`');
+    });
+
+    it('omits programmatic runners that are not direct-callable', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            {
+              name: Constants.PROGRAMMATIC_TOOL_CALLING,
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'direct_tool',
+              { name: 'direct_tool', allowed_callers: ['direct'] },
+            ],
+          ]),
+        },
+      });
+
+      expect(String((await ctx.systemRunnable!.invoke([]))[0].content)).toBe(
+        'Base'
+      );
     });
 
     it('excludes deferred code_execution-only tools until discovered', () => {
@@ -1122,7 +1332,11 @@ describe('AgentContext', () => {
       ]);
 
       const ctx = createBasicContext({
-        agentConfig: { instructions: 'Short', toolRegistry },
+        agentConfig: {
+          instructions: 'Short',
+          toolRegistry,
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+        },
         tokenCounter: mockTokenCounter,
       });
 
@@ -1830,7 +2044,10 @@ describe('AgentContext', () => {
 
     it('maintains consistent indexTokenCountMap across turns', () => {
       const ctx = createBasicContext({
-        agentConfig: { instructions: 'Base instructions' },
+        agentConfig: {
+          instructions: 'Base instructions',
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+        },
         tokenCounter: mockTokenCounter,
       });
 
@@ -1906,6 +2123,7 @@ describe('AgentContext', () => {
         agentConfig: {
           instructions: 'You are helpful.',
           toolRegistry,
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
         },
         tokenCounter: mockTokenCounter,
       });
@@ -1949,6 +2167,7 @@ describe('AgentContext', () => {
         agentConfig: {
           instructions: 'Assistant instructions',
           toolRegistry,
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
         },
         tokenCounter: mockTokenCounter,
       });

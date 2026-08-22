@@ -1,7 +1,7 @@
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
-import { Providers } from '@/common';
 import { projectAgentContextUsage } from '../projection';
+import { Providers } from '@/common';
 
 const countByChars = (msg: { content: unknown }): number => {
   const content =
@@ -69,5 +69,32 @@ describe('projectAgentContextUsage', () => {
     });
 
     expect(usage).toBeNull();
+  });
+
+  it('projects instructions from the effective execution backend', async () => {
+    const config: t.AgentInputs = {
+      ...agent(100_000),
+      toolRegistry: new Map([
+        [
+          'host_code_tool',
+          { name: 'host_code_tool', allowed_callers: ['code_execution'] },
+        ],
+      ]),
+    };
+    const withoutExecution = await projectAgentContextUsage({
+      agent: config,
+      messages: [],
+      tokenCounter: countByChars,
+    });
+    const withExecution = await projectAgentContextUsage({
+      agent: config,
+      messages: [],
+      tokenCounter: countByChars,
+      toolExecution: { engine: 'local' },
+    });
+
+    expect(withExecution!.breakdown.instructionTokens).toBeGreaterThan(
+      withoutExecution!.breakdown.instructionTokens
+    );
   });
 });
