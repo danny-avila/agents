@@ -224,7 +224,7 @@ export function extractUsedBashToolNames(
   toolNameMap: Map<string, string>
 ): Set<string> {
   const usedTools = new Set<string>();
-  const commandNames = extractBashCommandNames(code);
+  const commandNames = extractBashCommandNames(code, toolNameMap);
 
   for (const commandName of commandNames) {
     const originalName = toolNameMap.get(commandName);
@@ -276,10 +276,13 @@ type BashToken =
   | { type: 'nested'; tokens: BashToken[] };
 
 /** Returns shell words at command position, excluding arguments and comments. */
-function extractBashCommandNames(code: string): Set<string> {
+function extractBashCommandNames(
+  code: string,
+  knownToolNames?: { has(name: string): boolean }
+): Set<string> {
   const commands = new Set<string>();
 
-  collectBashCommandNames(tokenizeBash(code), commands);
+  collectBashCommandNames(tokenizeBash(code), commands, knownToolNames);
   return commands;
 }
 
@@ -291,7 +294,8 @@ function requiresAllBashTools(code: string): boolean {
 
 function collectBashCommandNames(
   tokens: BashToken[],
-  commands: Set<string>
+  commands: Set<string>,
+  knownToolNames?: { has(name: string): boolean }
 ): void {
   let expectsCommand = true;
   let skipRedirectTarget = false;
@@ -309,14 +313,18 @@ function collectBashCommandNames(
 
   const flushEval = (): void => {
     if (evalWords != null && evalWords.length > 0) {
-      collectBashCommandNames(tokenizeBash(evalWords.join(' ')), commands);
+      collectBashCommandNames(
+        tokenizeBash(evalWords.join(' ')),
+        commands,
+        knownToolNames
+      );
     }
     evalWords = undefined;
   };
 
   for (const token of tokens) {
     if (token.type === 'nested') {
-      collectBashCommandNames(token.tokens, commands);
+      collectBashCommandNames(token.tokens, commands, knownToolNames);
       if (skipRedirectTarget) {
         skipRedirectTarget = false;
       }
@@ -368,7 +376,11 @@ function collectBashCommandNames(
       continue;
     }
     if (expectsTrapAction) {
-      collectBashCommandNames(tokenizeBash(token.value), commands);
+      collectBashCommandNames(
+        tokenizeBash(token.value),
+        commands,
+        knownToolNames
+      );
       expectsTrapAction = false;
       expectsCommand = false;
       continue;
@@ -422,6 +434,13 @@ function collectBashCommandNames(
     }
     if (expectsFunctionName) {
       expectsFunctionName = false;
+      continue;
+    }
+    if (knownToolNames?.has(word) === true) {
+      commands.add(word);
+      pendingAssignments.clear();
+      commandPrefix = undefined;
+      expectsCommand = false;
       continue;
     }
     const assignment = word.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
@@ -1063,38 +1082,64 @@ function findBashHeredocDeclarations(
     while (/[ \t]/.test(line[targetStart] ?? '')) {
       targetStart += 1;
     }
-    const delimiterQuote = line[targetStart];
-    if (delimiterQuote === '\'' || delimiterQuote === '"') {
-      const targetEnd = line.indexOf(delimiterQuote, targetStart + 1);
-      if (targetEnd === -1) {
-        continue;
-      }
+    const parsedDelimiter = parseBashHeredocDelimiter(line, targetStart);
+    if (parsedDelimiter != null) {
       declarations.push({
-        delimiter: line.slice(targetStart + 1, targetEnd),
+        delimiter: parsedDelimiter.delimiter,
         stripTabs,
-        quoted: true,
+        quoted: parsedDelimiter.quoted,
       });
-      index = targetEnd;
-      continue;
-    }
-    let targetEnd = targetStart;
-    while (
-      targetEnd < line.length &&
-      !/[ \t;&|()<>]/.test(line[targetEnd])
-    ) {
-      targetEnd += 1;
-    }
-    if (targetEnd > targetStart) {
-      declarations.push({
-        delimiter: line.slice(targetStart, targetEnd),
-        stripTabs,
-        quoted: false,
-      });
-      index = targetEnd - 1;
+      index = parsedDelimiter.end - 1;
     }
   }
 
   return declarations;
+}
+
+function parseBashHeredocDelimiter(
+  line: string,
+  start: number
+): { delimiter: string; end: number; quoted: boolean } | undefined {
+  let delimiter = '';
+  let quoted = false;
+  let quote: '\'' | '"' | undefined;
+  let index = start;
+
+  while (index < line.length) {
+    const char = line[index];
+    if (quote == null && /[ \t;&|()<>]/.test(char)) {
+      break;
+    }
+    if (char === '\\' && quote !== '\'') {
+      const next = line[index + 1];
+      if (next != null && (quote == null || /[$`"\\\n]/.test(next))) {
+        quoted = true;
+        if (next !== '\n') delimiter += next;
+        index += 2;
+        continue;
+      }
+    }
+    if (char === '\'' || char === '"') {
+      if (quote == null) {
+        quote = char;
+        quoted = true;
+        index += 1;
+        continue;
+      }
+      if (quote === char) {
+        quote = undefined;
+        index += 1;
+        continue;
+      }
+    }
+    delimiter += char;
+    index += 1;
+  }
+
+  if (delimiter === '' || quote != null) {
+    return undefined;
+  }
+  return { delimiter, end: index, quoted };
 }
 
 /** Returns whether a reserved word begins where a shell command may begin. */

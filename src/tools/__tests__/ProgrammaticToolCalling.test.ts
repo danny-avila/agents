@@ -1085,6 +1085,20 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       expect(used).toEqual(new Set(['search_docs']));
     });
 
+    it('applies quote removal to heredoc delimiters', () => {
+      const escaped = extractUsedBashToolNames(
+        'cat <<E\\OF\n$(get_weather \'{}\')\nEOF\nsearch_docs \'{}\'',
+        availableTools
+      );
+      const mixedQuoted = extractUsedBashToolNames(
+        'cat <<E"O"F\n$(get_weather \'{}\')\nEOF\nsearch_docs \'{}\'',
+        availableTools
+      );
+
+      expect(escaped).toEqual(new Set(['search_docs']));
+      expect(mixedQuoted).toEqual(new Set(['search_docs']));
+    });
+
     it('leaves escaped unquoted-heredoc substitutions masked', () => {
       const used = extractUsedBashToolNames(
         'cat <<EOF\n\\$(get_weather \'{}\')\n$(search_docs \'{}\')\nEOF',
@@ -1209,6 +1223,18 @@ value="$(printf '%s' value#fragment; search_docs '{}')"`,
       );
 
       expect(used).toEqual(new Set(['get_weather', 'search_docs']));
+    });
+
+    it('prefers registered tool functions over shell scanner controls', () => {
+      const controlTools = new Map(
+        ['env', 'command', 'eval', 'trap'].map((name) => [name, name])
+      );
+      const used = extractUsedBashToolNames(
+        'env \'{}\'; command \'{}\'; eval \'{}\'; trap \'{}\'',
+        controlTools
+      );
+
+      expect(used).toEqual(new Set(['env', 'command', 'eval', 'trap']));
     });
 
     it('does not interpret arithmetic shifts as heredocs', () => {
