@@ -78,6 +78,7 @@ export type GoogleThinkingConfig = {
  *  Azure wrappers that both read them. */
 export type ManagedRequestOptions = {
   promptCacheExplicit?: boolean;
+  promptCacheKey?: string;
   safety_identifier?: string;
 };
 /**
