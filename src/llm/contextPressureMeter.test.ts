@@ -1,8 +1,4 @@
-import {
-  AIMessage,
-  HumanMessage,
-  ToolMessage,
-} from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import {
   createContextPressureMeter,
@@ -51,7 +47,9 @@ describe('createContextPressureMeter', () => {
       effectiveInstructionTokens: 10,
     });
     expect(meter.measure(projected).projectedMessageTokens).toBe(33);
-    expect(tokenCounter).toHaveBeenCalledTimes(3);
+    /** Stored counts cover the baseline; only the changed projection and its
+     *  baseline subtrahend are tokenized, never the untouched message. */
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
   });
 
   it('reuses stable exact counts across request-scoped meters', () => {
@@ -71,6 +69,40 @@ describe('createContextPressureMeter', () => {
         indexTokenCountMap: Object.fromEntries(
           messages.map((_, index) => [index, 8])
         ),
+        contextUsage: {
+          contextBudget: 10_000,
+          effectiveInstructionTokens: 100,
+          remainingContextTokens: 9_000,
+          calibrationRatio: 1,
+        },
+        instructionTokens: 100,
+        calibrationRatio: 1,
+      });
+
+    createMeter(retained).measure(retained);
+    createMeter(retained).measure(retained);
+
+    const appended = [...retained, new HumanMessage('new')];
+    createMeter(appended).measure(appended);
+
+    expect(tokenCounter).toHaveBeenCalledTimes(0);
+  });
+
+  it('reuses exact counts across request-scoped meters when no stored counts exist', () => {
+    const retained = Array.from(
+      { length: 100 },
+      (_, index) =>
+        new HumanMessage({ id: `message-${index}`, content: 'retained' })
+    );
+    const tokenCounter = jest.fn(contentLength);
+    const tokenCountCache = createExactTokenCountCache(tokenCounter);
+    const createMeter = (messages: BaseMessage[]) =>
+      createContextPressureMeter({
+        tokenCounter,
+        tokenCountCache,
+        sourceMessages: messages,
+        retainedMessages: messages,
+        indexTokenCountMap: {},
         contextUsage: {
           contextBudget: 10_000,
           effectiveInstructionTokens: 100,
@@ -252,7 +284,7 @@ describe('createContextPressureMeter', () => {
       ]);
     }
 
-    expect(tokenCounter).toHaveBeenCalledTimes(113);
+    expect(tokenCounter).toHaveBeenCalledTimes(13);
   });
 
   it('uses a conservative ratio for fallback payloads', () => {

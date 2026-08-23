@@ -1,4 +1,4 @@
-import { isProxy } from 'node:util/types';
+import { isArrayBuffer, isDate, isProxy } from 'node:util/types';
 import { ToolMessage, type BaseMessage } from '@langchain/core/messages';
 import {
   HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
@@ -151,11 +151,17 @@ function jsonStringLength(
 
 type NativeDateRead = { matched: true; time: number } | { matched: false };
 
+/**
+ * `isArrayBuffer` reads the internal slot natively (no user code, cross-realm safe) and
+ * costs nothing for the plain objects that make up almost all content; the getter's
+ * throw path was the expensive part, so it only runs once the brand is already known.
+ */
 function readNativeArrayBufferByteLength(value: unknown): number | undefined {
   if (
     value == null ||
     typeof value !== 'object' ||
-    NATIVE_ARRAY_BUFFER_BYTE_LENGTH_GETTER == null
+    NATIVE_ARRAY_BUFFER_BYTE_LENGTH_GETTER == null ||
+    !isArrayBuffer(value)
   ) {
     return undefined;
   }
@@ -167,7 +173,7 @@ function readNativeArrayBufferByteLength(value: unknown): number | undefined {
 }
 
 function readNativeDate(value: unknown): NativeDateRead {
-  if (value == null || typeof value !== 'object') {
+  if (value == null || typeof value !== 'object' || !isDate(value)) {
     return { matched: false };
   }
   try {
