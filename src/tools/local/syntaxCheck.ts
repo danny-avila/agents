@@ -96,6 +96,12 @@ async function probe(
   if (!result.cacheable && entry[cached] === probePromise) {
     delete entry[cached];
   }
+  if (result.cacheUntil != null && result.cacheUntil <= Date.now()) {
+    if (entry[cached] === probePromise) {
+      delete entry[cached];
+    }
+    return probe(command, args, cached, config);
+  }
   return result.available;
 }
 

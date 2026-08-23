@@ -766,6 +766,12 @@ async function isRipgrepAvailable(
   if (!result.cacheable && envMap.get(envKey) === probePromise) {
     envMap.delete(envKey);
   }
+  if (result.cacheUntil != null && result.cacheUntil <= Date.now()) {
+    if (envMap.get(envKey) === probePromise) {
+      envMap.delete(envKey);
+    }
+    return isRipgrepAvailable(config);
+  }
   return result.available;
 }
 

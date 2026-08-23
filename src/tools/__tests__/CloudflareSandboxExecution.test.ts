@@ -209,6 +209,48 @@ it('retries a transient capability-probe failure in a stable world', async () =>
   expect(execCalls).toBe(3);
 });
 
+it('reprobes an expired negative capability in a stateful world', async () => {
+  jest.useFakeTimers();
+  try {
+    jest.setSystemTime(0);
+    let execCalls = 0;
+    const config: t.CloudflareSandboxExecutionConfig = {
+      sandbox: createRuntime({
+        exec: async () => {
+          execCalls++;
+          if (execCalls === 1) {
+            return { exitCode: 127, stdout: '', stderr: 'node not found' };
+          }
+          if (execCalls === 2) {
+            return { exitCode: 0, stdout: 'v22', stderr: '' };
+          }
+          return { exitCode: 1, stdout: '', stderr: 'syntax error' };
+        },
+      }),
+    };
+
+    const first = await runPostEditSyntaxCheck(
+      '/workspace/first.js',
+      createCloudflareLocalExecutionConfig(config)
+    );
+    jest.setSystemTime(6000);
+    const second = await runPostEditSyntaxCheck(
+      '/workspace/second.js',
+      createCloudflareLocalExecutionConfig(config)
+    );
+
+    expect(first).toEqual({ ok: true });
+    expect(second).toEqual({
+      ok: false,
+      checker: 'node --check',
+      output: 'syntax error',
+    });
+    expect(execCalls).toBe(3);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
 it('reports the invoked runner name for Cloudflare caller-policy failures', async () => {
   const programmatic = createCloudflareProgrammaticToolCallingTool({
     sandbox: createRuntime(),

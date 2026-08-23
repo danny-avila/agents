@@ -22,6 +22,7 @@ const DEFAULT_MAX_SPAWNED_BYTES = 50 * 1024 * 1024;
 const DEFAULT_LOCAL_SESSION_ID = 'local';
 const DEFAULT_SHELL = process.platform === 'win32' ? 'bash.exe' : 'bash';
 const MAX_COMMAND_AVAILABILITY_ENVIRONMENTS = 16;
+const NEGATIVE_COMMAND_AVAILABILITY_TTL_MS = 5000;
 
 /** Produces a stable, non-plaintext key for environment-sensitive probes. */
 export function commandAvailabilityEnvCacheKey(
@@ -30,10 +31,9 @@ export function commandAvailabilityEnvCacheKey(
   if (env == null) {
     return '';
   }
-  const sorted: Record<string, string | undefined> = {};
-  for (const key of Object.keys(env).sort()) {
-    sorted[key] = env[key];
-  }
+  const sorted = Object.keys(env)
+    .sort()
+    .map((key): [string, string | null] => [key, env[key] ?? null]);
   return createHash('sha256').update(JSON.stringify(sorted)).digest('hex');
 }
 
@@ -959,6 +959,7 @@ export async function spawnLocalProcess(
 export type CommandAvailabilityProbe = {
   available: boolean;
   cacheable: boolean;
+  cacheUntil?: number;
 };
 
 async function isDurableCommandLookupError(
@@ -996,10 +997,14 @@ export async function probeLocalCommandAvailability(
       { internal: true }
     );
     const available = result.exitCode === 0;
+    const durableNegative =
+      result.exitCode === 126 || result.exitCode === 127;
     return {
       available,
-      cacheable:
-        available || result.exitCode === 126 || result.exitCode === 127,
+      cacheable: available || durableNegative,
+      ...(durableNegative
+        ? { cacheUntil: Date.now() + NEGATIVE_COMMAND_AVAILABILITY_TTL_MS }
+        : {}),
     };
   } catch (error) {
     const cacheable =
@@ -1009,6 +1014,9 @@ export async function probeLocalCommandAvailability(
     return {
       available: false,
       cacheable,
+      ...(cacheable
+        ? { cacheUntil: Date.now() + NEGATIVE_COMMAND_AVAILABILITY_TTL_MS }
+        : {}),
     };
   }
 }

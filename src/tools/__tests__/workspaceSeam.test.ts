@@ -133,6 +133,9 @@ describe('workspace seam', () => {
       expect(key).toBe(
         commandAvailabilityEnvCacheKey({ PATH: '/bin', TOKEN: secret })
       );
+      expect(commandAvailabilityEnvCacheKey({})).not.toBe(
+        commandAvailabilityEnvCacheKey({ PATH: undefined })
+      );
     });
 
     it('defaults to the Node host fs when nothing is supplied', () => {
