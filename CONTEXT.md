@@ -72,6 +72,12 @@ host explicitly declares that they implement the same deterministic surface
 contract.
 See [ADR 0001](docs/adr/0001-reuse-exact-context-token-counts.md) for the
 cache boundary and host-lifecycle trade-offs.
+Host-supplied index token counts are the baseline's accounting weight; a
+retained message is tokenized only when no such count exists or when a
+provider projection replaced its object, since the exact count then serves
+only as the subtrahend of that projection's delta. Native brand checks in
+content validation use `node:util/types` slot reads rather than throwing
+probes, so plain content objects never pay an exception per value.
 
 The meter's estimates decide overflow and recovery only. Provider-reported
 usage remains the source of truth for billing and Langfuse observations.

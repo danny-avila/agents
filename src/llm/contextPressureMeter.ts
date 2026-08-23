@@ -35,7 +35,9 @@ interface ProviderPayloadMeasureOptions {
 }
 
 interface ProviderMessageBaseline {
-  rawTokens: number;
+  message: BaseMessage;
+  /** Lazily tokenized: reading it costs a full count, so only read it on a changed projection. */
+  readonly rawTokens: number;
   accountingWeight: number;
 }
 
@@ -264,20 +266,27 @@ export function createContextPressureMeter({
       sourceIndices.set(sourceMessages[i], i);
     }
     baseline = retainedMessages.map((message, index) => {
-      const rawTokens = count(message);
       const sourceIndex = sourceIndices.get(message);
       const indexedTokens =
         sourceIndex != null ? indexTokenCountMap[sourceIndex] : undefined;
-      const accountingWeight =
+      const hasIndexedTokens =
         indexedTokens != null &&
         Number.isFinite(indexedTokens) &&
-        indexedTokens >= 0
-          ? indexedTokens
-          : rawTokens;
+        indexedTokens >= 0;
+      const accountingWeight = hasIndexedTokens
+        ? indexedTokens
+        : count(message);
       if (!origins.has(message)) {
         origins.set(message, index);
       }
-      return { rawTokens, accountingWeight };
+      return {
+        message,
+        /** Exact count is only needed as the subtrahend when a projection changed this message. */
+        get rawTokens(): number {
+          return count(message);
+        },
+        accountingWeight,
+      };
     });
     baselineWeights = {};
     for (let i = 0; i < baseline.length; i++) {
@@ -382,9 +391,7 @@ export function createContextPressureMeter({
     ) {
       let attribution = baselineAttributions.get(availableMessageTokens);
       if (attribution == null) {
-        const replyPrimerTokens = Math.round(
-          REPLY_PRIMER_TOKENS * usageRatio
-        );
+        const replyPrimerTokens = Math.round(REPLY_PRIMER_TOKENS * usageRatio);
         const attributableTokens =
           totalBaselineWeight > 0
             ? Math.min(
@@ -415,17 +422,20 @@ export function createContextPressureMeter({
       let newRawTokens = 0;
       const usedOrigins = new Set<number>();
       for (const message of messages) {
-        const rawTokens = count(message);
         const origin = origins.get(message);
         if (origin == null || usedOrigins.has(origin)) {
-          newRawTokens += rawTokens;
+          newRawTokens += count(message);
           continue;
         }
         usedOrigins.add(origin);
+        const projectionDelta =
+          message === baseline[origin].message
+            ? 0
+            : count(message) - baseline[origin].rawTokens;
         projectedMessageTokens += Math.max(
           0,
           attribution.attributedByOrigin[origin] +
-            Math.round((rawTokens - baseline[origin].rawTokens) * usageRatio)
+            Math.round(projectionDelta * usageRatio)
         );
       }
       projectedMessageTokens += Math.round(newRawTokens * usageRatio);
