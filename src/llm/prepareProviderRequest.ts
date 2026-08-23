@@ -14,7 +14,6 @@ import {
 } from '@/messages/core';
 import {
   coalesceAdjacentUserTurns,
-  strictAlternationProviders,
   appendPredecessorHandoffCue,
   removePredecessorHandoffCue,
 } from '@/messages';
@@ -23,8 +22,9 @@ import {
   stripBedrockCacheControl,
 } from '@/messages/cache';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
-import { Providers } from '@/common';
+import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { isAnthropicLike, isOpenAILike } from '@/utils/llm';
+import { Providers } from '@/common';
 
 const preparedProviderRequestBrand = Symbol('PreparedProviderRequest');
 
@@ -43,7 +43,7 @@ export interface ProviderPayloadMeasurement {
 export interface PreparedProviderRequest {
   readonly model: t.ChatModel;
   readonly modelId?: string;
-  readonly provider: Providers;
+  readonly provider: t.ProviderName;
   readonly projectionMode: ProviderMessageProjectionMode;
   readonly messages: BaseMessage[];
   readonly measurement?: ProviderPayloadMeasurement;
@@ -63,7 +63,7 @@ export interface ProviderRequestContext {
 export interface PrepareProviderRequestParams {
   model: t.ChatModel;
   messages: BaseMessage[];
-  provider: Providers;
+  provider: t.ProviderName;
   context?: ProviderRequestContext;
   config?: RunnableConfig;
   maxToolResultChars?: number;
@@ -72,7 +72,7 @@ export interface PrepareProviderRequestParams {
 
 export function usesNativeOpenAIResponses(
   model: t.ChatModel,
-  provider: Providers,
+  provider: t.ProviderName,
   callOptions?: unknown
 ): boolean {
   if (!isOpenAILike(provider)) {
@@ -142,7 +142,7 @@ export function usesNativeOpenAIResponses(
 
 function resolveProviderMessageProjectionMode(
   model: t.ChatModel,
-  provider: Providers,
+  provider: t.ProviderName,
   callOptions?: unknown
 ): ProviderMessageProjectionMode {
   return usesNativeOpenAIResponses(model, provider, callOptions)
@@ -153,17 +153,14 @@ function resolveProviderMessageProjectionMode(
 interface ProjectMessagesForProviderParams {
   model: t.ChatModel;
   messages: BaseMessage[];
-  provider: Providers;
+  provider: t.ProviderName;
   maxToolResultChars?: number;
   callOptions?: unknown;
 }
 
-function projectMessagesForProviderMode({
-  messages,
-  provider,
-  maxToolResultChars,
-}: ProjectMessagesForProviderParams,
-projectionMode: ProviderMessageProjectionMode
+function projectMessagesForProviderMode(
+  { messages, provider, maxToolResultChars }: ProjectMessagesForProviderParams,
+  projectionMode: ProviderMessageProjectionMode
 ): BaseMessage[] {
   const nativeOpenAIResponses = projectionMode === 'openai-responses';
   const providerInputMessages = projectToolStreamContentForProvider(
@@ -310,7 +307,7 @@ export function prepareProviderRequest({
         : (message): boolean => isRunProduced.call(context, message)
     )
     : removePredecessorHandoffCue(annotated);
-  const preparedMessages = strictAlternationProviders.has(provider)
+  const preparedMessages = providerRequiresStrictAlternation(provider)
     ? coalesceAdjacentUserTurns(cued)
     : cued;
 
@@ -332,7 +329,7 @@ export function prepareProviderRequest({
 export function assertPreparedProviderRequestFor(
   request: PreparedProviderRequest,
   model: t.ChatModel,
-  provider: Providers,
+  provider: t.ProviderName,
   config?: RunnableConfig
 ): void {
   if (
@@ -344,7 +341,9 @@ export function assertPreparedProviderRequestFor(
     throw new Error('Prepared provider request does not match serving model');
   }
   if (request.provider !== provider) {
-    throw new Error('Prepared provider request does not match serving provider');
+    throw new Error(
+      'Prepared provider request does not match serving provider'
+    );
   }
   if (
     request.projectionMode !==

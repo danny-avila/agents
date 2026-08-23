@@ -657,7 +657,7 @@ async function executeSummarizationWithFallback(params: {
      * `log('error', ...)` path below rather than bubbling up silently.
      */
     const summarizationModel = initializeModel({
-      provider: clientConfig.provider as Providers,
+      provider: clientConfig.provider,
       clientOptions: clientConfig.clientOptions as t.ClientOptions,
       tools: agentContext.getToolsForBinding(),
     }) as t.ChatModel;
@@ -670,13 +670,13 @@ async function executeSummarizationWithFallback(params: {
       priorSummaryText,
       config: summarizeConfig,
       stepId,
-      provider: clientConfig.provider as Providers,
+      provider: clientConfig.provider,
       reasoningKey: agentContext.reasoningKey,
       graph,
       usePromptCache,
       promptCacheTtl:
-        (clientConfig.provider as Providers) === Providers.ANTHROPIC ||
-        (clientConfig.provider as Providers) === Providers.OPENROUTER
+        clientConfig.provider === Providers.ANTHROPIC ||
+        clientConfig.provider === Providers.OPENROUTER
           ? resolvePromptCacheTtl(
             (
                 clientConfig.clientOptions as {
@@ -737,7 +737,7 @@ async function executeSummarizationWithFallback(params: {
         const onChunk = createSummarizationChunkHandler({
           stepId,
           config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
-          provider: clientConfig.provider as Providers,
+          provider: clientConfig.provider,
           reasoningKey: agentContext.reasoningKey,
           graph,
         });
@@ -1509,7 +1509,7 @@ export function createSummarizationChunkHandler({
 }: {
   stepId?: string;
   config?: RunnableConfig;
-  provider?: Providers;
+  provider?: t.ProviderName;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   graph?: StreamLimitState & { getBreakerController?: () => AbortController };
 }): OnChunk | undefined {
@@ -1622,7 +1622,7 @@ async function summarizeWithCacheHit({
   priorSummaryText: string;
   config?: RunnableConfig;
   stepId?: string;
-  provider: Providers;
+  provider: t.ProviderName;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
   usePromptCache?: boolean;

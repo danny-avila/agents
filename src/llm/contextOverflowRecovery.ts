@@ -18,7 +18,7 @@
  * provider-space budget.
  */
 import type { ContextOverflowInfo } from '@/utils/errors';
-import type { Providers } from '@/common';
+import type { ProviderName } from '@/types';
 import { getContextOverflowInfo } from '@/utils/errors';
 
 /** Fraction of the previous budget used when the provider named no ceiling. */
@@ -66,7 +66,7 @@ export interface OverflowRecoveryPlan {
 
 export interface OverflowRecoveryParams {
   error: unknown;
-  provider: Providers;
+  provider: ProviderName;
   /** Budget in force when the rejected prompt was built. */
   maxContextTokens?: number;
   /** Our own estimate of the prompt we actually sent. */

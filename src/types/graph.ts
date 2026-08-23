@@ -40,10 +40,10 @@ import type {
   StreamPreemption,
   TokenBudgetBreakdown,
 } from '@/types/run';
-import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { SubagentTaskConfig } from '@/types/subagentTasks';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
-import type { ClientOptions } from '@/types/llm';
+import type { ClientOptions, ProviderName } from '@/types/llm';
+import type { Callback, GraphNodeKeys } from '@/common';
 
 /** Interface for bound model with stream and invoke methods */
 export interface ChatModel {
@@ -839,7 +839,7 @@ export interface AgentInputs {
   toolEnd?: boolean;
   toolMap?: ToolMap;
   tools?: GraphTools;
-  provider: Providers;
+  provider: ProviderName;
   /** Stable/cacheable system instructions. */
   instructions?: string;
   streamBuffer?: number;

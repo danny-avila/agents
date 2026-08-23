@@ -72,7 +72,6 @@ import {
   splitAtRecencyBoundary,
   convertInjectedMessages,
   coalesceAdjacentUserTurns,
-  strictAlternationProviders,
   appendPredecessorHandoffCue,
   stampSyntheticProviderMessage,
 } from '@/messages';
@@ -99,14 +98,6 @@ import {
   sleep,
 } from '@/utils';
 import {
-  attemptInvoke,
-  tryFallbackProviders,
-  getFallbackErrorContext,
-  getFallbackOverflowCandidates,
-} from '@/llm/invoke';
-import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
-import { createContextPressureMeter } from '@/llm/contextPressureMeter';
-import {
   resolveStreamLimits,
   StreamLimitExceededError,
   sweepStaleStreamLimitEntries,
@@ -130,6 +121,12 @@ import {
   planContextOverflowRecovery,
   translateRecoveryBudget,
 } from '@/llm/contextOverflowRecovery';
+import {
+  attemptInvoke,
+  tryFallbackProviders,
+  getFallbackErrorContext,
+  getFallbackOverflowCandidates,
+} from '@/llm/invoke';
 import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
@@ -159,8 +156,11 @@ import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
+import { createContextPressureMeter } from '@/llm/contextPressureMeter';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
+import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { initializeLangfuseTracing } from '@/instrumentation';
 import { shouldTriggerSummarization } from '@/summarization';
@@ -324,7 +324,7 @@ function isGoogleServerSideToolMessageContentPart(
 }
 
 function hasGoogleServerSideToolDeltaContent(
-  provider: Providers | undefined,
+  provider: t.ProviderName | undefined,
   content: t.MessageDelta['content']
 ): content is t.MessageContentComplex[] {
   return (
@@ -337,7 +337,7 @@ function hasGoogleServerSideToolDeltaContent(
 }
 
 function getMessageDeltaContent(
-  provider: Providers | undefined,
+  provider: t.ProviderName | undefined,
   content: MessageContent | undefined
 ): t.MessageDelta['content'] | undefined {
   if (content == null) {
@@ -550,7 +550,7 @@ async function dispatchTextMessageContent({
 }: {
   graph: Graph<t.BaseGraphState>;
   stepKey: string;
-  provider?: Providers;
+  provider?: t.ProviderName;
   content: t.MessageDelta['content'];
   metadata: Record<string, unknown>;
 }): Promise<boolean> {
@@ -3237,7 +3237,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         info,
       }: {
         projection: ReturnType<typeof measureProviderPayload>;
-        provider?: Providers;
+        provider?: t.ProviderName;
         info: string;
       }): ContextOverflowError => {
         const error = new ContextOverflowError(
@@ -3508,7 +3508,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * drop messages, so coalescing has to see its output, and it is the
        * last shaping step before the cache breakpoint is chosen.
        */
-      if (strictAlternationProviders.has(agentContext.provider)) {
+      if (providerRequiresStrictAlternation(agentContext.provider)) {
         /**
          * Wrapped like every other provider transform: the merged message is
          * a NEW object, and without re-attachment the final pre-invoke

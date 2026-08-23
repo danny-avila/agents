@@ -46,6 +46,39 @@ const content = await run.processStream(
 );
 ```
 
+## Runtime Provider Registration
+
+Hosts can register a compatible LangChain chat model before creating a run,
+without adding the provider to this package. The provider registration carries
+the model constructor plus the shared message and streaming behavior the model
+needs.
+
+```typescript
+import { registerProvider } from '@librechat/agents/provider-registration';
+
+interface AcmeOptions {
+  apiKey: string;
+  model: string;
+}
+
+declare module '@librechat/agents/provider-registration' {
+  interface CustomProviderOptionsMap {
+    acme: AcmeOptions;
+  }
+}
+
+const unregister = registerProvider({
+  provider: 'acme',
+  model: AcmeChatModel,
+  family: 'openai',
+});
+```
+
+Register once per process before the provider is used. Duplicate names are
+rejected, and `unregister()` removes only that registration. Set
+`manualToolStream` or `strictAlternation` only when the provider contract needs
+those behaviors.
+
 ## Programmatic Sessions
 
 For scripts, CI, and programmatic integrations, use the session facade. It

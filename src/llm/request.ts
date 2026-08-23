@@ -7,7 +7,7 @@ import { Providers } from '@/common';
  * and OpenAI-compat (modelKwargs.thinking).
  */
 export function isThinkingEnabled(
-  provider: Providers,
+  provider: t.ProviderName,
   clientOptions?: t.ClientOptions
 ): boolean {
   if (!clientOptions) return false;
@@ -47,7 +47,7 @@ export function isThinkingEnabled(
  * use `maxTokens`.
  */
 export function getMaxOutputTokensKey(
-  provider: Providers | string
+  provider: t.ProviderName
 ): 'maxOutputTokens' | 'maxTokens' {
   return provider === Providers.GOOGLE || provider === Providers.VERTEXAI
     ? 'maxOutputTokens'

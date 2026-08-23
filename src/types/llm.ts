@@ -8,6 +8,7 @@ import type {
 } from '@langchain/openai';
 import type {
   BindToolsInput,
+  BaseChatModel,
   BaseChatModelParams,
 } from '@langchain/core/language_models/chat_models';
 import type { GoogleGenerativeAIChatInput } from '@langchain/google-genai';
@@ -21,6 +22,7 @@ import type { AnthropicInput } from '@langchain/anthropic';
 import type { Runnable } from '@langchain/core/runnables';
 import type { OpenAI as OpenAIClient } from 'openai';
 import type { ChatXAIInput } from '@langchain/xai';
+import type { CustomProviderOptionsMap } from '../provider-registration';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
 import type { PromptCacheTtl } from '@/messages/cache';
 import {
@@ -138,7 +140,7 @@ export type DeepSeekClientOptions = Partial<ChatDeepSeekInput> &
   StreamSmoothingOptions;
 export type XAIClientOptions = ChatXAIInput & StreamSmoothingOptions;
 
-export type ClientOptions =
+export type BuiltInClientOptions =
   | OpenAIClientOptions
   | AzureClientOptions
   | AnthropicClientOptions
@@ -149,13 +151,29 @@ export type ClientOptions =
   | DeepSeekClientOptions
   | XAIClientOptions;
 
+type CustomProviderName = Extract<keyof CustomProviderOptionsMap, string>;
+
+type RuntimeProviderName = string & {
+  readonly __runtimeProviderName?: never;
+};
+
+export type ProviderName =
+  | keyof ProviderOptionsMap
+  | CustomProviderName
+  | RuntimeProviderName;
+
+export type ClientOptions =
+  | BuiltInClientOptions
+  | CustomProviderOptionsMap[CustomProviderName];
+
 export type SharedLLMConfig = {
-  provider: Providers;
+  provider: ProviderName;
+  model?: string;
   _lc_stream_delay?: number;
 };
 
 export interface FallbackConfig {
-  provider: Providers;
+  provider: ProviderName;
   clientOptions?: ClientOptions;
   /** Context window used to corroborate ambiguous fallback overflow errors. */
   maxContextTokens?: number;
@@ -182,7 +200,7 @@ export type ProviderOptionsMap = {
   [Providers.MOONSHOT]: OpenAIClientOptions;
 };
 
-export type ChatModelMap = {
+export interface ChatModelMap {
   [Providers.XAI]: ChatXAI;
   [Providers.OPENAI]: ChatOpenAI;
   [Providers.AZURE]: AzureChatOpenAI;
@@ -195,14 +213,32 @@ export type ChatModelMap = {
   [Providers.BEDROCK]: CustomChatBedrockConverse;
   [Providers.GOOGLE]: CustomChatGoogleGenerativeAI;
   [Providers.MOONSHOT]: ChatMoonshot;
-};
+}
+
+export type ProviderOptionsFor<P extends ProviderName> =
+  P extends keyof ProviderOptionsMap
+    ? ProviderOptionsMap[P]
+    : P extends CustomProviderName
+      ? CustomProviderOptionsMap[P]
+      : BuiltInClientOptions;
+
+export type ProviderModelFor<P extends ProviderName> =
+  P extends keyof ChatModelMap
+    ? ChatModelMap[P] & BaseChatModel
+    : BaseChatModel;
+
+export type ProviderModelConstructor<P extends ProviderName> = new (
+  config: ProviderOptionsFor<P>
+) => ProviderModelFor<P>;
 
 export type ChatModelConstructorMap = {
   [P in Providers]: new (config: ProviderOptionsMap[P]) => ChatModelMap[P];
 };
 
-export type ChatModelInstance = ChatModelMap[Providers];
+export type ChatModelInstance = BaseChatModel;
 
-export type ModelWithTools = ChatModelInstance & {
+export type ModelWithTools = BaseChatModel & {
   bindTools(tools: CommonToolType[]): Runnable;
 };
+
+export type { CustomProviderOptionsMap } from '../provider-registration';

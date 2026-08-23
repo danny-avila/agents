@@ -7,8 +7,18 @@ import type {
   BaseMessageFields,
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
-import type * as t from '@/types';
 import type { ExactTokenCountCache } from '@/llm/contextPressureMeter';
+import type * as t from '@/types';
+import {
+  type CallerCapabilityProjection,
+  allowsToolCaller,
+  applyCallerCapabilityDefinitionOverrides,
+  createCallerCapabilityProjectionSnapshot,
+  isToolDefinitionActive,
+  isProgrammaticControlTool,
+  mergeCallerCapabilityDefinitions,
+  resolveCallerCapabilityProjection,
+} from '@/tools/CallerCapabilities';
 import {
   addTailCacheControl,
   addCacheControlToStablePrefixMessages,
@@ -19,6 +29,12 @@ import {
   cloneMessage,
   type PromptCacheTtl,
 } from '@/messages/cache';
+import {
+  isProgrammaticRunnerAutoBound,
+  isProgrammaticRunnerResolvedDirectly,
+  resolveLocalImplementationNames,
+  resolveLocalToolRegistry,
+} from '@/tools/local/resolveLocalExecutionTools';
 import {
   DEFAULT_RESERVE_RATIO,
   ORIGINAL_CONTENT_MAX_CHARS,
@@ -33,27 +49,11 @@ import {
   Constants,
   Providers,
 } from '@/common';
-import {
-  isProgrammaticRunnerAutoBound,
-  isProgrammaticRunnerResolvedDirectly,
-  resolveLocalImplementationNames,
-  resolveLocalToolRegistry,
-} from '@/tools/local/resolveLocalExecutionTools';
-import {
-  type CallerCapabilityProjection,
-  allowsToolCaller,
-  applyCallerCapabilityDefinitionOverrides,
-  createCallerCapabilityProjectionSnapshot,
-  isToolDefinitionActive,
-  isProgrammaticControlTool,
-  mergeCallerCapabilityDefinitions,
-  resolveCallerCapabilityProjection,
-} from '@/tools/CallerCapabilities';
+import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
+import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
-import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
-import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { toJsonSchema } from '@/utils/schema';
 
 type AgentSystemTextBlock = {
@@ -201,7 +201,7 @@ export class AgentContext {
   /** Human-readable name for this agent (used in handoff context). Falls back to agentId if not provided. */
   name?: string;
   /** Provider for this specific agent */
-  provider: Providers;
+  provider: t.ProviderName;
   /** Client options for this agent */
   clientOptions?: t.ClientOptions;
   /** Per-agent Langfuse tracing configuration. */
@@ -433,7 +433,7 @@ export class AgentContext {
     agentId: string;
     codeSessionKey?: string;
     name?: string;
-    provider: Providers;
+    provider: t.ProviderName;
     clientOptions?: t.ClientOptions;
     langfuse?: t.LangfuseConfig;
     maxContextTokens?: number;
@@ -570,7 +570,9 @@ export class AgentContext {
       directOnlyToolNames.length > 0
         ? `\nCall these tools directly; never list them in the \`tool_manifest\` or reference them inside ${programmaticRunnerNames}: ${directOnlyToolNames
           .map((name) => `\`${name}\``)
-          .join(', ')}. Every ${programmaticRunnerNames} call must include a \`tool_manifest\` containing the exact registered names used by its code; the manifest is validated before execution starts.`
+          .join(
+            ', '
+          )}. Every ${programmaticRunnerNames} call must include a \`tool_manifest\` containing the exact registered names used by its code; the manifest is validated before execution starts.`
         : '';
     const boundary =
       '\n\n' +
@@ -658,9 +660,8 @@ export class AgentContext {
         this.toolExecution,
         this.toolDefinitions?.some((toolDef) => toolDef.name === name) === true
       ) ||
-      this.graphTools?.some(
-        (tool) => 'name' in tool && tool.name === name
-      ) === true
+      this.graphTools?.some((tool) => 'name' in tool && tool.name === name) ===
+        true
     );
   }
 
@@ -1618,7 +1619,7 @@ export class AgentContext {
 
   /** Applies token calibration only when the observation came from this provider. */
   applyObservedOverflowCalibration(
-    provider: Providers | undefined,
+    provider: t.ProviderName | undefined,
     observedCalibrationRatio: number | undefined
   ): void {
     if (

@@ -2,7 +2,7 @@ import { ChatVertexAI } from '@langchain/google-vertexai';
 import type { Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
-import { getRegisteredChatModelClass } from '@/llm/providers';
+import { getChatModelClass } from '@/llm/providers';
 import { isOpenAILike } from '@/utils';
 import { Providers } from '@/common';
 
@@ -11,20 +11,22 @@ import { Providers } from '@/common';
  * provider, applies provider-specific field assignments, and optionally binds
  * tools.
  */
-export function initializeModel({
+export function initializeModel<P extends t.ProviderName>({
   provider,
   clientOptions,
   tools,
   override,
 }: {
-  provider: Providers | string;
-  clientOptions?: t.ClientOptions;
+  provider: P;
+  clientOptions?: t.ProviderOptionsFor<P>;
   tools?: t.GraphTools;
   override?: t.ChatModelInstance;
 }): Runnable {
   const model =
     override ??
-    new (getRegisteredChatModelClass(provider))(clientOptions ?? ({} as never));
+    new (getChatModelClass(provider))(
+      clientOptions ?? ({} as t.ProviderOptionsFor<P>)
+    );
 
   if (
     isOpenAILike(provider) &&
@@ -52,8 +54,14 @@ export function initializeModel({
   }
 
   if (!tools || tools.length === 0) {
-    return model as unknown as Runnable;
+    return model;
   }
 
-  return (model as t.ModelWithTools).bindTools(tools);
+  if (!('bindTools' in model) || typeof model.bindTools !== 'function') {
+    throw new TypeError(
+      `LLM provider does not support tool binding: ${provider}`
+    );
+  }
+
+  return model.bindTools(tools);
 }

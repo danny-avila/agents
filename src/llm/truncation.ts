@@ -1,4 +1,5 @@
 import type { AIMessageChunk, BaseMessage } from '@langchain/core/messages';
+import type { ProviderName } from '@/types';
 import { Providers } from '@/common';
 
 /**
@@ -7,7 +8,7 @@ import { Providers } from '@/common';
  * `functionCall` whole and seal it on arrival, so a `MAX_TOKENS` finish does
  * NOT imply the arguments were cut off — the truncation guard must skip them.
  */
-const ATOMIC_TOOL_CALL_ARG_PROVIDERS = new Set<Providers>([
+const ATOMIC_TOOL_CALL_ARG_PROVIDERS = new Set<ProviderName>([
   Providers.GOOGLE,
   Providers.VERTEXAI,
 ]);
@@ -162,7 +163,7 @@ function collectToolCallNames(message: AIMessageChunk | BaseMessage): string[] {
  */
 export function assertNotTruncatedToolCall(
   message: AIMessageChunk | BaseMessage | undefined | null,
-  provider?: Providers
+  provider?: ProviderName
 ): void {
   if (message == null) {
     return;

@@ -1,5 +1,6 @@
 export const packageEntries = Object.freeze({
   main: 'src/index.ts',
+  'provider-registration': 'src/provider-registration.ts',
   'openai/index': 'src/openai/index.ts',
   'responses/index': 'src/responses/index.ts',
   'langchain/index': 'src/langchain/index.ts',

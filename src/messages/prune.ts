@@ -13,6 +13,7 @@ import type {
 } from '@/types/stream';
 import type { ContextPruningConfig } from '@/types/graph';
 import type { TokenCounter } from '@/types/run';
+import type { ProviderName } from '@/types';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
@@ -130,7 +131,7 @@ export function clampCalibrationRatio(ratio: number): number {
 }
 
 export type PruneMessagesFactoryParams = {
-  provider?: Providers;
+  provider?: ProviderName;
   maxTokens: number;
   /** Per-tool-result character cap applied while reconciling cached counts. */
   maxToolResultChars?: number;

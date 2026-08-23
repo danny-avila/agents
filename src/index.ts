@@ -52,6 +52,12 @@ export type * from './types';
 /* LangChain compatibility facade */
 export * from './langchain';
 
+/**
+ * HITL primitives re-exported from `@langchain/langgraph` so hosts that
+ * build durable checkpoint savers, dispatch `Command({ resume })`, or
+ * detect interrupts can do so against the same langgraph instance the
+ * SDK was compiled against — avoiding accidental dual-version drift.
+ */
 export {
   Command,
   INTERRUPT,
@@ -71,12 +77,12 @@ export type {
   OpenRouterReasoningEffort,
   ChatOpenRouterCallOptions,
 } from './llm/openrouter';
-export {
-  getChatModelClass,
-  getRegisteredChatModelClass,
-  registerChatModelProvider,
-} from './llm/providers';
-export type { RegisteredChatModelConstructor } from './llm/providers';
+export { getChatModelClass } from './llm/providers';
+export { registerProvider } from './provider-registration';
+export type {
+  ProviderFamily,
+  ProviderRegistrationOptions,
+} from './provider-registration';
 export { CustomChatMistralAI } from './llm/mistral';
 export {
   smoothStream,
