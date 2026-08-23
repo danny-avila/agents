@@ -931,10 +931,18 @@ export type CommandAvailabilityProbe = {
   cacheable: boolean;
 };
 
+function isDurableCommandLookupError(error: object): boolean {
+  if (!('code' in error)) {
+    return false;
+  }
+  return error.code === 'ENOENT' || error.code === 'EACCES';
+}
+
 /**
  * Probes one executable without turning transient backend failures into
  * permanent capability facts. Exit 126/127 is a definite unusable/missing
- * executable; timeouts, transport failures, and other exits are retried.
+ * executable, as are native ENOENT/EACCES lookup failures. Timeouts,
+ * transport failures, and other exits are retried.
  */
 export async function probeLocalCommandAvailability(
   command: string,
@@ -954,8 +962,14 @@ export async function probeLocalCommandAvailability(
       cacheable:
         available || result.exitCode === 126 || result.exitCode === 127,
     };
-  } catch {
-    return { available: false, cacheable: false };
+  } catch (error) {
+    return {
+      available: false,
+      cacheable:
+        typeof error === 'object' &&
+        error != null &&
+        isDurableCommandLookupError(error),
+    };
   }
 }
 

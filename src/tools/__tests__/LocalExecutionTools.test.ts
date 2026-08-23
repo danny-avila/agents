@@ -963,6 +963,38 @@ describe('codex review fixes', () => {
       expect(probeCalls).toBe(2);
       expect(searchCalls).toBe(1);
     });
+
+    it('caches a native ENOENT ripgrep verdict on the same backend', async () => {
+      _resetRipgrepCacheForTests();
+      const realSpawn = (
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      let probeCalls = 0;
+      const missingBackend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'rg') {
+          probeCalls++;
+          return realSpawn(`missing-rg-${process.pid}`, args, opts);
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+      const cwd = await createTempDir();
+      await fsWriteFile(join(cwd, 'file.ts'), 'needle\n', 'utf8');
+      const grep = createLocalCodingToolBundle({
+        cwd,
+        exec: { spawn: missingBackend },
+      }).tools.find((tool) => tool.name === 'grep_search')!;
+
+      const first = await grep.invoke({ pattern: 'needle' });
+      const second = await grep.invoke({ pattern: 'needle' });
+
+      expect(JSON.stringify(first)).toContain('needle');
+      expect(JSON.stringify(second)).toContain('needle');
+      expect(probeCalls).toBe(1);
+    });
   });
 
   describe('additionalRoots resolved against workspace root (Codex P2 #3)', () => {
