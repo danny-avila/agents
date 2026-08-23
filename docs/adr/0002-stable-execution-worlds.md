@@ -32,6 +32,7 @@ each invocation.
 - Filesystem and subprocess adapters are explicitly paired as one namespace.
 - Local and Cloudflare output, error, timeout, cleanup, and security behavior
   remain in their existing adapters.
-- Hosts should treat an execution configuration as immutable for its lifetime.
+- Changes to captured Cloudflare workspace, timeout, or sandbox settings rebuild
+  the cached world so its filesystem and subprocess capabilities stay paired.
 - Non-bash local `execute_code` staging still uses the host temporary directory;
   moving temporary lifecycle operations into the world is a separate change.

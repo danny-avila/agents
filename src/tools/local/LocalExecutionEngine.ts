@@ -931,18 +931,27 @@ export type CommandAvailabilityProbe = {
   cacheable: boolean;
 };
 
-function isDurableCommandLookupError(error: object): boolean {
-  if (!('code' in error)) {
+async function isDurableCommandLookupError(
+  error: object,
+  config: t.LocalExecutionConfig
+): Promise<boolean> {
+  if (!('code' in error) || error.code !== 'ENOENT') {
     return false;
   }
-  return error.code === 'ENOENT' || error.code === 'EACCES';
+  try {
+    const cwd = getLocalCwd(config);
+    return (await getWorkspaceFS(config).stat(cwd)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /**
  * Probes one executable without turning transient backend failures into
  * permanent capability facts. Exit 126/127 is a definite unusable/missing
- * executable, as are native ENOENT/EACCES lookup failures. Timeouts,
- * transport failures, and other exits are retried.
+ * executable. A native ENOENT is stable only when the current working
+ * directory exists; timeouts, transport failures, and ambiguous lookup
+ * failures are retried.
  */
 export async function probeLocalCommandAvailability(
   command: string,
@@ -963,12 +972,13 @@ export async function probeLocalCommandAvailability(
         available || result.exitCode === 126 || result.exitCode === 127,
     };
   } catch (error) {
+    const cacheable =
+      typeof error === 'object' &&
+      error != null &&
+      (await isDurableCommandLookupError(error, config));
     return {
       available: false,
-      cacheable:
-        typeof error === 'object' &&
-        error != null &&
-        isDurableCommandLookupError(error),
+      cacheable,
     };
   }
 }

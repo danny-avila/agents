@@ -995,6 +995,42 @@ describe('codex review fixes', () => {
       expect(JSON.stringify(second)).toContain('needle');
       expect(probeCalls).toBe(1);
     });
+
+    it('does not cache ENOENT from a missing working directory', async () => {
+      _resetSyntaxCheckProbeCacheForTests();
+      const realSpawn = (
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      let probeCalls = 0;
+      const backend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'node' && args[0] === '--version') {
+          probeCalls++;
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+      const cwd = await createTempDir();
+      const sourcePath = join(cwd, 'valid.js');
+      await fsWriteFile(sourcePath, 'const valid = true;\n', 'utf8');
+
+      await runPostEditSyntaxCheck(sourcePath, {
+        cwd: join(cwd, 'missing'),
+        exec: { spawn: backend },
+      });
+      await runPostEditSyntaxCheck(sourcePath, {
+        cwd,
+        exec: { spawn: backend },
+      });
+      await runPostEditSyntaxCheck(sourcePath, {
+        cwd,
+        exec: { spawn: backend },
+      });
+
+      expect(probeCalls).toBe(2);
+    });
   });
 
   describe('additionalRoots resolved against workspace root (Codex P2 #3)', () => {

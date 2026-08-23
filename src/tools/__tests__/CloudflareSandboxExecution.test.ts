@@ -80,6 +80,29 @@ it('reuses one execution world for repeated Cloudflare tool bindings', () => {
   expect(Object.isFrozen(firstWorld)).toBe(true);
 });
 
+it('rebuilds the world when captured Cloudflare settings change', async () => {
+  const config: t.CloudflareSandboxExecutionConfig = {
+    sandbox: createRuntime(),
+    workspaceRoot: '/first',
+    timeoutMs: 100,
+  };
+
+  const firstWorld = createCloudflareExecutionWorld(config);
+  config.workspaceRoot = '/second';
+  const secondWorld = createCloudflareExecutionWorld(config);
+  config.timeoutMs = 200;
+  const thirdWorld = createCloudflareExecutionWorld(config);
+
+  expect(secondWorld).not.toBe(firstWorld);
+  expect(thirdWorld).not.toBe(secondWorld);
+  await expect(secondWorld.fs.realpath('/second/file.ts')).resolves.toBe(
+    '/second/file.ts'
+  );
+  await expect(firstWorld.fs.realpath('/second/file.ts')).rejects.toThrow(
+    'outside the Cloudflare sandbox workspace'
+  );
+});
+
 it('keeps remote capability probes warm across Cloudflare tool bindings', async () => {
   _resetSyntaxCheckProbeCacheForTests();
   let execCalls = 0;

@@ -44,9 +44,16 @@ type SandboxRuntimeContext = {
   shell: string;
 };
 
+type ExecutionWorldCacheEntry = {
+  world: t.ExecutionWorld;
+  workspaceRoot: string;
+  timeoutMs: number;
+  sandbox: t.CloudflareSandboxExecutionConfig['sandbox'];
+};
+
 const executionWorldCache = new WeakMap<
   t.CloudflareSandboxExecutionConfig,
-  t.ExecutionWorld
+  ExecutionWorldCacheEntry
 >();
 
 const sandboxFactoryCache = new WeakMap<
@@ -700,16 +707,31 @@ function createCloudflareSpawn(
 export function createCloudflareExecutionWorld(
   config: t.CloudflareSandboxExecutionConfig
 ): t.ExecutionWorld {
-  let world = executionWorldCache.get(config);
-  if (world == null) {
-    const fs = Object.freeze(createCloudflareWorkspaceFS(config));
-    world = Object.freeze({
-      spawn: createCloudflareSpawn(config),
-      fs,
-      sandboxed: true,
-    });
-    executionWorldCache.set(config, world);
+  const workspaceRoot = getCloudflareWorkspaceRoot(config);
+  const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const cached = executionWorldCache.get(config);
+  if (
+    cached?.workspaceRoot === workspaceRoot &&
+    Object.is(cached.timeoutMs, timeoutMs) &&
+    cached.sandbox === config.sandbox
+  ) {
+    return cached.world;
   }
+  if (cached?.sandbox !== config.sandbox) {
+    sandboxFactoryCache.delete(config);
+  }
+  const fs = Object.freeze(createCloudflareWorkspaceFS(config));
+  const world = Object.freeze({
+    spawn: createCloudflareSpawn(config),
+    fs,
+    sandboxed: true,
+  });
+  executionWorldCache.set(config, {
+    world,
+    workspaceRoot,
+    timeoutMs,
+    sandbox: config.sandbox,
+  });
   return world;
 }
 
