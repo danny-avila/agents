@@ -921,6 +921,116 @@ describe('codex review fixes', () => {
         .invoke({ pattern: 'needle' });
       expect(String(bResult)).toContain('needle');
     });
+
+    it('retries a transient ripgrep probe failure on the same backend', async () => {
+      _resetRipgrepCacheForTests();
+      const realSpawn = (
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      let probeCalls = 0;
+      let searchCalls = 0;
+      const transientBackend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'rg' && args[0] === '--version') {
+          probeCalls++;
+          return realSpawn(
+            'sh',
+            ['-c', probeCalls === 1 ? 'exit 1' : 'exit 0'],
+            opts
+          );
+        }
+        if (cmd === 'rg') {
+          searchCalls++;
+          return realSpawn('sh', ['-c', 'printf \'file.ts:1:needle\\n\''], opts);
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+      const cwd = await createTempDir();
+      await fsWriteFile(join(cwd, 'file.ts'), 'needle\n', 'utf8');
+      const grep = createLocalCodingToolBundle({
+        cwd,
+        exec: { spawn: transientBackend },
+      }).tools.find((tool) => tool.name === 'grep_search')!;
+
+      const first = await grep.invoke({ pattern: 'needle' });
+      const second = await grep.invoke({ pattern: 'needle' });
+
+      expect(JSON.stringify(first)).toContain('needle');
+      expect(JSON.stringify(second)).toContain('needle');
+      expect(probeCalls).toBe(2);
+      expect(searchCalls).toBe(1);
+    });
+
+    it('caches a native ENOENT ripgrep verdict on the same backend', async () => {
+      _resetRipgrepCacheForTests();
+      const realSpawn = (
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      let probeCalls = 0;
+      const missingBackend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'rg') {
+          probeCalls++;
+          return realSpawn(`missing-rg-${process.pid}`, args, opts);
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+      const cwd = await createTempDir();
+      await fsWriteFile(join(cwd, 'file.ts'), 'needle\n', 'utf8');
+      const grep = createLocalCodingToolBundle({
+        cwd,
+        exec: { spawn: missingBackend },
+      }).tools.find((tool) => tool.name === 'grep_search')!;
+
+      const first = await grep.invoke({ pattern: 'needle' });
+      const second = await grep.invoke({ pattern: 'needle' });
+
+      expect(JSON.stringify(first)).toContain('needle');
+      expect(JSON.stringify(second)).toContain('needle');
+      expect(probeCalls).toBe(1);
+    });
+
+    it('does not cache ENOENT from a missing working directory', async () => {
+      _resetSyntaxCheckProbeCacheForTests();
+      const realSpawn = (
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      let probeCalls = 0;
+      const backend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'node' && args[0] === '--version') {
+          probeCalls++;
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+      const cwd = await createTempDir();
+      const sourcePath = join(cwd, 'valid.js');
+      await fsWriteFile(sourcePath, 'const valid = true;\n', 'utf8');
+
+      await runPostEditSyntaxCheck(sourcePath, {
+        cwd: join(cwd, 'missing'),
+        exec: { spawn: backend },
+      });
+      await runPostEditSyntaxCheck(sourcePath, {
+        cwd,
+        exec: { spawn: backend },
+      });
+      await runPostEditSyntaxCheck(sourcePath, {
+        cwd,
+        exec: { spawn: backend },
+      });
+
+      expect(probeCalls).toBe(2);
+    });
   });
 
   describe('additionalRoots resolved against workspace root (Codex P2 #3)', () => {

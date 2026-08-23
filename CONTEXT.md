@@ -75,3 +75,15 @@ cache boundary and host-lifecycle trade-offs.
 
 The meter's estimates decide overflow and recovery only. Provider-reported
 usage remains the source of truth for billing and Langfuse observations.
+
+## Coding-Tool Execution
+
+An **Execution World** is the stable pairing of a filesystem namespace and a
+subprocess launcher used by coding tools. The Node host has one default world;
+remote backends retain one world per execution configuration so rebuilding an
+agent's tool binding does not make a warm backend look new to capability
+probes. Sandbox identity belongs to the same world, while timeout,
+cancellation, output, and command results remain invocation-scoped.
+
+See [ADR 0002](docs/adr/0002-stable-execution-worlds.md) for the adapter
+identity and compatibility boundary.

@@ -18,12 +18,15 @@
 
 import { extname } from 'path';
 import type * as t from '@/types';
-import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import {
+  commandAvailabilityEnvCacheKey,
   getSpawn,
   getWorkspaceFS,
+  probeLocalCommandAvailability,
+  setCommandAvailabilityCacheEntry,
   spawnLocalProcess,
 } from './LocalExecutionEngine';
+import { isWorkspaceClientTimeoutError } from './workspaceFS';
 
 export type SyntaxCheckOutcome =
   | { ok: true }
@@ -48,25 +51,16 @@ export type SyntaxChecker = (
  * reset hook re-creates the map.
  */
 type ProbeKind = 'hasNode' | 'hasPython' | 'hasBash';
-type ProbeCache = Partial<Record<ProbeKind, Promise<boolean>>>;
+type ProbeCache = Partial<
+  Record<ProbeKind, ReturnType<typeof probeLocalCommandAvailability>>
+>;
 
-// Per-backend × per-env cache. Codex P2 #40 — keying by spawn
-// backend alone misses env-driven availability changes (e.g. PATH
-// loses node between Runs that share the same backend). Same fix
-// shape as the ripgrep cache (Codex P1 #34).
+// Per-backend × hashed-env cache. The inner map is bounded so a long-lived
+// world cannot retain unbounded environment variants.
 let probeCacheByBackend = new WeakMap<
   t.LocalSpawn,
   Map<string, ProbeCache>
 >();
-
-function envCacheKey(env: NodeJS.ProcessEnv | undefined): string {
-  if (env == null) return '';
-  const sorted: Record<string, string | undefined> = {};
-  for (const k of Object.keys(env).sort()) {
-    sorted[k] = env[k];
-  }
-  return JSON.stringify(sorted);
-}
 
 function cacheFor(
   config: t.LocalExecutionConfig
@@ -77,11 +71,11 @@ function cacheFor(
     envMap = new Map();
     probeCacheByBackend.set(backend, envMap);
   }
-  const envKey = envCacheKey(config.env);
+  const envKey = commandAvailabilityEnvCacheKey(config.env);
   let entry = envMap.get(envKey);
   if (entry == null) {
     entry = {};
-    envMap.set(envKey, entry);
+    setCommandAvailabilityCacheEntry(envMap, envKey, entry);
   }
   return entry;
 }
@@ -95,17 +89,20 @@ async function probe(
   const entry = cacheFor(config);
   let probePromise = entry[cached];
   if (probePromise == null) {
-    probePromise = spawnLocalProcess(
-      command,
-      args,
-      { ...config, timeoutMs: 5000, sandbox: { enabled: false } },
-      { internal: true }
-    )
-      .then((result) => result != null && result.exitCode === 0)
-      .catch(() => false);
+    probePromise = probeLocalCommandAvailability(command, args, config);
     entry[cached] = probePromise;
   }
-  return probePromise;
+  const result = await probePromise;
+  if (!result.cacheable && entry[cached] === probePromise) {
+    delete entry[cached];
+  }
+  if (result.cacheUntil != null && result.cacheUntil <= Date.now()) {
+    if (entry[cached] === probePromise) {
+      delete entry[cached];
+    }
+    return probe(command, args, cached, config);
+  }
+  return result.available;
 }
 
 /**

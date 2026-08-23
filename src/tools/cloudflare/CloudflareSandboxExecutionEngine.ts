@@ -5,11 +5,11 @@ import type { WriteFileOptions, MakeDirectoryOptions, Stats } from 'fs';
 import type { ChildProcessWithoutNullStreams } from 'child_process';
 import type { FileHandle } from 'fs/promises';
 import type { WorkspaceFS, ReaddirEntry } from '@/tools/local/workspaceFS';
+import type * as t from '@/types';
 import {
   WorkspaceClientTimeoutError,
   isWorkspaceClientTimeoutError,
 } from '@/tools/local/workspaceFS';
-import type * as t from '@/types';
 import {
   LOCAL_SPAWN_TIMEOUT_MS,
   validateBashCommand,
@@ -44,9 +44,28 @@ type SandboxRuntimeContext = {
   shell: string;
 };
 
+type ExecutionWorldCacheEntry = {
+  world: t.ExecutionWorld;
+  workspaceRoot: string;
+  timeoutMs: number;
+  sandbox: t.CloudflareSandboxExecutionConfig['sandbox'];
+};
+
+const executionWorldCache = new WeakMap<
+  t.CloudflareSandboxExecutionConfig,
+  ExecutionWorldCacheEntry
+>();
+
+type SandboxFactoryCacheEntry = {
+  sandbox: () =>
+    | t.CloudflareSandboxRuntime
+    | Promise<t.CloudflareSandboxRuntime>;
+  promise: Promise<t.CloudflareSandboxRuntime>;
+};
+
 const sandboxFactoryCache = new WeakMap<
   t.CloudflareSandboxExecutionConfig,
-  Promise<t.CloudflareSandboxRuntime>
+  SandboxFactoryCacheEntry
 >();
 
 function normalizeWorkspaceRoot(workspaceRoot: string): string {
@@ -69,17 +88,20 @@ export async function resolveCloudflareSandbox(
   if (typeof sandbox !== 'function') {
     return sandbox;
   }
-  let cached = sandboxFactoryCache.get(config);
-  if (cached == null) {
-    cached = Promise.resolve()
-      .then(() => sandbox())
-      .catch((error: unknown) => {
-        sandboxFactoryCache.delete(config);
-        throw error;
-      });
-    sandboxFactoryCache.set(config, cached);
+  const cached = sandboxFactoryCache.get(config);
+  if (cached?.sandbox === sandbox) {
+    return cached.promise;
   }
-  return cached;
+  const promise = Promise.resolve()
+    .then(() => sandbox())
+    .catch((error: unknown) => {
+      if (sandboxFactoryCache.get(config)?.promise === promise) {
+        sandboxFactoryCache.delete(config);
+      }
+      throw error;
+    });
+  sandboxFactoryCache.set(config, { sandbox, promise });
+  return promise;
 }
 
 async function getRuntimeContext(
@@ -687,6 +709,39 @@ function createCloudflareSpawn(
   };
 }
 
+/**
+ * Returns one stable filesystem/process world for a Cloudflare configuration.
+ * Probe caches key on the spawn identity, so retaining it avoids repeating
+ * remote capability checks whenever an agent binding rebuilds its tools.
+ */
+export function createCloudflareExecutionWorld(
+  config: t.CloudflareSandboxExecutionConfig
+): t.ExecutionWorld {
+  const workspaceRoot = getCloudflareWorkspaceRoot(config);
+  const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const cached = executionWorldCache.get(config);
+  if (
+    cached?.workspaceRoot === workspaceRoot &&
+    Object.is(cached.timeoutMs, timeoutMs) &&
+    cached.sandbox === config.sandbox
+  ) {
+    return cached.world;
+  }
+  const fs = Object.freeze(createCloudflareWorkspaceFS(config));
+  const world = Object.freeze({
+    spawn: createCloudflareSpawn(config),
+    fs,
+    sandboxed: true,
+  });
+  executionWorldCache.set(config, {
+    world,
+    workspaceRoot,
+    timeoutMs,
+    sandbox: config.sandbox,
+  });
+  return world;
+}
+
 export function createCloudflareLocalExecutionConfig(
   config: t.CloudflareSandboxExecutionConfig
 ): t.LocalExecutionConfig {
@@ -694,11 +749,7 @@ export function createCloudflareLocalExecutionConfig(
   return {
     cwd: workspaceRoot,
     workspace: { root: workspaceRoot },
-    exec: {
-      spawn: createCloudflareSpawn(config),
-      fs: createCloudflareWorkspaceFS(config),
-      sandboxed: true,
-    },
+    exec: createCloudflareExecutionWorld(config),
     shell: config.shell ?? 'bash',
     timeoutMs: config.timeoutMs,
     maxOutputChars: config.maxOutputChars,

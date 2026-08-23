@@ -820,47 +820,35 @@ export type LocalWorkspaceConfig = {
 };
 
 /**
- * Engine-agnostic execution seam. Default uses Node's
- * `child_process.spawn` and `fs/promises`. A future engine (e.g.
- * stateful remote sandbox) supplies its own `spawn` and `fs` and
- * inherits every tool factory unchanged.
+ * One execution world shared by filesystem and subprocess operations.
+ * Backend identity is stable so capability probes remain warm when tool
+ * bundles are rebuilt for later agent bindings.
+ */
+export interface ExecutionWorld {
+  /** Launches a process inside this world's filesystem namespace. */
+  readonly spawn: LocalSpawn;
+  /** Reads and writes the same namespace observed by `spawn`. */
+  readonly fs: Readonly<import('@/tools/local/workspaceFS').WorkspaceFS>;
+  /** Whether the world already enforces a sandbox boundary. */
+  readonly sandboxed: boolean;
+}
+
+/**
+ * Backward-compatible partial execution-world override. Omitted fields use
+ * the Node host world; remote backends should provide the complete trio.
  *
- * **Important — pair `spawn` and `fs` together.** Most file-touching
- * surfaces in the local engine route through `getWorkspaceFS(config)`
- * so a host can transparently swap in a remote/in-memory FS. A small
- * set of helpers — currently the `execute_code` non-bash temp-file
- * write (Codex P2 [48]) — still uses host `fs/promises` directly to
- * stage source on disk before invoking the spawn. If you override
- * `spawn` to point at a remote runtime (SSH, container, etc.) you
- * MUST also override `fs` with the corresponding remote
- * implementation; otherwise temp source files written to the host
- * `/tmp` won't be visible to the remote interpreter and `py`/`js`/
- * `ts`/etc. executions will fail. (Bash-style executions go through
- * `executeLocalBash` which doesn't stage temp files, so they're
- * unaffected.)
+ * Non-bash `execute_code` still stages source through the host temporary
+ * directory. Remote runtimes should use their dedicated execution engine for
+ * that tool until temporary lifecycle operations join this seam.
  *
- * Threat-model note: the regex-based command validators
- * (`dangerousCommandPatterns`, `quotedDestructivePatterns`, etc.) and
- * the workspace policy hook are documented as best-effort tripwires.
- * The hard security boundary is `local.sandbox.enabled: true` (which
- * wraps execution in `@anthropic-ai/sandbox-runtime`); for adversarial-
- * model threat models, do NOT rely on the regex layer alone.
+ * Command validators and workspace policies are best-effort tripwires. For an
+ * adversarial-model threat model, use a backend sandbox boundary rather than
+ * relying on validation alone.
  */
 export type LocalExecConfig = {
-  /** Pluggable spawn (for SSH, container, remote workers, etc.). */
-  spawn?: LocalSpawn;
-  /**
-   * Pluggable filesystem (for remote-workspace engines). Pair with
-   * `spawn` — see the type-level note above on why both should be
-   * overridden together for non-host engines.
-   */
-  fs?: import('@/tools/local/workspaceFS').WorkspaceFS;
-  /**
-   * Set by custom execution backends that already provide their own
-   * sandbox boundary. Suppresses the local host-sandbox warning while
-   * preserving the warning for plain host `child_process` execution.
-   */
-  sandboxed?: boolean;
+  -readonly [Key in keyof ExecutionWorld]?: Key extends 'fs'
+    ? import('@/tools/local/workspaceFS').WorkspaceFS
+    : ExecutionWorld[Key];
 };
 
 export type LocalExecutionConfig = {
