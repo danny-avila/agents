@@ -260,11 +260,11 @@ export function getWorkspaceRoots(config?: t.LocalExecutionConfig): string[] {
 }
 
 /** Node-host execution world used when no backend override is configured. */
-export const nodeExecutionWorld: t.ExecutionWorld = {
+export const nodeExecutionWorld: t.ExecutionWorld = Object.freeze({
   spawn: spawn as t.LocalSpawn,
   fs: nodeWorkspaceFS,
   sandboxed: false,
-};
+});
 
 /** Resolves filesystem and subprocess capabilities as one execution world. */
 export function getExecutionWorld(

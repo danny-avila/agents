@@ -100,6 +100,7 @@ describe('workspace seam', () => {
       expect(world.fs).toBe(nodeWorkspaceFS);
       expect(world.spawn).toBe(getExecutionWorld().spawn);
       expect(world.sandboxed).toBe(false);
+      expect(Object.isFrozen(world)).toBe(true);
     });
 
     it('defaults to the Node host fs when nothing is supplied', () => {

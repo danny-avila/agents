@@ -702,11 +702,11 @@ export function createCloudflareExecutionWorld(
 ): t.ExecutionWorld {
   let world = executionWorldCache.get(config);
   if (world == null) {
-    world = {
+    world = Object.freeze({
       spawn: createCloudflareSpawn(config),
       fs: createCloudflareWorkspaceFS(config),
       sandboxed: true,
-    };
+    });
     executionWorldCache.set(config, world);
   }
   return world;

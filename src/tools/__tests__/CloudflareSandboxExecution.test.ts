@@ -76,6 +76,7 @@ it('reuses one execution world for repeated Cloudflare tool bindings', () => {
   expect(secondWorld).toBe(firstWorld);
   expect(localConfig.exec).toBe(firstWorld);
   expect(firstWorld.sandboxed).toBe(true);
+  expect(Object.isFrozen(firstWorld)).toBe(true);
 });
 
 it('keeps remote capability probes warm across Cloudflare tool bindings', async () => {

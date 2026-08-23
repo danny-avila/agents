@@ -826,11 +826,11 @@ export type LocalWorkspaceConfig = {
  */
 export interface ExecutionWorld {
   /** Launches a process inside this world's filesystem namespace. */
-  spawn: LocalSpawn;
+  readonly spawn: LocalSpawn;
   /** Reads and writes the same namespace observed by `spawn`. */
-  fs: import('@/tools/local/workspaceFS').WorkspaceFS;
+  readonly fs: import('@/tools/local/workspaceFS').WorkspaceFS;
   /** Whether the world already enforces a sandbox boundary. */
-  sandboxed: boolean;
+  readonly sandboxed: boolean;
 }
 
 /**
