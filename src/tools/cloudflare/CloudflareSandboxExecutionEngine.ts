@@ -5,11 +5,11 @@ import type { WriteFileOptions, MakeDirectoryOptions, Stats } from 'fs';
 import type { ChildProcessWithoutNullStreams } from 'child_process';
 import type { FileHandle } from 'fs/promises';
 import type { WorkspaceFS, ReaddirEntry } from '@/tools/local/workspaceFS';
+import type * as t from '@/types';
 import {
   WorkspaceClientTimeoutError,
   isWorkspaceClientTimeoutError,
 } from '@/tools/local/workspaceFS';
-import type * as t from '@/types';
 import {
   LOCAL_SPAWN_TIMEOUT_MS,
   validateBashCommand,
@@ -43,6 +43,11 @@ type SandboxRuntimeContext = {
   maxOutputChars: number;
   shell: string;
 };
+
+const executionWorldCache = new WeakMap<
+  t.CloudflareSandboxExecutionConfig,
+  t.ExecutionWorld
+>();
 
 const sandboxFactoryCache = new WeakMap<
   t.CloudflareSandboxExecutionConfig,
@@ -687,6 +692,26 @@ function createCloudflareSpawn(
   };
 }
 
+/**
+ * Returns one stable filesystem/process world for a Cloudflare configuration.
+ * Probe caches key on the spawn identity, so retaining it avoids repeating
+ * remote capability checks whenever an agent binding rebuilds its tools.
+ */
+export function createCloudflareExecutionWorld(
+  config: t.CloudflareSandboxExecutionConfig
+): t.ExecutionWorld {
+  let world = executionWorldCache.get(config);
+  if (world == null) {
+    world = {
+      spawn: createCloudflareSpawn(config),
+      fs: createCloudflareWorkspaceFS(config),
+      sandboxed: true,
+    };
+    executionWorldCache.set(config, world);
+  }
+  return world;
+}
+
 export function createCloudflareLocalExecutionConfig(
   config: t.CloudflareSandboxExecutionConfig
 ): t.LocalExecutionConfig {
@@ -694,11 +719,7 @@ export function createCloudflareLocalExecutionConfig(
   return {
     cwd: workspaceRoot,
     workspace: { root: workspaceRoot },
-    exec: {
-      spawn: createCloudflareSpawn(config),
-      fs: createCloudflareWorkspaceFS(config),
-      sandboxed: true,
-    },
+    exec: createCloudflareExecutionWorld(config),
     shell: config.shell ?? 'bash',
     timeoutMs: config.timeoutMs,
     maxOutputChars: config.maxOutputChars,

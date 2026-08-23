@@ -1,6 +1,7 @@
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
+  createCloudflareExecutionWorld,
   createCloudflareWorkspaceFS,
   createCloudflareLocalExecutionConfig,
   execWithClientTimeout,
@@ -11,6 +12,10 @@ import {
   createCloudflareBashProgrammaticToolCallingTool,
   createCloudflareProgrammaticToolCallingTool,
 } from '../cloudflare/CloudflareProgrammaticToolCalling';
+import {
+  runPostEditSyntaxCheck,
+  _resetSyntaxCheckProbeCacheForTests,
+} from '../local/syntaxCheck';
 import { createCloudflareBridgeRuntime } from '../cloudflare/CloudflareBridgeRuntime';
 import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
 import { isWorkspaceClientTimeoutError } from '../local/workspaceFS';
@@ -58,6 +63,40 @@ function createRuntime(
     ...overrides,
   };
 }
+
+it('reuses one execution world for repeated Cloudflare tool bindings', () => {
+  const config: t.CloudflareSandboxExecutionConfig = {
+    sandbox: createRuntime(),
+  };
+
+  const firstWorld = createCloudflareExecutionWorld(config);
+  const secondWorld = createCloudflareExecutionWorld(config);
+  const localConfig = createCloudflareLocalExecutionConfig(config);
+
+  expect(secondWorld).toBe(firstWorld);
+  expect(localConfig.exec).toBe(firstWorld);
+  expect(firstWorld.sandboxed).toBe(true);
+});
+
+it('keeps remote capability probes warm across Cloudflare tool bindings', async () => {
+  _resetSyntaxCheckProbeCacheForTests();
+  let execCalls = 0;
+  const config: t.CloudflareSandboxExecutionConfig = {
+    sandbox: createRuntime({
+      exec: async () => {
+        execCalls++;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+    }),
+  };
+
+  const firstBinding = createCloudflareLocalExecutionConfig(config);
+  const secondBinding = createCloudflareLocalExecutionConfig(config);
+  await runPostEditSyntaxCheck('/workspace/first.js', firstBinding);
+  await runPostEditSyntaxCheck('/workspace/second.js', secondBinding);
+
+  expect(execCalls).toBe(3);
+});
 
 it('reports the invoked runner name for Cloudflare caller-policy failures', async () => {
   const programmatic = createCloudflareProgrammaticToolCallingTool({

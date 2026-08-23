@@ -259,13 +259,34 @@ export function getWorkspaceRoots(config?: t.LocalExecutionConfig): string[] {
   return out;
 }
 
+/** Node-host execution world used when no backend override is configured. */
+export const nodeExecutionWorld: t.ExecutionWorld = {
+  spawn: spawn as t.LocalSpawn,
+  fs: nodeWorkspaceFS,
+  sandboxed: false,
+};
+
+/** Resolves filesystem and subprocess capabilities as one execution world. */
+export function getExecutionWorld(
+  config?: t.LocalExecutionConfig
+): t.ExecutionWorld {
+  if (config?.exec == null && config?.spawn == null) {
+    return nodeExecutionWorld;
+  }
+  return {
+    spawn: config.exec?.spawn ?? config.spawn ?? nodeExecutionWorld.spawn,
+    fs: config.exec?.fs ?? nodeExecutionWorld.fs,
+    sandboxed: config.exec?.sandboxed ?? false,
+  };
+}
+
 /**
  * Pluggable spawn resolver. Honours `local.exec.spawn` first, falls
  * back to the legacy top-level `local.spawn`, then to Node's
  * `child_process.spawn`. Centralised so engine swapping is one knob.
  */
 export function getSpawn(config?: t.LocalExecutionConfig): t.LocalSpawn {
-  return (config?.exec?.spawn ?? config?.spawn ?? spawn) as t.LocalSpawn;
+  return getExecutionWorld(config).spawn;
 }
 
 /**
@@ -274,7 +295,7 @@ export function getSpawn(config?: t.LocalExecutionConfig): t.LocalSpawn {
  * its own implementation here and inherits every file-touching tool.
  */
 export function getWorkspaceFS(config?: t.LocalExecutionConfig): WorkspaceFS {
-  return config?.exec?.fs ?? nodeWorkspaceFS;
+  return getExecutionWorld(config).fs;
 }
 
 /**
@@ -345,7 +366,7 @@ function maybeWarnSandboxOff(config: t.LocalExecutionConfig): void {
   if (
     sandboxOffWarned ||
     shouldUseLocalSandbox(config) ||
-    config.exec?.sandboxed === true
+    getExecutionWorld(config).sandboxed
   ) {
     return;
   }

@@ -11,6 +11,7 @@ import {
 } from '@jest/globals';
 import type { WorkspaceFS } from '../local/workspaceFS';
 import {
+  getExecutionWorld,
   resolveWorkspacePathSafe,
   getWorkspaceFS,
 } from '../local/LocalExecutionEngine';
@@ -93,6 +94,14 @@ describe('workspace seam', () => {
   });
 
   describe('WorkspaceFS seam', () => {
+    it('resolves the default filesystem and subprocess as one world', () => {
+      const world = getExecutionWorld({ workspace: { root: workspace } });
+
+      expect(world.fs).toBe(nodeWorkspaceFS);
+      expect(world.spawn).toBe(getExecutionWorld().spawn);
+      expect(world.sandboxed).toBe(false);
+    });
+
     it('defaults to the Node host fs when nothing is supplied', () => {
       expect(getWorkspaceFS({ workspace: { root: workspace } })).toBe(
         nodeWorkspaceFS
