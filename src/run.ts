@@ -452,7 +452,7 @@ export class Run<_T extends t.BaseGraphState> {
         provider,
         clientOptions,
         agentId: 'default',
-      };
+      } as t.AgentInputs;
       signal = legacySignal;
     }
 

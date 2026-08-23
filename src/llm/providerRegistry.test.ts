@@ -46,6 +46,43 @@ class HostProviderWithoutTools extends CoreFakeChatModel {
   }
 }
 
+function assertHostProviderConfigTypes(): void {
+  initializeModel({
+    provider: 'typed-host-test',
+    clientOptions: { endpoint: 'https://models.example.test' },
+  });
+  initializeModel({
+    provider: 'typed-host-test',
+    override: new HostProvider({ endpoint: 'https://models.example.test' }),
+  });
+
+  // @ts-expect-error Host provider construction requires its declared options.
+  initializeModel({ provider: 'typed-host-test' });
+
+  const config: t.LLMConfig = {
+    provider: 'typed-host-test',
+    endpoint: 'https://models.example.test',
+  };
+  void config;
+
+  // @ts-expect-error Host graph configuration requires its declared options.
+  const invalidConfig: t.LLMConfig = { provider: 'typed-host-test' };
+  void invalidConfig;
+
+  // @ts-expect-error Host fallbacks require their declared client options.
+  const invalidFallback: t.FallbackConfig = { provider: 'typed-host-test' };
+  void invalidFallback;
+
+  // @ts-expect-error Host agent configuration requires its declared options.
+  const invalidAgent: t.AgentInputs = {
+    agentId: 'typed-host-agent',
+    provider: 'typed-host-test',
+  };
+  void invalidAgent;
+}
+
+void assertHostProviderConfigTypes;
+
 const lookupTool = new DynamicStructuredTool({
   name: 'lookup',
   description: 'Looks up a value',

@@ -49,7 +49,7 @@ function createAnthropicAgent(
     instructions,
     maxContextTokens: MAX_CONTEXT_TOKENS,
     ...extras,
-  };
+  } as t.AgentInputs;
 }
 
 function createStreamConfig(threadId: string): Partial<RunnableConfig> & {

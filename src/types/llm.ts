@@ -153,37 +153,83 @@ export type BuiltInClientOptions =
 
 type CustomProviderName = Extract<keyof CustomProviderOptionsMap, string>;
 
-type RuntimeProviderName = string & {
+type LooseRuntimeProviderName = string & {
   readonly __runtimeProviderName?: never;
 };
 
 export type ProviderName =
   | keyof ProviderOptionsMap
   | CustomProviderName
-  | RuntimeProviderName;
+  | LooseRuntimeProviderName;
+
+declare const RUNTIME_PROVIDER_NAME: unique symbol;
+
+/** A runtime provider without declaration-merged option types. */
+export type RuntimeProviderName = string & {
+  readonly [RUNTIME_PROVIDER_NAME]: true;
+};
 
 export type ClientOptions =
   | BuiltInClientOptions
   | CustomProviderOptionsMap[CustomProviderName];
 
-export type SharedLLMConfig = {
-  provider: ProviderName;
+export type SharedLLMConfig<
+  P extends
+    | keyof ProviderOptionsMap
+    | CustomProviderName
+    | RuntimeProviderName = keyof ProviderOptionsMap,
+> = {
+  provider: P;
   model?: string;
   _lc_stream_delay?: number;
 };
 
-export interface FallbackConfig {
-  provider: ProviderName;
-  clientOptions?: ClientOptions;
+type CustomProviderClientOptionsConfig<P extends CustomProviderName> = {
+  provider: P;
+} & (object extends CustomProviderOptionsMap[P]
+  ? { clientOptions?: CustomProviderOptionsMap[P] }
+  : { clientOptions: CustomProviderOptionsMap[P] });
+
+export type ProviderClientOptionsConfig =
+  | {
+      provider: keyof ProviderOptionsMap;
+      clientOptions?: BuiltInClientOptions;
+    }
+  | {
+      [P in CustomProviderName]: CustomProviderClientOptionsConfig<P>;
+    }[CustomProviderName]
+  | {
+      provider: RuntimeProviderName;
+      clientOptions: ClientOptions;
+    };
+
+export type FallbackConfig = ProviderClientOptionsConfig & {
   /** Context window used to corroborate ambiguous fallback overflow errors. */
   maxContextTokens?: number;
-}
+};
 
-export type LLMConfig = SharedLLMConfig &
-  ClientOptions & {
+type LLMConfigFor<P extends CustomProviderName> = SharedLLMConfig<P> &
+  CustomProviderOptionsMap[P] & {
     /** Optional provider fallbacks in order of attempt */
     fallbacks?: FallbackConfig[];
   };
+
+export type BuiltInLLMConfig = SharedLLMConfig &
+  BuiltInClientOptions & {
+    /** Optional provider fallbacks in order of attempt */
+    fallbacks?: FallbackConfig[];
+  };
+
+export type LLMConfig =
+  | BuiltInLLMConfig
+  | {
+      [P in CustomProviderName]: LLMConfigFor<P>;
+    }[CustomProviderName]
+  | (SharedLLMConfig<RuntimeProviderName> &
+      ClientOptions & {
+        /** Optional provider fallbacks in order of attempt */
+        fallbacks?: FallbackConfig[];
+      });
 
 export type ProviderOptionsMap = {
   [Providers.AZURE]: AzureClientOptions;

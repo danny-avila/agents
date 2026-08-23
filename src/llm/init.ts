@@ -6,6 +6,30 @@ import { getChatModelClass } from '@/llm/providers';
 import { isOpenAILike } from '@/utils';
 import { Providers } from '@/common';
 
+type InitializeModelParams<P extends t.ProviderName> = {
+  provider: P;
+  tools?: t.GraphTools;
+} & (
+  | {
+      override: t.ChatModelInstance;
+      clientOptions?: t.ProviderOptionsFor<P>;
+    }
+  | ([P] extends [keyof t.ProviderOptionsMap]
+      ? {
+          override?: t.ChatModelInstance;
+          clientOptions?: t.ProviderOptionsFor<P>;
+        }
+      : object extends t.ProviderOptionsFor<P>
+        ? {
+            override?: t.ChatModelInstance;
+            clientOptions?: t.ProviderOptionsFor<P>;
+          }
+        : {
+            override?: undefined;
+            clientOptions: t.ProviderOptionsFor<P>;
+          })
+);
+
 /**
  * Creates a chat model instance for a given built-in or host-registered
  * provider, applies provider-specific field assignments, and optionally binds
@@ -16,16 +40,11 @@ export function initializeModel<P extends t.ProviderName>({
   clientOptions,
   tools,
   override,
-}: {
-  provider: P;
-  clientOptions?: t.ProviderOptionsFor<P>;
-  tools?: t.GraphTools;
-  override?: t.ChatModelInstance;
-}): Runnable {
+}: InitializeModelParams<P>): Runnable {
   const model =
     override ??
     new (getChatModelClass(provider))(
-      clientOptions ?? ({} as t.ProviderOptionsFor<P>)
+      (clientOptions ?? {}) as t.ProviderOptionsFor<P>
     );
 
   if (

@@ -55,6 +55,7 @@ needs.
 
 ```typescript
 import { registerProvider } from '@librechat/agents/provider-registration';
+import type { LLMConfig } from '@librechat/agents';
 
 interface AcmeOptions {
   apiKey: string;
@@ -72,12 +73,19 @@ const unregister = registerProvider({
   model: AcmeChatModel,
   family: 'openai',
 });
+
+const llmConfig: LLMConfig = {
+  provider: 'acme',
+  apiKey: process.env.ACME_API_KEY!,
+  model: 'acme-chat',
+};
 ```
 
 Register once per process before the provider is used. Duplicate names are
 rejected, and `unregister()` removes only that registration. Set
 `manualToolStream` or `strictAlternation` only when the provider contract needs
-those behaviors.
+those behaviors. Declaration-merged required options are enforced for direct
+model initialization, graph agents, primary graph configs, and fallbacks.
 
 ## Programmatic Sessions
 

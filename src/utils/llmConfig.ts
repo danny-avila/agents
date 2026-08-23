@@ -3,7 +3,7 @@ import type * as or from '@/llm/openrouter';
 import type * as t from '@/types';
 import { Providers } from '@/common';
 
-export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
+export const llmConfigs: Record<string, t.BuiltInLLMConfig | undefined> = {
   [Providers.OPENAI]: {
     provider: Providers.OPENAI,
     model: 'gpt-4.1',
@@ -68,7 +68,7 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
     modelKwargs: {
       max_tokens: 10000,
     },
-  } as or.ChatOpenRouterCallOptions & t.LLMConfig,
+  } as or.ChatOpenRouterCallOptions & t.BuiltInLLMConfig,
   [Providers.AZURE]: {
     provider: Providers.AZURE,
     temperature: 0.7,
@@ -159,7 +159,7 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
     // location: 'global',
     // thinkingBudget: -1,
     // includeThoughts: true,
-  } as t.VertexAIClientOptions & t.LLMConfig,
+  } as t.VertexAIClientOptions & t.BuiltInLLMConfig,
   [Providers.GOOGLE]: {
     provider: Providers.GOOGLE,
     model: 'gemini-2.5-flash',
@@ -194,7 +194,7 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
   },
 };
 
-export function getLLMConfig(provider: string): t.LLMConfig {
+export function getLLMConfig(provider: string): t.BuiltInLLMConfig {
   const config = llmConfigs[provider];
   if (config === undefined) {
     throw new Error(`Unsupported provider: ${provider}`);
