@@ -3157,6 +3157,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        */
       const contextPressure = createContextPressureMeter({
         tokenCounter: agentContext.tokenCounter,
+        tokenCountCache: agentContext.contextPressureTokenCounts,
         sourceMessages: messages,
         retainedMessages: messagesToUse,
         indexTokenCountMap: agentContext.indexTokenCountMap,

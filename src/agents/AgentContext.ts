@@ -8,6 +8,7 @@ import type {
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
+import type { ExactTokenCountCache } from '@/llm/contextPressureMeter';
 import {
   addTailCacheControl,
   addCacheControlToStablePrefixMessages,
@@ -51,6 +52,8 @@ import {
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
+import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
+import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { toJsonSchema } from '@/utils/schema';
 
 type AgentSystemTextBlock = {
@@ -235,6 +238,8 @@ export class AgentContext {
   pruneMessages?: ReturnType<typeof createPruneMessages>;
   /** Token counter function for this agent */
   tokenCounter?: t.TokenCounter;
+  /** Exact stable-message counts reused by request-scoped context-pressure meters. */
+  readonly contextPressureTokenCounts?: ExactTokenCountCache;
   /** Token count for the system message (instructions text). */
   systemMessageTokens: number = 0;
   /** Token count for instruction text emitted outside the system message. */
@@ -460,6 +465,10 @@ export class AgentContext {
     this.maxContextTokens = maxContextTokens;
     this.streamBuffer = streamBuffer;
     this.tokenCounter = tokenCounter;
+    this.contextPressureTokenCounts =
+      tokenCounter != null && isTokenCounterCacheCompatible(tokenCounter)
+        ? createExactTokenCountCache(tokenCounter)
+        : undefined;
     this.tools = tools;
     this.toolMap = toolMap;
     this.toolRegistry = resolveLocalToolRegistry({

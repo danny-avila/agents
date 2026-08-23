@@ -62,8 +62,16 @@ A **Context Pressure Meter** is the request-scoped projection of retained
 conversation messages into the provider's available context budget. It keeps
 provider-grounded attribution and exact token counts together so repeated
 artifact, compaction, prepared-request, and fallback probes tokenize only new
-message objects. Provider projections must clone changed messages; mutating a
-measured message would invalidate its exact cached count.
+message objects. Its Agent Context may retain exact counts across provider
+requests only for stable string-content messages whose token-relevant surface
+still matches.
+Mutable or ambiguous message shapes are recounted. Provider projections must
+clone changed messages; mutating a measured message invalidates its retained
+count on the next comparison. Custom token counters remain uncached unless a
+host explicitly declares that they implement the same deterministic surface
+contract.
+See [ADR 0001](docs/adr/0001-reuse-exact-context-token-counts.md) for the
+cache boundary and host-lifecycle trade-offs.
 
 The meter's estimates decide overflow and recovery only. Provider-reported
 usage remains the source of truth for billing and Langfuse observations.

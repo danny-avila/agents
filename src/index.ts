@@ -69,6 +69,7 @@ export {
 export type { Interrupt } from '@langchain/langgraph';
 
 /* LLM */
+export { markTokenCounterCacheCompatible } from './llm/tokenCounterCacheCompatibility';
 export { CustomOpenAIClient } from './llm/openai';
 export { ChatOpenRouter } from './llm/openrouter';
 export type {

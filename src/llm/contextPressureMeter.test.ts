@@ -1,9 +1,14 @@
-import { HumanMessage } from '@langchain/core/messages';
-
+import {
+  AIMessage,
+  HumanMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
-
+import {
+  createContextPressureMeter,
+  createExactTokenCountCache,
+} from './contextPressureMeter';
 import { stampSyntheticProviderMessage } from '@/messages';
-import { createContextPressureMeter } from './contextPressureMeter';
 
 function contentLength(message: BaseMessage): number {
   return typeof message.content === 'string'
@@ -47,6 +52,171 @@ describe('createContextPressureMeter', () => {
     });
     expect(meter.measure(projected).projectedMessageTokens).toBe(33);
     expect(tokenCounter).toHaveBeenCalledTimes(3);
+  });
+
+  it('reuses stable exact counts across request-scoped meters', () => {
+    const retained = Array.from(
+      { length: 100 },
+      (_, index) =>
+        new HumanMessage({ id: `message-${index}`, content: 'retained' })
+    );
+    const tokenCounter = jest.fn(contentLength);
+    const tokenCountCache = createExactTokenCountCache(tokenCounter);
+    const createMeter = (messages: BaseMessage[]) =>
+      createContextPressureMeter({
+        tokenCounter,
+        tokenCountCache,
+        sourceMessages: messages,
+        retainedMessages: messages,
+        indexTokenCountMap: Object.fromEntries(
+          messages.map((_, index) => [index, 8])
+        ),
+        contextUsage: {
+          contextBudget: 10_000,
+          effectiveInstructionTokens: 100,
+          remainingContextTokens: 9_000,
+          calibrationRatio: 1,
+        },
+        instructionTokens: 100,
+        calibrationRatio: 1,
+      });
+
+    createMeter(retained).measure(retained);
+    createMeter(retained).measure(retained);
+
+    const appended = [...retained, new HumanMessage('new')];
+    createMeter(appended).measure(appended);
+
+    expect(tokenCounter).toHaveBeenCalledTimes(101);
+  });
+
+  it('recounts stable messages after a token-relevant mutation', () => {
+    const message = new HumanMessage('short');
+    const tokenCounter = jest.fn(contentLength);
+    const cache = createExactTokenCountCache(tokenCounter);
+
+    expect(cache.count(message)).toBe(5);
+    message.content = 'longer content';
+    expect(cache.count(message)).toBe(14);
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps mutable complex messages on the exact recount path', () => {
+    const message = new HumanMessage({
+      content: [{ type: 'text', text: 'mutable' }],
+    });
+    const tokenCounter = jest.fn(contentLength);
+    const cache = createExactTokenCountCache(tokenCounter);
+
+    cache.count(message);
+    cache.count(message);
+
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops reusing an AI count when tool calls become mutable', () => {
+    const message = new AIMessage({ content: 'answer', tool_calls: [] });
+    const tokenCounter = jest.fn(contentLength);
+    const cache = createExactTokenCountCache(tokenCounter);
+
+    cache.count(message);
+    message.tool_calls = new Proxy([], {});
+    cache.count(message);
+
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
+  });
+
+  it('recounts a tool message when its provider type changes', () => {
+    const message = new ToolMessage({
+      content: 'result',
+      tool_call_id: 'call-1',
+    });
+    const tokenCounter = jest.fn(contentLength);
+    const cache = createExactTokenCountCache(tokenCounter);
+
+    cache.count(message);
+    message.additional_kwargs.type = 'computer_call_output';
+    cache.count(message);
+
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
+  });
+
+  it('recounts when provider metadata gains an accessor', () => {
+    const message = new HumanMessage('content');
+    const tokenCounter = jest.fn(contentLength);
+    const cache = createExactTokenCountCache(tokenCounter);
+
+    cache.count(message);
+    Object.defineProperty(message.additional_kwargs, 'type', {
+      configurable: true,
+      get: () => 'computer_call_output',
+    });
+    cache.count(message);
+
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
+  });
+
+  it('matches forced recounts across append, replace, reorder, and mutation', () => {
+    const first = new HumanMessage({ id: 'first', content: 'one' });
+    const second = new HumanMessage({ id: 'second', content: 'two' });
+    const third = new AIMessage({ id: 'third', content: 'three' });
+    const tokenCountCache = createExactTokenCountCache(contentLength);
+    const histories = [
+      [first, second],
+      [first, second, third],
+      [first, new HumanMessage({ id: 'replacement', content: 'replacement' })],
+      [second, first, third],
+    ];
+
+    for (const history of histories) {
+      const indexTokenCountMap = Object.fromEntries(
+        history.map((message, index) => [index, contentLength(message)])
+      );
+      const params = {
+        tokenCounter: contentLength,
+        sourceMessages: history,
+        retainedMessages: history,
+        indexTokenCountMap,
+        contextUsage: {
+          contextBudget: 100,
+          effectiveInstructionTokens: 10,
+          remainingContextTokens: 50,
+          calibrationRatio: 1.25,
+        },
+        instructionTokens: 10,
+        calibrationRatio: 1.25,
+      };
+      const cached = createContextPressureMeter({
+        ...params,
+        tokenCountCache,
+      }).measure(history);
+      const recounted = createContextPressureMeter(params).measure(history);
+
+      expect(cached).toEqual(recounted);
+    }
+
+    first.content = 'mutated after caching';
+    const mutatedParams = {
+      tokenCounter: contentLength,
+      sourceMessages: [first],
+      retainedMessages: [first],
+      indexTokenCountMap: { 0: contentLength(first) },
+      contextUsage: {
+        contextBudget: 100,
+        effectiveInstructionTokens: 10,
+        remainingContextTokens: 50,
+        calibrationRatio: 1.25,
+      },
+      instructionTokens: 10,
+      calibrationRatio: 1.25,
+    };
+
+    expect(
+      createContextPressureMeter({
+        ...mutatedParams,
+        tokenCountCache,
+      }).measure([first])
+    ).toEqual(createContextPressureMeter(mutatedParams).measure([first]));
   });
 
   it('tokenizes only changed candidates across a compaction search', () => {

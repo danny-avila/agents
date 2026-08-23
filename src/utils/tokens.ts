@@ -7,6 +7,7 @@ import {
   serializeStructuredValueBounded,
 } from './toolContent';
 import { ContentTypes } from '@/common/enum';
+import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 
 export type EncodingName = 'o200k_base' | 'claude';
 
@@ -1266,13 +1267,13 @@ export const createTokenCounter = async (
   const tok = await getTokenizer(encoding);
   const countTokens = (text: string): number => tok.count(text);
   const isClaude = encoding === 'claude';
-  return (message: BaseMessage): number => {
+  return markTokenCounterCacheCompatible((message: BaseMessage): number => {
     const count = getTokenCountForMessage(message, countTokens, encoding);
     const correctedCount = isClaude
       ? Math.ceil(count * CLAUDE_TOKEN_CORRECTION)
       : count;
     return ensureSafeTokenMeasurement(correctedCount, 'message');
-  };
+  });
 };
 
 /** Utility to manage the token encoder lifecycle explicitly. */
