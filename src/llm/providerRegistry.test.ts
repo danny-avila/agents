@@ -10,8 +10,11 @@ import {
   providerUsesManualToolStream,
   registerProvider,
 } from './providers';
+import { getMaxOutputTokensKey, isThinkingEnabled } from './request';
 import { prepareProviderRequest } from './prepareProviderRequest';
+import { registerBuiltInProvider } from './providerRegistry';
 import { toLangChainContent } from '@/messages/langchain';
+import { assertNotTruncatedToolCall } from './truncation';
 import { attemptInvoke } from './invoke';
 import { initializeModel } from './init';
 import { FakeChatModel } from './fake';
@@ -129,6 +132,15 @@ describe('provider registry', () => {
     });
   });
 
+  it('prefers a graph-local built-in over a shared host registration', () => {
+    const provider = 'promoted-built-in-test';
+    track(registerProvider({ provider, model: HostProvider }));
+
+    registerBuiltInProvider({ provider, model: HostProviderWithoutTools });
+
+    expect(getChatModelClass(provider)).toBe(HostProviderWithoutTools);
+  });
+
   it('normalizes manual streams with the registered provider family', async () => {
     const cases: Array<{
       provider: string;
@@ -197,6 +209,56 @@ describe('provider registry', () => {
         testCase.expectedType
       );
     }
+  });
+
+  it('applies registered families to request and response safeguards', () => {
+    const anthropicProvider = 'anthropic-family-host-test';
+    const bedrockProvider = 'bedrock-family-host-test';
+    const googleProvider = 'google-family-host-test';
+    track(
+      registerProvider({
+        provider: anthropicProvider,
+        model: HostProvider,
+        family: 'anthropic',
+      })
+    );
+    track(
+      registerProvider({
+        provider: bedrockProvider,
+        model: HostProvider,
+        family: 'bedrock',
+      })
+    );
+    track(
+      registerProvider({
+        provider: googleProvider,
+        model: HostProvider,
+        family: 'google',
+      })
+    );
+
+    expect(
+      isThinkingEnabled(anthropicProvider, {
+        thinking: { type: 'enabled', budget_tokens: 1024 },
+      } as t.AnthropicClientOptions)
+    ).toBe(true);
+    expect(
+      isThinkingEnabled(bedrockProvider, {
+        additionalModelRequestFields: {
+          thinking: { type: 'enabled', budget_tokens: 1024 },
+        },
+      } as t.BedrockAnthropicInput)
+    ).toBe(true);
+    expect(getMaxOutputTokensKey(googleProvider)).toBe('maxOutputTokens');
+
+    const atomicToolCall = new AIMessageChunk({
+      content: '',
+      tool_calls: [{ id: '1', name: 'lookup', args: { value: 'complete' } }],
+      response_metadata: { finishReason: 'MAX_TOKENS' },
+    });
+    expect(() =>
+      assertNotTruncatedToolCall(atomicToolCall, googleProvider)
+    ).not.toThrow();
   });
 
   it('rejects duplicate built-in and host registrations', () => {

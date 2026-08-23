@@ -1,5 +1,6 @@
 import type { AIMessageChunk, BaseMessage } from '@langchain/core/messages';
 import type { ProviderName } from '@/types';
+import { getProviderFamily } from '@/llm/providerRegistry';
 import { Providers } from '@/common';
 
 /**
@@ -168,7 +169,11 @@ export function assertNotTruncatedToolCall(
   if (message == null) {
     return;
   }
-  if (provider != null && ATOMIC_TOOL_CALL_ARG_PROVIDERS.has(provider)) {
+  if (
+    provider != null &&
+    (ATOMIC_TOOL_CALL_ARG_PROVIDERS.has(provider) ||
+      getProviderFamily(provider) === 'google')
+  ) {
     return;
   }
   const stopReason = getTruncationStopReason(message);

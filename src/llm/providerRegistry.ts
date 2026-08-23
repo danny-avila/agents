@@ -72,7 +72,7 @@ function createRegistration<
 function getRegistration(
   provider: ProviderName
 ): StoredProviderRegistration | undefined {
-  return registeredProviders.get(provider) ?? builtInProviders.get(provider);
+  return builtInProviders.get(provider) ?? registeredProviders.get(provider);
 }
 
 /** Registers one host provider until the returned disposer is called. */
@@ -101,7 +101,7 @@ export function registerBuiltInProvider<
   TModel extends BaseChatModel,
 >(options: ProviderRegistrationOptions<TOptions, TModel>): void {
   const provider = normalizeProvider(options.provider);
-  if (getRegistration(provider) != null) {
+  if (builtInProviders.has(provider)) {
     throw new Error(`LLM provider already registered: ${provider}`);
   }
   builtInProviders.set(provider, createRegistration(provider, options));

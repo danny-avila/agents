@@ -92,9 +92,11 @@ names fail closed, and a disposer removes only the exact registration that
 created it.
 
 Provider family, manual tool-stream handling, and strict message alternation
-belong to the registration. Exact provider-specific behavior such as Bedrock
-cache shaping or OpenRouter replay handling remains keyed to the built-in
-provider identity. Host option types are declaration-merged through the stable
+belong to the registration. Family governs shared protocol behavior such as
+thinking detection, output-token option names, and atomic tool-call handling.
+Exact provider-specific behavior such as Bedrock cache shaping or OpenRouter
+replay handling remains keyed to the built-in provider identity. Host option
+types are declaration-merged through the stable
 `@librechat/agents/provider-registration` subpath without widening the built-in
 option maps.
 

@@ -1,4 +1,5 @@
 import type * as t from '@/types';
+import { getProviderFamily } from '@/llm/providerRegistry';
 import { Providers } from '@/common';
 
 /**
@@ -11,16 +12,17 @@ export function isThinkingEnabled(
   clientOptions?: t.ClientOptions
 ): boolean {
   if (!clientOptions) return false;
+  const family = getProviderFamily(provider);
 
   if (
-    provider === Providers.ANTHROPIC &&
+    (provider === Providers.ANTHROPIC || family === 'anthropic') &&
     (clientOptions as t.AnthropicClientOptions).thinking != null
   ) {
     return true;
   }
 
   if (
-    provider === Providers.BEDROCK &&
+    (provider === Providers.BEDROCK || family === 'bedrock') &&
     (clientOptions as t.BedrockAnthropicInput).additionalModelRequestFields?.[
       'thinking'
     ] != null
@@ -29,7 +31,7 @@ export function isThinkingEnabled(
   }
 
   if (
-    provider === Providers.OPENAI &&
+    (provider === Providers.OPENAI || family === 'openai') &&
     (
       (clientOptions as t.OpenAIClientOptions).modelKwargs
         ?.thinking as t.AnthropicClientOptions['thinking']
@@ -49,7 +51,9 @@ export function isThinkingEnabled(
 export function getMaxOutputTokensKey(
   provider: t.ProviderName
 ): 'maxOutputTokens' | 'maxTokens' {
-  return provider === Providers.GOOGLE || provider === Providers.VERTEXAI
+  return provider === Providers.GOOGLE ||
+    provider === Providers.VERTEXAI ||
+    getProviderFamily(provider) === 'google'
     ? 'maxOutputTokens'
     : 'maxTokens';
 }

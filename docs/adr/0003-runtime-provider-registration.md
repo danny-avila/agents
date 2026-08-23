@@ -39,8 +39,9 @@ accepted at runtime but receive only the built-in option union at compile time.
 ## Consequences
 
 - Hosts can add compatible providers without an agents package release.
-- Provider-family message shaping and streaming traits stay local to one
-  registration instead of being recomputed across callers.
+- Provider-family message shaping, thinking detection, output-token keying,
+  truncation safeguards, and streaming traits resolve from one registration
+  instead of being recomputed across callers.
 - Built-in provider types remain precise, while typed host options require an
   explicit declaration merge.
 - Registration must run in every process before agent configuration is used;
