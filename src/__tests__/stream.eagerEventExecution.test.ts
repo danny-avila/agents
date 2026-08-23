@@ -56,6 +56,7 @@ function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
     toolOutputReferences: undefined,
     sessions: new Map(),
     toolCallStepIds: new Map(),
+    stepKeyIds: new Map(),
     messageIdsByStepKey: new Map(),
     messageStepHasToolCalls: new Map(),
     prelimMessageIdsByStepKey: new Map(),
