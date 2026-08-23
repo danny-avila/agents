@@ -13,7 +13,19 @@ interface StoredProviderRegistration {
   owner: symbol;
 }
 
-const providers = new Map<ProviderName, StoredProviderRegistration>();
+interface ProviderRegistryGlobal {
+  [key: symbol]: Map<ProviderName, StoredProviderRegistration> | undefined;
+}
+
+const PROVIDER_REGISTRY_KEY = Symbol.for(
+  '@librechat/agents:providerRegistry:v1'
+);
+const providerRegistryGlobal = globalThis as ProviderRegistryGlobal;
+const registeredProviders =
+  providerRegistryGlobal[PROVIDER_REGISTRY_KEY] ??
+  new Map<ProviderName, StoredProviderRegistration>();
+providerRegistryGlobal[PROVIDER_REGISTRY_KEY] = registeredProviders;
+const builtInProviders = new Map<ProviderName, StoredProviderRegistration>();
 
 function normalizeProvider(provider: ProviderName): ProviderName {
   if (typeof provider !== 'string' || provider.trim() === '') {
@@ -38,39 +50,67 @@ function isConstructible<T extends abstract new (...args: never[]) => object>(
   }
 }
 
+function createRegistration<
+  TOptions extends object,
+  TModel extends BaseChatModel,
+>(
+  provider: ProviderName,
+  options: ProviderRegistrationOptions<TOptions, TModel>
+): StoredProviderRegistration {
+  if (typeof options.model !== 'function' || !isConstructible(options.model)) {
+    throw new TypeError(`LLM provider constructor is invalid: ${provider}`);
+  }
+  return {
+    model: options.model,
+    family: options.family ?? 'generic',
+    manualToolStream: options.manualToolStream ?? false,
+    strictAlternation: options.strictAlternation ?? false,
+    owner: Symbol(provider),
+  };
+}
+
+function getRegistration(
+  provider: ProviderName
+): StoredProviderRegistration | undefined {
+  return registeredProviders.get(provider) ?? builtInProviders.get(provider);
+}
+
 /** Registers one host provider until the returned disposer is called. */
 export function registerProvider<
   TOptions extends object,
   TModel extends BaseChatModel,
 >(options: ProviderRegistrationOptions<TOptions, TModel>): () => void {
   const provider = normalizeProvider(options.provider);
-  if (typeof options.model !== 'function' || !isConstructible(options.model)) {
-    throw new TypeError(`LLM provider constructor is invalid: ${provider}`);
-  }
-  if (providers.has(provider)) {
+  if (getRegistration(provider) != null) {
     throw new Error(`LLM provider already registered: ${provider}`);
   }
 
-  const owner = Symbol(provider);
-  providers.set(provider, {
-    model: options.model,
-    family: options.family ?? 'generic',
-    manualToolStream: options.manualToolStream ?? false,
-    strictAlternation: options.strictAlternation ?? false,
-    owner,
-  });
+  const registration = createRegistration(provider, options);
+  registeredProviders.set(provider, registration);
 
   return (): void => {
-    if (providers.get(provider)?.owner === owner) {
-      providers.delete(provider);
+    if (registeredProviders.get(provider)?.owner === registration.owner) {
+      registeredProviders.delete(provider);
     }
   };
+}
+
+/** Initializes one built-in for the current package module graph. */
+export function registerBuiltInProvider<
+  TOptions extends object,
+  TModel extends BaseChatModel,
+>(options: ProviderRegistrationOptions<TOptions, TModel>): void {
+  const provider = normalizeProvider(options.provider);
+  if (getRegistration(provider) != null) {
+    throw new Error(`LLM provider already registered: ${provider}`);
+  }
+  builtInProviders.set(provider, createRegistration(provider, options));
 }
 
 export function getRegisteredChatModelClass<P extends ProviderName>(
   provider: P
 ): ProviderModelConstructor<P> {
-  const registration = providers.get(provider);
+  const registration = getRegistration(provider);
   if (!registration) {
     throw new Error(`Unsupported LLM provider: ${provider}`);
   }
@@ -80,15 +120,15 @@ export function getRegisteredChatModelClass<P extends ProviderName>(
 export function getProviderFamily(
   provider: ProviderName
 ): ProviderFamily | undefined {
-  return providers.get(provider)?.family;
+  return getRegistration(provider)?.family;
 }
 
 export function providerUsesManualToolStream(provider: ProviderName): boolean {
-  return providers.get(provider)?.manualToolStream ?? false;
+  return getRegistration(provider)?.manualToolStream ?? false;
 }
 
 export function providerRequiresStrictAlternation(
   provider: ProviderName
 ): boolean {
-  return providers.get(provider)?.strictAlternation ?? false;
+  return getRegistration(provider)?.strictAlternation ?? false;
 }

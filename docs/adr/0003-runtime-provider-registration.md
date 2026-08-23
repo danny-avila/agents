@@ -23,9 +23,13 @@ existing `getChatModelClass` interface, while hosts add registrations through
 
 Provider names are process-local and unique. Duplicate registrations fail
 closed. Registration returns an ownership-scoped disposer so tests and hot
-reload can remove only the binding they created. Constructors are validated as
-constructible, and model initialization reports a provider-specific error when
-tools are requested from a model without `bindTools`.
+reload can remove only the binding they created. The registry uses a versioned
+global symbol so ESM and CommonJS package graphs in the same process resolve
+the same host bindings. Built-ins remain module-graph-local so provider wrapper
+identity checks use the matching ESM or CommonJS constructors. Constructors are
+validated as constructible, and model initialization reports a
+provider-specific error when tools are requested from a model without
+`bindTools`.
 
 Host applications declaration-merge `CustomProviderOptionsMap` in
 `@librechat/agents/provider-registration` to carry their configuration type

@@ -13,7 +13,7 @@ import {
 } from '@/llm/openai';
 import {
   getRegisteredChatModelClass,
-  registerProvider,
+  registerBuiltInProvider,
 } from '@/llm/providerRegistry';
 import { CustomChatGoogleGenerativeAI } from '@/llm/google';
 import { CustomChatBedrockConverse } from '@/llm/bedrock';
@@ -29,47 +29,53 @@ type BuiltInProviderTraits = {
   strictAlternation?: boolean;
 };
 
-function registerBuiltInProvider<P extends Providers>(
+function initializeBuiltInProvider<P extends Providers>(
   provider: P,
   model: ChatModelConstructorMap[P],
   traits: BuiltInProviderTraits
 ): void {
-  registerProvider({
+  registerBuiltInProvider({
     provider,
     model,
     ...traits,
   });
 }
 
-registerBuiltInProvider(Providers.XAI, ChatXAI, { family: 'openai' });
-registerBuiltInProvider(Providers.OPENAI, ChatOpenAI, { family: 'openai' });
-registerBuiltInProvider(Providers.AZURE, AzureChatOpenAI, { family: 'openai' });
-registerBuiltInProvider(Providers.VERTEXAI, ChatVertexAI, { family: 'google' });
-registerBuiltInProvider(Providers.DEEPSEEK, ChatDeepSeek, { family: 'openai' });
-registerBuiltInProvider(Providers.MISTRALAI, CustomChatMistralAI, {
+initializeBuiltInProvider(Providers.XAI, ChatXAI, { family: 'openai' });
+initializeBuiltInProvider(Providers.OPENAI, ChatOpenAI, { family: 'openai' });
+initializeBuiltInProvider(Providers.AZURE, AzureChatOpenAI, {
+  family: 'openai',
+});
+initializeBuiltInProvider(Providers.VERTEXAI, ChatVertexAI, {
+  family: 'google',
+});
+initializeBuiltInProvider(Providers.DEEPSEEK, ChatDeepSeek, {
+  family: 'openai',
+});
+initializeBuiltInProvider(Providers.MISTRALAI, CustomChatMistralAI, {
   family: 'mistral',
   strictAlternation: true,
 });
-registerBuiltInProvider(Providers.MISTRAL, CustomChatMistralAI, {
+initializeBuiltInProvider(Providers.MISTRAL, CustomChatMistralAI, {
   family: 'mistral',
   strictAlternation: true,
 });
-registerBuiltInProvider(Providers.ANTHROPIC, CustomAnthropic, {
+initializeBuiltInProvider(Providers.ANTHROPIC, CustomAnthropic, {
   family: 'anthropic',
   manualToolStream: true,
 });
-registerBuiltInProvider(Providers.OPENROUTER, ChatOpenRouter, {
+initializeBuiltInProvider(Providers.OPENROUTER, ChatOpenRouter, {
   family: 'openai',
 });
-registerBuiltInProvider(Providers.BEDROCK, CustomChatBedrockConverse, {
+initializeBuiltInProvider(Providers.BEDROCK, CustomChatBedrockConverse, {
   family: 'bedrock',
   manualToolStream: true,
   strictAlternation: true,
 });
-registerBuiltInProvider(Providers.GOOGLE, CustomChatGoogleGenerativeAI, {
+initializeBuiltInProvider(Providers.GOOGLE, CustomChatGoogleGenerativeAI, {
   family: 'google',
 });
-registerBuiltInProvider(Providers.MOONSHOT, ChatMoonshot, {
+initializeBuiltInProvider(Providers.MOONSHOT, ChatMoonshot, {
   family: 'generic',
 });
 

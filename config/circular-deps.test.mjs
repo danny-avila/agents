@@ -54,7 +54,10 @@ async function createTarget(files, options = {}) {
 }
 
 test('the package build and checker share all public entries', () => {
-  assert.equal(Object.keys(packageEntries).length, 13);
+  assert.equal(
+    packageEntries['provider-registration'],
+    'src/provider-registration.ts'
+  );
   assert.equal(tsdownConfig.length, 2);
   for (const config of tsdownConfig) {
     assert.equal(config.entry, packageEntries);

@@ -1,8 +1,8 @@
 import { z } from 'zod';
-import { HumanMessage } from '@langchain/core/messages';
 import { DynamicStructuredTool } from '@langchain/core/tools';
+import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
 import { FakeChatModel as CoreFakeChatModel } from '@langchain/core/utils/testing';
-import type { ProviderName } from '@/types';
+import type * as t from '@/types';
 import {
   getProviderFamily,
   getChatModelClass,
@@ -11,6 +11,8 @@ import {
   registerProvider,
 } from './providers';
 import { prepareProviderRequest } from './prepareProviderRequest';
+import { toLangChainContent } from '@/messages/langchain';
+import { attemptInvoke } from './invoke';
 import { initializeModel } from './init';
 import { FakeChatModel } from './fake';
 import { isOpenAILike } from '@/utils';
@@ -112,6 +114,91 @@ describe('provider registry', () => {
     expect(providerRequiresStrictAlternation(Providers.BEDROCK)).toBe(true);
   });
 
+  it('shares host registrations with another package module graph', async () => {
+    track(
+      registerProvider({
+        provider: 'isolated-module-host-test',
+        model: HostProvider,
+      })
+    );
+    await jest.isolateModulesAsync(async () => {
+      const isolatedProviders = await import('./providers');
+      expect(
+        isolatedProviders.getChatModelClass('isolated-module-host-test')
+      ).toBe(HostProvider);
+    });
+  });
+
+  it('normalizes manual streams with the registered provider family', async () => {
+    const cases: Array<{
+      provider: string;
+      family: 'anthropic' | 'bedrock';
+      content: t.MessageContentComplex[];
+      expectedType: string;
+      expectedLength: number;
+    }> = [
+      {
+        provider: 'anthropic-stream-host-test',
+        family: 'anthropic',
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'private chain',
+            signature: 'signature',
+          },
+        ],
+        expectedType: 'thinking',
+        expectedLength: 1,
+      },
+      {
+        provider: 'bedrock-stream-host-test',
+        family: 'bedrock',
+        content: [
+          { type: 'reasoning_content', reasoningText: { text: 'one' } },
+          { type: 'reasoning_content', reasoningText: { text: 'two' } },
+        ],
+        expectedType: 'reasoning_content',
+        expectedLength: 1,
+      },
+    ];
+
+    for (const testCase of cases) {
+      track(
+        registerProvider({
+          provider: testCase.provider,
+          model: HostProvider,
+          family: testCase.family,
+          manualToolStream: true,
+        })
+      );
+      const chunk = new AIMessageChunk({
+        content: toLangChainContent(testCase.content),
+      });
+      const model: t.ChatModel = {
+        stream: async (): Promise<AsyncIterable<AIMessageChunk>> => {
+          return (async function* (): AsyncGenerator<AIMessageChunk> {
+            yield chunk;
+          })();
+        },
+        invoke: async (): Promise<AIMessageChunk> => chunk,
+      };
+
+      const result = await attemptInvoke({
+        model,
+        messages: [new HumanMessage('hello')],
+        provider: testCase.provider,
+        onChunk: (): void => undefined,
+      });
+      const content = result.messages?.[0]?.content;
+
+      expect(Array.isArray(content)).toBe(true);
+      expect(content).toHaveLength(testCase.expectedLength);
+      expect((content?.[0] as t.MessageContentComplex).type).toBe(
+        testCase.expectedType
+      );
+    }
+  });
+
   it('rejects duplicate built-in and host registrations', () => {
     expect(() =>
       registerProvider({
@@ -129,7 +216,7 @@ describe('provider registry', () => {
 
   it('rejects invalid names and non-constructible registrations', () => {
     expect(() =>
-      registerProvider({ provider: '' as ProviderName, model: HostProvider })
+      registerProvider({ provider: '' as t.ProviderName, model: HostProvider })
     ).toThrow('LLM provider name must be a non-empty string');
     expect(() =>
       registerProvider({

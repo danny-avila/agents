@@ -30,14 +30,17 @@ import {
   assertPreparedProviderRequestFor,
   prepareProviderRequest,
 } from '@/llm/prepareProviderRequest';
+import {
+  getProviderFamily,
+  providerUsesManualToolStream,
+} from '@/llm/providers';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
-import { providerUsesManualToolStream } from '@/llm/providers';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
-import { modifyDeltaProperties } from '@/messages';
 import { appendCallbacks } from '@/utils/callbacks';
+import { modifyDeltaProperties } from '@/messages';
 import { canSealPreempt } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 
@@ -102,6 +105,19 @@ export type OnChunk = (
 
 /** Unique per-model-attempt sequence; see the stamp in `attemptInvoke`. */
 let streamLimitAttemptSeq = 0;
+
+function getManualToolStreamNormalizationProvider(
+  provider: t.ProviderName
+): t.ProviderName {
+  const family = getProviderFamily(provider);
+  if (family === 'anthropic') {
+    return Providers.ANTHROPIC;
+  }
+  if (family === 'bedrock') {
+    return Providers.BEDROCK;
+  }
+  return provider;
+}
 
 /**
  * The registered handler that owns content-part dispatch, if any.
@@ -806,7 +822,10 @@ async function attemptInvokeBody(
     }
 
     if (providerUsesManualToolStream(provider)) {
-      finalChunk = modifyDeltaProperties(provider, finalChunk);
+      finalChunk = modifyDeltaProperties(
+        getManualToolStreamNormalizationProvider(provider),
+        finalChunk
+      );
     }
 
     if (preempted && finalChunk != null) {
