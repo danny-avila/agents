@@ -4,10 +4,12 @@ import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import {
+  commandAvailabilityEnvCacheKey,
   getSpawn,
   getWorkspaceFS,
   probeLocalCommandAvailability,
   resolveWorkspacePathSafe,
+  setCommandAvailabilityCacheEntry,
   spawnLocalProcess,
   truncateLocalOutput,
 } from './LocalExecutionEngine';
@@ -737,29 +739,13 @@ export function createLocalEditFileTool(
  * spawn-per-search.
  */
 // Per-backend × per-env cache. Codex P1 #34 — keying by spawn
-// backend alone misses the case where two Runs share a backend but
-// vary `local.env` (especially PATH). Stale cache then claims `rg`
-// is available, the rg path runs, and the spawn fails with ENOENT
-// instead of falling back to the Node walker. The inner Map is
-// keyed by a stable JSON hash of the effective env so each unique
-// env gets its own probe.
+// backend alone misses the case where two Runs share a backend but vary
+// `local.env`. The inner map uses non-plaintext environment hashes and is
+// bounded so stable worlds do not retain unbounded variants or raw secrets.
 let ripgrepAvailabilityByBackend = new WeakMap<
   t.LocalSpawn,
   Map<string, ReturnType<typeof probeLocalCommandAvailability>>
 >();
-
-function envCacheKey(env: NodeJS.ProcessEnv | undefined): string {
-  // PATH is the only env entry that affects command lookup, but
-  // hashing the whole env keeps the key correct for hosts that
-  // vary anything else relevant. Stable JSON via sorted keys so
-  // {A:1,B:2} and {B:2,A:1} produce the same hash.
-  if (env == null) return '';
-  const sorted: Record<string, string | undefined> = {};
-  for (const k of Object.keys(env).sort()) {
-    sorted[k] = env[k];
-  }
-  return JSON.stringify(sorted);
-}
 
 async function isRipgrepAvailable(
   config: t.LocalExecutionConfig
@@ -770,11 +756,11 @@ async function isRipgrepAvailable(
     envMap = new Map();
     ripgrepAvailabilityByBackend.set(backend, envMap);
   }
-  const envKey = envCacheKey(config.env);
+  const envKey = commandAvailabilityEnvCacheKey(config.env);
   let probePromise = envMap.get(envKey);
   if (probePromise == null) {
     probePromise = probeLocalCommandAvailability('rg', ['--version'], config);
-    envMap.set(envKey, probePromise);
+    setCommandAvailabilityCacheEntry(envMap, envKey, probePromise);
   }
   const result = await probePromise;
   if (!result.cacheable && envMap.get(envKey) === probePromise) {

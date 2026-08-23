@@ -21,6 +21,36 @@ const DEFAULT_MAX_OUTPUT_CHARS = 200000;
 const DEFAULT_MAX_SPAWNED_BYTES = 50 * 1024 * 1024;
 const DEFAULT_LOCAL_SESSION_ID = 'local';
 const DEFAULT_SHELL = process.platform === 'win32' ? 'bash.exe' : 'bash';
+const MAX_COMMAND_AVAILABILITY_ENVIRONMENTS = 16;
+
+/** Produces a stable, non-plaintext key for environment-sensitive probes. */
+export function commandAvailabilityEnvCacheKey(
+  env: NodeJS.ProcessEnv | undefined
+): string {
+  if (env == null) {
+    return '';
+  }
+  const sorted: Record<string, string | undefined> = {};
+  for (const key of Object.keys(env).sort()) {
+    sorted[key] = env[key];
+  }
+  return createHash('sha256').update(JSON.stringify(sorted)).digest('hex');
+}
+
+/** Adds a probe entry while bounding retained environment variants. */
+export function setCommandAvailabilityCacheEntry<T>(
+  cache: Map<string, T>,
+  key: string,
+  value: T
+): void {
+  if (!cache.has(key) && cache.size >= MAX_COMMAND_AVAILABILITY_ENVIRONMENTS) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) {
+      cache.delete(oldestKey);
+    }
+  }
+  cache.set(key, value);
+}
 
 // `(?:--\s+)?` before each destructive-target alternation: GNU/BSD
 // utilities accept `--` as an end-of-options marker, so `rm -rf -- /`

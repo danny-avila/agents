@@ -103,6 +103,56 @@ it('rebuilds the world when captured Cloudflare settings change', async () => {
   );
 });
 
+it('preserves a prewarmed factory when creating the first world', async () => {
+  let factoryCalls = 0;
+  const runtime = createRuntime({ readFile: async () => 'ok' });
+  const config: t.CloudflareSandboxExecutionConfig = {
+    sandbox: async () => {
+      factoryCalls++;
+      return runtime;
+    },
+  };
+
+  await createCloudflareWorkspaceFS(config).readFile('/workspace/first.txt');
+  const world = createCloudflareExecutionWorld(config);
+  await world.fs.readFile('/workspace/second.txt');
+
+  expect(factoryCalls).toBe(1);
+});
+
+it('does not let a stale factory rejection evict its replacement', async () => {
+  let rejectFirst: ((error: Error) => void) | undefined;
+  const firstFactory = new Promise<t.CloudflareSandboxRuntime>(
+    (_resolve, reject) => {
+      rejectFirst = reject;
+    }
+  );
+  let replacementCalls = 0;
+  const replacement = createRuntime({ readFile: async () => 'replacement' });
+  const config: t.CloudflareSandboxExecutionConfig = {
+    sandbox: () => firstFactory,
+  };
+
+  const firstWorld = createCloudflareExecutionWorld(config);
+  const staleRead = firstWorld.fs.readFile('/workspace/stale.txt');
+  await Promise.resolve();
+  config.sandbox = async () => {
+    replacementCalls++;
+    return replacement;
+  };
+  const replacementWorld = createCloudflareExecutionWorld(config);
+  await expect(
+    replacementWorld.fs.readFile('/workspace/replacement.txt', 'utf8')
+  ).resolves.toBe('replacement');
+  rejectFirst?.(new Error('stale factory failed'));
+  await expect(staleRead).rejects.toThrow('stale factory failed');
+  await expect(
+    replacementWorld.fs.readFile('/workspace/reused.txt', 'utf8')
+  ).resolves.toBe('replacement');
+
+  expect(replacementCalls).toBe(1);
+});
+
 it('keeps remote capability probes warm across Cloudflare tool bindings', async () => {
   _resetSyntaxCheckProbeCacheForTests();
   let execCalls = 0;

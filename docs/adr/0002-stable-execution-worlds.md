@@ -22,9 +22,11 @@ tool bindings. The existing partial `local.exec` shape and legacy top-level
 `local.spawn` option remain supported at the public configuration boundary.
 
 Capability caches continue to key by the world's subprocess function and
-environment. Reusing a world therefore reuses only backend capability facts;
-command output, timeout state, cancellation, and tool results remain scoped to
-each invocation.
+environment. Environment variants use bounded, non-plaintext keys. Sandbox
+factory results are also tied to the factory identity so a replacement cannot
+be evicted by an older request. Reusing a world therefore reuses only backend
+capability facts; command output, timeout state, cancellation, and tool results
+remain scoped to each invocation.
 
 ## Consequences
 

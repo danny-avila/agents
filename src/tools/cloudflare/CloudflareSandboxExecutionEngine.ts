@@ -56,9 +56,16 @@ const executionWorldCache = new WeakMap<
   ExecutionWorldCacheEntry
 >();
 
+type SandboxFactoryCacheEntry = {
+  sandbox: () =>
+    | t.CloudflareSandboxRuntime
+    | Promise<t.CloudflareSandboxRuntime>;
+  promise: Promise<t.CloudflareSandboxRuntime>;
+};
+
 const sandboxFactoryCache = new WeakMap<
   t.CloudflareSandboxExecutionConfig,
-  Promise<t.CloudflareSandboxRuntime>
+  SandboxFactoryCacheEntry
 >();
 
 function normalizeWorkspaceRoot(workspaceRoot: string): string {
@@ -81,17 +88,20 @@ export async function resolveCloudflareSandbox(
   if (typeof sandbox !== 'function') {
     return sandbox;
   }
-  let cached = sandboxFactoryCache.get(config);
-  if (cached == null) {
-    cached = Promise.resolve()
-      .then(() => sandbox())
-      .catch((error: unknown) => {
-        sandboxFactoryCache.delete(config);
-        throw error;
-      });
-    sandboxFactoryCache.set(config, cached);
+  const cached = sandboxFactoryCache.get(config);
+  if (cached?.sandbox === sandbox) {
+    return cached.promise;
   }
-  return cached;
+  const promise = Promise.resolve()
+    .then(() => sandbox())
+    .catch((error: unknown) => {
+      if (sandboxFactoryCache.get(config)?.promise === promise) {
+        sandboxFactoryCache.delete(config);
+      }
+      throw error;
+    });
+  sandboxFactoryCache.set(config, { sandbox, promise });
+  return promise;
 }
 
 async function getRuntimeContext(
@@ -716,9 +726,6 @@ export function createCloudflareExecutionWorld(
     cached.sandbox === config.sandbox
   ) {
     return cached.world;
-  }
-  if (cached?.sandbox !== config.sandbox) {
-    sandboxFactoryCache.delete(config);
   }
   const fs = Object.freeze(createCloudflareWorkspaceFS(config));
   const world = Object.freeze({
