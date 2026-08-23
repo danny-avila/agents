@@ -30,6 +30,7 @@ import {
 import { resolveContextPruningSettings } from './contextPruningSettings';
 import { hasUnsafeStructuredSerialization } from '@/utils/tokens';
 import { ContentTypes, Providers, Constants } from '@/common';
+import { getProviderFamily } from '@/llm/providerRegistry';
 import { applyContextPruning } from './contextPruning';
 import { toLangChainContent } from './langchain';
 
@@ -2066,6 +2067,15 @@ type ThinkingBlocks = {
 };
 
 export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
+  const providerFamily =
+    factoryParams.provider == null
+      ? undefined
+      : getProviderFamily(factoryParams.provider);
+  const usesBedrockThinking =
+    factoryParams.provider === Providers.BEDROCK ||
+    providerFamily === 'bedrock';
+  const usesOpenAIThinking =
+    factoryParams.provider === Providers.OPENAI || providerFamily === 'openai';
   const indexTokenCountMap = { ...factoryParams.indexTokenCountMap };
   let lastTurnStartIndex = factoryParams.startIndex;
   let lastCutOffIndex = 0;
@@ -2153,10 +2163,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       };
     }
 
-    if (
-      factoryParams.provider === Providers.OPENAI &&
-      factoryParams.thinkingEnabled === true
-    ) {
+    if (usesOpenAIThinking && factoryParams.thinkingEnabled === true) {
       for (let i = lastTurnStartIndex; i < params.messages.length; i++) {
         const m = params.messages[i];
         if (
@@ -2730,10 +2737,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       thinkingEnabled: factoryParams.thinkingEnabled,
       tokenCounter: factoryParams.tokenCounter,
       instructionTokens: rawSpaceInstructionTokens,
-      reasoningType:
-        factoryParams.provider === Providers.BEDROCK
-          ? ContentTypes.REASONING_CONTENT
-          : ContentTypes.THINKING,
+      reasoningType: usesBedrockThinking
+        ? ContentTypes.REASONING_CONTENT
+        : ContentTypes.THINKING,
       thinkingStartIndex:
         factoryParams.thinkingEnabled === true
           ? runThinkingStartIndex
@@ -2827,10 +2833,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         thinkingEnabled: factoryParams.thinkingEnabled,
         tokenCounter: factoryParams.tokenCounter,
         instructionTokens: currentInstructionTokens,
-        reasoningType:
-          factoryParams.provider === Providers.BEDROCK
-            ? ContentTypes.REASONING_CONTENT
-            : ContentTypes.THINKING,
+        reasoningType: usesBedrockThinking
+          ? ContentTypes.REASONING_CONTENT
+          : ContentTypes.THINKING,
         thinkingStartIndex:
           factoryParams.thinkingEnabled === true
             ? runThinkingStartIndex
@@ -2964,10 +2969,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           thinkingEnabled: factoryParams.thinkingEnabled,
           tokenCounter: factoryParams.tokenCounter,
           instructionTokens: currentInstructionTokens,
-          reasoningType:
-            factoryParams.provider === Providers.BEDROCK
-              ? ContentTypes.REASONING_CONTENT
-              : ContentTypes.THINKING,
+          reasoningType: usesBedrockThinking
+            ? ContentTypes.REASONING_CONTENT
+            : ContentTypes.THINKING,
           thinkingStartIndex:
             factoryParams.thinkingEnabled === true
               ? runThinkingStartIndex

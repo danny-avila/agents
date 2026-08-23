@@ -24,6 +24,7 @@ import {
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { isAnthropicLike, isOpenAILike } from '@/utils/llm';
+import { getProviderFamily } from '@/llm/providerRegistry';
 import { Providers } from '@/common';
 
 const preparedProviderRequestBrand = Symbol('PreparedProviderRequest');
@@ -162,6 +163,7 @@ function projectMessagesForProviderMode(
   { messages, provider, maxToolResultChars }: ProjectMessagesForProviderParams,
   projectionMode: ProviderMessageProjectionMode
 ): BaseMessage[] {
+  const providerFamily = getProviderFamily(provider);
   const nativeOpenAIResponses = projectionMode === 'openai-responses';
   const providerInputMessages = projectToolStreamContentForProvider(
     messages,
@@ -194,7 +196,7 @@ function projectMessagesForProviderMode(
       )
     );
   }
-  if (provider === Providers.ANTHROPIC) {
+  if (provider === Providers.ANTHROPIC || providerFamily === 'anthropic') {
     return projectComputerCallOutputsToText(
       projectSingleTextToolOutputsToText(
         stripBedrockCacheControl(providerInputMessages),
@@ -202,7 +204,7 @@ function projectMessagesForProviderMode(
       )
     );
   }
-  if (provider === Providers.BEDROCK) {
+  if (provider === Providers.BEDROCK || providerFamily === 'bedrock') {
     return stripAnthropicCacheControl(
       projectComputerCallOutputsToText(
         projectCacheControlledToolOutputsToText(
