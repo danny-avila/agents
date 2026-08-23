@@ -1,6 +1,7 @@
+import { isProxy } from 'node:util/types';
 import { ToolMessage } from '@langchain/core/messages';
 
-import type { BaseMessage } from '@langchain/core/messages';
+import type { AIMessage, BaseMessage } from '@langchain/core/messages';
 import type { ProviderPayloadMeasurement } from '@/llm/prepareProviderRequest';
 import type * as t from '@/types';
 
@@ -19,6 +20,7 @@ interface ContextPressureUsage {
 
 interface ContextPressureMeterParams {
   tokenCounter?: t.TokenCounter;
+  tokenCountCache?: ExactTokenCountCache;
   sourceMessages: BaseMessage[];
   retainedMessages: BaseMessage[];
   indexTokenCountMap: Record<string, number | undefined>;
@@ -51,6 +53,164 @@ export interface ContextPressureMeter {
   ): ProviderPayloadMeasurement;
 }
 
+export interface ExactTokenCountCache {
+  count(message: BaseMessage): number;
+}
+
+interface StableTokenSurface {
+  content: string;
+  messageType: string;
+  role?: string;
+  additionalType?: string;
+}
+
+interface ExactTokenCountCacheEntry {
+  surface: StableTokenSurface;
+  tokens: number;
+}
+
+function readDataProperty(
+  owner: object,
+  property: PropertyKey
+): { own: boolean; safe: boolean; value?: unknown } {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(owner, property);
+  } catch {
+    return { own: false, safe: false };
+  }
+  if (descriptor == null) {
+    return { own: false, safe: true };
+  }
+  return 'value' in descriptor
+    ? { own: true, safe: true, value: descriptor.value }
+    : { own: true, safe: false };
+}
+
+function getStableTokenSurface(
+  message: BaseMessage
+): StableTokenSurface | undefined {
+  if (isProxy(message)) {
+    return undefined;
+  }
+  const contentProperty = readDataProperty(message, 'content');
+  if (
+    !contentProperty.safe ||
+    !contentProperty.own ||
+    typeof contentProperty.value !== 'string'
+  ) {
+    return undefined;
+  }
+  const messageType = message.getType();
+  const roleProperty = readDataProperty(message, 'role');
+  if (!roleProperty.safe || (!roleProperty.own && 'role' in message)) {
+    return undefined;
+  }
+  const role = roleProperty.value;
+  if (role != null && typeof role !== 'string') {
+    return undefined;
+  }
+
+  const additionalKwargsProperty = readDataProperty(
+    message,
+    'additional_kwargs'
+  );
+  if (!additionalKwargsProperty.safe || !additionalKwargsProperty.own) {
+    return undefined;
+  }
+  const rawAdditionalKwargs = additionalKwargsProperty.value;
+  if (
+    rawAdditionalKwargs == null ||
+    typeof rawAdditionalKwargs !== 'object' ||
+    isProxy(rawAdditionalKwargs)
+  ) {
+    return undefined;
+  }
+  const additionalKwargs = rawAdditionalKwargs;
+  const typeProperty = readDataProperty(additionalKwargs, 'type');
+  if (!typeProperty.safe) {
+    return undefined;
+  }
+  if (messageType === 'ai' || role === 'assistant') {
+    const toolCallsProperty = readDataProperty(
+      message as AIMessage,
+      'tool_calls'
+    );
+    if (
+      !toolCallsProperty.safe ||
+      (!toolCallsProperty.own && 'tool_calls' in message)
+    ) {
+      return undefined;
+    }
+    const toolCalls = toolCallsProperty.value;
+    if (
+      toolCalls != null &&
+      (!Array.isArray(toolCalls) || isProxy(toolCalls) || toolCalls.length > 0)
+    ) {
+      return undefined;
+    }
+    const functionCall = readDataProperty(additionalKwargs, 'function_call');
+    if (!functionCall.safe || functionCall.value != null) {
+      return undefined;
+    }
+  }
+
+  let additionalType: string | undefined;
+  if (messageType === 'tool') {
+    const typeValue = typeProperty.value;
+    if (typeValue != null && typeof typeValue !== 'string') {
+      return undefined;
+    }
+    additionalType = typeof typeValue === 'string' ? typeValue : undefined;
+  }
+
+  return {
+    content: contentProperty.value,
+    messageType,
+    ...(role != null && { role }),
+    ...(additionalType != null && { additionalType }),
+  };
+}
+
+function tokenSurfacesMatch(
+  left: StableTokenSurface,
+  right: StableTokenSurface
+): boolean {
+  return (
+    left.content === right.content &&
+    left.messageType === right.messageType &&
+    left.role === right.role &&
+    left.additionalType === right.additionalType
+  );
+}
+
+/** Reuses exact counts only while every token-relevant stable field matches. */
+export function createExactTokenCountCache(
+  tokenCounter: t.TokenCounter
+): ExactTokenCountCache {
+  const entries = new WeakMap<BaseMessage, ExactTokenCountCacheEntry>();
+  return {
+    count(message): number {
+      const surface = getStableTokenSurface(message);
+      const cached = entries.get(message);
+      if (
+        surface != null &&
+        cached != null &&
+        tokenSurfacesMatch(cached.surface, surface)
+      ) {
+        return cached.tokens;
+      }
+      const tokens = tokenCounter(message);
+      if (surface != null) {
+        entries.set(message, { surface, tokens });
+      } else {
+        entries.delete(message);
+      }
+      return tokens;
+    },
+  };
+}
+
 function getProviderMessageOriginKey(message: BaseMessage): string | undefined {
   const type = message.getType();
   if (
@@ -69,6 +229,7 @@ function getProviderMessageOriginKey(message: BaseMessage): string | undefined {
 /** Measures repeated provider projections while tokenizing each message object once. */
 export function createContextPressureMeter({
   tokenCounter,
+  tokenCountCache,
   sourceMessages,
   retainedMessages,
   indexTokenCountMap,
@@ -88,12 +249,16 @@ export function createContextPressureMeter({
     if (cached != null) {
       return cached;
     }
-    const tokens = tokenCounter?.(message) ?? 0;
+    const tokens =
+      tokenCountCache?.count(message) ?? tokenCounter?.(message) ?? 0;
     tokenCounts.set(message, tokens);
     return tokens;
   };
 
-  if (contextUsage != null && tokenCounter != null) {
+  if (
+    contextUsage != null &&
+    (tokenCounter != null || tokenCountCache != null)
+  ) {
     const sourceIndices = new WeakMap<BaseMessage, number>();
     for (let i = 0; i < sourceMessages.length; i++) {
       sourceIndices.set(sourceMessages[i], i);
@@ -179,7 +344,7 @@ export function createContextPressureMeter({
       contextUsage?.effectiveInstructionTokens ??
       (forceRawRecount ? instructionTokens : undefined);
     if (
-      tokenCounter == null ||
+      (tokenCounter == null && tokenCountCache == null) ||
       contextBudget == null ||
       effectiveInstructionTokens == null
     ) {

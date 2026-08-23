@@ -3,6 +3,8 @@ import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { addBedrockCacheControl } from '@/messages/cache';
 import { Constants, Providers } from '@/common';
+import { createTokenCounter } from '@/utils/tokens';
+import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { AgentContext } from '../AgentContext';
 
 describe('AgentContext', () => {
@@ -1924,6 +1926,35 @@ describe('AgentContext', () => {
   });
 
   describe('reset()', () => {
+    it('retains the stable-message token cache across resets', async () => {
+      const tokenCounter = await createTokenCounter();
+      const ctx = createBasicContext({ tokenCounter });
+      const tokenCountCache = ctx.contextPressureTokenCounts;
+
+      ctx.reset();
+
+      expect(tokenCountCache).toBeDefined();
+      expect(ctx.contextPressureTokenCounts).toBe(tokenCountCache);
+    });
+
+    it('does not persist counts from an unmarked custom counter', () => {
+      const ctx = createBasicContext({ tokenCounter: () => 1 });
+
+      expect(ctx.contextPressureTokenCounts).toBeUndefined();
+    });
+
+    it('accepts an explicitly compatible host token counter', () => {
+      const tokenCounter = markTokenCounterCacheCompatible(jest.fn(() => 1));
+      const ctx = createBasicContext({ tokenCounter });
+      const message = new HumanMessage('stable');
+      tokenCounter.mockClear();
+
+      ctx.contextPressureTokenCounts?.count(message);
+      ctx.contextPressureTokenCounts?.count(message);
+
+      expect(tokenCounter).toHaveBeenCalledTimes(1);
+    });
+
     it('clears all cached state', () => {
       const ctx = createBasicContext({ agentConfig: { instructions: 'Test' } });
 
