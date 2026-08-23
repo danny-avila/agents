@@ -921,6 +921,48 @@ describe('codex review fixes', () => {
         .invoke({ pattern: 'needle' });
       expect(String(bResult)).toContain('needle');
     });
+
+    it('retries a transient ripgrep probe failure on the same backend', async () => {
+      _resetRipgrepCacheForTests();
+      const realSpawn = (
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      let probeCalls = 0;
+      let searchCalls = 0;
+      const transientBackend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'rg' && args[0] === '--version') {
+          probeCalls++;
+          return realSpawn(
+            'sh',
+            ['-c', probeCalls === 1 ? 'exit 1' : 'exit 0'],
+            opts
+          );
+        }
+        if (cmd === 'rg') {
+          searchCalls++;
+          return realSpawn('sh', ['-c', 'printf \'file.ts:1:needle\\n\''], opts);
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+      const cwd = await createTempDir();
+      await fsWriteFile(join(cwd, 'file.ts'), 'needle\n', 'utf8');
+      const grep = createLocalCodingToolBundle({
+        cwd,
+        exec: { spawn: transientBackend },
+      }).tools.find((tool) => tool.name === 'grep_search')!;
+
+      const first = await grep.invoke({ pattern: 'needle' });
+      const second = await grep.invoke({ pattern: 'needle' });
+
+      expect(JSON.stringify(first)).toContain('needle');
+      expect(JSON.stringify(second)).toContain('needle');
+      expect(probeCalls).toBe(2);
+      expect(searchCalls).toBe(1);
+    });
   });
 
   describe('additionalRoots resolved against workspace root (Codex P2 #3)', () => {

@@ -4,16 +4,17 @@ import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import {
-  createLocalBashProgrammaticToolCallingTool,
-  createLocalProgrammaticToolCallingTool,
-} from './LocalProgrammaticToolCalling';
-import {
   getSpawn,
   getWorkspaceFS,
+  probeLocalCommandAvailability,
   resolveWorkspacePathSafe,
   spawnLocalProcess,
   truncateLocalOutput,
 } from './LocalExecutionEngine';
+import {
+  createLocalBashProgrammaticToolCallingTool,
+  createLocalProgrammaticToolCallingTool,
+} from './LocalProgrammaticToolCalling';
 import {
   createLocalBashExecutionTool,
   createLocalCodeExecutionTool,
@@ -744,7 +745,7 @@ export function createLocalEditFileTool(
 // env gets its own probe.
 let ripgrepAvailabilityByBackend = new WeakMap<
   t.LocalSpawn,
-  Map<string, Promise<boolean>>
+  Map<string, ReturnType<typeof probeLocalCommandAvailability>>
 >();
 
 function envCacheKey(env: NodeJS.ProcessEnv | undefined): string {
@@ -772,17 +773,14 @@ async function isRipgrepAvailable(
   const envKey = envCacheKey(config.env);
   let probePromise = envMap.get(envKey);
   if (probePromise == null) {
-    probePromise = spawnLocalProcess(
-      'rg',
-      ['--version'],
-      { ...config, timeoutMs: 5000, sandbox: { enabled: false } },
-      { internal: true }
-    )
-      .then((probe) => probe.exitCode === 0)
-      .catch(() => false);
+    probePromise = probeLocalCommandAvailability('rg', ['--version'], config);
     envMap.set(envKey, probePromise);
   }
-  return probePromise;
+  const result = await probePromise;
+  if (!result.cacheable && envMap.get(envKey) === probePromise) {
+    envMap.delete(envKey);
+  }
+  return result.available;
 }
 
 /**

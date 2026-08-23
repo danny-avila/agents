@@ -702,9 +702,10 @@ export function createCloudflareExecutionWorld(
 ): t.ExecutionWorld {
   let world = executionWorldCache.get(config);
   if (world == null) {
+    const fs = Object.freeze(createCloudflareWorkspaceFS(config));
     world = Object.freeze({
       spawn: createCloudflareSpawn(config),
-      fs: createCloudflareWorkspaceFS(config),
+      fs,
       sandboxed: true,
     });
     executionWorldCache.set(config, world);

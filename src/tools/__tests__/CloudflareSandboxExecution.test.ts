@@ -76,6 +76,7 @@ it('reuses one execution world for repeated Cloudflare tool bindings', () => {
   expect(secondWorld).toBe(firstWorld);
   expect(localConfig.exec).toBe(firstWorld);
   expect(firstWorld.sandboxed).toBe(true);
+  expect(Object.isFrozen(firstWorld.fs)).toBe(true);
   expect(Object.isFrozen(firstWorld)).toBe(true);
 });
 
@@ -96,6 +97,42 @@ it('keeps remote capability probes warm across Cloudflare tool bindings', async 
   await runPostEditSyntaxCheck('/workspace/first.js', firstBinding);
   await runPostEditSyntaxCheck('/workspace/second.js', secondBinding);
 
+  expect(execCalls).toBe(3);
+});
+
+it('retries a transient capability-probe failure in a stable world', async () => {
+  _resetSyntaxCheckProbeCacheForTests();
+  let execCalls = 0;
+  const config: t.CloudflareSandboxExecutionConfig = {
+    sandbox: createRuntime({
+      exec: async () => {
+        execCalls++;
+        if (execCalls === 1) {
+          throw new Error('transient sandbox RPC failure');
+        }
+        if (execCalls === 2) {
+          return { exitCode: 0, stdout: 'v22', stderr: '' };
+        }
+        return { exitCode: 1, stdout: '', stderr: 'syntax error' };
+      },
+    }),
+  };
+
+  const first = await runPostEditSyntaxCheck(
+    '/workspace/first.js',
+    createCloudflareLocalExecutionConfig(config)
+  );
+  const second = await runPostEditSyntaxCheck(
+    '/workspace/second.js',
+    createCloudflareLocalExecutionConfig(config)
+  );
+
+  expect(first).toEqual({ ok: true });
+  expect(second).toEqual({
+    ok: false,
+    checker: 'node --check',
+    output: 'syntax error',
+  });
   expect(execCalls).toBe(3);
 });
 

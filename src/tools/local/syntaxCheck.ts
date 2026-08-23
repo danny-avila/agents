@@ -18,12 +18,13 @@
 
 import { extname } from 'path';
 import type * as t from '@/types';
-import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import {
   getSpawn,
   getWorkspaceFS,
+  probeLocalCommandAvailability,
   spawnLocalProcess,
 } from './LocalExecutionEngine';
+import { isWorkspaceClientTimeoutError } from './workspaceFS';
 
 export type SyntaxCheckOutcome =
   | { ok: true }
@@ -48,7 +49,9 @@ export type SyntaxChecker = (
  * reset hook re-creates the map.
  */
 type ProbeKind = 'hasNode' | 'hasPython' | 'hasBash';
-type ProbeCache = Partial<Record<ProbeKind, Promise<boolean>>>;
+type ProbeCache = Partial<
+  Record<ProbeKind, ReturnType<typeof probeLocalCommandAvailability>>
+>;
 
 // Per-backend × per-env cache. Codex P2 #40 — keying by spawn
 // backend alone misses env-driven availability changes (e.g. PATH
@@ -95,17 +98,14 @@ async function probe(
   const entry = cacheFor(config);
   let probePromise = entry[cached];
   if (probePromise == null) {
-    probePromise = spawnLocalProcess(
-      command,
-      args,
-      { ...config, timeoutMs: 5000, sandbox: { enabled: false } },
-      { internal: true }
-    )
-      .then((result) => result != null && result.exitCode === 0)
-      .catch(() => false);
+    probePromise = probeLocalCommandAvailability(command, args, config);
     entry[cached] = probePromise;
   }
-  return probePromise;
+  const result = await probePromise;
+  if (!result.cacheable && entry[cached] === probePromise) {
+    delete entry[cached];
+  }
+  return result.available;
 }
 
 /**

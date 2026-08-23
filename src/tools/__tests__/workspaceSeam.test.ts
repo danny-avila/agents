@@ -10,6 +10,7 @@ import {
   jest,
 } from '@jest/globals';
 import type { WorkspaceFS } from '../local/workspaceFS';
+import type * as t from '@/types';
 import {
   getExecutionWorld,
   resolveWorkspacePathSafe,
@@ -100,7 +101,20 @@ describe('workspace seam', () => {
       expect(world.fs).toBe(nodeWorkspaceFS);
       expect(world.spawn).toBe(getExecutionWorld().spawn);
       expect(world.sandboxed).toBe(false);
+      expect(Object.isFrozen(world.fs)).toBe(true);
       expect(Object.isFrozen(world)).toBe(true);
+    });
+
+    it('keeps the public override config incrementally mutable', () => {
+      const world = getExecutionWorld();
+      const config: t.LocalExecConfig = {};
+
+      config.spawn = world.spawn;
+      config.fs = { ...nodeWorkspaceFS } as WorkspaceFS;
+      config.sandboxed = true;
+
+      expect(config.spawn).toBe(world.spawn);
+      expect(config.sandboxed).toBe(true);
     });
 
     it('defaults to the Node host fs when nothing is supplied', () => {

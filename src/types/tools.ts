@@ -828,7 +828,7 @@ export interface ExecutionWorld {
   /** Launches a process inside this world's filesystem namespace. */
   readonly spawn: LocalSpawn;
   /** Reads and writes the same namespace observed by `spawn`. */
-  readonly fs: import('@/tools/local/workspaceFS').WorkspaceFS;
+  readonly fs: Readonly<import('@/tools/local/workspaceFS').WorkspaceFS>;
   /** Whether the world already enforces a sandbox boundary. */
   readonly sandboxed: boolean;
 }
@@ -845,7 +845,11 @@ export interface ExecutionWorld {
  * adversarial-model threat model, use a backend sandbox boundary rather than
  * relying on validation alone.
  */
-export type LocalExecConfig = Partial<ExecutionWorld>;
+export type LocalExecConfig = {
+  -readonly [Key in keyof ExecutionWorld]?: Key extends 'fs'
+    ? import('@/tools/local/workspaceFS').WorkspaceFS
+    : ExecutionWorld[Key];
+};
 
 export type LocalExecutionConfig = {
   /**

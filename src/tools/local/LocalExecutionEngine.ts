@@ -925,6 +925,40 @@ export async function spawnLocalProcess(
   });
 }
 
+/** Result of a command-availability probe and whether its verdict is stable. */
+export type CommandAvailabilityProbe = {
+  available: boolean;
+  cacheable: boolean;
+};
+
+/**
+ * Probes one executable without turning transient backend failures into
+ * permanent capability facts. Exit 126/127 is a definite unusable/missing
+ * executable; timeouts, transport failures, and other exits are retried.
+ */
+export async function probeLocalCommandAvailability(
+  command: string,
+  args: string[],
+  config: t.LocalExecutionConfig
+): Promise<CommandAvailabilityProbe> {
+  try {
+    const result = await spawnLocalProcess(
+      command,
+      args,
+      { ...config, timeoutMs: 5000, sandbox: { enabled: false } },
+      { internal: true }
+    );
+    const available = result.exitCode === 0;
+    return {
+      available,
+      cacheable:
+        available || result.exitCode === 126 || result.exitCode === 127,
+    };
+  } catch {
+    return { available: false, cacheable: false };
+  }
+}
+
 export async function executeLocalBash(
   command: string,
   config: t.LocalExecutionConfig = {}
