@@ -614,6 +614,7 @@ export type SubagentUpdatePhase =
   | 'run_step_closed'
   | 'message_delta'
   | 'reasoning_delta'
+  | 'control'
   | 'stop'
   | 'error';
 

@@ -28,9 +28,7 @@ const start = (
     ...(overrides.requestFingerprint == null
       ? {}
       : { requestFingerprint: overrides.requestFingerprint }),
-    ...(overrides.threadId == null
-      ? {}
-      : { threadId: overrides.threadId }),
+    ...(overrides.threadId == null ? {} : { threadId: overrides.threadId }),
     input: 'Research the question.',
     subagentKind: 'agent',
     subagentType: overrides.subagentType ?? 'researcher',
@@ -245,11 +243,33 @@ describe('InMemorySubagentTaskStore', () => {
     });
     expect(interrupt).toMatchObject({ status: 'accepted' });
     expect(steer).toMatchObject({ status: 'accepted' });
+    expect(
+      store.get('user:conversation', started.task.taskId)?.controlReceipts
+    ).toEqual([
+      expect.objectContaining({
+        controlId:
+          interrupt.status === 'accepted' ? interrupt.controlId : undefined,
+        action: 'interrupt',
+        status: 'accepted',
+      }),
+      expect.objectContaining({
+        controlId: steer.status === 'accepted' ? steer.controlId : undefined,
+        action: 'steer',
+        status: 'accepted',
+      }),
+      expect.objectContaining({ action: 'queue', status: 'accepted' }),
+    ]);
     expect(runtime?.shouldPreempt()).toBe(true);
     expect(runtime?.drain('preempt').map((message) => message.content)).toEqual(
       ['Stop searching and summarize now.']
     );
     expect(runtime?.shouldPreempt()).toBe(false);
+    expect(
+      store.get('user:conversation', started.task.taskId)?.controlReceipts?.[0]
+    ).toMatchObject({
+      status: 'applied',
+      boundary: 'preempt',
+    });
     expect(runtime?.drain('tool').map((message) => message.content)).toEqual([
       'Also check the primary source.',
     ]);
@@ -263,6 +283,25 @@ describe('InMemorySubagentTaskStore', () => {
         },
       ],
     });
+    expect(
+      store.get('user:conversation', started.task.taskId)?.controlReceipts
+    ).toEqual([
+      expect.objectContaining({
+        action: 'interrupt',
+        status: 'applied',
+        boundary: 'preempt',
+      }),
+      expect.objectContaining({
+        action: 'steer',
+        status: 'applied',
+        boundary: 'tool',
+      }),
+      expect.objectContaining({
+        action: 'queue',
+        status: 'applied',
+        boundary: 'turn',
+      }),
+    ]);
     expect(runtime?.closeTurn()).toEqual({ closed: true, messages: [] });
 
     finish({ content: 'done' });
@@ -295,13 +334,236 @@ describe('InMemorySubagentTaskStore', () => {
     if (queued.status !== 'accepted' || queued.controlId == null) {
       throw new Error('Expected a cancellable control receipt.');
     }
+    const cancelled = store.control('user:conversation', started.task.taskId, {
+      action: 'cancel_message',
+      controlId: queued.controlId,
+    });
+    expect(cancelled).toMatchObject({
+      status: 'accepted',
+      controlId: queued.controlId,
+    });
+    expect(
+      cancelled.status === 'accepted' ? cancelled.task.controlReceipts : []
+    ).toEqual([
+      expect.objectContaining({
+        controlId: queued.controlId,
+        status: 'rejected',
+        reason: 'withdrawn',
+      }),
+    ]);
+    expect(runtime?.drain('tool')).toEqual([]);
+    store.control('user:conversation', started.task.taskId, {
+      action: 'cancel',
+    });
+    await settle();
+  });
+
+  it('rejects accepted controls that lose a completion race', async () => {
+    let finish = (_result: { content: string }): void => undefined;
+    const result = new Promise<{ content: string }>((resolve) => {
+      finish = resolve;
+    });
+    const store = new InMemorySubagentTaskStore();
+    const started = start(store, async () => result);
+    if (!started.accepted) {
+      throw new Error('Expected task dispatch to be accepted.');
+    }
+    await settle();
+    const queued = store.control('user:conversation', started.task.taskId, {
+      action: 'queue',
+      message: 'This arrives too late.',
+    });
+    expect(queued).toMatchObject({ status: 'accepted' });
+
+    finish({ content: 'done' });
+    await settle();
+
+    expect(store.get('user:conversation', started.task.taskId)).toMatchObject({
+      status: 'completed',
+      controlReceipts: [
+        expect.objectContaining({
+          action: 'queue',
+          status: 'rejected',
+          reason: 'task_completed',
+        }),
+      ],
+    });
+  });
+
+  it('marks accepted controls failed when child execution fails', async () => {
+    let fail = (_error: Error): void => undefined;
+    const result = new Promise<{ content: string }>((_resolve, reject) => {
+      fail = reject;
+    });
+    const store = new InMemorySubagentTaskStore();
+    const started = start(store, async () => result);
+    if (!started.accepted) {
+      throw new Error('Expected task dispatch to be accepted.');
+    }
+    await settle();
     expect(
       store.control('user:conversation', started.task.taskId, {
-        action: 'cancel_message',
-        controlId: queued.controlId,
+        action: 'interrupt',
+        message: 'Stop and report now.',
       })
     ).toMatchObject({ status: 'accepted' });
+
+    fail(new Error('provider failed'));
+    await settle();
+
+    expect(store.get('user:conversation', started.task.taskId)).toMatchObject({
+      status: 'error',
+      controlReceipts: [
+        expect.objectContaining({
+          action: 'interrupt',
+          status: 'failed',
+          reason: 'task_failed',
+        }),
+      ],
+    });
+  });
+
+  it('rejects pending controls separately when the child is cancelled', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const started = start(
+      store,
+      async (runtime) =>
+        new Promise((_resolve, reject) => {
+          runtime.signal.addEventListener(
+            'abort',
+            () => reject(runtime.signal.reason),
+            { once: true }
+          );
+        })
+    );
+    if (!started.accepted) {
+      throw new Error('Expected task dispatch to be accepted.');
+    }
+    await settle();
+    expect(
+      store.control('user:conversation', started.task.taskId, {
+        action: 'queue',
+        message: 'Wait for the next turn.',
+      })
+    ).toMatchObject({ status: 'accepted' });
+
+    expect(
+      store.control('user:conversation', started.task.taskId, {
+        action: 'cancel',
+      })
+    ).toMatchObject({ status: 'cancelled' });
+    await settle();
+
+    expect(store.get('user:conversation', started.task.taskId)).toMatchObject({
+      status: 'cancelled',
+      controlReceipts: [
+        expect.objectContaining({
+          action: 'queue',
+          status: 'rejected',
+          reason: 'task_cancelled',
+        }),
+      ],
+    });
+  });
+
+  it('refuses saturation without evicting accepted controls', async () => {
+    const store = new InMemorySubagentTaskStore({
+      maxControlsPerTask: 2,
+      maxControlReceiptsPerTask: 2,
+    });
+    let runtime: SubagentTaskRuntime | undefined;
+    const started = start(
+      store,
+      async (taskRuntime) =>
+        new Promise((_resolve, reject) => {
+          runtime = taskRuntime;
+          taskRuntime.signal.addEventListener(
+            'abort',
+            () => reject(taskRuntime.signal.reason),
+            { once: true }
+          );
+        })
+    );
+    if (!started.accepted) {
+      throw new Error('Expected task dispatch to be accepted.');
+    }
+    await settle();
+    for (const message of ['first', 'second']) {
+      expect(
+        store.control('user:conversation', started.task.taskId, {
+          action: 'steer',
+          message,
+        })
+      ).toMatchObject({ status: 'accepted' });
+    }
+
+    expect(
+      store.control('user:conversation', started.task.taskId, {
+        action: 'steer',
+        message: 'third',
+      })
+    ).toEqual({
+      status: 'invalid',
+      message: 'Task already has 2 pending messages.',
+    });
+    expect(
+      store.get('user:conversation', started.task.taskId)?.controlReceipts
+    ).toEqual([
+      expect.objectContaining({ status: 'accepted' }),
+      expect.objectContaining({ status: 'accepted' }),
+    ]);
+    expect(runtime?.drain('tool').map((message) => message.content)).toEqual([
+      'first',
+      'second',
+    ]);
     expect(runtime?.drain('tool')).toEqual([]);
+    store.control('user:conversation', started.task.taskId, {
+      action: 'cancel',
+    });
+    await settle();
+  });
+
+  it('bounds terminal control receipts without dropping accepted commands', async () => {
+    const store = new InMemorySubagentTaskStore({
+      maxControlsPerTask: 1,
+      maxControlReceiptsPerTask: 2,
+    });
+    let runtime: SubagentTaskRuntime | undefined;
+    const started = start(
+      store,
+      async (taskRuntime) =>
+        new Promise((_resolve, reject) => {
+          runtime = taskRuntime;
+          taskRuntime.signal.addEventListener(
+            'abort',
+            () => reject(taskRuntime.signal.reason),
+            {
+              once: true,
+            }
+          );
+        })
+    );
+    if (!started.accepted) {
+      throw new Error('Expected task dispatch to be accepted.');
+    }
+    await settle();
+
+    for (const message of ['first', 'second', 'third']) {
+      expect(
+        store.control('user:conversation', started.task.taskId, {
+          action: 'steer',
+          message,
+        })
+      ).toMatchObject({ status: 'accepted' });
+      expect(runtime?.drain('tool')).toHaveLength(1);
+    }
+
+    expect(
+      store.get('user:conversation', started.task.taskId)?.controlReceipts
+    ).toEqual([
+      expect.objectContaining({ status: 'applied' }),
+      expect.objectContaining({ status: 'applied' }),
+    ]);
     store.control('user:conversation', started.task.taskId, {
       action: 'cancel',
     });
