@@ -266,6 +266,139 @@ describe('splitAtRecencyBoundary', () => {
       expect(result.tail).toEqual(messages.slice(4));
     });
 
+    it('falls back within the first turn after a leading preamble', () => {
+      const messages = [
+        new SystemMessage('programmatic preamble'),
+        new HumanMessage('inspect'),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call_a', name: 'search', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'result A',
+          tool_call_id: 'call_a',
+          name: 'search',
+        }),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call_b', name: 'search', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'result B',
+          tool_call_id: 'call_b',
+          name: 'search',
+        }),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 300,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 4));
+      expect(result.tail).toEqual(messages.slice(4));
+    });
+
+    it('does not split messages derived from one persisted source row', () => {
+      const messages = [
+        new HumanMessage('inspect'),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call_a', name: 'search', args: {} }],
+          additional_kwargs: { sourceMessageId: 'expanded-row' },
+        }),
+        new ToolMessage({
+          content: 'result A',
+          tool_call_id: 'call_a',
+          name: 'search',
+          additional_kwargs: { sourceMessageId: 'expanded-row' },
+        }),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call_b', name: 'search', args: {} }],
+          additional_kwargs: { sourceMessageId: 'expanded-row' },
+        }),
+        new ToolMessage({
+          content: 'result B',
+          tool_call_id: 'call_b',
+          name: 'search',
+          additional_kwargs: { sourceMessageId: 'expanded-row' },
+        }),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call_c', name: 'search', args: {} }],
+          additional_kwargs: { sourceMessageId: 'retained-row' },
+        }),
+        new ToolMessage({
+          content: 'result C',
+          tool_call_id: 'call_c',
+          name: 'search',
+          additional_kwargs: { sourceMessageId: 'retained-row' },
+        }),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 300,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 5));
+      expect(result.tail).toEqual(messages.slice(5));
+    });
+
+    it('recognizes raw and content-block provider tool pairs', () => {
+      const rawCallMessage = new AIMessage('');
+      rawCallMessage.additional_kwargs.tool_calls = [
+        {
+          id: 'raw_call',
+          type: 'function',
+          function: { name: 'search', arguments: '{}' },
+        },
+      ];
+      const messages = [
+        new HumanMessage('inspect'),
+        rawCallMessage,
+        new ToolMessage({
+          content: 'raw result',
+          tool_call_id: 'raw_call',
+          name: 'search',
+        }),
+        new AIMessage({
+          content: [
+            {
+              type: 'tool_use',
+              id: 'content_call',
+              name: 'search',
+              input: {},
+            },
+          ],
+        }),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'content_call',
+              content: 'content result',
+            },
+          ],
+        }),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 100,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 5));
+      expect(result.tail).toEqual(messages.slice(5));
+    });
+
     it('retains an open tool call and protects a lone user payload', () => {
       const openCall = [
         new HumanMessage('inspect'),

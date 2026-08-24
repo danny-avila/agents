@@ -3,6 +3,14 @@ import type {
   BaseMessage,
   ToolMessage,
 } from '@langchain/core/messages';
+import { getProviderSourceMessageIds } from './provenance';
+import {
+  getBoundedProviderPairingArray,
+  getBoundedProviderPairingArrayProperty,
+  getProviderToolCallPartDescriptor,
+  getProviderToolResultPartDescriptor,
+  PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS,
+} from './toolResultTypes';
 
 export const DEFAULT_RETAIN_RECENT_TURNS = 2;
 export const DEFAULT_INTRA_TURN_RETAIN_RATIO = 0.16;
@@ -84,21 +92,113 @@ export function resolveIntraTurnRetainTokens({
   );
 }
 
-function getToolCallIds(message: BaseMessage): string[] {
-  if (message.getType() !== 'ai') {
-    return [];
+function readOwnString(value: unknown, key: string): string | undefined {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
   }
-  const toolCalls = (message as AIMessage).tool_calls;
-  if (toolCalls == null || toolCalls.length === 0) {
-    return [];
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor != null &&
+      'value' in descriptor &&
+      typeof descriptor.value === 'string' &&
+      descriptor.value !== '' &&
+      descriptor.value.length <= PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS
+      ? descriptor.value
+      : undefined;
+  } catch {
+    return undefined;
   }
-  const ids: string[] = [];
-  for (const toolCall of toolCalls) {
-    if (toolCall.id != null && toolCall.id !== '') {
-      ids.push(toolCall.id);
+}
+
+function addToolPairingId(ids: Set<string>, candidate: unknown): void {
+  if (
+    typeof candidate === 'string' &&
+    candidate !== '' &&
+    candidate.length <= PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS
+  ) {
+    ids.add(candidate);
+  }
+}
+
+function getToolCallIds(message: BaseMessage): Set<string> {
+  const ids = new Set<string>();
+  const messageRole = (message as BaseMessage & { role?: unknown }).role;
+  if (message.getType() !== 'ai' && messageRole !== 'assistant') {
+    return ids;
+  }
+
+  for (const toolCall of (message as AIMessage).tool_calls ?? []) {
+    addToolPairingId(ids, toolCall.id);
+  }
+
+  const rawToolCalls = getBoundedProviderPairingArrayProperty(
+    message.additional_kwargs,
+    'tool_calls'
+  );
+  if (rawToolCalls != null) {
+    for (const toolCall of rawToolCalls) {
+      const id = readOwnString(toolCall, 'id');
+      addToolPairingId(ids, id);
     }
   }
+
+  const content = getBoundedProviderPairingArray(message.content);
+  if (content != null) {
+    for (const part of content) {
+      const descriptor = getProviderToolCallPartDescriptor(part);
+      if (descriptor != null) {
+        addToolPairingId(ids, descriptor.callId);
+      }
+    }
+  }
+
   return ids;
+}
+
+function getToolResultIds(message: BaseMessage): Set<string> {
+  const ids = new Set<string>();
+  if (message.getType() === 'tool') {
+    const toolMessage = message as ToolMessage & { toolCallId?: unknown };
+    addToolPairingId(ids, toolMessage.tool_call_id);
+    addToolPairingId(ids, toolMessage.toolCallId);
+  }
+
+  const content = getBoundedProviderPairingArray(message.content);
+  if (content != null) {
+    for (const part of content) {
+      const descriptor = getProviderToolResultPartDescriptor(part);
+      if (descriptor?.toolCallId != null) {
+        addToolPairingId(ids, descriptor.toolCallId);
+      }
+    }
+  }
+
+  return ids;
+}
+
+function isToolResultOnlyMessage(message: BaseMessage): boolean {
+  if (message.getType() === 'tool') {
+    return true;
+  }
+  const content = getBoundedProviderPairingArray(message.content);
+  if (content == null || content.length === 0) {
+    return false;
+  }
+  for (const part of content) {
+    if (getProviderToolResultPartDescriptor(part)?.toolCallId == null) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function getCoverageSourceIds(message: BaseMessage): string[] {
+  const sourceIds = getProviderSourceMessageIds(message);
+  if (sourceIds.length > 0) {
+    return sourceIds;
+  }
+  const messageId = message.id?.trim();
+  return messageId != null && messageId !== '' ? [messageId] : [];
 }
 
 function findIntraTurnBoundary(
@@ -114,7 +214,18 @@ function findIntraTurnBoundary(
     return undefined;
   }
 
+  const sourceIdsByIndex = new Array<string[]>(messages.length);
+  const lastIndexBySourceId = new Map<string, number>();
+  for (let i = 0; i < messages.length; i++) {
+    const sourceIds = getCoverageSourceIds(messages[i] as BaseMessage);
+    sourceIdsByIndex[i] = sourceIds;
+    for (const sourceId of sourceIds) {
+      lastIndexBySourceId.set(sourceId, i);
+    }
+  }
+
   const pendingToolCallIds = new Set<string>();
+  const straddlingSourceIds = new Set<string>();
   let completedToolCalls = 0;
   let boundary: number | undefined;
 
@@ -126,10 +237,18 @@ function findIntraTurnBoundary(
       pendingToolCallIds.add(callId);
     }
 
-    if (message.getType() === 'tool') {
-      const toolCallId = (message as ToolMessage).tool_call_id;
+    const toolResultIds = getToolResultIds(message);
+    for (const toolCallId of toolResultIds) {
       if (pendingToolCallIds.delete(toolCallId)) {
         completedToolCalls += 1;
+      }
+    }
+
+    for (const sourceId of sourceIdsByIndex[i] as string[]) {
+      if (lastIndexBySourceId.get(sourceId) === i) {
+        straddlingSourceIds.delete(sourceId);
+      } else {
+        straddlingSourceIds.add(sourceId);
       }
     }
 
@@ -139,7 +258,8 @@ function findIntraTurnBoundary(
     if (
       completedToolCalls > 0 &&
       pendingToolCallIds.size === 0 &&
-      message.getType() !== 'human'
+      straddlingSourceIds.size === 0 &&
+      (message.getType() !== 'human' || isToolResultOnlyMessage(message))
     ) {
       boundary = i + 1;
     }
@@ -257,7 +377,7 @@ export function splitAtRecencyBoundary(
     tailTurnCount += 1;
   }
 
-  if (tailStartIndex === 0) {
+  if (tailStartIndex === turnStarts[0]) {
     const intraTurnTokens = options.intraTurnTokens;
     if (
       intraTurnTokens != null &&
