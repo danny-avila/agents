@@ -2,7 +2,6 @@
 import { nanoid } from 'nanoid';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
-import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import {
   Command,
@@ -36,6 +35,7 @@ import {
   ACTIVITY_PHASE_LABEL_RUN_NAME,
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
+import { requireLazyModule } from '@/lazyRequire';
 import {
   requireValidSubagentResumeManifest,
   stripSubagentResumeManifest,
@@ -103,6 +103,18 @@ import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { isOpenAILike } from '@/utils/llm';
 import { executeHooks } from '@/hooks';
+
+/** Runs only for openai-family titling models, so the SDK loads with the first such
+ *  request instead of at import time. */
+function isLangchainOpenAIModel(
+  model: unknown
+): model is
+  | import('@langchain/openai').ChatOpenAI
+  | import('@langchain/openai').AzureChatOpenAI {
+  const { ChatOpenAI, AzureChatOpenAI } =
+    requireLazyModule<typeof import('@langchain/openai')>('@langchain/openai');
+  return model instanceof ChatOpenAI || model instanceof AzureChatOpenAI;
+}
 
 export const defaultOmitOptions = new Set([
   'stream',
@@ -1974,10 +1986,7 @@ export class Run<_T extends t.BaseGraphState> {
       clientOptions,
     }) as t.ChatModelInstance;
 
-    if (
-      isOpenAILike(provider) &&
-      (model instanceof ChatOpenAI || model instanceof AzureChatOpenAI)
-    ) {
+    if (isOpenAILike(provider) && isLangchainOpenAIModel(model)) {
       model.temperature = (clientOptions as t.OpenAIClientOptions | undefined)
         ?.temperature as number;
       model.topP = (clientOptions as t.OpenAIClientOptions | undefined)

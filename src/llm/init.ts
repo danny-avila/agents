@@ -1,8 +1,7 @@
-import { ChatVertexAI } from '@langchain/google-vertexai';
 import type { Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
-import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
 import { getChatModelClass } from '@/llm/providers';
+import { requireLazyModule } from '@/lazyRequire';
 import { isOpenAILike } from '@/utils';
 import { Providers } from '@/common';
 
@@ -30,6 +29,26 @@ type InitializeModelParams<P extends t.ProviderName> = {
           })
 );
 
+/** These guards run only for their own provider families, so the class they test
+ *  against loads with the family's first request instead of at import time. */
+function isOpenAIChatModel(
+  model: unknown
+): model is import('@/llm/openai').ChatOpenAI | import('@/llm/openai').AzureChatOpenAI {
+  const { ChatOpenAI, AzureChatOpenAI } = requireLazyModule<typeof import('@/llm/openai')>(
+    '@librechat/agents/llm/openai'
+  );
+  return model instanceof ChatOpenAI || model instanceof AzureChatOpenAI;
+}
+
+function isLangchainVertexModel(
+  model: unknown
+): model is import('@langchain/google-vertexai').ChatVertexAI {
+  const { ChatVertexAI } = requireLazyModule<typeof import('@langchain/google-vertexai')>(
+    '@langchain/google-vertexai'
+  );
+  return model instanceof ChatVertexAI;
+}
+
 /**
  * Creates a chat model instance for a given built-in or host-registered
  * provider, applies provider-specific field assignments, and optionally binds
@@ -47,10 +66,7 @@ export function initializeModel<P extends t.ProviderName>({
       (clientOptions ?? {}) as t.ProviderOptionsFor<P>
     );
 
-  if (
-    isOpenAILike(provider) &&
-    (model instanceof ChatOpenAI || model instanceof AzureChatOpenAI)
-  ) {
+  if (isOpenAILike(provider) && isOpenAIChatModel(model)) {
     const opts = clientOptions as t.OpenAIClientOptions | undefined;
     if (opts) {
       model.temperature = opts.temperature as number;
@@ -59,7 +75,7 @@ export function initializeModel<P extends t.ProviderName>({
       model.presencePenalty = opts.presencePenalty as number;
       model.n = opts.n as number;
     }
-  } else if (provider === Providers.VERTEXAI && model instanceof ChatVertexAI) {
+  } else if (provider === Providers.VERTEXAI && isLangchainVertexModel(model)) {
     const opts = clientOptions as t.VertexAIClientOptions | undefined;
     if (opts) {
       model.temperature = opts.temperature as number;

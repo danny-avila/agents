@@ -1,5 +1,12 @@
-import * as math from 'mathjs';
 import { Tool } from '@langchain/core/tools';
+import { requireLazyModule } from '@/lazyRequire';
+
+/** mathjs costs ~150ms of module init; a calculator that is never invoked never pays it. */
+let math: typeof import('mathjs') | undefined;
+const evaluateExpression = (input: string): string => {
+  math ??= requireLazyModule<typeof import('mathjs')>('mathjs');
+  return math.evaluate(input).toString();
+};
 
 export const CalculatorToolName = 'calculator';
 
@@ -36,7 +43,7 @@ export class Calculator extends Tool {
 
   async _call(input: string): Promise<string> {
     try {
-      return math.evaluate(input).toString();
+      return evaluateExpression(input);
     } catch {
       return 'I don\'t know how to do that.';
     }

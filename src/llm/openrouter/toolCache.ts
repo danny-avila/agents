@@ -5,7 +5,15 @@ import {
   buildAnthropicCacheControl,
   type PromptCacheTtl,
 } from '@/messages/cache';
-import { _convertToOpenAITool } from '@/llm/openai';
+import { requireLazyModule } from '@/lazyRequire';
+
+/** Loads with the first OpenRouter request rather than alongside every graph. */
+const convertToOpenAITool = (
+  tool: BindToolsInput
+): OpenAIClient.ChatCompletionTool =>
+  requireLazyModule<typeof import('@/llm/openai')>(
+    '@librechat/agents/llm/openai'
+  )._convertToOpenAITool(tool);
 
 type OpenRouterCacheControl = { type: 'ephemeral'; ttl?: '1h' };
 
@@ -38,7 +46,7 @@ function hasDeferredMarker(tool: unknown): boolean {
 }
 
 function toOpenRouterTool(tool: unknown): OpenRouterToolWithCacheControl {
-  const converted = _convertToOpenAITool(
+  const converted = convertToOpenAITool(
     tool as BindToolsInput
   ) as OpenRouterToolWithCacheControl;
 
