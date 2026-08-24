@@ -25,6 +25,7 @@ Results on 2026-08-24:
 | 100 tool steps |      253,006 |                  0 |   209,968 (83.0%) |         43,038 |
 
 This is a provider-runtime optimization rather than a local CPU microbenchmark:
-the selection adds one bounded linear scan only when compaction has already
-fired. The decision metric is how much repeated provider input becomes
+the selection adds bounded linear work only when compaction has already fired.
+A 5,000-iteration local probe over 100 tool steps averaged 0.073 ms per
+selection. The decision metric is how much repeated provider input becomes
 replaceable by one checkpoint while preserving recent raw evidence.
