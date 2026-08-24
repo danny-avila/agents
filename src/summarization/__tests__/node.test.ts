@@ -942,9 +942,68 @@ describe('recency window — first-turn protection', () => {
     expect(capturedMessages.slice(0, -1)).toEqual(messages.slice(0, 7));
     expect(setSummary).toHaveBeenCalledWith(
       expect.stringContaining('Checkpoint of the completed work'),
-      expect.any(Number)
+      expect.any(Number),
+      { precedesMessages: true }
     );
     expect(result.messages?.slice(1)).toEqual(messages.slice(7));
+  });
+
+  it('keeps a single-turn history when summarization degrades to metadata', async () => {
+    captureEvents();
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: (): never => {
+              throw new Error('summarizer unavailable');
+            },
+            stream: (): never => {
+              throw new Error('summarizer unavailable');
+            },
+          };
+        }
+      } as never
+    );
+    const agentContext = createAgentContext({
+      summarizationConfig: {},
+      maxContextTokens: 1_000,
+      tokenCounter: () => 100,
+    });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+    const messages: BaseMessage[] = [new HumanMessage('inspect the repo')];
+    for (let index = 0; index < 4; index++) {
+      const id = `call_${index}`;
+      messages.push(
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id, name: 'search', args: {} }],
+        }),
+        new ToolMessage({
+          content: `result ${index}`,
+          tool_call_id: id,
+          name: 'search',
+        })
+      );
+    }
+    messages.push(new AIMessage('preparing the change'));
+
+    const result = await summarizeNode(
+      {
+        messages,
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(agentContext.hasSummary()).toBe(false);
+    expect(result.messages).toBeUndefined();
   });
 
   it('still summarizes the head when older turns exist beyond the recency window', async () => {

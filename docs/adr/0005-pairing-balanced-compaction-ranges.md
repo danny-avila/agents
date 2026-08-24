@@ -37,6 +37,14 @@ at row granularity. The tail retains the configured `retainRecent.tokens`
 budget, or 16% of the context window when no explicit budget exists. A lone
 user message has no closed tool unit and remains intact.
 
+The fallback search ends at the next user turn; a closed pair in an older turn
+cannot authorize compacting a newer turn that contains no closed work of its
+own. If every summarizer attempt fails, the metadata-only emergency stub is not
+allowed to replace a fallback range because it cannot preserve the original
+goal or tool evidence. A successful checkpoint is injected before the entire
+retained tail, including for prompt-cache providers, so it never appears after
+newer assistant/tool activity or between a call and its native result.
+
 Range pricing reuses the `AgentContext` exact-token cache when its counter is
 compatible. Summarization, state replacement, source coverage, hooks, and
 Langfuse observations stay behind the existing summarize node.

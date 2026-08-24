@@ -73,6 +73,8 @@ export interface RecencySplit {
   tailTurnCount: number;
   /** Index in the original `messages` array where the tail begins. */
   tailStartIndex: number;
+  /** True when the pairing-balanced fallback selected the boundary. */
+  usedIntraTurnFallback: boolean;
 }
 
 export function resolveIntraTurnRetainTokens({
@@ -297,7 +299,8 @@ function getCoverageSourceIds(message: BaseMessage): string[] {
 function findIntraTurnBoundary(
   messages: BaseMessage[],
   countMessageAt: (index: number) => number,
-  retainTokens: number
+  retainTokens: number,
+  earliestRetainedTurnEndIndex: number
 ): number | undefined {
   let remainingTokens = 0;
   for (let i = 0; i < messages.length; i++) {
@@ -322,7 +325,11 @@ function findIntraTurnBoundary(
   let completedToolCalls = 0;
   let boundary: number | undefined;
 
-  for (let i = 0; i < messages.length - 1; i++) {
+  const boundarySearchEnd = Math.min(
+    messages.length - 1,
+    earliestRetainedTurnEndIndex - 1
+  );
+  for (let i = 0; i <= boundarySearchEnd; i++) {
     const message = messages[i] as BaseMessage;
     remainingTokens -= countMessageAt(i);
 
@@ -385,6 +392,7 @@ export function splitAtRecencyBoundary(
       tail: [],
       tailTurnCount: 0,
       tailStartIndex: messages.length,
+      usedIntraTurnFallback: false,
     };
   }
 
@@ -396,6 +404,7 @@ export function splitAtRecencyBoundary(
       tail: [],
       tailTurnCount: 0,
       tailStartIndex: messages.length,
+      usedIntraTurnFallback: false,
     };
   }
 
@@ -471,7 +480,8 @@ export function splitAtRecencyBoundary(
       const intraTurnBoundary = findIntraTurnBoundary(
         messages,
         countMessageAt,
-        intraTurnTokens
+        intraTurnTokens,
+        turnStarts[1] ?? messages.length
       );
       if (intraTurnBoundary != null) {
         return {
@@ -479,6 +489,7 @@ export function splitAtRecencyBoundary(
           tail: messages.slice(intraTurnBoundary),
           tailTurnCount,
           tailStartIndex: intraTurnBoundary,
+          usedIntraTurnFallback: true,
         };
       }
     }
@@ -489,5 +500,6 @@ export function splitAtRecencyBoundary(
     tail: messages.slice(tailStartIndex),
     tailTurnCount,
     tailStartIndex,
+    usedIntraTurnFallback: false,
   };
 }

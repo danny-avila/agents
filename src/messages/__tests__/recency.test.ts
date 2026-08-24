@@ -219,6 +219,7 @@ describe('splitAtRecencyBoundary', () => {
       expect(result.head).toEqual(messages.slice(0, 7));
       expect(result.tail).toEqual(messages.slice(7));
       expect(result.tailStartIndex).toBe(7);
+      expect(result.usedIntraTurnFallback).toBe(true);
       expect(result.tail[0]).toBeInstanceOf(AIMessage);
       expect((result.tail[0] as AIMessage).tool_calls?.[0]?.id).toBe('call_3');
       expect((result.tail[1] as ToolMessage).tool_call_id).toBe('call_3');
@@ -554,6 +555,35 @@ describe('splitAtRecencyBoundary', () => {
 
       expect(result.head).toEqual(messages.slice(0, 3));
       expect(result.tail).toEqual(messages.slice(3));
+    });
+
+    it('does not let an older tool pair license a cut in a later turn', () => {
+      const messages = [
+        new HumanMessage('first turn'),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'closed', name: 'search', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'closed result',
+          tool_call_id: 'closed',
+          name: 'search',
+        }),
+        new HumanMessage('large second user request'),
+        new AIMessage('working'),
+        new AIMessage('still working'),
+        new AIMessage('latest state'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 200,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 3));
+      expect(result.tail).toEqual(messages.slice(3));
+      expect(result.usedIntraTurnFallback).toBe(true);
     });
 
     it('retains an open tool call and protects a lone user payload', () => {
