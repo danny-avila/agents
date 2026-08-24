@@ -16,3 +16,4 @@ export * from './reducer';
 export * from './recency';
 export * from './assistantPhase';
 export * from './provenance';
+export * from './projectionInvariant';

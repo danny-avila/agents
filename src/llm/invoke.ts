@@ -1,5 +1,6 @@
 import { concat } from '@langchain/core/utils/stream';
 import { AIMessageChunk } from '@langchain/core/messages';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { getCallbackManagerForConfig } from '@langchain/core/runnables';
 import {
   CallbackManager,
@@ -40,7 +41,12 @@ import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
 import { appendCallbacks } from '@/utils/callbacks';
-import { modifyDeltaProperties } from '@/messages';
+import {
+  inspectProviderMessageProjection,
+  ProviderMessageProjectionInvariantError,
+  resolveProviderMessageProjectionInvariantMode,
+  modifyDeltaProperties,
+} from '@/messages';
 import { canSealPreempt } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 
@@ -105,6 +111,79 @@ export type OnChunk = (
 
 /** Unique per-model-attempt sequence; see the stamp in `attemptInvoke`. */
 let streamLimitAttemptSeq = 0;
+
+function createModelStartHandler({
+  config,
+  mode,
+  provider,
+  captureRunId,
+}: {
+  config: RunnableConfig;
+  mode: ReturnType<typeof resolveProviderMessageProjectionInvariantMode>;
+  provider: t.ProviderName;
+  captureRunId?: (runId: string) => void;
+}): BaseCallbackHandler {
+  let inspected = false;
+  const handler = BaseCallbackHandler.fromMethods({
+    handleChatModelStart: async (
+      _llm: Serialized,
+      messageBatches: BaseMessage[][],
+      runId: string
+    ): Promise<void> => {
+      captureRunId?.(runId);
+      if (mode === 'off' || inspected) {
+        return;
+      }
+      inspected = true;
+      const report = inspectProviderMessageProjection(messageBatches[0] ?? []);
+      if (report.valid) {
+        return;
+      }
+      if (mode === 'assert') {
+        throw new ProviderMessageProjectionInvariantError(report);
+      }
+      try {
+        const callbackManager = await getCallbackManagerForConfig(config);
+        await callbackManager?.handleCustomEvent?.(
+          GraphEvents.ON_AGENT_LOG,
+          {
+            level: 'warn',
+            scope: 'projection',
+            message: 'Provider message projection has provenance gaps',
+            data: { provider, report },
+            runId,
+          } satisfies t.AgentLogEvent,
+          runId
+        );
+      } catch {
+        return;
+      }
+    },
+  });
+  handler.name = 'provider-message-projection-invariant';
+  handler.raiseError = mode === 'assert';
+  handler.awaitHandlers = true;
+  return handler;
+}
+
+function withModelStartHandler({
+  config,
+  mode,
+  provider,
+  captureRunId,
+}: {
+  config: RunnableConfig;
+  mode: ReturnType<typeof resolveProviderMessageProjectionInvariantMode>;
+  provider: t.ProviderName;
+  captureRunId?: (runId: string) => void;
+}): RunnableConfig {
+  return {
+    ...config,
+    callbacks: appendCallbacks(config.callbacks, [
+      createModelStartHandler({ config, mode, provider, captureRunId }),
+    ]),
+  };
+}
 
 function getManualToolStreamNormalizationProvider(
   provider: t.ProviderName
@@ -632,6 +711,24 @@ async function attemptInvokeBody(
   config: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
   const { model, messages: messagesForProvider, provider } = request;
+  const projectionInvariantMode =
+    resolveProviderMessageProjectionInvariantMode();
+  let sealedRunId: string | undefined;
+  let invocationConfig = config;
+  const captureModelRunId =
+    model.stream != null && context?.preemption != null;
+  if (projectionInvariantMode !== 'off' || captureModelRunId) {
+    invocationConfig = withModelStartHandler({
+      config,
+      mode: projectionInvariantMode,
+      provider,
+      captureRunId: captureModelRunId
+        ? (runId: string): void => {
+          sealedRunId ??= runId;
+        }
+        : undefined,
+    });
+  }
 
   /**
    * Stamp the provider that is ACTUALLY serving this invocation onto the
@@ -647,28 +744,10 @@ async function attemptInvokeBody(
      * Observed, not dictated. `handleChatModelStart` fires with the chat
      * model's real run id before the first chunk, which is the only way to
      * name the run a seal has to close — pinning `config.runId` does not
-     * survive the bound runnable. Installed only when preemption is
-     * configured, so a run that cannot seal carries no extra handler.
+     * survive the bound runnable. The same handler owns the opt-in projection
+     * invariant so enabled diagnostics do not stack a second model callback.
      */
-    let sealedRunId: string | undefined;
-    const streamConfig =
-      context?.preemption == null
-        ? config
-        : {
-          ...config,
-          callbacks: appendCallbacks(config.callbacks, [
-            {
-              handleChatModelStart: (
-                _llm: Serialized,
-                _messages: BaseMessage[][],
-                runId: string
-              ): void => {
-                sealedRunId ??= runId;
-              },
-            },
-          ]),
-        };
-    const stream = await model.stream(messagesForProvider, streamConfig);
+    const stream = await model.stream(messagesForProvider, invocationConfig);
     let finalChunk: AIMessageChunk | undefined;
     let preempted = false;
     const registeredStreamHandler =
@@ -855,7 +934,7 @@ async function attemptInvokeBody(
     return { messages: [finalChunk as AIMessageChunk] };
   }
 
-  const finalMessage = await model.invoke(messagesForProvider, config);
+  const finalMessage = await model.invoke(messagesForProvider, invocationConfig);
   if ((finalMessage.tool_calls?.length ?? 0) > 0) {
     finalMessage.tool_calls = finalMessage.tool_calls?.filter(
       (tool_call: ToolCall) => !!tool_call.name

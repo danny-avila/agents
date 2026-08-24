@@ -23,7 +23,7 @@ import type {
 } from './types';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
-import { deserializeMessage } from './messageSerialization';
+import { deriveMessages } from './deriveMessages';
 import { createSummarizeNode } from '@/summarization/node';
 import { resolveStreamLimits } from '@/llm/streamLimits';
 import { JsonlSessionStore } from './JsonlSessionStore';
@@ -491,32 +491,6 @@ function createCheckpointReference(params: {
     checkpointNs,
     ...(parentCheckpointId != null ? { parentCheckpointId } : {}),
   };
-}
-
-function createSessionRunState(entries: SessionEntry[]): {
-  messages: BaseMessage[];
-  initialSummary?: InitialSummary;
-} {
-  const messages: BaseMessage[] = [];
-  let initialSummary: InitialSummary | undefined;
-  for (const entry of entries) {
-    if (entry.type === 'summary') {
-      initialSummary = {
-        text: entry.data.text,
-        tokenCount:
-          typeof entry.data.tokenCount === 'number' &&
-          Number.isFinite(entry.data.tokenCount)
-            ? entry.data.tokenCount
-            : 0,
-      };
-      messages.length = 0;
-      continue;
-    }
-    if (entry.type === 'message') {
-      messages.push(deserializeMessage(entry.data.message));
-    }
-  }
-  return { messages, initialSummary };
 }
 
 function isMessageEntry(
@@ -1103,7 +1077,7 @@ export class AgentSession {
       handlerResult.events.push(streamEvent);
       onEvent?.(streamEvent);
     };
-    const sessionState = createSessionRunState(
+    const sessionState = deriveMessages(
       isSessionThread ? (this.store?.getPath() ?? []) : []
     );
     let run: Run<t.IState> | undefined;
@@ -1349,7 +1323,7 @@ export class AgentSession {
       throw new Error('Cannot compact an ephemeral session');
     }
     const activePath = path ?? store.getPath();
-    const sessionState = createSessionRunState(activePath);
+    const sessionState = deriveMessages(activePath);
     const messageEntries = activePath.filter(isMessageEntry);
     if (sessionState.messages.length === 0) {
       return undefined;
@@ -1474,7 +1448,7 @@ export class AgentSession {
       threadId,
       userHandlers: this.runConfig.customHandlers,
     });
-    const sessionState = createSessionRunState(
+    const sessionState = deriveMessages(
       isSessionThread ? (this.store?.getPath() ?? []) : []
     );
     let run: Run<t.IState> | undefined;
