@@ -120,6 +120,29 @@ function readOwnString(value: unknown, key: string): string | undefined {
   }
 }
 
+function readOwnValue(value: unknown, key: string): unknown {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor != null && 'value' in descriptor
+      ? descriptor.value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const LEGACY_FUNCTION_CALL_PREFIX = 'legacy_function:';
+
+function getLegacyFunctionCallId(name: string): string | undefined {
+  const callId = `${LEGACY_FUNCTION_CALL_PREFIX}${name}`;
+  return callId.length <= PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS
+    ? callId
+    : undefined;
+}
+
 function getRawToolCallDescriptor(
   toolCall: unknown
 ): ProviderToolCallPartDescriptor | undefined {
@@ -175,11 +198,40 @@ function appendMessageToolCalls(
       }
     }
   }
+
+  const legacyFunctionCall = readOwnValue(
+    message.additional_kwargs,
+    'function_call'
+  );
+  const legacyFunctionName = readOwnString(legacyFunctionCall, 'name');
+  const legacyFunctionCallId =
+    legacyFunctionName == null
+      ? undefined
+      : getLegacyFunctionCallId(legacyFunctionName);
+  if (legacyFunctionCallId != null) {
+    appendProviderToolCallDescriptor(calls, {
+      callId: legacyFunctionCallId,
+      kind: 'tool',
+      name: legacyFunctionName,
+      sourceType: 'legacy_function_call',
+    });
+  }
 }
 
 function getToolMessageResultDescriptor(
   message: BaseMessage
 ): ProviderToolResultPartDescriptor | undefined {
+  if (message.getType() === 'function' && message.name != null) {
+    const toolCallId = getLegacyFunctionCallId(message.name);
+    return toolCallId == null
+      ? undefined
+      : {
+        type: 'function_message',
+        toolCallId,
+        compatibleCallKinds: ['tool'],
+        expectedToolNames: [message.name],
+      };
+  }
   if (message.getType() !== 'tool') {
     return undefined;
   }
@@ -257,7 +309,9 @@ function inspectMessagePairing(
   }
 
   const trustedHumanToolResult =
-    everyPartIsTrustedHumanResult && resultPartCount === content?.length;
+    everyPartIsTrustedHumanResult &&
+    resultPartCount > 0 &&
+    resultPartCount === content?.length;
   if (trustedHumanToolResult) {
     calls.clear();
     for (const [callId, entry] of candidateCalls) {

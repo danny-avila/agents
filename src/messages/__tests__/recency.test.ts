@@ -1,5 +1,6 @@
 import {
   AIMessage,
+  FunctionMessage,
   HumanMessage,
   ToolMessage,
   SystemMessage,
@@ -463,6 +464,29 @@ describe('splitAtRecencyBoundary', () => {
       expect(result.tailTurnCount).toBe(1);
     });
 
+    it('preserves an empty HumanMessage as a user turn', () => {
+      const messages = [
+        new HumanMessage('first turn'),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'closed', name: 'search', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'closed result',
+          tool_call_id: 'closed',
+          name: 'search',
+        }),
+        new HumanMessage({ content: [] }),
+        new AIMessage('working'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, { turns: 1 });
+
+      expect(result.head).toEqual(messages.slice(0, 3));
+      expect(result.tail).toEqual(messages.slice(3));
+      expect(result.tailTurnCount).toBe(1);
+    });
+
     it('keeps incompatible provider results from closing a tool call', () => {
       const messages = [
         new HumanMessage('inspect'),
@@ -517,6 +541,38 @@ describe('splitAtRecencyBoundary', () => {
 
       expect(result.head).toEqual(messages.slice(0, 4));
       expect(result.tail).toEqual(messages.slice(4));
+    });
+
+    it('keeps legacy OpenAI function calls with their FunctionMessage', () => {
+      const legacyCall = new AIMessage('');
+      legacyCall.additional_kwargs.function_call = {
+        name: 'lookup',
+        arguments: '{}',
+      };
+      const messages = [
+        new HumanMessage('inspect'),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'closed', name: 'search', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'closed result',
+          tool_call_id: 'closed',
+          name: 'search',
+        }),
+        legacyCall,
+        new FunctionMessage({ name: 'lookup', content: 'legacy result' }),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 200,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 3));
+      expect(result.tail).toEqual(messages.slice(3));
     });
 
     it('compacts paired Gemini code-execution units without identifiers', () => {
