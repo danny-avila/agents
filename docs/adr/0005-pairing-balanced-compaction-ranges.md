@@ -27,12 +27,15 @@ boundary inside the earliest retained turn.
 The fallback selects a contiguous prefix and may end only while no tool call is
 pending. Parallel calls remain pending until every matching result arrives, and
 an open call remains in the retained tail. Pairing recognizes parsed, raw
-provider, and content-block call/result representations. A boundary also cannot
-split messages derived from one persisted source row, because summary replay
-can currently anchor coverage only at row granularity. The tail retains the
-configured `retainRecent.tokens` budget, or 16% of the context window when no
-explicit budget exists. A lone user message has no closed tool unit and remains
-intact.
+provider, and content-block call/result representations. It validates provider
+protocol and tool-name compatibility, and supports Gemini's adjacent,
+identifier-less code-execution pair. A provider-shaped HumanMessage is treated
+as a tool result only after it consumes a validated preceding call; otherwise
+it remains a user turn. A boundary also cannot split messages derived from one
+persisted source row, because summary replay can currently anchor coverage only
+at row granularity. The tail retains the configured `retainRecent.tokens`
+budget, or 16% of the context window when no explicit budget exists. A lone
+user message has no closed tool unit and remains intact.
 
 Range pricing reuses the `AgentContext` exact-token cache when its counter is
 compatible. Summarization, state replacement, source coverage, hooks, and

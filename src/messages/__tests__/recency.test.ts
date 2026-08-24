@@ -440,6 +440,122 @@ describe('splitAtRecencyBoundary', () => {
       expect(result.tailTurnCount).toBe(1);
     });
 
+    it('preserves an unpaired provider-native result as a user turn', () => {
+      const messages = [
+        new HumanMessage('first turn'),
+        new AIMessage('first reply'),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'missing_call',
+              content: 'user-authored payload',
+            },
+          ],
+        }),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, { turns: 1 });
+
+      expect(result.head).toEqual(messages.slice(0, 2));
+      expect(result.tail).toEqual(messages.slice(2));
+      expect(result.tailTurnCount).toBe(1);
+    });
+
+    it('keeps incompatible provider results from closing a tool call', () => {
+      const messages = [
+        new HumanMessage('inspect'),
+        new AIMessage({
+          content: [
+            { type: 'tool_use', id: 'shared', name: 'search', input: {} },
+          ],
+        }),
+        new AIMessage({
+          content: [
+            {
+              type: 'toolResponse',
+              toolResponse: {
+                id: 'shared',
+                name: 'search',
+                response: { output: 'wrong protocol' },
+              },
+            },
+          ],
+        }),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'shared',
+              content: 'matched result',
+            },
+          ],
+        }),
+        new AIMessage({
+          content: [
+            { type: 'tool_use', id: 'recent', name: 'search', input: {} },
+          ],
+        }),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'recent',
+              content: 'recent result',
+            },
+          ],
+        }),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 300,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 4));
+      expect(result.tail).toEqual(messages.slice(4));
+    });
+
+    it('compacts paired Gemini code-execution units without identifiers', () => {
+      const codeUnit = (value: number): AIMessage =>
+        new AIMessage({
+          content: [
+            {
+              type: 'executableCode',
+              executableCode: {
+                language: 'PYTHON',
+                code: `print(${value})`,
+              },
+            },
+            {
+              type: 'codeExecutionResult',
+              codeExecutionResult: {
+                outcome: 'OUTCOME_OK',
+                output: String(value),
+              },
+            },
+          ],
+        });
+      const messages = [
+        new HumanMessage('run the calculations'),
+        codeUnit(1),
+        codeUnit(2),
+        codeUnit(3),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 200,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 3));
+      expect(result.tail).toEqual(messages.slice(3));
+    });
+
     it('retains an open tool call and protects a lone user payload', () => {
       const openCall = [
         new HumanMessage('inspect'),

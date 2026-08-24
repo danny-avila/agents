@@ -3,10 +3,18 @@ import type {
   BaseMessage,
   ToolMessage,
 } from '@langchain/core/messages';
+import type {
+  ProviderToolCallIndex,
+  ProviderToolCallPartDescriptor,
+  ProviderToolResultPartDescriptor,
+} from './toolResultTypes';
 import { getProviderSourceMessageIds } from './provenance';
 import {
+  appendProviderToolCallDescriptor,
+  consumeProviderToolResultPair,
   getBoundedProviderPairingArray,
   getBoundedProviderPairingArrayProperty,
+  getProviderAIMessageToolCallDescriptor,
   getProviderToolCallPartDescriptor,
   getProviderToolResultPartDescriptor,
   PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS,
@@ -110,25 +118,47 @@ function readOwnString(value: unknown, key: string): string | undefined {
   }
 }
 
-function addToolPairingId(ids: Set<string>, candidate: unknown): void {
-  if (
-    typeof candidate === 'string' &&
-    candidate !== '' &&
-    candidate.length <= PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS
-  ) {
-    ids.add(candidate);
+function getRawToolCallDescriptor(
+  toolCall: unknown
+): ProviderToolCallPartDescriptor | undefined {
+  const callId = readOwnString(toolCall, 'id');
+  if (callId == null) {
+    return undefined;
   }
+  let name: string | undefined;
+  if (toolCall != null && typeof toolCall === 'object') {
+    try {
+      const property = Object.getOwnPropertyDescriptor(toolCall, 'function');
+      name =
+        property != null && 'value' in property
+          ? readOwnString(property.value, 'name')
+          : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return {
+    callId,
+    kind: 'tool',
+    sourceType: 'raw_tool_calls',
+    ...(name == null ? {} : { name }),
+  };
 }
 
-function getToolCallIds(message: BaseMessage): Set<string> {
-  const ids = new Set<string>();
+function appendMessageToolCalls(
+  message: BaseMessage,
+  calls: ProviderToolCallIndex
+): void {
   const messageRole = (message as BaseMessage & { role?: unknown }).role;
   if (message.getType() !== 'ai' && messageRole !== 'assistant') {
-    return ids;
+    return;
   }
 
   for (const toolCall of (message as AIMessage).tool_calls ?? []) {
-    addToolPairingId(ids, toolCall.id);
+    const descriptor = getProviderAIMessageToolCallDescriptor(toolCall);
+    if (descriptor != null) {
+      appendProviderToolCallDescriptor(calls, descriptor);
+    }
   }
 
   const rawToolCalls = getBoundedProviderPairingArrayProperty(
@@ -137,59 +167,122 @@ function getToolCallIds(message: BaseMessage): Set<string> {
   );
   if (rawToolCalls != null) {
     for (const toolCall of rawToolCalls) {
-      const id = readOwnString(toolCall, 'id');
-      addToolPairingId(ids, id);
-    }
-  }
-
-  const content = getBoundedProviderPairingArray(message.content);
-  if (content != null) {
-    for (const part of content) {
-      const descriptor = getProviderToolCallPartDescriptor(part);
+      const descriptor = getRawToolCallDescriptor(toolCall);
       if (descriptor != null) {
-        addToolPairingId(ids, descriptor.callId);
+        appendProviderToolCallDescriptor(calls, descriptor);
       }
     }
   }
-
-  return ids;
 }
 
-function getToolResultIds(message: BaseMessage): Set<string> {
-  const ids = new Set<string>();
-  if (message.getType() === 'tool') {
-    const toolMessage = message as ToolMessage & { toolCallId?: unknown };
-    addToolPairingId(ids, toolMessage.tool_call_id);
-    addToolPairingId(ids, toolMessage.toolCallId);
+function getToolMessageResultDescriptor(
+  message: BaseMessage
+): ProviderToolResultPartDescriptor | undefined {
+  if (message.getType() !== 'tool') {
+    return undefined;
   }
+  const toolMessage = message as ToolMessage & { toolCallId?: unknown };
+  const toolCallId =
+    typeof toolMessage.tool_call_id === 'string'
+      ? toolMessage.tool_call_id
+      : toolMessage.toolCallId;
+  return typeof toolCallId === 'string' &&
+    toolCallId !== '' &&
+    toolCallId.length <= PROVIDER_TOOL_PAIRING_MAX_IDENTIFIER_CHARS
+    ? {
+      type: 'tool_message',
+      toolCallId,
+      compatibleCallKinds: ['tool'],
+    }
+    : undefined;
+}
 
+interface MessagePairingResult {
+  completedToolCalls: number;
+  trustedHumanToolResult: boolean;
+}
+
+function inspectMessagePairing(
+  message: BaseMessage,
+  calls: ProviderToolCallIndex
+): MessagePairingResult {
+  const isHuman = message.getType() === 'human';
+  const candidateCalls = isHuman ? new Map(calls) : calls;
+  if (!isHuman) {
+    appendMessageToolCalls(message, candidateCalls);
+  }
   const content = getBoundedProviderPairingArray(message.content);
+  let completedToolCalls = 0;
+  let resultPartCount = 0;
+  let everyPartIsTrustedHumanResult = isHuman && content != null;
   if (content != null) {
+    let previousPart: unknown;
     for (const part of content) {
-      const descriptor = getProviderToolResultPartDescriptor(part);
-      if (descriptor?.toolCallId != null) {
-        addToolPairingId(ids, descriptor.toolCallId);
+      const callDescriptor = getProviderToolCallPartDescriptor(part);
+      if (callDescriptor != null && !isHuman) {
+        appendProviderToolCallDescriptor(candidateCalls, callDescriptor);
       }
+      const resultDescriptor = getProviderToolResultPartDescriptor(part);
+      if (resultDescriptor == null) {
+        everyPartIsTrustedHumanResult = false;
+      } else {
+        resultPartCount += 1;
+        const canPairHumanResult =
+          !isHuman || resultDescriptor.allowHumanMessagePairing === true;
+        if (
+          canPairHumanResult &&
+          consumeProviderToolResultPair(
+            resultDescriptor,
+            candidateCalls,
+            previousPart
+          )
+        ) {
+          completedToolCalls += 1;
+        } else {
+          everyPartIsTrustedHumanResult = false;
+        }
+      }
+      previousPart = part;
     }
   }
 
-  return ids;
+  const toolMessageResult = getToolMessageResultDescriptor(message);
+  if (
+    toolMessageResult != null &&
+    consumeProviderToolResultPair(toolMessageResult, candidateCalls)
+  ) {
+    completedToolCalls += 1;
+  }
+
+  const trustedHumanToolResult =
+    everyPartIsTrustedHumanResult && resultPartCount === content?.length;
+  if (trustedHumanToolResult) {
+    calls.clear();
+    for (const [callId, entry] of candidateCalls) {
+      calls.set(callId, entry);
+    }
+  }
+  return {
+    completedToolCalls: isHuman && !trustedHumanToolResult
+      ? 0
+      : completedToolCalls,
+    trustedHumanToolResult,
+  };
 }
 
-function isToolResultOnlyMessage(message: BaseMessage): boolean {
-  if (message.getType() === 'tool') {
-    return true;
-  }
-  const content = getBoundedProviderPairingArray(message.content);
-  if (content == null || content.length === 0) {
-    return false;
-  }
-  for (const part of content) {
-    if (getProviderToolResultPartDescriptor(part)?.toolCallId == null) {
-      return false;
+function findTurnStarts(messages: BaseMessage[]): number[] {
+  const turnStarts: number[] = [];
+  const calls: ProviderToolCallIndex = new Map();
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i] as BaseMessage;
+    const pairing = inspectMessagePairing(message, calls);
+    if (message.getType() !== 'human' || pairing.trustedHumanToolResult) {
+      continue;
     }
+    turnStarts.push(i);
+    calls.clear();
   }
-  return true;
+  return turnStarts;
 }
 
 function getCoverageSourceIds(message: BaseMessage): string[] {
@@ -224,7 +317,7 @@ function findIntraTurnBoundary(
     }
   }
 
-  const pendingToolCallIds = new Set<string>();
+  const pendingToolCalls: ProviderToolCallIndex = new Map();
   const straddlingSourceIds = new Set<string>();
   let completedToolCalls = 0;
   let boundary: number | undefined;
@@ -233,15 +326,10 @@ function findIntraTurnBoundary(
     const message = messages[i] as BaseMessage;
     remainingTokens -= countMessageAt(i);
 
-    for (const callId of getToolCallIds(message)) {
-      pendingToolCallIds.add(callId);
-    }
-
-    const toolResultIds = getToolResultIds(message);
-    for (const toolCallId of toolResultIds) {
-      if (pendingToolCallIds.delete(toolCallId)) {
-        completedToolCalls += 1;
-      }
+    const pairing = inspectMessagePairing(message, pendingToolCalls);
+    completedToolCalls += pairing.completedToolCalls;
+    if (message.getType() === 'human' && !pairing.trustedHumanToolResult) {
+      pendingToolCalls.clear();
     }
 
     for (const sourceId of sourceIdsByIndex[i] as string[]) {
@@ -257,9 +345,9 @@ function findIntraTurnBoundary(
     }
     if (
       completedToolCalls > 0 &&
-      pendingToolCallIds.size === 0 &&
+      pendingToolCalls.size === 0 &&
       straddlingSourceIds.size === 0 &&
-      (message.getType() !== 'human' || isToolResultOnlyMessage(message))
+      (message.getType() !== 'human' || pairing.trustedHumanToolResult)
     ) {
       boundary = i + 1;
     }
@@ -300,15 +388,7 @@ export function splitAtRecencyBoundary(
     };
   }
 
-  const turnStarts: number[] = [];
-  for (let i = 0; i < messages.length; i++) {
-    if (
-      messages[i].getType() === 'human' &&
-      !isToolResultOnlyMessage(messages[i] as BaseMessage)
-    ) {
-      turnStarts.push(i);
-    }
-  }
+  const turnStarts = findTurnStarts(messages);
 
   if (turnStarts.length === 0) {
     return {
