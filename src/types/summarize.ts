@@ -18,12 +18,12 @@ export type SummarizationTrigger = {
  */
 export type RetainRecentConfig = {
   /**
-   * Maximum number of recent user-led turns to keep in the tail.  A turn
-   * begins at a HumanMessage and includes every following AIMessage and
-   * ToolMessage up to (but not including) the next HumanMessage.  Cutting
-   * at turn boundaries guarantees tool_use / tool_result pairs are never
-   * split.  Set to `0` to disable the recency window (legacy behavior:
-   * summarize everything).  Defaults to `2`.
+   * Maximum number of recent user-led turns to keep in the tail. A turn begins
+   * at a user-authored HumanMessage and includes every following AIMessage and
+   * tool result up to the next user-authored HumanMessage. Provider-native
+   * HumanMessages containing only tool results remain in the current turn.
+   * Set to `0` to disable the recency window (legacy behavior: summarize
+   * everything). Defaults to `2`.
    */
   turns?: number;
   /**

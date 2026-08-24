@@ -21,11 +21,11 @@ export const DEFAULT_INTRA_TURN_RETAIN_RATIO = 0.16;
  */
 export interface RecencyWindowOptions {
   /**
-   * Maximum number of recent user-led turns to keep in the tail.  A "turn"
-   * begins at a HumanMessage and includes every following AIMessage and
-   * ToolMessage up to (but not including) the next HumanMessage.  Cutting
-   * at turn boundaries guarantees that tool_use / tool_result pairs are
-   * never split across the head/tail divide.
+   * Maximum number of recent user-led turns to keep in the tail. A "turn"
+   * begins at a user-authored HumanMessage and includes every following
+   * AIMessage and tool result up to the next user-authored HumanMessage.
+   * Provider-native HumanMessages containing only tool results remain in the
+   * current turn, so the boundary cannot split them from their calls.
    *
    * The most recent turn is preserved unless `intraTurnTokens` enables the
    * pairing-balanced fallback for a tool-heavy history. A lone oversized user
@@ -302,7 +302,10 @@ export function splitAtRecencyBoundary(
 
   const turnStarts: number[] = [];
   for (let i = 0; i < messages.length; i++) {
-    if (messages[i].getType() === 'human') {
+    if (
+      messages[i].getType() === 'human' &&
+      !isToolResultOnlyMessage(messages[i] as BaseMessage)
+    ) {
       turnStarts.push(i);
     }
   }

@@ -399,6 +399,47 @@ describe('splitAtRecencyBoundary', () => {
       expect(result.tail).toEqual(messages.slice(5));
     });
 
+    it('does not treat provider-native result messages as user turns', () => {
+      const messages = [
+        new HumanMessage('inspect'),
+        new AIMessage({
+          content: [
+            { type: 'tool_use', id: 'call_a', name: 'search', input: {} },
+          ],
+        }),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_a',
+              content: 'result A',
+            },
+          ],
+        }),
+        new AIMessage({
+          content: [
+            { type: 'tool_use', id: 'call_b', name: 'search', input: {} },
+          ],
+        }),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_b',
+              content: 'result B',
+            },
+          ],
+        }),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, { turns: 1 });
+
+      expect(result.head).toEqual([]);
+      expect(result.tail).toEqual(messages);
+      expect(result.tailTurnCount).toBe(1);
+    });
+
     it('retains an open tool call and protects a lone user payload', () => {
       const openCall = [
         new HumanMessage('inspect'),
