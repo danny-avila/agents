@@ -22,6 +22,7 @@
  * providers do not bill the prompt. The `confirm` tier still overshoots by a
  * wide margin so an expensive model can never accidentally accept the prompt.
  */
+import '@/llm/providers.eager';
 import { writeFileSync } from 'fs';
 import { config as loadEnv } from 'dotenv';
 import { HumanMessage } from '@langchain/core/messages';
