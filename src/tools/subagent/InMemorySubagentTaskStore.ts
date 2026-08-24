@@ -196,6 +196,12 @@ function snapshot(task: StoredTask): SubagentTaskSnapshot {
   };
 }
 
+function cloneControlReceipt(
+  receipt: SubagentTaskControlReceipt
+): SubagentTaskControlReceipt {
+  return { ...receipt };
+}
+
 function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error
     ? signal.reason
@@ -219,6 +225,17 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
   constructor(options: InMemorySubagentTaskStoreOptions = {}) {
     this.options = resolveOptions(options);
   }
+
+  /**
+   * Payload-free transition seam for hosts that durably project authoritative
+   * receipts. Implementations must return synchronously and must not reproduce
+   * task-store transition rules.
+   */
+  protected onControlReceipt(
+    _scopeId: string,
+    _taskId: string,
+    _receipt: SubagentTaskControlReceipt
+  ): void {}
 
   start(request: SubagentTaskStartRequest): SubagentTaskStartResult {
     const scopeId = request.scopeId.trim();
@@ -455,13 +472,15 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
     };
     task.controls.push(control);
     task.updatedAt = Date.now();
-    task.controlReceipts.set(control.id, {
+    const receipt: SubagentTaskControlReceipt = {
       controlId: control.id,
       action: control.action,
       status: 'accepted',
       createdAt: task.updatedAt,
       updatedAt: task.updatedAt,
-    });
+    };
+    task.controlReceipts.set(control.id, receipt);
+    this.onControlReceipt(task.scopeId, task.id, cloneControlReceipt(receipt));
     return {
       status: 'accepted',
       task: snapshot(task),
@@ -586,13 +605,19 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
     if (receipt == null || receipt.status !== 'accepted') {
       return;
     }
-    task.controlReceipts.set(controlId, {
+    const transitioned: SubagentTaskControlReceipt = {
       ...receipt,
       status,
       updatedAt: Date.now(),
       ...(detail.boundary == null ? {} : { boundary: detail.boundary }),
       ...(detail.reason == null ? {} : { reason: detail.reason }),
-    });
+    };
+    task.controlReceipts.set(controlId, transitioned);
+    this.onControlReceipt(
+      task.scopeId,
+      task.id,
+      cloneControlReceipt(transitioned)
+    );
   }
 
   private failPendingControls(

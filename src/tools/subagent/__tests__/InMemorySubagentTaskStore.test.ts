@@ -1,6 +1,18 @@
 import { afterEach, describe, expect, it, jest } from '@jest/globals';
-import type { SubagentTaskRuntime } from '@/types';
+import type { SubagentTaskControlReceipt, SubagentTaskRuntime } from '@/types';
 import { InMemorySubagentTaskStore } from '@/tools/subagent/InMemorySubagentTaskStore';
+
+class ReceiptObservingStore extends InMemorySubagentTaskStore {
+  readonly observed: SubagentTaskControlReceipt[] = [];
+
+  protected override onControlReceipt(
+    _scopeId: string,
+    _taskId: string,
+    receipt: SubagentTaskControlReceipt
+  ): void {
+    this.observed.push(receipt);
+  }
+}
 
 const settle = async (): Promise<void> => {
   await Promise.resolve();
@@ -306,6 +318,49 @@ describe('InMemorySubagentTaskStore', () => {
 
     finish({ content: 'done' });
     await settle();
+  });
+
+  it('reports authoritative receipt transitions through one host seam', async () => {
+    const store = new ReceiptObservingStore();
+    let runtime: SubagentTaskRuntime | undefined;
+    let finish = (_result: { content: string }): void => undefined;
+    const result = new Promise<{ content: string }>((resolve) => {
+      finish = resolve;
+    });
+    const started = start(store, async (taskRuntime) => {
+      runtime = taskRuntime;
+      return result;
+    });
+    if (!started.accepted) {
+      throw new Error('Expected task dispatch to be accepted.');
+    }
+    await settle();
+    store.control('user:conversation', started.task.taskId, {
+      action: 'steer',
+      message: 'Use the primary source.',
+    });
+    store.control('user:conversation', started.task.taskId, {
+      action: 'queue',
+      message: 'Compare the result next turn.',
+    });
+    runtime?.drain('tool');
+    finish({ content: 'done' });
+    await settle();
+
+    expect(store.observed).toEqual([
+      expect.objectContaining({ action: 'steer', status: 'accepted' }),
+      expect.objectContaining({ action: 'queue', status: 'accepted' }),
+      expect.objectContaining({
+        action: 'steer',
+        status: 'applied',
+        boundary: 'tool',
+      }),
+      expect.objectContaining({
+        action: 'queue',
+        status: 'rejected',
+        reason: 'task_completed',
+      }),
+    ]);
   });
 
   it('cancels a pending message before it drains', async () => {
