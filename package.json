@@ -219,6 +219,7 @@
     "bench:cache": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/bench-prompt-cache.ts",
     "bench:context-pressure": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/bench-context-pressure-cache.ts",
     "bench:provider-derivation": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/bench-provider-derivation.ts",
+    "bench:provider-projection": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/bench-provider-request-projection.ts",
     "bench:execution-world": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/bench-execution-world.ts",
     "probe:overflow": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/context-overflow-probe.ts",
     "subagent": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-subagent.ts",
