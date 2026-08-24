@@ -53,9 +53,8 @@ import {
   cloneMessage,
   CALIBRATION_RATIO_MAX,
   createPruneMessages,
-  projectToolCallInputs,
+  projectToolMessagesForProvider,
   calculateMaxToolCallInputChars,
-  projectToolStreamContentForProvider,
   syncBudgetDerivedFields,
   addTailCacheControl,
   resolvePromptCacheTtl,
@@ -3178,15 +3177,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const maxProviderToolResultChars =
         agentContext.maxToolResultChars ??
         calculateMaxToolResultChars(agentContext.maxContextTokens);
-      const beforeToolStreamProjection = finalMessages;
-      finalMessages = trackProviderMessageOrigins(
-        beforeToolStreamProjection,
-        projectToolStreamContentForProvider(beforeToolStreamProjection)
-      );
       const beforeToolInputProjection = finalMessages;
       finalMessages = trackProviderMessageOrigins(
         beforeToolInputProjection,
-        projectToolCallInputs(
+        projectToolMessagesForProvider(
           beforeToolInputProjection,
           calculateMaxToolCallInputChars(agentContext.maxContextTokens)
         )

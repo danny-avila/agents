@@ -980,6 +980,19 @@ function isCompleteToolStreamContentBlock(block: unknown): boolean {
   }
 }
 
+/** Drops incomplete streamed text blocks before provider-facing tool shaping. */
+export function dropIncompleteToolStreamContent(
+  content: AIMessage['content']
+): AIMessage['content'] {
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  const completeContent = content.filter(isCompleteToolStreamContentBlock);
+  return completeContent.length === content.length
+    ? content
+    : toLangChainContent(completeContent);
+}
+
 function projectPreemptedResponsesV1Content(
   content: AIMessage['content'],
   reasoning: unknown,
@@ -2026,20 +2039,12 @@ export function projectToolStreamContentForProvider(
       }
       continue;
     }
-    if (!Array.isArray(assistantMessage.content)) {
-      continue;
-    }
-    const content = assistantMessage.content.filter(
-      isCompleteToolStreamContentBlock
-    );
-    if (content.length === assistantMessage.content.length) {
+    const content = dropIncompleteToolStreamContent(assistantMessage.content);
+    if (content === assistantMessage.content) {
       continue;
     }
     projected ??= [...messages];
-    projected[i] = cloneAIMessageWithContent(
-      assistantMessage,
-      toLangChainContent(content)
-    );
+    projected[i] = cloneAIMessageWithContent(assistantMessage, content);
   }
   return projected ?? messages;
 }
