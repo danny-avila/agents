@@ -11,10 +11,10 @@ export type SummarizationTrigger = {
 };
 
 /**
- * Controls how many recent messages are preserved verbatim during
- * compaction.  The most recent user-led turn is always preserved
- * regardless of these caps, so a single oversized first message is
- * never destroyed by summarization.
+ * Controls how much recent context is preserved verbatim during compaction.
+ * User-turn boundaries are preferred. Under context pressure, older closed
+ * tool units inside an otherwise indivisible turn may be summarized while a
+ * token-priced recent tail is retained. A lone user payload stays intact.
  */
 export type RetainRecentConfig = {
   /**
@@ -27,9 +27,11 @@ export type RetainRecentConfig = {
    */
   turns?: number;
   /**
-   * Optional cap on retained-recent tokens beyond the most recent turn.
-   * Older turns are added whole only while cumulative tokens stay below
-   * the cap.  Defaults to undefined (no cap; bounded only by `turns`).
+   * Optional retained-recent token budget. Older turns are added whole only
+   * while cumulative tokens stay below the cap. If a tool-heavy history has
+   * no compactable turn-level head, this is also the minimum recent tail kept
+   * behind a pairing-balanced intra-turn cut. When omitted, that fallback
+   * retains 16% of the configured context window.
    */
   tokens?: number;
 };

@@ -218,6 +218,7 @@
     "tool_search": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/tool_search.ts",
     "bench:cache": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/bench-prompt-cache.ts",
     "bench:context-pressure": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/bench-context-pressure-cache.ts",
+    "bench:compaction-range": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/bench-compaction-range.ts",
     "bench:provider-derivation": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/bench-provider-derivation.ts",
     "bench:provider-projection": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/bench-provider-request-projection.ts",
     "bench:execution-world": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/bench-execution-world.ts",

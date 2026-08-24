@@ -1,6 +1,11 @@
-import type { BaseMessage } from '@langchain/core/messages';
+import type {
+  AIMessage,
+  BaseMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 
 export const DEFAULT_RETAIN_RECENT_TURNS = 2;
+export const DEFAULT_INTRA_TURN_RETAIN_RATIO = 0.16;
 
 /**
  * Configuration for splitting a message list into a head (to be summarized)
@@ -14,9 +19,9 @@ export interface RecencyWindowOptions {
    * at turn boundaries guarantees that tool_use / tool_result pairs are
    * never split across the head/tail divide.
    *
-   * The most recent turn is always preserved regardless of this value or
-   * the token cap, so that a single oversized first message is never
-   * destroyed by summarization.
+   * The most recent turn is preserved unless `intraTurnTokens` enables the
+   * pairing-balanced fallback for a tool-heavy history. A lone oversized user
+   * message is never eligible for that fallback.
    *
    * Defaults to `2`.  A value of `0` disables the recency window (head =
    * everything, tail = empty), restoring the pre-recency-window behavior.
@@ -34,12 +39,19 @@ export interface RecencyWindowOptions {
   tokens?: number;
   /** Token-counter used to evaluate the optional `tokens` cap. */
   tokenCounter?: (m: BaseMessage) => number;
+  /**
+   * Minimum token budget to retain when the turn window would otherwise make
+   * the whole history indivisible. When set with `tokenCounter`, older closed
+   * tool-call/result units may be summarized from within the earliest retained
+   * turn. A lone user payload and open tool units remain indivisible.
+   */
+  intraTurnTokens?: number;
 }
 
 export interface RecencySplit {
   /** Older messages eligible for summarization.  Empty when nothing to summarize. */
   head: BaseMessage[];
-  /** Recent messages preserved verbatim.  Always contains the most recent turn when any HumanMessage exists. */
+  /** Recent messages preserved verbatim, beginning at a pairing-balanced boundary. */
   tail: BaseMessage[];
   /** Number of user-led turns retained in the tail (0 if no HumanMessage exists). */
   tailTurnCount: number;
@@ -47,18 +59,105 @@ export interface RecencySplit {
   tailStartIndex: number;
 }
 
+export function resolveIntraTurnRetainTokens({
+  tokens,
+  maxContextTokens,
+}: {
+  tokens?: number;
+  maxContextTokens?: number;
+}): number | undefined {
+  if (tokens != null) {
+    return Number.isFinite(tokens) && tokens > 0
+      ? Math.floor(tokens)
+      : undefined;
+  }
+  if (
+    maxContextTokens == null ||
+    !Number.isFinite(maxContextTokens) ||
+    maxContextTokens <= 0
+  ) {
+    return undefined;
+  }
+  return Math.max(
+    1,
+    Math.floor(maxContextTokens * DEFAULT_INTRA_TURN_RETAIN_RATIO)
+  );
+}
+
+function getToolCallIds(message: BaseMessage): string[] {
+  if (message.getType() !== 'ai') {
+    return [];
+  }
+  const toolCalls = (message as AIMessage).tool_calls;
+  if (toolCalls == null || toolCalls.length === 0) {
+    return [];
+  }
+  const ids: string[] = [];
+  for (const toolCall of toolCalls) {
+    if (toolCall.id != null && toolCall.id !== '') {
+      ids.push(toolCall.id);
+    }
+  }
+  return ids;
+}
+
+function findIntraTurnBoundary(
+  messages: BaseMessage[],
+  countMessageAt: (index: number) => number,
+  retainTokens: number
+): number | undefined {
+  let remainingTokens = 0;
+  for (let i = 0; i < messages.length; i++) {
+    remainingTokens += countMessageAt(i);
+  }
+  if (remainingTokens <= retainTokens) {
+    return undefined;
+  }
+
+  const pendingToolCallIds = new Set<string>();
+  let completedToolCalls = 0;
+  let boundary: number | undefined;
+
+  for (let i = 0; i < messages.length - 1; i++) {
+    const message = messages[i] as BaseMessage;
+    remainingTokens -= countMessageAt(i);
+
+    for (const callId of getToolCallIds(message)) {
+      pendingToolCallIds.add(callId);
+    }
+
+    if (message.getType() === 'tool') {
+      const toolCallId = (message as ToolMessage).tool_call_id;
+      if (pendingToolCallIds.delete(toolCallId)) {
+        completedToolCalls += 1;
+      }
+    }
+
+    if (remainingTokens < retainTokens) {
+      break;
+    }
+    if (
+      completedToolCalls > 0 &&
+      pendingToolCallIds.size === 0 &&
+      message.getType() !== 'human'
+    ) {
+      boundary = i + 1;
+    }
+  }
+
+  return boundary;
+}
+
 /**
  * Splits `messages` into a head (older, to summarize) and a tail (recent,
- * to preserve verbatim) at user-message boundaries.  The most recent
- * user-led turn is always included in the tail; additional older turns
- * are added subject to `turns` and `tokens` caps.
+ * to preserve verbatim), preferring user-message boundaries. The most recent
+ * user-led turn is normally included in the tail; additional older turns are
+ * added subject to `turns` and `tokens` caps.
  *
- * Cutting strictly at HumanMessage boundaries ensures that:
- * - tool_use ↔ tool_result pairs are never split (they always live within
- *   the same turn);
- * - the first user message is never replaced by a summary, addressing
- *   the "first turn destruction" failure mode where a single large
- *   user-pasted payload would otherwise be replaced by a generic summary.
+ * When that policy exposes no compactable head, `intraTurnTokens` may select
+ * a boundary after older closed tool-call/result units. This keeps runaway
+ * first-turn tool loops compactable without splitting parallel calls from
+ * their results. A user payload without a completed tool unit stays intact.
  *
  * When `messages` contains no HumanMessage (degenerate state — e.g. system
  * + assistant messages from a programmatic preamble), everything is
@@ -105,6 +204,16 @@ export function splitAtRecencyBoundary(
   const tokenCounter = options.tokenCounter;
   const trackTokens =
     tokensCap != null && Number.isFinite(tokensCap) && tokenCounter != null;
+  const messageTokens: Array<number | undefined> = new Array(messages.length);
+  const countMessageAt = (index: number): number => {
+    const cached = messageTokens[index];
+    if (cached != null) {
+      return cached;
+    }
+    const count = tokenCounter?.(messages[index] as BaseMessage) ?? 0;
+    messageTokens[index] = count;
+    return count;
+  };
 
   /**
    * Token-counting strategy: each candidate turn `t` spans the half-open
@@ -122,7 +231,7 @@ export function splitAtRecencyBoundary(
   let tailTokens = 0;
   if (trackTokens) {
     for (let i = lastTurnStart; i < messages.length; i++) {
-      tailTokens += tokenCounter(messages[i] as BaseMessage);
+      tailTokens += countMessageAt(i);
     }
   }
 
@@ -136,7 +245,7 @@ export function splitAtRecencyBoundary(
     if (trackTokens) {
       let turnTokens = 0;
       for (let i = turnStart; i < turnEnd; i++) {
-        turnTokens += tokenCounter(messages[i] as BaseMessage);
+        turnTokens += countMessageAt(i);
       }
       if (tailTokens + turnTokens > (tokensCap as number)) {
         break;
@@ -146,6 +255,30 @@ export function splitAtRecencyBoundary(
 
     tailStartIndex = turnStart;
     tailTurnCount += 1;
+  }
+
+  if (tailStartIndex === 0) {
+    const intraTurnTokens = options.intraTurnTokens;
+    if (
+      intraTurnTokens != null &&
+      Number.isFinite(intraTurnTokens) &&
+      intraTurnTokens > 0 &&
+      tokenCounter != null
+    ) {
+      const intraTurnBoundary = findIntraTurnBoundary(
+        messages,
+        countMessageAt,
+        intraTurnTokens
+      );
+      if (intraTurnBoundary != null) {
+        return {
+          head: messages.slice(0, intraTurnBoundary),
+          tail: messages.slice(intraTurnBoundary),
+          tailTurnCount,
+          tailStartIndex: intraTurnBoundary,
+        };
+      }
+    }
   }
 
   return {

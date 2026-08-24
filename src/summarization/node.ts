@@ -29,6 +29,7 @@ import {
 } from '@/messages/cache';
 import {
   DEFAULT_RETAIN_RECENT_TURNS,
+  resolveIntraTurnRetainTokens,
   splitAtRecencyBoundary,
 } from '@/messages/recency';
 import {
@@ -1091,12 +1092,19 @@ export function createSummarizeNode({
     const runnableConfig = config ?? graph.config;
 
     const retainRecent = agentContext.summarizationConfig?.retainRecent;
+    const recencyTokenCounter =
+      agentContext.contextPressureTokenCounts?.count ??
+      agentContext.tokenCounter;
     const { head: messagesToRefine, tailStartIndex } = splitAtRecencyBoundary(
       restoredMessages,
       {
         turns: retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS,
         tokens: retainRecent?.tokens,
-        tokenCounter: agentContext.tokenCounter,
+        tokenCounter: recencyTokenCounter,
+        intraTurnTokens: resolveIntraTurnRetainTokens({
+          tokens: retainRecent?.tokens,
+          maxContextTokens: agentContext.maxContextTokens,
+        }),
       }
     );
     /**
@@ -1596,9 +1604,10 @@ function traceConfig(
 
 /**
  * Cache-friendly compaction: sends raw conversation messages with the
- * summarization instruction appended as the final HumanMessage.
- * Providers with prompt caching get a cache hit on the system prompt +
- * tool definitions prefix.
+ * summarization instruction appended as the final HumanMessage. Bound tool
+ * definitions can reuse their cache prefix. Exact replay of the main request's
+ * system + tools + messages prefix requires a routed-request projection that
+ * this summarization path does not currently own.
  */
 async function summarizeWithCacheHit({
   model,

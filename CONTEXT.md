@@ -89,6 +89,16 @@ entry's graph regresses every host's boot.
 The meter's estimates decide overflow and recovery only. Provider-reported
 usage remains the source of truth for billing and Langfuse observations.
 
+A **Compaction Range** is the contiguous conversation prefix replaced by one
+durable checkpoint. Range selection prefers whole user-led turns. If that
+would leave no compactable prefix in a tool-heavy run, it may cut after an
+older closed tool-call/result unit while retaining a token-priced recent tail.
+Open and parallel tool units are indivisible, and a lone user payload is never
+eligible for the intra-turn fallback.
+
+See [ADR 0005](docs/adr/0005-pairing-balanced-compaction-ranges.md) for the
+range-selection and retention trade-offs.
+
 ## Provider Tool Derivation
 
 A **Provider Tool Derivation** is the copy-on-write projection of retained

@@ -882,6 +882,71 @@ describe('recency window — first-turn protection', () => {
     expect(result.messages).toBeUndefined();
   });
 
+  it('summarizes older closed tool units inside a long single turn', async () => {
+    captureEvents();
+
+    let capturedMessages: BaseMessage[] = [];
+    const invokeMock = jest.fn().mockImplementation((messages: unknown) => {
+      capturedMessages = messages as BaseMessage[];
+      return Promise.resolve({ content: 'Checkpoint of the completed work' });
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke: invokeMock };
+        }
+      } as never
+    );
+
+    const setSummary = jest.fn();
+    const agentContext = createAgentContext({
+      summarizationConfig: {},
+      maxContextTokens: 1_000,
+      tokenCounter: () => 100,
+      setSummary,
+    } as never);
+    const graph = mockGraph();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+    const messages: BaseMessage[] = [new HumanMessage('inspect the repo')];
+    for (let index = 0; index < 4; index++) {
+      const id = `call_${index}`;
+      messages.push(
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id, name: 'search', args: {} }],
+        }),
+        new ToolMessage({
+          content: `result ${index}`,
+          tool_call_id: id,
+          name: 'search',
+        })
+      );
+    }
+    messages.push(new AIMessage('preparing the change'));
+
+    const result = await summarizeNode(
+      {
+        messages,
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(capturedMessages.slice(0, -1)).toEqual(messages.slice(0, 7));
+    expect(setSummary).toHaveBeenCalledWith(
+      expect.stringContaining('Checkpoint of the completed work'),
+      expect.any(Number)
+    );
+    expect(result.messages?.slice(1)).toEqual(messages.slice(7));
+  });
+
   it('still summarizes the head when older turns exist beyond the recency window', async () => {
     captureEvents();
 
