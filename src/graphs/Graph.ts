@@ -68,6 +68,7 @@ import {
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
   DEFAULT_RETAIN_RECENT_TURNS,
+  resolveIntraTurnRetainTokens,
   splitAtRecencyBoundary,
   convertInjectedMessages,
   coalesceAdjacentUserTurns,
@@ -3936,6 +3937,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          */
         const estimatedPromptTokens = getEstimatedPromptTokens(contextUsage);
 
+        const recencyTokenCounter =
+          agentContext.contextPressureTokenCounts?.count ??
+          agentContext.tokenCounter;
         const canSummarizeOverflow =
           agentContext.summarizationEnabled === true &&
           splitAtRecencyBoundary(messages, {
@@ -3943,7 +3947,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               agentContext.summarizationConfig?.retainRecent?.turns ??
               DEFAULT_RETAIN_RECENT_TURNS,
             tokens: agentContext.summarizationConfig?.retainRecent?.tokens,
-            tokenCounter: agentContext.tokenCounter,
+            tokenCounter: recencyTokenCounter,
+            intraTurnTokens: resolveIntraTurnRetainTokens({
+              tokens: agentContext.summarizationConfig?.retainRecent?.tokens,
+              maxContextTokens: agentContext.maxContextTokens,
+            }),
           }).head.length > 0;
 
         const getLocalProviderOverflowMeasurement = (

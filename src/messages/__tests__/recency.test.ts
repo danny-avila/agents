@@ -5,7 +5,37 @@ import {
   SystemMessage,
   type BaseMessage,
 } from '@langchain/core/messages';
-import { splitAtRecencyBoundary } from '@/messages/recency';
+import {
+  resolveIntraTurnRetainTokens,
+  splitAtRecencyBoundary,
+} from '@/messages/recency';
+
+describe('resolveIntraTurnRetainTokens', () => {
+  it('prefers an explicit budget and otherwise retains 16% of context', () => {
+    expect(
+      resolveIntraTurnRetainTokens({
+        tokens: 4_096,
+        maxContextTokens: 100_000,
+      })
+    ).toBe(4_096);
+    expect(
+      resolveIntraTurnRetainTokens({ maxContextTokens: 100_000 })
+    ).toBe(16_000);
+  });
+
+  it('disables the fallback without a usable context budget', () => {
+    expect(resolveIntraTurnRetainTokens({})).toBeUndefined();
+    expect(
+      resolveIntraTurnRetainTokens({ maxContextTokens: 0 })
+    ).toBeUndefined();
+    expect(
+      resolveIntraTurnRetainTokens({
+        tokens: 0,
+        maxContextTokens: 100_000,
+      })
+    ).toBeUndefined();
+  });
+});
 
 describe('splitAtRecencyBoundary', () => {
   describe('default behavior (turns: 2)', () => {
@@ -158,6 +188,466 @@ describe('splitAtRecencyBoundary', () => {
       expect(result.tailTurnCount).toBe(2);
       expect(result.head).toEqual([]);
       expect(result.tail).toEqual(messages);
+    });
+  });
+
+  describe('pairing-balanced intra-turn fallback', () => {
+    it('compacts older closed tool units from a single long turn', () => {
+      const messages: BaseMessage[] = [new HumanMessage('inspect the repo')];
+      for (let index = 0; index < 4; index++) {
+        const id = `call_${index}`;
+        messages.push(
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id, name: 'search', args: { query: index } }],
+          }),
+          new ToolMessage({
+            content: `result ${index}`,
+            tool_call_id: id,
+            name: 'search',
+          })
+        );
+      }
+      messages.push(new AIMessage('preparing the change'));
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 300,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 7));
+      expect(result.tail).toEqual(messages.slice(7));
+      expect(result.tailStartIndex).toBe(7);
+      expect(result.usedIntraTurnFallback).toBe(true);
+      expect(result.tail[0]).toBeInstanceOf(AIMessage);
+      expect((result.tail[0] as AIMessage).tool_calls?.[0]?.id).toBe('call_3');
+      expect((result.tail[1] as ToolMessage).tool_call_id).toBe('call_3');
+    });
+
+    it('does not split parallel tool calls from their results', () => {
+      const messages = [
+        new HumanMessage('compare both'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'call_a', name: 'search', args: {} },
+            { id: 'call_b', name: 'search', args: {} },
+          ],
+        }),
+        new ToolMessage({
+          content: 'result A',
+          tool_call_id: 'call_a',
+          name: 'search',
+        }),
+        new ToolMessage({
+          content: 'result B',
+          tool_call_id: 'call_b',
+          name: 'search',
+        }),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call_c', name: 'search', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'result C',
+          tool_call_id: 'call_c',
+          name: 'search',
+        }),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 300,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 4));
+      expect(result.tail).toEqual(messages.slice(4));
+    });
+
+    it('falls back within the first turn after a leading preamble', () => {
+      const messages = [
+        new SystemMessage('programmatic preamble'),
+        new HumanMessage('inspect'),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call_a', name: 'search', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'result A',
+          tool_call_id: 'call_a',
+          name: 'search',
+        }),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call_b', name: 'search', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'result B',
+          tool_call_id: 'call_b',
+          name: 'search',
+        }),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 300,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 4));
+      expect(result.tail).toEqual(messages.slice(4));
+    });
+
+    it('does not split messages derived from one persisted source row', () => {
+      const messages = [
+        new HumanMessage('inspect'),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call_a', name: 'search', args: {} }],
+          additional_kwargs: { sourceMessageId: 'expanded-row' },
+        }),
+        new ToolMessage({
+          content: 'result A',
+          tool_call_id: 'call_a',
+          name: 'search',
+          additional_kwargs: { sourceMessageId: 'expanded-row' },
+        }),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call_b', name: 'search', args: {} }],
+          additional_kwargs: { sourceMessageId: 'expanded-row' },
+        }),
+        new ToolMessage({
+          content: 'result B',
+          tool_call_id: 'call_b',
+          name: 'search',
+          additional_kwargs: { sourceMessageId: 'expanded-row' },
+        }),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call_c', name: 'search', args: {} }],
+          additional_kwargs: { sourceMessageId: 'retained-row' },
+        }),
+        new ToolMessage({
+          content: 'result C',
+          tool_call_id: 'call_c',
+          name: 'search',
+          additional_kwargs: { sourceMessageId: 'retained-row' },
+        }),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 300,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 5));
+      expect(result.tail).toEqual(messages.slice(5));
+    });
+
+    it('recognizes raw and content-block provider tool pairs', () => {
+      const rawCallMessage = new AIMessage('');
+      rawCallMessage.additional_kwargs.tool_calls = [
+        {
+          id: 'raw_call',
+          type: 'function',
+          function: { name: 'search', arguments: '{}' },
+        },
+      ];
+      const messages = [
+        new HumanMessage('inspect'),
+        rawCallMessage,
+        new ToolMessage({
+          content: 'raw result',
+          tool_call_id: 'raw_call',
+          name: 'search',
+        }),
+        new AIMessage({
+          content: [
+            {
+              type: 'tool_use',
+              id: 'content_call',
+              name: 'search',
+              input: {},
+            },
+          ],
+        }),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'content_call',
+              content: 'content result',
+            },
+          ],
+        }),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 100,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 5));
+      expect(result.tail).toEqual(messages.slice(5));
+    });
+
+    it('does not treat provider-native result messages as user turns', () => {
+      const messages = [
+        new HumanMessage('inspect'),
+        new AIMessage({
+          content: [
+            { type: 'tool_use', id: 'call_a', name: 'search', input: {} },
+          ],
+        }),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_a',
+              content: 'result A',
+            },
+          ],
+        }),
+        new AIMessage({
+          content: [
+            { type: 'tool_use', id: 'call_b', name: 'search', input: {} },
+          ],
+        }),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_b',
+              content: 'result B',
+            },
+          ],
+        }),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, { turns: 1 });
+
+      expect(result.head).toEqual([]);
+      expect(result.tail).toEqual(messages);
+      expect(result.tailTurnCount).toBe(1);
+    });
+
+    it('preserves an unpaired provider-native result as a user turn', () => {
+      const messages = [
+        new HumanMessage('first turn'),
+        new AIMessage('first reply'),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'missing_call',
+              content: 'user-authored payload',
+            },
+          ],
+        }),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, { turns: 1 });
+
+      expect(result.head).toEqual(messages.slice(0, 2));
+      expect(result.tail).toEqual(messages.slice(2));
+      expect(result.tailTurnCount).toBe(1);
+    });
+
+    it('keeps incompatible provider results from closing a tool call', () => {
+      const messages = [
+        new HumanMessage('inspect'),
+        new AIMessage({
+          content: [
+            { type: 'tool_use', id: 'shared', name: 'search', input: {} },
+          ],
+        }),
+        new AIMessage({
+          content: [
+            {
+              type: 'toolResponse',
+              toolResponse: {
+                id: 'shared',
+                name: 'search',
+                response: { output: 'wrong protocol' },
+              },
+            },
+          ],
+        }),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'shared',
+              content: 'matched result',
+            },
+          ],
+        }),
+        new AIMessage({
+          content: [
+            { type: 'tool_use', id: 'recent', name: 'search', input: {} },
+          ],
+        }),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'recent',
+              content: 'recent result',
+            },
+          ],
+        }),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 300,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 4));
+      expect(result.tail).toEqual(messages.slice(4));
+    });
+
+    it('compacts paired Gemini code-execution units without identifiers', () => {
+      const codeUnit = (value: number): AIMessage =>
+        new AIMessage({
+          content: [
+            {
+              type: 'executableCode',
+              executableCode: {
+                language: 'PYTHON',
+                code: `print(${value})`,
+              },
+            },
+            {
+              type: 'codeExecutionResult',
+              codeExecutionResult: {
+                outcome: 'OUTCOME_OK',
+                output: String(value),
+              },
+            },
+          ],
+        });
+      const messages = [
+        new HumanMessage('run the calculations'),
+        codeUnit(1),
+        codeUnit(2),
+        codeUnit(3),
+        new AIMessage('done'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 200,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 3));
+      expect(result.tail).toEqual(messages.slice(3));
+    });
+
+    it('does not let an older tool pair license a cut in a later turn', () => {
+      const messages = [
+        new HumanMessage('first turn'),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'closed', name: 'search', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'closed result',
+          tool_call_id: 'closed',
+          name: 'search',
+        }),
+        new HumanMessage('large second user request'),
+        new AIMessage('working'),
+        new AIMessage('still working'),
+        new AIMessage('latest state'),
+      ];
+
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokenCounter: () => 100,
+        intraTurnTokens: 200,
+      });
+
+      expect(result.head).toEqual(messages.slice(0, 3));
+      expect(result.tail).toEqual(messages.slice(3));
+      expect(result.usedIntraTurnFallback).toBe(true);
+    });
+
+    it('retains an open tool call and protects a lone user payload', () => {
+      const openCall = [
+        new HumanMessage('inspect'),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'closed', name: 'search', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'closed result',
+          tool_call_id: 'closed',
+          name: 'search',
+        }),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'open', name: 'search', args: {} }],
+        }),
+      ];
+      const options = {
+        turns: 2,
+        tokenCounter: (): number => 100,
+        intraTurnTokens: 100,
+      };
+
+      const openResult = splitAtRecencyBoundary(openCall, options);
+      const loneUser = [new HumanMessage('payload'.repeat(10_000))];
+      const loneResult = splitAtRecencyBoundary(loneUser, options);
+
+      expect(openResult.head).toEqual(openCall.slice(0, 3));
+      expect(openResult.tail).toEqual(openCall.slice(3));
+      expect(loneResult.head).toEqual([]);
+      expect(loneResult.tail).toEqual(loneUser);
+    });
+
+    it('counts every message at most once when falling back within a turn', () => {
+      const messages: BaseMessage[] = [new HumanMessage('inspect')];
+      for (let index = 0; index < 100; index++) {
+        const id = `call_${index}`;
+        messages.push(
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id, name: 'search', args: {} }],
+          }),
+          new ToolMessage({
+            content: `result ${index}`,
+            tool_call_id: id,
+            name: 'search',
+          })
+        );
+      }
+      let calls = 0;
+
+      splitAtRecencyBoundary(messages, {
+        turns: 2,
+        tokens: 30,
+        tokenCounter: () => {
+          calls += 1;
+          return 1;
+        },
+        intraTurnTokens: 30,
+      });
+
+      expect(calls).toBe(messages.length);
     });
   });
 

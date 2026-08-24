@@ -778,6 +778,87 @@ describe('AgentContext', () => {
       expect(result[3].content).toBe('Second');
     });
 
+    it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
+      'places an intra-turn %s checkpoint before an assistant/tool tail',
+      async (provider) => {
+        const ctx = createBasicContext({
+          agentConfig: {
+            provider,
+            clientOptions: {
+              model:
+                provider === Providers.ANTHROPIC
+                  ? 'claude-haiku-4-5'
+                  : 'anthropic/claude-haiku-4.5',
+              promptCache: true,
+            },
+            instructions: 'Stable instructions',
+          },
+        });
+        ctx.setSummary('Intra-turn checkpoint', 7, {
+          precedesMessages: true,
+        });
+
+        const result = await ctx.systemRunnable!.invoke([
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              { id: 'call_1', name: 'calculator', args: { value: 2 } },
+            ],
+          }),
+          new ToolMessage({
+            content: '4',
+            name: 'calculator',
+            tool_call_id: 'call_1',
+          }),
+        ]);
+
+        expect(JSON.stringify(result[1].content)).toContain(
+          'Intra-turn checkpoint'
+        );
+        expect((result[2] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+        expect(result[3].getType()).toBe('tool');
+      }
+    );
+
+    it('does not insert an Anthropic checkpoint between a native call and result', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-haiku-4-5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+        },
+      });
+      ctx.setSummary('Intra-turn checkpoint', 7, {
+        precedesMessages: true,
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new AIMessage({
+          content: [
+            { type: 'tool_use', id: 'call_1', name: 'search', input: {} },
+          ],
+        }),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_1',
+              content: 'result',
+            },
+          ],
+        }),
+      ]);
+
+      expect(JSON.stringify(result[1].content)).toContain(
+        'Intra-turn checkpoint'
+      );
+      expect(result[2].getType()).toBe('ai');
+      expect(result[3].getType()).toBe('human');
+    });
+
     it('preserves the Bedrock system cache point through message cache-control pass', async () => {
       const ctx = createBasicContext({
         agentConfig: {

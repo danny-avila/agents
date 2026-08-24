@@ -11,25 +11,27 @@ export type SummarizationTrigger = {
 };
 
 /**
- * Controls how many recent messages are preserved verbatim during
- * compaction.  The most recent user-led turn is always preserved
- * regardless of these caps, so a single oversized first message is
- * never destroyed by summarization.
+ * Controls how much recent context is preserved verbatim during compaction.
+ * User-turn boundaries are preferred. Under context pressure, older closed
+ * tool units inside an otherwise indivisible turn may be summarized while a
+ * token-priced recent tail is retained. A lone user payload stays intact.
  */
 export type RetainRecentConfig = {
   /**
-   * Maximum number of recent user-led turns to keep in the tail.  A turn
-   * begins at a HumanMessage and includes every following AIMessage and
-   * ToolMessage up to (but not including) the next HumanMessage.  Cutting
-   * at turn boundaries guarantees tool_use / tool_result pairs are never
-   * split.  Set to `0` to disable the recency window (legacy behavior:
-   * summarize everything).  Defaults to `2`.
+   * Maximum number of recent user-led turns to keep in the tail. A turn begins
+   * at a user-authored HumanMessage and includes every following AIMessage and
+   * tool result up to the next user-authored HumanMessage. Provider-native
+   * HumanMessages containing only tool results remain in the current turn.
+   * Set to `0` to disable the recency window (legacy behavior: summarize
+   * everything). Defaults to `2`.
    */
   turns?: number;
   /**
-   * Optional cap on retained-recent tokens beyond the most recent turn.
-   * Older turns are added whole only while cumulative tokens stay below
-   * the cap.  Defaults to undefined (no cap; bounded only by `turns`).
+   * Optional retained-recent token budget. Older turns are added whole only
+   * while cumulative tokens stay below the cap. If a tool-heavy history has
+   * no compactable turn-level head, this is also the minimum recent tail kept
+   * behind a pairing-balanced intra-turn cut. When omitted, that fallback
+   * retains 16% of the configured context window.
    */
   tokens?: number;
 };

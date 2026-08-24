@@ -357,6 +357,8 @@ export class AgentContext {
    * - `'none'`: no summary present
    */
   private _summaryLocation: 'system_prompt' | 'user_message' | 'none' = 'none';
+  /** Whether a mid-run summary must appear before every retained message. */
+  private summaryPrecedesMessages: boolean = false;
   /**
    * Durable summary that survives reset() calls. Set from initialSummary
    * during fromConfig() and updated by setSummary() so that the latest
@@ -365,6 +367,7 @@ export class AgentContext {
    */
   private _durableSummaryText?: string;
   private _durableSummaryTokenCount: number = 0;
+  private durableSummaryPrecedesMessages: boolean = false;
   /** Number of summarization cycles that have occurred for this agent context */
   private _summaryVersion: number = 0;
   /**
@@ -989,10 +992,10 @@ export class AgentContext {
       return messages;
     }
 
-    const tailIndex = this.getPromptCacheDynamicTailIndex(
-      messages,
-      promptCacheProvider
-    );
+    const tailIndex =
+      this._summaryLocation === 'user_message' && this.summaryPrecedesMessages
+        ? 0
+        : this.getPromptCacheDynamicTailIndex(messages, promptCacheProvider);
     const stablePrefix = messages.slice(0, tailIndex);
     const trailingMessages = messages.slice(tailIndex);
     const cacheablePrefix = this.addStablePromptCacheMarkers(
@@ -1204,6 +1207,7 @@ export class AgentContext {
 
     this.summaryText = this._durableSummaryText;
     this.summaryTokenCount = this._durableSummaryTokenCount;
+    this.summaryPrecedesMessages = this.durableSummaryPrecedesMessages;
     this._lastSummarizationMsgCount = 0;
     this.lastCallUsage = undefined;
     this.totalTokensFresh = false;
@@ -1461,12 +1465,18 @@ export class AgentContext {
     }
   }
 
-  setSummary(text: string, tokenCount: number): void {
+  setSummary(
+    text: string,
+    tokenCount: number,
+    options?: { precedesMessages?: boolean }
+  ): void {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
     this._summaryLocation = 'user_message';
+    this.summaryPrecedesMessages = options?.precedesMessages === true;
     this._durableSummaryText = text;
     this._durableSummaryTokenCount = tokenCount;
+    this.durableSummaryPrecedesMessages = this.summaryPrecedesMessages;
     this._summaryVersion += 1;
     this.systemRunnableStale = true;
     this.pruneMessages = undefined;
@@ -1477,8 +1487,10 @@ export class AgentContext {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
     this._summaryLocation = 'system_prompt';
+    this.summaryPrecedesMessages = false;
     this._durableSummaryText = text;
     this._durableSummaryTokenCount = tokenCount;
+    this.durableSummaryPrecedesMessages = false;
     this._summaryVersion += 1;
     this.systemRunnableStale = true;
   }
@@ -1683,6 +1695,8 @@ export class AgentContext {
       this.summaryTokenCount = 0;
       this._durableSummaryText = undefined;
       this._durableSummaryTokenCount = 0;
+      this.summaryPrecedesMessages = false;
+      this.durableSummaryPrecedesMessages = false;
       this._summaryLocation = 'none';
       this.systemRunnableStale = true;
     }

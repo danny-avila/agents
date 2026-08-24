@@ -29,6 +29,7 @@ import {
 } from '@/messages/cache';
 import {
   DEFAULT_RETAIN_RECENT_TURNS,
+  resolveIntraTurnRetainTokens,
   splitAtRecencyBoundary,
 } from '@/messages/recency';
 import {
@@ -1091,14 +1092,22 @@ export function createSummarizeNode({
     const runnableConfig = config ?? graph.config;
 
     const retainRecent = agentContext.summarizationConfig?.retainRecent;
-    const { head: messagesToRefine, tailStartIndex } = splitAtRecencyBoundary(
-      restoredMessages,
-      {
-        turns: retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS,
+    const recencyTokenCounter =
+      agentContext.contextPressureTokenCounts?.count ??
+      agentContext.tokenCounter;
+    const {
+      head: messagesToRefine,
+      tailStartIndex,
+      usedIntraTurnFallback,
+    } = splitAtRecencyBoundary(restoredMessages, {
+      turns: retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS,
+      tokens: retainRecent?.tokens,
+      tokenCounter: recencyTokenCounter,
+      intraTurnTokens: resolveIntraTurnRetainTokens({
         tokens: retainRecent?.tokens,
-        tokenCounter: agentContext.tokenCounter,
-      }
-    );
+        maxContextTokens: agentContext.maxContextTokens,
+      }),
+    });
     /**
      * Use the *masked* messages for the retained tail so that any
      * truncation prune applied to oversized ToolMessage content stays
@@ -1305,10 +1314,17 @@ export function createSummarizeNode({
      * supposed to preserve. Leave state untouched and let the provider error
      * surface instead.
      */
-    if (usedMetadataStub === true && request.reason === 'overflow') {
+    if (
+      usedMetadataStub === true &&
+      (request.reason === 'overflow' || usedIntraTurnFallback)
+    ) {
+      const preservationReason =
+        request.reason === 'overflow'
+          ? 'overflow recovery'
+          : 'intra-turn compaction';
       log(
         'warn',
-        'Overflow summarization failed; keeping history rather than replacing it with a metadata stub'
+        `Summarization failed during ${preservationReason}; keeping history rather than replacing it with a metadata stub`
       );
       agentContext.markSummarizationTriggered(state.messages.length);
       /**
@@ -1330,8 +1346,7 @@ export function createSummarizeNode({
           {
             id: stepId,
             agentId: request.agentId,
-            error:
-              'Summarization failed during overflow recovery; conversation history was preserved',
+            error: `Summarization failed during ${preservationReason}; conversation history was preserved`,
           } satisfies t.SummarizeCompleteEvent,
           runnableConfig
         );
@@ -1364,7 +1379,13 @@ export function createSummarizeNode({
       agentContext.tokenCounter
     );
 
-    agentContext.setSummary(summaryText, tokenCount);
+    if (usedIntraTurnFallback) {
+      agentContext.setSummary(summaryText, tokenCount, {
+        precedesMessages: true,
+      });
+    } else {
+      agentContext.setSummary(summaryText, tokenCount);
+    }
 
     log('info', 'Summary persisted');
     log('debug', 'Summary details', {
@@ -1596,9 +1617,10 @@ function traceConfig(
 
 /**
  * Cache-friendly compaction: sends raw conversation messages with the
- * summarization instruction appended as the final HumanMessage.
- * Providers with prompt caching get a cache hit on the system prompt +
- * tool definitions prefix.
+ * summarization instruction appended as the final HumanMessage. Bound tool
+ * definitions can reuse their cache prefix. Exact replay of the main request's
+ * system + tools + messages prefix requires a routed-request projection that
+ * this summarization path does not currently own.
  */
 async function summarizeWithCacheHit({
   model,
