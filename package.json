@@ -131,6 +131,27 @@
       ],
       "responses": [
         "dist/types/responses/index.d.ts"
+      ],
+      "llm/openai": [
+        "./dist/types/llm/openai/index.d.ts"
+      ],
+      "llm/mistral": [
+        "./dist/types/llm/mistral/index.d.ts"
+      ],
+      "llm/anthropic": [
+        "./dist/types/llm/anthropic/index.d.ts"
+      ],
+      "llm/google": [
+        "./dist/types/llm/google/index.d.ts"
+      ],
+      "llm/bedrock": [
+        "./dist/types/llm/bedrock/index.d.ts"
+      ],
+      "llm/vertexai": [
+        "./dist/types/llm/vertexai/index.d.ts"
+      ],
+      "llm/openrouter": [
+        "./dist/types/llm/openrouter/index.d.ts"
       ]
     }
   },

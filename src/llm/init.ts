@@ -1,7 +1,7 @@
 import type { Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { getChatModelClass } from '@/llm/providers';
-import { requireLazyModule } from '@/lazyRequire';
+import { requireInternalModule, requireLazyModule } from '@/lazyRequire';
 import { isOpenAILike } from '@/utils';
 import { Providers } from '@/common';
 
@@ -34,9 +34,8 @@ type InitializeModelParams<P extends t.ProviderName> = {
 function isOpenAIChatModel(
   model: unknown
 ): model is import('@/llm/openai').ChatOpenAI | import('@/llm/openai').AzureChatOpenAI {
-  const { ChatOpenAI, AzureChatOpenAI } = requireLazyModule<typeof import('@/llm/openai')>(
-    '@librechat/agents/llm/openai'
-  );
+  const { ChatOpenAI, AzureChatOpenAI } =
+    requireInternalModule<typeof import('@/llm/openai')>('llm/openai/index');
   return model instanceof ChatOpenAI || model instanceof AzureChatOpenAI;
 }
 

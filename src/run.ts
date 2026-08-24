@@ -35,7 +35,7 @@ import {
   ACTIVITY_PHASE_LABEL_RUN_NAME,
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
-import { requireLazyModule } from '@/lazyRequire';
+import { requireInternalModule } from '@/lazyRequire';
 import {
   requireValidSubagentResumeManifest,
   stripSubagentResumeManifest,
@@ -109,10 +109,10 @@ import { executeHooks } from '@/hooks';
 function isLangchainOpenAIModel(
   model: unknown
 ): model is
-  | import('@langchain/openai').ChatOpenAI
-  | import('@langchain/openai').AzureChatOpenAI {
+  | import('@/llm/openai').ChatOpenAI
+  | import('@/llm/openai').AzureChatOpenAI {
   const { ChatOpenAI, AzureChatOpenAI } =
-    requireLazyModule<typeof import('@langchain/openai')>('@langchain/openai');
+    requireInternalModule<typeof import('@/llm/openai')>('llm/openai/index');
   return model instanceof ChatOpenAI || model instanceof AzureChatOpenAI;
 }
 

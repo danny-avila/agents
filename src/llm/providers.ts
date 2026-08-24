@@ -1,5 +1,5 @@
 import type { ProviderModelConstructor, ProviderName } from '@/types';
-import { requireLazyModule } from '@/lazyRequire';
+import { requireInternalModule } from '@/lazyRequire';
 import type { ProviderFamily } from '../provider-registration';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import {
@@ -37,7 +37,7 @@ function initializeBuiltInProvider(
 
 const fromOpenAI =
   (name: string) => (): ProviderModelClass =>
-    (requireLazyModule<Record<string, ProviderModelClass>>('@librechat/agents/llm/openai'))[
+    (requireInternalModule<Record<string, ProviderModelClass>>('llm/openai/index'))[
       name
     ];
 
@@ -48,14 +48,14 @@ initializeBuiltInProvider(Providers.AZURE, fromOpenAI('AzureChatOpenAI'), {
 });
 initializeBuiltInProvider(
   Providers.VERTEXAI,
-  () => (requireLazyModule<typeof import('@/llm/vertexai')>('@librechat/agents/llm/vertexai')).ChatVertexAI,
+  () => (requireInternalModule<typeof import('@/llm/vertexai')>('llm/vertexai/index')).ChatVertexAI,
   { family: 'google' }
 );
 initializeBuiltInProvider(Providers.DEEPSEEK, fromOpenAI('ChatDeepSeek'), {
   family: 'openai',
 });
 const loadMistral = (): ProviderModelClass =>
-  (requireLazyModule<typeof import('@/llm/mistral')>('@librechat/agents/llm/mistral')).CustomChatMistralAI;
+  (requireInternalModule<typeof import('@/llm/mistral')>('llm/mistral/index')).CustomChatMistralAI;
 initializeBuiltInProvider(Providers.MISTRALAI, loadMistral, {
   family: 'mistral',
   strictAlternation: true,
@@ -66,26 +66,26 @@ initializeBuiltInProvider(Providers.MISTRAL, loadMistral, {
 });
 initializeBuiltInProvider(
   Providers.ANTHROPIC,
-  () => (requireLazyModule<typeof import('@/llm/anthropic')>('@librechat/agents/llm/anthropic')).CustomAnthropic,
+  () => (requireInternalModule<typeof import('@/llm/anthropic')>('llm/anthropic/index')).CustomAnthropic,
   { family: 'anthropic', manualToolStream: true }
 );
 initializeBuiltInProvider(
   Providers.OPENROUTER,
   () =>
-    (requireLazyModule<typeof import('@/llm/openrouter')>('@librechat/agents/llm/openrouter')).ChatOpenRouter,
+    (requireInternalModule<typeof import('@/llm/openrouter')>('llm/openrouter/index')).ChatOpenRouter,
   { family: 'openai' }
 );
 initializeBuiltInProvider(
   Providers.BEDROCK,
   () =>
-    (requireLazyModule<typeof import('@/llm/bedrock')>('@librechat/agents/llm/bedrock'))
+    (requireInternalModule<typeof import('@/llm/bedrock')>('llm/bedrock/index'))
       .CustomChatBedrockConverse,
   { family: 'bedrock', manualToolStream: true, strictAlternation: true }
 );
 initializeBuiltInProvider(
   Providers.GOOGLE,
   () =>
-    (requireLazyModule<typeof import('@/llm/google')>('@librechat/agents/llm/google'))
+    (requireInternalModule<typeof import('@/llm/google')>('llm/google/index'))
       .CustomChatGoogleGenerativeAI,
   { family: 'google' }
 );
