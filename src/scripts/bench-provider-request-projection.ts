@@ -9,6 +9,10 @@ import {
 
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
+import {
+  inspectProviderMessageProjection,
+  setProviderMessageProvenance,
+} from '@/messages';
 import { Providers } from '@/common';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 
@@ -29,11 +33,20 @@ function createTextHistory(messageCount: number): BaseMessage[] {
   const messages: BaseMessage[] = [];
   for (let index = 0; index < messageCount; index++) {
     const content = `Message ${index}: ${'retained conversation context '.repeat(24)}`;
-    messages.push(
-      index % 2 === 0
-        ? new HumanMessage({ id: `human-${index}`, content })
-        : new AIMessage({ id: `assistant-${index}`, content })
-    );
+    const isUserMessage = index % 2 === 0;
+    const sourceMessageId = isUserMessage
+      ? `human-${index}`
+      : `assistant-${index}`;
+    const message = isUserMessage
+      ? new HumanMessage({ id: sourceMessageId, content })
+      : new AIMessage({ id: sourceMessageId, content });
+    setProviderMessageProvenance(message, [
+      {
+        attribution: isUserMessage ? 'user' : 'model',
+        sourceMessageId,
+      },
+    ]);
+    messages.push(message);
   }
   return messages;
 }
@@ -42,33 +55,42 @@ function createToolHistory(turnCount: number): BaseMessage[] {
   const messages: BaseMessage[] = [];
   for (let index = 0; index < turnCount; index++) {
     const callId = `call-${index}`;
-    messages.push(
-      new HumanMessage({
-        id: `human-${index}`,
-        content: `Find context for turn ${index}.`,
-      }),
-      new AIMessage({
-        id: `assistant-${index}`,
-        content: '',
-        tool_calls: [
-          {
-            id: callId,
-            name: 'search',
-            args: { query: `turn-${index}` },
-            type: 'tool_call',
-          },
-        ],
-      }),
-      new ToolMessage({
-        tool_call_id: callId,
-        content: [
-          {
-            type: 'text',
-            text: `Result ${index}: ${'structured provider-neutral tool output '.repeat(12)}`,
-          },
-        ],
-      })
-    );
+    const user = new HumanMessage({
+      id: `human-${index}`,
+      content: `Find context for turn ${index}.`,
+    });
+    const assistant = new AIMessage({
+      id: `assistant-${index}`,
+      content: '',
+      tool_calls: [
+        {
+          id: callId,
+          name: 'search',
+          args: { query: `turn-${index}` },
+          type: 'tool_call',
+        },
+      ],
+    });
+    const toolResult = new ToolMessage({
+      id: `tool-${index}`,
+      tool_call_id: callId,
+      content: [
+        {
+          type: 'text',
+          text: `Result ${index}: ${'structured provider-neutral tool output '.repeat(12)}`,
+        },
+      ],
+    });
+    setProviderMessageProvenance(user, [
+      { attribution: 'user', sourceMessageId: `human-${index}` },
+    ]);
+    setProviderMessageProvenance(assistant, [
+      { attribution: 'model', sourceMessageId: `assistant-${index}` },
+    ]);
+    setProviderMessageProvenance(toolResult, [
+      { attribution: 'tool', sourceMessageId: `tool-${index}` },
+    ]);
+    messages.push(user, assistant, toolResult);
   }
   return messages;
 }
@@ -80,7 +102,8 @@ function median(values: number[]): number {
 
 function runBenchmark(
   messages: BaseMessage[],
-  provider: t.ProviderName
+  provider: t.ProviderName,
+  inspectInvariant = false
 ): BenchmarkResult {
   let checksum = 0;
   const startedAt = performance.now();
@@ -91,6 +114,13 @@ function runBenchmark(
       provider,
     });
     checksum += request.messages.length;
+    if (inspectInvariant) {
+      const report = inspectProviderMessageProjection(request.messages);
+      if (!report.valid) {
+        throw new Error('Benchmark projection has provenance gaps');
+      }
+      checksum += report.sourceBackedMessageCount;
+    }
   }
   return {
     elapsedMs: performance.now() - startedAt,
@@ -104,32 +134,37 @@ for (const scenario of [
   { name: 'tools-100', messages: createToolHistory(100) },
 ]) {
   for (const provider of [Providers.OPENAI, Providers.ANTHROPIC]) {
-    runBenchmark(scenario.messages, provider);
-    const samples: BenchmarkResult[] = [];
-    for (let sample = 0; sample < SAMPLE_COUNT; sample++) {
-      samples.push(runBenchmark(scenario.messages, provider));
-    }
-    const checksum = samples[0].checksum;
-    if (samples.some((sample) => sample.checksum !== checksum)) {
-      throw new Error(
-        `Provider projection output changed for ${scenario.name}`
+    for (const invariant of ['off', 'observe'] as const) {
+      const inspectInvariant = invariant === 'observe';
+      runBenchmark(scenario.messages, provider, inspectInvariant);
+      const samples: BenchmarkResult[] = [];
+      for (let sample = 0; sample < SAMPLE_COUNT; sample++) {
+        samples.push(
+          runBenchmark(scenario.messages, provider, inspectInvariant)
+        );
+      }
+      const checksum = samples[0].checksum;
+      if (samples.some((sample) => sample.checksum !== checksum)) {
+        throw new Error(
+          `Provider projection output changed for ${scenario.name}`
+        );
+      }
+      const medianMs = median(samples.map(({ elapsedMs }) => elapsedMs));
+      console.log(
+        JSON.stringify({
+          scenario: scenario.name,
+          provider,
+          invariant,
+          iterations: ITERATIONS,
+          medianMs: Number(medianMs.toFixed(2)),
+          messagesPerSecond: Number(
+            (
+              (scenario.messages.length * ITERATIONS * 1_000) /
+              medianMs
+            ).toFixed(0)
+          ),
+        })
       );
     }
-    console.log(
-      JSON.stringify({
-        scenario: scenario.name,
-        provider,
-        iterations: ITERATIONS,
-        medianMs: Number(
-          median(samples.map(({ elapsedMs }) => elapsedMs)).toFixed(2)
-        ),
-        messagesPerSecond: Number(
-          (
-            (scenario.messages.length * ITERATIONS * 1_000) /
-            median(samples.map(({ elapsedMs }) => elapsedMs))
-          ).toFixed(0)
-        ),
-      })
-    );
   }
 }

@@ -97,6 +97,29 @@ provider-consumed tool-call input representation in one pass. Its output is
 the provider-safe preflight input for context-pressure measurement; provider-
 specific replay and wire shaping remain later request projections.
 
+## Model Context Reconstruction
+
+A **Session Log** is the append-only source of persisted conversation events.
+It retains message, summary, and lifecycle history without becoming a second
+mutable message state.
+
+A **Session Message Projection** is the deterministic reconstruction of model
+context from a Session Log. Summary events replace earlier projected context;
+message events append in log order. Agent runs, compaction, and resume derive
+their starting messages through the same projection.
+
+A **Provider Message Projection Invariant** checks the final message batch at
+the chat-model callback boundary, after runnable-level instruction injection
+and before provider serialization or I/O. Source-backed user, model, and tool
+contributions require provenance; source-less contributions are valid only
+when explicitly synthetic. The check reports counts, message positions, and
+roles only—never content, source IDs, or tool data.
+
+The invariant is opt-in through `AGENT_MESSAGE_PROJECTION_INVARIANT=observe`
+or `assert`. The default `off` path adds no callback handler and performs no
+message scan. The initial rollout uses observation to locate provenance gaps;
+assertion is reserved for tests and environments whose projection is complete.
+
 ## Runtime Provider Registration
 
 A **Provider Registration** is the process-local binding of one provider name
