@@ -2004,6 +2004,22 @@ export const formatAgentMessages = (
    * assistant turn. Held rather than emitted so an entry that produces
    * nothing cannot leave the anchor stranded as the final turn.
    */
+  const legacyContentEnabled = options?.legacyContent === true;
+  /** Emission choke point: every formatted message enters the result here, so
+   *  the legacy flatten happens once per message with no closing rescan. The
+   *  summary boundary slices payload entries before formatting, and nothing
+   *  mutates an emitted message's content afterwards, so flattening at
+   *  emission and flattening at return are equivalent. */
+  const emitFormattedMessage = (message: (typeof messages)[number]): void => {
+    if (legacyContentEnabled && isLegacyConvertible(message)) {
+      const flattened = flattenLegacyContent(
+        message.content as MessageContentComplex[]
+      );
+      message.content = flattened;
+      message.lc_kwargs.content = flattened;
+    }
+    messages.push(message);
+  };
   let pendingSteerAnchor = false;
   /**
    * Emits the deferred anchor ahead of `next` — the message about to be
@@ -2026,7 +2042,7 @@ export const formatAgentMessages = (
       'assistant'
     );
     stampSourceMessageIdentity(anchor, undefined, 0, 'synthetic');
-    messages.push(anchor);
+    emitFormattedMessage(anchor);
   };
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
@@ -2106,7 +2122,7 @@ export const formatAgentMessages = (
         provenanceParts
       );
       flushSteerAnchor(formattedMessage);
-      messages.push(formattedMessage);
+      emitFormattedMessage(formattedMessage);
 
       // Update the index mapping for this message
       indexMapping[i] = [messages.length - 1];
@@ -2367,7 +2383,7 @@ export const formatAgentMessages = (
       flushSteerAnchor(formattedMessages[0]);
     }
     for (const formattedMessage of formattedMessages) {
-      messages.push(formattedMessage);
+      emitFormattedMessage(formattedMessage);
     }
     if (endsWithSteerMessage(formattedMessages)) {
       pendingSteerAnchor = true;
@@ -2398,7 +2414,7 @@ export const formatAgentMessages = (
             'user'
           );
           stampSourceMessageIdentity(skillMessage, undefined, 0, 'synthetic');
-          messages.push(skillMessage);
+          emitFormattedMessage(skillMessage);
         }
       }
     }
@@ -2582,19 +2598,6 @@ export const formatAgentMessages = (
         updatedIndexTokenCountMap[resultIndices[lastIdx]] =
           tokenCount - distributed;
       }
-    }
-  }
-
-  if (options?.legacyContent === true) {
-    for (const message of messages) {
-      if (!isLegacyConvertible(message)) {
-        continue;
-      }
-      const flattened = flattenLegacyContent(
-        message.content as MessageContentComplex[]
-      );
-      message.content = flattened;
-      message.lc_kwargs.content = flattened;
     }
   }
 

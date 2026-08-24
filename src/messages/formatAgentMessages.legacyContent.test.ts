@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@jest/globals';
 import { HumanMessage } from '@langchain/core/messages';
-import type { TPayload } from '@/types';
+import type { MessageContentComplex, TPayload } from '@/types';
 import { formatContentStrings, isLegacyConvertible } from './content';
 import {
   getProviderMessageProvenance,
@@ -10,27 +10,26 @@ import {
 import { formatAgentMessages } from './format';
 import { ContentTypes } from '@/common';
 
-const textPart = (text: string) => ({ type: ContentTypes.TEXT, [ContentTypes.TEXT]: text });
+const textPart = (text: string): MessageContentComplex => ({
+  type: ContentTypes.TEXT,
+  [ContentTypes.TEXT]: text,
+});
 
-const buildPayload = (): TPayload =>
-  [
-    { role: 'system', content: 'You are helpful.' },
-    { role: 'user', content: [textPart('  hello '), textPart('there')] },
-    {
-      messageId: 'assistant-1',
-      isCreatedByUser: false,
-      content: [
-        { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'first block' },
-        { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'second block' },
-      ],
-    },
-    { role: 'user', content: 'plain string turn' },
-    {
-      messageId: 'assistant-2',
-      isCreatedByUser: false,
-      content: [{ type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'reply' }],
-    },
-  ] as unknown as TPayload;
+const buildPayload = (): TPayload => [
+  { role: 'system', content: 'You are helpful.' },
+  { role: 'user', content: [textPart('  hello '), textPart('there')] },
+  {
+    messageId: 'assistant-1',
+    isCreatedByUser: false,
+    content: [textPart('first block'), textPart('second block')],
+  },
+  { role: 'user', content: 'plain string turn' },
+  {
+    messageId: 'assistant-2',
+    isCreatedByUser: false,
+    content: [textPart('reply')],
+  },
+];
 
 describe('formatAgentMessages legacyContent option', () => {
   it('produces byte-identical content to the legacy projection applied afterwards', () => {

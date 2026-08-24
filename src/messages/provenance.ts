@@ -822,7 +822,7 @@ export function setFreshProviderMessageProvenance(
 ): void {
   const resolved = resolveProvenancePublication(parts);
   const replacement: UntrustedProviderMessageAdditionalKwargs = {
-    ...(message.additional_kwargs as Record<string, unknown>),
+    ...message.additional_kwargs,
   };
   replacement.provenance = resolved.provenance;
   const sourceMessageIds = resolved.sourceMessageIds;
@@ -833,11 +833,11 @@ export function setFreshProviderMessageProvenance(
     delete replacement.sourceMessageIds;
     delete replacement.sourceMessageId;
   }
-  const serializedReplacement: Record<PropertyKey, unknown> = {
-    ...(message.lc_kwargs as Record<string, unknown>),
+  const serializedReplacement: BaseMessage['lc_kwargs'] = {
+    ...message.lc_kwargs,
   };
   serializedReplacement.additional_kwargs = replacement;
-  message.additional_kwargs = replacement as BaseMessage['additional_kwargs'];
+  message.additional_kwargs = replacement;
   message.lc_kwargs = serializedReplacement;
 }
 
