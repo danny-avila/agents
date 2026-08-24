@@ -5,8 +5,13 @@ import type {
 } from '../provider-registration';
 import type { ProviderModelConstructor, ProviderName } from '@/types';
 
+type ProviderModelClass = new (config: never) => BaseChatModel;
+
 interface StoredProviderRegistration {
-  model: new (config: never) => BaseChatModel;
+  model?: ProviderModelClass;
+  /** Built-ins defer their provider SDK import until the first model request;
+   *  the resolved class is validated once and memoized into `model`. */
+  loadModel?: () => ProviderModelClass;
   family: ProviderFamily;
   manualToolStream: boolean;
   strictAlternation: boolean;
@@ -107,11 +112,46 @@ export function registerBuiltInProvider<
   builtInProviders.set(provider, createRegistration(provider, options));
 }
 
+interface BuiltInProviderLoaderOptions {
+  provider: ProviderName;
+  loadModel: () => ProviderModelClass;
+  family?: ProviderFamily;
+  manualToolStream?: boolean;
+  strictAlternation?: boolean;
+}
+
+/** Registers a built-in whose provider SDK loads on first use, not at import time. */
+export function registerBuiltInProviderLoader(
+  options: BuiltInProviderLoaderOptions
+): void {
+  const provider = normalizeProvider(options.provider);
+  if (builtInProviders.has(provider)) {
+    throw new Error(`LLM provider already registered: ${provider}`);
+  }
+  builtInProviders.set(provider, {
+    loadModel: options.loadModel,
+    family: options.family ?? 'generic',
+    manualToolStream: options.manualToolStream ?? false,
+    strictAlternation: options.strictAlternation ?? false,
+    owner: Symbol(provider),
+  });
+}
+
 export function getRegisteredChatModelClass<P extends ProviderName>(
   provider: P
 ): ProviderModelConstructor<P> {
   const registration = getRegistration(provider);
   if (!registration) {
+    throw new Error(`Unsupported LLM provider: ${provider}`);
+  }
+  if (registration.model == null && registration.loadModel != null) {
+    const loaded = registration.loadModel();
+    if (typeof loaded !== 'function' || !isConstructible(loaded)) {
+      throw new TypeError(`LLM provider constructor is invalid: ${provider}`);
+    }
+    registration.model = loaded;
+  }
+  if (registration.model == null) {
     throw new Error(`Unsupported LLM provider: ${provider}`);
   }
   return registration.model as ProviderModelConstructor<P>;

@@ -26,6 +26,14 @@ const config = {
      * Mapped ahead of the tsconfig path aliases so the specific pattern wins.
      */
     '^@langchain/mistralai$': '<rootDir>/test/stubs/mistralai.ts',
+    /**
+     * `src/lazyRequire.ts` is the one module allowed to touch `import.meta`
+     * (for `createRequire` in the ESM build); the CJS test transform cannot
+     * express it, and its production package self-references would load stale
+     * `dist/` output instead of the source under test. The stub resolves every
+     * lazy load through jest's resolver instead.
+     */
+    '^@/lazyRequire$': '<rootDir>/test/stubs/lazyRequire.ts',
     ...pathsToModuleNameMapper(tsconfig.compilerOptions.paths, {
       prefix: '<rootDir>/'
     }),

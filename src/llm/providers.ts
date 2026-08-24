@@ -1,27 +1,21 @@
-import type {
-  ChatModelConstructorMap,
-  ProviderModelConstructor,
-  ProviderName,
-} from '@/types';
+import type { ProviderModelConstructor, ProviderName } from '@/types';
+import { requireLazyModule } from '@/lazyRequire';
 import type { ProviderFamily } from '../provider-registration';
-import {
-  AzureChatOpenAI,
-  ChatDeepSeek,
-  ChatMoonshot,
-  ChatOpenAI,
-  ChatXAI,
-} from '@/llm/openai';
+import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import {
   getRegisteredChatModelClass,
-  registerBuiltInProvider,
+  registerBuiltInProviderLoader,
 } from '@/llm/providerRegistry';
-import { CustomChatGoogleGenerativeAI } from '@/llm/google';
-import { CustomChatBedrockConverse } from '@/llm/bedrock';
-import { CustomChatMistralAI } from '@/llm/mistral';
-import { CustomAnthropic } from '@/llm/anthropic';
-import { ChatOpenRouter } from '@/llm/openrouter';
-import { ChatVertexAI } from '@/llm/vertexai';
 import { Providers } from '@/common';
+
+/**
+ * Built-in provider SDKs load on first model request, not at import time: eagerly
+ * importing every provider cost hundreds of milliseconds of boot in hosts that
+ * configure one or two of them. `createRequire` keeps resolution synchronous and
+ * correct from both the CJS and ESM builds.
+ */
+
+type ProviderModelClass = new (config: never) => BaseChatModel;
 
 type BuiltInProviderTraits = {
   family: ProviderFamily;
@@ -29,53 +23,73 @@ type BuiltInProviderTraits = {
   strictAlternation?: boolean;
 };
 
-function initializeBuiltInProvider<P extends Providers>(
-  provider: P,
-  model: ChatModelConstructorMap[P],
+function initializeBuiltInProvider(
+  provider: Providers,
+  loadModel: () => ProviderModelClass,
   traits: BuiltInProviderTraits
 ): void {
-  registerBuiltInProvider({
+  registerBuiltInProviderLoader({
     provider,
-    model,
+    loadModel,
     ...traits,
   });
 }
 
-initializeBuiltInProvider(Providers.XAI, ChatXAI, { family: 'openai' });
-initializeBuiltInProvider(Providers.OPENAI, ChatOpenAI, { family: 'openai' });
-initializeBuiltInProvider(Providers.AZURE, AzureChatOpenAI, {
+const fromOpenAI =
+  (name: string) => (): ProviderModelClass =>
+    (requireLazyModule<Record<string, ProviderModelClass>>('@librechat/agents/llm/openai'))[
+      name
+    ];
+
+initializeBuiltInProvider(Providers.XAI, fromOpenAI('ChatXAI'), { family: 'openai' });
+initializeBuiltInProvider(Providers.OPENAI, fromOpenAI('ChatOpenAI'), { family: 'openai' });
+initializeBuiltInProvider(Providers.AZURE, fromOpenAI('AzureChatOpenAI'), {
   family: 'openai',
 });
-initializeBuiltInProvider(Providers.VERTEXAI, ChatVertexAI, {
-  family: 'google',
-});
-initializeBuiltInProvider(Providers.DEEPSEEK, ChatDeepSeek, {
+initializeBuiltInProvider(
+  Providers.VERTEXAI,
+  () => (requireLazyModule<typeof import('@/llm/vertexai')>('@librechat/agents/llm/vertexai')).ChatVertexAI,
+  { family: 'google' }
+);
+initializeBuiltInProvider(Providers.DEEPSEEK, fromOpenAI('ChatDeepSeek'), {
   family: 'openai',
 });
-initializeBuiltInProvider(Providers.MISTRALAI, CustomChatMistralAI, {
+const loadMistral = (): ProviderModelClass =>
+  (requireLazyModule<typeof import('@/llm/mistral')>('@librechat/agents/llm/mistral')).CustomChatMistralAI;
+initializeBuiltInProvider(Providers.MISTRALAI, loadMistral, {
   family: 'mistral',
   strictAlternation: true,
 });
-initializeBuiltInProvider(Providers.MISTRAL, CustomChatMistralAI, {
+initializeBuiltInProvider(Providers.MISTRAL, loadMistral, {
   family: 'mistral',
   strictAlternation: true,
 });
-initializeBuiltInProvider(Providers.ANTHROPIC, CustomAnthropic, {
-  family: 'anthropic',
-  manualToolStream: true,
-});
-initializeBuiltInProvider(Providers.OPENROUTER, ChatOpenRouter, {
-  family: 'openai',
-});
-initializeBuiltInProvider(Providers.BEDROCK, CustomChatBedrockConverse, {
-  family: 'bedrock',
-  manualToolStream: true,
-  strictAlternation: true,
-});
-initializeBuiltInProvider(Providers.GOOGLE, CustomChatGoogleGenerativeAI, {
-  family: 'google',
-});
-initializeBuiltInProvider(Providers.MOONSHOT, ChatMoonshot, {
+initializeBuiltInProvider(
+  Providers.ANTHROPIC,
+  () => (requireLazyModule<typeof import('@/llm/anthropic')>('@librechat/agents/llm/anthropic')).CustomAnthropic,
+  { family: 'anthropic', manualToolStream: true }
+);
+initializeBuiltInProvider(
+  Providers.OPENROUTER,
+  () =>
+    (requireLazyModule<typeof import('@/llm/openrouter')>('@librechat/agents/llm/openrouter')).ChatOpenRouter,
+  { family: 'openai' }
+);
+initializeBuiltInProvider(
+  Providers.BEDROCK,
+  () =>
+    (requireLazyModule<typeof import('@/llm/bedrock')>('@librechat/agents/llm/bedrock'))
+      .CustomChatBedrockConverse,
+  { family: 'bedrock', manualToolStream: true, strictAlternation: true }
+);
+initializeBuiltInProvider(
+  Providers.GOOGLE,
+  () =>
+    (requireLazyModule<typeof import('@/llm/google')>('@librechat/agents/llm/google'))
+      .CustomChatGoogleGenerativeAI,
+  { family: 'google' }
+);
+initializeBuiltInProvider(Providers.MOONSHOT, fromOpenAI('ChatMoonshot'), {
   family: 'generic',
 });
 
