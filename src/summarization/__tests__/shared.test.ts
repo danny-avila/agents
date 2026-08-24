@@ -1,14 +1,29 @@
 import {
-  SUMMARY_WRAPPER_OVERHEAD_TOKENS,
-  DEFAULT_SUMMARIZATION_PROMPT,
-  DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
+  buildSummaryCarrierText,
   separateSummarizationParameters,
   buildSummarizationInstruction,
 } from '@/summarization';
+import {
+  DEFAULT_SUMMARIZATION_PROMPT,
+  DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
+} from '@/summarization/shared';
 
 describe('summarization primitives', () => {
-  it('exports the wrapper overhead the summary token count is measured against', () => {
-    expect(SUMMARY_WRAPPER_OVERHEAD_TOKENS).toBe(33);
+  describe('buildSummaryCarrierText', () => {
+    it('wraps the summary in the tags and instruction it is re-injected with', () => {
+      const carrier = buildSummaryCarrierText('checkpoint body');
+      expect(
+        carrier.startsWith('<summary>\ncheckpoint body\n</summary>\n\n')
+      ).toBe(true);
+      expect(carrier).toContain('This is your own checkpoint');
+    });
+
+    /** A stored summary is budgeted for by measuring this, so the wrapper has
+     *  to cost enough to be worth measuring: the literal it replaced claimed 33
+     *  tokens for a carrier that had already grown well past that. */
+    it('carries an instruction long enough to matter to a context budget', () => {
+      expect(buildSummaryCarrierText('').length).toBeGreaterThan(200);
+    });
   });
 
   describe('separateSummarizationParameters', () => {

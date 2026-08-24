@@ -1,6 +1,15 @@
 import type { SummarizationTrigger } from '@/types';
 
-export * from './shared';
+/**
+ * The summary-boundary seam a caller compacting outside a run needs. The two
+ * default prompts stay out of it: LibreChat's manual flow deliberately words
+ * its own, so exporting these would publish an API with no consumer.
+ */
+export {
+  buildSummarizationInstruction,
+  buildSummaryCarrierText,
+  separateSummarizationParameters,
+} from './shared';
 
 const VALID_TRIGGER_TYPES = [
   'token_ratio',

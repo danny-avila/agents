@@ -498,7 +498,11 @@ async function runTenantSummarizationFlow(tenantId: string): Promise<void> {
           provider: Providers.OPENAI,
           clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
           instructions: 'Summarize when context is full.',
-          maxContextTokens: 120,
+          /* Under `compactingTokenCounter` a message costs its character
+           * count, so this sits between the summary's own carrier (~272) and
+           * the transcript (~397): high enough that the run survives its
+           * checkpoint, low enough that compaction still fires. */
+          maxContextTokens: 340,
           summarizationEnabled: true,
           summarizationConfig: {
             retainRecent: { turns: 0 },

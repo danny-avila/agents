@@ -51,6 +51,7 @@ import {
 } from '@/common';
 import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
+import { buildSummaryCarrierText } from '@/summarization/shared';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
@@ -934,11 +935,7 @@ export class AgentContext {
   private buildSummaryHumanMessage(
     promptCacheProvider: PromptCacheProvider | undefined
   ): HumanMessage {
-    const wrappedSummary =
-      '<summary>\n' +
-      (this.summaryText as string) +
-      '\n</summary>\n\n' +
-      'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
+    const wrappedSummary = buildSummaryCarrierText(this.summaryText as string);
 
     if (promptCacheProvider !== Providers.ANTHROPIC) {
       return new HumanMessage(wrappedSummary);

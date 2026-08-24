@@ -2,6 +2,7 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
+import { buildSummaryCarrierText } from '@/summarization/shared';
 import { addBedrockCacheControl } from '@/messages/cache';
 import { createTokenCounter } from '@/utils/tokens';
 import { Constants, Providers } from '@/common';
@@ -88,6 +89,31 @@ describe('AgentContext', () => {
       const names = (bound as Array<{ name?: string }>).map((t) => t.name);
       expect(names).toContain('ask_user_question');
       expect(names).toContain('echo');
+    });
+  });
+
+  describe('Summary carrier', () => {
+    /** The summary's stored token count is a measurement of the carrier built
+     *  by `buildSummaryCarrierText`. If this context ever injected different
+     *  text, every budget read against a persisted summary would be wrong by
+     *  the difference, silently. Asserting they are the same string is what
+     *  makes the accounting checkable in one place. */
+    it('injects exactly the carrier the summary was measured as', async () => {
+      const ctx = createBasicContext();
+      ctx.setSummary('checkpoint body', 0);
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('after compaction'),
+      ]);
+
+      const injected = result.find(
+        (message) =>
+          typeof message.content === 'string' &&
+          message.content.startsWith('<summary>')
+      );
+      expect(injected?.content).toBe(
+        buildSummaryCarrierText('checkpoint body')
+      );
     });
   });
 

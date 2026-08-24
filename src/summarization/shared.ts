@@ -5,12 +5,43 @@
  */
 
 /**
- * Token overhead of the XML wrapper + instruction text added around the
- * summary at injection time in AgentContext.buildSystemRunnable:
- * `<summary>\n${text}\n</summary>\n\nYour context window was compacted...`
- * ~33 tokens on Anthropic, ~24-27 on OpenAI.  Using 33 as a safe ceiling.
+ * Instruction that follows the summary body inside the carrier. Private on
+ * purpose: it is only ever correct alongside `buildSummaryCarrierText`, and a
+ * caller that reaches for the text separately is a caller that can drift from
+ * the accounting.
  */
-export const SUMMARY_WRAPPER_OVERHEAD_TOKENS = 33;
+const SUMMARY_CARRIER_INSTRUCTION =
+  'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
+
+/**
+ * Wraps a persisted summary in the carrier it is re-injected as, ahead of the
+ * messages that survived compaction.
+ *
+ * A stored summary costs what this returns, not what its body costs, so a
+ * caller budgeting for one measures this rather than adding a remembered
+ * constant to the bare text. The wrapper alone is ~48 tokens on `o200k_base`
+ * and more on Anthropic: too much to leave out of a context calculation, and
+ * too easy to get wrong from memory once the instruction is edited.
+ */
+export function buildSummaryCarrierText(summaryText: string): string {
+  return (
+    '<summary>\n' +
+    summaryText +
+    '\n</summary>\n\n' +
+    SUMMARY_CARRIER_INSTRUCTION
+  );
+}
+
+/**
+ * Approximate token cost of a carried summary for a caller with no tokenizer,
+ * which is one of the conditions overflow recovery summarizes under. Four
+ * characters per token is coarse, but it is derived from the text that will
+ * actually be sent, so an edit to the instruction moves it instead of leaving
+ * it stale the way a remembered constant does.
+ */
+export function estimateSummaryCarrierTokens(summaryText: string): number {
+  return Math.ceil(buildSummaryCarrierText(summaryText).length / 4);
+}
 
 /** Structured checkpoint prompt for fresh summarization (no prior summary). */
 export const DEFAULT_SUMMARIZATION_PROMPT = `Hold on, before you continue I need you to write me a checkpoint of everything so far. Your context window is filling up and this checkpoint replaces the messages above, so capture everything you need to pick right back up.

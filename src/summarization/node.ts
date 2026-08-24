@@ -1,9 +1,4 @@
-import {
-  AIMessage,
-  ToolMessage,
-  HumanMessage,
-  SystemMessage,
-} from '@langchain/core/messages';
+import { AIMessage, ToolMessage, HumanMessage } from '@langchain/core/messages';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { StreamLimitState } from '@/llm/streamLimits';
@@ -11,6 +6,14 @@ import type { AgentContext } from '@/agents/AgentContext';
 import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
+import {
+  DEFAULT_SUMMARIZATION_PROMPT,
+  DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
+  buildSummaryCarrierText,
+  estimateSummaryCarrierTokens,
+  separateSummarizationParameters,
+  buildSummarizationInstruction,
+} from './shared';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
@@ -47,18 +50,6 @@ import { getMaxOutputTokensKey } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 import { executeHooks } from '@/hooks';
-import {
-  SUMMARY_WRAPPER_OVERHEAD_TOKENS,
-  DEFAULT_SUMMARIZATION_PROMPT,
-  DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
-  separateSummarizationParameters,
-  buildSummarizationInstruction,
-} from './shared';
-
-export {
-  DEFAULT_SUMMARIZATION_PROMPT,
-  DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
-} from './shared';
 
 /**
  * Default number of recent user-led turns preserved verbatim during
@@ -296,23 +287,29 @@ function buildSummarizationClientConfig(
   };
 }
 
-/** Computes the token count for a summary, preferring provider output tokens when available. */
+/**
+ * Sizes a summary from the text that will actually be re-injected, carrier
+ * included, so the stored count is a measurement rather than a body count plus
+ * a remembered constant.
+ *
+ * The provider's `output_tokens` is deliberately not consulted. On a reasoning
+ * summarizer the two diverge by the hidden thinking, which is billed but never
+ * written into the checkpoint, so using it here would make every later context
+ * calculation reserve room for tokens that are never sent. Provider usage stays
+ * exclusively a billing input.
+ */
 function computeSummaryTokenCount(
   summaryText: string,
-  summaryUsage: Partial<UsageMetadata> | undefined,
   tokenCounter?: (message: BaseMessage) => number
 ): number {
-  const providerOutputTokens = Number(summaryUsage?.output_tokens) || 0;
-  if (providerOutputTokens > 0) {
-    return providerOutputTokens + SUMMARY_WRAPPER_OVERHEAD_TOKENS;
-  }
   if (tokenCounter) {
-    return (
-      tokenCounter(new SystemMessage(summaryText)) +
-      SUMMARY_WRAPPER_OVERHEAD_TOKENS
-    );
+    return tokenCounter(new HumanMessage(buildSummaryCarrierText(summaryText)));
   }
-  return 0;
+  /* A missing counter is not hypothetical here: `shouldSummarizeOverflow`
+   * fires precisely when there is nothing to count with, so this branch is
+   * the overflow-recovery summary. Estimating the same carrier keeps that
+   * summary reserving roughly its own size instead of nothing. */
+  return estimateSummaryCarrierTokens(summaryText);
 }
 
 /**
@@ -1302,7 +1299,6 @@ export function createSummarizeNode({
 
     const tokenCount = computeSummaryTokenCount(
       summaryText,
-      summaryUsage,
       agentContext.tokenCounter
     );
 

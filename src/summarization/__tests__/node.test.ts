@@ -3,13 +3,13 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import {
-  createSummarizeNode,
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
-} from '@/summarization/node';
+} from '@/summarization/shared';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
 import { Constants, GraphEvents, Providers } from '@/common';
+import { createSummarizeNode } from '@/summarization/node';
 import { AgentContext } from '@/agents/AgentContext';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
