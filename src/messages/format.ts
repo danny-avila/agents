@@ -46,6 +46,7 @@ import {
   hasBijectiveProviderContentPartMapping,
   inspectProviderMessageProvenance,
   inspectProviderSourceMessageIds,
+  setFreshProviderMessageProvenance,
   setInvalidProviderMessageProvenance,
   setProviderMessageProvenance,
 } from './provenance';
@@ -57,6 +58,7 @@ import {
 } from '@/utils/toolContent';
 import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
+import { flattenLegacyContent, isLegacyConvertible } from './content';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { Providers, ContentTypes, Constants } from '@/common';
 import { emitAgentLog } from '@/utils/events';
@@ -378,6 +380,12 @@ type SourceContentPartIndices = number | readonly number[];
 
 interface FormatAgentMessagesOptions {
   provider?: ProviderName;
+  /** Emit flattenable text content as the joined string the legacy-content
+   *  projection would produce, so the per-request `formatContentStrings` pass
+   *  finds nothing to convert and every history message keeps its identity —
+   *  which is what lets exact-count reuse skip re-tokenizing it. Set this if
+   *  and only if the run's provider uses legacy string content. */
+  legacyContent?: boolean;
   /** Reconstruct hidden `reasoning_content` from `THINK` parts onto prior
    *  tool-call messages. Explicit opt-in for OpenAI-compatible endpoints that
    *  replay reasoning across turns; defaults to on for DeepSeek thinking-mode. */
@@ -1380,7 +1388,7 @@ function stampSourceMessageIdentity(
       },
     ];
   }
-  setProviderMessageProvenance(message, partsToStamp);
+  setFreshProviderMessageProvenance(message, partsToStamp);
   if (sourceMessageId == null || derivedIndex !== 0) {
     return;
   }
@@ -1996,6 +2004,22 @@ export const formatAgentMessages = (
    * assistant turn. Held rather than emitted so an entry that produces
    * nothing cannot leave the anchor stranded as the final turn.
    */
+  const legacyContentEnabled = options?.legacyContent === true;
+  /** Emission choke point: every formatted message enters the result here, so
+   *  the legacy flatten happens once per message with no closing rescan. The
+   *  summary boundary slices payload entries before formatting, and nothing
+   *  mutates an emitted message's content afterwards, so flattening at
+   *  emission and flattening at return are equivalent. */
+  const emitFormattedMessage = (message: (typeof messages)[number]): void => {
+    if (legacyContentEnabled && isLegacyConvertible(message)) {
+      const flattened = flattenLegacyContent(
+        message.content as MessageContentComplex[]
+      );
+      message.content = flattened;
+      message.lc_kwargs.content = flattened;
+    }
+    messages.push(message);
+  };
   let pendingSteerAnchor = false;
   /**
    * Emits the deferred anchor ahead of `next` — the message about to be
@@ -2018,7 +2042,7 @@ export const formatAgentMessages = (
       'assistant'
     );
     stampSourceMessageIdentity(anchor, undefined, 0, 'synthetic');
-    messages.push(anchor);
+    emitFormattedMessage(anchor);
   };
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
@@ -2098,7 +2122,7 @@ export const formatAgentMessages = (
         provenanceParts
       );
       flushSteerAnchor(formattedMessage);
-      messages.push(formattedMessage);
+      emitFormattedMessage(formattedMessage);
 
       // Update the index mapping for this message
       indexMapping[i] = [messages.length - 1];
@@ -2359,7 +2383,7 @@ export const formatAgentMessages = (
       flushSteerAnchor(formattedMessages[0]);
     }
     for (const formattedMessage of formattedMessages) {
-      messages.push(formattedMessage);
+      emitFormattedMessage(formattedMessage);
     }
     if (endsWithSteerMessage(formattedMessages)) {
       pendingSteerAnchor = true;
@@ -2390,7 +2414,7 @@ export const formatAgentMessages = (
             'user'
           );
           stampSourceMessageIdentity(skillMessage, undefined, 0, 'synthetic');
-          messages.push(skillMessage);
+          emitFormattedMessage(skillMessage);
         }
       }
     }
