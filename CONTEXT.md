@@ -79,6 +79,13 @@ only as the subtrahend of that projection's delta. Native brand checks in
 content validation use `node:util/types` slot reads rather than throwing
 probes, so plain content objects never pay an exception per value.
 
+Provider SDK modules load on first use, never at import time: built-ins register
+loaders with the provider registry, `instanceof` guards resolve their classes
+through the same lazy seam, and every such load goes through `src/lazyRequire.ts`
+— the one module allowed to touch `import.meta`, stubbed in jest so tests resolve
+source modules. Adding an eager import of a provider SDK anywhere on the root
+entry's graph regresses every host's boot.
+
 The meter's estimates decide overflow and recovery only. Provider-reported
 usage remains the source of truth for billing and Langfuse observations.
 

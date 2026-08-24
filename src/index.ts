@@ -70,8 +70,9 @@ export type { Interrupt } from '@langchain/langgraph';
 
 /* LLM */
 export { markTokenCounterCacheCompatible } from './llm/tokenCounterCacheCompatibility';
-export { CustomOpenAIClient } from './llm/openai';
-export { ChatOpenRouter } from './llm/openrouter';
+/** Provider chat-model classes moved off the root barrel: importing any of them here
+ *  forced every host to pay that provider SDK's module init at boot. They remain
+ *  available from their own entries, e.g. `@librechat/agents/llm/openai`. */
 export type {
   OpenRouterReasoning,
   OpenRouterReasoningEffort,
@@ -83,7 +84,6 @@ export type {
   ProviderFamily,
   ProviderRegistrationOptions,
 } from './provider-registration';
-export { CustomChatMistralAI } from './llm/mistral';
 export {
   smoothStream,
   resolveStreamDelay,

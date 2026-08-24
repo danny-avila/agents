@@ -78,6 +78,41 @@
       "types": "./dist/types/langchain/utils/env.d.ts",
       "import": "./dist/esm/langchain/utils/env.mjs",
       "require": "./dist/cjs/langchain/utils/env.cjs"
+    },
+    "./llm/openai": {
+      "types": "./dist/types/llm/openai/index.d.ts",
+      "import": "./dist/esm/llm/openai/index.mjs",
+      "require": "./dist/cjs/llm/openai/index.cjs"
+    },
+    "./llm/mistral": {
+      "types": "./dist/types/llm/mistral/index.d.ts",
+      "import": "./dist/esm/llm/mistral/index.mjs",
+      "require": "./dist/cjs/llm/mistral/index.cjs"
+    },
+    "./llm/anthropic": {
+      "types": "./dist/types/llm/anthropic/index.d.ts",
+      "import": "./dist/esm/llm/anthropic/index.mjs",
+      "require": "./dist/cjs/llm/anthropic/index.cjs"
+    },
+    "./llm/google": {
+      "types": "./dist/types/llm/google/index.d.ts",
+      "import": "./dist/esm/llm/google/index.mjs",
+      "require": "./dist/cjs/llm/google/index.cjs"
+    },
+    "./llm/bedrock": {
+      "types": "./dist/types/llm/bedrock/index.d.ts",
+      "import": "./dist/esm/llm/bedrock/index.mjs",
+      "require": "./dist/cjs/llm/bedrock/index.cjs"
+    },
+    "./llm/vertexai": {
+      "types": "./dist/types/llm/vertexai/index.d.ts",
+      "import": "./dist/esm/llm/vertexai/index.mjs",
+      "require": "./dist/cjs/llm/vertexai/index.cjs"
+    },
+    "./llm/openrouter": {
+      "types": "./dist/types/llm/openrouter/index.d.ts",
+      "import": "./dist/esm/llm/openrouter/index.mjs",
+      "require": "./dist/cjs/llm/openrouter/index.cjs"
     }
   },
   "typesVersions": {
@@ -96,6 +131,27 @@
       ],
       "responses": [
         "dist/types/responses/index.d.ts"
+      ],
+      "llm/openai": [
+        "./dist/types/llm/openai/index.d.ts"
+      ],
+      "llm/mistral": [
+        "./dist/types/llm/mistral/index.d.ts"
+      ],
+      "llm/anthropic": [
+        "./dist/types/llm/anthropic/index.d.ts"
+      ],
+      "llm/google": [
+        "./dist/types/llm/google/index.d.ts"
+      ],
+      "llm/bedrock": [
+        "./dist/types/llm/bedrock/index.d.ts"
+      ],
+      "llm/vertexai": [
+        "./dist/types/llm/vertexai/index.d.ts"
+      ],
+      "llm/openrouter": [
+        "./dist/types/llm/openrouter/index.d.ts"
       ]
     }
   },

@@ -2,7 +2,6 @@
 import { nanoid } from 'nanoid';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
-import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import {
   Command,
@@ -36,6 +35,7 @@ import {
   ACTIVITY_PHASE_LABEL_RUN_NAME,
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
+import { isBuiltRuntime } from '@/lazyRequire';
 import {
   requireValidSubagentResumeManifest,
   stripSubagentResumeManifest,
@@ -101,8 +101,18 @@ import { createGraph } from '@/graphs/createGraph';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
-import { isOpenAILike } from '@/utils/llm';
+import { isOpenAILike, isLibreChatOpenAIModel } from '@/utils/llm';
 import { executeHooks } from '@/hooks';
+
+/** Source-mode runs have no dist siblings for the lazy-loading seam, so every
+ *  lazily loadable module is imported through the active loader before the
+ *  first model resolves. The built package never enters this branch. */
+async function ensureSourceModeProviders(): Promise<void> {
+  if (isBuiltRuntime()) {
+    return;
+  }
+  await import('@/llm/providers.eager');
+}
 
 export const defaultOmitOptions = new Set([
   'stream',
@@ -717,6 +727,7 @@ export class Run<_T extends t.BaseGraphState> {
   static async create<T extends t.BaseGraphState>(
     config: t.RunConfig
   ): Promise<Run<T>> {
+    await ensureSourceModeProviders();
     /** Create tokenCounter if indexTokenCountMap is provided but tokenCounter is not */
     if (config.indexTokenCountMap && !config.tokenCounter) {
       const gc = config.graphConfig;
@@ -1974,10 +1985,7 @@ export class Run<_T extends t.BaseGraphState> {
       clientOptions,
     }) as t.ChatModelInstance;
 
-    if (
-      isOpenAILike(provider) &&
-      (model instanceof ChatOpenAI || model instanceof AzureChatOpenAI)
-    ) {
+    if (isOpenAILike(provider) && isLibreChatOpenAIModel(model)) {
       model.temperature = (clientOptions as t.OpenAIClientOptions | undefined)
         ?.temperature as number;
       model.topP = (clientOptions as t.OpenAIClientOptions | undefined)

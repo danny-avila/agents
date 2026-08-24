@@ -1,9 +1,7 @@
-import { ChatVertexAI } from '@langchain/google-vertexai';
 import type { Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
-import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
 import { getChatModelClass } from '@/llm/providers';
-import { isOpenAILike } from '@/utils';
+import { isOpenAILike, isLibreChatOpenAIModel, constructorChainHasLcName } from '@/utils';
 import { Providers } from '@/common';
 
 type InitializeModelParams<P extends t.ProviderName> = {
@@ -30,6 +28,18 @@ type InitializeModelParams<P extends t.ProviderName> = {
           })
 );
 
+const VERTEX_LC_NAMES: ReadonlySet<string> = new Set(['ChatVertexAI']);
+
+/** Structural stand-in for `instanceof ChatVertexAI`: matches both builds of
+ *  `@langchain/google-vertexai`, while this package's own vertex class reports
+ *  `LibreChatVertexAI` and keeps failing this guard exactly as it did under
+ *  `instanceof`. */
+function isLangchainVertexModel(
+  model: unknown
+): model is import('@langchain/google-vertexai').ChatVertexAI {
+  return constructorChainHasLcName(model, VERTEX_LC_NAMES);
+}
+
 /**
  * Creates a chat model instance for a given built-in or host-registered
  * provider, applies provider-specific field assignments, and optionally binds
@@ -47,10 +57,7 @@ export function initializeModel<P extends t.ProviderName>({
       (clientOptions ?? {}) as t.ProviderOptionsFor<P>
     );
 
-  if (
-    isOpenAILike(provider) &&
-    (model instanceof ChatOpenAI || model instanceof AzureChatOpenAI)
-  ) {
+  if (isOpenAILike(provider) && isLibreChatOpenAIModel(model)) {
     const opts = clientOptions as t.OpenAIClientOptions | undefined;
     if (opts) {
       model.temperature = opts.temperature as number;
@@ -59,7 +66,7 @@ export function initializeModel<P extends t.ProviderName>({
       model.presencePenalty = opts.presencePenalty as number;
       model.n = opts.n as number;
     }
-  } else if (provider === Providers.VERTEXAI && model instanceof ChatVertexAI) {
+  } else if (provider === Providers.VERTEXAI && isLangchainVertexModel(model)) {
     const opts = clientOptions as t.VertexAIClientOptions | undefined;
     if (opts) {
       model.temperature = opts.temperature as number;
