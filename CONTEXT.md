@@ -82,6 +82,14 @@ probes, so plain content objects never pay an exception per value.
 The meter's estimates decide overflow and recovery only. Provider-reported
 usage remains the source of truth for billing and Langfuse observations.
 
+## Provider Tool Derivation
+
+A **Provider Tool Derivation** is the copy-on-write projection of retained
+assistant history that drops incomplete streamed text blocks and bounds every
+provider-consumed tool-call input representation in one pass. Its output is
+the provider-safe preflight input for context-pressure measurement; provider-
+specific replay and wire shaping remain later request projections.
+
 ## Runtime Provider Registration
 
 A **Provider Registration** is the process-local binding of one provider name

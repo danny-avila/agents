@@ -31,6 +31,7 @@ import { resolveContextPruningSettings } from './contextPruningSettings';
 import { hasUnsafeStructuredSerialization } from '@/utils/tokens';
 import { ContentTypes, Providers, Constants } from '@/common';
 import { getProviderFamily } from '@/llm/providerRegistry';
+import { dropIncompleteToolStreamContent } from './core';
 import { applyContextPruning } from './contextPruning';
 import { toLangChainContent } from './langchain';
 
@@ -1412,6 +1413,47 @@ function cloneWithProjectedProperties<T extends object>(
   ) as T;
 }
 
+function cloneAIMessageWithProjectedStreamContent(
+  message: AIMessage | AIMessageChunk,
+  changes: Readonly<Record<string, unknown>>,
+  streamContent: AIMessage['content']
+): AIMessage | AIMessageChunk {
+  const descriptors = Object.getOwnPropertyDescriptors(message) as Record<
+    string,
+    PropertyDescriptor | undefined
+  >;
+  for (const [key, projectedValue] of Object.entries(changes)) {
+    const descriptor = descriptors[key];
+    descriptors[key] = {
+      configurable: descriptor?.configurable ?? true,
+      enumerable: descriptor?.enumerable ?? true,
+      value: projectedValue,
+      writable: descriptor?.writable ?? true,
+    };
+  }
+  const lcKwargs = descriptors.lc_kwargs;
+  if (
+    lcKwargs != null &&
+    'value' in lcKwargs &&
+    typeof lcKwargs.value === 'object' &&
+    lcKwargs.value != null
+  ) {
+    descriptors.lc_kwargs = {
+      ...lcKwargs,
+      value: {
+        ...(lcKwargs.value as Record<string, unknown>),
+        ...(message.response_metadata.output_version === 'v1'
+          ? { content: undefined, contentBlocks: streamContent }
+          : { content: streamContent }),
+      },
+    };
+  }
+  return Object.create(
+    Object.getPrototypeOf(message),
+    descriptors as PropertyDescriptorMap
+  ) as AIMessage | AIMessageChunk;
+}
+
 function createBoundedTruncationValue(
   preview: string,
   originalChars: number,
@@ -1875,9 +1917,10 @@ export function calculateMaxToolCallInputChars(
  * Returns the original array when no message changes and otherwise clones only
  * the array and AI messages whose inline input or `tool_calls` args changed.
  */
-export function projectToolCallInputs(
+function projectToolCallInputsInternal(
   messages: BaseMessage[],
-  maxInputChars: number
+  maxInputChars: number,
+  dropIncompleteStreamContent: boolean
 ): BaseMessage[] {
   const normalizedMaxInputChars = normalizeToolInputLimit(maxInputChars);
   let projectedMessages: BaseMessage[] | undefined;
@@ -1889,16 +1932,21 @@ export function projectToolCallInputs(
     }
 
     const aiMessage = message as AIMessage | AIMessageChunk;
-    let projectedContent = aiMessage.content;
-    let contentChanged = false;
-    if (Array.isArray(aiMessage.content)) {
-      const originalContent = aiMessage.content as MessageContentComplex[];
+    const streamContent = dropIncompleteStreamContent
+      ? dropIncompleteToolStreamContent(aiMessage.content)
+      : aiMessage.content;
+    let projectedContent = streamContent;
+    let contentChanged = streamContent !== aiMessage.content;
+    if (Array.isArray(streamContent)) {
+      const originalContent = streamContent as MessageContentComplex[];
       const mappedContent = originalContent.map((block) =>
         projectInlineToolInput(block, normalizedMaxInputChars)
       );
-      contentChanged = mappedContent.some(
-        (block, blockIndex) => block !== originalContent[blockIndex]
-      );
+      contentChanged =
+        contentChanged ||
+        mappedContent.some(
+          (block, blockIndex) => block !== originalContent[blockIndex]
+        );
       projectedContent = toLangChainContent(mappedContent);
     }
 
@@ -2020,16 +2068,43 @@ export function projectToolCallInputs(
       continue;
     }
 
-    const projectedMessage = cloneWithProjectedProperties(aiMessage, {
+    const changes = {
       content: projectedContent,
       tool_calls: projectedToolCalls.length > 0 ? projectedToolCalls : [],
       additional_kwargs: projectedAdditionalKwargs,
       response_metadata: projectedResponseMetadata,
-    });
+    };
+    const projectedMessage =
+      streamContent === aiMessage.content
+        ? cloneWithProjectedProperties(aiMessage, changes)
+        : cloneAIMessageWithProjectedStreamContent(
+          aiMessage,
+          changes,
+          streamContent
+        );
     projectedMessages ??= [...messages];
     projectedMessages[i] = projectedMessage;
   }
   return projectedMessages ?? messages;
+}
+
+/** Projects all historical tool-call input representations to bounded values. */
+export function projectToolCallInputs(
+  messages: BaseMessage[],
+  maxInputChars: number
+): BaseMessage[] {
+  return projectToolCallInputsInternal(messages, maxInputChars, false);
+}
+
+/**
+ * Derives provider-safe tool history in one pass by dropping incomplete stream
+ * content and bounding every provider-consumed tool-call input representation.
+ */
+export function projectToolMessagesForProvider(
+  messages: BaseMessage[],
+  maxInputChars: number
+): BaseMessage[] {
+  return projectToolCallInputsInternal(messages, maxInputChars, true);
 }
 
 export function preFlightTruncateToolCallInputs(params: {
