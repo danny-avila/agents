@@ -1,7 +1,7 @@
 import type { Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { getChatModelClass } from '@/llm/providers';
-import { requireInternalModule, requireLazyModule } from '@/lazyRequire';
+import { requireInternalModule } from '@/lazyRequire';
 import { isOpenAILike } from '@/utils';
 import { Providers } from '@/common';
 
@@ -39,13 +39,26 @@ function isOpenAIChatModel(
   return model instanceof ChatOpenAI || model instanceof AzureChatOpenAI;
 }
 
+/** Structural stand-in for `instanceof ChatVertexAI`: the CJS and ESM builds of
+ *  `@langchain/google-vertexai` carry distinct constructors, so a class resolved
+ *  through `require` can never match an ESM consumer's override instance. Walking
+ *  the constructor chain for the `lc_name` serialization id matches both builds,
+ *  while this package's own vertex class reports `LibreChatVertexAI` and keeps
+ *  failing this guard exactly as it did under `instanceof`. */
 function isLangchainVertexModel(
   model: unknown
 ): model is import('@langchain/google-vertexai').ChatVertexAI {
-  const { ChatVertexAI } = requireLazyModule<typeof import('@langchain/google-vertexai')>(
-    '@langchain/google-vertexai'
-  );
-  return model instanceof ChatVertexAI;
+  if (typeof model !== 'object' || model == null) {
+    return false;
+  }
+  let ctor: unknown = model.constructor;
+  while (typeof ctor === 'function') {
+    if ((ctor as { lc_name?: () => string }).lc_name?.() === 'ChatVertexAI') {
+      return true;
+    }
+    ctor = Object.getPrototypeOf(ctor);
+  }
+  return false;
 }
 
 /**

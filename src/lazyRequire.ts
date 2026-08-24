@@ -15,11 +15,18 @@ import { createRequire } from 'node:module';
  */
 const moduleUrl = import.meta.url;
 const requireModule = createRequire(moduleUrl);
-const buildExtension = moduleUrl.endsWith('.mjs')
-  ? '.mjs'
-  : moduleUrl.endsWith('.cjs')
-    ? '.cjs'
-    : null;
+
+function detectBuildExtension(url: string): '.cjs' | '.mjs' | null {
+  if (url.endsWith('.mjs')) {
+    return '.mjs';
+  }
+  if (url.endsWith('.cjs')) {
+    return '.cjs';
+  }
+  return null;
+}
+
+const buildExtension = detectBuildExtension(moduleUrl);
 
 /** Source-mode commands run the TypeScript through an ESM loader that a synchronous
  *  CJS `require` can neither reach nor share module identity with, so lazily loadable
