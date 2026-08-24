@@ -766,11 +766,14 @@ function publishProviderMessageProvenance(
   }
 }
 
-/** Replaces typed provenance and synchronizes its stable plural source ids. */
-export function setProviderMessageProvenance(
-  message: BaseMessage,
+interface ResolvedProvenancePublication {
+  provenance: ProviderMessageProvenance;
+  sourceMessageIds?: readonly string[];
+}
+
+function resolveProvenancePublication(
   parts: readonly ProviderMessageProvenancePart[]
-): void {
+): ResolvedProvenancePublication {
   const normalizedParts = normalizeProvenanceParts(parts);
   const provenance: ProviderMessageProvenance = Object.freeze({
     version: PROVIDER_MESSAGE_PROVENANCE_VERSION,
@@ -782,21 +785,60 @@ export function setProviderMessageProvenance(
   for (const part of normalizedParts) {
     appendSourceMessageId(sourceMessageIds, seen, part.sourceMessageId);
   }
-  if (sourceMessageIds.length > 0) {
-    const immutableSourceMessageIds = Object.freeze(sourceMessageIds);
-    immutableProviderSourceMessageIds.add(immutableSourceMessageIds);
-    immutableProviderMessageSourceIds.set(
-      provenance,
-      immutableSourceMessageIds
-    );
-    publishProviderMessageProvenance(
-      message,
-      provenance,
-      immutableSourceMessageIds
-    );
-    return;
+  if (sourceMessageIds.length === 0) {
+    return { provenance };
   }
-  publishProviderMessageProvenance(message, provenance);
+  const immutableSourceMessageIds = Object.freeze(sourceMessageIds);
+  immutableProviderSourceMessageIds.add(immutableSourceMessageIds);
+  immutableProviderMessageSourceIds.set(provenance, immutableSourceMessageIds);
+  return { provenance, sourceMessageIds: immutableSourceMessageIds };
+}
+
+/** Replaces typed provenance and synchronizes its stable plural source ids. */
+export function setProviderMessageProvenance(
+  message: BaseMessage,
+  parts: readonly ProviderMessageProvenancePart[]
+): void {
+  const resolved = resolveProvenancePublication(parts);
+  publishProviderMessageProvenance(
+    message,
+    resolved.provenance,
+    resolved.sourceMessageIds
+  );
+}
+
+/**
+ * {@link setProviderMessageProvenance} for a message the caller itself just
+ * constructed from locally built plain objects. Such a message cannot carry
+ * proxies, accessors, or foreign aliases in `additional_kwargs`/`lc_kwargs`,
+ * so the publication skips the hardened descriptor walks while producing the
+ * same end state: fresh replacement objects on both slots, with the
+ * serialization mirror aliasing the live kwargs. Never call this with a
+ * message received across a seam — that is what the hardened variant is for.
+ */
+export function setFreshProviderMessageProvenance(
+  message: BaseMessage,
+  parts: readonly ProviderMessageProvenancePart[]
+): void {
+  const resolved = resolveProvenancePublication(parts);
+  const replacement: UntrustedProviderMessageAdditionalKwargs = {
+    ...(message.additional_kwargs as Record<string, unknown>),
+  };
+  replacement.provenance = resolved.provenance;
+  const sourceMessageIds = resolved.sourceMessageIds;
+  if (sourceMessageIds != null && sourceMessageIds.length > 0) {
+    replacement.sourceMessageIds = sourceMessageIds;
+    replacement.sourceMessageId = sourceMessageIds[sourceMessageIds.length - 1];
+  } else {
+    delete replacement.sourceMessageIds;
+    delete replacement.sourceMessageId;
+  }
+  const serializedReplacement: Record<PropertyKey, unknown> = {
+    ...(message.lc_kwargs as Record<string, unknown>),
+  };
+  serializedReplacement.additional_kwargs = replacement;
+  message.additional_kwargs = replacement as BaseMessage['additional_kwargs'];
+  message.lc_kwargs = serializedReplacement;
 }
 
 /** Publishes the canonical fail-closed marker for malformed provenance. */

@@ -22,6 +22,20 @@ export const isLegacyConvertible = (message: BaseMessage): boolean => {
   return message.content.every((block) => block.type === ContentTypes.TEXT);
 };
 
+/** Joins the text of {@link isLegacyConvertible} content blocks into the exact
+ *  string {@link formatContentStrings} has always produced for them. */
+export const flattenLegacyContent = (
+  blocks: MessageContentComplex[]
+): string => {
+  const content = blocks.reduce((acc, curr) => {
+    if (curr.type === ContentTypes.TEXT) {
+      return `${acc}${curr[ContentTypes.TEXT] ?? ''}\n`;
+    }
+    return acc;
+  }, '');
+  return content.trim();
+};
+
 /**
  * Formats an array of messages for LangChain, making sure all content fields are strings
  * @param {Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>} payload - The array of messages to format.
@@ -39,16 +53,12 @@ export const formatContentStrings = (
       continue;
     }
 
-    // Reduce text types to a single string
-    const blocks = message.content as MessageContentComplex[];
-    const content = blocks.reduce((acc, curr) => {
-      if (curr.type === ContentTypes.TEXT) {
-        return `${acc}${curr[ContentTypes.TEXT] ?? ''}\n`;
-      }
-      return acc;
-    }, '');
-
-    result.push(cloneMessage(message, content.trim()));
+    result.push(
+      cloneMessage(
+        message,
+        flattenLegacyContent(message.content as MessageContentComplex[])
+      )
+    );
   }
 
   return result;

@@ -46,6 +46,7 @@ import {
   hasBijectiveProviderContentPartMapping,
   inspectProviderMessageProvenance,
   inspectProviderSourceMessageIds,
+  setFreshProviderMessageProvenance,
   setInvalidProviderMessageProvenance,
   setProviderMessageProvenance,
 } from './provenance';
@@ -57,6 +58,7 @@ import {
 } from '@/utils/toolContent';
 import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
+import { flattenLegacyContent, isLegacyConvertible } from './content';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { Providers, ContentTypes, Constants } from '@/common';
 import { emitAgentLog } from '@/utils/events';
@@ -378,6 +380,12 @@ type SourceContentPartIndices = number | readonly number[];
 
 interface FormatAgentMessagesOptions {
   provider?: ProviderName;
+  /** Emit flattenable text content as the joined string the legacy-content
+   *  projection would produce, so the per-request `formatContentStrings` pass
+   *  finds nothing to convert and every history message keeps its identity —
+   *  which is what lets exact-count reuse skip re-tokenizing it. Set this if
+   *  and only if the run's provider uses legacy string content. */
+  legacyContent?: boolean;
   /** Reconstruct hidden `reasoning_content` from `THINK` parts onto prior
    *  tool-call messages. Explicit opt-in for OpenAI-compatible endpoints that
    *  replay reasoning across turns; defaults to on for DeepSeek thinking-mode. */
@@ -1380,7 +1388,7 @@ function stampSourceMessageIdentity(
       },
     ];
   }
-  setProviderMessageProvenance(message, partsToStamp);
+  setFreshProviderMessageProvenance(message, partsToStamp);
   if (sourceMessageId == null || derivedIndex !== 0) {
     return;
   }
@@ -2574,6 +2582,19 @@ export const formatAgentMessages = (
         updatedIndexTokenCountMap[resultIndices[lastIdx]] =
           tokenCount - distributed;
       }
+    }
+  }
+
+  if (options?.legacyContent === true) {
+    for (const message of messages) {
+      if (!isLegacyConvertible(message)) {
+        continue;
+      }
+      const flattened = flattenLegacyContent(
+        message.content as MessageContentComplex[]
+      );
+      message.content = flattened;
+      message.lc_kwargs.content = flattened;
     }
   }
 
