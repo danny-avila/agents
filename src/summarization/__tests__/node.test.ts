@@ -5,12 +5,14 @@ import type * as t from '@/types';
 import {
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
+  buildSummaryCarrierText,
 } from '@/summarization/shared';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { createSummarizeNode } from '@/summarization/node';
 import { AgentContext } from '@/agents/AgentContext';
+import { createTokenCounter } from '@/utils/tokens';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
 
@@ -2116,5 +2118,57 @@ describe('summarize node breaker capture', () => {
     for (const signal of capturedSignals) {
       expect(signal).toBe(entryBreaker.signal);
     }
+  });
+
+  /** `shouldSummarizeOverflow` fires precisely when the host supplied no
+   *  tokenCounter, so this branch IS the overflow-recovery summary, and its
+   *  count is persisted and then reserved on the retry. It used to be a
+   *  four-characters-per-token guess, which understates CJK several-fold and
+   *  so under-reserved exactly where a repeat overflow is most likely. Korean
+   *  is the sample here because it is the worst measured case. */
+  it('measures the carrier with a real tokenizer when the host has none', async () => {
+    const summaryBody =
+      '사용자가 인증 미들웨어를 리팩터링하여 속도 제한 전에 토큰 검증이 이루어지도록 요청했습니다. 기존 핸들러를 읽어보니 순서가 뒤바뀌어 있었습니다.';
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel(summaryBody);
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    expect(agentContext.tokenCounter).toBeUndefined();
+    const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(setSummary).toHaveBeenCalled();
+    const [persistedText, persistedCount] = setSummary.mock.calls[0] as [
+      string,
+      number,
+    ];
+    const carrier = buildSummaryCarrierText(persistedText);
+    const counter = await createTokenCounter();
+
+    expect(persistedCount).toBe(counter(new HumanMessage(carrier)));
+    /* The guess this replaced. Asserting the gap keeps the test from passing
+     * if anyone reintroduces a character heuristic here. */
+    expect(persistedCount).toBeGreaterThan(Math.ceil(carrier.length / 4));
   });
 });

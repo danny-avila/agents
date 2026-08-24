@@ -10,7 +10,6 @@ import {
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
   buildSummaryCarrierText,
-  estimateSummaryCarrierTokens,
   separateSummarizationParameters,
   buildSummarizationInstruction,
 } from './shared';
@@ -26,15 +25,15 @@ import {
   STREAM_LIMIT_EPOCH_KEY,
 } from '@/llm/streamLimits';
 import {
-  addTailCacheControl,
-  resolvePromptCacheTtl,
-  type PromptCacheTtl,
-} from '@/messages/cache';
-import {
   DEFAULT_RETAIN_RECENT_TURNS,
   resolveIntraTurnRetainTokens,
   splitAtRecencyBoundary,
 } from '@/messages/recency';
+import {
+  addTailCacheControl,
+  resolvePromptCacheTtl,
+  type PromptCacheTtl,
+} from '@/messages/cache';
 import {
   Constants,
   ContentTypes,
@@ -43,6 +42,7 @@ import {
   Providers,
 } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { createRemoveAllMessage } from '@/messages/reducer';
@@ -297,19 +297,32 @@ function buildSummarizationClientConfig(
  * written into the checkpoint, so using it here would make every later context
  * calculation reserve room for tokens that are never sent. Provider usage stays
  * exclusively a billing input.
+ *
+ * A missing host counter is not hypothetical: `shouldSummarizeOverflow` fires
+ * precisely when there is nothing to count with, so that branch is the
+ * overflow-recovery summary, and its count is persisted and then reserved by
+ * `AgentContext.instructionTokens` on the retry. Undercounting it is what makes
+ * the retry overflow again, which rules out a character heuristic: measured
+ * against `o200k_base` and Anthropic's tokenizer, four-characters-per-token
+ * understates base64 by 1.5x and Korean by 4.6x, and coefficients large enough
+ * to cover those overestimate English prose by roughly 4x. So this falls back
+ * to the tokenizer this package already bundles rather than to an estimate.
+ * The encoding is chosen from the summarizer's model, the only model signal
+ * this node has.
  */
-function computeSummaryTokenCount(
+async function computeSummaryTokenCount(
   summaryText: string,
-  tokenCounter?: (message: BaseMessage) => number
-): number {
+  tokenCounter?: (message: BaseMessage) => number,
+  summaryModelName?: string
+): Promise<number> {
+  const carrier = new HumanMessage(buildSummaryCarrierText(summaryText));
   if (tokenCounter) {
-    return tokenCounter(new HumanMessage(buildSummaryCarrierText(summaryText)));
+    return tokenCounter(carrier);
   }
-  /* A missing counter is not hypothetical here: `shouldSummarizeOverflow`
-   * fires precisely when there is nothing to count with, so this branch is
-   * the overflow-recovery summary. Estimating the same carrier keeps that
-   * summary reserving roughly its own size instead of nothing. */
-  return estimateSummaryCarrierTokens(summaryText);
+  const bundledCounter = await createTokenCounter(
+    encodingForModel(summaryModelName ?? '')
+  );
+  return bundledCounter(carrier);
 }
 
 /**
@@ -1297,9 +1310,10 @@ export function createSummarizeNode({
 
     const summaryText = enrichSummary(rawText, messagesToRefine);
 
-    const tokenCount = computeSummaryTokenCount(
+    const tokenCount = await computeSummaryTokenCount(
       summaryText,
-      agentContext.tokenCounter
+      agentContext.tokenCounter,
+      clientConfig.modelName
     );
 
     if (usedIntraTurnFallback) {

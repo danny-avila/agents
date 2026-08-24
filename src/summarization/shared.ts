@@ -32,17 +32,6 @@ export function buildSummaryCarrierText(summaryText: string): string {
   );
 }
 
-/**
- * Approximate token cost of a carried summary for a caller with no tokenizer,
- * which is one of the conditions overflow recovery summarizes under. Four
- * characters per token is coarse, but it is derived from the text that will
- * actually be sent, so an edit to the instruction moves it instead of leaving
- * it stale the way a remembered constant does.
- */
-export function estimateSummaryCarrierTokens(summaryText: string): number {
-  return Math.ceil(buildSummaryCarrierText(summaryText).length / 4);
-}
-
 /** Structured checkpoint prompt for fresh summarization (no prior summary). */
 export const DEFAULT_SUMMARIZATION_PROMPT = `Hold on, before you continue I need you to write me a checkpoint of everything so far. Your context window is filling up and this checkpoint replaces the messages above, so capture everything you need to pick right back up.
 
