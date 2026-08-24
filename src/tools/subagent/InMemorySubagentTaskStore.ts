@@ -228,14 +228,31 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
 
   /**
    * Payload-free transition seam for hosts that durably project authoritative
-   * receipts. Implementations must return synchronously and must not reproduce
-   * task-store transition rules.
+   * receipts. Implementations must return synchronously, must not reproduce
+   * task-store transition rules, and cannot veto task-store state transitions:
+   * hook failures are deliberately isolated by the caller.
    */
   protected onControlReceipt(
     _scopeId: string,
     _taskId: string,
     _receipt: SubagentTaskControlReceipt
   ): void {}
+
+  private emitControlReceipt(
+    task: StoredTask,
+    receipt: SubagentTaskControlReceipt
+  ): void {
+    try {
+      this.onControlReceipt(
+        task.scopeId,
+        task.id,
+        cloneControlReceipt(receipt)
+      );
+    } catch {
+      // A host projection is observability only. Task admission, draining, and
+      // settlement must remain correct when that projection is unavailable.
+    }
+  }
 
   start(request: SubagentTaskStartRequest): SubagentTaskStartResult {
     const scopeId = request.scopeId.trim();
@@ -480,7 +497,7 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
       updatedAt: task.updatedAt,
     };
     task.controlReceipts.set(control.id, receipt);
-    this.onControlReceipt(task.scopeId, task.id, cloneControlReceipt(receipt));
+    this.emitControlReceipt(task, receipt);
     return {
       status: 'accepted',
       task: snapshot(task),
@@ -613,11 +630,7 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
       ...(detail.reason == null ? {} : { reason: detail.reason }),
     };
     task.controlReceipts.set(controlId, transitioned);
-    this.onControlReceipt(
-      task.scopeId,
-      task.id,
-      cloneControlReceipt(transitioned)
-    );
+    this.emitControlReceipt(task, transitioned);
   }
 
   private failPendingControls(

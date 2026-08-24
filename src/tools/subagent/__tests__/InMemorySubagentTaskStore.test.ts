@@ -14,6 +14,12 @@ class ReceiptObservingStore extends InMemorySubagentTaskStore {
   }
 }
 
+class ThrowingReceiptStore extends InMemorySubagentTaskStore {
+  protected override onControlReceipt(): void {
+    throw new Error('projection unavailable');
+  }
+}
+
 const settle = async (): Promise<void> => {
   await Promise.resolve();
   await Promise.resolve();
@@ -623,6 +629,45 @@ describe('InMemorySubagentTaskStore', () => {
       action: 'cancel',
     });
     await settle();
+  });
+
+  it('isolates receipt projection failures from admission, drain, and settlement', async () => {
+    const store = new ThrowingReceiptStore({ maxRunningPerScope: 1 });
+    let runtime: SubagentTaskRuntime | undefined;
+    let finish: ((value: { content: string }) => void) | undefined;
+    const started = start(
+      store,
+      async (taskRuntime) =>
+        new Promise<{ content: string }>((resolve) => {
+          runtime = taskRuntime;
+          finish = resolve;
+        })
+    );
+    if (!started.accepted) {
+      throw new Error('Expected task dispatch to be accepted.');
+    }
+    await settle();
+
+    expect(
+      store.control('user:conversation', started.task.taskId, {
+        action: 'steer',
+        message: 'continue',
+      })
+    ).toMatchObject({ status: 'accepted' });
+    expect(runtime?.drain('tool')).toEqual([
+      expect.objectContaining({ content: 'continue' }),
+    ]);
+    finish?.({ content: 'done' });
+    await settle();
+
+    expect(store.get('user:conversation', started.task.taskId)).toMatchObject({
+      status: 'completed',
+    });
+    expect(
+      start(store, async () => ({ content: 'replacement' }), {
+        idempotencyKey: 'replacement-after-projection-failure',
+      })
+    ).toMatchObject({ accepted: true, isNew: true });
   });
 
   it('times out a non-cooperative task and frees its running slot', async () => {
