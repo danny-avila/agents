@@ -4,6 +4,7 @@ import type {
   SubagentTaskBoundary,
   SubagentTaskClaim,
   SubagentTaskControlCommand,
+  SubagentTaskControlReceipt,
   SubagentTaskControlResult,
   SubagentTaskProgress,
   SubagentTaskRuntime,
@@ -20,6 +21,7 @@ const DEFAULT_MAX_ERROR_CHARS = 4 * 1024;
 const DEFAULT_MAX_MESSAGE_CHARS = 64 * 1024;
 const DEFAULT_TASK_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_CONTROLS = 32;
+const DEFAULT_MAX_CONTROL_RECEIPTS = 64;
 const DEFAULT_MAX_RESULT_CHARS = 100_000;
 const DEFAULT_MAX_RUNNING_PER_SCOPE = 10;
 const DEFAULT_MAX_RUNNING_TOTAL = 100;
@@ -30,6 +32,7 @@ export interface InMemorySubagentTaskStoreOptions {
   completedTtlMs?: number;
   maxControlMessageChars?: number;
   maxControlsPerTask?: number;
+  maxControlReceiptsPerTask?: number;
   maxErrorChars?: number;
   maxResultChars?: number;
   maxRunningPerScope?: number;
@@ -57,6 +60,7 @@ type StoredTask = {
   updatedAt: number;
   controller: AbortController;
   controls: PendingControl[];
+  controlReceipts: Map<string, SubagentTaskControlReceipt>;
   progressEvents: number;
   resultClaimed: boolean;
   acceptingControls: boolean;
@@ -106,6 +110,13 @@ function resolveOptions(
     maxControlsPerTask: resolvePositiveInteger(
       options.maxControlsPerTask,
       DEFAULT_MAX_CONTROLS
+    ),
+    maxControlReceiptsPerTask: Math.max(
+      resolvePositiveInteger(
+        options.maxControlReceiptsPerTask,
+        DEFAULT_MAX_CONTROL_RECEIPTS
+      ),
+      resolvePositiveInteger(options.maxControlsPerTask, DEFAULT_MAX_CONTROLS)
     ),
     maxErrorChars: resolvePositiveInteger(
       options.maxErrorChars,
@@ -177,9 +188,18 @@ function snapshot(task: StoredTask): SubagentTaskSnapshot {
       task.status === 'completed' && task.result != null && !task.resultClaimed,
     resultClaimed: task.resultClaimed,
     pendingControls: task.controls.length,
+    controlReceipts: [...task.controlReceipts.values()].map((receipt) => ({
+      ...receipt,
+    })),
     ...(task.progress == null ? {} : { progress: { ...task.progress } }),
     ...(task.error == null ? {} : { error: task.error }),
   };
+}
+
+function cloneControlReceipt(
+  receipt: SubagentTaskControlReceipt
+): SubagentTaskControlReceipt {
+  return { ...receipt };
 }
 
 function abortReason(signal: AbortSignal): Error {
@@ -204,6 +224,34 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
 
   constructor(options: InMemorySubagentTaskStoreOptions = {}) {
     this.options = resolveOptions(options);
+  }
+
+  /**
+   * Payload-free transition seam for hosts that durably project authoritative
+   * receipts. Implementations must return synchronously, must not reproduce
+   * task-store transition rules, and cannot veto task-store state transitions:
+   * hook failures are deliberately isolated by the caller.
+   */
+  protected onControlReceipt(
+    _scopeId: string,
+    _taskId: string,
+    _receipt: SubagentTaskControlReceipt
+  ): void {}
+
+  private emitControlReceipt(
+    task: StoredTask,
+    receipt: SubagentTaskControlReceipt
+  ): void {
+    try {
+      this.onControlReceipt(
+        task.scopeId,
+        task.id,
+        cloneControlReceipt(receipt)
+      );
+    } catch {
+      // A host projection is observability only. Task admission, draining, and
+      // settlement must remain correct when that projection is unavailable.
+    }
   }
 
   start(request: SubagentTaskStartRequest): SubagentTaskStartResult {
@@ -272,6 +320,7 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
       updatedAt: now,
       controller: new AbortController(),
       controls: [],
+      controlReceipts: new Map(),
       progressEvents: 0,
       resultClaimed: false,
       acceptingControls: true,
@@ -312,6 +361,7 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
           }
           task.status = 'completed';
           task.acceptingControls = false;
+          this.failPendingControls(task, 'task_completed');
           task.controls.length = 0;
           task.result = truncateMiddle(
             result.content,
@@ -399,9 +449,16 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
       if (index < 0) {
         return { status: 'control_not_found', task: snapshot(task) };
       }
-      task.controls.splice(index, 1);
+      const [control] = task.controls.splice(index, 1);
       task.updatedAt = Date.now();
-      return { status: 'accepted', task: snapshot(task) };
+      this.transitionControl(task, control.id, 'rejected', {
+        reason: 'withdrawn',
+      });
+      return {
+        status: 'accepted',
+        task: snapshot(task),
+        controlId: control.id,
+      };
     }
     const message = command.message.trim();
     if (message === '') {
@@ -419,6 +476,12 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
         message: `Task already has ${this.options.maxControlsPerTask} pending messages.`,
       };
     }
+    if (!this.makeRoomForControlReceipt(task)) {
+      return {
+        status: 'invalid',
+        message: 'Task control receipt capacity is unavailable.',
+      };
+    }
     const control: PendingControl = {
       id: nanoid(),
       action: command.action,
@@ -426,6 +489,15 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
     };
     task.controls.push(control);
     task.updatedAt = Date.now();
+    const receipt: SubagentTaskControlReceipt = {
+      controlId: control.id,
+      action: control.action,
+      status: 'accepted',
+      createdAt: task.updatedAt,
+      updatedAt: task.updatedAt,
+    };
+    task.controlReceipts.set(control.id, receipt);
+    this.emitControlReceipt(task, receipt);
     return {
       status: 'accepted',
       task: snapshot(task),
@@ -525,6 +597,59 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
     }
   }
 
+  private makeRoomForControlReceipt(task: StoredTask): boolean {
+    while (
+      task.controlReceipts.size >= this.options.maxControlReceiptsPerTask
+    ) {
+      const terminal = [...task.controlReceipts].find(
+        ([, receipt]) => receipt.status !== 'accepted'
+      );
+      if (terminal == null) {
+        return false;
+      }
+      task.controlReceipts.delete(terminal[0]);
+    }
+    return true;
+  }
+
+  private transitionControl(
+    task: StoredTask,
+    controlId: string,
+    status: Exclude<SubagentTaskControlReceipt['status'], 'accepted'>,
+    detail: Pick<SubagentTaskControlReceipt, 'boundary' | 'reason'> = {}
+  ): void {
+    const receipt = task.controlReceipts.get(controlId);
+    if (receipt == null || receipt.status !== 'accepted') {
+      return;
+    }
+    const transitioned: SubagentTaskControlReceipt = {
+      ...receipt,
+      status,
+      updatedAt: Date.now(),
+      ...(detail.boundary == null ? {} : { boundary: detail.boundary }),
+      ...(detail.reason == null ? {} : { reason: detail.reason }),
+    };
+    task.controlReceipts.set(controlId, transitioned);
+    this.emitControlReceipt(task, transitioned);
+  }
+
+  private failPendingControls(
+    task: StoredTask,
+    reason: Extract<
+      NonNullable<SubagentTaskControlReceipt['reason']>,
+      'task_completed' | 'task_cancelled' | 'task_failed'
+    >
+  ): void {
+    for (const control of task.controls) {
+      this.transitionControl(
+        task,
+        control.id,
+        reason === 'task_failed' ? 'failed' : 'rejected',
+        { reason }
+      );
+    }
+  }
+
   private scheduleExpiry(task: StoredTask): void {
     this.clearTaskTimeout(task);
     this.clearTaskExpiry(task);
@@ -566,6 +691,10 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
     task.status = status;
     this.runningTasks -= 1;
     task.acceptingControls = false;
+    this.failPendingControls(
+      task,
+      status === 'cancelled' ? 'task_cancelled' : 'task_failed'
+    );
     task.controls.length = 0;
     task.error = message;
     task.updatedAt = Date.now();
@@ -575,6 +704,7 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
 
   private createRuntime(task: StoredTask): SubagentTaskRuntime {
     const take = (
+      boundary: SubagentTaskBoundary,
       accept: (control: PendingControl) => boolean
     ): InjectedMessage[] => {
       if (task.status !== 'running') {
@@ -588,6 +718,9 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
       task.controls = retained;
       if (selected.length > 0) {
         task.updatedAt = Date.now();
+        for (const control of selected) {
+          this.transitionControl(task, control.id, 'applied', { boundary });
+        }
       }
       return selected.map(toInjectedMessage);
     };
@@ -599,15 +732,15 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
         task.controls.some((control) => control.action === 'interrupt'),
       drain: (boundary: SubagentTaskBoundary): InjectedMessage[] => {
         if (boundary === 'preempt') {
-          return take((control) => control.action === 'interrupt');
+          return take(boundary, (control) => control.action === 'interrupt');
         }
         if (boundary === 'tool') {
-          return take((control) => control.action !== 'queue');
+          return take(boundary, (control) => control.action !== 'queue');
         }
-        return take(() => true);
+        return take(boundary, () => true);
       },
       closeTurn: (): { closed: boolean; messages: InjectedMessage[] } => {
-        const messages = take(() => true);
+        const messages = take('turn', () => true);
         if (messages.length > 0) {
           return { closed: false, messages };
         }
