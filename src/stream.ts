@@ -820,12 +820,11 @@ function startEagerToolExecutions(args: {
       toolCalls: entries.map((entry) => entry.request),
       userId: graph.config?.configurable?.user_id as string | undefined,
       agentId: agentContext?.agentId,
-      callerCapabilityProjection:
-        (
-          agentContext as
-            | Partial<Pick<AgentContext, 'getCallerCapabilityProjectionSnapshot'>>
-            | undefined
-        )?.getCallerCapabilityProjectionSnapshot?.(),
+      callerCapabilityProjection: (
+        agentContext as
+          | Partial<Pick<AgentContext, 'getCallerCapabilityProjectionSnapshot'>>
+          | undefined
+      )?.getCallerCapabilityProjectionSnapshot?.(),
       configurable: graph.config?.configurable as
         | Record<string, unknown>
         | undefined,
@@ -1327,7 +1326,7 @@ export function getChunkContent({
   reasoningKey,
 }: {
   chunk?: Partial<AIMessageChunk>;
-  provider?: Providers;
+  provider?: t.ProviderName;
   reasoningKey: 'reasoning_content' | 'reasoning';
 }): string | t.MessageContentComplex[] | undefined {
   if (
@@ -1851,7 +1850,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     if (Array.isArray(content) && content.every(isTextContentPart)) {
       const contentGroups = splitAssistantTextContentByPhase(content);
-      const currentStepId = graph.stepKeyIds?.get(stepKey)?.at(-1);
+      const currentStepId = graph.stepKeyIds.get(stepKey)?.at(-1);
       const currentStep =
         currentStepId == null ? undefined : graph.getRunStep(currentStepId);
       const currentPhase =

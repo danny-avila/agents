@@ -40,10 +40,10 @@ import type {
   StreamPreemption,
   TokenBudgetBreakdown,
 } from '@/types/run';
-import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { SubagentTaskConfig } from '@/types/subagentTasks';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
-import type { ClientOptions } from '@/types/llm';
+import type { ProviderClientOptionsConfig } from '@/types/llm';
+import type { Callback, GraphNodeKeys } from '@/common';
 
 /** Interface for bound model with stream and invoke methods */
 export interface ChatModel {
@@ -824,7 +824,7 @@ export interface LangfuseConfig {
   deterministicTraceId?: boolean;
 }
 
-export interface AgentInputs {
+interface AgentInputFields {
   agentId: string;
   /**
    * Partition key for transient code-session ids and file refs. Agents with
@@ -839,12 +839,10 @@ export interface AgentInputs {
   toolEnd?: boolean;
   toolMap?: ToolMap;
   tools?: GraphTools;
-  provider: Providers;
   /** Stable/cacheable system instructions. */
   instructions?: string;
   streamBuffer?: number;
   maxContextTokens?: number;
-  clientOptions?: ClientOptions;
   /** Per-agent Langfuse tracing configuration. */
   langfuse?: LangfuseConfig;
   /** Dynamic system tail appended after stable instructions without provider cache markers. */
@@ -913,6 +911,8 @@ export interface AgentInputs {
    */
   graphTools?: GenericTool[];
 }
+
+export type AgentInputs = AgentInputFields & ProviderClientOptionsConfig;
 
 export interface ContextPruningConfig {
   enabled?: boolean;

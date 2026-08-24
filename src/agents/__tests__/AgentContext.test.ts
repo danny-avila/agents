@@ -1,10 +1,10 @@
 // src/agents/__tests__/AgentContext.test.ts
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
-import { addBedrockCacheControl } from '@/messages/cache';
-import { Constants, Providers } from '@/common';
-import { createTokenCounter } from '@/utils/tokens';
 import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
+import { addBedrockCacheControl } from '@/messages/cache';
+import { createTokenCounter } from '@/utils/tokens';
+import { Constants, Providers } from '@/common';
 import { AgentContext } from '../AgentContext';
 
 describe('AgentContext', () => {
@@ -36,7 +36,7 @@ describe('AgentContext', () => {
         provider: Providers.OPENAI,
         instructions: 'Test instructions',
         ...agentConfig,
-      },
+      } as t.AgentInputs,
       tokenCounter,
       indexTokenCountMap,
       toolExecution

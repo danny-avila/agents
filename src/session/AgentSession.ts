@@ -588,7 +588,7 @@ function createAgentInputFromGraphConfig(
       provider,
       clientOptions,
       agentId: 'default',
-    };
+    } as t.AgentInputs;
   }
   const summarizationConfig: t.SummarizationConfig = {
     ...(agent.summarizationConfig ?? {}),

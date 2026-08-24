@@ -13,14 +13,9 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { PreparedProviderRequest } from '@/llm/prepareProviderRequest';
-import type { StreamLimitState } from '@/llm/streamLimits';
 import type { ContextOverflowContext } from '@/utils/errors';
+import type { StreamLimitState } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import {
-  modifyDeltaProperties,
-} from '@/messages';
-import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
-import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import {
   enforceStreamLimitsForWireChunk,
   registerActiveStreamLimitGeneration,
@@ -35,11 +30,17 @@ import {
   assertPreparedProviderRequestFor,
   prepareProviderRequest,
 } from '@/llm/prepareProviderRequest';
+import {
+  getProviderFamily,
+  providerUsesManualToolStream,
+} from '@/llm/providers';
+import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
+import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
-import { manualToolStreamProviders } from '@/llm/providers';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
 import { appendCallbacks } from '@/utils/callbacks';
+import { modifyDeltaProperties } from '@/messages';
 import { canSealPreempt } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 
@@ -105,6 +106,19 @@ export type OnChunk = (
 /** Unique per-model-attempt sequence; see the stamp in `attemptInvoke`. */
 let streamLimitAttemptSeq = 0;
 
+function getManualToolStreamNormalizationProvider(
+  provider: t.ProviderName
+): t.ProviderName {
+  const family = getProviderFamily(provider);
+  if (family === 'anthropic') {
+    return Providers.ANTHROPIC;
+  }
+  if (family === 'bedrock') {
+    return Providers.BEDROCK;
+  }
+  return provider;
+}
+
 /**
  * The registered handler that owns content-part dispatch, if any.
  *
@@ -136,7 +150,7 @@ function removeOpenRouterFinalReasoningReplayContent({
 }: {
   current?: AIMessageChunk;
   next: AIMessageChunk;
-  provider: Providers;
+  provider: t.ProviderName;
 }): AIMessageChunk {
   const content = getOpenRouterFinalReasoningContent({
     current,
@@ -161,7 +175,7 @@ function getOpenRouterFinalReasoningContent({
 }: {
   current?: AIMessageChunk;
   next: AIMessageChunk;
-  provider: Providers;
+  provider: t.ProviderName;
 }): string | undefined {
   if (
     provider !== Providers.OPENROUTER ||
@@ -197,7 +211,7 @@ function getStreamHandlingChunk({
 }: {
   current?: AIMessageChunk;
   next: AIMessageChunk;
-  provider: Providers;
+  provider: t.ProviderName;
 }): AIMessageChunk | undefined {
   const content = getOpenRouterFinalReasoningContent({
     current,
@@ -473,7 +487,7 @@ function appendStreamChunk({
 }: {
   current?: AIMessageChunk;
   next: AIMessageChunk;
-  provider: Providers;
+  provider: t.ProviderName;
 }): AIMessageChunk {
   if (current == null) {
     return next;
@@ -514,11 +528,11 @@ type AttemptInvokeParams = AttemptInvokeCommonParams &
         request?: never;
         model: t.ChatModel;
         messages: BaseMessage[];
-        provider: Providers;
+        provider: t.ProviderName;
       }
   );
 
-function resolveAttemptProvider(params: AttemptInvokeParams): Providers {
+function resolveAttemptProvider(params: AttemptInvokeParams): t.ProviderName {
   if (params.request != null) {
     return params.request.provider;
   }
@@ -586,9 +600,7 @@ export async function attemptInvoke(
       : undefined;
   const generationKey =
     leaseTarget != null
-      ? resolveGenerationKey(
-        stampedConfig.metadata as Record<string, unknown>
-      )
+      ? resolveGenerationKey(stampedConfig.metadata as Record<string, unknown>)
       : undefined;
   if (leaseTarget != null && generationKey != null) {
     registerActiveStreamLimitGeneration(leaseTarget, generationKey);
@@ -809,8 +821,11 @@ async function attemptInvokeBody(
       }
     }
 
-    if (manualToolStreamProviders.has(provider)) {
-      finalChunk = modifyDeltaProperties(provider, finalChunk);
+    if (providerUsesManualToolStream(provider)) {
+      finalChunk = modifyDeltaProperties(
+        getManualToolStreamNormalizationProvider(provider),
+        finalChunk
+      );
     }
 
     if (preempted && finalChunk != null) {
@@ -857,7 +872,7 @@ async function attemptInvokeBody(
  * differ, which is the whole reason a fallback exists.
  */
 export interface FallbackErrorContext {
-  provider: Providers;
+  provider: t.ProviderName;
   clientOptions?: t.ClientOptions;
   maxContextTokens?: number;
 }
@@ -968,7 +983,7 @@ export async function tryFallbackProviders({
   prepareProviderRequest?: (input: {
     model: t.ChatModel;
     messages: BaseMessage[];
-    provider: Providers;
+    provider: t.ProviderName;
     clientOptions?: t.ClientOptions;
     maxContextTokens?: number;
     config?: RunnableConfig;
@@ -977,7 +992,7 @@ export async function tryFallbackProviders({
   prepareProviderMessages?: (input: {
     model: t.ChatModel;
     messages: BaseMessage[];
-    provider: Providers;
+    provider: t.ProviderName;
     clientOptions?: t.ClientOptions;
     maxContextTokens?: number;
     config?: RunnableConfig;

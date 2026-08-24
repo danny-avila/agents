@@ -82,6 +82,27 @@ probes, so plain content objects never pay an exception per value.
 The meter's estimates decide overflow and recovery only. Provider-reported
 usage remains the source of truth for billing and Langfuse observations.
 
+## Runtime Provider Registration
+
+A **Provider Registration** is the process-local binding of one provider name
+to its chat-model constructor and the message/streaming traits the agents
+runtime must apply. Built-in and host providers resolve through the same
+registry. Hosts register before constructing agent configuration; duplicate
+names fail closed, and a disposer removes only the exact registration that
+created it.
+
+Provider family, manual tool-stream handling, and strict message alternation
+belong to the registration. Family governs shared protocol behavior such as
+thinking detection, output-token option names, and atomic tool-call handling.
+Exact provider-specific behavior such as Bedrock cache shaping or OpenRouter
+replay handling remains keyed to the built-in provider identity. Host option
+types are declaration-merged through the stable
+`@librechat/agents/provider-registration` subpath without widening the built-in
+option maps.
+
+See [ADR 0003](docs/adr/0003-runtime-provider-registration.md) for the shared
+registry seam and process-lifecycle trade-offs.
+
 ## Coding-Tool Execution
 
 An **Execution World** is the stable pairing of a filesystem namespace and a

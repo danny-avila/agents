@@ -22,7 +22,7 @@ import type * as l from '@/types/llm';
 export type ZodObjectAny = z.ZodObject<any, any, any, any>;
 export type BaseGraphConfig = {
   llmConfig: l.LLMConfig;
-  provider?: e.Providers;
+  provider?: l.ProviderName;
   clientOptions?: l.ClientOptions;
   /** Optional compile options for workflow.compile() */
   compileOptions?: g.CompileOptions;
@@ -47,7 +47,7 @@ export type SupervisedGraphConfig = BaseGraphConfig & {
   routingPolicies?: Array<{
     stage: string;
     agents?: string[];
-    model?: e.Providers;
+    model?: l.ProviderName;
     parallel?: boolean;
     /** Optional simple condition on content/tools */
     when?:
@@ -70,7 +70,7 @@ export type SupervisedGraphConfig = BaseGraphConfig & {
 
 export type RunTitleOptions = {
   inputText: string;
-  provider: e.Providers;
+  provider: l.ProviderName;
   contentParts: (s.MessageContentComplex | undefined)[];
   titlePrompt?: string;
   skipLanguage?: boolean;

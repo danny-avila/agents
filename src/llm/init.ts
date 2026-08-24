@@ -6,29 +6,46 @@ import { getChatModelClass } from '@/llm/providers';
 import { isOpenAILike } from '@/utils';
 import { Providers } from '@/common';
 
+type InitializeModelParams<P extends t.ProviderName> = {
+  provider: P;
+  tools?: t.GraphTools;
+} & (
+  | {
+      override: t.ChatModelInstance;
+      clientOptions?: t.ProviderOptionsFor<P>;
+    }
+  | ([P] extends [keyof t.ProviderOptionsMap]
+      ? {
+          override?: t.ChatModelInstance;
+          clientOptions?: t.ProviderOptionsFor<P>;
+        }
+      : object extends t.ProviderOptionsFor<P>
+        ? {
+            override?: t.ChatModelInstance;
+            clientOptions?: t.ProviderOptionsFor<P>;
+          }
+        : {
+            override?: undefined;
+            clientOptions: t.ProviderOptionsFor<P>;
+          })
+);
+
 /**
- * Creates a chat model instance for a given provider, applies provider-specific
- * field assignments, and optionally binds tools.
- *
- * This is the single entry point for model creation across the codebase — used
- * by both the agent graph (main LLM) and the summarization node (compaction LLM).
- * An optional `override` model can be passed to skip construction entirely
- * (useful for cached/reused model instances or test fakes).
+ * Creates a chat model instance for a given built-in or host-registered
+ * provider, applies provider-specific field assignments, and optionally binds
+ * tools.
  */
-export function initializeModel({
+export function initializeModel<P extends t.ProviderName>({
   provider,
   clientOptions,
   tools,
   override,
-}: {
-  provider: Providers;
-  clientOptions?: t.ClientOptions;
-  tools?: t.GraphTools;
-  override?: t.ChatModelInstance;
-}): Runnable {
+}: InitializeModelParams<P>): Runnable {
   const model =
     override ??
-    new (getChatModelClass(provider))(clientOptions ?? ({} as never));
+    new (getChatModelClass(provider))(
+      (clientOptions ?? {}) as t.ProviderOptionsFor<P>
+    );
 
   if (
     isOpenAILike(provider) &&
@@ -56,8 +73,14 @@ export function initializeModel({
   }
 
   if (!tools || tools.length === 0) {
-    return model as unknown as Runnable;
+    return model;
   }
 
-  return (model as t.ModelWithTools).bindTools(tools);
+  if (!('bindTools' in model) || typeof model.bindTools !== 'function') {
+    throw new TypeError(
+      `LLM provider does not support tool binding: ${provider}`
+    );
+  }
+
+  return model.bindTools(tools);
 }

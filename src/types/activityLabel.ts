@@ -1,7 +1,6 @@
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { AssistantTextPhase } from '@/types/assistantPhase';
-import type { ClientOptions } from '@/types/llm';
-import type { Providers } from '@/common';
+import type { ClientOptions, ProviderName } from '@/types/llm';
 
 /** One tool call's contribution to the label payload (host-assembled). */
 export type ActivityLabelToolEntry = {
@@ -25,7 +24,7 @@ export type ActivityLabelToolEntry = {
  * `activity_label` content type's formatter exclusions.
  */
 export type RunActivityLabelOptions = {
-  provider: Providers;
+  provider: ProviderName;
   clientOptions?: ClientOptions;
   /**
    * Agent that executed the labeled batch. Selects that agent's Langfuse
@@ -85,7 +84,7 @@ export type ActivityPhaseEntry = {
 
 /** Options for `Run.generateActivityPhaseLabel`. */
 export type RunActivityPhaseLabelOptions = {
-  provider: Providers;
+  provider: ProviderName;
   clientOptions?: ClientOptions;
   /**
    * Logical activities in run order. The SDK requires at least two so hosts

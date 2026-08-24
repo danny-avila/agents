@@ -1,5 +1,5 @@
 import type { SummaryContentBlock } from '@/types/stream';
-import type { Providers } from '@/common';
+import type { ProviderName } from '@/types/llm';
 
 export type SummarizationTrigger = {
   type:
@@ -35,7 +35,7 @@ export type RetainRecentConfig = {
 };
 
 export type SummarizationConfig = {
-  provider?: Providers;
+  provider?: ProviderName;
   model?: string;
   parameters?: Record<string, unknown>;
   prompt?: string;

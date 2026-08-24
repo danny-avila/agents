@@ -14,6 +14,11 @@
       "import": "./dist/esm/main.mjs",
       "require": "./dist/cjs/main.cjs"
     },
+    "./provider-registration": {
+      "types": "./dist/types/provider-registration.d.ts",
+      "import": "./dist/esm/provider-registration.mjs",
+      "require": "./dist/cjs/provider-registration.cjs"
+    },
     "./openai": {
       "types": "./dist/types/openai/index.d.ts",
       "import": "./dist/esm/openai/index.mjs",
@@ -77,6 +82,9 @@
   },
   "typesVersions": {
     "*": {
+      "provider-registration": [
+        "dist/types/provider-registration.d.ts"
+      ],
       "langchain": [
         "dist/types/langchain/index.d.ts"
       ],

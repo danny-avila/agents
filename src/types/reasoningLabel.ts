@@ -1,7 +1,6 @@
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { UsageMetadata } from '@langchain/core/messages';
-import type { ClientOptions } from '@/types/llm';
-import type { Providers } from '@/common';
+import type { ClientOptions, ProviderName } from '@/types/llm';
 
 /** Lifecycle state of the visible reasoning snapshot being labeled. */
 export type ReasoningLabelStatus = 'streaming' | 'complete';
@@ -15,7 +14,7 @@ export type ReasoningLabelResult = {
 
 /** Options for `Run.generateReasoningLabel`. */
 export type RunReasoningLabelOptions = {
-  provider: Providers;
+  provider: ProviderName;
   clientOptions?: ClientOptions;
   /**
    * Complete user-visible reasoning accumulated for this step so far. Hidden

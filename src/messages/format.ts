@@ -27,6 +27,7 @@ import type {
   ToolCallPart,
   TPayload,
   TMessage,
+  ProviderName,
 } from '@/types';
 import type {
   ProviderMessageAttribution,
@@ -366,7 +367,7 @@ export const formatFromLangChain = (
 interface FormatAssistantMessageOptions {
   preserveUnpairedServerToolUses?: boolean;
   preserveReasoningContent?: boolean;
-  provider?: Providers;
+  provider?: ProviderName;
   sourceMessageId?: string;
   sourceContentPartOffset?: number;
   sourceContentPartIndices?: readonly SourceContentPartIndices[];
@@ -376,7 +377,7 @@ interface FormatAssistantMessageOptions {
 type SourceContentPartIndices = number | readonly number[];
 
 interface FormatAgentMessagesOptions {
-  provider?: Providers;
+  provider?: ProviderName;
   /** Reconstruct hidden `reasoning_content` from `THINK` parts onto prior
    *  tool-call messages. Explicit opt-in for OpenAI-compatible endpoints that
    *  replay reasoning across turns; defaults to on for DeepSeek thinking-mode. */
@@ -478,10 +479,7 @@ function collectTrustedToolResultSourceContentPartIndices(
   let trusted: Set<number> | undefined;
   let previousPart: MessageContentComplex | null | undefined;
   for (let index = 0; index < content.length; index++) {
-    const part = content[index] as
-      | MessageContentComplex
-      | null
-      | undefined;
+    const part = content[index] as MessageContentComplex | null | undefined;
     if (part == null) {
       previousPart = part;
       continue;
@@ -509,13 +507,18 @@ function sourceContentPartIndicesAreTrustedToolResult(
   trustedToolSourceContentPartIndices: ReadonlySet<number> | undefined
 ): boolean {
   if (typeof sourceContentPartIndices === 'number') {
-    return trustedToolSourceContentPartIndices?.has(sourceContentPartIndices) === true;
+    return (
+      trustedToolSourceContentPartIndices?.has(sourceContentPartIndices) ===
+      true
+    );
   }
   if (sourceContentPartIndices.length === 0) {
     return false;
   }
   for (const sourceContentPartIndex of sourceContentPartIndices) {
-    if (trustedToolSourceContentPartIndices?.has(sourceContentPartIndex) !== true) {
+    if (
+      trustedToolSourceContentPartIndices?.has(sourceContentPartIndex) !== true
+    ) {
       return false;
     }
   }
@@ -1377,10 +1380,7 @@ function stampSourceMessageIdentity(
       },
     ];
   }
-  setProviderMessageProvenance(
-    message,
-    partsToStamp
-  );
+  setProviderMessageProvenance(message, partsToStamp);
   if (sourceMessageId == null || derivedIndex !== 0) {
     return;
   }
@@ -2759,9 +2759,7 @@ function getSyntheticProviderContextProvenanceParts(
 ): ProviderMessageProvenancePart[] | null {
   /** Fold labels are generated context, while retained source bytes keep their
    * original attribution so downstream policy can still route them exactly. */
-  const parts: ProviderMessageProvenancePart[] = [
-    { attribution: 'synthetic' },
-  ];
+  const parts: ProviderMessageProvenancePart[] = [{ attribution: 'synthetic' }];
   for (const source of sourceMessages) {
     const {
       message: sourceMessage,
@@ -3311,7 +3309,7 @@ function appendToolCalls(
  */
 export function ensureThinkingBlockInMessages(
   messages: BaseMessage[],
-  _provider: Providers,
+  _provider: ProviderName,
   config?: RunnableConfig,
   runStartIndex?: number
 ): BaseMessage[] {

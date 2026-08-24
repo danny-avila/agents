@@ -90,7 +90,7 @@ const modifyContent = ({
   messageType,
   content,
 }: {
-  provider: Providers;
+  provider: t.ProviderName;
   messageType: string;
   content: t.ExtendedMessageContent[];
 }): (t.ExtendedMessageContent | null)[] => {
@@ -243,7 +243,7 @@ function hasReasoningContent(content: BaseMessage['content']): boolean {
 }
 
 export function modifyDeltaProperties(
-  provider: Providers,
+  provider: t.ProviderName,
   obj?: AIMessageChunk
 ): AIMessageChunk | undefined {
   if (!obj || typeof obj !== 'object') return obj;

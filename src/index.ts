@@ -78,6 +78,11 @@ export type {
   ChatOpenRouterCallOptions,
 } from './llm/openrouter';
 export { getChatModelClass } from './llm/providers';
+export { registerProvider } from './provider-registration';
+export type {
+  ProviderFamily,
+  ProviderRegistrationOptions,
+} from './provider-registration';
 export { CustomChatMistralAI } from './llm/mistral';
 export {
   smoothStream,

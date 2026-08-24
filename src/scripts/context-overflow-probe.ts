@@ -918,7 +918,7 @@ async function runProbe(
   try {
     const model = initializeModel({
       provider: target.provider,
-      clientOptions: buildClientOptions(target),
+      clientOptions: buildClientOptions(target) as t.BuiltInClientOptions,
     }) as t.ChatModel;
 
     if (mode === 'invoke' || model.stream == null) {
