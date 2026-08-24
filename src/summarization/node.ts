@@ -3,6 +3,7 @@ import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { StreamLimitState } from '@/llm/streamLimits';
 import type { AgentContext } from '@/agents/AgentContext';
+import type { EncodingName } from '@/utils/tokens';
 import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
@@ -307,22 +308,48 @@ function buildSummarizationClientConfig(
  * understates base64 by 1.5x and Korean by 4.6x, and coefficients large enough
  * to cover those overestimate English prose by roughly 4x. So this falls back
  * to the tokenizer this package already bundles rather than to an estimate.
- * The encoding is chosen from the summarizer's model, the only model signal
- * this node has.
  */
 async function computeSummaryTokenCount(
   summaryText: string,
-  tokenCounter?: (message: BaseMessage) => number,
-  summaryModelName?: string
+  agentContext: AgentContext
 ): Promise<number> {
   const carrier = new HumanMessage(buildSummaryCarrierText(summaryText));
-  if (tokenCounter) {
-    return tokenCounter(carrier);
+  if (agentContext.tokenCounter) {
+    return agentContext.tokenCounter(carrier);
   }
   const bundledCounter = await createTokenCounter(
-    encodingForModel(summaryModelName ?? '')
+    encodingForReceivingAgent(agentContext)
   );
   return bundledCounter(carrier);
+}
+
+/**
+ * Encoding of the model that will *receive* the carrier.
+ *
+ * That is the agent's own model, never the summarizer's. The two are the same
+ * only by default: `summarizationConfig.model` is undefined for ordinary
+ * self-summarization and can name a different provider entirely when a cheap
+ * dedicated summarizer is configured. The count produced here is spent by
+ * `AgentContext.instructionTokens` against the agent's context window, so it
+ * has to be denominated in the agent's tokenizer, and Anthropic's counts run
+ * well above `o200k_base` on the same text: measuring CJK with the wrong one
+ * understates it by up to 1.9x.
+ *
+ * Model name first, mirroring how `Run.create` picks the encoding for the
+ * counter this is standing in for, so a Claude model reached through Bedrock or
+ * OpenRouter still resolves to `claude`. Provider is the fallback for a client
+ * that never recorded a model: `ANTHROPIC` implies a Claude tokenizer, while
+ * `BEDROCK` does not, since it also serves Llama, Titan and Mistral.
+ */
+function encodingForReceivingAgent(agentContext: AgentContext): EncodingName {
+  const model =
+    (agentContext.clientOptions as { model?: string } | undefined)?.model ?? '';
+  if (model !== '') {
+    return encodingForModel(model);
+  }
+  return agentContext.provider === Providers.ANTHROPIC
+    ? 'claude'
+    : 'o200k_base';
 }
 
 /**
@@ -1312,8 +1339,7 @@ export function createSummarizeNode({
 
     const tokenCount = await computeSummaryTokenCount(
       summaryText,
-      agentContext.tokenCounter,
-      clientConfig.modelName
+      agentContext
     );
 
     if (usedIntraTurnFallback) {
