@@ -14,3 +14,7 @@ export function requireLazyModule<T>(specifier: string): T {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   return require(specifier) as T;
 }
+
+export function isBuiltRuntime(): boolean {
+  return true;
+}

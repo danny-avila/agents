@@ -28,6 +28,12 @@ function detectBuildExtension(url: string): '.cjs' | '.mjs' | null {
 
 const buildExtension = detectBuildExtension(moduleUrl);
 
+/** False when the package runs from TypeScript source, where dist siblings do
+ *  not exist and lazily loadable modules must be registered up front. */
+export function isBuiltRuntime(): boolean {
+  return buildExtension != null;
+}
+
 /** Source-mode commands run the TypeScript through an ESM loader that a synchronous
  *  CJS `require` can neither reach nor share module identity with, so lazily loadable
  *  modules are provided up front instead: `@/llm/providers.eager` imports them through

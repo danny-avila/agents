@@ -1,8 +1,7 @@
 import type { Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { getChatModelClass } from '@/llm/providers';
-import { requireInternalModule } from '@/lazyRequire';
-import { isOpenAILike } from '@/utils';
+import { isOpenAILike, isLibreChatOpenAIModel, constructorChainHasLcName } from '@/utils';
 import { Providers } from '@/common';
 
 type InitializeModelParams<P extends t.ProviderName> = {
@@ -29,36 +28,16 @@ type InitializeModelParams<P extends t.ProviderName> = {
           })
 );
 
-/** These guards run only for their own provider families, so the class they test
- *  against loads with the family's first request instead of at import time. */
-function isOpenAIChatModel(
-  model: unknown
-): model is import('@/llm/openai').ChatOpenAI | import('@/llm/openai').AzureChatOpenAI {
-  const { ChatOpenAI, AzureChatOpenAI } =
-    requireInternalModule<typeof import('@/llm/openai')>('llm/openai/index');
-  return model instanceof ChatOpenAI || model instanceof AzureChatOpenAI;
-}
+const VERTEX_LC_NAMES: ReadonlySet<string> = new Set(['ChatVertexAI']);
 
-/** Structural stand-in for `instanceof ChatVertexAI`: the CJS and ESM builds of
- *  `@langchain/google-vertexai` carry distinct constructors, so a class resolved
- *  through `require` can never match an ESM consumer's override instance. Walking
- *  the constructor chain for the `lc_name` serialization id matches both builds,
- *  while this package's own vertex class reports `LibreChatVertexAI` and keeps
- *  failing this guard exactly as it did under `instanceof`. */
+/** Structural stand-in for `instanceof ChatVertexAI`: matches both builds of
+ *  `@langchain/google-vertexai`, while this package's own vertex class reports
+ *  `LibreChatVertexAI` and keeps failing this guard exactly as it did under
+ *  `instanceof`. */
 function isLangchainVertexModel(
   model: unknown
 ): model is import('@langchain/google-vertexai').ChatVertexAI {
-  if (typeof model !== 'object' || model == null) {
-    return false;
-  }
-  let ctor: unknown = model.constructor;
-  while (typeof ctor === 'function') {
-    if ((ctor as { lc_name?: () => string }).lc_name?.() === 'ChatVertexAI') {
-      return true;
-    }
-    ctor = Object.getPrototypeOf(ctor);
-  }
-  return false;
+  return constructorChainHasLcName(model, VERTEX_LC_NAMES);
 }
 
 /**
@@ -78,7 +57,7 @@ export function initializeModel<P extends t.ProviderName>({
       (clientOptions ?? {}) as t.ProviderOptionsFor<P>
     );
 
-  if (isOpenAILike(provider) && isOpenAIChatModel(model)) {
+  if (isOpenAILike(provider) && isLibreChatOpenAIModel(model)) {
     const opts = clientOptions as t.OpenAIClientOptions | undefined;
     if (opts) {
       model.temperature = opts.temperature as number;

@@ -1,4 +1,3 @@
-import '@/llm/providers.eager';
 /* eslint-disable no-console */
 // src/scripts/cli.ts
 import { config } from 'dotenv';
