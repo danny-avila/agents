@@ -71,7 +71,11 @@ cannot subsequently authorize discard of active or applied work. Commit
 consumes the settlement exactly once and returns structured indeterminate
 evidence for missing or invalid acknowledgements rather than exposing a
 retryable-looking exception. A host mailbox remains the durable cross-runtime
-owner and deduplication fence.
+owner and deduplication fence. The executor retains local terminal phase fences
+only for the dormant-checkpoint TTL; active phase count remains bounded by host
+admission, while prepared invocation authority carries an authenticated expiry
+so pruning cannot re-enable a stale capability. The mailbox prevents stale
+cross-runtime replay after expiry.
 
 Applied work may commit its Invocation Fork. Failed, cancelled, and
 completed-without-action invocations discard their forks. An applied fork that

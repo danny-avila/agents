@@ -240,6 +240,27 @@ describe('EventActorExecutor', () => {
     expect(Reflect.get(executor, 'discardInvocationReference')).toBeUndefined();
   });
 
+  it('rejects unknown adapter preparation statuses', async () => {
+    const host = new TestHost();
+    host.prepare = async () =>
+      ({
+        status: 'unknown',
+        head: head(0),
+      }) as unknown as Awaited<ReturnType<TestHost['prepare']>>;
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.prepare({
+        actorThreadId: 'actor-thread',
+        invocationId: 'unknown-preparation-status',
+        depth: 1,
+        event: { text: 'unknown-preparation-status' },
+      })
+    ).rejects.toThrow('preparation returned an invalid status');
+    expect(host.coldContinues).toBe(0);
+    expect(host.invokes).toBe(0);
+  });
+
   it('rejects preparation signing keys below 256 bits', () => {
     expect(
       () =>
@@ -247,6 +268,59 @@ describe('EventActorExecutor', () => {
           preparationSigningKey: 'short-key',
         })
     ).toThrow('preparationSigningKey must contain at least 32 bytes');
+  });
+
+  it('expires signed prepared invocation authority with its dormant fork', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_000);
+    try {
+      const host = new TestHost();
+      const executor = new EventActorExecutor(host, {
+        dormantCheckpointTtlMs: 10,
+      });
+      const preparation = await executor.prepare({
+        actorThreadId: 'actor-thread',
+        invocationId: 'expired-preparation',
+        depth: 1,
+        event: { text: 'expired-preparation' },
+      });
+      if (preparation.status !== 'ready') {
+        throw new Error('Expected warm preparation');
+      }
+
+      now.mockReturnValue(1_010);
+      await expect(executor.invoke(preparation.invocation)).rejects.toThrow(
+        'prepared invocation binding has expired'
+      );
+      await expect(
+        executor.discard(preparation.invocation, 'failed')
+      ).rejects.toThrow('prepared invocation binding has expired');
+      expect(host.invokes).toBe(0);
+      expect(host.discards).toHaveLength(0);
+
+      now.mockReturnValue(2_000);
+      host.invokeImpl = async () => ({ status: 'completed_no_action' });
+      const consumed = await executor.prepare({
+        actorThreadId: 'actor-thread',
+        invocationId: 'expired-terminal-phase',
+        depth: 1,
+        event: { text: 'expired-terminal-phase' },
+      });
+      if (consumed.status !== 'ready') {
+        throw new Error('Expected warm preparation');
+      }
+      await expect(executor.invoke(consumed.invocation)).resolves.toEqual({
+        status: 'completed_no_action',
+      });
+
+      now.mockReturnValue(2_010);
+      await expect(
+        executor.discard(consumed.invocation, 'completed_no_action')
+      ).rejects.toThrow('prepared invocation binding has expired');
+      expect(host.invokes).toBe(1);
+      expect(host.discards).toHaveLength(0);
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it('exposes the lifecycle seam for host-driven mailbox orchestration', async () => {
@@ -2476,6 +2550,37 @@ describe('EventActorExecutor', () => {
     expect(host.discards).toHaveLength(1);
   });
 
+  it('keeps a public no-action capability discardable but non-invokable', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async () => ({
+      status: 'completed_no_action',
+      result: 'nothing-applied',
+    });
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'public-no-action-phase',
+      depth: 1,
+      event: { text: 'public-no-action-phase' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+
+    await expect(executor.invoke(preparation.invocation)).resolves.toEqual({
+      status: 'completed_no_action',
+      result: 'nothing-applied',
+    });
+    await expect(executor.invoke(preparation.invocation)).rejects.toThrow(
+      'already consumed'
+    );
+    await expect(
+      executor.discard(preparation.invocation, 'completed_no_action')
+    ).resolves.toBeUndefined();
+    expect(host.invokes).toBe(1);
+    expect(host.discards).toHaveLength(1);
+  });
+
   it('revokes public discard authority while invocation is active and after action', async () => {
     const host = new TestHost();
     let started = (): void => undefined;
@@ -2549,6 +2654,37 @@ describe('EventActorExecutor', () => {
     await expect(
       executor.invoke(preparation.invocation)
     ).resolves.toMatchObject({ status: 'commit_indeterminate' });
+    await expect(
+      executor.discard(preparation.invocation, 'failed')
+    ).rejects.toThrow('no longer discardable');
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('returns indeterminate evidence when a public status read throws', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async () =>
+      Object.defineProperty({}, 'status', {
+        get: () => {
+          throw new Error('terminal status unavailable');
+        },
+      }) as EventActorTerminalResult<string>;
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'throwing-public-status',
+      depth: 1,
+      event: { text: 'throwing-public-status' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+
+    await expect(
+      executor.invoke(preparation.invocation)
+    ).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      error: { message: 'terminal status unavailable' },
+    });
     await expect(
       executor.discard(preparation.invocation, 'failed')
     ).rejects.toThrow('no longer discardable');

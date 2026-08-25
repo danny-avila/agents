@@ -10,6 +10,7 @@ import {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type {
   EventActorAdapterPrepareRequest,
+  EventActorAdapterPreparation,
   EventActorAppliedResult,
   EventActorCheckpointFork,
   EventActorCheckpointReference,
@@ -33,6 +34,7 @@ import type {
 
 const DEFAULT_MAX_DEPTH = 1;
 const DEFAULT_DORMANT_CHECKPOINT_TTL_MS = 24 * 60 * 60 * 1_000;
+const MAX_TIMEOUT_MS = 2_147_483_647;
 
 function createInvocationCheckpointNs(
   request: EventActorPrepareRequest<EventActorEvent>,
@@ -547,6 +549,13 @@ type EventActorAppliedSnapshot<TResult extends EventActorEvent> = {
   invocation: EventActorInvocationReference;
 };
 
+type EventActorPreparationPhase =
+  | { status: 'invoking' | 'discarding' }
+  | {
+      status: 'discardable' | 'retained' | 'discarded';
+      expiresAt: number;
+    };
+
 function createIndeterminateResult<TResult extends EventActorEvent>(
   invocation: EventActorInvocationReference,
   error: unknown,
@@ -661,10 +670,9 @@ export class EventActorExecutor<
   readonly #dormantCheckpointTtlMs: number;
   readonly #preparationSigningKey: Uint8Array;
   readonly #issuedSettlements = new WeakSet<object>();
-  readonly #preparationPhases = new Map<
-    string,
-    'invoking' | 'retained' | 'discarding' | 'discarded'
-  >();
+  readonly #preparationPhases = new Map<string, EventActorPreparationPhase>();
+  #phaseCleanupTimer: ReturnType<typeof setTimeout> | undefined;
+  #nextPhaseExpiry = Number.POSITIVE_INFINITY;
 
   constructor(
     adapter: EventActorHostAdapter<TEvent, TResult>,
@@ -712,26 +720,95 @@ export class EventActorExecutor<
     invocation: EventActorInvocation<TEvent>
   ): EventActorPreparedInvocation<TEvent> {
     const trustedInvocation = freezeInvocation(invocation);
+    const expiresAt = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      Date.now() + this.#dormantCheckpointTtlMs
+    );
+    const payload = serializeInvocationPreparation(trustedInvocation);
     return Object.freeze({
       ...trustedInvocation,
-      preparationDigest: this.#signPreparation(
-        serializeInvocationPreparation(trustedInvocation)
-      ),
+      preparationDigest: `${expiresAt}.${this.#signPreparation(
+        `${expiresAt}\0${payload}`
+      )}`,
     });
   }
 
   #validatePreparedInvocation(
-    invocation: EventActorPreparedInvocation<TEvent>
-  ): void {
+    invocation: EventActorPreparedInvocation<TEvent>,
+    allowExpired = false
+  ): number {
     requireNonEmpty(invocation.preparationDigest, 'preparationDigest');
+    const match = /^(\d+)\.([a-f0-9]{64})$/.exec(invocation.preparationDigest);
+    const expiresAt = Number(match?.[1]);
     if (
+      match == null ||
+      !Number.isSafeInteger(expiresAt) ||
+      expiresAt < 1 ||
       !this.#preparationSignatureMatches(
-        invocation.preparationDigest,
-        serializeInvocationPreparation(invocation)
+        match[2],
+        `${expiresAt}\0${serializeInvocationPreparation(invocation)}`
       )
     ) {
       throw new Error('Event actor prepared invocation binding is invalid');
     }
+    if (!allowExpired && expiresAt <= Date.now()) {
+      throw new Error('Event actor prepared invocation binding has expired');
+    }
+    return expiresAt;
+  }
+
+  #prunePreparationPhases(now = Date.now()): void {
+    if (this.#phaseCleanupTimer != null) {
+      clearTimeout(this.#phaseCleanupTimer);
+      this.#phaseCleanupTimer = undefined;
+    }
+    this.#nextPhaseExpiry = Number.POSITIVE_INFINITY;
+    for (const [digest, phase] of this.#preparationPhases) {
+      if ('expiresAt' in phase && phase.expiresAt <= now) {
+        this.#preparationPhases.delete(digest);
+      } else if ('expiresAt' in phase) {
+        this.#schedulePhaseCleanup(phase.expiresAt, now);
+      }
+    }
+  }
+
+  #schedulePhaseCleanup(expiresAt: number, now = Date.now()): void {
+    if (expiresAt >= this.#nextPhaseExpiry) {
+      return;
+    }
+    if (this.#phaseCleanupTimer != null) {
+      clearTimeout(this.#phaseCleanupTimer);
+    }
+    this.#nextPhaseExpiry = expiresAt;
+    this.#phaseCleanupTimer = setTimeout(
+      () => this.#prunePreparationPhases(),
+      Math.min(MAX_TIMEOUT_MS, Math.max(0, expiresAt - now))
+    );
+    this.#phaseCleanupTimer.unref();
+  }
+
+  #getPreparationPhase(
+    preparationDigest: string
+  ): EventActorPreparationPhase | undefined {
+    if (Date.now() >= this.#nextPhaseExpiry) {
+      this.#prunePreparationPhases();
+    }
+    return this.#preparationPhases.get(preparationDigest);
+  }
+
+  #setTerminalPreparationPhase(
+    preparationDigest: string,
+    status: 'discardable' | 'retained' | 'discarded'
+  ): void {
+    const phase = {
+      status,
+      expiresAt: Math.min(
+        Number.MAX_SAFE_INTEGER,
+        Date.now() + this.#dormantCheckpointTtlMs
+      ),
+    } as const;
+    this.#preparationPhases.set(preparationDigest, phase);
+    this.#schedulePhaseCleanup(phase.expiresAt);
   }
 
   async prepare(
@@ -777,8 +854,13 @@ export class EventActorExecutor<
     } finally {
       signal?.removeEventListener('abort', abort);
     }
-    if (preparation.status === 'ready') {
-      const adapterInvocation = snapshotInvocation(preparation.invocation);
+    const preparationStatus: unknown = preparation.status;
+    if (preparationStatus === 'ready') {
+      const readyPreparation = preparation as Extract<
+        EventActorAdapterPreparation<TEvent>,
+        { status: 'ready' }
+      >;
+      const adapterInvocation = snapshotInvocation(readyPreparation.invocation);
       validateInvocation(
         trustedRequest,
         adapterInvocation,
@@ -805,7 +887,14 @@ export class EventActorExecutor<
         invocation: preparedInvocation,
       });
     } else {
-      const preparedHead = freezeHead(preparation.head);
+      if (preparationStatus !== 'checkpoint_unavailable') {
+        throw new Error('Event actor preparation returned an invalid status');
+      }
+      const unavailablePreparation = preparation as Extract<
+        EventActorAdapterPreparation<TEvent>,
+        { status: 'checkpoint_unavailable' }
+      >;
+      const preparedHead = freezeHead(unavailablePreparation.head);
       validateHead(preparedHead, trustedRequest.actorThreadId);
       if (isAborted(controller.signal)) {
         throw new EventActorPreparationCancelledError(
@@ -917,10 +1006,10 @@ export class EventActorExecutor<
     const trustedInvocation = snapshotPreparedInvocation(invocation);
     this.#validatePreparedInvocation(trustedInvocation);
     const preparationDigest = trustedInvocation.preparationDigest;
-    if (this.#preparationPhases.has(preparationDigest)) {
+    if (this.#getPreparationPhase(preparationDigest) != null) {
       throw new Error('Event actor prepared invocation was already consumed');
     }
-    this.#preparationPhases.set(preparationDigest, 'invoking');
+    this.#preparationPhases.set(preparationDigest, { status: 'invoking' });
     const settlementInvocation = snapshotInvocationReference(trustedInvocation);
     let invocationCompleted = false;
     let definitelyNoAction = false;
@@ -931,8 +1020,13 @@ export class EventActorExecutor<
         AsyncLocalStorageProviderSingleton.getRunnableConfig()
       );
       invocationCompleted = true;
-      this.#preparationPhases.set(preparationDigest, 'retained');
-      const status: unknown = terminal.status;
+      this.#setTerminalPreparationPhase(preparationDigest, 'retained');
+      let status: unknown;
+      try {
+        status = terminal.status;
+      } catch (error) {
+        return createIndeterminateResult(settlementInvocation, error);
+      }
       if (status === 'applied') {
         const snapshot = snapshotAppliedTerminal<TResult>(
           settlementInvocation,
@@ -958,7 +1052,7 @@ export class EventActorExecutor<
           ? {}
           : { result: snapshotEvent(terminal.result) }),
       });
-      this.#preparationPhases.delete(preparationDigest);
+      this.#setTerminalPreparationPhase(preparationDigest, 'discardable');
       return completed;
     } catch (error) {
       if (
@@ -966,9 +1060,9 @@ export class EventActorExecutor<
         isParentCommand(error) ||
         (invocationCompleted && !definitelyNoAction)
       ) {
-        this.#preparationPhases.set(preparationDigest, 'retained');
+        this.#setTerminalPreparationPhase(preparationDigest, 'retained');
       } else {
-        this.#preparationPhases.delete(preparationDigest);
+        this.#setTerminalPreparationPhase(preparationDigest, 'discardable');
       }
       throw error;
     }
@@ -1127,19 +1221,30 @@ export class EventActorExecutor<
       throw new Error('Event actor discard reason is invalid');
     }
     const trustedInvocation = snapshotPreparedInvocation(invocation);
-    this.#validatePreparedInvocation(trustedInvocation);
+    const expiresAt = this.#validatePreparedInvocation(trustedInvocation, true);
     const preparationDigest = trustedInvocation.preparationDigest;
-    if (this.#preparationPhases.has(preparationDigest)) {
+    const previousPhase = this.#getPreparationPhase(preparationDigest);
+    if (expiresAt <= Date.now() && previousPhase == null) {
+      throw new Error('Event actor prepared invocation binding has expired');
+    }
+    if (previousPhase != null && previousPhase.status !== 'discardable') {
       throw new Error(
         'Event actor prepared invocation is no longer discardable'
       );
     }
-    this.#preparationPhases.set(preparationDigest, 'discarding');
+    this.#preparationPhases.set(preparationDigest, { status: 'discarding' });
     try {
       await this.#discardInvocationReference(trustedInvocation, reason);
-      this.#preparationPhases.set(preparationDigest, 'discarded');
+      this.#setTerminalPreparationPhase(preparationDigest, 'discarded');
     } catch (error) {
-      this.#preparationPhases.delete(preparationDigest);
+      if (previousPhase == null) {
+        this.#preparationPhases.delete(preparationDigest);
+      } else {
+        this.#preparationPhases.set(preparationDigest, previousPhase);
+        if ('expiresAt' in previousPhase) {
+          this.#schedulePhaseCleanup(previousPhase.expiresAt);
+        }
+      }
       throw error;
     }
   }

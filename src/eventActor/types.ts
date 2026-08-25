@@ -45,7 +45,10 @@ export interface EventActorInvocation<TEvent extends EventActorEvent>
 
 export interface EventActorPreparedInvocation<TEvent extends EventActorEvent>
   extends EventActorInvocation<TEvent> {
-  /** Executor-authenticated binding over the complete prepared invocation. */
+  /**
+   * Executor-authenticated, time-bounded binding over the complete prepared
+   * invocation. Its wire representation is opaque to callers.
+   */
   preparationDigest: string;
 }
 
