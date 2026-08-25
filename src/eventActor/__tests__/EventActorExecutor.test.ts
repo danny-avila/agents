@@ -232,6 +232,7 @@ describe('EventActorExecutor', () => {
 
     expect(Object.getOwnPropertyNames(executor)).toEqual([]);
     expect(Reflect.get(executor, 'preparationSigningKey')).toBeUndefined();
+    expect(Reflect.get(executor, 'preparationPhases')).toBeUndefined();
     expect(Reflect.get(executor, 'issuedSettlements')).toBeUndefined();
     expect(Reflect.get(executor, 'signPreparation')).toBeUndefined();
     expect(Reflect.get(executor, 'issueSettlement')).toBeUndefined();
@@ -642,6 +643,29 @@ describe('EventActorExecutor', () => {
     ]);
   });
 
+  it('discards a no-action fork when its result cannot be snapshotted', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async () => ({
+      status: 'completed_no_action',
+      result: new Array<EventActorEvent>(1) as unknown as string,
+    });
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('invalid-no-action-result'))
+    ).resolves.toMatchObject({
+      status: 'failed',
+      error: {
+        message: expect.stringContaining('arrays must not contain holes'),
+      },
+      continuation: 'warm',
+    });
+    expect(host.commits).toHaveLength(0);
+    expect(host.discards).toEqual([
+      expect.objectContaining({ reason: 'completed_no_action' }),
+    ]);
+  });
+
   it('discards failures and explicit cancellations without advancing the head', async () => {
     const failedHost = new TestHost();
     failedHost.invokeImpl = async () => {
@@ -745,6 +769,59 @@ describe('EventActorExecutor', () => {
       }
     );
     expect(host.commits).toHaveLength(1);
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('returns indeterminate evidence from the public commit seam', async () => {
+    const host = new TestHost();
+    host.commitError = new Error('response lost after public commit');
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'public-uncertain',
+      depth: 1,
+      event: { text: 'public-uncertain' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const settlement = await executor.invoke(preparation.invocation);
+    if (settlement.status !== 'applied') {
+      throw new Error('Expected applied settlement');
+    }
+
+    await expect(executor.commit(settlement)).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      result: 'public-uncertain',
+      checkpoint: { checkpointId: 'result-public-uncertain' },
+      error: { message: 'response lost after public commit' },
+    });
+    await expect(executor.commit(settlement)).rejects.toThrow(
+      'settlement was not issued by this executor'
+    );
+    expect(host.commits).toHaveLength(1);
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('converts hostile post-action errors without throwing', async () => {
+    const hostileError = {
+      [Symbol.toPrimitive]: () => {
+        throw new Error('string conversion failed');
+      },
+    };
+    const host = new TestHost();
+    host.commit = async () => {
+      throw hostileError;
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('hostile-commit-error'))
+    ).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      result: 'hostile-commit-error',
+      error: { message: 'Unknown event actor error' },
+    });
     expect(host.discards).toHaveLength(0);
   });
 
@@ -1334,6 +1411,45 @@ describe('EventActorExecutor', () => {
     await expect(executor.invoke(restored)).resolves.toMatchObject({
       status: 'applied',
       result: 'zero',
+    });
+  });
+
+  it('normalizes signed zero in authenticated actor heads', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) => ({
+      status: 'applied',
+      result: Object.is(prepared.base.generation, -0)
+        ? 'negative-zero-generation'
+        : 'zero-generation',
+      checkpoint: {
+        ...prepared.fork,
+        checkpointId: 'signed-zero-head-terminal',
+      },
+    });
+    const signingKey = 's'.repeat(32);
+    const issuer = new EventActorExecutor(host, {
+      preparationSigningKey: signingKey,
+    });
+    const preparation = await issuer.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'signed-zero-head',
+      depth: 1,
+      event: { text: 'signed-zero-head' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const restored = {
+      ...preparation.invocation,
+      base: { ...preparation.invocation.base, generation: -0 },
+    };
+    const verifier = new EventActorExecutor(host, {
+      preparationSigningKey: signingKey,
+    });
+
+    await expect(verifier.invoke(restored)).resolves.toMatchObject({
+      status: 'applied',
+      result: 'zero-generation',
     });
   });
 
@@ -2051,9 +2167,10 @@ describe('EventActorExecutor', () => {
       throw new Error('Expected applied terminal result');
     }
 
-    await expect(executor.commit(terminal)).rejects.toThrow(
-      'Event actor head is invalid'
-    );
+    await expect(executor.commit(terminal)).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      error: { message: 'Event actor head is invalid' },
+    });
   });
 
   it('rejects a stale commit head that did not advance past its base', async () => {
@@ -2074,9 +2191,10 @@ describe('EventActorExecutor', () => {
       throw new Error('Expected applied terminal result');
     }
 
-    await expect(executor.commit(terminal)).rejects.toThrow(
-      'did not advance past its base'
-    );
+    await expect(executor.commit(terminal)).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      error: { message: expect.stringContaining('did not advance past') },
+    });
   });
 
   it('rejects a stale commit head that switches checkpoint threads', async () => {
@@ -2109,9 +2227,10 @@ describe('EventActorExecutor', () => {
       throw new Error('Expected applied terminal result');
     }
 
-    await expect(executor.commit(terminal)).rejects.toThrow(
-      'changed its checkpoint thread'
-    );
+    await expect(executor.commit(terminal)).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      error: { message: expect.stringContaining('changed its checkpoint') },
+    });
   });
 
   it('retains applied work when stale moves the base checkpoint to another namespace', async () => {
@@ -2311,7 +2430,7 @@ describe('EventActorExecutor', () => {
       throw new Error('Expected applied terminal result');
     }
 
-    expect(() => executor.discard(malformed, 'failed')).toThrow(
+    await expect(executor.discard(malformed, 'failed')).rejects.toThrow(
       'prepared invocation binding is invalid'
     );
     const forgedSettlement = {
@@ -2339,10 +2458,13 @@ describe('EventActorExecutor', () => {
     }
 
     await expect(
+      executor.discard(preparation.invocation, 'applied' as unknown as 'failed')
+    ).rejects.toThrow('discard reason is invalid');
+    await expect(
       executor.discard(preparation.invocation, 'failed')
     ).resolves.toBeUndefined();
     expect(host.discards).toHaveLength(1);
-    expect(() =>
+    await expect(
       executor.discard(
         {
           ...preparation.invocation,
@@ -2350,8 +2472,87 @@ describe('EventActorExecutor', () => {
         },
         'failed'
       )
-    ).toThrow('prepared invocation binding is invalid');
+    ).rejects.toThrow('prepared invocation binding is invalid');
     expect(host.discards).toHaveLength(1);
+  });
+
+  it('revokes public discard authority while invocation is active and after action', async () => {
+    const host = new TestHost();
+    let started = (): void => undefined;
+    let release = (): void => undefined;
+    const invocationStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    host.invokeImpl = async (prepared) => {
+      started();
+      await gate;
+      return {
+        status: 'applied',
+        result: 'action-applied',
+        checkpoint: {
+          ...prepared.fork,
+          checkpointId: 'phase-bound-terminal',
+        },
+      };
+    };
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'phase-bound-discard',
+      depth: 1,
+      event: { text: 'phase-bound-discard' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+
+    const invocationResult = executor.invoke(preparation.invocation);
+    await invocationStarted;
+    await expect(
+      executor.discard(preparation.invocation, 'failed')
+    ).rejects.toThrow('no longer discardable');
+    release();
+    await expect(invocationResult).resolves.toMatchObject({
+      status: 'applied',
+    });
+    await expect(
+      executor.discard(preparation.invocation, 'failed')
+    ).rejects.toThrow('no longer discardable');
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('revokes public discard authority for indeterminate applied evidence', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) => ({
+      status: 'applied',
+      result: 'action-applied',
+      checkpoint: {
+        ...prepared.fork,
+        checkpointNs: 'foreign-namespace',
+        checkpointId: 'indeterminate-terminal',
+      },
+    });
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'indeterminate-discard',
+      depth: 1,
+      event: { text: 'indeterminate-discard' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+
+    await expect(
+      executor.invoke(preparation.invocation)
+    ).resolves.toMatchObject({ status: 'commit_indeterminate' });
+    await expect(
+      executor.discard(preparation.invocation, 'failed')
+    ).rejects.toThrow('no longer discardable');
+    expect(host.discards).toHaveLength(0);
   });
 
   it('detects a cold adapter mutating its copy of the prepared head', async () => {

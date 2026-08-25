@@ -13,7 +13,6 @@ import type {
   EventActorAppliedResult,
   EventActorCheckpointFork,
   EventActorCheckpointReference,
-  EventActorCommitResult,
   EventActorDiscardReason,
   EventActorEvent,
   EventActorExecutionRequest,
@@ -28,6 +27,7 @@ import type {
   EventActorPreparedInvocation,
   EventActorPrepareRequest,
   EventActorPreparation,
+  EventActorSettlementResult,
   EventActorTerminalResult,
 } from './types';
 
@@ -139,7 +139,7 @@ function snapshotCheckpointFork(
 function snapshotHead(head: EventActorHead): EventActorHead {
   return {
     actorThreadId: head.actorThreadId,
-    generation: head.generation,
+    generation: Object.is(head.generation, -0) ? 0 : head.generation,
     ...(head.checkpoint == null
       ? {}
       : { checkpoint: snapshotCheckpointReference(head.checkpoint) }),
@@ -533,7 +533,11 @@ function createRunnableConfig(
 }
 
 function asError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  try {
+    return error instanceof Error ? error : new Error(String(error));
+  } catch {
+    return new Error('Unknown event actor error');
+  }
 }
 
 type EventActorAppliedSnapshot<TResult extends EventActorEvent> = {
@@ -556,6 +560,18 @@ function createIndeterminateResult<TResult extends EventActorEvent>(
       threadId: invocation.fork.threadId,
       checkpointNs: invocation.fork.checkpointNs,
     }),
+    error: asError(error),
+  });
+}
+
+function createSettlementIndeterminateResult<TResult extends EventActorEvent>(
+  settlement: EventActorAppliedResult<TResult>,
+  error: unknown
+): EventActorIndeterminateResult<TResult> {
+  return Object.freeze({
+    status: 'commit_indeterminate',
+    result: settlement.result,
+    checkpoint: Object.freeze(snapshotCheckpointFork(settlement.checkpoint)),
     error: asError(error),
   });
 }
@@ -645,6 +661,10 @@ export class EventActorExecutor<
   readonly #dormantCheckpointTtlMs: number;
   readonly #preparationSigningKey: Uint8Array;
   readonly #issuedSettlements = new WeakSet<object>();
+  readonly #preparationPhases = new Map<
+    string,
+    'invoking' | 'retained' | 'discarding' | 'discarded'
+  >();
 
   constructor(
     adapter: EventActorHostAdapter<TEvent, TResult>,
@@ -896,24 +916,62 @@ export class EventActorExecutor<
   ): Promise<EventActorInvocationResult<TResult>> {
     const trustedInvocation = snapshotPreparedInvocation(invocation);
     this.#validatePreparedInvocation(trustedInvocation);
-    const settlementInvocation = snapshotInvocationReference(trustedInvocation);
-    const terminal = await this.#invokeWithConfig(
-      snapshotInvocation(trustedInvocation),
-      signal,
-      AsyncLocalStorageProviderSingleton.getRunnableConfig()
-    );
-    if (terminal.status === 'applied') {
-      const snapshot = snapshotAppliedTerminal(settlementInvocation, terminal);
-      return snapshot.status === 'snapshot_ready'
-        ? this.#issueSettlement(snapshot)
-        : snapshot;
+    const preparationDigest = trustedInvocation.preparationDigest;
+    if (this.#preparationPhases.has(preparationDigest)) {
+      throw new Error('Event actor prepared invocation was already consumed');
     }
-    return Object.freeze({
-      status: 'completed_no_action' as const,
-      ...(terminal.result === undefined
-        ? {}
-        : { result: snapshotEvent(terminal.result) }),
-    });
+    this.#preparationPhases.set(preparationDigest, 'invoking');
+    const settlementInvocation = snapshotInvocationReference(trustedInvocation);
+    let invocationCompleted = false;
+    let definitelyNoAction = false;
+    try {
+      const terminal = await this.#invokeWithConfig(
+        snapshotInvocation(trustedInvocation),
+        signal,
+        AsyncLocalStorageProviderSingleton.getRunnableConfig()
+      );
+      invocationCompleted = true;
+      this.#preparationPhases.set(preparationDigest, 'retained');
+      const status: unknown = terminal.status;
+      if (status === 'applied') {
+        const snapshot = snapshotAppliedTerminal<TResult>(
+          settlementInvocation,
+          terminal as Extract<
+            EventActorTerminalResult<TResult>,
+            { status: 'applied' }
+          >
+        );
+        return snapshot.status === 'snapshot_ready'
+          ? this.#issueSettlement(snapshot)
+          : snapshot;
+      }
+      if (status !== 'completed_no_action') {
+        return createIndeterminateResult(
+          settlementInvocation,
+          new Error('Event actor invocation returned an invalid status')
+        );
+      }
+      definitelyNoAction = true;
+      const completed = Object.freeze({
+        status: 'completed_no_action' as const,
+        ...(terminal.result === undefined
+          ? {}
+          : { result: snapshotEvent(terminal.result) }),
+      });
+      this.#preparationPhases.delete(preparationDigest);
+      return completed;
+    } catch (error) {
+      if (
+        isGraphInterrupt(error) ||
+        isParentCommand(error) ||
+        (invocationCompleted && !definitelyNoAction)
+      ) {
+        this.#preparationPhases.set(preparationDigest, 'retained');
+      } else {
+        this.#preparationPhases.delete(preparationDigest);
+      }
+      throw error;
+    }
   }
 
   #issueSettlement(
@@ -978,7 +1036,7 @@ export class EventActorExecutor<
 
   async commit(
     settlement: EventActorAppliedResult<TResult>
-  ): Promise<EventActorCommitResult> {
+  ): Promise<EventActorSettlementResult<TResult>> {
     if (!this.#issuedSettlements.has(settlement)) {
       throw new Error('Event actor settlement was not issued by this executor');
     }
@@ -988,62 +1046,102 @@ export class EventActorExecutor<
     validateInvocationReference(trustedInvocation, this.#maxDepth);
     const trustedCheckpoint = snapshotCheckpointFork(settlement.checkpoint);
     validateTerminalCheckpoint(trustedInvocation, trustedCheckpoint);
-    const committed = await this.#adapter.commit({
-      invocation: snapshotInvocationReference(trustedInvocation),
-      expectedHead: snapshotHead(trustedInvocation.base),
-      checkpoint: { ...trustedCheckpoint },
-      result: settlement.result,
-      retention: {
-        committedCheckpoints: 2,
-        dormantCheckpointTtlMs: this.#dormantCheckpointTtlMs,
-      },
-    });
-    if (committed.status === 'committed') {
-      const committedHead = snapshotHead(committed.head);
-      validateCommittedHead(
-        trustedInvocation,
-        trustedCheckpoint,
-        committedHead
-      );
-      return { status: 'committed', head: committedHead };
-    }
-    if (committed.head != null) {
-      const committedHead = snapshotHead(committed.head);
-      validateHead(committedHead, trustedInvocation.actorThreadId);
-      if (committedHead.generation <= trustedInvocation.base.generation) {
-        throw new Error('Stale event actor head did not advance past its base');
-      }
-      if (
-        trustedInvocation.base.checkpoint != null &&
-        committedHead.checkpoint?.threadId !==
-          trustedInvocation.base.checkpoint.threadId
-      ) {
-        throw new Error('Stale event actor head changed its checkpoint thread');
-      }
-      if (
-        checkpointIdsMatch(
-          committedHead.checkpoint,
-          trustedInvocation.base.checkpoint
-        ) ||
-        checkpointIdsMatch(committedHead.checkpoint, trustedInvocation.fork) ||
-        checkpointsMatch(committedHead.checkpoint, trustedCheckpoint)
-      ) {
-        throw new Error(
-          'Stale event actor head does not identify a competing checkpoint'
+    this.#issuedSettlements.delete(settlement);
+    try {
+      const committed = await this.#adapter.commit({
+        invocation: snapshotInvocationReference(trustedInvocation),
+        expectedHead: snapshotHead(trustedInvocation.base),
+        checkpoint: { ...trustedCheckpoint },
+        result: settlement.result,
+        retention: {
+          committedCheckpoints: 2,
+          dormantCheckpointTtlMs: this.#dormantCheckpointTtlMs,
+        },
+      });
+      const status: unknown = committed.status;
+      if (status === 'committed') {
+        const committedHead = snapshotHead(
+          (committed as { status: 'committed'; head: EventActorHead }).head
         );
+        validateCommittedHead(
+          trustedInvocation,
+          trustedCheckpoint,
+          committedHead
+        );
+        return { status: 'committed', head: committedHead };
       }
-      return { status: 'stale', head: committedHead };
+      if (status !== 'stale') {
+        throw new Error('Event actor commit returned an invalid status');
+      }
+      const staleHead = committed.head;
+      if (staleHead != null) {
+        const committedHead = snapshotHead(staleHead);
+        validateHead(committedHead, trustedInvocation.actorThreadId);
+        if (committedHead.generation <= trustedInvocation.base.generation) {
+          throw new Error(
+            'Stale event actor head did not advance past its base'
+          );
+        }
+        if (
+          trustedInvocation.base.checkpoint != null &&
+          committedHead.checkpoint?.threadId !==
+            trustedInvocation.base.checkpoint.threadId
+        ) {
+          throw new Error(
+            'Stale event actor head changed its checkpoint thread'
+          );
+        }
+        if (
+          checkpointIdsMatch(
+            committedHead.checkpoint,
+            trustedInvocation.base.checkpoint
+          ) ||
+          checkpointIdsMatch(
+            committedHead.checkpoint,
+            trustedInvocation.fork
+          ) ||
+          checkpointsMatch(committedHead.checkpoint, trustedCheckpoint)
+        ) {
+          throw new Error(
+            'Stale event actor head does not identify a competing checkpoint'
+          );
+        }
+        return { status: 'stale', head: committedHead };
+      }
+      return { status: 'stale' };
+    } catch (error) {
+      return createSettlementIndeterminateResult(settlement, error);
     }
-    return committed;
   }
 
-  discard(
+  async discard(
     invocation: EventActorPreparedInvocation<TEvent>,
     reason: EventActorDiscardReason
   ): Promise<void> {
+    const discardReason: unknown = reason;
+    if (
+      discardReason !== 'cancelled' &&
+      discardReason !== 'completed_no_action' &&
+      discardReason !== 'failed'
+    ) {
+      throw new Error('Event actor discard reason is invalid');
+    }
     const trustedInvocation = snapshotPreparedInvocation(invocation);
     this.#validatePreparedInvocation(trustedInvocation);
-    return this.#discardInvocationReference(trustedInvocation, reason);
+    const preparationDigest = trustedInvocation.preparationDigest;
+    if (this.#preparationPhases.has(preparationDigest)) {
+      throw new Error(
+        'Event actor prepared invocation is no longer discardable'
+      );
+    }
+    this.#preparationPhases.set(preparationDigest, 'discarding');
+    try {
+      await this.#discardInvocationReference(trustedInvocation, reason);
+      this.#preparationPhases.set(preparationDigest, 'discarded');
+    } catch (error) {
+      this.#preparationPhases.delete(preparationDigest);
+      throw error;
+    }
   }
 
   #discardInvocationReference(
@@ -1144,11 +1242,29 @@ export class EventActorExecutor<
       }
       return { status: 'failed', error: asError(error), continuation };
     }
-    if (terminal.status === 'completed_no_action') {
-      const result =
-        terminal.result === undefined
-          ? undefined
-          : snapshotEvent(terminal.result);
+    let terminalStatus: unknown;
+    try {
+      terminalStatus = terminal.status;
+    } catch (error) {
+      return {
+        ...createIndeterminateResult(invocationReference, error),
+        continuation,
+      };
+    }
+    if (terminalStatus === 'completed_no_action') {
+      let result: TResult | undefined;
+      try {
+        result =
+          terminal.result === undefined
+            ? undefined
+            : snapshotEvent(terminal.result);
+      } catch (error) {
+        await this.#discardInvocationReference(
+          invocationReference,
+          'completed_no_action'
+        );
+        return { status: 'failed', error: asError(error), continuation };
+      }
       await this.#discardInvocationReference(
         invocationReference,
         'completed_no_action'
@@ -1159,23 +1275,30 @@ export class EventActorExecutor<
         continuation,
       };
     }
-    const appliedSnapshot = snapshotAppliedTerminal(
+    if (terminalStatus !== 'applied') {
+      return {
+        ...createIndeterminateResult(
+          invocationReference,
+          new Error('Event actor invocation returned an invalid status')
+        ),
+        continuation,
+      };
+    }
+    const appliedSnapshot = snapshotAppliedTerminal<TResult>(
       invocationReference,
-      terminal
+      terminal as Extract<
+        EventActorTerminalResult<TResult>,
+        { status: 'applied' }
+      >
     );
     if (appliedSnapshot.status === 'commit_indeterminate') {
       return { ...appliedSnapshot, continuation };
     }
     const trustedTerminal = this.#issueSettlement(appliedSnapshot);
-    let committed;
-    try {
-      committed = await this.commit(trustedTerminal);
-    } catch (error) {
+    const committed = await this.commit(trustedTerminal);
+    if (committed.status === 'commit_indeterminate') {
       return {
-        status: 'commit_indeterminate',
-        result: trustedTerminal.result,
-        checkpoint: { ...trustedTerminal.checkpoint },
-        error: asError(error),
+        ...committed,
         continuation,
       };
     }

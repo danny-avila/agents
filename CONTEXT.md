@@ -66,8 +66,12 @@ across executor lifetimes provide the same private preparation signing key to
 every authorized executor.
 Public invocation produces an executor-issued **Applied Settlement** that binds
 immutable result and terminal checkpoint evidence to the exact invocation
-reference that ran; commit consumes that settlement rather than accepting a
-second caller-supplied invocation.
+reference that ran. Invocation start phase-fences the prepared capability so it
+cannot subsequently authorize discard of active or applied work. Commit
+consumes the settlement exactly once and returns structured indeterminate
+evidence for missing or invalid acknowledgements rather than exposing a
+retryable-looking exception. A host mailbox remains the durable cross-runtime
+owner and deduplication fence.
 
 Applied work may commit its Invocation Fork. Failed, cancelled, and
 completed-without-action invocations discard their forks. An applied fork that

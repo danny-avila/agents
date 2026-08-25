@@ -75,7 +75,7 @@ export type EventActorAppliedResult<TResult extends EventActorEvent> = Extract<
   EventActorTerminalResult<TResult>,
   { status: 'applied' }
 > & {
-  /** Executor-issued immutable reference to the invocation that produced this action. */
+  /** Executor-issued one-shot settlement for the invocation that produced this action. */
   invocation: EventActorInvocationReference;
 };
 
@@ -134,6 +134,11 @@ export interface EventActorCommitRequest<TResult extends EventActorEvent> {
 export type EventActorCommitResult =
   | { status: 'committed'; head: EventActorHead }
   | { status: 'stale'; head?: EventActorHead };
+
+/** Public settlement outcome after an action has already been applied. */
+export type EventActorSettlementResult<TResult extends EventActorEvent> =
+  | EventActorCommitResult
+  | EventActorIndeterminateResult<TResult>;
 
 export type EventActorDiscardReason =
   | 'cancelled'
