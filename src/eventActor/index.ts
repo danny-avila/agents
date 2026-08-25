@@ -24,6 +24,7 @@ export type {
   EventActorInvocationResult,
   EventActorPreparation,
   EventActorPreparationContext,
+  EventActorPreparedInvocation,
   EventActorPrepareRequest,
   EventActorTerminalResult,
 } from './types';

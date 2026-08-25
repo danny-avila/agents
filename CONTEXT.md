@@ -57,10 +57,12 @@ the generation and prior checkpoint identity.
 An **Event Actor Event** is immutable JSON data snapshotted at every public and
 host-adapter boundary. Cold reconstruction receives the explicit task-owned
 cancellation signal and owns rollback until it returns a validated invocation.
+Prepared invocations and unavailable request/head pairs carry integrity
+bindings so independently valid lifecycle evidence cannot be recombined.
 Public invocation produces an executor-issued **Applied Settlement** that binds
-terminal checkpoint evidence to the exact invocation reference that ran;
-commit consumes that settlement rather than accepting a second caller-supplied
-invocation.
+immutable result and terminal checkpoint evidence to the exact invocation
+reference that ran; commit consumes that settlement rather than accepting a
+second caller-supplied invocation.
 
 Applied work may commit its Invocation Fork. Failed, cancelled, and
 completed-without-action invocations discard their forks. An applied fork that

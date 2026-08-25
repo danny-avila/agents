@@ -6,6 +6,7 @@ import type {
   EventActorCheckpointFork,
   EventActorCommitRequest,
   EventActorDiscardRequest,
+  EventActorEvent,
   EventActorHead,
   EventActorHostAdapter,
   EventActorInvocation,
@@ -68,6 +69,7 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
   readonly commits: EventActorCommitRequest<string>[] = [];
   readonly discards: EventActorDiscardRequest[] = [];
   readonly invokeSignals: AbortSignal[] = [];
+  readonly prepareSignals: AbortSignal[] = [];
   readonly coldContinueSignals: AbortSignal[] = [];
   readonly invokeConfigs: RunnableConfig[] = [];
   readonly forkNamespaces: string[] = [];
@@ -76,7 +78,13 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
     signal: AbortSignal
   ) => Promise<EventActorTerminalResult<string>>;
 
-  async prepare(request: EventActorAdapterPrepareRequest<TestEvent>) {
+  async prepare(
+    request: EventActorAdapterPrepareRequest<TestEvent>,
+    context?: EventActorPreparationContext
+  ) {
+    if (context != null) {
+      this.prepareSignals.push(context.signal);
+    }
     if (!this.checkpointAvailable) {
       return {
         status: 'checkpoint_unavailable' as const,
@@ -288,6 +296,66 @@ describe('EventActorExecutor', () => {
     await expect(executor.commit(settlement)).resolves.toMatchObject({
       status: 'committed',
       head: { generation: 2 },
+    });
+  });
+
+  it('snapshots mutable settlement results before commit', async () => {
+    type ObjectResult = { outcome: string; detail: { code: number } };
+    const host = new TestHost();
+    const adapterResult: ObjectResult = {
+      outcome: 'applied',
+      detail: { code: 200 },
+    };
+    let committedResult: ObjectResult | undefined;
+    const adapter: EventActorHostAdapter<TestEvent, ObjectResult> = {
+      prepare: host.prepare.bind(host),
+      coldContinue: host.coldContinue.bind(host),
+      invoke: async (prepared) => ({
+        status: 'applied',
+        result: adapterResult,
+        checkpoint: {
+          ...prepared.fork,
+          checkpointId: 'object-result-terminal',
+        },
+      }),
+      commit: async (commitRequest) => {
+        committedResult = commitRequest.result;
+        return {
+          status: 'committed',
+          head: {
+            actorThreadId: commitRequest.invocation.actorThreadId,
+            generation: commitRequest.expectedHead.generation + 1,
+            checkpoint: { ...commitRequest.checkpoint },
+          },
+        };
+      },
+      discard: host.discard.bind(host),
+    };
+    const executor = new EventActorExecutor(adapter);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'immutable-result',
+      depth: 1,
+      event: { text: 'immutable-result' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const settlement = await executor.invoke(preparation.invocation);
+    if (settlement.status !== 'applied') {
+      throw new Error('Expected applied settlement');
+    }
+
+    adapterResult.outcome = 'mutated';
+    adapterResult.detail.code = 500;
+    expect(() => {
+      settlement.result.outcome = 'forged';
+    }).toThrow();
+    await executor.commit(settlement);
+
+    expect(committedResult).toEqual({
+      outcome: 'applied',
+      detail: { code: 200 },
     });
   });
 
@@ -702,7 +770,7 @@ describe('EventActorExecutor', () => {
     expect(host.invokes).toBe(2);
   });
 
-  it('enforces maxDepth for host-driven invocation', async () => {
+  it('rejects forged host-driven invocation depth', async () => {
     const host = new TestHost();
     const executor = new EventActorExecutor(host, { maxDepth: 1 });
     const preparation = await executor.prepare({
@@ -723,7 +791,7 @@ describe('EventActorExecutor', () => {
     };
 
     await expect(executor.invoke(forgedInvocation)).rejects.toThrow(
-      'exceeds maximum 1'
+      'prepared invocation binding is invalid'
     );
     expect(host.invokes).toBe(0);
   });
@@ -752,7 +820,17 @@ describe('EventActorExecutor', () => {
 
   it('binds ambient actor depth during public preparation', async () => {
     const host = new TestHost();
+    host.checkpointAvailable = false;
     const executor = new EventActorExecutor(host, { maxDepth: 2 });
+    const unavailablePreparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'ambient-cold-prepare',
+      depth: 1,
+      event: { text: 'ambient-cold-prepare' },
+    });
+    if (unavailablePreparation.status !== 'checkpoint_unavailable') {
+      throw new Error('Expected unavailable checkpoint');
+    }
     const runnableConfigSpy = jest
       .spyOn(AsyncLocalStorageProviderSingleton, 'getRunnableConfig')
       .mockReturnValue({ configurable: { event_actor_depth: 1 } });
@@ -762,16 +840,7 @@ describe('EventActorExecutor', () => {
       depth: 1,
       event: { text: 'ambient-warm-prepare' },
     });
-    const coldPreparation = executor.coldContinue({
-      status: 'checkpoint_unavailable',
-      request: {
-        actorThreadId: 'actor-thread',
-        invocationId: 'ambient-cold-prepare',
-        depth: 1,
-        event: { text: 'ambient-cold-prepare' },
-      },
-      head: head(0),
-    });
+    const coldPreparation = executor.coldContinue(unavailablePreparation);
     runnableConfigSpy.mockRestore();
 
     await expect(warmPreparation).rejects.toThrow(
@@ -867,6 +936,71 @@ describe('EventActorExecutor', () => {
     });
   });
 
+  it('rejects sparse arrays at the immutable JSON event boundary', async () => {
+    const adapter: EventActorHostAdapter<EventActorEvent, string> = {
+      prepare: async () => {
+        throw new Error('prepare must not run');
+      },
+      coldContinue: async () => {
+        throw new Error('coldContinue must not run');
+      },
+      invoke: async () => {
+        throw new Error('invoke must not run');
+      },
+      commit: async () => {
+        throw new Error('commit must not run');
+      },
+      discard: async () => undefined,
+    };
+    const prepareSpy = jest.spyOn(adapter, 'prepare');
+    const executor = new EventActorExecutor(adapter);
+
+    await expect(
+      executor.prepare({
+        actorThreadId: 'actor-thread',
+        invocationId: 'sparse-event',
+        depth: 1,
+        event: new Array<EventActorEvent>(1),
+      })
+    ).rejects.toThrow('event arrays must not contain holes');
+    expect(prepareSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects recombined unavailable request and head evidence', async () => {
+    const host = new TestHost();
+    host.checkpointAvailable = false;
+    const executor = new EventActorExecutor(host);
+    const first = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'first-unavailable',
+      depth: 1,
+      event: { text: 'first-unavailable' },
+    });
+    host.generation = 1;
+    const second = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'second-unavailable',
+      depth: 1,
+      event: { text: 'second-unavailable' },
+    });
+    if (
+      first.status !== 'checkpoint_unavailable' ||
+      second.status !== 'checkpoint_unavailable'
+    ) {
+      throw new Error('Expected unavailable checkpoints');
+    }
+
+    await expect(
+      executor.coldContinue({
+        status: 'checkpoint_unavailable',
+        request: first.request,
+        head: second.head,
+        preparationDigest: first.preparationDigest,
+      })
+    ).rejects.toThrow('unavailable preparation binding is invalid');
+    expect(host.coldContinues).toBe(0);
+  });
+
   it('snapshots the cold-continuation handoff before adapter work can yield', async () => {
     const host = new TestHost();
     host.checkpointAvailable = false;
@@ -902,6 +1036,7 @@ describe('EventActorExecutor', () => {
           ? {}
           : { checkpoint: { ...preparation.head.checkpoint } }),
       },
+      preparationDigest: preparation.preparationDigest,
     };
     const continuationPromise = executor.coldContinue(mutablePreparation);
     mutablePreparation.request.actorThreadId = 'mutated-actor';
@@ -980,7 +1115,7 @@ describe('EventActorExecutor', () => {
     expect(host.invokes).toBe(0);
   });
 
-  it('cancels before unavailable checkpoints enter cold continuation', async () => {
+  it('cancels in-flight initial preparation before cold continuation', async () => {
     const host = new TestHost();
     host.checkpointAvailable = false;
     const prepare = host.prepare.bind(host);
@@ -988,9 +1123,9 @@ describe('EventActorExecutor', () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    host.prepare = async (prepareRequest) => {
+    host.prepare = async (prepareRequest, context) => {
       await gate;
-      return prepare(prepareRequest);
+      return prepare(prepareRequest, context);
     };
     const controller = new AbortController();
     const execution = new EventActorExecutor(host).execute(
@@ -1001,8 +1136,10 @@ describe('EventActorExecutor', () => {
 
     await expect(execution).resolves.toEqual({
       status: 'cancelled',
-      continuation: 'cold',
+      continuation: 'warm',
     });
+    expect(host.prepareSignals).toHaveLength(1);
+    expect(host.prepareSignals[0].aborted).toBe(true);
     expect(host.coldContinues).toBe(0);
     expect(host.invokes).toBe(0);
     expect(host.discards).toHaveLength(0);
@@ -1045,6 +1182,39 @@ describe('EventActorExecutor', () => {
     expect(host.coldContinueSignals[0].aborted).toBe(true);
     expect(host.invokes).toBe(0);
     expect(host.discards).toHaveLength(0);
+  });
+
+  it('surfaces cleanup failure after cold continuation cancellation', async () => {
+    const host = new TestHost();
+    host.checkpointAvailable = false;
+    const coldContinue = host.coldContinue.bind(host);
+    let started = (): void => undefined;
+    const coldStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    host.coldContinue = async (prepareRequest, actorHead, context) => {
+      started();
+      await new Promise<void>((resolve) => {
+        context.signal.addEventListener('abort', () => resolve(), {
+          once: true,
+        });
+      });
+      return coldContinue(prepareRequest, actorHead, context);
+    };
+    host.discard = async () => {
+      throw new Error('cold cleanup failed');
+    };
+    const controller = new AbortController();
+    const executor = new EventActorExecutor(host);
+    const execution = executor.execute(
+      request('cleanup-failure', { signal: controller.signal })
+    );
+    await coldStarted;
+
+    controller.abort(new Error('cancel cold reconstruction'));
+
+    await expect(execution).rejects.toThrow('cold cleanup failed');
+    expect(host.invokes).toBe(0);
   });
 
   it('retains an applied result with a checkpoint outside the invocation fork', async () => {
@@ -1218,6 +1388,29 @@ describe('EventActorExecutor', () => {
       status: 'applied',
       result: 'authoritative-event',
     });
+  });
+
+  it('rejects an event recombined with another prepared invocation', async () => {
+    const host = new TestHost();
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'bound-event',
+      depth: 1,
+      event: { text: 'bound-event' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const forgedInvocation = {
+      ...preparation.invocation,
+      event: { text: 'replacement-event' },
+    };
+
+    await expect(executor.invoke(forgedInvocation)).rejects.toThrow(
+      'prepared invocation binding is invalid'
+    );
+    expect(host.invokes).toBe(0);
   });
 
   it('invokes with the authoritative request event after cold continuation', async () => {
@@ -1622,18 +1815,18 @@ describe('EventActorExecutor', () => {
 
   it('validates a cold-continuation head before adapter work', async () => {
     const host = new TestHost();
+    host.prepare = async () => ({
+      status: 'checkpoint_unavailable' as const,
+      head: { actorThreadId: 'another-actor', generation: 0 },
+    });
     const executor = new EventActorExecutor(host);
 
     await expect(
-      executor.coldContinue({
-        status: 'checkpoint_unavailable',
-        request: {
-          actorThreadId: 'actor-thread',
-          invocationId: 'foreign-head',
-          depth: 1,
-          event: { text: 'foreign-head' },
-        },
-        head: { actorThreadId: 'another-actor', generation: 0 },
+      executor.prepare({
+        actorThreadId: 'actor-thread',
+        invocationId: 'foreign-head',
+        depth: 1,
+        event: { text: 'foreign-head' },
       })
     ).rejects.toThrow('Event actor head is invalid');
     expect(host.coldContinues).toBe(0);
@@ -1676,7 +1869,18 @@ describe('EventActorExecutor', () => {
 
   it('detects a cold adapter mutating its copy of the prepared head', async () => {
     const host = new TestHost();
-    const validHead = head(1);
+    host.generation = 1;
+    host.checkpointAvailable = false;
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'mutated-head',
+      depth: 1,
+      event: { text: 'mutated-head' },
+    });
+    if (preparation.status !== 'checkpoint_unavailable') {
+      throw new Error('Expected unavailable checkpoint');
+    }
     host.coldContinue = async (prepareRequest, adapterHead) => {
       adapterHead.generation = 2;
       return {
@@ -1688,21 +1892,11 @@ describe('EventActorExecutor', () => {
         },
       };
     };
-    const executor = new EventActorExecutor(host);
 
-    await expect(
-      executor.coldContinue({
-        status: 'checkpoint_unavailable',
-        request: {
-          actorThreadId: 'actor-thread',
-          invocationId: 'mutated-head',
-          depth: 1,
-          event: { text: 'mutated-head' },
-        },
-        head: validHead,
-      })
-    ).rejects.toThrow('Cold continuation did not use the prepared actor head');
-    expect(validHead.generation).toBe(1);
+    await expect(executor.coldContinue(preparation)).rejects.toThrow(
+      'Cold continuation did not use the prepared actor head'
+    );
+    expect(preparation.head.generation).toBe(1);
   });
 
   it('uses the validated ownership snapshot after adapter invocation', async () => {

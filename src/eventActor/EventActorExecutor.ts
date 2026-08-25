@@ -16,6 +16,7 @@ import type {
   EventActorInvocation,
   EventActorInvocationResult,
   EventActorInvocationReference,
+  EventActorPreparedInvocation,
   EventActorPrepareRequest,
   EventActorPreparation,
   EventActorTerminalResult,
@@ -63,7 +64,22 @@ function snapshotEvent<TEvent extends EventActorEvent>(event: TEvent): TEvent {
     ancestors.add(value);
     try {
       if (Array.isArray(value)) {
-        return Object.freeze(value.map((item) => clone(item)));
+        if (Object.getOwnPropertySymbols(value).length > 0) {
+          throw new Error('Event actor event arrays must not contain symbols');
+        }
+        const snapshot: EventActorEvent[] = [];
+        for (let index = 0; index < value.length; index += 1) {
+          if (!Object.hasOwn(value, index)) {
+            throw new Error('Event actor event arrays must not contain holes');
+          }
+          snapshot.push(clone(value[index]));
+        }
+        if (Object.keys(value).length !== value.length) {
+          throw new Error(
+            'Event actor event arrays must not contain named properties'
+          );
+        }
+        return Object.freeze(snapshot);
       }
       const prototype = Object.getPrototypeOf(value);
       if (prototype !== Object.prototype && prototype !== null) {
@@ -73,7 +89,8 @@ function snapshotEvent<TEvent extends EventActorEvent>(event: TEvent): TEvent {
         throw new Error('Event actor events must not contain symbol keys');
       }
       const snapshot: Record<string, EventActorEvent> = {};
-      for (const [key, item] of Object.entries(value)) {
+      for (const key of Object.keys(value).sort()) {
+        const item = value[key as keyof typeof value];
         Object.defineProperty(snapshot, key, {
           configurable: false,
           enumerable: true,
@@ -149,6 +166,58 @@ function freezeInvocation<TEvent extends EventActorEvent>(
     ...freezeInvocationReference(invocation),
     event: snapshotEvent(invocation.event),
   });
+}
+
+function createPreparationDigest(value: object): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function createInvocationPreparationDigest<TEvent extends EventActorEvent>(
+  invocation: EventActorInvocation<TEvent>
+): string {
+  return createPreparationDigest({
+    kind: 'invocation',
+    actorThreadId: invocation.actorThreadId,
+    invocationId: invocation.invocationId,
+    depth: invocation.depth,
+    continuation: invocation.continuation,
+    base: invocation.base,
+    fork: invocation.fork,
+    event: invocation.event,
+  });
+}
+
+function createUnavailablePreparationDigest<TEvent extends EventActorEvent>(
+  request: EventActorPrepareRequest<TEvent>,
+  head: EventActorHead
+): string {
+  return createPreparationDigest({
+    kind: 'checkpoint_unavailable',
+    request,
+    head,
+  });
+}
+
+function createPreparedInvocation<TEvent extends EventActorEvent>(
+  invocation: EventActorInvocation<TEvent>
+): EventActorPreparedInvocation<TEvent> {
+  const trustedInvocation = freezeInvocation(invocation);
+  return Object.freeze({
+    ...trustedInvocation,
+    preparationDigest: createInvocationPreparationDigest(trustedInvocation),
+  });
+}
+
+function validatePreparedInvocation<TEvent extends EventActorEvent>(
+  invocation: EventActorPreparedInvocation<TEvent>
+): void {
+  requireNonEmpty(invocation.preparationDigest, 'preparationDigest');
+  if (
+    invocation.preparationDigest !==
+    createInvocationPreparationDigest(invocation)
+  ) {
+    throw new Error('Event actor prepared invocation binding is invalid');
+  }
 }
 
 function freezePrepareRequest<TEvent extends EventActorEvent>(
@@ -427,6 +496,18 @@ function isAborted(signal?: AbortSignal): boolean {
   return signal?.aborted === true;
 }
 
+class EventActorPreparationCancelledError extends Error {
+  constructor(
+    readonly continuation: 'warm' | 'cold',
+    reason: unknown
+  ) {
+    super(`Event actor ${continuation} preparation was cancelled`, {
+      cause: reason,
+    });
+    this.name = 'EventActorPreparationCancelledError';
+  }
+}
+
 function resolveExecutionDepth(
   requestedDepth: number | undefined,
   ambientConfig: RunnableConfig | undefined
@@ -467,7 +548,10 @@ function validateCommittedHead(
  * Runs one event against an isolated checkpoint fork and advances the stable
  * actor head only through the host's atomic commit interface.
  */
-export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
+export class EventActorExecutor<
+  TEvent extends EventActorEvent,
+  TResult extends EventActorEvent,
+> {
   private readonly maxDepth: number;
   private readonly dormantCheckpointTtlMs: number;
   private readonly issuedSettlements = new WeakSet<object>();
@@ -491,7 +575,8 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
   }
 
   async prepare(
-    request: EventActorPrepareRequest<TEvent>
+    request: EventActorPrepareRequest<TEvent>,
+    signal?: AbortSignal
   ): Promise<EventActorPreparation<TEvent>> {
     const trustedRequest = snapshotPrepareRequest(request);
     resolveExecutionDepth(
@@ -504,7 +589,34 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
       ...snapshotPrepareRequest(trustedRequest),
       checkpointNs,
     };
-    const preparation = await this.adapter.prepare({ ...adapterRequest });
+    const controller = new AbortController();
+    const abort = (): void => controller.abort(signal?.reason);
+    if (isAborted(signal)) {
+      abort();
+    } else {
+      signal?.addEventListener('abort', abort, { once: true });
+    }
+    if (isAborted(controller.signal)) {
+      signal?.removeEventListener('abort', abort);
+      throw new EventActorPreparationCancelledError(
+        'warm',
+        controller.signal.reason
+      );
+    }
+    let preparation;
+    try {
+      preparation = await this.adapter.prepare(
+        { ...adapterRequest },
+        { signal: controller.signal }
+      );
+    } catch (error) {
+      if (isAborted(controller.signal) && error === controller.signal.reason) {
+        throw new EventActorPreparationCancelledError('warm', error);
+      }
+      throw error;
+    } finally {
+      signal?.removeEventListener('abort', abort);
+    }
     if (preparation.status === 'ready') {
       validateInvocation(
         trustedRequest,
@@ -513,19 +625,42 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
         checkpointNs,
         this.maxDepth
       );
+      const preparedInvocation = createPreparedInvocation({
+        ...snapshotInvocation(preparation.invocation),
+        event: snapshotEvent(trustedRequest.event),
+      });
+      if (isAborted(controller.signal)) {
+        await this.discard(
+          snapshotInvocationReference(preparedInvocation),
+          'cancelled'
+        );
+        throw new EventActorPreparationCancelledError(
+          'warm',
+          controller.signal.reason
+        );
+      }
       return Object.freeze({
         status: 'ready',
-        invocation: freezeInvocation({
-          ...snapshotInvocation(preparation.invocation),
-          event: snapshotEvent(trustedRequest.event),
-        }),
+        invocation: preparedInvocation,
       });
     } else {
       validateHead(preparation.head, trustedRequest.actorThreadId);
+      if (isAborted(controller.signal)) {
+        throw new EventActorPreparationCancelledError(
+          'warm',
+          controller.signal.reason
+        );
+      }
+      const preparedRequest = freezePrepareRequest(trustedRequest);
+      const preparedHead = freezeHead(preparation.head);
       return Object.freeze({
         status: 'checkpoint_unavailable',
-        request: freezePrepareRequest(trustedRequest),
-        head: freezeHead(preparation.head),
+        request: preparedRequest,
+        head: preparedHead,
+        preparationDigest: createUnavailablePreparationDigest(
+          preparedRequest,
+          preparedHead
+        ),
       });
     }
   }
@@ -536,7 +671,14 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
       { status: 'checkpoint_unavailable' }
     >,
     signal?: AbortSignal
-  ): Promise<EventActorInvocation<TEvent>> {
+  ): Promise<EventActorPreparedInvocation<TEvent>> {
+    requireNonEmpty(preparation.preparationDigest, 'preparationDigest');
+    if (
+      preparation.preparationDigest !==
+      createUnavailablePreparationDigest(preparation.request, preparation.head)
+    ) {
+      throw new Error('Event actor unavailable preparation binding is invalid');
+    }
     const request = snapshotPrepareRequest(preparation.request);
     const trustedHead = snapshotHead(preparation.head);
     resolveExecutionDepth(
@@ -559,7 +701,10 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
     }
     if (isAborted(controller.signal)) {
       signal?.removeEventListener('abort', abort);
-      throw asError(controller.signal.reason ?? 'Event actor cancelled');
+      throw new EventActorPreparationCancelledError(
+        'cold',
+        controller.signal.reason
+      );
     }
     let invocation;
     try {
@@ -568,6 +713,11 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
         snapshotHead(trustedHead),
         { signal: controller.signal }
       );
+    } catch (error) {
+      if (isAborted(controller.signal) && error === controller.signal.reason) {
+        throw new EventActorPreparationCancelledError('cold', error);
+      }
+      throw error;
     } finally {
       signal?.removeEventListener('abort', abort);
     }
@@ -588,15 +738,19 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
         snapshotInvocationReference(trustedInvocation),
         'cancelled'
       );
-      throw asError(controller.signal.reason ?? 'Event actor cancelled');
+      throw new EventActorPreparationCancelledError(
+        'cold',
+        controller.signal.reason
+      );
     }
-    return freezeInvocation(trustedInvocation);
+    return createPreparedInvocation(trustedInvocation);
   }
 
   async invoke(
-    invocation: EventActorInvocation<TEvent>,
+    invocation: EventActorPreparedInvocation<TEvent>,
     signal?: AbortSignal
   ): Promise<EventActorInvocationResult<TResult>> {
+    validatePreparedInvocation(invocation);
     const trustedInvocation = snapshotInvocation(invocation);
     const settlementInvocation = snapshotInvocationReference(trustedInvocation);
     const terminal = await this.invokeWithConfig(
@@ -609,7 +763,9 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
     }
     return Object.freeze({
       status: 'completed_no_action' as const,
-      ...(terminal.result === undefined ? {} : { result: terminal.result }),
+      ...(terminal.result === undefined
+        ? {}
+        : { result: snapshotEvent(terminal.result) }),
     });
   }
 
@@ -619,7 +775,7 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
   ): EventActorAppliedResult<TResult> {
     const settlement = Object.freeze({
       status: 'applied' as const,
-      result: terminal.result,
+      result: snapshotEvent(terminal.result),
       checkpoint: Object.freeze({ ...terminal.checkpoint }),
       invocation: freezeInvocationReference(invocation),
     });
@@ -781,7 +937,15 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
       depth,
       event: trustedRequest.event,
     };
-    const preparation = await this.prepare(prepareRequest);
+    let preparation;
+    try {
+      preparation = await this.prepare(prepareRequest, trustedRequest.signal);
+    } catch (error) {
+      if (error instanceof EventActorPreparationCancelledError) {
+        return { status: 'cancelled', continuation: error.continuation };
+      }
+      throw error;
+    }
     if (
       preparation.status === 'checkpoint_unavailable' &&
       isAborted(trustedRequest.signal)
@@ -795,10 +959,7 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
           ? preparation.invocation
           : await this.coldContinue(preparation, trustedRequest.signal);
     } catch (error) {
-      if (
-        preparation.status === 'checkpoint_unavailable' &&
-        isAborted(trustedRequest.signal)
-      ) {
+      if (error instanceof EventActorPreparationCancelledError) {
         return { status: 'cancelled', continuation: 'cold' };
       }
       throw error;
@@ -826,10 +987,14 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
       return { status: 'failed', error: asError(error), continuation };
     }
     if (terminal.status === 'completed_no_action') {
+      const result =
+        terminal.result === undefined
+          ? undefined
+          : snapshotEvent(terminal.result);
       await this.discard(invocationReference, 'completed_no_action');
       return {
         status: 'completed_no_action',
-        ...(terminal.result === undefined ? {} : { result: terminal.result }),
+        ...(result === undefined ? {} : { result }),
         continuation,
       };
     }
@@ -883,7 +1048,7 @@ export class EventActorExecutor<TEvent extends EventActorEvent, TResult> {
 
 export function createEventActorExecutor<
   TEvent extends EventActorEvent,
-  TResult,
+  TResult extends EventActorEvent,
 >(
   adapter: EventActorHostAdapter<TEvent, TResult>,
   options: EventActorExecutorOptions = {}

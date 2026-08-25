@@ -43,19 +43,27 @@ export interface EventActorInvocation<TEvent extends EventActorEvent>
   event: TEvent;
 }
 
+export interface EventActorPreparedInvocation<TEvent extends EventActorEvent>
+  extends EventActorInvocation<TEvent> {
+  /** Integrity binding over the complete prepared invocation. */
+  preparationDigest: string;
+}
+
 export type EventActorAdapterPreparation<TEvent extends EventActorEvent> =
   | { status: 'ready'; invocation: EventActorInvocation<TEvent> }
   | { status: 'checkpoint_unavailable'; head: EventActorHead };
 
 export type EventActorPreparation<TEvent extends EventActorEvent> =
-  | { status: 'ready'; invocation: EventActorInvocation<TEvent> }
+  | { status: 'ready'; invocation: EventActorPreparedInvocation<TEvent> }
   | {
       status: 'checkpoint_unavailable';
       request: EventActorPrepareRequest<TEvent>;
       head: EventActorHead;
+      /** Integrity binding over this exact request/head pair. */
+      preparationDigest: string;
     };
 
-export type EventActorTerminalResult<TResult> =
+export type EventActorTerminalResult<TResult extends EventActorEvent> =
   | {
       status: 'applied';
       result: TResult;
@@ -63,7 +71,7 @@ export type EventActorTerminalResult<TResult> =
     }
   | { status: 'completed_no_action'; result?: TResult };
 
-export type EventActorAppliedResult<TResult> = Extract<
+export type EventActorAppliedResult<TResult extends EventActorEvent> = Extract<
   EventActorTerminalResult<TResult>,
   { status: 'applied' }
 > & {
@@ -71,7 +79,7 @@ export type EventActorAppliedResult<TResult> = Extract<
   invocation: EventActorInvocationReference;
 };
 
-export type EventActorInvocationResult<TResult> =
+export type EventActorInvocationResult<TResult extends EventActorEvent> =
   | EventActorAppliedResult<TResult>
   | Extract<
       EventActorTerminalResult<TResult>,
@@ -101,7 +109,7 @@ export interface EventActorAdapterPrepareRequest<TEvent extends EventActorEvent>
   checkpointNs: string;
 }
 
-export interface EventActorCommitRequest<TResult> {
+export interface EventActorCommitRequest<TResult extends EventActorEvent> {
   invocation: EventActorInvocationReference;
   expectedHead: EventActorHead;
   checkpoint: EventActorCheckpointFork;
@@ -133,20 +141,23 @@ export interface EventActorDiscardRequest {
  * deduplicates the logical `invocationId` before entering this seam, while each
  * SDK execution attempt receives a distinct checkpoint namespace. Preparation
  * methods own rollback until they return a ready invocation and must treat the
- * request event as immutable. `invoke` returns only after its provider, stream,
- * timer, and executor resources have been released. Once qualifying action
- * evidence exists, `invoke` must return `applied` even if a later abort or
- * provider failure occurs; a thrown error is therefore a definite no-action
- * failure whose fork is safe to discard. `commit` must not reclaim an applied
- * stale fork: the SDK retains and surfaces it as `commit_conflict` for host
+ * request event as immutable. On cancellation they roll back and reject with
+ * `context.signal.reason`; cleanup failures reject with their own error so they
+ * remain observable. `invoke` returns only after its provider, stream, timer,
+ * and executor resources have been released. Once qualifying action evidence
+ * exists, `invoke` must return `applied` even if a later abort or provider
+ * failure occurs; a thrown error is therefore a definite no-action failure
+ * whose fork is safe to discard. `commit` must not reclaim an applied stale
+ * fork: the SDK retains and surfaces it as `commit_conflict` for host
  * reconciliation.
  */
 export interface EventActorHostAdapter<
   TEvent extends EventActorEvent,
-  TResult,
+  TResult extends EventActorEvent,
 > {
   prepare(
-    request: EventActorAdapterPrepareRequest<TEvent>
+    request: EventActorAdapterPrepareRequest<TEvent>,
+    context: EventActorPreparationContext
   ): Promise<EventActorAdapterPreparation<TEvent>>;
   coldContinue(
     request: EventActorAdapterPrepareRequest<TEvent>,
@@ -172,7 +183,7 @@ export interface EventActorExecutionRequest<TEvent extends EventActorEvent> {
   signal?: AbortSignal;
 }
 
-export type EventActorExecutionResult<TResult> =
+export type EventActorExecutionResult<TResult extends EventActorEvent> =
   | {
       status: 'applied';
       result: TResult;
