@@ -173,8 +173,18 @@ function createRunnableConfig(
   signal: AbortSignal,
   ambient?: RunnableConfig
 ): RunnableConfig {
+  const {
+    signal: _ambientSignal,
+    runId: _ambientRunId,
+    runName: _ambientRunName,
+    callbacks: ambientCallbacks,
+    tags: ambientTags,
+    metadata: ambientMetadata,
+    configurable: ambientConfigurable,
+    ...ambientRuntime
+  } = ambient ?? {};
   const configurable = Object.fromEntries(
-    Object.entries(ambient?.configurable ?? {}).filter(
+    Object.entries(ambientConfigurable ?? {}).filter(
       ([key]) =>
         !key.startsWith('__pregel_') &&
         !key.startsWith('__librechat_') &&
@@ -191,18 +201,12 @@ function createRunnableConfig(
   delete configurable.event_actor_depth;
   delete configurable.event_actor_continuation;
   return {
+    ...ambientRuntime,
     signal,
-    ...(ambient?.recursionLimit == null
-      ? {}
-      : { recursionLimit: ambient.recursionLimit }),
-    ...(ambient?.maxConcurrency == null
-      ? {}
-      : { maxConcurrency: ambient.maxConcurrency }),
-    ...(ambient?.timeout == null ? {} : { timeout: ambient.timeout }),
-    ...(ambient?.callbacks == null ? {} : { callbacks: ambient.callbacks }),
-    ...(ambient?.tags == null ? {} : { tags: ambient.tags }),
+    ...(ambientCallbacks == null ? {} : { callbacks: ambientCallbacks }),
+    ...(ambientTags == null ? {} : { tags: ambientTags }),
     metadata: {
-      ...(ambient?.metadata ?? {}),
+      ...(ambientMetadata ?? {}),
       eventActorThreadId: invocation.actorThreadId,
       eventActorInvocationId: invocation.invocationId,
       eventActorGeneration: invocation.base.generation,

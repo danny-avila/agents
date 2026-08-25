@@ -441,34 +441,42 @@ describe('EventActorExecutor', () => {
       };
     };
     const executor = new EventActorExecutor(host);
+    const ambientStore = { get: jest.fn() };
+    const ambientContext = { tenantId: 'tenant-1' };
+    const ambientConfig = {
+      signal: parentController.signal,
+      callbacks: [],
+      tags: ['parent-trace'],
+      metadata: { userId: 'user-1', sessionId: 'session-1' },
+      recursionLimit: 80,
+      maxConcurrency: 4,
+      timeout: 30_000,
+      runId: 'parent-run',
+      runName: 'parent-run-name',
+      store: ambientStore,
+      context: ambientContext,
+      configurable: {
+        user_id: 'user-1',
+        requestBody: { conversationId: 'conversation-1' },
+        userMCPAuthMap: { chess: 'credential' },
+        thread_id: 'parent-thread',
+        checkpoint_ns: 'parent-namespace',
+        checkpoint_id: 'parent-checkpoint',
+        checkpoint_map: { parent: 'checkpoint' },
+        __pregel_checkpointer: { parent: true },
+        __pregel_scratchpad: { parent: true },
+        __librechat_subagent_resume_manifest: { parent: true },
+        __librechat_tool_approval_execution_scope: { parent: true },
+        lc_run_breaker_scope: { parent: true },
+      },
+    } as RunnableConfig & {
+      store: typeof ambientStore;
+      context: typeof ambientContext;
+    };
 
     const runnableConfigSpy = jest
       .spyOn(AsyncLocalStorageProviderSingleton, 'getRunnableConfig')
-      .mockReturnValue({
-        signal: parentController.signal,
-        callbacks: [],
-        tags: ['parent-trace'],
-        metadata: { userId: 'user-1', sessionId: 'session-1' },
-        recursionLimit: 80,
-        maxConcurrency: 4,
-        timeout: 30_000,
-        runId: 'parent-run',
-        runName: 'parent-run-name',
-        configurable: {
-          user_id: 'user-1',
-          requestBody: { conversationId: 'conversation-1' },
-          userMCPAuthMap: { chess: 'credential' },
-          thread_id: 'parent-thread',
-          checkpoint_ns: 'parent-namespace',
-          checkpoint_id: 'parent-checkpoint',
-          checkpoint_map: { parent: 'checkpoint' },
-          __pregel_checkpointer: { parent: true },
-          __pregel_scratchpad: { parent: true },
-          __librechat_subagent_resume_manifest: { parent: true },
-          __librechat_tool_approval_execution_scope: { parent: true },
-          lc_run_breaker_scope: { parent: true },
-        },
-      });
+      .mockReturnValue(ambientConfig);
     const executions = [
       executor.execute(request('sibling-a')),
       executor.execute(request('sibling-b')),
@@ -495,6 +503,8 @@ describe('EventActorExecutor', () => {
       recursionLimit: 80,
       maxConcurrency: 4,
       timeout: 30_000,
+      store: ambientStore,
+      context: ambientContext,
       metadata: {
         userId: 'user-1',
         sessionId: 'session-1',
