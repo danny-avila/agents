@@ -34,9 +34,17 @@ export interface EventActorInvocation<TEvent>
   event: TEvent;
 }
 
-export type EventActorPreparation<TEvent> =
+export type EventActorAdapterPreparation<TEvent> =
   | { status: 'ready'; invocation: EventActorInvocation<TEvent> }
   | { status: 'checkpoint_unavailable'; head: EventActorHead };
+
+export type EventActorPreparation<TEvent> =
+  | { status: 'ready'; invocation: EventActorInvocation<TEvent> }
+  | {
+      status: 'checkpoint_unavailable';
+      request: EventActorPrepareRequest<TEvent>;
+      head: EventActorHead;
+    };
 
 export type EventActorTerminalResult<TResult> =
   | {
@@ -112,7 +120,7 @@ export interface EventActorDiscardRequest {
 export interface EventActorHostAdapter<TEvent, TResult> {
   prepare(
     request: EventActorAdapterPrepareRequest<TEvent>
-  ): Promise<EventActorPreparation<TEvent>>;
+  ): Promise<EventActorAdapterPreparation<TEvent>>;
   coldContinue(
     request: EventActorAdapterPrepareRequest<TEvent>,
     head: EventActorHead

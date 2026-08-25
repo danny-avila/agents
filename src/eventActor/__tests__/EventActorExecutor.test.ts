@@ -657,15 +657,16 @@ describe('EventActorExecutor', () => {
       depth: 1,
       event: { text: 'ambient-warm-prepare' },
     });
-    const coldPreparation = executor.coldContinue(
-      {
+    const coldPreparation = executor.coldContinue({
+      status: 'checkpoint_unavailable',
+      request: {
         actorThreadId: 'actor-thread',
         invocationId: 'ambient-cold-prepare',
         depth: 1,
         event: { text: 'ambient-cold-prepare' },
       },
-      head(0)
-    );
+      head: head(0),
+    });
     runnableConfigSpy.mockRestore();
 
     await expect(warmPreparation).rejects.toThrow(
@@ -676,6 +677,36 @@ describe('EventActorExecutor', () => {
     );
     expect(host.coldContinues).toBe(0);
     expect(host.invokes).toBe(0);
+  });
+
+  it('preserves prepared ancestry after async-local context ends', async () => {
+    const host = new TestHost();
+    host.checkpointAvailable = false;
+    const executor = new EventActorExecutor(host, { maxDepth: 2 });
+    const runnableConfigSpy = jest
+      .spyOn(AsyncLocalStorageProviderSingleton, 'getRunnableConfig')
+      .mockReturnValue({ configurable: { event_actor_depth: 1 } });
+    const preparationPromise = executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'persisted-cold-ancestry',
+      depth: 2,
+      event: { text: 'persisted-cold-ancestry' },
+    });
+    runnableConfigSpy.mockRestore();
+    const preparation = await preparationPromise;
+    if (preparation.status !== 'checkpoint_unavailable') {
+      throw new Error('Expected unavailable checkpoint');
+    }
+
+    const invocation = await executor.coldContinue(preparation);
+
+    expect(preparation.request.depth).toBe(2);
+    expect(invocation).toMatchObject({
+      actorThreadId: 'actor-thread',
+      invocationId: 'persisted-cold-ancestry',
+      depth: 2,
+      continuation: 'cold',
+    });
   });
 
   it('derives nested depth from actor-owned ambient context', async () => {
@@ -1271,15 +1302,16 @@ describe('EventActorExecutor', () => {
     const executor = new EventActorExecutor(host);
 
     await expect(
-      executor.coldContinue(
-        {
+      executor.coldContinue({
+        status: 'checkpoint_unavailable',
+        request: {
           actorThreadId: 'actor-thread',
           invocationId: 'foreign-head',
           depth: 1,
           event: { text: 'foreign-head' },
         },
-        { actorThreadId: 'another-actor', generation: 0 }
-      )
+        head: { actorThreadId: 'another-actor', generation: 0 },
+      })
     ).rejects.toThrow('Event actor head is invalid');
     expect(host.coldContinues).toBe(0);
   });
@@ -1332,15 +1364,16 @@ describe('EventActorExecutor', () => {
     const executor = new EventActorExecutor(host);
 
     await expect(
-      executor.coldContinue(
-        {
+      executor.coldContinue({
+        status: 'checkpoint_unavailable',
+        request: {
           actorThreadId: 'actor-thread',
           invocationId: 'mutated-head',
           depth: 1,
           event: { text: 'mutated-head' },
         },
-        validHead
-      )
+        head: validHead,
+      })
     ).rejects.toThrow('Cold continuation did not use the prepared actor head');
     expect(validHead.generation).toBe(1);
   });

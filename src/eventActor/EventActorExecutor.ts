@@ -406,21 +406,25 @@ export class EventActorExecutor<TEvent, TResult> {
       validateHead(preparation.head, request.actorThreadId);
       return {
         status: 'checkpoint_unavailable',
+        request: { ...request, event: request.event },
         head: snapshotHead(preparation.head),
       };
     }
   }
 
   async coldContinue(
-    request: EventActorPrepareRequest<TEvent>,
-    head: EventActorHead
+    preparation: Extract<
+      EventActorPreparation<TEvent>,
+      { status: 'checkpoint_unavailable' }
+    >
   ): Promise<EventActorInvocation<TEvent>> {
+    const request = preparation.request;
     resolveExecutionDepth(
       request.depth,
       AsyncLocalStorageProviderSingleton.getRunnableConfig()
     );
     this.validatePrepareRequest(request);
-    const trustedHead = snapshotHead(head);
+    const trustedHead = snapshotHead(preparation.head);
     validateHead(trustedHead, request.actorThreadId);
     const checkpointNs = createInvocationCheckpointNs(request);
     const adapterRequest: EventActorAdapterPrepareRequest<TEvent> = {
@@ -620,7 +624,7 @@ export class EventActorExecutor<TEvent, TResult> {
     const invocation =
       preparation.status === 'ready'
         ? preparation.invocation
-        : await this.coldContinue(prepareRequest, preparation.head);
+        : await this.coldContinue(preparation);
     const continuation = preparation.status === 'ready' ? 'warm' : 'cold';
     const invocationReference = snapshotInvocationReference(invocation);
     const invocationForAdapter = snapshotInvocation(invocation);

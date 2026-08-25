@@ -4,6 +4,7 @@ export {
 } from './EventActorExecutor';
 export type {
   EventActorAdapterPrepareRequest,
+  EventActorAdapterPreparation,
   EventActorAppliedResult,
   EventActorCheckpointFork,
   EventActorCheckpointReference,
