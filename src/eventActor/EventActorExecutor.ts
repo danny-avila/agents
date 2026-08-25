@@ -192,6 +192,7 @@ function createRunnableConfig(
         key !== 'lc_run_breaker_scope'
     )
   );
+  delete configurable.run_id;
   delete configurable.thread_id;
   delete configurable.checkpoint_ns;
   delete configurable.checkpoint_id;
@@ -201,13 +202,27 @@ function createRunnableConfig(
   delete configurable.event_actor_generation;
   delete configurable.event_actor_depth;
   delete configurable.event_actor_continuation;
+  const metadata = Object.fromEntries(
+    Object.entries(ambientMetadata ?? {}).filter(
+      ([key]) =>
+        !key.startsWith('langgraph_') &&
+        !key.startsWith('__pregel_') &&
+        key !== 'run_id' &&
+        key !== 'thread_id' &&
+        key !== 'checkpoint_ns' &&
+        key !== 'checkpoint_id' &&
+        key !== 'checkpoint_map'
+    )
+  );
   return {
     ...ambientRuntime,
     signal,
     ...(ambientCallbacks == null ? {} : { callbacks: ambientCallbacks }),
     ...(ambientTags == null ? {} : { tags: ambientTags }),
     metadata: {
-      ...(ambientMetadata ?? {}),
+      ...metadata,
+      thread_id: invocation.fork.threadId,
+      checkpoint_ns: invocation.fork.checkpointNs,
       eventActorThreadId: invocation.actorThreadId,
       eventActorInvocationId: invocation.invocationId,
       eventActorGeneration: invocation.base.generation,
@@ -553,14 +568,19 @@ export class EventActorExecutor<TEvent, TResult> {
         continuation,
       };
     }
+    const trustedTerminal: EventActorAppliedResult<TResult> = {
+      status: 'applied',
+      result: terminal.result,
+      checkpoint: { ...terminal.checkpoint },
+    };
     let committed;
     try {
-      committed = await this.commit(invocationReference, terminal);
+      committed = await this.commit(invocationReference, trustedTerminal);
     } catch (error) {
       return {
         status: 'commit_indeterminate',
-        result: terminal.result,
-        checkpoint: { ...terminal.checkpoint },
+        result: trustedTerminal.result,
+        checkpoint: { ...trustedTerminal.checkpoint },
         error: asError(error),
         continuation,
       };
@@ -568,8 +588,8 @@ export class EventActorExecutor<TEvent, TResult> {
     if (committed.status === 'stale') {
       return {
         status: 'commit_conflict',
-        result: terminal.result,
-        checkpoint: { ...terminal.checkpoint },
+        result: trustedTerminal.result,
+        checkpoint: { ...trustedTerminal.checkpoint },
         ...(committed.head == null
           ? {}
           : { head: snapshotHead(committed.head) }),
@@ -578,7 +598,7 @@ export class EventActorExecutor<TEvent, TResult> {
     }
     return {
       status: 'applied',
-      result: terminal.result,
+      result: trustedTerminal.result,
       head: committed.head,
       continuation,
     };

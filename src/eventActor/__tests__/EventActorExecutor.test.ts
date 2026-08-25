@@ -3,6 +3,7 @@ import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type {
   EventActorAdapterPrepareRequest,
+  EventActorCheckpointFork,
   EventActorCommitRequest,
   EventActorDiscardRequest,
   EventActorHead,
@@ -447,7 +448,17 @@ describe('EventActorExecutor', () => {
       signal: parentController.signal,
       callbacks: [],
       tags: ['parent-trace'],
-      metadata: { userId: 'user-1', sessionId: 'session-1' },
+      metadata: {
+        userId: 'user-1',
+        sessionId: 'session-1',
+        run_id: 'parent-run',
+        thread_id: 'parent-thread',
+        checkpoint_ns: 'parent-namespace',
+        checkpoint_id: 'parent-checkpoint',
+        checkpoint_map: { parent: 'checkpoint' },
+        langgraph_checkpoint_ns: 'parent-langgraph-namespace',
+        __pregel_scratchpad: { parent: true },
+      },
       recursionLimit: 80,
       maxConcurrency: 4,
       timeout: 30_000,
@@ -457,6 +468,7 @@ describe('EventActorExecutor', () => {
       context: ambientContext,
       configurable: {
         user_id: 'user-1',
+        run_id: 'parent-configurable-run',
         requestBody: { conversationId: 'conversation-1' },
         userMCPAuthMap: { chess: 'credential' },
         thread_id: 'parent-thread',
@@ -508,6 +520,8 @@ describe('EventActorExecutor', () => {
       metadata: {
         userId: 'user-1',
         sessionId: 'session-1',
+        thread_id: 'actor-checkpoints',
+        checkpoint_ns: expect.stringMatching(/^event-actor\/[a-f0-9]{32}$/),
         eventActorThreadId: 'actor-thread',
       },
       configurable: {
@@ -537,8 +551,20 @@ describe('EventActorExecutor', () => {
     expect(host.invokeConfigs[0].configurable).not.toHaveProperty(
       'lc_run_breaker_scope'
     );
+    expect(host.invokeConfigs[0].configurable).not.toHaveProperty('run_id');
     expect(host.invokeConfigs[0]).not.toHaveProperty('runId');
     expect(host.invokeConfigs[0]).not.toHaveProperty('runName');
+    expect(host.invokeConfigs[0].metadata).not.toHaveProperty('run_id');
+    expect(host.invokeConfigs[0].metadata).not.toHaveProperty('checkpoint_id');
+    expect(host.invokeConfigs[0].metadata).not.toHaveProperty('checkpoint_map');
+    expect(host.invokeConfigs[0].metadata).not.toHaveProperty(
+      'langgraph_checkpoint_ns'
+    );
+    expect(
+      Object.keys(host.invokeConfigs[0].metadata ?? {}).some((key) =>
+        key.startsWith('__pregel_')
+      )
+    ).toBe(false);
     release();
 
     const results = await Promise.all(executions);
@@ -688,6 +714,45 @@ describe('EventActorExecutor', () => {
     expect(result.checkpoint).not.toHaveProperty('checkpointId');
     expect(host.commits).toHaveLength(0);
     expect(host.discards).toHaveLength(0);
+  });
+
+  it('snapshots validated terminal evidence before awaiting commit', async () => {
+    const host = new TestHost();
+    let terminalCheckpoint: EventActorCheckpointFork | undefined;
+    host.invokeImpl = async (prepared) => {
+      terminalCheckpoint = {
+        ...prepared.fork,
+        checkpointId: 'trusted-terminal',
+      };
+      return {
+        status: 'applied',
+        result: 'action-completed',
+        checkpoint: terminalCheckpoint,
+      };
+    };
+    host.commit = async () => {
+      if (terminalCheckpoint == null) {
+        throw new Error('Expected terminal checkpoint');
+      }
+      terminalCheckpoint.threadId = 'mutated-thread';
+      terminalCheckpoint.checkpointNs = 'mutated-namespace';
+      terminalCheckpoint.checkpointId = 'mutated-checkpoint';
+      return { status: 'stale' as const, head: head(1) };
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('mutable-terminal'))
+    ).resolves.toMatchObject({
+      status: 'commit_conflict',
+      result: 'action-completed',
+      checkpoint: {
+        invocationId: 'mutable-terminal',
+        threadId: 'actor-checkpoints',
+        checkpointNs: expect.stringMatching(/^event-actor\/[a-f0-9]{32}$/),
+        checkpointId: 'trusted-terminal',
+      },
+    });
   });
 
   it('invokes with the authoritative request event after warm preparation', async () => {
