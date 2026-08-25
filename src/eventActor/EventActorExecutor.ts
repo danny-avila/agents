@@ -88,6 +88,9 @@ function validateHead(
     if (checkpointRequired) {
       throw new Error('Committed event actor head has no checkpoint');
     }
+    if (head.generation > 0) {
+      throw new Error('Advanced event actor head has no checkpoint');
+    }
     return;
   }
   requireNonEmpty(head.checkpoint.threadId, 'head.checkpoint.threadId');
@@ -270,10 +273,20 @@ export class EventActorExecutor<TEvent, TResult> {
         'warm',
         adapterRequest.checkpointNs
       );
+      return {
+        status: 'ready',
+        invocation: {
+          ...snapshotInvocation(preparation.invocation),
+          event: request.event,
+        },
+      };
     } else {
       validateHead(preparation.head, request.actorThreadId);
+      return {
+        status: 'checkpoint_unavailable',
+        head: snapshotHead(preparation.head),
+      };
     }
-    return preparation;
   }
 
   async coldContinue(
@@ -298,7 +311,10 @@ export class EventActorExecutor<TEvent, TResult> {
       adapterRequest.checkpointNs,
       trustedHead
     );
-    return invocation;
+    return {
+      ...snapshotInvocation(invocation),
+      event: request.event,
+    };
   }
 
   async invoke(
@@ -381,6 +397,11 @@ export class EventActorExecutor<TEvent, TResult> {
         trustedCheckpoint,
         committed.head
       );
+      return { status: 'committed', head: snapshotHead(committed.head) };
+    }
+    if (committed.head != null) {
+      validateHead(committed.head, trustedInvocation.actorThreadId);
+      return { status: 'stale', head: snapshotHead(committed.head) };
     }
     return committed;
   }
@@ -457,8 +478,11 @@ export class EventActorExecutor<TEvent, TResult> {
     try {
       validateTerminalCheckpoint(invocationReference, terminal.checkpoint);
     } catch (error) {
-      await this.discard(invocationReference, 'failed');
-      return { status: 'failed', error: asError(error), continuation };
+      return {
+        status: 'commit_indeterminate',
+        error: asError(error),
+        continuation,
+      };
     }
     let committed;
     try {

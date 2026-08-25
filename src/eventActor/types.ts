@@ -152,7 +152,13 @@ export type EventActorExecutionResult<TResult> =
       continuation: 'warm' | 'cold';
     }
   | {
-      status: 'commit_indeterminate' | 'failed';
+      /** Applied handling cannot be proven safe to retry; retain its fork. */
+      status: 'commit_indeterminate';
+      error: Error;
+      continuation: 'warm' | 'cold';
+    }
+  | {
+      status: 'failed';
       error: Error;
       continuation: 'warm' | 'cold';
     };

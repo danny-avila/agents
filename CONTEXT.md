@@ -57,9 +57,10 @@ completed-without-action invocations discard their forks. An applied fork that
 loses the head comparison remains available for reconciliation. A missing or
 incompatible warm checkpoint uses **Cold Continuation**: the host rebuilds an
 Invocation Fork from bounded transcript and summary state while preserving the
-same logical Event Actor identity. An indeterminate commit is retained for
-reconciliation because deleting its fork could delete an actor head that the
-durable compare-and-swap already advanced.
+same logical Event Actor identity. An indeterminate applied settlement,
+including malformed action checkpoint evidence or an ambiguous commit
+acknowledgement, is retained for reconciliation because deleting its fork
+could erase the only durable evidence of an external action.
 
 ## Tool Caller Capabilities
 

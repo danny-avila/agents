@@ -512,7 +512,7 @@ describe('EventActorExecutor', () => {
     expect(host.invokes).toBe(2);
   });
 
-  it('discards a checkpoint outside the invocation fork', async () => {
+  it('retains an applied result with a checkpoint outside the invocation fork', async () => {
     const host = new TestHost();
     host.invokeImpl = async () => ({
       status: 'applied',
@@ -527,13 +527,95 @@ describe('EventActorExecutor', () => {
     const executor = new EventActorExecutor(host);
 
     await expect(executor.execute(request('escape'))).resolves.toMatchObject({
-      status: 'failed',
+      status: 'commit_indeterminate',
       error: expect.objectContaining({
         message: 'Event actor result escaped its invocation checkpoint fork',
       }),
     });
     expect(host.commits).toHaveLength(0);
-    expect(host.discards[0].reason).toBe('failed');
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('invokes with the authoritative request event after warm preparation', async () => {
+    const host = new TestHost();
+    const prepare = host.prepare.bind(host);
+    host.prepare = async (prepareRequest) => {
+      const prepared = await prepare(prepareRequest);
+      if (prepared.status === 'ready') {
+        prepared.invocation.event = { text: 'stale-event' };
+      }
+      return prepared;
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('authoritative-event'))
+    ).resolves.toMatchObject({
+      status: 'applied',
+      result: 'authoritative-event',
+    });
+  });
+
+  it('invokes with the authoritative request event after cold continuation', async () => {
+    const host = new TestHost();
+    host.checkpointAvailable = false;
+    const coldContinue = host.coldContinue.bind(host);
+    host.coldContinue = async (prepareRequest, actorHead) => {
+      const prepared = await coldContinue(prepareRequest, actorHead);
+      prepared.event = { text: 'stale-event' };
+      return prepared;
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('authoritative-cold-event'))
+    ).resolves.toMatchObject({
+      status: 'applied',
+      result: 'authoritative-cold-event',
+      continuation: 'cold',
+    });
+  });
+
+  it('rejects an advanced head without committed checkpoint identity', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    host.prepare = async () => ({
+      status: 'checkpoint_unavailable' as const,
+      head: { actorThreadId: 'actor-thread', generation: 1 },
+    });
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('missing-head-checkpoint'))
+    ).rejects.toThrow('Advanced event actor head has no checkpoint');
+    expect(host.coldContinues).toBe(0);
+    expect(host.invokes).toBe(0);
+  });
+
+  it('rejects a stale commit result for another actor', async () => {
+    const host = new TestHost();
+    host.commit = async () => ({
+      status: 'stale' as const,
+      head: { actorThreadId: 'another-actor', generation: 0 },
+    });
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'foreign-stale-head',
+      depth: 1,
+      event: { text: 'foreign-stale-head' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const terminal = await executor.invoke(preparation.invocation);
+    if (terminal.status !== 'applied') {
+      throw new Error('Expected applied terminal result');
+    }
+
+    await expect(
+      executor.commit(preparation.invocation, terminal)
+    ).rejects.toThrow('Event actor head is invalid');
   });
 
   it('commits an applied result even when cancellation arrives as invoke returns', async () => {
