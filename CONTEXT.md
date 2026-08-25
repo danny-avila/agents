@@ -42,6 +42,24 @@ A **Resume Projection** is the durable manifest view produced from an
 Execution Record. A projection is scoped to one exact fork and resume attempt;
 an unscoped projection fails closed when a parent tool-call ID is ambiguous.
 
+## Event Actors
+
+An **Event Actor** is one stable logical child thread that handles a sequence
+of authoritative host events without retaining a live executor between them.
+
+An **Event Actor Head** is the current committed checkpoint identity and its
+monotonic generation. Each invocation runs on an **Invocation Fork** owned by
+that invocation. The host advances the Event Actor Head only through an atomic
+comparison against both the generation and prior checkpoint identity.
+
+Applied work may commit its Invocation Fork. Failed, cancelled, stale, and
+completed-without-action invocations discard their forks. A missing or
+incompatible warm checkpoint uses **Cold Continuation**: the host rebuilds an
+Invocation Fork from bounded transcript and summary state while preserving the
+same logical Event Actor identity. An indeterminate commit is retained for
+reconciliation because deleting its fork could delete an actor head that the
+durable compare-and-swap already advanced.
+
 ## Tool Caller Capabilities
 
 A **Caller Capability Projection** is the effective classification of tool

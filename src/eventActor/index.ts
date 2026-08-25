@@ -1,0 +1,25 @@
+export {
+  EventActorExecutor,
+  createEventActorExecutor,
+} from './EventActorExecutor';
+export type {
+  EventActorAdapterPrepareRequest,
+  EventActorAppliedResult,
+  EventActorCheckpointFork,
+  EventActorCheckpointReference,
+  EventActorCommitRequest,
+  EventActorCommitResult,
+  EventActorDiscardReason,
+  EventActorDiscardRequest,
+  EventActorExecutionRequest,
+  EventActorExecutionResult,
+  EventActorExecutorOptions,
+  EventActorHead,
+  EventActorHostAdapter,
+  EventActorInvocation,
+  EventActorInvocationContext,
+  EventActorInvocationReference,
+  EventActorPreparation,
+  EventActorPrepareRequest,
+  EventActorTerminalResult,
+} from './types';
