@@ -131,6 +131,12 @@ function validateInvocation<TEvent>(
   requireNonEmpty(invocation.fork.threadId, 'fork.threadId');
   requireNonEmpty(invocation.fork.checkpointNs, 'fork.checkpointNs');
   if (
+    invocation.base.checkpoint != null &&
+    invocation.fork.threadId !== invocation.base.checkpoint.threadId
+  ) {
+    throw new Error('Event actor fork changed its logical checkpoint thread');
+  }
+  if (
     expectedHead != null &&
     (expectedHead.actorThreadId !== request.actorThreadId ||
       invocation.base.generation !== expectedHead.generation ||
@@ -181,6 +187,13 @@ function createRunnableConfig(
   delete configurable.event_actor_continuation;
   return {
     signal,
+    ...(ambient?.recursionLimit == null
+      ? {}
+      : { recursionLimit: ambient.recursionLimit }),
+    ...(ambient?.maxConcurrency == null
+      ? {}
+      : { maxConcurrency: ambient.maxConcurrency }),
+    ...(ambient?.timeout == null ? {} : { timeout: ambient.timeout }),
     ...(ambient?.callbacks == null ? {} : { callbacks: ambient.callbacks }),
     ...(ambient?.tags == null ? {} : { tags: ambient.tags }),
     metadata: {
@@ -401,6 +414,9 @@ export class EventActorExecutor<TEvent, TResult> {
     }
     if (committed.head != null) {
       validateHead(committed.head, trustedInvocation.actorThreadId);
+      if (committed.head.generation <= trustedInvocation.base.generation) {
+        throw new Error('Stale event actor head did not advance past its base');
+      }
       return { status: 'stale', head: snapshotHead(committed.head) };
     }
     return committed;
@@ -480,6 +496,8 @@ export class EventActorExecutor<TEvent, TResult> {
     } catch (error) {
       return {
         status: 'commit_indeterminate',
+        result: terminal.result,
+        checkpoint: { ...invocationReference.fork },
         error: asError(error),
         continuation,
       };
@@ -490,6 +508,8 @@ export class EventActorExecutor<TEvent, TResult> {
     } catch (error) {
       return {
         status: 'commit_indeterminate',
+        result: terminal.result,
+        checkpoint: { ...terminal.checkpoint },
         error: asError(error),
         continuation,
       };
@@ -499,6 +519,9 @@ export class EventActorExecutor<TEvent, TResult> {
         status: 'commit_conflict',
         result: terminal.result,
         checkpoint: { ...terminal.checkpoint },
+        ...(committed.head == null
+          ? {}
+          : { head: snapshotHead(committed.head) }),
         continuation,
       };
     }

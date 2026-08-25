@@ -87,8 +87,7 @@ export type EventActorCommitResult =
 export type EventActorDiscardReason =
   | 'cancelled'
   | 'completed_no_action'
-  | 'failed'
-  | 'stale';
+  | 'failed';
 
 export interface EventActorDiscardRequest {
   invocation: EventActorInvocationReference;
@@ -101,10 +100,14 @@ export interface EventActorDiscardRequest {
  * atomically before advancing the logical actor head. The host mailbox
  * deduplicates the logical `invocationId` before entering this seam, while each
  * SDK execution attempt receives a distinct checkpoint namespace. Preparation
- * methods own rollback until they return a ready invocation; `invoke` returns
- * only after its provider, stream, timer, and executor resources have been
- * released. `commit` must not reclaim an applied stale fork: the SDK retains
- * and surfaces it as `commit_conflict` for host reconciliation.
+ * methods own rollback until they return a ready invocation and must treat the
+ * request event as immutable. `invoke` returns only after its provider, stream,
+ * timer, and executor resources have been released. Once qualifying action
+ * evidence exists, `invoke` must return `applied` even if a later abort or
+ * provider failure occurs; a thrown error is therefore a definite no-action
+ * failure whose fork is safe to discard. `commit` must not reclaim an applied
+ * stale fork: the SDK retains and surfaces it as `commit_conflict` for host
+ * reconciliation.
  */
 export interface EventActorHostAdapter<TEvent, TResult> {
   prepare(
@@ -149,11 +152,14 @@ export type EventActorExecutionResult<TResult> =
       status: 'commit_conflict';
       result: TResult;
       checkpoint: EventActorCheckpointFork;
+      head?: EventActorHead;
       continuation: 'warm' | 'cold';
     }
   | {
       /** Applied handling cannot be proven safe to retry; retain its fork. */
       status: 'commit_indeterminate';
+      result: TResult;
+      checkpoint: EventActorCheckpointFork;
       error: Error;
       continuation: 'warm' | 'cold';
     }

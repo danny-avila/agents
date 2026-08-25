@@ -49,8 +49,10 @@ of authoritative host events without retaining a live executor between them.
 
 An **Event Actor Head** is the current committed checkpoint identity and its
 monotonic generation. Each invocation runs on an **Invocation Fork** owned by
-that invocation. The host advances the Event Actor Head only through an atomic
-comparison against both the generation and prior checkpoint identity.
+that invocation. Once committed state exists, every fork stays on the same
+logical checkpoint thread and changes only its invocation namespace. The host
+advances the Event Actor Head only through an atomic comparison against both
+the generation and prior checkpoint identity.
 
 Applied work may commit its Invocation Fork. Failed, cancelled, and
 completed-without-action invocations discard their forks. An applied fork that

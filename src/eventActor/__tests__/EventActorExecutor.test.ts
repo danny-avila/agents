@@ -365,6 +365,13 @@ describe('EventActorExecutor', () => {
       'applied',
       'commit_conflict',
     ]);
+    expect(
+      results.find((result) => result.status === 'commit_conflict')
+    ).toMatchObject({
+      result: 'same-event',
+      checkpoint: { invocationId: 'same-event' },
+      head: { actorThreadId: 'actor-thread', generation: 1 },
+    });
     expect(host.generation).toBe(1);
     expect(new Set(host.forkNamespaces).size).toBe(2);
     expect(host.discards).toHaveLength(0);
@@ -378,6 +385,11 @@ describe('EventActorExecutor', () => {
     await expect(executor.execute(request('uncertain'))).resolves.toMatchObject(
       {
         status: 'commit_indeterminate',
+        result: 'uncertain',
+        checkpoint: {
+          invocationId: 'uncertain',
+          checkpointId: 'result-uncertain',
+        },
         error: { message: 'connection dropped after commit' },
       }
     );
@@ -433,6 +445,11 @@ describe('EventActorExecutor', () => {
         callbacks: [],
         tags: ['parent-trace'],
         metadata: { userId: 'user-1', sessionId: 'session-1' },
+        recursionLimit: 80,
+        maxConcurrency: 4,
+        timeout: 30_000,
+        runId: 'parent-run',
+        runName: 'parent-run-name',
         configurable: {
           user_id: 'user-1',
           requestBody: { conversationId: 'conversation-1' },
@@ -466,6 +483,9 @@ describe('EventActorExecutor', () => {
     expect(host.invokeConfigs[0]).toMatchObject({
       callbacks: [],
       tags: ['parent-trace'],
+      recursionLimit: 80,
+      maxConcurrency: 4,
+      timeout: 30_000,
       metadata: {
         userId: 'user-1',
         sessionId: 'session-1',
@@ -490,6 +510,8 @@ describe('EventActorExecutor', () => {
     expect(host.invokeConfigs[0].configurable).not.toHaveProperty(
       'checkpoint_map'
     );
+    expect(host.invokeConfigs[0]).not.toHaveProperty('runId');
+    expect(host.invokeConfigs[0]).not.toHaveProperty('runName');
     release();
 
     const results = await Promise.all(executions);
@@ -528,6 +550,11 @@ describe('EventActorExecutor', () => {
 
     await expect(executor.execute(request('escape'))).resolves.toMatchObject({
       status: 'commit_indeterminate',
+      result: 'bad',
+      checkpoint: {
+        invocationId: 'escape',
+        threadId: 'actor-checkpoints',
+      },
       error: expect.objectContaining({
         message: 'Event actor result escaped its invocation checkpoint fork',
       }),
@@ -592,6 +619,25 @@ describe('EventActorExecutor', () => {
     expect(host.invokes).toBe(0);
   });
 
+  it('rejects a fork that leaves the committed logical checkpoint thread', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    const prepare = host.prepare.bind(host);
+    host.prepare = async (prepareRequest) => {
+      const prepared = await prepare(prepareRequest);
+      if (prepared.status === 'ready') {
+        prepared.invocation.fork.threadId = 'another-checkpoint-thread';
+      }
+      return prepared;
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('foreign-checkpoint-thread'))
+    ).rejects.toThrow('changed its logical checkpoint thread');
+    expect(host.invokes).toBe(0);
+  });
+
   it('rejects a stale commit result for another actor', async () => {
     const host = new TestHost();
     host.commit = async () => ({
@@ -616,6 +662,29 @@ describe('EventActorExecutor', () => {
     await expect(
       executor.commit(preparation.invocation, terminal)
     ).rejects.toThrow('Event actor head is invalid');
+  });
+
+  it('rejects a stale commit head that did not advance past its base', async () => {
+    const host = new TestHost();
+    host.commit = async () => ({ status: 'stale' as const, head: head(0) });
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'non-advanced-stale-head',
+      depth: 1,
+      event: { text: 'non-advanced-stale-head' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const terminal = await executor.invoke(preparation.invocation);
+    if (terminal.status !== 'applied') {
+      throw new Error('Expected applied terminal result');
+    }
+
+    await expect(
+      executor.commit(preparation.invocation, terminal)
+    ).rejects.toThrow('did not advance past its base');
   });
 
   it('commits an applied result even when cancellation arrives as invoke returns', async () => {
