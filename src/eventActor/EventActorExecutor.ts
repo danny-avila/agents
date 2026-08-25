@@ -178,7 +178,24 @@ function validateInvocationReference(
       invocation.fork.checkpointId ?? '',
       'fork.checkpointId for resumed actor'
     );
+    if (
+      invocation.continuation === 'warm' &&
+      invocation.fork.checkpointId !== invocation.base.checkpoint.checkpointId
+    ) {
+      throw new Error(
+        'Warm event actor fork did not start from the committed checkpoint'
+      );
+    }
   }
+}
+
+function checkpointIdsMatch(
+  left: EventActorCheckpointFork | EventActorHead['checkpoint'],
+  right: EventActorCheckpointFork | EventActorHead['checkpoint']
+): boolean {
+  return (
+    left != null && right != null && left.checkpointId === right.checkpointId
+  );
 }
 
 function checkpointsMatch(
@@ -186,11 +203,9 @@ function checkpointsMatch(
   right: EventActorCheckpointFork | EventActorHead['checkpoint']
 ): boolean {
   return (
-    left != null &&
-    right != null &&
-    left.threadId === right.threadId &&
-    left.checkpointNs === right.checkpointNs &&
-    left.checkpointId === right.checkpointId
+    checkpointIdsMatch(left, right) &&
+    left?.threadId === right?.threadId &&
+    left?.checkpointNs === right?.checkpointNs
   );
 }
 
@@ -427,11 +442,22 @@ export class EventActorExecutor<TEvent, TResult> {
     signal?: AbortSignal
   ): Promise<EventActorTerminalResult<TResult>> {
     const trustedInvocation = snapshotInvocation(invocation);
-    return this.invokeWithConfig(
+    const terminal = await this.invokeWithConfig(
       trustedInvocation,
       signal,
       AsyncLocalStorageProviderSingleton.getRunnableConfig()
     );
+    if (terminal.status === 'applied') {
+      return {
+        status: 'applied',
+        result: terminal.result,
+        checkpoint: { ...terminal.checkpoint },
+      };
+    }
+    return {
+      status: 'completed_no_action',
+      ...(terminal.result === undefined ? {} : { result: terminal.result }),
+    };
   }
 
   private async invokeWithConfig(
@@ -439,6 +465,7 @@ export class EventActorExecutor<TEvent, TResult> {
     signal: AbortSignal | undefined,
     ambientConfig: RunnableConfig | undefined
   ): Promise<EventActorTerminalResult<TResult>> {
+    resolveExecutionDepth(invocation.depth, ambientConfig);
     validateInvocation(
       {
         actorThreadId: invocation.actorThreadId,
@@ -512,12 +539,14 @@ export class EventActorExecutor<TEvent, TResult> {
         throw new Error('Stale event actor head did not advance past its base');
       }
       if (
-        committed.head.checkpoint?.threadId !== trustedInvocation.fork.threadId
+        trustedInvocation.base.checkpoint != null &&
+        committed.head.checkpoint?.threadId !==
+          trustedInvocation.base.checkpoint.threadId
       ) {
         throw new Error('Stale event actor head changed its checkpoint thread');
       }
       if (
-        checkpointsMatch(
+        checkpointIdsMatch(
           committed.head.checkpoint,
           trustedInvocation.base.checkpoint
         ) ||

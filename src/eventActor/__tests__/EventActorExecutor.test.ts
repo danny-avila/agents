@@ -623,6 +623,28 @@ describe('EventActorExecutor', () => {
     expect(host.invokes).toBe(0);
   });
 
+  it('enforces ambient actor depth for host-driven invocation', async () => {
+    const host = new TestHost();
+    const executor = new EventActorExecutor(host, { maxDepth: 2 });
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'ambient-host-driven-depth',
+      depth: 1,
+      event: { text: 'ambient-host-driven-depth' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const runnableConfigSpy = jest
+      .spyOn(AsyncLocalStorageProviderSingleton, 'getRunnableConfig')
+      .mockReturnValue({ configurable: { event_actor_depth: 1 } });
+    const execution = executor.invoke(preparation.invocation);
+    runnableConfigSpy.mockRestore();
+
+    await expect(execution).rejects.toThrow('must advance parent depth 1');
+    expect(host.invokes).toBe(0);
+  });
+
   it('derives nested depth from actor-owned ambient context', async () => {
     const host = new TestHost();
     const executor = new EventActorExecutor(host);
@@ -885,6 +907,42 @@ describe('EventActorExecutor', () => {
     expect(host.invokes).toBe(0);
   });
 
+  it('binds a warm resumed fork to the committed checkpoint', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    const prepare = host.prepare.bind(host);
+    host.prepare = async (prepareRequest) => {
+      const prepared = await prepare(prepareRequest);
+      if (prepared.status === 'ready') {
+        prepared.invocation.fork.checkpointId = 'another-checkpoint';
+      }
+      return prepared;
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(executor.execute(request('wrong-warm-start'))).rejects.toThrow(
+      'did not start from the committed checkpoint'
+    );
+    expect(host.invokes).toBe(0);
+  });
+
+  it('allows a cold resumed fork to start from reconstructed state', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    host.checkpointAvailable = false;
+    const coldContinue = host.coldContinue.bind(host);
+    host.coldContinue = async (prepareRequest, actorHead) => {
+      const prepared = await coldContinue(prepareRequest, actorHead);
+      prepared.fork.checkpointId = 'reconstructed-start';
+      return prepared;
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('reconstructed-cold-start'))
+    ).resolves.toMatchObject({ status: 'applied', continuation: 'cold' });
+  });
+
   it('requires a cold resumed fork to identify its starting checkpoint', async () => {
     const host = new TestHost();
     host.generation = 1;
@@ -1018,13 +1076,13 @@ describe('EventActorExecutor', () => {
     ).rejects.toThrow('changed its checkpoint thread');
   });
 
-  it('retains applied work when a stale head only relabels the base checkpoint', async () => {
+  it('retains applied work when stale moves the base checkpoint to another namespace', async () => {
     const host = new TestHost();
     host.generation = 1;
     host.commit = async () => ({
       status: 'stale' as const,
       head: {
-        ...head(1, 'committed', 'checkpoint-0'),
+        ...head(1, 'another-namespace', 'checkpoint-0'),
         generation: 2,
       },
     });
@@ -1066,6 +1124,33 @@ describe('EventActorExecutor', () => {
       },
     });
     expect(host.discards).toHaveLength(0);
+  });
+
+  it('accepts an initial stale winner that establishes another checkpoint thread', async () => {
+    const host = new TestHost();
+    host.commit = async () => ({
+      status: 'stale' as const,
+      head: {
+        actorThreadId: 'actor-thread',
+        generation: 1,
+        checkpoint: {
+          threadId: 'winner-checkpoint-thread',
+          checkpointNs: 'winner-namespace',
+          checkpointId: 'winner-checkpoint',
+        },
+      },
+    });
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('initial-thread-race'))
+    ).resolves.toMatchObject({
+      status: 'commit_conflict',
+      head: {
+        generation: 1,
+        checkpoint: { threadId: 'winner-checkpoint-thread' },
+      },
+    });
   });
 
   it('commits an applied result even when cancellation arrives as invoke returns', async () => {
@@ -1253,6 +1338,47 @@ describe('EventActorExecutor', () => {
     if (terminal.status !== 'applied') {
       throw new Error('Expected applied terminal result');
     }
+    await expect(
+      executor.commit(preparation.invocation, terminal)
+    ).resolves.toMatchObject({ status: 'committed' });
+  });
+
+  it('snapshots applied checkpoint evidence returned by public invoke', async () => {
+    const host = new TestHost();
+    let adapterCheckpoint: EventActorCheckpointFork | undefined;
+    host.invokeImpl = async (prepared) => {
+      adapterCheckpoint = {
+        ...prepared.fork,
+        checkpointId: 'public-invoke-terminal',
+      };
+      return {
+        status: 'applied',
+        result: 'public-invoke-action',
+        checkpoint: adapterCheckpoint,
+      };
+    };
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'public-invoke-snapshot',
+      depth: 1,
+      event: { text: 'public-invoke-snapshot' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+
+    const terminal = await executor.invoke(preparation.invocation);
+    if (terminal.status !== 'applied' || adapterCheckpoint == null) {
+      throw new Error('Expected applied terminal result');
+    }
+    adapterCheckpoint.checkpointId = 'mutated-checkpoint';
+    adapterCheckpoint.checkpointNs = 'mutated-namespace';
+
+    expect(terminal.checkpoint).toMatchObject({
+      checkpointId: 'public-invoke-terminal',
+      checkpointNs: expect.stringMatching(/^event-actor\/[a-f0-9]{32}$/),
+    });
     await expect(
       executor.commit(preparation.invocation, terminal)
     ).resolves.toMatchObject({ status: 'committed' });
