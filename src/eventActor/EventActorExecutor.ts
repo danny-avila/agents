@@ -233,6 +233,26 @@ function isAborted(signal?: AbortSignal): boolean {
   return signal?.aborted === true;
 }
 
+function resolveExecutionDepth(
+  requestedDepth: number | undefined,
+  ambientConfig: RunnableConfig | undefined
+): number {
+  const ambientDepth = ambientConfig?.configurable?.event_actor_depth;
+  if (ambientDepth == null) {
+    return requestedDepth ?? 1;
+  }
+  if (!Number.isSafeInteger(ambientDepth) || Number(ambientDepth) < 1) {
+    throw new Error('Ambient event actor depth is invalid');
+  }
+  const nestedDepth = Number(ambientDepth) + 1;
+  if (requestedDepth != null && requestedDepth !== nestedDepth) {
+    throw new Error(
+      `Nested event actor depth ${requestedDepth} must advance parent depth ${ambientDepth}`
+    );
+  }
+  return nestedDepth;
+}
+
 function validateCommittedHead(
   invocation: EventActorInvocationReference,
   checkpoint: EventActorCheckpointFork,
@@ -465,7 +485,7 @@ export class EventActorExecutor<TEvent, TResult> {
   ): Promise<EventActorExecutionResult<TResult>> {
     const ambientConfig =
       AsyncLocalStorageProviderSingleton.getRunnableConfig();
-    const depth = request.depth ?? 1;
+    const depth = resolveExecutionDepth(request.depth, ambientConfig);
     const prepareRequest: EventActorPrepareRequest<TEvent> = {
       actorThreadId: request.actorThreadId,
       invocationId: request.invocationId,
@@ -473,6 +493,12 @@ export class EventActorExecutor<TEvent, TResult> {
       event: request.event,
     };
     const preparation = await this.prepare(prepareRequest);
+    if (
+      preparation.status === 'checkpoint_unavailable' &&
+      isAborted(request.signal)
+    ) {
+      return { status: 'cancelled', continuation: 'cold' };
+    }
     const invocation =
       preparation.status === 'ready'
         ? preparation.invocation
@@ -501,7 +527,11 @@ export class EventActorExecutor<TEvent, TResult> {
     }
     if (terminal.status === 'completed_no_action') {
       await this.discard(invocationReference, 'completed_no_action');
-      return { status: 'completed_no_action', continuation };
+      return {
+        status: 'completed_no_action',
+        ...(terminal.result === undefined ? {} : { result: terminal.result }),
+        continuation,
+      };
     }
     try {
       validateTerminalCheckpoint(invocationReference, terminal.checkpoint);

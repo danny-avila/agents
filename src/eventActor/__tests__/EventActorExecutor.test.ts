@@ -293,11 +293,15 @@ describe('EventActorExecutor', () => {
 
   it('discards normal completions without qualifying action evidence', async () => {
     const host = new TestHost();
-    host.invokeImpl = async () => ({ status: 'completed_no_action' });
+    host.invokeImpl = async () => ({
+      status: 'completed_no_action',
+      result: 'observation recorded',
+    });
     const executor = new EventActorExecutor(host);
 
     await expect(executor.execute(request('no-action'))).resolves.toEqual({
       status: 'completed_no_action',
+      result: 'observation recorded',
       continuation: 'warm',
     });
     expect(host.commits).toHaveLength(0);
@@ -545,6 +549,54 @@ describe('EventActorExecutor', () => {
       executor.execute(request('grandchild', { depth: 2 }))
     ).rejects.toThrow('exceeds maximum 1');
     expect(host.invokes).toBe(2);
+  });
+
+  it('derives nested depth from actor-owned ambient context', async () => {
+    const host = new TestHost();
+    const executor = new EventActorExecutor(host);
+    const ambientConfig: RunnableConfig = {
+      configurable: { event_actor_depth: 1 },
+    };
+    const runnableConfigSpy = jest
+      .spyOn(AsyncLocalStorageProviderSingleton, 'getRunnableConfig')
+      .mockReturnValue(ambientConfig);
+
+    await expect(
+      executor.execute(request('implicit-grandchild'))
+    ).rejects.toThrow('exceeds maximum 1');
+    await expect(
+      executor.execute(request('forged-grandchild', { depth: 1 }))
+    ).rejects.toThrow('must advance parent depth 1');
+    runnableConfigSpy.mockRestore();
+    expect(host.invokes).toBe(0);
+  });
+
+  it('cancels before unavailable checkpoints enter cold continuation', async () => {
+    const host = new TestHost();
+    host.checkpointAvailable = false;
+    const prepare = host.prepare.bind(host);
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    host.prepare = async (prepareRequest) => {
+      await gate;
+      return prepare(prepareRequest);
+    };
+    const controller = new AbortController();
+    const execution = new EventActorExecutor(host).execute(
+      request('cancel-before-cold', { signal: controller.signal })
+    );
+    controller.abort(new Error('cancelled'));
+    release();
+
+    await expect(execution).resolves.toEqual({
+      status: 'cancelled',
+      continuation: 'cold',
+    });
+    expect(host.coldContinues).toBe(0);
+    expect(host.invokes).toBe(0);
+    expect(host.discards).toHaveLength(0);
   });
 
   it('retains an applied result with a checkpoint outside the invocation fork', async () => {

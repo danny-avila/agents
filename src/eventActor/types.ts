@@ -144,7 +144,12 @@ export type EventActorExecutionResult<TResult> =
       continuation: 'warm' | 'cold';
     }
   | {
-      status: 'completed_no_action' | 'cancelled';
+      status: 'completed_no_action';
+      result?: TResult;
+      continuation: 'warm' | 'cold';
+    }
+  | {
+      status: 'cancelled';
       continuation: 'warm' | 'cold';
     }
   | {
