@@ -110,6 +110,7 @@ function validateInvocation<TEvent>(
   checkpointNs: string,
   expectedHead?: EventActorInvocation<TEvent>['base']
 ): void {
+  validateInvocationReference(invocation);
   if (
     invocation.actorThreadId !== request.actorThreadId ||
     invocation.invocationId !== request.invocationId ||
@@ -127,15 +128,6 @@ function validateInvocation<TEvent>(
       'Event actor preparation returned mismatched checkpoint ownership'
     );
   }
-  validateHead(invocation.base, request.actorThreadId);
-  requireNonEmpty(invocation.fork.threadId, 'fork.threadId');
-  requireNonEmpty(invocation.fork.checkpointNs, 'fork.checkpointNs');
-  if (
-    invocation.base.checkpoint != null &&
-    invocation.fork.threadId !== invocation.base.checkpoint.threadId
-  ) {
-    throw new Error('Event actor fork changed its logical checkpoint thread');
-  }
   if (
     expectedHead != null &&
     (expectedHead.actorThreadId !== request.actorThreadId ||
@@ -148,6 +140,37 @@ function validateInvocation<TEvent>(
         expectedHead.checkpoint?.checkpointNs)
   ) {
     throw new Error('Cold continuation did not use the prepared actor head');
+  }
+}
+
+function validateInvocationReference(
+  invocation: EventActorInvocationReference
+): void {
+  requireNonEmpty(invocation.actorThreadId, 'actorThreadId');
+  requireNonEmpty(invocation.invocationId, 'invocationId');
+  if (!Number.isSafeInteger(invocation.depth) || invocation.depth < 1) {
+    throw new Error('Event actor invocation depth is invalid');
+  }
+  const continuation: unknown = invocation.continuation;
+  if (continuation !== 'warm' && continuation !== 'cold') {
+    throw new Error('Event actor invocation continuation is invalid');
+  }
+  validateHead(invocation.base, invocation.actorThreadId);
+  if (invocation.fork.invocationId !== invocation.invocationId) {
+    throw new Error(
+      'Event actor invocation has mismatched checkpoint ownership'
+    );
+  }
+  requireNonEmpty(invocation.fork.threadId, 'fork.threadId');
+  requireNonEmpty(invocation.fork.checkpointNs, 'fork.checkpointNs');
+  if (invocation.base.checkpoint != null) {
+    if (invocation.fork.threadId !== invocation.base.checkpoint.threadId) {
+      throw new Error('Event actor fork changed its logical checkpoint thread');
+    }
+    requireNonEmpty(
+      invocation.fork.checkpointId ?? '',
+      'fork.checkpointId for resumed actor'
+    );
   }
 }
 
@@ -437,6 +460,7 @@ export class EventActorExecutor<TEvent, TResult> {
     terminal: EventActorAppliedResult<TResult>
   ): Promise<EventActorCommitResult> {
     const trustedInvocation = snapshotInvocationReference(invocation);
+    validateInvocationReference(trustedInvocation);
     const trustedCheckpoint = { ...terminal.checkpoint };
     validateTerminalCheckpoint(trustedInvocation, trustedCheckpoint);
     const committed = await this.adapter.commit({
@@ -478,8 +502,10 @@ export class EventActorExecutor<TEvent, TResult> {
     invocation: EventActorInvocationReference,
     reason: EventActorDiscardReason
   ): Promise<void> {
+    const trustedInvocation = snapshotInvocationReference(invocation);
+    validateInvocationReference(trustedInvocation);
     return this.adapter.discard({
-      invocation: snapshotInvocationReference(invocation),
+      invocation: trustedInvocation,
       reason,
     });
   }

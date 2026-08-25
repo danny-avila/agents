@@ -85,15 +85,23 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
         ),
       };
     }
+    const actorHead = head(
+      this.generation,
+      this.committedCheckpointNs,
+      this.committedCheckpointId
+    );
+    const prepared = invocation(request, 'warm', this.generation);
     return {
       status: 'ready' as const,
       invocation: {
-        ...invocation(request, 'warm', this.generation),
-        base: head(
-          this.generation,
-          this.committedCheckpointNs,
-          this.committedCheckpointId
-        ),
+        ...prepared,
+        base: actorHead,
+        fork: {
+          ...prepared.fork,
+          ...(actorHead.checkpoint?.checkpointId == null
+            ? {}
+            : { checkpointId: actorHead.checkpoint.checkpointId }),
+        },
       },
     };
   }
@@ -103,13 +111,21 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
     _head: EventActorHead
   ) {
     this.coldContinues += 1;
+    const actorHead = head(
+      this.generation,
+      this.committedCheckpointNs,
+      this.committedCheckpointId
+    );
+    const prepared = invocation(request, 'cold', this.generation);
     return {
-      ...invocation(request, 'cold', this.generation),
-      base: head(
-        this.generation,
-        this.committedCheckpointNs,
-        this.committedCheckpointId
-      ),
+      ...prepared,
+      base: actorHead,
+      fork: {
+        ...prepared.fork,
+        ...(actorHead.checkpoint?.checkpointId == null
+          ? {}
+          : { checkpointId: actorHead.checkpoint.checkpointId }),
+      },
     };
   }
 
@@ -830,6 +846,43 @@ describe('EventActorExecutor', () => {
     expect(host.invokes).toBe(0);
   });
 
+  it('requires a warm resumed fork to identify its starting checkpoint', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    const prepare = host.prepare.bind(host);
+    host.prepare = async (prepareRequest) => {
+      const prepared = await prepare(prepareRequest);
+      if (prepared.status === 'ready') {
+        delete prepared.invocation.fork.checkpointId;
+      }
+      return prepared;
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('missing-warm-start'))
+    ).rejects.toThrow('fork.checkpointId for resumed actor');
+    expect(host.invokes).toBe(0);
+  });
+
+  it('requires a cold resumed fork to identify its starting checkpoint', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    host.checkpointAvailable = false;
+    const coldContinue = host.coldContinue.bind(host);
+    host.coldContinue = async (prepareRequest, actorHead) => {
+      const prepared = await coldContinue(prepareRequest, actorHead);
+      delete prepared.fork.checkpointId;
+      return prepared;
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('missing-cold-start'))
+    ).rejects.toThrow('fork.checkpointId for resumed actor');
+    expect(host.invokes).toBe(0);
+  });
+
   it('rejects a stale commit result for another actor', async () => {
     const host = new TestHost();
     host.commit = async () => ({
@@ -975,6 +1028,37 @@ describe('EventActorExecutor', () => {
     expect(host.coldContinues).toBe(0);
   });
 
+  it('rejects malformed ownership before destructive host operations', async () => {
+    const host = new TestHost();
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'malformed-ownership',
+      depth: 1,
+      event: { text: 'malformed-ownership' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const malformed = {
+      ...preparation.invocation,
+      base: { ...preparation.invocation.base, actorThreadId: 'another-actor' },
+    };
+    const terminal = await executor.invoke(preparation.invocation);
+    if (terminal.status !== 'applied') {
+      throw new Error('Expected applied terminal result');
+    }
+
+    expect(() => executor.discard(malformed, 'failed')).toThrow(
+      'Event actor head is invalid'
+    );
+    await expect(executor.commit(malformed, terminal)).rejects.toThrow(
+      'Event actor head is invalid'
+    );
+    expect(host.discards).toHaveLength(0);
+    expect(host.commits).toHaveLength(0);
+  });
+
   it('detects a cold adapter mutating its copy of the prepared head', async () => {
     const host = new TestHost();
     const validHead = head(1);
@@ -983,6 +1067,10 @@ describe('EventActorExecutor', () => {
       return {
         ...invocation(prepareRequest, 'cold', 2),
         base: adapterHead,
+        fork: {
+          ...invocation(prepareRequest, 'cold', 2).fork,
+          checkpointId: adapterHead.checkpoint?.checkpointId,
+        },
       };
     };
     const executor = new EventActorExecutor(host);
