@@ -35,7 +35,6 @@ import {
   ACTIVITY_PHASE_LABEL_RUN_NAME,
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
-import { isBuiltRuntime } from '@/lazyRequire';
 import {
   requireValidSubagentResumeManifest,
   stripSubagentResumeManifest,
@@ -94,14 +93,16 @@ import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { stampSyntheticProviderMessage } from '@/messages/provenance';
+import { isOpenAILike, isLibreChatOpenAIModel } from '@/utils/llm';
 import { initializeLangfuseTracing } from './instrumentation';
 import { seedRunInitialSessions } from '@/utils/toolSessions';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
+import { resolveClientOptionsModel } from '@/llm/request';
 import { createGraph } from '@/graphs/createGraph';
 import { resolveMaxSeals } from '@/llm/preempt';
+import { isBuiltRuntime } from '@/lazyRequire';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
-import { isOpenAILike, isLibreChatOpenAIModel } from '@/utils/llm';
 import { executeHooks } from '@/hooks';
 
 /** Source-mode runs have no dist siblings for the lazy-loading seam, so every
@@ -728,12 +729,16 @@ export class Run<_T extends t.BaseGraphState> {
     config: t.RunConfig
   ): Promise<Run<T>> {
     await ensureSourceModeProviders();
-    /** Create tokenCounter if indexTokenCountMap is provided but tokenCounter is not */
+    /** Create tokenCounter if indexTokenCountMap is provided but tokenCounter is
+     *  not. The model is read through both option keys: `modelName` is
+     *  LangChain's alias for `model`, so consulting one alone would give a
+     *  Claude-backed agent an `o200k_base` counter and undercount every message
+     *  it measures. */
     if (config.indexTokenCountMap && !config.tokenCounter) {
       const gc = config.graphConfig;
       const clientOpts =
         'agents' in gc ? gc.agents[0]?.clientOptions : gc.clientOptions;
-      const model = (clientOpts as { model?: string } | undefined)?.model ?? '';
+      const model = resolveClientOptionsModel(clientOpts) ?? '';
       config.tokenCounter = await createTokenCounter(encodingForModel(model));
     }
     return new Run<T>(config);

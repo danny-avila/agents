@@ -47,11 +47,14 @@ import {
   StepTypes,
   Providers,
 } from '@/common';
+import {
+  getMaxOutputTokensKey,
+  resolveClientOptionsModel,
+} from '@/llm/request';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { createRemoveAllMessage } from '@/messages/reducer';
-import { getMaxOutputTokensKey } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 import { executeHooks } from '@/hooks';
@@ -356,14 +359,17 @@ async function computeSummaryTokenCount(
  *
  * Model name first, mirroring how `Run.create` picks the encoding for the
  * counter this is standing in for, so a Claude model reached through Bedrock or
- * OpenRouter still resolves to `claude`. Provider is the fallback for a client
- * that never recorded a model: `ANTHROPIC` implies a Claude tokenizer, while
- * `BEDROCK` does not, since it also serves Llama, Titan and Mistral.
+ * OpenRouter still resolves to `claude`. Both option keys are consulted:
+ * `modelName` is LangChain's alias for `model` and hosts configure agents
+ * through either, so reading one key alone would report an unconfigured model
+ * and quietly hand a Claude agent the `o200k_base` tokenizer. Provider is the
+ * fallback for a client that never recorded a model: `ANTHROPIC` implies a
+ * Claude tokenizer, while `BEDROCK` does not, since it also serves Llama, Titan
+ * and Mistral.
  */
 function encodingForReceivingAgent(agentContext: AgentContext): EncodingName {
-  const model =
-    (agentContext.clientOptions as { model?: string } | undefined)?.model ?? '';
-  if (model !== '') {
+  const model = resolveClientOptionsModel(agentContext.clientOptions);
+  if (model != null) {
     return encodingForModel(model);
   }
   return agentContext.provider === Providers.ANTHROPIC

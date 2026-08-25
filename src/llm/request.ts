@@ -44,6 +44,30 @@ export function isThinkingEnabled(
 }
 
 /**
+ * Model configured on client options, under whichever of the two keys carries
+ * it. LangChain accepts `modelName` as an alias for `model` and this package
+ * writes both (see `buildSummarizationClientConfig`), while hosts configure
+ * agents through either. Reading only one key therefore does not fail loudly:
+ * it reports an unconfigured model, and every caller here treats that as a cue
+ * to fall back to a default, so a Claude agent configured through the alias is
+ * silently handled as something else.
+ */
+export function resolveClientOptionsModel(
+  clientOptions: t.ClientOptions | undefined
+): string | undefined {
+  const options = clientOptions as
+    | { model?: unknown; modelName?: unknown }
+    | undefined;
+  if (typeof options?.model === 'string' && options.model !== '') {
+    return options.model;
+  }
+  if (typeof options?.modelName === 'string' && options.modelName !== '') {
+    return options.modelName;
+  }
+  return undefined;
+}
+
+/**
  * Returns the correct key for setting max output tokens on the model
  * constructor options.  Google/Vertex use `maxOutputTokens`, all others
  * use `maxTokens`.

@@ -28,6 +28,12 @@ import {
   STREAM_LIMIT_ATTEMPT_KEY,
 } from '@/llm/streamLimits';
 import {
+  inspectProviderMessageProjection,
+  ProviderMessageProjectionInvariantError,
+  resolveProviderMessageProjectionInvariantMode,
+  modifyDeltaProperties,
+} from '@/messages';
+import {
   assertPreparedProviderRequestFor,
   prepareProviderRequest,
 } from '@/llm/prepareProviderRequest';
@@ -38,15 +44,10 @@ import {
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
+import { resolveClientOptionsModel } from '@/llm/request';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
 import { appendCallbacks } from '@/utils/callbacks';
-import {
-  inspectProviderMessageProjection,
-  ProviderMessageProjectionInvariantError,
-  resolveProviderMessageProjectionInvariantMode,
-  modifyDeltaProperties,
-} from '@/messages';
 import { canSealPreempt } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 
@@ -715,8 +716,7 @@ async function attemptInvokeBody(
     resolveProviderMessageProjectionInvariantMode();
   let sealedRunId: string | undefined;
   let invocationConfig = config;
-  const captureModelRunId =
-    model.stream != null && context?.preemption != null;
+  const captureModelRunId = model.stream != null && context?.preemption != null;
   if (projectionInvariantMode !== 'off' || captureModelRunId) {
     invocationConfig = withModelStartHandler({
       config,
@@ -934,7 +934,10 @@ async function attemptInvokeBody(
     return { messages: [finalChunk as AIMessageChunk] };
   }
 
-  const finalMessage = await model.invoke(messagesForProvider, invocationConfig);
+  const finalMessage = await model.invoke(
+    messagesForProvider,
+    invocationConfig
+  );
   if ((finalMessage.tool_calls?.length ?? 0) > 0) {
     finalMessage.tool_calls = finalMessage.tool_calls?.filter(
       (tool_call: ToolCall) => !!tool_call.name
@@ -995,25 +998,6 @@ export function getFallbackOverflowCandidates(
     return [];
   }
   return [...(fallbackOverflowCandidates.get(error) ?? [])];
-}
-
-/**
- * Best-effort read of the configured model name from client options.
- * Providers disagree on the key (`model` vs `modelName`).
- */
-function extractClientOptionsModel(
-  clientOptions: t.ClientOptions | undefined
-): string | undefined {
-  const options = clientOptions as
-    | { model?: unknown; modelName?: unknown }
-    | undefined;
-  if (typeof options?.model === 'string' && options.model !== '') {
-    return options.model;
-  }
-  if (typeof options?.modelName === 'string' && options.modelName !== '') {
-    return options.modelName;
-  }
-  return undefined;
 }
 
 /**
@@ -1106,7 +1090,7 @@ export async function tryFallbackProviders({
        * `ls_model_name`. The serving provider is stamped uniformly by
        * `attemptInvoke` (`INVOKED_PROVIDER`).
        */
-      const fbModelName = extractClientOptionsModel(fb.clientOptions);
+      const fbModelName = resolveClientOptionsModel(fb.clientOptions);
       const fbConfig: RunnableConfig | undefined =
         fbModelName == null
           ? config

@@ -2321,4 +2321,57 @@ describe('summarize node breaker capture', () => {
 
     expect(setSummary.mock.calls[0][1]).toBe(4242);
   });
+
+  /** `modelName` is LangChain's alias for `model` and this repository
+   *  configures agents through both, so reading only `model` reported an
+   *  unconfigured model and fell through to the provider — which for a
+   *  Claude-backed OpenRouter agent means `o200k_base` and the same
+   *  under-reservation the receiving-agent fix exists to prevent. */
+  it('resolves the receiving model through the modelName alias', async () => {
+    const summaryBody =
+      '사용자가 인증 미들웨어를 리팩터링하여 속도 제한 전에 토큰 검증이 이루어지도록 요청했습니다. 기존 핸들러를 읽어보니 순서가 뒤바뀌어 있었습니다.';
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel(summaryBody);
+        }
+      } as never
+    );
+
+    /* OpenRouter, so the provider fallback cannot stand in for the model: it
+     * serves Claude alongside everything else and resolves to `o200k_base`. */
+    const agentContext = createAgentContext({
+      provider: Providers.OPENROUTER,
+      clientOptions: { modelName: 'anthropic/claude-sonnet-4' },
+    });
+    const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    const [persistedText, persistedCount] = setSummary.mock.calls[0] as [
+      string,
+      number,
+    ];
+    const carrier = new HumanMessage(buildSummaryCarrierText(persistedText));
+    const claudeCounter = await createTokenCounter('claude');
+    const openaiCounter = await createTokenCounter('o200k_base');
+
+    expect(persistedCount).toBe(claudeCounter(carrier));
+    expect(claudeCounter(carrier)).toBeGreaterThan(openaiCounter(carrier));
+  });
 });

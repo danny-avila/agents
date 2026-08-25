@@ -131,6 +131,7 @@ import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { convertInjectedMessages } from '@/messages/injected';
+import { resolveClientOptionsModel } from '@/llm/request';
 import { composeAbortSignals } from '@/utils/misc';
 import { HandlerRegistry } from '@/events';
 
@@ -1091,8 +1092,7 @@ export class SubagentExecutor {
       return JSON.stringify({
         status: 'rejected',
         tool: Constants.SUBAGENT,
-        message:
-          'Child-thread continuation is not enabled by this host.',
+        message: 'Child-thread continuation is not enabled by this host.',
       });
     }
     const detachedHandlers = new HandlerRegistry();
@@ -2261,9 +2261,7 @@ export class SubagentExecutor {
     }
     if (this.maxDepth <= 0) {
       return Promise.resolve(
-        createSubagentFailure(
-          'Error: Maximum subagent nesting depth exceeded.'
-        )
+        createSubagentFailure('Error: Maximum subagent nesting depth exceeded.')
       );
     }
     if (
@@ -3300,7 +3298,7 @@ function createUsageCaptureHandler(args: {
         defaultMember?.[1];
       const model =
         callInfo?.model ??
-        (memberInput == null ? undefined : extractConfiguredModel(memberInput));
+        resolveClientOptionsModel(memberInput?.clientOptions);
       const callProvider = callInfo?.provider ?? memberInput?.provider;
       for (const generationGroup of output.generations) {
         /**
@@ -3421,27 +3419,6 @@ function getGraphEventMemberAgentId({
   return metadataAgentId != null && memberInputs.has(metadataAgentId)
     ? metadataAgentId
     : undefined;
-}
-
-/**
- * Best-effort read of the configured model from a subagent's client
- * options. Providers disagree on the key (`model` vs `modelName`), and the
- * value is only a fallback for calls that carry no `ls_model_name`.
- */
-function extractConfiguredModel(agentInputs: AgentInputs): string | undefined {
-  const clientOptions = agentInputs.clientOptions as
-    | { model?: unknown; modelName?: unknown }
-    | undefined;
-  if (typeof clientOptions?.model === 'string' && clientOptions.model !== '') {
-    return clientOptions.model;
-  }
-  if (
-    typeof clientOptions?.modelName === 'string' &&
-    clientOptions.modelName !== ''
-  ) {
-    return clientOptions.modelName;
-  }
-  return undefined;
 }
 
 function sanitizeResolverConfigurable(
