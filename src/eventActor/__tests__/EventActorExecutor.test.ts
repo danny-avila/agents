@@ -603,6 +603,26 @@ describe('EventActorExecutor', () => {
     expect(host.invokes).toBe(2);
   });
 
+  it('enforces maxDepth for host-driven invocation', async () => {
+    const host = new TestHost();
+    const executor = new EventActorExecutor(host, { maxDepth: 1 });
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'host-driven-depth',
+      depth: 1,
+      event: { text: 'host-driven-depth' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    preparation.invocation.depth = 2;
+
+    await expect(executor.invoke(preparation.invocation)).rejects.toThrow(
+      'exceeds maximum 1'
+    );
+    expect(host.invokes).toBe(0);
+  });
+
   it('derives nested depth from actor-owned ambient context', async () => {
     const host = new TestHost();
     const executor = new EventActorExecutor(host);
@@ -883,6 +903,37 @@ describe('EventActorExecutor', () => {
     expect(host.invokes).toBe(0);
   });
 
+  it('retains the SDK-generated namespace across warm adapter mutation', async () => {
+    const host = new TestHost();
+    const prepare = host.prepare.bind(host);
+    host.prepare = async (prepareRequest) => {
+      prepareRequest.checkpointNs = 'shared-namespace';
+      return prepare(prepareRequest);
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('mutated-warm-namespace'))
+    ).rejects.toThrow('mismatched checkpoint ownership');
+    expect(host.invokes).toBe(0);
+  });
+
+  it('retains the SDK-generated namespace across cold adapter mutation', async () => {
+    const host = new TestHost();
+    host.checkpointAvailable = false;
+    const coldContinue = host.coldContinue.bind(host);
+    host.coldContinue = async (prepareRequest, actorHead) => {
+      prepareRequest.checkpointNs = 'shared-namespace';
+      return coldContinue(prepareRequest, actorHead);
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('mutated-cold-namespace'))
+    ).rejects.toThrow('mismatched checkpoint ownership');
+    expect(host.invokes).toBe(0);
+  });
+
   it('rejects a stale commit result for another actor', async () => {
     const host = new TestHost();
     host.commit = async () => ({
@@ -965,6 +1016,56 @@ describe('EventActorExecutor', () => {
     await expect(
       executor.commit(preparation.invocation, terminal)
     ).rejects.toThrow('changed its checkpoint thread');
+  });
+
+  it('retains applied work when a stale head only relabels the base checkpoint', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    host.commit = async () => ({
+      status: 'stale' as const,
+      head: {
+        ...head(1, 'committed', 'checkpoint-0'),
+        generation: 2,
+      },
+    });
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('stale-base-checkpoint'))
+    ).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      result: 'stale-base-checkpoint',
+      error: {
+        message:
+          'Stale event actor head does not identify a competing checkpoint',
+      },
+    });
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('retains applied work when stale names the submitted checkpoint', async () => {
+    const host = new TestHost();
+    host.commit = async (commitRequest) => ({
+      status: 'stale' as const,
+      head: {
+        actorThreadId: 'actor-thread',
+        generation: 1,
+        checkpoint: { ...commitRequest.checkpoint },
+      },
+    });
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('stale-terminal-checkpoint'))
+    ).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      result: 'stale-terminal-checkpoint',
+      error: {
+        message:
+          'Stale event actor head does not identify a competing checkpoint',
+      },
+    });
+    expect(host.discards).toHaveLength(0);
   });
 
   it('commits an applied result even when cancellation arrives as invoke returns', async () => {

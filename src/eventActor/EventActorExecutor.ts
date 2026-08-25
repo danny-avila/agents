@@ -108,9 +108,10 @@ function validateInvocation<TEvent>(
   invocation: EventActorInvocation<TEvent>,
   continuation: 'warm' | 'cold',
   checkpointNs: string,
+  maxDepth: number,
   expectedHead?: EventActorInvocation<TEvent>['base']
 ): void {
-  validateInvocationReference(invocation);
+  validateInvocationReference(invocation, maxDepth);
   if (
     invocation.actorThreadId !== request.actorThreadId ||
     invocation.invocationId !== request.invocationId ||
@@ -144,12 +145,18 @@ function validateInvocation<TEvent>(
 }
 
 function validateInvocationReference(
-  invocation: EventActorInvocationReference
+  invocation: EventActorInvocationReference,
+  maxDepth?: number
 ): void {
   requireNonEmpty(invocation.actorThreadId, 'actorThreadId');
   requireNonEmpty(invocation.invocationId, 'invocationId');
   if (!Number.isSafeInteger(invocation.depth) || invocation.depth < 1) {
     throw new Error('Event actor invocation depth is invalid');
+  }
+  if (maxDepth != null && invocation.depth > maxDepth) {
+    throw new Error(
+      `Event actor depth ${invocation.depth} exceeds maximum ${maxDepth}`
+    );
   }
   const continuation: unknown = invocation.continuation;
   if (continuation !== 'warm' && continuation !== 'cold') {
@@ -172,6 +179,19 @@ function validateInvocationReference(
       'fork.checkpointId for resumed actor'
     );
   }
+}
+
+function checkpointsMatch(
+  left: EventActorCheckpointFork | EventActorHead['checkpoint'],
+  right: EventActorCheckpointFork | EventActorHead['checkpoint']
+): boolean {
+  return (
+    left != null &&
+    right != null &&
+    left.threadId === right.threadId &&
+    left.checkpointNs === right.checkpointNs &&
+    left.checkpointId === right.checkpointId
+  );
 }
 
 function validateTerminalCheckpoint(
@@ -342,17 +362,19 @@ export class EventActorExecutor<TEvent, TResult> {
     request: EventActorPrepareRequest<TEvent>
   ): Promise<EventActorPreparation<TEvent>> {
     this.validatePrepareRequest(request);
+    const checkpointNs = createInvocationCheckpointNs(request);
     const adapterRequest: EventActorAdapterPrepareRequest<TEvent> = {
       ...request,
-      checkpointNs: createInvocationCheckpointNs(request),
+      checkpointNs,
     };
-    const preparation = await this.adapter.prepare(adapterRequest);
+    const preparation = await this.adapter.prepare({ ...adapterRequest });
     if (preparation.status === 'ready') {
       validateInvocation(
         request,
         preparation.invocation,
         'warm',
-        adapterRequest.checkpointNs
+        checkpointNs,
+        this.maxDepth
       );
       return {
         status: 'ready',
@@ -377,19 +399,21 @@ export class EventActorExecutor<TEvent, TResult> {
     this.validatePrepareRequest(request);
     const trustedHead = snapshotHead(head);
     validateHead(trustedHead, request.actorThreadId);
+    const checkpointNs = createInvocationCheckpointNs(request);
     const adapterRequest: EventActorAdapterPrepareRequest<TEvent> = {
       ...request,
-      checkpointNs: createInvocationCheckpointNs(request),
+      checkpointNs,
     };
     const invocation = await this.adapter.coldContinue(
-      adapterRequest,
+      { ...adapterRequest },
       snapshotHead(trustedHead)
     );
     validateInvocation(
       request,
       invocation,
       'cold',
-      adapterRequest.checkpointNs,
+      checkpointNs,
+      this.maxDepth,
       trustedHead
     );
     return {
@@ -424,7 +448,8 @@ export class EventActorExecutor<TEvent, TResult> {
       },
       invocation,
       invocation.continuation,
-      invocation.fork.checkpointNs
+      invocation.fork.checkpointNs,
+      this.maxDepth
     );
     const controller = new AbortController();
     const abort = (): void => controller.abort(signal?.reason);
@@ -460,7 +485,7 @@ export class EventActorExecutor<TEvent, TResult> {
     terminal: EventActorAppliedResult<TResult>
   ): Promise<EventActorCommitResult> {
     const trustedInvocation = snapshotInvocationReference(invocation);
-    validateInvocationReference(trustedInvocation);
+    validateInvocationReference(trustedInvocation, this.maxDepth);
     const trustedCheckpoint = { ...terminal.checkpoint };
     validateTerminalCheckpoint(trustedInvocation, trustedCheckpoint);
     const committed = await this.adapter.commit({
@@ -487,11 +512,20 @@ export class EventActorExecutor<TEvent, TResult> {
         throw new Error('Stale event actor head did not advance past its base');
       }
       if (
-        trustedInvocation.base.checkpoint != null &&
-        committed.head.checkpoint?.threadId !==
-          trustedInvocation.base.checkpoint.threadId
+        committed.head.checkpoint?.threadId !== trustedInvocation.fork.threadId
       ) {
         throw new Error('Stale event actor head changed its checkpoint thread');
+      }
+      if (
+        checkpointsMatch(
+          committed.head.checkpoint,
+          trustedInvocation.base.checkpoint
+        ) ||
+        checkpointsMatch(committed.head.checkpoint, trustedCheckpoint)
+      ) {
+        throw new Error(
+          'Stale event actor head does not identify a competing checkpoint'
+        );
       }
       return { status: 'stale', head: snapshotHead(committed.head) };
     }
@@ -503,7 +537,7 @@ export class EventActorExecutor<TEvent, TResult> {
     reason: EventActorDiscardReason
   ): Promise<void> {
     const trustedInvocation = snapshotInvocationReference(invocation);
-    validateInvocationReference(trustedInvocation);
+    validateInvocationReference(trustedInvocation, this.maxDepth);
     return this.adapter.discard({
       invocation: trustedInvocation,
       reason,
