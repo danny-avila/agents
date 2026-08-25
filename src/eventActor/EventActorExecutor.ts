@@ -58,7 +58,9 @@ function validateHead(
     return;
   }
   requireNonEmpty(head.checkpoint.threadId, 'head.checkpoint.threadId');
-  requireNonEmpty(head.checkpoint.checkpointNs, 'head.checkpoint.checkpointNs');
+  if (typeof head.checkpoint.checkpointNs !== 'string') {
+    throw new Error('head.checkpoint.checkpointNs must be a string');
+  }
   requireNonEmpty(
     head.checkpoint.checkpointId ?? '',
     'head.checkpoint.checkpointId'
@@ -126,10 +128,21 @@ function validateTerminalCheckpoint(
 
 function createRunnableConfig(
   invocation: EventActorInvocationReference,
-  signal: AbortSignal
+  signal: AbortSignal,
+  ambient?: RunnableConfig
 ): RunnableConfig {
   return {
     signal,
+    ...(ambient?.callbacks == null ? {} : { callbacks: ambient.callbacks }),
+    ...(ambient?.tags == null ? {} : { tags: ambient.tags }),
+    metadata: {
+      ...(ambient?.metadata ?? {}),
+      eventActorThreadId: invocation.actorThreadId,
+      eventActorInvocationId: invocation.invocationId,
+      eventActorGeneration: invocation.base.generation,
+      eventActorDepth: invocation.depth,
+      eventActorContinuation: invocation.continuation,
+    },
     configurable: {
       thread_id: invocation.fork.threadId,
       checkpoint_ns: invocation.fork.checkpointNs,
@@ -155,10 +168,16 @@ function isAborted(signal?: AbortSignal): boolean {
 
 function validateCommittedHead(
   invocation: EventActorInvocationReference,
+  checkpoint: EventActorCheckpointFork,
   head: EventActorInvocationReference['base']
 ): void {
   validateHead(head, invocation.actorThreadId, true);
-  if (head.generation !== invocation.base.generation + 1) {
+  if (
+    head.generation !== invocation.base.generation + 1 ||
+    head.checkpoint?.threadId !== checkpoint.threadId ||
+    head.checkpoint.checkpointNs !== checkpoint.checkpointNs ||
+    head.checkpoint.checkpointId !== checkpoint.checkpointId
+  ) {
     throw new Error('Event actor commit returned an invalid logical head');
   }
 }
@@ -199,20 +218,12 @@ export class EventActorExecutor<TEvent, TResult> {
     };
     const preparation = await this.adapter.prepare(adapterRequest);
     if (preparation.status === 'ready') {
-      try {
-        validateInvocation(
-          request,
-          preparation.invocation,
-          'warm',
-          adapterRequest.checkpointNs
-        );
-      } catch (error) {
-        await this.adapter.discard({
-          invocation: preparation.invocation,
-          reason: 'failed',
-        });
-        throw error;
-      }
+      validateInvocation(
+        request,
+        preparation.invocation,
+        'warm',
+        adapterRequest.checkpointNs
+      );
     } else {
       validateHead(preparation.head, request.actorThreadId);
     }
@@ -229,24 +240,31 @@ export class EventActorExecutor<TEvent, TResult> {
       checkpointNs: createInvocationCheckpointNs(request),
     };
     const invocation = await this.adapter.coldContinue(adapterRequest, head);
-    try {
-      validateInvocation(
-        request,
-        invocation,
-        'cold',
-        adapterRequest.checkpointNs,
-        head
-      );
-    } catch (error) {
-      await this.adapter.discard({ invocation, reason: 'failed' });
-      throw error;
-    }
+    validateInvocation(
+      request,
+      invocation,
+      'cold',
+      adapterRequest.checkpointNs,
+      head
+    );
     return invocation;
   }
 
   async invoke(
     invocation: EventActorInvocation<TEvent>,
     signal?: AbortSignal
+  ): Promise<EventActorTerminalResult<TResult>> {
+    return this.invokeWithConfig(
+      invocation,
+      signal,
+      AsyncLocalStorageProviderSingleton.getRunnableConfig()
+    );
+  }
+
+  private async invokeWithConfig(
+    invocation: EventActorInvocation<TEvent>,
+    signal: AbortSignal | undefined,
+    ambientConfig: RunnableConfig | undefined
   ): Promise<EventActorTerminalResult<TResult>> {
     validateInvocation(
       {
@@ -266,7 +284,11 @@ export class EventActorExecutor<TEvent, TResult> {
     } else {
       signal?.addEventListener('abort', abort, { once: true });
     }
-    const config = createRunnableConfig(invocation, controller.signal);
+    const config = createRunnableConfig(
+      invocation,
+      controller.signal,
+      ambientConfig
+    );
     try {
       if (controller.signal.aborted) {
         throw asError(controller.signal.reason ?? 'Event actor cancelled');
@@ -300,7 +322,7 @@ export class EventActorExecutor<TEvent, TResult> {
       },
     });
     if (committed.status === 'committed') {
-      validateCommittedHead(invocation, committed.head);
+      validateCommittedHead(invocation, terminal.checkpoint, committed.head);
     }
     return committed;
   }
@@ -331,6 +353,8 @@ export class EventActorExecutor<TEvent, TResult> {
   async execute(
     request: EventActorExecutionRequest<TEvent>
   ): Promise<EventActorExecutionResult<TResult>> {
+    const ambientConfig =
+      AsyncLocalStorageProviderSingleton.getRunnableConfig();
     const depth = request.depth ?? 1;
     const prepareRequest: EventActorPrepareRequest<TEvent> = {
       actorThreadId: request.actorThreadId,
@@ -351,7 +375,11 @@ export class EventActorExecutor<TEvent, TResult> {
     }
     let terminal;
     try {
-      terminal = await this.invoke(invocation, request.signal);
+      terminal = await this.invokeWithConfig(
+        invocation,
+        request.signal,
+        ambientConfig
+      );
     } catch (error) {
       const reason = isAborted(request.signal) ? 'cancelled' : 'failed';
       await this.discard(invocationReference, reason);
@@ -359,10 +387,6 @@ export class EventActorExecutor<TEvent, TResult> {
         return { status: 'cancelled', continuation };
       }
       return { status: 'failed', error: asError(error), continuation };
-    }
-    if (isAborted(request.signal)) {
-      await this.discard(invocationReference, 'cancelled');
-      return { status: 'cancelled', continuation };
     }
     if (terminal.status === 'completed_no_action') {
       await this.discard(invocationReference, 'completed_no_action');

@@ -1,5 +1,6 @@
-import { describe, expect, it } from '@jest/globals';
+import { describe, expect, it, jest } from '@jest/globals';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type {
   EventActorAdapterPrepareRequest,
   EventActorCommitRequest,
@@ -7,6 +8,7 @@ import type {
   EventActorHead,
   EventActorHostAdapter,
   EventActorInvocation,
+  EventActorInvocationContext,
   EventActorPrepareRequest,
   EventActorTerminalResult,
 } from '@/eventActor';
@@ -14,7 +16,11 @@ import { EventActorExecutor } from '@/eventActor';
 
 type TestEvent = { text: string };
 
-const head = (generation = 0): EventActorHead => {
+const head = (
+  generation = 0,
+  checkpointNs = 'committed',
+  checkpointId = `checkpoint-${generation}`
+): EventActorHead => {
   const actorHead: EventActorHead = {
     actorThreadId: 'actor-thread',
     generation,
@@ -26,8 +32,8 @@ const head = (generation = 0): EventActorHead => {
     ...actorHead,
     checkpoint: {
       threadId: 'actor-checkpoints',
-      checkpointNs: 'committed',
-      checkpointId: `checkpoint-${generation}`,
+      checkpointNs,
+      checkpointId,
     },
   };
 };
@@ -50,6 +56,8 @@ const invocation = (
 class TestHost implements EventActorHostAdapter<TestEvent, string> {
   generation = 0;
   checkpointAvailable = true;
+  committedCheckpointNs = 'committed';
+  committedCheckpointId = 'checkpoint-0';
   invokes = 0;
   activeInvocations = 0;
   maxActiveInvocations = 0;
@@ -57,6 +65,7 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
   readonly commits: EventActorCommitRequest<string>[] = [];
   readonly discards: EventActorDiscardRequest[] = [];
   readonly invokeSignals: AbortSignal[] = [];
+  readonly invokeConfigs: RunnableConfig[] = [];
   readonly forkNamespaces: string[] = [];
   invokeImpl?: (
     prepared: EventActorInvocation<TestEvent>,
@@ -67,12 +76,23 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
     if (!this.checkpointAvailable) {
       return {
         status: 'checkpoint_unavailable' as const,
-        head: head(this.generation),
+        head: head(
+          this.generation,
+          this.committedCheckpointNs,
+          this.committedCheckpointId
+        ),
       };
     }
     return {
       status: 'ready' as const,
-      invocation: invocation(request, 'warm', this.generation),
+      invocation: {
+        ...invocation(request, 'warm', this.generation),
+        base: head(
+          this.generation,
+          this.committedCheckpointNs,
+          this.committedCheckpointId
+        ),
+      },
     };
   }
 
@@ -80,12 +100,19 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
     request: EventActorAdapterPrepareRequest<TestEvent>,
     _head: EventActorHead
   ) {
-    return invocation(request, 'cold', this.generation);
+    return {
+      ...invocation(request, 'cold', this.generation),
+      base: head(
+        this.generation,
+        this.committedCheckpointNs,
+        this.committedCheckpointId
+      ),
+    };
   }
 
   async invoke(
     prepared: EventActorInvocation<TestEvent>,
-    context: { signal: AbortSignal }
+    context: EventActorInvocationContext
   ) {
     this.invokes += 1;
     this.activeInvocations += 1;
@@ -94,6 +121,7 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
       this.activeInvocations
     );
     this.invokeSignals.push(context.signal);
+    this.invokeConfigs.push(context.config);
     this.forkNamespaces.push(prepared.fork.checkpointNs);
     try {
       if (this.invokeImpl != null) {
@@ -118,10 +146,26 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
       throw this.commitError;
     }
     if (request.expectedHead.generation !== this.generation) {
-      return { status: 'stale' as const, head: head(this.generation) };
+      return {
+        status: 'stale' as const,
+        head: head(
+          this.generation,
+          this.committedCheckpointNs,
+          this.committedCheckpointId
+        ),
+      };
     }
     this.generation += 1;
-    return { status: 'committed' as const, head: head(this.generation) };
+    this.committedCheckpointNs = request.checkpoint.checkpointNs;
+    this.committedCheckpointId = request.checkpoint.checkpointId ?? '';
+    return {
+      status: 'committed' as const,
+      head: head(
+        this.generation,
+        this.committedCheckpointNs,
+        this.committedCheckpointId
+      ),
+    };
   }
 
   async discard(request: EventActorDiscardRequest) {
@@ -205,6 +249,25 @@ describe('EventActorExecutor', () => {
     expect(host.commits[0].invocation).toMatchObject({
       actorThreadId: 'actor-thread',
       continuation: 'cold',
+    });
+  });
+
+  it('accepts a committed actor head in LangGraph root checkpoint namespace', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    host.committedCheckpointNs = '';
+    host.committedCheckpointId = 'root-checkpoint';
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('root-namespace'))
+    ).resolves.toMatchObject({
+      status: 'applied',
+      head: { generation: 2 },
+    });
+    expect(host.commits[0].expectedHead.checkpoint).toMatchObject({
+      checkpointNs: '',
+      checkpointId: 'root-checkpoint',
     });
   });
 
@@ -321,6 +384,27 @@ describe('EventActorExecutor', () => {
     expect(host.discards).toHaveLength(0);
   });
 
+  it('rejects a committed head that does not promote the terminal checkpoint', async () => {
+    const host = new TestHost();
+    const commit = host.commit.bind(host);
+    host.commit = async (commitRequest) => {
+      const result = await commit(commitRequest);
+      if (result.status === 'committed' && result.head.checkpoint != null) {
+        result.head.checkpoint.checkpointId = 'different-checkpoint';
+      }
+      return result;
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('wrong-head'))
+    ).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      error: { message: 'Event actor commit returned an invalid logical head' },
+    });
+    expect(host.discards).toHaveLength(0);
+  });
+
   it('replaces an ambient parent signal with independent task-owned signals', async () => {
     const host = new TestHost();
     const parentController = new AbortController();
@@ -341,13 +425,19 @@ describe('EventActorExecutor', () => {
     };
     const executor = new EventActorExecutor(host);
 
-    const executions = await AsyncLocalStorageProviderSingleton.runWithConfig(
-      { signal: parentController.signal },
-      async () => [
-        executor.execute(request('sibling-a')),
-        executor.execute(request('sibling-b')),
-      ]
-    );
+    const runnableConfigSpy = jest
+      .spyOn(AsyncLocalStorageProviderSingleton, 'getRunnableConfig')
+      .mockReturnValue({
+        signal: parentController.signal,
+        callbacks: [],
+        tags: ['parent-trace'],
+        metadata: { userId: 'user-1', sessionId: 'session-1' },
+      });
+    const executions = [
+      executor.execute(request('sibling-a')),
+      executor.execute(request('sibling-b')),
+    ];
+    runnableConfigSpy.mockRestore();
     while (host.invokes < 2) {
       await Promise.resolve();
     }
@@ -362,6 +452,16 @@ describe('EventActorExecutor', () => {
     ).toBe(true);
     expect(host.invokeSignals).not.toContain(parentController.signal);
     expect(host.invokeSignals.every((signal) => !signal.aborted)).toBe(true);
+    expect(host.invokeConfigs).toHaveLength(2);
+    expect(host.invokeConfigs[0]).toMatchObject({
+      callbacks: [],
+      tags: ['parent-trace'],
+      metadata: {
+        userId: 'user-1',
+        sessionId: 'session-1',
+        eventActorThreadId: 'actor-thread',
+      },
+    });
     release();
 
     const results = await Promise.all(executions);
@@ -408,7 +508,32 @@ describe('EventActorExecutor', () => {
     expect(host.discards[0].reason).toBe('failed');
   });
 
-  it('rejects and discards a preparation that reuses another fork namespace', async () => {
+  it('commits an applied result even when cancellation arrives as invoke returns', async () => {
+    const host = new TestHost();
+    const controller = new AbortController();
+    host.invokeImpl = async (prepared) => {
+      controller.abort(new Error('parent settled'));
+      return {
+        status: 'applied',
+        result: 'move submitted',
+        checkpoint: {
+          ...prepared.fork,
+          checkpointId: 'applied-before-abort',
+        },
+      };
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(
+        request('applied-before-abort', { signal: controller.signal })
+      )
+    ).resolves.toMatchObject({ status: 'applied', head: { generation: 1 } });
+    expect(host.commits).toHaveLength(1);
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('rejects a preparation without discarding its untrusted fork reference', async () => {
     const host = new TestHost();
     const prepare = host.prepare.bind(host);
     host.prepare = async (prepareRequest) => {
@@ -423,8 +548,6 @@ describe('EventActorExecutor', () => {
     await expect(executor.execute(request('wrong-namespace'))).rejects.toThrow(
       'mismatched checkpoint ownership'
     );
-    expect(host.discards).toEqual([
-      expect.objectContaining({ reason: 'failed' }),
-    ]);
+    expect(host.discards).toHaveLength(0);
   });
 });
