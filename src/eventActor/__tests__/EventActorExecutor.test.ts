@@ -645,6 +645,39 @@ describe('EventActorExecutor', () => {
     expect(host.invokes).toBe(0);
   });
 
+  it('binds ambient actor depth during public preparation', async () => {
+    const host = new TestHost();
+    const executor = new EventActorExecutor(host, { maxDepth: 2 });
+    const runnableConfigSpy = jest
+      .spyOn(AsyncLocalStorageProviderSingleton, 'getRunnableConfig')
+      .mockReturnValue({ configurable: { event_actor_depth: 1 } });
+    const warmPreparation = executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'ambient-warm-prepare',
+      depth: 1,
+      event: { text: 'ambient-warm-prepare' },
+    });
+    const coldPreparation = executor.coldContinue(
+      {
+        actorThreadId: 'actor-thread',
+        invocationId: 'ambient-cold-prepare',
+        depth: 1,
+        event: { text: 'ambient-cold-prepare' },
+      },
+      head(0)
+    );
+    runnableConfigSpy.mockRestore();
+
+    await expect(warmPreparation).rejects.toThrow(
+      'must advance parent depth 1'
+    );
+    await expect(coldPreparation).rejects.toThrow(
+      'must advance parent depth 1'
+    );
+    expect(host.coldContinues).toBe(0);
+    expect(host.invokes).toBe(0);
+  });
+
   it('derives nested depth from actor-owned ambient context', async () => {
     const host = new TestHost();
     const executor = new EventActorExecutor(host);
@@ -1118,6 +1151,43 @@ describe('EventActorExecutor', () => {
     ).resolves.toMatchObject({
       status: 'commit_indeterminate',
       result: 'stale-terminal-checkpoint',
+      error: {
+        message:
+          'Stale event actor head does not identify a competing checkpoint',
+      },
+    });
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('retains cold-applied work when stale names its reconstructed start', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    host.checkpointAvailable = false;
+    const coldContinue = host.coldContinue.bind(host);
+    host.coldContinue = async (prepareRequest, actorHead) => {
+      const prepared = await coldContinue(prepareRequest, actorHead);
+      prepared.fork.checkpointId = 'reconstructed-start';
+      return prepared;
+    };
+    host.commit = async () => ({
+      status: 'stale' as const,
+      head: {
+        actorThreadId: 'actor-thread',
+        generation: 2,
+        checkpoint: {
+          threadId: 'actor-checkpoints',
+          checkpointNs: 'winner-namespace',
+          checkpointId: 'reconstructed-start',
+        },
+      },
+    });
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('stale-reconstructed-start'))
+    ).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      result: 'stale-reconstructed-start',
       error: {
         message:
           'Stale event actor head does not identify a competing checkpoint',

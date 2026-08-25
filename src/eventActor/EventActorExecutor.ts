@@ -376,6 +376,10 @@ export class EventActorExecutor<TEvent, TResult> {
   async prepare(
     request: EventActorPrepareRequest<TEvent>
   ): Promise<EventActorPreparation<TEvent>> {
+    resolveExecutionDepth(
+      request.depth,
+      AsyncLocalStorageProviderSingleton.getRunnableConfig()
+    );
     this.validatePrepareRequest(request);
     const checkpointNs = createInvocationCheckpointNs(request);
     const adapterRequest: EventActorAdapterPrepareRequest<TEvent> = {
@@ -411,6 +415,10 @@ export class EventActorExecutor<TEvent, TResult> {
     request: EventActorPrepareRequest<TEvent>,
     head: EventActorHead
   ): Promise<EventActorInvocation<TEvent>> {
+    resolveExecutionDepth(
+      request.depth,
+      AsyncLocalStorageProviderSingleton.getRunnableConfig()
+    );
     this.validatePrepareRequest(request);
     const trustedHead = snapshotHead(head);
     validateHead(trustedHead, request.actorThreadId);
@@ -550,6 +558,7 @@ export class EventActorExecutor<TEvent, TResult> {
           committed.head.checkpoint,
           trustedInvocation.base.checkpoint
         ) ||
+        checkpointIdsMatch(committed.head.checkpoint, trustedInvocation.fork) ||
         checkpointsMatch(committed.head.checkpoint, trustedCheckpoint)
       ) {
         throw new Error(
