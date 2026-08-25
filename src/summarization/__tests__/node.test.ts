@@ -12,9 +12,11 @@ import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { createSummarizeNode } from '@/summarization/node';
+import { registerProvider } from '@/llm/providerRegistry';
 import { AgentContext } from '@/agents/AgentContext';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
+import { FakeChatModel } from '@/llm/fake';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -2373,5 +2375,70 @@ describe('summarize node breaker capture', () => {
 
     expect(persistedCount).toBe(claudeCounter(carrier));
     expect(claudeCounter(carrier)).toBeGreaterThan(openaiCounter(carrier));
+  });
+
+  /** A host provider registered with `family: 'anthropic'` serves Claude under
+   *  whatever name and deployment alias the host chose, so an exact match on
+   *  the `ANTHROPIC` enum missed it and fell back to `o200k_base`. The rest of
+   *  the package reads the trait as a family (`isThinkingEnabled`), and the
+   *  tokenizer choice now does too. */
+  it('honors a registered anthropic family with no configured model', async () => {
+    const summaryBody =
+      '사용자가 인증 미들웨어를 리팩터링하여 속도 제한 전에 토큰 검증이 이루어지도록 요청했습니다. 기존 핸들러를 읽어보니 순서가 뒤바뀌어 있었습니다.';
+    const dispose = registerProvider({
+      provider: 'claude-host-summarization-test',
+      model: class extends FakeChatModel {
+        constructor() {
+          super({ responses: [summaryBody] });
+        }
+      },
+      family: 'anthropic',
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel(summaryBody);
+        }
+      } as never
+    );
+
+    try {
+      /* No model on either key: the provider is the only signal there is. */
+      const agentContext = createAgentContext({
+        provider: 'claude-host-summarization-test',
+        clientOptions: {},
+      });
+      const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+      const node = createSummarizeNode({
+        agentContext,
+        graph: mockGraph(),
+        generateStepId,
+      });
+
+      await node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+
+      const [persistedText, persistedCount] = setSummary.mock.calls[0] as [
+        string,
+        number,
+      ];
+      const carrier = new HumanMessage(buildSummaryCarrierText(persistedText));
+      const claudeCounter = await createTokenCounter('claude');
+      const openaiCounter = await createTokenCounter('o200k_base');
+
+      expect(persistedCount).toBe(claudeCounter(carrier));
+      expect(claudeCounter(carrier)).toBeGreaterThan(openaiCounter(carrier));
+    } finally {
+      dispose();
+    }
   });
 });

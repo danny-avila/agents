@@ -55,6 +55,7 @@ import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { createRemoveAllMessage } from '@/messages/reducer';
+import { getProviderFamily } from '@/llm/providerRegistry';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 import { executeHooks } from '@/hooks';
@@ -363,16 +364,22 @@ async function computeSummaryTokenCount(
  * `modelName` is LangChain's alias for `model` and hosts configure agents
  * through either, so reading one key alone would report an unconfigured model
  * and quietly hand a Claude agent the `o200k_base` tokenizer. Provider is the
- * fallback for a client that never recorded a model: `ANTHROPIC` implies a
- * Claude tokenizer, while `BEDROCK` does not, since it also serves Llama, Titan
- * and Mistral.
+ * fallback for a client that never recorded a model, and it is read as a family
+ * rather than as one enum value: a host can register its own provider with
+ * `family: 'anthropic'` (the trait `isThinkingEnabled` already reads the same
+ * way), and such a provider serves Claude behind whatever name and deployment
+ * alias the host chose. `BEDROCK` is left out by the same rule, since its
+ * family is `bedrock` and it also serves Llama, Titan and Mistral. The enum
+ * check stays ahead of the family lookup because the registry is populated by
+ * importing `@/llm/providers`, which a root-barrel consumer defers.
  */
 function encodingForReceivingAgent(agentContext: AgentContext): EncodingName {
   const model = resolveClientOptionsModel(agentContext.clientOptions);
   if (model != null) {
     return encodingForModel(model);
   }
-  return agentContext.provider === Providers.ANTHROPIC
+  return agentContext.provider === Providers.ANTHROPIC ||
+    getProviderFamily(agentContext.provider) === 'anthropic'
     ? 'claude'
     : 'o200k_base';
 }
