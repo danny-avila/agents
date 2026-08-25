@@ -1225,9 +1225,8 @@ describe('toolContent', () => {
       process.execPath,
       [
         '--max-old-space-size=128',
-        '--loader',
-        'ts-node/esm/transpile-only',
-        '--experimental-specifier-resolution=node',
+        '--import',
+        'tsx',
         '--input-type=module',
         '--eval',
         script,

@@ -183,7 +183,7 @@ never pays for a summarization they opted out of.
 ## Re-running the probe
 
 ```bash
-DOTENV_CONFIG_PATH=./.env node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/context-overflow-probe.ts --list
+DOTENV_CONFIG_PATH=./.env npx tsx ./src/scripts/context-overflow-probe.ts --list
 ```
 
 Drop `--list` to execute. Useful flags: `--only <provider,…>`, `--model
