@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it, jest } from '@jest/globals';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import type { RunnableConfig } from '@langchain/core/runnables';
@@ -225,6 +226,15 @@ const request = (
 });
 
 describe('EventActorExecutor', () => {
+  it('rejects preparation signing keys below 256 bits', () => {
+    expect(
+      () =>
+        new EventActorExecutor(new TestHost(), {
+          preparationSigningKey: 'short-key',
+        })
+    ).toThrow('preparationSigningKey must contain at least 32 bytes');
+  });
+
   it('exposes the lifecycle seam for host-driven mailbox orchestration', async () => {
     const host = new TestHost();
     const executor = new EventActorExecutor(host);
@@ -357,6 +367,93 @@ describe('EventActorExecutor', () => {
       outcome: 'applied',
       detail: { code: 200 },
     });
+  });
+
+  it('snapshots applied results before reporting an invalid terminal checkpoint', async () => {
+    type ObjectResult = { outcome: string; detail: { code: number } };
+    const host = new TestHost();
+    const adapterResult: ObjectResult = {
+      outcome: 'applied',
+      detail: { code: 200 },
+    };
+    const adapter: EventActorHostAdapter<TestEvent, ObjectResult> = {
+      prepare: host.prepare.bind(host),
+      coldContinue: host.coldContinue.bind(host),
+      invoke: async () => ({
+        status: 'applied',
+        result: adapterResult,
+        checkpoint: {
+          invocationId: 'invalid-terminal',
+          threadId: 'foreign-checkpoint-thread',
+          checkpointNs: 'foreign-checkpoint-namespace',
+        },
+      }),
+      commit: async () => {
+        throw new Error('commit must not run');
+      },
+      discard: host.discard.bind(host),
+    };
+    const executor = new EventActorExecutor(adapter);
+
+    const execution = await executor.execute({
+      actorThreadId: 'actor-thread',
+      invocationId: 'invalid-terminal',
+      event: { text: 'invalid-terminal' },
+    });
+    if (execution.status !== 'commit_indeterminate') {
+      throw new Error('Expected an indeterminate commit');
+    }
+    adapterResult.outcome = 'mutated';
+    adapterResult.detail.code = 500;
+
+    expect(execution.result).toEqual({
+      outcome: 'applied',
+      detail: { code: 200 },
+    });
+    expect(Object.isFrozen(execution.result)).toBe(true);
+    expect(Object.isFrozen(execution.result.detail)).toBe(true);
+  });
+
+  it('validates and commits the same terminal checkpoint snapshot', async () => {
+    const host = new TestHost();
+    let namespaceReads = 0;
+    host.invokeImpl = async (prepared) => ({
+      status: 'applied',
+      result: 'single-read-terminal',
+      checkpoint: Object.defineProperties(
+        {},
+        {
+          invocationId: {
+            enumerable: true,
+            value: prepared.invocationId,
+          },
+          threadId: { enumerable: true, value: prepared.fork.threadId },
+          checkpointNs: {
+            enumerable: true,
+            get: () => {
+              namespaceReads += 1;
+              return namespaceReads === 1
+                ? prepared.fork.checkpointNs
+                : 'forged-namespace';
+            },
+          },
+          checkpointId: {
+            enumerable: true,
+            value: 'single-read-terminal-checkpoint',
+          },
+        }
+      ) as EventActorCheckpointFork,
+    });
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('single-read-terminal'))
+    ).resolves.toMatchObject({
+      status: 'applied',
+      result: 'single-read-terminal',
+      head: { generation: 1 },
+    });
+    expect(namespaceReads).toBe(1);
   });
 
   it('commits applied work with current-plus-previous retention', async () => {
@@ -796,6 +893,160 @@ describe('EventActorExecutor', () => {
     expect(host.invokes).toBe(0);
   });
 
+  it('rejects a publicly recomputable digest as preparation authority', async () => {
+    const host = new TestHost();
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'plain-digest-forgery',
+      depth: 1,
+      event: { text: 'plain-digest-forgery' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const forgedEvent = { text: 'forged-event' };
+    const forgedDigest = createHash('sha256')
+      .update(
+        JSON.stringify({
+          kind: 'invocation',
+          actorThreadId: preparation.invocation.actorThreadId,
+          invocationId: preparation.invocation.invocationId,
+          depth: preparation.invocation.depth,
+          continuation: preparation.invocation.continuation,
+          base: {
+            actorThreadId: preparation.invocation.base.actorThreadId,
+            generation: preparation.invocation.base.generation,
+            checkpoint: null,
+          },
+          fork: {
+            invocationId: preparation.invocation.fork.invocationId,
+            threadId: preparation.invocation.fork.threadId,
+            checkpointId: null,
+            checkpointNs: preparation.invocation.fork.checkpointNs,
+          },
+          event: forgedEvent,
+        })
+      )
+      .digest('hex');
+
+    await expect(
+      executor.invoke({
+        ...preparation.invocation,
+        event: forgedEvent,
+        preparationDigest: forgedDigest,
+      })
+    ).rejects.toThrow('prepared invocation binding is invalid');
+    expect(host.invokes).toBe(0);
+  });
+
+  it('restores canonical prepared authority with the same private key', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    const signingKey = 'stable-preparation-key'.repeat(2);
+    const firstExecutor = new EventActorExecutor(host, {
+      preparationSigningKey: signingKey,
+    });
+    const preparation = await firstExecutor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'restored-warm-authority',
+      depth: 1,
+      event: { text: 'restored-warm-authority' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const baseCheckpoint = preparation.invocation.base.checkpoint;
+    if (baseCheckpoint == null) {
+      throw new Error('Expected a committed base checkpoint');
+    }
+    const restored = {
+      preparationDigest: preparation.invocation.preparationDigest,
+      event: { text: preparation.invocation.event.text },
+      fork: {
+        checkpointNs: preparation.invocation.fork.checkpointNs,
+        checkpointId: preparation.invocation.fork.checkpointId,
+        threadId: preparation.invocation.fork.threadId,
+        invocationId: preparation.invocation.fork.invocationId,
+      },
+      base: {
+        checkpoint: {
+          checkpointNs: baseCheckpoint.checkpointNs,
+          checkpointId: baseCheckpoint.checkpointId,
+          threadId: baseCheckpoint.threadId,
+        },
+        generation: preparation.invocation.base.generation,
+        actorThreadId: preparation.invocation.base.actorThreadId,
+      },
+      continuation: preparation.invocation.continuation,
+      depth: preparation.invocation.depth,
+      invocationId: preparation.invocation.invocationId,
+      actorThreadId: preparation.invocation.actorThreadId,
+    };
+    const restoredExecutor = new EventActorExecutor(host, {
+      preparationSigningKey: signingKey,
+    });
+
+    await expect(restoredExecutor.invoke(restored)).resolves.toMatchObject({
+      status: 'applied',
+      result: 'restored-warm-authority',
+    });
+  });
+
+  it('rejects restored prepared authority signed by another executor', async () => {
+    const host = new TestHost();
+    const issuer = new EventActorExecutor(host, {
+      preparationSigningKey: 'issuer-key'.repeat(4),
+    });
+    const preparation = await issuer.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'foreign-authority',
+      depth: 1,
+      event: { text: 'foreign-authority' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const verifier = new EventActorExecutor(host, {
+      preparationSigningKey: 'different-key'.repeat(4),
+    });
+
+    await expect(verifier.invoke(preparation.invocation)).rejects.toThrow(
+      'prepared invocation binding is invalid'
+    );
+    expect(host.invokes).toBe(0);
+  });
+
+  it('authenticates and executes the same immutable invocation snapshot', async () => {
+    const host = new TestHost();
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'single-read-invocation',
+      depth: 1,
+      event: { text: 'single-read-invocation' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    let reads = 0;
+    const event = Object.defineProperty({}, 'text', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return reads === 1 ? 'single-read-invocation' : 'forged-event';
+      },
+    }) as TestEvent;
+
+    await expect(
+      executor.invoke({ ...preparation.invocation, event })
+    ).resolves.toMatchObject({
+      status: 'applied',
+      result: 'single-read-invocation',
+    });
+    expect(reads).toBe(1);
+  });
+
   it('enforces ambient actor depth for host-driven invocation', async () => {
     const host = new TestHost();
     const executor = new EventActorExecutor(host, { maxDepth: 2 });
@@ -999,6 +1250,84 @@ describe('EventActorExecutor', () => {
       })
     ).rejects.toThrow('unavailable preparation binding is invalid');
     expect(host.coldContinues).toBe(0);
+  });
+
+  it('restores canonical unavailable authority with the same private key', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    host.checkpointAvailable = false;
+    const signingKey = 'stable-unavailable-key'.repeat(2);
+    const issuer = new EventActorExecutor(host, {
+      preparationSigningKey: signingKey,
+    });
+    const preparation = await issuer.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'restored-unavailable-authority',
+      depth: 1,
+      event: { text: 'restored-unavailable-authority' },
+    });
+    if (preparation.status !== 'checkpoint_unavailable') {
+      throw new Error('Expected unavailable checkpoint');
+    }
+    const restored = {
+      preparationDigest: preparation.preparationDigest,
+      head: {
+        checkpoint: {
+          checkpointNs: preparation.head.checkpoint?.checkpointNs ?? '',
+          checkpointId: preparation.head.checkpoint?.checkpointId,
+          threadId: preparation.head.checkpoint?.threadId ?? '',
+        },
+        generation: preparation.head.generation,
+        actorThreadId: preparation.head.actorThreadId,
+      },
+      request: {
+        event: { text: preparation.request.event.text },
+        depth: preparation.request.depth,
+        invocationId: preparation.request.invocationId,
+        actorThreadId: preparation.request.actorThreadId,
+      },
+      status: 'checkpoint_unavailable' as const,
+    };
+    const verifier = new EventActorExecutor(host, {
+      preparationSigningKey: signingKey,
+    });
+
+    await expect(verifier.coldContinue(restored)).resolves.toMatchObject({
+      actorThreadId: 'actor-thread',
+      invocationId: 'restored-unavailable-authority',
+      continuation: 'cold',
+    });
+  });
+
+  it('authenticates and cold-continues the same immutable handoff snapshot', async () => {
+    const host = new TestHost();
+    host.checkpointAvailable = false;
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'single-read-cold-handoff',
+      depth: 1,
+      event: { text: 'single-read-cold-handoff' },
+    });
+    if (preparation.status !== 'checkpoint_unavailable') {
+      throw new Error('Expected unavailable checkpoint');
+    }
+    let reads = 0;
+    const event = Object.defineProperty({}, 'text', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return reads === 1 ? 'single-read-cold-handoff' : 'forged-event';
+      },
+    }) as TestEvent;
+
+    await expect(
+      executor.coldContinue({
+        ...preparation,
+        request: { ...preparation.request, event },
+      })
+    ).resolves.toMatchObject({ event: { text: 'single-read-cold-handoff' } });
+    expect(reads).toBe(1);
   });
 
   it('snapshots the cold-continuation handoff before adapter work can yield', async () => {
@@ -1854,7 +2183,7 @@ describe('EventActorExecutor', () => {
     }
 
     expect(() => executor.discard(malformed, 'failed')).toThrow(
-      'Event actor head is invalid'
+      'prepared invocation binding is invalid'
     );
     const forgedSettlement = {
       ...terminal,
@@ -1865,6 +2194,35 @@ describe('EventActorExecutor', () => {
     );
     expect(host.discards).toHaveLength(0);
     expect(host.commits).toHaveLength(0);
+  });
+
+  it('requires executor-issued authority before public discard', async () => {
+    const host = new TestHost();
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'authorized-discard',
+      depth: 1,
+      event: { text: 'authorized-discard' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+
+    await expect(
+      executor.discard(preparation.invocation, 'failed')
+    ).resolves.toBeUndefined();
+    expect(host.discards).toHaveLength(1);
+    expect(() =>
+      executor.discard(
+        {
+          ...preparation.invocation,
+          preparationDigest: '0'.repeat(64),
+        },
+        'failed'
+      )
+    ).toThrow('prepared invocation binding is invalid');
+    expect(host.discards).toHaveLength(1);
   });
 
   it('detects a cold adapter mutating its copy of the prepared head', async () => {

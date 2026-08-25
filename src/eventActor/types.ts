@@ -45,7 +45,7 @@ export interface EventActorInvocation<TEvent extends EventActorEvent>
 
 export interface EventActorPreparedInvocation<TEvent extends EventActorEvent>
   extends EventActorInvocation<TEvent> {
-  /** Integrity binding over the complete prepared invocation. */
+  /** Executor-authenticated binding over the complete prepared invocation. */
   preparationDigest: string;
 }
 
@@ -59,7 +59,7 @@ export type EventActorPreparation<TEvent extends EventActorEvent> =
       status: 'checkpoint_unavailable';
       request: EventActorPrepareRequest<TEvent>;
       head: EventActorHead;
-      /** Integrity binding over this exact request/head pair. */
+      /** Executor-authenticated binding over this exact request/head pair. */
       preparationDigest: string;
     };
 
@@ -224,4 +224,6 @@ export type EventActorExecutionResult<TResult extends EventActorEvent> =
 export interface EventActorExecutorOptions {
   maxDepth?: number;
   dormantCheckpointTtlMs?: number;
+  /** Stable private key of at least 32 bytes for cross-lifetime handoffs. */
+  preparationSigningKey?: string | Uint8Array;
 }
