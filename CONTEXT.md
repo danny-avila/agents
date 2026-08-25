@@ -42,6 +42,56 @@ A **Resume Projection** is the durable manifest view produced from an
 Execution Record. A projection is scoped to one exact fork and resume attempt;
 an unscoped projection fails closed when a parent tool-call ID is ambiguous.
 
+## Event Actors
+
+An **Event Actor** is one stable logical child thread that handles a sequence
+of authoritative host events without retaining a live executor between them.
+
+An **Event Actor Head** is the current committed checkpoint identity and its
+monotonic generation. Each invocation runs on an **Invocation Fork** owned by
+that invocation. Once committed state exists, every fork stays on the same
+logical checkpoint thread and changes only its invocation namespace. The host
+advances the Event Actor Head only through an atomic comparison against both
+the generation and prior checkpoint identity.
+
+An **Event Actor Event** is immutable JSON data snapshotted at every public and
+host-adapter boundary; signed zero normalizes to JSON's zero representation.
+Checkpoint snapshots retain only the declared identity fields. Cold
+reconstruction receives the explicit task-owned cancellation signal and owns
+rollback until it returns a validated invocation.
+Prepared invocations and unavailable request/head pairs carry canonical,
+time-bounded, executor-authenticated integrity bindings so independently valid
+lifecycle evidence cannot be forged, recombined, or replayed after expiry.
+Cold continuation consumes its unavailable handoff before adapter work. Hosts
+that persist those handoffs across executor lifetimes provide the same private
+preparation signing key to every authorized executor.
+Public invocation produces an executor-issued **Applied Settlement** that binds
+immutable result and terminal checkpoint evidence to the exact invocation
+reference that ran. Invocation start phase-fences the prepared capability so it
+cannot subsequently authorize discard of active or applied work. Commit
+consumes the settlement exactly once and returns structured indeterminate
+evidence for missing or invalid acknowledgements rather than exposing a
+retryable-looking exception. A host mailbox remains the durable cross-runtime
+owner and deduplication fence. Public invocation reclaims definitely-no-action
+forks before returning or rethrowing, while ambiguous and applied outcomes stay
+retained. The executor opportunistically prunes local terminal phase fences
+after the dormant-checkpoint TTL without scheduling timers that retain
+short-lived executors. A fence never expires before its signed authority, so
+pruning cannot re-enable a stale capability; the mailbox prevents stale
+cross-runtime replay after expiry.
+
+Applied work may commit its Invocation Fork. Failed, cancelled, and
+completed-without-action invocations discard their forks. An applied fork that
+loses the head comparison remains available for reconciliation. A missing or
+incompatible warm checkpoint uses **Cold Continuation**: the host rebuilds an
+Invocation Fork from bounded transcript and summary state while preserving the
+same logical Event Actor identity. An indeterminate applied settlement,
+including malformed action checkpoint evidence or an ambiguous commit
+acknowledgement, is retained for reconciliation because deleting its fork
+could erase the only durable evidence of an external action.
+LangGraph interrupts and parent commands also retain the fork and propagate as
+control flow so the host can resume or route the checkpointed actor.
+
 ## Tool Caller Capabilities
 
 A **Caller Capability Projection** is the effective classification of tool
