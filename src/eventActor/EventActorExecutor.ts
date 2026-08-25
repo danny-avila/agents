@@ -34,7 +34,6 @@ import type {
 
 const DEFAULT_MAX_DEPTH = 1;
 const DEFAULT_DORMANT_CHECKPOINT_TTL_MS = 24 * 60 * 60 * 1_000;
-const MAX_TIMEOUT_MS = 2_147_483_647;
 
 function createInvocationCheckpointNs(
   request: EventActorPrepareRequest<EventActorEvent>,
@@ -671,7 +670,6 @@ export class EventActorExecutor<
   readonly #preparationSigningKey: Uint8Array;
   readonly #issuedSettlements = new WeakSet<object>();
   readonly #preparationPhases = new Map<string, EventActorPreparationPhase>();
-  #phaseCleanupTimer: ReturnType<typeof setTimeout> | undefined;
   #nextPhaseExpiry = Number.POSITIVE_INFINITY;
 
   constructor(
@@ -720,71 +718,68 @@ export class EventActorExecutor<
     invocation: EventActorInvocation<TEvent>
   ): EventActorPreparedInvocation<TEvent> {
     const trustedInvocation = freezeInvocation(invocation);
+    const payload = serializeInvocationPreparation(trustedInvocation);
+    return Object.freeze({
+      ...trustedInvocation,
+      preparationDigest: this.#createTimedPreparationDigest(payload),
+    });
+  }
+
+  #createTimedPreparationDigest(payload: string): string {
     const expiresAt = Math.min(
       Number.MAX_SAFE_INTEGER,
       Date.now() + this.#dormantCheckpointTtlMs
     );
-    const payload = serializeInvocationPreparation(trustedInvocation);
-    return Object.freeze({
-      ...trustedInvocation,
-      preparationDigest: `${expiresAt}.${this.#signPreparation(
-        `${expiresAt}\0${payload}`
-      )}`,
-    });
+    return `${expiresAt}.${this.#signPreparation(`${expiresAt}\0${payload}`)}`;
+  }
+
+  #validateTimedPreparationDigest(
+    preparationDigest: string,
+    payload: string,
+    subject: 'prepared invocation' | 'unavailable preparation',
+    allowExpired = false
+  ): number {
+    requireNonEmpty(preparationDigest, 'preparationDigest');
+    const match = /^(\d+)\.([a-f0-9]{64})$/.exec(preparationDigest);
+    const expiresAt = Number(match?.[1]);
+    if (
+      match == null ||
+      !Number.isSafeInteger(expiresAt) ||
+      expiresAt < 1 ||
+      !this.#preparationSignatureMatches(match[2], `${expiresAt}\0${payload}`)
+    ) {
+      throw new Error(`Event actor ${subject} binding is invalid`);
+    }
+    if (!allowExpired && expiresAt <= Date.now()) {
+      throw new Error(`Event actor ${subject} binding has expired`);
+    }
+    return expiresAt;
   }
 
   #validatePreparedInvocation(
     invocation: EventActorPreparedInvocation<TEvent>,
     allowExpired = false
   ): number {
-    requireNonEmpty(invocation.preparationDigest, 'preparationDigest');
-    const match = /^(\d+)\.([a-f0-9]{64})$/.exec(invocation.preparationDigest);
-    const expiresAt = Number(match?.[1]);
-    if (
-      match == null ||
-      !Number.isSafeInteger(expiresAt) ||
-      expiresAt < 1 ||
-      !this.#preparationSignatureMatches(
-        match[2],
-        `${expiresAt}\0${serializeInvocationPreparation(invocation)}`
-      )
-    ) {
-      throw new Error('Event actor prepared invocation binding is invalid');
-    }
-    if (!allowExpired && expiresAt <= Date.now()) {
-      throw new Error('Event actor prepared invocation binding has expired');
-    }
-    return expiresAt;
+    return this.#validateTimedPreparationDigest(
+      invocation.preparationDigest,
+      serializeInvocationPreparation(invocation),
+      'prepared invocation',
+      allowExpired
+    );
   }
 
   #prunePreparationPhases(now = Date.now()): void {
-    if (this.#phaseCleanupTimer != null) {
-      clearTimeout(this.#phaseCleanupTimer);
-      this.#phaseCleanupTimer = undefined;
-    }
     this.#nextPhaseExpiry = Number.POSITIVE_INFINITY;
     for (const [digest, phase] of this.#preparationPhases) {
       if ('expiresAt' in phase && phase.expiresAt <= now) {
         this.#preparationPhases.delete(digest);
       } else if ('expiresAt' in phase) {
-        this.#schedulePhaseCleanup(phase.expiresAt, now);
+        this.#nextPhaseExpiry = Math.min(
+          this.#nextPhaseExpiry,
+          phase.expiresAt
+        );
       }
     }
-  }
-
-  #schedulePhaseCleanup(expiresAt: number, now = Date.now()): void {
-    if (expiresAt >= this.#nextPhaseExpiry) {
-      return;
-    }
-    if (this.#phaseCleanupTimer != null) {
-      clearTimeout(this.#phaseCleanupTimer);
-    }
-    this.#nextPhaseExpiry = expiresAt;
-    this.#phaseCleanupTimer = setTimeout(
-      () => this.#prunePreparationPhases(),
-      Math.min(MAX_TIMEOUT_MS, Math.max(0, expiresAt - now))
-    );
-    this.#phaseCleanupTimer.unref();
   }
 
   #getPreparationPhase(
@@ -798,17 +793,22 @@ export class EventActorExecutor<
 
   #setTerminalPreparationPhase(
     preparationDigest: string,
-    status: 'discardable' | 'retained' | 'discarded'
+    status: 'discardable' | 'retained' | 'discarded',
+    authorityExpiresAt: number
   ): void {
+    const now = Date.now();
+    if (now >= this.#nextPhaseExpiry) {
+      this.#prunePreparationPhases(now);
+    }
     const phase = {
       status,
-      expiresAt: Math.min(
-        Number.MAX_SAFE_INTEGER,
-        Date.now() + this.#dormantCheckpointTtlMs
+      expiresAt: Math.max(
+        authorityExpiresAt,
+        Math.min(Number.MAX_SAFE_INTEGER, now + this.#dormantCheckpointTtlMs)
       ),
     } as const;
     this.#preparationPhases.set(preparationDigest, phase);
-    this.#schedulePhaseCleanup(phase.expiresAt);
+    this.#nextPhaseExpiry = Math.min(this.#nextPhaseExpiry, phase.expiresAt);
   }
 
   async prepare(
@@ -907,7 +907,7 @@ export class EventActorExecutor<
         status: 'checkpoint_unavailable',
         request: preparedRequest,
         head: preparedHead,
-        preparationDigest: this.#signPreparation(
+        preparationDigest: this.#createTimedPreparationDigest(
           serializeUnavailablePreparation(preparedRequest, preparedHead)
         ),
       });
@@ -924,15 +924,11 @@ export class EventActorExecutor<
     const request = snapshotPrepareRequest(preparation.request);
     const trustedHead = snapshotHead(preparation.head);
     const preparationDigest = preparation.preparationDigest;
-    requireNonEmpty(preparationDigest, 'preparationDigest');
-    if (
-      !this.#preparationSignatureMatches(
-        preparationDigest,
-        serializeUnavailablePreparation(request, trustedHead)
-      )
-    ) {
-      throw new Error('Event actor unavailable preparation binding is invalid');
-    }
+    const authorityExpiresAt = this.#validateTimedPreparationDigest(
+      preparationDigest,
+      serializeUnavailablePreparation(request, trustedHead),
+      'unavailable preparation'
+    );
     resolveExecutionDepth(
       request.depth,
       AsyncLocalStorageProviderSingleton.getRunnableConfig()
@@ -958,6 +954,13 @@ export class EventActorExecutor<
         controller.signal.reason
       );
     }
+    if (this.#getPreparationPhase(preparationDigest) != null) {
+      signal?.removeEventListener('abort', abort);
+      throw new Error(
+        'Event actor unavailable preparation was already consumed'
+      );
+    }
+    this.#preparationPhases.set(preparationDigest, { status: 'invoking' });
     let invocation;
     try {
       invocation = await this.#adapter.coldContinue(
@@ -966,6 +969,11 @@ export class EventActorExecutor<
         { signal: controller.signal }
       );
     } catch (error) {
+      this.#setTerminalPreparationPhase(
+        preparationDigest,
+        'discarded',
+        authorityExpiresAt
+      );
       if (isAborted(controller.signal) && error === controller.signal.reason) {
         throw new EventActorPreparationCancelledError('cold', error);
       }
@@ -973,6 +981,11 @@ export class EventActorExecutor<
     } finally {
       signal?.removeEventListener('abort', abort);
     }
+    this.#setTerminalPreparationPhase(
+      preparationDigest,
+      'retained',
+      authorityExpiresAt
+    );
     const adapterInvocation = snapshotInvocation(invocation);
     validateInvocation(
       request,
@@ -991,12 +1004,24 @@ export class EventActorExecutor<
         snapshotInvocationReference(trustedInvocation),
         'cancelled'
       );
+      this.#setTerminalPreparationPhase(
+        preparationDigest,
+        'discarded',
+        authorityExpiresAt
+      );
       throw new EventActorPreparationCancelledError(
         'cold',
         controller.signal.reason
       );
     }
-    return this.#createPreparedInvocation(trustedInvocation);
+    const preparedInvocation =
+      this.#createPreparedInvocation(trustedInvocation);
+    this.#setTerminalPreparationPhase(
+      preparationDigest,
+      'discarded',
+      authorityExpiresAt
+    );
+    return preparedInvocation;
   }
 
   async invoke(
@@ -1004,68 +1029,97 @@ export class EventActorExecutor<
     signal?: AbortSignal
   ): Promise<EventActorInvocationResult<TResult>> {
     const trustedInvocation = snapshotPreparedInvocation(invocation);
-    this.#validatePreparedInvocation(trustedInvocation);
+    const authorityExpiresAt =
+      this.#validatePreparedInvocation(trustedInvocation);
     const preparationDigest = trustedInvocation.preparationDigest;
     if (this.#getPreparationPhase(preparationDigest) != null) {
       throw new Error('Event actor prepared invocation was already consumed');
     }
     this.#preparationPhases.set(preparationDigest, { status: 'invoking' });
     const settlementInvocation = snapshotInvocationReference(trustedInvocation);
-    let invocationCompleted = false;
-    let definitelyNoAction = false;
+    let terminal: EventActorTerminalResult<TResult>;
     try {
-      const terminal = await this.#invokeWithConfig(
+      terminal = await this.#invokeWithConfig(
         snapshotInvocation(trustedInvocation),
         signal,
         AsyncLocalStorageProviderSingleton.getRunnableConfig()
       );
-      invocationCompleted = true;
-      this.#setTerminalPreparationPhase(preparationDigest, 'retained');
-      let status: unknown;
-      try {
-        status = terminal.status;
-      } catch (error) {
-        return createIndeterminateResult(settlementInvocation, error);
-      }
-      if (status === 'applied') {
-        const snapshot = snapshotAppliedTerminal<TResult>(
-          settlementInvocation,
-          terminal as Extract<
-            EventActorTerminalResult<TResult>,
-            { status: 'applied' }
-          >
+    } catch (error) {
+      if (isGraphInterrupt(error) || isParentCommand(error)) {
+        this.#setTerminalPreparationPhase(
+          preparationDigest,
+          'retained',
+          authorityExpiresAt
         );
-        return snapshot.status === 'snapshot_ready'
-          ? this.#issueSettlement(snapshot)
-          : snapshot;
+        throw error;
       }
-      if (status !== 'completed_no_action') {
-        return createIndeterminateResult(
-          settlementInvocation,
-          new Error('Event actor invocation returned an invalid status')
-        );
-      }
-      definitelyNoAction = true;
-      const completed = Object.freeze({
+      this.#setTerminalPreparationPhase(
+        preparationDigest,
+        'discardable',
+        authorityExpiresAt
+      );
+      await this.discard(
+        trustedInvocation,
+        isAborted(signal) ? 'cancelled' : 'failed'
+      );
+      throw error;
+    }
+    this.#setTerminalPreparationPhase(
+      preparationDigest,
+      'retained',
+      authorityExpiresAt
+    );
+    let status: unknown;
+    try {
+      status = terminal.status;
+    } catch (error) {
+      return createIndeterminateResult(settlementInvocation, error);
+    }
+    if (status === 'applied') {
+      const snapshot = snapshotAppliedTerminal<TResult>(
+        settlementInvocation,
+        terminal as Extract<
+          EventActorTerminalResult<TResult>,
+          { status: 'applied' }
+        >
+      );
+      return snapshot.status === 'snapshot_ready'
+        ? this.#issueSettlement(snapshot)
+        : snapshot;
+    }
+    if (status !== 'completed_no_action') {
+      return createIndeterminateResult(
+        settlementInvocation,
+        new Error('Event actor invocation returned an invalid status')
+      );
+    }
+    let completed: Extract<
+      EventActorTerminalResult<TResult>,
+      { status: 'completed_no_action' }
+    >;
+    try {
+      completed = Object.freeze({
         status: 'completed_no_action' as const,
         ...(terminal.result === undefined
           ? {}
           : { result: snapshotEvent(terminal.result) }),
       });
-      this.#setTerminalPreparationPhase(preparationDigest, 'discardable');
-      return completed;
     } catch (error) {
-      if (
-        isGraphInterrupt(error) ||
-        isParentCommand(error) ||
-        (invocationCompleted && !definitelyNoAction)
-      ) {
-        this.#setTerminalPreparationPhase(preparationDigest, 'retained');
-      } else {
-        this.#setTerminalPreparationPhase(preparationDigest, 'discardable');
-      }
+      this.#setTerminalPreparationPhase(
+        preparationDigest,
+        'discardable',
+        authorityExpiresAt
+      );
+      await this.discard(trustedInvocation, 'completed_no_action');
       throw error;
     }
+    this.#setTerminalPreparationPhase(
+      preparationDigest,
+      'discardable',
+      authorityExpiresAt
+    );
+    await this.discard(trustedInvocation, 'completed_no_action');
+    return completed;
   }
 
   #issueSettlement(
@@ -1235,14 +1289,21 @@ export class EventActorExecutor<
     this.#preparationPhases.set(preparationDigest, { status: 'discarding' });
     try {
       await this.#discardInvocationReference(trustedInvocation, reason);
-      this.#setTerminalPreparationPhase(preparationDigest, 'discarded');
+      this.#setTerminalPreparationPhase(
+        preparationDigest,
+        'discarded',
+        expiresAt
+      );
     } catch (error) {
       if (previousPhase == null) {
         this.#preparationPhases.delete(preparationDigest);
       } else {
         this.#preparationPhases.set(preparationDigest, previousPhase);
         if ('expiresAt' in previousPhase) {
-          this.#schedulePhaseCleanup(previousPhase.expiresAt);
+          this.#nextPhaseExpiry = Math.min(
+            this.#nextPhaseExpiry,
+            previousPhase.expiresAt
+          );
         }
       }
       throw error;

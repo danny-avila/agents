@@ -60,10 +60,11 @@ Checkpoint snapshots retain only the declared identity fields. Cold
 reconstruction receives the explicit task-owned cancellation signal and owns
 rollback until it returns a validated invocation.
 Prepared invocations and unavailable request/head pairs carry canonical,
-executor-authenticated integrity bindings so independently valid lifecycle
-evidence cannot be forged or recombined. Hosts that persist those handoffs
-across executor lifetimes provide the same private preparation signing key to
-every authorized executor.
+time-bounded, executor-authenticated integrity bindings so independently valid
+lifecycle evidence cannot be forged, recombined, or replayed after expiry.
+Cold continuation consumes its unavailable handoff before adapter work. Hosts
+that persist those handoffs across executor lifetimes provide the same private
+preparation signing key to every authorized executor.
 Public invocation produces an executor-issued **Applied Settlement** that binds
 immutable result and terminal checkpoint evidence to the exact invocation
 reference that ran. Invocation start phase-fences the prepared capability so it
@@ -71,10 +72,12 @@ cannot subsequently authorize discard of active or applied work. Commit
 consumes the settlement exactly once and returns structured indeterminate
 evidence for missing or invalid acknowledgements rather than exposing a
 retryable-looking exception. A host mailbox remains the durable cross-runtime
-owner and deduplication fence. The executor retains local terminal phase fences
-only for the dormant-checkpoint TTL; active phase count remains bounded by host
-admission, while prepared invocation authority carries an authenticated expiry
-so pruning cannot re-enable a stale capability. The mailbox prevents stale
+owner and deduplication fence. Public invocation reclaims definitely-no-action
+forks before returning or rethrowing, while ambiguous and applied outcomes stay
+retained. The executor opportunistically prunes local terminal phase fences
+after the dormant-checkpoint TTL without scheduling timers that retain
+short-lived executors. A fence never expires before its signed authority, so
+pruning cannot re-enable a stale capability; the mailbox prevents stale
 cross-runtime replay after expiry.
 
 Applied work may commit its Invocation Fork. Failed, cancelled, and

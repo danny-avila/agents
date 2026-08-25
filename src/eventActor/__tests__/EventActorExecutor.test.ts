@@ -317,7 +317,82 @@ describe('EventActorExecutor', () => {
         executor.discard(consumed.invocation, 'completed_no_action')
       ).rejects.toThrow('prepared invocation binding has expired');
       expect(host.invokes).toBe(1);
-      expect(host.discards).toHaveLength(0);
+      expect(host.discards).toHaveLength(1);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('retains a terminal fence through signed authority expiry after clock rollback', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_000);
+    try {
+      const host = new TestHost();
+      const executor = new EventActorExecutor(host, {
+        dormantCheckpointTtlMs: 100,
+      });
+      const preparation = await executor.prepare({
+        actorThreadId: 'actor-thread',
+        invocationId: 'rollback-terminal-fence',
+        depth: 1,
+        event: { text: 'rollback-terminal-fence' },
+      });
+      if (preparation.status !== 'ready') {
+        throw new Error('Expected warm preparation');
+      }
+
+      now.mockReturnValue(900);
+      await expect(
+        executor.invoke(preparation.invocation)
+      ).resolves.toMatchObject({ status: 'applied' });
+      now.mockReturnValue(1_050);
+      await expect(executor.invoke(preparation.invocation)).rejects.toThrow(
+        'already consumed'
+      );
+      expect(host.invokes).toBe(1);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('time-bounds and consumes checkpoint-unavailable handoffs', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_000);
+    try {
+      const host = new TestHost();
+      host.checkpointAvailable = false;
+      const executor = new EventActorExecutor(host, {
+        dormantCheckpointTtlMs: 10,
+      });
+      const consumed = await executor.prepare({
+        actorThreadId: 'actor-thread',
+        invocationId: 'consumed-unavailable',
+        depth: 1,
+        event: { text: 'consumed-unavailable' },
+      });
+      if (consumed.status !== 'checkpoint_unavailable') {
+        throw new Error('Expected unavailable checkpoint');
+      }
+      await expect(executor.coldContinue(consumed)).resolves.toMatchObject({
+        invocationId: 'consumed-unavailable',
+        continuation: 'cold',
+      });
+      await expect(executor.coldContinue(consumed)).rejects.toThrow(
+        'unavailable preparation was already consumed'
+      );
+
+      const expired = await executor.prepare({
+        actorThreadId: 'actor-thread',
+        invocationId: 'expired-unavailable',
+        depth: 1,
+        event: { text: 'expired-unavailable' },
+      });
+      if (expired.status !== 'checkpoint_unavailable') {
+        throw new Error('Expected unavailable checkpoint');
+      }
+      now.mockReturnValue(1_010);
+      await expect(executor.coldContinue(expired)).rejects.toThrow(
+        'unavailable preparation binding has expired'
+      );
+      expect(host.coldContinues).toBe(1);
     } finally {
       now.mockRestore();
     }
@@ -2550,7 +2625,7 @@ describe('EventActorExecutor', () => {
     expect(host.discards).toHaveLength(1);
   });
 
-  it('keeps a public no-action capability discardable but non-invokable', async () => {
+  it('reclaims a public no-action fork before returning and prevents reinvocation', async () => {
     const host = new TestHost();
     host.invokeImpl = async () => ({
       status: 'completed_no_action',
@@ -2576,9 +2651,71 @@ describe('EventActorExecutor', () => {
     );
     await expect(
       executor.discard(preparation.invocation, 'completed_no_action')
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow('no longer discardable');
     expect(host.invokes).toBe(1);
     expect(host.discards).toHaveLength(1);
+  });
+
+  it('reclaims a definitely failed public invocation before rethrowing', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async () => {
+      throw new Error('provider failed before action');
+    };
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'public-failure-cleanup',
+      depth: 1,
+      event: { text: 'public-failure-cleanup' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+
+    await expect(executor.invoke(preparation.invocation)).rejects.toThrow(
+      'provider failed before action'
+    );
+    await expect(executor.invoke(preparation.invocation)).rejects.toThrow(
+      'already consumed'
+    );
+    expect(host.discards).toEqual([
+      expect.objectContaining({ reason: 'failed' }),
+    ]);
+  });
+
+  it('preserves cleanup-only authority after public failure cleanup rejects', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async () => {
+      throw new Error('provider failed before action');
+    };
+    host.discard = async (discardRequest) => {
+      host.discards.push(discardRequest);
+      throw new Error('cleanup failed');
+    };
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'public-failure-cleanup-retry',
+      depth: 1,
+      event: { text: 'public-failure-cleanup-retry' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+
+    await expect(executor.invoke(preparation.invocation)).rejects.toThrow(
+      'cleanup failed'
+    );
+    await expect(executor.invoke(preparation.invocation)).rejects.toThrow(
+      'already consumed'
+    );
+    host.discard = async (discardRequest) => {
+      host.discards.push(discardRequest);
+    };
+    await expect(
+      executor.discard(preparation.invocation, 'failed')
+    ).resolves.toBeUndefined();
+    expect(host.discards).toHaveLength(2);
   });
 
   it('revokes public discard authority while invocation is active and after action', async () => {

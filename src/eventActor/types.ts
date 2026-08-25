@@ -168,7 +168,8 @@ export interface EventActorDiscardRequest {
  * failure occurs; a thrown error is therefore a definite no-action failure
  * whose fork is safe to discard. `commit` must not reclaim an applied stale
  * fork: the SDK retains and surfaces it as `commit_conflict` for host
- * reconciliation.
+ * reconciliation. `discard` must be idempotent for the same invocation because
+ * an ambiguous cleanup failure can be retried through the public lifecycle.
  */
 export interface EventActorHostAdapter<
   TEvent extends EventActorEvent,
@@ -242,6 +243,7 @@ export type EventActorExecutionResult<TResult extends EventActorEvent> =
 
 export interface EventActorExecutorOptions {
   maxDepth?: number;
+  /** Also bounds signed preparation authority and local terminal fences. */
   dormantCheckpointTtlMs?: number;
   /** Stable private key of at least 32 bytes for cross-lifetime handoffs. */
   preparationSigningKey?: string | Uint8Array;
