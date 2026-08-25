@@ -7,12 +7,12 @@ import {
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
   buildSummaryCarrierText,
 } from '@/summarization/shared';
+import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { createSummarizeNode } from '@/summarization/node';
 import { AgentContext } from '@/agents/AgentContext';
-import { createTokenCounter } from '@/utils/tokens';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
 
@@ -2226,5 +2226,99 @@ describe('summarize node breaker capture', () => {
     /* Guards the actual defect: the two encodings must disagree here, or this
      * test would pass just as well while measuring with the wrong one. */
     expect(claudeCounter(carrier)).toBeGreaterThan(openaiCounter(carrier));
+  });
+
+  /** `Run.create` derives one counter from `agents[0]` and `StandardGraph`
+   *  hands it to every `AgentContext`, so a Claude agent sitting behind a GPT
+   *  first agent receives an `o200k_base` counter. Trusting it here measured
+   *  the carrier in the wrong units and under-reserved the persisted
+   *  checkpoint on the retry, which is the overflow this count exists to
+   *  prevent. */
+  it('ignores a shared counter built for another agent encoding', async () => {
+    const summaryBody =
+      '사용자가 인증 미들웨어를 리팩터링하여 속도 제한 전에 토큰 검증이 이루어지도록 요청했습니다. 기존 핸들러를 읽어보니 순서가 뒤바뀌어 있었습니다.';
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel(summaryBody);
+        }
+      } as never
+    );
+
+    const sharedCounter = await createTokenCounter(encodingForModel('gpt-4o'));
+    const agentContext = createAgentContext({
+      provider: Providers.ANTHROPIC,
+      clientOptions: { model: 'claude-sonnet-4' },
+      tokenCounter: sharedCounter,
+    });
+    const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    const [persistedText, persistedCount] = setSummary.mock.calls[0] as [
+      string,
+      number,
+    ];
+    const carrier = new HumanMessage(buildSummaryCarrierText(persistedText));
+    const claudeCounter = await createTokenCounter('claude');
+
+    expect(persistedCount).toBe(claudeCounter(carrier));
+    expect(persistedCount).toBeGreaterThan(sharedCounter(carrier));
+  });
+
+  /** The other half of the same rule: a counter the host built itself carries
+   *  no encoding stamp, and its units are the ones the host's own
+   *  `indexTokenCountMap` is denominated in, so it stays authoritative rather
+   *  than being second-guessed by a bundled tokenizer. */
+  it('keeps using a host-supplied counter of unknown encoding', async () => {
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel('Checkpoint body');
+        }
+      } as never
+    );
+
+    const hostCounter = jest.fn((): number => 4242);
+    const agentContext = createAgentContext({
+      provider: Providers.ANTHROPIC,
+      clientOptions: { model: 'claude-sonnet-4' },
+      tokenCounter: hostCounter,
+    });
+    const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(setSummary.mock.calls[0][1]).toBe(4242);
   });
 });

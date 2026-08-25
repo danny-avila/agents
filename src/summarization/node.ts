@@ -36,6 +36,11 @@ import {
   type PromptCacheTtl,
 } from '@/messages/cache';
 import {
+  createTokenCounter,
+  encodingForModel,
+  encodingOfTokenCounter,
+} from '@/utils/tokens';
+import {
   Constants,
   ContentTypes,
   GraphEvents,
@@ -43,7 +48,6 @@ import {
   Providers,
 } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
-import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { createRemoveAllMessage } from '@/messages/reducer';
@@ -308,18 +312,33 @@ function buildSummarizationClientConfig(
  * understates base64 by 1.5x and Korean by 4.6x, and coefficients large enough
  * to cover those overestimate English prose by roughly 4x. So this falls back
  * to the tokenizer this package already bundles rather than to an estimate.
+ *
+ * A host counter that is present is not automatically the right one either. In
+ * a heterogeneous multi-agent run `Run.create` derives a single counter from
+ * `agents[0]` and `StandardGraph` hands that same counter to every
+ * `AgentContext`, so a Claude agent behind a GPT first agent would otherwise
+ * measure its carrier in `o200k_base` and under-reserve by up to 1.9x on CJK.
+ * When the counter came from `createTokenCounter` its encoding is known, so a
+ * disagreement with the receiving agent's encoding takes the bundled path
+ * instead. A counter the host built itself is unstamped and stays authoritative:
+ * its units are the ones the rest of that host's accounting is denominated in.
  */
 async function computeSummaryTokenCount(
   summaryText: string,
   agentContext: AgentContext
 ): Promise<number> {
   const carrier = new HumanMessage(buildSummaryCarrierText(summaryText));
-  if (agentContext.tokenCounter) {
-    return agentContext.tokenCounter(carrier);
+  const encoding = encodingForReceivingAgent(agentContext);
+  const hostCounter = agentContext.tokenCounter;
+  const hostEncoding =
+    hostCounter != null ? encodingOfTokenCounter(hostCounter) : undefined;
+  if (
+    hostCounter != null &&
+    (hostEncoding == null || hostEncoding === encoding)
+  ) {
+    return hostCounter(carrier);
   }
-  const bundledCounter = await createTokenCounter(
-    encodingForReceivingAgent(agentContext)
-  );
+  const bundledCounter = await createTokenCounter(encoding);
   return bundledCounter(carrier);
 }
 

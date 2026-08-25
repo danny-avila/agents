@@ -6,8 +6,8 @@ import {
   isAtomicToolContentBlock,
   serializeStructuredValueBounded,
 } from './toolContent';
-import { ContentTypes } from '@/common/enum';
 import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
+import { ContentTypes } from '@/common/enum';
 
 export type EncodingName = 'o200k_base' | 'claude';
 
@@ -1257,6 +1257,25 @@ export function apportionTokenCounts(
  */
 const CLAUDE_TOKEN_CORRECTION = 1.1;
 
+const tokenCounterEncodings = new WeakMap<
+  (message: BaseMessage) => number,
+  EncodingName
+>();
+
+/**
+ * Encoding a counter measures in, for counters built here.
+ *
+ * `undefined` for a counter the host supplied itself: unknown, not wrong. A
+ * caller that needs a count in a specific encoding can therefore tell "counts
+ * in the encoding I need" from "counts in a different one" without treating
+ * every foreign counter as suspect.
+ */
+export function encodingOfTokenCounter(
+  tokenCounter: (message: BaseMessage) => number
+): EncodingName | undefined {
+  return tokenCounterEncodings.get(tokenCounter);
+}
+
 /**
  * Creates a token counter function using the specified encoding.
  * Lazily loads the encoding data on first use via dynamic import.
@@ -1267,13 +1286,17 @@ export const createTokenCounter = async (
   const tok = await getTokenizer(encoding);
   const countTokens = (text: string): number => tok.count(text);
   const isClaude = encoding === 'claude';
-  return markTokenCounterCacheCompatible((message: BaseMessage): number => {
-    const count = getTokenCountForMessage(message, countTokens, encoding);
-    const correctedCount = isClaude
-      ? Math.ceil(count * CLAUDE_TOKEN_CORRECTION)
-      : count;
-    return ensureSafeTokenMeasurement(correctedCount, 'message');
-  });
+  const counter = markTokenCounterCacheCompatible(
+    (message: BaseMessage): number => {
+      const count = getTokenCountForMessage(message, countTokens, encoding);
+      const correctedCount = isClaude
+        ? Math.ceil(count * CLAUDE_TOKEN_CORRECTION)
+        : count;
+      return ensureSafeTokenMeasurement(correctedCount, 'message');
+    }
+  );
+  tokenCounterEncodings.set(counter, encoding);
+  return counter;
 };
 
 /** Utility to manage the token encoder lifecycle explicitly. */
