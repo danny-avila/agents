@@ -160,7 +160,8 @@ function validateTerminalCheckpoint(
     checkpoint.threadId !== invocation.fork.threadId ||
     checkpoint.checkpointNs !== invocation.fork.checkpointNs ||
     checkpoint.checkpointId == null ||
-    checkpoint.checkpointId.trim() === ''
+    checkpoint.checkpointId.trim() === '' ||
+    checkpoint.checkpointId === invocation.fork.checkpointId
   ) {
     throw new Error(
       'Event actor result escaped its invocation checkpoint fork'

@@ -652,6 +652,44 @@ describe('EventActorExecutor', () => {
     expect(host.discards).toHaveLength(0);
   });
 
+  it('retains an applied result that reports the fork starting checkpoint', async () => {
+    const host = new TestHost();
+    const prepare = host.prepare.bind(host);
+    host.prepare = async (prepareRequest) => {
+      const prepared = await prepare(prepareRequest);
+      if (prepared.status === 'ready') {
+        prepared.invocation.fork.checkpointId = 'starting-checkpoint';
+      }
+      return prepared;
+    };
+    host.invokeImpl = async (prepared) => ({
+      status: 'applied',
+      result: 'action-claimed',
+      checkpoint: { ...prepared.fork },
+    });
+    const executor = new EventActorExecutor(host);
+
+    const result = await executor.execute(request('unchanged-checkpoint'));
+
+    expect(result).toMatchObject({
+      status: 'commit_indeterminate',
+      result: 'action-claimed',
+      checkpoint: {
+        invocationId: 'unchanged-checkpoint',
+        threadId: 'actor-checkpoints',
+      },
+      error: {
+        message: 'Event actor result escaped its invocation checkpoint fork',
+      },
+    });
+    if (result.status !== 'commit_indeterminate') {
+      throw new Error('Expected indeterminate commit');
+    }
+    expect(result.checkpoint).not.toHaveProperty('checkpointId');
+    expect(host.commits).toHaveLength(0);
+    expect(host.discards).toHaveLength(0);
+  });
+
   it('invokes with the authoritative request event after warm preparation', async () => {
     const host = new TestHost();
     const prepare = host.prepare.bind(host);
