@@ -79,8 +79,19 @@ export type EventActorAppliedResult<TResult extends EventActorEvent> = Extract<
   invocation: EventActorInvocationReference;
 };
 
+export interface EventActorIndeterminateResult<
+  TResult extends EventActorEvent,
+> {
+  /** Applied handling cannot be proven safe to retry; retain its fork. */
+  status: 'commit_indeterminate';
+  result?: TResult;
+  checkpoint: EventActorCheckpointFork;
+  error: Error;
+}
+
 export type EventActorInvocationResult<TResult extends EventActorEvent> =
   | EventActorAppliedResult<TResult>
+  | EventActorIndeterminateResult<TResult>
   | Extract<
       EventActorTerminalResult<TResult>,
       { status: 'completed_no_action' }
@@ -210,7 +221,7 @@ export type EventActorExecutionResult<TResult extends EventActorEvent> =
   | {
       /** Applied handling cannot be proven safe to retry; retain its fork. */
       status: 'commit_indeterminate';
-      result: TResult;
+      result?: TResult;
       checkpoint: EventActorCheckpointFork;
       error: Error;
       continuation: 'warm' | 'cold';

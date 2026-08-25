@@ -1,3 +1,4 @@
+import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
   createHash,
@@ -11,6 +12,7 @@ import type {
   EventActorAdapterPrepareRequest,
   EventActorAppliedResult,
   EventActorCheckpointFork,
+  EventActorCheckpointReference,
   EventActorCommitResult,
   EventActorDiscardReason,
   EventActorEvent,
@@ -19,6 +21,7 @@ import type {
   EventActorExecutorOptions,
   EventActorHead,
   EventActorHostAdapter,
+  EventActorIndeterminateResult,
   EventActorInvocation,
   EventActorInvocationResult,
   EventActorInvocationReference,
@@ -59,7 +62,7 @@ function snapshotEvent<TEvent extends EventActorEvent>(event: TEvent): TEvent {
       if (!Number.isFinite(value)) {
         throw new Error('Event actor event numbers must be finite');
       }
-      return value;
+      return Object.is(value, -0) ? 0 : value;
     }
     if (typeof value !== 'object') {
       throw new Error('Event actor events must contain only JSON values');
@@ -112,11 +115,34 @@ function snapshotEvent<TEvent extends EventActorEvent>(event: TEvent): TEvent {
   return clone(event) as TEvent;
 }
 
+function snapshotCheckpointReference(
+  checkpoint: EventActorCheckpointReference
+): EventActorCheckpointReference {
+  return {
+    threadId: checkpoint.threadId,
+    ...(checkpoint.checkpointId == null
+      ? {}
+      : { checkpointId: checkpoint.checkpointId }),
+    checkpointNs: checkpoint.checkpointNs,
+  };
+}
+
+function snapshotCheckpointFork(
+  checkpoint: EventActorCheckpointFork
+): EventActorCheckpointFork {
+  return {
+    ...snapshotCheckpointReference(checkpoint),
+    invocationId: checkpoint.invocationId,
+  };
+}
+
 function snapshotHead(head: EventActorHead): EventActorHead {
   return {
     actorThreadId: head.actorThreadId,
     generation: head.generation,
-    ...(head.checkpoint == null ? {} : { checkpoint: { ...head.checkpoint } }),
+    ...(head.checkpoint == null
+      ? {}
+      : { checkpoint: snapshotCheckpointReference(head.checkpoint) }),
   };
 }
 
@@ -129,7 +155,7 @@ function snapshotInvocationReference(
     depth: invocation.depth,
     continuation: invocation.continuation,
     base: snapshotHead(invocation.base),
-    fork: { ...invocation.fork },
+    fork: snapshotCheckpointFork(invocation.fork),
   };
 }
 
@@ -510,6 +536,48 @@ function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
+type EventActorAppliedSnapshot<TResult extends EventActorEvent> = {
+  status: 'snapshot_ready';
+  result: TResult;
+  checkpoint: EventActorCheckpointFork;
+  invocation: EventActorInvocationReference;
+};
+
+function createIndeterminateResult<TResult extends EventActorEvent>(
+  invocation: EventActorInvocationReference,
+  error: unknown,
+  result?: TResult
+): EventActorIndeterminateResult<TResult> {
+  return Object.freeze({
+    status: 'commit_indeterminate',
+    ...(result === undefined ? {} : { result }),
+    checkpoint: Object.freeze({
+      invocationId: invocation.fork.invocationId,
+      threadId: invocation.fork.threadId,
+      checkpointNs: invocation.fork.checkpointNs,
+    }),
+    error: asError(error),
+  });
+}
+
+function snapshotAppliedTerminal<TResult extends EventActorEvent>(
+  invocation: EventActorInvocationReference,
+  terminal: Extract<EventActorTerminalResult<TResult>, { status: 'applied' }>
+): EventActorAppliedSnapshot<TResult> | EventActorIndeterminateResult<TResult> {
+  let result: TResult | undefined;
+  try {
+    result = snapshotEvent(terminal.result);
+    return {
+      status: 'snapshot_ready',
+      result,
+      checkpoint: snapshotCheckpointFork(terminal.checkpoint),
+      invocation: freezeInvocationReference(invocation),
+    };
+  } catch (error) {
+    return createIndeterminateResult(invocation, error, result);
+  }
+}
+
 function isAborted(signal?: AbortSignal): boolean {
   return signal?.aborted === true;
 }
@@ -570,17 +638,19 @@ export class EventActorExecutor<
   TEvent extends EventActorEvent,
   TResult extends EventActorEvent,
 > {
-  private readonly maxDepth: number;
-  private readonly dormantCheckpointTtlMs: number;
-  private readonly preparationSigningKey: Uint8Array;
-  private readonly issuedSettlements = new WeakSet<object>();
+  readonly #adapter: EventActorHostAdapter<TEvent, TResult>;
+  readonly #maxDepth: number;
+  readonly #dormantCheckpointTtlMs: number;
+  readonly #preparationSigningKey: Uint8Array;
+  readonly #issuedSettlements = new WeakSet<object>();
 
   constructor(
-    private readonly adapter: EventActorHostAdapter<TEvent, TResult>,
+    adapter: EventActorHostAdapter<TEvent, TResult>,
     options: EventActorExecutorOptions = {}
   ) {
-    this.maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
-    this.dormantCheckpointTtlMs =
+    this.#adapter = adapter;
+    this.#maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
+    this.#dormantCheckpointTtlMs =
       options.dormantCheckpointTtlMs ?? DEFAULT_DORMANT_CHECKPOINT_TTL_MS;
     const signingKey = Buffer.from(
       options.preparationSigningKey ?? randomBytes(32)
@@ -588,55 +658,52 @@ export class EventActorExecutor<
     if (signingKey.byteLength < 32) {
       throw new Error('preparationSigningKey must contain at least 32 bytes');
     }
-    this.preparationSigningKey = signingKey;
-    if (!Number.isSafeInteger(this.maxDepth) || this.maxDepth < 1) {
+    this.#preparationSigningKey = signingKey;
+    if (!Number.isSafeInteger(this.#maxDepth) || this.#maxDepth < 1) {
       throw new Error('maxDepth must be a positive safe integer');
     }
     if (
-      !Number.isSafeInteger(this.dormantCheckpointTtlMs) ||
-      this.dormantCheckpointTtlMs < 1
+      !Number.isSafeInteger(this.#dormantCheckpointTtlMs) ||
+      this.#dormantCheckpointTtlMs < 1
     ) {
       throw new Error('dormantCheckpointTtlMs must be a positive safe integer');
     }
   }
 
-  private signPreparation(payload: string): string {
-    return createHmac('sha256', this.preparationSigningKey)
+  #signPreparation(payload: string): string {
+    return createHmac('sha256', this.#preparationSigningKey)
       .update(payload)
       .digest('hex');
   }
 
-  private preparationSignatureMatches(
-    signature: string,
-    payload: string
-  ): boolean {
+  #preparationSignatureMatches(signature: string, payload: string): boolean {
     if (!/^[a-f0-9]{64}$/.test(signature)) {
       return false;
     }
     return timingSafeEqual(
       Buffer.from(signature, 'hex'),
-      Buffer.from(this.signPreparation(payload), 'hex')
+      Buffer.from(this.#signPreparation(payload), 'hex')
     );
   }
 
-  private createPreparedInvocation(
+  #createPreparedInvocation(
     invocation: EventActorInvocation<TEvent>
   ): EventActorPreparedInvocation<TEvent> {
     const trustedInvocation = freezeInvocation(invocation);
     return Object.freeze({
       ...trustedInvocation,
-      preparationDigest: this.signPreparation(
+      preparationDigest: this.#signPreparation(
         serializeInvocationPreparation(trustedInvocation)
       ),
     });
   }
 
-  private validatePreparedInvocation(
+  #validatePreparedInvocation(
     invocation: EventActorPreparedInvocation<TEvent>
   ): void {
     requireNonEmpty(invocation.preparationDigest, 'preparationDigest');
     if (
-      !this.preparationSignatureMatches(
+      !this.#preparationSignatureMatches(
         invocation.preparationDigest,
         serializeInvocationPreparation(invocation)
       )
@@ -654,7 +721,7 @@ export class EventActorExecutor<
       trustedRequest.depth,
       AsyncLocalStorageProviderSingleton.getRunnableConfig()
     );
-    this.validatePrepareRequest(trustedRequest);
+    this.#validatePrepareRequest(trustedRequest);
     const checkpointNs = createInvocationCheckpointNs(trustedRequest);
     const adapterRequest: EventActorAdapterPrepareRequest<TEvent> = {
       ...snapshotPrepareRequest(trustedRequest),
@@ -676,7 +743,7 @@ export class EventActorExecutor<
     }
     let preparation;
     try {
-      preparation = await this.adapter.prepare(
+      preparation = await this.#adapter.prepare(
         { ...adapterRequest },
         { signal: controller.signal }
       );
@@ -695,14 +762,14 @@ export class EventActorExecutor<
         adapterInvocation,
         'warm',
         checkpointNs,
-        this.maxDepth
+        this.#maxDepth
       );
-      const preparedInvocation = this.createPreparedInvocation({
+      const preparedInvocation = this.#createPreparedInvocation({
         ...adapterInvocation,
         event: snapshotEvent(trustedRequest.event),
       });
       if (isAborted(controller.signal)) {
-        await this.discardInvocationReference(
+        await this.#discardInvocationReference(
           snapshotInvocationReference(preparedInvocation),
           'cancelled'
         );
@@ -729,7 +796,7 @@ export class EventActorExecutor<
         status: 'checkpoint_unavailable',
         request: preparedRequest,
         head: preparedHead,
-        preparationDigest: this.signPreparation(
+        preparationDigest: this.#signPreparation(
           serializeUnavailablePreparation(preparedRequest, preparedHead)
         ),
       });
@@ -748,7 +815,7 @@ export class EventActorExecutor<
     const preparationDigest = preparation.preparationDigest;
     requireNonEmpty(preparationDigest, 'preparationDigest');
     if (
-      !this.preparationSignatureMatches(
+      !this.#preparationSignatureMatches(
         preparationDigest,
         serializeUnavailablePreparation(request, trustedHead)
       )
@@ -759,7 +826,7 @@ export class EventActorExecutor<
       request.depth,
       AsyncLocalStorageProviderSingleton.getRunnableConfig()
     );
-    this.validatePrepareRequest(request);
+    this.#validatePrepareRequest(request);
     validateHead(trustedHead, request.actorThreadId);
     const checkpointNs = createInvocationCheckpointNs(request);
     const adapterRequest: EventActorAdapterPrepareRequest<TEvent> = {
@@ -782,7 +849,7 @@ export class EventActorExecutor<
     }
     let invocation;
     try {
-      invocation = await this.adapter.coldContinue(
+      invocation = await this.#adapter.coldContinue(
         { ...adapterRequest },
         snapshotHead(trustedHead),
         { signal: controller.signal }
@@ -801,7 +868,7 @@ export class EventActorExecutor<
       adapterInvocation,
       'cold',
       checkpointNs,
-      this.maxDepth,
+      this.#maxDepth,
       trustedHead
     );
     const trustedInvocation: EventActorInvocation<TEvent> = {
@@ -809,7 +876,7 @@ export class EventActorExecutor<
       event: snapshotEvent(request.event),
     };
     if (isAborted(controller.signal)) {
-      await this.discardInvocationReference(
+      await this.#discardInvocationReference(
         snapshotInvocationReference(trustedInvocation),
         'cancelled'
       );
@@ -818,7 +885,7 @@ export class EventActorExecutor<
         controller.signal.reason
       );
     }
-    return this.createPreparedInvocation(trustedInvocation);
+    return this.#createPreparedInvocation(trustedInvocation);
   }
 
   async invoke(
@@ -826,15 +893,18 @@ export class EventActorExecutor<
     signal?: AbortSignal
   ): Promise<EventActorInvocationResult<TResult>> {
     const trustedInvocation = snapshotPreparedInvocation(invocation);
-    this.validatePreparedInvocation(trustedInvocation);
+    this.#validatePreparedInvocation(trustedInvocation);
     const settlementInvocation = snapshotInvocationReference(trustedInvocation);
-    const terminal = await this.invokeWithConfig(
+    const terminal = await this.#invokeWithConfig(
       snapshotInvocation(trustedInvocation),
       signal,
       AsyncLocalStorageProviderSingleton.getRunnableConfig()
     );
     if (terminal.status === 'applied') {
-      return this.issueSettlement(settlementInvocation, terminal);
+      const snapshot = snapshotAppliedTerminal(settlementInvocation, terminal);
+      return snapshot.status === 'snapshot_ready'
+        ? this.#issueSettlement(snapshot)
+        : snapshot;
     }
     return Object.freeze({
       status: 'completed_no_action' as const,
@@ -844,21 +914,20 @@ export class EventActorExecutor<
     });
   }
 
-  private issueSettlement(
-    invocation: EventActorInvocationReference,
-    terminal: Extract<EventActorTerminalResult<TResult>, { status: 'applied' }>
+  #issueSettlement(
+    snapshot: EventActorAppliedSnapshot<TResult>
   ): EventActorAppliedResult<TResult> {
     const settlement = Object.freeze({
       status: 'applied' as const,
-      result: snapshotEvent(terminal.result),
-      checkpoint: Object.freeze({ ...terminal.checkpoint }),
-      invocation: freezeInvocationReference(invocation),
+      result: snapshot.result,
+      checkpoint: Object.freeze(snapshotCheckpointFork(snapshot.checkpoint)),
+      invocation: freezeInvocationReference(snapshot.invocation),
     });
-    this.issuedSettlements.add(settlement);
+    this.#issuedSettlements.add(settlement);
     return settlement;
   }
 
-  private async invokeWithConfig(
+  async #invokeWithConfig(
     invocation: EventActorInvocation<TEvent>,
     signal: AbortSignal | undefined,
     ambientConfig: RunnableConfig | undefined
@@ -874,7 +943,7 @@ export class EventActorExecutor<
       invocation,
       invocation.continuation,
       invocation.fork.checkpointNs,
-      this.maxDepth
+      this.#maxDepth
     );
     const controller = new AbortController();
     const abort = (): void => controller.abort(signal?.reason);
@@ -895,7 +964,7 @@ export class EventActorExecutor<
       return await AsyncLocalStorageProviderSingleton.runWithConfig(
         config,
         () =>
-          this.adapter.invoke(invocation, {
+          this.#adapter.invoke(invocation, {
             signal: controller.signal,
             config,
           })
@@ -908,23 +977,23 @@ export class EventActorExecutor<
   async commit(
     settlement: EventActorAppliedResult<TResult>
   ): Promise<EventActorCommitResult> {
-    if (!this.issuedSettlements.has(settlement)) {
+    if (!this.#issuedSettlements.has(settlement)) {
       throw new Error('Event actor settlement was not issued by this executor');
     }
     const trustedInvocation = snapshotInvocationReference(
       settlement.invocation
     );
-    validateInvocationReference(trustedInvocation, this.maxDepth);
-    const trustedCheckpoint = { ...settlement.checkpoint };
+    validateInvocationReference(trustedInvocation, this.#maxDepth);
+    const trustedCheckpoint = snapshotCheckpointFork(settlement.checkpoint);
     validateTerminalCheckpoint(trustedInvocation, trustedCheckpoint);
-    const committed = await this.adapter.commit({
+    const committed = await this.#adapter.commit({
       invocation: snapshotInvocationReference(trustedInvocation),
       expectedHead: snapshotHead(trustedInvocation.base),
       checkpoint: { ...trustedCheckpoint },
       result: settlement.result,
       retention: {
         committedCheckpoints: 2,
-        dormantCheckpointTtlMs: this.dormantCheckpointTtlMs,
+        dormantCheckpointTtlMs: this.#dormantCheckpointTtlMs,
       },
     });
     if (committed.status === 'committed') {
@@ -971,34 +1040,32 @@ export class EventActorExecutor<
     reason: EventActorDiscardReason
   ): Promise<void> {
     const trustedInvocation = snapshotPreparedInvocation(invocation);
-    this.validatePreparedInvocation(trustedInvocation);
-    return this.discardInvocationReference(trustedInvocation, reason);
+    this.#validatePreparedInvocation(trustedInvocation);
+    return this.#discardInvocationReference(trustedInvocation, reason);
   }
 
-  private discardInvocationReference(
+  #discardInvocationReference(
     invocation: EventActorInvocationReference,
     reason: EventActorDiscardReason
   ): Promise<void> {
     const trustedInvocation = snapshotInvocationReference(invocation);
-    validateInvocationReference(trustedInvocation, this.maxDepth);
-    return this.adapter.discard({
+    validateInvocationReference(trustedInvocation, this.#maxDepth);
+    return this.#adapter.discard({
       invocation: trustedInvocation,
       reason,
     });
   }
 
-  private validatePrepareRequest(
-    request: EventActorPrepareRequest<TEvent>
-  ): void {
+  #validatePrepareRequest(request: EventActorPrepareRequest<TEvent>): void {
     requireNonEmpty(request.actorThreadId, 'actorThreadId');
     requireNonEmpty(request.invocationId, 'invocationId');
     if (
       !Number.isSafeInteger(request.depth) ||
       request.depth < 1 ||
-      request.depth > this.maxDepth
+      request.depth > this.#maxDepth
     ) {
       throw new Error(
-        `Event actor depth ${request.depth} exceeds maximum ${this.maxDepth}`
+        `Event actor depth ${request.depth} exceeds maximum ${this.#maxDepth}`
       );
     }
   }
@@ -1054,19 +1121,22 @@ export class EventActorExecutor<
     const invocationReference = snapshotInvocationReference(invocation);
     const invocationForAdapter = snapshotInvocation(invocation);
     if (isAborted(trustedRequest.signal)) {
-      await this.discardInvocationReference(invocationReference, 'cancelled');
+      await this.#discardInvocationReference(invocationReference, 'cancelled');
       return { status: 'cancelled', continuation };
     }
     let terminal;
     try {
-      terminal = await this.invokeWithConfig(
+      terminal = await this.#invokeWithConfig(
         invocationForAdapter,
         trustedRequest.signal,
         ambientConfig
       );
     } catch (error) {
+      if (isGraphInterrupt(error) || isParentCommand(error)) {
+        throw error;
+      }
       const reason = isAborted(trustedRequest.signal) ? 'cancelled' : 'failed';
-      await this.discardInvocationReference(invocationReference, reason);
+      await this.#discardInvocationReference(invocationReference, reason);
       if (reason === 'cancelled') {
         return { status: 'cancelled', continuation };
       }
@@ -1077,7 +1147,7 @@ export class EventActorExecutor<
         terminal.result === undefined
           ? undefined
           : snapshotEvent(terminal.result);
-      await this.discardInvocationReference(
+      await this.#discardInvocationReference(
         invocationReference,
         'completed_no_action'
       );
@@ -1087,28 +1157,29 @@ export class EventActorExecutor<
         continuation,
       };
     }
-    const trustedResult = snapshotEvent(terminal.result);
-    const trustedCheckpoint = { ...terminal.checkpoint };
+    const appliedSnapshot = snapshotAppliedTerminal(
+      invocationReference,
+      terminal
+    );
+    if (appliedSnapshot.status === 'commit_indeterminate') {
+      return { ...appliedSnapshot, continuation };
+    }
     try {
-      validateTerminalCheckpoint(invocationReference, trustedCheckpoint);
+      validateTerminalCheckpoint(
+        invocationReference,
+        appliedSnapshot.checkpoint
+      );
     } catch (error) {
       return {
-        status: 'commit_indeterminate',
-        result: trustedResult,
-        checkpoint: {
-          invocationId: invocationReference.fork.invocationId,
-          threadId: invocationReference.fork.threadId,
-          checkpointNs: invocationReference.fork.checkpointNs,
-        },
-        error: asError(error),
+        ...createIndeterminateResult(
+          invocationReference,
+          error,
+          appliedSnapshot.result
+        ),
         continuation,
       };
     }
-    const trustedTerminal = this.issueSettlement(invocationReference, {
-      ...terminal,
-      result: trustedResult,
-      checkpoint: trustedCheckpoint,
-    });
+    const trustedTerminal = this.#issueSettlement(appliedSnapshot);
     let committed;
     try {
       committed = await this.commit(trustedTerminal);

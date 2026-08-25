@@ -55,8 +55,10 @@ advances the Event Actor Head only through an atomic comparison against both
 the generation and prior checkpoint identity.
 
 An **Event Actor Event** is immutable JSON data snapshotted at every public and
-host-adapter boundary. Cold reconstruction receives the explicit task-owned
-cancellation signal and owns rollback until it returns a validated invocation.
+host-adapter boundary; signed zero normalizes to JSON's zero representation.
+Checkpoint snapshots retain only the declared identity fields. Cold
+reconstruction receives the explicit task-owned cancellation signal and owns
+rollback until it returns a validated invocation.
 Prepared invocations and unavailable request/head pairs carry canonical,
 executor-authenticated integrity bindings so independently valid lifecycle
 evidence cannot be forged or recombined. Hosts that persist those handoffs
@@ -76,6 +78,8 @@ same logical Event Actor identity. An indeterminate applied settlement,
 including malformed action checkpoint evidence or an ambiguous commit
 acknowledgement, is retained for reconciliation because deleting its fork
 could erase the only durable evidence of an external action.
+LangGraph interrupts and parent commands also retain the fork and propagate as
+control flow so the host can resume or route the checkpointed actor.
 
 ## Tool Caller Capabilities
 

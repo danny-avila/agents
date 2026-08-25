@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it, jest } from '@jest/globals';
+import { Command, GraphInterrupt, ParentCommand } from '@langchain/langgraph';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type {
@@ -18,7 +19,7 @@ import type {
 } from '@/eventActor';
 import { EventActorExecutor } from '@/eventActor';
 
-type TestEvent = { text: string };
+type TestEvent = { text: string; value?: number };
 
 const head = (
   generation = 0,
@@ -226,6 +227,18 @@ const request = (
 });
 
 describe('EventActorExecutor', () => {
+  it('keeps lifecycle capability state runtime-private', () => {
+    const executor = new EventActorExecutor(new TestHost());
+
+    expect(Object.getOwnPropertyNames(executor)).toEqual([]);
+    expect(Reflect.get(executor, 'preparationSigningKey')).toBeUndefined();
+    expect(Reflect.get(executor, 'issuedSettlements')).toBeUndefined();
+    expect(Reflect.get(executor, 'signPreparation')).toBeUndefined();
+    expect(Reflect.get(executor, 'issueSettlement')).toBeUndefined();
+    expect(Reflect.get(executor, 'invokeWithConfig')).toBeUndefined();
+    expect(Reflect.get(executor, 'discardInvocationReference')).toBeUndefined();
+  });
+
   it('rejects preparation signing keys below 256 bits', () => {
     expect(
       () =>
@@ -403,6 +416,9 @@ describe('EventActorExecutor', () => {
     if (execution.status !== 'commit_indeterminate') {
       throw new Error('Expected an indeterminate commit');
     }
+    if (execution.result == null) {
+      throw new Error('Expected preserved applied result evidence');
+    }
     adapterResult.outcome = 'mutated';
     adapterResult.detail.code = 500;
 
@@ -412,6 +428,41 @@ describe('EventActorExecutor', () => {
     });
     expect(Object.isFrozen(execution.result)).toBe(true);
     expect(Object.isFrozen(execution.result.detail)).toBe(true);
+  });
+
+  it('returns indeterminate evidence when an applied result is not JSON-safe', async () => {
+    const host = new TestHost();
+    const sparseResult = new Array<EventActorEvent>(1);
+    const adapter: EventActorHostAdapter<TestEvent, EventActorEvent> = {
+      prepare: host.prepare.bind(host),
+      coldContinue: host.coldContinue.bind(host),
+      invoke: async (prepared) => ({
+        status: 'applied',
+        result: sparseResult,
+        checkpoint: {
+          ...prepared.fork,
+          checkpointId: 'sparse-result-terminal',
+        },
+      }),
+      commit: async () => {
+        throw new Error('commit must not run');
+      },
+      discard: host.discard.bind(host),
+    };
+    const executor = new EventActorExecutor(adapter);
+
+    const execution = await executor.execute(request('sparse-result'));
+    expect(execution).toEqual(
+      expect.objectContaining({
+        status: 'commit_indeterminate',
+        error: expect.objectContaining({
+          message: expect.stringContaining('arrays must not contain holes'),
+        }),
+        continuation: 'warm',
+      })
+    );
+    expect(execution).not.toHaveProperty('result');
+    expect(host.discards).toHaveLength(0);
   });
 
   it('validates and commits the same terminal checkpoint snapshot', async () => {
@@ -620,6 +671,21 @@ describe('EventActorExecutor', () => {
     expect(cancelledHost.commits).toHaveLength(0);
     expect(failedHost.discards[0].reason).toBe('failed');
     expect(cancelledHost.discards[0].reason).toBe('cancelled');
+  });
+
+  it.each([
+    ['GraphInterrupt', new GraphInterrupt([])],
+    ['ParentCommand', new ParentCommand(new Command({ goto: 'parent-node' }))],
+  ])('propagates %s without discarding its resumable fork', async (_, flow) => {
+    const host = new TestHost();
+    host.invokeImpl = async () => {
+      throw flow;
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(executor.execute(request('control-flow'))).rejects.toBe(flow);
+    expect(host.discards).toHaveLength(0);
+    expect(host.commits).toHaveLength(0);
   });
 
   it('isolates duplicate deliveries and retains an applied CAS conflict', async () => {
@@ -983,6 +1049,28 @@ describe('EventActorExecutor', () => {
       invocationId: preparation.invocation.invocationId,
       actorThreadId: preparation.invocation.actorThreadId,
     };
+    const extension = Symbol('checkpoint-extension');
+    Object.assign(restored.fork, { untrustedExtension: 'fork-extension' });
+    Object.assign(restored.base.checkpoint, {
+      untrustedExtension: 'checkpoint-extension',
+    });
+    Object.defineProperty(restored.fork, extension, {
+      enumerable: true,
+      value: 'symbol-extension',
+    });
+    host.invokeImpl = async (prepared) => {
+      expect(prepared.fork).not.toHaveProperty('untrustedExtension');
+      expect(prepared.base.checkpoint).not.toHaveProperty('untrustedExtension');
+      expect(Object.getOwnPropertySymbols(prepared.fork)).toHaveLength(0);
+      return {
+        status: 'applied',
+        result: prepared.event.text,
+        checkpoint: {
+          ...prepared.fork,
+          checkpointId: 'restored-authority-terminal',
+        },
+      };
+    };
     const restoredExecutor = new EventActorExecutor(host, {
       preparationSigningKey: signingKey,
     });
@@ -1217,6 +1305,38 @@ describe('EventActorExecutor', () => {
     expect(prepareSpy).not.toHaveBeenCalled();
   });
 
+  it('normalizes signed zero at the immutable JSON boundary', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) => ({
+      status: 'applied',
+      result: Object.is(prepared.event.value, -0) ? 'negative-zero' : 'zero',
+      checkpoint: {
+        ...prepared.fork,
+        checkpointId: 'signed-zero-terminal',
+      },
+    });
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'signed-zero',
+      depth: 1,
+      event: { text: 'signed-zero', value: -0 },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const restored = {
+      ...preparation.invocation,
+      event: { text: 'signed-zero', value: 0 },
+    };
+
+    expect(Object.is(preparation.invocation.event.value, -0)).toBe(false);
+    await expect(executor.invoke(restored)).resolves.toMatchObject({
+      status: 'applied',
+      result: 'zero',
+    });
+  });
+
   it('rejects recombined unavailable request and head evidence', async () => {
     const host = new TestHost();
     host.checkpointAvailable = false;
@@ -1287,6 +1407,15 @@ describe('EventActorExecutor', () => {
         actorThreadId: preparation.request.actorThreadId,
       },
       status: 'checkpoint_unavailable' as const,
+    };
+    Object.assign(restored.head.checkpoint, {
+      untrustedExtension: 'checkpoint-extension',
+    });
+    const coldContinue = host.coldContinue.bind(host);
+    host.coldContinue = async (adapterRequest, actorHead, context) => {
+      expect(actorHead).not.toHaveProperty('untrustedExtension');
+      expect(actorHead.checkpoint).not.toHaveProperty('untrustedExtension');
+      return coldContinue(adapterRequest, actorHead, context);
     };
     const verifier = new EventActorExecutor(host, {
       preparationSigningKey: signingKey,

@@ -20,6 +20,7 @@ export type {
   EventActorHostAdapter,
   EventActorInvocation,
   EventActorInvocationContext,
+  EventActorIndeterminateResult,
   EventActorInvocationReference,
   EventActorInvocationResult,
   EventActorPreparation,
