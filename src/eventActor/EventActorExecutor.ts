@@ -66,6 +66,33 @@ function snapshotInvocation<TEvent>(
   };
 }
 
+function snapshotPrepareRequest<TEvent>(
+  request: EventActorPrepareRequest<TEvent>
+): EventActorPrepareRequest<TEvent> {
+  return {
+    actorThreadId: request.actorThreadId,
+    invocationId: request.invocationId,
+    depth: request.depth,
+    event: request.event,
+  };
+}
+
+function snapshotAmbientConfig(
+  config: RunnableConfig | undefined
+): RunnableConfig | undefined {
+  if (config == null) {
+    return undefined;
+  }
+  return {
+    ...config,
+    ...(config.tags == null ? {} : { tags: [...config.tags] }),
+    ...(config.metadata == null ? {} : { metadata: { ...config.metadata } }),
+    ...(config.configurable == null
+      ? {}
+      : { configurable: { ...config.configurable } }),
+  };
+}
+
 function requireNonEmpty(value: string, name: string): void {
   if (value.trim() === '') {
     throw new Error(`${name} must not be empty`);
@@ -376,20 +403,21 @@ export class EventActorExecutor<TEvent, TResult> {
   async prepare(
     request: EventActorPrepareRequest<TEvent>
   ): Promise<EventActorPreparation<TEvent>> {
+    const trustedRequest = snapshotPrepareRequest(request);
     resolveExecutionDepth(
-      request.depth,
+      trustedRequest.depth,
       AsyncLocalStorageProviderSingleton.getRunnableConfig()
     );
-    this.validatePrepareRequest(request);
-    const checkpointNs = createInvocationCheckpointNs(request);
+    this.validatePrepareRequest(trustedRequest);
+    const checkpointNs = createInvocationCheckpointNs(trustedRequest);
     const adapterRequest: EventActorAdapterPrepareRequest<TEvent> = {
-      ...request,
+      ...trustedRequest,
       checkpointNs,
     };
     const preparation = await this.adapter.prepare({ ...adapterRequest });
     if (preparation.status === 'ready') {
       validateInvocation(
-        request,
+        trustedRequest,
         preparation.invocation,
         'warm',
         checkpointNs,
@@ -399,14 +427,14 @@ export class EventActorExecutor<TEvent, TResult> {
         status: 'ready',
         invocation: {
           ...snapshotInvocation(preparation.invocation),
-          event: request.event,
+          event: trustedRequest.event,
         },
       };
     } else {
-      validateHead(preparation.head, request.actorThreadId);
+      validateHead(preparation.head, trustedRequest.actorThreadId);
       return {
         status: 'checkpoint_unavailable',
-        request: { ...request, event: request.event },
+        request: snapshotPrepareRequest(trustedRequest),
         head: snapshotHead(preparation.head),
       };
     }
@@ -418,13 +446,13 @@ export class EventActorExecutor<TEvent, TResult> {
       { status: 'checkpoint_unavailable' }
     >
   ): Promise<EventActorInvocation<TEvent>> {
-    const request = preparation.request;
+    const request = snapshotPrepareRequest(preparation.request);
+    const trustedHead = snapshotHead(preparation.head);
     resolveExecutionDepth(
       request.depth,
       AsyncLocalStorageProviderSingleton.getRunnableConfig()
     );
     this.validatePrepareRequest(request);
-    const trustedHead = snapshotHead(preparation.head);
     validateHead(trustedHead, request.actorThreadId);
     const checkpointNs = createInvocationCheckpointNs(request);
     const adapterRequest: EventActorAdapterPrepareRequest<TEvent> = {
@@ -605,19 +633,27 @@ export class EventActorExecutor<TEvent, TResult> {
   async execute(
     request: EventActorExecutionRequest<TEvent>
   ): Promise<EventActorExecutionResult<TResult>> {
-    const ambientConfig =
-      AsyncLocalStorageProviderSingleton.getRunnableConfig();
-    const depth = resolveExecutionDepth(request.depth, ambientConfig);
-    const prepareRequest: EventActorPrepareRequest<TEvent> = {
+    const trustedRequest: EventActorExecutionRequest<TEvent> = {
       actorThreadId: request.actorThreadId,
       invocationId: request.invocationId,
-      depth,
       event: request.event,
+      ...(request.depth == null ? {} : { depth: request.depth }),
+      ...(request.signal == null ? {} : { signal: request.signal }),
+    };
+    const ambientConfig = snapshotAmbientConfig(
+      AsyncLocalStorageProviderSingleton.getRunnableConfig()
+    );
+    const depth = resolveExecutionDepth(trustedRequest.depth, ambientConfig);
+    const prepareRequest: EventActorPrepareRequest<TEvent> = {
+      actorThreadId: trustedRequest.actorThreadId,
+      invocationId: trustedRequest.invocationId,
+      depth,
+      event: trustedRequest.event,
     };
     const preparation = await this.prepare(prepareRequest);
     if (
       preparation.status === 'checkpoint_unavailable' &&
-      isAborted(request.signal)
+      isAborted(trustedRequest.signal)
     ) {
       return { status: 'cancelled', continuation: 'cold' };
     }
@@ -628,7 +664,7 @@ export class EventActorExecutor<TEvent, TResult> {
     const continuation = preparation.status === 'ready' ? 'warm' : 'cold';
     const invocationReference = snapshotInvocationReference(invocation);
     const invocationForAdapter = snapshotInvocation(invocation);
-    if (isAborted(request.signal)) {
+    if (isAborted(trustedRequest.signal)) {
       await this.discard(invocationReference, 'cancelled');
       return { status: 'cancelled', continuation };
     }
@@ -636,11 +672,11 @@ export class EventActorExecutor<TEvent, TResult> {
     try {
       terminal = await this.invokeWithConfig(
         invocationForAdapter,
-        request.signal,
+        trustedRequest.signal,
         ambientConfig
       );
     } catch (error) {
-      const reason = isAborted(request.signal) ? 'cancelled' : 'failed';
+      const reason = isAborted(trustedRequest.signal) ? 'cancelled' : 'failed';
       await this.discard(invocationReference, reason);
       if (reason === 'cancelled') {
         return { status: 'cancelled', continuation };

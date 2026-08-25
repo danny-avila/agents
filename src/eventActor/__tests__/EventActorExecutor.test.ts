@@ -709,6 +709,127 @@ describe('EventActorExecutor', () => {
     });
   });
 
+  it('snapshots prepared ancestry before adapter work can yield', async () => {
+    const host = new TestHost();
+    host.checkpointAvailable = false;
+    const prepare = host.prepare.bind(host);
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    host.prepare = async (adapterRequest) => {
+      await gate;
+      return prepare(adapterRequest);
+    };
+    const executor = new EventActorExecutor(host, { maxDepth: 2 });
+    const mutableRequest: EventActorPrepareRequest<TestEvent> = {
+      actorThreadId: 'actor-thread',
+      invocationId: 'mutable-prepared-ancestry',
+      depth: 2,
+      event: { text: 'mutable-prepared-ancestry' },
+    };
+    const runnableConfigSpy = jest
+      .spyOn(AsyncLocalStorageProviderSingleton, 'getRunnableConfig')
+      .mockReturnValue({ configurable: { event_actor_depth: 1 } });
+
+    const preparationPromise = executor.prepare(mutableRequest);
+    runnableConfigSpy.mockRestore();
+    mutableRequest.actorThreadId = 'mutated-actor';
+    mutableRequest.invocationId = 'mutated-invocation';
+    mutableRequest.depth = 1;
+    release();
+
+    await expect(preparationPromise).resolves.toMatchObject({
+      status: 'checkpoint_unavailable',
+      request: {
+        actorThreadId: 'actor-thread',
+        invocationId: 'mutable-prepared-ancestry',
+        depth: 2,
+      },
+      head: { actorThreadId: 'actor-thread', generation: 0 },
+    });
+  });
+
+  it('snapshots the cold-continuation handoff before adapter work can yield', async () => {
+    const host = new TestHost();
+    host.checkpointAvailable = false;
+    const executor = new EventActorExecutor(host, { maxDepth: 2 });
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'mutable-cold-handoff',
+      depth: 2,
+      event: { text: 'mutable-cold-handoff' },
+    });
+    if (preparation.status !== 'checkpoint_unavailable') {
+      throw new Error('Expected unavailable checkpoint');
+    }
+    const coldContinue = host.coldContinue.bind(host);
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    host.coldContinue = async (adapterRequest, actorHead) => {
+      await gate;
+      return coldContinue(adapterRequest, actorHead);
+    };
+
+    const continuationPromise = executor.coldContinue(preparation);
+    preparation.request.actorThreadId = 'mutated-actor';
+    preparation.request.invocationId = 'mutated-invocation';
+    preparation.request.depth = 1;
+    preparation.head.actorThreadId = 'mutated-actor';
+    release();
+
+    await expect(continuationPromise).resolves.toMatchObject({
+      actorThreadId: 'actor-thread',
+      invocationId: 'mutable-cold-handoff',
+      depth: 2,
+      continuation: 'cold',
+      base: { actorThreadId: 'actor-thread', generation: 0 },
+    });
+  });
+
+  it('snapshots the execution identity and signal before preparation yields', async () => {
+    const host = new TestHost();
+    const prepare = host.prepare.bind(host);
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    host.prepare = async (adapterRequest) => {
+      await gate;
+      return prepare(adapterRequest);
+    };
+    const executor = new EventActorExecutor(host);
+    const originalController = new AbortController();
+    const replacementController = new AbortController();
+    const mutableRequest = request('mutable-execution', {
+      signal: originalController.signal,
+    });
+
+    const execution = executor.execute(mutableRequest);
+    mutableRequest.actorThreadId = 'mutated-actor';
+    mutableRequest.invocationId = 'mutated-invocation';
+    mutableRequest.signal = replacementController.signal;
+    originalController.abort(new Error('cancel original execution'));
+    release();
+
+    await expect(execution).resolves.toMatchObject({
+      status: 'cancelled',
+      continuation: 'warm',
+    });
+    expect(host.invokes).toBe(0);
+    expect(host.discards).toEqual([
+      expect.objectContaining({
+        invocation: expect.objectContaining({
+          actorThreadId: 'actor-thread',
+          invocationId: 'mutable-execution',
+        }),
+        reason: 'cancelled',
+      }),
+    ]);
+  });
+
   it('derives nested depth from actor-owned ambient context', async () => {
     const host = new TestHost();
     const executor = new EventActorExecutor(host);
