@@ -567,12 +567,14 @@ function snapshotAppliedTerminal<TResult extends EventActorEvent>(
   let result: TResult | undefined;
   try {
     result = snapshotEvent(terminal.result);
-    return {
+    const snapshot: EventActorAppliedSnapshot<TResult> = {
       status: 'snapshot_ready',
       result,
       checkpoint: snapshotCheckpointFork(terminal.checkpoint),
       invocation: freezeInvocationReference(invocation),
     };
+    validateTerminalCheckpoint(snapshot.invocation, snapshot.checkpoint);
+    return snapshot;
   } catch (error) {
     return createIndeterminateResult(invocation, error, result);
   }
@@ -1163,21 +1165,6 @@ export class EventActorExecutor<
     );
     if (appliedSnapshot.status === 'commit_indeterminate') {
       return { ...appliedSnapshot, continuation };
-    }
-    try {
-      validateTerminalCheckpoint(
-        invocationReference,
-        appliedSnapshot.checkpoint
-      );
-    } catch (error) {
-      return {
-        ...createIndeterminateResult(
-          invocationReference,
-          error,
-          appliedSnapshot.result
-        ),
-        continuation,
-      };
     }
     const trustedTerminal = this.#issueSettlement(appliedSnapshot);
     let committed;

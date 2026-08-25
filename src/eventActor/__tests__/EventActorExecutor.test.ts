@@ -2494,4 +2494,41 @@ describe('EventActorExecutor', () => {
       status: 'committed',
     });
   });
+
+  it('returns indeterminate evidence for an invalid public terminal checkpoint', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) => ({
+      status: 'applied',
+      result: 'public-invalid-checkpoint',
+      checkpoint: {
+        ...prepared.fork,
+        checkpointNs: 'foreign-checkpoint-namespace',
+        checkpointId: 'public-invalid-terminal',
+      },
+    });
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'public-invalid-checkpoint',
+      depth: 1,
+      event: { text: 'public-invalid-checkpoint' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+
+    const terminal = await executor.invoke(preparation.invocation);
+
+    expect(terminal).toEqual(
+      expect.objectContaining({
+        status: 'commit_indeterminate',
+        result: 'public-invalid-checkpoint',
+        error: expect.objectContaining({
+          message: expect.stringContaining('escaped its invocation'),
+        }),
+      })
+    );
+    expect(host.commits).toHaveLength(0);
+    expect(host.discards).toHaveLength(0);
+  });
 });
