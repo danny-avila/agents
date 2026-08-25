@@ -12,6 +12,7 @@ export type {
   EventActorCommitResult,
   EventActorDiscardReason,
   EventActorDiscardRequest,
+  EventActorEvent,
   EventActorExecutionRequest,
   EventActorExecutionResult,
   EventActorExecutorOptions,
@@ -20,7 +21,9 @@ export type {
   EventActorInvocation,
   EventActorInvocationContext,
   EventActorInvocationReference,
+  EventActorInvocationResult,
   EventActorPreparation,
+  EventActorPreparationContext,
   EventActorPrepareRequest,
   EventActorTerminalResult,
 } from './types';

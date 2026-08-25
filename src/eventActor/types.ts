@@ -1,5 +1,14 @@
 import type { RunnableConfig } from '@langchain/core/runnables';
 
+/** Durable event payload accepted by the actor lifecycle. */
+export type EventActorEvent =
+  | null
+  | boolean
+  | number
+  | string
+  | readonly EventActorEvent[]
+  | { readonly [key: string]: EventActorEvent };
+
 /** Stable reference to one persisted LangGraph checkpoint. */
 export interface EventActorCheckpointReference {
   threadId: string;
@@ -29,16 +38,16 @@ export interface EventActorInvocationReference {
   fork: EventActorCheckpointFork;
 }
 
-export interface EventActorInvocation<TEvent>
+export interface EventActorInvocation<TEvent extends EventActorEvent>
   extends EventActorInvocationReference {
   event: TEvent;
 }
 
-export type EventActorAdapterPreparation<TEvent> =
+export type EventActorAdapterPreparation<TEvent extends EventActorEvent> =
   | { status: 'ready'; invocation: EventActorInvocation<TEvent> }
   | { status: 'checkpoint_unavailable'; head: EventActorHead };
 
-export type EventActorPreparation<TEvent> =
+export type EventActorPreparation<TEvent extends EventActorEvent> =
   | { status: 'ready'; invocation: EventActorInvocation<TEvent> }
   | {
       status: 'checkpoint_unavailable';
@@ -57,21 +66,36 @@ export type EventActorTerminalResult<TResult> =
 export type EventActorAppliedResult<TResult> = Extract<
   EventActorTerminalResult<TResult>,
   { status: 'applied' }
->;
+> & {
+  /** Executor-issued immutable reference to the invocation that produced this action. */
+  invocation: EventActorInvocationReference;
+};
+
+export type EventActorInvocationResult<TResult> =
+  | EventActorAppliedResult<TResult>
+  | Extract<
+      EventActorTerminalResult<TResult>,
+      { status: 'completed_no_action' }
+    >;
 
 export interface EventActorInvocationContext {
   signal: AbortSignal;
   config: RunnableConfig;
 }
 
-export interface EventActorPrepareRequest<TEvent> {
+export interface EventActorPreparationContext {
+  /** Explicit task-owned cancellation; parent-run ambient signals are excluded. */
+  signal: AbortSignal;
+}
+
+export interface EventActorPrepareRequest<TEvent extends EventActorEvent> {
   actorThreadId: string;
   invocationId: string;
   depth: number;
   event: TEvent;
 }
 
-export interface EventActorAdapterPrepareRequest<TEvent>
+export interface EventActorAdapterPrepareRequest<TEvent extends EventActorEvent>
   extends EventActorPrepareRequest<TEvent> {
   /** Unique execution-attempt namespace; invocationId remains the logical idempotency key. */
   checkpointNs: string;
@@ -117,13 +141,17 @@ export interface EventActorDiscardRequest {
  * stale fork: the SDK retains and surfaces it as `commit_conflict` for host
  * reconciliation.
  */
-export interface EventActorHostAdapter<TEvent, TResult> {
+export interface EventActorHostAdapter<
+  TEvent extends EventActorEvent,
+  TResult,
+> {
   prepare(
     request: EventActorAdapterPrepareRequest<TEvent>
   ): Promise<EventActorAdapterPreparation<TEvent>>;
   coldContinue(
     request: EventActorAdapterPrepareRequest<TEvent>,
-    head: EventActorHead
+    head: EventActorHead,
+    context: EventActorPreparationContext
   ): Promise<EventActorInvocation<TEvent>>;
   invoke(
     invocation: EventActorInvocation<TEvent>,
@@ -135,7 +163,7 @@ export interface EventActorHostAdapter<TEvent, TResult> {
   discard(request: EventActorDiscardRequest): Promise<void>;
 }
 
-export interface EventActorExecutionRequest<TEvent> {
+export interface EventActorExecutionRequest<TEvent extends EventActorEvent> {
   actorThreadId: string;
   invocationId: string;
   event: TEvent;

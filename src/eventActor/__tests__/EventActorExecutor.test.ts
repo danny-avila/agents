@@ -10,6 +10,7 @@ import type {
   EventActorHostAdapter,
   EventActorInvocation,
   EventActorInvocationContext,
+  EventActorPreparationContext,
   EventActorPrepareRequest,
   EventActorTerminalResult,
 } from '@/eventActor';
@@ -67,6 +68,7 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
   readonly commits: EventActorCommitRequest<string>[] = [];
   readonly discards: EventActorDiscardRequest[] = [];
   readonly invokeSignals: AbortSignal[] = [];
+  readonly coldContinueSignals: AbortSignal[] = [];
   readonly invokeConfigs: RunnableConfig[] = [];
   readonly forkNamespaces: string[] = [];
   invokeImpl?: (
@@ -108,9 +110,11 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
 
   async coldContinue(
     request: EventActorAdapterPrepareRequest<TestEvent>,
-    _head: EventActorHead
+    _head: EventActorHead,
+    context: EventActorPreparationContext
   ) {
     this.coldContinues += 1;
+    this.coldContinueSignals.push(context.signal);
     const actorHead = head(
       this.generation,
       this.committedCheckpointNs,
@@ -164,14 +168,23 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
     if (this.commitError != null) {
       throw this.commitError;
     }
-    if (request.expectedHead.generation !== this.generation) {
+    const currentHead = head(
+      this.generation,
+      this.committedCheckpointNs,
+      this.committedCheckpointId
+    );
+    if (
+      request.expectedHead.generation !== currentHead.generation ||
+      request.expectedHead.checkpoint?.threadId !==
+        currentHead.checkpoint?.threadId ||
+      request.expectedHead.checkpoint?.checkpointNs !==
+        currentHead.checkpoint?.checkpointNs ||
+      request.expectedHead.checkpoint?.checkpointId !==
+        currentHead.checkpoint?.checkpointId
+    ) {
       return {
         status: 'stale' as const,
-        head: head(
-          this.generation,
-          this.committedCheckpointNs,
-          this.committedCheckpointId
-        ),
+        head: currentHead,
       };
     }
     this.generation += 1;
@@ -224,13 +237,58 @@ describe('EventActorExecutor', () => {
     if (terminal.status !== 'applied') {
       throw new Error('Expected applied terminal result');
     }
-    await expect(
-      executor.commit(preparation.invocation, terminal)
-    ).resolves.toMatchObject({
+    await expect(executor.commit(terminal)).resolves.toMatchObject({
       status: 'committed',
       head: { generation: 1 },
     });
     expect(host.activeInvocations).toBe(0);
+  });
+
+  it('binds host-driven commit to the exact invocation that executed', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    host.checkpointAvailable = false;
+    const coldContinue = host.coldContinue.bind(host);
+    host.coldContinue = async (prepareRequest, actorHead, context) => {
+      const prepared = await coldContinue(prepareRequest, actorHead, context);
+      prepared.fork.checkpointId = 'reconstructed-start';
+      return prepared;
+    };
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'sealed-settlement',
+      depth: 1,
+      event: { text: 'sealed-settlement' },
+    });
+    if (preparation.status !== 'checkpoint_unavailable') {
+      throw new Error('Expected unavailable checkpoint');
+    }
+    const prepared = await executor.coldContinue(preparation);
+    const settlement = await executor.invoke(prepared);
+    if (settlement.status !== 'applied') {
+      throw new Error('Expected applied settlement');
+    }
+
+    expect(Object.isFrozen(settlement)).toBe(true);
+    expect(Object.isFrozen(settlement.invocation)).toBe(true);
+    expect(() => {
+      settlement.invocation.base.generation = 2;
+    }).toThrow();
+    const forgedSettlement = {
+      ...settlement,
+      invocation: {
+        ...settlement.invocation,
+        base: head(2, 'later', 'later-checkpoint'),
+      },
+    };
+    await expect(executor.commit(forgedSettlement)).rejects.toThrow(
+      'settlement was not issued by this executor'
+    );
+    await expect(executor.commit(settlement)).resolves.toMatchObject({
+      status: 'committed',
+      head: { generation: 2 },
+    });
   });
 
   it('commits applied work with current-plus-previous retention', async () => {
@@ -254,6 +312,47 @@ describe('EventActorExecutor', () => {
       },
     });
     expect(host.discards).toHaveLength(0);
+  });
+
+  it('models checkpoint identity in the test adapter CAS', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    const fork: EventActorCheckpointFork = {
+      invocationId: 'same-generation-mismatch',
+      threadId: 'actor-checkpoints',
+      checkpointNs: 'attempt',
+      checkpointId: 'terminal',
+    };
+
+    await expect(
+      host.commit({
+        invocation: {
+          actorThreadId: 'actor-thread',
+          invocationId: 'same-generation-mismatch',
+          depth: 1,
+          continuation: 'warm',
+          base: head(1, 'wrong-namespace', 'checkpoint-0'),
+          fork,
+        },
+        expectedHead: head(1, 'wrong-namespace', 'checkpoint-0'),
+        checkpoint: fork,
+        result: 'must-not-commit',
+        retention: {
+          committedCheckpoints: 2,
+          dormantCheckpointTtlMs: 60_000,
+        },
+      })
+    ).resolves.toMatchObject({
+      status: 'stale',
+      head: {
+        generation: 1,
+        checkpoint: {
+          checkpointNs: 'committed',
+          checkpointId: 'checkpoint-0',
+        },
+      },
+    });
+    expect(host.generation).toBe(1);
   });
 
   it('cold-continues the same logical actor when its checkpoint is unavailable', async () => {
@@ -615,9 +714,15 @@ describe('EventActorExecutor', () => {
     if (preparation.status !== 'ready') {
       throw new Error('Expected warm preparation');
     }
-    preparation.invocation.depth = 2;
+    expect(() => {
+      preparation.invocation.depth = 2;
+    }).toThrow();
+    const forgedInvocation = {
+      ...preparation.invocation,
+      depth: 2,
+    };
 
-    await expect(executor.invoke(preparation.invocation)).rejects.toThrow(
+    await expect(executor.invoke(forgedInvocation)).rejects.toThrow(
       'exceeds maximum 1'
     );
     expect(host.invokes).toBe(0);
@@ -737,16 +842,28 @@ describe('EventActorExecutor', () => {
     mutableRequest.actorThreadId = 'mutated-actor';
     mutableRequest.invocationId = 'mutated-invocation';
     mutableRequest.depth = 1;
+    mutableRequest.event.text = 'mutated-event';
     release();
 
-    await expect(preparationPromise).resolves.toMatchObject({
+    const preparation = await preparationPromise;
+    expect(preparation).toMatchObject({
       status: 'checkpoint_unavailable',
       request: {
         actorThreadId: 'actor-thread',
         invocationId: 'mutable-prepared-ancestry',
         depth: 2,
+        event: { text: 'mutable-prepared-ancestry' },
       },
       head: { actorThreadId: 'actor-thread', generation: 0 },
+    });
+    if (preparation.status !== 'checkpoint_unavailable') {
+      throw new Error('Expected unavailable checkpoint');
+    }
+    expect(() => {
+      preparation.request.event.text = 'mutated-after-prepare';
+    }).toThrow();
+    await expect(executor.coldContinue(preparation)).resolves.toMatchObject({
+      event: { text: 'mutable-prepared-ancestry' },
     });
   });
 
@@ -768,16 +885,29 @@ describe('EventActorExecutor', () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    host.coldContinue = async (adapterRequest, actorHead) => {
+    host.coldContinue = async (adapterRequest, actorHead, context) => {
       await gate;
-      return coldContinue(adapterRequest, actorHead);
+      return coldContinue(adapterRequest, actorHead, context);
     };
 
-    const continuationPromise = executor.coldContinue(preparation);
-    preparation.request.actorThreadId = 'mutated-actor';
-    preparation.request.invocationId = 'mutated-invocation';
-    preparation.request.depth = 1;
-    preparation.head.actorThreadId = 'mutated-actor';
+    const mutablePreparation = {
+      status: 'checkpoint_unavailable' as const,
+      request: {
+        ...preparation.request,
+        event: { ...preparation.request.event },
+      },
+      head: {
+        ...preparation.head,
+        ...(preparation.head.checkpoint == null
+          ? {}
+          : { checkpoint: { ...preparation.head.checkpoint } }),
+      },
+    };
+    const continuationPromise = executor.coldContinue(mutablePreparation);
+    mutablePreparation.request.actorThreadId = 'mutated-actor';
+    mutablePreparation.request.invocationId = 'mutated-invocation';
+    mutablePreparation.request.depth = 1;
+    mutablePreparation.head.actorThreadId = 'mutated-actor';
     release();
 
     await expect(continuationPromise).resolves.toMatchObject({
@@ -878,6 +1008,45 @@ describe('EventActorExecutor', () => {
     expect(host.discards).toHaveLength(0);
   });
 
+  it('propagates task cancellation into in-flight cold continuation', async () => {
+    const host = new TestHost();
+    host.checkpointAvailable = false;
+    let started = (): void => undefined;
+    const coldStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    host.coldContinue = async (_prepareRequest, _actorHead, context) => {
+      host.coldContinueSignals.push(context.signal);
+      started();
+      return await new Promise<EventActorInvocation<TestEvent>>(
+        (_resolve, reject) => {
+          context.signal.addEventListener(
+            'abort',
+            () => reject(context.signal.reason),
+            { once: true }
+          );
+        }
+      );
+    };
+    const controller = new AbortController();
+    const executor = new EventActorExecutor(host);
+    const execution = executor.execute(
+      request('cancel-during-cold', { signal: controller.signal })
+    );
+    await coldStarted;
+
+    controller.abort(new Error('cancel cold reconstruction'));
+
+    await expect(execution).resolves.toEqual({
+      status: 'cancelled',
+      continuation: 'cold',
+    });
+    expect(host.coldContinueSignals).toHaveLength(1);
+    expect(host.coldContinueSignals[0].aborted).toBe(true);
+    expect(host.invokes).toBe(0);
+    expect(host.discards).toHaveLength(0);
+  });
+
   it('retains an applied result with a checkpoint outside the invocation fork', async () => {
     const host = new TestHost();
     const prepare = host.prepare.bind(host);
@@ -959,6 +1128,39 @@ describe('EventActorExecutor', () => {
     expect(host.discards).toHaveLength(0);
   });
 
+  it('retains a cold-applied result that reports the committed base checkpoint', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    host.checkpointAvailable = false;
+    const coldContinue = host.coldContinue.bind(host);
+    host.coldContinue = async (prepareRequest, actorHead, context) => {
+      const prepared = await coldContinue(prepareRequest, actorHead, context);
+      prepared.fork.checkpointId = 'reconstructed-start';
+      return prepared;
+    };
+    host.invokeImpl = async (prepared) => ({
+      status: 'applied',
+      result: 'action-claimed',
+      checkpoint: {
+        ...prepared.fork,
+        checkpointId: prepared.base.checkpoint?.checkpointId,
+      },
+    });
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('cold-base-terminal'))
+    ).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      result: 'action-claimed',
+      error: {
+        message: 'Event actor result escaped its invocation checkpoint fork',
+      },
+    });
+    expect(host.commits).toHaveLength(0);
+    expect(host.discards).toHaveLength(0);
+  });
+
   it('snapshots validated terminal evidence before awaiting commit', async () => {
     const host = new TestHost();
     let terminalCheckpoint: EventActorCheckpointFork | undefined;
@@ -1022,8 +1224,8 @@ describe('EventActorExecutor', () => {
     const host = new TestHost();
     host.checkpointAvailable = false;
     const coldContinue = host.coldContinue.bind(host);
-    host.coldContinue = async (prepareRequest, actorHead) => {
-      const prepared = await coldContinue(prepareRequest, actorHead);
+    host.coldContinue = async (prepareRequest, actorHead, context) => {
+      const prepared = await coldContinue(prepareRequest, actorHead, context);
       prepared.event = { text: 'stale-event' };
       return prepared;
     };
@@ -1116,8 +1318,8 @@ describe('EventActorExecutor', () => {
     host.generation = 1;
     host.checkpointAvailable = false;
     const coldContinue = host.coldContinue.bind(host);
-    host.coldContinue = async (prepareRequest, actorHead) => {
-      const prepared = await coldContinue(prepareRequest, actorHead);
+    host.coldContinue = async (prepareRequest, actorHead, context) => {
+      const prepared = await coldContinue(prepareRequest, actorHead, context);
       prepared.fork.checkpointId = 'reconstructed-start';
       return prepared;
     };
@@ -1133,8 +1335,8 @@ describe('EventActorExecutor', () => {
     host.generation = 1;
     host.checkpointAvailable = false;
     const coldContinue = host.coldContinue.bind(host);
-    host.coldContinue = async (prepareRequest, actorHead) => {
-      const prepared = await coldContinue(prepareRequest, actorHead);
+    host.coldContinue = async (prepareRequest, actorHead, context) => {
+      const prepared = await coldContinue(prepareRequest, actorHead, context);
       delete prepared.fork.checkpointId;
       return prepared;
     };
@@ -1165,9 +1367,9 @@ describe('EventActorExecutor', () => {
     const host = new TestHost();
     host.checkpointAvailable = false;
     const coldContinue = host.coldContinue.bind(host);
-    host.coldContinue = async (prepareRequest, actorHead) => {
+    host.coldContinue = async (prepareRequest, actorHead, context) => {
       prepareRequest.checkpointNs = 'shared-namespace';
-      return coldContinue(prepareRequest, actorHead);
+      return coldContinue(prepareRequest, actorHead, context);
     };
     const executor = new EventActorExecutor(host);
 
@@ -1198,9 +1400,9 @@ describe('EventActorExecutor', () => {
       throw new Error('Expected applied terminal result');
     }
 
-    await expect(
-      executor.commit(preparation.invocation, terminal)
-    ).rejects.toThrow('Event actor head is invalid');
+    await expect(executor.commit(terminal)).rejects.toThrow(
+      'Event actor head is invalid'
+    );
   });
 
   it('rejects a stale commit head that did not advance past its base', async () => {
@@ -1221,9 +1423,9 @@ describe('EventActorExecutor', () => {
       throw new Error('Expected applied terminal result');
     }
 
-    await expect(
-      executor.commit(preparation.invocation, terminal)
-    ).rejects.toThrow('did not advance past its base');
+    await expect(executor.commit(terminal)).rejects.toThrow(
+      'did not advance past its base'
+    );
   });
 
   it('rejects a stale commit head that switches checkpoint threads', async () => {
@@ -1256,9 +1458,9 @@ describe('EventActorExecutor', () => {
       throw new Error('Expected applied terminal result');
     }
 
-    await expect(
-      executor.commit(preparation.invocation, terminal)
-    ).rejects.toThrow('changed its checkpoint thread');
+    await expect(executor.commit(terminal)).rejects.toThrow(
+      'changed its checkpoint thread'
+    );
   });
 
   it('retains applied work when stale moves the base checkpoint to another namespace', async () => {
@@ -1316,8 +1518,8 @@ describe('EventActorExecutor', () => {
     host.generation = 1;
     host.checkpointAvailable = false;
     const coldContinue = host.coldContinue.bind(host);
-    host.coldContinue = async (prepareRequest, actorHead) => {
-      const prepared = await coldContinue(prepareRequest, actorHead);
+    host.coldContinue = async (prepareRequest, actorHead, context) => {
+      const prepared = await coldContinue(prepareRequest, actorHead, context);
       prepared.fork.checkpointId = 'reconstructed-start';
       return prepared;
     };
@@ -1461,8 +1663,12 @@ describe('EventActorExecutor', () => {
     expect(() => executor.discard(malformed, 'failed')).toThrow(
       'Event actor head is invalid'
     );
-    await expect(executor.commit(malformed, terminal)).rejects.toThrow(
-      'Event actor head is invalid'
+    const forgedSettlement = {
+      ...terminal,
+      invocation: malformed,
+    };
+    await expect(executor.commit(forgedSettlement)).rejects.toThrow(
+      'settlement was not issued by this executor'
     );
     expect(host.discards).toHaveLength(0);
     expect(host.commits).toHaveLength(0);
@@ -1562,9 +1768,9 @@ describe('EventActorExecutor', () => {
     if (terminal.status !== 'applied') {
       throw new Error('Expected applied terminal result');
     }
-    await expect(
-      executor.commit(preparation.invocation, terminal)
-    ).resolves.toMatchObject({ status: 'committed' });
+    await expect(executor.commit(terminal)).resolves.toMatchObject({
+      status: 'committed',
+    });
   });
 
   it('snapshots applied checkpoint evidence returned by public invoke', async () => {
@@ -1603,8 +1809,8 @@ describe('EventActorExecutor', () => {
       checkpointId: 'public-invoke-terminal',
       checkpointNs: expect.stringMatching(/^event-actor\/[a-f0-9]{32}$/),
     });
-    await expect(
-      executor.commit(preparation.invocation, terminal)
-    ).resolves.toMatchObject({ status: 'committed' });
+    await expect(executor.commit(terminal)).resolves.toMatchObject({
+      status: 'committed',
+    });
   });
 });
