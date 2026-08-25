@@ -58,6 +58,7 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
   checkpointAvailable = true;
   committedCheckpointNs = 'committed';
   committedCheckpointId = 'checkpoint-0';
+  coldContinues = 0;
   invokes = 0;
   activeInvocations = 0;
   maxActiveInvocations = 0;
@@ -100,6 +101,7 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
     request: EventActorAdapterPrepareRequest<TestEvent>,
     _head: EventActorHead
   ) {
+    this.coldContinues += 1;
     return {
       ...invocation(request, 'cold', this.generation),
       base: head(
@@ -335,7 +337,7 @@ describe('EventActorExecutor', () => {
     expect(cancelledHost.discards[0].reason).toBe('cancelled');
   });
 
-  it('allows only one concurrent invocation from a committed generation to advance', async () => {
+  it('isolates duplicate deliveries and retains an applied CAS conflict', async () => {
     const host = new TestHost();
     let release = (): void => undefined;
     const gate = new Promise<void>((resolve) => {
@@ -353,20 +355,19 @@ describe('EventActorExecutor', () => {
       };
     };
     const executor = new EventActorExecutor(host);
-    const first = executor.execute(request('event-a'));
-    const second = executor.execute(request('event-b'));
+    const first = executor.execute(request('same-event'));
+    const second = executor.execute(request('same-event'));
     await Promise.resolve();
     release();
 
     const results = await Promise.all([first, second]);
     expect(results.map((result) => result.status).sort()).toEqual([
       'applied',
-      'stale',
+      'commit_conflict',
     ]);
     expect(host.generation).toBe(1);
-    expect(host.discards).toEqual([
-      expect.objectContaining({ reason: 'stale' }),
-    ]);
+    expect(new Set(host.forkNamespaces).size).toBe(2);
+    expect(host.discards).toHaveLength(0);
   });
 
   it('retains a fork when commit acknowledgement is indeterminate', async () => {
@@ -432,6 +433,15 @@ describe('EventActorExecutor', () => {
         callbacks: [],
         tags: ['parent-trace'],
         metadata: { userId: 'user-1', sessionId: 'session-1' },
+        configurable: {
+          user_id: 'user-1',
+          requestBody: { conversationId: 'conversation-1' },
+          userMCPAuthMap: { chess: 'credential' },
+          thread_id: 'parent-thread',
+          checkpoint_ns: 'parent-namespace',
+          checkpoint_id: 'parent-checkpoint',
+          checkpoint_map: { parent: 'checkpoint' },
+        },
       });
     const executions = [
       executor.execute(request('sibling-a')),
@@ -461,7 +471,25 @@ describe('EventActorExecutor', () => {
         sessionId: 'session-1',
         eventActorThreadId: 'actor-thread',
       },
+      configurable: {
+        user_id: 'user-1',
+        requestBody: { conversationId: 'conversation-1' },
+        userMCPAuthMap: { chess: 'credential' },
+        event_actor_thread_id: 'actor-thread',
+      },
     });
+    expect(host.invokeConfigs[0].configurable?.thread_id).toBe(
+      'actor-checkpoints'
+    );
+    expect(host.invokeConfigs[0].configurable?.checkpoint_ns).toMatch(
+      /^event-actor\/[a-f0-9]{32}$/
+    );
+    expect(host.invokeConfigs[0].configurable).not.toHaveProperty(
+      'checkpoint_id'
+    );
+    expect(host.invokeConfigs[0].configurable).not.toHaveProperty(
+      'checkpoint_map'
+    );
     release();
 
     const results = await Promise.all(executions);
@@ -549,5 +577,117 @@ describe('EventActorExecutor', () => {
       'mismatched checkpoint ownership'
     );
     expect(host.discards).toHaveLength(0);
+  });
+
+  it('validates a cold-continuation head before adapter work', async () => {
+    const host = new TestHost();
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.coldContinue(
+        {
+          actorThreadId: 'actor-thread',
+          invocationId: 'foreign-head',
+          depth: 1,
+          event: { text: 'foreign-head' },
+        },
+        { actorThreadId: 'another-actor', generation: 0 }
+      )
+    ).rejects.toThrow('Event actor head is invalid');
+    expect(host.coldContinues).toBe(0);
+  });
+
+  it('detects a cold adapter mutating its copy of the prepared head', async () => {
+    const host = new TestHost();
+    const validHead = head(1);
+    host.coldContinue = async (prepareRequest, adapterHead) => {
+      adapterHead.generation = 2;
+      return {
+        ...invocation(prepareRequest, 'cold', 2),
+        base: adapterHead,
+      };
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.coldContinue(
+        {
+          actorThreadId: 'actor-thread',
+          invocationId: 'mutated-head',
+          depth: 1,
+          event: { text: 'mutated-head' },
+        },
+        validHead
+      )
+    ).rejects.toThrow('Cold continuation did not use the prepared actor head');
+    expect(validHead.generation).toBe(1);
+  });
+
+  it('uses the validated ownership snapshot after adapter invocation', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) => {
+      const checkpoint = {
+        ...prepared.fork,
+        checkpointId: 'trusted-terminal',
+      };
+      prepared.actorThreadId = 'another-actor';
+      prepared.base.generation = 99;
+      prepared.fork.checkpointNs = 'another-fork';
+      return {
+        status: 'applied',
+        result: 'applied-before-mutation',
+        checkpoint,
+      };
+    };
+    const executor = new EventActorExecutor(host);
+
+    await expect(
+      executor.execute(request('mutating-adapter'))
+    ).resolves.toMatchObject({
+      status: 'applied',
+      head: { actorThreadId: 'actor-thread', generation: 1 },
+    });
+    expect(host.commits[0].invocation).toMatchObject({
+      actorThreadId: 'actor-thread',
+      invocationId: 'mutating-adapter',
+      base: { generation: 0 },
+      fork: { checkpointNs: expect.stringMatching(/^event-actor\//) },
+    });
+  });
+
+  it('keeps a host-driven prepared invocation immutable across invoke', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) => {
+      const checkpoint = {
+        ...prepared.fork,
+        checkpointId: 'host-driven-terminal',
+      };
+      prepared.base.generation = 99;
+      prepared.fork.checkpointNs = 'mutated-by-adapter';
+      return { status: 'applied', result: 'done', checkpoint };
+    };
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'host-driven-mutation',
+      depth: 1,
+      event: { text: 'host-driven-mutation' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const originalNamespace = preparation.invocation.fork.checkpointNs;
+
+    const terminal = await executor.invoke(preparation.invocation);
+
+    expect(preparation.invocation.base.generation).toBe(0);
+    expect(preparation.invocation.fork.checkpointNs).toBe(originalNamespace);
+    expect(terminal.status).toBe('applied');
+    if (terminal.status !== 'applied') {
+      throw new Error('Expected applied terminal result');
+    }
+    await expect(
+      executor.commit(preparation.invocation, terminal)
+    ).resolves.toMatchObject({ status: 'committed' });
   });
 });

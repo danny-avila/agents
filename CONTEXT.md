@@ -52,8 +52,9 @@ monotonic generation. Each invocation runs on an **Invocation Fork** owned by
 that invocation. The host advances the Event Actor Head only through an atomic
 comparison against both the generation and prior checkpoint identity.
 
-Applied work may commit its Invocation Fork. Failed, cancelled, stale, and
-completed-without-action invocations discard their forks. A missing or
+Applied work may commit its Invocation Fork. Failed, cancelled, and
+completed-without-action invocations discard their forks. An applied fork that
+loses the head comparison remains available for reconciliation. A missing or
 incompatible warm checkpoint uses **Cold Continuation**: the host rebuilds an
 Invocation Fork from bounded transcript and summary state while preserving the
 same logical Event Actor identity. An indeterminate commit is retained for

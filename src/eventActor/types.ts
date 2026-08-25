@@ -65,6 +65,7 @@ export interface EventActorPrepareRequest<TEvent> {
 
 export interface EventActorAdapterPrepareRequest<TEvent>
   extends EventActorPrepareRequest<TEvent> {
+  /** Unique execution-attempt namespace; invocationId remains the logical idempotency key. */
   checkpointNs: string;
 }
 
@@ -97,9 +98,13 @@ export interface EventActorDiscardRequest {
 /**
  * Host adapter for durable actor state and the concrete agent invocation.
  * `commit` must compare both the expected generation and checkpoint identity
- * atomically before advancing the logical actor head. Preparation methods own
- * rollback until they return a ready invocation; `invoke` returns only after
- * its provider, stream, timer, and executor resources have been released.
+ * atomically before advancing the logical actor head. The host mailbox
+ * deduplicates the logical `invocationId` before entering this seam, while each
+ * SDK execution attempt receives a distinct checkpoint namespace. Preparation
+ * methods own rollback until they return a ready invocation; `invoke` returns
+ * only after its provider, stream, timer, and executor resources have been
+ * released. `commit` must not reclaim an applied stale fork: the SDK retains
+ * and surfaces it as `commit_conflict` for host reconciliation.
  */
 export interface EventActorHostAdapter<TEvent, TResult> {
   prepare(
@@ -136,7 +141,14 @@ export type EventActorExecutionResult<TResult> =
       continuation: 'warm' | 'cold';
     }
   | {
-      status: 'completed_no_action' | 'cancelled' | 'stale';
+      status: 'completed_no_action' | 'cancelled';
+      continuation: 'warm' | 'cold';
+    }
+  | {
+      /** The action happened, but another head won the CAS. Reconcile; do not retry. */
+      status: 'commit_conflict';
+      result: TResult;
+      checkpoint: EventActorCheckpointFork;
       continuation: 'warm' | 'cold';
     }
   | {

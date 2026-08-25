@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type {
@@ -23,14 +23,47 @@ const DEFAULT_MAX_DEPTH = 1;
 const DEFAULT_DORMANT_CHECKPOINT_TTL_MS = 24 * 60 * 60 * 1_000;
 
 function createInvocationCheckpointNs(
-  request: EventActorPrepareRequest<unknown>
+  request: EventActorPrepareRequest<unknown>,
+  attemptId = randomUUID()
 ): string {
   return `event-actor/${createHash('sha256')
     .update(request.actorThreadId)
     .update('\0')
     .update(request.invocationId)
+    .update('\0')
+    .update(attemptId)
     .digest('hex')
     .slice(0, 32)}`;
+}
+
+function snapshotHead(head: EventActorHead): EventActorHead {
+  return {
+    actorThreadId: head.actorThreadId,
+    generation: head.generation,
+    ...(head.checkpoint == null ? {} : { checkpoint: { ...head.checkpoint } }),
+  };
+}
+
+function snapshotInvocationReference(
+  invocation: EventActorInvocationReference
+): EventActorInvocationReference {
+  return {
+    actorThreadId: invocation.actorThreadId,
+    invocationId: invocation.invocationId,
+    depth: invocation.depth,
+    continuation: invocation.continuation,
+    base: snapshotHead(invocation.base),
+    fork: { ...invocation.fork },
+  };
+}
+
+function snapshotInvocation<TEvent>(
+  invocation: EventActorInvocation<TEvent>
+): EventActorInvocation<TEvent> {
+  return {
+    ...snapshotInvocationReference(invocation),
+    event: invocation.event,
+  };
 }
 
 function requireNonEmpty(value: string, name: string): void {
@@ -131,6 +164,18 @@ function createRunnableConfig(
   signal: AbortSignal,
   ambient?: RunnableConfig
 ): RunnableConfig {
+  const configurable: Record<string, unknown> = {
+    ...(ambient?.configurable ?? {}),
+  };
+  delete configurable.thread_id;
+  delete configurable.checkpoint_ns;
+  delete configurable.checkpoint_id;
+  delete configurable.checkpoint_map;
+  delete configurable.event_actor_thread_id;
+  delete configurable.event_actor_invocation_id;
+  delete configurable.event_actor_generation;
+  delete configurable.event_actor_depth;
+  delete configurable.event_actor_continuation;
   return {
     signal,
     ...(ambient?.callbacks == null ? {} : { callbacks: ambient.callbacks }),
@@ -144,6 +189,7 @@ function createRunnableConfig(
       eventActorContinuation: invocation.continuation,
     },
     configurable: {
+      ...configurable,
       thread_id: invocation.fork.threadId,
       checkpoint_ns: invocation.fork.checkpointNs,
       ...(invocation.fork.checkpointId == null
@@ -235,17 +281,22 @@ export class EventActorExecutor<TEvent, TResult> {
     head: EventActorHead
   ): Promise<EventActorInvocation<TEvent>> {
     this.validatePrepareRequest(request);
+    const trustedHead = snapshotHead(head);
+    validateHead(trustedHead, request.actorThreadId);
     const adapterRequest: EventActorAdapterPrepareRequest<TEvent> = {
       ...request,
       checkpointNs: createInvocationCheckpointNs(request),
     };
-    const invocation = await this.adapter.coldContinue(adapterRequest, head);
+    const invocation = await this.adapter.coldContinue(
+      adapterRequest,
+      snapshotHead(trustedHead)
+    );
     validateInvocation(
       request,
       invocation,
       'cold',
       adapterRequest.checkpointNs,
-      head
+      trustedHead
     );
     return invocation;
   }
@@ -254,8 +305,9 @@ export class EventActorExecutor<TEvent, TResult> {
     invocation: EventActorInvocation<TEvent>,
     signal?: AbortSignal
   ): Promise<EventActorTerminalResult<TResult>> {
+    const trustedInvocation = snapshotInvocation(invocation);
     return this.invokeWithConfig(
-      invocation,
+      trustedInvocation,
       signal,
       AsyncLocalStorageProviderSingleton.getRunnableConfig()
     );
@@ -275,7 +327,7 @@ export class EventActorExecutor<TEvent, TResult> {
       },
       invocation,
       invocation.continuation,
-      createInvocationCheckpointNs(invocation)
+      invocation.fork.checkpointNs
     );
     const controller = new AbortController();
     const abort = (): void => controller.abort(signal?.reason);
@@ -310,11 +362,13 @@ export class EventActorExecutor<TEvent, TResult> {
     invocation: EventActorInvocationReference,
     terminal: EventActorAppliedResult<TResult>
   ): Promise<EventActorCommitResult> {
-    validateTerminalCheckpoint(invocation, terminal.checkpoint);
+    const trustedInvocation = snapshotInvocationReference(invocation);
+    const trustedCheckpoint = { ...terminal.checkpoint };
+    validateTerminalCheckpoint(trustedInvocation, trustedCheckpoint);
     const committed = await this.adapter.commit({
-      invocation,
-      expectedHead: invocation.base,
-      checkpoint: terminal.checkpoint,
+      invocation: snapshotInvocationReference(trustedInvocation),
+      expectedHead: snapshotHead(trustedInvocation.base),
+      checkpoint: { ...trustedCheckpoint },
       result: terminal.result,
       retention: {
         committedCheckpoints: 2,
@@ -322,7 +376,11 @@ export class EventActorExecutor<TEvent, TResult> {
       },
     });
     if (committed.status === 'committed') {
-      validateCommittedHead(invocation, terminal.checkpoint, committed.head);
+      validateCommittedHead(
+        trustedInvocation,
+        trustedCheckpoint,
+        committed.head
+      );
     }
     return committed;
   }
@@ -331,7 +389,10 @@ export class EventActorExecutor<TEvent, TResult> {
     invocation: EventActorInvocationReference,
     reason: EventActorDiscardReason
   ): Promise<void> {
-    return this.adapter.discard({ invocation, reason });
+    return this.adapter.discard({
+      invocation: snapshotInvocationReference(invocation),
+      reason,
+    });
   }
 
   private validatePrepareRequest(
@@ -368,7 +429,8 @@ export class EventActorExecutor<TEvent, TResult> {
         ? preparation.invocation
         : await this.coldContinue(prepareRequest, preparation.head);
     const continuation = preparation.status === 'ready' ? 'warm' : 'cold';
-    const invocationReference: EventActorInvocationReference = invocation;
+    const invocationReference = snapshotInvocationReference(invocation);
+    const invocationForAdapter = snapshotInvocation(invocation);
     if (isAborted(request.signal)) {
       await this.discard(invocationReference, 'cancelled');
       return { status: 'cancelled', continuation };
@@ -376,7 +438,7 @@ export class EventActorExecutor<TEvent, TResult> {
     let terminal;
     try {
       terminal = await this.invokeWithConfig(
-        invocation,
+        invocationForAdapter,
         request.signal,
         ambientConfig
       );
@@ -409,8 +471,12 @@ export class EventActorExecutor<TEvent, TResult> {
       };
     }
     if (committed.status === 'stale') {
-      await this.discard(invocationReference, 'stale');
-      return { status: 'stale', continuation };
+      return {
+        status: 'commit_conflict',
+        result: terminal.result,
+        checkpoint: { ...terminal.checkpoint },
+        continuation,
+      };
     }
     return {
       status: 'applied',
