@@ -458,6 +458,11 @@ describe('EventActorExecutor', () => {
           checkpoint_ns: 'parent-namespace',
           checkpoint_id: 'parent-checkpoint',
           checkpoint_map: { parent: 'checkpoint' },
+          __pregel_checkpointer: { parent: true },
+          __pregel_scratchpad: { parent: true },
+          __librechat_subagent_resume_manifest: { parent: true },
+          __librechat_tool_approval_execution_scope: { parent: true },
+          lc_run_breaker_scope: { parent: true },
         },
       });
     const executions = [
@@ -510,6 +515,14 @@ describe('EventActorExecutor', () => {
     expect(host.invokeConfigs[0].configurable).not.toHaveProperty(
       'checkpoint_map'
     );
+    expect(
+      Object.keys(host.invokeConfigs[0].configurable ?? {}).some(
+        (key) => key.startsWith('__pregel_') || key.startsWith('__librechat_')
+      )
+    ).toBe(false);
+    expect(host.invokeConfigs[0].configurable).not.toHaveProperty(
+      'lc_run_breaker_scope'
+    );
     expect(host.invokeConfigs[0]).not.toHaveProperty('runId');
     expect(host.invokeConfigs[0]).not.toHaveProperty('runName');
     release();
@@ -536,6 +549,14 @@ describe('EventActorExecutor', () => {
 
   it('retains an applied result with a checkpoint outside the invocation fork', async () => {
     const host = new TestHost();
+    const prepare = host.prepare.bind(host);
+    host.prepare = async (prepareRequest) => {
+      const prepared = await prepare(prepareRequest);
+      if (prepared.status === 'ready') {
+        prepared.invocation.fork.checkpointId = 'starting-checkpoint';
+      }
+      return prepared;
+    };
     host.invokeImpl = async () => ({
       status: 'applied',
       result: 'bad',
@@ -548,7 +569,8 @@ describe('EventActorExecutor', () => {
     });
     const executor = new EventActorExecutor(host);
 
-    await expect(executor.execute(request('escape'))).resolves.toMatchObject({
+    const result = await executor.execute(request('escape'));
+    expect(result).toMatchObject({
       status: 'commit_indeterminate',
       result: 'bad',
       checkpoint: {
@@ -559,6 +581,11 @@ describe('EventActorExecutor', () => {
         message: 'Event actor result escaped its invocation checkpoint fork',
       }),
     });
+    expect(result).toHaveProperty('checkpoint');
+    if (result.status !== 'commit_indeterminate') {
+      throw new Error('Expected indeterminate commit');
+    }
+    expect(result.checkpoint).not.toHaveProperty('checkpointId');
     expect(host.commits).toHaveLength(0);
     expect(host.discards).toHaveLength(0);
   });
@@ -685,6 +712,41 @@ describe('EventActorExecutor', () => {
     await expect(
       executor.commit(preparation.invocation, terminal)
     ).rejects.toThrow('did not advance past its base');
+  });
+
+  it('rejects a stale commit head that switches checkpoint threads', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    host.commit = async () => ({
+      status: 'stale' as const,
+      head: {
+        actorThreadId: 'actor-thread',
+        generation: 2,
+        checkpoint: {
+          threadId: 'another-checkpoint-thread',
+          checkpointNs: 'other-namespace',
+          checkpointId: 'other-checkpoint',
+        },
+      },
+    });
+    const executor = new EventActorExecutor(host);
+    const preparation = await executor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'switched-stale-thread',
+      depth: 1,
+      event: { text: 'switched-stale-thread' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const terminal = await executor.invoke(preparation.invocation);
+    if (terminal.status !== 'applied') {
+      throw new Error('Expected applied terminal result');
+    }
+
+    await expect(
+      executor.commit(preparation.invocation, terminal)
+    ).rejects.toThrow('changed its checkpoint thread');
   });
 
   it('commits an applied result even when cancellation arrives as invoke returns', async () => {

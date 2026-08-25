@@ -173,9 +173,14 @@ function createRunnableConfig(
   signal: AbortSignal,
   ambient?: RunnableConfig
 ): RunnableConfig {
-  const configurable: Record<string, unknown> = {
-    ...(ambient?.configurable ?? {}),
-  };
+  const configurable = Object.fromEntries(
+    Object.entries(ambient?.configurable ?? {}).filter(
+      ([key]) =>
+        !key.startsWith('__pregel_') &&
+        !key.startsWith('__librechat_') &&
+        key !== 'lc_run_breaker_scope'
+    )
+  );
   delete configurable.thread_id;
   delete configurable.checkpoint_ns;
   delete configurable.checkpoint_id;
@@ -417,6 +422,13 @@ export class EventActorExecutor<TEvent, TResult> {
       if (committed.head.generation <= trustedInvocation.base.generation) {
         throw new Error('Stale event actor head did not advance past its base');
       }
+      if (
+        trustedInvocation.base.checkpoint != null &&
+        committed.head.checkpoint?.threadId !==
+          trustedInvocation.base.checkpoint.threadId
+      ) {
+        throw new Error('Stale event actor head changed its checkpoint thread');
+      }
       return { status: 'stale', head: snapshotHead(committed.head) };
     }
     return committed;
@@ -497,7 +509,11 @@ export class EventActorExecutor<TEvent, TResult> {
       return {
         status: 'commit_indeterminate',
         result: terminal.result,
-        checkpoint: { ...invocationReference.fork },
+        checkpoint: {
+          invocationId: invocationReference.fork.invocationId,
+          threadId: invocationReference.fork.threadId,
+          checkpointNs: invocationReference.fork.checkpointNs,
+        },
         error: asError(error),
         continuation,
       };
