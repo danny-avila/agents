@@ -2052,7 +2052,7 @@ export class AgentContext {
     systemProjectionFingerprint?: string;
     toolProjectionFingerprint?: string;
     messages: readonly BaseMessage[];
-    projectedMessages?: readonly BaseMessage[];
+    projectedMessages?: readonly BaseMessage[] | null;
     restoredToolSubstitution: boolean;
     summarizerFallbackServed?: boolean;
   }): CompactionReplayEligibility {

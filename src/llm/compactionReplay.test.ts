@@ -15,6 +15,7 @@ import {
   type CompactionReplayState,
 } from '@/llm/compactionReplay';
 import type * as t from '@/types';
+import { addTailCacheControl } from '@/messages/cache';
 import { setProviderMessageProvenance } from '@/messages/provenance';
 import { Providers } from '@/common';
 
@@ -89,7 +90,7 @@ function inspect(
     systemRevision: number;
     toolRevision: number;
     messages: BaseMessage[];
-    projectedMessages: BaseMessage[];
+    projectedMessages: BaseMessage[] | null;
     restoredToolSubstitution: boolean;
     summarizerFallbackServed: boolean;
   }> = {}
@@ -733,6 +734,31 @@ describe('compaction replay eligibility', () => {
     ).toMatchObject({
       eligible: false,
       reason: 'provider_projection_changed',
+    });
+  });
+
+  it('accepts a prepared prefix after restoring its history cache marker', () => {
+    const sourceMessages = [sourceMessage('a'), sourceMessage('b')];
+    const normalProjection = addTailCacheControl([...sourceMessages]);
+    const envelope = createEnvelope({
+      messages: normalProjection,
+      sourceMessages,
+    });
+
+    expect(
+      inspect(envelope, {
+        messages: sourceMessages,
+        projectedMessages: addTailCacheControl([...sourceMessages]),
+      })
+    ).toMatchObject({ eligible: true, replayMessageCount: 2 });
+  });
+
+  it('fails closed when prepared-prefix extraction is inconclusive', () => {
+    const envelope = createEnvelope();
+
+    expect(inspect(envelope, { projectedMessages: null })).toMatchObject({
+      eligible: false,
+      reason: 'provider_projection_unknown',
     });
   });
 

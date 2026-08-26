@@ -25,7 +25,9 @@ import {
 } from '@/llm/streamLimits';
 import {
   addTailCacheControl,
+  addBedrockTailCacheControl,
   resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
   type PromptCacheTtl,
 } from '@/messages/cache';
 import {
@@ -686,7 +688,10 @@ async function executeSummarizationWithFallback(params: {
   let usedMetadataStub = false;
   let summarizationModel: t.ChatModel | undefined;
   let compactionReplayRouteSnapshot: CompactionReplayRouteSnapshot | undefined;
-  let compactionReplayProjectedMessages: readonly BaseMessage[] | undefined;
+  let compactionReplayProjectedMessages:
+    | readonly BaseMessage[]
+    | null
+    | undefined;
   const summarizationTools = agentContext.getToolsForBinding();
 
   const observeCompactionReplay = (summarizerFallbackServed: boolean): void => {
@@ -783,8 +788,43 @@ async function executeSummarizationWithFallback(params: {
     });
     summaryText = result.text;
     summaryUsage = result.usage;
-    compactionReplayProjectedMessages =
-      extractCompactionReplayPrefixProjection(result.preparedMessages);
+    if (process.env.AGENT_DEBUG_LOGGING === 'true') {
+      const projectedPrefix = extractCompactionReplayPrefixProjection(
+        result.preparedMessages
+      );
+      if (projectedPrefix == null) {
+        compactionReplayProjectedMessages = null;
+      } else if (!usePromptCache) {
+        compactionReplayProjectedMessages = projectedPrefix;
+      } else if (clientConfig.provider === Providers.BEDROCK) {
+        const clientOptions = clientConfig.clientOptions as
+          | t.BedrockAnthropicClientOptions
+          | undefined;
+        compactionReplayProjectedMessages = addBedrockTailCacheControl(
+          [...projectedPrefix],
+          resolveBedrockPromptCacheTtl(
+            clientOptions?.promptCacheTtl,
+            (clientOptions as { model?: string } | undefined)?.model
+          )
+        );
+      } else if (
+        clientConfig.provider === Providers.ANTHROPIC ||
+        clientConfig.provider === Providers.OPENROUTER
+      ) {
+        compactionReplayProjectedMessages = addTailCacheControl(
+          [...projectedPrefix],
+          resolvePromptCacheTtl(
+            (
+                  clientConfig.clientOptions as {
+                    promptCacheTtl?: PromptCacheTtl;
+                  }
+            ).promptCacheTtl
+          )
+        );
+      } else {
+        compactionReplayProjectedMessages = projectedPrefix;
+      }
+    }
     observeCompactionReplay(false);
   } catch (primaryError) {
     const primaryDescribed = describeProviderError(
@@ -1779,9 +1819,11 @@ async function summarizeWithCacheHit({
   );
 
   const instructionMessage = new HumanMessage(instruction);
-  setProviderMessageProvenance(instructionMessage, [
-    { attribution: 'synthetic' },
-  ]);
+  if (process.env.AGENT_DEBUG_LOGGING === 'true') {
+    setProviderMessageProvenance(instructionMessage, [
+      { attribution: 'synthetic' },
+    ]);
+  }
   const fullMessages = [...messages, instructionMessage];
   const invokeMessages =
     usePromptCache === true

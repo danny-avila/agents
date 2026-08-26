@@ -85,7 +85,7 @@ interface CompactionReplayCandidate {
   readonly systemRevision: number;
   readonly toolRevision: number;
   readonly messages: readonly BaseMessage[];
-  readonly projectedMessages?: readonly BaseMessage[];
+  readonly projectedMessages?: readonly BaseMessage[] | null;
   readonly restoredToolSubstitution: boolean;
   readonly summarizerFallbackServed?: boolean;
 }
@@ -821,6 +821,13 @@ export function inspectCompactionReplayEligibility(
   if (candidate.restoredToolSubstitution) {
     return ineligible(
       'restored_tool_substitution',
+      replaySourceCount,
+      requestSourceCount
+    );
+  }
+  if (candidate.projectedMessages === null) {
+    return ineligible(
+      'provider_projection_unknown',
       replaySourceCount,
       requestSourceCount
     );
