@@ -4,7 +4,7 @@ import type * as t from '@/types';
 import { inspectProviderSourceMessageIds } from '@/messages/provenance';
 import { Providers } from '@/common';
 
-type CacheNamespaceValue = string | number | boolean | object | null;
+type CacheNamespaceValue = string;
 
 export interface CompactionReplayRecipe {
   readonly provider: t.ProviderName;
@@ -86,6 +86,8 @@ const CACHE_NAMESPACE_KEYS = [
   'azureOpenAIApiVersion',
   'azureOpenAIApiKey',
   'azureOpenAIBasePath',
+  'openAIApiKey',
+  'openAIBasePath',
   'googleApiKey',
   'location',
   'credentials',
@@ -104,36 +106,113 @@ const CACHE_NAMESPACE_KEYS = [
 
 const BUILT_IN_PROVIDER_NAMES = new Set<string>(Object.values(Providers));
 
-function isCacheNamespaceValue(value: unknown): value is CacheNamespaceValue {
-  if (
-    typeof value === 'string' ||
-    typeof value === 'number' ||
-    typeof value === 'boolean' ||
-    value === null ||
-    typeof value === 'object'
-  ) {
-    return true;
+function serializeCacheNamespaceValue(
+  value: unknown,
+  seen: Set<object>
+): string | undefined {
+  if (value === null) {
+    return 'null';
   }
-  return false;
+  if (typeof value === 'string') {
+    return `string:${JSON.stringify(value)}`;
+  }
+  if (typeof value === 'boolean') {
+    return `boolean:${value}`;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      return undefined;
+    }
+    return `number:${Object.is(value, -0) ? '-0' : value}`;
+  }
+  if (typeof value !== 'object' || seen.has(value)) {
+    return undefined;
+  }
+
+  seen.add(value);
+  const parts: string[] = [];
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const serialized = serializeCacheNamespaceValue(value[i], seen);
+      if (serialized == null) {
+        seen.delete(value);
+        return undefined;
+      }
+      parts.push(serialized);
+    }
+    seen.delete(value);
+    return `array:[${parts.join(',')}]`;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    seen.delete(value);
+    return undefined;
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    seen.delete(value);
+    return undefined;
+  }
+  const keys = Object.getOwnPropertyNames(value).sort();
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor == null || !('value' in descriptor)) {
+      seen.delete(value);
+      return undefined;
+    }
+    const serialized = serializeCacheNamespaceValue(descriptor.value, seen);
+    if (serialized == null) {
+      seen.delete(value);
+      return undefined;
+    }
+    parts.push(`${JSON.stringify(key)}:${serialized}`);
+  }
+  seen.delete(value);
+  return `object:{${parts.join(',')}}`;
+}
+
+function fingerprintSerializedValue(serialized: string): string {
+  let hashA = 0x811c9dc5;
+  let hashB = 0x9e3779b9;
+  for (let i = 0; i < serialized.length; i++) {
+    const code = serialized.charCodeAt(i);
+    hashA = Math.imul(hashA ^ code, 0x01000193);
+    hashB = Math.imul(hashB ^ code, 0x5bd1e995);
+    hashB ^= hashB >>> 13;
+  }
+  return `${serialized.length}:${hashA >>> 0}:${hashB >>> 0}`;
+}
+
+function fingerprintCacheNamespaceValue(value: unknown): string | undefined {
+  const serialized = serializeCacheNamespaceValue(value, new Set<object>());
+  return serialized == null ? undefined : fingerprintSerializedValue(serialized);
 }
 
 /** Captures only routing identity; values are never emitted in diagnostics. */
 export function createCompactionCacheNamespace(
   provider: t.ProviderName,
-  options?: t.ClientOptions | Record<string, unknown>
+  options?: t.ClientOptions | Record<string, unknown>,
+  servingRouteKnown = true
 ): CompactionCacheNamespace {
+  if (!BUILT_IN_PROVIDER_NAMES.has(provider) || !servingRouteKnown) {
+    return Object.freeze({
+      complete: false,
+      entries: Object.freeze([]),
+    });
+  }
   const entries: Array<readonly [string, CacheNamespaceValue]> = [];
-  let complete = BUILT_IN_PROVIDER_NAMES.has(provider);
+  let complete = true;
   for (const key of CACHE_NAMESPACE_KEYS) {
     const value = (options as Record<string, unknown> | undefined)?.[key];
     if (value === undefined) {
       continue;
     }
-    if (!isCacheNamespaceValue(value)) {
+    const fingerprint = fingerprintCacheNamespaceValue(value);
+    if (fingerprint == null) {
       complete = false;
       continue;
     }
-    entries.push(Object.freeze([key, value] as const));
+    entries.push(Object.freeze([key, fingerprint] as const));
   }
   return Object.freeze({
     complete,
@@ -172,15 +251,7 @@ function isSyntheticMessage(message: BaseMessage): boolean {
 function fingerprintMessage(message: BaseMessage): string | undefined {
   try {
     const serialized = JSON.stringify(message.toDict());
-    let hashA = 0x811c9dc5;
-    let hashB = 0x9e3779b9;
-    for (let i = 0; i < serialized.length; i++) {
-      const code = serialized.charCodeAt(i);
-      hashA = Math.imul(hashA ^ code, 0x01000193);
-      hashB = Math.imul(hashB ^ code, 0x5bd1e995);
-      hashB ^= hashB >>> 13;
-    }
-    return `${serialized.length}:${hashA >>> 0}:${hashB >>> 0}`;
+    return fingerprintSerializedValue(serialized);
   } catch {
     return undefined;
   }

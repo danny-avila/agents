@@ -1993,7 +1993,8 @@ export class AgentContext {
 
   captureCompactionReplayRecipe(
     request: PreparedProviderRequest,
-    sourceMessages: readonly BaseMessage[]
+    sourceMessages: readonly BaseMessage[],
+    servingRouteKnown = true
   ): void {
     this.compactionReplayState = createCompactionReplayRecipe({
       provider: request.provider,
@@ -2001,7 +2002,8 @@ export class AgentContext {
       projectionMode: request.projectionMode,
       cacheNamespace: createCompactionCacheNamespace(
         this.provider,
-        this.clientOptions
+        this.clientOptions,
+        servingRouteKnown
       ),
       systemRevision: this.compactionSystemRevision,
       toolRevision: this.compactionToolRevision,

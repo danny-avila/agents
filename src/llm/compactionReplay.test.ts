@@ -163,6 +163,71 @@ describe('compaction replay eligibility', () => {
     }
   );
 
+  it.each(['openAIApiKey', 'openAIBasePath'] as const)(
+    'includes the Azure %s routing alias in cache identity',
+    (key) => {
+      const recipe = createEnvelope({
+        provider: Providers.AZURE,
+        cacheNamespace: createCompactionCacheNamespace(
+          Providers.AZURE,
+          { [key]: 'primary' }
+        ),
+      });
+
+      expect(
+        inspect(recipe, {
+          provider: Providers.AZURE,
+          cacheNamespace: createCompactionCacheNamespace(
+            Providers.AZURE,
+            { [key]: 'summary' }
+          ),
+        })
+      ).toMatchObject({
+        eligible: false,
+        reason: 'cache_namespace_mismatch',
+      });
+    }
+  );
+
+  it('snapshots nested cache identity before host mutation', () => {
+    const options = {
+      configuration: { baseURL: 'https://primary.test' },
+    };
+    const recipe = createEnvelope({
+      cacheNamespace: createCompactionCacheNamespace(
+        Providers.ANTHROPIC,
+        options
+      ),
+    });
+    options.configuration.baseURL = 'https://summary.test';
+
+    expect(
+      inspect(recipe, {
+        cacheNamespace: createCompactionCacheNamespace(
+          Providers.ANTHROPIC,
+          options
+        ),
+      })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_mismatch',
+    });
+  });
+
+  it('fails closed when the serving model owns an unknown route', () => {
+    const cacheNamespace = createCompactionCacheNamespace(
+      Providers.ANTHROPIC,
+      { baseURL: 'https://configured.test' },
+      false
+    );
+    const recipe = createEnvelope({ cacheNamespace });
+
+    expect(inspect(recipe, { cacheNamespace })).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_unknown',
+    });
+  });
+
   it('fails closed when a runtime provider cannot prove its cache namespace', () => {
     const provider = 'runtime-provider' as t.ProviderName;
     const cacheNamespace = createCompactionCacheNamespace(provider, {
