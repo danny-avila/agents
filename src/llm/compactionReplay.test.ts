@@ -9,6 +9,7 @@ import {
   createCompactionReplayRecipe,
   createCompactionToolProjectionFingerprint,
   EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
+  extractCompactionReplayPrefixProjection,
   inspectCompactionReplayEligibility,
   type CompactionReplayRecipe,
   type CompactionReplayState,
@@ -88,6 +89,7 @@ function inspect(
     systemRevision: number;
     toolRevision: number;
     messages: BaseMessage[];
+    projectedMessages: BaseMessage[];
     restoredToolSubstitution: boolean;
     summarizerFallbackServed: boolean;
   }> = {}
@@ -112,6 +114,7 @@ function inspect(
     systemRevision: overrides.systemRevision ?? 2,
     toolRevision: overrides.toolRevision ?? 3,
     messages: overrides.messages ?? [sourceMessage('a'), sourceMessage('b')],
+    projectedMessages: overrides.projectedMessages,
     restoredToolSubstitution: overrides.restoredToolSubstitution ?? false,
     summarizerFallbackServed: overrides.summarizerFallbackServed,
   });
@@ -406,6 +409,27 @@ describe('compaction replay eligibility', () => {
     });
   });
 
+  it('includes Anthropic inference geography in cache identity', () => {
+    const recipe = createEnvelope({
+      cacheNamespace: createCompactionCacheNamespace(Providers.ANTHROPIC, {
+        apiKey: 'test-key',
+        inferenceGeo: 'us',
+      }),
+    });
+
+    expect(
+      inspect(recipe, {
+        cacheNamespace: createCompactionCacheNamespace(Providers.ANTHROPIC, {
+          apiKey: 'test-key',
+          inferenceGeo: 'eu',
+        }),
+      })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_mismatch',
+    });
+  });
+
   it('fails closed when credentials come from an opaque external source', () => {
     const cacheNamespace = createCompactionCacheNamespace(Providers.ANTHROPIC, {
       baseURL: 'https://provider.test',
@@ -690,6 +714,45 @@ describe('compaction replay eligibility', () => {
       replaySourceCount: 2,
       requestSourceCount: 2,
     });
+  });
+
+  it('rejects a changed prepared summarizer projection', () => {
+    const sourceMessages = [sourceMessage('a'), sourceMessage('b')];
+    const changed = sourceMessage('b');
+    changed.content = 'provider-truncated';
+    const envelope = createEnvelope({
+      messages: sourceMessages,
+      sourceMessages,
+    });
+
+    expect(
+      inspect(envelope, {
+        messages: sourceMessages,
+        projectedMessages: [sourceMessages[0], changed],
+      })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'provider_projection_changed',
+    });
+  });
+
+  it('extracts only a provenance-proven projection before summary instructions', () => {
+    const source = sourceMessage('a');
+    const instruction = new HumanMessage('summarize');
+    setProviderMessageProvenance(instruction, [
+      { attribution: 'synthetic' },
+    ]);
+
+    expect(
+      extractCompactionReplayPrefixProjection([source, instruction])
+    ).toEqual([source]);
+
+    const merged = new HumanMessage('source then summarize');
+    setProviderMessageProvenance(merged, [
+      { attribution: 'user', sourceMessageId: 'a' },
+      { attribution: 'synthetic' },
+    ]);
+    expect(extractCompactionReplayPrefixProjection([merged])).toBeUndefined();
   });
 
   it('ignores a synthetic prior checkpoint when proving source order', () => {

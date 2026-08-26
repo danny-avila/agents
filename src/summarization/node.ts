@@ -44,12 +44,15 @@ import {
   createCompactionCacheNamespace,
   createCompactionToolProjectionFingerprint,
   EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
+  extractCompactionReplayPrefixProjection,
   isCompactionPromptCacheEnabled,
 } from '@/llm/compactionReplay';
 import {
+  prepareProviderRequest,
   resolveServingModelId,
   usesNativeOpenAIResponses,
 } from '@/llm/prepareProviderRequest';
+import { setProviderMessageProvenance } from '@/messages/provenance';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
@@ -683,6 +686,7 @@ async function executeSummarizationWithFallback(params: {
   let usedMetadataStub = false;
   let summarizationModel: t.ChatModel | undefined;
   let compactionReplayRouteSnapshot: CompactionReplayRouteSnapshot | undefined;
+  let compactionReplayProjectedMessages: readonly BaseMessage[] | undefined;
   const summarizationTools = agentContext.getToolsForBinding();
 
   const observeCompactionReplay = (summarizerFallbackServed: boolean): void => {
@@ -721,6 +725,7 @@ async function executeSummarizationWithFallback(params: {
         ? createCompactionToolProjectionFingerprint(summarizationTools)
         : undefined,
       messages,
+      projectedMessages: compactionReplayProjectedMessages,
       restoredToolSubstitution,
       summarizerFallbackServed,
     });
@@ -778,6 +783,8 @@ async function executeSummarizationWithFallback(params: {
     });
     summaryText = result.text;
     summaryUsage = result.usage;
+    compactionReplayProjectedMessages =
+      extractCompactionReplayPrefixProjection(result.preparedMessages);
     observeCompactionReplay(false);
   } catch (primaryError) {
     const primaryDescribed = describeProviderError(
@@ -1760,24 +1767,40 @@ async function summarizeWithCacheHit({
   usePromptCache?: boolean;
   promptCacheTtl?: PromptCacheTtl;
   log?: LogFn;
-}): Promise<{ text: string; usage?: Partial<UsageMetadata> }> {
+}): Promise<{
+  text: string;
+  usage?: Partial<UsageMetadata>;
+  preparedMessages: readonly BaseMessage[];
+}> {
   const instruction = buildSummarizationInstruction(
     promptText,
     updatePromptText,
     priorSummaryText
   );
 
-  const fullMessages = [...messages, new HumanMessage(instruction)];
+  const instructionMessage = new HumanMessage(instruction);
+  setProviderMessageProvenance(instructionMessage, [
+    { attribution: 'synthetic' },
+  ]);
+  const fullMessages = [...messages, instructionMessage];
   const invokeMessages =
     usePromptCache === true
       ? addTailCacheControl(fullMessages, promptCacheTtl)
       : fullMessages;
 
+  const invokeConfig = withBreakerSignal(
+    traceConfig(config, 'cache_hit_compaction'),
+    graph
+  );
+  const preparedRequest = prepareProviderRequest({
+    model,
+    messages: invokeMessages,
+    provider,
+    config: invokeConfig,
+  });
   const result = await attemptInvoke(
     {
-      model,
-      messages: invokeMessages,
-      provider,
+      request: preparedRequest,
       onChunk: createSummarizationChunkHandler({
         stepId,
         config: traceConfig(config, 'cache_hit_compaction'),
@@ -1789,7 +1812,7 @@ async function summarizeWithCacheHit({
        * producer claim never stacks with the onChunk handler's). */
       streamLimitState: graph,
     },
-    withBreakerSignal(traceConfig(config, 'cache_hit_compaction'), graph)
+    invokeConfig
   );
 
   const responseMsg = result.messages?.[0];
@@ -1840,5 +1863,5 @@ async function summarizeWithCacheHit({
       }
       : {}),
   });
-  return { text, usage };
+  return { text, usage, preparedMessages: preparedRequest.messages };
 }

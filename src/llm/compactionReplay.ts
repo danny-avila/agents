@@ -1,7 +1,10 @@
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ProviderMessageProjectionMode } from '@/llm/prepareProviderRequest';
 import type * as t from '@/types';
-import { inspectProviderSourceMessageIds } from '@/messages/provenance';
+import {
+  inspectProviderMessageProvenance,
+  inspectProviderSourceMessageIds,
+} from '@/messages/provenance';
 import { toJsonSchema } from '@/utils/schema';
 import { Providers } from '@/common';
 
@@ -40,6 +43,8 @@ export type CompactionReplayIneligibilityReason =
   | 'restored_tool_substitution'
   | 'source_content_unknown'
   | 'source_content_mismatch'
+  | 'provider_projection_unknown'
+  | 'provider_projection_changed'
   | 'ambiguous_lineage'
   | 'source_not_prefix';
 
@@ -80,6 +85,7 @@ interface CompactionReplayCandidate {
   readonly systemRevision: number;
   readonly toolRevision: number;
   readonly messages: readonly BaseMessage[];
+  readonly projectedMessages?: readonly BaseMessage[];
   readonly restoredToolSubstitution: boolean;
   readonly summarizerFallbackServed?: boolean;
 }
@@ -124,6 +130,7 @@ const CACHE_NAMESPACE_KEYS = [
   'useResponsesApi',
   'thinking',
   'thinkingBudget',
+  'inferenceGeo',
   'additionalModelRequestFields',
   'modelKwargs',
   'applicationInferenceProfile',
@@ -567,6 +574,38 @@ function fingerprintMessages(
   return Object.freeze(fingerprints);
 }
 
+/** Removes only trailing, provenance-proven synthetic request instructions. */
+export function extractCompactionReplayPrefixProjection(
+  messages: readonly BaseMessage[]
+): readonly BaseMessage[] | undefined {
+  let end = messages.length;
+  while (end > 0) {
+    const inspected = inspectProviderMessageProvenance(messages[end - 1]);
+    if (inspected.status !== 'valid') {
+      return undefined;
+    }
+    const parts = inspected.provenance.parts;
+    let hasSource = false;
+    let hasSynthetic = false;
+    for (const part of parts) {
+      if (part.sourceMessageId != null) {
+        hasSource = true;
+      }
+      if (part.attribution === 'synthetic') {
+        hasSynthetic = true;
+      }
+    }
+    if (hasSource) {
+      return hasSynthetic ? undefined : messages.slice(0, end);
+    }
+    if (!hasSynthetic) {
+      return undefined;
+    }
+    end--;
+  }
+  return [];
+}
+
 interface SourceLineage {
   readonly sourceMessageIds: readonly string[];
   readonly messageSourceCounts: readonly number[];
@@ -666,7 +705,9 @@ export function inspectCompactionReplayEligibility(
   state: CompactionReplayState | undefined,
   candidate: CompactionReplayCandidate
 ): CompactionReplayEligibility {
-  const candidateLineage = inspectSourceLineage(candidate.messages);
+  const candidateLineage = inspectSourceLineage(
+    candidate.projectedMessages ?? candidate.messages
+  );
   const replaySourceCount = candidateLineage?.sourceMessageIds.length ?? 0;
   if (candidate.summarizerFallbackServed === true) {
     return ineligible(
@@ -875,6 +916,36 @@ export function inspectCompactionReplayEligibility(
       replaySourceCount,
       requestSourceCount
     );
+  }
+
+  if (candidate.projectedMessages != null) {
+    if (candidate.projectedMessages.length !== replayMessageCount) {
+      return ineligible(
+        'provider_projection_changed',
+        replaySourceCount,
+        requestSourceCount
+      );
+    }
+    for (let i = 0; i < replayMessageCount; i++) {
+      const requestFingerprint = fingerprintMessage(recipe.messages[i]);
+      const candidateFingerprint = fingerprintMessage(
+        candidate.projectedMessages[i]
+      );
+      if (requestFingerprint == null || candidateFingerprint == null) {
+        return ineligible(
+          'provider_projection_unknown',
+          replaySourceCount,
+          requestSourceCount
+        );
+      }
+      if (requestFingerprint !== candidateFingerprint) {
+        return ineligible(
+          'provider_projection_changed',
+          replaySourceCount,
+          requestSourceCount
+        );
+      }
+    }
   }
 
   return {
