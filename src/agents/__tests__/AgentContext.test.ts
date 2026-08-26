@@ -104,7 +104,7 @@ describe('AgentContext', () => {
         messages: [message],
         provider: Providers.OPENAI,
       });
-      ctx.captureCompactionReplayRecipe(request);
+      ctx.captureCompactionReplayRecipe(request, [message]);
       return createCompactionCacheNamespace(Providers.OPENAI);
     };
 

@@ -32,8 +32,14 @@ function createEnvelope(
     systemRevision: number;
     toolRevision: number;
     messages: BaseMessage[];
+    sourceMessages: BaseMessage[];
   }> = {}
 ): CompactionReplayRecipe {
+  const sourceMessages = overrides.sourceMessages ?? [
+    sourceMessage('a'),
+    sourceMessage('b'),
+    sourceMessage('c'),
+  ];
   const envelope = createCompactionReplayRecipe({
     provider: overrides.provider ?? Providers.ANTHROPIC,
     modelId: overrides.modelId ?? 'claude-sonnet',
@@ -45,12 +51,8 @@ function createEnvelope(
       }),
     systemRevision: overrides.systemRevision ?? 2,
     toolRevision: overrides.toolRevision ?? 3,
-    messages: overrides.messages ?? [
-      new SystemMessage('stable'),
-      sourceMessage('a'),
-      sourceMessage('b'),
-      sourceMessage('c'),
-    ],
+    messages: overrides.messages ?? [new SystemMessage('stable'), ...sourceMessages],
+    sourceMessages,
   });
   return envelope;
 }
@@ -136,6 +138,29 @@ describe('compaction replay eligibility', () => {
     });
   });
 
+  it.each(['anthropicApiKey', 'anthropicApiUrl'] as const)(
+    'includes the Anthropic %s routing alias in cache identity',
+    (key) => {
+      const recipe = createEnvelope({
+        cacheNamespace: createCompactionCacheNamespace(Providers.ANTHROPIC, {
+          [key]: 'primary',
+        }),
+      });
+
+      expect(
+        inspect(recipe, {
+          cacheNamespace: createCompactionCacheNamespace(
+            Providers.ANTHROPIC,
+            { [key]: 'summary' }
+          ),
+        })
+      ).toMatchObject({
+        eligible: false,
+        reason: 'cache_namespace_mismatch',
+      });
+    }
+  );
+
   it('fails closed when a runtime provider cannot prove its cache namespace', () => {
     const provider = 'runtime-provider' as t.ProviderName;
     const cacheNamespace = createCompactionCacheNamespace(provider, {
@@ -159,6 +184,19 @@ describe('compaction replay eligibility', () => {
     expect(inspect(recipe, { cacheNamespace })).toMatchObject({
       eligible: false,
       reason: 'cache_namespace_unknown',
+    });
+  });
+
+  it('rejects changed content even when source lineage is unchanged', () => {
+    const recipe = createEnvelope();
+
+    expect(
+      inspect(recipe, {
+        messages: [sourceMessage('a'), new HumanMessage({ content: 'changed', id: 'b' })],
+      })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'source_content_mismatch',
     });
   });
 
@@ -233,6 +271,7 @@ describe('compaction replay eligibility', () => {
     });
     const envelope = createEnvelope({
       messages: [new SystemMessage('stable'), coalesced, sourceMessage('c')],
+      sourceMessages: [sourceMessage('a'), sourceMessage('b'), sourceMessage('c')],
     });
 
     expect(inspect(envelope, { messages: [sourceMessage('a')] })).toMatchObject(
@@ -247,6 +286,7 @@ describe('compaction replay eligibility', () => {
     });
     const envelope = createEnvelope({
       messages: [new SystemMessage('stable'), coalesced, sourceMessage('c')],
+      sourceMessages: [sourceMessage('a'), sourceMessage('b'), sourceMessage('c')],
     });
 
     expect(
@@ -269,6 +309,12 @@ describe('compaction replay eligibility', () => {
     const envelope = createEnvelope({
       messages: [
         new SystemMessage('stable'),
+        priorCheckpoint,
+        sourceMessage('a'),
+        sourceMessage('b'),
+        sourceMessage('c'),
+      ],
+      sourceMessages: [
         priorCheckpoint,
         sourceMessage('a'),
         sourceMessage('b'),
@@ -299,7 +345,7 @@ describe('compaction replay eligibility', () => {
   it('retains the prepared-message reference without mutating its messages', () => {
     const messages = [sourceMessage('a'), sourceMessage('b')];
     const before = [...messages];
-    const recipe = createEnvelope({ messages });
+    const recipe = createEnvelope({ messages, sourceMessages: messages });
 
     expect(recipe.messages).toBe(messages);
     inspect(recipe, { messages: [sourceMessage('a')] });
@@ -317,6 +363,7 @@ describe('compaction replay eligibility', () => {
     ]);
     const envelope = createEnvelope({
       messages: [new SystemMessage('stable'), sourceMessage('a'), tool],
+      sourceMessages: [sourceMessage('a'), tool],
     });
 
     expect(

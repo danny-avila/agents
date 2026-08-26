@@ -219,6 +219,59 @@ describe('createSummarizeNode', () => {
     ).toBeUndefined();
   });
 
+  it('observes the actual summarizer projection mode in debug logging', async () => {
+    const previousDebugLogging = process.env.AGENT_DEBUG_LOGGING;
+    process.env.AGENT_DEBUG_LOGGING = 'true';
+    try {
+      jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+        class {
+          constructor() {
+            return {
+              _useResponsesApi: (): boolean => true,
+              invoke: jest.fn().mockResolvedValue({ content: 'Summary text' }),
+            };
+          }
+        } as never
+      );
+
+      const agentContext = createAgentContext();
+      const inspect = jest
+        .spyOn(agentContext, 'inspectCompactionReplay')
+        .mockReturnValue({
+          eligible: false,
+          reason: 'no_request_snapshot',
+          replaySourceCount: 0,
+          requestSourceCount: 0,
+        });
+      const node = createSummarizeNode({
+        agentContext,
+        graph: mockGraph(),
+        generateStepId,
+      });
+
+      await node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+
+      expect(inspect).toHaveBeenCalledWith(
+        expect.objectContaining({ projectionMode: 'openai-responses' })
+      );
+    } finally {
+      if (previousDebugLogging == null) {
+        delete process.env.AGENT_DEBUG_LOGGING;
+      } else {
+        process.env.AGENT_DEBUG_LOGGING = previousDebugLogging;
+      }
+    }
+  });
+
   it('stamps INVOKED_MODEL/INVOKED_PROVIDER metadata for a dedicated summarizer model', async () => {
     captureEvents();
 

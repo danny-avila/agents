@@ -3890,8 +3890,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               invokeConfig
             )
         );
-        if (agentContext.summarizationEnabled === true) {
-          agentContext.captureCompactionReplayRecipe(preparedRequest);
+        if (
+          agentContext.summarizationEnabled === true &&
+          process.env.AGENT_DEBUG_LOGGING === 'true'
+        ) {
+          agentContext.captureCompactionReplayRecipe(
+            preparedRequest,
+            messagesToUse
+          );
         }
       } catch (primaryError) {
         clearCurrentDeltaStepMarkers({
@@ -4153,7 +4159,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 },
               })
           );
-          if (agentContext.summarizationEnabled === true) {
+          if (
+            agentContext.summarizationEnabled === true &&
+            process.env.AGENT_DEBUG_LOGGING === 'true'
+          ) {
             agentContext.markCompactionReplayFallbackServed();
           }
         } catch (fallbackError) {

@@ -15,7 +15,7 @@ import {
 import { setProviderMessageProvenance } from '@/messages/provenance';
 import { Providers } from '@/common';
 
-const CAPTURE_ITERATIONS = 100_000;
+const CAPTURE_ITERATIONS = 2_000;
 const INSPECTION_ITERATIONS = 2_000;
 
 function stamp<T extends BaseMessage>(message: T, sourceId: string): T {
@@ -95,6 +95,7 @@ for (const toolSteps of [20, 50, 100]) {
         systemRevision: 0,
         toolRevision: 0,
         messages,
+        sourceMessages: messages,
       });
     const envelope = createEnvelope();
     const compactableMessages = messages.slice(0, messages.length - 4);

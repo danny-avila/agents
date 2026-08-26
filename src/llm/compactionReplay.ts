@@ -19,6 +19,7 @@ export interface CompactionReplayRecipe {
   readonly systemRevision: number;
   readonly toolRevision: number;
   readonly messages: readonly BaseMessage[];
+  readonly sourceMessageFingerprints?: readonly string[];
 }
 
 export type CompactionReplayState = CompactionReplayRecipe | 'fallback';
@@ -34,6 +35,8 @@ export type CompactionReplayIneligibilityReason =
   | 'tool_projection_changed'
   | 'projection_mode_mismatch'
   | 'restored_tool_substitution'
+  | 'source_content_unknown'
+  | 'source_content_mismatch'
   | 'ambiguous_lineage'
   | 'source_not_prefix';
 
@@ -71,6 +74,8 @@ interface CompactionReplayCandidate {
 
 const CACHE_NAMESPACE_KEYS = [
   'apiKey',
+  'anthropicApiKey',
+  'anthropicApiUrl',
   'baseURL',
   'baseUrl',
   'organization',
@@ -167,6 +172,37 @@ function isSyntheticMessage(message: BaseMessage): boolean {
   return kwargs.source != null && kwargs.source !== 'steer';
 }
 
+function fingerprintMessage(message: BaseMessage): string | undefined {
+  try {
+    const serialized = JSON.stringify(message.toDict());
+    let hashA = 0x811c9dc5;
+    let hashB = 0x9e3779b9;
+    for (let i = 0; i < serialized.length; i++) {
+      const code = serialized.charCodeAt(i);
+      hashA = Math.imul(hashA ^ code, 0x01000193);
+      hashB = Math.imul(hashB ^ code, 0x5bd1e995);
+      hashB ^= hashB >>> 13;
+    }
+    return `${serialized.length}:${hashA >>> 0}:${hashB >>> 0}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function fingerprintMessages(
+  messages: readonly BaseMessage[]
+): readonly string[] | undefined {
+  const fingerprints: string[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const fingerprint = fingerprintMessage(messages[i]);
+    if (fingerprint == null) {
+      return undefined;
+    }
+    fingerprints.push(fingerprint);
+  }
+  return Object.freeze(fingerprints);
+}
+
 interface SourceLineage {
   readonly sourceMessageIds: readonly string[];
   readonly messageSourceCounts: readonly number[];
@@ -225,6 +261,7 @@ export function createCompactionReplayRecipe(params: {
   systemRevision: number;
   toolRevision: number;
   messages: readonly BaseMessage[];
+  sourceMessages: readonly BaseMessage[];
 }): CompactionReplayRecipe {
   return Object.freeze({
     provider: params.provider,
@@ -234,6 +271,7 @@ export function createCompactionReplayRecipe(params: {
     systemRevision: params.systemRevision,
     toolRevision: params.toolRevision,
     messages: params.messages,
+    sourceMessageFingerprints: fingerprintMessages(params.sourceMessages),
   });
 }
 
@@ -351,6 +389,37 @@ export function inspectCompactionReplayEligibility(
     ) {
       return ineligible(
         'source_not_prefix',
+        replaySourceCount,
+        requestSourceCount
+      );
+    }
+  }
+  if (recipe.sourceMessageFingerprints == null) {
+    return ineligible(
+      'source_content_unknown',
+      replaySourceCount,
+      requestSourceCount
+    );
+  }
+  if (candidate.messages.length > recipe.sourceMessageFingerprints.length) {
+    return ineligible(
+      'source_content_mismatch',
+      replaySourceCount,
+      requestSourceCount
+    );
+  }
+  for (let i = 0; i < candidate.messages.length; i++) {
+    const fingerprint = fingerprintMessage(candidate.messages[i]);
+    if (fingerprint == null) {
+      return ineligible(
+        'source_content_unknown',
+        replaySourceCount,
+        requestSourceCount
+      );
+    }
+    if (fingerprint !== recipe.sourceMessageFingerprints[i]) {
+      return ineligible(
+        'source_content_mismatch',
         replaySourceCount,
         requestSourceCount
       );

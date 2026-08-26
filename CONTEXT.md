@@ -149,11 +149,12 @@ eligible for the intra-turn fallback.
 See [ADR 0005](docs/adr/0005-pairing-balanced-compaction-ranges.md) for the
 range-selection and retention trade-offs.
 
-A **Compaction Replay Recipe** is the run-local, constant-time record of the
+A **Compaction Replay Recipe** is the debug-only, run-local record of the
 latest successful normal request's serving route, cache namespace, provider
-projection mode, prepared-message reference, and system/tool projection
-revisions. It contains no live model or provider stream. Source lineage is
-derived only when compaction is attempted, and reset releases the recipe.
+projection mode, prepared-message reference, bounded source-content
+fingerprints, and system/tool projection revisions. It contains no live model
+or provider stream, is absent from ordinary production runs, and reset releases
+the recipe.
 
 A **Compaction Request Projection** is the cache-compatible provider request
 used to summarize one Compaction Range. When the summarizer uses the same

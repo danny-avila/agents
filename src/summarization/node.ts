@@ -40,6 +40,7 @@ import {
   Providers,
 } from '@/common';
 import { createCompactionCacheNamespace } from '@/llm/compactionReplay';
+import { usesNativeOpenAIResponses } from '@/llm/prepareProviderRequest';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
@@ -643,6 +644,7 @@ async function executeSummarizationWithFallback(params: {
   log: LogFn;
   /** Carries the run's stream limits so the event cap covers summary streams. */
   graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
+  restoredToolSubstitution: boolean;
 }): Promise<{
   text: string;
   usage?: Partial<UsageMetadata>;
@@ -662,6 +664,7 @@ async function executeSummarizationWithFallback(params: {
     usePromptCache,
     log,
     graph,
+    restoredToolSubstitution,
   } = params;
 
   const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
@@ -681,6 +684,27 @@ async function executeSummarizationWithFallback(params: {
       clientOptions: clientConfig.clientOptions as t.ClientOptions,
       tools: agentContext.getToolsForBinding(),
     }) as t.ChatModel;
+
+    if (process.env.AGENT_DEBUG_LOGGING === 'true') {
+      const compactionReplay = agentContext.inspectCompactionReplay({
+        provider: clientConfig.provider as t.ProviderName,
+        modelId: resolveSummarizationModelId(clientConfig),
+        projectionMode: usesNativeOpenAIResponses(
+          summarizationModel,
+          clientConfig.provider as t.ProviderName,
+          summarizeConfig
+        )
+          ? 'openai-responses'
+          : 'chat-messages',
+        cacheNamespace: createCompactionCacheNamespace(
+          clientConfig.provider as t.ProviderName,
+          clientConfig.clientOptions
+        ),
+        messages,
+        restoredToolSubstitution,
+      });
+      log('debug', 'Compaction replay eligibility', { ...compactionReplay });
+    }
 
     const result = await summarizeWithCacheHit({
       model: summarizationModel,
@@ -1250,30 +1274,21 @@ export function createSummarizeNode({
       });
     };
 
-    if (process.env.AGENT_DEBUG_LOGGING === 'true') {
-      let restoredToolSubstitution = false;
-      if (restoredMessages !== state.messages && originalPending != null) {
-        for (const index of originalPending.keys()) {
-          if (
-            index < tailStartIndex &&
-            restoredMessages[index] !== state.messages[index]
-          ) {
-            restoredToolSubstitution = true;
-            break;
-          }
+    let restoredToolSubstitution = false;
+    if (
+      process.env.AGENT_DEBUG_LOGGING === 'true' &&
+      restoredMessages !== state.messages &&
+      originalPending != null
+    ) {
+      for (const index of originalPending.keys()) {
+        if (
+          index < tailStartIndex &&
+          restoredMessages[index] !== state.messages[index]
+        ) {
+          restoredToolSubstitution = true;
+          break;
         }
       }
-      const compactionReplay = agentContext.inspectCompactionReplay({
-        provider: clientConfig.provider as t.ProviderName,
-        modelId: resolveSummarizationModelId(clientConfig),
-        cacheNamespace: createCompactionCacheNamespace(
-          clientConfig.provider as t.ProviderName,
-          clientConfig.clientOptions
-        ),
-        messages: messagesToRefine,
-        restoredToolSubstitution,
-      });
-      log('debug', 'Compaction replay eligibility', { ...compactionReplay });
     }
 
     log('debug', 'Summarization starting', {
@@ -1349,6 +1364,7 @@ export function createSummarizeNode({
       usePromptCache: isSelfSummarizeModel && hasPromptCache,
       log,
       graph,
+      restoredToolSubstitution,
     });
 
     /**

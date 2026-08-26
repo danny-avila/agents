@@ -1993,7 +1993,10 @@ export class AgentContext {
     return hasNewDiscoveries;
   }
 
-  captureCompactionReplayRecipe(request: PreparedProviderRequest): void {
+  captureCompactionReplayRecipe(
+    request: PreparedProviderRequest,
+    sourceMessages: readonly BaseMessage[]
+  ): void {
     this.compactionReplayState = createCompactionReplayRecipe({
       provider: request.provider,
       modelId: request.modelId,
@@ -2002,6 +2005,7 @@ export class AgentContext {
       systemRevision: this.compactionSystemRevision,
       toolRevision: this.compactionToolRevision,
       messages: request.messages,
+      sourceMessages,
     });
   }
 
