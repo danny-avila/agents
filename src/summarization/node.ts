@@ -26,6 +26,7 @@ import {
 import {
   addTailCacheControl,
   addBedrockTailCacheControl,
+  resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
   type PromptCacheTtl,
 } from '@/messages/cache';
@@ -785,8 +786,16 @@ async function executeSummarizationWithFallback(params: {
       bedrockModelId:
         clientConfig.provider === Providers.BEDROCK
           ? (
+              clientConfig.clientOptions as
+                | {
+                  applicationInferenceProfile?: string;
+                  model?: string;
+                }
+                | undefined
+          )?.applicationInferenceProfile ??
+            (
               clientConfig.clientOptions as { model?: string } | undefined
-          )?.model
+            )?.model
           : undefined,
       log,
     });
@@ -1763,7 +1772,10 @@ export function applySummarizationHistoryCache(params: {
       )
     );
   }
-  return addTailCacheControl([...params.messages], params.promptCacheTtl);
+  return addTailCacheControl(
+    [...params.messages],
+    resolvePromptCacheTtl(params.promptCacheTtl)
+  );
 }
 
 /**

@@ -17,6 +17,22 @@ import * as eventUtils from '@/utils/events';
 import * as invokeUtils from '@/llm/invoke';
 
 describe('applySummarizationHistoryCache', () => {
+  it('uses the one-hour default for Anthropic history', () => {
+    const cached = applySummarizationHistoryCache({
+      messages: [new HumanMessage('history')],
+      provider: Providers.ANTHROPIC,
+      enabled: true,
+    });
+
+    expect(cached[0].content).toEqual([
+      {
+        type: 'text',
+        text: 'history',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ]);
+  });
+
   it('places a Bedrock cache point on history before the instruction is appended', () => {
     const history = [new HumanMessage('history')];
     const cached = applySummarizationHistoryCache({
@@ -30,6 +46,21 @@ describe('applySummarizationHistoryCache', () => {
     expect(cached[0].content).toEqual([
       { type: 'text', text: 'history' },
       { cachePoint: { type: 'default', ttl: '1h' } },
+    ]);
+  });
+
+  it('uses five minutes for an unknown Bedrock inference profile family', () => {
+    const cached = applySummarizationHistoryCache({
+      messages: [new HumanMessage('history')],
+      provider: Providers.BEDROCK,
+      enabled: true,
+      bedrockModelId:
+        'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/nova',
+    });
+
+    expect(cached[0].content).toEqual([
+      { type: 'text', text: 'history' },
+      { cachePoint: { type: 'default' } },
     ]);
   });
 });
