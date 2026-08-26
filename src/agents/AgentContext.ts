@@ -63,6 +63,7 @@ import {
   createCompactionCacheNamespace,
   createCompactionReplayRecipe,
   createCompactionToolProjectionFingerprint,
+  EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
   isCompactionPromptCacheEnabled,
   inspectCompactionReplayEligibility,
 } from '@/llm/compactionReplay';
@@ -2013,6 +2014,10 @@ export class AgentContext {
         servingRouteKnown
       ),
       promptCacheEnabled,
+      systemProjectionFingerprint:
+        this.systemRunnable == null
+          ? EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT
+          : undefined,
       toolProjectionFingerprint:
         promptCacheEnabled
           ? createCompactionToolProjectionFingerprint(tools)
@@ -2035,6 +2040,7 @@ export class AgentContext {
     projectionMode?: ProviderMessageProjectionMode;
     cacheNamespace: CompactionCacheNamespace;
     promptCacheEnabled: boolean;
+    systemProjectionFingerprint?: string;
     toolProjectionFingerprint?: string;
     messages: readonly BaseMessage[];
     restoredToolSubstitution: boolean;

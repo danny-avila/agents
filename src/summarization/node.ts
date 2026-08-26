@@ -42,6 +42,7 @@ import {
 import {
   createCompactionCacheNamespace,
   createCompactionToolProjectionFingerprint,
+  EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
   isCompactionPromptCacheEnabled,
 } from '@/llm/compactionReplay';
 import {
@@ -713,6 +714,8 @@ async function executeSummarizationWithFallback(params: {
         clientConfig.clientOptions
       ),
       promptCacheEnabled,
+      systemProjectionFingerprint:
+        EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
       toolProjectionFingerprint:
         promptCacheEnabled
           ? createCompactionToolProjectionFingerprint(summarizationTools)

@@ -284,6 +284,16 @@ const SCENARIOS: Array<{
   },
 ];
 
+function isolateCacheNamespace(
+  steps: BaseMessage[][],
+  marker: 'A' | 'B'
+): BaseMessage[][] {
+  return steps.map((messages) => [
+    new SystemMessage(`Benchmark cache namespace ${marker}.`),
+    ...messages,
+  ]);
+}
+
 // ---------------------------------------------------------------------------
 // Provider plumbing.
 // ---------------------------------------------------------------------------
@@ -516,17 +526,22 @@ async function collectTimedStream(
 }
 
 async function runCompactionSummaryProbe(params: {
-  nonce: string;
+  conversationId: string;
+  cacheMarker: 'A' | 'B';
   replay: boolean;
   apply: (m: BaseMessage[]) => BaseMessage[];
   invokeTimed: (m: BaseMessage[]) => Promise<TimedUsage>;
 }): Promise<{ prime: TimedUsage; summary: TimedUsage; totals: Totals }> {
-  const history = toolLoopScenario(params.nonce, 5).at(-1) ?? [];
+  const history = toolLoopScenario(params.conversationId, 5).at(-1) ?? [];
+  const cacheNamespace = new SystemMessage(
+    `Benchmark cache namespace ${params.cacheMarker}.`
+  );
   const normalRequest = params.apply([
+    cacheNamespace,
     new SystemMessage(
-      `Stable agent instructions for ${params.nonce}. ${filler(
+      `Stable agent instructions for ${params.conversationId}. ${filler(
         STABLE_TOKENS,
-        `sys${params.nonce}`
+        `sys${params.conversationId}`
       )}`
     ),
     ...history,
@@ -537,7 +552,7 @@ async function runCompactionSummaryProbe(params: {
   );
   const summaryRequest = params.replay
     ? [...normalRequest, compactionInstruction]
-    : params.apply([...history, compactionInstruction]);
+    : params.apply([cacheNamespace, ...history, compactionInstruction]);
   const summary = await params.invokeTimed(summaryRequest);
   const totals = emptyTotals();
   addUsage(totals, summary.usage);
@@ -577,10 +592,11 @@ async function main(): Promise<void> {
   let scenarioCount = 0;
 
   for (const scenario of SCENARIOS) {
-    // Distinct nonce per strategy run so legacy and tail never share a cache.
-    const legacySteps = scenario.build(uniqueNonce('legacy'), args.rounds);
+    const conversationId = uniqueNonce('comparison');
+    const conversation = scenario.build(conversationId, args.rounds);
+    const legacySteps = isolateCacheNamespace(conversation, 'A');
     const legacy = await runStrategy(legacySteps, strategies.legacy, invoke);
-    const tailSteps = scenario.build(uniqueNonce('tail'), args.rounds);
+    const tailSteps = isolateCacheNamespace(conversation, 'B');
     const tail = await runStrategy(tailSteps, strategies.tail, invoke);
 
     console.log(`SCENARIO: ${scenario.name}  (${legacySteps.length} calls)`);
@@ -609,14 +625,17 @@ async function main(): Promise<void> {
     if (better) tailWins++;
   }
 
+  const compactionConversationId = uniqueNonce('compaction-comparison');
   const independent = await runCompactionSummaryProbe({
-    nonce: uniqueNonce('independent-summary'),
+    conversationId: compactionConversationId,
+    cacheMarker: 'A',
     replay: false,
     apply: strategies.tail,
     invokeTimed,
   });
   const replay = await runCompactionSummaryProbe({
-    nonce: uniqueNonce('replayed-summary'),
+    conversationId: compactionConversationId,
+    cacheMarker: 'B',
     replay: true,
     apply: strategies.tail,
     invokeTimed,

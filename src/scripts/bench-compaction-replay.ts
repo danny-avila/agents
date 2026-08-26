@@ -11,6 +11,7 @@ import {
   createCompactionCacheNamespace,
   createCompactionReplayRecipe,
   createCompactionToolProjectionFingerprint,
+  EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
   inspectCompactionReplayEligibility,
 } from '@/llm/compactionReplay';
 import { setProviderMessageProvenance } from '@/messages/provenance';
@@ -95,6 +96,8 @@ for (const toolSteps of [20, 50, 100]) {
         projectionMode: 'chat-messages',
         cacheNamespace,
         promptCacheEnabled: true,
+        systemProjectionFingerprint:
+          EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
         toolProjectionFingerprint:
           createCompactionToolProjectionFingerprint(undefined),
         systemRevision: 0,
@@ -116,6 +119,8 @@ for (const toolSteps of [20, 50, 100]) {
           projectionMode: 'chat-messages',
           cacheNamespace,
           promptCacheEnabled: true,
+          systemProjectionFingerprint:
+            EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
           toolProjectionFingerprint:
             createCompactionToolProjectionFingerprint(undefined),
           systemRevision: 0,
@@ -133,6 +138,8 @@ for (const toolSteps of [20, 50, 100]) {
         projectionMode: 'chat-messages',
         cacheNamespace,
         promptCacheEnabled: true,
+        systemProjectionFingerprint:
+          EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
         toolProjectionFingerprint:
           createCompactionToolProjectionFingerprint(undefined),
         systemRevision: 0,

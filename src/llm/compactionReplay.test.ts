@@ -8,6 +8,7 @@ import {
   createCompactionCacheNamespace,
   createCompactionReplayRecipe,
   createCompactionToolProjectionFingerprint,
+  EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
   inspectCompactionReplayEligibility,
   type CompactionReplayRecipe,
   type CompactionReplayState,
@@ -31,6 +32,7 @@ function createEnvelope(
     projectionMode: 'chat-messages' | 'openai-responses';
     cacheNamespace: ReturnType<typeof createCompactionCacheNamespace>;
     promptCacheEnabled: boolean;
+    systemProjectionFingerprint: string | null;
     toolProjectionFingerprint: string;
     systemRevision: number;
     toolRevision: number;
@@ -54,6 +56,11 @@ function createEnvelope(
         baseURL: 'https://provider.test',
       }),
     promptCacheEnabled: overrides.promptCacheEnabled ?? true,
+    systemProjectionFingerprint:
+      overrides.systemProjectionFingerprint === null
+        ? undefined
+        : (overrides.systemProjectionFingerprint ??
+          EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT),
     toolProjectionFingerprint:
       overrides.toolProjectionFingerprint ??
       createCompactionToolProjectionFingerprint(undefined),
@@ -73,6 +80,7 @@ function inspect(
     projectionMode: 'chat-messages' | 'openai-responses';
     cacheNamespace: ReturnType<typeof createCompactionCacheNamespace>;
     promptCacheEnabled: boolean;
+    systemProjectionFingerprint: string;
     toolProjectionFingerprint: string;
     systemRevision: number;
     toolRevision: number;
@@ -92,6 +100,9 @@ function inspect(
         baseURL: 'https://provider.test',
       }),
     promptCacheEnabled: overrides.promptCacheEnabled ?? true,
+    systemProjectionFingerprint:
+      overrides.systemProjectionFingerprint ??
+      EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
     toolProjectionFingerprint:
       overrides.toolProjectionFingerprint ??
       createCompactionToolProjectionFingerprint(undefined),
@@ -299,6 +310,69 @@ describe('compaction replay eligibility', () => {
     });
   });
 
+  it('fails closed when the normal system projection is not replayed', () => {
+    const recipe = createEnvelope({
+      systemProjectionFingerprint: null,
+    });
+
+    expect(inspect(recipe)).toMatchObject({
+      eligible: false,
+      reason: 'system_projection_unknown',
+    });
+  });
+
+  it('includes Google API version in cache identity', () => {
+    const credentials = { apiKey: 'test-key' };
+    const recipe = createEnvelope({
+      provider: Providers.GOOGLE,
+      cacheNamespace: createCompactionCacheNamespace(Providers.GOOGLE, {
+        ...credentials,
+        apiVersion: 'v1',
+      }),
+    });
+
+    expect(
+      inspect(recipe, {
+        provider: Providers.GOOGLE,
+        cacheNamespace: createCompactionCacheNamespace(Providers.GOOGLE, {
+          ...credentials,
+          apiVersion: 'v1beta',
+        }),
+      })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_mismatch',
+    });
+  });
+
+  it('includes OpenRouter upstream routing in cache identity', () => {
+    const recipe = createEnvelope({
+      provider: Providers.OPENROUTER,
+      cacheNamespace: createCompactionCacheNamespace(Providers.OPENROUTER, {
+        apiKey: 'test-key',
+        modelKwargs: { provider: { order: ['anthropic'] } },
+        promptCache: true,
+      }),
+    });
+
+    expect(
+      inspect(recipe, {
+        provider: Providers.OPENROUTER,
+        cacheNamespace: createCompactionCacheNamespace(
+          Providers.OPENROUTER,
+          {
+            apiKey: 'test-key',
+            modelKwargs: { provider: { order: ['google'] } },
+            promptCache: true,
+          }
+        ),
+      })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_mismatch',
+    });
+  });
+
   it('fails closed when credentials come from an opaque external source', () => {
     const cacheNamespace = createCompactionCacheNamespace(
       Providers.ANTHROPIC,
@@ -335,6 +409,37 @@ describe('compaction replay eligibility', () => {
         eligible: false,
         reason: 'cache_namespace_mismatch',
       });
+    } finally {
+      if (originalBaseURL == null) {
+        delete process.env.OPENAI_BASE_URL;
+      } else {
+        process.env.OPENAI_BASE_URL = originalBaseURL;
+      }
+    }
+  });
+
+  it('ignores an environment endpoint overridden by explicit options', () => {
+    const originalBaseURL = process.env.OPENAI_BASE_URL;
+    try {
+      process.env.OPENAI_BASE_URL = 'https://ignored-primary.test';
+      const recipe = createEnvelope({
+        provider: Providers.OPENAI,
+        cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
+          apiKey: 'test-key',
+          baseURL: 'https://explicit.test',
+        }),
+      });
+      process.env.OPENAI_BASE_URL = 'https://ignored-summary.test';
+
+      expect(
+        inspect(recipe, {
+          provider: Providers.OPENAI,
+          cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
+            apiKey: 'test-key',
+            baseURL: 'https://explicit.test',
+          }),
+        })
+      ).toMatchObject({ eligible: true });
     } finally {
       if (originalBaseURL == null) {
         delete process.env.OPENAI_BASE_URL;

@@ -5,6 +5,7 @@ import type * as t from '@/types';
 import {
   createCompactionCacheNamespace,
   createCompactionToolProjectionFingerprint,
+  EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
 } from '@/llm/compactionReplay';
 import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
@@ -98,8 +99,17 @@ describe('AgentContext', () => {
   });
 
   describe('compaction replay recipe lifecycle', () => {
+    const createReplayContext = (): AgentContext =>
+      createBasicContext({
+        agentConfig: {
+          instructions: undefined,
+          additional_instructions: undefined,
+        },
+      });
     const replayIdentity = {
       promptCacheEnabled: true,
+      systemProjectionFingerprint:
+        EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
       toolProjectionFingerprint:
         createCompactionToolProjectionFingerprint(undefined),
     };
@@ -128,7 +138,7 @@ describe('AgentContext', () => {
     };
 
     it('releases the run-local recipe on reset', () => {
-      const ctx = createBasicContext();
+      const ctx = createReplayContext();
       const message = new HumanMessage({ content: 'hello', id: 'source-1' });
       const cacheNamespace = captureRecipe(ctx, message);
 
@@ -156,7 +166,7 @@ describe('AgentContext', () => {
     });
 
     it('snapshots the current cache route on every capture', () => {
-      const ctx = createBasicContext();
+      const ctx = createReplayContext();
       const message = new HumanMessage({ content: 'hello', id: 'source-1' });
       ctx.clientOptions = { apiKey: 'first-key' } as t.ClientOptions;
       captureRecipe(ctx, message);
@@ -180,7 +190,7 @@ describe('AgentContext', () => {
         message: HumanMessage;
         cacheNamespace: ReturnType<typeof createCompactionCacheNamespace>;
       } => {
-        const ctx = createBasicContext();
+        const ctx = createReplayContext();
         const message = new HumanMessage({ content: 'hello', id: 'source-1' });
         const cacheNamespace = captureRecipe(ctx, message);
         return { ctx, message, cacheNamespace };

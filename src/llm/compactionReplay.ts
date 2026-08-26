@@ -13,6 +13,7 @@ export interface CompactionReplayRecipe {
   readonly projectionMode: ProviderMessageProjectionMode;
   readonly cacheNamespace: CompactionCacheNamespace;
   readonly promptCacheEnabled: boolean;
+  readonly systemProjectionFingerprint?: string;
   readonly toolProjectionFingerprint?: string;
   readonly systemRevision: number;
   readonly toolRevision: number;
@@ -32,6 +33,7 @@ export type CompactionReplayIneligibilityReason =
   | 'cache_namespace_mismatch'
   | 'prompt_cache_disabled'
   | 'system_projection_changed'
+  | 'system_projection_unknown'
   | 'tool_projection_changed'
   | 'tool_projection_unknown'
   | 'projection_mode_mismatch'
@@ -68,6 +70,7 @@ interface CompactionReplayCandidate {
   readonly projectionMode?: ProviderMessageProjectionMode;
   readonly cacheNamespace: CompactionCacheNamespace;
   readonly promptCacheEnabled: boolean;
+  readonly systemProjectionFingerprint?: string;
   readonly toolProjectionFingerprint?: string;
   readonly systemRevision: number;
   readonly toolRevision: number;
@@ -97,6 +100,8 @@ const CACHE_NAMESPACE_KEYS = [
   'openAIApiKey',
   'openAIBasePath',
   'openAIApiVersion',
+  'apiVersion',
+  'azureOpenAIEndpoint',
   'googleApiKey',
   'location',
   'credentials',
@@ -114,6 +119,7 @@ const CACHE_NAMESPACE_KEYS = [
   'thinking',
   'thinkingBudget',
   'additionalModelRequestFields',
+  'modelKwargs',
   'azureADTokenProvider',
 ] as const;
 
@@ -145,20 +151,76 @@ const PROVIDER_CREDENTIAL_KEYS: Partial<
   [Providers.MOONSHOT]: ['apiKey', 'openAIApiKey'],
 };
 
-const PROVIDER_ENVIRONMENT_ROUTE_KEYS: Partial<
-  Record<Providers, readonly string[]>
+interface EnvironmentRouteIdentity {
+  readonly environmentKey: string;
+  readonly optionPaths: readonly (readonly string[])[];
+}
+
+const PROVIDER_ENVIRONMENT_ROUTES: Partial<
+  Record<Providers, readonly EnvironmentRouteIdentity[]>
 > = {
-  [Providers.OPENAI]: ['OPENAI_BASE_URL'],
-  [Providers.AZURE]: [
-    'OPENAI_BASE_URL',
-    'AZURE_OPENAI_ENDPOINT',
-    'AZURE_OPENAI_BASE_PATH',
+  [Providers.OPENAI]: [
+    {
+      environmentKey: 'OPENAI_BASE_URL',
+      optionPaths: [['baseURL'], ['baseUrl'], ['configuration', 'baseURL']],
+    },
   ],
-  [Providers.BEDROCK]: ['BEDROCK_AWS_REGION', 'AWS_DEFAULT_REGION'],
-  [Providers.VERTEXAI]: ['GOOGLE_CLOUD_PROJECT', 'GCLOUD_PROJECT'],
-  [Providers.DEEPSEEK]: ['OPENAI_BASE_URL'],
-  [Providers.XAI]: ['OPENAI_BASE_URL'],
-  [Providers.MOONSHOT]: ['OPENAI_BASE_URL'],
+  [Providers.AZURE]: [
+    {
+      environmentKey: 'OPENAI_BASE_URL',
+      optionPaths: [['baseURL'], ['baseUrl'], ['configuration', 'baseURL']],
+    },
+    {
+      environmentKey: 'AZURE_OPENAI_ENDPOINT',
+      optionPaths: [['azureOpenAIEndpoint'], ['endpoint']],
+    },
+    {
+      environmentKey: 'AZURE_OPENAI_BASE_PATH',
+      optionPaths: [
+        ['azureOpenAIBasePath'],
+        ['openAIBasePath'],
+        ['configuration', 'baseURL'],
+      ],
+    },
+  ],
+  [Providers.BEDROCK]: [
+    {
+      environmentKey: 'BEDROCK_AWS_REGION',
+      optionPaths: [['region'], ['region_name']],
+    },
+    {
+      environmentKey: 'AWS_DEFAULT_REGION',
+      optionPaths: [['region'], ['region_name']],
+    },
+  ],
+  [Providers.VERTEXAI]: [
+    {
+      environmentKey: 'GOOGLE_CLOUD_PROJECT',
+      optionPaths: [['projectId'], ['project']],
+    },
+    {
+      environmentKey: 'GCLOUD_PROJECT',
+      optionPaths: [['projectId'], ['project']],
+    },
+  ],
+  [Providers.DEEPSEEK]: [
+    {
+      environmentKey: 'OPENAI_BASE_URL',
+      optionPaths: [['baseURL'], ['baseUrl'], ['configuration', 'baseURL']],
+    },
+  ],
+  [Providers.XAI]: [
+    {
+      environmentKey: 'OPENAI_BASE_URL',
+      optionPaths: [['baseURL'], ['baseUrl'], ['configuration', 'baseURL']],
+    },
+  ],
+  [Providers.MOONSHOT]: [
+    {
+      environmentKey: 'OPENAI_BASE_URL',
+      optionPaths: [['baseURL'], ['baseUrl'], ['configuration', 'baseURL']],
+    },
+  ],
 };
 
 function hasExplicitCredentialIdentity(
@@ -176,6 +238,24 @@ function hasExplicitCredentialIdentity(
     );
   } catch {
     return false;
+  }
+}
+
+function hasDefinedOptionPath(
+  options: t.ClientOptions | Record<string, unknown> | undefined,
+  path: readonly string[]
+): boolean | undefined {
+  try {
+    let current: unknown = options;
+    for (const key of path) {
+      if (current == null || typeof current !== 'object') {
+        return false;
+      }
+      current = (current as Record<string, unknown>)[key];
+    }
+    return current !== undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -255,6 +335,9 @@ function fingerprintSerializedValue(serialized: string): string {
   }
   return `${serialized.length}:${hashA >>> 0}:${hashB >>> 0}`;
 }
+
+export const EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT =
+  fingerprintSerializedValue('system:empty');
 
 function fingerprintCacheNamespaceValue(value: unknown): string | undefined {
   try {
@@ -384,11 +467,27 @@ export function createCompactionCacheNamespace(
     }
     entries.push(Object.freeze([key, fingerprint] as const));
   }
-  for (const key of
-    PROVIDER_ENVIRONMENT_ROUTE_KEYS[provider as Providers] ?? []) {
+  for (const route of
+    PROVIDER_ENVIRONMENT_ROUTES[provider as Providers] ?? []) {
+    let overridden = false;
+    for (const path of route.optionPaths) {
+      const defined = hasDefinedOptionPath(options, path);
+      if (defined == null) {
+        complete = false;
+        overridden = true;
+        break;
+      }
+      if (defined) {
+        overridden = true;
+        break;
+      }
+    }
+    if (overridden) {
+      continue;
+    }
     let value: string | undefined;
     try {
-      value = process.env[key];
+      value = process.env[route.environmentKey];
     } catch {
       complete = false;
       continue;
@@ -401,7 +500,9 @@ export function createCompactionCacheNamespace(
       complete = false;
       continue;
     }
-    entries.push(Object.freeze([`env:${key}`, fingerprint] as const));
+    entries.push(
+      Object.freeze([`env:${route.environmentKey}`, fingerprint] as const)
+    );
   }
   return Object.freeze({
     complete,
@@ -516,6 +617,7 @@ export function createCompactionReplayRecipe(params: {
   projectionMode: ProviderMessageProjectionMode;
   cacheNamespace: CompactionCacheNamespace;
   promptCacheEnabled: boolean;
+  systemProjectionFingerprint?: string;
   toolProjectionFingerprint?: string;
   systemRevision: number;
   toolRevision: number;
@@ -528,6 +630,7 @@ export function createCompactionReplayRecipe(params: {
     projectionMode: params.projectionMode,
     cacheNamespace: params.cacheNamespace,
     promptCacheEnabled: params.promptCacheEnabled,
+    systemProjectionFingerprint: params.systemProjectionFingerprint,
     toolProjectionFingerprint: params.toolProjectionFingerprint,
     systemRevision: params.systemRevision,
     toolRevision: params.toolRevision,
@@ -601,6 +704,26 @@ export function inspectCompactionReplayEligibility(
   if (!recipe.promptCacheEnabled || !candidate.promptCacheEnabled) {
     return ineligible(
       'prompt_cache_disabled',
+      replaySourceCount,
+      requestSourceCount
+    );
+  }
+  if (
+    recipe.systemProjectionFingerprint == null ||
+    candidate.systemProjectionFingerprint == null
+  ) {
+    return ineligible(
+      'system_projection_unknown',
+      replaySourceCount,
+      requestSourceCount
+    );
+  }
+  if (
+    recipe.systemProjectionFingerprint !==
+    candidate.systemProjectionFingerprint
+  ) {
+    return ineligible(
+      'system_projection_changed',
       replaySourceCount,
       requestSourceCount
     );
