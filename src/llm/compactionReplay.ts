@@ -391,6 +391,7 @@ function projectToolForFingerprint(tool: unknown): object | undefined {
       'parameters',
       'function',
       'toolSpec',
+      'strict',
       'cache_control',
       'cachePoint',
       'defer_loading',
@@ -404,6 +405,9 @@ function projectToolForFingerprint(tool: unknown): object | undefined {
     const extras = candidate.extras as Record<string, unknown> | undefined;
     if (extras?.cache_control !== undefined) {
       projection.extrasCacheControl = extras.cache_control;
+    }
+    if (extras?.strict !== undefined) {
+      projection.extrasStrict = extras.strict;
     }
     if (extras?.providerToolDefinition !== undefined) {
       projection.providerToolDefinition = extras.providerToolDefinition;

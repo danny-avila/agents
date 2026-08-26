@@ -3,6 +3,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import {
+  applySummarizationHistoryCache,
   createSummarizeNode,
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
@@ -14,6 +15,24 @@ import { AgentContext } from '@/agents/AgentContext';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
 import * as invokeUtils from '@/llm/invoke';
+
+describe('applySummarizationHistoryCache', () => {
+  it('places a Bedrock cache point on history before the instruction is appended', () => {
+    const history = [new HumanMessage('history')];
+    const cached = applySummarizationHistoryCache({
+      messages: history,
+      provider: Providers.BEDROCK,
+      enabled: true,
+      bedrockModelId: 'anthropic.claude-sonnet',
+    });
+
+    expect(cached).toHaveLength(1);
+    expect(cached[0].content).toEqual([
+      { type: 'text', text: 'history' },
+      { cachePoint: { type: 'default', ttl: '1h' } },
+    ]);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -26,7 +26,6 @@ import {
 import {
   addTailCacheControl,
   addBedrockTailCacheControl,
-  resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
   type PromptCacheTtl,
 } from '@/messages/cache';
@@ -775,55 +774,28 @@ async function executeSummarizationWithFallback(params: {
       usePromptCache,
       promptCacheTtl:
         clientConfig.provider === Providers.ANTHROPIC ||
-        clientConfig.provider === Providers.OPENROUTER
-          ? resolvePromptCacheTtl(
-            (
+        clientConfig.provider === Providers.OPENROUTER ||
+        clientConfig.provider === Providers.BEDROCK
+          ? (
                 clientConfig.clientOptions as {
                   promptCacheTtl?: PromptCacheTtl;
                 }
-            ).promptCacheTtl
-          )
+          ).promptCacheTtl
+          : undefined,
+      bedrockModelId:
+        clientConfig.provider === Providers.BEDROCK
+          ? (
+              clientConfig.clientOptions as { model?: string } | undefined
+          )?.model
           : undefined,
       log,
     });
     summaryText = result.text;
     summaryUsage = result.usage;
     if (process.env.AGENT_DEBUG_LOGGING === 'true') {
-      const projectedPrefix = extractCompactionReplayPrefixProjection(
-        result.preparedMessages
-      );
-      if (projectedPrefix == null) {
-        compactionReplayProjectedMessages = null;
-      } else if (!usePromptCache) {
-        compactionReplayProjectedMessages = projectedPrefix;
-      } else if (clientConfig.provider === Providers.BEDROCK) {
-        const clientOptions = clientConfig.clientOptions as
-          | t.BedrockAnthropicClientOptions
-          | undefined;
-        compactionReplayProjectedMessages = addBedrockTailCacheControl(
-          [...projectedPrefix],
-          resolveBedrockPromptCacheTtl(
-            clientOptions?.promptCacheTtl,
-            (clientOptions as { model?: string } | undefined)?.model
-          )
-        );
-      } else if (
-        clientConfig.provider === Providers.ANTHROPIC ||
-        clientConfig.provider === Providers.OPENROUTER
-      ) {
-        compactionReplayProjectedMessages = addTailCacheControl(
-          [...projectedPrefix],
-          resolvePromptCacheTtl(
-            (
-                  clientConfig.clientOptions as {
-                    promptCacheTtl?: PromptCacheTtl;
-                  }
-            ).promptCacheTtl
-          )
-        );
-      } else {
-        compactionReplayProjectedMessages = projectedPrefix;
-      }
+      compactionReplayProjectedMessages =
+        extractCompactionReplayPrefixProjection(result.preparedMessages) ??
+        null;
     }
     observeCompactionReplay(false);
   } catch (primaryError) {
@@ -1772,6 +1744,28 @@ function traceConfig(
   };
 }
 
+export function applySummarizationHistoryCache(params: {
+  messages: BaseMessage[];
+  provider: t.ProviderName;
+  enabled: boolean;
+  promptCacheTtl?: PromptCacheTtl;
+  bedrockModelId?: string;
+}): BaseMessage[] {
+  if (!params.enabled) {
+    return params.messages;
+  }
+  if (params.provider === Providers.BEDROCK) {
+    return addBedrockTailCacheControl(
+      [...params.messages],
+      resolveBedrockPromptCacheTtl(
+        params.promptCacheTtl,
+        params.bedrockModelId
+      )
+    );
+  }
+  return addTailCacheControl([...params.messages], params.promptCacheTtl);
+}
+
 /**
  * Cache-friendly compaction: sends raw conversation messages with the
  * summarization instruction appended as the final HumanMessage. Bound tool
@@ -1792,6 +1786,7 @@ async function summarizeWithCacheHit({
   graph,
   usePromptCache,
   promptCacheTtl,
+  bedrockModelId,
   log,
 }: {
   model: t.ChatModel;
@@ -1806,6 +1801,7 @@ async function summarizeWithCacheHit({
   graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
   usePromptCache?: boolean;
   promptCacheTtl?: PromptCacheTtl;
+  bedrockModelId?: string;
   log?: LogFn;
 }): Promise<{
   text: string;
@@ -1824,11 +1820,14 @@ async function summarizeWithCacheHit({
       { attribution: 'synthetic' },
     ]);
   }
-  const fullMessages = [...messages, instructionMessage];
-  const invokeMessages =
-    usePromptCache === true
-      ? addTailCacheControl(fullMessages, promptCacheTtl)
-      : fullMessages;
+  const cachedHistory = applySummarizationHistoryCache({
+    messages,
+    provider,
+    enabled: usePromptCache === true,
+    promptCacheTtl,
+    bedrockModelId,
+  });
+  const invokeMessages = [...cachedHistory, instructionMessage];
 
   const invokeConfig = withBreakerSignal(
     traceConfig(config, 'cache_hit_compaction'),

@@ -550,6 +550,28 @@ describe('compaction replay eligibility', () => {
     });
   });
 
+  it.each([
+    [{ strict: true }, { strict: false }],
+    [{ extras: { strict: true } }, { extras: { strict: false } }],
+  ])('includes provider-facing strict tool settings', (primary, summary) => {
+    const recipe = createEnvelope({
+      toolProjectionFingerprint: createCompactionToolProjectionFingerprint([
+        { name: 'stable', ...primary },
+      ]),
+    });
+
+    expect(
+      inspect(recipe, {
+        toolProjectionFingerprint: createCompactionToolProjectionFingerprint([
+          { name: 'stable', ...summary },
+        ]),
+      })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'tool_projection_changed',
+    });
+  });
+
   it('fails closed when a runtime provider cannot prove its cache namespace', () => {
     const provider = 'runtime-provider' as t.ProviderName;
     const cacheNamespace = createCompactionCacheNamespace(provider, {
