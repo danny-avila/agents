@@ -39,7 +39,11 @@ import {
   StepTypes,
   Providers,
 } from '@/common';
-import { createCompactionCacheNamespace } from '@/llm/compactionReplay';
+import {
+  createCompactionCacheNamespace,
+  createCompactionToolProjectionFingerprint,
+  isCompactionPromptCacheEnabled,
+} from '@/llm/compactionReplay';
 import {
   resolveServingModelId,
   usesNativeOpenAIResponses,
@@ -676,6 +680,7 @@ async function executeSummarizationWithFallback(params: {
   let summaryUsage: Partial<UsageMetadata> | undefined;
   let usedMetadataStub = false;
   let summarizationModel: t.ChatModel | undefined;
+  const summarizationTools = agentContext.getToolsForBinding();
 
   const observeCompactionReplay = (
     summarizerFallbackServed: boolean
@@ -693,6 +698,10 @@ async function executeSummarizationWithFallback(params: {
         ? 'openai-responses'
         : 'chat-messages';
     }
+    const promptCacheEnabled = isCompactionPromptCacheEnabled(
+      clientConfig.provider as t.ProviderName,
+      clientConfig.clientOptions
+    );
     const compactionReplay = agentContext.inspectCompactionReplay({
       provider: clientConfig.provider as t.ProviderName,
       modelId:
@@ -703,6 +712,11 @@ async function executeSummarizationWithFallback(params: {
         clientConfig.provider as t.ProviderName,
         clientConfig.clientOptions
       ),
+      promptCacheEnabled,
+      toolProjectionFingerprint:
+        promptCacheEnabled
+          ? createCompactionToolProjectionFingerprint(summarizationTools)
+          : undefined,
       messages,
       restoredToolSubstitution,
       summarizerFallbackServed,
@@ -719,7 +733,7 @@ async function executeSummarizationWithFallback(params: {
     summarizationModel = initializeModel({
       provider: clientConfig.provider,
       clientOptions: clientConfig.clientOptions as t.ClientOptions,
-      tools: agentContext.getToolsForBinding(),
+      tools: summarizationTools,
     }) as t.ChatModel;
 
     const result = await summarizeWithCacheHit({

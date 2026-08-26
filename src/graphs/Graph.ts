@@ -3897,7 +3897,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.captureCompactionReplayRecipe(
             preparedRequest,
             messagesToUse,
-            this.overrideModel == null
+            this.overrideModel == null,
+            toolsForBinding
           );
         }
       } catch (primaryError) {

@@ -62,6 +62,8 @@ import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibil
 import {
   createCompactionCacheNamespace,
   createCompactionReplayRecipe,
+  createCompactionToolProjectionFingerprint,
+  isCompactionPromptCacheEnabled,
   inspectCompactionReplayEligibility,
 } from '@/llm/compactionReplay';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
@@ -1994,8 +1996,13 @@ export class AgentContext {
   captureCompactionReplayRecipe(
     request: PreparedProviderRequest,
     sourceMessages: readonly BaseMessage[],
-    servingRouteKnown = true
+    servingRouteKnown = true,
+    tools?: t.GraphTools
   ): void {
+    const promptCacheEnabled = isCompactionPromptCacheEnabled(
+      this.provider,
+      this.clientOptions
+    );
     this.compactionReplayState = createCompactionReplayRecipe({
       provider: request.provider,
       modelId: request.modelId,
@@ -2005,6 +2012,11 @@ export class AgentContext {
         this.clientOptions,
         servingRouteKnown
       ),
+      promptCacheEnabled,
+      toolProjectionFingerprint:
+        promptCacheEnabled
+          ? createCompactionToolProjectionFingerprint(tools)
+          : undefined,
       systemRevision: this.compactionSystemRevision,
       toolRevision: this.compactionToolRevision,
       messages: request.messages,
@@ -2022,6 +2034,8 @@ export class AgentContext {
     modelId?: string;
     projectionMode?: ProviderMessageProjectionMode;
     cacheNamespace: CompactionCacheNamespace;
+    promptCacheEnabled: boolean;
+    toolProjectionFingerprint?: string;
     messages: readonly BaseMessage[];
     restoredToolSubstitution: boolean;
     summarizerFallbackServed?: boolean;

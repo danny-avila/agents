@@ -422,11 +422,73 @@ interface UsageChunk {
   usage_metadata?: Usage;
 }
 
+function hasStreamPayload(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return value !== '';
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return true;
+  }
+  if (Array.isArray(value)) {
+    return value.some(hasStreamPayload);
+  }
+  if (value == null || typeof value !== 'object') {
+    return false;
+  }
+  return Object.values(value as Record<string, unknown>).some(
+    hasStreamPayload
+  );
+}
+
 function hasStreamContent(content: unknown): boolean {
   if (typeof content === 'string') {
     return content !== '';
   }
-  return Array.isArray(content) ? content.length > 0 : content != null;
+  if (Array.isArray(content)) {
+    return content.some(hasStreamContent);
+  }
+  if (content == null || typeof content !== 'object') {
+    return false;
+  }
+  const block = content as Record<string, unknown>;
+  for (const key of [
+    'text',
+    'thinking',
+    'reasoning',
+    'partial_json',
+    'input',
+    'args',
+    'content',
+  ] as const) {
+    if (hasStreamPayload(block[key])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function sumUsage(
+  accumulated: Usage | undefined,
+  chunk: Usage
+): Usage {
+  const previousDetails = accumulated?.input_token_details;
+  const chunkDetails = chunk.input_token_details;
+  return {
+    input_tokens:
+      (accumulated?.input_tokens ?? 0) + (chunk.input_tokens ?? 0),
+    output_tokens:
+      (accumulated?.output_tokens ?? 0) + (chunk.output_tokens ?? 0),
+    total_tokens:
+      (accumulated?.total_tokens ?? 0) + (chunk.total_tokens ?? 0),
+    input_token_details: {
+      cache_creation:
+        (previousDetails?.cache_creation ?? 0) +
+        (chunkDetails?.cache_creation ?? 0),
+      cache_read:
+        (previousDetails?.cache_read ?? 0) +
+        (chunkDetails?.cache_read ?? 0),
+    },
+  };
 }
 
 async function collectTimedStream(
@@ -443,7 +505,7 @@ async function collectTimedStream(
       timeToFirstTokenMs = performance.now() - startedAt;
     }
     if (chunk.usage_metadata != null) {
-      usage = chunk.usage_metadata;
+      usage = sumUsage(usage, chunk.usage_metadata);
     }
   }
   return {

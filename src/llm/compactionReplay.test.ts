@@ -7,6 +7,7 @@ import type { BaseMessage } from '@langchain/core/messages';
 import {
   createCompactionCacheNamespace,
   createCompactionReplayRecipe,
+  createCompactionToolProjectionFingerprint,
   inspectCompactionReplayEligibility,
   type CompactionReplayRecipe,
   type CompactionReplayState,
@@ -29,6 +30,8 @@ function createEnvelope(
     modelId: string;
     projectionMode: 'chat-messages' | 'openai-responses';
     cacheNamespace: ReturnType<typeof createCompactionCacheNamespace>;
+    promptCacheEnabled: boolean;
+    toolProjectionFingerprint: string;
     systemRevision: number;
     toolRevision: number;
     messages: BaseMessage[];
@@ -49,6 +52,10 @@ function createEnvelope(
       createCompactionCacheNamespace(Providers.ANTHROPIC, {
         baseURL: 'https://provider.test',
       }),
+    promptCacheEnabled: overrides.promptCacheEnabled ?? true,
+    toolProjectionFingerprint:
+      overrides.toolProjectionFingerprint ??
+      createCompactionToolProjectionFingerprint(undefined),
     systemRevision: overrides.systemRevision ?? 2,
     toolRevision: overrides.toolRevision ?? 3,
     messages: overrides.messages ?? [new SystemMessage('stable'), ...sourceMessages],
@@ -64,6 +71,8 @@ function inspect(
     modelId: string;
     projectionMode: 'chat-messages' | 'openai-responses';
     cacheNamespace: ReturnType<typeof createCompactionCacheNamespace>;
+    promptCacheEnabled: boolean;
+    toolProjectionFingerprint: string;
     systemRevision: number;
     toolRevision: number;
     messages: BaseMessage[];
@@ -80,6 +89,10 @@ function inspect(
       createCompactionCacheNamespace(Providers.ANTHROPIC, {
         baseURL: 'https://provider.test',
       }),
+    promptCacheEnabled: overrides.promptCacheEnabled ?? true,
+    toolProjectionFingerprint:
+      overrides.toolProjectionFingerprint ??
+      createCompactionToolProjectionFingerprint(undefined),
     systemRevision: overrides.systemRevision ?? 2,
     toolRevision: overrides.toolRevision ?? 3,
     messages: overrides.messages ?? [sourceMessage('a'), sourceMessage('b')],
@@ -163,7 +176,7 @@ describe('compaction replay eligibility', () => {
     }
   );
 
-  it.each(['openAIApiKey', 'openAIBasePath'] as const)(
+  it.each(['openAIApiKey', 'openAIBasePath', 'openAIApiVersion'] as const)(
     'includes the Azure %s routing alias in cache identity',
     (key) => {
       const recipe = createEnvelope({
@@ -264,6 +277,36 @@ describe('compaction replay eligibility', () => {
     expect(inspect(recipe, { cacheNamespace })).toMatchObject({
       eligible: false,
       reason: 'cache_namespace_unknown',
+    });
+  });
+
+  it('requires explicit prompt caching for gated providers', () => {
+    const recipe = createEnvelope({ promptCacheEnabled: false });
+
+    expect(inspect(recipe)).toMatchObject({
+      eligible: false,
+      reason: 'prompt_cache_disabled',
+    });
+  });
+
+  it('compares the actual ordered tool projection', () => {
+    const primaryTools = createCompactionToolProjectionFingerprint([
+      { name: 'stable', extras: { cache_control: { type: 'ephemeral' } } },
+      { name: 'deferred', defer_loading: true },
+    ]);
+    const summaryTools = createCompactionToolProjectionFingerprint([
+      { name: 'stable' },
+      { name: 'deferred', defer_loading: true },
+    ]);
+    const recipe = createEnvelope({
+      toolProjectionFingerprint: primaryTools,
+    });
+
+    expect(
+      inspect(recipe, { toolProjectionFingerprint: summaryTools })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'tool_projection_changed',
     });
   });
 

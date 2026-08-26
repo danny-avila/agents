@@ -2,6 +2,7 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { ProviderMessageProjectionMode } from '@/llm/prepareProviderRequest';
 import type * as t from '@/types';
 import { inspectProviderSourceMessageIds } from '@/messages/provenance';
+import { toJsonSchema } from '@/utils/schema';
 import { Providers } from '@/common';
 
 type CacheNamespaceValue = string;
@@ -11,6 +12,8 @@ export interface CompactionReplayRecipe {
   readonly modelId?: string;
   readonly projectionMode: ProviderMessageProjectionMode;
   readonly cacheNamespace: CompactionCacheNamespace;
+  readonly promptCacheEnabled: boolean;
+  readonly toolProjectionFingerprint?: string;
   readonly systemRevision: number;
   readonly toolRevision: number;
   readonly messages: readonly BaseMessage[];
@@ -27,8 +30,10 @@ export type CompactionReplayIneligibilityReason =
   | 'model_mismatch'
   | 'cache_namespace_unknown'
   | 'cache_namespace_mismatch'
+  | 'prompt_cache_disabled'
   | 'system_projection_changed'
   | 'tool_projection_changed'
+  | 'tool_projection_unknown'
   | 'projection_mode_mismatch'
   | 'restored_tool_substitution'
   | 'source_content_unknown'
@@ -62,6 +67,8 @@ interface CompactionReplayCandidate {
   readonly modelId?: string;
   readonly projectionMode?: ProviderMessageProjectionMode;
   readonly cacheNamespace: CompactionCacheNamespace;
+  readonly promptCacheEnabled: boolean;
+  readonly toolProjectionFingerprint?: string;
   readonly systemRevision: number;
   readonly toolRevision: number;
   readonly messages: readonly BaseMessage[];
@@ -89,6 +96,7 @@ const CACHE_NAMESPACE_KEYS = [
   'azureOpenAIBasePath',
   'openAIApiKey',
   'openAIBasePath',
+  'openAIApiVersion',
   'googleApiKey',
   'location',
   'credentials',
@@ -192,6 +200,91 @@ function fingerprintCacheNamespaceValue(value: unknown): string | undefined {
       : fingerprintSerializedValue(serialized);
   } catch {
     return undefined;
+  }
+}
+
+function projectToolForFingerprint(tool: unknown): object | undefined {
+  try {
+    if (tool == null || typeof tool !== 'object') {
+      return undefined;
+    }
+    const candidate = tool as Record<string, unknown>;
+    const projection: Record<string, unknown> = {};
+    const name =
+      typeof candidate.name === 'string' ? candidate.name : undefined;
+    const description =
+      typeof candidate.description === 'string'
+        ? candidate.description
+        : undefined;
+    if (name != null) {
+      projection.name = name;
+    }
+    if (description != null) {
+      projection.description = description;
+    }
+    if (candidate.schema != null) {
+      projection.schema = toJsonSchema(candidate.schema, name, description);
+    }
+    for (const key of [
+      'type',
+      'input_schema',
+      'parameters',
+      'function',
+      'toolSpec',
+      'cache_control',
+      'cachePoint',
+      'defer_loading',
+      '__lc_bedrock_cache_point_after',
+      '__lc_bedrock_skip_tool_cache',
+    ] as const) {
+      if (candidate[key] !== undefined) {
+        projection[key] = candidate[key];
+      }
+    }
+    const extras = candidate.extras as Record<string, unknown> | undefined;
+    if (extras?.cache_control !== undefined) {
+      projection.extrasCacheControl = extras.cache_control;
+    }
+    if (extras?.providerToolDefinition !== undefined) {
+      projection.providerToolDefinition = extras.providerToolDefinition;
+    }
+    return Object.keys(projection).length === 0 ? undefined : projection;
+  } catch {
+    return undefined;
+  }
+}
+
+export function createCompactionToolProjectionFingerprint(
+  tools: readonly unknown[] | undefined
+): string | undefined {
+  const projections: object[] = [];
+  for (const tool of tools ?? []) {
+    const projection = projectToolForFingerprint(tool);
+    if (projection == null) {
+      return undefined;
+    }
+    projections.push(projection);
+  }
+  return fingerprintCacheNamespaceValue(projections);
+}
+
+export function isCompactionPromptCacheEnabled(
+  provider: t.ProviderName,
+  options?: t.ClientOptions | Record<string, unknown>
+): boolean {
+  if (
+    provider !== Providers.ANTHROPIC &&
+    provider !== Providers.BEDROCK &&
+    provider !== Providers.OPENROUTER
+  ) {
+    return true;
+  }
+  try {
+    return (
+      (options as Record<string, unknown> | undefined)?.promptCache === true
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -339,6 +432,8 @@ export function createCompactionReplayRecipe(params: {
   modelId?: string;
   projectionMode: ProviderMessageProjectionMode;
   cacheNamespace: CompactionCacheNamespace;
+  promptCacheEnabled: boolean;
+  toolProjectionFingerprint?: string;
   systemRevision: number;
   toolRevision: number;
   messages: readonly BaseMessage[];
@@ -349,6 +444,8 @@ export function createCompactionReplayRecipe(params: {
     modelId: params.modelId,
     projectionMode: params.projectionMode,
     cacheNamespace: params.cacheNamespace,
+    promptCacheEnabled: params.promptCacheEnabled,
+    toolProjectionFingerprint: params.toolProjectionFingerprint,
     systemRevision: params.systemRevision,
     toolRevision: params.toolRevision,
     messages: params.messages,
@@ -414,6 +511,32 @@ export function inspectCompactionReplayEligibility(
   if (!cacheNamespacesEqual(recipe.cacheNamespace, candidate.cacheNamespace)) {
     return ineligible(
       'cache_namespace_mismatch',
+      replaySourceCount,
+      requestSourceCount
+    );
+  }
+  if (!recipe.promptCacheEnabled || !candidate.promptCacheEnabled) {
+    return ineligible(
+      'prompt_cache_disabled',
+      replaySourceCount,
+      requestSourceCount
+    );
+  }
+  if (
+    recipe.toolProjectionFingerprint == null ||
+    candidate.toolProjectionFingerprint == null
+  ) {
+    return ineligible(
+      'tool_projection_unknown',
+      replaySourceCount,
+      requestSourceCount
+    );
+  }
+  if (
+    recipe.toolProjectionFingerprint !== candidate.toolProjectionFingerprint
+  ) {
+    return ineligible(
+      'tool_projection_changed',
       replaySourceCount,
       requestSourceCount
     );

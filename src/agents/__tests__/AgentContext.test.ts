@@ -2,7 +2,10 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import type * as t from '@/types';
-import { createCompactionCacheNamespace } from '@/llm/compactionReplay';
+import {
+  createCompactionCacheNamespace,
+  createCompactionToolProjectionFingerprint,
+} from '@/llm/compactionReplay';
 import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { addBedrockCacheControl } from '@/messages/cache';
@@ -95,6 +98,11 @@ describe('AgentContext', () => {
   });
 
   describe('compaction replay recipe lifecycle', () => {
+    const replayIdentity = {
+      promptCacheEnabled: true,
+      toolProjectionFingerprint:
+        createCompactionToolProjectionFingerprint(undefined),
+    };
     const captureRecipe = (
       ctx: AgentContext,
       message: HumanMessage
@@ -120,6 +128,7 @@ describe('AgentContext', () => {
         ctx.inspectCompactionReplay({
           provider: Providers.OPENAI,
           cacheNamespace,
+          ...replayIdentity,
           messages: [message],
           restoredToolSubstitution: false,
         })
@@ -131,6 +140,7 @@ describe('AgentContext', () => {
         ctx.inspectCompactionReplay({
           provider: Providers.OPENAI,
           cacheNamespace,
+          ...replayIdentity,
           messages: [message],
           restoredToolSubstitution: false,
         })
@@ -149,6 +159,7 @@ describe('AgentContext', () => {
         ctx.inspectCompactionReplay({
           provider: Providers.OPENAI,
           cacheNamespace: currentNamespace,
+          ...replayIdentity,
           messages: [message],
           restoredToolSubstitution: false,
         })
@@ -174,6 +185,7 @@ describe('AgentContext', () => {
         ctx.inspectCompactionReplay({
           provider: Providers.OPENAI,
           cacheNamespace,
+          ...replayIdentity,
           messages: [message],
           restoredToolSubstitution: false,
         });

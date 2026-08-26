@@ -10,6 +10,7 @@ import type { BaseMessage } from '@langchain/core/messages';
 import {
   createCompactionCacheNamespace,
   createCompactionReplayRecipe,
+  createCompactionToolProjectionFingerprint,
   inspectCompactionReplayEligibility,
 } from '@/llm/compactionReplay';
 import { setProviderMessageProvenance } from '@/messages/provenance';
@@ -92,6 +93,9 @@ for (const toolSteps of [20, 50, 100]) {
         modelId: 'benchmark-model',
         projectionMode: 'chat-messages',
         cacheNamespace,
+        promptCacheEnabled: true,
+        toolProjectionFingerprint:
+          createCompactionToolProjectionFingerprint(undefined),
         systemRevision: 0,
         toolRevision: 0,
         messages,
@@ -110,6 +114,9 @@ for (const toolSteps of [20, 50, 100]) {
           modelId: 'benchmark-model',
           projectionMode: 'chat-messages',
           cacheNamespace,
+          promptCacheEnabled: true,
+          toolProjectionFingerprint:
+            createCompactionToolProjectionFingerprint(undefined),
           systemRevision: 0,
           toolRevision: 0,
           messages: compactableMessages,
@@ -124,6 +131,9 @@ for (const toolSteps of [20, 50, 100]) {
         modelId: 'benchmark-model',
         projectionMode: 'chat-messages',
         cacheNamespace,
+        promptCacheEnabled: true,
+        toolProjectionFingerprint:
+          createCompactionToolProjectionFingerprint(undefined),
         systemRevision: 0,
         toolRevision: 0,
         messages: compactableMessages,
