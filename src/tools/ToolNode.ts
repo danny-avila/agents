@@ -3369,6 +3369,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }),
         usageCount: this.toolUsageCount,
         invalidArgsBehavior: 'error-result',
+        getToolSchema: (toolName) =>
+          this.toolDefinitions?.get(toolName)?.parameters ??
+          this.toolRegistry?.get(toolName)?.parameters,
         recordTurn: (toolName, reservedTurn, callId) => {
           this.recordEventToolPlanningTurn(
             toolName,

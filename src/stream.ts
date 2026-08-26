@@ -770,6 +770,9 @@ function createEagerToolExecutionPlan(args: {
       ),
     })),
     usageCount: graph.getEagerEventToolUsageCount(agentContext?.agentId),
+    getToolSchema: (toolName) =>
+      agentContext?.toolDefinitions?.find((tool) => tool.name === toolName)
+        ?.parameters,
   });
   if (plan == null) {
     return undefined;
