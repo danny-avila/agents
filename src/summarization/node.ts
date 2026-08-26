@@ -785,17 +785,14 @@ async function executeSummarizationWithFallback(params: {
           : undefined,
       bedrockModelId:
         clientConfig.provider === Providers.BEDROCK
-          ? (
-              clientConfig.clientOptions as
-                | {
-                  applicationInferenceProfile?: string;
-                  model?: string;
-                }
-                | undefined
-          )?.applicationInferenceProfile ??
-            (
-              clientConfig.clientOptions as { model?: string } | undefined
-            )?.model
+          ? resolveBedrockCompactionCacheModel(
+            clientConfig.clientOptions as
+              | {
+                applicationInferenceProfile?: string;
+                model?: string;
+              }
+              | undefined
+          )
           : undefined,
       log,
     });
@@ -1776,6 +1773,14 @@ export function applySummarizationHistoryCache(params: {
     [...params.messages],
     resolvePromptCacheTtl(params.promptCacheTtl)
   );
+}
+
+export function resolveBedrockCompactionCacheModel(
+  options:
+    | { applicationInferenceProfile?: string; model?: string }
+    | undefined
+): string | undefined {
+  return options?.model;
 }
 
 /**

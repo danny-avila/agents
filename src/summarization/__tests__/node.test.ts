@@ -7,6 +7,7 @@ import {
   createSummarizeNode,
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
+  resolveBedrockCompactionCacheModel,
 } from '@/summarization/node';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
@@ -49,19 +50,28 @@ describe('applySummarizationHistoryCache', () => {
     ]);
   });
 
-  it('uses five minutes for an unknown Bedrock inference profile family', () => {
+  it('uses five minutes for a configured non-Claude Bedrock model', () => {
     const cached = applySummarizationHistoryCache({
       messages: [new HumanMessage('history')],
       provider: Providers.BEDROCK,
       enabled: true,
-      bedrockModelId:
-        'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/nova',
+      bedrockModelId: 'amazon.nova-pro-v1:0',
     });
 
     expect(cached[0].content).toEqual([
       { type: 'text', text: 'history' },
       { cachePoint: { type: 'default' } },
     ]);
+  });
+
+  it('keeps the configured Claude cache family for an opaque profile ARN', () => {
+    expect(
+      resolveBedrockCompactionCacheModel({
+        applicationInferenceProfile:
+          'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opaque',
+        model: 'anthropic.claude-sonnet',
+      })
+    ).toBe('anthropic.claude-sonnet');
   });
 });
 
