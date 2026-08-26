@@ -40,7 +40,10 @@ import {
   Providers,
 } from '@/common';
 import { createCompactionCacheNamespace } from '@/llm/compactionReplay';
-import { usesNativeOpenAIResponses } from '@/llm/prepareProviderRequest';
+import {
+  resolveServingModelId,
+  usesNativeOpenAIResponses,
+} from '@/llm/prepareProviderRequest';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
@@ -672,6 +675,40 @@ async function executeSummarizationWithFallback(params: {
   let summaryText = '';
   let summaryUsage: Partial<UsageMetadata> | undefined;
   let usedMetadataStub = false;
+  let summarizationModel: t.ChatModel | undefined;
+
+  const observeCompactionReplay = (
+    summarizerFallbackServed: boolean
+  ): void => {
+    if (process.env.AGENT_DEBUG_LOGGING !== 'true') {
+      return;
+    }
+    let projectionMode: 'chat-messages' | 'openai-responses' | undefined;
+    if (summarizationModel != null) {
+      projectionMode = usesNativeOpenAIResponses(
+        summarizationModel,
+        clientConfig.provider as t.ProviderName,
+        summarizeConfig
+      )
+        ? 'openai-responses'
+        : 'chat-messages';
+    }
+    const compactionReplay = agentContext.inspectCompactionReplay({
+      provider: clientConfig.provider as t.ProviderName,
+      modelId:
+        resolveServingModelId(summarizationModel) ??
+        resolveSummarizationModelId(clientConfig),
+      projectionMode,
+      cacheNamespace: createCompactionCacheNamespace(
+        clientConfig.provider as t.ProviderName,
+        clientConfig.clientOptions
+      ),
+      messages,
+      restoredToolSubstitution,
+      summarizerFallbackServed,
+    });
+    log('debug', 'Compaction replay eligibility', { ...compactionReplay });
+  };
 
   try {
     /**
@@ -679,32 +716,11 @@ async function executeSummarizationWithFallback(params: {
      * (e.g. an unrecognized summarization.provider) surfaces through the
      * `log('error', ...)` path below rather than bubbling up silently.
      */
-    const summarizationModel = initializeModel({
+    summarizationModel = initializeModel({
       provider: clientConfig.provider,
       clientOptions: clientConfig.clientOptions as t.ClientOptions,
       tools: agentContext.getToolsForBinding(),
     }) as t.ChatModel;
-
-    if (process.env.AGENT_DEBUG_LOGGING === 'true') {
-      const compactionReplay = agentContext.inspectCompactionReplay({
-        provider: clientConfig.provider as t.ProviderName,
-        modelId: resolveSummarizationModelId(clientConfig),
-        projectionMode: usesNativeOpenAIResponses(
-          summarizationModel,
-          clientConfig.provider as t.ProviderName,
-          summarizeConfig
-        )
-          ? 'openai-responses'
-          : 'chat-messages',
-        cacheNamespace: createCompactionCacheNamespace(
-          clientConfig.provider as t.ProviderName,
-          clientConfig.clientOptions
-        ),
-        messages,
-        restoredToolSubstitution,
-      });
-      log('debug', 'Compaction replay eligibility', { ...compactionReplay });
-    }
 
     const result = await summarizeWithCacheHit({
       model: summarizationModel,
@@ -733,6 +749,7 @@ async function executeSummarizationWithFallback(params: {
     });
     summaryText = result.text;
     summaryUsage = result.usage;
+    observeCompactionReplay(false);
   } catch (primaryError) {
     const primaryDescribed = describeProviderError(
       primaryError,
@@ -811,6 +828,9 @@ async function executeSummarizationWithFallback(params: {
           summaryText = extractResponseText(
             fbMsg as { content: string | object }
           );
+          if (summaryText !== '') {
+            observeCompactionReplay(true);
+          }
         }
       } catch (fbErr) {
         if (fbErr instanceof StreamLimitExceededError) {

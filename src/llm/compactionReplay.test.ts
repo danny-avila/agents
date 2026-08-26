@@ -68,6 +68,7 @@ function inspect(
     toolRevision: number;
     messages: BaseMessage[];
     restoredToolSubstitution: boolean;
+    summarizerFallbackServed: boolean;
   }> = {}
 ) {
   return inspectCompactionReplayEligibility(state, {
@@ -84,6 +85,7 @@ function inspect(
     messages: overrides.messages ?? [sourceMessage('a'), sourceMessage('b')],
     restoredToolSubstitution:
       overrides.restoredToolSubstitution ?? false,
+    summarizerFallbackServed: overrides.summarizerFallbackServed,
   });
 }
 
@@ -203,6 +205,11 @@ describe('compaction replay eligibility', () => {
   it.each([
     ['no_request_snapshot', undefined, {}],
     ['fallback_served_request', 'fallback', {}],
+    [
+      'summarizer_fallback_served_request',
+      createEnvelope(),
+      { summarizerFallbackServed: true },
+    ],
     [
       'provider_mismatch',
       createEnvelope(),

@@ -13,6 +13,7 @@ import { Constants, GraphEvents, Providers } from '@/common';
 import { AgentContext } from '@/agents/AgentContext';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
+import * as invokeUtils from '@/llm/invoke';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -227,6 +228,7 @@ describe('createSummarizeNode', () => {
         class {
           constructor() {
             return {
+              model: 'actual-summary-model',
               _useResponsesApi: (): boolean => true,
               invoke: jest.fn().mockResolvedValue({ content: 'Summary text' }),
             };
@@ -261,7 +263,72 @@ describe('createSummarizeNode', () => {
       );
 
       expect(inspect).toHaveBeenCalledWith(
-        expect.objectContaining({ projectionMode: 'openai-responses' })
+        expect.objectContaining({
+          modelId: 'actual-summary-model',
+          projectionMode: 'openai-responses',
+          summarizerFallbackServed: false,
+        })
+      );
+    } finally {
+      if (previousDebugLogging == null) {
+        delete process.env.AGENT_DEBUG_LOGGING;
+      } else {
+        process.env.AGENT_DEBUG_LOGGING = previousDebugLogging;
+      }
+    }
+  });
+
+  it('marks a successfully served summarizer fallback ineligible', async () => {
+    const previousDebugLogging = process.env.AGENT_DEBUG_LOGGING;
+    process.env.AGENT_DEBUG_LOGGING = 'true';
+    try {
+      jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+        class {
+          constructor() {
+            return {
+              model: 'primary-summary-model',
+              invoke: jest.fn().mockRejectedValue(new Error('primary failed')),
+            };
+          }
+        } as never
+      );
+      jest.spyOn(invokeUtils, 'tryFallbackProviders').mockResolvedValue({
+        messages: [new AIMessage('Fallback summary')],
+      } as never);
+
+      const agentContext = createAgentContext({
+        clientOptions: {
+          fallbacks: [{ provider: Providers.ANTHROPIC, model: 'fallback' }],
+        },
+      });
+      const inspect = jest
+        .spyOn(agentContext, 'inspectCompactionReplay')
+        .mockReturnValue({
+          eligible: false,
+          reason: 'summarizer_fallback_served_request',
+          replaySourceCount: 0,
+          requestSourceCount: 0,
+        });
+      const node = createSummarizeNode({
+        agentContext,
+        graph: mockGraph(),
+        generateStepId,
+      });
+
+      await node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+
+      expect(inspect).toHaveBeenCalledTimes(1);
+      expect(inspect).toHaveBeenCalledWith(
+        expect.objectContaining({ summarizerFallbackServed: true })
       );
     } finally {
       if (previousDebugLogging == null) {

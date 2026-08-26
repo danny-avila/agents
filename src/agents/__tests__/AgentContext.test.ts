@@ -105,7 +105,10 @@ describe('AgentContext', () => {
         provider: Providers.OPENAI,
       });
       ctx.captureCompactionReplayRecipe(request, [message]);
-      return createCompactionCacheNamespace(Providers.OPENAI);
+      return createCompactionCacheNamespace(
+        Providers.OPENAI,
+        ctx.clientOptions
+      );
     };
 
     it('releases the run-local recipe on reset', () => {
@@ -132,6 +135,24 @@ describe('AgentContext', () => {
           restoredToolSubstitution: false,
         })
       ).toMatchObject({ eligible: false, reason: 'no_request_snapshot' });
+    });
+
+    it('snapshots the current cache route on every capture', () => {
+      const ctx = createBasicContext();
+      const message = new HumanMessage({ content: 'hello', id: 'source-1' });
+      ctx.clientOptions = { apiKey: 'first-key' } as t.ClientOptions;
+      captureRecipe(ctx, message);
+      ctx.clientOptions = { apiKey: 'second-key' } as t.ClientOptions;
+      const currentNamespace = captureRecipe(ctx, message);
+
+      expect(
+        ctx.inspectCompactionReplay({
+          provider: Providers.OPENAI,
+          cacheNamespace: currentNamespace,
+          messages: [message],
+          restoredToolSubstitution: false,
+        })
+      ).toMatchObject({ eligible: true });
     });
 
     it('distinguishes tool discovery from system-only projection changes', () => {

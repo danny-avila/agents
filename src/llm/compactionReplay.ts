@@ -6,11 +6,6 @@ import { Providers } from '@/common';
 
 type CacheNamespaceValue = string | number | boolean | object | null;
 
-export interface CompactionProjectionRevisions {
-  readonly systemRevision: number;
-  readonly toolRevision: number;
-}
-
 export interface CompactionReplayRecipe {
   readonly provider: t.ProviderName;
   readonly modelId?: string;
@@ -27,6 +22,7 @@ export type CompactionReplayState = CompactionReplayRecipe | 'fallback';
 export type CompactionReplayIneligibilityReason =
   | 'no_request_snapshot'
   | 'fallback_served_request'
+  | 'summarizer_fallback_served_request'
   | 'provider_mismatch'
   | 'model_mismatch'
   | 'cache_namespace_unknown'
@@ -70,6 +66,7 @@ interface CompactionReplayCandidate {
   readonly toolRevision: number;
   readonly messages: readonly BaseMessage[];
   readonly restoredToolSubstitution: boolean;
+  readonly summarizerFallbackServed?: boolean;
 }
 
 const CACHE_NAMESPACE_KEYS = [
@@ -294,6 +291,13 @@ export function inspectCompactionReplayEligibility(
 ): CompactionReplayEligibility {
   const candidateLineage = inspectSourceLineage(candidate.messages);
   const replaySourceCount = candidateLineage?.sourceMessageIds.length ?? 0;
+  if (candidate.summarizerFallbackServed === true) {
+    return ineligible(
+      'summarizer_fallback_served_request',
+      replaySourceCount,
+      0
+    );
+  }
   if (state == null) {
     return ineligible('no_request_snapshot', replaySourceCount, 0);
   }

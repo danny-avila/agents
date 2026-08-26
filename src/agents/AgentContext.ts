@@ -357,8 +357,6 @@ export class AgentContext {
   private compactionToolRevision = 0;
   /** Latest successful normal-request recipe, or a fallback-served marker. */
   private compactionReplayState?: CompactionReplayState;
-  /** Lazily derived because contexts without summarization never need it. */
-  private compactionCacheNamespace?: CompactionCacheNamespace;
   /** Promise for token calculation initialization */
   tokenCalculationPromise?: Promise<void>;
   /** Format content blocks as strings (for legacy compatibility) */
@@ -2001,7 +1999,10 @@ export class AgentContext {
       provider: request.provider,
       modelId: request.modelId,
       projectionMode: request.projectionMode,
-      cacheNamespace: this.getCompactionCacheNamespace(),
+      cacheNamespace: createCompactionCacheNamespace(
+        this.provider,
+        this.clientOptions
+      ),
       systemRevision: this.compactionSystemRevision,
       toolRevision: this.compactionToolRevision,
       messages: request.messages,
@@ -2014,14 +2015,6 @@ export class AgentContext {
     this.compactionReplayState = 'fallback';
   }
 
-  private getCompactionCacheNamespace(): CompactionCacheNamespace {
-    this.compactionCacheNamespace ??= createCompactionCacheNamespace(
-      this.provider,
-      this.clientOptions
-    );
-    return this.compactionCacheNamespace;
-  }
-
   inspectCompactionReplay(params: {
     provider: t.ProviderName;
     modelId?: string;
@@ -2029,6 +2022,7 @@ export class AgentContext {
     cacheNamespace: CompactionCacheNamespace;
     messages: readonly BaseMessage[];
     restoredToolSubstitution: boolean;
+    summarizerFallbackServed?: boolean;
   }): CompactionReplayEligibility {
     return inspectCompactionReplayEligibility(this.compactionReplayState, {
       ...params,
