@@ -1,7 +1,10 @@
 // src/agents/__tests__/AgentContext.test.ts
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import { FakeListChatModel } from '@langchain/core/utils/testing';
 import type * as t from '@/types';
+import { createCompactionCacheNamespace } from '@/llm/compactionReplay';
 import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
+import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { addBedrockCacheControl } from '@/messages/cache';
 import { createTokenCounter } from '@/utils/tokens';
 import { Constants, Providers } from '@/common';
@@ -88,6 +91,85 @@ describe('AgentContext', () => {
       const names = (bound as Array<{ name?: string }>).map((t) => t.name);
       expect(names).toContain('ask_user_question');
       expect(names).toContain('echo');
+    });
+  });
+
+  describe('compaction replay recipe lifecycle', () => {
+    const captureRecipe = (
+      ctx: AgentContext,
+      message: HumanMessage
+    ): ReturnType<typeof createCompactionCacheNamespace> => {
+      const request = prepareProviderRequest({
+        model: new FakeListChatModel({ responses: ['ok'] }) as t.ChatModel,
+        messages: [message],
+        provider: Providers.OPENAI,
+      });
+      ctx.captureCompactionReplayRecipe(request);
+      return createCompactionCacheNamespace(Providers.OPENAI);
+    };
+
+    it('releases the run-local recipe on reset', () => {
+      const ctx = createBasicContext();
+      const message = new HumanMessage({ content: 'hello', id: 'source-1' });
+      const cacheNamespace = captureRecipe(ctx, message);
+
+      expect(
+        ctx.inspectCompactionReplay({
+          provider: Providers.OPENAI,
+          cacheNamespace,
+          messages: [message],
+          restoredToolSubstitution: false,
+        })
+      ).toMatchObject({ eligible: true });
+
+      ctx.reset();
+
+      expect(
+        ctx.inspectCompactionReplay({
+          provider: Providers.OPENAI,
+          cacheNamespace,
+          messages: [message],
+          restoredToolSubstitution: false,
+        })
+      ).toMatchObject({ eligible: false, reason: 'no_request_snapshot' });
+    });
+
+    it('distinguishes tool discovery from system-only projection changes', () => {
+      const createRecordedContext = (): {
+        ctx: AgentContext;
+        message: HumanMessage;
+        cacheNamespace: ReturnType<typeof createCompactionCacheNamespace>;
+      } => {
+        const ctx = createBasicContext();
+        const message = new HumanMessage({ content: 'hello', id: 'source-1' });
+        const cacheNamespace = captureRecipe(ctx, message);
+        return { ctx, message, cacheNamespace };
+      };
+      const inspect = ({
+        ctx,
+        message,
+        cacheNamespace,
+      }: ReturnType<typeof createRecordedContext>) =>
+        ctx.inspectCompactionReplay({
+          provider: Providers.OPENAI,
+          cacheNamespace,
+          messages: [message],
+          restoredToolSubstitution: false,
+        });
+
+      const toolChanged = createRecordedContext();
+      toolChanged.ctx.markToolsAsDiscovered(['deferred-tool']);
+      expect(inspect(toolChanged)).toMatchObject({
+        eligible: false,
+        reason: 'tool_projection_changed',
+      });
+
+      const systemChanged = createRecordedContext();
+      systemChanged.ctx.setHandoffContext('parent', []);
+      expect(inspect(systemChanged)).toMatchObject({
+        eligible: false,
+        reason: 'system_projection_changed',
+      });
     });
   });
 

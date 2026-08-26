@@ -149,6 +149,35 @@ eligible for the intra-turn fallback.
 See [ADR 0005](docs/adr/0005-pairing-balanced-compaction-ranges.md) for the
 range-selection and retention trade-offs.
 
+A **Compaction Replay Recipe** is the run-local, constant-time record of the
+latest successful normal request's serving route, cache namespace, provider
+projection mode, prepared-message reference, and system/tool projection
+revisions. It contains no live model or provider stream. Source lineage is
+derived only when compaction is attempted, and reset releases the recipe.
+
+A **Compaction Request Projection** is the cache-compatible provider request
+used to summarize one Compaction Range. When the summarizer uses the same
+routed provider and model, the projection replays the normal request's stable
+system instructions, tool schemas, and compactable message prefix and appends
+only the compaction instruction. A different provider or model uses an
+independent projection and makes no cache-reuse claim.
+
+A **Compaction Semantic Index** is a bounded, source-addressed projection of
+committed tool intents, tool outcomes, activity phases, and user-visible
+reasoning labels. It guides checkpoint creation without becoming conversation
+truth: raw source messages remain authoritative, pending labels are excluded,
+and hidden reasoning is never eligible.
+
+A **Compaction Pin** is a bounded typed fact that must survive checkpoint
+generation, such as an exact path, identifier, URL, error, pending approval,
+user steer, or artifact reference. Pins retain source provenance and are
+merged mechanically rather than relying on generated checkpoint text.
+
+A **Compaction Transaction** is the durable attempt that selects and prices a
+Compaction Range, generates and validates its replacement, commits the
+checkpoint, and records either completion or failure. The selected source
+span must still be stable when asynchronous generation completes.
+
 ## Provider Tool Derivation
 
 A **Provider Tool Derivation** is the copy-on-write projection of retained

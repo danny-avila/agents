@@ -1,0 +1,335 @@
+import {
+  HumanMessage,
+  SystemMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
+import {
+  createCompactionCacheNamespace,
+  createCompactionReplayRecipe,
+  inspectCompactionReplayEligibility,
+  type CompactionReplayRecipe,
+  type CompactionReplayState,
+} from '@/llm/compactionReplay';
+import type * as t from '@/types';
+import { setProviderMessageProvenance } from '@/messages/provenance';
+import { Providers } from '@/common';
+
+function sourceMessage(id: string): HumanMessage {
+  const message = new HumanMessage({ content: id, id });
+  setProviderMessageProvenance(message, [
+    { attribution: 'user', sourceMessageId: id },
+  ]);
+  return message;
+}
+
+function createEnvelope(
+  overrides: Partial<{
+    provider: t.ProviderName;
+    modelId: string;
+    projectionMode: 'chat-messages' | 'openai-responses';
+    cacheNamespace: ReturnType<typeof createCompactionCacheNamespace>;
+    systemRevision: number;
+    toolRevision: number;
+    messages: BaseMessage[];
+  }> = {}
+): CompactionReplayRecipe {
+  const envelope = createCompactionReplayRecipe({
+    provider: overrides.provider ?? Providers.ANTHROPIC,
+    modelId: overrides.modelId ?? 'claude-sonnet',
+    projectionMode: overrides.projectionMode ?? 'chat-messages',
+    cacheNamespace:
+      overrides.cacheNamespace ??
+      createCompactionCacheNamespace(Providers.ANTHROPIC, {
+        baseURL: 'https://provider.test',
+      }),
+    systemRevision: overrides.systemRevision ?? 2,
+    toolRevision: overrides.toolRevision ?? 3,
+    messages: overrides.messages ?? [
+      new SystemMessage('stable'),
+      sourceMessage('a'),
+      sourceMessage('b'),
+      sourceMessage('c'),
+    ],
+  });
+  return envelope;
+}
+
+function inspect(
+  state: CompactionReplayState | undefined,
+  overrides: Partial<{
+    provider: t.ProviderName;
+    modelId: string;
+    projectionMode: 'chat-messages' | 'openai-responses';
+    cacheNamespace: ReturnType<typeof createCompactionCacheNamespace>;
+    systemRevision: number;
+    toolRevision: number;
+    messages: BaseMessage[];
+    restoredToolSubstitution: boolean;
+  }> = {}
+) {
+  return inspectCompactionReplayEligibility(state, {
+    provider: overrides.provider ?? Providers.ANTHROPIC,
+    modelId: overrides.modelId,
+    projectionMode: overrides.projectionMode,
+    cacheNamespace:
+      overrides.cacheNamespace ??
+      createCompactionCacheNamespace(Providers.ANTHROPIC, {
+        baseURL: 'https://provider.test',
+      }),
+    systemRevision: overrides.systemRevision ?? 2,
+    toolRevision: overrides.toolRevision ?? 3,
+    messages: overrides.messages ?? [sourceMessage('a'), sourceMessage('b')],
+    restoredToolSubstitution:
+      overrides.restoredToolSubstitution ?? false,
+  });
+}
+
+describe('compaction replay eligibility', () => {
+  it.each([
+    Providers.ANTHROPIC,
+    Providers.BEDROCK,
+    Providers.OPENROUTER,
+  ])('finds the exact source prefix for %s', (provider) => {
+    const envelope = createEnvelope({ provider });
+    const result = inspect(envelope, { provider });
+
+    expect(result).toEqual({
+      eligible: true,
+      replayMessageCount: 3,
+      replaySourceCount: 2,
+      requestSourceCount: 3,
+    });
+  });
+
+  it('inherits the captured model when no dedicated summary model is set', () => {
+    const envelope = createEnvelope();
+    expect(inspect(envelope)).toMatchObject({
+      eligible: true,
+    });
+  });
+
+  it('treats a changed prompt-cache marker policy as a namespace mismatch', () => {
+    const envelope = createEnvelope({
+      cacheNamespace: createCompactionCacheNamespace(Providers.ANTHROPIC, {
+        promptCache: true,
+        promptCacheTtl: '1h',
+      }),
+    });
+
+    expect(
+      inspect(
+        envelope,
+        {
+          cacheNamespace: createCompactionCacheNamespace(
+            Providers.ANTHROPIC,
+            {
+              promptCache: true,
+              promptCacheTtl: '5m',
+            }
+          ),
+        }
+      )
+    ).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_mismatch',
+    });
+  });
+
+  it('fails closed when a runtime provider cannot prove its cache namespace', () => {
+    const provider = 'runtime-provider' as t.ProviderName;
+    const cacheNamespace = createCompactionCacheNamespace(provider, {
+      baseURL: 'https://runtime-provider.test',
+    });
+    const recipe = createEnvelope({ provider, cacheNamespace });
+
+    expect(inspect(recipe, { provider, cacheNamespace })).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_unknown',
+    });
+  });
+
+  it('fails closed when cache identity contains an unsupported value', () => {
+    const cacheNamespace = createCompactionCacheNamespace(
+      Providers.ANTHROPIC,
+      { apiKey: () => 'dynamic-key' }
+    );
+    const recipe = createEnvelope({ cacheNamespace });
+
+    expect(inspect(recipe, { cacheNamespace })).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_unknown',
+    });
+  });
+
+  it.each([
+    ['no_request_snapshot', undefined, {}],
+    ['fallback_served_request', 'fallback', {}],
+    [
+      'provider_mismatch',
+      createEnvelope(),
+      { provider: Providers.OPENAI },
+    ],
+    [
+      'model_mismatch',
+      createEnvelope(),
+      { modelId: 'different-model' },
+    ],
+    [
+      'cache_namespace_mismatch',
+      createEnvelope(),
+      {
+        cacheNamespace: createCompactionCacheNamespace(Providers.ANTHROPIC, {
+          baseURL: 'https://other.test',
+        }),
+      },
+    ],
+    [
+      'system_projection_changed',
+      createEnvelope(),
+      { systemRevision: 4 },
+    ],
+    [
+      'tool_projection_changed',
+      createEnvelope(),
+      { toolRevision: 4 },
+    ],
+    [
+      'projection_mode_mismatch',
+      createEnvelope(),
+      { projectionMode: 'openai-responses' },
+    ],
+    [
+      'restored_tool_substitution',
+      createEnvelope(),
+      { restoredToolSubstitution: true },
+    ],
+    [
+      'source_not_prefix',
+      createEnvelope(),
+      { messages: [sourceMessage('b')] },
+    ],
+    [
+      'ambiguous_lineage',
+      createEnvelope(),
+      { messages: [new HumanMessage('missing id')] },
+    ],
+  ] as const)(
+    'fails closed with %s',
+    (reason, state, overrides) => {
+      expect(
+        inspect(
+          state as CompactionReplayState | undefined,
+          overrides as Parameters<typeof inspect>[1]
+        )
+      ).toMatchObject({ eligible: false, reason });
+    }
+  );
+
+  it('rejects a cut through one coalesced provider message', () => {
+    const coalesced = new HumanMessage({
+      content: 'a then b',
+      additional_kwargs: { sourceMessageIds: ['a', 'b'] },
+    });
+    const envelope = createEnvelope({
+      messages: [new SystemMessage('stable'), coalesced, sourceMessage('c')],
+    });
+
+    expect(inspect(envelope, { messages: [sourceMessage('a')] })).toMatchObject(
+      { eligible: false, reason: 'ambiguous_lineage' }
+    );
+  });
+
+  it('accepts a complete strict-alternation coalesced prefix', () => {
+    const coalesced = new HumanMessage({
+      content: 'a then b',
+      additional_kwargs: { sourceMessageIds: ['a', 'b'] },
+    });
+    const envelope = createEnvelope({
+      messages: [new SystemMessage('stable'), coalesced, sourceMessage('c')],
+    });
+
+    expect(
+      inspect(envelope, {
+        messages: [sourceMessage('a'), sourceMessage('b')],
+      })
+    ).toEqual({
+      eligible: true,
+      replayMessageCount: 2,
+      replaySourceCount: 2,
+      requestSourceCount: 3,
+    });
+  });
+
+  it('ignores a synthetic prior checkpoint when proving source order', () => {
+    const priorCheckpoint = new HumanMessage({
+      content: '<summary>prior checkpoint</summary>',
+      additional_kwargs: { injected: true, source: 'summary' },
+    });
+    const envelope = createEnvelope({
+      messages: [
+        new SystemMessage('stable'),
+        priorCheckpoint,
+        sourceMessage('a'),
+        sourceMessage('b'),
+        sourceMessage('c'),
+      ],
+    });
+
+    expect(
+      inspect(
+        envelope,
+        { messages: [priorCheckpoint, sourceMessage('a'), sourceMessage('b')] }
+      )
+    ).toEqual({
+      eligible: true,
+      replayMessageCount: 4,
+      replaySourceCount: 2,
+      requestSourceCount: 3,
+    });
+  });
+
+  it('retains only a frozen recipe container, not the live model', () => {
+    const envelope = createEnvelope();
+
+    expect(Object.isFrozen(envelope)).toBe(true);
+    expect('model' in envelope).toBe(false);
+  });
+
+  it('retains the prepared-message reference without mutating its messages', () => {
+    const messages = [sourceMessage('a'), sourceMessage('b')];
+    const before = [...messages];
+    const recipe = createEnvelope({ messages });
+
+    expect(recipe.messages).toBe(messages);
+    inspect(recipe, { messages: [sourceMessage('a')] });
+    expect(messages).toEqual(before);
+  });
+
+  it('treats a restored tool result as ineligible even with exact lineage', () => {
+    const tool = new ToolMessage({
+      content: 'result',
+      tool_call_id: 'call_1',
+      id: 'tool-source',
+    });
+    setProviderMessageProvenance(tool, [
+      { attribution: 'tool', sourceMessageId: 'tool-source' },
+    ]);
+    const envelope = createEnvelope({
+      messages: [new SystemMessage('stable'), sourceMessage('a'), tool],
+    });
+
+    expect(
+      inspect(
+        envelope,
+        {
+          messages: [sourceMessage('a'), tool],
+          restoredToolSubstitution: true,
+        }
+      )
+    ).toMatchObject({
+      eligible: false,
+      reason: 'restored_tool_substitution',
+    });
+  });
+});

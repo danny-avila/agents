@@ -39,6 +39,7 @@ import {
   StepTypes,
   Providers,
 } from '@/common';
+import { createCompactionCacheNamespace } from '@/llm/compactionReplay';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
@@ -367,6 +368,24 @@ function buildSummarizationClientConfig(
     promptText,
     updatePromptText,
   };
+}
+
+function resolveSummarizationModelId(
+  clientConfig: SummarizationClientConfig
+): string | undefined {
+  if (clientConfig.modelName != null && clientConfig.modelName !== '') {
+    return clientConfig.modelName;
+  }
+  const options = clientConfig.clientOptions as {
+    model?: unknown;
+    modelName?: unknown;
+  };
+  if (typeof options.model === 'string' && options.model !== '') {
+    return options.model;
+  }
+  return typeof options.modelName === 'string' && options.modelName !== ''
+    ? options.modelName
+    : undefined;
 }
 
 /** Computes the token count for a summary, preferring provider output tokens when available. */
@@ -1230,6 +1249,32 @@ export function createSummarizeNode({
         agentId: request.agentId,
       });
     };
+
+    if (process.env.AGENT_DEBUG_LOGGING === 'true') {
+      let restoredToolSubstitution = false;
+      if (restoredMessages !== state.messages && originalPending != null) {
+        for (const index of originalPending.keys()) {
+          if (
+            index < tailStartIndex &&
+            restoredMessages[index] !== state.messages[index]
+          ) {
+            restoredToolSubstitution = true;
+            break;
+          }
+        }
+      }
+      const compactionReplay = agentContext.inspectCompactionReplay({
+        provider: clientConfig.provider as t.ProviderName,
+        modelId: resolveSummarizationModelId(clientConfig),
+        cacheNamespace: createCompactionCacheNamespace(
+          clientConfig.provider as t.ProviderName,
+          clientConfig.clientOptions
+        ),
+        messages: messagesToRefine,
+        restoredToolSubstitution,
+      });
+      log('debug', 'Compaction replay eligibility', { ...compactionReplay });
+    }
 
     log('debug', 'Summarization starting', {
       messagesToRefineCount: messagesToRefine.length,

@@ -18,6 +18,8 @@
  *  - Multi-turn chat (frequent user messages): legacy's two rolling markers do
  *    fine here; the tail strategy ties (never worse).
  *  - Realistic agent (user turns interleaved with tool rounds): tail wins.
+ *  - Compaction summary: compares today's independent summary projection with
+ *    exact replay of the already-cached normal request plus one instruction.
  *
  * Metrics (per strategy, summed over all calls in a scenario)
  *  - cache_read   : tokens served from cache (HIGHER is better).
@@ -39,12 +41,14 @@
  * Not a unit test (no `.test.` suffix) so CI never runs it; it makes real,
  * paid API calls.
  */
+import { performance } from 'node:perf_hooks';
 import { config } from 'dotenv';
 config({ path: process.env.BENCH_ENV_FILE || '.env' });
 
 import {
   HumanMessage,
   AIMessage,
+  SystemMessage,
   ToolMessage,
   type BaseMessage,
 } from '@langchain/core/messages';
@@ -303,6 +307,7 @@ interface StrategyPair {
 
 function makeProvider(args: Args): {
   invoke: (messages: BaseMessage[]) => Promise<Usage | undefined>;
+  invokeTimed: (messages: BaseMessage[]) => Promise<TimedUsage>;
   strategies: StrategyPair;
   label: string;
 } {
@@ -327,6 +332,8 @@ function makeProvider(args: Args): {
       label: `bedrock:${model}`,
       invoke: async (messages) =>
         (await llm.invoke(messages)).usage_metadata as Usage,
+      invokeTimed: async (messages) =>
+        collectTimedStream(llm.stream(messages)),
       strategies: {
         legacy: (m) => addBedrockCacheControl<BaseMessage>(m),
         tail: (m) => addBedrockTailCacheControl<BaseMessage>(m),
@@ -347,6 +354,7 @@ function makeProvider(args: Args): {
     label: `anthropic:${model}`,
     invoke: async (messages) =>
       (await llm.invoke(messages)).usage_metadata as Usage,
+    invokeTimed: async (messages) => collectTimedStream(llm.stream(messages)),
     strategies: {
       legacy: (m) => addCacheControl<BaseMessage>(m),
       tail: (m) => addTailCacheControl<BaseMessage>(m),
@@ -403,6 +411,77 @@ async function runStrategy(
   return totals;
 }
 
+interface TimedUsage {
+  usage?: Usage;
+  timeToFirstTokenMs?: number;
+  latencyMs: number;
+}
+
+interface UsageChunk {
+  content?: unknown;
+  usage_metadata?: Usage;
+}
+
+function hasStreamContent(content: unknown): boolean {
+  if (typeof content === 'string') {
+    return content !== '';
+  }
+  return Array.isArray(content) ? content.length > 0 : content != null;
+}
+
+async function collectTimedStream(
+  streamPromise:
+    | AsyncIterable<UsageChunk>
+    | Promise<AsyncIterable<UsageChunk>>
+): Promise<TimedUsage> {
+  const startedAt = performance.now();
+  const stream = await streamPromise;
+  let usage: Usage | undefined;
+  let timeToFirstTokenMs: number | undefined;
+  for await (const chunk of stream) {
+    if (timeToFirstTokenMs == null && hasStreamContent(chunk.content)) {
+      timeToFirstTokenMs = performance.now() - startedAt;
+    }
+    if (chunk.usage_metadata != null) {
+      usage = chunk.usage_metadata;
+    }
+  }
+  return {
+    usage,
+    timeToFirstTokenMs,
+    latencyMs: performance.now() - startedAt,
+  };
+}
+
+async function runCompactionSummaryProbe(params: {
+  nonce: string;
+  replay: boolean;
+  apply: (m: BaseMessage[]) => BaseMessage[];
+  invokeTimed: (m: BaseMessage[]) => Promise<TimedUsage>;
+}): Promise<{ prime: TimedUsage; summary: TimedUsage; totals: Totals }> {
+  const history = toolLoopScenario(params.nonce, 5).at(-1) ?? [];
+  const normalRequest = params.apply([
+    new SystemMessage(
+      `Stable agent instructions for ${params.nonce}. ${filler(
+        STABLE_TOKENS,
+        `sys${params.nonce}`
+      )}`
+    ),
+    ...history,
+  ]);
+  const prime = await params.invokeTimed(normalRequest);
+  const compactionInstruction = new HumanMessage(
+    'Write a checkpoint that preserves completed work, exact identifiers, failures, and next actions.'
+  );
+  const summaryRequest = params.replay
+    ? [...normalRequest, compactionInstruction]
+    : params.apply([...history, compactionInstruction]);
+  const summary = await params.invokeTimed(summaryRequest);
+  const totals = emptyTotals();
+  addUsage(totals, summary.usage);
+  return { prime, summary, totals };
+}
+
 function pct(legacy: number, tail: number): string {
   if (legacy === 0) return tail === 0 ? '0%' : 'n/a';
   const delta = ((tail - legacy) / legacy) * 100;
@@ -426,7 +505,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const { invoke, strategies, label } = makeProvider(args);
+  const { invoke, invokeTimed, strategies, label } = makeProvider(args);
   console.log(`\nProvider: ${label}   rounds=${args.rounds}`);
   console.log(
     'Metrics summed over all calls in a scenario. read↑ better; fresh↓ and effective↓ better.\n'
@@ -467,6 +546,43 @@ async function main(): Promise<void> {
     scenarioCount++;
     if (better) tailWins++;
   }
+
+  const independent = await runCompactionSummaryProbe({
+    nonce: uniqueNonce('independent-summary'),
+    replay: false,
+    apply: strategies.tail,
+    invokeTimed,
+  });
+  const replay = await runCompactionSummaryProbe({
+    nonce: uniqueNonce('replayed-summary'),
+    replay: true,
+    apply: strategies.tail,
+    invokeTimed,
+  });
+  console.log('SCENARIO: Compaction summary request (2 calls per variant)');
+  console.log(
+    JSON.stringify({
+      independent: {
+        summaryUsage: independent.summary.usage,
+        summaryEffectiveInput: Math.round(independent.totals.effective),
+        summaryTimeToFirstTokenMs:
+          independent.summary.timeToFirstTokenMs == null
+            ? undefined
+            : Math.round(independent.summary.timeToFirstTokenMs),
+        summaryLatencyMs: Math.round(independent.summary.latencyMs),
+      },
+      exactReplay: {
+        summaryUsage: replay.summary.usage,
+        summaryEffectiveInput: Math.round(replay.totals.effective),
+        summaryTimeToFirstTokenMs:
+          replay.summary.timeToFirstTokenMs == null
+            ? undefined
+            : Math.round(replay.summary.timeToFirstTokenMs),
+        summaryLatencyMs: Math.round(replay.summary.latencyMs),
+      },
+      note: 'Each variant uses an isolated nonce and primes its own normal request before the measured summary call.',
+    })
+  );
 
   console.log(
     `RESULT: tail strategy is better-or-equal in ${tailWins}/${scenarioCount} scenarios.`

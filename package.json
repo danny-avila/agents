@@ -218,6 +218,7 @@
     "bench:cache": "tsx ./src/scripts/bench-prompt-cache.ts",
     "bench:context-pressure": "tsx ./src/scripts/bench-context-pressure-cache.ts",
     "bench:compaction-range": "tsx ./src/scripts/bench-compaction-range.ts",
+    "bench:compaction-replay": "tsx ./src/scripts/bench-compaction-replay.ts",
     "bench:provider-derivation": "tsx ./src/scripts/bench-provider-derivation.ts",
     "bench:provider-projection": "tsx ./src/scripts/bench-provider-request-projection.ts",
     "bench:execution-world": "tsx ./src/scripts/bench-execution-world.ts",

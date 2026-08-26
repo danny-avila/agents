@@ -7,6 +7,15 @@ import type {
   BaseMessageFields,
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
+import type {
+  CompactionCacheNamespace,
+  CompactionReplayEligibility,
+  CompactionReplayState,
+} from '@/llm/compactionReplay';
+import type {
+  PreparedProviderRequest,
+  ProviderMessageProjectionMode,
+} from '@/llm/prepareProviderRequest';
 import type { ExactTokenCountCache } from '@/llm/contextPressureMeter';
 import type * as t from '@/types';
 import {
@@ -50,6 +59,11 @@ import {
   Providers,
 } from '@/common';
 import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
+import {
+  createCompactionCacheNamespace,
+  createCompactionReplayRecipe,
+  inspectCompactionReplayEligibility,
+} from '@/llm/compactionReplay';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
@@ -338,6 +352,13 @@ export class AgentContext {
   >;
   /** Whether system runnable needs rebuild (set when discovered tools change) */
   private systemRunnableStale: boolean = true;
+  /** Monotonic identities for cache-relevant system and tool projections. */
+  private compactionSystemRevision = 0;
+  private compactionToolRevision = 0;
+  /** Latest successful normal-request recipe, or a fallback-served marker. */
+  private compactionReplayState?: CompactionReplayState;
+  /** Lazily derived because contexts without summarization never need it. */
+  private compactionCacheNamespace?: CompactionCacheNamespace;
   /** Promise for token calculation initialization */
   tokenCalculationPromise?: Promise<void>;
   /** Format content blocks as strings (for legacy compatibility) */
@@ -1191,6 +1212,9 @@ export class AgentContext {
     this.deferredToolNames = [];
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
+    this.compactionSystemRevision += 1;
+    this.compactionToolRevision += 1;
+    this.compactionReplayState = undefined;
     this.lastToken = undefined;
     this.indexTokenCountMap = { ...this.baseIndexTokenCountMap };
     this.currentUsage = undefined;
@@ -1452,6 +1476,7 @@ export class AgentContext {
   setHandoffContext(sourceAgentName: string, parallelSiblings: string[]): void {
     this.handoffContext = { sourceAgentName, parallelSiblings };
     this.systemRunnableStale = true;
+    this.compactionSystemRevision += 1;
   }
 
   /**
@@ -1462,6 +1487,7 @@ export class AgentContext {
     if (this.handoffContext) {
       this.handoffContext = undefined;
       this.systemRunnableStale = true;
+      this.compactionSystemRevision += 1;
     }
   }
 
@@ -1479,6 +1505,7 @@ export class AgentContext {
     this.durableSummaryPrecedesMessages = this.summaryPrecedesMessages;
     this._summaryVersion += 1;
     this.systemRunnableStale = true;
+    this.compactionSystemRevision += 1;
     this.pruneMessages = undefined;
   }
 
@@ -1493,6 +1520,7 @@ export class AgentContext {
     this.durableSummaryPrecedesMessages = false;
     this._summaryVersion += 1;
     this.systemRunnableStale = true;
+    this.compactionSystemRevision += 1;
   }
 
   /**
@@ -1699,6 +1727,7 @@ export class AgentContext {
       this.durableSummaryPrecedesMessages = false;
       this._summaryLocation = 'none';
       this.systemRunnableStale = true;
+      this.compactionSystemRevision += 1;
     }
   }
 
@@ -1950,6 +1979,8 @@ export class AgentContext {
     }
     if (hasNewDiscoveries) {
       this.systemRunnableStale = true;
+      this.compactionSystemRevision += 1;
+      this.compactionToolRevision += 1;
       /** Refresh schema token accounting so the next call's budget and
        *  per-tool breakdown include the newly discovered tools; awaited
        *  via tokenCalculationPromise before the next model call */
@@ -1960,6 +1991,46 @@ export class AgentContext {
       }
     }
     return hasNewDiscoveries;
+  }
+
+  captureCompactionReplayRecipe(request: PreparedProviderRequest): void {
+    this.compactionReplayState = createCompactionReplayRecipe({
+      provider: request.provider,
+      modelId: request.modelId,
+      projectionMode: request.projectionMode,
+      cacheNamespace: this.getCompactionCacheNamespace(),
+      systemRevision: this.compactionSystemRevision,
+      toolRevision: this.compactionToolRevision,
+      messages: request.messages,
+    });
+  }
+
+  /** Prevents a later compaction from attributing a fallback call to primary. */
+  markCompactionReplayFallbackServed(): void {
+    this.compactionReplayState = 'fallback';
+  }
+
+  private getCompactionCacheNamespace(): CompactionCacheNamespace {
+    this.compactionCacheNamespace ??= createCompactionCacheNamespace(
+      this.provider,
+      this.clientOptions
+    );
+    return this.compactionCacheNamespace;
+  }
+
+  inspectCompactionReplay(params: {
+    provider: t.ProviderName;
+    modelId?: string;
+    projectionMode?: ProviderMessageProjectionMode;
+    cacheNamespace: CompactionCacheNamespace;
+    messages: readonly BaseMessage[];
+    restoredToolSubstitution: boolean;
+  }): CompactionReplayEligibility {
+    return inspectCompactionReplayEligibility(this.compactionReplayState, {
+      ...params,
+      systemRevision: this.compactionSystemRevision,
+      toolRevision: this.compactionToolRevision,
+    });
   }
 
   /**

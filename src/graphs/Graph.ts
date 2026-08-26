@@ -3890,6 +3890,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               invokeConfig
             )
         );
+        if (agentContext.summarizationEnabled === true) {
+          agentContext.captureCompactionReplayRecipe(preparedRequest);
+        }
       } catch (primaryError) {
         clearCurrentDeltaStepMarkers({
           graph: this,
@@ -4150,6 +4153,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 },
               })
           );
+          if (agentContext.summarizationEnabled === true) {
+            agentContext.markCompactionReplayFallbackServed();
+          }
         } catch (fallbackError) {
           if (fallbackError instanceof StreamLimitExceededError) {
             /** Same treatment as the primary path: a fallback stream that
