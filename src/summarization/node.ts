@@ -6,6 +6,7 @@ import {
 } from '@langchain/core/messages';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { CompactionReplayRouteSnapshot } from '@/llm/compactionReplay';
 import type { StreamLimitState } from '@/llm/streamLimits';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { HookRegistry } from '@/hooks';
@@ -681,11 +682,10 @@ async function executeSummarizationWithFallback(params: {
   let summaryUsage: Partial<UsageMetadata> | undefined;
   let usedMetadataStub = false;
   let summarizationModel: t.ChatModel | undefined;
+  let compactionReplayRouteSnapshot: CompactionReplayRouteSnapshot | undefined;
   const summarizationTools = agentContext.getToolsForBinding();
 
-  const observeCompactionReplay = (
-    summarizerFallbackServed: boolean
-  ): void => {
+  const observeCompactionReplay = (summarizerFallbackServed: boolean): void => {
     if (process.env.AGENT_DEBUG_LOGGING !== 'true') {
       return;
     }
@@ -699,27 +699,27 @@ async function executeSummarizationWithFallback(params: {
         ? 'openai-responses'
         : 'chat-messages';
     }
-    const promptCacheEnabled = isCompactionPromptCacheEnabled(
-      clientConfig.provider as t.ProviderName,
-      clientConfig.clientOptions
-    );
+    const promptCacheEnabled =
+      compactionReplayRouteSnapshot?.promptCacheEnabled ?? false;
     const compactionReplay = agentContext.inspectCompactionReplay({
       provider: clientConfig.provider as t.ProviderName,
       modelId:
         resolveServingModelId(summarizationModel) ??
         resolveSummarizationModelId(clientConfig),
       projectionMode,
-      cacheNamespace: createCompactionCacheNamespace(
-        clientConfig.provider as t.ProviderName,
-        clientConfig.clientOptions
-      ),
+      cacheNamespace:
+        compactionReplayRouteSnapshot?.cacheNamespace ??
+        createCompactionCacheNamespace(
+          clientConfig.provider as t.ProviderName,
+          undefined,
+          false
+        ),
       promptCacheEnabled,
       systemProjectionFingerprint:
         EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
-      toolProjectionFingerprint:
-        promptCacheEnabled
-          ? createCompactionToolProjectionFingerprint(summarizationTools)
-          : undefined,
+      toolProjectionFingerprint: promptCacheEnabled
+        ? createCompactionToolProjectionFingerprint(summarizationTools)
+        : undefined,
       messages,
       restoredToolSubstitution,
       summarizerFallbackServed,
@@ -738,6 +738,18 @@ async function executeSummarizationWithFallback(params: {
       clientOptions: clientConfig.clientOptions as t.ClientOptions,
       tools: summarizationTools,
     }) as t.ChatModel;
+    if (process.env.AGENT_DEBUG_LOGGING === 'true') {
+      compactionReplayRouteSnapshot = Object.freeze({
+        cacheNamespace: createCompactionCacheNamespace(
+          clientConfig.provider as t.ProviderName,
+          clientConfig.clientOptions
+        ),
+        promptCacheEnabled: isCompactionPromptCacheEnabled(
+          clientConfig.provider as t.ProviderName,
+          clientConfig.clientOptions
+        ),
+      });
+    }
 
     const result = await summarizeWithCacheHit({
       model: summarizationModel,

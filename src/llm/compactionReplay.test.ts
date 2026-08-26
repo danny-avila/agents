@@ -66,7 +66,10 @@ function createEnvelope(
       createCompactionToolProjectionFingerprint(undefined),
     systemRevision: overrides.systemRevision ?? 2,
     toolRevision: overrides.toolRevision ?? 3,
-    messages: overrides.messages ?? [new SystemMessage('stable'), ...sourceMessages],
+    messages: overrides.messages ?? [
+      new SystemMessage('stable'),
+      ...sourceMessages,
+    ],
     sourceMessages,
   });
   return envelope;
@@ -109,28 +112,26 @@ function inspect(
     systemRevision: overrides.systemRevision ?? 2,
     toolRevision: overrides.toolRevision ?? 3,
     messages: overrides.messages ?? [sourceMessage('a'), sourceMessage('b')],
-    restoredToolSubstitution:
-      overrides.restoredToolSubstitution ?? false,
+    restoredToolSubstitution: overrides.restoredToolSubstitution ?? false,
     summarizerFallbackServed: overrides.summarizerFallbackServed,
   });
 }
 
 describe('compaction replay eligibility', () => {
-  it.each([
-    Providers.ANTHROPIC,
-    Providers.BEDROCK,
-    Providers.OPENROUTER,
-  ])('finds the exact source prefix for %s', (provider) => {
-    const envelope = createEnvelope({ provider });
-    const result = inspect(envelope, { provider });
+  it.each([Providers.ANTHROPIC, Providers.BEDROCK, Providers.OPENROUTER])(
+    'finds the exact source prefix for %s',
+    (provider) => {
+      const envelope = createEnvelope({ provider });
+      const result = inspect(envelope, { provider });
 
-    expect(result).toEqual({
-      eligible: true,
-      replayMessageCount: 3,
-      replaySourceCount: 2,
-      requestSourceCount: 3,
-    });
-  });
+      expect(result).toEqual({
+        eligible: true,
+        replayMessageCount: 3,
+        replaySourceCount: 2,
+        requestSourceCount: 3,
+      });
+    }
+  );
 
   it('inherits the captured model when no dedicated summary model is set', () => {
     const envelope = createEnvelope();
@@ -149,19 +150,13 @@ describe('compaction replay eligibility', () => {
     });
 
     expect(
-      inspect(
-        envelope,
-        {
-          cacheNamespace: createCompactionCacheNamespace(
-            Providers.ANTHROPIC,
-            {
-              apiKey: 'test-key',
-              promptCache: true,
-              promptCacheTtl: '5m',
-            }
-          ),
-        }
-      )
+      inspect(envelope, {
+        cacheNamespace: createCompactionCacheNamespace(Providers.ANTHROPIC, {
+          apiKey: 'test-key',
+          promptCache: true,
+          promptCacheTtl: '5m',
+        }),
+      })
     ).toMatchObject({
       eligible: false,
       reason: 'cache_namespace_mismatch',
@@ -180,10 +175,10 @@ describe('compaction replay eligibility', () => {
 
       expect(
         inspect(recipe, {
-          cacheNamespace: createCompactionCacheNamespace(
-            Providers.ANTHROPIC,
-            { apiKey: 'shared-key', [key]: 'summary' }
-          ),
+          cacheNamespace: createCompactionCacheNamespace(Providers.ANTHROPIC, {
+            apiKey: 'shared-key',
+            [key]: 'summary',
+          }),
         })
       ).toMatchObject({
         eligible: false,
@@ -197,19 +192,19 @@ describe('compaction replay eligibility', () => {
     (key) => {
       const recipe = createEnvelope({
         provider: Providers.AZURE,
-        cacheNamespace: createCompactionCacheNamespace(
-          Providers.AZURE,
-          { azureOpenAIApiKey: 'shared-key', [key]: 'primary' }
-        ),
+        cacheNamespace: createCompactionCacheNamespace(Providers.AZURE, {
+          azureOpenAIApiKey: 'shared-key',
+          [key]: 'primary',
+        }),
       });
 
       expect(
         inspect(recipe, {
           provider: Providers.AZURE,
-          cacheNamespace: createCompactionCacheNamespace(
-            Providers.AZURE,
-            { azureOpenAIApiKey: 'shared-key', [key]: 'summary' }
-          ),
+          cacheNamespace: createCompactionCacheNamespace(Providers.AZURE, {
+            azureOpenAIApiKey: 'shared-key',
+            [key]: 'summary',
+          }),
         })
       ).toMatchObject({
         eligible: false,
@@ -247,25 +242,19 @@ describe('compaction replay eligibility', () => {
   it('includes the Vertex project ID in cache identity', () => {
     const recipe = createEnvelope({
       provider: Providers.VERTEXAI,
-      cacheNamespace: createCompactionCacheNamespace(
-        Providers.VERTEXAI,
-        {
-          credentials: { client_email: 'test@example.test' },
-          projectId: 'primary-project',
-        }
-      ),
+      cacheNamespace: createCompactionCacheNamespace(Providers.VERTEXAI, {
+        credentials: { client_email: 'test@example.test' },
+        projectId: 'primary-project',
+      }),
     });
 
     expect(
       inspect(recipe, {
         provider: Providers.VERTEXAI,
-        cacheNamespace: createCompactionCacheNamespace(
-          Providers.VERTEXAI,
-          {
-            credentials: { client_email: 'test@example.test' },
-            projectId: 'summary-project',
-          }
-        ),
+        cacheNamespace: createCompactionCacheNamespace(Providers.VERTEXAI, {
+          credentials: { client_email: 'test@example.test' },
+          projectId: 'summary-project',
+        }),
       })
     ).toMatchObject({
       eligible: false,
@@ -299,10 +288,9 @@ describe('compaction replay eligibility', () => {
 
     expect(
       inspect(recipe, {
-        cacheNamespace: createCompactionCacheNamespace(
-          Providers.ANTHROPIC,
-          { apiKey: 'test-key' }
-        ),
+        cacheNamespace: createCompactionCacheNamespace(Providers.ANTHROPIC, {
+          apiKey: 'test-key',
+        }),
       })
     ).toMatchObject({
       eligible: false,
@@ -358,14 +346,59 @@ describe('compaction replay eligibility', () => {
     expect(
       inspect(recipe, {
         provider: Providers.OPENROUTER,
-        cacheNamespace: createCompactionCacheNamespace(
-          Providers.OPENROUTER,
-          {
-            apiKey: 'test-key',
-            modelKwargs: { provider: { order: ['google'] } },
-            promptCache: true,
-          }
-        ),
+        cacheNamespace: createCompactionCacheNamespace(Providers.OPENROUTER, {
+          apiKey: 'test-key',
+          modelKwargs: { provider: { order: ['google'] } },
+          promptCache: true,
+        }),
+      })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_mismatch',
+    });
+  });
+
+  it('includes the Bedrock application inference profile in cache identity', () => {
+    const recipe = createEnvelope({
+      provider: Providers.BEDROCK,
+      cacheNamespace: createCompactionCacheNamespace(Providers.BEDROCK, {
+        credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+        applicationInferenceProfile: 'arn:primary',
+        promptCache: true,
+      }),
+    });
+
+    expect(
+      inspect(recipe, {
+        provider: Providers.BEDROCK,
+        cacheNamespace: createCompactionCacheNamespace(Providers.BEDROCK, {
+          credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+          applicationInferenceProfile: 'arn:summary',
+          promptCache: true,
+        }),
+      })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_mismatch',
+    });
+  });
+
+  it('includes OpenAI explicit cache projection mode in cache identity', () => {
+    const recipe = createEnvelope({
+      provider: Providers.OPENAI,
+      cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
+        apiKey: 'test-key',
+        promptCacheExplicit: true,
+      }),
+    });
+
+    expect(
+      inspect(recipe, {
+        provider: Providers.OPENAI,
+        cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
+          apiKey: 'test-key',
+          promptCacheExplicit: false,
+        }),
       })
     ).toMatchObject({
       eligible: false,
@@ -374,10 +407,9 @@ describe('compaction replay eligibility', () => {
   });
 
   it('fails closed when credentials come from an opaque external source', () => {
-    const cacheNamespace = createCompactionCacheNamespace(
-      Providers.ANTHROPIC,
-      { baseURL: 'https://provider.test' }
-    );
+    const cacheNamespace = createCompactionCacheNamespace(Providers.ANTHROPIC, {
+      baseURL: 'https://provider.test',
+    });
     const recipe = createEnvelope({ cacheNamespace });
 
     expect(inspect(recipe, { cacheNamespace })).toMatchObject({
@@ -507,10 +539,9 @@ describe('compaction replay eligibility', () => {
   });
 
   it('fails closed when cache identity contains an unsupported value', () => {
-    const cacheNamespace = createCompactionCacheNamespace(
-      Providers.ANTHROPIC,
-      { apiKey: () => 'dynamic-key' }
-    );
+    const cacheNamespace = createCompactionCacheNamespace(Providers.ANTHROPIC, {
+      apiKey: () => 'dynamic-key',
+    });
     const recipe = createEnvelope({ cacheNamespace });
 
     expect(inspect(recipe, { cacheNamespace })).toMatchObject({
@@ -524,7 +555,10 @@ describe('compaction replay eligibility', () => {
 
     expect(
       inspect(recipe, {
-        messages: [sourceMessage('a'), new HumanMessage({ content: 'changed', id: 'b' })],
+        messages: [
+          sourceMessage('a'),
+          new HumanMessage({ content: 'changed', id: 'b' }),
+        ],
       })
     ).toMatchObject({
       eligible: false,
@@ -540,16 +574,8 @@ describe('compaction replay eligibility', () => {
       createEnvelope(),
       { summarizerFallbackServed: true },
     ],
-    [
-      'provider_mismatch',
-      createEnvelope(),
-      { provider: Providers.OPENAI },
-    ],
-    [
-      'model_mismatch',
-      createEnvelope(),
-      { modelId: 'different-model' },
-    ],
+    ['provider_mismatch', createEnvelope(), { provider: Providers.OPENAI }],
+    ['model_mismatch', createEnvelope(), { modelId: 'different-model' }],
     [
       'cache_namespace_mismatch',
       createEnvelope(),
@@ -560,16 +586,8 @@ describe('compaction replay eligibility', () => {
         }),
       },
     ],
-    [
-      'system_projection_changed',
-      createEnvelope(),
-      { systemRevision: 4 },
-    ],
-    [
-      'tool_projection_changed',
-      createEnvelope(),
-      { toolRevision: 4 },
-    ],
+    ['system_projection_changed', createEnvelope(), { systemRevision: 4 }],
+    ['tool_projection_changed', createEnvelope(), { toolRevision: 4 }],
     [
       'projection_mode_mismatch',
       createEnvelope(),
@@ -580,27 +598,20 @@ describe('compaction replay eligibility', () => {
       createEnvelope(),
       { restoredToolSubstitution: true },
     ],
-    [
-      'source_not_prefix',
-      createEnvelope(),
-      { messages: [sourceMessage('b')] },
-    ],
+    ['source_not_prefix', createEnvelope(), { messages: [sourceMessage('b')] }],
     [
       'ambiguous_lineage',
       createEnvelope(),
       { messages: [new HumanMessage('missing id')] },
     ],
-  ] as const)(
-    'fails closed with %s',
-    (reason, state, overrides) => {
-      expect(
-        inspect(
-          state as CompactionReplayState | undefined,
-          overrides as Parameters<typeof inspect>[1]
-        )
-      ).toMatchObject({ eligible: false, reason });
-    }
-  );
+  ] as const)('fails closed with %s', (reason, state, overrides) => {
+    expect(
+      inspect(
+        state as CompactionReplayState | undefined,
+        overrides as Parameters<typeof inspect>[1]
+      )
+    ).toMatchObject({ eligible: false, reason });
+  });
 
   it('rejects a cut through one coalesced provider message', () => {
     const coalesced = new HumanMessage({
@@ -609,7 +620,11 @@ describe('compaction replay eligibility', () => {
     });
     const envelope = createEnvelope({
       messages: [new SystemMessage('stable'), coalesced, sourceMessage('c')],
-      sourceMessages: [sourceMessage('a'), sourceMessage('b'), sourceMessage('c')],
+      sourceMessages: [
+        sourceMessage('a'),
+        sourceMessage('b'),
+        sourceMessage('c'),
+      ],
     });
 
     expect(inspect(envelope, { messages: [sourceMessage('a')] })).toMatchObject(
@@ -624,7 +639,11 @@ describe('compaction replay eligibility', () => {
     });
     const envelope = createEnvelope({
       messages: [new SystemMessage('stable'), coalesced, sourceMessage('c')],
-      sourceMessages: [sourceMessage('a'), sourceMessage('b'), sourceMessage('c')],
+      sourceMessages: [
+        sourceMessage('a'),
+        sourceMessage('b'),
+        sourceMessage('c'),
+      ],
     });
 
     expect(
@@ -636,6 +655,40 @@ describe('compaction replay eligibility', () => {
       replayMessageCount: 2,
       replaySourceCount: 2,
       requestSourceCount: 3,
+    });
+  });
+
+  it('includes every repeated artifact projection at the replay boundary', () => {
+    const firstArtifact = new ToolMessage({
+      content: 'first placeholder',
+      tool_call_id: 'call_1',
+      additional_kwargs: { sourceMessageIds: ['a'] },
+    });
+    const secondArtifact = new ToolMessage({
+      content: 'second placeholder',
+      tool_call_id: 'call_2',
+      additional_kwargs: { sourceMessageIds: ['b'] },
+    });
+    const aggregate = new HumanMessage({
+      content: 'expanded artifacts',
+      additional_kwargs: { sourceMessageIds: ['a', 'b'] },
+    });
+    const sourceMessages = [sourceMessage('a'), sourceMessage('b')];
+    const envelope = createEnvelope({
+      messages: [
+        new SystemMessage('stable'),
+        firstArtifact,
+        secondArtifact,
+        aggregate,
+      ],
+      sourceMessages,
+    });
+
+    expect(inspect(envelope, { messages: sourceMessages })).toEqual({
+      eligible: true,
+      replayMessageCount: 4,
+      replaySourceCount: 2,
+      requestSourceCount: 2,
     });
   });
 
@@ -661,10 +714,9 @@ describe('compaction replay eligibility', () => {
     });
 
     expect(
-      inspect(
-        envelope,
-        { messages: [priorCheckpoint, sourceMessage('a'), sourceMessage('b')] }
-      )
+      inspect(envelope, {
+        messages: [priorCheckpoint, sourceMessage('a'), sourceMessage('b')],
+      })
     ).toEqual({
       eligible: true,
       replayMessageCount: 4,
@@ -705,13 +757,10 @@ describe('compaction replay eligibility', () => {
     });
 
     expect(
-      inspect(
-        envelope,
-        {
-          messages: [sourceMessage('a'), tool],
-          restoredToolSubstitution: true,
-        }
-      )
+      inspect(envelope, {
+        messages: [sourceMessage('a'), tool],
+        restoredToolSubstitution: true,
+      })
     ).toMatchObject({
       eligible: false,
       reason: 'restored_tool_substitution',

@@ -2944,6 +2944,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           .withConfig({ runName: AGENT_MODEL_CALL_RUN_NAME });
       }
 
+      const compactionReplayRouteSnapshot =
+        agentContext.summarizationEnabled === true &&
+        process.env.AGENT_DEBUG_LOGGING === 'true'
+          ? agentContext.createCompactionReplayRouteSnapshot(
+            this.overrideModel == null
+          )
+          : undefined;
+
       if (agentContext.tokenCalculationPromise) {
         await agentContext.tokenCalculationPromise;
       }
@@ -3898,7 +3906,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             preparedRequest,
             messagesToUse,
             this.overrideModel == null,
-            toolsForBinding
+            toolsForBinding,
+            compactionReplayRouteSnapshot
           );
         }
       } catch (primaryError) {

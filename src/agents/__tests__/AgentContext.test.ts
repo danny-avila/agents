@@ -184,6 +184,52 @@ describe('AgentContext', () => {
       ).toMatchObject({ eligible: true });
     });
 
+    it('retains the route snapshot taken before an in-flight mutation', () => {
+      const ctx = createReplayContext();
+      const message = new HumanMessage({ content: 'hello', id: 'source-1' });
+      ctx.clientOptions = { apiKey: 'serving-key' } as t.ClientOptions;
+      const servingRoute = ctx.createCompactionReplayRouteSnapshot();
+      ctx.clientOptions = { apiKey: 'next-key' } as t.ClientOptions;
+      const request = prepareProviderRequest({
+        model: new FakeListChatModel({ responses: ['ok'] }) as t.ChatModel,
+        messages: [message],
+        provider: Providers.OPENAI,
+      });
+
+      ctx.captureCompactionReplayRecipe(
+        request,
+        [message],
+        true,
+        undefined,
+        servingRoute
+      );
+
+      expect(
+        ctx.inspectCompactionReplay({
+          provider: Providers.OPENAI,
+          cacheNamespace: servingRoute.cacheNamespace,
+          ...replayIdentity,
+          messages: [message],
+          restoredToolSubstitution: false,
+        })
+      ).toMatchObject({ eligible: true });
+      expect(
+        ctx.inspectCompactionReplay({
+          provider: Providers.OPENAI,
+          cacheNamespace: createCompactionCacheNamespace(
+            Providers.OPENAI,
+            ctx.clientOptions
+          ),
+          ...replayIdentity,
+          messages: [message],
+          restoredToolSubstitution: false,
+        })
+      ).toMatchObject({
+        eligible: false,
+        reason: 'cache_namespace_mismatch',
+      });
+    });
+
     it('distinguishes tool discovery from system-only projection changes', () => {
       const createRecordedContext = (): {
         ctx: AgentContext;

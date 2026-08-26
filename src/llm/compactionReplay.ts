@@ -64,6 +64,11 @@ export interface CompactionCacheNamespace {
   >;
 }
 
+export interface CompactionReplayRouteSnapshot {
+  readonly cacheNamespace: CompactionCacheNamespace;
+  readonly promptCacheEnabled: boolean;
+}
+
 interface CompactionReplayCandidate {
   readonly provider: t.ProviderName;
   readonly modelId?: string;
@@ -111,6 +116,7 @@ const CACHE_NAMESPACE_KEYS = [
   'authOptions',
   'profile',
   'promptCache',
+  'promptCacheExplicit',
   'promptCacheTtl',
   'customHeaders',
   'defaultHeaders',
@@ -120,36 +126,36 @@ const CACHE_NAMESPACE_KEYS = [
   'thinkingBudget',
   'additionalModelRequestFields',
   'modelKwargs',
+  'applicationInferenceProfile',
   'azureADTokenProvider',
 ] as const;
 
 const BUILT_IN_PROVIDER_NAMES = new Set<string>(Object.values(Providers));
 
-const PROVIDER_CREDENTIAL_KEYS: Partial<
-  Record<Providers, readonly string[]>
-> = {
-  [Providers.OPENAI]: ['apiKey', 'openAIApiKey'],
-  [Providers.AZURE]: [
-    'apiKey',
-    'openAIApiKey',
-    'azureOpenAIApiKey',
-    'azureADTokenProvider',
-  ],
-  [Providers.ANTHROPIC]: ['apiKey', 'anthropicApiKey'],
-  [Providers.BEDROCK]: [
-    'credentials',
-    'awsAccessKeyId',
-    'awsSecretAccessKey',
-  ],
-  [Providers.VERTEXAI]: ['credentials'],
-  [Providers.GOOGLE]: ['apiKey', 'googleApiKey'],
-  [Providers.MISTRALAI]: ['apiKey'],
-  [Providers.MISTRAL]: ['apiKey'],
-  [Providers.DEEPSEEK]: ['apiKey'],
-  [Providers.OPENROUTER]: ['apiKey', 'openAIApiKey'],
-  [Providers.XAI]: ['apiKey'],
-  [Providers.MOONSHOT]: ['apiKey', 'openAIApiKey'],
-};
+const PROVIDER_CREDENTIAL_KEYS: Partial<Record<Providers, readonly string[]>> =
+  {
+    [Providers.OPENAI]: ['apiKey', 'openAIApiKey'],
+    [Providers.AZURE]: [
+      'apiKey',
+      'openAIApiKey',
+      'azureOpenAIApiKey',
+      'azureADTokenProvider',
+    ],
+    [Providers.ANTHROPIC]: ['apiKey', 'anthropicApiKey'],
+    [Providers.BEDROCK]: [
+      'credentials',
+      'awsAccessKeyId',
+      'awsSecretAccessKey',
+    ],
+    [Providers.VERTEXAI]: ['credentials'],
+    [Providers.GOOGLE]: ['apiKey', 'googleApiKey'],
+    [Providers.MISTRALAI]: ['apiKey'],
+    [Providers.MISTRAL]: ['apiKey'],
+    [Providers.DEEPSEEK]: ['apiKey'],
+    [Providers.OPENROUTER]: ['apiKey', 'openAIApiKey'],
+    [Providers.XAI]: ['apiKey'],
+    [Providers.MOONSHOT]: ['apiKey', 'openAIApiKey'],
+  };
 
 interface EnvironmentRouteIdentity {
   readonly environmentKey: string;
@@ -467,8 +473,8 @@ export function createCompactionCacheNamespace(
     }
     entries.push(Object.freeze([key, fingerprint] as const));
   }
-  for (const route of
-    PROVIDER_ENVIRONMENT_ROUTES[provider as Providers] ?? []) {
+  for (const route of PROVIDER_ENVIRONMENT_ROUTES[provider as Providers] ??
+    []) {
     let overridden = false;
     for (const path of route.optionPaths) {
       const defined = hasDefinedOptionPath(options, path);
@@ -568,12 +574,15 @@ interface SourceLineage {
 
 function appendUniqueSourceIds(
   target: string[],
-  sourceIds: readonly string[]
+  sourceIds: readonly string[],
+  seen: Set<string>
 ): void {
   for (const sourceId of sourceIds) {
-    if (target[target.length - 1] !== sourceId) {
-      target.push(sourceId);
+    if (seen.has(sourceId)) {
+      continue;
     }
+    seen.add(sourceId);
+    target.push(sourceId);
   }
 }
 
@@ -582,6 +591,7 @@ function inspectSourceLineage(
 ): SourceLineage | undefined {
   const sourceMessageIds: string[] = [];
   const messageSourceCounts: number[] = [];
+  const seenSourceMessageIds = new Set<string>();
 
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i];
@@ -601,7 +611,7 @@ function inspectSourceLineage(
       messageSourceCounts.push(sourceMessageIds.length);
       continue;
     }
-    appendUniqueSourceIds(sourceMessageIds, ids);
+    appendUniqueSourceIds(sourceMessageIds, ids, seenSourceMessageIds);
     messageSourceCounts.push(sourceMessageIds.length);
   }
 
@@ -681,10 +691,7 @@ export function inspectCompactionReplayEligibility(
       requestSourceCount
     );
   }
-  if (
-    candidate.modelId != null &&
-    recipe.modelId !== candidate.modelId
-  ) {
+  if (candidate.modelId != null && recipe.modelId !== candidate.modelId) {
     return ineligible('model_mismatch', replaySourceCount, requestSourceCount);
   }
   if (!recipe.cacheNamespace.complete || !candidate.cacheNamespace.complete) {
@@ -719,8 +726,7 @@ export function inspectCompactionReplayEligibility(
     );
   }
   if (
-    recipe.systemProjectionFingerprint !==
-    candidate.systemProjectionFingerprint
+    recipe.systemProjectionFingerprint !== candidate.systemProjectionFingerprint
   ) {
     return ineligible(
       'system_projection_changed',

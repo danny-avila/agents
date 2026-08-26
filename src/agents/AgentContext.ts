@@ -10,6 +10,7 @@ import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type {
   CompactionCacheNamespace,
   CompactionReplayEligibility,
+  CompactionReplayRouteSnapshot,
   CompactionReplayState,
 } from '@/llm/compactionReplay';
 import type {
@@ -1998,34 +1999,42 @@ export class AgentContext {
     request: PreparedProviderRequest,
     sourceMessages: readonly BaseMessage[],
     servingRouteKnown = true,
-    tools?: t.GraphTools
+    tools?: t.GraphTools,
+    routeSnapshot = this.createCompactionReplayRouteSnapshot(servingRouteKnown)
   ): void {
-    const promptCacheEnabled = isCompactionPromptCacheEnabled(
-      this.provider,
-      this.clientOptions
-    );
     this.compactionReplayState = createCompactionReplayRecipe({
       provider: request.provider,
       modelId: request.modelId,
       projectionMode: request.projectionMode,
+      cacheNamespace: routeSnapshot.cacheNamespace,
+      promptCacheEnabled: routeSnapshot.promptCacheEnabled,
+      systemProjectionFingerprint:
+        this.systemRunnable == null
+          ? EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT
+          : undefined,
+      toolProjectionFingerprint: routeSnapshot.promptCacheEnabled
+        ? createCompactionToolProjectionFingerprint(tools)
+        : undefined,
+      systemRevision: this.compactionSystemRevision,
+      toolRevision: this.compactionToolRevision,
+      messages: request.messages,
+      sourceMessages,
+    });
+  }
+
+  createCompactionReplayRouteSnapshot(
+    servingRouteKnown = true
+  ): CompactionReplayRouteSnapshot {
+    return Object.freeze({
       cacheNamespace: createCompactionCacheNamespace(
         this.provider,
         this.clientOptions,
         servingRouteKnown
       ),
-      promptCacheEnabled,
-      systemProjectionFingerprint:
-        this.systemRunnable == null
-          ? EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT
-          : undefined,
-      toolProjectionFingerprint:
-        promptCacheEnabled
-          ? createCompactionToolProjectionFingerprint(tools)
-          : undefined,
-      systemRevision: this.compactionSystemRevision,
-      toolRevision: this.compactionToolRevision,
-      messages: request.messages,
-      sourceMessages,
+      promptCacheEnabled: isCompactionPromptCacheEnabled(
+        this.provider,
+        this.clientOptions
+      ),
     });
   }
 
