@@ -3,7 +3,11 @@ import type { Tool, ToolConfiguration } from '@aws-sdk/client-bedrock-runtime';
 import type { OpenAIClient } from '@langchain/openai';
 import type { DocumentType } from '@smithy/types';
 import type { GraphTools } from '@/types';
-import { buildBedrockCachePoint, type PromptCacheTtl } from '@/messages/cache';
+import {
+  buildBedrockCachePoint,
+  supportsBedrockToolCache,
+  type PromptCacheTtl,
+} from '@/messages/cache';
 import { requireInternalModule } from '@/lazyRequire';
 
 /** Loads with the first Bedrock request rather than alongside every graph. */
@@ -145,6 +149,21 @@ export function partitionAndMarkBedrockToolCache(
   );
 
   return [...staticTools, ...deferredTools] as GraphTools;
+}
+
+export function prepareBedrockToolsForPromptCache(
+  tools: GraphTools | undefined,
+  isDeferred: (toolName: string) => boolean,
+  promptCacheEnabled: boolean,
+  model?: string
+): GraphTools | undefined {
+  if (
+    !promptCacheEnabled ||
+    (model != null && !supportsBedrockToolCache(model))
+  ) {
+    return tools;
+  }
+  return partitionAndMarkBedrockToolCache(tools, isDeferred) ?? tools;
 }
 
 export function insertBedrockToolCachePoint(

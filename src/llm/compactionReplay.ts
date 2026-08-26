@@ -20,7 +20,8 @@ export interface CompactionReplayRecipe {
   readonly toolProjectionFingerprint?: string;
   readonly systemRevision: number;
   readonly toolRevision: number;
-  readonly messages: readonly BaseMessage[];
+  readonly messageFingerprints?: readonly string[];
+  readonly sourceLineage?: SourceLineage;
   readonly sourceMessageFingerprints?: readonly string[];
 }
 
@@ -176,6 +177,14 @@ const PROVIDER_ENVIRONMENT_ROUTES: Partial<
     {
       environmentKey: 'OPENAI_BASE_URL',
       optionPaths: [['baseURL'], ['baseUrl'], ['configuration', 'baseURL']],
+    },
+    {
+      environmentKey: 'OPENAI_ORG_ID',
+      optionPaths: [['organization']],
+    },
+    {
+      environmentKey: 'OPENAI_PROJECT_ID',
+      optionPaths: [['project']],
     },
   ],
   [Providers.AZURE]: [
@@ -658,10 +667,10 @@ function inspectSourceLineage(
     messageSourceCounts.push(sourceMessageIds.length);
   }
 
-  return {
+  return Object.freeze({
     sourceMessageIds: Object.freeze(sourceMessageIds),
     messageSourceCounts: Object.freeze(messageSourceCounts),
-  };
+  });
 }
 
 export function createCompactionReplayRecipe(params: {
@@ -687,7 +696,8 @@ export function createCompactionReplayRecipe(params: {
     toolProjectionFingerprint: params.toolProjectionFingerprint,
     systemRevision: params.systemRevision,
     toolRevision: params.toolRevision,
-    messages: params.messages,
+    messageFingerprints: fingerprintMessages(params.messages),
+    sourceLineage: inspectSourceLineage(params.messages),
     sourceMessageFingerprints: fingerprintMessages(params.sourceMessages),
   });
 }
@@ -727,7 +737,7 @@ export function inspectCompactionReplayEligibility(
     return ineligible('fallback_served_request', replaySourceCount, 0);
   }
   const recipe = state;
-  const requestLineage = inspectSourceLineage(recipe.messages);
+  const requestLineage = recipe.sourceLineage;
   const requestSourceCount = requestLineage?.sourceMessageIds.length ?? 0;
   if (recipe.provider !== candidate.provider) {
     return ineligible(
@@ -938,7 +948,7 @@ export function inspectCompactionReplayEligibility(
       );
     }
     for (let i = 0; i < replayMessageCount; i++) {
-      const requestFingerprint = fingerprintMessage(recipe.messages[i]);
+      const requestFingerprint = recipe.messageFingerprints?.[i];
       const candidateFingerprint = fingerprintMessage(
         candidate.projectedMessages[i]
       );

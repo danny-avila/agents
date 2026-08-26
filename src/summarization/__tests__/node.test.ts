@@ -10,6 +10,7 @@ import {
   resolveBedrockCompactionCacheModel,
 } from '@/summarization/node';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
+import { createCompactionToolProjectionFingerprint } from '@/llm/compactionReplay';
 import { convertInjectedMessages } from '@/messages/injected';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { AgentContext } from '@/agents/AgentContext';
@@ -327,6 +328,167 @@ describe('createSummarizeNode', () => {
           modelId: 'actual-summary-model',
           projectionMode: 'openai-responses',
           summarizerFallbackServed: false,
+        })
+      );
+    } finally {
+      if (previousDebugLogging == null) {
+        delete process.env.AGENT_DEBUG_LOGGING;
+      } else {
+        process.env.AGENT_DEBUG_LOGGING = previousDebugLogging;
+      }
+    }
+  });
+
+  it('honors an effective summarization prompt-cache override', async () => {
+    const previousDebugLogging = process.env.AGENT_DEBUG_LOGGING;
+    process.env.AGENT_DEBUG_LOGGING = 'true';
+    try {
+      jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+        class {
+          constructor() {
+            return mockInvokeModel('Summary text');
+          }
+        } as never
+      );
+
+      const agentContext = createAgentContext({
+        provider: Providers.BEDROCK,
+        clientOptions: {
+          model: 'anthropic.claude-sonnet',
+          promptCache: true,
+        },
+        summarizationConfig: {
+          retainRecent: { turns: 0 },
+          parameters: { promptCache: false },
+        },
+      });
+      const inspect = jest
+        .spyOn(agentContext, 'inspectCompactionReplay')
+        .mockReturnValue({
+          eligible: false,
+          reason: 'prompt_cache_disabled',
+          replaySourceCount: 0,
+          requestSourceCount: 0,
+        });
+      const node = createSummarizeNode({
+        agentContext,
+        graph: mockGraph(),
+        generateStepId,
+      });
+
+      await node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+
+      expect(inspect).toHaveBeenCalledWith(
+        expect.objectContaining({
+          promptCacheEnabled: false,
+          toolProjectionFingerprint: undefined,
+        })
+      );
+    } finally {
+      if (previousDebugLogging == null) {
+        delete process.env.AGENT_DEBUG_LOGGING;
+      } else {
+        process.env.AGENT_DEBUG_LOGGING = previousDebugLogging;
+      }
+    }
+  });
+
+  it('fingerprints the Bedrock tools actually bound by the summarizer', async () => {
+    const previousDebugLogging = process.env.AGENT_DEBUG_LOGGING;
+    process.env.AGENT_DEBUG_LOGGING = 'true';
+    try {
+      let boundTools: t.GraphTools | undefined;
+      const model: {
+        model: string;
+        invoke: jest.Mock;
+        bindTools: (tools: t.GraphTools) => object;
+      } = {
+        model: 'anthropic.claude-sonnet',
+        invoke: jest.fn().mockResolvedValue({ content: 'Summary text' }),
+        bindTools: (tools: t.GraphTools): object => {
+          boundTools = tools;
+          return model;
+        },
+      };
+      jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+        class {
+          constructor() {
+            return model;
+          }
+        } as never
+      );
+
+      const rawTools = [
+        {
+          type: 'function',
+          function: {
+            name: 'static_tool',
+            description: 'Static tool',
+            parameters: { type: 'object', properties: {} },
+          },
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'dynamic_tool',
+            description: 'Dynamic tool',
+            parameters: { type: 'object', properties: {} },
+          },
+        },
+      ] as t.GraphTools;
+      const agentContext = createAgentContext({
+        provider: Providers.BEDROCK,
+        clientOptions: {
+          model: 'anthropic.claude-sonnet',
+          promptCache: true,
+        },
+      });
+      jest.spyOn(agentContext, 'getToolsForBinding').mockReturnValue(rawTools);
+      jest
+        .spyOn(agentContext, 'getEffectiveToolDefinitions')
+        .mockReturnValue([
+          { name: 'static_tool' },
+          { name: 'dynamic_tool', defer_loading: true },
+        ]);
+      const inspect = jest
+        .spyOn(agentContext, 'inspectCompactionReplay')
+        .mockReturnValue({
+          eligible: false,
+          reason: 'no_request_snapshot',
+          replaySourceCount: 0,
+          requestSourceCount: 0,
+        });
+      const node = createSummarizeNode({
+        agentContext,
+        graph: mockGraph(),
+        generateStepId,
+      });
+
+      await node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+
+      expect(boundTools).toBeDefined();
+      expect(inspect).toHaveBeenCalledWith(
+        expect.objectContaining({
+          toolProjectionFingerprint:
+            createCompactionToolProjectionFingerprint(boundTools),
         })
       );
     } finally {

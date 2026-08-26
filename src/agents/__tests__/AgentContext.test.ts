@@ -130,7 +130,9 @@ describe('AgentContext', () => {
         messages: [message],
         provider: Providers.OPENAI,
       });
-      ctx.captureCompactionReplayRecipe(request, [message]);
+      ctx.captureCompactionReplayRecipe(
+        ctx.createCompactionReplayRecipeSnapshot(request, [message])
+      );
       return createCompactionCacheNamespace(
         Providers.OPENAI,
         ctx.clientOptions
@@ -197,11 +199,13 @@ describe('AgentContext', () => {
       });
 
       ctx.captureCompactionReplayRecipe(
-        request,
-        [message],
-        true,
-        undefined,
-        servingRoute
+        ctx.createCompactionReplayRecipeSnapshot(
+          request,
+          [message],
+          true,
+          undefined,
+          servingRoute
+        )
       );
 
       expect(

@@ -506,6 +506,90 @@ describe('compaction replay eligibility', () => {
     }
   });
 
+  it('snapshots environment-derived OpenAI organization and project routing', () => {
+    const originalOrgId = process.env.OPENAI_ORG_ID;
+    const originalProjectId = process.env.OPENAI_PROJECT_ID;
+    try {
+      process.env.OPENAI_ORG_ID = 'org-primary';
+      process.env.OPENAI_PROJECT_ID = 'project-primary';
+      const recipe = createEnvelope({
+        provider: Providers.OPENAI,
+        cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
+          apiKey: 'test-key',
+        }),
+      });
+      process.env.OPENAI_ORG_ID = 'org-summary';
+      process.env.OPENAI_PROJECT_ID = 'project-summary';
+
+      expect(
+        inspect(recipe, {
+          provider: Providers.OPENAI,
+          cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
+            apiKey: 'test-key',
+          }),
+        })
+      ).toMatchObject({
+        eligible: false,
+        reason: 'cache_namespace_mismatch',
+      });
+    } finally {
+      if (originalOrgId == null) {
+        delete process.env.OPENAI_ORG_ID;
+      } else {
+        process.env.OPENAI_ORG_ID = originalOrgId;
+      }
+      if (originalProjectId == null) {
+        delete process.env.OPENAI_PROJECT_ID;
+      } else {
+        process.env.OPENAI_PROJECT_ID = originalProjectId;
+      }
+    }
+  });
+
+  it('prefers explicit OpenAI organization and project routing', () => {
+    const originalOrgId = process.env.OPENAI_ORG_ID;
+    const originalProjectId = process.env.OPENAI_PROJECT_ID;
+    try {
+      process.env.OPENAI_ORG_ID = 'org-environment-primary';
+      process.env.OPENAI_PROJECT_ID = 'project-environment-primary';
+      const explicitRoute = {
+        apiKey: 'test-key',
+        organization: 'org-explicit',
+        project: 'project-explicit',
+      };
+      const recipe = createEnvelope({
+        provider: Providers.OPENAI,
+        cacheNamespace: createCompactionCacheNamespace(
+          Providers.OPENAI,
+          explicitRoute
+        ),
+      });
+      process.env.OPENAI_ORG_ID = 'org-environment-summary';
+      process.env.OPENAI_PROJECT_ID = 'project-environment-summary';
+
+      expect(
+        inspect(recipe, {
+          provider: Providers.OPENAI,
+          cacheNamespace: createCompactionCacheNamespace(
+            Providers.OPENAI,
+            explicitRoute
+          ),
+        })
+      ).toMatchObject({ eligible: true });
+    } finally {
+      if (originalOrgId == null) {
+        delete process.env.OPENAI_ORG_ID;
+      } else {
+        process.env.OPENAI_ORG_ID = originalOrgId;
+      }
+      if (originalProjectId == null) {
+        delete process.env.OPENAI_PROJECT_ID;
+      } else {
+        process.env.OPENAI_PROJECT_ID = originalProjectId;
+      }
+    }
+  });
+
   it('fails closed when the serving model owns an unknown route', () => {
     const cacheNamespace = createCompactionCacheNamespace(
       Providers.ANTHROPIC,
@@ -787,9 +871,7 @@ describe('compaction replay eligibility', () => {
   it('extracts only a provenance-proven projection before summary instructions', () => {
     const source = sourceMessage('a');
     const instruction = new HumanMessage('summarize');
-    setProviderMessageProvenance(instruction, [
-      { attribution: 'synthetic' },
-    ]);
+    setProviderMessageProvenance(instruction, [{ attribution: 'synthetic' }]);
 
     expect(
       extractCompactionReplayPrefixProjection([source, instruction])
@@ -843,14 +925,19 @@ describe('compaction replay eligibility', () => {
     expect('model' in envelope).toBe(false);
   });
 
-  it('retains the prepared-message reference without mutating its messages', () => {
+  it('snapshots prepared messages without retaining their mutable objects', () => {
     const messages = [sourceMessage('a'), sourceMessage('b')];
-    const before = [...messages];
     const recipe = createEnvelope({ messages, sourceMessages: messages });
 
-    expect(recipe.messages).toBe(messages);
-    inspect(recipe, { messages: [sourceMessage('a')] });
-    expect(messages).toEqual(before);
+    messages[0].content = 'mutated after snapshot';
+
+    expect('messages' in recipe).toBe(false);
+    expect(
+      inspect(recipe, {
+        messages: [sourceMessage('a')],
+        projectedMessages: [sourceMessage('a')],
+      })
+    ).toMatchObject({ eligible: true });
   });
 
   it('treats a restored tool result as ineligible even with exact lineage', () => {

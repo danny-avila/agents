@@ -10,6 +10,7 @@ import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type {
   CompactionCacheNamespace,
   CompactionReplayEligibility,
+  CompactionReplayRecipe,
   CompactionReplayRouteSnapshot,
   CompactionReplayState,
 } from '@/llm/compactionReplay';
@@ -1995,14 +1996,14 @@ export class AgentContext {
     return hasNewDiscoveries;
   }
 
-  captureCompactionReplayRecipe(
+  createCompactionReplayRecipeSnapshot(
     request: PreparedProviderRequest,
     sourceMessages: readonly BaseMessage[],
     servingRouteKnown = true,
     tools?: t.GraphTools,
     routeSnapshot = this.createCompactionReplayRouteSnapshot(servingRouteKnown)
-  ): void {
-    this.compactionReplayState = createCompactionReplayRecipe({
+  ): CompactionReplayRecipe {
+    return createCompactionReplayRecipe({
       provider: request.provider,
       modelId: request.modelId,
       projectionMode: request.projectionMode,
@@ -2020,6 +2021,10 @@ export class AgentContext {
       messages: request.messages,
       sourceMessages,
     });
+  }
+
+  captureCompactionReplayRecipe(recipe: CompactionReplayRecipe): void {
+    this.compactionReplayState = recipe;
   }
 
   createCompactionReplayRouteSnapshot(

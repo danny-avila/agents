@@ -59,7 +59,6 @@ import {
   addTailCacheControl,
   resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
-  supportsBedrockToolCache,
   isSyntheticProviderContextMessage,
   compactSyntheticProviderContextMessage,
   getMessageId,
@@ -155,7 +154,7 @@ import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
-import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
+import { prepareBedrockToolsForPromptCache } from '@/llm/bedrock/toolCache';
 import { createContextPressureMeter } from '@/llm/contextPressureMeter';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
@@ -2918,16 +2917,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const bedrockModel = (
           agentContext.clientOptions as { model?: string } | undefined
         )?.model;
-        // An omitted model falls back to LangChain's default Claude model (which
-        // supports tool caching); only an explicit non-Claude model (e.g. Nova)
-        // skips tool marking so its stray marker never leaks into toolConfig.
-        if (bedrockModel == null || supportsBedrockToolCache(bedrockModel)) {
-          toolsForBinding =
-            partitionAndMarkBedrockToolCache(
-              rawToolsForBinding,
-              isDeferredTool
-            ) ?? rawToolsForBinding;
-        }
+        toolsForBinding = prepareBedrockToolsForPromptCache(
+          rawToolsForBinding,
+          isDeferredTool,
+          true,
+          bedrockModel
+        );
       }
 
       let model =
@@ -3881,6 +3876,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             throw preInvokeTrip;
           }
         }
+        const compactionReplayRecipeSnapshot =
+          agentContext.summarizationEnabled === true &&
+          process.env.AGENT_DEBUG_LOGGING === 'true'
+            ? agentContext.createCompactionReplayRecipeSnapshot(
+              preparedRequest,
+              messagesToUse,
+              this.overrideModel == null,
+              toolsForBinding,
+              compactionReplayRouteSnapshot
+            )
+            : undefined;
         result = await withLangfuseRuntimeScope(
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,
@@ -3898,16 +3904,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               invokeConfig
             )
         );
-        if (
-          agentContext.summarizationEnabled === true &&
-          process.env.AGENT_DEBUG_LOGGING === 'true'
-        ) {
+        if (compactionReplayRecipeSnapshot != null) {
           agentContext.captureCompactionReplayRecipe(
-            preparedRequest,
-            messagesToUse,
-            this.overrideModel == null,
-            toolsForBinding,
-            compactionReplayRouteSnapshot
+            compactionReplayRecipeSnapshot
           );
         }
       } catch (primaryError) {

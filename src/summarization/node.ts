@@ -58,7 +58,9 @@ import { setProviderMessageProvenance } from '@/messages/provenance';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
+import { prepareBedrockToolsForPromptCache } from '@/llm/bedrock/toolCache';
 import { createRemoveAllMessage } from '@/messages/reducer';
+import { makeIsDeferred } from '@/messages';
 import { getMaxOutputTokensKey } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
@@ -692,7 +694,19 @@ async function executeSummarizationWithFallback(params: {
     | readonly BaseMessage[]
     | null
     | undefined;
-  const summarizationTools = agentContext.getToolsForBinding();
+  const rawSummarizationTools = agentContext.getToolsForBinding();
+  const bedrockOptions = clientConfig.clientOptions as
+    | t.BedrockAnthropicClientOptions
+    | undefined;
+  const summarizationTools =
+    clientConfig.provider === Providers.BEDROCK
+      ? prepareBedrockToolsForPromptCache(
+        rawSummarizationTools,
+        makeIsDeferred(agentContext.getEffectiveToolDefinitions()),
+        bedrockOptions?.promptCache === true,
+        (bedrockOptions as { model?: string } | undefined)?.model
+      )
+      : rawSummarizationTools;
 
   const observeCompactionReplay = (summarizerFallbackServed: boolean): void => {
     if (process.env.AGENT_DEBUG_LOGGING !== 'true') {
@@ -1338,7 +1352,7 @@ export function createSummarizeNode({
       clientConfig.provider === (agentContext.provider as string);
     const hasPromptCache =
       isSelfSummarizeModel &&
-      (agentContext.clientOptions as Record<string, unknown> | undefined)
+      (clientConfig.clientOptions as Record<string, unknown> | undefined)
         ?.promptCache === true;
 
     const log: LogFn = (level, message, data) => {

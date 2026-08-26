@@ -4,6 +4,7 @@ import type { GraphTools } from '@/types';
 import {
   insertBedrockToolCachePoint,
   partitionAndMarkBedrockToolCache,
+  prepareBedrockToolsForPromptCache,
 } from './toolCache';
 
 type OpenAITool = {
@@ -59,6 +60,48 @@ function getToolSpec(entry: Tool): Tool.ToolSpecMember['toolSpec'] {
 }
 
 describe('partitionAndMarkBedrockToolCache', () => {
+  it('uses the same formatted tools for cache-aware model projections', () => {
+    const tools = [
+      createOpenAITool('static_tool'),
+      createOpenAITool('dynamic_tool'),
+    ] as GraphTools;
+
+    const prepared = prepareBedrockToolsForPromptCache(
+      tools,
+      (name) => name === 'dynamic_tool',
+      true,
+      'anthropic.claude-sonnet'
+    ) as Tool[];
+    const result = insertBedrockToolCachePoint({ tools: prepared }, false);
+
+    expect(toolNames(result?.tools)).toEqual([
+      'static_tool',
+      'cachePoint',
+      'dynamic_tool',
+    ]);
+  });
+
+  it('leaves tools untouched when effective prompt caching is disabled', () => {
+    const tools = [createOpenAITool('static_tool')] as GraphTools;
+
+    expect(prepareBedrockToolsForPromptCache(tools, () => false, false)).toBe(
+      tools
+    );
+  });
+
+  it('leaves tools untouched for an explicit non-Claude Bedrock model', () => {
+    const tools = [createOpenAITool('static_tool')] as GraphTools;
+
+    expect(
+      prepareBedrockToolsForPromptCache(
+        tools,
+        () => false,
+        true,
+        'amazon.nova-pro-v1:0'
+      )
+    ).toBe(tools);
+  });
+
   it('inserts the Bedrock cache point after the last static tool', () => {
     const tools = [
       createOpenAITool('static_one'),
