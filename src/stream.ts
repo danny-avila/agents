@@ -736,6 +736,12 @@ function createEagerToolExecutionPlan(args: {
   if (candidateToolCalls.length === 0) {
     return [];
   }
+  const toolSchemas = new Map(
+    agentContext?.toolDefinitions?.map(({ name, parameters }) => [
+      name,
+      parameters,
+    ])
+  );
 
   // Eager execution must preserve ToolNode batch semantics exactly for every
   // unstarted call. If any candidate cannot be planned, fall back for that
@@ -770,9 +776,7 @@ function createEagerToolExecutionPlan(args: {
       ),
     })),
     usageCount: graph.getEagerEventToolUsageCount(agentContext?.agentId),
-    getToolSchema: (toolName) =>
-      agentContext?.toolDefinitions?.find((tool) => tool.name === toolName)
-        ?.parameters,
+    getToolSchema: (toolName) => toolSchemas.get(toolName),
   });
   if (plan == null) {
     return undefined;

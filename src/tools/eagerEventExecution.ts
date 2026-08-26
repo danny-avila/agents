@@ -46,7 +46,9 @@ function coerceValueForSchema(
       return value;
     }
     const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : value;
+    return Number.isFinite(parsed) && String(parsed) === value
+      ? parsed
+      : value;
   }
 
   if (schema.type === 'boolean' && typeof value === 'string') {
@@ -73,15 +75,18 @@ function coerceValueForSchema(
   }
 
   const record = value as Record<string, unknown>;
-  const properties = schema.properties;
-  if (properties == null) {
-    return record;
-  }
+  const additionalProperties =
+    typeof schema.additionalProperties === 'object'
+      ? schema.additionalProperties
+      : undefined;
 
   return Object.fromEntries(
     Object.entries(record).map(([key, entry]) => [
       key,
-      coerceValueForSchema(entry, properties[key]),
+      coerceValueForSchema(
+        entry,
+        schema.properties?.[key] ?? additionalProperties
+      ),
     ])
   );
 }

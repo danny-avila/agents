@@ -17,6 +17,10 @@ describe('coerceArgsForSchema', () => {
         type: 'object',
         properties: { delay_seconds: { type: 'number' } },
       },
+      metadata: {
+        type: 'object',
+        additionalProperties: { type: 'integer' },
+      },
     },
   };
 
@@ -28,6 +32,7 @@ describe('coerceArgsForSchema', () => {
           dry_run: 'false',
           retries: ['1', '2'],
           settings: { delay_seconds: '1.25' },
+          metadata: { attempt: '3' },
           label: '001',
         },
         issueSchema
@@ -37,6 +42,7 @@ describe('coerceArgsForSchema', () => {
       dry_run: false,
       retries: [1, 2],
       settings: { delay_seconds: 1.25 },
+      metadata: { attempt: 3 },
       label: '001',
     });
   });
@@ -48,6 +54,7 @@ describe('coerceArgsForSchema', () => {
           issue_number: '02365',
           dry_run: 'False',
           retries: ['9007199254740992'],
+          settings: { delay_seconds: '9007199254740993' },
         },
         issueSchema
       )
@@ -55,6 +62,7 @@ describe('coerceArgsForSchema', () => {
       issue_number: '02365',
       dry_run: 'False',
       retries: ['9007199254740992'],
+      settings: { delay_seconds: '9007199254740993' },
     });
   });
 });
