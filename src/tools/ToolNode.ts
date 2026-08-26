@@ -72,6 +72,7 @@ import {
 import {
   buildToolExecutionRequestPlan,
   coerceArgsForSchema,
+  coerceRecordArgs,
   resolveRuntimeSessionHint,
   recordArgsEqual,
 } from '@/tools/eagerEventExecution';
@@ -1141,9 +1142,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
   private coerceEventToolArgs(
     toolName: string,
-    args: Record<string, unknown>
+    args: unknown
   ): Record<string, unknown> {
-    return coerceArgsForSchema(args, this.getToolParameterSchema(toolName));
+    const recordArgs = coerceRecordArgs(args);
+    return coerceArgsForSchema(
+      recordArgs ?? (args as Record<string, unknown>),
+      this.getToolParameterSchema(toolName)
+    );
   }
 
   /** Serializes the live caller projection for event-driven hosts. */
