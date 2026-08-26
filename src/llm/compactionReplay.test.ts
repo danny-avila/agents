@@ -214,6 +214,45 @@ describe('compaction replay eligibility', () => {
     });
   });
 
+  it('includes the Vertex project ID in cache identity', () => {
+    const recipe = createEnvelope({
+      provider: Providers.VERTEXAI,
+      cacheNamespace: createCompactionCacheNamespace(
+        Providers.VERTEXAI,
+        { projectId: 'primary-project' }
+      ),
+    });
+
+    expect(
+      inspect(recipe, {
+        provider: Providers.VERTEXAI,
+        cacheNamespace: createCompactionCacheNamespace(
+          Providers.VERTEXAI,
+          { projectId: 'summary-project' }
+        ),
+      })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_mismatch',
+    });
+  });
+
+  it('fails closed instead of throwing on an opaque route object', () => {
+    const revocable = Proxy.revocable({}, {});
+    revocable.revoke();
+
+    expect(() =>
+      createCompactionCacheNamespace(Providers.ANTHROPIC, {
+        configuration: revocable.proxy,
+      })
+    ).not.toThrow();
+    expect(
+      createCompactionCacheNamespace(Providers.ANTHROPIC, {
+        configuration: revocable.proxy,
+      })
+    ).toMatchObject({ complete: false });
+  });
+
   it('fails closed when the serving model owns an unknown route', () => {
     const cacheNamespace = createCompactionCacheNamespace(
       Providers.ANTHROPIC,

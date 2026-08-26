@@ -77,6 +77,7 @@ const CACHE_NAMESPACE_KEYS = [
   'baseUrl',
   'organization',
   'project',
+  'projectId',
   'region',
   'region_name',
   'endpoint',
@@ -184,8 +185,14 @@ function fingerprintSerializedValue(serialized: string): string {
 }
 
 function fingerprintCacheNamespaceValue(value: unknown): string | undefined {
-  const serialized = serializeCacheNamespaceValue(value, new Set<object>());
-  return serialized == null ? undefined : fingerprintSerializedValue(serialized);
+  try {
+    const serialized = serializeCacheNamespaceValue(value, new Set<object>());
+    return serialized == null
+      ? undefined
+      : fingerprintSerializedValue(serialized);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Captures only routing identity; values are never emitted in diagnostics. */
@@ -203,7 +210,13 @@ export function createCompactionCacheNamespace(
   const entries: Array<readonly [string, CacheNamespaceValue]> = [];
   let complete = true;
   for (const key of CACHE_NAMESPACE_KEYS) {
-    const value = (options as Record<string, unknown> | undefined)?.[key];
+    let value: unknown;
+    try {
+      value = (options as Record<string, unknown> | undefined)?.[key];
+    } catch {
+      complete = false;
+      continue;
+    }
     if (value === undefined) {
       continue;
     }
