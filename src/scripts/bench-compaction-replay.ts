@@ -84,6 +84,7 @@ for (const toolSteps of [20, 50, 100]) {
     const cacheNamespace = createCompactionCacheNamespace(
       Providers.ANTHROPIC,
       {
+        apiKey: 'benchmark-key',
         baseURL: 'https://benchmark.invalid',
       }
     );

@@ -111,9 +111,73 @@ const CACHE_NAMESPACE_KEYS = [
   'defaultHeaders',
   'configuration',
   'useResponsesApi',
+  'thinking',
+  'thinkingBudget',
+  'additionalModelRequestFields',
+  'azureADTokenProvider',
 ] as const;
 
 const BUILT_IN_PROVIDER_NAMES = new Set<string>(Object.values(Providers));
+
+const PROVIDER_CREDENTIAL_KEYS: Partial<
+  Record<Providers, readonly string[]>
+> = {
+  [Providers.OPENAI]: ['apiKey', 'openAIApiKey'],
+  [Providers.AZURE]: [
+    'apiKey',
+    'openAIApiKey',
+    'azureOpenAIApiKey',
+    'azureADTokenProvider',
+  ],
+  [Providers.ANTHROPIC]: ['apiKey', 'anthropicApiKey'],
+  [Providers.BEDROCK]: [
+    'credentials',
+    'awsAccessKeyId',
+    'awsSecretAccessKey',
+  ],
+  [Providers.VERTEXAI]: ['credentials'],
+  [Providers.GOOGLE]: ['apiKey', 'googleApiKey'],
+  [Providers.MISTRALAI]: ['apiKey'],
+  [Providers.MISTRAL]: ['apiKey'],
+  [Providers.DEEPSEEK]: ['apiKey'],
+  [Providers.OPENROUTER]: ['apiKey', 'openAIApiKey'],
+  [Providers.XAI]: ['apiKey'],
+  [Providers.MOONSHOT]: ['apiKey', 'openAIApiKey'],
+};
+
+const PROVIDER_ENVIRONMENT_ROUTE_KEYS: Partial<
+  Record<Providers, readonly string[]>
+> = {
+  [Providers.OPENAI]: ['OPENAI_BASE_URL'],
+  [Providers.AZURE]: [
+    'OPENAI_BASE_URL',
+    'AZURE_OPENAI_ENDPOINT',
+    'AZURE_OPENAI_BASE_PATH',
+  ],
+  [Providers.BEDROCK]: ['BEDROCK_AWS_REGION', 'AWS_DEFAULT_REGION'],
+  [Providers.VERTEXAI]: ['GOOGLE_CLOUD_PROJECT', 'GCLOUD_PROJECT'],
+  [Providers.DEEPSEEK]: ['OPENAI_BASE_URL'],
+  [Providers.XAI]: ['OPENAI_BASE_URL'],
+  [Providers.MOONSHOT]: ['OPENAI_BASE_URL'],
+};
+
+function hasExplicitCredentialIdentity(
+  provider: t.ProviderName,
+  options?: t.ClientOptions | Record<string, unknown>
+): boolean {
+  const keys = PROVIDER_CREDENTIAL_KEYS[provider as Providers];
+  if (keys == null) {
+    return false;
+  }
+  try {
+    return keys.some(
+      (key) =>
+        (options as Record<string, unknown> | undefined)?.[key] !== undefined
+    );
+  } catch {
+    return false;
+  }
+}
 
 function serializeCacheNamespaceValue(
   value: unknown,
@@ -301,7 +365,7 @@ export function createCompactionCacheNamespace(
     });
   }
   const entries: Array<readonly [string, CacheNamespaceValue]> = [];
-  let complete = true;
+  let complete = hasExplicitCredentialIdentity(provider, options);
   for (const key of CACHE_NAMESPACE_KEYS) {
     let value: unknown;
     try {
@@ -319,6 +383,25 @@ export function createCompactionCacheNamespace(
       continue;
     }
     entries.push(Object.freeze([key, fingerprint] as const));
+  }
+  for (const key of
+    PROVIDER_ENVIRONMENT_ROUTE_KEYS[provider as Providers] ?? []) {
+    let value: string | undefined;
+    try {
+      value = process.env[key];
+    } catch {
+      complete = false;
+      continue;
+    }
+    if (value === undefined) {
+      continue;
+    }
+    const fingerprint = fingerprintCacheNamespaceValue(value);
+    if (fingerprint == null) {
+      complete = false;
+      continue;
+    }
+    entries.push(Object.freeze([`env:${key}`, fingerprint] as const));
   }
   return Object.freeze({
     complete,

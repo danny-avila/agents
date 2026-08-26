@@ -107,6 +107,14 @@ describe('AgentContext', () => {
       ctx: AgentContext,
       message: HumanMessage
     ): ReturnType<typeof createCompactionCacheNamespace> => {
+      if (
+        (ctx.clientOptions as { apiKey?: unknown } | undefined)?.apiKey == null
+      ) {
+        ctx.clientOptions = {
+          ...ctx.clientOptions,
+          apiKey: 'test-key',
+        } as t.ClientOptions;
+      }
       const request = prepareProviderRequest({
         model: new FakeListChatModel({ responses: ['ok'] }) as t.ChatModel,
         messages: [message],

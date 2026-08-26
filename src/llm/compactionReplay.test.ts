@@ -50,6 +50,7 @@ function createEnvelope(
     cacheNamespace:
       overrides.cacheNamespace ??
       createCompactionCacheNamespace(Providers.ANTHROPIC, {
+        apiKey: 'test-key',
         baseURL: 'https://provider.test',
       }),
     promptCacheEnabled: overrides.promptCacheEnabled ?? true,
@@ -87,6 +88,7 @@ function inspect(
     cacheNamespace:
       overrides.cacheNamespace ??
       createCompactionCacheNamespace(Providers.ANTHROPIC, {
+        apiKey: 'test-key',
         baseURL: 'https://provider.test',
       }),
     promptCacheEnabled: overrides.promptCacheEnabled ?? true,
@@ -129,6 +131,7 @@ describe('compaction replay eligibility', () => {
   it('treats a changed prompt-cache marker policy as a namespace mismatch', () => {
     const envelope = createEnvelope({
       cacheNamespace: createCompactionCacheNamespace(Providers.ANTHROPIC, {
+        apiKey: 'test-key',
         promptCache: true,
         promptCacheTtl: '1h',
       }),
@@ -141,6 +144,7 @@ describe('compaction replay eligibility', () => {
           cacheNamespace: createCompactionCacheNamespace(
             Providers.ANTHROPIC,
             {
+              apiKey: 'test-key',
               promptCache: true,
               promptCacheTtl: '5m',
             }
@@ -158,6 +162,7 @@ describe('compaction replay eligibility', () => {
     (key) => {
       const recipe = createEnvelope({
         cacheNamespace: createCompactionCacheNamespace(Providers.ANTHROPIC, {
+          apiKey: 'shared-key',
           [key]: 'primary',
         }),
       });
@@ -166,7 +171,7 @@ describe('compaction replay eligibility', () => {
         inspect(recipe, {
           cacheNamespace: createCompactionCacheNamespace(
             Providers.ANTHROPIC,
-            { [key]: 'summary' }
+            { apiKey: 'shared-key', [key]: 'summary' }
           ),
         })
       ).toMatchObject({
@@ -183,7 +188,7 @@ describe('compaction replay eligibility', () => {
         provider: Providers.AZURE,
         cacheNamespace: createCompactionCacheNamespace(
           Providers.AZURE,
-          { [key]: 'primary' }
+          { azureOpenAIApiKey: 'shared-key', [key]: 'primary' }
         ),
       });
 
@@ -192,7 +197,7 @@ describe('compaction replay eligibility', () => {
           provider: Providers.AZURE,
           cacheNamespace: createCompactionCacheNamespace(
             Providers.AZURE,
-            { [key]: 'summary' }
+            { azureOpenAIApiKey: 'shared-key', [key]: 'summary' }
           ),
         })
       ).toMatchObject({
@@ -205,6 +210,7 @@ describe('compaction replay eligibility', () => {
   it('snapshots nested cache identity before host mutation', () => {
     const options = {
       configuration: { baseURL: 'https://primary.test' },
+      apiKey: 'test-key',
     };
     const recipe = createEnvelope({
       cacheNamespace: createCompactionCacheNamespace(
@@ -232,7 +238,10 @@ describe('compaction replay eligibility', () => {
       provider: Providers.VERTEXAI,
       cacheNamespace: createCompactionCacheNamespace(
         Providers.VERTEXAI,
-        { projectId: 'primary-project' }
+        {
+          credentials: { client_email: 'test@example.test' },
+          projectId: 'primary-project',
+        }
       ),
     });
 
@@ -241,7 +250,10 @@ describe('compaction replay eligibility', () => {
         provider: Providers.VERTEXAI,
         cacheNamespace: createCompactionCacheNamespace(
           Providers.VERTEXAI,
-          { projectId: 'summary-project' }
+          {
+            credentials: { client_email: 'test@example.test' },
+            projectId: 'summary-project',
+          }
         ),
       })
     ).toMatchObject({
@@ -264,6 +276,72 @@ describe('compaction replay eligibility', () => {
         configuration: revocable.proxy,
       })
     ).toMatchObject({ complete: false });
+  });
+
+  it('fingerprints the effective thinking mode', () => {
+    const recipe = createEnvelope({
+      cacheNamespace: createCompactionCacheNamespace(Providers.ANTHROPIC, {
+        apiKey: 'test-key',
+        thinking: { type: 'enabled', budget_tokens: 1_024 },
+      }),
+    });
+
+    expect(
+      inspect(recipe, {
+        cacheNamespace: createCompactionCacheNamespace(
+          Providers.ANTHROPIC,
+          { apiKey: 'test-key' }
+        ),
+      })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_mismatch',
+    });
+  });
+
+  it('fails closed when credentials come from an opaque external source', () => {
+    const cacheNamespace = createCompactionCacheNamespace(
+      Providers.ANTHROPIC,
+      { baseURL: 'https://provider.test' }
+    );
+    const recipe = createEnvelope({ cacheNamespace });
+
+    expect(inspect(recipe, { cacheNamespace })).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_unknown',
+    });
+  });
+
+  it('snapshots environment-derived endpoint routing', () => {
+    const originalBaseURL = process.env.OPENAI_BASE_URL;
+    try {
+      process.env.OPENAI_BASE_URL = 'https://primary.test';
+      const recipe = createEnvelope({
+        provider: Providers.OPENAI,
+        cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
+          apiKey: 'test-key',
+        }),
+      });
+      process.env.OPENAI_BASE_URL = 'https://summary.test';
+
+      expect(
+        inspect(recipe, {
+          provider: Providers.OPENAI,
+          cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
+            apiKey: 'test-key',
+          }),
+        })
+      ).toMatchObject({
+        eligible: false,
+        reason: 'cache_namespace_mismatch',
+      });
+    } finally {
+      if (originalBaseURL == null) {
+        delete process.env.OPENAI_BASE_URL;
+      } else {
+        process.env.OPENAI_BASE_URL = originalBaseURL;
+      }
+    }
   });
 
   it('fails closed when the serving model owns an unknown route', () => {
@@ -372,6 +450,7 @@ describe('compaction replay eligibility', () => {
       createEnvelope(),
       {
         cacheNamespace: createCompactionCacheNamespace(Providers.ANTHROPIC, {
+          apiKey: 'test-key',
           baseURL: 'https://other.test',
         }),
       },
