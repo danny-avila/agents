@@ -34,6 +34,7 @@ type FetchMock = jest.MockedFunction<
 >;
 
 type CodeApiRequestBody = {
+  code?: string;
   timeout?: number;
   continuation_token?: string;
   runtime_session_hint?: string;
@@ -797,6 +798,26 @@ describe('CodeAPI auth header injection', () => {
     );
 
     expect(requestBodyAt(0).timeout).toBe(15000);
+  });
+
+  it('initializes Bash’s last background PID before strict user code', async () => {
+    const tool = createBashProgrammaticToolCallingTool();
+
+    await tool.invoke(
+      { code: 'set -euo pipefail\nlookup_user "{}"' },
+      {
+        toolCall: {
+          name: 'bash_programmatic_code_execution',
+          args: {},
+          toolMap: toolMap(),
+          toolDefs,
+        },
+      }
+    );
+
+    expect(requestBodyAt(0).code).toBe(
+      ': &\nwait "$!"\nset -euo pipefail\nlookup_user "{}"'
+    );
   });
 
   it('describes the PTC timeout as a single sandbox run cap', () => {

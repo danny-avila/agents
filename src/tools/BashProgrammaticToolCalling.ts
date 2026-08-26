@@ -40,6 +40,7 @@ config();
 
 const DEFAULT_MAX_ROUND_TRIPS = 20;
 const DEFAULT_RUN_TIMEOUT_MS = resolveCodeApiRunTimeoutMs();
+const BASH_LAST_BACKGROUND_PID_GUARD = ': &\nwait "$!"';
 
 /** Bash reserved words that get `_tool` suffix when used as function names */
 const BASH_RESERVED = new Set([
@@ -170,6 +171,14 @@ export const BashProgrammaticToolCallingDefinition = {
   description: BashProgrammaticToolCallingDescription,
   schema: BashProgrammaticToolCallingSchema,
 } as const;
+
+function prepareBashProgrammaticCode(code: string): string {
+  /* The Code API's generated Bash wrapper reads `$!` after user code. A user
+   * `set -u` makes that expansion fail when no background process has run.
+   * Seed and reap a no-op job before user code so strict mode remains active
+   * for the payload while the wrapper can safely read its special parameter. */
+  return `${BASH_LAST_BACKGROUND_PID_GUARD}\n${code}`;
+}
 
 function maybeParseJsonResultString(result: unknown): unknown {
   if (typeof result !== 'string') {
@@ -320,6 +329,7 @@ export function createBashProgrammaticToolCallingTool(
     async (rawParams, config) => {
       const params = rawParams as ProgrammaticInvocationParams;
       const { code } = params;
+      const preparedCode = prepareBashProgrammaticCode(code);
       const timeout = clampCodeApiRunTimeoutMs(params.timeout, maxRunTimeoutMs);
 
       const toolCall = (config.toolCall ?? {}) as ToolCall &
@@ -417,7 +427,7 @@ export function createBashProgrammaticToolCallingTool(
           EXEC_ENDPOINT,
           {
             lang: 'bash',
-            code,
+            code: preparedCode,
             tools: effectiveTools,
             session_id,
             timeout,
