@@ -535,7 +535,11 @@ describe('shapeLangfuseSpan', () => {
         [METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES]: 1,
         [INPUT]: JSON.stringify({
           messages: [
-            { type: 'human', content: 'raw history stays visible' },
+            {
+              type: 'human',
+              content:
+                'raw history keeps <compaction-semantic-index>example</compaction-semantic-index>',
+            },
             {
               type: 'human',
               content:
@@ -550,7 +554,9 @@ describe('shapeLangfuseSpan', () => {
     shapeLangfuseSpan(span);
 
     expect(span.attributes[METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES]).toBe(1);
-    expect(span.attributes[INPUT]).toContain('raw history stays visible');
+    expect(span.attributes[INPUT]).toContain(
+      '<compaction-semantic-index>example</compaction-semantic-index>'
+    );
     expect(span.attributes[INPUT]).toContain('Checkpoint prompt');
     expect(span.attributes[INPUT]).toContain(
       '<compaction-semantic-index redacted=\\"true\\" />'

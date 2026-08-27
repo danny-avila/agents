@@ -36,8 +36,8 @@ const DEPRECATED_TRACE_OUTPUT_ATTRIBUTE = 'langfuse.trace.output';
 const OBSERVATION_METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
 const OBSERVATION_METADATA_OPERATION = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${LANGFUSE_OPERATION_METADATA_KEY}`;
 const OBSERVATION_METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.compaction_semantic_index_entries`;
-const COMPACTION_SEMANTIC_INDEX_PATTERN =
-  /<compaction-semantic-index>[\s\S]*?<\/compaction-semantic-index>\s*/g;
+const COMPACTION_SEMANTIC_INDEX_OPEN = '<compaction-semantic-index>';
+const COMPACTION_SEMANTIC_INDEX_CLOSE = '</compaction-semantic-index>';
 const REDACTED_COMPACTION_SEMANTIC_INDEX =
   '<compaction-semantic-index redacted="true" />\n\n';
 
@@ -71,25 +71,67 @@ function parseAttributeValue(value: unknown): unknown {
   }
 }
 
-function redactCompactionSemanticIndexValue(value: unknown): unknown {
+type CompactionSemanticIndexRedaction = {
+  value: unknown;
+  redacted: boolean;
+};
+
+function redactCompactionSemanticIndexText(
+  value: string
+): CompactionSemanticIndexRedaction {
+  const start = value.lastIndexOf(COMPACTION_SEMANTIC_INDEX_OPEN);
+  if (start < 0) {
+    return { value, redacted: false };
+  }
+  const close = value.indexOf(COMPACTION_SEMANTIC_INDEX_CLOSE, start);
+  if (close < 0) {
+    return { value, redacted: false };
+  }
+  let end = close + COMPACTION_SEMANTIC_INDEX_CLOSE.length;
+  while (end < value.length && /\s/.test(value[end])) {
+    end++;
+  }
+  return {
+    value:
+      value.slice(0, start) +
+      REDACTED_COMPACTION_SEMANTIC_INDEX +
+      value.slice(end),
+    redacted: true,
+  };
+}
+
+function redactCompactionSemanticIndexValue(
+  value: unknown
+): CompactionSemanticIndexRedaction {
   if (typeof value === 'string') {
-    return value.replace(
-      COMPACTION_SEMANTIC_INDEX_PATTERN,
-      REDACTED_COMPACTION_SEMANTIC_INDEX
-    );
+    return redactCompactionSemanticIndexText(value);
   }
   if (Array.isArray(value)) {
-    return value.map(redactCompactionSemanticIndexValue);
+    for (let index = value.length - 1; index >= 0; index--) {
+      const nested = redactCompactionSemanticIndexValue(value[index]);
+      if (nested.redacted) {
+        const result = [...value];
+        result[index] = nested.value;
+        return { value: result, redacted: true };
+      }
+    }
+    return { value, redacted: false };
   }
   if (!isRecord(value)) {
-    return value;
+    return { value, redacted: false };
   }
-  return Object.fromEntries(
-    Object.entries(value).map(([key, nestedValue]) => [
-      key,
-      redactCompactionSemanticIndexValue(nestedValue),
-    ])
-  );
+  const entries = Object.entries(value);
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const [key, nestedValue] = entries[index];
+    const nested = redactCompactionSemanticIndexValue(nestedValue);
+    if (nested.redacted) {
+      return {
+        value: { ...value, [key]: nested.value },
+        redacted: true,
+      };
+    }
+  }
+  return { value, redacted: false };
 }
 
 function redactCompactionSemanticIndexInput(span: MutableSpan): void {
@@ -107,11 +149,14 @@ function redactCompactionSemanticIndexInput(span: MutableSpan): void {
     return;
   }
   const parsed = parseAttributeValue(input);
-  const redacted = redactCompactionSemanticIndexValue(parsed);
+  const redaction = redactCompactionSemanticIndexValue(parsed);
+  if (!redaction.redacted) {
+    return;
+  }
   span.attributes[inputKey] =
-    typeof redacted === 'string' && parsed === input
-      ? redacted
-      : JSON.stringify(redacted);
+    typeof redaction.value === 'string' && parsed === input
+      ? redaction.value
+      : JSON.stringify(redaction.value);
 }
 
 function getMessageArray(
