@@ -146,8 +146,17 @@ older closed tool-call/result unit while retaining a token-priced recent tail.
 Open and parallel tool units are indivisible, and a lone user payload is never
 eligible for the intra-turn fallback.
 
+A **Cache-Aligned Compaction Request** reuses the normal provider request's
+cacheable tool prefix and anchors retained history before the one-off
+summarization instruction. Provider-specific cache markers and TTL resolution
+come from shared request-preparation functions; cache-read usage is the source
+of truth for whether reuse occurred. Compaction never predicts cache identity
+from a hand-maintained list of provider options or environment variables.
+
 See [ADR 0005](docs/adr/0005-pairing-balanced-compaction-ranges.md) for the
 range-selection and retention trade-offs.
+See [ADR 0006](docs/adr/0006-align-compaction-with-provider-cache-prefixes.md)
+for the prompt-cache boundary and rejected predictive replay design.
 
 ## Provider Tool Derivation
 

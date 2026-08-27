@@ -3,9 +3,11 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import {
+  applySummarizationHistoryCache,
   createSummarizeNode,
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
+  resolveBedrockCompactionCacheModel,
 } from '@/summarization/node';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
@@ -13,6 +15,74 @@ import { Constants, GraphEvents, Providers } from '@/common';
 import { AgentContext } from '@/agents/AgentContext';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
+
+describe('applySummarizationHistoryCache', () => {
+  it('marks Anthropic history before the compaction instruction', () => {
+    const cached = applySummarizationHistoryCache({
+      messages: [new HumanMessage('history')],
+      provider: Providers.ANTHROPIC,
+      enabled: true,
+    });
+
+    expect(cached[0].content).toEqual([
+      {
+        type: 'text',
+        text: 'history',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ]);
+  });
+
+  it('marks Bedrock history before the compaction instruction', () => {
+    const cached = applySummarizationHistoryCache({
+      messages: [new HumanMessage('history')],
+      provider: Providers.BEDROCK,
+      enabled: true,
+      bedrockModelId: 'anthropic.claude-sonnet',
+    });
+
+    expect(cached[0].content).toEqual([
+      { type: 'text', text: 'history' },
+      { cachePoint: { type: 'default', ttl: '1h' } },
+    ]);
+  });
+
+  it('uses five minutes for an explicit non-Claude Bedrock model', () => {
+    const cached = applySummarizationHistoryCache({
+      messages: [new HumanMessage('history')],
+      provider: Providers.BEDROCK,
+      enabled: true,
+      bedrockModelId: 'amazon.nova-pro-v1:0',
+    });
+
+    expect(cached[0].content).toEqual([
+      { type: 'text', text: 'history' },
+      { cachePoint: { type: 'default' } },
+    ]);
+  });
+
+  it('keeps the configured model family for an opaque Bedrock profile', () => {
+    expect(
+      resolveBedrockCompactionCacheModel({
+        applicationInferenceProfile:
+          'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opaque',
+        model: 'anthropic.claude-sonnet',
+      })
+    ).toBe('anthropic.claude-sonnet');
+  });
+
+  it('does not add provider-specific markers to a fallback provider', () => {
+    const messages = [new HumanMessage('history')];
+
+    expect(
+      applySummarizationHistoryCache({
+        messages,
+        provider: Providers.OPENAI,
+        enabled: true,
+      })
+    ).toBe(messages);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -160,6 +230,51 @@ beforeEach(() => {
 });
 
 describe('createSummarizeNode', () => {
+  it('binds the live graph tool projection for cache-aligned compaction', async () => {
+    captureEvents();
+
+    const projectedTools = [{ name: 'projected-tool' }] as t.GraphTools;
+    const bindTools = jest
+      .fn()
+      .mockReturnValue(mockInvokeModel('Cache-aligned summary'));
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        bindTools = bindTools;
+      } as never
+    );
+
+    const agentContext = createAgentContext({
+      provider: Providers.ANTHROPIC,
+      clientOptions: { promptCache: true },
+    });
+    const graph = {
+      ...mockGraph(),
+      getToolsForBinding: jest.fn(() => projectedTools),
+    };
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(graph.getToolsForBinding).toHaveBeenCalledWith(
+      Providers.ANTHROPIC,
+      expect.objectContaining({ promptCache: true })
+    );
+    expect(bindTools).toHaveBeenCalledWith(projectedTools);
+  });
+
   it('emits ON_SUMMARIZE_START and ON_SUMMARIZE_COMPLETE on success', async () => {
     const events = captureEvents();
 
