@@ -6,11 +6,19 @@ import {
 } from '@langchain/core/messages';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { RenderedCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import type { StreamLimitState } from '@/llm/streamLimits';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
+import {
+  addTailCacheControl,
+  addBedrockTailCacheControl,
+  resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
+  type PromptCacheTtl,
+} from '@/messages/cache';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
@@ -23,13 +31,6 @@ import {
   STREAM_LIMIT_EPOCH_KEY,
 } from '@/llm/streamLimits';
 import {
-  addTailCacheControl,
-  addBedrockTailCacheControl,
-  resolvePromptCacheTtl,
-  resolveBedrockPromptCacheTtl,
-  type PromptCacheTtl,
-} from '@/messages/cache';
-import {
   DEFAULT_RETAIN_RECENT_TURNS,
   resolveIntraTurnRetainTokens,
   splitAtRecencyBoundary,
@@ -41,9 +42,10 @@ import {
   StepTypes,
   Providers,
 } from '@/common';
+import { renderCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
-import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
+import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { makeIsDeferred } from '@/messages/anthropicToolCache';
 import { createRemoveAllMessage } from '@/messages/reducer';
@@ -625,6 +627,7 @@ async function executeSummarizationWithFallback(params: {
   summarizeConfig?: RunnableConfig;
   stepId: string;
   usePromptCache: boolean;
+  semanticIndex: RenderedCompactionSemanticIndex;
   log: LogFn;
   /** Carries the run's stream limits so the event cap covers summary streams. */
   graph?: StreamLimitState & {
@@ -651,6 +654,7 @@ async function executeSummarizationWithFallback(params: {
     summarizeConfig,
     stepId,
     usePromptCache,
+    semanticIndex,
     log,
     graph,
   } = params;
@@ -693,6 +697,7 @@ async function executeSummarizationWithFallback(params: {
       promptText: clientConfig.promptText,
       updatePromptText: clientConfig.updatePromptText,
       priorSummaryText,
+      semanticIndexAppendix: semanticIndex.appendix,
       config: summarizeConfig,
       stepId,
       provider: clientConfig.provider,
@@ -785,7 +790,8 @@ async function executeSummarizationWithFallback(params: {
               buildSummarizationInstruction(
                 clientConfig.promptText,
                 clientConfig.updatePromptText,
-                priorSummaryText
+                priorSummaryText,
+                semanticIndex.appendix
               )
             ),
           ],
@@ -1188,6 +1194,10 @@ export function createSummarizeNode({
       agentContext,
       agentContext.summarizationConfig
     );
+    const semanticIndex = renderCompactionSemanticIndex(
+      agentContext.compactionSemanticIndex,
+      messagesToRefine
+    );
 
     const stepKey = `summarize-${request.agentId}`;
     const [stepId, stepIndex] = generateStepId(stepKey);
@@ -1229,6 +1239,8 @@ export function createSummarizeNode({
           model: clientConfig.modelName,
           messagesToRefineCount: messagesToRefine.length,
           summaryVersion: agentContext.summaryVersion + 1,
+          semanticIndexEntryCount: semanticIndex.entryCount,
+          semanticIndexCharCount: semanticIndex.charCount,
         } satisfies t.SummarizeStartEvent,
         runnableConfig
       );
@@ -1276,6 +1288,9 @@ export function createSummarizeNode({
       isSelfSummarize: isSelfSummarizeModel,
       hasPromptCache,
       provider: clientConfig.provider,
+      semanticIndexEntryCount: semanticIndex.entryCount,
+      semanticIndexCharCount: semanticIndex.charCount,
+      semanticIndexOmittedEntryCount: semanticIndex.omittedEntryCount,
     });
 
     const summarizeConfig: RunnableConfig | undefined = config
@@ -1291,6 +1306,10 @@ export function createSummarizeNode({
           agentId: request.agentId,
           summarization_provider: clientConfig.provider,
           summarization_model: clientConfig.modelName,
+          compaction_semantic_index_entries: semanticIndex.entryCount,
+          compaction_semantic_index_chars: semanticIndex.charCount,
+          compaction_semantic_index_omitted_entries:
+            semanticIndex.omittedEntryCount,
           /**
              * Per-call model attribution for usage consumers (the subagent
              * usage-capture handler): the summarizer's model can differ from
@@ -1340,6 +1359,7 @@ export function createSummarizeNode({
       summarizeConfig,
       stepId,
       usePromptCache: isSelfSummarizeModel && hasPromptCache,
+      semanticIndex,
       log,
       graph,
     });
@@ -1544,12 +1564,15 @@ function extractResponseText(response: { content: string | object }): string {
 function buildSummarizationInstruction(
   promptText: string,
   updatePromptText: string | undefined,
-  priorSummaryText: string
+  priorSummaryText: string,
+  semanticIndexAppendix = ''
 ): string {
   const effectivePrompt = priorSummaryText
     ? (updatePromptText ?? promptText)
     : promptText;
-  const parts = [effectivePrompt];
+  const parts = semanticIndexAppendix
+    ? [semanticIndexAppendix, '\n\n', effectivePrompt]
+    : [effectivePrompt];
   if (priorSummaryText) {
     parts.push(
       `\n\n<previous-summary>\n${priorSummaryText}\n</previous-summary>`
@@ -1705,6 +1728,7 @@ async function summarizeWithCacheHit({
   promptText,
   updatePromptText,
   priorSummaryText,
+  semanticIndexAppendix,
   config,
   stepId,
   provider,
@@ -1720,6 +1744,7 @@ async function summarizeWithCacheHit({
   promptText: string;
   updatePromptText?: string;
   priorSummaryText: string;
+  semanticIndexAppendix?: string;
   config?: RunnableConfig;
   stepId?: string;
   provider: t.ProviderName;
@@ -1733,7 +1758,8 @@ async function summarizeWithCacheHit({
   const instruction = buildSummarizationInstruction(
     promptText,
     updatePromptText,
-    priorSummaryText
+    priorSummaryText,
+    semanticIndexAppendix
   );
 
   const cachedHistory = applySummarizationHistoryCache({

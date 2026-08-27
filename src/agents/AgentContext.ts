@@ -50,6 +50,7 @@ import {
   Providers,
 } from '@/common';
 import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
+import { snapshotCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
@@ -108,6 +109,7 @@ export class AgentContext {
       discoveredTools,
       summarizationEnabled,
       summarizationConfig,
+      compactionSemanticIndex,
       initialSummary,
       contextPruningConfig,
       maxToolResultChars,
@@ -141,6 +143,7 @@ export class AgentContext {
       discoveredTools,
       summarizationEnabled,
       summarizationConfig,
+      compactionSemanticIndex,
       contextPruningConfig,
       maxToolResultChars,
     });
@@ -346,6 +349,8 @@ export class AgentContext {
   summarizationEnabled?: boolean;
   /** Summarization runtime settings used by graph pruning hooks */
   summarizationConfig?: t.SummarizationConfig;
+  /** Host-supplied advisory guidance consumed only when compaction runs. */
+  compactionSemanticIndex?: t.CompactionSemanticIndex;
   /** Current summary text produced by the summarize node, integrated into system message */
   private summaryText?: string;
   /** Token count of the current summary (tracked for token accounting) */
@@ -430,6 +435,7 @@ export class AgentContext {
     discoveredTools,
     summarizationEnabled,
     summarizationConfig,
+    compactionSemanticIndex,
     contextPruningConfig,
     maxToolResultChars,
   }: {
@@ -456,6 +462,7 @@ export class AgentContext {
     discoveredTools?: string[];
     summarizationEnabled?: boolean;
     summarizationConfig?: t.SummarizationConfig;
+    compactionSemanticIndex?: t.CompactionSemanticIndex;
     contextPruningConfig?: t.ContextPruningConfig;
     maxToolResultChars?: number;
   }) {
@@ -495,6 +502,11 @@ export class AgentContext {
     this.useLegacyContent = useLegacyContent ?? false;
     this.summarizationEnabled = summarizationEnabled;
     this.summarizationConfig = summarizationConfig;
+    if (compactionSemanticIndex != null) {
+      this.compactionSemanticIndex = snapshotCompactionSemanticIndex(
+        compactionSemanticIndex
+      );
+    }
     this.contextPruningConfig = contextPruningConfig;
     this.maxToolResultChars = maxToolResultChars;
 

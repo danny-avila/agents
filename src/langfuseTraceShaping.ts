@@ -35,6 +35,11 @@ const DEPRECATED_TRACE_INPUT_ATTRIBUTE = 'langfuse.trace.input';
 const DEPRECATED_TRACE_OUTPUT_ATTRIBUTE = 'langfuse.trace.output';
 const OBSERVATION_METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
 const OBSERVATION_METADATA_OPERATION = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${LANGFUSE_OPERATION_METADATA_KEY}`;
+const OBSERVATION_METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.compaction_semantic_index_entries`;
+const COMPACTION_SEMANTIC_INDEX_PATTERN =
+  /<compaction-semantic-index>[\s\S]*?<\/compaction-semantic-index>\s*/g;
+const REDACTED_COMPACTION_SEMANTIC_INDEX =
+  '<compaction-semantic-index redacted="true" />\n\n';
 
 type MutableSpan = ReadableSpan & {
   name: string;
@@ -64,6 +69,48 @@ function parseAttributeValue(value: unknown): unknown {
   } catch {
     return value;
   }
+}
+
+function redactCompactionSemanticIndexValue(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.replace(
+      COMPACTION_SEMANTIC_INDEX_PATTERN,
+      REDACTED_COMPACTION_SEMANTIC_INDEX
+    );
+  }
+  if (Array.isArray(value)) {
+    return value.map(redactCompactionSemanticIndexValue);
+  }
+  if (!isRecord(value)) {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, nestedValue]) => [
+      key,
+      redactCompactionSemanticIndexValue(nestedValue),
+    ])
+  );
+}
+
+function redactCompactionSemanticIndexInput(span: MutableSpan): void {
+  const entryCount =
+    span.attributes[
+      OBSERVATION_METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES
+    ];
+  if (Number(entryCount) <= 0) {
+    return;
+  }
+  const inputKey = LangfuseOtelSpanAttributes.OBSERVATION_INPUT;
+  const input = span.attributes[inputKey];
+  if (input == null) {
+    return;
+  }
+  const parsed = parseAttributeValue(input);
+  const redacted = redactCompactionSemanticIndexValue(parsed);
+  span.attributes[inputKey] =
+    typeof redacted === 'string' && parsed === input
+      ? redacted
+      : JSON.stringify(redacted);
 }
 
 function getMessageArray(
@@ -594,6 +641,7 @@ export function shapeLangfuseSpan(span: ReadableSpan): void {
   const mutable = span as MutableSpan;
   delete mutable.attributes[DEPRECATED_TRACE_INPUT_ATTRIBUTE];
   delete mutable.attributes[DEPRECATED_TRACE_OUTPUT_ATTRIBUTE];
+  redactCompactionSemanticIndexInput(mutable);
   const isGraphObservation = isGraphSpan(mutable);
   if (mutable.name.startsWith(LANGGRAPH_AGENT_NODE_PREFIX)) {
     shapeAgentNodeSpan(mutable);

@@ -36,6 +36,7 @@ const OBSERVATION_TYPE = LangfuseOtelSpanAttributes.OBSERVATION_TYPE;
 const TRACE_TAGS = LangfuseOtelSpanAttributes.TRACE_TAGS;
 const METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
 const METADATA_OPERATION = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${LANGFUSE_OPERATION_METADATA_KEY}`;
+const METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.compaction_semantic_index_entries`;
 
 /** The outer workflow node: a non-root LangGraph node span whose
  *  `langgraph_node` metadata equals its name. */
@@ -524,6 +525,37 @@ describe('shapeLangfuseSpan', () => {
     const span = createSpan('ChatOpenAI', { [INPUT]: original }, 'parent-1');
     shapeLangfuseSpan(span);
     expect(span.attributes[INPUT]).toBe(original);
+  });
+
+  it('redacts semantic-index content while retaining compaction trace counts', () => {
+    const span = createSpan(
+      'ChatOpenAI',
+      {
+        [OBSERVATION_TYPE]: 'generation',
+        [METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES]: 1,
+        [INPUT]: JSON.stringify({
+          messages: [
+            { type: 'human', content: 'raw history stays visible' },
+            {
+              type: 'human',
+              content:
+                '<compaction-semantic-index>\n- activity_phase: secret label\n</compaction-semantic-index>\n\nCheckpoint prompt',
+            },
+          ],
+        }),
+      },
+      'parent-1'
+    );
+
+    shapeLangfuseSpan(span);
+
+    expect(span.attributes[METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES]).toBe(1);
+    expect(span.attributes[INPUT]).toContain('raw history stays visible');
+    expect(span.attributes[INPUT]).toContain('Checkpoint prompt');
+    expect(span.attributes[INPUT]).toContain(
+      '<compaction-semantic-index redacted=\\"true\\" />'
+    );
+    expect(span.attributes[INPUT]).not.toContain('secret label');
   });
 
   it('preserves root attributes when extraction finds nothing', () => {
