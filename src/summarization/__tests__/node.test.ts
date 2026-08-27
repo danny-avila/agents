@@ -10,8 +10,12 @@ import {
   resolveBedrockCompactionCacheModel,
 } from '@/summarization/node';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
-import { createCompactionToolProjectionFingerprint } from '@/llm/compactionReplay';
+import {
+  createCompactionReplayCandidateSnapshot,
+  createCompactionToolProjectionFingerprint,
+} from '@/llm/compactionReplay';
 import { convertInjectedMessages } from '@/messages/injected';
+import { setProviderMessageProvenance } from '@/messages/provenance';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { AgentContext } from '@/agents/AgentContext';
 import * as providers from '@/llm/providers';
@@ -328,6 +332,80 @@ describe('createSummarizeNode', () => {
           modelId: 'actual-summary-model',
           projectionMode: 'openai-responses',
           summarizerFallbackServed: false,
+        })
+      );
+    } finally {
+      if (previousDebugLogging == null) {
+        delete process.env.AGENT_DEBUG_LOGGING;
+      } else {
+        process.env.AGENT_DEBUG_LOGGING = previousDebugLogging;
+      }
+    }
+  });
+
+  it('observes the summarizer projection captured before provider mutation', async () => {
+    const previousDebugLogging = process.env.AGENT_DEBUG_LOGGING;
+    process.env.AGENT_DEBUG_LOGGING = 'true';
+    try {
+      jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+        class {
+          constructor() {
+            return {
+              invoke: jest.fn().mockImplementation(
+                async (messages: BaseMessage[]) => {
+                  messages[0].content = 'mutated during invocation';
+                  return { content: 'Summary text' };
+                }
+              ),
+            };
+          }
+        } as never
+      );
+
+      const messages = [
+        new HumanMessage({ content: 'Hello', id: 'source-1' }),
+        new AIMessage({ content: 'World', id: 'source-2' }),
+      ];
+      setProviderMessageProvenance(messages[0], [
+        { attribution: 'user', sourceMessageId: 'source-1' },
+      ]);
+      setProviderMessageProvenance(messages[1], [
+        { attribution: 'model', sourceMessageId: 'source-2' },
+      ]);
+      const sourceSnapshot = createCompactionReplayCandidateSnapshot(messages);
+      const agentContext = createAgentContext();
+      const inspect = jest
+        .spyOn(agentContext, 'inspectCompactionReplay')
+        .mockReturnValue({
+          eligible: false,
+          reason: 'no_request_snapshot',
+          replaySourceCount: 0,
+          requestSourceCount: 0,
+        });
+      const node = createSummarizeNode({
+        agentContext,
+        graph: mockGraph(),
+        generateStepId,
+      });
+
+      await node(
+        {
+          messages,
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+
+      expect(inspect).toHaveBeenCalledWith(
+        expect.objectContaining({
+          snapshot: expect.objectContaining({
+            sourceMessageFingerprints:
+              sourceSnapshot.sourceMessageFingerprints,
+            projection: 'projected',
+          }),
         })
       );
     } finally {

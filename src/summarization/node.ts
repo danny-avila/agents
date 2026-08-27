@@ -6,7 +6,10 @@ import {
 } from '@langchain/core/messages';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { CompactionReplayRouteSnapshot } from '@/llm/compactionReplay';
+import type {
+  CompactionReplayCandidateSnapshot,
+  CompactionReplayRouteSnapshot,
+} from '@/llm/compactionReplay';
 import type { StreamLimitState } from '@/llm/streamLimits';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { HookRegistry } from '@/hooks';
@@ -44,6 +47,7 @@ import {
 } from '@/common';
 import {
   createCompactionCacheNamespace,
+  createCompactionReplayCandidateSnapshot,
   createCompactionToolProjectionFingerprint,
   EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
   extractCompactionReplayPrefixProjection,
@@ -690,10 +694,10 @@ async function executeSummarizationWithFallback(params: {
   let usedMetadataStub = false;
   let summarizationModel: t.ChatModel | undefined;
   let compactionReplayRouteSnapshot: CompactionReplayRouteSnapshot | undefined;
-  let compactionReplayProjectedMessages:
-    | readonly BaseMessage[]
-    | null
+  let compactionReplayCandidateSnapshot:
+    | CompactionReplayCandidateSnapshot
     | undefined;
+  let compactionReplayToolProjectionFingerprint: string | undefined;
   const rawSummarizationTools = agentContext.getToolsForBinding();
   const bedrockOptions = clientConfig.clientOptions as
     | t.BedrockAnthropicClientOptions
@@ -741,10 +745,10 @@ async function executeSummarizationWithFallback(params: {
       systemProjectionFingerprint:
         EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
       toolProjectionFingerprint: promptCacheEnabled
-        ? createCompactionToolProjectionFingerprint(summarizationTools)
+        ? compactionReplayToolProjectionFingerprint
         : undefined,
       messages,
-      projectedMessages: compactionReplayProjectedMessages,
+      snapshot: compactionReplayCandidateSnapshot,
       restoredToolSubstitution,
       summarizerFallbackServed,
     });
@@ -757,11 +761,6 @@ async function executeSummarizationWithFallback(params: {
      * (e.g. an unrecognized summarization.provider) surfaces through the
      * `log('error', ...)` path below rather than bubbling up silently.
      */
-    summarizationModel = initializeModel({
-      provider: clientConfig.provider,
-      clientOptions: clientConfig.clientOptions as t.ClientOptions,
-      tools: summarizationTools,
-    }) as t.ChatModel;
     if (process.env.AGENT_DEBUG_LOGGING === 'true') {
       compactionReplayRouteSnapshot = Object.freeze({
         cacheNamespace: createCompactionCacheNamespace(
@@ -773,7 +772,17 @@ async function executeSummarizationWithFallback(params: {
           clientConfig.clientOptions
         ),
       });
+      if (compactionReplayRouteSnapshot.promptCacheEnabled) {
+        compactionReplayToolProjectionFingerprint =
+          createCompactionToolProjectionFingerprint(summarizationTools);
+      }
     }
+
+    summarizationModel = initializeModel({
+      provider: clientConfig.provider,
+      clientOptions: clientConfig.clientOptions as t.ClientOptions,
+      tools: summarizationTools,
+    }) as t.ChatModel;
 
     const result = await summarizeWithCacheHit({
       model: summarizationModel,
@@ -812,11 +821,8 @@ async function executeSummarizationWithFallback(params: {
     });
     summaryText = result.text;
     summaryUsage = result.usage;
-    if (process.env.AGENT_DEBUG_LOGGING === 'true') {
-      compactionReplayProjectedMessages =
-        extractCompactionReplayPrefixProjection(result.preparedMessages) ??
-        null;
-    }
+    compactionReplayCandidateSnapshot =
+      result.compactionReplayCandidateSnapshot;
     observeCompactionReplay(false);
   } catch (primaryError) {
     const primaryDescribed = describeProviderError(
@@ -1837,7 +1843,7 @@ async function summarizeWithCacheHit({
 }): Promise<{
   text: string;
   usage?: Partial<UsageMetadata>;
-  preparedMessages: readonly BaseMessage[];
+  compactionReplayCandidateSnapshot?: CompactionReplayCandidateSnapshot;
 }> {
   const instruction = buildSummarizationInstruction(
     promptText,
@@ -1870,6 +1876,14 @@ async function summarizeWithCacheHit({
     provider,
     config: invokeConfig,
   });
+  const compactionReplayCandidateSnapshot =
+    process.env.AGENT_DEBUG_LOGGING === 'true'
+      ? createCompactionReplayCandidateSnapshot(
+        messages,
+        extractCompactionReplayPrefixProjection(preparedRequest.messages) ??
+            null
+      )
+      : undefined;
   const result = await attemptInvoke(
     {
       request: preparedRequest,
@@ -1935,5 +1949,9 @@ async function summarizeWithCacheHit({
       }
       : {}),
   });
-  return { text, usage, preparedMessages: preparedRequest.messages };
+  return {
+    text,
+    usage,
+    compactionReplayCandidateSnapshot,
+  };
 }

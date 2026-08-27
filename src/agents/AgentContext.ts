@@ -9,6 +9,7 @@ import type {
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type {
   CompactionCacheNamespace,
+  CompactionReplayCandidateSnapshot,
   CompactionReplayEligibility,
   CompactionReplayRecipe,
   CompactionReplayRouteSnapshot,
@@ -2058,6 +2059,7 @@ export class AgentContext {
     toolProjectionFingerprint?: string;
     messages: readonly BaseMessage[];
     projectedMessages?: readonly BaseMessage[] | null;
+    snapshot?: CompactionReplayCandidateSnapshot;
     restoredToolSubstitution: boolean;
     summarizerFallbackServed?: boolean;
   }): CompactionReplayEligibility {

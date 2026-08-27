@@ -75,6 +75,15 @@ export interface CompactionReplayRouteSnapshot {
   readonly promptCacheEnabled: boolean;
 }
 
+export interface CompactionReplayCandidateSnapshot {
+  readonly sourceMessageCount: number;
+  readonly sourceMessageFingerprints?: readonly string[];
+  readonly projection: 'unknown' | 'source' | 'projected';
+  readonly lineage?: SourceLineage;
+  readonly projectedMessageCount?: number;
+  readonly projectedMessageFingerprints?: readonly string[];
+}
+
 interface CompactionReplayCandidate {
   readonly provider: t.ProviderName;
   readonly modelId?: string;
@@ -87,6 +96,7 @@ interface CompactionReplayCandidate {
   readonly toolRevision: number;
   readonly messages: readonly BaseMessage[];
   readonly projectedMessages?: readonly BaseMessage[] | null;
+  readonly snapshot?: CompactionReplayCandidateSnapshot;
   readonly restoredToolSubstitution: boolean;
   readonly summarizerFallbackServed?: boolean;
 }
@@ -702,6 +712,37 @@ export function createCompactionReplayRecipe(params: {
   });
 }
 
+export function createCompactionReplayCandidateSnapshot(
+  messages: readonly BaseMessage[],
+  projectedMessages?: readonly BaseMessage[] | null
+): CompactionReplayCandidateSnapshot {
+  const sourceMessageFingerprints = fingerprintMessages(messages);
+  if (projectedMessages === null) {
+    return Object.freeze({
+      sourceMessageCount: messages.length,
+      sourceMessageFingerprints,
+      projection: 'unknown',
+      lineage: inspectSourceLineage(messages),
+    });
+  }
+  if (projectedMessages === undefined) {
+    return Object.freeze({
+      sourceMessageCount: messages.length,
+      sourceMessageFingerprints,
+      projection: 'source',
+      lineage: inspectSourceLineage(messages),
+    });
+  }
+  return Object.freeze({
+    sourceMessageCount: messages.length,
+    sourceMessageFingerprints,
+    projection: 'projected',
+    lineage: inspectSourceLineage(projectedMessages),
+    projectedMessageCount: projectedMessages.length,
+    projectedMessageFingerprints: fingerprintMessages(projectedMessages),
+  });
+}
+
 function ineligible(
   reason: CompactionReplayIneligibilityReason,
   replaySourceCount: number,
@@ -719,9 +760,12 @@ export function inspectCompactionReplayEligibility(
   state: CompactionReplayState | undefined,
   candidate: CompactionReplayCandidate
 ): CompactionReplayEligibility {
-  const candidateLineage = inspectSourceLineage(
-    candidate.projectedMessages ?? candidate.messages
-  );
+  const candidateLineage =
+    candidate.snapshot != null
+      ? candidate.snapshot.lineage
+      : inspectSourceLineage(
+        candidate.projectedMessages ?? candidate.messages
+      );
   const replaySourceCount = candidateLineage?.sourceMessageIds.length ?? 0;
   if (candidate.summarizerFallbackServed === true) {
     return ineligible(
@@ -839,7 +883,10 @@ export function inspectCompactionReplayEligibility(
       requestSourceCount
     );
   }
-  if (candidate.projectedMessages === null) {
+  if (
+    candidate.snapshot?.projection === 'unknown' ||
+    (candidate.snapshot == null && candidate.projectedMessages === null)
+  ) {
     return ineligible(
       'provider_projection_unknown',
       replaySourceCount,
@@ -886,15 +933,20 @@ export function inspectCompactionReplayEligibility(
       requestSourceCount
     );
   }
-  if (candidate.messages.length > recipe.sourceMessageFingerprints.length) {
+  const candidateSourceMessageCount =
+    candidate.snapshot?.sourceMessageCount ?? candidate.messages.length;
+  if (candidateSourceMessageCount > recipe.sourceMessageFingerprints.length) {
     return ineligible(
       'source_content_mismatch',
       replaySourceCount,
       requestSourceCount
     );
   }
-  for (let i = 0; i < candidate.messages.length; i++) {
-    const fingerprint = fingerprintMessage(candidate.messages[i]);
+  for (let i = 0; i < candidateSourceMessageCount; i++) {
+    const fingerprint =
+      candidate.snapshot != null
+        ? candidate.snapshot.sourceMessageFingerprints?.[i]
+        : fingerprintMessage(candidate.messages[i]);
     if (fingerprint == null) {
       return ineligible(
         'source_content_unknown',
@@ -939,8 +991,18 @@ export function inspectCompactionReplayEligibility(
     );
   }
 
-  if (candidate.projectedMessages != null) {
-    if (candidate.projectedMessages.length !== replayMessageCount) {
+  const projectedSnapshot =
+    candidate.snapshot?.projection === 'projected'
+      ? candidate.snapshot
+      : undefined;
+  const candidateProjectedMessages =
+    candidate.snapshot == null ? candidate.projectedMessages : undefined;
+  if (projectedSnapshot != null || candidateProjectedMessages != null) {
+    const projectedMessageCount =
+      projectedSnapshot != null
+        ? projectedSnapshot.projectedMessageCount
+        : candidateProjectedMessages?.length;
+    if (projectedMessageCount !== replayMessageCount) {
       return ineligible(
         'provider_projection_changed',
         replaySourceCount,
@@ -949,9 +1011,15 @@ export function inspectCompactionReplayEligibility(
     }
     for (let i = 0; i < replayMessageCount; i++) {
       const requestFingerprint = recipe.messageFingerprints?.[i];
-      const candidateFingerprint = fingerprintMessage(
-        candidate.projectedMessages[i]
-      );
+      let candidateFingerprint: string | undefined;
+      if (projectedSnapshot != null) {
+        candidateFingerprint =
+          projectedSnapshot.projectedMessageFingerprints?.[i];
+      } else if (candidateProjectedMessages != null) {
+        candidateFingerprint = fingerprintMessage(
+          candidateProjectedMessages[i]
+        );
+      }
       if (requestFingerprint == null || candidateFingerprint == null) {
         return ineligible(
           'provider_projection_unknown',

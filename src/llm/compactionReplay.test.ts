@@ -6,11 +6,13 @@ import {
 import type { BaseMessage } from '@langchain/core/messages';
 import {
   createCompactionCacheNamespace,
+  createCompactionReplayCandidateSnapshot,
   createCompactionReplayRecipe,
   createCompactionToolProjectionFingerprint,
   EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
   extractCompactionReplayPrefixProjection,
   inspectCompactionReplayEligibility,
+  type CompactionReplayCandidateSnapshot,
   type CompactionReplayRecipe,
   type CompactionReplayState,
 } from '@/llm/compactionReplay';
@@ -91,6 +93,7 @@ function inspect(
     toolRevision: number;
     messages: BaseMessage[];
     projectedMessages: BaseMessage[] | null;
+    snapshot: CompactionReplayCandidateSnapshot;
     restoredToolSubstitution: boolean;
     summarizerFallbackServed: boolean;
   }> = {}
@@ -116,6 +119,7 @@ function inspect(
     toolRevision: overrides.toolRevision ?? 3,
     messages: overrides.messages ?? [sourceMessage('a'), sourceMessage('b')],
     projectedMessages: overrides.projectedMessages,
+    snapshot: overrides.snapshot,
     restoredToolSubstitution: overrides.restoredToolSubstitution ?? false,
     summarizerFallbackServed: overrides.summarizerFallbackServed,
   });
@@ -938,6 +942,32 @@ describe('compaction replay eligibility', () => {
         projectedMessages: [sourceMessage('a')],
       })
     ).toMatchObject({ eligible: true });
+  });
+
+  it('uses the pre-invoke candidate snapshot after live messages mutate', () => {
+    const sourceMessages = [sourceMessage('a'), sourceMessage('b')];
+    const projectedMessages = [...sourceMessages];
+    const recipe = createEnvelope({
+      messages: projectedMessages,
+      sourceMessages,
+    });
+    const candidateMessages = [sourceMessage('a')];
+    const candidateProjection = [...candidateMessages];
+    const snapshot = createCompactionReplayCandidateSnapshot(
+      candidateMessages,
+      candidateProjection
+    );
+
+    candidateMessages[0].content = 'mutated source';
+    candidateProjection[0].content = 'mutated projection';
+
+    expect(
+      inspect(recipe, {
+        messages: candidateMessages,
+        projectedMessages: candidateProjection,
+        snapshot,
+      })
+    ).toMatchObject({ eligible: true, replayMessageCount: 1 });
   });
 
   it('treats a restored tool result as ineligible even with exact lineage', () => {

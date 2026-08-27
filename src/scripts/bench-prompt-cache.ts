@@ -550,9 +550,13 @@ async function runCompactionSummaryProbe(params: {
   const compactionInstruction = new HumanMessage(
     'Write a checkpoint that preserves completed work, exact identifiers, failures, and next actions.'
   );
+  const independentlyCachedHistory = params.apply([
+    cacheNamespace,
+    ...history,
+  ]);
   const summaryRequest = params.replay
     ? [...normalRequest, compactionInstruction]
-    : params.apply([cacheNamespace, ...history, compactionInstruction]);
+    : [...independentlyCachedHistory, compactionInstruction];
   const summary = await params.invokeTimed(summaryRequest);
   const totals = emptyTotals();
   addUsage(totals, summary.usage);

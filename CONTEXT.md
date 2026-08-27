@@ -151,9 +151,9 @@ range-selection and retention trade-offs.
 
 A **Compaction Replay Recipe** is the debug-only, run-local record of the
 latest successful normal request's serving route, cache namespace, provider
-projection mode, prepared-message reference, bounded source-content
-fingerprints, and system/tool projection revisions. It contains no live model
-or provider stream, is absent from ordinary production runs, and reset releases
+projection mode, immutable prepared/source fingerprints and lineage, and
+system/tool projection revisions. It contains no live messages, model, or
+provider stream, is absent from ordinary production runs, and reset releases
 the recipe.
 
 A **Compaction Request Projection** is the cache-compatible provider request

@@ -9,6 +9,7 @@ import {
 import type { BaseMessage } from '@langchain/core/messages';
 import {
   createCompactionCacheNamespace,
+  createCompactionReplayCandidateSnapshot,
   createCompactionReplayRecipe,
   createCompactionToolProjectionFingerprint,
   EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT,
@@ -111,6 +112,10 @@ for (const toolSteps of [20, 50, 100]) {
       createEnvelope();
     });
     const inspectionMs = measure(INSPECTION_ITERATIONS, () => {
+      const snapshot = createCompactionReplayCandidateSnapshot(
+        compactableMessages,
+        compactableMessages
+      );
       inspectCompactionReplayEligibility(
         envelope,
         {
@@ -126,10 +131,15 @@ for (const toolSteps of [20, 50, 100]) {
           systemRevision: 0,
           toolRevision: 0,
           messages: compactableMessages,
+          snapshot,
           restoredToolSubstitution: false,
         }
       );
     });
+    const snapshot = createCompactionReplayCandidateSnapshot(
+      compactableMessages,
+      compactableMessages
+    );
     const eligibility = inspectCompactionReplayEligibility(
       envelope,
       {
@@ -145,6 +155,7 @@ for (const toolSteps of [20, 50, 100]) {
         systemRevision: 0,
         toolRevision: 0,
         messages: compactableMessages,
+        snapshot,
         restoredToolSubstitution: false,
       }
     );
@@ -156,7 +167,7 @@ for (const toolSteps of [20, 50, 100]) {
         requestMessages: messages.length,
         compactableMessages: compactableMessages.length,
         captureMicrosecondsPerRequest: Number((captureMs * 1_000).toFixed(3)),
-        inspectionMicrosecondsPerCompaction: Number(
+        candidateCaptureAndInspectionMicrosecondsPerCompaction: Number(
           (inspectionMs * 1_000).toFixed(3)
         ),
         eligibility,
