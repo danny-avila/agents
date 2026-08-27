@@ -101,8 +101,8 @@ describe('renderCompactionSemanticIndex', () => {
     expect(
       snapshotCompactionSemanticIndex([
         activityEntry({ text: 'x'.repeat(10_000) }),
-      ])?.[0].text
-    ).toHaveLength(COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars);
+      ])
+    ).toEqual([]);
 
     const oversized = Array.from(
       {
@@ -163,6 +163,35 @@ describe('renderCompactionSemanticIndex', () => {
     expect(rendered.appendix).not.toContain('conflict b');
   });
 
+  it('rejects oversized identities and tied text before bounded values can alias', () => {
+    const oversizedIdentity = 'i'.repeat(
+      COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars + 1
+    );
+    const sharedPrefix = 'x'.repeat(
+      COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars
+    );
+    const index: CompactionSemanticIndex = [
+      activityEntry({ sourceMessageId: oversizedIdentity }),
+      activityEntry({
+        sourceContentIndex: 2,
+        revision: 3,
+        text: `${sharedPrefix}a`,
+      }),
+      activityEntry({
+        sourceContentIndex: 2,
+        revision: 3,
+        text: `${sharedPrefix}b`,
+      }),
+    ];
+
+    expect(snapshotCompactionSemanticIndex(index)).toEqual([]);
+    expect(renderCompactionSemanticIndex(index, messages)).toMatchObject({
+      appendix: '',
+      entryCount: 0,
+      omittedEntryCount: index.length,
+    });
+  });
+
   it('lets pending and redacted latest revisions suppress stale guidance', () => {
     const index: CompactionSemanticIndex = [
       activityEntry({ sourceContentIndex: 0, revision: 1, text: 'stale' }),
@@ -170,7 +199,7 @@ describe('renderCompactionSemanticIndex', () => {
         sourceContentIndex: 0,
         revision: 2,
         status: 'pending',
-        text: 'still changing',
+        text: 'still changing'.repeat(1_000),
       }),
       activityEntry({
         sourceContentIndex: 1,
@@ -180,7 +209,7 @@ describe('renderCompactionSemanticIndex', () => {
       activityEntry({
         sourceContentIndex: 1,
         revision: 2,
-        text: 'sensitive current label',
+        text: 'sensitive current label'.repeat(1_000),
         redacted: true,
       }),
     ];
@@ -189,6 +218,7 @@ describe('renderCompactionSemanticIndex', () => {
 
     expect(rendered.appendix).toBe('');
     expect(rendered.entryCount).toBe(0);
+    expect(snapshotCompactionSemanticIndex(index)).toHaveLength(index.length);
   });
 
   it('orders by source position, content position, semantic type, and local identity', () => {

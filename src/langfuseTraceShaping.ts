@@ -97,7 +97,8 @@ function redactCompactionSemanticIndexInput(span: MutableSpan): void {
     span.attributes[
       OBSERVATION_METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES
     ];
-  if (Number(entryCount) <= 0) {
+  const numericEntryCount = Number(entryCount);
+  if (!Number.isFinite(numericEntryCount) || numericEntryCount <= 0) {
     return;
   }
   const inputKey = LangfuseOtelSpanAttributes.OBSERVATION_INPUT;

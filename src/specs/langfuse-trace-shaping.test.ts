@@ -558,6 +558,27 @@ describe('shapeLangfuseSpan', () => {
     expect(span.attributes[INPUT]).not.toContain('secret label');
   });
 
+  it('does not redact a literal index example without positive metadata', () => {
+    const original = JSON.stringify({
+      messages: [
+        {
+          type: 'human',
+          content:
+            '<compaction-semantic-index>example</compaction-semantic-index>',
+        },
+      ],
+    });
+    const span = createSpan(
+      'ChatOpenAI',
+      { [OBSERVATION_TYPE]: 'generation', [INPUT]: original },
+      'parent-1'
+    );
+
+    shapeLangfuseSpan(span);
+
+    expect(span.attributes[INPUT]).toBe(original);
+  });
+
   it('preserves root attributes when extraction finds nothing', () => {
     const span = createSpan('LibreChat Agent', { [INPUT]: 'plain text' });
     shapeLangfuseSpan(span);

@@ -82,19 +82,22 @@ function snapshotEntry(
   } = entry;
   if (
     typeof sourceMessageId !== 'string' ||
+    sourceMessageId.length >
+      COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars ||
     typeof sourceContentIndex !== 'number' ||
     typeof revision !== 'number' ||
     !VALID_ENTRY_TYPES.has(type) ||
     !VALID_ENTRY_STATUSES.has(status) ||
     typeof text !== 'string' ||
+    (status === 'committed' &&
+      redacted !== true &&
+      text.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars) ||
     (redacted !== undefined && typeof redacted !== 'boolean')
   ) {
     return undefined;
   }
   const snapshotText =
-    redacted === true
-      ? ''
-      : text.slice(0, COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars);
+    redacted === true || status === 'pending' ? '' : text;
   const common = {
     sourceMessageId,
     sourceContentIndex,
@@ -108,12 +111,15 @@ function snapshotEntry(
   }
   if (type === 'reasoning_label') {
     const reasoningStepId = entry.reasoningStepId;
-    return typeof reasoningStepId === 'string'
+    return typeof reasoningStepId === 'string' &&
+      reasoningStepId.length <=
+        COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
       ? Object.freeze({ type, reasoningStepId, ...common })
       : undefined;
   }
   const toolCallId = entry.toolCallId;
-  return typeof toolCallId === 'string'
+  return typeof toolCallId === 'string' &&
+    toolCallId.length <= COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
     ? Object.freeze({ type, toolCallId, ...common })
     : undefined;
 }
@@ -146,11 +152,11 @@ export function snapshotCompactionSemanticIndex(
 }
 
 function normalizeIdentity(value: string): string | undefined {
+  if (value.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars) {
+    return undefined;
+  }
   const normalized = value.trim();
-  if (
-    normalized === '' ||
-    normalized.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
-  ) {
+  if (normalized === '') {
     return undefined;
   }
   return normalized;
@@ -213,13 +219,18 @@ function normalizeEntry(
     return undefined;
   }
   const redacted = entry.redacted === true;
-  const text = redacted
+  const pending = entry.status === 'pending';
+  if (
+    !redacted &&
+    !pending &&
+    entry.text.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars
+  ) {
+    return undefined;
+  }
+  const text = redacted || pending
     ? ''
-    : entry.text
-      .slice(0, COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars)
-      .replace(/\s+/g, ' ')
-      .trim();
-  if (!redacted && text === '') {
+    : entry.text.replace(/\s+/g, ' ').trim();
+  if (!redacted && !pending && text === '') {
     return undefined;
   }
 
