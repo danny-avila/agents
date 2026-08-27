@@ -314,6 +314,35 @@ describe('compaction replay eligibility', () => {
     }
   });
 
+  it('ignores OPENAI_BASE_URL for the fixed default xAI endpoint', () => {
+    const originalBaseURL = process.env.OPENAI_BASE_URL;
+    try {
+      process.env.OPENAI_BASE_URL = 'https://ignored-primary.x.ai';
+      const recipe = createEnvelope({
+        provider: Providers.XAI,
+        cacheNamespace: createCompactionCacheNamespace(Providers.XAI, {
+          apiKey: 'shared-key',
+        }),
+      });
+      process.env.OPENAI_BASE_URL = 'https://ignored-summary.x.ai';
+
+      expect(
+        inspect(recipe, {
+          provider: Providers.XAI,
+          cacheNamespace: createCompactionCacheNamespace(Providers.XAI, {
+            apiKey: 'shared-key',
+          }),
+        })
+      ).toMatchObject({ eligible: true });
+    } finally {
+      if (originalBaseURL == null) {
+        delete process.env.OPENAI_BASE_URL;
+      } else {
+        process.env.OPENAI_BASE_URL = originalBaseURL;
+      }
+    }
+  });
+
   it('snapshots nested cache identity before host mutation', () => {
     const options = {
       configuration: { baseURL: 'https://primary.test' },
@@ -484,6 +513,44 @@ describe('compaction replay eligibility', () => {
     });
   });
 
+  it('snapshots the AWS_REGION Bedrock route fallback', () => {
+    const originalRegion = process.env.AWS_REGION;
+    const options = {
+      credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+      promptCache: true,
+    };
+    try {
+      process.env.AWS_REGION = 'us-east-1';
+      const recipe = createEnvelope({
+        provider: Providers.BEDROCK,
+        cacheNamespace: createCompactionCacheNamespace(
+          Providers.BEDROCK,
+          options
+        ),
+      });
+      process.env.AWS_REGION = 'us-west-2';
+
+      expect(
+        inspect(recipe, {
+          provider: Providers.BEDROCK,
+          cacheNamespace: createCompactionCacheNamespace(
+            Providers.BEDROCK,
+            options
+          ),
+        })
+      ).toMatchObject({
+        eligible: false,
+        reason: 'cache_namespace_mismatch',
+      });
+    } finally {
+      if (originalRegion == null) {
+        delete process.env.AWS_REGION;
+      } else {
+        process.env.AWS_REGION = originalRegion;
+      }
+    }
+  });
+
   it('includes OpenAI explicit cache projection mode in cache identity', () => {
     const recipe = createEnvelope({
       provider: Providers.OPENAI,
@@ -557,6 +624,40 @@ describe('compaction replay eligibility', () => {
           provider: Providers.OPENAI,
           cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
             apiKey: 'test-key',
+          }),
+        })
+      ).toMatchObject({
+        eligible: false,
+        reason: 'cache_namespace_mismatch',
+      });
+    } finally {
+      if (originalBaseURL == null) {
+        delete process.env.OPENAI_BASE_URL;
+      } else {
+        process.env.OPENAI_BASE_URL = originalBaseURL;
+      }
+    }
+  });
+
+  it('treats a null route option as an environment fallback', () => {
+    const originalBaseURL = process.env.OPENAI_BASE_URL;
+    try {
+      process.env.OPENAI_BASE_URL = 'https://primary.test';
+      const recipe = createEnvelope({
+        provider: Providers.OPENAI,
+        cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
+          apiKey: 'test-key',
+          baseURL: null,
+        }),
+      });
+      process.env.OPENAI_BASE_URL = 'https://summary.test';
+
+      expect(
+        inspect(recipe, {
+          provider: Providers.OPENAI,
+          cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
+            apiKey: 'test-key',
+            baseURL: null,
           }),
         })
       ).toMatchObject({
@@ -820,6 +921,35 @@ describe('compaction replay eligibility', () => {
           { name: 'stable', ...summary },
         ]),
       })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'tool_projection_changed',
+    });
+  });
+
+  it('includes every Anthropic built-in provider field', () => {
+    const primaryTools = createCompactionToolProjectionFingerprint([
+      {
+        type: 'web_search_20250305',
+        name: 'web_search',
+        max_uses: 3,
+        cache_control: { type: 'ephemeral' },
+      },
+    ]);
+    const summaryTools = createCompactionToolProjectionFingerprint([
+      {
+        type: 'web_search_20250305',
+        name: 'web_search',
+        max_uses: 5,
+        cache_control: { type: 'ephemeral' },
+      },
+    ]);
+    const recipe = createEnvelope({
+      toolProjectionFingerprint: primaryTools,
+    });
+
+    expect(
+      inspect(recipe, { toolProjectionFingerprint: summaryTools })
     ).toMatchObject({
       eligible: false,
       reason: 'tool_projection_changed',

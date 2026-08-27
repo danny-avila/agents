@@ -52,7 +52,7 @@ type AnthropicToolCacheCandidate = {
   cache_control?: unknown;
 };
 
-function isAnthropicBuiltInTool(
+export function isAnthropicBuiltInTool(
   tool: AnthropicToolCacheCandidate
 ): tool is AnthropicToolCacheCandidate & { type: string } {
   const { type } = tool;

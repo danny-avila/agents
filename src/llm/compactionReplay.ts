@@ -5,6 +5,7 @@ import {
   inspectProviderMessageProvenance,
   inspectProviderSourceMessageIds,
 } from '@/messages/provenance';
+import { isAnthropicBuiltInTool } from '@/messages/anthropicToolCache';
 import { toJsonSchema } from '@/utils/schema';
 import { Providers } from '@/common';
 
@@ -242,6 +243,10 @@ const PROVIDER_ENVIRONMENT_ROUTES: Partial<
       optionPaths: [['region'], ['region_name']],
     },
     {
+      environmentKey: 'AWS_REGION',
+      optionPaths: [['region'], ['region_name']],
+    },
+    {
       environmentKey: 'AWS_DEFAULT_REGION',
       optionPaths: [['region'], ['region_name']],
     },
@@ -260,17 +265,6 @@ const PROVIDER_ENVIRONMENT_ROUTES: Partial<
     {
       environmentKey: 'OPENAI_BASE_URL',
       optionPaths: [['baseURL'], ['baseUrl'], ['configuration', 'baseURL']],
-    },
-  ],
-  [Providers.XAI]: [
-    {
-      environmentKey: 'OPENAI_BASE_URL',
-      optionPaths: [
-        ['baseURL'],
-        ['baseUrl'],
-        ['configuration', 'baseURL'],
-        ['clientConfig', 'baseURL'],
-      ],
     },
   ],
   [Providers.MOONSHOT]: [
@@ -311,7 +305,7 @@ function hasDefinedOptionPath(
       }
       current = (current as Record<string, unknown>)[key];
     }
-    return current !== undefined;
+    return current != null;
   } catch {
     return undefined;
   }
@@ -414,6 +408,11 @@ function projectToolForFingerprint(tool: unknown): object | undefined {
       return undefined;
     }
     const candidate = tool as Record<string, unknown>;
+    if (isAnthropicBuiltInTool(candidate)) {
+      const providerDefinition = { ...candidate };
+      delete providerDefinition.extras;
+      return providerDefinition;
+    }
     const projection: Record<string, unknown> = {};
     const name =
       typeof candidate.name === 'string' ? candidate.name : undefined;
