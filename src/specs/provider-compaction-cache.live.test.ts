@@ -179,14 +179,19 @@ describe('Merged compaction provider cache validation', () => {
   jest.setTimeout(180_000);
 
   const hasBedrock =
-    (process.env.BEDROCK_AWS_REGION ?? '') !== '' &&
+    (process.env.BEDROCK_AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? '') !==
+      '' &&
     (process.env.BEDROCK_AWS_ACCESS_KEY_ID ?? '') !== '' &&
     (process.env.BEDROCK_AWS_SECRET_ACCESS_KEY ?? '') !== '';
   const bedrockTest = hasBedrock ? test : test.skip;
   bedrockTest('Bedrock Claude reuses the aligned compaction prefix', async () => {
     const result = await runExplicitCacheProbe({
       provider: Providers.BEDROCK,
-      clientOptions: getLLMConfig(Providers.BEDROCK) as t.ClientOptions,
+      clientOptions: {
+        ...getLLMConfig(Providers.BEDROCK),
+        region:
+          process.env.BEDROCK_AWS_REGION ?? process.env.AWS_DEFAULT_REGION,
+      } as t.ClientOptions,
     });
     console.log(`  Bedrock cache benchmark: ${JSON.stringify(result)}`);
     expectCacheReuse(result);
