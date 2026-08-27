@@ -53,8 +53,9 @@ resolver or append interface with explicit timing and failure semantics.
 
 ## Consequences
 
-- Normal model requests perform no index validation, serialization, or message
-  traversal. The extra work occurs once only when compaction actually fires.
+- Caller-owned index data is bounded and snapshotted once at AgentContext
+  construction. Normal model requests perform no index serialization or
+  source-message traversal; those costs occur only when compaction fires.
 - Hosts can improve checkpoint navigation using semantic work already paid for,
   while the SDK keeps generated labels advisory and bounded.
 - A later LibreChat adapter owns extraction, lifecycle, ownership, and rollout

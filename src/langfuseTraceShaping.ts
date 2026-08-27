@@ -79,10 +79,10 @@ type CompactionSemanticIndexRedaction = {
 function redactCompactionSemanticIndexText(
   value: string
 ): CompactionSemanticIndexRedaction {
-  const start = value.indexOf(COMPACTION_SEMANTIC_INDEX_OPEN);
-  if (start < 0) {
+  if (!value.startsWith(COMPACTION_SEMANTIC_INDEX_OPEN)) {
     return { value, redacted: false };
   }
+  const start = 0;
   const close = value.indexOf(COMPACTION_SEMANTIC_INDEX_CLOSE, start);
   if (close < 0) {
     return { value, redacted: false };

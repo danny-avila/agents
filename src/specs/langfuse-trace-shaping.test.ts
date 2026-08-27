@@ -538,7 +538,7 @@ describe('shapeLangfuseSpan', () => {
             {
               type: 'human',
               content:
-                'raw history keeps <compaction-semantic-index>example</compaction-semantic-index>',
+                '<compaction-semantic-index>raw history example</compaction-semantic-index>',
             },
             {
               type: 'human',
@@ -555,7 +555,7 @@ describe('shapeLangfuseSpan', () => {
 
     expect(span.attributes[METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES]).toBe(1);
     expect(span.attributes[INPUT]).toContain(
-      '<compaction-semantic-index>example</compaction-semantic-index>'
+      '<compaction-semantic-index>raw history example</compaction-semantic-index>'
     );
     expect(span.attributes[INPUT]).toContain('Checkpoint prompt');
     expect(span.attributes[INPUT]).toContain(
