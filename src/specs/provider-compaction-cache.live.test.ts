@@ -28,7 +28,7 @@ function createTools(nonce: string): t.GraphTools {
   return Array.from({ length: 8 }, (_, index) => ({
     name: `cache_probe_${index}`,
     description: `${nonce} ${LARGE_PREFIX}`,
-    input_schema: {
+    schema: {
       type: 'object' as const,
       properties: {
         value: { type: 'string' },
