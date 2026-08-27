@@ -543,7 +543,7 @@ describe('shapeLangfuseSpan', () => {
             {
               type: 'human',
               content:
-                '<compaction-semantic-index>\n- activity_phase: secret label\n</compaction-semantic-index>\n\nCheckpoint prompt',
+                '<compaction-semantic-index>\n- activity_phase: secret label\n</compaction-semantic-index>\n\nCheckpoint prompt with <compaction-semantic-index>custom example</compaction-semantic-index>',
             },
           ],
         }),
@@ -558,6 +558,9 @@ describe('shapeLangfuseSpan', () => {
       '<compaction-semantic-index>example</compaction-semantic-index>'
     );
     expect(span.attributes[INPUT]).toContain('Checkpoint prompt');
+    expect(span.attributes[INPUT]).toContain(
+      '<compaction-semantic-index>custom example</compaction-semantic-index>'
+    );
     expect(span.attributes[INPUT]).toContain(
       '<compaction-semantic-index redacted=\\"true\\" />'
     );

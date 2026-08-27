@@ -14,7 +14,11 @@ const messages = Array.from({ length: 12 }, (_, index) => {
     content: `message ${index}`,
   });
   setFreshProviderMessageProvenance(message, [
-    { attribution: 'user', sourceMessageId },
+    {
+      attribution: 'user',
+      sourceMessageId,
+      sourceContentPartIndices: [0, 1, 2, 3],
+    },
   ]);
   return message;
 });

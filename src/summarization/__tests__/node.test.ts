@@ -294,10 +294,18 @@ describe('createSummarizeNode', () => {
       new AIMessage({ id: 'message-2', content: 'I inspected it' }),
     ];
     setFreshProviderMessageProvenance(rawHistory[0], [
-      { attribution: 'user', sourceMessageId: 'message-1' },
+      {
+        attribution: 'user',
+        sourceMessageId: 'message-1',
+        sourceContentPartIndices: [0],
+      },
     ]);
     setFreshProviderMessageProvenance(rawHistory[1], [
-      { attribution: 'model', sourceMessageId: 'message-2' },
+      {
+        attribution: 'model',
+        sourceMessageId: 'message-2',
+        sourceContentPartIndices: [0],
+      },
     ]);
     const run = async (
       compactionSemanticIndex?: t.CompactionSemanticIndex

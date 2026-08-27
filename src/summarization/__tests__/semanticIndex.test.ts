@@ -27,13 +27,20 @@ function activityEntry(
   };
 }
 
-function sourceMessage(id: string, content: string): HumanMessage {
+function sourceMessage(
+  id: string,
+  content: string,
+  sourceContentPartIndices: number[] = Array.from(
+    { length: 128 },
+    (_, index) => index
+  )
+): HumanMessage {
   const message = new HumanMessage({ id, content });
   setFreshProviderMessageProvenance(message, [
     {
       attribution: 'user',
       sourceMessageId: id,
-      sourceContentPartIndices: [0],
+      sourceContentPartIndices,
     },
   ]);
   return message;
@@ -102,17 +109,19 @@ describe('renderCompactionSemanticIndex', () => {
       snapshotCompactionSemanticIndex([
         activityEntry({ text: 'x'.repeat(10_000) }),
       ])
-    ).toEqual([]);
+    ).toEqual([expect.objectContaining({ text: '', redacted: true })]);
 
     const oversized = Array.from(
       {
-        length:
-          COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 1,
+        length: COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 1,
       },
       (_, sourceContentIndex) => activityEntry({ sourceContentIndex })
     );
-    expect(snapshotCompactionSemanticIndex(oversized)).toBeUndefined();
-    expect(renderCompactionSemanticIndex(oversized, messages)).toMatchObject({
+    const oversizedSnapshot = snapshotCompactionSemanticIndex(oversized);
+    expect(oversizedSnapshot).toEqual([]);
+    expect(
+      renderCompactionSemanticIndex(oversizedSnapshot, messages)
+    ).toMatchObject({
       appendix: '',
       entryCount: 0,
       omittedEntryCount: oversized.length,
@@ -135,6 +144,20 @@ describe('renderCompactionSemanticIndex', () => {
     expect(rendered.appendix).toBe('');
     expect(rendered.entryCount).toBe(0);
     expect(rendered.omittedEntryCount).toBe(index.length);
+  });
+
+  it('requires the exact source content part to remain in the compaction range', () => {
+    const rendered = renderCompactionSemanticIndex(
+      [
+        activityEntry({ sourceContentIndex: 0, text: 'retained part' }),
+        activityEntry({ sourceContentIndex: 2, text: 'omitted part' }),
+      ],
+      [sourceMessage('message-1', 'partial source', [0])]
+    );
+
+    expect(rendered.entryCount).toBe(1);
+    expect(rendered.appendix).toContain('retained part');
+    expect(rendered.appendix).not.toContain('omitted part');
   });
 
   it('uses only the highest revision and fails closed on a conflicting tie', () => {
@@ -184,7 +207,10 @@ describe('renderCompactionSemanticIndex', () => {
       }),
     ];
 
-    expect(snapshotCompactionSemanticIndex(index)).toEqual([]);
+    expect(snapshotCompactionSemanticIndex(index)).toEqual([
+      expect.objectContaining({ text: '', redacted: true }),
+      expect.objectContaining({ text: '', redacted: true }),
+    ]);
     expect(renderCompactionSemanticIndex(index, messages)).toMatchObject({
       appendix: '',
       entryCount: 0,
@@ -219,6 +245,52 @@ describe('renderCompactionSemanticIndex', () => {
     expect(rendered.appendix).toBe('');
     expect(rendered.entryCount).toBe(0);
     expect(snapshotCompactionSemanticIndex(index)).toHaveLength(index.length);
+  });
+
+  it('lets an oversized latest revision suppress stale guidance', () => {
+    const snapshot = snapshotCompactionSemanticIndex([
+      activityEntry({ revision: 1, text: 'stale label' }),
+      activityEntry({
+        revision: 2,
+        text: 'x'.repeat(
+          COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars + 1
+        ),
+      }),
+    ]);
+
+    expect(snapshot).toHaveLength(2);
+    expect(snapshot?.[1]).toMatchObject({ text: '', redacted: true });
+    expect(renderCompactionSemanticIndex(snapshot, messages)).toMatchObject({
+      appendix: '',
+      providedEntryCount: 2,
+      entryCount: 0,
+      omittedEntryCount: 2,
+    });
+  });
+
+  it('preserves omission counts when snapshotting rejects entries', () => {
+    const hostileEntry = activityEntry();
+    Object.defineProperty(hostileEntry, 'text', {
+      get() {
+        throw new Error('hostile getter');
+      },
+    });
+    const snapshot = snapshotCompactionSemanticIndex([
+      activityEntry({
+        sourceMessageId: 'x'.repeat(
+          COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars + 1
+        ),
+      }),
+      hostileEntry,
+      activityEntry({ text: 'accepted' }),
+    ]);
+
+    expect(snapshot).toHaveLength(1);
+    expect(renderCompactionSemanticIndex(snapshot, messages)).toMatchObject({
+      providedEntryCount: 3,
+      entryCount: 1,
+      omittedEntryCount: 2,
+    });
   });
 
   it('orders by source position, content position, semantic type, and local identity', () => {
@@ -294,13 +366,10 @@ describe('renderCompactionSemanticIndex', () => {
     );
     expect(
       lines.every(
-        (line) =>
-          line.length <= COMPACTION_SEMANTIC_INDEX_LIMITS.maxEntryChars
+        (line) => line.length <= COMPACTION_SEMANTIC_INDEX_LIMITS.maxEntryChars
       )
     ).toBe(true);
     expect(rendered.entryCount).toBeLessThan(index.length);
-    expect(rendered.omittedEntryCount).toBe(
-      index.length - rendered.entryCount
-    );
+    expect(rendered.omittedEntryCount).toBe(index.length - rendered.entryCount);
   });
 });

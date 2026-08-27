@@ -26,12 +26,14 @@ persisted source message and content part. Tool entries also name their tool
 call, and reasoning labels name their reasoning step. Entries carry a monotonic
 revision, committed/pending lifecycle, and a redaction bit.
 
-The summarization module validates source identities against only the raw
-messages in the selected Compaction Range. For each logical identity it selects
-the highest revision, rejects conflicting ties, and excludes pending, redacted,
-empty, malformed, or out-of-range entries. It then orders accepted entries by
-source position and local identity, escapes them as data, and enforces fixed
-per-entry, total-character, and entry-count budgets.
+The summarization module validates each source identity and exact persisted
+content-part index against only the raw messages in the selected Compaction
+Range. For each logical identity it selects the highest revision, rejects
+conflicting ties, and excludes pending, redacted, empty, malformed, or
+out-of-range entries. Oversized newer revisions become bounded, textless
+tombstones so they cannot resurrect older guidance. It then orders accepted
+entries by source position and local identity, escapes them as data, and
+enforces fixed per-entry, total-character, and entry-count budgets.
 
 The rendered appendix is placed inside the unique final HumanMessage, before
 the compaction instruction. Raw history and its provider cache breakpoint are
@@ -39,7 +41,8 @@ unchanged. Raw messages remain authoritative, and no raw evidence is removed.
 When the host supplies no index, the ordinary request path and compaction prompt
 remain unchanged.
 
-Compaction traces record included-entry, character, and omitted-entry counts.
+Compaction traces record included-entry, character, and omitted-entry counts,
+including entries rejected while the caller-owned input is snapshotted.
 The export-time trace shaper redacts the appendix body from observation input.
 Self-spawned subagents do not inherit their parent's run-scoped index; explicit
 child configurations may provide an index belonging to the child.

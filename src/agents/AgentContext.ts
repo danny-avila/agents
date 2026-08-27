@@ -148,7 +148,13 @@ export class AgentContext {
       maxToolResultChars,
     });
 
-    agentContext._sourceInputs = agentConfig;
+    agentContext._sourceInputs =
+      compactionSemanticIndex == null
+        ? agentConfig
+        : {
+          ...agentConfig,
+          compactionSemanticIndex: agentContext.compactionSemanticIndex,
+        };
     agentContext.subagentConfigs = subagentConfigs;
     agentContext.maxSubagentDepth = maxSubagentDepth;
     /**
