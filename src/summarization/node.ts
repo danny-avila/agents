@@ -24,7 +24,9 @@ import {
 } from '@/llm/streamLimits';
 import {
   addTailCacheControl,
+  addBedrockTailCacheControl,
   resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
   type PromptCacheTtl,
 } from '@/messages/cache';
 import {
@@ -41,7 +43,9 @@ import {
 } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
+import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
+import { makeIsDeferred } from '@/messages/anthropicToolCache';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getMaxOutputTokensKey } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
@@ -623,7 +627,13 @@ async function executeSummarizationWithFallback(params: {
   usePromptCache: boolean;
   log: LogFn;
   /** Carries the run's stream limits so the event cap covers summary streams. */
-  graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
+  graph?: StreamLimitState & {
+    getBreakerSignal?: () => AbortSignal;
+    getToolsForBinding?: (
+      provider: t.ProviderName,
+      clientOptions: t.ClientOptions | undefined
+    ) => t.GraphTools | undefined;
+  };
 }): Promise<{
   text: string;
   usage?: Partial<UsageMetadata>;
@@ -657,10 +667,24 @@ async function executeSummarizationWithFallback(params: {
      * (e.g. an unrecognized summarization.provider) surfaces through the
      * `log('error', ...)` path below rather than bubbling up silently.
      */
+    const summarizationTools = usePromptCache
+      ? (graph?.getToolsForBinding?.(
+          clientConfig.provider as t.ProviderName,
+          clientConfig.clientOptions as t.ClientOptions
+      ) ??
+        prepareToolsForPromptCache({
+          provider: clientConfig.provider as t.ProviderName,
+          clientOptions: clientConfig.clientOptions as t.ClientOptions,
+          tools: agentContext.getToolsForBinding(),
+          isDeferred: makeIsDeferred(
+            agentContext.getEffectiveToolDefinitions()
+          ),
+        }))
+      : agentContext.getToolsForBinding();
     const summarizationModel = initializeModel({
       provider: clientConfig.provider,
       clientOptions: clientConfig.clientOptions as t.ClientOptions,
-      tools: agentContext.getToolsForBinding(),
+      tools: summarizationTools,
     }) as t.ChatModel;
 
     const result = await summarizeWithCacheHit({
@@ -677,13 +701,23 @@ async function executeSummarizationWithFallback(params: {
       usePromptCache,
       promptCacheTtl:
         clientConfig.provider === Providers.ANTHROPIC ||
-        clientConfig.provider === Providers.OPENROUTER
-          ? resolvePromptCacheTtl(
-            (
+        clientConfig.provider === Providers.OPENROUTER ||
+        clientConfig.provider === Providers.BEDROCK
+          ? (
                 clientConfig.clientOptions as {
                   promptCacheTtl?: PromptCacheTtl;
                 }
-            ).promptCacheTtl
+          ).promptCacheTtl
+          : undefined,
+      bedrockModelId:
+        clientConfig.provider === Providers.BEDROCK
+          ? resolveBedrockCompactionCacheModel(
+            clientConfig.clientOptions as
+              | {
+                applicationInferenceProfile?: string;
+                model?: string;
+              }
+              | undefined
           )
           : undefined,
       log,
@@ -900,6 +934,10 @@ interface CreateSummarizeNodeParams {
     runId?: string;
     isMultiAgent: boolean;
     hookRegistry?: HookRegistry;
+    getToolsForBinding?: (
+      provider: t.ProviderName,
+      clientOptions: t.ClientOptions | undefined
+    ) => t.GraphTools | undefined;
     dispatchRunStep: (
       runStep: t.RunStep,
       config?: RunnableConfig
@@ -1221,7 +1259,7 @@ export function createSummarizeNode({
       clientConfig.provider === (agentContext.provider as string);
     const hasPromptCache =
       isSelfSummarizeModel &&
-      (agentContext.clientOptions as Record<string, unknown> | undefined)
+      (clientConfig.clientOptions as Record<string, unknown> | undefined)
         ?.promptCache === true;
 
     const log: LogFn = (level, message, data) => {
@@ -1615,6 +1653,45 @@ function traceConfig(
   };
 }
 
+export function applySummarizationHistoryCache(params: {
+  messages: BaseMessage[];
+  provider: t.ProviderName;
+  enabled: boolean;
+  promptCacheTtl?: PromptCacheTtl;
+  bedrockModelId?: string;
+}): BaseMessage[] {
+  if (!params.enabled) {
+    return params.messages;
+  }
+  if (params.provider === Providers.BEDROCK) {
+    return addBedrockTailCacheControl(
+      [...params.messages],
+      resolveBedrockPromptCacheTtl(
+        params.promptCacheTtl,
+        params.bedrockModelId
+      )
+    );
+  }
+  if (
+    params.provider !== Providers.ANTHROPIC &&
+    params.provider !== Providers.OPENROUTER
+  ) {
+    return params.messages;
+  }
+  return addTailCacheControl(
+    [...params.messages],
+    resolvePromptCacheTtl(params.promptCacheTtl)
+  );
+}
+
+export function resolveBedrockCompactionCacheModel(
+  options:
+    | { applicationInferenceProfile?: string; model?: string }
+    | undefined
+): string | undefined {
+  return options?.model;
+}
+
 /**
  * Cache-friendly compaction: sends raw conversation messages with the
  * summarization instruction appended as the final HumanMessage. Bound tool
@@ -1635,6 +1712,7 @@ async function summarizeWithCacheHit({
   graph,
   usePromptCache,
   promptCacheTtl,
+  bedrockModelId,
   log,
 }: {
   model: t.ChatModel;
@@ -1649,6 +1727,7 @@ async function summarizeWithCacheHit({
   graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
   usePromptCache?: boolean;
   promptCacheTtl?: PromptCacheTtl;
+  bedrockModelId?: string;
   log?: LogFn;
 }): Promise<{ text: string; usage?: Partial<UsageMetadata> }> {
   const instruction = buildSummarizationInstruction(
@@ -1657,11 +1736,17 @@ async function summarizeWithCacheHit({
     priorSummaryText
   );
 
-  const fullMessages = [...messages, new HumanMessage(instruction)];
-  const invokeMessages =
-    usePromptCache === true
-      ? addTailCacheControl(fullMessages, promptCacheTtl)
-      : fullMessages;
+  const cachedHistory = applySummarizationHistoryCache({
+    messages,
+    provider,
+    enabled: usePromptCache === true,
+    promptCacheTtl,
+    bedrockModelId,
+  });
+  const invokeMessages = [
+    ...cachedHistory,
+    new HumanMessage(instruction),
+  ];
 
   const result = await attemptInvoke(
     {

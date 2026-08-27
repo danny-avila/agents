@@ -1,5 +1,6 @@
 /* eslint-disable no-console */
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { performance } from 'node:perf_hooks';
 import { config } from 'dotenv';
 config();
 import { Calculator } from '@/tools/Calculator';
@@ -19,6 +20,8 @@ import { createTokenCounter } from '@/utils/tokens';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { Run } from '@/run';
 import { formatAgentMessages } from '@/messages/format';
+import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
+import { CustomAnthropic } from '@/llm/anthropic';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import * as providers from '@/llm/providers';
 import { hasAnyEnv, hasEnv, hasEveryEnv } from './spec.utils';
@@ -305,6 +308,82 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
     'never compute in your head. Keep explanations concise (2-3 sentences max).',
     'When summarizing prior work, list each calculation and its result.',
   ].join(' ');
+
+  test('cache-aligned summarization reuses the normal tool prefix', async () => {
+    const nonce = `${Date.now()}-${Math.random()}`;
+    const description = `${nonce} ${'stable cache benchmark token '.repeat(180)}`;
+    const tools = Array.from({ length: 8 }, (_, index) => ({
+      name: `cache_probe_${index}`,
+      description,
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          value: { type: 'string' },
+        },
+      },
+    })) as t.GraphTools;
+    const preparedTools = prepareToolsForPromptCache({
+      provider: Providers.ANTHROPIC,
+      clientOptions: { promptCache: true },
+      tools,
+      isDeferred: () => false,
+    });
+    const createModel = (
+      boundTools: t.GraphTools
+    ): ReturnType<CustomAnthropic['bindTools']> =>
+      new CustomAnthropic({
+        model: 'claude-haiku-4-5',
+        anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+        maxTokens: 8,
+        temperature: 0,
+      }).bindTools(boundTools);
+
+    const prime = await createModel(preparedTools ?? tools).invoke([
+      new HumanMessage('Prime the normal request tool prefix. Reply OK.'),
+    ]);
+    const primeCacheCreation =
+      prime.usage_metadata?.input_token_details?.cache_creation ?? 0;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    const baselineStartedAt = performance.now();
+    const baseline = await createModel(tools).invoke([
+      new HumanMessage('Baseline compaction request. Reply OK.'),
+    ]);
+    const baselineLatencyMs = performance.now() - baselineStartedAt;
+
+    const alignedStartedAt = performance.now();
+    const aligned = await createModel(preparedTools ?? tools).invoke([
+      new HumanMessage('Cache-aligned compaction request. Reply OK.'),
+    ]);
+    const alignedLatencyMs = performance.now() - alignedStartedAt;
+
+    const baselineCacheRead =
+      baseline.usage_metadata?.input_token_details?.cache_read ?? 0;
+    const alignedCacheRead =
+      aligned.usage_metadata?.input_token_details?.cache_read ?? 0;
+    console.log(
+      `  Compaction tool-prefix benchmark: ${JSON.stringify({
+        prime: {
+          cacheCreationInputTokens: primeCacheCreation,
+          inputTokens: prime.usage_metadata?.input_tokens,
+        },
+        baseline: {
+          cacheReadInputTokens: baselineCacheRead,
+          inputTokens: baseline.usage_metadata?.input_tokens,
+          latencyMs: Math.round(baselineLatencyMs),
+        },
+        aligned: {
+          cacheReadInputTokens: alignedCacheRead,
+          inputTokens: aligned.usage_metadata?.input_tokens,
+          latencyMs: Math.round(alignedLatencyMs),
+        },
+      })}`
+    );
+
+    expect(primeCacheCreation).toBeGreaterThan(0);
+    expect(alignedCacheRead).toBeGreaterThan(baselineCacheRead);
+    expect(alignedCacheRead).toBeGreaterThan(0);
+  }, 180_000);
 
   test('heavy multi-turn with tool calls triggers and survives summarization', async () => {
     const spies = createSpies();

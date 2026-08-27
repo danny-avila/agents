@@ -59,14 +59,12 @@ import {
   addTailCacheControl,
   resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
-  supportsBedrockToolCache,
   isSyntheticProviderContextMessage,
   compactSyntheticProviderContextMessage,
   getMessageId,
   getMessageCreationContentMetadata,
   splitAssistantTextContentByPhase,
   makeIsDeferred,
-  partitionAndMarkAnthropicToolCache,
   DEFAULT_RETAIN_RECENT_TURNS,
   resolveIntraTurnRetainTokens,
   splitAtRecencyBoundary,
@@ -149,14 +147,13 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
-import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
-import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { createContextPressureMeter } from '@/llm/contextPressureMeter';
+import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
@@ -2789,6 +2786,27 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     };
   }
 
+  private getPreparedToolsForBinding(
+    agentContext: AgentContext,
+    provider: t.ProviderName = agentContext.provider,
+    clientOptions: t.ClientOptions | undefined = agentContext.clientOptions
+  ): t.GraphTools | undefined {
+    const tools = resolveLocalToolsForBinding({
+      tools: agentContext.getToolsForBinding(),
+      toolExecution: this.toolExecution,
+      toolRegistry: agentContext.toolRegistry,
+      discoveredToolNames: new Set(agentContext.getDiscoveredTools()),
+    });
+    return prepareToolsForPromptCache({
+      provider,
+      clientOptions,
+      tools,
+      isDeferred: makeIsDeferred(
+        agentContext.getEffectiveToolDefinitions()
+      ),
+    });
+  }
+
   createCallModel(agentId = 'default') {
     return async (
       state: t.AgentSubgraphState,
@@ -2846,13 +2864,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.markToolsAsDiscovered(discoveredNames);
       }
 
-      const rawToolsForBinding = resolveLocalToolsForBinding({
-        tools: agentContext.getToolsForBinding(),
-        toolExecution: this.toolExecution,
-        toolRegistry: agentContext.toolRegistry,
-        discoveredToolNames: new Set(agentContext.getDiscoveredTools()),
-      });
-
       /**
        * Anthropic prompt-cache breakpoint on the tool definitions.
        *
@@ -2866,69 +2877,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * Discovered deferred tools that arrive across turns sit *after*
        * the breakpoint and don't invalidate the prefix.
        */
-      let toolsForBinding = rawToolsForBinding;
-      const isDeferredTool = makeIsDeferred(
-        agentContext.getEffectiveToolDefinitions()
-      );
-      if (
-        agentContext.provider === Providers.ANTHROPIC &&
-        (agentContext.clientOptions as t.AnthropicClientOptions | undefined)
-          ?.promptCache === true
-      ) {
-        toolsForBinding =
-          partitionAndMarkAnthropicToolCache(
-            rawToolsForBinding,
-            isDeferredTool,
-            resolvePromptCacheTtl(
-              (
-                agentContext.clientOptions as
-                  | t.AnthropicClientOptions
-                  | undefined
-              )?.promptCacheTtl
-            )
-          ) ?? rawToolsForBinding;
-      } else if (
-        agentContext.provider === Providers.OPENROUTER &&
-        (
-          agentContext.clientOptions as
-            | t.ProviderOptionsMap[Providers.OPENROUTER]
-            | undefined
-        )?.promptCache === true
-      ) {
-        toolsForBinding =
-          partitionAndMarkOpenRouterToolCache(
-            rawToolsForBinding,
-            isDeferredTool,
-            resolvePromptCacheTtl(
-              (
-                agentContext.clientOptions as
-                  | t.ProviderOptionsMap[Providers.OPENROUTER]
-                  | undefined
-              )?.promptCacheTtl
-            )
-          ) ?? rawToolsForBinding;
-      } else if (
-        agentContext.provider === Providers.BEDROCK &&
-        (
-          agentContext.clientOptions as
-            | t.BedrockAnthropicClientOptions
-            | undefined
-        )?.promptCache === true
-      ) {
-        const bedrockModel = (
-          agentContext.clientOptions as { model?: string } | undefined
-        )?.model;
-        // An omitted model falls back to LangChain's default Claude model (which
-        // supports tool caching); only an explicit non-Claude model (e.g. Nova)
-        // skips tool marking so its stray marker never leaks into toolConfig.
-        if (bedrockModel == null || supportsBedrockToolCache(bedrockModel)) {
-          toolsForBinding =
-            partitionAndMarkBedrockToolCache(
-              rawToolsForBinding,
-              isDeferredTool
-            ) ?? rawToolsForBinding;
-        }
-      }
+      const toolsForBinding = this.getPreparedToolsForBinding(agentContext);
 
       let model =
         this.overrideModel ??
@@ -4924,6 +4873,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             runId: this.runId,
             isMultiAgent: this.isMultiAgentGraph(),
             hookRegistry: this.hookRegistry,
+            getToolsForBinding: (
+              provider: t.ProviderName,
+              clientOptions: t.ClientOptions | undefined
+            ): t.GraphTools | undefined =>
+              this.getPreparedToolsForBinding(
+                agentContext,
+                provider,
+                clientOptions
+              ),
             /**
              * Live references (both maps are cleared in place, never
              * replaced), so summarization streams share the run's event
