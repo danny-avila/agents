@@ -578,6 +578,54 @@ describe('createSummarizeNode', () => {
     }
   });
 
+  it('routes Bedrock tool preparation errors through fallback recovery', async () => {
+    const invalidTools = [{}] as t.GraphTools;
+    const fallback = jest
+      .spyOn(invokeUtils, 'tryFallbackProviders')
+      .mockResolvedValue({
+        messages: [new AIMessage('Fallback summary')],
+      } as never);
+    const setSummary = jest.fn();
+    const agentContext = createAgentContext({
+      provider: Providers.BEDROCK,
+      clientOptions: {
+        model: 'anthropic.claude-sonnet',
+        promptCache: true,
+        fallbacks: [{ provider: Providers.ANTHROPIC, model: 'fallback' }],
+      },
+      setSummary,
+    });
+    jest
+      .spyOn(agentContext, 'getToolsForBinding')
+      .mockReturnValue(invalidTools);
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await expect(
+      node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      )
+    ).resolves.not.toThrow();
+
+    expect(fallback).toHaveBeenCalledWith(
+      expect.objectContaining({ tools: invalidTools })
+    );
+    expect(setSummary).toHaveBeenCalledWith(
+      'Fallback summary',
+      expect.any(Number)
+    );
+  });
+
   it('marks a successfully served summarizer fallback ineligible', async () => {
     const previousDebugLogging = process.env.AGENT_DEBUG_LOGGING;
     process.env.AGENT_DEBUG_LOGGING = 'true';

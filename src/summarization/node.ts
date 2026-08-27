@@ -698,19 +698,6 @@ async function executeSummarizationWithFallback(params: {
     | CompactionReplayCandidateSnapshot
     | undefined;
   let compactionReplayToolProjectionFingerprint: string | undefined;
-  const rawSummarizationTools = agentContext.getToolsForBinding();
-  const bedrockOptions = clientConfig.clientOptions as
-    | t.BedrockAnthropicClientOptions
-    | undefined;
-  const summarizationTools =
-    clientConfig.provider === Providers.BEDROCK
-      ? prepareBedrockToolsForPromptCache(
-        rawSummarizationTools,
-        makeIsDeferred(agentContext.getEffectiveToolDefinitions()),
-        bedrockOptions?.promptCache === true,
-        (bedrockOptions as { model?: string } | undefined)?.model
-      )
-      : rawSummarizationTools;
 
   const observeCompactionReplay = (summarizerFallbackServed: boolean): void => {
     if (process.env.AGENT_DEBUG_LOGGING !== 'true') {
@@ -761,6 +748,19 @@ async function executeSummarizationWithFallback(params: {
      * (e.g. an unrecognized summarization.provider) surfaces through the
      * `log('error', ...)` path below rather than bubbling up silently.
      */
+    const rawSummarizationTools = agentContext.getToolsForBinding();
+    const bedrockOptions = clientConfig.clientOptions as
+      | t.BedrockAnthropicClientOptions
+      | undefined;
+    const summarizationTools =
+      clientConfig.provider === Providers.BEDROCK
+        ? prepareBedrockToolsForPromptCache(
+          rawSummarizationTools,
+          makeIsDeferred(agentContext.getEffectiveToolDefinitions()),
+          bedrockOptions?.promptCache === true,
+          (bedrockOptions as { model?: string } | undefined)?.model
+        )
+        : rawSummarizationTools;
     if (process.env.AGENT_DEBUG_LOGGING === 'true') {
       compactionReplayRouteSnapshot = Object.freeze({
         cacheNamespace: createCompactionCacheNamespace(

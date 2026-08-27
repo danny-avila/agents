@@ -227,6 +227,93 @@ describe('compaction replay eligibility', () => {
     }
   );
 
+  it.each([
+    ['responsesPromptCache', true, false],
+    ['responsesPromptCacheTtl', '1h', '5m'],
+  ] as const)(
+    'includes the OpenAI Responses %s setting in cache identity',
+    (key, primary, summary) => {
+      const recipe = createEnvelope({
+        provider: Providers.OPENAI,
+        cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
+          apiKey: 'shared-key',
+          [key]: primary,
+        }),
+      });
+
+      expect(
+        inspect(recipe, {
+          provider: Providers.OPENAI,
+          cacheNamespace: createCompactionCacheNamespace(Providers.OPENAI, {
+            apiKey: 'shared-key',
+            [key]: summary,
+          }),
+        })
+      ).toMatchObject({
+        eligible: false,
+        reason: 'cache_namespace_mismatch',
+      });
+    }
+  );
+
+  it('includes the xAI clientConfig endpoint in cache identity', () => {
+    const recipe = createEnvelope({
+      provider: Providers.XAI,
+      cacheNamespace: createCompactionCacheNamespace(Providers.XAI, {
+        apiKey: 'shared-key',
+        clientConfig: { baseURL: 'https://primary.x.ai' },
+      }),
+    });
+
+    expect(
+      inspect(recipe, {
+        provider: Providers.XAI,
+        cacheNamespace: createCompactionCacheNamespace(Providers.XAI, {
+          apiKey: 'shared-key',
+          clientConfig: { baseURL: 'https://summary.x.ai' },
+        }),
+      })
+    ).toMatchObject({
+      eligible: false,
+      reason: 'cache_namespace_mismatch',
+    });
+  });
+
+  it('lets an explicit xAI clientConfig endpoint override the environment', () => {
+    const originalBaseURL = process.env.OPENAI_BASE_URL;
+    const options = {
+      apiKey: 'shared-key',
+      clientConfig: { baseURL: 'https://explicit.x.ai' },
+    };
+    try {
+      process.env.OPENAI_BASE_URL = 'https://ignored-primary.x.ai';
+      const recipe = createEnvelope({
+        provider: Providers.XAI,
+        cacheNamespace: createCompactionCacheNamespace(
+          Providers.XAI,
+          options
+        ),
+      });
+      process.env.OPENAI_BASE_URL = 'https://ignored-summary.x.ai';
+
+      expect(
+        inspect(recipe, {
+          provider: Providers.XAI,
+          cacheNamespace: createCompactionCacheNamespace(
+            Providers.XAI,
+            options
+          ),
+        })
+      ).toMatchObject({ eligible: true });
+    } finally {
+      if (originalBaseURL == null) {
+        delete process.env.OPENAI_BASE_URL;
+      } else {
+        process.env.OPENAI_BASE_URL = originalBaseURL;
+      }
+    }
+  });
+
   it('snapshots nested cache identity before host mutation', () => {
     const options = {
       configuration: { baseURL: 'https://primary.test' },

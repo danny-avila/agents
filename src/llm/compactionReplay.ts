@@ -135,8 +135,11 @@ const CACHE_NAMESPACE_KEYS = [
   'promptCache',
   'promptCacheExplicit',
   'promptCacheTtl',
+  'responsesPromptCache',
+  'responsesPromptCacheTtl',
   'customHeaders',
   'defaultHeaders',
+  'clientConfig',
   'configuration',
   'useResponsesApi',
   'thinking',
@@ -262,7 +265,12 @@ const PROVIDER_ENVIRONMENT_ROUTES: Partial<
   [Providers.XAI]: [
     {
       environmentKey: 'OPENAI_BASE_URL',
-      optionPaths: [['baseURL'], ['baseUrl'], ['configuration', 'baseURL']],
+      optionPaths: [
+        ['baseURL'],
+        ['baseUrl'],
+        ['configuration', 'baseURL'],
+        ['clientConfig', 'baseURL'],
+      ],
     },
   ],
   [Providers.MOONSHOT]: [
