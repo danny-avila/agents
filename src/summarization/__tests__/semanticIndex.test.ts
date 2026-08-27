@@ -128,6 +128,33 @@ describe('renderCompactionSemanticIndex', () => {
     });
   });
 
+  it('captures the admitted array length before reading accessor-backed entries', () => {
+    const callerIndex = [activityEntry()];
+    let expandedEntryRead = false;
+    Object.defineProperty(callerIndex, 0, {
+      get() {
+        callerIndex.length = 2;
+        Object.defineProperty(callerIndex, 1, {
+          get() {
+            expandedEntryRead = true;
+            return activityEntry({ sourceContentIndex: 1 });
+          },
+        });
+        return activityEntry();
+      },
+    });
+
+    const snapshot = snapshotCompactionSemanticIndex(callerIndex);
+
+    expect(snapshot).toHaveLength(1);
+    expect(expandedEntryRead).toBe(false);
+    expect(renderCompactionSemanticIndex(snapshot, messages)).toMatchObject({
+      providedEntryCount: 1,
+      entryCount: 1,
+      omittedEntryCount: 0,
+    });
+  });
+
   it('rejects malformed and out-of-range source references', () => {
     const index: CompactionSemanticIndex = [
       activityEntry({ sourceMessageId: '' }),
@@ -338,6 +365,41 @@ describe('renderCompactionSemanticIndex', () => {
     expect(forward).not.toContain('message-1');
     expect(forward).not.toContain('tool-a');
     expect(forward).not.toContain('reasoning-2');
+  });
+
+  it('preserves contribution order when source messages are folded together', () => {
+    const folded = new HumanMessage('folded context');
+    setFreshProviderMessageProvenance(folded, [
+      {
+        attribution: 'user',
+        sourceMessageId: 'message-1',
+        sourceContentPartIndices: [2],
+      },
+      {
+        attribution: 'user',
+        sourceMessageId: 'message-2',
+        sourceContentPartIndices: [0],
+      },
+    ]);
+    const rendered = renderCompactionSemanticIndex(
+      [
+        activityEntry({
+          sourceMessageId: 'message-2',
+          sourceContentIndex: 0,
+          text: 'later source',
+        }),
+        activityEntry({
+          sourceMessageId: 'message-1',
+          sourceContentIndex: 2,
+          text: 'earlier source',
+        }),
+      ],
+      [folded]
+    );
+
+    expect(rendered.appendix.indexOf('earlier source')).toBeLessThan(
+      rendered.appendix.indexOf('later source')
+    );
   });
 
   it('escapes host text and enforces per-entry and total budgets', () => {

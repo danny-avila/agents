@@ -32,8 +32,8 @@ Range. For each logical identity it selects the highest revision, rejects
 conflicting ties, and excludes pending, redacted, empty, malformed, or
 out-of-range entries. Oversized newer revisions become bounded, textless
 tombstones so they cannot resurrect older guidance. It then orders accepted
-entries by source position and local identity, escapes them as data, and
-enforces fixed per-entry, total-character, and entry-count budgets.
+entries by exact provenance-contribution order and local identity, escapes them
+as data, and enforces fixed per-entry, total-character, and entry-count budgets.
 
 The rendered appendix is placed inside the unique final HumanMessage, before
 the compaction instruction. Raw history and its provider cache breakpoint are

@@ -38,8 +38,7 @@ const snapshotProvidedEntryCounts = new WeakMap<
 >();
 
 type SourceReference = {
-  sourceOrder: number;
-  contentIndices: Set<number>;
+  contentOrders: Map<number, number>;
 };
 
 type NormalizedEntry = {
@@ -146,15 +145,16 @@ export function snapshotCompactionSemanticIndex(
     if (!Array.isArray(index)) {
       return undefined;
     }
+    const inputLength = index.length;
     const providedEntryCount =
-      snapshotProvidedEntryCounts.get(index) ?? index.length;
-    if (index.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries) {
+      snapshotProvidedEntryCounts.get(index) ?? inputLength;
+    if (inputLength > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries) {
       const snapshot = Object.freeze([]) as CompactionSemanticIndex;
       snapshotProvidedEntryCounts.set(snapshot, providedEntryCount);
       return snapshot;
     }
     const snapshot: CompactionSemanticIndexEntry[] = [];
-    for (let position = 0; position < index.length; position++) {
+    for (let position = 0; position < inputLength; position++) {
       let entry: CompactionSemanticIndexEntry | undefined;
       try {
         entry = snapshotEntry(index[position]);
@@ -188,6 +188,7 @@ function collectSourceReferences(
   messages: BaseMessage[]
 ): Map<string, SourceReference> {
   const result = new Map<string, SourceReference>();
+  let contributionOrder = 0;
   for (let index = 0; index < messages.length; index++) {
     const message = messages[index];
     const provenanceState = inspectProviderMessageProvenance(message);
@@ -202,11 +203,17 @@ function collectSourceReferences(
       }
       let reference = result.get(sourceMessageId);
       if (reference == null) {
-        reference = { sourceOrder: index, contentIndices: new Set() };
+        reference = { contentOrders: new Map() };
         result.set(sourceMessageId, reference);
       }
       for (const sourceContentPartIndex of sourceContentPartIndices) {
-        reference.contentIndices.add(sourceContentPartIndex);
+        if (!reference.contentOrders.has(sourceContentPartIndex)) {
+          reference.contentOrders.set(
+            sourceContentPartIndex,
+            contributionOrder
+          );
+        }
+        contributionOrder++;
       }
     }
   }
@@ -245,7 +252,8 @@ function normalizeEntry(
   ) {
     return undefined;
   }
-  if (!sourceReference.contentIndices.has(sourceContentIndex)) {
+  const sourceOrder = sourceReference.contentOrders.get(sourceContentIndex);
+  if (sourceOrder == null) {
     return undefined;
   }
   const revision = entry.revision;
@@ -283,7 +291,7 @@ function normalizeEntry(
   return {
     type,
     sourceMessageId,
-    sourceOrder: sourceReference.sourceOrder,
+    sourceOrder,
     sourceContentIndex,
     revision,
     status: entry.status,
