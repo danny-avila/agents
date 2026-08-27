@@ -21,6 +21,12 @@ import { addTailCacheControl } from '@/messages/cache';
 import { setProviderMessageProvenance } from '@/messages/provenance';
 import { Providers } from '@/common';
 
+const AZURE_ENVIRONMENT_ROUTE_CASES = [
+  ['AZURE_OPENAI_API_INSTANCE_NAME', 'azureOpenAIApiInstanceName'],
+  ['AZURE_OPENAI_API_DEPLOYMENT_NAME', 'azureOpenAIApiDeploymentName'],
+  ['AZURE_OPENAI_API_VERSION', 'azureOpenAIApiVersion'],
+] as const;
+
 function sourceMessage(id: string): HumanMessage {
   const message = new HumanMessage({ content: id, id });
   setProviderMessageProvenance(message, [
@@ -509,6 +515,79 @@ describe('compaction replay eligibility', () => {
       }
     }
   });
+
+  it.each(AZURE_ENVIRONMENT_ROUTE_CASES)(
+    'snapshots the Azure %s route fallback',
+    (environmentKey, _optionKey) => {
+      const originalValue = process.env[environmentKey];
+      try {
+        process.env[environmentKey] = 'primary';
+        const recipe = createEnvelope({
+          provider: Providers.AZURE,
+          cacheNamespace: createCompactionCacheNamespace(Providers.AZURE, {
+            azureOpenAIApiKey: 'shared-key',
+          }),
+        });
+        process.env[environmentKey] = 'summary';
+
+        expect(
+          inspect(recipe, {
+            provider: Providers.AZURE,
+            cacheNamespace: createCompactionCacheNamespace(Providers.AZURE, {
+              azureOpenAIApiKey: 'shared-key',
+            }),
+          })
+        ).toMatchObject({
+          eligible: false,
+          reason: 'cache_namespace_mismatch',
+        });
+      } finally {
+        if (originalValue == null) {
+          delete process.env[environmentKey];
+        } else {
+          process.env[environmentKey] = originalValue;
+        }
+      }
+    }
+  );
+
+  it.each(AZURE_ENVIRONMENT_ROUTE_CASES)(
+    'ignores Azure %s when %s is explicit',
+    (environmentKey, optionKey) => {
+      const originalValue = process.env[environmentKey];
+      const options = {
+        azureOpenAIApiKey: 'shared-key',
+        [optionKey]: 'explicit',
+      };
+      try {
+        process.env[environmentKey] = 'ignored-primary';
+        const recipe = createEnvelope({
+          provider: Providers.AZURE,
+          cacheNamespace: createCompactionCacheNamespace(
+            Providers.AZURE,
+            options
+          ),
+        });
+        process.env[environmentKey] = 'ignored-summary';
+
+        expect(
+          inspect(recipe, {
+            provider: Providers.AZURE,
+            cacheNamespace: createCompactionCacheNamespace(
+              Providers.AZURE,
+              options
+            ),
+          })
+        ).toMatchObject({ eligible: true });
+      } finally {
+        if (originalValue == null) {
+          delete process.env[environmentKey];
+        } else {
+          process.env[environmentKey] = originalValue;
+        }
+      }
+    }
+  );
 
   it('snapshots environment-derived OpenAI organization and project routing', () => {
     const originalOrgId = process.env.OPENAI_ORG_ID;

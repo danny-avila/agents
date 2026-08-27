@@ -155,6 +155,7 @@ import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { prepareBedrockToolsForPromptCache } from '@/llm/bedrock/toolCache';
+import { createCompactionToolProjectionFingerprint } from '@/llm/compactionReplay';
 import { createContextPressureMeter } from '@/llm/contextPressureMeter';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
@@ -2925,6 +2926,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
+      const compactionReplayRouteSnapshot =
+        agentContext.summarizationEnabled === true &&
+        process.env.AGENT_DEBUG_LOGGING === 'true'
+          ? agentContext.createCompactionReplayRouteSnapshot(
+            this.overrideModel == null
+          )
+          : undefined;
+      const compactionReplayToolProjectionSnapshot =
+        compactionReplayRouteSnapshot?.promptCacheEnabled === true
+          ? Object.freeze({
+            fingerprint: createCompactionToolProjectionFingerprint(
+              toolsForBinding
+            ),
+          })
+          : undefined;
+
       let model =
         this.overrideModel ??
         initializeModel({
@@ -2938,14 +2955,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           .pipe(model as Runnable)
           .withConfig({ runName: AGENT_MODEL_CALL_RUN_NAME });
       }
-
-      const compactionReplayRouteSnapshot =
-        agentContext.summarizationEnabled === true &&
-        process.env.AGENT_DEBUG_LOGGING === 'true'
-          ? agentContext.createCompactionReplayRouteSnapshot(
-            this.overrideModel == null
-          )
-          : undefined;
 
       if (agentContext.tokenCalculationPromise) {
         await agentContext.tokenCalculationPromise;
@@ -3884,7 +3893,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               messagesToUse,
               this.overrideModel == null,
               toolsForBinding,
-              compactionReplayRouteSnapshot
+              compactionReplayRouteSnapshot,
+              compactionReplayToolProjectionSnapshot
             )
             : undefined;
         result = await withLangfuseRuntimeScope(

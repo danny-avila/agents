@@ -214,6 +214,24 @@ const PROVIDER_ENVIRONMENT_ROUTES: Partial<
         ['configuration', 'baseURL'],
       ],
     },
+    {
+      environmentKey: 'AZURE_OPENAI_API_INSTANCE_NAME',
+      optionPaths: [['azureOpenAIApiInstanceName']],
+    },
+    {
+      environmentKey: 'AZURE_OPENAI_API_DEPLOYMENT_NAME',
+      optionPaths: [
+        ['azureOpenAIApiDeploymentName'],
+        ['deploymentName'],
+      ],
+    },
+    {
+      environmentKey: 'AZURE_OPENAI_API_VERSION',
+      optionPaths: [
+        ['azureOpenAIApiVersion'],
+        ['openAIApiVersion'],
+      ],
+    },
   ],
   [Providers.BEDROCK]: [
     {

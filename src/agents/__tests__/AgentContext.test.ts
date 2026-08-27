@@ -234,6 +234,35 @@ describe('AgentContext', () => {
       });
     });
 
+    it('retains the tool projection captured when the model was bound', () => {
+      const ctx = createReplayContext();
+      const message = new HumanMessage({ content: 'hello', id: 'source-1' });
+      const tools = [createMockTool('stable-tool')];
+      const fingerprint = createCompactionToolProjectionFingerprint(tools);
+      const toolProjectionSnapshot = Object.freeze({ fingerprint });
+      const routeSnapshot = ctx.createCompactionReplayRouteSnapshot();
+      const request = prepareProviderRequest({
+        model: new FakeListChatModel({ responses: ['ok'] }) as t.ChatModel,
+        messages: [message],
+        provider: Providers.OPENAI,
+      });
+
+      tools[0].description = 'Mutated after model binding';
+      const recipe = ctx.createCompactionReplayRecipeSnapshot(
+        request,
+        [message],
+        true,
+        tools,
+        routeSnapshot,
+        toolProjectionSnapshot
+      );
+
+      expect(recipe.toolProjectionFingerprint).toBe(fingerprint);
+      expect(recipe.toolProjectionFingerprint).not.toBe(
+        createCompactionToolProjectionFingerprint(tools)
+      );
+    });
+
     it('distinguishes tool discovery from system-only projection changes', () => {
       const createRecordedContext = (): {
         ctx: AgentContext;

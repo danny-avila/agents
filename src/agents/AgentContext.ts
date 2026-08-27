@@ -2002,8 +2002,16 @@ export class AgentContext {
     sourceMessages: readonly BaseMessage[],
     servingRouteKnown = true,
     tools?: t.GraphTools,
-    routeSnapshot = this.createCompactionReplayRouteSnapshot(servingRouteKnown)
+    routeSnapshot = this.createCompactionReplayRouteSnapshot(servingRouteKnown),
+    toolProjectionSnapshot?: { readonly fingerprint?: string }
   ): CompactionReplayRecipe {
+    let toolProjectionFingerprint: string | undefined;
+    if (routeSnapshot.promptCacheEnabled) {
+      toolProjectionFingerprint =
+        toolProjectionSnapshot == null
+          ? createCompactionToolProjectionFingerprint(tools)
+          : toolProjectionSnapshot.fingerprint;
+    }
     return createCompactionReplayRecipe({
       provider: request.provider,
       modelId: request.modelId,
@@ -2014,9 +2022,7 @@ export class AgentContext {
         this.systemRunnable == null
           ? EMPTY_COMPACTION_SYSTEM_PROJECTION_FINGERPRINT
           : undefined,
-      toolProjectionFingerprint: routeSnapshot.promptCacheEnabled
-        ? createCompactionToolProjectionFingerprint(tools)
-        : undefined,
+      toolProjectionFingerprint,
       systemRevision: this.compactionSystemRevision,
       toolRevision: this.compactionToolRevision,
       messages: request.messages,
