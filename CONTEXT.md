@@ -153,9 +153,11 @@ come from shared request-preparation functions; cache-read usage is the source
 of truth for whether reuse occurred. Compaction never predicts cache identity
 from a hand-maintained list of provider options or environment variables.
 
-A **Compaction Semantic Index** is optional, host-supplied navigation guidance
-for the summarizer. Its committed, user-visible entries are source-addressed,
-revisioned, redaction-aware, deterministically ordered, and strictly bounded.
+A **Compaction Semantic Index** is optional navigation guidance derived during
+Model Context Reconstruction's existing persisted-content analysis. Its
+committed, user-visible entries are source-addressed, revisioned,
+redaction-aware, deterministically ordered, and strictly bounded. The host
+owns enablement and identifies which tool `intent` fields are semantic labels.
 The index is appended only after cacheable raw history; it never replaces raw
 messages or makes generated labels authoritative.
 

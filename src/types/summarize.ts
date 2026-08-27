@@ -72,7 +72,7 @@ export type CompactionReasoningSemanticIndexEntry =
   };
 
 /**
- * Host-supplied navigation hints for the compaction model. Entries remain
+ * Source-addressed navigation hints for the compaction model. Entries remain
  * advisory: raw messages are always sent and remain authoritative.
  */
 export type CompactionSemanticIndexEntry =

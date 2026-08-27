@@ -1,11 +1,22 @@
 import { performance } from 'node:perf_hooks';
 import { HumanMessage } from '@langchain/core/messages';
-import type { CompactionSemanticIndex } from '@/types';
+import type {
+  CompactionSemanticIndex,
+  CompactionSemanticIndexEntry,
+  MessageContentComplex,
+  TPayload,
+} from '@/types';
 import { setFreshProviderMessageProvenance } from '@/messages/provenance';
 import { renderCompactionSemanticIndex } from '@/summarization/semanticIndex';
+import { formatAgentMessages } from '@/messages/format';
+import { ContentTypes } from '@/common';
 
 const WARMUP_ITERATIONS = 5_000;
 const MEASURED_ITERATIONS = 25_000;
+const FORMAT_WARMUP_ITERATIONS = 500;
+const FORMAT_SAMPLE_ITERATIONS = 1_000;
+const FORMAT_SAMPLE_COUNT = 9;
+const INTENT_TOOL_NAMES: ReadonlySet<string> = new Set(['search_docs']);
 
 const messages = Array.from({ length: 12 }, (_, index) => {
   const sourceMessageId = `message-${index}`;
@@ -46,12 +57,263 @@ function run(
   return { elapsedMs: performance.now() - startedAt, checksum };
 }
 
+const persistedPayload: TPayload = Array.from(
+  { length: 8 },
+  (_, messageIndex) => ({
+    role: 'assistant',
+    messageId: `persisted-${messageIndex}`,
+    content: [
+      ...Array.from({ length: 2 }, (_, toolIndex) => ({
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: `tool-${messageIndex}-${toolIndex}`,
+          name: 'search_docs',
+          args: {
+            intent: `Locate implementation ${messageIndex}-${toolIndex}`,
+            query: `query ${messageIndex}-${toolIndex}`,
+          },
+          output: `result ${messageIndex}-${toolIndex}`,
+          outcome: `Located implementation ${messageIndex}-${toolIndex}`,
+        },
+      })),
+      {
+        type: ContentTypes.THINK,
+        think: `reasoning ${messageIndex}`,
+        reasoning_label: `Checked ownership ${messageIndex}`,
+        reasoning_label_step_id: `reasoning-${messageIndex}`,
+        reasoning_label_revision: 1,
+        reasoning_label_status: 'complete',
+      },
+      {
+        type: ContentTypes.ACTIVITY_LABEL,
+        activity_label: `Mapped request phase ${messageIndex}`,
+        activity_label_type: 'phase',
+        activity_start_index: 0,
+        pending: false,
+      },
+      {
+        type: ContentTypes.TEXT,
+        text: `Completed request analysis ${messageIndex}`,
+      },
+    ],
+  })
+);
+
+function stripActivityLabelParts(payload: TPayload): TPayload {
+  return payload.map((message) => {
+    if (!Array.isArray(message.content)) {
+      return message;
+    }
+    const filtered = message.content.filter(
+      (part) => part.type !== ContentTypes.ACTIVITY_LABEL
+    );
+    if (filtered.length === message.content.length) {
+      return message;
+    }
+    return { ...message, content: filtered };
+  });
+}
+
+type BenchmarkSemanticPart = MessageContentComplex & {
+  activity_label?: string;
+  activity_label_type?: string;
+  activity_start_index?: number;
+  pending?: boolean;
+  reasoning_label?: string;
+  reasoning_label_revision?: number;
+  reasoning_label_status?: string;
+  reasoning_label_step_id?: string;
+};
+
+function deriveSemanticIndexSeparately(
+  payload: TPayload
+): CompactionSemanticIndexEntry[] {
+  const entries: CompactionSemanticIndexEntry[] = [];
+  for (let messageIndex = 0; messageIndex < payload.length; messageIndex++) {
+    const message = payload[messageIndex];
+    const sourceMessageId =
+      typeof message.messageId === 'string' ? message.messageId : undefined;
+    if (sourceMessageId == null || !Array.isArray(message.content)) {
+      continue;
+    }
+    for (
+      let contentIndex = 0;
+      contentIndex < message.content.length;
+      contentIndex++
+    ) {
+      const part = message.content[contentIndex] as BenchmarkSemanticPart;
+      if (part.type === ContentTypes.TOOL_CALL && part.tool_call?.id != null) {
+        const { id: toolCallId, args, outcome } = part.tool_call;
+        const intent =
+          args != null && typeof args === 'object' && !Array.isArray(args)
+            ? args.intent
+            : undefined;
+        if (typeof intent === 'string') {
+          entries.push({
+            type: 'tool_intent',
+            sourceMessageId,
+            sourceContentIndex: contentIndex,
+            revision: 0,
+            status: 'committed',
+            text: intent,
+            toolCallId,
+          });
+        }
+        if (typeof outcome === 'string') {
+          entries.push({
+            type: 'tool_outcome',
+            sourceMessageId,
+            sourceContentIndex: contentIndex,
+            revision: 0,
+            status: 'committed',
+            text: outcome,
+            toolCallId,
+          });
+        }
+        continue;
+      }
+      if (
+        part.type === ContentTypes.THINK &&
+        typeof part.reasoning_label === 'string' &&
+        typeof part.reasoning_label_step_id === 'string' &&
+        typeof part.reasoning_label_revision === 'number'
+      ) {
+        entries.push({
+          type: 'reasoning_label',
+          sourceMessageId,
+          sourceContentIndex: contentIndex,
+          revision: part.reasoning_label_revision,
+          status:
+            part.reasoning_label_status === 'complete'
+              ? 'committed'
+              : 'pending',
+          text: part.reasoning_label,
+          reasoningStepId: part.reasoning_label_step_id,
+        });
+        continue;
+      }
+      if (
+        part.type === ContentTypes.ACTIVITY_LABEL &&
+        part.activity_label_type === 'phase' &&
+        typeof part.activity_label === 'string' &&
+        typeof part.activity_start_index === 'number'
+      ) {
+        entries.push({
+          type: 'activity_phase',
+          sourceMessageId,
+          sourceContentIndex: part.activity_start_index,
+          revision: 0,
+          status: part.pending === true ? 'pending' : 'committed',
+          text: part.activity_label,
+        });
+      }
+    }
+  }
+  return entries;
+}
+
+type FormatBenchmarkMode =
+  | 'disabled'
+  | 'legacy-prestrip'
+  | 'separate-projection'
+  | 'one-pass';
+
+function runFormatting(
+  iterations: number,
+  mode: FormatBenchmarkMode
+): { elapsedMs: number; checksum: number } {
+  let checksum = 0;
+  const startedAt = performance.now();
+  for (let iteration = 0; iteration < iterations; iteration++) {
+    const payload =
+      mode === 'legacy-prestrip' || mode === 'separate-projection'
+        ? stripActivityLabelParts(persistedPayload)
+        : persistedPayload;
+    const separatelyDerived =
+      mode === 'separate-projection'
+        ? deriveSemanticIndexSeparately(persistedPayload)
+        : undefined;
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      mode === 'one-pass'
+        ? {
+          preserveReasoningContent: true,
+          compactionSemanticIndex: {
+            intentToolNames: INTENT_TOOL_NAMES,
+          },
+        }
+        : { preserveReasoningContent: true }
+    );
+    checksum +=
+      result.messages.length +
+      (result.compactionSemanticIndex?.length ?? separatelyDerived?.length ?? 0);
+  }
+  return { elapsedMs: performance.now() - startedAt, checksum };
+}
+
+function median(values: number[]): number {
+  const ordered = [...values].sort((left, right) => left - right);
+  return ordered[Math.floor(ordered.length / 2)];
+}
+
+function formatTiming(results: Array<{
+  elapsedMs: number;
+  checksum: number;
+}>): {
+  medianTotalMs: number;
+  microsecondsPerProjection: number;
+  checksum: number;
+} {
+  const medianElapsedMs = median(results.map((result) => result.elapsedMs));
+  return {
+    medianTotalMs: Number(medianElapsedMs.toFixed(3)),
+    microsecondsPerProjection: Number(
+      ((medianElapsedMs * 1_000) / FORMAT_SAMPLE_ITERATIONS).toFixed(3)
+    ),
+    checksum: results.reduce((total, result) => total + result.checksum, 0),
+  };
+}
+
 run(WARMUP_ITERATIONS, undefined);
 run(WARMUP_ITERATIONS, semanticIndex);
 
 const disabled = run(MEASURED_ITERATIONS, undefined);
 const enabled = run(MEASURED_ITERATIONS, semanticIndex);
+runFormatting(FORMAT_WARMUP_ITERATIONS, 'disabled');
+runFormatting(FORMAT_WARMUP_ITERATIONS, 'legacy-prestrip');
+runFormatting(FORMAT_WARMUP_ITERATIONS, 'separate-projection');
+runFormatting(FORMAT_WARMUP_ITERATIONS, 'one-pass');
+const formatModes: FormatBenchmarkMode[] = [
+  'disabled',
+  'legacy-prestrip',
+  'separate-projection',
+  'one-pass',
+];
+const formatSamples = new Map<
+  FormatBenchmarkMode,
+  Array<{ elapsedMs: number; checksum: number }>
+>(formatModes.map((mode) => [mode, []]));
+for (let sample = 0; sample < FORMAT_SAMPLE_COUNT; sample++) {
+  for (let offset = 0; offset < formatModes.length; offset++) {
+    const mode = formatModes[(sample + offset) % formatModes.length];
+    formatSamples
+      .get(mode)
+      ?.push(runFormatting(FORMAT_SAMPLE_ITERATIONS, mode));
+  }
+}
+const formatDisabled = formatTiming(formatSamples.get('disabled') ?? []);
+const legacyPrestrip = formatTiming(
+  formatSamples.get('legacy-prestrip') ?? []
+);
+const separateProjection = formatTiming(
+  formatSamples.get('separate-projection') ?? []
+);
+const onePass = formatTiming(formatSamples.get('one-pass') ?? []);
 
+// eslint-disable-next-line no-console
 console.log(
   JSON.stringify(
     {
@@ -70,6 +332,24 @@ console.log(
           ((enabled.elapsedMs * 1_000) / MEASURED_ITERATIONS).toFixed(3)
         ),
         checksum: enabled.checksum,
+      },
+      formatterProjection: {
+        iterationsPerSample: FORMAT_SAMPLE_ITERATIONS,
+        samples: FORMAT_SAMPLE_COUNT,
+        messagesPerProjection: persistedPayload.length,
+        derivedEntriesPerProjection: 48,
+        disabled: formatDisabled,
+        legacyPrestripWithoutDerivation: legacyPrestrip,
+        separateProjectionWithPrestrip: separateProjection,
+        onePassWithDerivation: onePass,
+        onePassGainVsSeparatePercent: Number(
+          (
+            ((separateProjection.microsecondsPerProjection -
+              onePass.microsecondsPerProjection) /
+              separateProjection.microsecondsPerProjection) *
+            100
+          ).toFixed(2)
+        ),
       },
     },
     null,
