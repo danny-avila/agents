@@ -35,7 +35,6 @@ import {
   ACTIVITY_PHASE_LABEL_RUN_NAME,
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
-import { isBuiltRuntime } from '@/lazyRequire';
 import {
   requireValidSubagentResumeManifest,
   stripSubagentResumeManifest,
@@ -94,14 +93,15 @@ import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { stampSyntheticProviderMessage } from '@/messages/provenance';
+import { isOpenAILike, isLibreChatOpenAIModel } from '@/utils/llm';
 import { initializeLangfuseTracing } from './instrumentation';
 import { seedRunInitialSessions } from '@/utils/toolSessions';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 import { createGraph } from '@/graphs/createGraph';
 import { resolveMaxSeals } from '@/llm/preempt';
+import { isBuiltRuntime } from '@/lazyRequire';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
-import { isOpenAILike, isLibreChatOpenAIModel } from '@/utils/llm';
 import { executeHooks } from '@/hooks';
 
 /** Source-mode runs have no dist siblings for the lazy-loading seam, so every
@@ -792,6 +792,18 @@ export class Run<_T extends t.BaseGraphState> {
 
   getToolCount(): number {
     return this.Graph?.getToolCount() ?? 0;
+  }
+
+  /**
+   * True when the run's last turn ended at `END` because the provider hit
+   * its output token ceiling while producing plain text/reasoning — no tool
+   * call, so `assertNotTruncatedToolCall` never sees it and the graph reads
+   * the turn as an ordinary completion. Hosts check this alongside
+   * `getPreemptStats()` / `getHaltReason()` to decide whether to persist the
+   * response as unfinished instead of a silently truncated "complete" one.
+   */
+  getOutputTruncated(): boolean {
+    return this.Graph?.outputTruncatedIncomplete ?? false;
   }
 
   /**
