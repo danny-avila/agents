@@ -98,6 +98,11 @@ describe('renderCompactionSemanticIndex', () => {
         activityEntry({ text: 'secret', redacted: true }),
       ])?.[0].text
     ).toBe('');
+    expect(
+      snapshotCompactionSemanticIndex([
+        activityEntry({ text: 'x'.repeat(10_000) }),
+      ])?.[0].text
+    ).toHaveLength(COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars);
 
     const oversized = Array.from(
       {
@@ -239,7 +244,7 @@ describe('renderCompactionSemanticIndex', () => {
       (_, sourceContentIndex) =>
         activityEntry({
           sourceContentIndex,
-          text: `<instruction>${'long label '.repeat(100)}</instruction>`,
+          text: `<instruction>${'&'.repeat(1_000)}</instruction>`,
         })
     );
 
@@ -250,6 +255,9 @@ describe('renderCompactionSemanticIndex', () => {
 
     expect(rendered.appendix).not.toContain('<instruction>');
     expect(rendered.appendix).toContain('&lt;instruction&gt;');
+    expect(rendered.appendix).not.toContain('&amp…');
+    expect(rendered.appendix).not.toContain('&am…');
+    expect(rendered.appendix).not.toContain('&a…');
     expect(rendered.charCount).toBe(rendered.appendix.length);
     expect(rendered.charCount).toBeLessThanOrEqual(
       COMPACTION_SEMANTIC_INDEX_LIMITS.maxTotalChars

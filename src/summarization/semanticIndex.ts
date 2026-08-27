@@ -10,6 +10,7 @@ export const COMPACTION_SEMANTIC_INDEX_LIMITS = Object.freeze({
   maxEntries: 64,
   maxEntryChars: 512,
   maxTotalChars: 4_096,
+  maxInputTextChars: 4_096,
   maxIdentityChars: 512,
   maxSourceContentIndex: 4_095,
 } as const);
@@ -90,12 +91,16 @@ function snapshotEntry(
   ) {
     return undefined;
   }
+  const snapshotText =
+    redacted === true
+      ? ''
+      : text.slice(0, COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars);
   const common = {
     sourceMessageId,
     sourceContentIndex,
     revision,
     status,
-    text: redacted === true ? '' : text,
+    text: snapshotText,
     ...(redacted !== undefined ? { redacted } : {}),
   };
   if (type === 'activity_phase') {
@@ -208,7 +213,12 @@ function normalizeEntry(
     return undefined;
   }
   const redacted = entry.redacted === true;
-  const text = redacted ? '' : entry.text.replace(/\s+/g, ' ').trim();
+  const text = redacted
+    ? ''
+    : entry.text
+      .slice(0, COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars)
+      .replace(/\s+/g, ' ')
+      .trim();
   if (!redacted && text === '') {
     return undefined;
   }
@@ -310,22 +320,35 @@ function selectLatestRevisions(
   return selected;
 }
 
-function escapeXml(value: string): string {
-  return value.replace(/[&<>"']/g, (character) => {
-    if (character === '&') {
-      return '&amp;';
-    }
-    if (character === '<') {
-      return '&lt;';
-    }
-    if (character === '>') {
-      return '&gt;';
-    }
-    if (character === '"') {
-      return '&quot;';
-    }
+function escapeXmlCharacter(character: string): string {
+  if (character === '&') {
+    return '&amp;';
+  }
+  if (character === '<') {
+    return '&lt;';
+  }
+  if (character === '>') {
+    return '&gt;';
+  }
+  if (character === '"') {
+    return '&quot;';
+  }
+  if (character === '\'') {
     return '&apos;';
-  });
+  }
+  return character;
+}
+
+function escapeXmlBounded(value: string, maxChars: number): string {
+  const escaped = value.replace(/[&<>"']/g, escapeXmlCharacter);
+  if (escaped.length <= maxChars) {
+    return escaped;
+  }
+  let truncated = escaped.slice(0, Math.max(0, maxChars - 1));
+  if (truncated.lastIndexOf('&') > truncated.lastIndexOf(';')) {
+    truncated = truncated.slice(0, truncated.lastIndexOf('&'));
+  }
+  return truncated + '…';
 }
 
 function formatEntry(entry: NormalizedEntry): string | undefined {
@@ -335,12 +358,7 @@ function formatEntry(entry: NormalizedEntry): string | undefined {
   if (availableTextChars <= 0) {
     return undefined;
   }
-  const escapedText = escapeXml(entry.text);
-  const text =
-    escapedText.length <= availableTextChars
-      ? escapedText
-      : `${escapedText.slice(0, Math.max(0, availableTextChars - 1))}…`;
-  return prefix + text;
+  return prefix + escapeXmlBounded(entry.text, availableTextChars);
 }
 
 /**
