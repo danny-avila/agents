@@ -145,6 +145,8 @@ jobs:
             pattern: 'Bedrock Summarization E2E'
           - group: local
             pattern: 'no API keys'
+          - group: provider-cache
+            pattern: 'Merged compaction provider cache validation'
     steps:
       - uses: actions/checkout@v4
 
@@ -159,12 +161,14 @@ jobs:
           key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: Run summarization tests (${{ matrix.group }})
-        run: npx jest src/specs/summarization.test.ts -t "${{ matrix.pattern }}" --maxWorkers=50%
+        run: npx jest src/specs/summarization.test.ts src/specs/provider-compaction-cache.live.test.ts -t "${{ matrix.pattern }}" --maxWorkers=50%
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_CACHE_MODEL: ${{ secrets.OPENROUTER_CACHE_MODEL }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           AZURE_MODEL_NAME: ${{ secrets.AZURE_MODEL_NAME }}
           AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
@@ -172,6 +176,7 @@ jobs:
           AZURE_OPENAI_API_INSTANCE: ${{ secrets.AZURE_OPENAI_API_INSTANCE }}
           AZURE_OPENAI_API_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_API_DEPLOYMENT }}
           AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          BEDROCK_AWS_REGION: ${{ secrets.BEDROCK_AWS_REGION || secrets.AWS_DEFAULT_REGION }}
           BEDROCK_AWS_ACCESS_KEY_ID: ${{ secrets.BEDROCK_AWS_ACCESS_KEY_ID }}
           BEDROCK_AWS_SECRET_ACCESS_KEY: ${{ secrets.BEDROCK_AWS_SECRET_ACCESS_KEY }}
 
