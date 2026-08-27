@@ -374,9 +374,12 @@ export const formatFromLangChain = (
 };
 
 interface FormatAssistantMessageOptions {
+  compactionSemanticIndex?: CompactionSemanticIndexEntry[];
+  intentToolNames?: ReadonlySet<string>;
   preserveUnpairedServerToolUses?: boolean;
   preserveReasoningContent?: boolean;
   provider?: ProviderName;
+  retainedSourceContentEnd?: number;
   sourceMessageId?: string;
   sourceContentPartOffset?: number;
   sourceContentPartIndices?: readonly SourceContentPartIndices[];
@@ -507,13 +510,18 @@ function appendDerivedCompactionSemanticEntry(
   entry: CompactionSemanticIndexEntry
 ): void {
   if (
-    entries.length >= COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries ||
-    entry.sourceMessageId.length >
-      COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars ||
-    entry.sourceContentIndex < 0 ||
-    entry.sourceContentIndex >
-      COMPACTION_SEMANTIC_INDEX_LIMITS.maxSourceContentIndex
+    entries.length >= COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries
   ) {
+    return;
+  }
+  if (entry.status === 'pending') {
+    entries.push({ ...entry, text: '' });
+    return;
+  }
+  if (
+    entry.text.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars
+  ) {
+    entries.push({ ...entry, text: '', redacted: true });
     return;
   }
   entries.push(entry);
@@ -526,18 +534,30 @@ function collectCompactionSemanticEntriesFromPart(
   sourceContentIndex: number,
   retainedSourceContentStart: number,
   retainedSourceContentEnd: number,
-  intentToolNames?: ReadonlySet<string>
+  intentToolNames?: ReadonlySet<string>,
+  parsedToolInput?: ToolCallPart['args']
 ): void {
-  if (entries.length >= COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries) {
+  if (
+    entries.length >= COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries ||
+    sourceMessageId.length >
+      COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
+  ) {
     return;
   }
 
   if (part.type === ContentTypes.TOOL_CALL) {
+    if (
+      sourceContentIndex < 0 ||
+      sourceContentIndex >
+        COMPACTION_SEMANTIC_INDEX_LIMITS.maxSourceContentIndex
+    ) {
+      return;
+    }
     const toolCall = part.tool_call;
     const toolCallId = toolCall?.id;
     if (
       typeof toolCallId !== 'string' ||
-      toolCallId.trim() === '' ||
+      toolCallId === '' ||
       toolCallId.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
     ) {
       return;
@@ -546,8 +566,13 @@ function collectCompactionSemanticEntriesFromPart(
       typeof toolCall.name === 'string' &&
       intentToolNames?.has(toolCall.name) === true
     ) {
-      const intent = parseServerToolInput(toolCall.args).intent;
-      if (typeof intent === 'string' && intent.trim() !== '') {
+      const intent =
+        parsedToolInput != null &&
+        typeof parsedToolInput === 'object' &&
+        !Array.isArray(parsedToolInput)
+          ? parsedToolInput.intent
+          : undefined;
+      if (typeof intent === 'string' && intent !== '') {
         appendDerivedCompactionSemanticEntry(entries, {
           type: 'tool_intent',
           sourceMessageId,
@@ -559,7 +584,7 @@ function collectCompactionSemanticEntriesFromPart(
         });
       }
     }
-    if (typeof toolCall.outcome === 'string' && toolCall.outcome.trim() !== '') {
+    if (typeof toolCall.outcome === 'string' && toolCall.outcome !== '') {
       appendDerivedCompactionSemanticEntry(entries, {
         type: 'tool_outcome',
         sourceMessageId,
@@ -574,13 +599,20 @@ function collectCompactionSemanticEntriesFromPart(
   }
 
   if (part.type === ContentTypes.THINK) {
+    if (
+      sourceContentIndex < 0 ||
+      sourceContentIndex >
+        COMPACTION_SEMANTIC_INDEX_LIMITS.maxSourceContentIndex
+    ) {
+      return;
+    }
     const reasoningStepId = part.reasoning_label_step_id;
     const revision = part.reasoning_label_revision;
     const status = part.reasoning_label_status;
     const text = part.reasoning_label;
     if (
       typeof reasoningStepId !== 'string' ||
-      reasoningStepId.trim() === '' ||
+      reasoningStepId === '' ||
       reasoningStepId.length >
         COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars ||
       typeof revision !== 'number' ||
@@ -614,7 +646,9 @@ function collectCompactionSemanticEntriesFromPart(
     typeof activitySourceContentIndex !== 'number' ||
     !Number.isSafeInteger(activitySourceContentIndex) ||
     activitySourceContentIndex < retainedSourceContentStart ||
-    activitySourceContentIndex >= retainedSourceContentEnd
+    activitySourceContentIndex >= retainedSourceContentEnd ||
+    activitySourceContentIndex >
+      COMPACTION_SEMANTIC_INDEX_LIMITS.maxSourceContentIndex
   ) {
     return;
   }
@@ -638,10 +672,7 @@ function collectCompactionSemanticEntriesFromPart(
 
 function collectTrustedToolResultSourceContentPartIndices(
   content: readonly unknown[] | undefined,
-  sourceContentPartOffset: number,
-  compactionSemanticIndex?: CompactionSemanticIndexEntry[],
-  sourceMessageId?: string,
-  intentToolNames?: ReadonlySet<string>
+  sourceContentPartOffset: number
 ): Set<number> | undefined {
   if (content == null) {
     return undefined;
@@ -654,17 +685,6 @@ function collectTrustedToolResultSourceContentPartIndices(
     if (part == null) {
       previousPart = part;
       continue;
-    }
-    if (compactionSemanticIndex != null && sourceMessageId != null) {
-      collectCompactionSemanticEntriesFromPart(
-        compactionSemanticIndex,
-        part,
-        sourceMessageId,
-        sourceContentPartOffset + index,
-        sourceContentPartOffset,
-        sourceContentPartOffset + content.length,
-        intentToolNames
-      );
     }
     const call = getProviderToolCallPartDescriptor(part);
     if (call != null) {
@@ -1042,6 +1062,17 @@ function formatAssistantMessage(
   >();
   const shouldPreserveReasoningContent =
     options?.preserveReasoningContent === true;
+  const compactionSemanticIndex = options?.compactionSemanticIndex;
+  const semanticSourceMessageId =
+    compactionSemanticIndex != null &&
+    options?.sourceMessageId != null &&
+    options.sourceMessageId.length <=
+      COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
+      ? options.sourceMessageId
+      : undefined;
+  const retainedSourceContentStart = options?.sourceContentPartOffset ?? 0;
+  const retainedSourceContentEnd =
+    options?.retainedSourceContentEnd ?? retainedSourceContentStart;
   const serverToolResultIds = new Set<string>();
   const preferredToolCallParts = new Map<string, MessageContentComplex>();
 
@@ -1150,6 +1181,9 @@ function formatAssistantMessage(
       if (part == null) {
         continue;
       }
+      if (part.type === ContentTypes.ACTIVITY_LABEL) {
+        continue;
+      }
       const isTrustedResult = isTrustedServerToolResult(
         part,
         getSourcePartIndices(partIndex),
@@ -1185,6 +1219,24 @@ function formatAssistantMessage(
         continue;
       }
       const sourcePartIndices = getSourcePartIndices(partIndex);
+      if (part.type === ContentTypes.ACTIVITY_LABEL) {
+        if (
+          compactionSemanticIndex != null &&
+          semanticSourceMessageId != null &&
+          typeof sourcePartIndices === 'number'
+        ) {
+          collectCompactionSemanticEntriesFromPart(
+            compactionSemanticIndex,
+            part,
+            semanticSourceMessageId,
+            sourcePartIndices,
+            retainedSourceContentStart,
+            retainedSourceContentEnd,
+            options?.intentToolNames
+          );
+        }
+        continue;
+      }
       const toolUseId = getToolUseId(part);
       if (toolUseId != null) {
         const isServerToolResult =
@@ -1291,12 +1343,29 @@ function formatAssistantMessage(
           ) {
             continue;
           }
+          const serverToolInput = parseServerToolInput(_args);
+          if (
+            compactionSemanticIndex != null &&
+            semanticSourceMessageId != null &&
+            typeof sourcePartIndices === 'number'
+          ) {
+            collectCompactionSemanticEntriesFromPart(
+              compactionSemanticIndex,
+              part,
+              semanticSourceMessageId,
+              sourcePartIndices,
+              retainedSourceContentStart,
+              retainedSourceContentEnd,
+              options.intentToolNames,
+              serverToolInput
+            );
+          }
           pendingServerToolUses.set(_tool_call.id, {
             content: {
               type: 'server_tool_use',
               id: _tool_call.id,
               name: _tool_call.name,
-              input: parseServerToolInput(_args),
+              input: serverToolInput,
             } as MessageContentComplex,
             sourceContentPartIndices: sourcePartIndices,
           });
@@ -1328,6 +1397,22 @@ function formatAssistantMessage(
         }
 
         tool_call.args = args;
+        if (
+          compactionSemanticIndex != null &&
+          semanticSourceMessageId != null &&
+          typeof sourcePartIndices === 'number'
+        ) {
+          collectCompactionSemanticEntriesFromPart(
+            compactionSemanticIndex,
+            part,
+            semanticSourceMessageId,
+            sourcePartIndices,
+            retainedSourceContentStart,
+            retainedSourceContentEnd,
+            options?.intentToolNames,
+            args
+          );
+        }
         if (
           options?.provider === Providers.ANTHROPIC &&
           Array.isArray(lastAIMessage.content)
@@ -1366,6 +1451,22 @@ function formatAssistantMessage(
         part.type === ContentTypes.REASONING_CONTENT ||
         part.type === 'redacted_thinking'
       ) {
+        if (
+          part.type === ContentTypes.THINK &&
+          compactionSemanticIndex != null &&
+          semanticSourceMessageId != null &&
+          typeof sourcePartIndices === 'number'
+        ) {
+          collectCompactionSemanticEntriesFromPart(
+            compactionSemanticIndex,
+            part,
+            semanticSourceMessageId,
+            sourcePartIndices,
+            retainedSourceContentStart,
+            retainedSourceContentEnd,
+            options?.intentToolNames
+          );
+        }
         hasReasoning = true;
         pendingReasoningContent += extractReasoningContent(part);
         appendSourceContentPartIndices(
@@ -1444,8 +1545,7 @@ function formatAssistantMessage(
       } else if (
         part.type === ContentTypes.ERROR ||
         part.type === ContentTypes.AGENT_UPDATE ||
-        part.type === ContentTypes.SUMMARY ||
-        part.type === ContentTypes.ACTIVITY_LABEL
+        part.type === ContentTypes.SUMMARY
       ) {
         continue;
       } else {
@@ -2323,10 +2423,7 @@ export const formatAgentMessages = (
     const processedToolSourceContentPartIndices =
       collectTrustedToolResultSourceContentPartIndices(
         getBoundedProviderPairingArrayProperty(message, 'content'),
-        sourceContentPartOffset,
-        compactionSemanticIndex,
-        sourceMessageId,
-        options?.compactionSemanticIndex?.intentToolNames
+        sourceContentPartOffset
       );
     let pendingSkillNames: Set<string> | undefined;
     if (discoveredTools) {
@@ -2515,11 +2612,16 @@ export const formatAgentMessages = (
     }
 
     const formattedMessages = formatAssistantMessage(processedMessage, {
+      compactionSemanticIndex,
+      intentToolNames: options?.compactionSemanticIndex?.intentToolNames,
       preserveUnpairedServerToolUses: i === payload.length - 1,
       preserveReasoningContent:
         options?.preserveReasoningContent ??
         options?.provider === Providers.DEEPSEEK,
       provider: options?.provider,
+      retainedSourceContentEnd:
+        sourceContentPartOffset +
+        (Array.isArray(message.content) ? message.content.length : 0),
       sourceMessageId,
       sourceContentPartOffset,
       sourceContentPartIndices: processedSourceContentPartIndices,

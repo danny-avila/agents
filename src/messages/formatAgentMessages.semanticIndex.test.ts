@@ -146,6 +146,31 @@ describe('formatAgentMessages compaction semantic index', () => {
     );
   });
 
+  it('reuses the formatter parse for string-backed tool arguments', () => {
+    const args = JSON.stringify({
+      intent: 'Inspect the projection',
+      query: 'projection',
+    });
+    const payload = semanticPayload();
+    const content = payload[0].content;
+    if (Array.isArray(content) && content[0].type === ContentTypes.TOOL_CALL) {
+      content[0].tool_call = { ...content[0].tool_call, args };
+    }
+    const parse = jest.spyOn(JSON, 'parse');
+
+    try {
+      formatAgentMessages(payload, undefined, undefined, undefined, {
+        compactionSemanticIndex: { intentToolNames: new Set(['search_docs']) },
+      });
+
+      expect(
+        parse.mock.calls.filter(([value]) => value === args)
+      ).toHaveLength(1);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
   it('fails closed without stable source identity and preserves pending state', () => {
     const payload = semanticPayload();
     delete payload[0].messageId;
@@ -243,5 +268,36 @@ describe('formatAgentMessages compaction semantic index', () => {
       COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries
     );
     expect(result.messages).toHaveLength(toolCallCount + 1);
+  });
+
+  it('returns bounded tombstones instead of retaining oversized label text', () => {
+    const payload = semanticPayload();
+    const content = payload[0].content;
+    if (Array.isArray(content) && content[0].type === ContentTypes.TOOL_CALL) {
+      content[0].tool_call = {
+        ...content[0].tool_call,
+        outcome: 'x'.repeat(
+          COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars + 1
+        ),
+      };
+    }
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { compactionSemanticIndex: { intentToolNames: new Set(['search_docs']) } }
+    );
+
+    expect(result.compactionSemanticIndex).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'tool_outcome',
+          text: '',
+          redacted: true,
+        }),
+      ])
+    );
   });
 });

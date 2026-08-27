@@ -9,12 +9,12 @@ import type {
 import { setFreshProviderMessageProvenance } from '@/messages/provenance';
 import { renderCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import { formatAgentMessages } from '@/messages/format';
-import { ContentTypes } from '@/common';
+import { COMPACTION_SEMANTIC_INDEX_LIMITS, ContentTypes } from '@/common';
 
 const WARMUP_ITERATIONS = 5_000;
 const MEASURED_ITERATIONS = 25_000;
 const FORMAT_WARMUP_ITERATIONS = 500;
-const FORMAT_SAMPLE_ITERATIONS = 1_000;
+const FORMAT_SAMPLE_ITERATIONS = 300;
 const FORMAT_SAMPLE_COUNT = 9;
 const INTENT_TOOL_NAMES: ReadonlySet<string> = new Set(['search_docs']);
 
@@ -58,7 +58,7 @@ function run(
 }
 
 const persistedPayload: TPayload = Array.from(
-  { length: 8 },
+  { length: 32 },
   (_, messageIndex) => ({
     role: 'assistant',
     messageId: `persisted-${messageIndex}`,
@@ -125,6 +125,26 @@ type BenchmarkSemanticPart = MessageContentComplex & {
   reasoning_label_step_id?: string;
 };
 
+function appendSeparateSemanticEntry(
+  entries: CompactionSemanticIndexEntry[],
+  entry: CompactionSemanticIndexEntry
+): void {
+  if (entries.length >= COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries) {
+    return;
+  }
+  if (entry.status === 'pending') {
+    entries.push({ ...entry, text: '' });
+    return;
+  }
+  if (
+    entry.text.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars
+  ) {
+    entries.push({ ...entry, text: '', redacted: true });
+    return;
+  }
+  entries.push(entry);
+}
+
 function deriveSemanticIndexSeparately(
   payload: TPayload
 ): CompactionSemanticIndexEntry[] {
@@ -133,7 +153,12 @@ function deriveSemanticIndexSeparately(
     const message = payload[messageIndex];
     const sourceMessageId =
       typeof message.messageId === 'string' ? message.messageId : undefined;
-    if (sourceMessageId == null || !Array.isArray(message.content)) {
+    if (
+      sourceMessageId == null ||
+      sourceMessageId.length >
+        COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars ||
+      !Array.isArray(message.content)
+    ) {
       continue;
     }
     for (
@@ -142,14 +167,29 @@ function deriveSemanticIndexSeparately(
       contentIndex++
     ) {
       const part = message.content[contentIndex] as BenchmarkSemanticPart;
-      if (part.type === ContentTypes.TOOL_CALL && part.tool_call?.id != null) {
+      if (
+        contentIndex > COMPACTION_SEMANTIC_INDEX_LIMITS.maxSourceContentIndex
+      ) {
+        continue;
+      }
+      if (
+        part.type === ContentTypes.TOOL_CALL &&
+        typeof part.tool_call?.id === 'string' &&
+        part.tool_call.id !== '' &&
+        part.tool_call.id.length <=
+          COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
+      ) {
         const { id: toolCallId, args, outcome } = part.tool_call;
         const intent =
-          args != null && typeof args === 'object' && !Array.isArray(args)
+          part.tool_call.name != null &&
+          INTENT_TOOL_NAMES.has(part.tool_call.name) &&
+          args != null &&
+          typeof args === 'object' &&
+          !Array.isArray(args)
             ? args.intent
             : undefined;
-        if (typeof intent === 'string') {
-          entries.push({
+        if (typeof intent === 'string' && intent !== '') {
+          appendSeparateSemanticEntry(entries, {
             type: 'tool_intent',
             sourceMessageId,
             sourceContentIndex: contentIndex,
@@ -159,8 +199,8 @@ function deriveSemanticIndexSeparately(
             toolCallId,
           });
         }
-        if (typeof outcome === 'string') {
-          entries.push({
+        if (typeof outcome === 'string' && outcome !== '') {
+          appendSeparateSemanticEntry(entries, {
             type: 'tool_outcome',
             sourceMessageId,
             sourceContentIndex: contentIndex,
@@ -176,9 +216,16 @@ function deriveSemanticIndexSeparately(
         part.type === ContentTypes.THINK &&
         typeof part.reasoning_label === 'string' &&
         typeof part.reasoning_label_step_id === 'string' &&
-        typeof part.reasoning_label_revision === 'number'
+        part.reasoning_label_step_id !== '' &&
+        part.reasoning_label_step_id.length <=
+          COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars &&
+        typeof part.reasoning_label_revision === 'number' &&
+        Number.isSafeInteger(part.reasoning_label_revision) &&
+        part.reasoning_label_revision >= 0 &&
+        (part.reasoning_label_status === 'complete' ||
+          part.reasoning_label_status === 'streaming')
       ) {
-        entries.push({
+        appendSeparateSemanticEntry(entries, {
           type: 'reasoning_label',
           sourceMessageId,
           sourceContentIndex: contentIndex,
@@ -196,9 +243,14 @@ function deriveSemanticIndexSeparately(
         part.type === ContentTypes.ACTIVITY_LABEL &&
         part.activity_label_type === 'phase' &&
         typeof part.activity_label === 'string' &&
-        typeof part.activity_start_index === 'number'
+        typeof part.activity_start_index === 'number' &&
+        Number.isSafeInteger(part.activity_start_index) &&
+        part.activity_start_index >= 0 &&
+        part.activity_start_index < message.content.length &&
+        part.activity_start_index <=
+          COMPACTION_SEMANTIC_INDEX_LIMITS.maxSourceContentIndex
       ) {
-        entries.push({
+        appendSeparateSemanticEntry(entries, {
           type: 'activity_phase',
           sourceMessageId,
           sourceContentIndex: part.activity_start_index,
@@ -337,15 +389,15 @@ console.log(
         iterationsPerSample: FORMAT_SAMPLE_ITERATIONS,
         samples: FORMAT_SAMPLE_COUNT,
         messagesPerProjection: persistedPayload.length,
-        derivedEntriesPerProjection: 48,
+        derivedEntriesPerProjection: persistedPayload.length * 6,
         disabled: formatDisabled,
         legacyPrestripWithoutDerivation: legacyPrestrip,
         separateProjectionWithPrestrip: separateProjection,
         onePassWithDerivation: onePass,
-        onePassGainVsSeparatePercent: Number(
+        onePassDeltaVsSeparatePercent: Number(
           (
-            ((separateProjection.microsecondsPerProjection -
-              onePass.microsecondsPerProjection) /
+            ((onePass.microsecondsPerProjection -
+              separateProjection.microsecondsPerProjection) /
               separateProjection.microsecondsPerProjection) *
             100
           ).toFixed(2)
