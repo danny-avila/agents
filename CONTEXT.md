@@ -67,18 +67,49 @@ that persist those handoffs across executor lifetimes provide the same private
 preparation signing key to every authorized executor.
 Public invocation produces an executor-issued **Applied Settlement** that binds
 immutable result and terminal checkpoint evidence to the exact invocation
-reference that ran. Invocation start phase-fences the prepared capability so it
-cannot subsequently authorize discard of active or applied work. Commit
-consumes the settlement exactly once and returns structured indeterminate
-evidence for missing or invalid acknowledgements rather than exposing a
-retryable-looking exception. A host mailbox remains the durable cross-runtime
-owner and deduplication fence. Public invocation reclaims definitely-no-action
-forks before returning or rethrowing, while ambiguous and applied outcomes stay
-retained. The executor opportunistically prunes local terminal phase fences
-after the dormant-checkpoint TTL without scheduling timers that retain
-short-lived executors. A fence never expires before its signed authority, so
-pruning cannot re-enable a stale capability; the mailbox prevents stale
-cross-runtime replay after expiry.
+reference that ran. A **Suspended Event Actor Invocation** is authenticated,
+versioned, JSON-safe evidence that the same logical invocation remains
+nonterminal at one exact paused checkpoint and interrupt. It contains no graph,
+configuration, signal, closure, or process-local handle. **Suspension
+Authority** is the combination of that integrity evidence and the host's
+durable current-state fence: the signature prevents forgery and recombination,
+while the host fence prevents replay and proves one-shot ownership.
+
+A **Resume Attempt** is one host-claimed decision identified by a unique attempt
+ID. The host must claim it before applying the decision and must reject every
+competing, duplicate, stale, expired, or foreign claim. When resumed execution
+pauses again, **Re-pause Replacement** atomically publishes a new suspension
+with a new identity and monotonic attempt while consuming the claimed old
+suspension. Neither suspension is current if that comparison-and-swap cannot
+be proven. A resumed applied result carries signed settlement authority; the
+host consumes its suspension fence atomically with the actor-head comparison,
+so settlement may move to another authorized executor without process-local
+object identity. Cancellation similarly claims, discards, and closes the
+current suspension as one host operation. Expiry removes signature authority
+to resume but never proves an external action outcome; cleanup of expired
+evidence still requires a host-proven current-state transition.
+
+Suspension and resumed-settlement versions are fail-closed compatibility
+boundaries. During a rolling deployment, the host must capability-route durable
+records only to executors that support their exact version; a terminal-only old
+executor must never consume a new suspended job. Unknown versions are rejected
+before host mutation. Every executor that may handle the same current evidence
+uses the same signing key. Key rotation therefore requires draining, cancelling,
+or explicitly migrating all current signed evidence before the old key is
+removed; silently replacing the key strands valid paused work by design.
+
+Invocation start phase-fences the prepared capability so it cannot subsequently
+authorize discard of active or applied work. Commit consumes local settlement
+identity or authenticated resumed settlement authority and returns structured
+indeterminate evidence for missing or invalid acknowledgements rather than
+exposing a retryable-looking exception. A host mailbox remains the durable
+cross-runtime owner and deduplication fence. Public invocation reclaims
+definitely-no-action forks before returning or rethrowing, while ambiguous and
+applied outcomes stay retained. The executor opportunistically prunes local
+terminal phase fences after the dormant-checkpoint TTL without scheduling
+timers that retain short-lived executors. A fence never expires before its
+signed authority, so pruning cannot re-enable a stale capability; the mailbox
+prevents stale cross-runtime replay after expiry.
 
 Applied work may commit its Invocation Fork. Failed, cancelled, and
 completed-without-action invocations discard their forks. An applied fork that
@@ -89,8 +120,9 @@ same logical Event Actor identity. An indeterminate applied settlement,
 including malformed action checkpoint evidence or an ambiguous commit
 acknowledgement, is retained for reconciliation because deleting its fork
 could erase the only durable evidence of an external action.
-LangGraph interrupts and parent commands also retain the fork and propagate as
-control flow so the host can resume or route the checkpointed actor.
+Hosts may translate a durable LangGraph pause into the structured suspension
+result. Untranslated LangGraph interrupts and parent commands retain the fork
+and propagate as control flow for compatibility and routing.
 
 ## Tool Caller Capabilities
 

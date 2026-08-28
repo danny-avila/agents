@@ -74,13 +74,155 @@ export type EventActorTerminalResult<TResult extends EventActorEvent> =
     }
   | { status: 'completed_no_action'; result?: TResult };
 
+/** JSON-safe interrupt descriptor retained with a suspended invocation fork. */
+export interface EventActorInterrupt<
+  TPayload extends EventActorEvent = EventActorEvent,
+> {
+  id: string;
+  payload: TPayload;
+}
+
+/**
+ * Nonterminal adapter outcome. The checkpoint must already contain the pause;
+ * the SDK publishes its authority through `suspend` before exposing it.
+ */
+export interface EventActorAdapterSuspendedResult<
+  TPayload extends EventActorEvent = EventActorEvent,
+> {
+  status: 'suspended';
+  checkpoint: EventActorCheckpointFork;
+  interrupt: EventActorInterrupt<TPayload>;
+}
+
+export type EventActorAdapterInvocationResult<
+  TResult extends EventActorEvent,
+  TPayload extends EventActorEvent = EventActorEvent,
+> =
+  | EventActorTerminalResult<TResult>
+  | EventActorAdapterSuspendedResult<TPayload>;
+
+/**
+ * Authenticated, versioned, JSON-safe evidence for one nonterminal invocation.
+ * Integrity does not make this evidence one-shot; the host's durable current
+ * suspension record is the replay and ownership fence. Hosts must capability-
+ * route each exact version during rolling deploys and drain or migrate current
+ * evidence before rotating away from its signing key.
+ */
+export interface EventActorSuspension<
+  TPayload extends EventActorEvent = EventActorEvent,
+> {
+  version: 1;
+  suspensionId: string;
+  attempt: number;
+  issuedAt: number;
+  expiresAt: number;
+  invocation: EventActorInvocationReference;
+  checkpoint: EventActorCheckpointFork;
+  interrupt: EventActorInterrupt<TPayload>;
+  suspensionDigest: string;
+}
+
+export interface EventActorSuspendedResult<
+  TPayload extends EventActorEvent = EventActorEvent,
+> {
+  status: 'suspended';
+  suspension: EventActorSuspension<TPayload>;
+}
+
+export interface EventActorSuspendRequest {
+  suspension: EventActorSuspension;
+  /** CAS predecessor required when a claimed resume pauses again. */
+  previous?: {
+    suspensionId: string;
+    attempt: number;
+    resumeAttemptId: string;
+  };
+}
+
+export type EventActorSuspendResult =
+  | { status: 'stored' }
+  | { status: 'stale' };
+
+export interface EventActorAdapterResumeRequest {
+  suspension: EventActorSuspension;
+  resumeAttemptId: string;
+  value: EventActorEvent;
+}
+
+export type EventActorAdapterResumeResult<TResult extends EventActorEvent> =
+  | {
+      status: 'claimed';
+      result: EventActorAdapterInvocationResult<TResult>;
+    }
+  | {
+      /** The host proved no action before returning this claimed failure. */
+      status: 'claimed_failed';
+      error: Error;
+    }
+  | { status: 'stale' };
+
+export interface EventActorResumeRequest {
+  suspension: EventActorSuspension;
+  resumeAttemptId: string;
+  value: EventActorEvent;
+  signal?: AbortSignal;
+}
+
+export interface EventActorCancelSuspensionRequest {
+  suspension: EventActorSuspension;
+  cancelAttemptId: string;
+  reason?: 'cancelled' | 'expired';
+  signal?: AbortSignal;
+}
+
+export interface EventActorAdapterCancelSuspensionRequest {
+  suspension: EventActorSuspension;
+  cancelAttemptId: string;
+  reason: 'cancelled' | 'expired';
+}
+
+export type EventActorCancelSuspensionResult =
+  | { status: 'cancelled' }
+  | EventActorIndeterminateResult<EventActorEvent>;
+
+export type EventActorAdapterCancelSuspensionResult =
+  | { status: 'cancelled' }
+  | { status: 'stale' };
+
+export interface EventActorSettleSuspensionRequest {
+  suspensionId: string;
+  attempt: number;
+  resumeAttemptId: string;
+  status: 'completed_no_action' | 'failed';
+}
+
+export type EventActorSettleSuspensionResult =
+  | { status: 'settled' }
+  | { status: 'stale' };
+
 export type EventActorAppliedResult<TResult extends EventActorEvent> = Extract<
   EventActorTerminalResult<TResult>,
   { status: 'applied' }
 > & {
-  /** Executor-issued one-shot settlement for the invocation that produced this action. */
+  /** Executor-issued settlement for the invocation that produced this action. */
   invocation: EventActorInvocationReference;
+  /** Authenticated cross-executor authority for a resumed terminal action. */
+  settlementAuthority?: EventActorSettlementAuthority;
 };
+
+/**
+ * Authenticated fence that binds a resumed terminal result to its claimed
+ * suspension. The host must consume it atomically with the actor-head CAS.
+ */
+export interface EventActorSettlementAuthority {
+  version: 1;
+  suspensionId: string;
+  attempt: number;
+  resumeAttemptId: string;
+  issuedAt: number;
+  expiresAt: number;
+  settlementDigest: string;
+}
 
 export interface EventActorIndeterminateResult<
   TResult extends EventActorEvent,
@@ -95,6 +237,7 @@ export interface EventActorIndeterminateResult<
 export type EventActorInvocationResult<TResult extends EventActorEvent> =
   | EventActorAppliedResult<TResult>
   | EventActorIndeterminateResult<TResult>
+  | EventActorSuspendedResult
   | Extract<
       EventActorTerminalResult<TResult>,
       { status: 'completed_no_action' }
@@ -128,6 +271,8 @@ export interface EventActorCommitRequest<TResult extends EventActorEvent> {
   expectedHead: EventActorHead;
   checkpoint: EventActorCheckpointFork;
   result: TResult;
+  /** Host must consume this suspension fence atomically with the head CAS. */
+  settlementAuthority?: EventActorSettlementAuthority;
   retention: {
     committedCheckpoints: 2;
     dormantCheckpointTtlMs: number;
@@ -156,7 +301,11 @@ export interface EventActorDiscardRequest {
 /**
  * Host adapter for durable actor state and the concrete agent invocation.
  * `commit` must compare both the expected generation and checkpoint identity
- * atomically before advancing the logical actor head. The host mailbox
+ * atomically before advancing the logical actor head. When settlement authority
+ * is present, that same transaction must also verify and close the exact
+ * suspension/resume-attempt fence, including stale-head outcomes. Retrying an
+ * ambiguous acknowledgement must return the durable outcome rather than apply
+ * the same terminal transition again. The host mailbox
  * deduplicates the logical `invocationId` before entering this seam, while each
  * SDK execution attempt receives a distinct checkpoint namespace. Preparation
  * methods own rollback until they return a ready invocation and must treat the
@@ -170,6 +319,18 @@ export interface EventActorDiscardRequest {
  * fork: the SDK retains and surfaces it as `commit_conflict` for host
  * reconciliation. `discard` must be idempotent for the same invocation because
  * an ambiguous cleanup failure can be retried through the public lifecycle.
+ *
+ * Suspension-capable hosts implement all optional suspension methods. `suspend`
+ * publishes an initial suspension only while its logical invocation is current;
+ * with `previous`, it atomically replaces only the exact claimed predecessor.
+ * `resume` atomically claims the current suspension before applying its value to
+ * the declared interrupt and rejects duplicate or competing claims as `stale`.
+ * It must return `claimed_failed` only when it can prove no qualifying action;
+ * any failure after an action returns `applied`. `settleSuspension` atomically
+ * discards the claimed fork and closes its fence for definite no-action
+ * outcomes. `cancelSuspension`
+ * atomically claims, discards, and closes current state, including expired
+ * evidence; expiration alone never implies a safe action outcome.
  */
 export interface EventActorHostAdapter<
   TEvent extends EventActorEvent,
@@ -187,7 +348,20 @@ export interface EventActorHostAdapter<
   invoke(
     invocation: EventActorInvocation<TEvent>,
     context: EventActorInvocationContext
-  ): Promise<EventActorTerminalResult<TResult>>;
+  ): Promise<EventActorAdapterInvocationResult<TResult>>;
+  suspend?(request: EventActorSuspendRequest): Promise<EventActorSuspendResult>;
+  resume?(
+    request: EventActorAdapterResumeRequest,
+    context: EventActorInvocationContext
+  ): Promise<EventActorAdapterResumeResult<TResult>>;
+  /** Atomically claims, discards, and closes the current suspension. */
+  cancelSuspension?(
+    request: EventActorAdapterCancelSuspensionRequest,
+    context: EventActorPreparationContext
+  ): Promise<EventActorAdapterCancelSuspensionResult>;
+  settleSuspension?(
+    request: EventActorSettleSuspensionRequest
+  ): Promise<EventActorSettleSuspensionResult>;
   commit(
     request: EventActorCommitRequest<TResult>
   ): Promise<EventActorCommitResult>;
@@ -219,6 +393,9 @@ export type EventActorExecutionResult<TResult extends EventActorEvent> =
       status: 'cancelled';
       continuation: 'warm' | 'cold';
     }
+  | (EventActorSuspendedResult & {
+      continuation: 'warm' | 'cold';
+    })
   | {
       /** The action happened, but another head won the CAS. Reconcile; do not retry. */
       status: 'commit_conflict';
@@ -247,4 +424,6 @@ export interface EventActorExecutorOptions {
   dormantCheckpointTtlMs?: number;
   /** Stable private key of at least 32 bytes for cross-lifetime handoffs. */
   preparationSigningKey?: string | Uint8Array;
+  /** Maximum UTF-8 byte size of canonical suspension evidence. */
+  maxSuspensionPayloadBytes?: number;
 }
