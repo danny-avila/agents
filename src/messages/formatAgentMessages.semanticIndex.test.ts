@@ -301,6 +301,67 @@ describe('formatAgentMessages compaction semantic index', () => {
     );
   });
 
+  it('retains newer suppressing revisions when balanced admission overflows', () => {
+    const messageCount =
+      COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 80;
+    const payload: TPayload = Array.from(
+      { length: messageCount },
+      (_, index) => {
+        const isOldRevision = index === 0;
+        const isNewRevision = index === 100;
+        let activityLabel = `Filler activity ${index}`;
+        if (isOldRevision) {
+          activityLabel = 'stale retained label';
+        } else if (isNewRevision) {
+          activityLabel = 'new pending label';
+        }
+        return {
+          role: 'assistant',
+          messageId:
+            isOldRevision || isNewRevision
+              ? 'revision-source'
+              : `filler-source-${index}`,
+          content: [
+            { type: ContentTypes.TEXT, text: `Assistant text ${index}` },
+            {
+              type: ContentTypes.ACTIVITY_LABEL,
+              activity_label: activityLabel,
+              activity_label_type: 'phase',
+              activity_label_revision: isNewRevision ? 2 : 1,
+              activity_start_index: 0,
+              pending: isNewRevision,
+            } as MessageContentComplex,
+          ],
+        };
+      }
+    );
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { compactionSemanticIndex: {} }
+    );
+    const revisions = result.compactionSemanticIndex?.filter(
+      ({ sourceMessageId }) => sourceMessageId === 'revision-source'
+    );
+
+    expect(revisions).toEqual([
+      expect.objectContaining({
+        revision: 2,
+        status: 'pending',
+        text: '',
+      }),
+    ]);
+    expect(
+      renderCompactionSemanticIndex(
+        result.compactionSemanticIndex,
+        result.messages
+      ).appendix
+    ).not.toContain('stale retained label');
+  });
+
   it('returns bounded tombstones instead of retaining oversized label text', () => {
     const payload = semanticPayload();
     const content = payload[0].content;

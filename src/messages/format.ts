@@ -508,7 +508,9 @@ type CompactionSemanticContentPart = MessageContentComplex & {
 
 type OrderedCompactionSemanticIndexEntry = {
   entry: CompactionSemanticIndexEntry;
+  identityHash: number;
   order: number;
+  retentionCount: number;
 };
 
 type CompactionSemanticEntryRing = {
@@ -524,6 +526,7 @@ type CompactionSemanticTypeCoverage = {
 type CompactionSemanticCoverageState = {
   head: OrderedCompactionSemanticIndexEntry[];
   tail: CompactionSemanticEntryRing;
+  latestByIdentityHash: Map<number, OrderedCompactionSemanticIndexEntry[]>;
   typeCoverage: Map<
     CompactionSemanticIndexEntry['type'],
     CompactionSemanticTypeCoverage
@@ -542,6 +545,14 @@ const DERIVED_SEMANTIC_TAIL_LIMIT =
   COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries / 2;
 const DERIVED_SEMANTIC_TYPE_EDGE_LIMIT =
   COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries / 32;
+const DERIVED_SEMANTIC_TYPE_HASH: Readonly<
+  Record<CompactionSemanticIndexEntry['type'], number>
+> = Object.freeze({
+  tool_intent: 1,
+  tool_outcome: 2,
+  activity_phase: 3,
+  reasoning_label: 4,
+});
 
 function createDerivedCompactionSemanticIndexCollector(): DerivedCompactionSemanticIndexCollector {
   return {
@@ -554,20 +565,120 @@ function createCompactionSemanticCoverageState(): CompactionSemanticCoverageStat
   return {
     head: [],
     tail: { entries: [], cursor: 0 },
+    latestByIdentityHash: new Map(),
     typeCoverage: new Map(),
   };
 }
 
+function getDerivedCompactionSemanticLocalId(
+  entry: CompactionSemanticIndexEntry
+): string {
+  if (entry.type === 'reasoning_label') {
+    return entry.reasoningStepId;
+  }
+  if (entry.type !== 'activity_phase') {
+    return entry.toolCallId;
+  }
+  return '';
+}
+
+function hashDerivedCompactionSemanticIdentityString(
+  initialHash: number,
+  value: string
+): number {
+  let hash = initialHash;
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return hash;
+}
+
+function hashDerivedCompactionSemanticIdentity(
+  entry: CompactionSemanticIndexEntry
+): number {
+  let hash = 2_166_136_261 ^ DERIVED_SEMANTIC_TYPE_HASH[entry.type];
+  hash = Math.imul(hash, 16_777_619);
+  hash = hashDerivedCompactionSemanticIdentityString(
+    hash,
+    entry.sourceMessageId
+  );
+  hash ^= entry.sourceContentIndex;
+  hash = Math.imul(hash, 16_777_619);
+  hash = hashDerivedCompactionSemanticIdentityString(
+    hash,
+    getDerivedCompactionSemanticLocalId(entry)
+  );
+  return hash >>> 0;
+}
+
+function entriesShareDerivedCompactionSemanticIdentity(
+  left: CompactionSemanticIndexEntry,
+  right: CompactionSemanticIndexEntry
+): boolean {
+  return (
+    left.type === right.type &&
+    left.sourceMessageId === right.sourceMessageId &&
+    left.sourceContentIndex === right.sourceContentIndex &&
+    getDerivedCompactionSemanticLocalId(left) ===
+      getDerivedCompactionSemanticLocalId(right)
+  );
+}
+
+function entriesHaveConflictingSemanticState(
+  left: CompactionSemanticIndexEntry,
+  right: CompactionSemanticIndexEntry
+): boolean {
+  return (
+    left.status !== right.status ||
+    (left.redacted === true) !== (right.redacted === true) ||
+    left.text !== right.text
+  );
+}
+
+function retainCompactionSemanticEntry(
+  entry: OrderedCompactionSemanticIndexEntry
+): void {
+  entry.retentionCount++;
+}
+
+function releaseCompactionSemanticEntry(
+  coverage: CompactionSemanticCoverageState,
+  entry: OrderedCompactionSemanticIndexEntry
+): void {
+  entry.retentionCount--;
+  if (
+    entry.retentionCount === 0 &&
+    coverage.latestByIdentityHash.has(entry.identityHash)
+  ) {
+    const bucket = coverage.latestByIdentityHash.get(entry.identityHash);
+    if (bucket == null) {
+      return;
+    }
+    const entryIndex = bucket.indexOf(entry);
+    if (entryIndex >= 0) {
+      bucket.splice(entryIndex, 1);
+    }
+    if (bucket.length === 0) {
+      coverage.latestByIdentityHash.delete(entry.identityHash);
+    }
+  }
+}
+
 function appendCompactionSemanticEntryRing(
+  coverage: CompactionSemanticCoverageState,
   ring: CompactionSemanticEntryRing,
   entry: OrderedCompactionSemanticIndexEntry,
   limit: number
 ): void {
   if (ring.entries.length < limit) {
     ring.entries.push(entry);
+    retainCompactionSemanticEntry(entry);
     return;
   }
+  releaseCompactionSemanticEntry(coverage, ring.entries[ring.cursor]);
   ring.entries[ring.cursor] = entry;
+  retainCompactionSemanticEntry(entry);
   ring.cursor = (ring.cursor + 1) % limit;
 }
 
@@ -592,13 +703,22 @@ function appendDerivedCompactionSemanticEntry(
     collector.entries.push(boundedEntry);
     return;
   }
-  const orderedEntry = { entry: boundedEntry, order };
+  const orderedEntry = {
+    entry: boundedEntry,
+    identityHash: hashDerivedCompactionSemanticIdentity(boundedEntry),
+    order,
+    retentionCount: 0,
+  };
   if (collector.coverage == null) {
     collector.coverage = createCompactionSemanticCoverageState();
     for (let order = 0; order < collector.entries.length; order++) {
       appendCoverageBalancedCompactionSemanticEntry(collector.coverage, {
         entry: collector.entries[order],
+        identityHash: hashDerivedCompactionSemanticIdentity(
+          collector.entries[order]
+        ),
         order,
+        retentionCount: 0,
       });
     }
     collector.entries = [];
@@ -613,10 +733,39 @@ function appendCoverageBalancedCompactionSemanticEntry(
   coverage: CompactionSemanticCoverageState,
   orderedEntry: OrderedCompactionSemanticIndexEntry
 ): void {
+  const identityHash = orderedEntry.identityHash;
+  const identityBucket = coverage.latestByIdentityHash.get(identityHash);
+  const current = identityBucket?.find(({ entry }) =>
+    entriesShareDerivedCompactionSemanticIdentity(entry, orderedEntry.entry)
+  );
+  if (current != null) {
+    if (orderedEntry.entry.revision < current.entry.revision) {
+      return;
+    }
+    if (orderedEntry.entry.revision === current.entry.revision) {
+      if (
+        entriesHaveConflictingSemanticState(current.entry, orderedEntry.entry)
+      ) {
+        current.entry = { ...current.entry, text: '', redacted: true };
+        current.order = orderedEntry.order;
+      }
+      return;
+    }
+    current.entry = orderedEntry.entry;
+    current.order = orderedEntry.order;
+    return;
+  }
+  if (identityBucket == null) {
+    coverage.latestByIdentityHash.set(identityHash, [orderedEntry]);
+  } else {
+    identityBucket.push(orderedEntry);
+  }
   if (coverage.head.length < DERIVED_SEMANTIC_HEAD_LIMIT) {
     coverage.head.push(orderedEntry);
+    retainCompactionSemanticEntry(orderedEntry);
   }
   appendCompactionSemanticEntryRing(
+    coverage,
     coverage.tail,
     orderedEntry,
     DERIVED_SEMANTIC_TAIL_LIMIT
@@ -628,8 +777,10 @@ function appendCoverageBalancedCompactionSemanticEntry(
   }
   if (typeCoverage.head.length < DERIVED_SEMANTIC_TYPE_EDGE_LIMIT) {
     typeCoverage.head.push(orderedEntry);
+    retainCompactionSemanticEntry(orderedEntry);
   }
   appendCompactionSemanticEntryRing(
+    coverage,
     typeCoverage.tail,
     orderedEntry,
     DERIVED_SEMANTIC_TYPE_EDGE_LIMIT
