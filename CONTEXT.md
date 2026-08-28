@@ -89,6 +89,15 @@ current suspension as one host operation. Expiry removes signature authority
 to resume but never proves an external action outcome; cleanup of expired
 evidence still requires a host-proven current-state transition.
 
+Suspension and resumed-settlement versions are fail-closed compatibility
+boundaries. During a rolling deployment, the host must capability-route durable
+records only to executors that support their exact version; a terminal-only old
+executor must never consume a new suspended job. Unknown versions are rejected
+before host mutation. Every executor that may handle the same current evidence
+uses the same signing key. Key rotation therefore requires draining, cancelling,
+or explicitly migrating all current signed evidence before the old key is
+removed; silently replacing the key strands valid paused work by design.
+
 Invocation start phase-fences the prepared capability so it cannot subsequently
 authorize discard of active or applied work. Commit consumes local settlement
 identity or authenticated resumed settlement authority and returns structured

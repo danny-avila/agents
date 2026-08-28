@@ -104,7 +104,9 @@ export type EventActorAdapterInvocationResult<
 /**
  * Authenticated, versioned, JSON-safe evidence for one nonterminal invocation.
  * Integrity does not make this evidence one-shot; the host's durable current
- * suspension record is the replay and ownership fence.
+ * suspension record is the replay and ownership fence. Hosts must capability-
+ * route each exact version during rolling deploys and drain or migrate current
+ * evidence before rotating away from its signing key.
  */
 export interface EventActorSuspension<
   TPayload extends EventActorEvent = EventActorEvent,
