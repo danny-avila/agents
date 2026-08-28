@@ -11,7 +11,11 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type {
   EventActorAdapterPrepareRequest,
   EventActorAdapterPreparation,
+  EventActorAdapterInvocationResult,
+  EventActorAdapterResumeResult,
   EventActorAppliedResult,
+  EventActorCancelSuspensionRequest,
+  EventActorCancelSuspensionResult,
   EventActorCheckpointFork,
   EventActorCheckpointReference,
   EventActorDiscardReason,
@@ -28,12 +32,17 @@ import type {
   EventActorPreparedInvocation,
   EventActorPrepareRequest,
   EventActorPreparation,
+  EventActorResumeRequest,
+  EventActorSettlementAuthority,
   EventActorSettlementResult,
+  EventActorSuspendedResult,
+  EventActorSuspension,
   EventActorTerminalResult,
 } from './types';
 
 const DEFAULT_MAX_DEPTH = 1;
 const DEFAULT_DORMANT_CHECKPOINT_TTL_MS = 24 * 60 * 60 * 1_000;
+const DEFAULT_MAX_SUSPENSION_PAYLOAD_BYTES = 64 * 1_024;
 
 function createInvocationCheckpointNs(
   request: EventActorPrepareRequest<EventActorEvent>,
@@ -265,6 +274,53 @@ function serializeUnavailablePreparation<TEvent extends EventActorEvent>(
   });
 }
 
+function serializeSuspension(
+  suspension: Omit<EventActorSuspension, 'suspensionDigest'>
+): string {
+  return JSON.stringify({
+    version: suspension.version,
+    suspensionId: suspension.suspensionId,
+    attempt: suspension.attempt,
+    issuedAt: suspension.issuedAt,
+    expiresAt: suspension.expiresAt,
+    invocation: {
+      actorThreadId: suspension.invocation.actorThreadId,
+      invocationId: suspension.invocation.invocationId,
+      depth: suspension.invocation.depth,
+      continuation: suspension.invocation.continuation,
+      base: canonicalHead(suspension.invocation.base),
+      fork: snapshotCheckpointFork(suspension.invocation.fork),
+    },
+    checkpoint: snapshotCheckpointFork(suspension.checkpoint),
+    interrupt: {
+      id: suspension.interrupt.id,
+      payload: snapshotEvent(suspension.interrupt.payload),
+    },
+  });
+}
+
+function serializeSettlement<TResult extends EventActorEvent>(
+  authority: Omit<EventActorSettlementAuthority, 'settlementDigest'>,
+  invocation: EventActorInvocationReference,
+  checkpoint: EventActorCheckpointFork,
+  result: TResult
+): string {
+  return JSON.stringify({
+    kind: 'resumed_settlement',
+    authority,
+    invocation: {
+      actorThreadId: invocation.actorThreadId,
+      invocationId: invocation.invocationId,
+      depth: invocation.depth,
+      continuation: invocation.continuation,
+      base: canonicalHead(invocation.base),
+      fork: snapshotCheckpointFork(invocation.fork),
+    },
+    checkpoint: snapshotCheckpointFork(checkpoint),
+    result: snapshotEvent(result),
+  });
+}
+
 function freezePrepareRequest<TEvent extends EventActorEvent>(
   request: EventActorPrepareRequest<TEvent>
 ): EventActorPrepareRequest<TEvent> {
@@ -375,7 +431,8 @@ function validateInvocation<TEvent extends EventActorEvent>(
 
 function validateInvocationReference(
   invocation: EventActorInvocationReference,
-  maxDepth?: number
+  maxDepth?: number,
+  allowAdvancedFork = false
 ): void {
   requireNonEmpty(invocation.actorThreadId, 'actorThreadId');
   requireNonEmpty(invocation.invocationId, 'invocationId');
@@ -408,6 +465,7 @@ function validateInvocationReference(
       'fork.checkpointId for resumed actor'
     );
     if (
+      !allowAdvancedFork &&
       invocation.continuation === 'warm' &&
       invocation.fork.checkpointId !== invocation.base.checkpoint.checkpointId
     ) {
@@ -555,6 +613,12 @@ type EventActorPreparationPhase =
       expiresAt: number;
     };
 
+interface EventActorSettlementSuspension {
+  suspensionId: string;
+  attempt: number;
+  resumeAttemptId: string;
+}
+
 function createIndeterminateResult<TResult extends EventActorEvent>(
   invocation: EventActorInvocationReference,
   error: unknown,
@@ -667,6 +731,7 @@ export class EventActorExecutor<
   readonly #adapter: EventActorHostAdapter<TEvent, TResult>;
   readonly #maxDepth: number;
   readonly #dormantCheckpointTtlMs: number;
+  readonly #maxSuspensionPayloadBytes: number;
   readonly #preparationSigningKey: Uint8Array;
   readonly #issuedSettlements = new WeakSet<object>();
   readonly #preparationPhases = new Map<string, EventActorPreparationPhase>();
@@ -680,6 +745,14 @@ export class EventActorExecutor<
     this.#maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
     this.#dormantCheckpointTtlMs =
       options.dormantCheckpointTtlMs ?? DEFAULT_DORMANT_CHECKPOINT_TTL_MS;
+    this.#maxSuspensionPayloadBytes =
+      options.maxSuspensionPayloadBytes ?? DEFAULT_MAX_SUSPENSION_PAYLOAD_BYTES;
+    if (
+      !Number.isSafeInteger(this.#maxSuspensionPayloadBytes) ||
+      this.#maxSuspensionPayloadBytes < 1
+    ) {
+      throw new Error('maxSuspensionPayloadBytes must be a positive integer');
+    }
     const signingKey = Buffer.from(
       options.preparationSigningKey ?? randomBytes(32)
     );
@@ -1037,7 +1110,7 @@ export class EventActorExecutor<
     }
     this.#preparationPhases.set(preparationDigest, { status: 'invoking' });
     const settlementInvocation = snapshotInvocationReference(trustedInvocation);
-    let terminal: EventActorTerminalResult<TResult>;
+    let terminal: EventActorAdapterInvocationResult<TResult>;
     try {
       terminal = await this.#invokeWithConfig(
         snapshotInvocation(trustedInvocation),
@@ -1075,6 +1148,19 @@ export class EventActorExecutor<
     } catch (error) {
       return createIndeterminateResult(settlementInvocation, error);
     }
+    if (status === 'suspended') {
+      try {
+        return await this.#createSuspensionResult(
+          settlementInvocation,
+          terminal as Extract<
+            EventActorAdapterInvocationResult<TResult>,
+            { status: 'suspended' }
+          >
+        );
+      } catch (error) {
+        return createIndeterminateResult(settlementInvocation, error);
+      }
+    }
     if (status === 'applied') {
       const snapshot = snapshotAppliedTerminal<TResult>(
         settlementInvocation,
@@ -1098,11 +1184,15 @@ export class EventActorExecutor<
       { status: 'completed_no_action' }
     >;
     try {
+      const terminalCompleted = terminal as Extract<
+        EventActorTerminalResult<TResult>,
+        { status: 'completed_no_action' }
+      >;
       completed = Object.freeze({
         status: 'completed_no_action' as const,
-        ...(terminal.result === undefined
+        ...(terminalCompleted.result === undefined
           ? {}
-          : { result: snapshotEvent(terminal.result) }),
+          : { result: snapshotEvent(terminalCompleted.result) }),
       });
     } catch (error) {
       this.#setTerminalPreparationPhase(
@@ -1122,24 +1212,422 @@ export class EventActorExecutor<
     return completed;
   }
 
+  async #createSuspensionResult(
+    invocation: EventActorInvocationReference,
+    paused: Extract<
+      EventActorAdapterInvocationResult<TResult>,
+      { status: 'suspended' }
+    >,
+    previous?: {
+      suspension: EventActorSuspension;
+      resumeAttemptId: string;
+    }
+  ): Promise<EventActorSuspendedResult> {
+    const checkpoint = snapshotCheckpointFork(paused.checkpoint);
+    const invocationStart =
+      previous == null
+        ? invocation
+        : freezeInvocationReference({
+          ...invocation,
+          fork: previous.suspension.checkpoint,
+        });
+    validateTerminalCheckpoint(invocationStart, checkpoint);
+    requireNonEmpty(paused.interrupt.id, 'interrupt.id');
+    if (previous?.suspension.attempt === Number.MAX_SAFE_INTEGER) {
+      throw new Error('Event actor suspension attempt is exhausted');
+    }
+    const issuedAt = Date.now();
+    const unsigned: Omit<EventActorSuspension, 'suspensionDigest'> = {
+      version: 1,
+      suspensionId: randomUUID(),
+      attempt: previous == null ? 0 : previous.suspension.attempt + 1,
+      issuedAt,
+      expiresAt: Math.min(
+        Number.MAX_SAFE_INTEGER,
+        issuedAt + this.#dormantCheckpointTtlMs
+      ),
+      invocation: freezeInvocationReference(invocation),
+      checkpoint: Object.freeze(checkpoint),
+      interrupt: Object.freeze({
+        id: paused.interrupt.id,
+        payload: snapshotEvent(paused.interrupt.payload),
+      }),
+    };
+    const serialized = serializeSuspension(unsigned);
+    this.#validateSuspensionSize(serialized);
+    const suspension = Object.freeze({
+      ...unsigned,
+      suspensionDigest: this.#signPreparation(serialized),
+    });
+    if (this.#adapter.suspend == null) {
+      throw new Error('Event actor suspension storage is unavailable');
+    }
+    const stored = await this.#adapter.suspend({
+      suspension,
+      ...(previous == null
+        ? {}
+        : {
+          previous: {
+            suspensionId: previous.suspension.suspensionId,
+            attempt: previous.suspension.attempt,
+            resumeAttemptId: previous.resumeAttemptId,
+          },
+        }),
+    });
+    if (stored.status !== 'stored') {
+      throw new Error('Event actor suspension ownership is stale');
+    }
+    return Object.freeze({ status: 'suspended', suspension });
+  }
+
   #issueSettlement(
-    snapshot: EventActorAppliedSnapshot<TResult>
+    snapshot: EventActorAppliedSnapshot<TResult>,
+    suspension?: EventActorSettlementSuspension
   ): EventActorAppliedResult<TResult> {
+    const invocation = freezeInvocationReference(snapshot.invocation);
+    const checkpoint = Object.freeze(
+      snapshotCheckpointFork(snapshot.checkpoint)
+    );
+    let settlementAuthority: EventActorSettlementAuthority | undefined;
+    if (suspension != null) {
+      const issuedAt = Date.now();
+      const unsigned: Omit<EventActorSettlementAuthority, 'settlementDigest'> =
+        {
+          version: 1,
+          ...suspension,
+          issuedAt,
+          expiresAt: Math.min(
+            Number.MAX_SAFE_INTEGER,
+            issuedAt + this.#dormantCheckpointTtlMs
+          ),
+        };
+      settlementAuthority = Object.freeze({
+        ...unsigned,
+        settlementDigest: this.#signPreparation(
+          serializeSettlement(unsigned, invocation, checkpoint, snapshot.result)
+        ),
+      });
+    }
     const settlement = Object.freeze({
       status: 'applied' as const,
       result: snapshot.result,
-      checkpoint: Object.freeze(snapshotCheckpointFork(snapshot.checkpoint)),
-      invocation: freezeInvocationReference(snapshot.invocation),
+      checkpoint,
+      invocation,
+      ...(settlementAuthority == null ? {} : { settlementAuthority }),
     });
     this.#issuedSettlements.add(settlement);
     return settlement;
+  }
+
+  #snapshotAndValidateSettlementAuthority(
+    authority: EventActorSettlementAuthority | undefined,
+    invocation: EventActorInvocationReference,
+    checkpoint: EventActorCheckpointFork,
+    result: TResult
+  ): EventActorSettlementAuthority | undefined {
+    if (authority == null) {
+      return undefined;
+    }
+    const trusted = Object.freeze({
+      version: authority.version,
+      suspensionId: authority.suspensionId,
+      attempt: authority.attempt,
+      resumeAttemptId: authority.resumeAttemptId,
+      issuedAt: authority.issuedAt,
+      expiresAt: authority.expiresAt,
+      settlementDigest: authority.settlementDigest,
+    });
+    const version: unknown = trusted.version;
+    if (version !== 1) {
+      throw new Error('Event actor settlement authority version is invalid');
+    }
+    requireNonEmpty(trusted.suspensionId, 'suspensionId');
+    requireNonEmpty(trusted.resumeAttemptId, 'resumeAttemptId');
+    if (!Number.isSafeInteger(trusted.attempt) || trusted.attempt < 0) {
+      throw new Error('Event actor settlement authority attempt is invalid');
+    }
+    if (
+      !Number.isSafeInteger(trusted.issuedAt) ||
+      !Number.isSafeInteger(trusted.expiresAt) ||
+      trusted.issuedAt < 0 ||
+      trusted.expiresAt <= trusted.issuedAt
+    ) {
+      throw new Error('Event actor settlement authority lifetime is invalid');
+    }
+    const { settlementDigest: _digest, ...unsigned } = trusted;
+    if (
+      !this.#preparationSignatureMatches(
+        trusted.settlementDigest,
+        serializeSettlement(unsigned, invocation, checkpoint, result)
+      )
+    ) {
+      throw new Error('Event actor settlement authority binding is invalid');
+    }
+    if (trusted.expiresAt <= Date.now()) {
+      throw new Error('Event actor settlement authority binding has expired');
+    }
+    return trusted;
+  }
+
+  #snapshotAndValidateSuspension(
+    suspension: EventActorSuspension,
+    allowExpired = false
+  ): EventActorSuspension {
+    const trusted: EventActorSuspension = Object.freeze({
+      version: suspension.version,
+      suspensionId: suspension.suspensionId,
+      attempt: suspension.attempt,
+      issuedAt: suspension.issuedAt,
+      expiresAt: suspension.expiresAt,
+      invocation: freezeInvocationReference(suspension.invocation),
+      checkpoint: Object.freeze(snapshotCheckpointFork(suspension.checkpoint)),
+      interrupt: Object.freeze({
+        id: suspension.interrupt.id,
+        payload: snapshotEvent(suspension.interrupt.payload),
+      }),
+      suspensionDigest: suspension.suspensionDigest,
+    });
+    const version: unknown = trusted.version;
+    if (version !== 1) {
+      throw new Error('Event actor suspension version is invalid');
+    }
+    requireNonEmpty(trusted.suspensionId, 'suspensionId');
+    requireNonEmpty(trusted.interrupt.id, 'interrupt.id');
+    if (!Number.isSafeInteger(trusted.attempt) || trusted.attempt < 0) {
+      throw new Error('Event actor suspension attempt is invalid');
+    }
+    if (
+      !Number.isSafeInteger(trusted.issuedAt) ||
+      !Number.isSafeInteger(trusted.expiresAt) ||
+      trusted.issuedAt < 0 ||
+      trusted.expiresAt <= trusted.issuedAt
+    ) {
+      throw new Error('Event actor suspension lifetime is invalid');
+    }
+    validateInvocationReference(trusted.invocation, this.#maxDepth);
+    validateTerminalCheckpoint(trusted.invocation, trusted.checkpoint);
+    const { suspensionDigest: _digest, ...unsigned } = trusted;
+    const serialized = serializeSuspension(unsigned);
+    this.#validateSuspensionSize(serialized);
+    if (
+      !this.#preparationSignatureMatches(trusted.suspensionDigest, serialized)
+    ) {
+      throw new Error('Event actor suspension binding is invalid');
+    }
+    if (!allowExpired && trusted.expiresAt <= Date.now()) {
+      throw new Error('Event actor suspension binding has expired');
+    }
+    return trusted;
+  }
+
+  #validateSuspensionSize(serialized: string): void {
+    if (
+      Buffer.byteLength(serialized, 'utf8') > this.#maxSuspensionPayloadBytes
+    ) {
+      throw new Error('Event actor suspension exceeds maximum payload size');
+    }
+  }
+
+  async cancelSuspension(
+    request: EventActorCancelSuspensionRequest
+  ): Promise<EventActorCancelSuspensionResult> {
+    const suspension = this.#snapshotAndValidateSuspension(
+      request.suspension,
+      true
+    );
+    requireNonEmpty(request.cancelAttemptId, 'cancelAttemptId');
+    const reason: unknown = request.reason ?? 'cancelled';
+    if (reason !== 'cancelled' && reason !== 'expired') {
+      throw new Error('Event actor suspension cancellation reason is invalid');
+    }
+    if (this.#adapter.cancelSuspension == null) {
+      throw new Error('Event actor suspension cancellation is unavailable');
+    }
+    const controller = new AbortController();
+    const abort = (): void => controller.abort(request.signal?.reason);
+    if (isAborted(request.signal)) {
+      abort();
+    } else {
+      request.signal?.addEventListener('abort', abort, { once: true });
+    }
+    try {
+      const cancelled = await this.#adapter.cancelSuspension(
+        {
+          suspension,
+          cancelAttemptId: request.cancelAttemptId,
+          reason,
+        },
+        { signal: controller.signal }
+      );
+      if (cancelled.status !== 'cancelled') {
+        return createIndeterminateResult(
+          {
+            ...suspension.invocation,
+            fork: suspension.checkpoint,
+          },
+          new Error('Event actor suspension ownership is stale')
+        );
+      }
+      return Object.freeze({ status: 'cancelled' });
+    } catch (error) {
+      return createIndeterminateResult(
+        {
+          ...suspension.invocation,
+          fork: suspension.checkpoint,
+        },
+        error
+      );
+    } finally {
+      request.signal?.removeEventListener('abort', abort);
+    }
+  }
+
+  async resume(
+    request: EventActorResumeRequest
+  ): Promise<EventActorInvocationResult<TResult>> {
+    const suspension = this.#snapshotAndValidateSuspension(request.suspension);
+    requireNonEmpty(request.resumeAttemptId, 'resumeAttemptId');
+    if (this.#adapter.resume == null) {
+      throw new Error('Event actor suspension resume is unavailable');
+    }
+    const value = snapshotEvent(request.value);
+    const resumedReference = freezeInvocationReference({
+      ...suspension.invocation,
+      fork: suspension.checkpoint,
+    });
+    const controller = new AbortController();
+    const abort = (): void => controller.abort(request.signal?.reason);
+    if (isAborted(request.signal)) {
+      abort();
+    } else {
+      request.signal?.addEventListener('abort', abort, { once: true });
+    }
+    const config = createRunnableConfig(
+      resumedReference,
+      controller.signal,
+      AsyncLocalStorageProviderSingleton.getRunnableConfig()
+    );
+    let resumed: EventActorAdapterResumeResult<TResult>;
+    try {
+      resumed = await AsyncLocalStorageProviderSingleton.runWithConfig(
+        config,
+        () =>
+          this.#adapter.resume!(
+            {
+              suspension,
+              resumeAttemptId: request.resumeAttemptId,
+              value,
+            },
+            { signal: controller.signal, config }
+          )
+      );
+    } catch (error) {
+      return createIndeterminateResult(resumedReference, error);
+    } finally {
+      request.signal?.removeEventListener('abort', abort);
+    }
+    if (resumed.status === 'claimed_failed') {
+      try {
+        if (this.#adapter.settleSuspension == null) {
+          throw new Error('Event actor suspension settlement is unavailable');
+        }
+        const settled = await this.#adapter.settleSuspension({
+          suspensionId: suspension.suspensionId,
+          attempt: suspension.attempt,
+          resumeAttemptId: request.resumeAttemptId,
+          status: 'failed',
+        });
+        if (settled.status !== 'settled') {
+          throw new Error('Event actor suspension settlement is stale');
+        }
+      } catch (error) {
+        return createIndeterminateResult(resumedReference, error);
+      }
+      throw resumed.error;
+    }
+    if (resumed.status !== 'claimed') {
+      return createIndeterminateResult(
+        resumedReference,
+        new Error('Event actor suspension ownership is stale')
+      );
+    }
+    const status: unknown = resumed.result.status;
+    if (status === 'suspended') {
+      try {
+        return await this.#createSuspensionResult(
+          suspension.invocation,
+          resumed.result as Extract<
+            EventActorAdapterInvocationResult<TResult>,
+            { status: 'suspended' }
+          >,
+          {
+            suspension,
+            resumeAttemptId: request.resumeAttemptId,
+          }
+        );
+      } catch (error) {
+        return createIndeterminateResult(resumedReference, error);
+      }
+    }
+    if (status === 'completed_no_action') {
+      let result: TResult | undefined;
+      try {
+        const completed = resumed.result as Extract<
+          EventActorTerminalResult<TResult>,
+          { status: 'completed_no_action' }
+        >;
+        result =
+          completed.result === undefined
+            ? undefined
+            : snapshotEvent(completed.result);
+        if (this.#adapter.settleSuspension == null) {
+          throw new Error('Event actor suspension settlement is unavailable');
+        }
+        const settled = await this.#adapter.settleSuspension({
+          suspensionId: suspension.suspensionId,
+          attempt: suspension.attempt,
+          resumeAttemptId: request.resumeAttemptId,
+          status: 'completed_no_action',
+        });
+        if (settled.status !== 'settled') {
+          throw new Error('Event actor suspension settlement is stale');
+        }
+        return Object.freeze({
+          status: 'completed_no_action' as const,
+          ...(result === undefined ? {} : { result }),
+        });
+      } catch (error) {
+        return createIndeterminateResult(resumedReference, error, result);
+      }
+    }
+    if (status !== 'applied') {
+      return createIndeterminateResult(
+        resumedReference,
+        new Error('Event actor resumed invocation returned an invalid status')
+      );
+    }
+    const applied = snapshotAppliedTerminal<TResult>(
+      resumedReference,
+      resumed.result as Extract<
+        EventActorTerminalResult<TResult>,
+        { status: 'applied' }
+      >
+    );
+    if (applied.status === 'commit_indeterminate') {
+      return applied;
+    }
+    return this.#issueSettlement(applied, {
+      suspensionId: suspension.suspensionId,
+      attempt: suspension.attempt,
+      resumeAttemptId: request.resumeAttemptId,
+    });
   }
 
   async #invokeWithConfig(
     invocation: EventActorInvocation<TEvent>,
     signal: AbortSignal | undefined,
     ambientConfig: RunnableConfig | undefined
-  ): Promise<EventActorTerminalResult<TResult>> {
+  ): Promise<EventActorAdapterInvocationResult<TResult>> {
     resolveExecutionDepth(invocation.depth, ambientConfig);
     validateInvocation(
       {
@@ -1185,22 +1673,42 @@ export class EventActorExecutor<
   async commit(
     settlement: EventActorAppliedResult<TResult>
   ): Promise<EventActorSettlementResult<TResult>> {
-    if (!this.#issuedSettlements.has(settlement)) {
-      throw new Error('Event actor settlement was not issued by this executor');
-    }
+    const locallyIssued = this.#issuedSettlements.has(settlement);
     const trustedInvocation = snapshotInvocationReference(
       settlement.invocation
     );
-    validateInvocationReference(trustedInvocation, this.#maxDepth);
     const trustedCheckpoint = snapshotCheckpointFork(settlement.checkpoint);
+    const trustedResult = snapshotEvent(settlement.result);
+    const settlementAuthority = this.#snapshotAndValidateSettlementAuthority(
+      settlement.settlementAuthority,
+      trustedInvocation,
+      trustedCheckpoint,
+      trustedResult
+    );
+    if (settlementAuthority == null && !locallyIssued) {
+      throw new Error('Event actor settlement was not issued by this executor');
+    }
+    validateInvocationReference(
+      trustedInvocation,
+      this.#maxDepth,
+      settlementAuthority != null
+    );
     validateTerminalCheckpoint(trustedInvocation, trustedCheckpoint);
     this.#issuedSettlements.delete(settlement);
+    const trustedSettlement: EventActorAppliedResult<TResult> = {
+      status: 'applied',
+      result: trustedResult,
+      checkpoint: trustedCheckpoint,
+      invocation: trustedInvocation,
+      ...(settlementAuthority == null ? {} : { settlementAuthority }),
+    };
     try {
       const committed = await this.#adapter.commit({
         invocation: snapshotInvocationReference(trustedInvocation),
         expectedHead: snapshotHead(trustedInvocation.base),
         checkpoint: { ...trustedCheckpoint },
-        result: settlement.result,
+        result: trustedResult,
+        ...(settlementAuthority == null ? {} : { settlementAuthority }),
         retention: {
           committedCheckpoints: 2,
           dormantCheckpointTtlMs: this.#dormantCheckpointTtlMs,
@@ -1258,7 +1766,7 @@ export class EventActorExecutor<
       }
       return { status: 'stale' };
     } catch (error) {
-      return createSettlementIndeterminateResult(settlement, error);
+      return createSettlementIndeterminateResult(trustedSettlement, error);
     }
   }
 
@@ -1417,13 +1925,34 @@ export class EventActorExecutor<
         continuation,
       };
     }
+    if (terminalStatus === 'suspended') {
+      try {
+        const suspended = await this.#createSuspensionResult(
+          invocationReference,
+          terminal as Extract<
+            EventActorAdapterInvocationResult<TResult>,
+            { status: 'suspended' }
+          >
+        );
+        return { ...suspended, continuation };
+      } catch (error) {
+        return {
+          ...createIndeterminateResult(invocationReference, error),
+          continuation,
+        };
+      }
+    }
     if (terminalStatus === 'completed_no_action') {
       let result: TResult | undefined;
       try {
+        const completed = terminal as Extract<
+          EventActorTerminalResult<TResult>,
+          { status: 'completed_no_action' }
+        >;
         result =
-          terminal.result === undefined
+          completed.result === undefined
             ? undefined
-            : snapshotEvent(terminal.result);
+            : snapshotEvent(completed.result);
       } catch (error) {
         await this.#discardInvocationReference(
           invocationReference,

@@ -5,6 +5,7 @@ import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type {
   EventActorAdapterPrepareRequest,
+  EventActorAdapterInvocationResult,
   EventActorCheckpointFork,
   EventActorCommitRequest,
   EventActorDiscardRequest,
@@ -15,6 +16,7 @@ import type {
   EventActorInvocationContext,
   EventActorPreparationContext,
   EventActorPrepareRequest,
+  EventActorSuspension,
   EventActorTerminalResult,
 } from '@/eventActor';
 import { EventActorExecutor } from '@/eventActor';
@@ -75,10 +77,22 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
   readonly coldContinueSignals: AbortSignal[] = [];
   readonly invokeConfigs: RunnableConfig[] = [];
   readonly forkNamespaces: string[] = [];
+  readonly suspensions: EventActorSuspension[] = [];
+  readonly resumeAttempts: string[] = [];
+  readonly settledSuspensions: string[] = [];
+  readonly cancelledSuspensions: string[] = [];
+  currentSuspension?: EventActorSuspension;
+  claimedResumeAttemptId?: string;
   invokeImpl?: (
     prepared: EventActorInvocation<TestEvent>,
     signal: AbortSignal
   ) => Promise<EventActorTerminalResult<string>>;
+  resumeImpl?: (
+    suspension: EventActorSuspension,
+    value: EventActorEvent,
+    signal: AbortSignal
+  ) => Promise<EventActorAdapterInvocationResult<string>>;
+  resumeFailure?: Error;
 
   async prepare(
     request: EventActorAdapterPrepareRequest<TestEvent>,
@@ -173,11 +187,136 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
     }
   }
 
+  async suspend(request: {
+    suspension: EventActorSuspension;
+    previous?: {
+      suspensionId: string;
+      attempt: number;
+      resumeAttemptId: string;
+    };
+  }) {
+    if (request.previous == null) {
+      if (this.currentSuspension != null) {
+        return { status: 'stale' as const };
+      }
+    } else if (
+      this.currentSuspension?.suspensionId !== request.previous.suspensionId ||
+      this.currentSuspension.attempt !== request.previous.attempt ||
+      this.claimedResumeAttemptId !== request.previous.resumeAttemptId
+    ) {
+      return { status: 'stale' as const };
+    }
+    this.suspensions.push(request.suspension);
+    this.currentSuspension = request.suspension;
+    this.claimedResumeAttemptId = undefined;
+    return { status: 'stored' as const };
+  }
+
+  async resume(
+    request: {
+      suspension: EventActorSuspension;
+      resumeAttemptId: string;
+      value: EventActorEvent;
+    },
+    context: EventActorInvocationContext
+  ) {
+    if (
+      this.currentSuspension?.suspensionId !==
+        request.suspension.suspensionId ||
+      this.currentSuspension.attempt !== request.suspension.attempt ||
+      this.claimedResumeAttemptId != null
+    ) {
+      return { status: 'stale' as const };
+    }
+    this.claimedResumeAttemptId = request.resumeAttemptId;
+    this.resumeAttempts.push(request.resumeAttemptId);
+    if (this.resumeFailure != null) {
+      return { status: 'claimed_failed' as const, error: this.resumeFailure };
+    }
+    const result =
+      this.resumeImpl == null
+        ? {
+          status: 'applied' as const,
+          result: 'resumed',
+          checkpoint: {
+            ...request.suspension.checkpoint,
+            checkpointId: `resumed-${request.resumeAttemptId}`,
+          },
+        }
+        : await this.resumeImpl(
+          request.suspension,
+          request.value,
+          context.signal
+        );
+    return { status: 'claimed' as const, result };
+  }
+
+  async settleSuspension(request: {
+    suspensionId: string;
+    status: 'completed_no_action' | 'failed';
+  }) {
+    if (this.currentSuspension?.suspensionId !== request.suspensionId) {
+      return { status: 'stale' as const };
+    }
+    this.discards.push({
+      invocation: {
+        ...this.currentSuspension.invocation,
+        fork: this.currentSuspension.checkpoint,
+      },
+      reason: request.status,
+    });
+    this.settledSuspensions.push(request.suspensionId);
+    this.currentSuspension = undefined;
+    this.claimedResumeAttemptId = undefined;
+    return { status: 'settled' as const };
+  }
+
+  async cancelSuspension(request: {
+    suspension: EventActorSuspension;
+    cancelAttemptId: string;
+  }) {
+    if (
+      this.currentSuspension?.suspensionId !==
+        request.suspension.suspensionId ||
+      this.currentSuspension.attempt !== request.suspension.attempt ||
+      this.claimedResumeAttemptId != null
+    ) {
+      return { status: 'stale' as const };
+    }
+    this.cancelledSuspensions.push(request.suspension.suspensionId);
+    this.discards.push({
+      invocation: {
+        ...request.suspension.invocation,
+        fork: request.suspension.checkpoint,
+      },
+      reason: 'cancelled',
+    });
+    this.currentSuspension = undefined;
+    return { status: 'cancelled' as const };
+  }
+
   async commit(request: EventActorCommitRequest<string>) {
     this.commits.push(request);
     if (this.commitError != null) {
       throw this.commitError;
     }
+    const authority = request.settlementAuthority;
+    if (
+      authority != null &&
+      (this.currentSuspension?.suspensionId !== authority.suspensionId ||
+        this.currentSuspension.attempt !== authority.attempt ||
+        this.claimedResumeAttemptId !== authority.resumeAttemptId)
+    ) {
+      throw new Error('Stale suspension settlement authority');
+    }
+    const settleSuspension = (): void => {
+      if (authority == null) {
+        return;
+      }
+      this.settledSuspensions.push(authority.suspensionId);
+      this.currentSuspension = undefined;
+      this.claimedResumeAttemptId = undefined;
+    };
     const currentHead = head(
       this.generation,
       this.committedCheckpointNs,
@@ -192,6 +331,7 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
       request.expectedHead.checkpoint?.checkpointId !==
         currentHead.checkpoint?.checkpointId
     ) {
+      settleSuspension();
       return {
         status: 'stale' as const,
         head: currentHead,
@@ -200,6 +340,7 @@ class TestHost implements EventActorHostAdapter<TestEvent, string> {
     this.generation += 1;
     this.committedCheckpointNs = request.checkpoint.checkpointNs;
     this.committedCheckpointId = request.checkpoint.checkpointId ?? '';
+    settleSuspension();
     return {
       status: 'committed' as const,
       head: head(
@@ -613,6 +754,683 @@ describe('EventActorExecutor', () => {
     );
     expect(execution).not.toHaveProperty('result');
     expect(host.discards).toHaveLength(0);
+  });
+
+  it('returns authenticated JSON-safe suspension evidence without settling its fork', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_000);
+    try {
+      const host = new TestHost();
+      host.invokeImpl = async (prepared) =>
+        ({
+          status: 'suspended',
+          checkpoint: {
+            ...prepared.fork,
+            checkpointId: 'paused-checkpoint',
+          },
+          interrupt: {
+            id: 'interrupt-1',
+            payload: { type: 'tool_approval', toolName: 'deploy' },
+          },
+        }) as unknown as EventActorTerminalResult<string>;
+      const executor = new EventActorExecutor(host, {
+        dormantCheckpointTtlMs: 5_000,
+        preparationSigningKey: 's'.repeat(32),
+      });
+      const preparation = await executor.prepare({
+        actorThreadId: 'actor-thread',
+        invocationId: 'suspend-json',
+        depth: 1,
+        event: { text: 'suspend-json' },
+      });
+      if (preparation.status !== 'ready') {
+        throw new Error('Expected warm preparation');
+      }
+
+      const result = await executor.invoke(preparation.invocation);
+
+      expect(result).toMatchObject({
+        status: 'suspended',
+        suspension: {
+          version: 1,
+          suspensionId: expect.any(String),
+          attempt: 0,
+          issuedAt: 1_000,
+          expiresAt: 6_000,
+          invocation: {
+            actorThreadId: 'actor-thread',
+            invocationId: 'suspend-json',
+            fork: { invocationId: 'suspend-json' },
+          },
+          checkpoint: {
+            invocationId: 'suspend-json',
+            checkpointId: 'paused-checkpoint',
+          },
+          interrupt: {
+            id: 'interrupt-1',
+            payload: { type: 'tool_approval', toolName: 'deploy' },
+          },
+          suspensionDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
+      });
+      expect(JSON.parse(JSON.stringify(result))).toEqual(result);
+      if (result.status !== 'suspended') {
+        throw new Error('Expected suspension');
+      }
+      expect(host.suspensions).toEqual([result.suspension]);
+      expect(host.commits).toHaveLength(0);
+      expect(host.discards).toHaveLength(0);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('resumes a JSON-round-tripped suspension on another executor and commits once', async () => {
+    const host = new TestHost();
+    host.generation = 1;
+    host.committedCheckpointId = 'checkpoint-1';
+    host.invokeImpl = async (prepared) =>
+      ({
+        status: 'suspended',
+        checkpoint: {
+          ...prepared.fork,
+          checkpointId: 'cross-executor-paused',
+        },
+        interrupt: {
+          id: 'interrupt-cross-executor',
+          payload: { type: 'tool_approval', toolName: 'deploy' },
+        },
+      }) as unknown as EventActorTerminalResult<string>;
+    const options = { preparationSigningKey: 'x'.repeat(32) };
+    const firstExecutor = new EventActorExecutor(host, options);
+    const preparation = await firstExecutor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'cross-executor',
+      depth: 1,
+      event: { text: 'cross-executor' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const paused = await firstExecutor.invoke(preparation.invocation);
+    if (paused.status !== 'suspended') {
+      throw new Error('Expected suspended invocation');
+    }
+    const transferred = JSON.parse(
+      JSON.stringify(paused.suspension)
+    ) as typeof paused.suspension;
+
+    const secondExecutor = new EventActorExecutor(host, options);
+    const resumed = await (
+      secondExecutor as unknown as {
+        resume(request: {
+          suspension: typeof transferred;
+          resumeAttemptId: string;
+          value: EventActorEvent;
+        }): Promise<
+          Awaited<ReturnType<EventActorExecutor<TestEvent, string>['invoke']>>
+        >;
+      }
+    ).resume({
+      suspension: transferred,
+      resumeAttemptId: 'resume-1',
+      value: { approved: true },
+    });
+    if (resumed.status !== 'applied') {
+      throw new Error('Expected applied resumed invocation');
+    }
+
+    const transferredSettlement = JSON.parse(
+      JSON.stringify(resumed)
+    ) as typeof resumed;
+    const forgedSettlement = JSON.parse(
+      JSON.stringify(transferredSettlement)
+    ) as typeof transferredSettlement;
+    forgedSettlement.result = 'forged';
+    await expect(
+      new EventActorExecutor(host, options).commit(forgedSettlement)
+    ).rejects.toThrow('Event actor settlement authority binding is invalid');
+    await expect(
+      new EventActorExecutor(host, {
+        preparationSigningKey: 'z'.repeat(32),
+      }).commit(transferredSettlement)
+    ).rejects.toThrow('Event actor settlement authority binding is invalid');
+    expect(host.commits).toHaveLength(0);
+    const thirdExecutor = new EventActorExecutor(host, options);
+    await expect(
+      thirdExecutor.commit(transferredSettlement)
+    ).resolves.toMatchObject({
+      status: 'committed',
+      head: { generation: 2 },
+    });
+    expect(host.resumeAttempts).toEqual(['resume-1']);
+    expect(host.commits).toHaveLength(1);
+    expect(host.settledSuspensions).toEqual([transferred.suspensionId]);
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('atomically replaces a suspension when a resumed invocation pauses again', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) =>
+      ({
+        status: 'suspended',
+        checkpoint: {
+          ...prepared.fork,
+          checkpointId: 'first-pause',
+        },
+        interrupt: {
+          id: 'interrupt-first',
+          payload: { type: 'tool_approval', toolName: 'deploy' },
+        },
+      }) as unknown as EventActorTerminalResult<string>;
+    host.resumeImpl = async (suspension) => ({
+      status: 'suspended',
+      checkpoint: {
+        ...suspension.checkpoint,
+        checkpointId: 'second-pause',
+      },
+      interrupt: {
+        id: 'interrupt-second',
+        payload: { type: 'ask_user_question', question: 'Which region?' },
+      },
+    });
+    const options = { preparationSigningKey: 'r'.repeat(32) };
+    const firstExecutor = new EventActorExecutor(host, options);
+    const preparation = await firstExecutor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 're-pause',
+      depth: 1,
+      event: { text: 're-pause' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const firstPause = await firstExecutor.invoke(preparation.invocation);
+    if (firstPause.status !== 'suspended') {
+      throw new Error('Expected first suspension');
+    }
+
+    const secondExecutor = new EventActorExecutor(host, options);
+    const secondPause = await secondExecutor.resume({
+      suspension: firstPause.suspension,
+      resumeAttemptId: 'resume-first',
+      value: { approved: true },
+    });
+
+    expect(secondPause).toMatchObject({
+      status: 'suspended',
+      suspension: {
+        attempt: 1,
+        checkpoint: { checkpointId: 'second-pause' },
+        interrupt: { id: 'interrupt-second' },
+      },
+    });
+    if (secondPause.status !== 'suspended') {
+      throw new Error('Expected replacement suspension');
+    }
+    expect(secondPause.suspension.suspensionId).not.toBe(
+      firstPause.suspension.suspensionId
+    );
+    await expect(
+      new EventActorExecutor(host, options).resume({
+        suspension: firstPause.suspension,
+        resumeAttemptId: 'stale-old-resume',
+        value: { approved: true },
+      })
+    ).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      error: { message: 'Event actor suspension ownership is stale' },
+    });
+    expect(host.currentSuspension).toEqual(secondPause.suspension);
+    expect(host.discards).toHaveLength(0);
+    expect(host.commits).toHaveLength(0);
+
+    host.resumeImpl = async (suspension) => ({
+      status: 'applied',
+      result: 're-pause-complete',
+      checkpoint: {
+        ...suspension.checkpoint,
+        checkpointId: 're-pause-terminal',
+      },
+    });
+    const terminal = await new EventActorExecutor(host, options).resume({
+      suspension: JSON.parse(JSON.stringify(secondPause.suspension)),
+      resumeAttemptId: 'resume-second',
+      value: { region: 'us-east-1' },
+    });
+    if (terminal.status !== 'applied') {
+      throw new Error('Expected terminal resumed invocation');
+    }
+    await expect(
+      new EventActorExecutor(host, options).commit(
+        JSON.parse(JSON.stringify(terminal))
+      )
+    ).resolves.toMatchObject({ status: 'committed', head: { generation: 1 } });
+    expect(host.currentSuspension).toBeUndefined();
+    expect(host.settledSuspensions).toEqual([
+      secondPause.suspension.suspensionId,
+    ]);
+  });
+
+  it('closes and discards a resumed suspension that completes without action', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) =>
+      ({
+        status: 'suspended',
+        checkpoint: {
+          ...prepared.fork,
+          checkpointId: 'no-action-paused',
+        },
+        interrupt: {
+          id: 'interrupt-no-action',
+          payload: { type: 'tool_approval' },
+        },
+      }) as unknown as EventActorTerminalResult<string>;
+    host.resumeImpl = async () => ({
+      status: 'completed_no_action',
+      result: 'declined',
+    });
+    const options = { preparationSigningKey: 'n'.repeat(32) };
+    const firstExecutor = new EventActorExecutor(host, options);
+    const preparation = await firstExecutor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'resumed-no-action',
+      depth: 1,
+      event: { text: 'resumed-no-action' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const paused = await firstExecutor.invoke(preparation.invocation);
+    if (paused.status !== 'suspended') {
+      throw new Error('Expected suspension');
+    }
+
+    await expect(
+      new EventActorExecutor(host, options).resume({
+        suspension: paused.suspension,
+        resumeAttemptId: 'decline-attempt',
+        value: { approved: false },
+      })
+    ).resolves.toEqual({ status: 'completed_no_action', result: 'declined' });
+    expect(host.discards).toHaveLength(1);
+    expect(host.discards[0]?.invocation.fork.checkpointId).toBe(
+      'no-action-paused'
+    );
+    expect(host.settledSuspensions).toEqual([paused.suspension.suspensionId]);
+    expect(host.currentSuspension).toBeUndefined();
+  });
+
+  it('cancels a transferred suspension through the host current-state fence', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) =>
+      ({
+        status: 'suspended',
+        checkpoint: {
+          ...prepared.fork,
+          checkpointId: 'cancel-paused',
+        },
+        interrupt: {
+          id: 'interrupt-cancel',
+          payload: { type: 'ask_user_question' },
+        },
+      }) as unknown as EventActorTerminalResult<string>;
+    const options = { preparationSigningKey: 'c'.repeat(32) };
+    const firstExecutor = new EventActorExecutor(host, options);
+    const preparation = await firstExecutor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'cancel-transfer',
+      depth: 1,
+      event: { text: 'cancel-transfer' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const paused = await firstExecutor.invoke(preparation.invocation);
+    if (paused.status !== 'suspended') {
+      throw new Error('Expected suspension');
+    }
+    const transferred = JSON.parse(
+      JSON.stringify(paused.suspension)
+    ) as typeof paused.suspension;
+
+    await expect(
+      new EventActorExecutor(host, options).cancelSuspension({
+        suspension: transferred,
+        cancelAttemptId: 'cancel-1',
+      })
+    ).resolves.toEqual({ status: 'cancelled' });
+    expect(host.cancelledSuspensions).toEqual([transferred.suspensionId]);
+    expect(host.discards).toHaveLength(1);
+    await expect(
+      new EventActorExecutor(host, options).cancelSuspension({
+        suspension: transferred,
+        cancelAttemptId: 'cancel-duplicate',
+      })
+    ).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      error: { message: 'Event actor suspension ownership is stale' },
+    });
+  });
+
+  it('allows only one competing resume attempt to claim a suspension', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) =>
+      ({
+        status: 'suspended',
+        checkpoint: { ...prepared.fork, checkpointId: 'race-paused' },
+        interrupt: {
+          id: 'interrupt-race',
+          payload: { type: 'tool_approval' },
+        },
+      }) as unknown as EventActorTerminalResult<string>;
+    let releaseResume: (() => void) | undefined;
+    host.resumeImpl = async (suspension) => {
+      await new Promise<void>((resolve) => {
+        releaseResume = resolve;
+      });
+      return {
+        status: 'applied',
+        result: 'winner',
+        checkpoint: {
+          ...suspension.checkpoint,
+          checkpointId: 'race-terminal',
+        },
+      };
+    };
+    const options = { preparationSigningKey: 'q'.repeat(32) };
+    const firstExecutor = new EventActorExecutor(host, options);
+    const preparation = await firstExecutor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'resume-race',
+      depth: 1,
+      event: { text: 'resume-race' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const paused = await firstExecutor.invoke(preparation.invocation);
+    if (paused.status !== 'suspended') {
+      throw new Error('Expected suspension');
+    }
+    const winnerExecutor = new EventActorExecutor(host, options);
+    const winner = winnerExecutor.resume({
+      suspension: paused.suspension,
+      resumeAttemptId: 'race-winner',
+      value: { approved: true },
+    });
+    await Promise.resolve();
+    await expect(
+      new EventActorExecutor(host, options).resume({
+        suspension: paused.suspension,
+        resumeAttemptId: 'race-winner',
+        value: { approved: true },
+      })
+    ).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      error: { message: 'Event actor suspension ownership is stale' },
+    });
+    await expect(
+      new EventActorExecutor(host, options).resume({
+        suspension: paused.suspension,
+        resumeAttemptId: 'race-loser',
+        value: { approved: false },
+      })
+    ).resolves.toMatchObject({
+      status: 'commit_indeterminate',
+      error: { message: 'Event actor suspension ownership is stale' },
+    });
+    releaseResume?.();
+    const applied = await winner;
+    expect(applied.status).toBe('applied');
+    expect(host.resumeAttempts).toEqual(['race-winner']);
+  });
+
+  it('rejects tampered, foreign-key, and expired suspension evidence before host mutation', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(10_000);
+    try {
+      const host = new TestHost();
+      host.invokeImpl = async (prepared) =>
+        ({
+          status: 'suspended',
+          checkpoint: { ...prepared.fork, checkpointId: 'secure-paused' },
+          interrupt: {
+            id: 'interrupt-secure',
+            payload: { type: 'tool_approval', toolName: 'deploy' },
+          },
+        }) as unknown as EventActorTerminalResult<string>;
+      const options = {
+        preparationSigningKey: 's'.repeat(32),
+        dormantCheckpointTtlMs: 100,
+      };
+      const executor = new EventActorExecutor(host, options);
+      const preparation = await executor.prepare({
+        actorThreadId: 'actor-thread',
+        invocationId: 'secure-suspension',
+        depth: 1,
+        event: { text: 'secure-suspension' },
+      });
+      if (preparation.status !== 'ready') {
+        throw new Error('Expected warm preparation');
+      }
+      const paused = await executor.invoke(preparation.invocation);
+      if (paused.status !== 'suspended') {
+        throw new Error('Expected suspension');
+      }
+      const mutate = (
+        change: (suspension: EventActorSuspension) => void
+      ): EventActorSuspension => {
+        const suspension = JSON.parse(
+          JSON.stringify(paused.suspension)
+        ) as EventActorSuspension;
+        change(suspension);
+        return suspension;
+      };
+      const forged = [
+        mutate((suspension) => {
+          suspension.invocation.actorThreadId = 'foreign-actor';
+        }),
+        mutate((suspension) => {
+          suspension.checkpoint.checkpointId = 'foreign-checkpoint';
+        }),
+        mutate((suspension) => {
+          suspension.attempt += 1;
+        }),
+        mutate((suspension) => {
+          suspension.interrupt.id = 'foreign-interrupt';
+        }),
+        mutate((suspension) => {
+          suspension.interrupt.payload = { approved: true };
+        }),
+        mutate((suspension) => {
+          suspension.expiresAt += 1;
+        }),
+      ];
+      for (const suspension of forged) {
+        await expect(
+          new EventActorExecutor(host, options).resume({
+            suspension,
+            resumeAttemptId: 'forged-attempt',
+            value: { approved: true },
+          })
+        ).rejects.toThrow();
+      }
+      await expect(
+        new EventActorExecutor(host, {
+          ...options,
+          preparationSigningKey: 'w'.repeat(32),
+        }).resume({
+          suspension: paused.suspension,
+          resumeAttemptId: 'wrong-key',
+          value: { approved: true },
+        })
+      ).rejects.toThrow('Event actor suspension binding is invalid');
+      now.mockReturnValue(10_101);
+      await expect(
+        new EventActorExecutor(host, options).resume({
+          suspension: paused.suspension,
+          resumeAttemptId: 'expired',
+          value: { approved: true },
+        })
+      ).rejects.toThrow('Event actor suspension binding has expired');
+      expect(host.resumeAttempts).toHaveLength(0);
+      expect(host.currentSuspension).toEqual(paused.suspension);
+      await expect(
+        new EventActorExecutor(host, options).cancelSuspension({
+          suspension: paused.suspension,
+          cancelAttemptId: 'expire-cleanup',
+          reason: 'expired',
+        })
+      ).resolves.toEqual({ status: 'cancelled' });
+      expect(host.currentSuspension).toBeUndefined();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('surfaces suspension through the high-level execute lifecycle', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) =>
+      ({
+        status: 'suspended',
+        checkpoint: { ...prepared.fork, checkpointId: 'execute-paused' },
+        interrupt: {
+          id: 'interrupt-execute',
+          payload: { type: 'ask_user_question', question: 'Continue?' },
+        },
+      }) as unknown as EventActorTerminalResult<string>;
+    const result = await new EventActorExecutor(host, {
+      preparationSigningKey: 'e'.repeat(32),
+    }).execute(request('execute-suspended'));
+
+    expect(result).toMatchObject({
+      status: 'suspended',
+      continuation: 'warm',
+      suspension: {
+        checkpoint: { checkpointId: 'execute-paused' },
+        interrupt: { id: 'interrupt-execute' },
+      },
+    });
+    expect(host.currentSuspension).toMatchObject({
+      checkpoint: { checkpointId: 'execute-paused' },
+    });
+    expect(host.commits).toHaveLength(0);
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('surfaces a cold-continuation suspension without committing its fork', async () => {
+    const host = new TestHost();
+    host.checkpointAvailable = false;
+    host.invokeImpl = async (prepared) =>
+      ({
+        status: 'suspended',
+        checkpoint: { ...prepared.fork, checkpointId: 'cold-paused' },
+        interrupt: {
+          id: 'interrupt-cold',
+          payload: { type: 'tool_approval' },
+        },
+      }) as unknown as EventActorTerminalResult<string>;
+    const result = await new EventActorExecutor(host, {
+      preparationSigningKey: 'k'.repeat(32),
+    }).execute(request('cold-suspended'));
+
+    expect(result).toMatchObject({
+      status: 'suspended',
+      continuation: 'cold',
+      suspension: { checkpoint: { checkpointId: 'cold-paused' } },
+    });
+    expect(host.coldContinues).toBe(1);
+    expect(host.commits).toHaveLength(0);
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('bounds suspension encoding before publishing durable authority', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) =>
+      ({
+        status: 'suspended',
+        checkpoint: { ...prepared.fork, checkpointId: 'oversized-paused' },
+        interrupt: {
+          id: 'interrupt-oversized',
+          payload: { text: 'x'.repeat(1_025) },
+        },
+      }) as unknown as EventActorTerminalResult<string>;
+    const result = await new EventActorExecutor(host, {
+      preparationSigningKey: 'o'.repeat(32),
+      maxSuspensionPayloadBytes: 1_024,
+    }).execute(request('oversized-suspension'));
+
+    expect(result).toMatchObject({
+      status: 'commit_indeterminate',
+      error: { message: 'Event actor suspension exceeds maximum payload size' },
+    });
+    expect(host.suspensions).toHaveLength(0);
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('fails closed and retains the fork when suspension publication is stale', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) =>
+      ({
+        status: 'suspended',
+        checkpoint: { ...prepared.fork, checkpointId: 'unstored-paused' },
+        interrupt: {
+          id: 'interrupt-unstored',
+          payload: { type: 'tool_approval' },
+        },
+      }) as unknown as EventActorTerminalResult<string>;
+    jest.spyOn(host, 'suspend').mockResolvedValue({ status: 'stale' });
+    const result = await new EventActorExecutor(host, {
+      preparationSigningKey: 'u'.repeat(32),
+    }).execute(request('unstored-suspension'));
+
+    expect(result).toMatchObject({
+      status: 'commit_indeterminate',
+      checkpoint: { checkpointNs: expect.any(String) },
+      error: { message: 'Event actor suspension ownership is stale' },
+    });
+    expect(host.commits).toHaveLength(0);
+    expect(host.discards).toHaveLength(0);
+  });
+
+  it('discards and closes a claimed resume that proves definite no-action failure', async () => {
+    const host = new TestHost();
+    host.invokeImpl = async (prepared) =>
+      ({
+        status: 'suspended',
+        checkpoint: { ...prepared.fork, checkpointId: 'failure-paused' },
+        interrupt: {
+          id: 'interrupt-failure',
+          payload: { type: 'tool_approval' },
+        },
+      }) as unknown as EventActorTerminalResult<string>;
+    host.resumeFailure = new Error('provider failed before action');
+    const options = { preparationSigningKey: 'f'.repeat(32) };
+    const firstExecutor = new EventActorExecutor(host, options);
+    const preparation = await firstExecutor.prepare({
+      actorThreadId: 'actor-thread',
+      invocationId: 'resume-failure',
+      depth: 1,
+      event: { text: 'resume-failure' },
+    });
+    if (preparation.status !== 'ready') {
+      throw new Error('Expected warm preparation');
+    }
+    const paused = await firstExecutor.invoke(preparation.invocation);
+    if (paused.status !== 'suspended') {
+      throw new Error('Expected suspension');
+    }
+
+    await expect(
+      new EventActorExecutor(host, options).resume({
+        suspension: paused.suspension,
+        resumeAttemptId: 'failure-attempt',
+        value: { approved: true },
+      })
+    ).rejects.toThrow('provider failed before action');
+    expect(host.discards).toHaveLength(1);
+    expect(host.discards[0]?.reason).toBe('failed');
+    expect(host.settledSuspensions).toEqual([paused.suspension.suspensionId]);
+    expect(host.currentSuspension).toBeUndefined();
   });
 
   it('validates and commits the same terminal checkpoint snapshot', async () => {
