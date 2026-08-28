@@ -239,20 +239,32 @@ describe('formatAgentMessages compaction semantic index', () => {
   it('bounds entries while continuing ordinary message reconstruction', () => {
     const toolCallCount =
       COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries / 2 + 16;
+    const content: MessageContentComplex[] = Array.from(
+      { length: toolCallCount },
+      (_, index) => ({
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: `tool-${index}`,
+          name: 'search_docs',
+          args: { intent: `Search ${index}` },
+          output: `Result ${index}`,
+          outcome: `Found ${index}`,
+        },
+      })
+    );
+    const middleToolIndex = toolCallCount / 2;
+    content.splice(middleToolIndex + 1, 0, {
+      type: ContentTypes.ACTIVITY_LABEL,
+      activity_label: 'Rare middle activity',
+      activity_label_type: 'phase',
+      activity_start_index: middleToolIndex,
+      pending: false,
+    } as MessageContentComplex);
     const payload: TPayload = [
       {
         role: 'assistant',
         messageId: 'assistant-bounded-source',
-        content: Array.from({ length: toolCallCount }, (_, index) => ({
-          type: ContentTypes.TOOL_CALL,
-          tool_call: {
-            id: `tool-${index}`,
-            name: 'search_docs',
-            args: { intent: `Search ${index}` },
-            output: `Result ${index}`,
-            outcome: `Found ${index}`,
-          },
-        })),
+        content,
       },
     ];
 
@@ -264,10 +276,29 @@ describe('formatAgentMessages compaction semantic index', () => {
       { compactionSemanticIndex: { intentToolNames: new Set(['search_docs']) } }
     );
 
-    expect(result.compactionSemanticIndex).toHaveLength(
+    expect(result.compactionSemanticIndex?.length).toBeLessThanOrEqual(
       COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries
     );
+    expect(result.compactionSemanticIndex).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ text: 'Search 0' }),
+        expect.objectContaining({ text: `Found ${toolCallCount - 1}` }),
+        expect.objectContaining({ text: 'Rare middle activity' }),
+      ])
+    );
     expect(result.messages).toHaveLength(toolCallCount + 1);
+
+    const rendered = renderCompactionSemanticIndex(
+      result.compactionSemanticIndex,
+      result.messages
+    );
+    expect(rendered.providedEntryCount).toBe(toolCallCount * 2 + 1);
+    expect(rendered.appendix).toContain('Search 0');
+    expect(rendered.appendix).toContain(`Found ${toolCallCount - 1}`);
+    expect(rendered.appendix).toContain('Rare middle activity');
+    expect(rendered.omittedEntryCount).toBe(
+      rendered.providedEntryCount - rendered.entryCount
+    );
   });
 
   it('returns bounded tombstones instead of retaining oversized label text', () => {

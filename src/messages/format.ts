@@ -58,6 +58,7 @@ import {
   isAtomicToolContentBlock,
   serializeStructuredValueBounded,
 } from '@/utils/toolContent';
+import { setCompactionSemanticIndexProvidedEntryCount } from '@/summarization/semanticIndex';
 import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
 import { flattenLegacyContent, isLegacyConvertible } from './content';
@@ -374,7 +375,7 @@ export const formatFromLangChain = (
 };
 
 interface FormatAssistantMessageOptions {
-  compactionSemanticIndex?: CompactionSemanticIndexEntry[];
+  compactionSemanticIndex?: DerivedCompactionSemanticIndexCollector;
   intentToolNames?: ReadonlySet<string>;
   preserveUnpairedServerToolUses?: boolean;
   preserveReasoningContent?: boolean;
@@ -505,30 +506,172 @@ type CompactionSemanticContentPart = MessageContentComplex & {
   reasoning_label_step_id?: string;
 };
 
+type OrderedCompactionSemanticIndexEntry = {
+  entry: CompactionSemanticIndexEntry;
+  order: number;
+};
+
+type CompactionSemanticEntryRing = {
+  entries: OrderedCompactionSemanticIndexEntry[];
+  cursor: number;
+};
+
+type CompactionSemanticTypeCoverage = {
+  head: OrderedCompactionSemanticIndexEntry[];
+  tail: CompactionSemanticEntryRing;
+};
+
+type CompactionSemanticCoverageState = {
+  head: OrderedCompactionSemanticIndexEntry[];
+  tail: CompactionSemanticEntryRing;
+  typeCoverage: Map<
+    CompactionSemanticIndexEntry['type'],
+    CompactionSemanticTypeCoverage
+  >;
+};
+
+type DerivedCompactionSemanticIndexCollector = {
+  entries: CompactionSemanticIndexEntry[];
+  entryCount: number;
+  coverage?: CompactionSemanticCoverageState;
+};
+
+const DERIVED_SEMANTIC_HEAD_LIMIT =
+  COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries / 4;
+const DERIVED_SEMANTIC_TAIL_LIMIT =
+  COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries / 2;
+const DERIVED_SEMANTIC_TYPE_EDGE_LIMIT =
+  COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries / 32;
+
+function createDerivedCompactionSemanticIndexCollector(): DerivedCompactionSemanticIndexCollector {
+  return {
+    entries: [],
+    entryCount: 0,
+  };
+}
+
+function createCompactionSemanticCoverageState(): CompactionSemanticCoverageState {
+  return {
+    head: [],
+    tail: { entries: [], cursor: 0 },
+    typeCoverage: new Map(),
+  };
+}
+
+function appendCompactionSemanticEntryRing(
+  ring: CompactionSemanticEntryRing,
+  entry: OrderedCompactionSemanticIndexEntry,
+  limit: number
+): void {
+  if (ring.entries.length < limit) {
+    ring.entries.push(entry);
+    return;
+  }
+  ring.entries[ring.cursor] = entry;
+  ring.cursor = (ring.cursor + 1) % limit;
+}
+
 function appendDerivedCompactionSemanticEntry(
-  entries: CompactionSemanticIndexEntry[],
+  collector: DerivedCompactionSemanticIndexCollector,
   entry: CompactionSemanticIndexEntry
 ): void {
-  if (
-    entries.length >= COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries
-  ) {
-    return;
-  }
+  let boundedEntry = entry;
   if (entry.status === 'pending') {
-    entries.push({ ...entry, text: '' });
-    return;
-  }
-  if (
+    boundedEntry = { ...entry, text: '' };
+  } else if (
     entry.text.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars
   ) {
-    entries.push({ ...entry, text: '', redacted: true });
+    boundedEntry = { ...entry, text: '', redacted: true };
+  }
+  const order = collector.entryCount;
+  collector.entryCount++;
+  if (
+    collector.coverage == null &&
+    collector.entries.length < COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries
+  ) {
+    collector.entries.push(boundedEntry);
     return;
   }
-  entries.push(entry);
+  const orderedEntry = { entry: boundedEntry, order };
+  if (collector.coverage == null) {
+    collector.coverage = createCompactionSemanticCoverageState();
+    for (let order = 0; order < collector.entries.length; order++) {
+      appendCoverageBalancedCompactionSemanticEntry(collector.coverage, {
+        entry: collector.entries[order],
+        order,
+      });
+    }
+    collector.entries = [];
+  }
+  appendCoverageBalancedCompactionSemanticEntry(
+    collector.coverage,
+    orderedEntry
+  );
+}
+
+function appendCoverageBalancedCompactionSemanticEntry(
+  coverage: CompactionSemanticCoverageState,
+  orderedEntry: OrderedCompactionSemanticIndexEntry
+): void {
+  if (coverage.head.length < DERIVED_SEMANTIC_HEAD_LIMIT) {
+    coverage.head.push(orderedEntry);
+  }
+  appendCompactionSemanticEntryRing(
+    coverage.tail,
+    orderedEntry,
+    DERIVED_SEMANTIC_TAIL_LIMIT
+  );
+  let typeCoverage = coverage.typeCoverage.get(orderedEntry.entry.type);
+  if (typeCoverage == null) {
+    typeCoverage = { head: [], tail: { entries: [], cursor: 0 } };
+    coverage.typeCoverage.set(orderedEntry.entry.type, typeCoverage);
+  }
+  if (typeCoverage.head.length < DERIVED_SEMANTIC_TYPE_EDGE_LIMIT) {
+    typeCoverage.head.push(orderedEntry);
+  }
+  appendCompactionSemanticEntryRing(
+    typeCoverage.tail,
+    orderedEntry,
+    DERIVED_SEMANTIC_TYPE_EDGE_LIMIT
+  );
+}
+
+function finalizeDerivedCompactionSemanticIndex(
+  collector: DerivedCompactionSemanticIndexCollector | undefined
+): CompactionSemanticIndex | undefined {
+  if (collector == null || collector.entryCount === 0) {
+    return undefined;
+  }
+  if (collector.coverage == null) {
+    setCompactionSemanticIndexProvidedEntryCount(
+      collector.entries,
+      collector.entryCount
+    );
+    return collector.entries;
+  }
+  const retained = new Map<number, CompactionSemanticIndexEntry>();
+  const retain = (
+    entries: readonly OrderedCompactionSemanticIndexEntry[]
+  ): void => {
+    for (const { entry, order } of entries) {
+      retained.set(order, entry);
+    }
+  };
+  retain(collector.coverage.head);
+  retain(collector.coverage.tail.entries);
+  for (const typeCoverage of collector.coverage.typeCoverage.values()) {
+    retain(typeCoverage.head);
+    retain(typeCoverage.tail.entries);
+  }
+  const result = [...retained.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, entry]) => entry);
+  setCompactionSemanticIndexProvidedEntryCount(result, collector.entryCount);
+  return result;
 }
 
 function collectCompactionSemanticEntriesFromPart(
-  entries: CompactionSemanticIndexEntry[],
+  collector: DerivedCompactionSemanticIndexCollector,
   part: CompactionSemanticContentPart,
   sourceMessageId: string,
   sourceContentIndex: number,
@@ -538,7 +681,6 @@ function collectCompactionSemanticEntriesFromPart(
   parsedToolInput?: ToolCallPart['args']
 ): void {
   if (
-    entries.length >= COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries ||
     sourceMessageId.length >
       COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
   ) {
@@ -573,7 +715,7 @@ function collectCompactionSemanticEntriesFromPart(
           ? parsedToolInput.intent
           : undefined;
       if (typeof intent === 'string' && intent !== '') {
-        appendDerivedCompactionSemanticEntry(entries, {
+        appendDerivedCompactionSemanticEntry(collector, {
           type: 'tool_intent',
           sourceMessageId,
           sourceContentIndex,
@@ -585,7 +727,7 @@ function collectCompactionSemanticEntriesFromPart(
       }
     }
     if (typeof toolCall.outcome === 'string' && toolCall.outcome !== '') {
-      appendDerivedCompactionSemanticEntry(entries, {
+      appendDerivedCompactionSemanticEntry(collector, {
         type: 'tool_outcome',
         sourceMessageId,
         sourceContentIndex,
@@ -623,7 +765,7 @@ function collectCompactionSemanticEntriesFromPart(
     ) {
       return;
     }
-    appendDerivedCompactionSemanticEntry(entries, {
+    appendDerivedCompactionSemanticEntry(collector, {
       type: 'reasoning_label',
       sourceMessageId,
       sourceContentIndex,
@@ -660,7 +802,7 @@ function collectCompactionSemanticEntriesFromPart(
   if (revision < 0 || typeof part.activity_label !== 'string') {
     return;
   }
-  appendDerivedCompactionSemanticEntry(entries, {
+  appendDerivedCompactionSemanticEntry(collector, {
     type: 'activity_phase',
     sourceMessageId,
     sourceContentIndex: activitySourceContentIndex,
@@ -2281,8 +2423,10 @@ export const formatAgentMessages = (
    * nothing cannot leave the anchor stranded as the final turn.
    */
   const legacyContentEnabled = options?.legacyContent === true;
-  const compactionSemanticIndex: CompactionSemanticIndexEntry[] | undefined =
-    options?.compactionSemanticIndex != null ? [] : undefined;
+  const compactionSemanticIndexCollector =
+    options?.compactionSemanticIndex != null
+      ? createDerivedCompactionSemanticIndexCollector()
+      : undefined;
   /** Emission choke point: every formatted message enters the result here, so
    *  the legacy flatten happens once per message with no closing rescan. The
    *  summary boundary slices payload entries before formatting, and nothing
@@ -2612,7 +2756,7 @@ export const formatAgentMessages = (
     }
 
     const formattedMessages = formatAssistantMessage(processedMessage, {
-      compactionSemanticIndex,
+      compactionSemanticIndex: compactionSemanticIndexCollector,
       intentToolNames: options?.compactionSemanticIndex?.intentToolNames,
       preserveUnpairedServerToolUses: i === payload.length - 1,
       preserveReasoningContent:
@@ -2893,10 +3037,9 @@ export const formatAgentMessages = (
       ? { text: summaryBoundary.text, tokenCount: summaryBoundary.tokenCount }
       : undefined,
     boundaryTokenAdjustment,
-    compactionSemanticIndex:
-      compactionSemanticIndex != null && compactionSemanticIndex.length > 0
-        ? compactionSemanticIndex
-        : undefined,
+    compactionSemanticIndex: finalizeDerivedCompactionSemanticIndex(
+      compactionSemanticIndexCollector
+    ),
   };
 };
 

@@ -2,6 +2,7 @@ import { HumanMessage } from '@langchain/core/messages';
 import type {
   CompactionActivitySemanticIndexEntry,
   CompactionSemanticIndex,
+  CompactionSemanticIndexEntry,
 } from '@/types';
 import {
   COMPACTION_SEMANTIC_INDEX_LIMITS,
@@ -399,6 +400,71 @@ describe('renderCompactionSemanticIndex', () => {
 
     expect(rendered.appendix.indexOf('earlier source')).toBeLessThan(
       rendered.appendix.indexOf('later source')
+    );
+  });
+
+  it('balances temporal and semantic-type coverage before spending the character budget', () => {
+    const filler = 'x'.repeat(420);
+    const index: CompactionSemanticIndex = [
+      {
+        type: 'tool_intent',
+        sourceMessageId: 'message-1',
+        sourceContentIndex: 0,
+        toolCallId: 'tool-initial',
+        revision: 1,
+        status: 'committed',
+        text: `initial goal ${filler}`,
+      },
+      ...Array.from(
+        { length: 124 },
+        (_, offset): CompactionSemanticIndexEntry => ({
+          type: 'tool_intent',
+          sourceMessageId: 'message-1',
+          sourceContentIndex: offset + 1,
+          toolCallId: `tool-${offset + 1}`,
+          revision: 1,
+          status: 'committed',
+          text: `middle intent ${offset + 1} ${filler}`,
+        })
+      ),
+      {
+        type: 'reasoning_label',
+        sourceMessageId: 'message-1',
+        sourceContentIndex: 52,
+        reasoningStepId: 'reasoning-52',
+        revision: 1,
+        status: 'committed',
+        text: 'rare reasoning checkpoint',
+      },
+      activityEntry({
+        sourceContentIndex: 78,
+        text: 'rare activity checkpoint',
+      }),
+      {
+        type: 'tool_outcome',
+        sourceMessageId: 'message-1',
+        sourceContentIndex: 127,
+        toolCallId: 'tool-latest',
+        revision: 1,
+        status: 'committed',
+        text: `latest outcome ${filler}`,
+      },
+    ];
+
+    const rendered = renderCompactionSemanticIndex(index, [
+      sourceMessage('message-1', 'long tool history'),
+    ]);
+
+    expect(rendered.entryCount).toBeLessThan(index.length);
+    expect(rendered.appendix).toContain('initial goal');
+    expect(rendered.appendix).toContain('rare reasoning checkpoint');
+    expect(rendered.appendix).toContain('rare activity checkpoint');
+    expect(rendered.appendix).toContain('latest outcome');
+    expect(rendered.appendix.indexOf('initial goal')).toBeLessThan(
+      rendered.appendix.indexOf('rare reasoning checkpoint')
+    );
+    expect(rendered.appendix.indexOf('rare activity checkpoint')).toBeLessThan(
+      rendered.appendix.indexOf('latest outcome')
     );
   });
 

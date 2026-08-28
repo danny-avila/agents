@@ -45,6 +45,12 @@ out-of-range entries. Oversized newer revisions become bounded, textless
 tombstones so they cannot resurrect older guidance. It then orders accepted
 entries by exact provenance-contribution order and local identity, escapes them
 as data, and enforces fixed per-entry, total-character, and entry-count budgets.
+When derived input crosses its admission cap, fixed-memory retention keeps an
+early prefix, a recent suffix, and bounded first/latest representatives of
+every semantic type. Rendering spends its smaller character budget on temporal
+endpoints, latest/earliest type representatives, and recursively bisected
+history before restoring exact provenance order. Long histories therefore do
+not turn the bounds into an oldest-entry-only policy.
 
 The rendered appendix is placed inside the unique final HumanMessage, before
 the compaction instruction. Raw history and its provider cache breakpoint are
