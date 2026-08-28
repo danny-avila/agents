@@ -358,25 +358,37 @@ async function computeSummaryTokenCount(
  * well above `o200k_base` on the same text: measuring CJK with the wrong one
  * understates it by up to 1.9x.
  *
- * Model name first, mirroring how `Run.create` picks the encoding for the
- * counter this is standing in for, so a Claude model reached through Bedrock or
- * OpenRouter still resolves to `claude`. Both option keys are consulted:
- * `modelName` is LangChain's alias for `model` and hosts configure agents
- * through either, so reading one key alone would report an unconfigured model
- * and quietly hand a Claude agent the `o200k_base` tokenizer. Provider is the
- * fallback for a client that never recorded a model, and it is read as a family
- * rather than as one enum value: a host can register its own provider with
+ * Both signals are read, because only one of them can ever be positive.
+ * `encodingForModel` matches the substring `claude`, so a name it accepts is
+ * proof, which is what keeps a Claude model reached through Bedrock or
+ * OpenRouter resolving to `claude`. A name it rejects is only the absence of
+ * proof: `production` is an opaque deployment alias, not a statement that the
+ * model behind it is something other than Claude. Both option keys are
+ * consulted for that name, since `modelName` is LangChain's alias for `model`
+ * and hosts configure agents through either, so reading one key alone would
+ * report an unconfigured model and quietly hand a Claude agent the
+ * `o200k_base` tokenizer.
+ *
+ * The provider therefore decides every case the name leaves open, not just the
+ * case where no model was recorded at all, and it is read as a family rather
+ * than as one enum value: a host can register its own provider with
  * `family: 'anthropic'` (the trait `isThinkingEnabled` already reads the same
  * way), and such a provider serves Claude behind whatever name and deployment
  * alias the host chose. `BEDROCK` is left out by the same rule, since its
  * family is `bedrock` and it also serves Llama, Titan and Mistral. The enum
  * check stays ahead of the family lookup because the registry is populated by
  * importing `@/llm/providers`, which a root-barrel consumer defers.
+ *
+ * On an opaque alias this deliberately parts ways with `Run.create`, which
+ * infers from the model name alone and stamps its counter `o200k_base`. That
+ * stamp records which tokenizer the counter is, not which one the agent needs,
+ * so the disagreement routes the carrier to the bundled Claude tokenizer by
+ * the same rule that rejects another agent's counter.
  */
 function encodingForReceivingAgent(agentContext: AgentContext): EncodingName {
   const model = resolveClientOptionsModel(agentContext.clientOptions);
-  if (model != null) {
-    return encodingForModel(model);
+  if (model != null && encodingForModel(model) === 'claude') {
+    return 'claude';
   }
   return agentContext.provider === Providers.ANTHROPIC ||
     getProviderFamily(agentContext.provider) === 'anthropic'

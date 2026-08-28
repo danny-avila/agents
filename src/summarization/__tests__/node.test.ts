@@ -2441,4 +2441,72 @@ describe('summarize node breaker capture', () => {
       dispose();
     }
   });
+
+  /** `encodingForModel` matches the substring `claude`, so an opaque
+   *  deployment alias reports `o200k_base` while proving nothing about the
+   *  model behind it. Treating that as the answer skipped the family lookup
+   *  entirely and under-reserved the CJK checkpoint by the same 1.9x the
+   *  family fix exists to prevent, including against the `o200k_base` counter
+   *  `Run.create` stamps from that same alias. */
+  it('honors a registered anthropic family behind an opaque model alias', async () => {
+    const summaryBody =
+      '사용자가 인증 미들웨어를 리팩터링하여 속도 제한 전에 토큰 검증이 이루어지도록 요청했습니다. 기존 핸들러를 읽어보니 순서가 뒤바뀌어 있었습니다.';
+    const dispose = registerProvider({
+      provider: 'claude-alias-summarization-test',
+      model: class extends FakeChatModel {
+        constructor() {
+          super({ responses: [summaryBody] });
+        }
+      },
+      family: 'anthropic',
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel(summaryBody);
+        }
+      } as never
+    );
+
+    try {
+      const sharedCounter = await createTokenCounter(
+        encodingForModel('production')
+      );
+      const agentContext = createAgentContext({
+        provider: 'claude-alias-summarization-test',
+        clientOptions: { model: 'production' },
+        tokenCounter: sharedCounter,
+      });
+      const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+      const node = createSummarizeNode({
+        agentContext,
+        graph: mockGraph(),
+        generateStepId,
+      });
+
+      await node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+
+      const [persistedText, persistedCount] = setSummary.mock.calls[0] as [
+        string,
+        number,
+      ];
+      const carrier = new HumanMessage(buildSummaryCarrierText(persistedText));
+      const claudeCounter = await createTokenCounter('claude');
+
+      expect(persistedCount).toBe(claudeCounter(carrier));
+      expect(persistedCount).toBeGreaterThan(sharedCounter(carrier));
+    } finally {
+      dispose();
+    }
+  });
 });
