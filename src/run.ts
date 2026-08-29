@@ -35,7 +35,6 @@ import {
   ACTIVITY_PHASE_LABEL_RUN_NAME,
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
-import { isBuiltRuntime } from '@/lazyRequire';
 import {
   requireValidSubagentResumeManifest,
   stripSubagentResumeManifest,
@@ -94,14 +93,15 @@ import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { stampSyntheticProviderMessage } from '@/messages/provenance';
+import { isOpenAILike, isLibreChatOpenAIModel } from '@/utils/llm';
 import { initializeLangfuseTracing } from './instrumentation';
 import { seedRunInitialSessions } from '@/utils/toolSessions';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 import { createGraph } from '@/graphs/createGraph';
 import { resolveMaxSeals } from '@/llm/preempt';
+import { isBuiltRuntime } from '@/lazyRequire';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
-import { isOpenAILike, isLibreChatOpenAIModel } from '@/utils/llm';
 import { executeHooks } from '@/hooks';
 
 /** Source-mode runs have no dist siblings for the lazy-loading seam, so every
@@ -130,6 +130,7 @@ export const defaultOmitOptions = new Set([
 const ACTIVITY_LABEL_TRACE_NAME = 'LibreChat Activity Label';
 const ACTIVITY_PHASE_TRACE_NAME = 'LibreChat Activity Phase';
 const REASONING_LABEL_TRACE_NAME = 'LibreChat Reasoning Label';
+const OUTPUT_TRUNCATED_HALT_REASON = 'output_truncated';
 
 const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_AGENT_UPDATE,
@@ -795,6 +796,18 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   /**
+   * True when the run's last turn ended at `END` because the provider hit
+   * its output token ceiling while producing plain text/reasoning — no tool
+   * call, so `assertNotTruncatedToolCall` never sees it and the graph reads
+   * the turn as an ordinary completion. Hosts check this alongside
+   * `getPreemptStats()` / `getHaltReason()` to decide whether to persist the
+   * response as unfinished instead of a silently truncated "complete" one.
+   */
+  getOutputTruncated(): boolean {
+    return this.Graph?.outputTruncatedIncomplete ?? false;
+  }
+
+  /**
    * Creates a custom event callback handler that intercepts custom events
    * and processes them through our handler registry instead of EventStreamCallbackHandler
    */
@@ -1362,6 +1375,13 @@ export class Run<_T extends t.BaseGraphState> {
         this._haltedReason == null &&
         this.hookRegistry?.hasHookFor('Stop', this.id) === true
       ) {
+        let stopReason = graph.preemptHaltReason;
+        if (stopReason == null && graph.preemptIncomplete) {
+          stopReason = 'preempt_incomplete';
+        }
+        if (stopReason == null && graph.outputTruncatedIncomplete) {
+          stopReason = OUTPUT_TRUNCATED_HALT_REASON;
+        }
         await executeHooks({
           registry: this.hookRegistry,
           input: {
@@ -1377,9 +1397,7 @@ export class Run<_T extends t.BaseGraphState> {
              * actual cause, not the generic label — and `preempt_incomplete`
              * is reserved for the boundary that simply had nothing to inject.
              */
-            stopReason:
-              graph.preemptHaltReason ??
-              (graph.preemptIncomplete ? 'preempt_incomplete' : undefined),
+            stopReason,
             stopHookActive: false, // will be true when stop is triggered by a hook (Phase 2)
           },
           sessionId: this.id,
@@ -1409,6 +1427,11 @@ export class Run<_T extends t.BaseGraphState> {
         this._haltedReason = graph.preemptHaltReason;
       } else if (this._haltedReason == null && graph.preemptIncomplete) {
         this._haltedReason = 'preempt_incomplete';
+      } else if (
+        this._haltedReason == null &&
+        graph.outputTruncatedIncomplete
+      ) {
+        this._haltedReason = OUTPUT_TRUNCATED_HALT_REASON;
       }
     };
 
@@ -1614,13 +1637,16 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   /**
-   * Returns the reason a hook halted the run via
-   * `preventContinuation: true`, or `undefined` if no hook halted.
+   * Returns why the run ended without a natural completion, or `undefined`
+   * when it completed normally. Reasons include hook- and prompt-driven
+   * halts, `preempt_incomplete` when a cooperative seal ended the turn
+   * without continuation content, and `output_truncated` when the provider
+   * stopped a plain-text/reasoning response at its output-token ceiling.
    *
    * Hosts inspect this after `processStream` returns to distinguish a
-   * natural completion (`undefined`) from a hook-driven halt (a
-   * truthy string). Independent from `getInterrupt()` — a halted run
-   * has no interrupt; an interrupted run has no halt reason.
+   * natural completion from a terminal partial response. Independent from
+   * `getInterrupt()` — a halted run has no interrupt; an interrupted run has
+   * no halt reason.
    */
   getHaltReason(): string | undefined {
     return this._haltedReason;

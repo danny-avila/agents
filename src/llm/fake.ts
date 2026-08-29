@@ -14,6 +14,15 @@ export class FakeChatModel extends FakeListChatModel {
   private splitStrategy: SplitStrategy;
   private toolCalls: ToolCall[] = [];
   private addedToolCalls: boolean = false;
+  /**
+   * Attached to the last streamed chunk of every response, mirroring a real
+   * provider's terminal `finish_reason`/`stop_reason` on `generationInfo`.
+   * Lets truncation-path tests (`getTruncationStopReason`) drive a genuine
+   * `Run`/`StandardGraph` without a live provider. `undefined` (the
+   * default) reproduces the previous behavior exactly: no metadata on any
+   * chunk.
+   */
+  private finalChunkGenerationInfo?: Record<string, unknown>;
 
   constructor({
     responses,
@@ -21,16 +30,19 @@ export class FakeChatModel extends FakeListChatModel {
     emitCustomEvent,
     splitStrategy = { type: 'regex', value: /(?<=\s+)|(?=\s+)/ },
     toolCalls = [],
+    finalChunkGenerationInfo,
   }: {
     responses: string[];
     sleep?: number;
     emitCustomEvent?: boolean;
     splitStrategy?: SplitStrategy;
     toolCalls?: ToolCall[];
+    finalChunkGenerationInfo?: Record<string, unknown>;
   }) {
     super({ responses, sleep, emitCustomEvent });
     this.splitStrategy = splitStrategy;
     this.toolCalls = toolCalls;
+    this.finalChunkGenerationInfo = finalChunkGenerationInfo;
   }
 
   private splitText(text: string): string[] {
@@ -47,14 +59,16 @@ export class FakeChatModel extends FakeListChatModel {
   }
   _createResponseChunk(
     text: string,
-    tool_call_chunks?: ToolCallChunk[]
+    tool_call_chunks?: ToolCallChunk[],
+    responseMetadata?: Record<string, unknown>
   ): ChatGenerationChunk {
     return new ChatGenerationChunk({
       text,
-      generationInfo: {},
+      generationInfo: responseMetadata ?? {},
       message: new AIMessageChunk({
         content: text,
         tool_call_chunks,
+        response_metadata: responseMetadata,
         additional_kwargs: tool_call_chunks
           ? {
             tool_calls: tool_call_chunks.map((toolCall) => ({
@@ -87,14 +101,31 @@ export class FakeChatModel extends FakeListChatModel {
     }
 
     const chunks = this.splitText(response);
-    for await (const chunk of chunks) {
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
       await this._sleepIfRequested();
 
       if (options.thrownErrorString != null && options.thrownErrorString) {
         throw new Error(options.thrownErrorString);
       }
 
-      const responseChunk = super._createResponseChunk(chunk);
+      /**
+       * Only the true terminal chunk of the response gets the metadata: when
+       * this response also appends a trailing tool-call chunk below, THAT
+       * chunk is terminal instead (not currently exercised by any test —
+       * a caller wanting truncated-tool-call metadata should attach it
+       * there).
+       */
+      const isTerminalChunk =
+        i === chunks.length - 1 && this.toolCalls.length === 0;
+      const responseChunk =
+        isTerminalChunk && this.finalChunkGenerationInfo != null
+          ? this._createResponseChunk(
+            chunk,
+            undefined,
+            this.finalChunkGenerationInfo
+          )
+          : super._createResponseChunk(chunk);
       yield responseChunk;
       void runManager?.handleLLMNewToken(chunk);
     }

@@ -164,6 +164,7 @@ import { shouldTriggerSummarization } from '@/summarization';
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
+import { getTruncationStopReason } from '@/llm/truncation';
 import { messagesStateReducer } from '@/messages/reducer';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
@@ -1426,6 +1427,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   preemptIncomplete = false;
   /**
+   * True when `routeMessage` sent a turn to `END` because the last AI
+   * message carries no tool call, AND the provider reports it stopped for
+   * hitting the output token ceiling (`getTruncationStopReason`). Plain-text
+   * and reasoning turns cut off this way carry no tool call for
+   * `assertNotTruncatedToolCall` to catch, so `toolsCondition` reads them as
+   * an ordinary finished turn otherwise — hosts read this flag to persist
+   * the turn as unfinished instead of a silently truncated "complete" answer.
+   *
+   * Deliberately separate from `preemptIncomplete`/`preemptHaltReason`: this
+   * has no interaction with the preempt/seal machinery (in particular the
+   * `preemptHaltReason` check at each model node's entry), so setting it
+   * cannot suppress an unrelated agent's turn in a multi-agent graph.
+   */
+  outputTruncatedIncomplete = false;
+  /**
    * `stopReason` from a `PreemptBoundary` hook that halted the turn.
    *
    * Clearing the registry halt is what keeps the sealed turn alive, but the
@@ -1702,6 +1718,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.preemptEmptyBoundaries = 0;
     this.preemptIncomplete = false;
     this.preemptHaltReason = undefined;
+    this.outputTruncatedIncomplete = false;
   }
 
   /**
@@ -4818,11 +4835,27 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (state.summarizationRequest != null) {
         return summarizeNode;
       }
-      return toolsCondition(
+      const decision = toolsCondition(
         state as t.BaseGraphState,
         toolNode,
         this.invokedToolIds
       );
+      /**
+       * `toolsCondition` only looks at `tool_calls` — a plain-text/reasoning
+       * turn cut off by the output token ceiling has none, so it reads as an
+       * ordinary finished turn and routes here to END. Flag it so hosts can
+       * tell a genuinely finished answer from one the model never got to
+       * complete. See `outputTruncatedIncomplete` for why this stays clear
+       * of the preempt/seal halt fields.
+       */
+      if (decision === END) {
+        const { messages } = state as t.BaseGraphState;
+        const lastMessage = messages[messages.length - 1];
+        if (getTruncationStopReason(lastMessage) != null) {
+          this.outputTruncatedIncomplete = true;
+        }
+      }
+      return decision;
     };
 
     const StateAnnotation = Annotation.Root({
