@@ -106,27 +106,35 @@ function snapshotEntry(
       COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars ||
     typeof sourceContentIndex !== 'number' ||
     typeof revision !== 'number' ||
-    !VALID_ENTRY_TYPES.has(type) ||
-    !VALID_ENTRY_STATUSES.has(status) ||
-    typeof text !== 'string' ||
-    (redacted !== undefined && typeof redacted !== 'boolean')
+    !VALID_ENTRY_TYPES.has(type)
   ) {
     return undefined;
   }
+  const malformedState =
+    !VALID_ENTRY_STATUSES.has(status) ||
+    typeof text !== 'string' ||
+    (redacted !== undefined && typeof redacted !== 'boolean');
+  const snapshotStatus = VALID_ENTRY_STATUSES.has(status)
+    ? status
+    : 'committed';
+  const validText = typeof text === 'string' ? text : '';
   const oversized =
-    status === 'committed' &&
+    !malformedState &&
+    snapshotStatus === 'committed' &&
     redacted !== true &&
-    text.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars;
+    validText.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars;
+  const snapshotRedacted =
+    malformedState || redacted === true || oversized;
   const snapshotText =
-    redacted === true || status === 'pending' || oversized ? '' : text;
+    snapshotRedacted || snapshotStatus === 'pending' ? '' : validText;
   const common = {
     sourceMessageId,
     sourceContentIndex,
     revision,
-    status,
+    status: snapshotStatus,
     text: snapshotText,
-    ...(redacted !== undefined || oversized
-      ? { redacted: redacted === true || oversized }
+    ...(redacted !== undefined || oversized || malformedState
+      ? { redacted: snapshotRedacted }
       : {}),
   };
   if (type === 'activity_phase') {
@@ -273,14 +281,23 @@ function normalizeEntry(
   if (!Number.isSafeInteger(revision) || revision < 0) {
     return undefined;
   }
+  const malformedState =
+    !VALID_ENTRY_STATUSES.has(entry.status) ||
+    typeof entry.text !== 'string' ||
+    (entry.redacted !== undefined && typeof entry.redacted !== 'boolean');
+  const status = VALID_ENTRY_STATUSES.has(entry.status)
+    ? entry.status
+    : 'committed';
+  const validText = typeof entry.text === 'string' ? entry.text : '';
   const oversized =
-    entry.status === 'committed' &&
+    !malformedState &&
+    status === 'committed' &&
     entry.redacted !== true &&
-    entry.text.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars;
-  const redacted = entry.redacted === true || oversized;
-  const pending = entry.status === 'pending';
+    validText.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars;
+  const redacted = malformedState || entry.redacted === true || oversized;
+  const pending = status === 'pending';
   const text =
-    redacted || pending ? '' : entry.text.replace(/\s+/g, ' ').trim();
+    redacted || pending ? '' : validText.replace(/\s+/g, ' ').trim();
   if (!redacted && !pending && text === '') {
     return undefined;
   }
@@ -307,7 +324,7 @@ function normalizeEntry(
     sourceOrder,
     sourceContentIndex,
     revision,
-    status: entry.status,
+    status,
     text,
     redacted,
     localId,

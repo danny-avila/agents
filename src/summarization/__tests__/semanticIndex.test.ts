@@ -275,6 +275,45 @@ describe('renderCompactionSemanticIndex', () => {
     expect(snapshotCompactionSemanticIndex(index)).toHaveLength(index.length);
   });
 
+  it('snapshots malformed semantic state as a suppressing tombstone', () => {
+    const stale: CompactionSemanticIndexEntry = {
+      type: 'tool_outcome',
+      sourceMessageId: 'message-1',
+      sourceContentIndex: 0,
+      revision: 1,
+      status: 'committed',
+      text: 'sensitive stale outcome',
+      toolCallId: 'tool-1',
+    };
+    const malformed: CompactionSemanticIndexEntry = {
+      ...stale,
+      revision: 2,
+      text: 'sensitive current outcome',
+    };
+    Object.assign(malformed, { redacted: 'true' });
+
+    const snapshot = snapshotCompactionSemanticIndex([stale, malformed]);
+
+    expect(snapshot?.[1]).toMatchObject({
+      revision: 2,
+      status: 'committed',
+      text: '',
+      redacted: true,
+    });
+    expect(renderCompactionSemanticIndex(snapshot, messages)).toMatchObject({
+      appendix: '',
+      entryCount: 0,
+      omittedEntryCount: 2,
+    });
+    expect(
+      renderCompactionSemanticIndex([stale, malformed], messages)
+    ).toMatchObject({
+      appendix: '',
+      entryCount: 0,
+      omittedEntryCount: 2,
+    });
+  });
+
   it('lets an oversized latest revision suppress stale guidance', () => {
     const snapshot = snapshotCompactionSemanticIndex([
       activityEntry({ revision: 1, text: 'stale label' }),

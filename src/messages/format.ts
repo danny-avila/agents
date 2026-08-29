@@ -966,20 +966,23 @@ function collectCompactionSemanticEntriesFromPart(
         COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars ||
       typeof revision !== 'number' ||
       !Number.isSafeInteger(revision) ||
-      revision < 0 ||
-      (status !== 'complete' && status !== 'streaming') ||
-      typeof text !== 'string'
+      revision < 0
     ) {
       return;
     }
+    const malformedState =
+      (status !== 'complete' && status !== 'streaming') ||
+      typeof text !== 'string';
     appendDerivedCompactionSemanticEntry(collector, {
       type: 'reasoning_label',
       sourceMessageId,
       sourceContentIndex,
       revision,
-      status: status === 'complete' ? 'committed' : 'pending',
-      text,
+      status:
+        status === 'streaming' || malformedState ? 'pending' : 'committed',
+      text: typeof text === 'string' ? text : '',
       reasoningStepId,
+      ...(malformedState ? { redacted: true } : {}),
     });
     return;
   }
@@ -1003,21 +1006,27 @@ function collectCompactionSemanticEntriesFromPart(
   }
   const revision = part.activity_label_revision;
   if (
-    (revision !== undefined &&
-      (typeof revision !== 'number' ||
-        !Number.isSafeInteger(revision) ||
-        revision < 0)) ||
-    typeof part.activity_label !== 'string'
+    revision !== undefined &&
+    (typeof revision !== 'number' ||
+      !Number.isSafeInteger(revision) ||
+      revision < 0)
   ) {
     return;
   }
+  const malformedPending =
+    part.pending !== undefined && typeof part.pending !== 'boolean';
+  const malformedText = typeof part.activity_label !== 'string';
+  const malformedState = malformedPending || malformedText;
+  const text = typeof part.activity_label === 'string' ? part.activity_label : '';
   appendDerivedCompactionSemanticEntry(collector, {
     type: 'activity_phase',
     sourceMessageId,
     sourceContentIndex: activitySourceContentIndex,
     revision: revision ?? 0,
-    status: part.pending === true ? 'pending' : 'committed',
-    text: part.activity_label,
+    status:
+      part.pending === true || malformedPending ? 'pending' : 'committed',
+    text,
+    ...(malformedState ? { redacted: true } : {}),
   });
 }
 

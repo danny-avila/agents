@@ -232,6 +232,64 @@ describe('formatAgentMessages compaction semantic index', () => {
     }
   );
 
+  it('turns a malformed activity pending flag into a suppressing tombstone', () => {
+    const malformedPending = {
+      type: ContentTypes.ACTIVITY_LABEL,
+      activity_label: 'malformed current label',
+      activity_label_type: 'phase',
+      activity_label_revision: 2,
+      activity_start_index: 0,
+      pending: false,
+    } as MessageContentComplex;
+    Object.assign(malformedPending, { pending: 'true' });
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        messageId: 'malformed-pending-source',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Old evidence' },
+          {
+            type: ContentTypes.ACTIVITY_LABEL,
+            activity_label: 'stale committed label',
+            activity_label_type: 'phase',
+            activity_label_revision: 1,
+            activity_start_index: 0,
+            pending: false,
+          } as MessageContentComplex,
+        ],
+      },
+      {
+        role: 'assistant',
+        messageId: 'malformed-pending-source',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Current evidence' },
+          malformedPending,
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { compactionSemanticIndex: {} }
+    );
+
+    expect(result.compactionSemanticIndex?.[1]).toMatchObject({
+      revision: 2,
+      status: 'pending',
+      text: '',
+      redacted: true,
+    });
+    expect(
+      renderCompactionSemanticIndex(
+        result.compactionSemanticIndex,
+        result.messages
+      ).appendix
+    ).not.toContain('stale committed label');
+  });
+
   it('does not derive a phase whose evidence was removed by a summary slice', () => {
     const payload = semanticPayload();
     const content = payload[0].content;
