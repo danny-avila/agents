@@ -90,4 +90,31 @@ describe('output-token truncation without a tool call', () => {
 
     expect(run.getOutputTruncated()).toBe(false);
   });
+
+  it('clears truncation state before the next invocation on a reused run', async () => {
+    const run = await createPlainRun('reused-run');
+    run.Graph!.overrideModel = new FakeChatModel({
+      responses: ['First response is cut off'],
+      finalChunkGenerationInfo: { finish_reason: 'length' },
+    }) as unknown as t.ChatModel;
+
+    await run.processStream(
+      { messages: [new HumanMessage('First request')] },
+      streamConfig
+    );
+    expect(run.getOutputTruncated()).toBe(true);
+    expect(run.getHaltReason()).toBe('output_truncated');
+
+    run.Graph!.overrideModel = new FakeChatModel({
+      responses: ['Second response completes normally.'],
+      finalChunkGenerationInfo: { finish_reason: 'stop' },
+    }) as unknown as t.ChatModel;
+    await run.processStream(
+      { messages: [new HumanMessage('Second request')] },
+      streamConfig
+    );
+
+    expect(run.getOutputTruncated()).toBe(false);
+    expect(run.getHaltReason()).toBeUndefined();
+  });
 });

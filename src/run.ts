@@ -1637,13 +1637,16 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   /**
-   * Returns the reason a hook halted the run via
-   * `preventContinuation: true`, or `undefined` if no hook halted.
+   * Returns why the run ended without a natural completion, or `undefined`
+   * when it completed normally. Reasons include hook- and prompt-driven
+   * halts, `preempt_incomplete` when a cooperative seal ended the turn
+   * without continuation content, and `output_truncated` when the provider
+   * stopped a plain-text/reasoning response at its output-token ceiling.
    *
    * Hosts inspect this after `processStream` returns to distinguish a
-   * natural completion (`undefined`) from a hook-driven halt (a
-   * truthy string). Independent from `getInterrupt()` — a halted run
-   * has no interrupt; an interrupted run has no halt reason.
+   * natural completion from a terminal partial response. Independent from
+   * `getInterrupt()` — a halted run has no interrupt; an interrupted run has
+   * no halt reason.
    */
   getHaltReason(): string | undefined {
     return this._haltedReason;
