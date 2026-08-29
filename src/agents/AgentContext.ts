@@ -75,6 +75,14 @@ type ProgrammaticToolInstructionTarget = {
 };
 
 /**
+ * Consecutive summarization attempts that may return no usable summary before
+ * the run stops asking. Every such attempt spends a full model call over the
+ * whole history and leaves the message set exactly as it was, so the cap
+ * bounds spend as much as it bounds the compaction loop.
+ */
+const MAX_SUMMARIZATION_FAILURES = 3;
+
+/**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
  */
 export class AgentContext {
@@ -376,6 +384,13 @@ export class AgentContext {
    * Summarization is allowed to fire again only when new messages appear.
    */
   private _lastSummarizationMsgCount: number = 0;
+  /**
+   * Consecutive summarization attempts that produced no usable summary.
+   * An empty or failed summary leaves the message set exactly as it was, so
+   * the next prune cycle would ask again on identical state. Cleared by
+   * `setSummary` and by `reset()`.
+   */
+  private _summarizationFailures: number = 0;
   /**
    * Forced compactions performed after a provider rejected a prompt as too
    * large. Bounds the recovery loop so a model that keeps refusing cannot
@@ -1209,6 +1224,7 @@ export class AgentContext {
     this.summaryTokenCount = this._durableSummaryTokenCount;
     this.summaryPrecedesMessages = this.durableSummaryPrecedesMessages;
     this._lastSummarizationMsgCount = 0;
+    this._summarizationFailures = 0;
     this.lastCallUsage = undefined;
     this.totalTokensFresh = false;
     this.restoreContextBudgetAfterOverflow();
@@ -1478,6 +1494,7 @@ export class AgentContext {
     this._durableSummaryTokenCount = tokenCount;
     this.durableSummaryPrecedesMessages = this.summaryPrecedesMessages;
     this._summaryVersion += 1;
+    this._summarizationFailures = 0;
     this.systemRunnableStale = true;
     this.pruneMessages = undefined;
   }
@@ -1545,6 +1562,31 @@ export class AgentContext {
    */
   markSummarizationTriggered(msgCount: number): void {
     this._lastSummarizationMsgCount = msgCount;
+  }
+
+  /**
+   * Records a summarization attempt that produced no usable summary — an
+   * empty model response, or a provider failure the run declined to paper
+   * over with a metadata stub. Cleared by the next successful summary.
+   */
+  recordSummarizationFailure(): void {
+    this._summarizationFailures += 1;
+  }
+
+  get summarizationFailures(): number {
+    return this._summarizationFailures;
+  }
+
+  /**
+   * True once consecutive no-progress attempts reach {@link MAX_SUMMARIZATION_FAILURES}.
+   * A summarizer that has returned nothing this many times in a row will keep
+   * returning nothing: each empty result leaves the history unchanged, so the
+   * next prune cycle re-triggers on the same state and the run burns its
+   * recursion budget on empty summary steps. Summarization stays off for the
+   * remainder of the run; `reset()` restores it for the next one.
+   */
+  get summarizationExhausted(): boolean {
+    return this._summarizationFailures >= MAX_SUMMARIZATION_FAILURES;
   }
 
   get overflowRecoveryAttempts(): number {

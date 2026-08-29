@@ -1,7 +1,7 @@
 /* eslint-disable no-console */
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { performance } from 'node:perf_hooks';
 import { config } from 'dotenv';
+import { performance } from 'node:perf_hooks';
 config();
 import { Calculator } from '@/tools/Calculator';
 import {
@@ -3898,5 +3898,123 @@ describe('Large tool result surviving context — no double summarization (no AP
     console.log(
       `  Double-summarization prevented: ${startCalls <= 1 ? 'YES' : 'NO'}`
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Empty summarizer output must not loop (FakeListChatModel — no API keys)
+// ---------------------------------------------------------------------------
+
+describe('Empty summarizer output (no API keys)', () => {
+  jest.setTimeout(60_000);
+
+  const SUMMARIZER_MODEL = 'summarizer-that-returns-nothing';
+  const AGENT_REPLY = 'Here is the answer to your final question.';
+  const streamConfig = {
+    configurable: { thread_id: 'empty-summary-loop' },
+    recursionLimit: 25,
+    streamMode: 'values',
+    version: 'v2' as const,
+  };
+
+  let getChatModelClassSpy: jest.SpyInstance;
+  const originalGetChatModelClass = providers.getChatModelClass;
+  let summarizerCallCount = 0;
+
+  beforeEach(() => {
+    summarizerCallCount = 0;
+    getChatModelClassSpy = jest
+      .spyOn(providers, 'getChatModelClass')
+      .mockImplementation(((provider: Providers) => {
+        if (provider !== Providers.OPENAI) {
+          return originalGetChatModelClass(provider);
+        }
+        return class extends FakeListChatModel {
+          constructor(options: any) {
+            const isSummarizer = options?.model === SUMMARIZER_MODEL;
+            if (isSummarizer) {
+              summarizerCallCount++;
+            }
+            super({ responses: [isSummarizer ? '' : AGENT_REPLY] });
+          }
+        } as any;
+      }) as typeof providers.getChatModelClass);
+  });
+
+  afterEach(() => {
+    getChatModelClassSpy.mockRestore();
+  });
+
+  test('a summarizer returning nothing does not loop the run to its recursion cap', async () => {
+    const spies = createSpies();
+    const tokenCounter = await createTokenCounter();
+
+    const padding = 'x'.repeat(400);
+    const conversationHistory: BaseMessage[] = [];
+    for (let i = 0; i < 10; i++) {
+      conversationHistory.push(new HumanMessage(`Question ${i}${padding}`));
+      conversationHistory.push(new AIMessage(`Answer ${i}${padding}`));
+    }
+    conversationHistory.push(new HumanMessage('Final question'));
+
+    const indexTokenCountMap = buildIndexTokenCountMap(
+      conversationHistory,
+      tokenCounter
+    );
+
+    const { aggregateContent } = createContentAggregator();
+    const collectedUsage: UsageMetadata[] = [];
+
+    const run = await Run.create<t.IState>({
+      runId: `empty-summary-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: getLLMConfig(Providers.OPENAI),
+        instructions: 'You are a helpful assistant.',
+        maxContextTokens: 600,
+        summarizationEnabled: true,
+        summarizationConfig: {
+          provider: Providers.OPENAI,
+          model: SUMMARIZER_MODEL,
+        },
+      },
+      returnContent: true,
+      customHandlers: buildHandlers(collectedUsage, aggregateContent, spies),
+      tokenCounter,
+      indexTokenCountMap,
+    });
+
+    let error: Error | undefined;
+    try {
+      await run.processStream(
+        { messages: conversationHistory },
+        streamConfig as any
+      );
+    } catch (err) {
+      error = err as Error;
+    }
+
+    const startCalls = spies.onSummarizeStartSpy.mock.calls.length;
+    console.log(
+      `  Empty-summary attempts: ${startCalls}, summarizer model calls: ${summarizerCallCount}`
+    );
+
+    /**
+     * The regression: an empty summary compacts nothing, so the agent node
+     * saw the same unchanged state and re-triggered — the run spent its whole
+     * recursion budget on empty summary steps and died on GraphRecursionError.
+     */
+    expect(error?.message ?? '').not.toMatch(/[Rr]ecursion/);
+    expect(startCalls).toBeLessThanOrEqual(3);
+    expect(summarizerCallCount).toBeLessThanOrEqual(3);
+
+    /** Nothing empty was committed as the run's summary. */
+    const summarizedContent = spies.onSummarizeCompleteSpy.mock.calls.flat();
+    for (const data of summarizedContent) {
+      const summary = (data as t.SummarizeCompleteEvent).summary;
+      if (summary != null) {
+        expect(summary.content?.length ?? 0).toBeGreaterThan(0);
+      }
+    }
   });
 });

@@ -12,6 +12,13 @@ import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
 import {
+  addTailCacheControl,
+  addBedrockTailCacheControl,
+  resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
+  type PromptCacheTtl,
+} from '@/messages/cache';
+import {
   cloneToolMessageWithContent,
   compactToolContent,
   isComputerCallOutputMessage,
@@ -22,13 +29,6 @@ import {
   StreamLimitExceededError,
   STREAM_LIMIT_EPOCH_KEY,
 } from '@/llm/streamLimits';
-import {
-  addTailCacheControl,
-  addBedrockTailCacheControl,
-  resolvePromptCacheTtl,
-  resolveBedrockPromptCacheTtl,
-  type PromptCacheTtl,
-} from '@/messages/cache';
 import {
   DEFAULT_RETAIN_RECENT_TURNS,
   resolveIntraTurnRetainTokens,
@@ -42,8 +42,8 @@ import {
   Providers,
 } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
-import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
+import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { makeIsDeferred } from '@/messages/anthropicToolCache';
 import { createRemoveAllMessage } from '@/messages/reducer';
@@ -704,20 +704,20 @@ async function executeSummarizationWithFallback(params: {
         clientConfig.provider === Providers.OPENROUTER ||
         clientConfig.provider === Providers.BEDROCK
           ? (
-                clientConfig.clientOptions as {
-                  promptCacheTtl?: PromptCacheTtl;
-                }
+              clientConfig.clientOptions as {
+                promptCacheTtl?: PromptCacheTtl;
+              }
           ).promptCacheTtl
           : undefined,
       bedrockModelId:
         clientConfig.provider === Providers.BEDROCK
           ? resolveBedrockCompactionCacheModel(
-            clientConfig.clientOptions as
-              | {
-                applicationInferenceProfile?: string;
-                model?: string;
-              }
-              | undefined
+              clientConfig.clientOptions as
+                | {
+                    applicationInferenceProfile?: string;
+                    model?: string;
+                  }
+                | undefined
           )
           : undefined,
       log,
@@ -1092,6 +1092,29 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
+    /**
+     * A summarizer that has already returned nothing several times in a row
+     * keeps returning nothing, and every empty result leaves the message set
+     * exactly as it was — so the next prune cycle re-triggers on identical
+     * state. Stopping here bounds that loop instead of letting the run spend
+     * its recursion budget dispatching empty summary steps.
+     */
+    if (agentContext.summarizationExhausted) {
+      emitAgentLog(
+        config,
+        'warn',
+        'summarize',
+        'Summarization skipped — consecutive attempts produced no usable summary',
+        {
+          failures: agentContext.summarizationFailures,
+          reason: request.reason ?? 'trigger',
+        },
+        { runId: graph.runId, agentId: request.agentId }
+      );
+      agentContext.markSummarizationTriggered(state.messages.length);
+      return { summarizationRequest: undefined };
+    }
+
     const maxCtx = agentContext.maxContextTokens ?? 0;
     if (maxCtx > 0 && agentContext.instructionTokens >= maxCtx) {
       emitAgentLog(
@@ -1365,6 +1388,7 @@ export function createSummarizeNode({
         `Summarization failed during ${preservationReason}; keeping history rather than replacing it with a metadata stub`
       );
       agentContext.markSummarizationTriggered(state.messages.length);
+      agentContext.recordSummarizationFailure();
       /**
        * The run step was already dispatched, so it has to be resolved here or
        * consumers tracking step lifecycle keep an unfinished placeholder for
@@ -1393,7 +1417,22 @@ export function createSummarizeNode({
     }
 
     if (!rawText) {
-      agentContext.markSummarizationTriggered(0);
+      /**
+       * An empty summary compacts nothing, so the state the pruner sees next
+       * is byte-identical to the one that just triggered. Resetting the guard
+       * to `0` here made `shouldSkipSummarization` answer `false` forever,
+       * and the agent node re-triggered on that unchanged state until the
+       * graph hit its recursion cap — a loop of empty summary steps, each one
+       * a billed model call. Recording the current count keeps the guard
+       * honest; the failure tally bounds the retries once new messages do
+       * arrive and legitimately lift it.
+       */
+      agentContext.markSummarizationTriggered(state.messages.length);
+      agentContext.recordSummarizationFailure();
+      log('warn', 'Summarization produced empty output', {
+        failures: agentContext.summarizationFailures,
+        messagesToRefineCount: messagesToRefine.length,
+      });
       if (runnableConfig) {
         await safeDispatchCustomEvent(
           GraphEvents.ON_SUMMARIZE_COMPLETE,
@@ -1666,10 +1705,7 @@ export function applySummarizationHistoryCache(params: {
   if (params.provider === Providers.BEDROCK) {
     return addBedrockTailCacheControl(
       [...params.messages],
-      resolveBedrockPromptCacheTtl(
-        params.promptCacheTtl,
-        params.bedrockModelId
-      )
+      resolveBedrockPromptCacheTtl(params.promptCacheTtl, params.bedrockModelId)
     );
   }
   if (
@@ -1685,9 +1721,7 @@ export function applySummarizationHistoryCache(params: {
 }
 
 export function resolveBedrockCompactionCacheModel(
-  options:
-    | { applicationInferenceProfile?: string; model?: string }
-    | undefined
+  options: { applicationInferenceProfile?: string; model?: string } | undefined
 ): string | undefined {
   return options?.model;
 }
@@ -1743,10 +1777,7 @@ async function summarizeWithCacheHit({
     promptCacheTtl,
     bedrockModelId,
   });
-  const invokeMessages = [
-    ...cachedHistory,
-    new HumanMessage(instruction),
-  ];
+  const invokeMessages = [...cachedHistory, new HumanMessage(instruction)];
 
   const result = await attemptInvoke(
     {
