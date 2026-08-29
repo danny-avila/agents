@@ -56,7 +56,7 @@ describe('output-token truncation without a tool call', () => {
     expect(run.getOutputTruncated()).toBe(true);
     expect(run.Graph?.outputTruncatedIncomplete).toBe(true);
     // Distinct from the preempt/seal machinery — this path never touches it.
-    expect(run.getHaltReason()).toBeUndefined();
+    expect(run.getHaltReason()).toBe('output_truncated');
     expect(run.Graph?.preemptIncomplete).toBe(false);
   });
 
@@ -74,6 +74,7 @@ describe('output-token truncation without a tool call', () => {
 
     expect(run.getOutputTruncated()).toBe(false);
     expect(run.Graph?.outputTruncatedIncomplete).toBe(false);
+    expect(run.getHaltReason()).toBeUndefined();
   });
 
   it('does not flag a turn with no finish-reason metadata at all', async () => {
