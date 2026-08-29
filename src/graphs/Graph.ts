@@ -153,10 +153,10 @@ import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { createContextPressureMeter } from '@/llm/contextPressureMeter';
-import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
+import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { initializeLangfuseTracing } from '@/instrumentation';
@@ -2801,9 +2801,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       provider,
       clientOptions,
       tools,
-      isDeferred: makeIsDeferred(
-        agentContext.getEffectiveToolDefinitions()
-      ),
+      isDeferred: makeIsDeferred(agentContext.getEffectiveToolDefinitions()),
     });
   }
 
@@ -3030,9 +3028,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           messagesToRefine.length > 0;
 
         if (hasPrunedMessages) {
-          const shouldSkip = agentContext.shouldSkipSummarization(
-            messages.length
-          );
+          const shouldSkip =
+            agentContext.summarizationExhausted ||
+            agentContext.shouldSkipSummarization(messages.length);
           const triggerResult =
             !shouldSkip &&
             shouldTriggerSummarization({
@@ -3089,6 +3087,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 messageCount: messages.length,
                 messagesToRefineCount: messagesToRefine.length,
                 contextLength: context.length,
+                summarizationFailures: agentContext.summarizationFailures,
+                summarizationExhausted: agentContext.summarizationExhausted,
               },
               { runId: this.runId, agentId }
             );

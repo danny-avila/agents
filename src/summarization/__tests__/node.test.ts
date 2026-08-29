@@ -2056,6 +2056,200 @@ describe('createSummarizeNode — overflow recovery', () => {
   });
 });
 
+describe('createSummarizeNode — empty summarizer output', () => {
+  /** Model whose response carries no text — the shape a reasoning-only
+   *  completion produces once `extractResponseText` drops thinking blocks. */
+  function mockReasoningOnlyModel(): { invoke: jest.Mock } {
+    return {
+      invoke: jest.fn().mockResolvedValue({
+        content: [{ type: 'thinking', thinking: 'deliberating' }],
+      }),
+    };
+  }
+
+  it('leaves the dedupe guard on the current message count', async () => {
+    const events = captureEvents();
+
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockReasoningOnlyModel();
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    const messages = [
+      new HumanMessage('older question'),
+      new AIMessage('older answer'),
+      new HumanMessage('latest question'),
+    ];
+
+    const result = await node(
+      {
+        messages,
+        summarizationRequest: { remainingContextTokens: 0, agentId: 'agent_0' },
+      },
+      {} as RunnableConfig
+    );
+
+    /** State is untouched: nothing was compacted, so nothing is removed. */
+    expect(result.messages).toBeUndefined();
+    expect(agentContext.hasSummary()).toBe(false);
+    /**
+     * The regression: the node used to mark `0` here, which made
+     * `shouldSkipSummarization` answer `false` for every later count. The
+     * agent node then re-triggered on this same unchanged state, and the run
+     * looped through empty summary steps until the graph's recursion cap.
+     */
+    expect(agentContext.shouldSkipSummarization(messages.length)).toBe(true);
+    expect(agentContext.summarizationFailures).toBe(1);
+
+    const completeEvent = events.find(
+      (e) => e.event === GraphEvents.ON_SUMMARIZE_COMPLETE
+    );
+    expect((completeEvent?.data as t.SummarizeCompleteEvent).error).toBe(
+      'Summarization produced empty output'
+    );
+    expect(
+      (completeEvent?.data as t.SummarizeCompleteEvent).summary
+    ).toBeUndefined();
+  });
+
+  it('stops spending model calls once consecutive empty attempts hit the cap', async () => {
+    captureEvents();
+
+    const invoke = jest.fn().mockResolvedValue({ content: '' });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    /** Growing history: each attempt clears the message-count guard on its
+     *  own, so only the failure tally can stop the retries. */
+    const messages: BaseMessage[] = [];
+    for (let attempt = 0; attempt < 6; attempt++) {
+      messages.push(new HumanMessage(`question ${attempt}`));
+      messages.push(new AIMessage(`answer ${attempt}`));
+      await node(
+        {
+          messages: [...messages],
+          summarizationRequest: {
+            remainingContextTokens: 0,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+    }
+
+    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(agentContext.summarizationExhausted).toBe(true);
+  });
+
+  it('clears the failure tally once a summary succeeds', async () => {
+    captureEvents();
+
+    let call = 0;
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          call++;
+          return mockInvokeModel(call === 1 ? '' : 'A real checkpoint');
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    const first = [new HumanMessage('q1'), new AIMessage('a1')];
+    await node(
+      {
+        messages: first,
+        summarizationRequest: { remainingContextTokens: 0, agentId: 'agent_0' },
+      },
+      {} as RunnableConfig
+    );
+    expect(agentContext.summarizationFailures).toBe(1);
+
+    await node(
+      {
+        messages: [...first, new HumanMessage('q2'), new AIMessage('a2')],
+        summarizationRequest: { remainingContextTokens: 0, agentId: 'agent_0' },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(agentContext.summarizationFailures).toBe(0);
+    expect(agentContext.summarizationExhausted).toBe(false);
+    expect(agentContext.getSummaryText()).toContain('A real checkpoint');
+  });
+
+  it('counts a preserved-history stub failure toward the cap', async () => {
+    captureEvents();
+
+    const invoke = jest.fn().mockRejectedValue(new Error('provider down'));
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    /** Escalated overflow recovery: the stub is refused so history survives,
+     *  which means the attempt made no progress either. */
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    const messages: BaseMessage[] = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      messages.push(new HumanMessage(`question ${attempt}`));
+      messages.push(new AIMessage(`answer ${attempt}`));
+      await node(
+        {
+          messages: [...messages],
+          summarizationRequest: {
+            remainingContextTokens: 0,
+            agentId: 'agent_0',
+            reason: 'overflow',
+            allowSummarization: true,
+          },
+        },
+        {} as RunnableConfig
+      );
+    }
+
+    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(agentContext.hasSummary()).toBe(false);
+  });
+});
+
 describe('summarize node breaker capture', () => {
   it('stamps the entry-captured breaker epoch into summary attempt metadata', async () => {
     captureEvents();
