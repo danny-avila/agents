@@ -574,10 +574,10 @@ function getDerivedCompactionSemanticLocalId(
   entry: CompactionSemanticIndexEntry
 ): string {
   if (entry.type === 'reasoning_label') {
-    return entry.reasoningStepId;
+    return entry.reasoningStepId.trim();
   }
   if (entry.type !== 'activity_phase') {
-    return entry.toolCallId;
+    return entry.toolCallId.trim();
   }
   return '';
 }
@@ -601,7 +601,7 @@ function hashDerivedCompactionSemanticIdentity(
   hash = Math.imul(hash, 16_777_619);
   hash = hashDerivedCompactionSemanticIdentityString(
     hash,
-    entry.sourceMessageId
+    entry.sourceMessageId.trim()
   );
   hash ^= entry.sourceContentIndex;
   hash = Math.imul(hash, 16_777_619);
@@ -618,7 +618,7 @@ function entriesShareDerivedCompactionSemanticIdentity(
 ): boolean {
   return (
     left.type === right.type &&
-    left.sourceMessageId === right.sourceMessageId &&
+    left.sourceMessageId.trim() === right.sourceMessageId.trim() &&
     left.sourceContentIndex === right.sourceContentIndex &&
     getDerivedCompactionSemanticLocalId(left) ===
       getDerivedCompactionSemanticLocalId(right)
@@ -680,6 +680,59 @@ function appendCompactionSemanticEntryRing(
   ring.entries[ring.cursor] = entry;
   retainCompactionSemanticEntry(entry);
   ring.cursor = (ring.cursor + 1) % limit;
+}
+
+function renewCompactionSemanticEntryRing(
+  coverage: CompactionSemanticCoverageState,
+  ring: CompactionSemanticEntryRing,
+  entry: OrderedCompactionSemanticIndexEntry,
+  limit: number
+): void {
+  const existingIndex = ring.entries.indexOf(entry);
+  if (existingIndex < 0) {
+    appendCompactionSemanticEntryRing(coverage, ring, entry, limit);
+    return;
+  }
+  if (ring.entries.length < limit) {
+    ring.entries.splice(existingIndex, 1);
+    ring.entries.push(entry);
+    return;
+  }
+  const newestIndex =
+    (ring.cursor + ring.entries.length - 1) % ring.entries.length;
+  let currentIndex = existingIndex;
+  for (
+    let offset = 0;
+    currentIndex !== newestIndex && offset < ring.entries.length;
+    offset++
+  ) {
+    const nextIndex = (currentIndex + 1) % ring.entries.length;
+    ring.entries[currentIndex] = ring.entries[nextIndex];
+    currentIndex = nextIndex;
+  }
+  ring.entries[newestIndex] = entry;
+}
+
+function renewCoverageBalancedCompactionSemanticEntry(
+  coverage: CompactionSemanticCoverageState,
+  entry: OrderedCompactionSemanticIndexEntry
+): void {
+  renewCompactionSemanticEntryRing(
+    coverage,
+    coverage.tail,
+    entry,
+    DERIVED_SEMANTIC_TAIL_LIMIT
+  );
+  const typeCoverage = coverage.typeCoverage.get(entry.entry.type);
+  if (typeCoverage == null) {
+    return;
+  }
+  renewCompactionSemanticEntryRing(
+    coverage,
+    typeCoverage.tail,
+    entry,
+    DERIVED_SEMANTIC_TYPE_EDGE_LIMIT
+  );
 }
 
 function appendDerivedCompactionSemanticEntry(
@@ -748,11 +801,13 @@ function appendCoverageBalancedCompactionSemanticEntry(
       ) {
         current.entry = { ...current.entry, text: '', redacted: true };
         current.order = orderedEntry.order;
+        renewCoverageBalancedCompactionSemanticEntry(coverage, current);
       }
       return;
     }
     current.entry = orderedEntry.entry;
     current.order = orderedEntry.order;
+    renewCoverageBalancedCompactionSemanticEntry(coverage, current);
     return;
   }
   if (identityBucket == null) {

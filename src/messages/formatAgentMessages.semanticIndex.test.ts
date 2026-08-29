@@ -362,6 +362,128 @@ describe('formatAgentMessages compaction semantic index', () => {
     ).not.toContain('stale retained label');
   });
 
+  it('renews recent retention when an admitted identity advances', () => {
+    const messageCount =
+      COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 100;
+    const payload: TPayload = Array.from(
+      { length: messageCount },
+      (_, index) => {
+        const isOldRevision = index === 200;
+        const isNewRevision = index === 257;
+        let activityLabel = `Filler activity ${index}`;
+        if (isOldRevision) {
+          activityLabel = 'older guidance';
+        } else if (isNewRevision) {
+          activityLabel = 'latest retained guidance';
+        }
+        return {
+          role: 'assistant',
+          messageId:
+            isOldRevision || isNewRevision
+              ? 'recent-revision-source'
+              : `recent-filler-source-${index}`,
+          content: [
+            { type: ContentTypes.TEXT, text: `Assistant text ${index}` },
+            {
+              type: ContentTypes.ACTIVITY_LABEL,
+              activity_label: activityLabel,
+              activity_label_type: 'phase',
+              activity_label_revision: isNewRevision ? 2 : 1,
+              activity_start_index: 0,
+              pending: false,
+            } as MessageContentComplex,
+          ],
+        };
+      }
+    );
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { compactionSemanticIndex: {} }
+    );
+
+    expect(
+      result.compactionSemanticIndex?.filter(
+        ({ sourceMessageId }) =>
+          sourceMessageId === 'recent-revision-source'
+      )
+    ).toEqual([
+      expect.objectContaining({
+        revision: 2,
+        text: 'latest retained guidance',
+      }),
+    ]);
+  });
+
+  it('balances revisions with renderer-normalized identities', () => {
+    const messageCount =
+      COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 80;
+    const payload: TPayload = Array.from(
+      { length: messageCount },
+      (_, index) => {
+        const isOldRevision = index === 0;
+        const isNewRevision = index === 100;
+        let reasoningLabel = `Filler reasoning ${index}`;
+        let reasoningStepId = `filler-step-${index}`;
+        if (isOldRevision) {
+          reasoningLabel = 'stale normalized label';
+          reasoningStepId = 'shared-step';
+        } else if (isNewRevision) {
+          reasoningLabel = 'new normalized pending label';
+          reasoningStepId = ' shared-step ';
+        }
+        return {
+          role: 'assistant',
+          messageId:
+            isOldRevision || isNewRevision
+              ? 'normalized-revision-source'
+              : `normalized-filler-source-${index}`,
+          content: [
+            {
+              type: ContentTypes.THINK,
+              think: `Reasoning ${index}`,
+              reasoning_label: reasoningLabel,
+              reasoning_label_step_id: reasoningStepId,
+              reasoning_label_revision: isNewRevision ? 2 : 1,
+              reasoning_label_status: isNewRevision
+                ? 'streaming'
+                : 'complete',
+            } as MessageContentComplex,
+          ],
+        };
+      }
+    );
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { preserveReasoningContent: true, compactionSemanticIndex: {} }
+    );
+    const revisions = result.compactionSemanticIndex?.filter(
+      ({ sourceMessageId }) =>
+        sourceMessageId === 'normalized-revision-source'
+    );
+
+    expect(revisions).toEqual([
+      expect.objectContaining({
+        revision: 2,
+        status: 'pending',
+        text: '',
+      }),
+    ]);
+    expect(
+      renderCompactionSemanticIndex(
+        result.compactionSemanticIndex,
+        result.messages
+      ).appendix
+    ).not.toContain('stale normalized label');
+  });
+
   it('returns bounded tombstones instead of retaining oversized label text', () => {
     const payload = semanticPayload();
     const content = payload[0].content;
