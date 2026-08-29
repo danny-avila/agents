@@ -42,3 +42,14 @@ export const ACTIVITY_LABEL_RUN_NAME = 'StepLabel';
 export const REASONING_LABEL_RUN_NAME = 'ReasoningLabel';
 export const ACTIVITY_PHASE_RUN_NAME = 'MultiStepLabel';
 export const ACTIVITY_PHASE_LABEL_RUN_NAME = 'MultiStepLabelGeneration';
+
+/** Shared admission and rendering bounds for compaction navigation hints. */
+export const COMPACTION_SEMANTIC_INDEX_LIMITS = Object.freeze({
+  maxInputEntries: 256,
+  maxEntries: 64,
+  maxEntryChars: 512,
+  maxTotalChars: 4_096,
+  maxInputTextChars: 4_096,
+  maxIdentityChars: 512,
+  maxSourceContentIndex: 4_095,
+} as const);

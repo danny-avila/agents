@@ -9,6 +9,7 @@ import {
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
   resolveBedrockCompactionCacheModel,
 } from '@/summarization/node';
+import { setFreshProviderMessageProvenance } from '@/messages/provenance';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
 import { Constants, GraphEvents, Providers } from '@/common';
@@ -106,6 +107,7 @@ function createAgentContext(
     instructions = 'Test agent',
     summarizationEnabled = true,
     summarizationConfig,
+    compactionSemanticIndex,
     maxContextTokens,
     tools,
     ...extra
@@ -122,6 +124,7 @@ function createAgentContext(
     instructions: instructions as string,
     summarizationEnabled: summarizationEnabled as boolean,
     summarizationConfig: effectiveSummarizationConfig,
+    ...(compactionSemanticIndex != null ? { compactionSemanticIndex } : {}),
     ...(maxContextTokens != null ? { maxContextTokens } : {}),
     ...(tools != null ? { tools } : {}),
   } as import('@/types').AgentInputs);
@@ -273,6 +276,93 @@ describe('createSummarizeNode', () => {
       expect.objectContaining({ promptCache: true })
     );
     expect(bindTools).toHaveBeenCalledWith(projectedTools);
+  });
+
+  it('keeps cached raw history identical when semantic guidance is appended', async () => {
+    const events = captureEvents();
+    const calls: BaseMessage[][] = [];
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        invoke(messages: BaseMessage[]): Promise<{ content: string }> {
+          calls.push(messages);
+          return Promise.resolve({ content: 'summary' });
+        }
+      } as never
+    );
+    const rawHistory = [
+      new HumanMessage({ id: 'message-1', content: 'Inspect the runtime' }),
+      new AIMessage({ id: 'message-2', content: 'I inspected it' }),
+    ];
+    setFreshProviderMessageProvenance(rawHistory[0], [
+      {
+        attribution: 'user',
+        sourceMessageId: 'message-1',
+        sourceContentPartIndices: [0],
+      },
+    ]);
+    setFreshProviderMessageProvenance(rawHistory[1], [
+      {
+        attribution: 'model',
+        sourceMessageId: 'message-2',
+        sourceContentPartIndices: [0],
+      },
+    ]);
+    const run = async (
+      compactionSemanticIndex?: t.CompactionSemanticIndex
+    ): Promise<void> => {
+      const node = createSummarizeNode({
+        agentContext: createAgentContext({
+          provider: Providers.ANTHROPIC,
+          clientOptions: { promptCache: true },
+          compactionSemanticIndex,
+        }),
+        graph: mockGraph(),
+        generateStepId,
+      });
+      await node(
+        {
+          messages: rawHistory,
+          summarizationRequest: {
+            remainingContextTokens: 1_000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+    };
+
+    await run();
+    await run([
+      {
+        type: 'activity_phase',
+        sourceMessageId: 'message-1',
+        sourceContentIndex: 0,
+        revision: 1,
+        status: 'committed',
+        text: 'Mapped the runtime seam',
+      },
+    ]);
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0].slice(0, -1).map((message) => message.toJSON())).toEqual(
+      calls[1].slice(0, -1).map((message) => message.toJSON())
+    );
+    expect(String(calls[0].at(-1)?.content)).not.toContain(
+      '<compaction-semantic-index>'
+    );
+    expect(String(calls[1].at(-1)?.content)).toContain(
+      '<compaction-semantic-index>'
+    );
+    expect(String(calls[1].at(-1)?.content)).toContain(
+      DEFAULT_SUMMARIZATION_PROMPT
+    );
+    const starts = events.filter(
+      (event) => event.event === GraphEvents.ON_SUMMARIZE_START
+    );
+    expect(starts.at(-1)?.data).toMatchObject({
+      semanticIndexEntryCount: 1,
+      semanticIndexCharCount: expect.any(Number),
+    });
   });
 
   it('emits ON_SUMMARIZE_START and ON_SUMMARIZE_COMPLETE on success', async () => {

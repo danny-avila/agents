@@ -221,6 +221,7 @@
     "bench:provider-derivation": "tsx ./src/scripts/bench-provider-derivation.ts",
     "bench:provider-projection": "tsx ./src/scripts/bench-provider-request-projection.ts",
     "bench:execution-world": "tsx ./src/scripts/bench-execution-world.ts",
+    "bench:compaction-semantic-index": "tsx ./src/scripts/bench-compaction-semantic-index.ts",
     "probe:overflow": "tsx -r dotenv/config ./src/scripts/context-overflow-probe.ts",
     "subagent": "tsx -r dotenv/config ./src/scripts/multi-agent-subagent.ts",
     "subagent:events": "tsx -r dotenv/config ./src/scripts/subagent-event-driven-debug.ts",

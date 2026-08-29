@@ -35,6 +35,11 @@ const DEPRECATED_TRACE_INPUT_ATTRIBUTE = 'langfuse.trace.input';
 const DEPRECATED_TRACE_OUTPUT_ATTRIBUTE = 'langfuse.trace.output';
 const OBSERVATION_METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
 const OBSERVATION_METADATA_OPERATION = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${LANGFUSE_OPERATION_METADATA_KEY}`;
+const OBSERVATION_METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.compaction_semantic_index_entries`;
+const COMPACTION_SEMANTIC_INDEX_OPEN = '<compaction-semantic-index>';
+const COMPACTION_SEMANTIC_INDEX_CLOSE = '</compaction-semantic-index>';
+const REDACTED_COMPACTION_SEMANTIC_INDEX =
+  '<compaction-semantic-index redacted="true" />\n\n';
 
 type MutableSpan = ReadableSpan & {
   name: string;
@@ -64,6 +69,94 @@ function parseAttributeValue(value: unknown): unknown {
   } catch {
     return value;
   }
+}
+
+type CompactionSemanticIndexRedaction = {
+  value: unknown;
+  redacted: boolean;
+};
+
+function redactCompactionSemanticIndexText(
+  value: string
+): CompactionSemanticIndexRedaction {
+  if (!value.startsWith(COMPACTION_SEMANTIC_INDEX_OPEN)) {
+    return { value, redacted: false };
+  }
+  const start = 0;
+  const close = value.indexOf(COMPACTION_SEMANTIC_INDEX_CLOSE, start);
+  if (close < 0) {
+    return { value, redacted: false };
+  }
+  let end = close + COMPACTION_SEMANTIC_INDEX_CLOSE.length;
+  while (end < value.length && /\s/.test(value[end])) {
+    end++;
+  }
+  return {
+    value:
+      value.slice(0, start) +
+      REDACTED_COMPACTION_SEMANTIC_INDEX +
+      value.slice(end),
+    redacted: true,
+  };
+}
+
+function redactCompactionSemanticIndexValue(
+  value: unknown
+): CompactionSemanticIndexRedaction {
+  if (typeof value === 'string') {
+    return redactCompactionSemanticIndexText(value);
+  }
+  if (Array.isArray(value)) {
+    for (let index = value.length - 1; index >= 0; index--) {
+      const nested = redactCompactionSemanticIndexValue(value[index]);
+      if (nested.redacted) {
+        const result = [...value];
+        result[index] = nested.value;
+        return { value: result, redacted: true };
+      }
+    }
+    return { value, redacted: false };
+  }
+  if (!isRecord(value)) {
+    return { value, redacted: false };
+  }
+  const entries = Object.entries(value);
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const [key, nestedValue] = entries[index];
+    const nested = redactCompactionSemanticIndexValue(nestedValue);
+    if (nested.redacted) {
+      return {
+        value: { ...value, [key]: nested.value },
+        redacted: true,
+      };
+    }
+  }
+  return { value, redacted: false };
+}
+
+function redactCompactionSemanticIndexInput(span: MutableSpan): void {
+  const entryCount =
+    span.attributes[
+      OBSERVATION_METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES
+    ];
+  const numericEntryCount = Number(entryCount);
+  if (!Number.isFinite(numericEntryCount) || numericEntryCount <= 0) {
+    return;
+  }
+  const inputKey = LangfuseOtelSpanAttributes.OBSERVATION_INPUT;
+  const input = span.attributes[inputKey];
+  if (input == null) {
+    return;
+  }
+  const parsed = parseAttributeValue(input);
+  const redaction = redactCompactionSemanticIndexValue(parsed);
+  if (!redaction.redacted) {
+    return;
+  }
+  span.attributes[inputKey] =
+    typeof redaction.value === 'string' && parsed === input
+      ? redaction.value
+      : JSON.stringify(redaction.value);
 }
 
 function getMessageArray(
@@ -594,6 +687,7 @@ export function shapeLangfuseSpan(span: ReadableSpan): void {
   const mutable = span as MutableSpan;
   delete mutable.attributes[DEPRECATED_TRACE_INPUT_ATTRIBUTE];
   delete mutable.attributes[DEPRECATED_TRACE_OUTPUT_ATTRIBUTE];
+  redactCompactionSemanticIndexInput(mutable);
   const isGraphObservation = isGraphSpan(mutable);
   if (mutable.name.startsWith(LANGGRAPH_AGENT_NODE_PREFIX)) {
     shapeAgentNodeSpan(mutable);
