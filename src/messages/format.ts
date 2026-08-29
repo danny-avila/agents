@@ -632,7 +632,8 @@ function entriesHaveConflictingSemanticState(
   return (
     left.status !== right.status ||
     (left.redacted === true) !== (right.redacted === true) ||
-    left.text !== right.text
+    left.text.replace(/\s+/g, ' ').trim() !==
+      right.text.replace(/\s+/g, ' ').trim()
   );
 }
 
@@ -1000,19 +1001,21 @@ function collectCompactionSemanticEntriesFromPart(
   ) {
     return;
   }
-  const revision =
-    typeof part.activity_label_revision === 'number' &&
-    Number.isSafeInteger(part.activity_label_revision)
-      ? part.activity_label_revision
-      : 0;
-  if (revision < 0 || typeof part.activity_label !== 'string') {
+  const revision = part.activity_label_revision;
+  if (
+    (revision !== undefined &&
+      (typeof revision !== 'number' ||
+        !Number.isSafeInteger(revision) ||
+        revision < 0)) ||
+    typeof part.activity_label !== 'string'
+  ) {
     return;
   }
   appendDerivedCompactionSemanticEntry(collector, {
     type: 'activity_phase',
     sourceMessageId,
     sourceContentIndex: activitySourceContentIndex,
-    revision,
+    revision: revision ?? 0,
     status: part.pending === true ? 'pending' : 'committed',
     text: part.activity_label,
   });

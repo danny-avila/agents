@@ -207,6 +207,31 @@ describe('formatAgentMessages compaction semantic index', () => {
     );
   });
 
+  it.each(['2', 1.5, Number.POSITIVE_INFINITY])(
+    'rejects an explicitly malformed activity revision %p',
+    (revision) => {
+      const payload = semanticPayload();
+      const content = payload[0].content;
+      if (Array.isArray(content)) {
+        Object.assign(content[2], { activity_label_revision: revision });
+      }
+
+      const result = formatAgentMessages(
+        payload,
+        undefined,
+        undefined,
+        undefined,
+        { compactionSemanticIndex: {} }
+      );
+
+      expect(result.compactionSemanticIndex).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: 'activity_phase' }),
+        ])
+      );
+    }
+  );
+
   it('does not derive a phase whose evidence was removed by a summary slice', () => {
     const payload = semanticPayload();
     const content = payload[0].content;
@@ -482,6 +507,62 @@ describe('formatAgentMessages compaction semantic index', () => {
         result.messages
       ).appendix
     ).not.toContain('stale normalized label');
+  });
+
+  it('accepts renderer-equivalent text for an equal retained revision', () => {
+    const messageCount =
+      COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 80;
+    const payload: TPayload = Array.from(
+      { length: messageCount },
+      (_, index) => {
+        const isFirstRevision = index === 0;
+        const isEquivalentRevision = index === 100;
+        let activityLabel = `Filler activity ${index}`;
+        if (isFirstRevision) {
+          activityLabel = 'checking cache';
+        } else if (isEquivalentRevision) {
+          activityLabel = 'checking   cache';
+        }
+        return {
+          role: 'assistant',
+          messageId:
+            isFirstRevision || isEquivalentRevision
+              ? 'equivalent-text-source'
+              : `equivalent-filler-source-${index}`,
+          content: [
+            { type: ContentTypes.TEXT, text: `Assistant text ${index}` },
+            {
+              type: ContentTypes.ACTIVITY_LABEL,
+              activity_label: activityLabel,
+              activity_label_type: 'phase',
+              activity_label_revision: 1,
+              activity_start_index: 0,
+              pending: false,
+            } as MessageContentComplex,
+          ],
+        };
+      }
+    );
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { compactionSemanticIndex: {} }
+    );
+
+    expect(
+      result.compactionSemanticIndex?.filter(
+        ({ sourceMessageId }) => sourceMessageId === 'equivalent-text-source'
+      )
+    ).toEqual([
+      expect.objectContaining({
+        revision: 1,
+        status: 'committed',
+        text: 'checking cache',
+      }),
+    ]);
   });
 
   it('returns bounded tombstones instead of retaining oversized label text', () => {
