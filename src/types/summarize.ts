@@ -82,6 +82,13 @@ export type CompactionSemanticIndexEntry =
 
 export type CompactionSemanticIndex = readonly CompactionSemanticIndexEntry[];
 
+/** Serializable continuation state for a bounded compaction semantic index. */
+export type CompactionSemanticIndexSnapshot = {
+  entries: CompactionSemanticIndex;
+  /** Cumulative entries supplied before validation and bounded retention. */
+  providedEntryCount: number;
+};
+
 export type SummarizationConfig = {
   provider?: ProviderName;
   model?: string;

@@ -194,12 +194,14 @@ The index is appended only after cacheable raw history; it never replaces raw
 messages or makes generated labels authoritative.
 
 An **Incremental Compaction Semantic Index** evolves a previously committed,
-bounded index with labels from only the current persisted payload. Model
-Context Reconstruction snapshots the prior index, admits it chronologically
-through the same coverage-balanced collector, and derives the delta during its
-existing content pass. Work is independent of unbounded conversation length:
-`O(B + delta)`, where `B` is capped at 256. Invalid prior state degrades to
-delta-only derivation rather than disabling new guidance.
+bounded index with labels from only the current persisted payload. Its
+serializable snapshot contains retained entries plus their cumulative supplied
+count so omission telemetry survives process boundaries. Model Context
+Reconstruction snapshots the prior entries, admits them chronologically through
+the same coverage-balanced collector, and derives the delta during its existing
+content pass. Work is independent of unbounded conversation length: `O(B +
+delta)`, where `B` is capped at 256. Invalid prior state degrades to delta-only
+derivation rather than disabling new guidance.
 
 See [ADR 0005](docs/adr/0005-pairing-balanced-compaction-ranges.md) for the
 range-selection and retention trade-offs.

@@ -347,7 +347,7 @@ function runFormatting(
 
 type IncrementalBenchmarkMode = 'full-history' | 'bounded-delta';
 
-const incrementalBaseIndex = formatAgentMessages(
+const incrementalBaseSnapshot = formatAgentMessages(
   warmHistoryPayload,
   undefined,
   undefined,
@@ -356,7 +356,7 @@ const incrementalBaseIndex = formatAgentMessages(
     preserveReasoningContent: true,
     compactionSemanticIndex: { intentToolNames: INTENT_TOOL_NAMES },
   }
-).compactionSemanticIndex;
+).compactionSemanticIndexSnapshot;
 const fullWarmHistoryPayload = [
   ...warmHistoryPayload,
   ...incrementalDeltaPayload,
@@ -379,8 +379,8 @@ function runIncrementalEvolution(
       {
         preserveReasoningContent: true,
         compactionSemanticIndex: {
-          baseIndex:
-            mode === 'bounded-delta' ? incrementalBaseIndex : undefined,
+          baseSnapshot:
+            mode === 'bounded-delta' ? incrementalBaseSnapshot : undefined,
           intentToolNames: INTENT_TOOL_NAMES,
         },
       }
@@ -516,7 +516,7 @@ console.log(
         iterationsPerSample: INCREMENTAL_SAMPLE_ITERATIONS,
         samples: FORMAT_SAMPLE_COUNT,
         historicalMessages: warmHistoryPayload.length,
-        retainedBaseEntries: incrementalBaseIndex?.length ?? 0,
+        retainedBaseEntries: incrementalBaseSnapshot?.entries.length ?? 0,
         deltaMessages: incrementalDeltaPayload.length,
         fullHistory: fullHistoryEvolution,
         boundedDelta: boundedDeltaEvolution,

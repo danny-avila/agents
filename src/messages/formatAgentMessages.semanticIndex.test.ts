@@ -1,5 +1,6 @@
 import type {
   CompactionSemanticIndex,
+  CompactionSemanticIndexSnapshot,
   MessageContentComplex,
   TPayload,
 } from '@/types';
@@ -53,6 +54,13 @@ type TestSemanticPart = MessageContentComplex & {
   pending?: boolean;
   reasoning_label_status?: string;
 };
+
+function semanticSnapshot(
+  entries: CompactionSemanticIndex,
+  providedEntryCount = entries.length
+): CompactionSemanticIndexSnapshot {
+  return { entries, providedEntryCount };
+}
 
 describe('formatAgentMessages compaction semantic index', () => {
   it('derives exact semantic guidance without changing provider messages', () => {
@@ -186,17 +194,77 @@ describe('formatAgentMessages compaction semantic index', () => {
       undefined,
       undefined,
       undefined,
-      { compactionSemanticIndex: { baseIndex } }
+      { compactionSemanticIndex: { baseSnapshot: semanticSnapshot(baseIndex) } }
     );
 
     expect(
       result.compactionSemanticIndex?.filter(
-        ({ sourceMessageId }) =>
-          sourceMessageId === 'malformed-revision-source'
+        ({ sourceMessageId }) => sourceMessageId === 'malformed-revision-source'
       )
     ).toEqual([
       expect.objectContaining({ revision: 2, text: 'valid delta label' }),
     ]);
+  });
+
+  it('fails malformed snapshot-envelope metadata closed without losing the delta', () => {
+    const baseIndex: CompactionSemanticIndex = [
+      {
+        type: 'activity_phase',
+        sourceMessageId: 'base-one',
+        sourceContentIndex: 0,
+        revision: 0,
+        status: 'committed',
+        text: 'Base one',
+      },
+      {
+        type: 'activity_phase',
+        sourceMessageId: 'base-two',
+        sourceContentIndex: 0,
+        revision: 0,
+        status: 'committed',
+        text: 'Base two',
+      },
+    ];
+    const malformedCount = semanticSnapshot(baseIndex, 1);
+
+    const result = formatAgentMessages(
+      semanticPayload(),
+      undefined,
+      undefined,
+      undefined,
+      {
+        compactionSemanticIndex: {
+          baseSnapshot: malformedCount,
+          intentToolNames: new Set(['search_docs']),
+        },
+      }
+    );
+
+    expect(result.compactionSemanticIndexSnapshot?.providedEntryCount).toBe(6);
+
+    const throwingSnapshot = semanticSnapshot([]);
+    Object.defineProperty(throwingSnapshot, 'entries', {
+      get() {
+        throw new Error('caller-owned getter failed');
+      },
+    });
+    const deltaOnly = formatAgentMessages(
+      semanticPayload(),
+      undefined,
+      undefined,
+      undefined,
+      {
+        compactionSemanticIndex: {
+          baseSnapshot: throwingSnapshot,
+          intentToolNames: new Set(['search_docs']),
+        },
+      }
+    );
+
+    expect(deltaOnly.compactionSemanticIndex).toHaveLength(4);
+    expect(
+      deltaOnly.compactionSemanticIndexSnapshot?.providedEntryCount
+    ).toBe(4);
   });
 
   it('evolves a bounded prior snapshot without changing delta provider messages', () => {
@@ -225,7 +293,7 @@ describe('formatAgentMessages compaction semantic index', () => {
       {
         preserveReasoningContent: true,
         compactionSemanticIndex: {
-          baseIndex,
+          baseSnapshot: semanticSnapshot(baseIndex),
           intentToolNames: new Set(['search_docs']),
         },
       }
@@ -237,6 +305,10 @@ describe('formatAgentMessages compaction semantic index', () => {
       baseline.messages.map((message) => message.toDict())
     );
     expect(evolved.compactionSemanticIndex).toHaveLength(5);
+    expect(evolved.compactionSemanticIndexSnapshot).toEqual({
+      entries: evolved.compactionSemanticIndex,
+      providedEntryCount: 5,
+    });
     expect(evolved.compactionSemanticIndex?.[0]).toEqual(
       expect.objectContaining({
         sourceMessageId: 'prior-source',
@@ -273,7 +345,7 @@ describe('formatAgentMessages compaction semantic index', () => {
       undefined,
       {
         compactionSemanticIndex: {
-          baseIndex: oversizedBase,
+          baseSnapshot: semanticSnapshot(oversizedBase),
           intentToolNames: new Set(['search_docs']),
         },
       }
@@ -295,8 +367,7 @@ describe('formatAgentMessages compaction semantic index', () => {
     ).toEqual(
       expect.objectContaining({
         providedEntryCount:
-          oversizedBase.length +
-          (result.compactionSemanticIndex?.length ?? 0),
+          oversizedBase.length + (result.compactionSemanticIndex?.length ?? 0),
         entryCount: 3,
         omittedEntryCount: oversizedBase.length + 1,
       })
@@ -304,16 +375,18 @@ describe('formatAgentMessages compaction semantic index', () => {
   });
 
   it('keeps serialized warm-turn evolution bounded and coverage balanced', () => {
-    let evolved: CompactionSemanticIndex = Array.from(
-      { length: COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries },
-      (_, index) => ({
-        type: 'activity_phase' as const,
-        sourceMessageId: `base-source-${index}`,
-        sourceContentIndex: 0,
-        revision: 0,
-        status: 'committed' as const,
-        text: `Base phase ${index}`,
-      })
+    let evolvedSnapshot = semanticSnapshot(
+      Array.from(
+        { length: COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries },
+        (_, index) => ({
+          type: 'activity_phase' as const,
+          sourceMessageId: `base-source-${index}`,
+          sourceContentIndex: 0,
+          revision: 0,
+          status: 'committed' as const,
+          text: `Base phase ${index}`,
+        })
+      )
     );
 
     for (let turn = 0; turn < 24; turn++) {
@@ -338,17 +411,20 @@ describe('formatAgentMessages compaction semantic index', () => {
         undefined,
         undefined,
         undefined,
-        { compactionSemanticIndex: { baseIndex: evolved } }
+        { compactionSemanticIndex: { baseSnapshot: evolvedSnapshot } }
       );
-      evolved = JSON.parse(
-        JSON.stringify(result.compactionSemanticIndex)
-      ) as CompactionSemanticIndex;
-      expect(evolved.length).toBeLessThanOrEqual(
+      evolvedSnapshot = JSON.parse(
+        JSON.stringify(result.compactionSemanticIndexSnapshot)
+      ) as CompactionSemanticIndexSnapshot;
+      expect(evolvedSnapshot.entries.length).toBeLessThanOrEqual(
         COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries
       );
     }
 
-    expect(evolved).toEqual(
+    expect(evolvedSnapshot.providedEntryCount).toBe(
+      COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 24
+    );
+    expect(evolvedSnapshot.entries).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ sourceMessageId: 'base-source-0' }),
         expect.objectContaining({ sourceMessageId: 'warm-source-23' }),
@@ -392,7 +468,7 @@ describe('formatAgentMessages compaction semantic index', () => {
       undefined,
       undefined,
       undefined,
-      { compactionSemanticIndex: { baseIndex } }
+      { compactionSemanticIndex: { baseSnapshot: semanticSnapshot(baseIndex) } }
     );
 
     expect(

@@ -30,6 +30,7 @@ import type {
   ProviderName,
   CompactionSemanticIndex,
   CompactionSemanticIndexEntry,
+  CompactionSemanticIndexSnapshot,
 } from '@/types';
 import type {
   ProviderMessageAttribution,
@@ -414,10 +415,10 @@ export interface FormatAgentMessagesOptions {
    *  the host identifies as semantic-label fields; business `intent`
    *  parameters must remain ordinary tool input. */
   compactionSemanticIndex?: {
-    /** Previously committed bounded guidance to evolve with entries derived
-     *  from this payload. The formatter snapshots and validates caller-owned
-     *  data before scanning the new messages. */
-    baseIndex?: CompactionSemanticIndex;
+    /** Previously committed, serializable guidance to evolve with entries
+     *  derived from this payload. The formatter snapshots and validates
+     *  caller-owned data before scanning the new messages. */
+    baseSnapshot?: CompactionSemanticIndexSnapshot;
     intentToolNames?: ReadonlySet<string>;
   };
 }
@@ -564,20 +565,39 @@ const DERIVED_SEMANTIC_TYPE_HASH: Readonly<
 });
 
 function createDerivedCompactionSemanticIndexCollector(
-  baseIndex?: CompactionSemanticIndex
+  baseSnapshot?: CompactionSemanticIndexSnapshot
 ): DerivedCompactionSemanticIndexCollector {
   const collector: DerivedCompactionSemanticIndexCollector = {
     entries: [],
     entryCount: 0,
     omittedBaseEntryCount: 0,
   };
-  const snapshot = snapshotCompactionSemanticIndex(baseIndex);
+  let baseEntries: CompactionSemanticIndex | undefined;
+  let serializedProvidedEntryCount: number | undefined;
+  try {
+    baseEntries = baseSnapshot?.entries;
+    serializedProvidedEntryCount = baseSnapshot?.providedEntryCount;
+  } catch {
+    return collector;
+  }
+  const snapshot = snapshotCompactionSemanticIndex(baseEntries);
   if (snapshot == null) {
     return collector;
   }
+  const snapshotProvidedEntryCount =
+    getCompactionSemanticIndexProvidedEntryCount(snapshot);
+  const validSerializedProvidedEntryCount =
+    typeof serializedProvidedEntryCount === 'number' &&
+    Number.isSafeInteger(serializedProvidedEntryCount) &&
+    serializedProvidedEntryCount >= snapshotProvidedEntryCount;
+  const providedEntryCount =
+    validSerializedProvidedEntryCount &&
+    serializedProvidedEntryCount != null
+      ? serializedProvidedEntryCount
+      : snapshotProvidedEntryCount;
   collector.omittedBaseEntryCount = Math.max(
     0,
-    getCompactionSemanticIndexProvidedEntryCount(snapshot) - snapshot.length
+    providedEntryCount - snapshot.length
   );
   for (let index = 0; index < snapshot.length; index++) {
     appendDerivedCompactionSemanticEntry(collector, snapshot[index]);
@@ -867,23 +887,25 @@ function appendCoverageBalancedCompactionSemanticEntry(
   );
 }
 
-function finalizeDerivedCompactionSemanticIndex(
+function finalizeDerivedCompactionSemanticIndexSnapshot(
   collector: DerivedCompactionSemanticIndexCollector | undefined
-): CompactionSemanticIndex | undefined {
+): CompactionSemanticIndexSnapshot | undefined {
   if (
     collector == null ||
     (collector.entryCount === 0 && collector.omittedBaseEntryCount === 0)
   ) {
     return undefined;
   }
-  const providedEntryCount =
-    collector.entryCount + collector.omittedBaseEntryCount;
+  const providedEntryCount = Math.min(
+    Number.MAX_SAFE_INTEGER,
+    collector.entryCount + collector.omittedBaseEntryCount
+  );
   if (collector.coverage == null) {
     setCompactionSemanticIndexProvidedEntryCount(
       collector.entries,
       providedEntryCount
     );
-    return collector.entries;
+    return { entries: collector.entries, providedEntryCount };
   }
   const retained = new Map<number, CompactionSemanticIndexEntry>();
   const retain = (
@@ -903,7 +925,7 @@ function finalizeDerivedCompactionSemanticIndex(
     .sort(([left], [right]) => left - right)
     .map(([, entry]) => entry);
   setCompactionSemanticIndexProvidedEntryCount(result, providedEntryCount);
-  return result;
+  return { entries: result, providedEntryCount };
 }
 
 function collectCompactionSemanticEntriesFromPart(
@@ -2655,6 +2677,8 @@ export const formatAgentMessages = (
   boundaryTokenAdjustment?: SummaryTokenAdjustment;
   /** Bounded semantic guidance derived during persisted-content analysis. */
   compactionSemanticIndex?: CompactionSemanticIndex;
+  /** Serializable continuation state for incrementally evolving the index. */
+  compactionSemanticIndexSnapshot?: CompactionSemanticIndexSnapshot;
 } => {
   const messages: Array<
     | RoleBearingMessage<HumanMessage>
@@ -2672,7 +2696,7 @@ export const formatAgentMessages = (
   const compactionSemanticIndexCollector =
     options?.compactionSemanticIndex != null
       ? createDerivedCompactionSemanticIndexCollector(
-        options.compactionSemanticIndex.baseIndex
+        options.compactionSemanticIndex.baseSnapshot
       )
       : undefined;
   /** Emission choke point: every formatted message enters the result here, so
@@ -3276,6 +3300,10 @@ export const formatAgentMessages = (
     }
   }
 
+  const compactionSemanticIndexSnapshot =
+    finalizeDerivedCompactionSemanticIndexSnapshot(
+      compactionSemanticIndexCollector
+    );
   return {
     messages,
     indexTokenCountMap: indexTokenCountMap
@@ -3285,9 +3313,8 @@ export const formatAgentMessages = (
       ? { text: summaryBoundary.text, tokenCount: summaryBoundary.tokenCount }
       : undefined,
     boundaryTokenAdjustment,
-    compactionSemanticIndex: finalizeDerivedCompactionSemanticIndex(
-      compactionSemanticIndexCollector
-    ),
+    compactionSemanticIndex: compactionSemanticIndexSnapshot?.entries,
+    compactionSemanticIndexSnapshot,
   };
 };
 

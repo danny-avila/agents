@@ -22,11 +22,14 @@ source coordinates or perform another message pass.
 ## Decision
 
 The existing `formatAgentMessages` compaction option accepts an optional
-`baseIndex`. Before formatting the current payload, the SDK snapshots and
-validates this caller-owned index. Valid prior entries enter the private
-coverage-balanced collector in chronological order; semantic entries derived
-from the current payload follow during the formatter's existing content pass.
-The returned `compactionSemanticIndex` is the evolved bounded snapshot.
+`baseSnapshot`. This serializable envelope contains the retained entries and
+their cumulative producer-side entry count. Before formatting the current
+payload, the SDK snapshots and validates this caller-owned state. Valid prior
+entries enter the private coverage-balanced collector in chronological order;
+semantic entries derived from the current payload follow during the
+formatter's existing content pass. The returned
+`compactionSemanticIndexSnapshot` is the evolved bounded envelope; the
+existing `compactionSemanticIndex` result remains its entries-only projection.
 
 The public interface exposes no mutable accumulator or retention internals.
 The prior snapshot remains subject to ADR 0007's 256-entry input bound. An
@@ -53,7 +56,8 @@ Langfuse trace shaping are unchanged.
   reasoning labels without rescanning historical messages.
 - Formatter ownership keeps source-coordinate extraction and retention policy
   local to the module that already has the necessary context.
-- Persisted snapshots remain plain index entries and can cross process or actor
-  boundaries without serializing SDK implementation details.
+- Persisted snapshots remain plain entries plus one cumulative count and can
+  cross process or actor boundaries without serializing SDK implementation
+  details. The count preserves omission telemetry across JSON persistence.
 - LibreChat needs a focused adoption change after the SDK version containing
   this interface is published.
