@@ -177,15 +177,16 @@ export class JinaReranker extends BaseReranker {
       );
 
       run.model = response.data?.model;
-      run.units = response.data?.usage.total_tokens;
+      run.units = response.data?.usage?.total_tokens;
 
-      if (!response.data || !response.data.results.length) {
+      const results = response.data?.results;
+      if (!Array.isArray(results) || results.length === 0) {
         return this.fallback(run, 'bad_response');
       }
 
       return this.complete(
         run,
-        response.data.results.map((result) => {
+        results.map((result) => {
           const docIndex = result.index;
           const score = result.relevance_score;
           let text = '';
@@ -272,15 +273,16 @@ export class CohereReranker extends BaseReranker {
       );
 
       run.model = model;
-      run.units = response.data?.meta.billed_units.search_units;
+      run.units = response.data?.meta?.billed_units?.search_units;
 
-      if (!response.data || !response.data.results.length) {
+      const results = response.data?.results;
+      if (!Array.isArray(results) || results.length === 0) {
         return this.fallback(run, 'bad_response');
       }
 
       return this.complete(
         run,
-        response.data.results.map((result) => {
+        results.map((result) => {
           const docIndex = result.index;
           const score = result.relevance_score;
           const text = documents[docIndex];

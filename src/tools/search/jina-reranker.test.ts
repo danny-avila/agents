@@ -147,6 +147,43 @@ describe('JinaReranker', () => {
       );
     });
 
+    it('should keep a ranking when the response omits the usage telemetry', async () => {
+      const reranker = new JinaReranker({
+        apiKey: 'test-key',
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      const warnSpy = jest
+        .spyOn(mockLogger, 'warn')
+        .mockImplementation(() => mockLogger);
+      const errorSpy = jest
+        .spyOn(mockLogger, 'error')
+        .mockImplementation(() => mockLogger);
+      // A Jina-compatible endpoint may return results with no `usage` block.
+      jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: {
+          model: 'custom-reranker',
+          results: [
+            { index: 1, relevance_score: 0.9 },
+            { index: 0, relevance_score: 0.4 },
+          ],
+        },
+      });
+
+      const result = await reranker.rerank(
+        'test query',
+        ['document1', 'document2'],
+        2
+      );
+
+      expect(result).toEqual([
+        { text: 'document2', score: 0.9 },
+        { text: 'document1', score: 0.4 },
+      ]);
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(errorSpy).not.toHaveBeenCalled();
+    });
+
     it('should log compact Axios errors without request internals', async () => {
       const customUrl =
         'https://test-jina-endpoint.com/v1/rerank?api_key=hidden';

@@ -503,12 +503,13 @@ describe('executeParallelSearches topStories dedupe', () => {
 
     const merged = await executeParallelSearches({
       searchAPI,
-      provider: 'serper',
       query: 'test query',
       safeSearch: 1,
       images: false,
       videos: false,
       news: true,
+      logger: silentLogger,
+      provider: 'serper',
       metrics: createSearchMetrics(silentLogger),
     });
 
@@ -621,5 +622,98 @@ describe('createSourceProcessor log volume', () => {
 
     metrics.flush();
     expect(logger.debug).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('executeParallelSearches call contract', () => {
+  const createMockLogger = (): t.Logger =>
+    ({
+      error: jest.fn(),
+      warn: jest.fn(),
+      info: jest.fn(),
+      debug: jest.fn(),
+    }) as unknown as t.Logger;
+
+  const okResult: t.SearchResult = {
+    success: true,
+    data: { organic: [makeOrganic('https://a.com')] },
+  };
+
+  test('summarizes itself when called with only the legacy arguments', async () => {
+    const logger = createMockLogger();
+    const searchAPI = { getSources: async (): Promise<t.SearchResult> => okResult };
+
+    const merged = await executeParallelSearches({
+      searchAPI,
+      query: 'test query',
+      safeSearch: 1,
+      images: false,
+      videos: false,
+      news: false,
+      logger,
+    });
+
+    expect(merged.success).toBe(true);
+    /** No collector supplied, so this call owns and flushes its own. */
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    expect(String((logger.debug as jest.Mock).mock.calls[0][0])).toContain(
+      'search=unknown queries=1'
+    );
+  });
+
+  test('rethrows the main search error object rather than a wrapped copy', async () => {
+    const logger = createMockLogger();
+    class ProviderError extends Error {}
+    const failure = new ProviderError('provider exploded');
+    const searchAPI = {
+      getSources: async (): Promise<t.SearchResult> => {
+        throw failure;
+      },
+    };
+
+    await expect(
+      executeParallelSearches({
+        searchAPI,
+        query: 'test query',
+        safeSearch: 1,
+        images: false,
+        videos: false,
+        news: false,
+        logger,
+      })
+    ).rejects.toBe(failure);
+
+    /** A rejected query was error-level before it was aggregated. */
+    expect(logger.warn).not.toHaveBeenCalled();
+    const [line, detail] = (logger.error as jest.Mock).mock.calls[0];
+    expect(String(line)).toContain('failed=1 reasons={web:other:1}');
+    expect(detail).toBe('provider exploded');
+  });
+
+  test('keeps a sub-search failure off the error channel', async () => {
+    const logger = createMockLogger();
+    const searchAPI = {
+      getSources: async (params: t.GetSourcesParams): Promise<t.SearchResult> =>
+        params.type === 'news'
+          ? { success: false, error: 'timeout of 10000ms exceeded' }
+          : okResult,
+    };
+
+    const merged = await executeParallelSearches({
+      searchAPI,
+      query: 'test query',
+      safeSearch: 1,
+      images: false,
+      videos: false,
+      news: true,
+      logger,
+      provider: 'serper',
+    });
+
+    expect(merged.success).toBe(true);
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(String((logger.warn as jest.Mock).mock.calls[0][0])).toContain(
+      'failed=1 reasons={news:timeout:1}'
+    );
   });
 });

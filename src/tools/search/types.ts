@@ -344,7 +344,9 @@ export interface JinaRerankerResult {
 
 export interface JinaRerankerResponse {
   model: string;
-  usage: {
+  /** Telemetry only, and absent from some Jina-compatible endpoints — never
+   * dereference it on a path that would discard a usable ranking. */
+  usage?: {
     total_tokens: number;
   };
   results: JinaRerankerResult[];
@@ -358,12 +360,13 @@ export interface CohereRerankerResult {
 export interface CohereRerankerResponse {
   results: CohereRerankerResult[];
   id: string;
-  meta: {
-    api_version: {
+  /** Telemetry only; see {@link JinaRerankerResponse.usage}. */
+  meta?: {
+    api_version?: {
       version: string;
       is_experimental: boolean;
     };
-    billed_units: {
+    billed_units?: {
       search_units: number;
     };
   };
@@ -438,6 +441,10 @@ export interface SearchObservation {
   results: number;
   durationMs: number;
   error?: string;
+  /** The query rejected rather than reporting failure in its response. Those
+   * were logged at error level before they were aggregated, so the summary
+   * has to carry the distinction to keep that severity. */
+  thrown?: boolean;
 }
 
 /** One scraped link. A failure carries `error`; a success carries the sizes

@@ -92,7 +92,6 @@ const countResults = (
  */
 export async function executeParallelSearches({
   searchAPI,
-  provider,
   query,
   date,
   country,
@@ -100,10 +99,11 @@ export async function executeParallelSearches({
   images,
   videos,
   news,
+  logger,
+  provider = 'unknown',
   metrics,
 }: {
   searchAPI: ReturnType<typeof createSearchAPI>;
-  provider: string;
   query: string;
   date?: DATE_RANGE;
   country?: string;
@@ -111,11 +111,19 @@ export async function executeParallelSearches({
   images: boolean;
   videos: boolean;
   news: boolean;
-  metrics: t.SearchMetrics;
+  logger: t.Logger;
+  /** Labels the provider in the run summary. Optional so the pre-existing
+   * call contract still holds for callers outside this package. */
+  provider?: string;
+  /** Collector owned by the caller. Without one, this call opens and flushes
+   * its own, so a direct caller still gets the single summary line. */
+  metrics?: t.SearchMetrics;
 }): Promise<t.SearchResult> {
-  /** Every sub-search shares this shape, and a failed one must resolve rather
-   * than reject so the siblings still merge; only the main search's failure
-   * is fatal, and that is raised from its `success` flag below. */
+  const collector = metrics ?? createSearchMetrics(logger);
+
+  /** Sub-searches resolve rather than reject so their siblings still merge.
+   * A rejected MAIN search stays fatal and rethrows the provider's own error
+   * — callers have always seen that error object, not a wrapped copy. */
   const runSearch = async (type: t.SubSearchType): Promise<t.SearchResult> => {
     const startedAt = Date.now();
     try {
@@ -126,7 +134,7 @@ export async function executeParallelSearches({
         safeSearch,
         ...(type !== 'web' && { type }),
       });
-      metrics.recordSearch({
+      collector.recordSearch({
         provider,
         type,
         results: countResults(type, result.data),
@@ -136,14 +144,18 @@ export async function executeParallelSearches({
       return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      metrics.recordSearch({
+      collector.recordSearch({
         provider,
         type,
         results: 0,
         durationMs: Date.now() - startedAt,
         error: message,
+        thrown: true,
       });
-      return { success: false, error: `${type} search failed: ${message}` };
+      if (type === 'web') {
+        throw error;
+      }
+      return { success: false, error: message };
     }
   };
 
@@ -161,7 +173,11 @@ export async function executeParallelSearches({
   }
 
   // Run all searches in parallel
-  const results = await Promise.all(searchTasks);
+  const results = await Promise.all(searchTasks).finally(() => {
+    if (metrics == null) {
+      collector.flush();
+    }
+  });
 
   // Get the main search result (first result)
   const mainResult = results[0];
@@ -292,7 +308,6 @@ function createSearchProcessor({
       // Execute parallel searches and merge results
       const searchResult = await executeParallelSearches({
         searchAPI,
-        provider,
         query,
         date,
         country,
@@ -300,6 +315,8 @@ function createSearchProcessor({
         images: supportsImages && images,
         videos: supportsVideos && videos,
         news: supportsNews && news,
+        logger,
+        provider,
         metrics,
       });
 

@@ -180,7 +180,7 @@ describe('createSearchMetrics', () => {
       type: 'news',
       results: 0,
       durationMs: 200,
-      error: 'timeout',
+      error: 'Serper API request failed: timeout of 10000ms exceeded',
     });
     metrics.flush();
 
@@ -188,7 +188,80 @@ describe('createSearchMetrics', () => {
     expect(line).toContain('search=serper queries=3');
     expect(line).toContain('results={web:8,images:10}');
     expect(line).toContain('dur=900ms');
+    /** Provider prose is classified, not copied into the summary verbatim. */
     expect(line).toContain('failed=1 reasons={news:timeout:1}');
+    expect(line).not.toContain('Serper API request failed');
+  });
+
+  it('collapses equivalent search failures into one classified reason', () => {
+    const logger = createMockLogger();
+    const metrics = createSearchMetrics(logger);
+
+    for (const message of [
+      'Images search failed: timeout of 10000ms exceeded',
+      'Images search failed: ETIMEDOUT connecting to provider',
+    ]) {
+      metrics.recordSearch({
+        provider: 'serper',
+        type: 'images',
+        results: 0,
+        durationMs: 10,
+        error: message,
+      });
+    }
+    metrics.flush();
+
+    expect(lineOf(logger.warn)).toContain('failed=2 reasons={images:timeout:2}');
+  });
+
+  it('raises the search phase to error only when a query rejected', () => {
+    const soft = createMockLogger();
+    const softMetrics = createSearchMetrics(soft);
+    softMetrics.recordSearch({
+      provider: 'serper',
+      type: 'news',
+      results: 0,
+      durationMs: 5,
+      error: 'Request failed with status code 429',
+    });
+    softMetrics.flush();
+    expect(soft.error).not.toHaveBeenCalled();
+    expect(lineOf(soft.warn)).toContain('failed=1 reasons={news:http_429:1}');
+
+    const thrown = createMockLogger();
+    const thrownMetrics = createSearchMetrics(thrown);
+    thrownMetrics.recordSearch({
+      provider: 'serper',
+      type: 'images',
+      results: 0,
+      durationMs: 5,
+      error: 'socket hang up',
+      thrown: true,
+    });
+    thrownMetrics.flush();
+    expect(thrown.warn).not.toHaveBeenCalled();
+    expect(thrown.error).toHaveBeenCalledWith(
+      expect.stringContaining('failed=1 reasons={images:connection:1}'),
+      'socket hang up'
+    );
+  });
+
+  it('bounds a provider-supplied model name inside the summary line', () => {
+    const logger = createMockLogger();
+    const metrics = createSearchMetrics(logger);
+
+    metrics.recordRerank({
+      provider: 'jina',
+      model: 'm'.repeat(500),
+      chunks: 4,
+      results: 4,
+      durationMs: 1,
+    });
+    metrics.flush();
+
+    const line = lineOf(logger.debug);
+    expect(line).toContain('model=');
+    expect(line.length).toBeLessThan(200);
   });
 
   it('resets after a flush so a reused collector never double-counts', () => {

@@ -8,6 +8,9 @@ const MAX_REASON_KEYS = 6;
 const MAX_FAILURE_SAMPLES = 3;
 /** Cap on the raw provider message carried alongside a summary. */
 const MAX_DETAIL_LENGTH = 200;
+/** Cap on a provider-supplied label placed inside a summary line, so a
+ * malformed response cannot stretch a fixed-width line without bound. */
+const MAX_LABEL_LENGTH = 48;
 const OTHER_REASON = 'other';
 
 const HTTP_STATUS_REGEX = /\b(?:status(?:\scode)?|http)\D{0,3}(\d{3})\b/i;
@@ -38,7 +41,8 @@ export const classifyFailure = (message?: string): string => {
   return OTHER_REASON;
 };
 
-const bump = (counts: Map<string, number>, key: string): void => {
+const bump = (counts: Map<string, number>, rawKey: string): void => {
+  const key = label(rawKey);
   const existing = counts.get(key);
   if (existing != null) {
     counts.set(key, existing + 1);
@@ -73,18 +77,23 @@ const formatMap = (counts: Map<string, number>): string => {
   return `{${out}}`;
 };
 
-const truncateDetail = (detail: string): string =>
-  detail.length <= MAX_DETAIL_LENGTH
-    ? detail
-    : `${detail.slice(0, MAX_DETAIL_LENGTH)}…`;
+const truncate = (value: string, max: number): string =>
+  value.length <= max ? value : `${value.slice(0, max)}…`;
+
+/** Every provider-supplied string that reaches a summary line or a map key
+ * goes through here: the phases promise a fixed-width line, and neither a
+ * remote payload nor an external caller's label is bounded on its own. */
+const label = (value: string): string => truncate(value, MAX_LABEL_LENGTH);
 
 interface SearchPhase {
   provider: string;
   queries: number;
   failed: number;
+  errors: number;
   durationMs: number;
   types: Map<string, number>;
   reasons: Map<string, number>;
+  detail?: string;
 }
 
 interface ScrapePhase {
@@ -137,7 +146,9 @@ export const createSearchMetrics = (
   let rerank: RerankPhase | undefined;
 
   const flushSearch = (phase: SearchPhase): void => {
-    let line = `[web_search] search=${phase.provider} queries=${phase.queries}`;
+    let line =
+      `[web_search] search=${label(phase.provider)}` +
+      ` queries=${phase.queries}`;
     if (phase.types.size > 0) {
       line += ` results=${formatMap(phase.types)}`;
     }
@@ -146,9 +157,18 @@ export const createSearchMetrics = (
       logger.debug(line);
       return;
     }
-    logger.warn(
-      `${line} failed=${phase.failed} reasons=${formatMap(phase.reasons)}`
-    );
+    line += ` failed=${phase.failed} reasons=${formatMap(phase.reasons)}`;
+    /** A rejected query was an error-level event before it was aggregated;
+     * a provider that merely reported failure was not. */
+    if (phase.errors === 0) {
+      logger.warn(line);
+      return;
+    }
+    if (phase.detail == null) {
+      logger.error(line);
+      return;
+    }
+    logger.error(line, phase.detail);
   };
 
   const flushScrape = (phase: ScrapePhase): void => {
@@ -175,13 +195,13 @@ export const createSearchMetrics = (
 
   const flushRerank = (phase: RerankPhase): void => {
     let line =
-      `[web_search] rerank=${phase.provider} calls=${phase.calls}` +
+      `[web_search] rerank=${label(phase.provider)} calls=${phase.calls}` +
       ` chunks=${phase.chunks} maxChunks=${phase.maxChunks}` +
       ` results=${phase.results}` +
       ` dur=${formatMs(phase.durationMs)}` +
       ` maxDur=${formatMs(phase.maxDurationMs)}`;
     if (phase.model != null) {
-      line += ` model=${phase.model}`;
+      line += ` model=${label(phase.model)}`;
     }
     if (phase.units > 0) {
       line += ` units=${phase.units}`;
@@ -225,6 +245,7 @@ export const createSearchMetrics = (
       provider: observation.provider,
       queries: 0,
       failed: 0,
+      errors: 0,
       durationMs: 0,
       types: new Map(),
       reasons: new Map(),
@@ -235,10 +256,20 @@ export const createSearchMetrics = (
     search.durationMs = Math.max(search.durationMs, observation.durationMs);
     if (observation.error != null) {
       search.failed += 1;
-      bump(search.reasons, `${observation.type}:${observation.error}`);
+      /** Provider messages are prose: classify before counting, or equivalent
+       * failures never collapse and the raw text lands in the summary. */
+      bump(
+        search.reasons,
+        `${observation.type}:${classifyFailure(observation.error)}`
+      );
+      search.detail ??= truncate(observation.error, MAX_DETAIL_LENGTH);
+      if (observation.thrown === true) {
+        search.errors += 1;
+      }
     } else if (observation.results > 0) {
-      const seen = search.types.get(observation.type) ?? 0;
-      search.types.set(observation.type, seen + observation.results);
+      const type = label(observation.type);
+      const seen = search.types.get(type) ?? 0;
+      search.types.set(type, seen + observation.results);
     }
     if (autoFlush) {
       flush();
@@ -265,7 +296,7 @@ export const createSearchMetrics = (
       if (scrape.samples.length < MAX_FAILURE_SAMPLES) {
         scrape.samples.push(`${hostOf(observation.url)}:${reason}`);
       }
-      scrape.detail ??= truncateDetail(observation.error);
+      scrape.detail ??= truncate(observation.error, MAX_DETAIL_LENGTH);
     } else {
       scrape.ok += 1;
       const chars = observation.chars ?? 0;
