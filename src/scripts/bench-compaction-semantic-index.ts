@@ -16,6 +16,8 @@ const MEASURED_ITERATIONS = 25_000;
 const FORMAT_WARMUP_ITERATIONS = 500;
 const FORMAT_SAMPLE_ITERATIONS = 300;
 const FORMAT_SAMPLE_COUNT = 9;
+const INCREMENTAL_WARMUP_ITERATIONS = 300;
+const INCREMENTAL_SAMPLE_ITERATIONS = 300;
 const INTENT_TOOL_NAMES: ReadonlySet<string> = new Set(['search_docs']);
 
 const messages = Array.from({ length: 12 }, (_, index) => {
@@ -57,9 +59,8 @@ function run(
   return { elapsedMs: performance.now() - startedAt, checksum };
 }
 
-const persistedPayload: TPayload = Array.from(
-  { length: 32 },
-  (_, messageIndex) => ({
+function createPersistedMessage(messageIndex: number): TPayload[number] {
+  return {
     role: 'assistant',
     messageId: `persisted-${messageIndex}`,
     content: [
@@ -96,8 +97,46 @@ const persistedPayload: TPayload = Array.from(
         text: `Completed request analysis ${messageIndex}`,
       },
     ],
-  })
+  };
+}
+
+const persistedPayload: TPayload = Array.from(
+  { length: 32 },
+  (_, messageIndex) => createPersistedMessage(messageIndex)
 );
+const warmHistoryPayload: TPayload = Array.from(
+  { length: 100 },
+  (_, messageIndex) => createPersistedMessage(messageIndex)
+);
+const incrementalDeltaPayload: TPayload = [
+  {
+    role: 'assistant',
+    messageId: 'persisted-warm-delta',
+    content: [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'tool-warm-delta',
+          name: 'search_docs',
+          args: {
+            intent: 'Locate the warm continuation implementation',
+            query: 'warm continuation',
+          },
+          output: 'result warm delta',
+          outcome: 'Located the warm continuation implementation',
+        },
+      },
+      {
+        type: ContentTypes.ACTIVITY_LABEL,
+        activity_label: 'Mapped the warm continuation phase',
+        activity_label_type: 'phase',
+        activity_start_index: 0,
+        pending: false,
+      },
+      { type: ContentTypes.TEXT, text: 'Completed the warm continuation' },
+    ],
+  },
+];
 
 function stripActivityLabelParts(payload: TPayload): TPayload {
   return payload.map((message) => {
@@ -136,9 +175,7 @@ function appendSeparateSemanticEntry(
     entries.push({ ...entry, text: '' });
     return;
   }
-  if (
-    entry.text.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars
-  ) {
+  if (entry.text.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputTextChars) {
     entries.push({ ...entry, text: '', redacted: true });
     return;
   }
@@ -292,16 +329,64 @@ function runFormatting(
       undefined,
       mode === 'one-pass'
         ? {
-          preserveReasoningContent: true,
-          compactionSemanticIndex: {
-            intentToolNames: INTENT_TOOL_NAMES,
-          },
-        }
+            preserveReasoningContent: true,
+            compactionSemanticIndex: {
+              intentToolNames: INTENT_TOOL_NAMES,
+            },
+          }
         : { preserveReasoningContent: true }
     );
     checksum +=
       result.messages.length +
-      (result.compactionSemanticIndex?.length ?? separatelyDerived?.length ?? 0);
+      (result.compactionSemanticIndex?.length ??
+        separatelyDerived?.length ??
+        0);
+  }
+  return { elapsedMs: performance.now() - startedAt, checksum };
+}
+
+type IncrementalBenchmarkMode = 'full-history' | 'bounded-delta';
+
+const incrementalBaseIndex = formatAgentMessages(
+  warmHistoryPayload,
+  undefined,
+  undefined,
+  undefined,
+  {
+    preserveReasoningContent: true,
+    compactionSemanticIndex: { intentToolNames: INTENT_TOOL_NAMES },
+  }
+).compactionSemanticIndex;
+const fullWarmHistoryPayload = [
+  ...warmHistoryPayload,
+  ...incrementalDeltaPayload,
+];
+
+function runIncrementalEvolution(
+  iterations: number,
+  mode: IncrementalBenchmarkMode
+): { elapsedMs: number; checksum: number } {
+  let checksum = 0;
+  const startedAt = performance.now();
+  for (let iteration = 0; iteration < iterations; iteration++) {
+    const result = formatAgentMessages(
+      mode === 'full-history'
+        ? fullWarmHistoryPayload
+        : incrementalDeltaPayload,
+      undefined,
+      undefined,
+      undefined,
+      {
+        preserveReasoningContent: true,
+        compactionSemanticIndex: {
+          baseIndex:
+            mode === 'bounded-delta' ? incrementalBaseIndex : undefined,
+          intentToolNames: INTENT_TOOL_NAMES,
+        },
+      }
+    );
+    checksum +=
+      result.messages.length + (result.compactionSemanticIndex?.length ?? 0);
   }
   return { elapsedMs: performance.now() - startedAt, checksum };
 }
@@ -311,10 +396,12 @@ function median(values: number[]): number {
   return ordered[Math.floor(ordered.length / 2)];
 }
 
-function formatTiming(results: Array<{
-  elapsedMs: number;
-  checksum: number;
-}>): {
+function formatTiming(
+  results: Array<{
+    elapsedMs: number;
+    checksum: number;
+  }>
+): {
   medianTotalMs: number;
   microsecondsPerProjection: number;
   checksum: number;
@@ -357,13 +444,35 @@ for (let sample = 0; sample < FORMAT_SAMPLE_COUNT; sample++) {
   }
 }
 const formatDisabled = formatTiming(formatSamples.get('disabled') ?? []);
-const legacyPrestrip = formatTiming(
-  formatSamples.get('legacy-prestrip') ?? []
-);
+const legacyPrestrip = formatTiming(formatSamples.get('legacy-prestrip') ?? []);
 const separateProjection = formatTiming(
   formatSamples.get('separate-projection') ?? []
 );
 const onePass = formatTiming(formatSamples.get('one-pass') ?? []);
+runIncrementalEvolution(INCREMENTAL_WARMUP_ITERATIONS, 'full-history');
+runIncrementalEvolution(INCREMENTAL_WARMUP_ITERATIONS, 'bounded-delta');
+const incrementalModes: IncrementalBenchmarkMode[] = [
+  'full-history',
+  'bounded-delta',
+];
+const incrementalSamples = new Map<
+  IncrementalBenchmarkMode,
+  Array<{ elapsedMs: number; checksum: number }>
+>(incrementalModes.map((mode) => [mode, []]));
+for (let sample = 0; sample < FORMAT_SAMPLE_COUNT; sample++) {
+  for (let offset = 0; offset < incrementalModes.length; offset++) {
+    const mode = incrementalModes[(sample + offset) % incrementalModes.length];
+    incrementalSamples
+      .get(mode)
+      ?.push(runIncrementalEvolution(INCREMENTAL_SAMPLE_ITERATIONS, mode));
+  }
+}
+const fullHistoryEvolution = formatTiming(
+  incrementalSamples.get('full-history') ?? []
+);
+const boundedDeltaEvolution = formatTiming(
+  incrementalSamples.get('bounded-delta') ?? []
+);
 
 // eslint-disable-next-line no-console
 console.log(
@@ -399,6 +508,29 @@ console.log(
             ((onePass.microsecondsPerProjection -
               separateProjection.microsecondsPerProjection) /
               separateProjection.microsecondsPerProjection) *
+            100
+          ).toFixed(2)
+        ),
+      },
+      warmTurnEvolution: {
+        iterationsPerSample: INCREMENTAL_SAMPLE_ITERATIONS,
+        samples: FORMAT_SAMPLE_COUNT,
+        historicalMessages: warmHistoryPayload.length,
+        retainedBaseEntries: incrementalBaseIndex?.length ?? 0,
+        deltaMessages: incrementalDeltaPayload.length,
+        fullHistory: fullHistoryEvolution,
+        boundedDelta: boundedDeltaEvolution,
+        speedup: Number(
+          (
+            fullHistoryEvolution.microsecondsPerProjection /
+            boundedDeltaEvolution.microsecondsPerProjection
+          ).toFixed(2)
+        ),
+        latencyReductionPercent: Number(
+          (
+            ((fullHistoryEvolution.microsecondsPerProjection -
+              boundedDeltaEvolution.microsecondsPerProjection) /
+              fullHistoryEvolution.microsecondsPerProjection) *
             100
           ).toFixed(2)
         ),

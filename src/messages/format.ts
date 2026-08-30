@@ -58,17 +58,20 @@ import {
   isAtomicToolContentBlock,
   serializeStructuredValueBounded,
 } from '@/utils/toolContent';
-import { setCompactionSemanticIndexProvidedEntryCount } from '@/summarization/semanticIndex';
-import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
-import { toLangChainContent, toLangChainMessageFields } from './langchain';
-import { flattenLegacyContent, isLegacyConvertible } from './content';
-import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import {
+  snapshotCompactionSemanticIndex,
+  setCompactionSemanticIndexProvidedEntryCount,
+} from '@/summarization/semanticIndex';
 import {
   Providers,
   ContentTypes,
   Constants,
   COMPACTION_SEMANTIC_INDEX_LIMITS,
 } from '@/common';
+import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
+import { toLangChainContent, toLangChainMessageFields } from './langchain';
+import { flattenLegacyContent, isLegacyConvertible } from './content';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { emitAgentLog } from '@/utils/events';
 
 interface MediaMessageParams {
@@ -389,7 +392,7 @@ interface FormatAssistantMessageOptions {
 
 type SourceContentPartIndices = number | readonly number[];
 
-interface FormatAgentMessagesOptions {
+export interface FormatAgentMessagesOptions {
   provider?: ProviderName;
   /** Emit flattenable text content as the joined string the legacy-content
    *  projection would produce, so the per-request `formatContentStrings` pass
@@ -410,6 +413,10 @@ interface FormatAgentMessagesOptions {
    *  the host identifies as semantic-label fields; business `intent`
    *  parameters must remain ordinary tool input. */
   compactionSemanticIndex?: {
+    /** Previously committed bounded guidance to evolve with entries derived
+     *  from this payload. The formatter snapshots and validates caller-owned
+     *  data before scanning the new messages. */
+    baseIndex?: CompactionSemanticIndex;
     intentToolNames?: ReadonlySet<string>;
   };
 }
@@ -554,11 +561,21 @@ const DERIVED_SEMANTIC_TYPE_HASH: Readonly<
   reasoning_label: 4,
 });
 
-function createDerivedCompactionSemanticIndexCollector(): DerivedCompactionSemanticIndexCollector {
-  return {
+function createDerivedCompactionSemanticIndexCollector(
+  baseIndex?: CompactionSemanticIndex
+): DerivedCompactionSemanticIndexCollector {
+  const collector: DerivedCompactionSemanticIndexCollector = {
     entries: [],
     entryCount: 0,
   };
+  const snapshot = snapshotCompactionSemanticIndex(baseIndex);
+  if (snapshot == null) {
+    return collector;
+  }
+  for (let index = 0; index < snapshot.length; index++) {
+    appendDerivedCompactionSemanticEntry(collector, snapshot[index]);
+  }
+  return collector;
 }
 
 function createCompactionSemanticCoverageState(): CompactionSemanticCoverageState {
@@ -888,8 +905,7 @@ function collectCompactionSemanticEntriesFromPart(
   parsedToolInput?: ToolCallPart['args']
 ): void {
   if (
-    sourceMessageId.length >
-      COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
+    sourceMessageId.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
   ) {
     return;
   }
@@ -1017,14 +1033,14 @@ function collectCompactionSemanticEntriesFromPart(
     part.pending !== undefined && typeof part.pending !== 'boolean';
   const malformedText = typeof part.activity_label !== 'string';
   const malformedState = malformedPending || malformedText;
-  const text = typeof part.activity_label === 'string' ? part.activity_label : '';
+  const text =
+    typeof part.activity_label === 'string' ? part.activity_label : '';
   appendDerivedCompactionSemanticEntry(collector, {
     type: 'activity_phase',
     sourceMessageId,
     sourceContentIndex: activitySourceContentIndex,
     revision: revision ?? 0,
-    status:
-      part.pending === true || malformedPending ? 'pending' : 'committed',
+    status: part.pending === true || malformedPending ? 'pending' : 'committed',
     text,
     ...(malformedState ? { redacted: true } : {}),
   });
@@ -2643,7 +2659,9 @@ export const formatAgentMessages = (
   const legacyContentEnabled = options?.legacyContent === true;
   const compactionSemanticIndexCollector =
     options?.compactionSemanticIndex != null
-      ? createDerivedCompactionSemanticIndexCollector()
+      ? createDerivedCompactionSemanticIndexCollector(
+        options.compactionSemanticIndex.baseIndex
+      )
       : undefined;
   /** Emission choke point: every formatted message enters the result here, so
    *  the legacy flatten happens once per message with no closing rescan. The

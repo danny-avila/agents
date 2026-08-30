@@ -1,4 +1,8 @@
-import type { MessageContentComplex, TPayload } from '@/types';
+import type {
+  CompactionSemanticIndex,
+  MessageContentComplex,
+  TPayload,
+} from '@/types';
 import { renderCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import { COMPACTION_SEMANTIC_INDEX_LIMITS, ContentTypes } from '@/common';
 import { formatAgentMessages } from './format';
@@ -146,6 +150,201 @@ describe('formatAgentMessages compaction semantic index', () => {
     );
   });
 
+  it('evolves a bounded prior snapshot without changing delta provider messages', () => {
+    const baseIndex: CompactionSemanticIndex = [
+      {
+        type: 'activity_phase',
+        sourceMessageId: 'prior-source',
+        sourceContentIndex: 0,
+        revision: 1,
+        status: 'committed',
+        text: 'Completed the prior phase',
+      },
+    ];
+    const baseline = formatAgentMessages(
+      semanticPayload(),
+      undefined,
+      undefined,
+      undefined,
+      { preserveReasoningContent: true }
+    );
+    const evolved = formatAgentMessages(
+      semanticPayload(),
+      undefined,
+      undefined,
+      undefined,
+      {
+        preserveReasoningContent: true,
+        compactionSemanticIndex: {
+          baseIndex,
+          intentToolNames: new Set(['search_docs']),
+        },
+      }
+    );
+
+    baseIndex[0].text = 'caller mutation';
+
+    expect(evolved.messages.map((message) => message.toDict())).toEqual(
+      baseline.messages.map((message) => message.toDict())
+    );
+    expect(evolved.compactionSemanticIndex).toHaveLength(5);
+    expect(evolved.compactionSemanticIndex?.[0]).toEqual(
+      expect.objectContaining({
+        sourceMessageId: 'prior-source',
+        text: 'Completed the prior phase',
+      })
+    );
+    expect(evolved.compactionSemanticIndex).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sourceMessageId: 'assistant-semantic-source',
+          type: 'tool_intent',
+        }),
+      ])
+    );
+  });
+
+  it('fails an oversized prior snapshot closed while retaining the delta', () => {
+    const oversizedBase: CompactionSemanticIndex = Array.from(
+      { length: COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 1 },
+      (_, index) => ({
+        type: 'activity_phase' as const,
+        sourceMessageId: `oversized-source-${index}`,
+        sourceContentIndex: 0,
+        revision: 0,
+        status: 'committed' as const,
+        text: `Oversized prior phase ${index}`,
+      })
+    );
+
+    const result = formatAgentMessages(
+      semanticPayload(),
+      undefined,
+      undefined,
+      undefined,
+      {
+        compactionSemanticIndex: {
+          baseIndex: oversizedBase,
+          intentToolNames: new Set(['search_docs']),
+        },
+      }
+    );
+
+    expect(result.compactionSemanticIndex).toHaveLength(4);
+    expect(result.compactionSemanticIndex).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sourceMessageId: expect.stringContaining('oversized-source-'),
+        }),
+      ])
+    );
+  });
+
+  it('keeps serialized warm-turn evolution bounded and coverage balanced', () => {
+    let evolved: CompactionSemanticIndex = Array.from(
+      { length: COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries },
+      (_, index) => ({
+        type: 'activity_phase' as const,
+        sourceMessageId: `base-source-${index}`,
+        sourceContentIndex: 0,
+        revision: 0,
+        status: 'committed' as const,
+        text: `Base phase ${index}`,
+      })
+    );
+
+    for (let turn = 0; turn < 24; turn++) {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          messageId: `warm-source-${turn}`,
+          content: [
+            { type: ContentTypes.TEXT, text: `Warm answer ${turn}` },
+            {
+              type: ContentTypes.ACTIVITY_LABEL,
+              activity_label: `Warm phase ${turn}`,
+              activity_label_type: 'phase',
+              activity_start_index: 0,
+              pending: false,
+            } as MessageContentComplex,
+          ],
+        },
+      ];
+      const result = formatAgentMessages(
+        payload,
+        undefined,
+        undefined,
+        undefined,
+        { compactionSemanticIndex: { baseIndex: evolved } }
+      );
+      evolved = JSON.parse(
+        JSON.stringify(result.compactionSemanticIndex)
+      ) as CompactionSemanticIndex;
+      expect(evolved.length).toBeLessThanOrEqual(
+        COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries
+      );
+    }
+
+    expect(evolved).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sourceMessageId: 'base-source-0' }),
+        expect.objectContaining({ sourceMessageId: 'warm-source-23' }),
+      ])
+    );
+  });
+
+  it('applies newer delta tombstones over a full prior snapshot', () => {
+    const baseIndex: CompactionSemanticIndex = Array.from(
+      { length: COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries },
+      (_, index) => ({
+        type: 'activity_phase' as const,
+        sourceMessageId:
+          index === 200 ? 'continued-source' : `revision-base-${index}`,
+        sourceContentIndex: 0,
+        revision: 1,
+        status: 'committed' as const,
+        text: index === 200 ? 'stale label' : `Base label ${index}`,
+      })
+    );
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        messageId: 'continued-source',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Continued answer' },
+          {
+            type: ContentTypes.ACTIVITY_LABEL,
+            activity_label: 'new pending label',
+            activity_label_type: 'phase',
+            activity_label_revision: 2,
+            activity_start_index: 0,
+            pending: true,
+          } as MessageContentComplex,
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { compactionSemanticIndex: { baseIndex } }
+    );
+
+    expect(
+      result.compactionSemanticIndex?.filter(
+        ({ sourceMessageId }) => sourceMessageId === 'continued-source'
+      )
+    ).toEqual([
+      expect.objectContaining({
+        revision: 2,
+        status: 'pending',
+        text: '',
+      }),
+    ]);
+  });
+
   it('reuses the formatter parse for string-backed tool arguments', () => {
     const args = JSON.stringify({
       intent: 'Inspect the projection',
@@ -163,9 +362,9 @@ describe('formatAgentMessages compaction semantic index', () => {
         compactionSemanticIndex: { intentToolNames: new Set(['search_docs']) },
       });
 
-      expect(
-        parse.mock.calls.filter(([value]) => value === args)
-      ).toHaveLength(1);
+      expect(parse.mock.calls.filter(([value]) => value === args)).toHaveLength(
+        1
+      );
     } finally {
       parse.mockRestore();
     }
@@ -385,8 +584,7 @@ describe('formatAgentMessages compaction semantic index', () => {
   });
 
   it('retains newer suppressing revisions when balanced admission overflows', () => {
-    const messageCount =
-      COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 80;
+    const messageCount = COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 80;
     const payload: TPayload = Array.from(
       { length: messageCount },
       (_, index) => {
@@ -446,8 +644,7 @@ describe('formatAgentMessages compaction semantic index', () => {
   });
 
   it('renews recent retention when an admitted identity advances', () => {
-    const messageCount =
-      COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 100;
+    const messageCount = COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 100;
     const payload: TPayload = Array.from(
       { length: messageCount },
       (_, index) => {
@@ -490,8 +687,7 @@ describe('formatAgentMessages compaction semantic index', () => {
 
     expect(
       result.compactionSemanticIndex?.filter(
-        ({ sourceMessageId }) =>
-          sourceMessageId === 'recent-revision-source'
+        ({ sourceMessageId }) => sourceMessageId === 'recent-revision-source'
       )
     ).toEqual([
       expect.objectContaining({
@@ -502,8 +698,7 @@ describe('formatAgentMessages compaction semantic index', () => {
   });
 
   it('balances revisions with renderer-normalized identities', () => {
-    const messageCount =
-      COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 80;
+    const messageCount = COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 80;
     const payload: TPayload = Array.from(
       { length: messageCount },
       (_, index) => {
@@ -531,9 +726,7 @@ describe('formatAgentMessages compaction semantic index', () => {
               reasoning_label: reasoningLabel,
               reasoning_label_step_id: reasoningStepId,
               reasoning_label_revision: isNewRevision ? 2 : 1,
-              reasoning_label_status: isNewRevision
-                ? 'streaming'
-                : 'complete',
+              reasoning_label_status: isNewRevision ? 'streaming' : 'complete',
             } as MessageContentComplex,
           ],
         };
@@ -548,8 +741,7 @@ describe('formatAgentMessages compaction semantic index', () => {
       { preserveReasoningContent: true, compactionSemanticIndex: {} }
     );
     const revisions = result.compactionSemanticIndex?.filter(
-      ({ sourceMessageId }) =>
-        sourceMessageId === 'normalized-revision-source'
+      ({ sourceMessageId }) => sourceMessageId === 'normalized-revision-source'
     );
 
     expect(revisions).toEqual([
@@ -568,8 +760,7 @@ describe('formatAgentMessages compaction semantic index', () => {
   });
 
   it('accepts renderer-equivalent text for an equal retained revision', () => {
-    const messageCount =
-      COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 80;
+    const messageCount = COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries + 80;
     const payload: TPayload = Array.from(
       { length: messageCount },
       (_, index) => {
