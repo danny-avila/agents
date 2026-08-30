@@ -13,7 +13,7 @@ import type {
 } from '../types';
 import type * as t from '@/types';
 import { HookRegistry } from '../HookRegistry';
-import { Providers } from '@/common';
+import { Providers, StepTypes } from '@/common';
 import { Run } from '@/run';
 
 const llmConfig: t.LLMConfig = {
@@ -300,6 +300,11 @@ describe('Run-level hook integration', () => {
         role: 'user',
         source: 'steer',
       });
+      const messageSteps = run.Graph!.contentData.filter(
+        (step) => step.type === StepTypes.MESSAGE_CREATION
+      );
+      expect(messageSteps).toHaveLength(2);
+      expect(new Set(messageSteps.map((step) => step.id)).size).toBe(2);
     });
 
     it('serializes StopFinalize after ordinary Stop decisions are folded', async () => {
@@ -349,6 +354,29 @@ describe('Run-level hook integration', () => {
         'plugin continuation',
         'continued answer',
       ]);
+    });
+
+    it('fails the run when final continuation admission is indeterminate', async () => {
+      const registry = new HookRegistry();
+      registry.register('StopFinalize', {
+        hooks: [
+          async (): Promise<StopHookOutput> => {
+            throw new Error('claim response unavailable');
+          },
+        ],
+      });
+
+      const run = await createRun(registry, 'failed-final-admission');
+      run.Graph!.overrideTestModel(['first answer']);
+
+      await expect(
+        run.processStream(
+          { messages: [new HumanMessage('initial prompt')] },
+          callerConfig
+        )
+      ).rejects.toThrow(
+        'StopFinalize terminal admission failed: claim response unavailable'
+      );
     });
 
     it('does not self-loop when Stop blocks without injectable content', async () => {
@@ -419,6 +447,83 @@ describe('Run-level hook integration', () => {
         'first answer',
         'checkpoint steer',
         'continued answer',
+      ]);
+    });
+
+    it('advances an explicitly pinned checkpoint before the warm segment', async () => {
+      const checkpointer = new MemorySaver();
+      const threadConfig = {
+        ...callerConfig,
+        configurable: { thread_id: 'pinned-warm-thread' },
+      };
+      const seedRun = await Run.create<t.IState>({
+        runId: 'pinned-warm-seed',
+        graphConfig: {
+          type: 'standard',
+          llmConfig,
+          compileOptions: { checkpointer },
+        },
+        returnContent: true,
+        skipCleanup: true,
+      });
+      seedRun.Graph!.overrideTestModel(['seed answer']);
+      await seedRun.processStream(
+        { messages: [new HumanMessage('seed prompt')] },
+        threadConfig
+      );
+      const seedTuple = await checkpointer.getTuple(threadConfig);
+      const checkpointId = seedTuple?.config.configurable?.checkpoint_id;
+      expect(typeof checkpointId).toBe('string');
+
+      const registry = new HookRegistry();
+      registry.register('Stop', {
+        hooks: [
+          async (input): Promise<StopHookOutput> =>
+            input.continuationCount === 0
+              ? {
+                decision: 'block',
+                injectedMessages: [
+                  { role: 'user', content: 'branch steer', source: 'steer' },
+                ],
+              }
+              : { decision: 'continue' },
+        ],
+      });
+      const branchRun = await Run.create<t.IState>({
+        runId: 'pinned-warm-branch',
+        graphConfig: {
+          type: 'standard',
+          llmConfig,
+          compileOptions: { checkpointer },
+        },
+        returnContent: true,
+        skipCleanup: true,
+        hooks: registry,
+      });
+      branchRun.Graph!.overrideTestModel([
+        'branch answer',
+        'continued branch answer',
+      ]);
+      await branchRun.processStream(
+        { messages: [new HumanMessage('branch prompt')] },
+        {
+          ...threadConfig,
+          configurable: {
+            ...threadConfig.configurable,
+            checkpoint_id: checkpointId,
+          },
+        }
+      );
+
+      expect(
+        branchRun.Graph!.messages.map((message) => message.content)
+      ).toEqual([
+        'seed prompt',
+        'seed answer',
+        'branch prompt',
+        'branch answer',
+        'branch steer',
+        'continued branch answer',
       ]);
     });
 

@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  HumanMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 import {
   describe,
   it,
@@ -29,6 +33,8 @@ import type {
   PostToolBatchHookInput,
   PostToolBatchHookOutput,
   RunStartHookOutput,
+  StopHookInput,
+  StopHookOutput,
   UserPromptSubmitHookOutput,
 } from '@/hooks';
 import type * as t from '@/types';
@@ -1327,6 +1333,114 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
      * reason carried over from the previous pass. */
     expect(run.getInterrupt()).toBeUndefined();
     expect(run.getHaltReason()).toBeUndefined();
+  });
+
+  it('preserves the warm continuation budget across a HITL resume', async () => {
+    const { Run: RunClass } = await import('@/run');
+    const registry = new HookRegistry();
+    const stopInputs: StopHookInput[] = [];
+    let run: Awaited<ReturnType<typeof RunClass.create<t.IState>>>;
+    const checkpointer = new MemorySaver();
+    const toolCallId = 'abcdef0123456789abcdef0123456789';
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review',
+        }),
+      ],
+    });
+    registry.register('Stop', {
+      hooks: [
+        async (input): Promise<StopHookOutput> => {
+          stopInputs.push(input);
+          if (input.continuationCount > 0) {
+            return { decision: 'continue' };
+          }
+          run.Graph?.overrideTestModel(
+            ['tool request', 'final answer'],
+            undefined,
+            [
+              {
+                id: toolCallId,
+                name: 'echo',
+                args: { command: 'continue' },
+                type: 'tool_call',
+              },
+            ]
+          );
+          return {
+            decision: 'block',
+            injectedMessages: [
+              { role: 'user', content: 'late steer', source: 'steer' },
+            ],
+          };
+        },
+      ],
+    });
+    run = await RunClass.create<t.IState>({
+      runId: 'warm-hitl-budget',
+      graphConfig: {
+        type: 'standard',
+        compileOptions: { checkpointer },
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+            tools: [createSchemaStub('echo')],
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+      maxStopContinuations: 1,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel(['first answer']);
+    const config = {
+      configurable: { thread_id: 'warm-hitl-budget-thread' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream(
+      { messages: [new HumanMessage('initial prompt')] },
+      config
+    );
+    expect(run.getInterrupt()).toBeDefined();
+    expect(stopInputs.map((input) => input.continuationCount)).toEqual([0]);
+
+    run = await RunClass.create<t.IState>({
+      runId: 'warm-hitl-budget',
+      graphConfig: {
+        type: 'standard',
+        compileOptions: { checkpointer },
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+            tools: [createSchemaStub('echo')],
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+      maxStopContinuations: 1,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel(['final answer']);
+    await run.resume([{ type: 'approve' }], config);
+
+    expect(run.getInterrupt()).toBeUndefined();
+    expect(stopInputs.map((input) => input.continuationCount)).toEqual([0, 1]);
+    expect(
+      stopInputs.map((input) => input.continuationBudgetRemaining)
+    ).toEqual([1, 0]);
   });
 
   it('Run.resume() forwards `update` so langgraph applies the channel edit through streamEvents', async () => {

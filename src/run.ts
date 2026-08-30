@@ -166,6 +166,24 @@ function materializeStopContinuation(
   return messages;
 }
 
+function advanceCheckpointCursor(
+  config: t.RunStreamConfig
+): t.RunStreamConfig {
+  const configurable = { ...config.configurable };
+  delete configurable.checkpoint_id;
+  delete configurable.checkpoint_map;
+  return { ...config, configurable };
+}
+
+function assertFinalAdmissionSucceeded(result: AggregatedHookResult): void {
+  if (result.errors.length === 0) {
+    return;
+  }
+  throw new Error(
+    `StopFinalize terminal admission failed: ${result.errors.join('; ')}`
+  );
+}
+
 const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_AGENT_UPDATE,
   GraphEvents.ON_RUN_STEP,
@@ -262,7 +280,10 @@ function getInterruptHookSessionId(payload: unknown): string | undefined {
 
 type InterruptStateSnapshot = {
   config?: RunnableConfig;
-  values?: { messages?: BaseMessage[] };
+  values?: {
+    messages?: BaseMessage[];
+    runStepState?: t.RunStepResumeState;
+  };
   tasks?: Array<{
     interrupts?: Array<{ id?: string; value?: unknown }>;
     state?: RunnableConfig | InterruptStateSnapshot;
@@ -1213,6 +1234,7 @@ export class Run<_T extends t.BaseGraphState> {
           : undefined,
       traceAnchor: graph.langfuseTraceAnchor,
       runId: graph.langfuseScopeRunId,
+      deferRootRunId: this.id,
       // The aggregate multi-agent policy from the runtime scope — the
       // handler must restore THIS (not the primary agent's config-derived
       // policy) when rejecting a foreign scope.
@@ -1227,6 +1249,7 @@ export class Run<_T extends t.BaseGraphState> {
       throw new Error('Run ID not provided');
     }
 
+    config.runId = this.id;
     config.run_id = this.id;
     config.configurable = Object.assign(config.configurable ?? {}, {
       run_id: this.id,
@@ -1276,7 +1299,7 @@ export class Run<_T extends t.BaseGraphState> {
 
     const consumeStream = async (): Promise<void> => {
       let streamInputs: t.IState | Command = inputs;
-      let stopContinuationCount = 0;
+      let streamConfig = config;
 
       for (;;) {
         /**
@@ -1287,7 +1310,7 @@ export class Run<_T extends t.BaseGraphState> {
          */
         const stream = graphRunnable.streamEvents(
           streamInputs as t.IState,
-          { ...config, runName: graph.runName },
+          { ...streamConfig, runName: graph.runName },
           {
             raiseError: true,
             /** Custom events are handled by createCustomEventCallback(). */
@@ -1356,6 +1379,7 @@ export class Run<_T extends t.BaseGraphState> {
         }
 
         const stopMessages = graph.getRunMessages() ?? stateInputs?.messages ?? [];
+        const stopContinuationCount = graph.getStopContinuationCount();
         const continuationBudgetRemaining = Math.max(
           0,
           this.maxStopContinuations - stopContinuationCount
@@ -1406,7 +1430,8 @@ export class Run<_T extends t.BaseGraphState> {
             },
             sessionId: this.id,
             signal: config.signal,
-          }).catch((): undefined => undefined);
+          });
+          assertFinalAdmissionSucceeded(finalized);
           stopResult = mergeAggregatedHookResults(stopResult, finalized);
         }
 
@@ -1426,7 +1451,9 @@ export class Run<_T extends t.BaseGraphState> {
                 'Stop hook attempted to inject messages after the terminal continuation budget was exhausted.'
               );
             }
-            stopContinuationCount += 1;
+            const nextContinuationCount = stopContinuationCount + 1;
+            graph.setStopContinuationCount(nextContinuationCount);
+            graph.advanceStreamSegment();
             /**
              * A checkpointer already owns the completed graph state, so only
              * the delta is submitted. Without one, each invocation starts from
@@ -1437,7 +1464,11 @@ export class Run<_T extends t.BaseGraphState> {
               messages: this.hasCheckpointer
                 ? injected
                 : [...graph.messages, ...injected],
+              runStepState: graph.createRunStepResumeState(),
             };
+            if (this.hasCheckpointer) {
+              streamConfig = advanceCheckpointCursor(streamConfig);
+            }
             continue;
           }
         }
@@ -1877,7 +1908,8 @@ export class Run<_T extends t.BaseGraphState> {
       return;
     }
     this.Graph?.restoreRunStepResumeState(
-      getRunStepResumeState(persistedInterrupt.value)
+      getRunStepResumeState(persistedInterrupt.value) ??
+        snapshot.values?.runStepState
     );
     const persistedMessages = getPersistedMessages(snapshot);
     if (persistedMessages != null) {

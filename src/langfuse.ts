@@ -79,6 +79,8 @@ type LangfuseHandlerParams = {
    *  only adopted when stamped with the same run (see
    *  `LangfuseRuntimeContext.runId`). */
   runId?: string;
+  /** Keep this root open while one processStream call executes graph segments. */
+  deferRootRunId?: string;
   /** The run's resolved tool-output policy — for multi-agent streams the
    *  conservative aggregate across agents, which `this.langfuse` (the
    *  primary agent's config) cannot reproduce. Applied when a foreign
@@ -293,9 +295,19 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private readonly agentId?: string;
   private readonly parentSpanContext?: SpanContext;
   private readonly runId?: string;
+  private readonly deferredRootRunId?: string;
   private readonly identity: HandlerIdentity;
   private readonly toolOutputTracing?: ResolvedLangfuseToolOutputTracingConfig;
   private readonly trackedRunIds = new Set<string>();
+  private deferredRootStarted = false;
+  private deferredRootOutcome:
+    | {
+      type: 'end';
+      output: Parameters<CallbackHandler['handleChainEnd']>[0];
+      parentRunId?: string;
+    }
+    | { type: 'error'; error: Error; parentRunId?: string }
+    | undefined;
 
   constructor(params?: AgentLangfuseHandlerParams) {
     const {
@@ -306,6 +318,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
       parentSpanContext,
       inheritTraceIdentity,
       runId,
+      deferRootRunId,
       toolOutputTracing,
       traceName,
       ...handlerParams
@@ -326,6 +339,10 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     this.agentId = agentId;
     this.parentSpanContext = parentSpanContext;
     this.runId = runId;
+    this.deferredRootRunId = deferRootRunId;
+    if (deferRootRunId != null) {
+      this.awaitHandlers = true;
+    }
     this.toolOutputTracing = toolOutputTracing;
     this.identity = {
       userId: inheritTraceIdentity === true ? undefined : handlerParams.userId,
@@ -528,6 +545,17 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleChainStart(
     ...args: Parameters<CallbackHandler['handleChainStart']>
   ): ReturnType<CallbackHandler['handleChainStart']> {
+    const [, , runId, parentRunId] = args;
+    if (
+      runId === this.deferredRootRunId &&
+      parentRunId == null &&
+      this.deferredRootStarted
+    ) {
+      return Promise.resolve();
+    }
+    if (runId === this.deferredRootRunId && parentRunId == null) {
+      this.deferredRootStarted = true;
+    }
     return this.withRuntimeContext(
       () => super.handleChainStart(...args),
       this.startsDetachedRun(args[2], args[3]),
@@ -539,6 +567,13 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     ...args: Parameters<CallbackHandler['handleChainError']>
   ): ReturnType<CallbackHandler['handleChainError']> {
     const [error, runId, parentRunId] = args;
+    if (runId === this.deferredRootRunId && parentRunId == null) {
+      this.deferredRootOutcome = {
+        type: 'error',
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+      return Promise.resolve();
+    }
     if (error != null && parentRunId != null && isGraphInterrupt(error)) {
       return super.handleChainEnd(
         GRAPH_INTERRUPT_CONTROL_FLOW,
@@ -554,6 +589,36 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
       );
     }
     return super.handleChainError(...args);
+  }
+
+  override handleChainEnd(
+    ...args: Parameters<CallbackHandler['handleChainEnd']>
+  ): ReturnType<CallbackHandler['handleChainEnd']> {
+    const [output, runId, parentRunId] = args;
+    if (runId === this.deferredRootRunId && parentRunId == null) {
+      this.deferredRootOutcome = { type: 'end', output };
+      return Promise.resolve();
+    }
+    return super.handleChainEnd(...args);
+  }
+
+  async finishDeferredRoot(): Promise<void> {
+    const runId = this.deferredRootRunId;
+    const outcome = this.deferredRootOutcome;
+    if (!this.deferredRootStarted || runId == null || outcome == null) {
+      return;
+    }
+    this.deferredRootStarted = false;
+    this.deferredRootOutcome = undefined;
+    if (outcome.type === 'error') {
+      await super.handleChainError(
+        outcome.error,
+        runId,
+        outcome.parentRunId
+      );
+      return;
+    }
+    await super.handleChainEnd(outcome.output, runId, outcome.parentRunId);
   }
 
   override handleAgentAction(
@@ -792,6 +857,7 @@ export function createLangfuseHandler({
   parentSpanContext,
   inheritTraceIdentity,
   runId,
+  deferRootRunId,
   toolOutputTracing,
   traceName,
 }: AgentLangfuseHandlerParams): CallbackHandler | undefined {
@@ -813,6 +879,7 @@ export function createLangfuseHandler({
     parentSpanContext,
     inheritTraceIdentity,
     runId,
+    deferRootRunId,
     toolOutputTracing,
     traceName,
   });
@@ -865,6 +932,9 @@ export function isLangfuseCallbackHandler(value: unknown): boolean {
 }
 
 export async function disposeLangfuseHandler(value: unknown): Promise<void> {
+  if (value instanceof ScopedLangfuseCallbackHandler) {
+    await value.finishDeferredRoot();
+  }
   if (
     value == null ||
     parseBooleanEnv(process.env[LANGFUSE_FORCE_FLUSH_ON_DISPOSE]) !== true

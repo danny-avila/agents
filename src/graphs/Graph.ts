@@ -771,6 +771,8 @@ export abstract class Graph<
   contentData: t.RunStep[] = [];
   protected nextContentIndex = 0;
   protected runStepStateRevision = 0;
+  protected stopContinuationCount = 0;
+  protected streamSegment = 0;
   stepKeyIds: Map<string, string[]> = new Map<string, string[]>();
   contentIndexMap: Map<string, number> = new Map();
   toolCallStepIds: Map<string, string> = new Map();
@@ -900,6 +902,8 @@ export abstract class Graph<
     this.contentData = [];
     this.nextContentIndex = 0;
     this.runStepStateRevision = 0;
+    this.stopContinuationCount = 0;
+    this.streamSegment = 0;
     this.contentIndexMap = new Map();
     this.stepKeyIds = new Map();
     this.toolCallStepIds.clear();
@@ -1537,6 +1541,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.cachedRunMessages = undefined;
     this.cachedDiscoveredTools = undefined;
     this.config = resetIfNotEmpty(this.config, undefined);
+    this.stopContinuationCount = 0;
+    this.streamSegment = 0;
     if (keepContent !== true) {
       this.contentData = resetIfNotEmpty(this.contentData, []);
       this.nextContentIndex = 0;
@@ -1835,6 +1841,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       version: 1,
       revision: this.runStepStateRevision,
       nextIndex: this.nextContentIndex,
+      stopContinuationCount: this.stopContinuationCount,
+      streamSegment: this.streamSegment,
       toolCallSteps: [...this.toolCallStepIds].map(([toolCallId, stepId]) => ({
         toolCallId,
         stepId,
@@ -1854,6 +1862,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
     this.nextContentIndex = state.nextIndex;
     this.runStepStateRevision = state.revision;
+    this.stopContinuationCount = state.stopContinuationCount ?? 0;
+    this.streamSegment = state.streamSegment ?? 0;
     for (const { toolCallId, stepId } of state.toolCallSteps) {
       this.toolCallStepIds.set(toolCallId, stepId);
     }
@@ -1886,6 +1896,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return this.contentData[index];
     }
     return undefined;
+  }
+
+  getStopContinuationCount(): number {
+    return this.stopContinuationCount;
+  }
+
+  setStopContinuationCount(count: number): void {
+    this.stopContinuationCount = count;
+  }
+
+  advanceStreamSegment(): void {
+    this.streamSegment += 1;
   }
 
   /**
@@ -2336,6 +2358,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       metadata.langgraph_node as string,
       metadata.langgraph_step as number,
       checkpointNs,
+      this.streamSegment,
     ];
 
     return keyList;

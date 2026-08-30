@@ -116,6 +116,10 @@ export interface RunStepResumeState {
   version: 1;
   revision: number;
   nextIndex: number;
+  /** Warm terminal continuations already admitted for this execution. */
+  stopContinuationCount?: number;
+  /** Distinguishes LangGraph event keys when a warm continuation restarts steps. */
+  streamSegment?: number;
   toolCallSteps: Array<{ toolCallId: string; stepId: string }>;
   steps: RunStepResumeEntry[];
 }

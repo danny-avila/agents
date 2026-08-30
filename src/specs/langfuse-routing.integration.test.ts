@@ -7,6 +7,7 @@ import type { SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { Context } from '@opentelemetry/api';
+import type { StopHookOutput } from '@/hooks';
 import type * as t from '@/types';
 import {
   registerLangfuseManagedSpan,
@@ -18,6 +19,7 @@ import { withLangfuseRuntimeScope } from '@/langfuseRuntimeScope';
 import { initializeLangfuseTracing } from '@/instrumentation';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
 import { createLangfuseHandler } from '@/langfuse';
+import { HookRegistry } from '@/hooks';
 import * as providers from '@/llm/providers';
 import { Run } from '@/run';
 
@@ -985,6 +987,51 @@ describe('Langfuse per-run routing integration', () => {
     expect(secondParent?.spanId).not.toBe(firstParent?.spanId);
     expect(secondTraceAnchor).not.toBe(firstTraceAnchor);
     expect(secondScopeRunId).not.toBe(firstScopeRunId);
+  });
+
+  it('keeps warm terminal continuations under one trace root', async () => {
+    const tenantId = 'tenant-warm-continuation';
+    const registry = new HookRegistry();
+    registry.register('Stop', {
+      hooks: [
+        async (input): Promise<StopHookOutput> =>
+          input.continuationCount === 0
+            ? {
+              decision: 'block',
+              injectedMessages: [
+                { role: 'user', content: 'late steer', source: 'steer' },
+              ],
+            }
+            : { decision: 'continue' },
+      ],
+    });
+    const run = await Run.create<t.IState>({
+      runId: `routing-${tenantId}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [createAgent(tenantId)],
+      },
+      langfuse: tenantLangfuse(tenantId),
+      hooks: registry,
+      returnContent: true,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel(['first answer', 'continued answer']);
+
+    await run.processStream(
+      { messages: [new HumanMessage('initial prompt')] },
+      callerConfig
+    );
+
+    const roots = startsForTenant(tenantId).filter(
+      (record) => record.name === 'AgentGraph' && record.parentSpanId == null
+    );
+    expect(roots).toHaveLength(1);
+    expect(
+      startsForTenant(tenantId).filter(
+        (record) => record.parentSpanId === roots[0].spanId
+      ).length
+    ).toBeGreaterThan(0);
   });
 
   it('generates a scope stamp for directly-constructed graphs without a run id', async () => {

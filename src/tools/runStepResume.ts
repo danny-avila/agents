@@ -23,6 +23,12 @@ export function isRunStepResumeState(
     (state.revision ?? -1) < 0 ||
     !Number.isSafeInteger(state.nextIndex) ||
     (state.nextIndex ?? -1) < 0 ||
+    (state.stopContinuationCount != null &&
+      (!Number.isSafeInteger(state.stopContinuationCount) ||
+        state.stopContinuationCount < 0)) ||
+    (state.streamSegment != null &&
+      (!Number.isSafeInteger(state.streamSegment) ||
+        state.streamSegment < 0)) ||
     !Array.isArray(state.toolCallSteps) ||
     !Array.isArray(state.steps)
   ) {
