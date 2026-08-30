@@ -542,10 +542,17 @@ type CompactionSemanticCoverageState = {
   >;
 };
 
+type CompactionSemanticRevisionFloor = {
+  entry: CompactionSemanticIndexEntry;
+  order: number;
+};
+
 type DerivedCompactionSemanticIndexCollector = {
   entries: CompactionSemanticIndexEntry[];
   entryCount: number;
+  baseEntryCount: number;
   omittedBaseEntryCount: number;
+  baseRevisionFloors?: Map<number, CompactionSemanticRevisionFloor[]>;
   coverage?: CompactionSemanticCoverageState;
 };
 
@@ -570,6 +577,7 @@ function createDerivedCompactionSemanticIndexCollector(
   const collector: DerivedCompactionSemanticIndexCollector = {
     entries: [],
     entryCount: 0,
+    baseEntryCount: 0,
     omittedBaseEntryCount: 0,
   };
   let baseEntries: CompactionSemanticIndex | undefined;
@@ -600,8 +608,9 @@ function createDerivedCompactionSemanticIndexCollector(
     providedEntryCount - snapshot.length
   );
   for (let index = 0; index < snapshot.length; index++) {
-    appendDerivedCompactionSemanticEntry(collector, snapshot[index]);
+    appendDerivedCompactionSemanticEntry(collector, snapshot[index], true);
   }
+  collector.baseEntryCount = collector.entryCount;
   return collector;
 }
 
@@ -679,6 +688,86 @@ function entriesHaveConflictingSemanticState(
     left.text.replace(/\s+/g, ' ').trim() !==
       right.text.replace(/\s+/g, ' ').trim()
   );
+}
+
+function findCompactionSemanticRevisionFloor(
+  collector: DerivedCompactionSemanticIndexCollector,
+  entry: CompactionSemanticIndexEntry,
+  identityHash: number
+): CompactionSemanticRevisionFloor | undefined {
+  return collector.baseRevisionFloors
+    ?.get(identityHash)
+    ?.find((floor) =>
+      entriesShareDerivedCompactionSemanticIdentity(floor.entry, entry)
+    );
+}
+
+function seedCompactionSemanticRevisionFloor(
+  collector: DerivedCompactionSemanticIndexCollector,
+  entry: CompactionSemanticIndexEntry,
+  order: number
+): void {
+  collector.baseRevisionFloors ??= new Map();
+  const identityHash = hashDerivedCompactionSemanticIdentity(entry);
+  const existing = findCompactionSemanticRevisionFloor(
+    collector,
+    entry,
+    identityHash
+  );
+  if (existing != null) {
+    if (entry.revision > existing.entry.revision) {
+      existing.entry = entry;
+      existing.order = order;
+    }
+    return;
+  }
+  const floor = { entry, order };
+  const bucket = collector.baseRevisionFloors.get(identityHash);
+  if (bucket == null) {
+    collector.baseRevisionFloors.set(identityHash, [floor]);
+    return;
+  }
+  bucket.push(floor);
+}
+
+function updateCompactionSemanticRevisionFloor(
+  collector: DerivedCompactionSemanticIndexCollector,
+  orderedEntry: OrderedCompactionSemanticIndexEntry
+): void {
+  const floor = findCompactionSemanticRevisionFloor(
+    collector,
+    orderedEntry.entry,
+    orderedEntry.identityHash
+  );
+  if (floor == null || orderedEntry.entry.revision <= floor.entry.revision) {
+    return;
+  }
+  floor.entry = orderedEntry.entry;
+  floor.order = orderedEntry.order;
+}
+
+function shouldRejectCompactionSemanticEntryBelowBaseFloor(
+  collector: DerivedCompactionSemanticIndexCollector,
+  orderedEntry: OrderedCompactionSemanticIndexEntry
+): boolean {
+  const floor = findCompactionSemanticRevisionFloor(
+    collector,
+    orderedEntry.entry,
+    orderedEntry.identityHash
+  );
+  if (floor == null || orderedEntry.order === floor.order) {
+    return false;
+  }
+  const currentBucket = collector.coverage?.latestByIdentityHash.get(
+    orderedEntry.identityHash
+  );
+  const current = currentBucket?.find(({ entry }) =>
+    entriesShareDerivedCompactionSemanticIdentity(entry, orderedEntry.entry)
+  );
+  if (current != null) {
+    return false;
+  }
+  return orderedEntry.entry.revision <= floor.entry.revision;
 }
 
 function retainCompactionSemanticEntry(
@@ -782,7 +871,8 @@ function renewCoverageBalancedCompactionSemanticEntry(
 
 function appendDerivedCompactionSemanticEntry(
   collector: DerivedCompactionSemanticIndexCollector,
-  entry: CompactionSemanticIndexEntry
+  entry: CompactionSemanticIndexEntry,
+  baseEntry = false
 ): void {
   let boundedEntry = entry;
   if (entry.status === 'pending') {
@@ -799,6 +889,14 @@ function appendDerivedCompactionSemanticEntry(
     collector.entries.length < COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries
   ) {
     collector.entries.push(boundedEntry);
+    if (!baseEntry && collector.baseRevisionFloors != null) {
+      updateCompactionSemanticRevisionFloor(collector, {
+        entry: boundedEntry,
+        identityHash: hashDerivedCompactionSemanticIdentity(boundedEntry),
+        order,
+        retentionCount: 0,
+      });
+    }
     return;
   }
   const orderedEntry = {
@@ -808,23 +906,54 @@ function appendDerivedCompactionSemanticEntry(
     retentionCount: 0,
   };
   if (collector.coverage == null) {
+    for (let order = 0; order < collector.baseEntryCount; order++) {
+      seedCompactionSemanticRevisionFloor(
+        collector,
+        collector.entries[order],
+        order
+      );
+    }
     collector.coverage = createCompactionSemanticCoverageState();
     for (let order = 0; order < collector.entries.length; order++) {
-      appendCoverageBalancedCompactionSemanticEntry(collector.coverage, {
+      const bufferedEntry = {
         entry: collector.entries[order],
         identityHash: hashDerivedCompactionSemanticIdentity(
           collector.entries[order]
         ),
         order,
         retentionCount: 0,
-      });
+      };
+      if (
+        shouldRejectCompactionSemanticEntryBelowBaseFloor(
+          collector,
+          bufferedEntry
+        )
+      ) {
+        continue;
+      }
+      appendCoverageBalancedCompactionSemanticEntry(
+        collector.coverage,
+        bufferedEntry
+      );
+      if (order >= collector.baseEntryCount) {
+        updateCompactionSemanticRevisionFloor(collector, bufferedEntry);
+      }
     }
     collector.entries = [];
+  }
+  if (
+    !baseEntry &&
+    shouldRejectCompactionSemanticEntryBelowBaseFloor(collector, orderedEntry)
+  ) {
+    return;
   }
   appendCoverageBalancedCompactionSemanticEntry(
     collector.coverage,
     orderedEntry
   );
+  if (!baseEntry) {
+    updateCompactionSemanticRevisionFloor(collector, orderedEntry);
+  }
 }
 
 function appendCoverageBalancedCompactionSemanticEntry(

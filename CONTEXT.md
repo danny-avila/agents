@@ -201,7 +201,9 @@ Reconstruction snapshots the prior entries, admits them chronologically through
 the same coverage-balanced collector, and derives the delta during its existing
 content pass. Work is independent of unbounded conversation length: `O(B +
 delta)`, where `B` is capped at 256. Invalid prior state degrades to delta-only
-derivation rather than disabling new guidance.
+derivation rather than disabling new guidance. Ephemeral revision floors for
+the bounded base prevent coverage omissions from admitting stale delta labels;
+they never become serialized collector state.
 
 See [ADR 0005](docs/adr/0005-pairing-balanced-compaction-ranges.md) for the
 range-selection and retention trade-offs.

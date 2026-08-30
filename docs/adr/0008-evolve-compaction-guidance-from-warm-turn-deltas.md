@@ -38,6 +38,13 @@ current payload is still derived. Newer revisions and tombstones in the delta
 renew their logical identity's recency and prevent stale labels from
 resurfacing once balanced admission is active.
 
+While an evolution is in progress, the collector keeps one private revision
+floor for every logical identity in the bounded base snapshot. Coverage
+retention may omit a base entry from output, but cannot therefore admit an
+older delta revision or resurrect guidance suppressed by a base tombstone.
+These floors are capped by the same 256-entry base and are not serialized as
+collector state.
+
 Evolution costs `O(B + delta)`, where `B` is the bounded prior snapshot and
 `delta` is the current payload. It is therefore independent of unbounded
 conversation length, but is not described as pure `O(delta)`. When semantic

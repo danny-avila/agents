@@ -484,6 +484,123 @@ describe('formatAgentMessages compaction semantic index', () => {
     ]);
   });
 
+  it.each([
+    { deltaRevision: 4, expectedRevision: undefined },
+    { deltaRevision: 5, expectedRevision: undefined },
+    { deltaRevision: 6, expectedRevision: 6 },
+  ])(
+    'preserves revision floors for coverage-omitted base identities at delta revision $deltaRevision',
+    ({ deltaRevision, expectedRevision }) => {
+      const baseIndex: CompactionSemanticIndex = Array.from(
+        { length: COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries },
+        (_, index) => ({
+          type: 'activity_phase' as const,
+          sourceMessageId:
+          index === 100 ? 'coverage-gap-source' : `floor-base-${index}`,
+          sourceContentIndex: 0,
+          revision: index === 100 ? 5 : 1,
+          status: 'committed' as const,
+          text: index === 100 ? 'newer base label' : `Floor base ${index}`,
+        })
+      );
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          messageId: 'coverage-gap-source',
+          content: [
+            { type: ContentTypes.TEXT, text: 'Current answer' },
+          {
+            type: ContentTypes.ACTIVITY_LABEL,
+            activity_label: 'stale delta label',
+            activity_label_type: 'phase',
+            activity_label_revision: deltaRevision,
+            activity_start_index: 0,
+            pending: false,
+          } as MessageContentComplex,
+          ],
+        },
+      ];
+
+      const result = formatAgentMessages(
+        payload,
+        undefined,
+        undefined,
+        undefined,
+        { compactionSemanticIndex: { baseSnapshot: semanticSnapshot(baseIndex) } }
+      );
+
+      const retained =
+      result.compactionSemanticIndex?.filter(
+        ({ sourceMessageId }) => sourceMessageId === 'coverage-gap-source'
+      ) ?? [];
+      expect(retained).toEqual(
+        expectedRevision == null
+          ? []
+          : [expect.objectContaining({ revision: expectedRevision })]
+      );
+    }
+  );
+
+  it('applies revision floors while replaying the bounded base itself', () => {
+    const baseIndex: CompactionSemanticIndex = Array.from(
+      { length: COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries },
+      (_, index) => {
+        const newer = index === 64;
+        const stale = index === 200;
+        let revision = 1;
+        let text = `Reordered base ${index}`;
+        if (newer) {
+          revision = 5;
+          text = 'newer base revision';
+        } else if (stale) {
+          revision = 4;
+          text = 'stale reordered base revision';
+        }
+        return {
+          type: 'activity_phase' as const,
+          sourceMessageId:
+            newer || stale
+              ? 'reordered-base-source'
+              : `reordered-base-${index}`,
+          sourceContentIndex: 0,
+          revision,
+          status: 'committed' as const,
+          text,
+        };
+      }
+    );
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        messageId: 'coverage-trigger',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Current answer' },
+          {
+            type: ContentTypes.ACTIVITY_LABEL,
+            activity_label: 'Current phase',
+            activity_label_type: 'phase',
+            activity_start_index: 0,
+            pending: false,
+          } as MessageContentComplex,
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { compactionSemanticIndex: { baseSnapshot: semanticSnapshot(baseIndex) } }
+    );
+
+    expect(
+      result.compactionSemanticIndex?.filter(
+        ({ sourceMessageId }) => sourceMessageId === 'reordered-base-source'
+      )
+    ).toEqual([]);
+  });
+
   it('reuses the formatter parse for string-backed tool arguments', () => {
     const args = JSON.stringify({
       intent: 'Inspect the projection',
