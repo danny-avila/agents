@@ -344,7 +344,9 @@ export interface JinaRerankerResult {
 
 export interface JinaRerankerResponse {
   model: string;
-  usage: {
+  /** Telemetry only, and absent from some Jina-compatible endpoints — never
+   * dereference it on a path that would discard a usable ranking. */
+  usage?: {
     total_tokens: number;
   };
   results: JinaRerankerResult[];
@@ -358,12 +360,13 @@ export interface CohereRerankerResult {
 export interface CohereRerankerResponse {
   results: CohereRerankerResult[];
   id: string;
-  meta: {
-    api_version: {
+  /** Telemetry only; see {@link JinaRerankerResponse.usage}. */
+  meta?: {
+    api_version?: {
       version: string;
       is_experimental: boolean;
     };
-    billed_units: {
+    billed_units?: {
       search_units: number;
     };
   };
@@ -407,6 +410,96 @@ export interface RagApiRerankResponse {
 export type SafeSearchLevel = 0 | 1 | 2;
 
 export type Logger = WinstonLogger;
+
+/** Compact, redacted view of a thrown error, safe to hand to a logger. */
+export interface SafeErrorLog {
+  message: string;
+  name?: string;
+  code?: string;
+  status?: number;
+  method?: string;
+  url?: string;
+  responseDataSummary?: string;
+  value?: string;
+}
+
+/** Why a rerank returned the candidates' original order instead of a ranking. */
+export type RerankFallback =
+  | 'no_api_key'
+  | 'no_base_url'
+  | 'no_token_supplier'
+  | 'bad_response'
+  | 'invalid_results'
+  | 'chunk_error'
+  | 'placeholder'
+  | 'error';
+
+/** One provider query. `results` is the row count that query contributed. */
+export interface SearchObservation {
+  provider: string;
+  type: string;
+  results: number;
+  durationMs: number;
+  error?: string;
+  /** The query rejected rather than reporting failure in its response. Those
+   * were logged at error level before they were aggregated, so the summary
+   * has to carry the distinction to keep that severity. */
+  thrown?: boolean;
+}
+
+/** One scraped link. A failure carries `error`; a success carries the sizes
+ * the scrape produced, so the summary can report both without a second pass. */
+export interface ScrapeObservation {
+  url: string;
+  chars?: number;
+  highlights?: number;
+  error?: string;
+}
+
+/** One reranker round trip. A search reranks once per scraped source, so
+ * these fold into a single summary rather than logging per source. */
+export interface RerankObservation {
+  provider: string;
+  chunks: number;
+  results: number;
+  durationMs: number;
+  model?: string;
+  /** Provider-reported usage: Jina tokens, Cohere billed search units. */
+  units?: number;
+  /** Chunks a provider candidate cap dropped before submission. */
+  dropped?: number;
+  /** Set only when a provider cap reduced the requested result count, so a
+   * search returning fewer highlights than configured says why. */
+  topK?: number;
+  topKLimit?: number;
+  reason?: RerankFallback;
+  error?: SafeErrorLog;
+}
+
+/** Per-rerank state threaded from the start of a call to whichever exit it
+ * takes, so every path records exactly one observation. */
+export interface RerankRun {
+  metrics: SearchMetrics;
+  documents: string[];
+  topK: number;
+  startedAt: number;
+  model?: string;
+  units?: number;
+  dropped?: number;
+  topKLimit?: number;
+}
+
+/**
+ * Fold-as-you-go counters for one `web_search` call. Recording is O(1) and
+ * allocation-free past a bounded reason map; {@link SearchMetrics.flush}
+ * emits at most one line per phase that actually ran.
+ */
+export interface SearchMetrics {
+  recordSearch(observation: SearchObservation): void;
+  recordScrape(observation: ScrapeObservation): void;
+  recordRerank(observation: RerankObservation): void;
+  flush(): void;
+}
 export interface SearchToolConfig
   extends SearchConfig,
     ProcessSourcesConfig,
@@ -701,6 +794,10 @@ export interface FirecrawlScraperConfig extends BaseSearchProviderConfig {
   onlyMainContent?: boolean;
   changeTrackingOptions?: object;
 }
+
+/** Result kind a parallel sub-search covers; `web` is the untyped main
+ * search, which every provider serves without a `type` parameter. */
+export type SubSearchType = 'web' | 'images' | 'videos' | 'news';
 
 export type GetSourcesParams = {
   query: string;
@@ -1038,6 +1135,9 @@ export type ProcessSourcesFields = {
   news: boolean;
   proMode: boolean;
   onGetHighlights: SearchToolConfig['onGetHighlights'];
+  /** Collector owned by the caller; when omitted, one is created and flushed
+   * for this call so a direct `processSources` still summarizes itself. */
+  metrics?: SearchMetrics;
 };
 
 export interface SearchToolSchema {
