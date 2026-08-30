@@ -53,15 +53,16 @@ import {
   setProviderMessageProvenance,
 } from './provenance';
 import {
+  snapshotCompactionSemanticIndex,
+  getCompactionSemanticIndexProvidedEntryCount,
+  setCompactionSemanticIndexProvidedEntryCount,
+} from '@/summarization/semanticIndex';
+import {
   compactToolContent,
   getToolContentCharLength,
   isAtomicToolContentBlock,
   serializeStructuredValueBounded,
 } from '@/utils/toolContent';
-import {
-  snapshotCompactionSemanticIndex,
-  setCompactionSemanticIndexProvidedEntryCount,
-} from '@/summarization/semanticIndex';
 import {
   Providers,
   ContentTypes,
@@ -543,6 +544,7 @@ type CompactionSemanticCoverageState = {
 type DerivedCompactionSemanticIndexCollector = {
   entries: CompactionSemanticIndexEntry[];
   entryCount: number;
+  omittedBaseEntryCount: number;
   coverage?: CompactionSemanticCoverageState;
 };
 
@@ -567,11 +569,16 @@ function createDerivedCompactionSemanticIndexCollector(
   const collector: DerivedCompactionSemanticIndexCollector = {
     entries: [],
     entryCount: 0,
+    omittedBaseEntryCount: 0,
   };
   const snapshot = snapshotCompactionSemanticIndex(baseIndex);
   if (snapshot == null) {
     return collector;
   }
+  collector.omittedBaseEntryCount = Math.max(
+    0,
+    getCompactionSemanticIndexProvidedEntryCount(snapshot) - snapshot.length
+  );
   for (let index = 0; index < snapshot.length; index++) {
     appendDerivedCompactionSemanticEntry(collector, snapshot[index]);
   }
@@ -863,13 +870,18 @@ function appendCoverageBalancedCompactionSemanticEntry(
 function finalizeDerivedCompactionSemanticIndex(
   collector: DerivedCompactionSemanticIndexCollector | undefined
 ): CompactionSemanticIndex | undefined {
-  if (collector == null || collector.entryCount === 0) {
+  if (
+    collector == null ||
+    (collector.entryCount === 0 && collector.omittedBaseEntryCount === 0)
+  ) {
     return undefined;
   }
+  const providedEntryCount =
+    collector.entryCount + collector.omittedBaseEntryCount;
   if (collector.coverage == null) {
     setCompactionSemanticIndexProvidedEntryCount(
       collector.entries,
-      collector.entryCount
+      providedEntryCount
     );
     return collector.entries;
   }
@@ -890,7 +902,7 @@ function finalizeDerivedCompactionSemanticIndex(
   const result = [...retained.entries()]
     .sort(([left], [right]) => left - right)
     .map(([, entry]) => entry);
-  setCompactionSemanticIndexProvidedEntryCount(result, collector.entryCount);
+  setCompactionSemanticIndexProvidedEntryCount(result, providedEntryCount);
   return result;
 }
 

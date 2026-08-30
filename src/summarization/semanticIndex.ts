@@ -50,6 +50,13 @@ export function setCompactionSemanticIndexProvidedEntryCount(
   snapshotProvidedEntryCounts.set(index, providedEntryCount);
 }
 
+/** Reads producer-side cardinality without exposing snapshot bookkeeping. */
+export function getCompactionSemanticIndexProvidedEntryCount(
+  index: CompactionSemanticIndex
+): number {
+  return snapshotProvidedEntryCounts.get(index) ?? index.length;
+}
+
 type SourceReference = {
   contentOrders: Map<number, number>;
 };
@@ -102,10 +109,13 @@ function snapshotEntry(
   } = entry;
   if (
     typeof sourceMessageId !== 'string' ||
-    sourceMessageId.length >
-      COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars ||
-    typeof sourceContentIndex !== 'number' ||
-    typeof revision !== 'number' ||
+    normalizeIdentity(sourceMessageId) == null ||
+    !Number.isSafeInteger(sourceContentIndex) ||
+    sourceContentIndex < 0 ||
+    sourceContentIndex >
+      COMPACTION_SEMANTIC_INDEX_LIMITS.maxSourceContentIndex ||
+    !Number.isSafeInteger(revision) ||
+    revision < 0 ||
     !VALID_ENTRY_TYPES.has(type)
   ) {
     return undefined;
@@ -143,14 +153,13 @@ function snapshotEntry(
   if (type === 'reasoning_label') {
     const reasoningStepId = entry.reasoningStepId;
     return typeof reasoningStepId === 'string' &&
-      reasoningStepId.length <=
-        COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
+      normalizeIdentity(reasoningStepId) != null
       ? Object.freeze({ type, reasoningStepId, ...common })
       : undefined;
   }
   const toolCallId = entry.toolCallId;
   return typeof toolCallId === 'string' &&
-    toolCallId.length <= COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
+    normalizeIdentity(toolCallId) != null
     ? Object.freeze({ type, toolCallId, ...common })
     : undefined;
 }

@@ -150,6 +150,55 @@ describe('formatAgentMessages compaction semantic index', () => {
     );
   });
 
+  it('rejects malformed base revisions before delta revision selection', () => {
+    const baseIndex: CompactionSemanticIndex = Array.from(
+      { length: COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries },
+      (_, index) => ({
+        type: 'activity_phase' as const,
+        sourceMessageId:
+          index === 200 ? 'malformed-revision-source' : `valid-base-${index}`,
+        sourceContentIndex: 0,
+        revision: index === 200 ? Number.MAX_SAFE_INTEGER + 1 : 1,
+        status: 'committed' as const,
+        text: index === 200 ? 'invalid newer label' : `Valid base ${index}`,
+      })
+    );
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        messageId: 'malformed-revision-source',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Current answer' },
+          {
+            type: ContentTypes.ACTIVITY_LABEL,
+            activity_label: 'valid delta label',
+            activity_label_type: 'phase',
+            activity_label_revision: 2,
+            activity_start_index: 0,
+            pending: false,
+          } as MessageContentComplex,
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { compactionSemanticIndex: { baseIndex } }
+    );
+
+    expect(
+      result.compactionSemanticIndex?.filter(
+        ({ sourceMessageId }) =>
+          sourceMessageId === 'malformed-revision-source'
+      )
+    ).toEqual([
+      expect.objectContaining({ revision: 2, text: 'valid delta label' }),
+    ]);
+  });
+
   it('evolves a bounded prior snapshot without changing delta provider messages', () => {
     const baseIndex: CompactionSemanticIndex = [
       {
@@ -237,6 +286,20 @@ describe('formatAgentMessages compaction semantic index', () => {
           sourceMessageId: expect.stringContaining('oversized-source-'),
         }),
       ])
+    );
+    expect(
+      renderCompactionSemanticIndex(
+        result.compactionSemanticIndex,
+        result.messages
+      )
+    ).toEqual(
+      expect.objectContaining({
+        providedEntryCount:
+          oversizedBase.length +
+          (result.compactionSemanticIndex?.length ?? 0),
+        entryCount: 3,
+        omittedEntryCount: oversizedBase.length + 1,
+      })
     );
   });
 
