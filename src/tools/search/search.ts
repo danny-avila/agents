@@ -168,24 +168,41 @@ const getHighlights = async ({
     return;
   }
 
-  const startedAt = Date.now();
+  /** Both failures are this reranker's attempt for this source, so they stay
+   * in its phase — but they are caught separately: sharing one `catch` would
+   * report a reranker that threw as a chunking failure, with a chunk count
+   * of zero for text that split fine. */
+  const chunkStartedAt = Date.now();
+  let documents: string[];
   try {
-    const documents = await chunker.splitText(
+    documents = await chunker.splitText(
       truncateContent(content, maxContentLength),
       chunkOptions
     );
-    return await reranker.rerank(query, documents, topResults, metrics);
   } catch (error) {
-    /** Chunking failed before the reranker was reached, but this was still
-     * that reranker's attempt for this source — labelling it with the real
-     * provider keeps one coherent phase, and `chunk_error` says where it
-     * broke. */
     metrics.recordRerank({
       provider: reranker.provider,
       chunks: 0,
       results: 0,
-      durationMs: Date.now() - startedAt,
+      durationMs: Date.now() - chunkStartedAt,
       reason: 'chunk_error',
+      error: formatErrorForLog(error),
+    });
+    return;
+  }
+
+  const rerankStartedAt = Date.now();
+  try {
+    return await reranker.rerank(query, documents, topResults, metrics);
+  } catch (error) {
+    /** The bundled rerankers absorb their own failures and record the
+     * observation themselves; a custom implementation may reject instead. */
+    metrics.recordRerank({
+      provider: reranker.provider,
+      chunks: documents.length,
+      results: 0,
+      durationMs: Date.now() - rerankStartedAt,
+      reason: 'error',
       error: formatErrorForLog(error),
     });
     return;
@@ -683,9 +700,14 @@ export const createSourceProcessor = (
       metrics: t.SearchMetrics;
       onGetHighlights: t.SearchToolConfig['onGetHighlights'];
     }): Promise<Array<t.ScrapeResult>> => {
-      try {
-        let responses: Array<[string, t.AnyScraperResponse]>;
+      let responses: Array<[string, t.AnyScraperResponse]>;
 
+      /** Scoped to acquisition alone. A batch `scrapeUrls` that rejects
+       * yields no per-link responses, so nothing downstream will ever report
+       * these links — without recording them here a total outage would flush
+       * no scrape summary at all, reading exactly like a search that never
+       * scraped anything. */
+      try {
         if (scraper.scrapeUrls) {
           responses = await scraper.scrapeUrls(links);
         } else {
@@ -700,13 +722,25 @@ export const createSourceProcessor = (
             )
           );
         }
+      } catch (error) {
+        logger_.error('Error in scrapeMany:', error);
+        const message = String(error);
+        for (const link of links) {
+          metrics.recordScrape({ url: link, error: message });
+        }
+        return [];
+      }
 
+      try {
         return await Promise.all(
           responses.map(([url, response]) =>
             processLink(url, response, query, metrics, onGetHighlights)
           )
         );
       } catch (error) {
+        /** `processLink` absorbs its own failures and has already recorded
+         * whatever it reached, so this only preserves the soft failure the
+         * caller has always seen — it must not re-count these links. */
         logger_.error('Error in scrapeMany:', error);
         return [];
       }

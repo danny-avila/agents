@@ -599,6 +599,83 @@ describe('createSourceProcessor log volume', () => {
     expect(rerankLine).toContain('rerank=recording calls=6');
   });
 
+  test('attributes a rejecting reranker to the reranker, not the chunker', async () => {
+    const logger = createCountingLogger();
+    class RejectingReranker extends BaseReranker {
+      readonly provider = 'custom';
+      constructor() {
+        super(silentLogger);
+      }
+      async rerank(): Promise<t.Highlight[]> {
+        throw new Error('custom reranker exploded');
+      }
+    }
+    const link = 'https://a.com';
+    const processor = createSourceProcessor(
+      { reranker: new RejectingReranker(), logger },
+      createFakeScraper({ [link]: makeLongContent(2000) })
+    );
+
+    await processor.processSources({
+      query: 'test query',
+      proMode: true,
+      onGetHighlights: undefined,
+      news: false,
+      numElements: 1,
+      result: { success: true, data: { organic: [makeOrganic(link)] } },
+    });
+
+    /** Splitting succeeded, so the chunk count is real and the reason must
+     * point at the reranker rather than the chunker. */
+    const summary = (logger.error as jest.Mock).mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.includes('[web_search] rerank'));
+    expect(summary).toContain('rerank=custom calls=1');
+    expect(summary).toContain('reasons={error:1}');
+    expect(summary).not.toContain('chunk_error');
+    expect(summary).not.toContain('chunks=0');
+  });
+
+  test('counts every link of a batch scrape that never returned responses', async () => {
+    const logger = createCountingLogger();
+    const links = ['https://a.com', 'https://b.com', 'https://c.com'];
+    const scraper: t.BaseScraper = {
+      scrapeUrl: async (url: string): Promise<[string, t.AnyScraperResponse]> => [
+        url,
+        { success: true, data: { markdown: 'unused' } },
+      ],
+      scrapeUrls: async (): Promise<Array<[string, t.AnyScraperResponse]>> => {
+        throw new Error('connect ECONNREFUSED 127.0.0.1:3002');
+      },
+      extractContent: (): [string, undefined] => ['', undefined],
+      extractMetadata: (): t.GenericScrapeMetadata => ({}),
+    };
+    const processor = createSourceProcessor(
+      { reranker: new RecordingReranker(), logger },
+      scraper
+    );
+
+    await processor.processSources({
+      query: 'test query',
+      proMode: true,
+      onGetHighlights: undefined,
+      news: false,
+      numElements: links.length,
+      result: {
+        success: true,
+        data: { organic: links.map((link) => makeOrganic(link)) },
+      },
+    });
+
+    /** A wholly failed batch must not read like a search that scraped
+     * nothing: the summary has to show the attempt and the outage. */
+    const summary = (logger.error as jest.Mock).mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.includes('[web_search] scrape'));
+    expect(summary).toContain('links=3 ok=0');
+    expect(summary).toContain('failed=3 reasons={connection:3}');
+  });
+
   test('flushes to the owning collector instead of logging itself', async () => {
     const logger = createCountingLogger();
     const metrics = createSearchMetrics(logger);
