@@ -124,6 +124,26 @@ Hosts may translate a durable LangGraph pause into the structured suspension
 result. Untranslated LangGraph interrupts and parent commands retain the fork
 and propagate as control flow for compatibility and routing.
 
+## Terminal Run Continuation
+
+A **Terminal Run Continuation** keeps one naturally completed `Run` alive when
+its terminal hooks admit queued host input. Ordinary Stop hooks execute in
+parallel and fold policy/notification requests first; the serialized
+StopFinalize phase then observes whether they already planned or prevented a
+continuation, allowing a durable host to make one atomic claim-or-seal decision.
+A `block` result with injected messages starts another graph segment before Run
+cleanup, hook-session teardown, or final content extraction. The continuation
+retains the same public run, trace scope, event handlers, graph sidecars, and
+content accumulator; it does not replay RunStart or UserPromptSubmit hooks.
+
+Continuation is bounded. Both terminal phases report the admitted count and
+remaining budget. StopFinalize additionally reports the folded planned and
+prevented state so unrelated continuation sources cannot close each other's
+admission. HITL pauses, aborts, hook halts, output truncation, and empty
+Stop injections remain terminal and never enter this path. With a checkpointer,
+the next segment submits only its injected delta; without one, it seeds the new
+graph invocation from the live in-process transcript.
+
 ## Tool Caller Capabilities
 
 A **Caller Capability Projection** is the effective classification of tool

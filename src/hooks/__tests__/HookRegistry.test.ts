@@ -311,7 +311,7 @@ describe('HookRegistry', () => {
       expect(registry.hasResultAlteringHooks('run-1')).toBe(false);
     });
 
-    it('returns false when only observation hooks are registered', () => {
+    it('returns false when hooks cannot rewrite tool results', () => {
       const registry = new HookRegistry();
       registry.register('PostToolBatch', { hooks: [async () => ({})] });
       registry.register('Stop', { hooks: [async () => ({})] });

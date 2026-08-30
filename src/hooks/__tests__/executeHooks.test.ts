@@ -51,6 +51,8 @@ function stopInput(overrides: Partial<StopHookInput> = {}): StopHookInput {
     runId: 'run-1',
     messages: [],
     stopHookActive: false,
+    continuationCount: 0,
+    continuationBudgetRemaining: 8,
     ...overrides,
   };
 }
@@ -1209,6 +1211,7 @@ describe('executeHooks', () => {
         matchQuery: 'Bash',
       });
       expect(result.errors).toHaveLength(0);
+      expect(result.hasHookFailures).toBe(true);
     });
 
     it('routes non-internal errors through an optional logger instead of console', async () => {

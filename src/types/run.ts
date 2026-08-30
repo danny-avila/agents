@@ -253,6 +253,14 @@ export type RunConfig = {
    */
   hooks?: HookRegistry;
   /**
+   * Maximum number of times a `Stop` hook may keep this Run warm by returning
+   * `decision: 'block'` with messages to inject. Defaults to
+   * `DEFAULT_MAX_STOP_CONTINUATIONS`; non-finite values use the default and
+   * values at or below zero disable terminal continuation while preserving the
+   * final Stop notification.
+   */
+  maxStopContinuations?: number;
+  /**
    * Opt-in cooperative preemption for this run. Requires a `hooks` registry
    * with a `PreemptBoundary` matcher — the seal only stops the stream, the
    * hook is what supplies the messages to resume with. Omit to keep the

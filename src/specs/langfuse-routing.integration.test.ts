@@ -1,12 +1,14 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { HumanMessage } from '@langchain/core/messages';
+import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import type { SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { Context } from '@opentelemetry/api';
+import type { StopHookOutput } from '@/hooks';
 import type * as t from '@/types';
 import {
   registerLangfuseManagedSpan,
@@ -19,6 +21,7 @@ import { initializeLangfuseTracing } from '@/instrumentation';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
 import { createLangfuseHandler } from '@/langfuse';
 import * as providers from '@/llm/providers';
+import { HookRegistry } from '@/hooks';
 import { Run } from '@/run';
 
 type ProcessorParams = {
@@ -36,6 +39,7 @@ type SpanStartRecord = {
 };
 
 const spanStarts: SpanStartRecord[] = [];
+const endedSpans: MockSpan[] = [];
 let providerInput:
   | {
       spanProcessors?: SpanProcessor[];
@@ -85,6 +89,7 @@ function createMockSpan(
     attributes,
     addEvent: jest.fn(),
     end: jest.fn(() => {
+      endedSpans.push(span);
       for (const processor of providerInput?.spanProcessors ?? []) {
         processor.onEnd(span as never);
       }
@@ -543,6 +548,7 @@ describe('Langfuse per-run routing integration', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     spanStarts.length = 0;
+    endedSpans.length = 0;
     delete process.env.LANGFUSE_PUBLIC_KEY;
     delete process.env.LANGFUSE_SECRET_KEY;
     delete process.env.LANGFUSE_BASE_URL;
@@ -989,6 +995,97 @@ describe('Langfuse per-run routing integration', () => {
     expect(secondParent?.spanId).not.toBe(firstParent?.spanId);
     expect(secondTraceAnchor).not.toBe(firstTraceAnchor);
     expect(secondScopeRunId).not.toBe(firstScopeRunId);
+  });
+
+  it('keeps warm terminal continuations under one trace root', async () => {
+    const tenantId = 'tenant-warm-continuation';
+    const registry = new HookRegistry();
+    registry.register('Stop', {
+      hooks: [
+        async (input): Promise<StopHookOutput> =>
+          input.continuationCount === 0
+            ? {
+              decision: 'block',
+              injectedMessages: [
+                { role: 'user', content: 'late steer', source: 'steer' },
+              ],
+            }
+            : { decision: 'continue' },
+      ],
+    });
+    const run = await Run.create<t.IState>({
+      runId: `routing-${tenantId}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [createAgent(tenantId)],
+      },
+      langfuse: tenantLangfuse(tenantId),
+      hooks: registry,
+      returnContent: true,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel(['first answer', 'continued answer']);
+
+    await run.processStream(
+      { messages: [new HumanMessage('initial prompt')] },
+      callerConfig
+    );
+
+    const roots = startsForTenant(tenantId).filter(
+      (record) => record.name === 'AgentGraph' && record.parentSpanId == null
+    );
+    expect(roots).toHaveLength(1);
+    expect(
+      startsForTenant(tenantId).filter(
+        (record) => record.parentSpanId === roots[0].spanId
+      ).length
+    ).toBeGreaterThan(0);
+  });
+
+  it('marks the deferred root as failed when terminal admission fails', async () => {
+    const tenantId = 'tenant-terminal-admission-failure';
+    const registry = new HookRegistry();
+    registry.register('StopFinalize', {
+      hooks: [
+        async (): Promise<StopHookOutput> => {
+          throw new Error('terminal admission unavailable');
+        },
+      ],
+    });
+    const run = await Run.create<t.IState>({
+      runId: `routing-${tenantId}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [createAgent(tenantId)],
+      },
+      langfuse: tenantLangfuse(tenantId),
+      hooks: registry,
+      returnContent: true,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel(['first answer']);
+
+    await expect(
+      run.processStream(
+        { messages: [new HumanMessage('initial prompt')] },
+        callerConfig
+      )
+    ).rejects.toThrow(
+      'StopFinalize terminal admission failed: terminal admission unavailable'
+    );
+
+    const root = endedSpans.find(
+      (span) =>
+        span.name === 'AgentGraph' &&
+        span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_LEVEL] ===
+          'ERROR'
+    );
+    expect(root).toBeDefined();
+    expect(
+      root?.attributes[
+        LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE
+      ]
+    ).toContain('terminal admission unavailable');
   });
 
   it('generates a scope stamp for directly-constructed graphs without a run id', async () => {

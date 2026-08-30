@@ -22,6 +22,7 @@ export const HOOK_EVENTS = [
   'SubagentStart',
   'SubagentStop',
   'Stop',
+  'StopFinalize',
   'StopFailure',
   'PreCompact',
   'PostCompact',
@@ -209,7 +210,34 @@ export interface StopHookInput extends BaseHookInput {
   hook_event_name: 'Stop';
   messages: BaseMessage[];
   stopReason?: string;
+  /** True after this hook has already kept the current Run warm once. */
   stopHookActive: boolean;
+  /** Number of terminal continuations already admitted in this Run. */
+  continuationCount: number;
+  /**
+   * Remaining continuations the SDK can honor. A host that durably claims
+   * queued work MUST seal admission instead when this reaches zero.
+   */
+  continuationBudgetRemaining: number;
+}
+
+/**
+ * Serialized terminal admission phase. Unlike ordinary `Stop` hooks (which
+ * execute in parallel), this fires after their outputs have been folded so a
+ * durable host can make one final claim-or-seal decision with full knowledge
+ * of whether another hook already kept the Run warm.
+ */
+export interface StopFinalizeHookInput extends BaseHookInput {
+  hook_event_name: 'StopFinalize';
+  messages: BaseMessage[];
+  stopReason?: string;
+  stopHookActive: boolean;
+  continuationCount: number;
+  continuationBudgetRemaining: number;
+  /** A regular Stop hook already supplied a valid warm continuation. */
+  continuationPlanned: boolean;
+  /** A halt reason or Stop output forbids another graph segment. */
+  continuationPrevented: boolean;
 }
 
 export interface StopFailureHookInput extends BaseHookInput {
@@ -259,6 +287,7 @@ export type HookInput =
   | SubagentStartHookInput
   | SubagentStopHookInput
   | StopHookInput
+  | StopFinalizeHookInput
   | StopFailureHookInput
   | PreCompactHookInput
   | PostCompactHookInput;
@@ -276,6 +305,7 @@ export type HookInputByEvent = {
   SubagentStart: SubagentStartHookInput;
   SubagentStop: SubagentStopHookInput;
   Stop: StopHookInput;
+  StopFinalize: StopFinalizeHookInput;
   StopFailure: StopFailureHookInput;
   PreCompact: PreCompactHookInput;
   PostCompact: PostCompactHookInput;
@@ -298,10 +328,11 @@ export interface BaseHookOutput {
    * mid-run steering message). Accumulated across hooks in registration
    * order.
    *
-   * Consumed at exactly two dispatch sites, both of which run the same
-   * converter so the emitted shapes cannot drift: `PostToolBatch` (the tool
-   * boundary) and `PreemptBoundary` (a cooperative mid-generation seal).
-   * Every other event ignores the field.
+   * Consumed at three dispatch sites, all of which run the same converter so
+   * the emitted shapes cannot drift: `PostToolBatch` (the tool boundary),
+   * `PreemptBoundary` (a cooperative mid-generation seal), and a blocking
+   * `Stop` hook (terminal Run continuation). Every other event ignores the
+   * field.
    */
   injectedMessages?: InjectedMessage[];
   /** True to prevent the next model turn. Any hook can set this. */
@@ -435,9 +466,17 @@ export interface SubagentStartHookOutput extends BaseHookOutput {
 export type SubagentStopHookOutput = BaseHookOutput;
 
 export interface StopHookOutput extends BaseHookOutput {
+  /**
+   * `block` keeps a naturally terminal Run warm only when the output also
+   * supplies non-empty `injectedMessages` or `additionalContext`. The SDK
+   * starts another graph segment inside the same `processStream` call; no
+   * RunStart/UserPromptSubmit hooks or terminal cleanup occur between them.
+   */
   decision?: StopDecision;
   reason?: string;
 }
+
+export type StopFinalizeHookOutput = StopHookOutput;
 
 export type StopFailureHookOutput = BaseHookOutput;
 
@@ -458,6 +497,7 @@ export type HookOutputByEvent = {
   SubagentStart: SubagentStartHookOutput;
   SubagentStop: SubagentStopHookOutput;
   Stop: StopHookOutput;
+  StopFinalize: StopFinalizeHookOutput;
   StopFailure: StopFailureHookOutput;
   PreCompact: PreCompactHookOutput;
   PostCompact: PostCompactHookOutput;
@@ -476,6 +516,7 @@ export type HookOutput =
   | SubagentStartHookOutput
   | SubagentStopHookOutput
   | StopHookOutput
+  | StopFinalizeHookOutput
   | StopFailureHookOutput
   | PreCompactHookOutput
   | PostCompactHookOutput;
@@ -593,6 +634,8 @@ export interface AggregatedHookResult {
    * `preventContinuation` do not overwrite the reason.
    */
   stopReason?: string;
+  /** True when any hook failed, including internal hooks with hidden diagnostics. */
+  hasHookFailures?: true;
   /** Error messages from hooks that threw; always present (possibly empty). */
   errors: string[];
 }

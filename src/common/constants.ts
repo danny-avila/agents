@@ -21,6 +21,14 @@ export const DEFAULT_TOOL_TOKEN_MULTIPLIER = 1.4;
 export const DEFAULT_MAX_SEALS = 8;
 
 /**
+ * Default ceiling on Stop-hook continuations within one Run. A blocking Stop
+ * hook can keep a naturally terminal run warm by injecting another user turn;
+ * the ceiling prevents a faulty hook or continuously arriving input from
+ * keeping one processStream call alive forever.
+ */
+export const DEFAULT_MAX_STOP_CONTINUATIONS = 8;
+
+/**
  * Per-hook timeout for `PreemptBoundary`, deliberately far above
  * `DEFAULT_HOOK_TIMEOUT_MS`. A host drain has already popped its queue and
  * persisted content by the time this fires, so a timeout does not cancel the

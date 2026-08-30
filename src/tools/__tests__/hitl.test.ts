@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  HumanMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 import {
   describe,
   it,
@@ -29,11 +33,14 @@ import type {
   PostToolBatchHookInput,
   PostToolBatchHookOutput,
   RunStartHookOutput,
+  StopHookInput,
+  StopHookOutput,
   UserPromptSubmitHookOutput,
 } from '@/hooks';
 import type * as t from '@/types';
 import { Constants, Providers as providers, GraphEvents } from '@/common';
 import { getProviderMessageProvenance } from '@/messages/provenance';
+import { getRunStepResumeState } from '@/tools/runStepResume';
 import { HookRegistry, createToolPolicyHook } from '@/hooks';
 import * as events from '@/utils/events';
 import { askUserQuestion } from '@/hitl';
@@ -84,6 +91,48 @@ function mockEventDispatch(mockResults: t.ToolExecuteResult[]): void {
         (request.resolve as (r: t.ToolExecuteResult[]) => void)(mockResults);
       }
     });
+}
+
+async function stripStopContinuationExecutionIds(
+  checkpointer: MemorySaver,
+  threadId: string
+): Promise<void> {
+  for (const checkpoints of Object.values(
+    checkpointer.storage[threadId] ?? {}
+  )) {
+    for (const stored of Object.values(checkpoints)) {
+      const checkpoint = await checkpointer.serde.loadsTyped(
+        'json',
+        stored[0]
+      );
+      const runStepState = (
+        checkpoint as {
+          channel_values?: { runStepState?: t.RunStepResumeState };
+        }
+      ).channel_values?.runStepState;
+      if (runStepState != null) {
+        delete runStepState.stopContinuationExecutionId;
+        const [, serialized] = await checkpointer.serde.dumpsTyped(checkpoint);
+        stored[0] = serialized;
+      }
+    }
+  }
+  for (const [key, writes] of Object.entries(checkpointer.writes)) {
+    const [storedThreadId] = JSON.parse(key) as [string, string, string];
+    if (storedThreadId !== threadId) {
+      continue;
+    }
+    for (const stored of Object.values(writes)) {
+      const value = await checkpointer.serde.loadsTyped('json', stored[2]);
+      const runStepState = getRunStepResumeState(value);
+      if (runStepState == null) {
+        continue;
+      }
+      delete runStepState.stopContinuationExecutionId;
+      const [, serialized] = await checkpointer.serde.dumpsTyped(value);
+      stored[2] = serialized;
+    }
+  }
 }
 
 type MessagesUpdate = { messages: BaseMessage[] };
@@ -1327,6 +1376,177 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
      * reason carried over from the previous pass. */
     expect(run.getInterrupt()).toBeUndefined();
     expect(run.getHaltReason()).toBeUndefined();
+  });
+
+  it('preserves the warm continuation budget across a HITL resume', async () => {
+    const { Run: RunClass } = await import('@/run');
+    const registry = new HookRegistry();
+    const stopInputs: StopHookInput[] = [];
+    let run: Awaited<ReturnType<typeof RunClass.create<t.IState>>>;
+    const checkpointer = new MemorySaver();
+    const toolCallId = 'abcdef0123456789abcdef0123456789';
+    const threadConfig = {
+      configurable: { thread_id: 'warm-hitl-budget-thread' },
+      version: 'v2' as const,
+    };
+    const seedRun = await RunClass.create<t.IState>({
+      runId: 'warm-hitl-budget-seed',
+      graphConfig: {
+        type: 'standard',
+        compileOptions: { checkpointer },
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+            tools: [createSchemaStub('echo')],
+          },
+        ],
+      },
+      skipCleanup: true,
+    });
+    seedRun.Graph?.overrideTestModel(['seed answer']);
+    await seedRun.processStream(
+      { messages: [new HumanMessage('seed prompt')] },
+      threadConfig
+    );
+    const seedTuple = await checkpointer.getTuple(threadConfig);
+    const seedCheckpointId = seedTuple?.config.configurable?.checkpoint_id;
+    expect(typeof seedCheckpointId).toBe('string');
+    const config = {
+      ...threadConfig,
+      configurable: {
+        ...threadConfig.configurable,
+        checkpoint_id: seedCheckpointId,
+      },
+    };
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review',
+        }),
+      ],
+    });
+    registry.register('Stop', {
+      hooks: [
+        async (input): Promise<StopHookOutput> => {
+          stopInputs.push(input);
+          if (input.continuationCount > 1) {
+            return { decision: 'continue' };
+          }
+          if (input.continuationCount === 1) {
+            return {
+              decision: 'block',
+              injectedMessages: [
+                {
+                  role: 'user',
+                  content: 'post-upgrade steer',
+                  source: 'steer',
+                },
+              ],
+            };
+          }
+          run.Graph?.overrideTestModel(
+            ['tool request', 'final answer'],
+            undefined,
+            [
+              {
+                id: toolCallId,
+                name: 'echo',
+                args: { command: 'continue' },
+                type: 'tool_call',
+              },
+            ]
+          );
+          return {
+            decision: 'block',
+            injectedMessages: [
+              { role: 'user', content: 'late steer', source: 'steer' },
+            ],
+          };
+        },
+      ],
+    });
+    run = await RunClass.create<t.IState>({
+      runId: 'warm-hitl-budget',
+      graphConfig: {
+        type: 'standard',
+        compileOptions: { checkpointer },
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+            tools: [createSchemaStub('echo')],
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+      maxStopContinuations: 2,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel(['first answer']);
+
+    await run.processStream(
+      { messages: [new HumanMessage('initial prompt')] },
+      config
+    );
+    const interrupt = run.getInterrupt();
+    expect(interrupt).toBeDefined();
+    expect(interrupt?.checkpointId).toEqual(expect.any(String));
+    expect(interrupt?.checkpointId).not.toBe(seedCheckpointId);
+    expect(stopInputs.map((input) => input.continuationCount)).toEqual([0]);
+    await stripStopContinuationExecutionIds(
+      checkpointer,
+      threadConfig.configurable.thread_id
+    );
+
+    run = await RunClass.create<t.IState>({
+      runId: 'warm-hitl-budget',
+      graphConfig: {
+        type: 'standard',
+        compileOptions: { checkpointer },
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+            tools: [createSchemaStub('echo')],
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+      maxStopContinuations: 2,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel([
+      'final answer',
+      'post-upgrade continued answer',
+    ]);
+    await run.resume([{ type: 'approve' }], {
+      ...config,
+      configurable: {
+        ...config.configurable,
+        checkpoint_id: interrupt?.checkpointId,
+      },
+    });
+
+    expect(run.getInterrupt()).toBeUndefined();
+    expect(stopInputs.map((input) => input.continuationCount)).toEqual([
+      0, 1, 2,
+    ]);
+    expect(
+      stopInputs.map((input) => input.continuationBudgetRemaining)
+    ).toEqual([2, 1, 0]);
   });
 
   it('Run.resume() forwards `update` so langgraph applies the channel edit through streamEvents', async () => {
