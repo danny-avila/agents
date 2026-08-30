@@ -316,6 +316,83 @@ describe('createSearchMetrics', () => {
     expect(lineOf(logger.debug)).toContain('rerank=mixed calls=2');
   });
 
+  it('keeps a placeholder reranker at debug, and real fallbacks at warn', () => {
+    const placeholder = createMockLogger();
+    const placeholderMetrics = createSearchMetrics(placeholder);
+    placeholderMetrics.recordRerank({
+      provider: 'infinity',
+      chunks: 4,
+      results: 4,
+      durationMs: 1,
+      reason: 'placeholder',
+    });
+    placeholderMetrics.flush();
+    /** `infinity` is a supported setting that returns input order by design;
+     * choosing it must not read as a degradation. */
+    expect(placeholder.warn).not.toHaveBeenCalled();
+    expect(lineOf(placeholder.debug)).toContain('reasons={placeholder:1}');
+
+    const degraded = createMockLogger();
+    const degradedMetrics = createSearchMetrics(degraded);
+    degradedMetrics.recordRerank({
+      provider: 'infinity',
+      chunks: 4,
+      results: 4,
+      durationMs: 1,
+      reason: 'placeholder',
+    });
+    degradedMetrics.recordRerank({
+      provider: 'infinity',
+      chunks: 4,
+      results: 4,
+      durationMs: 1,
+      reason: 'no_api_key',
+    });
+    degradedMetrics.flush();
+    expect(degraded.debug).not.toHaveBeenCalled();
+    expect(lineOf(degraded.warn)).toContain('fallbacks=2');
+  });
+
+  it('marks the model mixed rather than crediting the first one seen', () => {
+    const logger = createMockLogger();
+    const metrics = createSearchMetrics(logger);
+
+    metrics.recordRerank({
+      provider: 'rag-api',
+      model: 'fast-v1-a',
+      chunks: 4,
+      results: 4,
+      durationMs: 1,
+    });
+    metrics.recordRerank({
+      provider: 'rag-api',
+      model: 'fast-v1-b',
+      chunks: 4,
+      results: 4,
+      durationMs: 1,
+    });
+    metrics.flush();
+
+    expect(lineOf(logger.debug)).toContain('model="mixed"');
+  });
+
+  it('reports a clamped result count so short highlights have an explanation', () => {
+    const logger = createMockLogger();
+    const metrics = createSearchMetrics(logger);
+
+    metrics.recordRerank({
+      provider: 'rag-api',
+      chunks: 40,
+      results: 25,
+      durationMs: 1,
+      topK: 40,
+      topKLimit: 25,
+    });
+    metrics.flush();
+
+    expect(lineOf(logger.debug)).toContain('topK=40 topKLimit=25');
+  });
+
   it('bounds a provider-supplied model name inside the summary line', () => {
     const logger = createMockLogger();
     const metrics = createSearchMetrics(logger);

@@ -66,6 +66,30 @@ export function resolveSearchOutcome(
   return `Found ${count} result${count === 1 ? '' : 's'} for "${query}"`;
 }
 
+/** Distinct rows across the main search's two collections. SearXNG derives
+ * both from one result array — a row matching its news heuristic lands in
+ * `organic` and `topStories` alike — so summing the lengths would report
+ * more rows than the provider actually returned. */
+const countWebResults = (data: t.SearchResultData): number => {
+  const organic = data.organic ?? [];
+  const topStories = data.topStories ?? [];
+  if (organic.length === 0 || topStories.length === 0) {
+    return organic.length + topStories.length;
+  }
+
+  const links = new Set<string>();
+  let unlinked = 0;
+  for (const row of [...organic, ...topStories]) {
+    if (row.link) {
+      links.add(row.link);
+      continue;
+    }
+    /** Nothing to dedupe a blank link against, so it counts on its own. */
+    unlinked += 1;
+  }
+  return links.size + unlinked;
+};
+
 /** Rows a sub-search contributed, for the run summary's per-type breakdown. */
 const countResults = (
   type: t.SubSearchType,
@@ -83,7 +107,7 @@ const countResults = (
   if (type === 'news') {
     return data.news?.length ?? 0;
   }
-  return (data.organic?.length ?? 0) + (data.topStories?.length ?? 0);
+  return countWebResults(data);
 };
 
 /**

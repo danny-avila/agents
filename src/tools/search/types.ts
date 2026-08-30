@@ -468,6 +468,10 @@ export interface RerankObservation {
   units?: number;
   /** Chunks a provider candidate cap dropped before submission. */
   dropped?: number;
+  /** Set only when a provider cap reduced the requested result count, so a
+   * search returning fewer highlights than configured says why. */
+  topK?: number;
+  topKLimit?: number;
   reason?: RerankFallback;
   error?: SafeErrorLog;
 }
@@ -482,6 +486,7 @@ export interface RerankRun {
   model?: string;
   units?: number;
   dropped?: number;
+  topKLimit?: number;
 }
 
 /**

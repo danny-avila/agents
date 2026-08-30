@@ -767,6 +767,38 @@ describe('executeParallelSearches call contract', () => {
     expect(detail).toBe('provider exploded');
   });
 
+  test('counts a row shared by organic and topStories once', async () => {
+    const logger = createMockLogger();
+    /** The SearXNG shape: both collections built from the same rows. */
+    const shared: t.SearchResult = {
+      success: true,
+      data: {
+        organic: [
+          makeOrganic('https://a.com'),
+          makeOrganic('https://news.com'),
+          makeOrganic('https://c.com'),
+        ],
+        topStories: [makeStory('https://news.com')],
+      },
+    };
+    const searchAPI = { getSources: async (): Promise<t.SearchResult> => shared };
+
+    await executeParallelSearches({
+      searchAPI,
+      query: 'test query',
+      safeSearch: 1,
+      images: false,
+      videos: false,
+      news: false,
+      logger,
+      provider: 'searxng',
+    });
+
+    expect(String((logger.debug as jest.Mock).mock.calls[0][0])).toContain(
+      'results={web:3}'
+    );
+  });
+
   test('records a slow sibling failure even when the main search rejects first', async () => {
     const logger = createMockLogger();
     const failure = new Error('main provider exploded');

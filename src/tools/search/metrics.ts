@@ -133,6 +133,8 @@ interface RerankPhase {
   chunks: number;
   maxChunks: number;
   dropped: number;
+  topK?: number;
+  topKLimit?: number;
   results: number;
   units: number;
   durationMs: number;
@@ -228,11 +230,22 @@ export const createSearchMetrics = (
     if (phase.dropped > 0) {
       line += ` dropped=${phase.dropped}`;
     }
+    if (phase.topKLimit != null) {
+      line += ` topK=${phase.topK} topKLimit=${phase.topKLimit}`;
+    }
     if (phase.fallbacks === 0) {
       logger.debug(line);
       return;
     }
     line += ` fallbacks=${phase.fallbacks} reasons=${formatMap(phase.reasons)}`;
+    /** A placeholder reranker returns input order by design, so a phase whose
+     * only fallbacks are placeholders is the configuration working — it stays
+     * at the debug level it had before these counters existed. */
+    const degraded = phase.fallbacks - (phase.reasons.get('placeholder') ?? 0);
+    if (degraded === 0 && phase.errors === 0) {
+      logger.debug(line);
+      return;
+    }
     if (phase.errors === 0) {
       logger.warn(line);
       return;
@@ -356,13 +369,20 @@ export const createSearchMetrics = (
     rerank.maxChunks = Math.max(rerank.maxChunks, observation.chunks);
     rerank.results += observation.results;
     rerank.dropped += observation.dropped ?? 0;
+    rerank.topK ??= observation.topK;
+    rerank.topKLimit ??= observation.topKLimit;
     rerank.units += observation.units ?? 0;
     rerank.durationMs += observation.durationMs;
     rerank.maxDurationMs = Math.max(
       rerank.maxDurationMs,
       observation.durationMs
     );
-    rerank.model ??= observation.model;
+    if (observation.model != null) {
+      rerank.model =
+        rerank.model == null
+          ? observation.model
+          : mergeProvider(rerank.model, observation.model);
+    }
     if (observation.reason != null) {
       rerank.fallbacks += 1;
       bump(rerank.reasons, observation.reason);

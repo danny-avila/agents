@@ -87,6 +87,8 @@ export abstract class BaseReranker {
       model: run.model,
       units: run.units,
       dropped: run.dropped,
+      topK: run.topKLimit != null ? run.topK : undefined,
+      topKLimit: run.topKLimit,
       reason,
       error,
     });
@@ -325,8 +327,16 @@ const buildRagApiCandidates = (
     ? documents.map(toRagApiCandidate)
     : documents.slice(0, RAG_API_MAX_CANDIDATES).map(toRagApiCandidate);
 
-const clampRagApiTopN = (topN: number): number =>
-  Math.min(topN, RAG_API_MAX_TOP_N);
+/** Reports the clamp on `run` rather than logging it per call: a search
+ * configured above the contract limit returns fewer highlights than asked
+ * for, and the summary is the only place that now says so. */
+const clampRagApiTopN = (topN: number, run: t.RerankRun): number => {
+  if (topN <= RAG_API_MAX_TOP_N) {
+    return topN;
+  }
+  run.topKLimit = RAG_API_MAX_TOP_N;
+  return RAG_API_MAX_TOP_N;
+};
 
 /** Deterministic tie ordering: rank by score descending, breaking ties on
  * original candidate index rather than relying on rag_api's response order. */
@@ -464,7 +474,7 @@ export class RagApiReranker extends BaseReranker {
     }
 
     const candidates = buildRagApiCandidates(documents);
-    const topN = clampRagApiTopN(Math.max(0, topK));
+    const topN = clampRagApiTopN(Math.max(0, topK), run);
     run.dropped = documents.length - candidates.length;
     const requestData: t.RagApiRerankRequestBody = {
       profile: this.profile,
