@@ -166,7 +166,10 @@ describe('RagApiReranker', () => {
       ]);
       expect(postSpy).not.toHaveBeenCalled();
       expect(warnSpy).toHaveBeenCalledWith(
-        'RAG_API_URL is not set. Using default ranking.'
+        expect.stringContaining('rerank=rag-api calls=1')
+      );
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('fallbacks=1 reasons={no_base_url:1}')
       );
 
       if (typeof originalEnv === 'string') {
@@ -193,7 +196,7 @@ describe('RagApiReranker', () => {
       ]);
       expect(postSpy).not.toHaveBeenCalled();
       expect(warnSpy).toHaveBeenCalledWith(
-        'No rag_api token supplier configured. Using default ranking.'
+        expect.stringContaining('fallbacks=1 reasons={no_token_supplier:1}')
       );
     });
 
@@ -390,7 +393,7 @@ describe('RagApiReranker', () => {
       ]);
     });
 
-    it('should truncate candidates beyond the 50-candidate contract limit with a debug log', async () => {
+    it('should truncate candidates beyond the 50-candidate contract limit and report the overflow', async () => {
       const tokenSupplier = jest.fn().mockResolvedValue('token');
       const reranker = new RagApiReranker({
         baseUrl,
@@ -418,22 +421,18 @@ describe('RagApiReranker', () => {
         (requestBody as t.RagApiRerankRequestBody).candidates
       ).toHaveLength(50);
       expect(debugSpy).toHaveBeenCalledWith(
-        expect.stringContaining(
-          'accepts at most 50 candidates; truncating 60 to 50'
-        )
+        expect.stringContaining('dropped=10')
       );
     });
 
-    it('should clamp top_n beyond the 25-result contract limit with a debug log', async () => {
+    it('should clamp top_n beyond the 25-result contract limit', async () => {
       const tokenSupplier = jest.fn().mockResolvedValue('token');
       const reranker = new RagApiReranker({
         baseUrl,
         tokenSupplier,
         logger: mockLogger,
       });
-      const debugSpy = jest
-        .spyOn(mockLogger, 'debug')
-        .mockImplementation(() => mockLogger);
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
       const documents = Array.from({ length: 30 }, (_, i) => `document${i}`);
       const postSpy = jest.spyOn(axios, 'post').mockResolvedValueOnce({
         data: {
@@ -450,9 +449,6 @@ describe('RagApiReranker', () => {
       const [, requestBody] = postSpy.mock.calls[0];
       expect((requestBody as t.RagApiRerankRequestBody).top_n).toBe(25);
       expect(result).toHaveLength(25);
-      expect(debugSpy).toHaveBeenCalledWith(
-        expect.stringContaining('accepts top_n <= 25; clamping 40 to 25')
-      );
     });
 
     it('should fall back to the candidates original order on a request timeout', async () => {
@@ -485,7 +481,7 @@ describe('RagApiReranker', () => {
         { text: 'document3', score: 0 },
       ]);
       expect(errorSpy).toHaveBeenCalledWith(
-        'Error using rag_api reranker',
+        expect.stringContaining('rerank=rag-api'),
         expect.objectContaining({ code: 'ECONNABORTED' })
       );
     });
@@ -513,7 +509,7 @@ describe('RagApiReranker', () => {
 
       expect(result).toEqual([{ text: 'document1', score: 0 }]);
       expect(errorSpy).toHaveBeenCalledWith(
-        'Error using rag_api reranker',
+        expect.stringContaining('rerank=rag-api'),
         expect.objectContaining({ status: 500 })
       );
 
@@ -547,7 +543,7 @@ describe('RagApiReranker', () => {
         { text: 'document2', score: 0 },
       ]);
       expect(warnSpy).toHaveBeenCalledWith(
-        'Unexpected response format from rag_api rerank. Using default ranking.'
+        expect.stringContaining('fallbacks=1 reasons={bad_response:1}')
       );
     });
 
@@ -582,7 +578,7 @@ describe('RagApiReranker', () => {
         { text: 'document2', score: 0 },
       ]);
       expect(warnSpy).toHaveBeenCalledWith(
-        'rag_api rerank response contained no valid results. Using default ranking.'
+        expect.stringContaining('fallbacks=1 reasons={invalid_results:1}')
       );
     });
 
@@ -632,7 +628,7 @@ describe('RagApiReranker', () => {
       expect(Date.now() - startedAt).toBeLessThan(2000);
       expect(postSpy).not.toHaveBeenCalled();
       expect(errorSpy).toHaveBeenCalledWith(
-        'Error using rag_api reranker',
+        expect.stringContaining('rerank=rag-api'),
         expect.objectContaining({
           message: 'rag_api rerank exceeded its 50ms timeout.',
         })
@@ -750,7 +746,7 @@ describe('RagApiReranker', () => {
         { text: 'document2', score: 0 },
       ]);
       expect(warnSpy).toHaveBeenCalledWith(
-        'rag_api rerank response contained no valid results. Using default ranking.'
+        expect.stringContaining('fallbacks=1 reasons={invalid_results:1}')
       );
     });
 
@@ -785,7 +781,7 @@ describe('RagApiReranker', () => {
         { text: 'document2', score: 0 },
       ]);
       expect(warnSpy).toHaveBeenCalledWith(
-        'rag_api rerank response contained no valid results. Using default ranking.'
+        expect.stringContaining('fallbacks=1 reasons={invalid_results:1}')
       );
     });
 
@@ -820,7 +816,7 @@ describe('RagApiReranker', () => {
         { text: 'document2', score: 0 },
       ]);
       expect(warnSpy).toHaveBeenCalledWith(
-        'rag_api rerank response contained no valid results. Using default ranking.'
+        expect.stringContaining('fallbacks=1 reasons={invalid_results:1}')
       );
     });
 

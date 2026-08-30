@@ -1,9 +1,14 @@
 import axios from 'axios';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import type * as t from './types';
-import { getAttribution, createDefaultLogger } from './utils';
+import {
+  getAttribution,
+  createDefaultLogger,
+  formatErrorForLog,
+} from './utils';
 import { createKeenableAPI } from './keenable-search';
 import { createTavilyAPI } from './tavily-search';
+import { createSearchMetrics } from './metrics';
 import { createCrwAPI } from './crw-search';
 import { BaseReranker } from './rerankers';
 
@@ -139,50 +144,46 @@ function createSourceUpdateCallback(sourceMap: Map<string, t.ValidSource>) {
   };
 }
 
+/** Returns undefined without logging when there is nothing to rank: an empty
+ * scrape is already counted by the scrape summary, and a missing reranker is
+ * reported once at tool construction rather than once per source. */
 const getHighlights = async ({
   query,
   content,
   reranker,
+  metrics,
   topResults = 5,
   maxContentLength = DEFAULT_MAX_CONTENT_LENGTH,
   chunkOptions,
-  logger,
 }: {
   content: string;
   query: string;
   reranker?: BaseReranker;
+  metrics: t.SearchMetrics;
   topResults?: number;
   maxContentLength?: number;
   chunkOptions?: { chunkSize: number; chunkOverlap: number };
-  logger?: t.Logger;
 }): Promise<t.Highlight[] | undefined> => {
-  const logger_ = logger || createDefaultLogger();
-
-  if (!content) {
-    logger_.warn('No content provided for highlights');
-    return;
-  }
-  if (!reranker) {
-    logger_.warn('No reranker provided for highlights');
+  if (!content || !reranker) {
     return;
   }
 
+  const startedAt = Date.now();
   try {
     const documents = await chunker.splitText(
       truncateContent(content, maxContentLength),
       chunkOptions
     );
-    if (Array.isArray(documents)) {
-      return await reranker.rerank(query, documents, topResults);
-    } else {
-      logger_.error(
-        'Expected documents to be an array, got:',
-        typeof documents
-      );
-      return;
-    }
+    return await reranker.rerank(query, documents, topResults, metrics);
   } catch (error) {
-    logger_.error('Error in content processing:', error);
+    metrics.recordRerank({
+      provider: 'chunker',
+      chunks: 0,
+      results: 0,
+      durationMs: Date.now() - startedAt,
+      reason: 'chunk_error',
+      error: formatErrorForLog(error),
+    });
     return;
   }
 };
@@ -598,51 +599,77 @@ export const createSourceProcessor = (
       };
     }
 
-    logger_.error(
-      `Error scraping ${url}: ${response.error ?? 'Unknown error'}`
-    );
     return { url, attribution, error: true, content: '' };
   };
 
   const addHighlights = async (
     result: t.ScrapeResult,
     query: string,
+    metrics: t.SearchMetrics,
     onGetHighlights: t.SearchToolConfig['onGetHighlights']
   ): Promise<t.ScrapeResult> => {
-    if (result.error != null) {
-      return result;
+    const highlights = await getHighlights({
+      query,
+      reranker,
+      metrics,
+      topResults,
+      content: result.content,
+      maxContentLength,
+      chunkOptions,
+    });
+    if (onGetHighlights) {
+      onGetHighlights(result.url);
     }
-    try {
-      const highlights = await getHighlights({
-        query,
-        reranker,
-        topResults,
-        content: result.content,
-        maxContentLength,
-        chunkOptions,
-        logger: logger_,
-      });
-      if (onGetHighlights) {
-        onGetHighlights(result.url);
-      }
-      return { ...result, highlights };
-    } catch (error) {
+    return { ...result, highlights };
+  };
+
+  /** Scrape and rerank one link, recording the single observation that link
+   * contributes to the run summary — the only place a per-link outcome is
+   * reported, so nothing here logs per link. */
+  const processLink = async (
+    url: string,
+    response: t.AnyScraperResponse,
+    query: string,
+    metrics: t.SearchMetrics,
+    onGetHighlights: t.SearchToolConfig['onGetHighlights']
+  ): Promise<t.ScrapeResult> => {
+    const scraped = processResponse(url, response);
+    if (scraped.error === true) {
+      metrics.recordScrape({ url, error: response.error ?? 'Unknown error' });
+      return scraped;
+    }
+    /** `getHighlights` absorbs its own failures, so only a throwing
+     * `onGetHighlights` consumer reaches here; one bad callback must not
+     * discard the sibling links awaiting alongside it. */
+    const result = await addHighlights(
+      scraped,
+      query,
+      metrics,
+      onGetHighlights
+    ).catch((error) => {
       logger_.error('Error processing scraped content:', error);
-      return result;
-    }
+      return scraped;
+    });
+    metrics.recordScrape({
+      url,
+      chars: result.content.length,
+      highlights: result.highlights?.length ?? 0,
+    });
+    return result;
   };
 
   const webScraper = {
     scrapeMany: async ({
       query,
       links,
+      metrics,
       onGetHighlights,
     }: {
       query: string;
       links: string[];
+      metrics: t.SearchMetrics;
       onGetHighlights: t.SearchToolConfig['onGetHighlights'];
     }): Promise<Array<t.ScrapeResult>> => {
-      logger_.debug(`Scraping ${links.length} links`);
       try {
         let responses: Array<[string, t.AnyScraperResponse]>;
 
@@ -653,24 +680,19 @@ export const createSourceProcessor = (
             links.map((link) =>
               scraper
                 .scrapeUrl(link, {})
-                .catch((error): [string, t.AnyScraperResponse] => {
-                  logger_.error(`Error scraping ${link}:`, error);
-                  return [link, { success: false, error: String(error) }];
-                })
+                .catch((error): [string, t.AnyScraperResponse] => [
+                  link,
+                  { success: false, error: String(error) },
+                ])
             )
           );
         }
 
-        const withHighlights = await Promise.all(
+        return await Promise.all(
           responses.map(([url, response]) =>
-            addHighlights(
-              processResponse(url, response),
-              query,
-              onGetHighlights
-            )
+            processLink(url, response, query, metrics, onGetHighlights)
           )
         );
-        return withHighlights;
       } catch (error) {
         logger_.error('Error in scrapeMany:', error);
         return [];
@@ -682,12 +704,14 @@ export const createSourceProcessor = (
     links,
     query,
     target,
+    metrics,
     onGetHighlights,
     onContentScraped,
   }: {
     links: string[];
     query: string;
     target: number;
+    metrics: t.SearchMetrics;
     onGetHighlights: t.SearchToolConfig['onGetHighlights'];
     onContentScraped?: (link: string, update?: Partial<t.ValidSource>) => void;
   }): Promise<void> => {
@@ -695,6 +719,7 @@ export const createSourceProcessor = (
     // const remainingLinks = links.slice(target).reverse();
     const results = await webScraper.scrapeMany({
       query,
+      metrics,
       links: initialLinks,
       onGetHighlights,
     });
@@ -719,7 +744,11 @@ export const createSourceProcessor = (
     news,
     proMode = true,
     onGetHighlights,
+    metrics: ownerMetrics,
   }: t.ProcessSourcesFields): Promise<t.SearchResultData> => {
+    /** The caller owns the collector when it supplies one — it has phases of
+     * its own to fold in and flushes them together. */
+    const metrics = ownerMetrics ?? createSearchMetrics(logger_);
     try {
       if (!result.data) {
         return {
@@ -759,6 +788,7 @@ export const createSourceProcessor = (
         const onContentScraped = createSourceUpdateCallback(wikiSourceMap);
         await fetchContents({
           query,
+          metrics,
           target: 1,
           onGetHighlights,
           onContentScraped,
@@ -809,6 +839,7 @@ export const createSourceProcessor = (
         promises.push(
           fetchContents({
             query,
+            metrics,
             onGetHighlights,
             onContentScraped,
             links: organicLinks,
@@ -822,6 +853,7 @@ export const createSourceProcessor = (
         promises.push(
           fetchContents({
             query,
+            metrics,
             onGetHighlights,
             onContentScraped,
             links: topStoryLinks,
@@ -851,6 +883,10 @@ export const createSourceProcessor = (
         ...result.data,
         error: error instanceof Error ? error.message : String(error),
       };
+    } finally {
+      if (ownerMetrics == null) {
+        metrics.flush();
+      }
     }
   };
 

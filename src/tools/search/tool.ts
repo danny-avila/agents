@@ -21,6 +21,7 @@ import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { createCrwScraper } from './crw-scraper';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
+import { createSearchMetrics } from './metrics';
 import { createDefaultLogger } from './utils';
 import { createReranker } from './rerankers';
 import { Constants } from '@/common';
@@ -65,12 +66,33 @@ export function resolveSearchOutcome(
   return `Found ${count} result${count === 1 ? '' : 's'} for "${query}"`;
 }
 
+/** Rows a sub-search contributed, for the run summary's per-type breakdown. */
+const countResults = (
+  type: t.SubSearchType,
+  data?: t.SearchResultData
+): number => {
+  if (data == null) {
+    return 0;
+  }
+  if (type === 'images') {
+    return data.images?.length ?? 0;
+  }
+  if (type === 'videos') {
+    return data.videos?.length ?? 0;
+  }
+  if (type === 'news') {
+    return data.news?.length ?? 0;
+  }
+  return (data.organic?.length ?? 0) + (data.topStories?.length ?? 0);
+};
+
 /**
  * Executes parallel searches and merges the results,
  * deduplicating top stories by link
  */
 export async function executeParallelSearches({
   searchAPI,
+  provider,
   query,
   date,
   country,
@@ -78,9 +100,10 @@ export async function executeParallelSearches({
   images,
   videos,
   news,
-  logger,
+  metrics,
 }: {
   searchAPI: ReturnType<typeof createSearchAPI>;
+  provider: string;
   query: string;
   date?: DATE_RANGE;
   country?: string;
@@ -88,75 +111,53 @@ export async function executeParallelSearches({
   images: boolean;
   videos: boolean;
   news: boolean;
-  logger: t.Logger;
+  metrics: t.SearchMetrics;
 }): Promise<t.SearchResult> {
+  /** Every sub-search shares this shape, and a failed one must resolve rather
+   * than reject so the siblings still merge; only the main search's failure
+   * is fatal, and that is raised from its `success` flag below. */
+  const runSearch = async (type: t.SubSearchType): Promise<t.SearchResult> => {
+    const startedAt = Date.now();
+    try {
+      const result = await searchAPI.getSources({
+        query,
+        date,
+        country,
+        safeSearch,
+        ...(type !== 'web' && { type }),
+      });
+      metrics.recordSearch({
+        provider,
+        type,
+        results: countResults(type, result.data),
+        durationMs: Date.now() - startedAt,
+        error: result.success ? undefined : (result.error ?? 'Search failed'),
+      });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      metrics.recordSearch({
+        provider,
+        type,
+        results: 0,
+        durationMs: Date.now() - startedAt,
+        error: message,
+      });
+      return { success: false, error: `${type} search failed: ${message}` };
+    }
+  };
+
   // Prepare all search tasks to run in parallel
-  const searchTasks: Promise<t.SearchResult>[] = [
-    // Main search
-    searchAPI.getSources({
-      query,
-      date,
-      country,
-      safeSearch,
-    }),
-  ];
+  const searchTasks: Promise<t.SearchResult>[] = [runSearch('web')];
 
   if (images) {
-    searchTasks.push(
-      searchAPI
-        .getSources({
-          query,
-          date,
-          country,
-          safeSearch,
-          type: 'images',
-        })
-        .catch((error) => {
-          logger.error('Error fetching images:', error);
-          return {
-            success: false,
-            error: `Images search failed: ${error instanceof Error ? error.message : String(error)}`,
-          };
-        })
-    );
+    searchTasks.push(runSearch('images'));
   }
   if (videos) {
-    searchTasks.push(
-      searchAPI
-        .getSources({
-          query,
-          date,
-          country,
-          safeSearch,
-          type: 'videos',
-        })
-        .catch((error) => {
-          logger.error('Error fetching videos:', error);
-          return {
-            success: false,
-            error: `Videos search failed: ${error instanceof Error ? error.message : String(error)}`,
-          };
-        })
-    );
+    searchTasks.push(runSearch('videos'));
   }
   if (news) {
-    searchTasks.push(
-      searchAPI
-        .getSources({
-          query,
-          date,
-          country,
-          safeSearch,
-          type: 'news',
-        })
-        .catch((error) => {
-          logger.error('Error fetching news:', error);
-          return {
-            success: false,
-            error: `News search failed: ${error instanceof Error ? error.message : String(error)}`,
-          };
-        })
-    );
+    searchTasks.push(runSearch('news'));
   }
 
   // Run all searches in parallel
@@ -239,6 +240,7 @@ export async function executeParallelSearches({
 
 function createSearchProcessor({
   searchAPI,
+  provider,
   safeSearch,
   supportsImages,
   supportsVideos,
@@ -249,6 +251,7 @@ function createSearchProcessor({
   separatorExpandBy,
   logger,
 }: {
+  provider: string;
   safeSearch: t.SearchToolConfig['safeSearch'];
   supportsImages: boolean;
   supportsVideos: boolean;
@@ -281,10 +284,15 @@ function createSearchProcessor({
     videos?: boolean;
     news?: boolean;
   }): Promise<t.SearchResultData> {
+    /** One collector for the whole call: the provider, scrape, and rerank
+     * phases each fold into counters and flush together, so a search costs a
+     * bounded handful of lines instead of a few per source. */
+    const metrics = createSearchMetrics(logger);
     try {
       // Execute parallel searches and merge results
       const searchResult = await executeParallelSearches({
         searchAPI,
+        provider,
         query,
         date,
         country,
@@ -292,7 +300,7 @@ function createSearchProcessor({
         images: supportsImages && images,
         videos: supportsVideos && videos,
         news: supportsNews && news,
-        logger,
+        metrics,
       });
 
       onSearchResults?.(searchResult);
@@ -300,6 +308,7 @@ function createSearchProcessor({
       const processedSources = await sourceProcessor.processSources({
         query,
         news,
+        metrics,
         result: searchResult,
         proMode,
         onGetHighlights,
@@ -322,6 +331,8 @@ function createSearchProcessor({
         relatedSearches: [],
         error: error instanceof Error ? error.message : String(error),
       };
+    } finally {
+      metrics.flush();
     }
   };
 }
@@ -585,7 +596,9 @@ export const createSearchTool = (
     logger,
   });
 
-  if (!selectedReranker) {
+  /** `none` is a deliberate opt-out that `createReranker` already reports;
+   * only an unusable configuration warrants a warning here. */
+  if (!selectedReranker && rerankerType !== 'none') {
     logger.warn('No reranker selected. Using default ranking.');
   }
 
@@ -605,6 +618,7 @@ export const createSearchTool = (
 
   const search = createSearchProcessor({
     searchAPI,
+    provider: searchProvider,
     safeSearch,
     // Keenable is organic-only: its API ignores `type`, so image/news
     // sub-searches would spend rate limit and merge nothing.

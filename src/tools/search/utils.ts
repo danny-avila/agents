@@ -2,21 +2,13 @@
 
 import { isAxiosError } from 'axios';
 
+import type { SafeErrorLog } from './types';
 import type { AxiosError } from 'axios';
 import type * as t from './types';
 
 const LOG_VALUE_MAX_LENGTH = 2048;
 
-export interface SafeErrorLog {
-  message: string;
-  name?: string;
-  code?: string;
-  status?: number;
-  method?: string;
-  url?: string;
-  responseDataSummary?: string;
-  value?: string;
-}
+export type { SafeErrorLog } from './types';
 
 /**
  * Singleton instance of the default logger

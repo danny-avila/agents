@@ -1,6 +1,7 @@
 import type * as t from './types';
 import { executeParallelSearches } from './tool';
 import { createSourceProcessor } from './search';
+import { createSearchMetrics } from './metrics';
 import { expandHighlights } from './highlights';
 import { BaseReranker } from './rerankers';
 
@@ -13,6 +14,7 @@ const silentLogger = {
 } as t.Logger;
 
 class RecordingReranker extends BaseReranker {
+  protected readonly provider = 'recording';
   public rerankCalls: string[][] = [];
   public topKCalls: number[] = [];
 
@@ -23,11 +25,15 @@ class RecordingReranker extends BaseReranker {
   async rerank(
     _query: string,
     documents: string[],
-    topK: number = 5
+    topK: number = 5,
+    metrics?: t.SearchMetrics
   ): Promise<t.Highlight[]> {
     this.rerankCalls.push(documents);
     this.topKCalls.push(topK);
-    return this.getDefaultRanking(documents, topK);
+    return this.complete(
+      this.beginRerank(documents, topK, metrics),
+      this.getDefaultRanking(documents, topK)
+    );
   }
 }
 
@@ -497,12 +503,13 @@ describe('executeParallelSearches topStories dedupe', () => {
 
     const merged = await executeParallelSearches({
       searchAPI,
+      provider: 'serper',
       query: 'test query',
       safeSearch: 1,
       images: false,
       videos: false,
       news: true,
-      logger: silentLogger,
+      metrics: createSearchMetrics(silentLogger),
     });
 
     expect(merged.data?.topStories?.map((story) => story.link)).toEqual([
@@ -512,5 +519,107 @@ describe('executeParallelSearches topStories dedupe', () => {
     ]);
     expect(merged.data?.topStories?.[0].title).toBe('Story for https://n1.com');
     expect(merged.data?.news).toBeUndefined();
+  });
+});
+
+describe('createSourceProcessor log volume', () => {
+  const createCountingLogger = (): t.Logger =>
+    ({
+      error: jest.fn(),
+      warn: jest.fn(),
+      info: jest.fn(),
+      debug: jest.fn(),
+    }) as unknown as t.Logger;
+
+  const createMixedScraper = (
+    okLinks: string[],
+    failingLinks: Map<string, string>
+  ): t.BaseScraper => ({
+    scrapeUrl: async (url: string): Promise<[string, t.AnyScraperResponse]> => {
+      const failure = failingLinks.get(url);
+      if (failure != null) {
+        return [url, { success: false, error: failure }];
+      }
+      return [
+        url,
+        {
+          success: true,
+          data: { markdown: okLinks.includes(url) ? makeLongContent(4000) : '' },
+        },
+      ];
+    },
+    extractContent: (
+      response: t.AnyScraperResponse
+    ): [string, undefined | t.References] => [
+      (response as t.FirecrawlScrapeResponse).data?.markdown ?? '',
+      undefined,
+    ],
+    extractMetadata: (): t.GenericScrapeMetadata => ({}),
+  });
+
+  test('summarizes an eight-source search in one line per phase', async () => {
+    const logger = createCountingLogger();
+    const okLinks = Array.from({ length: 6 }, (_, i) => `https://ok${i}.com`);
+    const failing = new Map([
+      ['https://bad0.com', 'Request failed with status code 403'],
+      ['https://bad1.com', 'timeout of 7500ms exceeded'],
+    ]);
+    const links = [...okLinks, ...failing.keys()];
+    const processor = createSourceProcessor(
+      { reranker: new RecordingReranker(), logger },
+      createMixedScraper(okLinks, failing)
+    );
+
+    await processor.processSources({
+      query: 'test query',
+      proMode: true,
+      onGetHighlights: undefined,
+      news: false,
+      numElements: links.length,
+      result: {
+        success: true,
+        data: { organic: links.map((link) => makeOrganic(link)) },
+      },
+    });
+
+    /** Eight links formerly logged a scrape line plus three reranker lines
+     * each; the whole call must now cost one line per phase. */
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(logger.warn).not.toHaveBeenCalled();
+
+    const scrapeLine = String((logger.error as jest.Mock).mock.calls[0][0]);
+    expect(scrapeLine).toContain('links=8 ok=6');
+    expect(scrapeLine).toContain(
+      'failed=2 reasons={http_403:1,timeout:1}'
+    );
+
+    const rerankLine = String((logger.debug as jest.Mock).mock.calls[0][0]);
+    expect(rerankLine).toContain('rerank=recording calls=6');
+  });
+
+  test('flushes to the owning collector instead of logging itself', async () => {
+    const logger = createCountingLogger();
+    const metrics = createSearchMetrics(logger);
+    const link = 'https://a.com';
+    const processor = createSourceProcessor(
+      { reranker: new RecordingReranker(), logger },
+      createFakeScraper({ [link]: makeLongContent(2000) })
+    );
+
+    await processor.processSources({
+      query: 'test query',
+      proMode: true,
+      onGetHighlights: undefined,
+      news: false,
+      numElements: 1,
+      metrics,
+      result: { success: true, data: { organic: [makeOrganic(link)] } },
+    });
+
+    expect(logger.debug).not.toHaveBeenCalled();
+
+    metrics.flush();
+    expect(logger.debug).toHaveBeenCalledTimes(2);
   });
 });

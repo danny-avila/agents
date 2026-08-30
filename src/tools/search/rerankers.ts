@@ -1,6 +1,7 @@
 import axios from 'axios';
 import type * as t from './types';
 import { createDefaultLogger, formatErrorForLog } from './utils';
+import { createSearchMetrics } from './metrics';
 
 const DEFAULT_JINA_API_URL = 'https://api.jina.ai/v1/rerank';
 
@@ -17,16 +18,25 @@ const getDefaultJinaApiUrl = (): string =>
 export abstract class BaseReranker {
   protected apiKey: string | undefined;
   protected logger: t.Logger;
+  protected abstract readonly provider: string;
+  private ownMetrics?: t.SearchMetrics;
 
   constructor(logger?: t.Logger) {
     // Each specific reranker will set its API key
     this.logger = logger || createDefaultLogger();
   }
 
+  /**
+   * A search reranks once per scraped source, so nothing here logs per call:
+   * every exit records one observation through `metrics` and the enclosing
+   * search emits a single summary. `metrics` is optional only for direct use
+   * of a reranker, which falls back to an auto-flushing collector.
+   */
   abstract rerank(
     query: string,
     documents: string[],
-    topK?: number
+    topK?: number,
+    metrics?: t.SearchMetrics
   ): Promise<t.Highlight[]>;
 
   protected getDefaultRanking(
@@ -37,9 +47,74 @@ export abstract class BaseReranker {
       .slice(0, Math.min(topK, documents.length))
       .map((doc) => ({ text: doc, score: 0 }));
   }
+
+  /** A direct caller has no enclosing search to fold into, so one
+   * auto-flushing collector per instance emits that call's summary on its
+   * own; record and flush run synchronously, so concurrent calls on the same
+   * instance cannot share a total. */
+  private localMetrics(): t.SearchMetrics {
+    this.ownMetrics ??= createSearchMetrics(this.logger, true);
+    return this.ownMetrics;
+  }
+
+  /** Opens the per-call state every exit path records against. */
+  protected beginRerank(
+    documents: string[],
+    topK: number,
+    metrics?: t.SearchMetrics
+  ): t.RerankRun {
+    return {
+      metrics: metrics ?? this.localMetrics(),
+      documents,
+      topK,
+      startedAt: Date.now(),
+    };
+  }
+
+  private record(
+    run: t.RerankRun,
+    highlights: t.Highlight[],
+    reason?: t.RerankFallback,
+    error?: t.SafeErrorLog
+  ): t.Highlight[] {
+    run.metrics.recordRerank({
+      provider: this.provider,
+      chunks: run.documents.length,
+      results: highlights.length,
+      durationMs: Date.now() - run.startedAt,
+      model: run.model,
+      units: run.units,
+      dropped: run.dropped,
+      reason,
+      error,
+    });
+    return highlights;
+  }
+
+  protected complete(
+    run: t.RerankRun,
+    highlights: t.Highlight[]
+  ): t.Highlight[] {
+    return this.record(run, highlights);
+  }
+
+  /** Records the call as a fallback and returns the candidates' input order. */
+  protected fallback(
+    run: t.RerankRun,
+    reason: t.RerankFallback,
+    error?: t.SafeErrorLog
+  ): t.Highlight[] {
+    return this.record(
+      run,
+      this.getDefaultRanking(run.documents, run.topK),
+      reason,
+      error
+    );
+  }
 }
 
 export class JinaReranker extends BaseReranker {
+  protected readonly provider = 'jina';
   private apiUrl: string;
   private timeout: number;
   private httpAgent?: t.HttpAgent;
@@ -69,16 +144,14 @@ export class JinaReranker extends BaseReranker {
   async rerank(
     query: string,
     documents: string[],
-    topK: number = 5
+    topK: number = 5,
+    metrics?: t.SearchMetrics
   ): Promise<t.Highlight[]> {
-    this.logger.debug(
-      `Reranking ${documents.length} chunks with Jina using API URL: ${this.apiUrl}`
-    );
+    const run = this.beginRerank(documents, topK, metrics);
 
     try {
       if (this.apiKey == null || this.apiKey === '') {
-        this.logger.warn('JINA_API_KEY is not set. Using default ranking.');
-        return this.getDefaultRanking(documents, topK);
+        return this.fallback(run, 'no_api_key');
       }
 
       const requestData = {
@@ -103,11 +176,16 @@ export class JinaReranker extends BaseReranker {
         }
       );
 
-      this.logger.debug('Jina API Model:', response.data?.model);
-      this.logger.debug('Jina API Usage:', response.data?.usage);
+      run.model = response.data?.model;
+      run.units = response.data?.usage.total_tokens;
 
-      if (response.data && response.data.results.length) {
-        return response.data.results.map((result) => {
+      if (!response.data || !response.data.results.length) {
+        return this.fallback(run, 'bad_response');
+      }
+
+      return this.complete(
+        run,
+        response.data.results.map((result) => {
           const docIndex = result.index;
           const score = result.relevance_score;
           let text = '';
@@ -126,22 +204,16 @@ export class JinaReranker extends BaseReranker {
           }
 
           return { text, score };
-        });
-      } else {
-        this.logger.warn(
-          'Unexpected response format from Jina API. Using default ranking.'
-        );
-        return this.getDefaultRanking(documents, topK);
-      }
+        })
+      );
     } catch (error) {
-      this.logger.error('Error using Jina reranker', formatErrorForLog(error));
-      // Fallback to default ranking on error
-      return this.getDefaultRanking(documents, topK);
+      return this.fallback(run, 'error', formatErrorForLog(error));
     }
   }
 }
 
 export class CohereReranker extends BaseReranker {
+  protected readonly provider = 'cohere';
   private timeout: number;
   private httpAgent?: t.HttpAgent;
   private httpsAgent?: t.HttpsAgent;
@@ -167,18 +239,19 @@ export class CohereReranker extends BaseReranker {
   async rerank(
     query: string,
     documents: string[],
-    topK: number = 5
+    topK: number = 5,
+    metrics?: t.SearchMetrics
   ): Promise<t.Highlight[]> {
-    this.logger.debug(`Reranking ${documents.length} chunks with Cohere`);
+    const run = this.beginRerank(documents, topK, metrics);
 
     try {
       if (this.apiKey == null || this.apiKey === '') {
-        this.logger.warn('COHERE_API_KEY is not set. Using default ranking.');
-        return this.getDefaultRanking(documents, topK);
+        return this.fallback(run, 'no_api_key');
       }
 
+      const model = 'rerank-v3.5';
       const requestData = {
-        model: 'rerank-v3.5',
+        model,
         query: query,
         top_n: topK,
         documents: documents,
@@ -198,29 +271,24 @@ export class CohereReranker extends BaseReranker {
         }
       );
 
-      this.logger.debug('Cohere API ID:', response.data?.id);
-      this.logger.debug('Cohere API Meta:', response.data?.meta);
+      run.model = model;
+      run.units = response.data?.meta.billed_units.search_units;
 
-      if (response.data && response.data.results.length) {
-        return response.data.results.map((result) => {
+      if (!response.data || !response.data.results.length) {
+        return this.fallback(run, 'bad_response');
+      }
+
+      return this.complete(
+        run,
+        response.data.results.map((result) => {
           const docIndex = result.index;
           const score = result.relevance_score;
           const text = documents[docIndex];
           return { text, score };
-        });
-      } else {
-        this.logger.warn(
-          'Unexpected response format from Cohere API. Using default ranking.'
-        );
-        return this.getDefaultRanking(documents, topK);
-      }
-    } catch (error) {
-      this.logger.error(
-        'Error using Cohere reranker',
-        formatErrorForLog(error)
+        })
       );
-      // Fallback to default ranking on error
-      return this.getDefaultRanking(documents, topK);
+    } catch (error) {
+      return this.fallback(run, 'error', formatErrorForLog(error));
     }
   }
 }
@@ -244,29 +312,17 @@ const toRagApiCandidate = (
 
 /** A single source split into overlapping chunks routinely exceeds the
  * contract limit, so documents are capped before any candidate is built:
- * only the submittable window is ever allocated. */
+ * only the submittable window is ever allocated. The overflow is reported
+ * through the run's `dropped` counter rather than a per-call log. */
 const buildRagApiCandidates = (
-  documents: string[],
-  logger: t.Logger
-): t.RagApiRerankCandidate[] => {
-  if (documents.length <= RAG_API_MAX_CANDIDATES) {
-    return documents.map(toRagApiCandidate);
-  }
-  logger.debug(
-    `rag_api fast-v1 accepts at most ${RAG_API_MAX_CANDIDATES} candidates; truncating ${documents.length} to ${RAG_API_MAX_CANDIDATES}.`
-  );
-  return documents.slice(0, RAG_API_MAX_CANDIDATES).map(toRagApiCandidate);
-};
+  documents: string[]
+): t.RagApiRerankCandidate[] =>
+  documents.length <= RAG_API_MAX_CANDIDATES
+    ? documents.map(toRagApiCandidate)
+    : documents.slice(0, RAG_API_MAX_CANDIDATES).map(toRagApiCandidate);
 
-const clampRagApiTopN = (topN: number, logger: t.Logger): number => {
-  if (topN <= RAG_API_MAX_TOP_N) {
-    return topN;
-  }
-  logger.debug(
-    `rag_api fast-v1 accepts top_n <= ${RAG_API_MAX_TOP_N}; clamping ${topN} to ${RAG_API_MAX_TOP_N}.`
-  );
-  return RAG_API_MAX_TOP_N;
-};
+const clampRagApiTopN = (topN: number): number =>
+  Math.min(topN, RAG_API_MAX_TOP_N);
 
 /** Deterministic tie ordering: rank by score descending, breaking ties on
  * original candidate index rather than relying on rag_api's response order. */
@@ -349,6 +405,7 @@ const withRerankDeadline = <T>(
  * to the candidates' original order via {@link BaseReranker.getDefaultRanking}.
  */
 export class RagApiReranker extends BaseReranker {
+  protected readonly provider = 'rag-api';
   private baseUrl?: string;
   private tokenSupplier?: t.RagApiTokenSupplier;
   private profile: string;
@@ -383,32 +440,28 @@ export class RagApiReranker extends BaseReranker {
   async rerank(
     query: string,
     documents: string[],
-    topK: number = 5
+    topK: number = 5,
+    metrics?: t.SearchMetrics
   ): Promise<t.Highlight[]> {
     if (documents.length === 0) {
       return [];
     }
 
-    this.logger.debug(
-      `Reranking ${documents.length} chunks with rag_api (${this.profile}) using base URL: ${this.baseUrl}`
-    );
+    const run = this.beginRerank(documents, topK, metrics);
 
     const baseUrl = this.baseUrl;
     if (baseUrl == null || baseUrl === '') {
-      this.logger.warn('RAG_API_URL is not set. Using default ranking.');
-      return this.getDefaultRanking(documents, topK);
+      return this.fallback(run, 'no_base_url');
     }
 
     const tokenSupplier = this.tokenSupplier;
     if (tokenSupplier == null) {
-      this.logger.warn(
-        'No rag_api token supplier configured. Using default ranking.'
-      );
-      return this.getDefaultRanking(documents, topK);
+      return this.fallback(run, 'no_token_supplier');
     }
 
-    const candidates = buildRagApiCandidates(documents, this.logger);
-    const topN = clampRagApiTopN(Math.max(0, topK), this.logger);
+    const candidates = buildRagApiCandidates(documents);
+    const topN = clampRagApiTopN(Math.max(0, topK));
+    run.dropped = documents.length - candidates.length;
     const requestData: t.RagApiRerankRequestBody = {
       profile: this.profile,
       query,
@@ -436,40 +489,35 @@ export class RagApiReranker extends BaseReranker {
         return response.data;
       }, this.timeout);
 
-      this.logger.debug('rag_api rerank model:', data?.model);
+      run.model = data?.model;
 
       const rawResults = data?.results;
       if (!Array.isArray(rawResults) || rawResults.length === 0) {
-        this.logger.warn(
-          'Unexpected response format from rag_api rerank. Using default ranking.'
-        );
-        return this.getDefaultRanking(documents, topK);
+        return this.fallback(run, 'bad_response');
       }
 
       if (!isValidRagApiBatch(rawResults, candidates.length)) {
-        this.logger.warn(
-          'rag_api rerank response contained no valid results. Using default ranking.'
-        );
-        return this.getDefaultRanking(documents, topK);
+        return this.fallback(run, 'invalid_results');
       }
 
-      return sortRagApiResults(rawResults)
-        .slice(0, topN)
-        .map((result) => ({
-          text: documents[result.index],
-          score: result.score,
-        }));
-    } catch (error) {
-      this.logger.error(
-        'Error using rag_api reranker',
-        formatErrorForLog(error)
+      return this.complete(
+        run,
+        sortRagApiResults(rawResults)
+          .slice(0, topN)
+          .map((result) => ({
+            text: documents[result.index],
+            score: result.score,
+          }))
       );
-      return this.getDefaultRanking(documents, topK);
+    } catch (error) {
+      return this.fallback(run, 'error', formatErrorForLog(error));
     }
   }
 }
 
 export class InfinityReranker extends BaseReranker {
+  protected readonly provider = 'infinity';
+
   constructor(logger?: t.Logger) {
     super(logger);
     // No API key needed for the placeholder implementation
@@ -478,13 +526,14 @@ export class InfinityReranker extends BaseReranker {
   async rerank(
     query: string,
     documents: string[],
-    topK: number = 5
+    topK: number = 5,
+    metrics?: t.SearchMetrics
   ): Promise<t.Highlight[]> {
-    this.logger.debug(
-      `Reranking ${documents.length} chunks with Infinity (placeholder)`
-    );
     // This would be replaced with actual Infinity reranker implementation
-    return this.getDefaultRanking(documents, topK);
+    return this.fallback(
+      this.beginRerank(documents, topK, metrics),
+      'placeholder'
+    );
   }
 }
 
