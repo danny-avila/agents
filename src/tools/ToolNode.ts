@@ -71,6 +71,8 @@ import {
 } from '@/tools/intentArg';
 import {
   buildToolExecutionRequestPlan,
+  coerceArgsForSchema,
+  coerceRecordArgs,
   resolveRuntimeSessionHint,
   recordArgsEqual,
 } from '@/tools/eagerEventExecution';
@@ -1126,6 +1128,26 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.toolRegistry?.values()
       ),
       (toolDef) => isToolDefinitionActive(toolDef, discoveredToolNames)
+    );
+  }
+
+  private getToolParameterSchema(
+    toolName: string
+  ): t.JsonSchemaType | undefined {
+    return (
+      this.toolDefinitions?.get(toolName)?.parameters ??
+      this.toolRegistry?.get(toolName)?.parameters
+    );
+  }
+
+  private coerceEventToolArgs(
+    toolName: string,
+    args: unknown
+  ): Record<string, unknown> {
+    const recordArgs = coerceRecordArgs(args);
+    return coerceArgsForSchema(
+      recordArgs ?? (args as Record<string, unknown>),
+      this.getToolParameterSchema(toolName)
     );
   }
 
@@ -2758,7 +2780,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return {
         call,
         stepId: this.toolCallStepIds?.get(call.id!) ?? '',
-        args: resolvedArgs,
+        args: this.coerceEventToolArgs(call.name, resolvedArgs),
         batchIndex: batchIndices?.[i],
       };
     });
@@ -3002,7 +3024,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               entry.call.name
             ),
           });
-          entry.args = resolved as Record<string, unknown>;
+          entry.args = this.coerceEventToolArgs(
+            entry.call.name,
+            resolved as Record<string, unknown>
+          );
           if (entry.call.id != null) {
             if (unresolved.length > 0) {
               unresolvedByCallId.set(entry.call.id, unresolved);
@@ -3012,7 +3037,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           }
           return;
         }
-        entry.args = nextArgs;
+        entry.args = this.coerceEventToolArgs(entry.call.name, nextArgs);
       };
 
       const askEntries: Array<{
@@ -3369,6 +3394,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }),
         usageCount: this.toolUsageCount,
         invalidArgsBehavior: 'error-result',
+        getToolSchema: (toolName) => this.getToolParameterSchema(toolName),
         recordTurn: (toolName, reservedTurn, callId) => {
           this.recordEventToolPlanningTurn(
             toolName,

@@ -7,16 +7,89 @@ import {
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
   buildSummaryCarrierText,
 } from '@/summarization/shared';
+import {
+  applySummarizationHistoryCache,
+  resolveBedrockCompactionCacheModel,
+  createSummarizeNode,
+} from '@/summarization/node';
+import { setFreshProviderMessageProvenance } from '@/messages/provenance';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
 import { Constants, GraphEvents, Providers } from '@/common';
-import { createSummarizeNode } from '@/summarization/node';
 import { registerProvider } from '@/llm/providerRegistry';
 import { AgentContext } from '@/agents/AgentContext';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
 import { FakeChatModel } from '@/llm/fake';
+
+describe('applySummarizationHistoryCache', () => {
+  it('marks Anthropic history before the compaction instruction', () => {
+    const cached = applySummarizationHistoryCache({
+      messages: [new HumanMessage('history')],
+      provider: Providers.ANTHROPIC,
+      enabled: true,
+    });
+
+    expect(cached[0].content).toEqual([
+      {
+        type: 'text',
+        text: 'history',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ]);
+  });
+
+  it('marks Bedrock history before the compaction instruction', () => {
+    const cached = applySummarizationHistoryCache({
+      messages: [new HumanMessage('history')],
+      provider: Providers.BEDROCK,
+      enabled: true,
+      bedrockModelId: 'anthropic.claude-sonnet',
+    });
+
+    expect(cached[0].content).toEqual([
+      { type: 'text', text: 'history' },
+      { cachePoint: { type: 'default', ttl: '1h' } },
+    ]);
+  });
+
+  it('uses five minutes for an explicit non-Claude Bedrock model', () => {
+    const cached = applySummarizationHistoryCache({
+      messages: [new HumanMessage('history')],
+      provider: Providers.BEDROCK,
+      enabled: true,
+      bedrockModelId: 'amazon.nova-pro-v1:0',
+    });
+
+    expect(cached[0].content).toEqual([
+      { type: 'text', text: 'history' },
+      { cachePoint: { type: 'default' } },
+    ]);
+  });
+
+  it('keeps the configured model family for an opaque Bedrock profile', () => {
+    expect(
+      resolveBedrockCompactionCacheModel({
+        applicationInferenceProfile:
+          'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opaque',
+        model: 'anthropic.claude-sonnet',
+      })
+    ).toBe('anthropic.claude-sonnet');
+  });
+
+  it('does not add provider-specific markers to a fallback provider', () => {
+    const messages = [new HumanMessage('history')];
+
+    expect(
+      applySummarizationHistoryCache({
+        messages,
+        provider: Providers.OPENAI,
+        enabled: true,
+      })
+    ).toBe(messages);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -40,6 +113,7 @@ function createAgentContext(
     instructions = 'Test agent',
     summarizationEnabled = true,
     summarizationConfig,
+    compactionSemanticIndex,
     maxContextTokens,
     tools,
     ...extra
@@ -56,6 +130,7 @@ function createAgentContext(
     instructions: instructions as string,
     summarizationEnabled: summarizationEnabled as boolean,
     summarizationConfig: effectiveSummarizationConfig,
+    ...(compactionSemanticIndex != null ? { compactionSemanticIndex } : {}),
     ...(maxContextTokens != null ? { maxContextTokens } : {}),
     ...(tools != null ? { tools } : {}),
   } as import('@/types').AgentInputs);
@@ -164,6 +239,138 @@ beforeEach(() => {
 });
 
 describe('createSummarizeNode', () => {
+  it('binds the live graph tool projection for cache-aligned compaction', async () => {
+    captureEvents();
+
+    const projectedTools = [{ name: 'projected-tool' }] as t.GraphTools;
+    const bindTools = jest
+      .fn()
+      .mockReturnValue(mockInvokeModel('Cache-aligned summary'));
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        bindTools = bindTools;
+      } as never
+    );
+
+    const agentContext = createAgentContext({
+      provider: Providers.ANTHROPIC,
+      clientOptions: { promptCache: true },
+    });
+    const graph = {
+      ...mockGraph(),
+      getToolsForBinding: jest.fn(() => projectedTools),
+    };
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(graph.getToolsForBinding).toHaveBeenCalledWith(
+      Providers.ANTHROPIC,
+      expect.objectContaining({ promptCache: true })
+    );
+    expect(bindTools).toHaveBeenCalledWith(projectedTools);
+  });
+
+  it('keeps cached raw history identical when semantic guidance is appended', async () => {
+    const events = captureEvents();
+    const calls: BaseMessage[][] = [];
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        invoke(messages: BaseMessage[]): Promise<{ content: string }> {
+          calls.push(messages);
+          return Promise.resolve({ content: 'summary' });
+        }
+      } as never
+    );
+    const rawHistory = [
+      new HumanMessage({ id: 'message-1', content: 'Inspect the runtime' }),
+      new AIMessage({ id: 'message-2', content: 'I inspected it' }),
+    ];
+    setFreshProviderMessageProvenance(rawHistory[0], [
+      {
+        attribution: 'user',
+        sourceMessageId: 'message-1',
+        sourceContentPartIndices: [0],
+      },
+    ]);
+    setFreshProviderMessageProvenance(rawHistory[1], [
+      {
+        attribution: 'model',
+        sourceMessageId: 'message-2',
+        sourceContentPartIndices: [0],
+      },
+    ]);
+    const run = async (
+      compactionSemanticIndex?: t.CompactionSemanticIndex
+    ): Promise<void> => {
+      const node = createSummarizeNode({
+        agentContext: createAgentContext({
+          provider: Providers.ANTHROPIC,
+          clientOptions: { promptCache: true },
+          compactionSemanticIndex,
+        }),
+        graph: mockGraph(),
+        generateStepId,
+      });
+      await node(
+        {
+          messages: rawHistory,
+          summarizationRequest: {
+            remainingContextTokens: 1_000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+    };
+
+    await run();
+    await run([
+      {
+        type: 'activity_phase',
+        sourceMessageId: 'message-1',
+        sourceContentIndex: 0,
+        revision: 1,
+        status: 'committed',
+        text: 'Mapped the runtime seam',
+      },
+    ]);
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0].slice(0, -1).map((message) => message.toJSON())).toEqual(
+      calls[1].slice(0, -1).map((message) => message.toJSON())
+    );
+    expect(String(calls[0].at(-1)?.content)).not.toContain(
+      '<compaction-semantic-index>'
+    );
+    expect(String(calls[1].at(-1)?.content)).toContain(
+      '<compaction-semantic-index>'
+    );
+    expect(String(calls[1].at(-1)?.content)).toContain(
+      DEFAULT_SUMMARIZATION_PROMPT
+    );
+    const starts = events.filter(
+      (event) => event.event === GraphEvents.ON_SUMMARIZE_START
+    );
+    expect(starts.at(-1)?.data).toMatchObject({
+      semanticIndexEntryCount: 1,
+      semanticIndexCharCount: expect.any(Number),
+    });
+  });
+
   it('emits ON_SUMMARIZE_START and ON_SUMMARIZE_COMPLETE on success', async () => {
     const events = captureEvents();
 
@@ -1852,6 +2059,200 @@ describe('createSummarizeNode — overflow recovery', () => {
     );
 
     expect(agentContext.hasSummary()).toBe(true);
+  });
+});
+
+describe('createSummarizeNode — empty summarizer output', () => {
+  /** Model whose response carries no text — the shape a reasoning-only
+   *  completion produces once `extractResponseText` drops thinking blocks. */
+  function mockReasoningOnlyModel(): { invoke: jest.Mock } {
+    return {
+      invoke: jest.fn().mockResolvedValue({
+        content: [{ type: 'thinking', thinking: 'deliberating' }],
+      }),
+    };
+  }
+
+  it('leaves the dedupe guard on the current message count', async () => {
+    const events = captureEvents();
+
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockReasoningOnlyModel();
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    const messages = [
+      new HumanMessage('older question'),
+      new AIMessage('older answer'),
+      new HumanMessage('latest question'),
+    ];
+
+    const result = await node(
+      {
+        messages,
+        summarizationRequest: { remainingContextTokens: 0, agentId: 'agent_0' },
+      },
+      {} as RunnableConfig
+    );
+
+    /** State is untouched: nothing was compacted, so nothing is removed. */
+    expect(result.messages).toBeUndefined();
+    expect(agentContext.hasSummary()).toBe(false);
+    /**
+     * The regression: the node used to mark `0` here, which made
+     * `shouldSkipSummarization` answer `false` for every later count. The
+     * agent node then re-triggered on this same unchanged state, and the run
+     * looped through empty summary steps until the graph's recursion cap.
+     */
+    expect(agentContext.shouldSkipSummarization(messages.length)).toBe(true);
+    expect(agentContext.summarizationFailures).toBe(1);
+
+    const completeEvent = events.find(
+      (e) => e.event === GraphEvents.ON_SUMMARIZE_COMPLETE
+    );
+    expect((completeEvent?.data as t.SummarizeCompleteEvent).error).toBe(
+      'Summarization produced empty output'
+    );
+    expect(
+      (completeEvent?.data as t.SummarizeCompleteEvent).summary
+    ).toBeUndefined();
+  });
+
+  it('stops spending model calls once consecutive empty attempts hit the cap', async () => {
+    captureEvents();
+
+    const invoke = jest.fn().mockResolvedValue({ content: '' });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    /** Growing history: each attempt clears the message-count guard on its
+     *  own, so only the failure tally can stop the retries. */
+    const messages: BaseMessage[] = [];
+    for (let attempt = 0; attempt < 6; attempt++) {
+      messages.push(new HumanMessage(`question ${attempt}`));
+      messages.push(new AIMessage(`answer ${attempt}`));
+      await node(
+        {
+          messages: [...messages],
+          summarizationRequest: {
+            remainingContextTokens: 0,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+    }
+
+    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(agentContext.summarizationExhausted).toBe(true);
+  });
+
+  it('clears the failure tally once a summary succeeds', async () => {
+    captureEvents();
+
+    let call = 0;
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          call++;
+          return mockInvokeModel(call === 1 ? '' : 'A real checkpoint');
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    const first = [new HumanMessage('q1'), new AIMessage('a1')];
+    await node(
+      {
+        messages: first,
+        summarizationRequest: { remainingContextTokens: 0, agentId: 'agent_0' },
+      },
+      {} as RunnableConfig
+    );
+    expect(agentContext.summarizationFailures).toBe(1);
+
+    await node(
+      {
+        messages: [...first, new HumanMessage('q2'), new AIMessage('a2')],
+        summarizationRequest: { remainingContextTokens: 0, agentId: 'agent_0' },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(agentContext.summarizationFailures).toBe(0);
+    expect(agentContext.summarizationExhausted).toBe(false);
+    expect(agentContext.getSummaryText()).toContain('A real checkpoint');
+  });
+
+  it('counts a preserved-history stub failure toward the cap', async () => {
+    captureEvents();
+
+    const invoke = jest.fn().mockRejectedValue(new Error('provider down'));
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    /** Escalated overflow recovery: the stub is refused so history survives,
+     *  which means the attempt made no progress either. */
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    const messages: BaseMessage[] = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      messages.push(new HumanMessage(`question ${attempt}`));
+      messages.push(new AIMessage(`answer ${attempt}`));
+      await node(
+        {
+          messages: [...messages],
+          summarizationRequest: {
+            remainingContextTokens: 0,
+            agentId: 'agent_0',
+            reason: 'overflow',
+            allowSummarization: true,
+          },
+        },
+        {} as RunnableConfig
+      );
+    }
+
+    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(agentContext.hasSummary()).toBe(false);
   });
 });
 

@@ -1,6 +1,7 @@
 import { AIMessage, ToolMessage, HumanMessage } from '@langchain/core/messages';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { RenderedCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import type { StreamLimitState } from '@/llm/streamLimits';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { EncodingName } from '@/utils/tokens';
@@ -14,6 +15,13 @@ import {
   separateSummarizationParameters,
   buildSummarizationInstruction,
 } from './shared';
+import {
+  addTailCacheControl,
+  addBedrockTailCacheControl,
+  resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
+  type PromptCacheTtl,
+} from '@/messages/cache';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
@@ -31,11 +39,6 @@ import {
   splitAtRecencyBoundary,
 } from '@/messages/recency';
 import {
-  addTailCacheControl,
-  resolvePromptCacheTtl,
-  type PromptCacheTtl,
-} from '@/messages/cache';
-import {
   createTokenCounter,
   encodingForModel,
   encodingOfTokenCounter,
@@ -51,9 +54,12 @@ import {
   getMaxOutputTokensKey,
   resolveClientOptionsModel,
 } from '@/llm/request';
+import { renderCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
+import { makeIsDeferred } from '@/messages/anthropicToolCache';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getProviderFamily } from '@/llm/providerRegistry';
 import { initializeModel } from '@/llm/init';
@@ -629,9 +635,16 @@ async function executeSummarizationWithFallback(params: {
   summarizeConfig?: RunnableConfig;
   stepId: string;
   usePromptCache: boolean;
+  semanticIndex: RenderedCompactionSemanticIndex;
   log: LogFn;
   /** Carries the run's stream limits so the event cap covers summary streams. */
-  graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
+  graph?: StreamLimitState & {
+    getBreakerSignal?: () => AbortSignal;
+    getToolsForBinding?: (
+      provider: t.ProviderName,
+      clientOptions: t.ClientOptions | undefined
+    ) => t.GraphTools | undefined;
+  };
 }): Promise<{
   text: string;
   usage?: Partial<UsageMetadata>;
@@ -649,6 +662,7 @@ async function executeSummarizationWithFallback(params: {
     summarizeConfig,
     stepId,
     usePromptCache,
+    semanticIndex,
     log,
     graph,
   } = params;
@@ -665,10 +679,24 @@ async function executeSummarizationWithFallback(params: {
      * (e.g. an unrecognized summarization.provider) surfaces through the
      * `log('error', ...)` path below rather than bubbling up silently.
      */
+    const summarizationTools = usePromptCache
+      ? (graph?.getToolsForBinding?.(
+          clientConfig.provider as t.ProviderName,
+          clientConfig.clientOptions as t.ClientOptions
+      ) ??
+        prepareToolsForPromptCache({
+          provider: clientConfig.provider as t.ProviderName,
+          clientOptions: clientConfig.clientOptions as t.ClientOptions,
+          tools: agentContext.getToolsForBinding(),
+          isDeferred: makeIsDeferred(
+            agentContext.getEffectiveToolDefinitions()
+          ),
+        }))
+      : agentContext.getToolsForBinding();
     const summarizationModel = initializeModel({
       provider: clientConfig.provider,
       clientOptions: clientConfig.clientOptions as t.ClientOptions,
-      tools: agentContext.getToolsForBinding(),
+      tools: summarizationTools,
     }) as t.ChatModel;
 
     const result = await summarizeWithCacheHit({
@@ -677,6 +705,7 @@ async function executeSummarizationWithFallback(params: {
       promptText: clientConfig.promptText,
       updatePromptText: clientConfig.updatePromptText,
       priorSummaryText,
+      semanticIndexAppendix: semanticIndex.appendix,
       config: summarizeConfig,
       stepId,
       provider: clientConfig.provider,
@@ -685,13 +714,23 @@ async function executeSummarizationWithFallback(params: {
       usePromptCache,
       promptCacheTtl:
         clientConfig.provider === Providers.ANTHROPIC ||
-        clientConfig.provider === Providers.OPENROUTER
-          ? resolvePromptCacheTtl(
-            (
-                clientConfig.clientOptions as {
-                  promptCacheTtl?: PromptCacheTtl;
-                }
-            ).promptCacheTtl
+        clientConfig.provider === Providers.OPENROUTER ||
+        clientConfig.provider === Providers.BEDROCK
+          ? (
+              clientConfig.clientOptions as {
+                promptCacheTtl?: PromptCacheTtl;
+              }
+          ).promptCacheTtl
+          : undefined,
+      bedrockModelId:
+        clientConfig.provider === Providers.BEDROCK
+          ? resolveBedrockCompactionCacheModel(
+              clientConfig.clientOptions as
+                | {
+                    applicationInferenceProfile?: string;
+                    model?: string;
+                  }
+                | undefined
           )
           : undefined,
       log,
@@ -759,7 +798,8 @@ async function executeSummarizationWithFallback(params: {
               buildSummarizationInstruction(
                 clientConfig.promptText,
                 clientConfig.updatePromptText,
-                priorSummaryText
+                priorSummaryText,
+                semanticIndex.appendix
               )
             ),
           ],
@@ -908,6 +948,10 @@ interface CreateSummarizeNodeParams {
     runId?: string;
     isMultiAgent: boolean;
     hookRegistry?: HookRegistry;
+    getToolsForBinding?: (
+      provider: t.ProviderName,
+      clientOptions: t.ClientOptions | undefined
+    ) => t.GraphTools | undefined;
     dispatchRunStep: (
       runStep: t.RunStep,
       config?: RunnableConfig
@@ -1062,6 +1106,29 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
+    /**
+     * A summarizer that has already returned nothing several times in a row
+     * keeps returning nothing, and every empty result leaves the message set
+     * exactly as it was — so the next prune cycle re-triggers on identical
+     * state. Stopping here bounds that loop instead of letting the run spend
+     * its recursion budget dispatching empty summary steps.
+     */
+    if (agentContext.summarizationExhausted) {
+      emitAgentLog(
+        config,
+        'warn',
+        'summarize',
+        'Summarization skipped — consecutive attempts produced no usable summary',
+        {
+          failures: agentContext.summarizationFailures,
+          reason: request.reason ?? 'trigger',
+        },
+        { runId: graph.runId, agentId: request.agentId }
+      );
+      agentContext.markSummarizationTriggered(state.messages.length);
+      return { summarizationRequest: undefined };
+    }
+
     const maxCtx = agentContext.maxContextTokens ?? 0;
     if (maxCtx > 0 && agentContext.instructionTokens >= maxCtx) {
       emitAgentLog(
@@ -1158,6 +1225,10 @@ export function createSummarizeNode({
       agentContext,
       agentContext.summarizationConfig
     );
+    const semanticIndex = renderCompactionSemanticIndex(
+      agentContext.compactionSemanticIndex,
+      messagesToRefine
+    );
 
     const stepKey = `summarize-${request.agentId}`;
     const [stepId, stepIndex] = generateStepId(stepKey);
@@ -1199,6 +1270,8 @@ export function createSummarizeNode({
           model: clientConfig.modelName,
           messagesToRefineCount: messagesToRefine.length,
           summaryVersion: agentContext.summaryVersion + 1,
+          semanticIndexEntryCount: semanticIndex.entryCount,
+          semanticIndexCharCount: semanticIndex.charCount,
         } satisfies t.SummarizeStartEvent,
         runnableConfig
       );
@@ -1229,7 +1302,7 @@ export function createSummarizeNode({
       clientConfig.provider === (agentContext.provider as string);
     const hasPromptCache =
       isSelfSummarizeModel &&
-      (agentContext.clientOptions as Record<string, unknown> | undefined)
+      (clientConfig.clientOptions as Record<string, unknown> | undefined)
         ?.promptCache === true;
 
     const log: LogFn = (level, message, data) => {
@@ -1246,6 +1319,9 @@ export function createSummarizeNode({
       isSelfSummarize: isSelfSummarizeModel,
       hasPromptCache,
       provider: clientConfig.provider,
+      semanticIndexEntryCount: semanticIndex.entryCount,
+      semanticIndexCharCount: semanticIndex.charCount,
+      semanticIndexOmittedEntryCount: semanticIndex.omittedEntryCount,
     });
 
     const summarizeConfig: RunnableConfig | undefined = config
@@ -1261,6 +1337,10 @@ export function createSummarizeNode({
           agentId: request.agentId,
           summarization_provider: clientConfig.provider,
           summarization_model: clientConfig.modelName,
+          compaction_semantic_index_entries: semanticIndex.entryCount,
+          compaction_semantic_index_chars: semanticIndex.charCount,
+          compaction_semantic_index_omitted_entries:
+            semanticIndex.omittedEntryCount,
           /**
              * Per-call model attribution for usage consumers (the subagent
              * usage-capture handler): the summarizer's model can differ from
@@ -1310,6 +1390,7 @@ export function createSummarizeNode({
       summarizeConfig,
       stepId,
       usePromptCache: isSelfSummarizeModel && hasPromptCache,
+      semanticIndex,
       log,
       graph,
     });
@@ -1335,6 +1416,7 @@ export function createSummarizeNode({
         `Summarization failed during ${preservationReason}; keeping history rather than replacing it with a metadata stub`
       );
       agentContext.markSummarizationTriggered(state.messages.length);
+      agentContext.recordSummarizationFailure();
       /**
        * The run step was already dispatched, so it has to be resolved here or
        * consumers tracking step lifecycle keep an unfinished placeholder for
@@ -1363,7 +1445,22 @@ export function createSummarizeNode({
     }
 
     if (!rawText) {
-      agentContext.markSummarizationTriggered(0);
+      /**
+       * An empty summary compacts nothing, so the state the pruner sees next
+       * is byte-identical to the one that just triggered. Resetting the guard
+       * to `0` here made `shouldSkipSummarization` answer `false` forever,
+       * and the agent node re-triggered on that unchanged state until the
+       * graph hit its recursion cap — a loop of empty summary steps, each one
+       * a billed model call. Recording the current count keeps the guard
+       * honest; the failure tally bounds the retries once new messages do
+       * arrive and legitimately lift it.
+       */
+      agentContext.markSummarizationTriggered(state.messages.length);
+      agentContext.recordSummarizationFailure();
+      log('warn', 'Summarization produced empty output', {
+        failures: agentContext.summarizationFailures,
+        messagesToRefineCount: messagesToRefine.length,
+      });
       if (runnableConfig) {
         await safeDispatchCustomEvent(
           GraphEvents.ON_SUMMARIZE_COMPLETE,
@@ -1605,6 +1702,40 @@ function traceConfig(
   };
 }
 
+export function applySummarizationHistoryCache(params: {
+  messages: BaseMessage[];
+  provider: t.ProviderName;
+  enabled: boolean;
+  promptCacheTtl?: PromptCacheTtl;
+  bedrockModelId?: string;
+}): BaseMessage[] {
+  if (!params.enabled) {
+    return params.messages;
+  }
+  if (params.provider === Providers.BEDROCK) {
+    return addBedrockTailCacheControl(
+      [...params.messages],
+      resolveBedrockPromptCacheTtl(params.promptCacheTtl, params.bedrockModelId)
+    );
+  }
+  if (
+    params.provider !== Providers.ANTHROPIC &&
+    params.provider !== Providers.OPENROUTER
+  ) {
+    return params.messages;
+  }
+  return addTailCacheControl(
+    [...params.messages],
+    resolvePromptCacheTtl(params.promptCacheTtl)
+  );
+}
+
+export function resolveBedrockCompactionCacheModel(
+  options: { applicationInferenceProfile?: string; model?: string } | undefined
+): string | undefined {
+  return options?.model;
+}
+
 /**
  * Cache-friendly compaction: sends raw conversation messages with the
  * summarization instruction appended as the final HumanMessage. Bound tool
@@ -1618,6 +1749,7 @@ async function summarizeWithCacheHit({
   promptText,
   updatePromptText,
   priorSummaryText,
+  semanticIndexAppendix,
   config,
   stepId,
   provider,
@@ -1625,6 +1757,7 @@ async function summarizeWithCacheHit({
   graph,
   usePromptCache,
   promptCacheTtl,
+  bedrockModelId,
   log,
 }: {
   model: t.ChatModel;
@@ -1632,6 +1765,7 @@ async function summarizeWithCacheHit({
   promptText: string;
   updatePromptText?: string;
   priorSummaryText: string;
+  semanticIndexAppendix?: string;
   config?: RunnableConfig;
   stepId?: string;
   provider: t.ProviderName;
@@ -1639,19 +1773,24 @@ async function summarizeWithCacheHit({
   graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
   usePromptCache?: boolean;
   promptCacheTtl?: PromptCacheTtl;
+  bedrockModelId?: string;
   log?: LogFn;
 }): Promise<{ text: string; usage?: Partial<UsageMetadata> }> {
   const instruction = buildSummarizationInstruction(
     promptText,
     updatePromptText,
-    priorSummaryText
+    priorSummaryText,
+    semanticIndexAppendix
   );
 
-  const fullMessages = [...messages, new HumanMessage(instruction)];
-  const invokeMessages =
-    usePromptCache === true
-      ? addTailCacheControl(fullMessages, promptCacheTtl)
-      : fullMessages;
+  const cachedHistory = applySummarizationHistoryCache({
+    messages,
+    provider,
+    enabled: usePromptCache === true,
+    promptCacheTtl,
+    bedrockModelId,
+  });
+  const invokeMessages = [...cachedHistory, new HumanMessage(instruction)];
 
   const result = await attemptInvoke(
     {

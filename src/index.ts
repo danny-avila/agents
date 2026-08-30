@@ -43,6 +43,9 @@ export * from './hooks';
 /* Programmatic sessions */
 export * from './session';
 
+/* Event actors */
+export * from './eventActor';
+
 /* HITL helpers */
 export * from './hitl';
 

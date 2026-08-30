@@ -42,6 +42,88 @@ A **Resume Projection** is the durable manifest view produced from an
 Execution Record. A projection is scoped to one exact fork and resume attempt;
 an unscoped projection fails closed when a parent tool-call ID is ambiguous.
 
+## Event Actors
+
+An **Event Actor** is one stable logical child thread that handles a sequence
+of authoritative host events without retaining a live executor between them.
+
+An **Event Actor Head** is the current committed checkpoint identity and its
+monotonic generation. Each invocation runs on an **Invocation Fork** owned by
+that invocation. Once committed state exists, every fork stays on the same
+logical checkpoint thread and changes only its invocation namespace. The host
+advances the Event Actor Head only through an atomic comparison against both
+the generation and prior checkpoint identity.
+
+An **Event Actor Event** is immutable JSON data snapshotted at every public and
+host-adapter boundary; signed zero normalizes to JSON's zero representation.
+Checkpoint snapshots retain only the declared identity fields. Cold
+reconstruction receives the explicit task-owned cancellation signal and owns
+rollback until it returns a validated invocation.
+Prepared invocations and unavailable request/head pairs carry canonical,
+time-bounded, executor-authenticated integrity bindings so independently valid
+lifecycle evidence cannot be forged, recombined, or replayed after expiry.
+Cold continuation consumes its unavailable handoff before adapter work. Hosts
+that persist those handoffs across executor lifetimes provide the same private
+preparation signing key to every authorized executor.
+Public invocation produces an executor-issued **Applied Settlement** that binds
+immutable result and terminal checkpoint evidence to the exact invocation
+reference that ran. A **Suspended Event Actor Invocation** is authenticated,
+versioned, JSON-safe evidence that the same logical invocation remains
+nonterminal at one exact paused checkpoint and interrupt. It contains no graph,
+configuration, signal, closure, or process-local handle. **Suspension
+Authority** is the combination of that integrity evidence and the host's
+durable current-state fence: the signature prevents forgery and recombination,
+while the host fence prevents replay and proves one-shot ownership.
+
+A **Resume Attempt** is one host-claimed decision identified by a unique attempt
+ID. The host must claim it before applying the decision and must reject every
+competing, duplicate, stale, expired, or foreign claim. When resumed execution
+pauses again, **Re-pause Replacement** atomically publishes a new suspension
+with a new identity and monotonic attempt while consuming the claimed old
+suspension. Neither suspension is current if that comparison-and-swap cannot
+be proven. A resumed applied result carries signed settlement authority; the
+host consumes its suspension fence atomically with the actor-head comparison,
+so settlement may move to another authorized executor without process-local
+object identity. Cancellation similarly claims, discards, and closes the
+current suspension as one host operation. Expiry removes signature authority
+to resume but never proves an external action outcome; cleanup of expired
+evidence still requires a host-proven current-state transition.
+
+Suspension and resumed-settlement versions are fail-closed compatibility
+boundaries. During a rolling deployment, the host must capability-route durable
+records only to executors that support their exact version; a terminal-only old
+executor must never consume a new suspended job. Unknown versions are rejected
+before host mutation. Every executor that may handle the same current evidence
+uses the same signing key. Key rotation therefore requires draining, cancelling,
+or explicitly migrating all current signed evidence before the old key is
+removed; silently replacing the key strands valid paused work by design.
+
+Invocation start phase-fences the prepared capability so it cannot subsequently
+authorize discard of active or applied work. Commit consumes local settlement
+identity or authenticated resumed settlement authority and returns structured
+indeterminate evidence for missing or invalid acknowledgements rather than
+exposing a retryable-looking exception. A host mailbox remains the durable
+cross-runtime owner and deduplication fence. Public invocation reclaims
+definitely-no-action forks before returning or rethrowing, while ambiguous and
+applied outcomes stay retained. The executor opportunistically prunes local
+terminal phase fences after the dormant-checkpoint TTL without scheduling
+timers that retain short-lived executors. A fence never expires before its
+signed authority, so pruning cannot re-enable a stale capability; the mailbox
+prevents stale cross-runtime replay after expiry.
+
+Applied work may commit its Invocation Fork. Failed, cancelled, and
+completed-without-action invocations discard their forks. An applied fork that
+loses the head comparison remains available for reconciliation. A missing or
+incompatible warm checkpoint uses **Cold Continuation**: the host rebuilds an
+Invocation Fork from bounded transcript and summary state while preserving the
+same logical Event Actor identity. An indeterminate applied settlement,
+including malformed action checkpoint evidence or an ambiguous commit
+acknowledgement, is retained for reconciliation because deleting its fork
+could erase the only durable evidence of an external action.
+Hosts may translate a durable LangGraph pause into the structured suspension
+result. Untranslated LangGraph interrupts and parent commands retain the fork
+and propagate as control flow for compatibility and routing.
+
 ## Tool Caller Capabilities
 
 A **Caller Capability Projection** is the effective classification of tool
@@ -96,8 +178,27 @@ older closed tool-call/result unit while retaining a token-priced recent tail.
 Open and parallel tool units are indivisible, and a lone user payload is never
 eligible for the intra-turn fallback.
 
+A **Cache-Aligned Compaction Request** reuses the normal provider request's
+cacheable tool prefix and anchors retained history before the one-off
+summarization instruction. Provider-specific cache markers and TTL resolution
+come from shared request-preparation functions; cache-read usage is the source
+of truth for whether reuse occurred. Compaction never predicts cache identity
+from a hand-maintained list of provider options or environment variables.
+
+A **Compaction Semantic Index** is optional navigation guidance derived during
+Model Context Reconstruction's existing persisted-content analysis. Its
+committed, user-visible entries are source-addressed, revisioned,
+redaction-aware, deterministically ordered, and strictly bounded. The host
+owns enablement and identifies which tool `intent` fields are semantic labels.
+The index is appended only after cacheable raw history; it never replaces raw
+messages or makes generated labels authoritative.
+
 See [ADR 0005](docs/adr/0005-pairing-balanced-compaction-ranges.md) for the
 range-selection and retention trade-offs.
+See [ADR 0007](docs/adr/0007-guide-compaction-with-a-bounded-semantic-index.md)
+for the index trust, ordering, and latency boundaries.
+See [ADR 0006](docs/adr/0006-align-compaction-with-provider-cache-prefixes.md)
+for the prompt-cache boundary and rejected predictive replay design.
 
 ## Provider Tool Derivation
 

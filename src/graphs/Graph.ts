@@ -59,14 +59,12 @@ import {
   addTailCacheControl,
   resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
-  supportsBedrockToolCache,
   isSyntheticProviderContextMessage,
   compactSyntheticProviderContextMessage,
   getMessageId,
   getMessageCreationContentMetadata,
   splitAssistantTextContentByPhase,
   makeIsDeferred,
-  partitionAndMarkAnthropicToolCache,
   DEFAULT_RETAIN_RECENT_TURNS,
   resolveIntraTurnRetainTokens,
   splitAtRecencyBoundary,
@@ -149,17 +147,16 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
-import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
-import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { createContextPressureMeter } from '@/llm/contextPressureMeter';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
+import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { initializeLangfuseTracing } from '@/instrumentation';
@@ -167,6 +164,7 @@ import { shouldTriggerSummarization } from '@/summarization';
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
+import { getTruncationStopReason } from '@/llm/truncation';
 import { messagesStateReducer } from '@/messages/reducer';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
@@ -1429,6 +1427,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   preemptIncomplete = false;
   /**
+   * True when `routeMessage` sent a turn to `END` because the last AI
+   * message carries no tool call, AND the provider reports it stopped for
+   * hitting the output token ceiling (`getTruncationStopReason`). Plain-text
+   * and reasoning turns cut off this way carry no tool call for
+   * `assertNotTruncatedToolCall` to catch, so `toolsCondition` reads them as
+   * an ordinary finished turn otherwise — hosts read this flag to persist
+   * the turn as unfinished instead of a silently truncated "complete" answer.
+   *
+   * Deliberately separate from `preemptIncomplete`/`preemptHaltReason`: this
+   * has no interaction with the preempt/seal machinery (in particular the
+   * `preemptHaltReason` check at each model node's entry), so setting it
+   * cannot suppress an unrelated agent's turn in a multi-agent graph.
+   */
+  outputTruncatedIncomplete = false;
+  /**
    * `stopReason` from a `PreemptBoundary` hook that halted the turn.
    *
    * Clearing the registry halt is what keeps the sealed turn alive, but the
@@ -1705,6 +1718,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.preemptEmptyBoundaries = 0;
     this.preemptIncomplete = false;
     this.preemptHaltReason = undefined;
+    this.outputTruncatedIncomplete = false;
   }
 
   /**
@@ -2789,6 +2803,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     };
   }
 
+  private getPreparedToolsForBinding(
+    agentContext: AgentContext,
+    provider: t.ProviderName = agentContext.provider,
+    clientOptions: t.ClientOptions | undefined = agentContext.clientOptions
+  ): t.GraphTools | undefined {
+    const tools = resolveLocalToolsForBinding({
+      tools: agentContext.getToolsForBinding(),
+      toolExecution: this.toolExecution,
+      toolRegistry: agentContext.toolRegistry,
+      discoveredToolNames: new Set(agentContext.getDiscoveredTools()),
+    });
+    return prepareToolsForPromptCache({
+      provider,
+      clientOptions,
+      tools,
+      isDeferred: makeIsDeferred(agentContext.getEffectiveToolDefinitions()),
+    });
+  }
+
   createCallModel(agentId = 'default') {
     return async (
       state: t.AgentSubgraphState,
@@ -2846,13 +2879,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.markToolsAsDiscovered(discoveredNames);
       }
 
-      const rawToolsForBinding = resolveLocalToolsForBinding({
-        tools: agentContext.getToolsForBinding(),
-        toolExecution: this.toolExecution,
-        toolRegistry: agentContext.toolRegistry,
-        discoveredToolNames: new Set(agentContext.getDiscoveredTools()),
-      });
-
       /**
        * Anthropic prompt-cache breakpoint on the tool definitions.
        *
@@ -2866,69 +2892,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * Discovered deferred tools that arrive across turns sit *after*
        * the breakpoint and don't invalidate the prefix.
        */
-      let toolsForBinding = rawToolsForBinding;
-      const isDeferredTool = makeIsDeferred(
-        agentContext.getEffectiveToolDefinitions()
-      );
-      if (
-        agentContext.provider === Providers.ANTHROPIC &&
-        (agentContext.clientOptions as t.AnthropicClientOptions | undefined)
-          ?.promptCache === true
-      ) {
-        toolsForBinding =
-          partitionAndMarkAnthropicToolCache(
-            rawToolsForBinding,
-            isDeferredTool,
-            resolvePromptCacheTtl(
-              (
-                agentContext.clientOptions as
-                  | t.AnthropicClientOptions
-                  | undefined
-              )?.promptCacheTtl
-            )
-          ) ?? rawToolsForBinding;
-      } else if (
-        agentContext.provider === Providers.OPENROUTER &&
-        (
-          agentContext.clientOptions as
-            | t.ProviderOptionsMap[Providers.OPENROUTER]
-            | undefined
-        )?.promptCache === true
-      ) {
-        toolsForBinding =
-          partitionAndMarkOpenRouterToolCache(
-            rawToolsForBinding,
-            isDeferredTool,
-            resolvePromptCacheTtl(
-              (
-                agentContext.clientOptions as
-                  | t.ProviderOptionsMap[Providers.OPENROUTER]
-                  | undefined
-              )?.promptCacheTtl
-            )
-          ) ?? rawToolsForBinding;
-      } else if (
-        agentContext.provider === Providers.BEDROCK &&
-        (
-          agentContext.clientOptions as
-            | t.BedrockAnthropicClientOptions
-            | undefined
-        )?.promptCache === true
-      ) {
-        const bedrockModel = (
-          agentContext.clientOptions as { model?: string } | undefined
-        )?.model;
-        // An omitted model falls back to LangChain's default Claude model (which
-        // supports tool caching); only an explicit non-Claude model (e.g. Nova)
-        // skips tool marking so its stray marker never leaks into toolConfig.
-        if (bedrockModel == null || supportsBedrockToolCache(bedrockModel)) {
-          toolsForBinding =
-            partitionAndMarkBedrockToolCache(
-              rawToolsForBinding,
-              isDeferredTool
-            ) ?? rawToolsForBinding;
-        }
-      }
+      const toolsForBinding = this.getPreparedToolsForBinding(agentContext);
 
       let model =
         this.overrideModel ??
@@ -3081,9 +3045,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           messagesToRefine.length > 0;
 
         if (hasPrunedMessages) {
-          const shouldSkip = agentContext.shouldSkipSummarization(
-            messages.length
-          );
+          const shouldSkip =
+            agentContext.summarizationExhausted ||
+            agentContext.shouldSkipSummarization(messages.length);
           const triggerResult =
             !shouldSkip &&
             shouldTriggerSummarization({
@@ -3140,6 +3104,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 messageCount: messages.length,
                 messagesToRefineCount: messagesToRefine.length,
                 contextLength: context.length,
+                summarizationFailures: agentContext.summarizationFailures,
+                summarizationExhausted: agentContext.summarizationExhausted,
               },
               { runId: this.runId, agentId }
             );
@@ -4869,11 +4835,27 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (state.summarizationRequest != null) {
         return summarizeNode;
       }
-      return toolsCondition(
+      const decision = toolsCondition(
         state as t.BaseGraphState,
         toolNode,
         this.invokedToolIds
       );
+      /**
+       * `toolsCondition` only looks at `tool_calls` — a plain-text/reasoning
+       * turn cut off by the output token ceiling has none, so it reads as an
+       * ordinary finished turn and routes here to END. Flag it so hosts can
+       * tell a genuinely finished answer from one the model never got to
+       * complete. See `outputTruncatedIncomplete` for why this stays clear
+       * of the preempt/seal halt fields.
+       */
+      if (decision === END) {
+        const { messages } = state as t.BaseGraphState;
+        const lastMessage = messages[messages.length - 1];
+        if (getTruncationStopReason(lastMessage) != null) {
+          this.outputTruncatedIncomplete = true;
+        }
+      }
+      return decision;
     };
 
     const StateAnnotation = Annotation.Root({
@@ -4924,6 +4906,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             runId: this.runId,
             isMultiAgent: this.isMultiAgentGraph(),
             hookRegistry: this.hookRegistry,
+            getToolsForBinding: (
+              provider: t.ProviderName,
+              clientOptions: t.ClientOptions | undefined
+            ): t.GraphTools | undefined =>
+              this.getPreparedToolsForBinding(
+                agentContext,
+                provider,
+                clientOptions
+              ),
             /**
              * Live references (both maps are cleared in place, never
              * replaced), so summarization streams share the run's event

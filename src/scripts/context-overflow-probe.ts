@@ -7,8 +7,7 @@
  * guessed phrases.
  *
  * Run:
- *   DOTENV_CONFIG_PATH=/path/to/.env node --loader ./tsconfig-paths-bootstrap.mjs \
- *     --experimental-specifier-resolution=node ./src/scripts/context-overflow-probe.ts
+ *   DOTENV_CONFIG_PATH=/path/to/.env tsx ./src/scripts/context-overflow-probe.ts
  *
  * Flags:
  *   --only <provider[,provider]>  restrict to given providers

@@ -429,6 +429,51 @@ describe('buildChildInputs', () => {
     expect(result.discoveredTools).toBeUndefined();
   });
 
+  it('scrubs a parent compaction index on self-spawn but keeps an explicit child index', () => {
+    const compactionSemanticIndex: NonNullable<
+      AgentInputs['compactionSemanticIndex']
+    > = [
+      {
+        type: 'activity_phase',
+        sourceMessageId: 'message-parent',
+        sourceContentIndex: 2,
+        revision: 1,
+        status: 'committed',
+        text: 'Parent-only activity',
+      },
+    ];
+    const inputsWithIndex: AgentInputs = {
+      ...parentAgentInputs,
+      compactionSemanticIndex,
+    };
+
+    expect(
+      buildChildInputs(
+        {
+          type: 'self',
+          name: 'Self',
+          description: 'd',
+          self: true,
+          agentInputs: { ...inputsWithIndex },
+        },
+        'child-self',
+        3
+      ).compactionSemanticIndex
+    ).toBeUndefined();
+    expect(
+      buildChildInputs(
+        {
+          type: 'researcher',
+          name: 'R',
+          description: 'd',
+          agentInputs: inputsWithIndex,
+        },
+        'child-explicit',
+        3
+      ).compactionSemanticIndex
+    ).toBe(compactionSemanticIndex);
+  });
+
   it('overrides agentId with the passed childAgentId', () => {
     const config: ResolvedSubagentConfig = {
       type: 'researcher',
@@ -780,7 +825,7 @@ describe('SubagentExecutor', () => {
       responses[0].background_task_id,
       (status) => status === 'completed'
     );
-    expect(secondInvocation.signal?.aborted).toBe(false);
+    expect(secondInvocation.signal.aborted).toBe(false);
     expect(
       store.get('owner:conversation', responses[1].background_task_id)
     ).toMatchObject({

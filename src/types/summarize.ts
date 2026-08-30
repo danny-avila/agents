@@ -36,6 +36,52 @@ export type RetainRecentConfig = {
   tokens?: number;
 };
 
+export type CompactionSemanticIndexStatus = 'committed' | 'pending';
+
+type CompactionSemanticIndexEntryBase = {
+  /** Persisted message that owns the indexed content. */
+  sourceMessageId: string;
+  /** Zero-based content-part index within the persisted source message. */
+  sourceContentIndex: number;
+  /** Monotonic host revision for this logical entry. */
+  revision: number;
+  /** Only committed entries may guide compaction. */
+  status: CompactionSemanticIndexStatus;
+  /** User-visible semantic guidance. Hidden reasoning must never be supplied. */
+  text: string;
+  /** Omits the entry entirely when host policy redacts its source. */
+  redacted?: boolean;
+};
+
+export type CompactionToolSemanticIndexEntry =
+  CompactionSemanticIndexEntryBase & {
+    type: 'tool_intent' | 'tool_outcome';
+    toolCallId: string;
+  };
+
+export type CompactionActivitySemanticIndexEntry =
+  CompactionSemanticIndexEntryBase & {
+    type: 'activity_phase';
+  };
+
+export type CompactionReasoningSemanticIndexEntry =
+  CompactionSemanticIndexEntryBase & {
+    type: 'reasoning_label';
+    /** Stable identity shared by every user-visible label revision. */
+    reasoningStepId: string;
+  };
+
+/**
+ * Source-addressed navigation hints for the compaction model. Entries remain
+ * advisory: raw messages are always sent and remain authoritative.
+ */
+export type CompactionSemanticIndexEntry =
+  | CompactionToolSemanticIndexEntry
+  | CompactionActivitySemanticIndexEntry
+  | CompactionReasoningSemanticIndexEntry;
+
+export type CompactionSemanticIndex = readonly CompactionSemanticIndexEntry[];
+
 export type SummarizationConfig = {
   provider?: ProviderName;
   model?: string;
@@ -96,6 +142,10 @@ export interface SummarizeStartEvent {
   messagesToRefineCount: number;
   /** Which summarization cycle this is (1-based, increments each time summarization fires) */
   summaryVersion: number;
+  /** Committed, source-valid semantic hints included in the request. */
+  semanticIndexEntryCount?: number;
+  /** Serialized semantic-index characters included in the request. */
+  semanticIndexCharCount?: number;
 }
 
 export interface SummarizeDeltaEvent {

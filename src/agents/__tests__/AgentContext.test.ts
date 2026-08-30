@@ -117,6 +117,60 @@ describe('AgentContext', () => {
     });
   });
 
+  describe('fromConfig — compaction semantic index', () => {
+    it('retains only the bounded snapshot in source inputs', () => {
+      const hostIndex: t.CompactionSemanticIndexEntry[] = [
+        {
+          type: 'activity_phase',
+          sourceMessageId: 'message-1',
+          sourceContentIndex: 0,
+          revision: 1,
+          status: 'committed',
+          text: 'Committed label',
+        },
+        {
+          type: 'activity_phase',
+          sourceMessageId: 'x'.repeat(513),
+          sourceContentIndex: 0,
+          revision: 1,
+          status: 'committed',
+          text: 'Rejected label',
+        },
+      ];
+      const context = createBasicContext({
+        agentConfig: { compactionSemanticIndex: hostIndex },
+      });
+
+      expect(context.compactionSemanticIndex).toHaveLength(1);
+      expect(context._sourceInputs?.compactionSemanticIndex).toBe(
+        context.compactionSemanticIndex
+      );
+      expect(context._sourceInputs?.compactionSemanticIndex).not.toBe(
+        hostIndex
+      );
+
+      const oversizedIndex = Array.from({ length: 257 }, (_, index) => ({
+        type: 'activity_phase' as const,
+        sourceMessageId: 'message-1',
+        sourceContentIndex: index,
+        revision: 1,
+        status: 'committed' as const,
+        text: 'Committed label',
+      }));
+      const oversizedContext = createBasicContext({
+        agentConfig: { compactionSemanticIndex: oversizedIndex },
+      });
+
+      expect(oversizedContext.compactionSemanticIndex).toEqual([]);
+      expect(oversizedContext._sourceInputs?.compactionSemanticIndex).toBe(
+        oversizedContext.compactionSemanticIndex
+      );
+      expect(oversizedContext._sourceInputs?.compactionSemanticIndex).not.toBe(
+        oversizedIndex
+      );
+    });
+  });
+
   describe('System Runnable - Lazy Creation', () => {
     it('creates system runnable on first access', () => {
       const ctx = createBasicContext({

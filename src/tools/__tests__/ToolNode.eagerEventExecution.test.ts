@@ -117,6 +117,103 @@ describe('ToolNode eager event tool execution', () => {
     expect(result.messages[0].content).toBe('eager result');
   });
 
+  it('normalizes schema arguments before hooks and after hook edits', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('ran');
+    const receivedHookInputs: PreToolUseHookInput[] = [];
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> => {
+          receivedHookInputs.push(input);
+          return {
+            decision: 'allow',
+            updatedInput: { issue_number: '2365' },
+          };
+        },
+      ],
+    });
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('issue_write')],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      toolCallStepIds: new Map([['call_issue', 'step_issue']]),
+      toolDefinitions: new Map([
+        [
+          'issue_write',
+          {
+            name: 'issue_write',
+            parameters: {
+              type: 'object',
+              properties: { issue_number: { type: 'integer' } },
+            },
+          },
+        ],
+      ]),
+    });
+
+    await toolNode.invoke({
+      messages: [
+        createAIMessage('call_issue', 'issue_write', {
+          issue_number: '2365',
+        }),
+      ],
+    });
+
+    expect(receivedHookInputs[0].toolInput).toEqual({ issue_number: 2365 });
+    expect(toolExecuteCalls[0].toolCalls[0].args).toEqual({
+      issue_number: 2365,
+    });
+  });
+
+  it('parses serialized event arguments before policy hooks', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('ran');
+    const receivedHookInputs: PreToolUseHookInput[] = [];
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> => {
+          receivedHookInputs.push(input);
+          return { decision: 'allow' };
+        },
+      ],
+    });
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('issue_write')],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      toolCallStepIds: new Map([['call_issue', 'step_issue']]),
+      toolDefinitions: new Map([
+        [
+          'issue_write',
+          {
+            name: 'issue_write',
+            parameters: {
+              type: 'object',
+              properties: { issue_number: { type: 'integer' } },
+            },
+          },
+        ],
+      ]),
+    });
+
+    await toolNode.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          {
+            id: 'call_issue',
+            name: 'issue_write',
+            args: '{"issue_number":"2365"}',
+          },
+        ]),
+      ],
+    });
+
+    expect(receivedHookInputs[0].toolInput).toEqual({ issue_number: 2365 });
+    expect(toolExecuteCalls[0].toolCalls[0].args).toEqual({
+      issue_number: 2365,
+    });
+  });
+
   it('uses a prestarted event result when final args are canonically equivalent', async () => {
     const { toolExecuteCalls } = installToolExecuteResponder('redispatched');
     const eagerExecutions = new Map<string, t.EagerEventToolExecution>();

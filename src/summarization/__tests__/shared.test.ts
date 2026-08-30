@@ -82,5 +82,24 @@ describe('summarization primitives', () => {
         'fresh'
       );
     });
+
+    /** The semantic index leads the instruction so the checkpoint request is
+     *  the last thing the model reads, and the prior summary still trails it. */
+    it('leads with the semantic index appendix when one is rendered', () => {
+      expect(
+        buildSummarizationInstruction('fresh', 'update', undefined, '<index/>')
+      ).toBe('<index/>\n\nfresh');
+      expect(
+        buildSummarizationInstruction('fresh', 'update', 'prior', '<index/>')
+      ).toBe(
+        '<index/>\n\nupdate\n\n<previous-summary>\nprior\n</previous-summary>'
+      );
+    });
+
+    it('omits the appendix separator when no index was rendered', () => {
+      expect(buildSummarizationInstruction('fresh', 'update', '', '')).toBe(
+        'fresh'
+      );
+    });
   });
 });

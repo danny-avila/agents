@@ -3,7 +3,7 @@
  * Direct test of the Code API to verify session file persistence.
  * This bypasses the LLM and tests the API directly.
  *
- * Run with: npx ts-node -r dotenv/config src/scripts/test_code_api.ts
+ * Run with: npx tsx -r dotenv/config src/scripts/test_code_api.ts
  */
 import { config } from 'dotenv';
 config();

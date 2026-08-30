@@ -13,6 +13,7 @@ import type { GoogleAIToolType } from '@langchain/google-common';
 import type {
   SummarizationNodeInput,
   SummarizeCompleteEvent,
+  CompactionSemanticIndex,
   SummarizationConfig,
   SummarizeStartEvent,
   SummarizeDeltaEvent,
@@ -871,6 +872,14 @@ interface AgentInputFields {
   discoveredTools?: string[];
   summarizationEnabled?: boolean;
   summarizationConfig?: SummarizationConfig;
+  /**
+   * Optional host-supplied, user-visible guidance for compaction. The SDK
+   * validates, bounds, and scopes entries to the messages being compacted;
+   * raw conversation messages remain authoritative. Captured when the
+   * AgentContext is constructed; labels committed later in the same run are
+   * outside this construction-time interface.
+   */
+  compactionSemanticIndex?: CompactionSemanticIndex;
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
    *  Injected into the dynamic system tail via AgentContext. */
   initialSummary?: { text: string; tokenCount: number };

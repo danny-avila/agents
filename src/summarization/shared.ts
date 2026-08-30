@@ -115,11 +115,14 @@ export function separateSummarizationParameters(
 export function buildSummarizationInstruction(
   promptText: string,
   updatePromptText: string | undefined,
-  priorSummaryText?: string
+  priorSummaryText?: string,
+  semanticIndexAppendix = ''
 ): string {
   const prior = priorSummaryText?.trim() ?? '';
   const effectivePrompt = prior ? (updatePromptText ?? promptText) : promptText;
-  const parts = [effectivePrompt];
+  const parts = semanticIndexAppendix
+    ? [semanticIndexAppendix, '\n\n', effectivePrompt]
+    : [effectivePrompt];
   if (prior) {
     parts.push(`\n\n<previous-summary>\n${prior}\n</previous-summary>`);
   }

@@ -20,10 +20,10 @@ import { Run } from '@/run';
  * 3. Child usage has real token counts (the previously-unbilled tokens).
  *
  * Usage:
- *   OPENAI_API_KEY=... npx ts-node -r tsconfig-paths/register src/scripts/subagent-usage-sink.ts
+ *   OPENAI_API_KEY=... npx tsx src/scripts/subagent-usage-sink.ts
  *
  * Or with Anthropic:
- *   ANTHROPIC_API_KEY=... npx ts-node -r tsconfig-paths/register src/scripts/subagent-usage-sink.ts --provider anthropic
+ *   ANTHROPIC_API_KEY=... npx tsx src/scripts/subagent-usage-sink.ts --provider anthropic
  */
 
 const useAnthropic =
