@@ -347,6 +347,19 @@ function combineAggregatedResults(
   return combined;
 }
 
+/** Deterministically fold results from serialized hook phases. */
+export function mergeAggregatedHookResults(
+  ...results: Array<AggregatedHookResult | undefined>
+): AggregatedHookResult | undefined {
+  let combined: AggregatedHookResult | undefined;
+  for (const result of results) {
+    if (result != null) {
+      combined = combineAggregatedResults(combined, result);
+    }
+  }
+  return combined;
+}
+
 function createPendingApprovalReplay(
   approvalResult: AggregatedHookResult,
   pendingApproval: AggregatedHookResult | undefined,

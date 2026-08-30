@@ -43,7 +43,9 @@ type MatcherBucket = Partial<Record<HookEvent, HookMatcher<HookEvent>[]>>;
 /**
  * Events whose hooks can change a tool call's input or output. Presence of
  * any of these disables eager tool execution and early completion emission;
- * observation-only events (`PostToolBatch`, `Stop`, telemetry hooks) do not.
+ * hooks that cannot rewrite a tool result (`PostToolBatch`, `Stop`, telemetry
+ * hooks) do not. A Stop hook may continue the Run, but only after every tool
+ * result in the terminal graph segment is already authoritative.
  */
 const RESULT_ALTERING_HOOK_EVENTS = [
   'PreToolUse',

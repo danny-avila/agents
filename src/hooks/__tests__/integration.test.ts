@@ -1,4 +1,5 @@
 // src/hooks/__tests__/integration.test.ts
+import { MemorySaver } from '@langchain/langgraph';
 import { HumanMessage } from '@langchain/core/messages';
 import type {
   HookCallback,
@@ -6,6 +7,7 @@ import type {
   RunStartHookOutput,
   UserPromptSubmitHookOutput,
   StopHookInput,
+  StopFinalizeHookInput,
   StopHookOutput,
   StopFailureHookOutput,
 } from '../types';
@@ -227,7 +229,244 @@ describe('Run-level hook integration', () => {
       expect(captured!.hook_event_name).toBe('Stop');
       expect(captured!.runId).toBe('test-run');
       expect(captured!.stopHookActive).toBe(false);
+      expect(captured!.continuationCount).toBe(0);
+      expect(captured!.continuationBudgetRemaining).toBe(8);
       expect(captured!.messages.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('keeps the same Run warm when Stop blocks with injected messages', async () => {
+      const registry = new HookRegistry();
+      const captured: StopHookInput[] = [];
+      let runStarts = 0;
+      let promptSubmissions = 0;
+      registry.register('RunStart', {
+        hooks: [
+          async (): Promise<RunStartHookOutput> => {
+            runStarts += 1;
+            return {};
+          },
+        ],
+      });
+      registry.register('UserPromptSubmit', {
+        hooks: [
+          async (): Promise<UserPromptSubmitHookOutput> => {
+            promptSubmissions += 1;
+            return {};
+          },
+        ],
+      });
+      registry.register('Stop', {
+        hooks: [
+          async (input): Promise<StopHookOutput> => {
+            captured.push(input);
+            if (input.continuationCount > 0) {
+              return { decision: 'continue' };
+            }
+            return {
+              decision: 'block',
+              injectedMessages: [
+                { role: 'user', content: 'late steer', source: 'steer' },
+              ],
+            };
+          },
+        ],
+      });
+
+      const run = await createRun(registry, 'warm-run');
+      run.Graph!.overrideTestModel(['first answer', 'continued answer']);
+      await run.processStream(
+        { messages: [new HumanMessage('initial prompt')] },
+        callerConfig
+      );
+
+      expect(captured).toHaveLength(2);
+      expect(captured.map((input) => input.stopHookActive)).toEqual([
+        false,
+        true,
+      ]);
+      expect(captured.map((input) => input.continuationCount)).toEqual([0, 1]);
+      expect(
+        captured.map((input) => input.continuationBudgetRemaining)
+      ).toEqual([8, 7]);
+      expect(runStarts).toBe(1);
+      expect(promptSubmissions).toBe(1);
+      expect(run.Graph!.messages.map((message) => message.content)).toEqual([
+        'initial prompt',
+        'first answer',
+        'late steer',
+        'continued answer',
+      ]);
+      expect(run.Graph!.messages[2].additional_kwargs).toMatchObject({
+        role: 'user',
+        source: 'steer',
+      });
+    });
+
+    it('serializes StopFinalize after ordinary Stop decisions are folded', async () => {
+      const registry = new HookRegistry();
+      const finalized: StopFinalizeHookInput[] = [];
+      registry.register('Stop', {
+        hooks: [
+          async (input): Promise<StopHookOutput> =>
+            input.continuationCount === 0
+              ? {
+                decision: 'block',
+                injectedMessages: [
+                  { role: 'user', content: 'plugin continuation' },
+                ],
+              }
+              : { decision: 'continue' },
+        ],
+      });
+      registry.register('StopFinalize', {
+        hooks: [
+          async (input): Promise<StopHookOutput> => {
+            finalized.push(input);
+            return { decision: 'continue' };
+          },
+        ],
+      });
+
+      const run = await createRun(registry, 'finalized-warm-run');
+      run.Graph!.overrideTestModel(['first answer', 'continued answer']);
+      await run.processStream(
+        { messages: [new HumanMessage('initial prompt')] },
+        callerConfig
+      );
+
+      expect(finalized).toHaveLength(2);
+      expect(finalized.map((input) => input.continuationPlanned)).toEqual([
+        true,
+        false,
+      ]);
+      expect(finalized.map((input) => input.continuationPrevented)).toEqual([
+        false,
+        false,
+      ]);
+      expect(run.Graph!.messages.map((message) => message.content)).toEqual([
+        'initial prompt',
+        'first answer',
+        'plugin continuation',
+        'continued answer',
+      ]);
+    });
+
+    it('does not self-loop when Stop blocks without injectable content', async () => {
+      const registry = new HookRegistry();
+      let calls = 0;
+      registry.register('Stop', {
+        hooks: [
+          async (): Promise<StopHookOutput> => {
+            calls += 1;
+            return { decision: 'block' };
+          },
+        ],
+      });
+
+      const run = await createRun(registry, 'empty-warm-run');
+      run.Graph!.overrideTestModel(['only answer']);
+      await run.processStream(
+        { messages: [new HumanMessage('initial prompt')] },
+        callerConfig
+      );
+
+      expect(calls).toBe(1);
+      expect(run.Graph!.messages.map((message) => message.content)).toEqual([
+        'initial prompt',
+        'only answer',
+      ]);
+    });
+
+    it('submits only the injected delta when a checkpointer owns prior state', async () => {
+      const registry = new HookRegistry();
+      registry.register('Stop', {
+        hooks: [
+          async (input): Promise<StopHookOutput> =>
+            input.continuationCount === 0
+              ? {
+                decision: 'block',
+                injectedMessages: [
+                  {
+                    role: 'user',
+                    content: 'checkpoint steer',
+                    source: 'steer',
+                  },
+                ],
+              }
+              : { decision: 'continue' },
+        ],
+      });
+      const run = await Run.create<t.IState>({
+        runId: 'checkpoint-warm-run',
+        graphConfig: {
+          type: 'standard',
+          llmConfig,
+          compileOptions: { checkpointer: new MemorySaver() },
+        },
+        returnContent: true,
+        skipCleanup: true,
+        hooks: registry,
+      });
+      run.Graph!.overrideTestModel(['first answer', 'continued answer']);
+
+      await run.processStream(
+        { messages: [new HumanMessage('initial prompt')] },
+        callerConfig
+      );
+
+      expect(run.Graph!.messages.map((message) => message.content)).toEqual([
+        'initial prompt',
+        'first answer',
+        'checkpoint steer',
+        'continued answer',
+      ]);
+    });
+
+    it('reports a zero budget and refuses continuation past the configured cap', async () => {
+      const registry = new HookRegistry();
+      const remaining: number[] = [];
+      registry.register('Stop', {
+        hooks: [
+          async (input): Promise<StopHookOutput> => {
+            remaining.push(input.continuationBudgetRemaining);
+            if (input.continuationBudgetRemaining === 0) {
+              return { decision: 'continue' };
+            }
+            return {
+              decision: 'block',
+              injectedMessages: [
+                {
+                  role: 'user',
+                  content: `steer ${input.continuationCount + 1}`,
+                  source: 'steer',
+                },
+              ],
+            };
+          },
+        ],
+      });
+      const run = await Run.create<t.IState>({
+        runId: 'capped-warm-run',
+        graphConfig: { type: 'standard', llmConfig },
+        returnContent: true,
+        skipCleanup: true,
+        hooks: registry,
+        maxStopContinuations: 1,
+      });
+      run.Graph!.overrideTestModel(['first answer', 'second answer']);
+
+      await run.processStream(
+        { messages: [new HumanMessage('initial prompt')] },
+        callerConfig
+      );
+
+      expect(remaining).toEqual([1, 0]);
+      expect(run.Graph!.messages.map((message) => message.content)).toEqual([
+        'initial prompt',
+        'first answer',
+        'steer 1',
+        'second answer',
+      ]);
     });
 
     it('does not fire when the stream throws an error', async () => {

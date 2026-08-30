@@ -21,9 +21,9 @@ import type {
 } from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import type { StandardGraph } from '@/graphs/Graph';
-import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import {
   Callback,
@@ -33,6 +33,7 @@ import {
   REASONING_LABEL_RUN_NAME,
   ACTIVITY_PHASE_RUN_NAME,
   ACTIVITY_PHASE_LABEL_RUN_NAME,
+  DEFAULT_MAX_STOP_CONTINUATIONS,
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
 import {
@@ -94,6 +95,8 @@ import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { stampSyntheticProviderMessage } from '@/messages/provenance';
 import { isOpenAILike, isLibreChatOpenAIModel } from '@/utils/llm';
+import { executeHooks, mergeAggregatedHookResults } from '@/hooks';
+import { convertInjectedMessages } from '@/messages/injected';
 import { initializeLangfuseTracing } from './instrumentation';
 import { seedRunInitialSessions } from '@/utils/toolSessions';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
@@ -102,7 +105,6 @@ import { resolveMaxSeals } from '@/llm/preempt';
 import { isBuiltRuntime } from '@/lazyRequire';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
-import { executeHooks } from '@/hooks';
 
 /** Source-mode runs have no dist siblings for the lazy-loading seam, so every
  *  lazily loadable module is imported through the active loader before the
@@ -131,6 +133,38 @@ const ACTIVITY_LABEL_TRACE_NAME = 'LibreChat Activity Label';
 const ACTIVITY_PHASE_TRACE_NAME = 'LibreChat Activity Phase';
 const REASONING_LABEL_TRACE_NAME = 'LibreChat Reasoning Label';
 const OUTPUT_TRUNCATED_HALT_REASON = 'output_truncated';
+
+function resolveMaxStopContinuations(value: number | undefined): number {
+  if (value == null || !Number.isFinite(value)) {
+    return DEFAULT_MAX_STOP_CONTINUATIONS;
+  }
+  return Math.max(0, Math.floor(value));
+}
+
+function materializeStopContinuation(
+  result: AggregatedHookResult
+): BaseMessage[] {
+  const messages: BaseMessage[] = [];
+  const contexts = result.additionalContexts.filter(
+    (context) => context.trim() !== ''
+  );
+  if (contexts.length > 0) {
+    messages.push(
+      stampSyntheticProviderMessage(
+        new HumanMessage({
+          content: contexts.join('\n\n'),
+          additional_kwargs: {
+            role: 'system',
+            isMeta: true,
+            source: 'hook',
+          },
+        })
+      )
+    );
+  }
+  messages.push(...convertInjectedMessages(result.injectedMessages));
+  return messages;
+}
 
 const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_AGENT_UPDATE,
@@ -316,6 +350,7 @@ export class Run<_T extends t.BaseGraphState> {
   private toolExecution?: t.ToolExecutionConfig;
   private subagentUsageSink?: t.SubagentUsageSink;
   private preemption?: t.StreamPreemption;
+  private maxStopContinuations: number;
   private streamLimits?: t.StreamLimits;
   private subagentTasks?: t.SubagentTaskConfig;
   private indexTokenCountMap?: Record<string, number>;
@@ -387,6 +422,9 @@ export class Run<_T extends t.BaseGraphState> {
     this.subagentUsageSink = config.subagentUsageSink;
     this.subagentTasks = config.subagentTasks;
     this.preemption = config.preemption;
+    this.maxStopContinuations = resolveMaxStopContinuations(
+      config.maxStopContinuations
+    );
     this.streamLimits = config.streamLimits;
 
     if (!config.graphConfig) {
@@ -1237,144 +1275,78 @@ export class Run<_T extends t.BaseGraphState> {
     let terminalAt: number | undefined;
 
     const consumeStream = async (): Promise<void> => {
-      /**
-       * `streamEvents` accepts both state inputs and `Command` (resume) at
-       * runtime, but our `CompiledStateWorkflow` type narrows the first
-       * arg to `BaseGraphState`. Cast on the call so the resume path
-       * type-checks without widening the wrapper for every caller.
-       */
-      const stream = graphRunnable.streamEvents(
-        inputs as t.IState,
-        { ...config, runName: graph.runName },
-        {
-          raiseError: true,
-          /**
-           * Prevent EventStreamCallbackHandler from processing custom events.
-           * Custom events are already handled via our createCustomEventCallback()
-           * which routes them through the handlerRegistry.
-           * Without this flag, EventStreamCallbackHandler throws errors when
-           * custom events are dispatched for run IDs not in its internal map
-           * (due to timing issues in parallel execution or after run cleanup).
-           */
-          ignoreCustomEvent: true,
-        }
-      );
+      let streamInputs: t.IState | Command = inputs;
+      let stopContinuationCount = 0;
 
-      for await (const event of stream) {
-        const { data, metadata, ...info } = event;
-
-        const eventName: t.EventName = info.event;
-
-        /** Skip custom events as they're handled by our callback */
-        if (CUSTOM_GRAPH_EVENTS.has(eventName)) {
-          continue;
-        }
-
+      for (;;) {
         /**
-         * Detect interrupts surfaced by LangGraph as a synthetic
-         * `__interrupt__` field on the streamed chunk and stash the
-         * first one for the host to read via `run.getInterrupt()`
-         * once the stream drains. Captured as `unknown` because the
-         * SDK does not validate the runtime payload shape — the
-         * built-in ToolNode raises a `HumanInterruptPayload`
-         * (`tool_approval` / `ask_user_question`), but custom nodes
-         * can pass any payload to `interrupt()`. Callers narrow with
-         * the `isToolApprovalInterrupt` / `isAskUserQuestionInterrupt`
-         * guards or assert via `getInterrupt<T>()`.
+         * `streamEvents` accepts both state inputs and `Command` (resume) at
+         * runtime, but our `CompiledStateWorkflow` type narrows the first
+         * arg to `BaseGraphState`. Cast on the call so the resume path
+         * type-checks without widening the wrapper for every caller.
          */
-        if (
-          this._interrupt == null &&
-          data.chunk != null &&
-          isInterrupted<unknown>(data.chunk)
-        ) {
-          const interrupts = data.chunk[INTERRUPT];
-          if (interrupts.length > 0) {
-            const first = interrupts[0];
-            /**
-             * Capture the interrupt unconditionally — `interrupt(null)`
-             * and `interrupt(undefined)` are valid pauses (a custom
-             * node may want to pause without metadata) and the host
-             * still needs to know the run is awaiting resume. Gating
-             * on `payload != null` would silently downgrade a paused
-             * run to "completed" and let the `Stop` hook fire,
-             * breaking host resume handling.
-             */
-            this._interrupt = {
-              interruptId: first.id ?? '',
-              threadId,
-              payload: first.value,
-            };
+        const stream = graphRunnable.streamEvents(
+          streamInputs as t.IState,
+          { ...config, runName: graph.runName },
+          {
+            raiseError: true,
+            /** Custom events are handled by createCustomEventCallback(). */
+            ignoreCustomEvent: true,
+          }
+        );
+
+        for await (const event of stream) {
+          const { data, metadata, ...info } = event;
+          const eventName: t.EventName = info.event;
+
+          if (CUSTOM_GRAPH_EVENTS.has(eventName)) {
+            continue;
+          }
+
+          if (
+            this._interrupt == null &&
+            data.chunk != null &&
+            isInterrupted<unknown>(data.chunk)
+          ) {
+            const interrupts = data.chunk[INTERRUPT];
+            if (interrupts.length > 0) {
+              const first = interrupts[0];
+              this._interrupt = {
+                interruptId: first.id ?? '',
+                threadId,
+                payload: first.value,
+              };
+            }
+          }
+
+          const modelEndAt =
+            eventName === GraphEvents.CHAT_MODEL_END ? Date.now() : undefined;
+          const handler = this.handlerRegistry?.getHandler(eventName);
+          if (handler) {
+            await handler.handle(eventName, data, metadata, this.Graph);
+          }
+
+          if (eventName === GraphEvents.CHAT_MODEL_END && this.Graph != null) {
+            await this.Graph.closeOpenMessageStep(metadata, modelEndAt);
+          }
+
+          const haltSignal = this.hookRegistry?.getHaltSignal(this.id);
+          if (haltSignal != null) {
+            this._haltedReason = haltSignal.reason;
+            break;
           }
         }
 
-        /**
-         * Stamped before the handler runs: the close below happens after an
-         * arbitrarily slow host handler resolves, and the step's duration
-         * should end when the model did, not when the host finished with it.
-         */
-        const modelEndAt =
-          eventName === GraphEvents.CHAT_MODEL_END ? Date.now() : undefined;
-        const handler = this.handlerRegistry?.getHandler(eventName);
-        if (handler) {
-          await handler.handle(eventName, data, metadata, this.Graph);
+        terminalAt = Date.now();
+
+        if (this._interrupt != null) {
+          await this.resolveInterruptResumeConfig(config);
+          return;
+        }
+        if (this._haltedReason != null) {
+          return;
         }
 
-        /**
-         * A finished model call ends its lane's open message step. Placed
-         * here — not in `ModelEndHandler` — because hosts replace the
-         * CHAT_MODEL_END handler with their own instance, which would
-         * silently drop the close.
-         */
-        if (eventName === GraphEvents.CHAT_MODEL_END && this.Graph != null) {
-          await this.Graph.closeOpenMessageStep(metadata, modelEndAt);
-        }
-
-        /**
-         * Mid-flight halt: any hook (PreToolUse, PostToolUse,
-         * PostToolBatch, SubagentStart/Stop, PreCompact, PostCompact)
-         * that returned `preventContinuation: true` raises a halt
-         * signal on the registry via `executeHooks`. We poll between
-         * stream events and break out as soon as one is set so the
-         * graph doesn't take another model turn after the halting
-         * operation completes.
-         *
-         * This `break` is NOT graceful, despite what a `continue: false`
-         * reading suggests. Leaving the `for await` calls the iterator's
-         * `return()`, which cancels the reader
-         * (`@langchain/core/utils/stream`), and langgraph's stream wrapper
-         * turns that cancel into `_abortController.abort()`
-         * (`pregel/stream.js`). The in-flight model call or tool batch is
-         * torn down where it stands — it does not finish first.
-         *
-         * A halt is therefore the wrong tool for "stop generating but keep
-         * what you have". That is what `RunConfig.preemption` is for: it
-         * seals the stream at a provider-safe boundary and keeps the run.
-         */
-        const haltSignal = this.hookRegistry?.getHaltSignal(this.id);
-        if (haltSignal != null) {
-          this._haltedReason = haltSignal.reason;
-          break;
-        }
-      }
-
-      terminalAt = Date.now();
-
-      if (this._interrupt != null) {
-        await this.resolveInterruptResumeConfig(config);
-      }
-
-      /**
-       * Skip the Stop hook when the run paused on a HITL interrupt
-       * (still pending human input) or was halted by a hook (the host
-       * already chose to stop, so a Stop hook firing now would be
-       * misleading). The host fires Stop on the resumed-and-completed
-       * run instead.
-       */
-      if (
-        this._interrupt == null &&
-        this._haltedReason == null &&
-        this.hookRegistry?.hasHookFor('Stop', this.id) === true
-      ) {
         let stopReason = graph.preemptHaltReason;
         if (stopReason == null && graph.preemptIncomplete) {
           stopReason = 'preempt_incomplete';
@@ -1382,56 +1354,102 @@ export class Run<_T extends t.BaseGraphState> {
         if (stopReason == null && graph.outputTruncatedIncomplete) {
           stopReason = OUTPUT_TRUNCATED_HALT_REASON;
         }
-        await executeHooks({
-          registry: this.hookRegistry,
-          input: {
-            hook_event_name: 'Stop',
-            runId: this.id,
-            threadId,
-            agentId: graph.defaultAgentId,
-            messages: graph.getRunMessages() ?? stateInputs?.messages ?? [],
-            /**
-             * A seal whose boundary ended the turn early must say so. The
-             * hook-supplied reason wins when a `PreemptBoundary` hook halted
-             * with one — a persistence/audit `Stop` hook should record the
-             * actual cause, not the generic label — and `preempt_incomplete`
-             * is reserved for the boundary that simply had nothing to inject.
-             */
-            stopReason,
-            stopHookActive: false, // will be true when stop is triggered by a hook (Phase 2)
-          },
-          sessionId: this.id,
-        }).catch(() => {
-          /* Stop hook errors must not masquerade as stream failures */
-        });
-      }
 
-      /**
-       * A `PreemptBoundary` hook that returned `preventContinuation` has its
-       * registry halt cleared by the graph — that is what stops the halt from
-       * cancelling the stream before the sealed turn commits — so the reason
-       * is carried across on the graph instead. Surfaced here, AFTER the
-       * `Stop` dispatch above, so the host still receives a completion signal
-       * to persist the partial answer with while `getHaltReason()` correctly
-       * reports that a hook stopped the run rather than the model finishing.
-       *
-       * An empty boundary — sealed, but nothing to inject because the host's
-       * queue was drained or cancelled in the meantime — cut the answer short
-       * just as surely, only without a hook-supplied reason. It surfaces
-       * through the same channel under the same name the `Stop` dispatch
-       * already used for its `stopReason`, so terminal consumers
-       * (`AgentSession` emits `run.halted`, not `run.completed`) cannot
-       * finalize a truncated answer as a natural finish.
-       */
-      if (this._haltedReason == null && graph.preemptHaltReason != null) {
-        this._haltedReason = graph.preemptHaltReason;
-      } else if (this._haltedReason == null && graph.preemptIncomplete) {
-        this._haltedReason = 'preempt_incomplete';
-      } else if (
-        this._haltedReason == null &&
-        graph.outputTruncatedIncomplete
-      ) {
-        this._haltedReason = OUTPUT_TRUNCATED_HALT_REASON;
+        const stopMessages = graph.getRunMessages() ?? stateInputs?.messages ?? [];
+        const continuationBudgetRemaining = Math.max(
+          0,
+          this.maxStopContinuations - stopContinuationCount
+        );
+        let stopResult: AggregatedHookResult | undefined;
+        if (this.hookRegistry?.hasHookFor('Stop', this.id) === true) {
+          stopResult = await executeHooks({
+            registry: this.hookRegistry,
+            input: {
+              hook_event_name: 'Stop',
+              runId: this.id,
+              threadId,
+              agentId: graph.defaultAgentId,
+              messages: stopMessages,
+              stopReason,
+              stopHookActive: stopContinuationCount > 0,
+              continuationCount: stopContinuationCount,
+              continuationBudgetRemaining,
+            },
+            sessionId: this.id,
+            signal: config.signal,
+          }).catch((): undefined => undefined);
+        }
+
+        if (this.hookRegistry?.hasHookFor('StopFinalize', this.id) === true) {
+          const stopInjected =
+            stopResult == null ? [] : materializeStopContinuation(stopResult);
+          const continuationPrevented =
+            stopReason != null || stopResult?.preventContinuation === true;
+          const finalized = await executeHooks({
+            registry: this.hookRegistry,
+            input: {
+              hook_event_name: 'StopFinalize',
+              runId: this.id,
+              threadId,
+              agentId: graph.defaultAgentId,
+              messages: stopMessages,
+              stopReason,
+              stopHookActive: stopContinuationCount > 0,
+              continuationCount: stopContinuationCount,
+              continuationBudgetRemaining,
+              continuationPlanned:
+                !continuationPrevented &&
+                stopResult?.stopDecision === 'block' &&
+                stopInjected.length > 0 &&
+                continuationBudgetRemaining > 0,
+              continuationPrevented,
+            },
+            sessionId: this.id,
+            signal: config.signal,
+          }).catch((): undefined => undefined);
+          stopResult = mergeAggregatedHookResults(stopResult, finalized);
+        }
+
+        if (stopResult?.preventContinuation === true) {
+          this._haltedReason =
+            stopResult.stopReason ?? stopResult.reason ?? 'preventContinuation';
+          return;
+        }
+
+        const requestsContinuation =
+          stopReason == null && stopResult?.stopDecision === 'block';
+        if (requestsContinuation && stopResult != null) {
+          const injected = materializeStopContinuation(stopResult);
+          if (injected.length > 0) {
+            if (stopContinuationCount >= this.maxStopContinuations) {
+              throw new Error(
+                'Stop hook attempted to inject messages after the terminal continuation budget was exhausted.'
+              );
+            }
+            stopContinuationCount += 1;
+            /**
+             * A checkpointer already owns the completed graph state, so only
+             * the delta is submitted. Without one, each invocation starts from
+             * empty state and must be seeded with the live full transcript.
+             * Graph sidecars and the outer Run stay intact in both cases.
+             */
+            streamInputs = {
+              messages: this.hasCheckpointer
+                ? injected
+                : [...graph.messages, ...injected],
+            };
+            continue;
+          }
+        }
+
+        if (graph.preemptHaltReason != null) {
+          this._haltedReason = graph.preemptHaltReason;
+        } else if (graph.preemptIncomplete) {
+          this._haltedReason = 'preempt_incomplete';
+        } else if (graph.outputTruncatedIncomplete) {
+          this._haltedReason = OUTPUT_TRUNCATED_HALT_REASON;
+        }
+        return;
       }
     };
 

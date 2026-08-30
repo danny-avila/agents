@@ -51,6 +51,8 @@ function stopInput(overrides: Partial<StopHookInput> = {}): StopHookInput {
     runId: 'run-1',
     messages: [],
     stopHookActive: false,
+    continuationCount: 0,
+    continuationBudgetRemaining: 8,
     ...overrides,
   };
 }
