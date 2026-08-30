@@ -4,17 +4,18 @@ import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import {
-  Command,
-  INTERRUPT,
-  MemorySaver,
-  isInterrupted,
-} from '@langchain/langgraph';
-import {
   AIMessage,
   BaseMessage,
   HumanMessage,
   SystemMessage,
 } from '@langchain/core/messages';
+import {
+  Command,
+  INTERRUPT,
+  MemorySaver,
+  Overwrite,
+  isInterrupted,
+} from '@langchain/langgraph';
 import type {
   MessageContentComplex,
   UsageMetadata,
@@ -296,9 +297,78 @@ type WorkflowWithStateHistory = {
     options?: { subgraphs?: boolean }
   ): Promise<InterruptStateSnapshot>;
   getStateHistory?(
-    config: RunnableConfig
+    config: RunnableConfig,
+    options?: { filter?: Record<string, unknown>; limit?: number }
   ): AsyncIterableIterator<InterruptStateSnapshot>;
 };
+
+async function resolveCompletedSegmentConfig(
+  workflow: t.CompiledStateWorkflow,
+  config: t.RunStreamConfig,
+  executionId: string,
+  streamSegment: number
+): Promise<t.RunStreamConfig> {
+  const stateWorkflow = workflow as t.CompiledStateWorkflow &
+    WorkflowWithStateHistory;
+  const stateHistory = stateWorkflow.getStateHistory;
+  if (typeof stateHistory !== 'function') {
+    throw new Error(
+      'Cannot continue a checkpointed run without exact state history.'
+    );
+  }
+  const lookup = advanceCheckpointCursor(config);
+
+  const resolveSnapshot = (
+    snapshot: InterruptStateSnapshot | undefined
+  ): t.RunStreamConfig | undefined => {
+    if (snapshot == null) {
+      return undefined;
+    }
+    const runStepState =
+      snapshot.values?.runStepState ??
+      snapshot.tasks
+        ?.flatMap((task) => task.interrupts ?? [])
+        .map((pendingInterrupt) =>
+          getRunStepResumeState(pendingInterrupt.value)
+        )
+        .find((state): state is t.RunStepResumeState => state != null);
+    if (
+      runStepState?.stopContinuationExecutionId !== executionId ||
+      runStepState.streamSegment !== streamSegment
+    ) {
+      return undefined;
+    }
+    const checkpointId = snapshot.config?.configurable?.checkpoint_id;
+    if (typeof checkpointId !== 'string' || checkpointId.length === 0) {
+      return undefined;
+    }
+    return {
+      ...config,
+      configurable: {
+        ...config.configurable,
+        ...snapshot.config?.configurable,
+      },
+    };
+  };
+
+  if (typeof stateWorkflow.getState === 'function') {
+    const latest = await stateWorkflow.getState(lookup);
+    const latestConfig = resolveSnapshot(latest);
+    if (latestConfig != null) {
+      return latestConfig;
+    }
+  }
+
+  for await (const snapshot of stateHistory.call(workflow, lookup)) {
+    const snapshotConfig = resolveSnapshot(snapshot);
+    if (snapshotConfig != null) {
+      return snapshotConfig;
+    }
+  }
+  throw new Error(
+    'Cannot identify the checkpoint committed by the completed graph segment.'
+  );
+}
 
 function getFirstPersistedInterrupt(
   snapshot: InterruptStateSnapshot
@@ -1169,6 +1239,7 @@ export class Run<_T extends t.BaseGraphState> {
             checkpointId === '' ? 0 : ++this.checkpointForkSeq,
           ]);
       graph.resetValues(streamOptions?.keepContent, checkpointScope);
+      graph.startStopContinuationExecution(nanoid());
     }
     this._interrupt = undefined;
     this._haltedReason = undefined;
@@ -1298,7 +1369,13 @@ export class Run<_T extends t.BaseGraphState> {
     let terminalAt: number | undefined;
 
     const consumeStream = async (): Promise<void> => {
-      let streamInputs: t.IState | Command = inputs;
+      let streamInputs: t.IState | Command =
+        !isResume && this.hasCheckpointer
+          ? ({
+            ...(inputs as t.IState),
+            runStepState: new Overwrite(graph.createRunStepResumeState()),
+          } as unknown as t.IState)
+          : inputs;
       let streamConfig = config;
 
       for (;;) {
@@ -1363,7 +1440,10 @@ export class Run<_T extends t.BaseGraphState> {
         terminalAt = Date.now();
 
         if (this._interrupt != null) {
-          await this.resolveInterruptResumeConfig(config);
+          const interruptConfig = this.hasCheckpointer
+            ? advanceCheckpointCursor(streamConfig)
+            : streamConfig;
+          await this.resolveInterruptResumeConfig(interruptConfig);
           return;
         }
         if (this._haltedReason != null) {
@@ -1451,6 +1531,14 @@ export class Run<_T extends t.BaseGraphState> {
                 'Stop hook attempted to inject messages after the terminal continuation budget was exhausted.'
               );
             }
+            const completedSegmentConfig = this.hasCheckpointer
+              ? await resolveCompletedSegmentConfig(
+                graphRunnable,
+                streamConfig,
+                graph.getStopContinuationExecutionId(),
+                graph.getStreamSegment()
+              )
+              : streamConfig;
             const nextContinuationCount = stopContinuationCount + 1;
             graph.setStopContinuationCount(nextContinuationCount);
             graph.advanceStreamSegment();
@@ -1466,9 +1554,7 @@ export class Run<_T extends t.BaseGraphState> {
                 : [...graph.messages, ...injected],
               runStepState: graph.createRunStepResumeState(),
             };
-            if (this.hasCheckpointer) {
-              streamConfig = advanceCheckpointCursor(streamConfig);
-            }
+            streamConfig = completedSegmentConfig;
             continue;
           }
         }
@@ -1504,6 +1590,10 @@ export class Run<_T extends t.BaseGraphState> {
     } catch (err) {
       terminalAt = Date.now();
       streamThrew = true;
+      await langfuseHandler?.handleChainError(
+        err instanceof Error ? err : new Error(String(err)),
+        this.id
+      );
       /**
        * Corroborate cancellation against an actually-aborted signal. A
        * provider SDK or host handler can reject with an `AbortError` while

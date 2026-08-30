@@ -12,8 +12,8 @@ import type {
   StopFailureHookOutput,
 } from '../types';
 import type * as t from '@/types';
-import { HookRegistry } from '../HookRegistry';
 import { Providers, StepTypes } from '@/common';
+import { HookRegistry } from '../HookRegistry';
 import { Run } from '@/run';
 
 const llmConfig: t.LLMConfig = {
@@ -476,17 +476,36 @@ describe('Run-level hook integration', () => {
       expect(typeof checkpointId).toBe('string');
 
       const registry = new HookRegistry();
+      let siblingCompleted = false;
       registry.register('Stop', {
         hooks: [
-          async (input): Promise<StopHookOutput> =>
-            input.continuationCount === 0
-              ? {
-                decision: 'block',
-                injectedMessages: [
-                  { role: 'user', content: 'branch steer', source: 'steer' },
-                ],
-              }
-              : { decision: 'continue' },
+          async (input): Promise<StopHookOutput> => {
+            if (input.continuationCount > 0) {
+              return { decision: 'continue' };
+            }
+            const siblingRun = await Run.create<t.IState>({
+              runId: 'pinned-warm-sibling',
+              graphConfig: {
+                type: 'standard',
+                llmConfig,
+                compileOptions: { checkpointer },
+              },
+              returnContent: true,
+              skipCleanup: true,
+            });
+            siblingRun.Graph!.overrideTestModel(['sibling answer']);
+            await siblingRun.processStream(
+              { messages: [new HumanMessage('sibling prompt')] },
+              threadConfig
+            );
+            siblingCompleted = true;
+            return {
+              decision: 'block',
+              injectedMessages: [
+                { role: 'user', content: 'branch steer', source: 'steer' },
+              ],
+            };
+          },
         ],
       });
       const branchRun = await Run.create<t.IState>({
@@ -515,6 +534,7 @@ describe('Run-level hook integration', () => {
         }
       );
 
+      expect(siblingCompleted).toBe(true);
       expect(
         branchRun.Graph!.messages.map((message) => message.content)
       ).toEqual([
@@ -525,6 +545,59 @@ describe('Run-level hook integration', () => {
         'branch steer',
         'continued branch answer',
       ]);
+    });
+
+    it('resets persisted continuation admission for the next fresh turn', async () => {
+      const checkpointer = new MemorySaver();
+      const counts: number[] = [];
+      let admitted = false;
+      const registry = new HookRegistry();
+      registry.register('Stop', {
+        hooks: [
+          async (input): Promise<StopHookOutput> => {
+            counts.push(input.continuationCount);
+            if (admitted) {
+              return { decision: 'continue' };
+            }
+            admitted = true;
+            return {
+              decision: 'block',
+              injectedMessages: [
+                { role: 'user', content: 'first-turn steer', source: 'steer' },
+              ],
+            };
+          },
+        ],
+      });
+      const run = await Run.create<t.IState>({
+        runId: 'fresh-turn-continuation-reset',
+        graphConfig: {
+          type: 'standard',
+          llmConfig,
+          compileOptions: { checkpointer },
+        },
+        returnContent: true,
+        skipCleanup: true,
+        hooks: registry,
+        maxStopContinuations: 1,
+      });
+      const config = {
+        ...callerConfig,
+        configurable: { thread_id: 'fresh-turn-continuation-reset-thread' },
+      };
+      run.Graph!.overrideTestModel(['first answer', 'continued answer']);
+      await run.processStream(
+        { messages: [new HumanMessage('first prompt')] },
+        config
+      );
+
+      run.Graph!.overrideTestModel(['next answer']);
+      await run.processStream(
+        { messages: [new HumanMessage('next prompt')] },
+        config
+      );
+
+      expect(counts).toEqual([0, 1, 0]);
     });
 
     it('reports a zero budget and refuses continuation past the configured cap', async () => {

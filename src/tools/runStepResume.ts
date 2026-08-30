@@ -26,6 +26,9 @@ export function isRunStepResumeState(
     (state.stopContinuationCount != null &&
       (!Number.isSafeInteger(state.stopContinuationCount) ||
         state.stopContinuationCount < 0)) ||
+    (state.stopContinuationExecutionId != null &&
+      (typeof state.stopContinuationExecutionId !== 'string' ||
+        state.stopContinuationExecutionId.length === 0)) ||
     (state.streamSegment != null &&
       (!Number.isSafeInteger(state.streamSegment) ||
         state.streamSegment < 0)) ||

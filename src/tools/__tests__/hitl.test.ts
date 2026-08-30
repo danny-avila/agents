@@ -1342,6 +1342,43 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     let run: Awaited<ReturnType<typeof RunClass.create<t.IState>>>;
     const checkpointer = new MemorySaver();
     const toolCallId = 'abcdef0123456789abcdef0123456789';
+    const threadConfig = {
+      configurable: { thread_id: 'warm-hitl-budget-thread' },
+      version: 'v2' as const,
+    };
+    const seedRun = await RunClass.create<t.IState>({
+      runId: 'warm-hitl-budget-seed',
+      graphConfig: {
+        type: 'standard',
+        compileOptions: { checkpointer },
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+            tools: [createSchemaStub('echo')],
+          },
+        ],
+      },
+      skipCleanup: true,
+    });
+    seedRun.Graph?.overrideTestModel(['seed answer']);
+    await seedRun.processStream(
+      { messages: [new HumanMessage('seed prompt')] },
+      threadConfig
+    );
+    const seedTuple = await checkpointer.getTuple(threadConfig);
+    const seedCheckpointId = seedTuple?.config.configurable?.checkpoint_id;
+    expect(typeof seedCheckpointId).toBe('string');
+    const config = {
+      ...threadConfig,
+      configurable: {
+        ...threadConfig.configurable,
+        checkpoint_id: seedCheckpointId,
+      },
+    };
     registry.register('PreToolUse', {
       hooks: [
         async (): Promise<PreToolUseHookOutput> => ({
@@ -1400,16 +1437,15 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
       skipCleanup: true,
     });
     run.Graph?.overrideTestModel(['first answer']);
-    const config = {
-      configurable: { thread_id: 'warm-hitl-budget-thread' },
-      version: 'v2' as const,
-    };
 
     await run.processStream(
       { messages: [new HumanMessage('initial prompt')] },
       config
     );
-    expect(run.getInterrupt()).toBeDefined();
+    const interrupt = run.getInterrupt();
+    expect(interrupt).toBeDefined();
+    expect(interrupt?.checkpointId).toEqual(expect.any(String));
+    expect(interrupt?.checkpointId).not.toBe(seedCheckpointId);
     expect(stopInputs.map((input) => input.continuationCount)).toEqual([0]);
 
     run = await RunClass.create<t.IState>({
@@ -1434,7 +1470,13 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
       skipCleanup: true,
     });
     run.Graph?.overrideTestModel(['final answer']);
-    await run.resume([{ type: 'approve' }], config);
+    await run.resume([{ type: 'approve' }], {
+      ...config,
+      configurable: {
+        ...config.configurable,
+        checkpoint_id: interrupt?.checkpointId,
+      },
+    });
 
     expect(run.getInterrupt()).toBeUndefined();
     expect(stopInputs.map((input) => input.continuationCount)).toEqual([0, 1]);
