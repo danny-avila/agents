@@ -18,7 +18,9 @@ const getDefaultJinaApiUrl = (): string =>
 export abstract class BaseReranker {
   protected apiKey: string | undefined;
   protected logger: t.Logger;
-  protected abstract readonly provider: string;
+  /** Public so a caller that fails before reaching `rerank` can still
+   * attribute the attempt to the configured reranker. */
+  abstract readonly provider: string;
   private ownMetrics?: t.SearchMetrics;
 
   constructor(logger?: t.Logger) {
@@ -114,7 +116,7 @@ export abstract class BaseReranker {
 }
 
 export class JinaReranker extends BaseReranker {
-  protected readonly provider = 'jina';
+  readonly provider = 'jina';
   private apiUrl: string;
   private timeout: number;
   private httpAgent?: t.HttpAgent;
@@ -214,7 +216,7 @@ export class JinaReranker extends BaseReranker {
 }
 
 export class CohereReranker extends BaseReranker {
-  protected readonly provider = 'cohere';
+  readonly provider = 'cohere';
   private timeout: number;
   private httpAgent?: t.HttpAgent;
   private httpsAgent?: t.HttpsAgent;
@@ -407,7 +409,7 @@ const withRerankDeadline = <T>(
  * to the candidates' original order via {@link BaseReranker.getDefaultRanking}.
  */
 export class RagApiReranker extends BaseReranker {
-  protected readonly provider = 'rag-api';
+  readonly provider = 'rag-api';
   private baseUrl?: string;
   private tokenSupplier?: t.RagApiTokenSupplier;
   private profile: string;
@@ -518,7 +520,7 @@ export class RagApiReranker extends BaseReranker {
 }
 
 export class InfinityReranker extends BaseReranker {
-  protected readonly provider = 'infinity';
+  readonly provider = 'infinity';
 
   constructor(logger?: t.Logger) {
     super(logger);

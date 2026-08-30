@@ -120,10 +120,15 @@ export async function executeParallelSearches({
   metrics?: t.SearchMetrics;
 }): Promise<t.SearchResult> {
   const collector = metrics ?? createSearchMetrics(logger);
+  /** A rejected main search is fatal, but rethrowing it from the task itself
+   * would settle `Promise.all` while its siblings are still in flight, and
+   * their observations would then land in an already-flushed phase. Every
+   * task resolves; the failure is held here and raised once all have run. */
+  let mainFailure: { error: unknown } | undefined;
 
   /** Sub-searches resolve rather than reject so their siblings still merge.
-   * A rejected MAIN search stays fatal and rethrows the provider's own error
-   * — callers have always seen that error object, not a wrapped copy. */
+   * A rejected MAIN search rethrows the provider's own error below — callers
+   * have always seen that error object, not a wrapped copy. */
   const runSearch = async (type: t.SubSearchType): Promise<t.SearchResult> => {
     const startedAt = Date.now();
     try {
@@ -153,7 +158,7 @@ export async function executeParallelSearches({
         thrown: true,
       });
       if (type === 'web') {
-        throw error;
+        mainFailure = { error };
       }
       return { success: false, error: message };
     }
@@ -172,12 +177,16 @@ export async function executeParallelSearches({
     searchTasks.push(runSearch('news'));
   }
 
-  // Run all searches in parallel
-  const results = await Promise.all(searchTasks).finally(() => {
-    if (metrics == null) {
-      collector.flush();
-    }
-  });
+  // Run all searches in parallel. No task rejects, so every observation is
+  // recorded before the collector is flushed or a failure is raised.
+  const results = await Promise.all(searchTasks);
+  if (metrics == null) {
+    collector.flush();
+  }
+
+  if (mainFailure != null) {
+    throw mainFailure.error;
+  }
 
   // Get the main search result (first result)
   const mainResult = results[0];

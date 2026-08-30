@@ -14,7 +14,7 @@ const silentLogger = {
 } as t.Logger;
 
 class RecordingReranker extends BaseReranker {
-  protected readonly provider = 'recording';
+  readonly provider = 'recording';
   public rerankCalls: string[][] = [];
   public topKCalls: number[] = [];
 
@@ -688,6 +688,44 @@ describe('executeParallelSearches call contract', () => {
     const [line, detail] = (logger.error as jest.Mock).mock.calls[0];
     expect(String(line)).toContain('failed=1 reasons={web:other:1}');
     expect(detail).toBe('provider exploded');
+  });
+
+  test('records a slow sibling failure even when the main search rejects first', async () => {
+    const logger = createMockLogger();
+    const failure = new Error('main provider exploded');
+    const searchAPI = {
+      getSources: async (
+        params: t.GetSourcesParams
+      ): Promise<t.SearchResult> => {
+        if (params.type !== 'images') {
+          throw failure;
+        }
+        // Settles well after the main search has already rejected.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return { success: false, error: 'timeout of 10000ms exceeded' };
+      },
+    };
+
+    await expect(
+      executeParallelSearches({
+        searchAPI,
+        query: 'test query',
+        safeSearch: 1,
+        images: true,
+        videos: false,
+        news: false,
+        logger,
+        provider: 'serper',
+      })
+    ).rejects.toBe(failure);
+
+    /** The summary must not be flushed while a sibling is still in flight,
+     * or that provider's failure is lost from the aggregate entirely. */
+    const line = String((logger.error as jest.Mock).mock.calls[0][0]);
+    expect(line).toContain('queries=2');
+    expect(line).toContain('failed=2');
+    expect(line).toContain('images:timeout:1');
+    expect(line).toContain('web:other:1');
   });
 
   test('keeps a sub-search failure off the error channel', async () => {

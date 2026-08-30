@@ -176,8 +176,12 @@ const getHighlights = async ({
     );
     return await reranker.rerank(query, documents, topResults, metrics);
   } catch (error) {
+    /** Chunking failed before the reranker was reached, but this was still
+     * that reranker's attempt for this source — labelling it with the real
+     * provider keeps one coherent phase, and `chunk_error` says where it
+     * broke. */
     metrics.recordRerank({
-      provider: 'chunker',
+      provider: reranker.provider,
       chunks: 0,
       results: 0,
       durationMs: Date.now() - startedAt,
@@ -633,7 +637,16 @@ export const createSourceProcessor = (
     metrics: t.SearchMetrics,
     onGetHighlights: t.SearchToolConfig['onGetHighlights']
   ): Promise<t.ScrapeResult> => {
-    const scraped = processResponse(url, response);
+    /** `extractContent`/`extractMetadata` are the scraper implementation's
+     * code: one malformed response must not reject alongside its siblings,
+     * which would discard their results and their observations with them. */
+    let scraped: t.ScrapeResult;
+    try {
+      scraped = processResponse(url, response);
+    } catch (error) {
+      metrics.recordScrape({ url, error: String(error) });
+      return { url, error: true, content: '' };
+    }
     if (scraped.error === true) {
       metrics.recordScrape({ url, error: response.error ?? 'Unknown error' });
       return scraped;

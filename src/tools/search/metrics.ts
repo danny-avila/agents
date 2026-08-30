@@ -80,10 +80,26 @@ const formatMap = (counts: Map<string, number>): string => {
 const truncate = (value: string, max: number): string =>
   value.length <= max ? value : `${value.slice(0, max)}…`;
 
+/** Newlines, bidi overrides, and other non-printing characters let a remote
+ * payload split one summary into several physical lines or forge a second
+ * apparent entry, so they never survive into a log message. */
+const UNPRINTABLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}"]+/gu;
+
+const sanitize = (value: string): string => value.replace(UNPRINTABLE, ' ');
+
 /** Every provider-supplied string that reaches a summary line or a map key
- * goes through here: the phases promise a fixed-width line, and neither a
- * remote payload nor an external caller's label is bounded on its own. */
-const label = (value: string): string => truncate(value, MAX_LABEL_LENGTH);
+ * goes through here: the phases promise one bounded line, and neither a
+ * remote payload nor an external caller's label is safe on its own. */
+const label = (value: string): string =>
+  truncate(sanitize(value), MAX_LABEL_LENGTH);
+
+const detailOf = (value: string): string =>
+  truncate(sanitize(value), MAX_DETAIL_LENGTH);
+
+/** A phase carries one provider label. Nothing in this package mixes them,
+ * but a wrong label is worse than an honest one if that ever changes. */
+const mergeProvider = (current: string, incoming: string): string =>
+  current === incoming ? current : 'mixed';
 
 interface SearchPhase {
   provider: string;
@@ -201,7 +217,10 @@ export const createSearchMetrics = (
       ` dur=${formatMs(phase.durationMs)}` +
       ` maxDur=${formatMs(phase.maxDurationMs)}`;
     if (phase.model != null) {
-      line += ` model=${label(phase.model)}`;
+      /** The only free-form remote value in the line, so it is the one field
+       * that gets delimited — a truncated payload cannot then read as
+       * further fields. */
+      line += ` model="${label(phase.model)}"`;
     }
     if (phase.units > 0) {
       line += ` units=${phase.units}`;
@@ -250,6 +269,7 @@ export const createSearchMetrics = (
       types: new Map(),
       reasons: new Map(),
     };
+    search.provider = mergeProvider(search.provider, observation.provider);
     search.queries += 1;
     /** Sub-searches run concurrently, so the phase lasts as long as its
      * slowest query rather than the sum of all of them. */
@@ -262,9 +282,13 @@ export const createSearchMetrics = (
         search.reasons,
         `${observation.type}:${classifyFailure(observation.error)}`
       );
-      search.detail ??= truncate(observation.error, MAX_DETAIL_LENGTH);
+      /** `detail` is only ever logged on the error path, so it is captured
+       * only from a thrown observation — otherwise an earlier soft failure's
+       * message would be attached to an exception it has nothing to do
+       * with, and the real one dropped. */
       if (observation.thrown === true) {
         search.errors += 1;
+        search.detail ??= detailOf(observation.error);
       }
     } else if (observation.results > 0) {
       const type = label(observation.type);
@@ -294,9 +318,9 @@ export const createSearchMetrics = (
       const reason = classifyFailure(observation.error);
       bump(scrape.reasons, reason);
       if (scrape.samples.length < MAX_FAILURE_SAMPLES) {
-        scrape.samples.push(`${hostOf(observation.url)}:${reason}`);
+        scrape.samples.push(label(`${hostOf(observation.url)}:${reason}`));
       }
-      scrape.detail ??= truncate(observation.error, MAX_DETAIL_LENGTH);
+      scrape.detail ??= detailOf(observation.error);
     } else {
       scrape.ok += 1;
       const chars = observation.chars ?? 0;
@@ -326,6 +350,7 @@ export const createSearchMetrics = (
       maxDurationMs: 0,
       reasons: new Map(),
     };
+    rerank.provider = mergeProvider(rerank.provider, observation.provider);
     rerank.calls += 1;
     rerank.chunks += observation.chunks;
     rerank.maxChunks = Math.max(rerank.maxChunks, observation.chunks);

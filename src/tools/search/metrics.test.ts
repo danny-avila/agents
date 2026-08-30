@@ -78,7 +78,7 @@ describe('createSearchMetrics', () => {
     expect(line).toContain('calls=8');
     expect(line).toContain('chunks=108 maxChunks=17');
     expect(line).toContain('results=40');
-    expect(line).toContain('model=rerank-v3.5');
+    expect(line).toContain('model="rerank-v3.5"');
     expect(line).toContain('units=8');
     expect(line).toContain('maxDur=107ms');
   });
@@ -246,6 +246,76 @@ describe('createSearchMetrics', () => {
     );
   });
 
+  it('strips control characters from a provider-supplied label', () => {
+    const logger = createMockLogger();
+    const metrics = createSearchMetrics(logger);
+
+    metrics.recordRerank({
+      provider: 'jina',
+      // A forged second entry, were the newline to survive into the message.
+      model: 'evil\n[web_search] scrape links=0 ok=0 chars=0 highlights=0',
+      chunks: 4,
+      results: 4,
+      durationMs: 1,
+    });
+    metrics.flush();
+
+    /** The line it could have forged cannot exist: the record stays one
+     * physical line, and the label is bounded within it. */
+    const line = lineOf(logger.debug);
+    expect(line.split(/\r?\n|[\u2028\u2029]/)).toHaveLength(1);
+    /** Whatever survives truncation stays inside the delimited field. */
+    expect(/ model="[^"]*"$/.test(line)).toBe(true);
+  });
+
+  it('attaches the thrown query detail, not an earlier soft failure', () => {
+    const logger = createMockLogger();
+    const metrics = createSearchMetrics(logger);
+
+    metrics.recordSearch({
+      provider: 'serper',
+      type: 'news',
+      results: 0,
+      durationMs: 5,
+      error: 'Request failed with status code 429',
+    });
+    metrics.recordSearch({
+      provider: 'serper',
+      type: 'images',
+      results: 0,
+      durationMs: 5,
+      error: 'socket hang up',
+      thrown: true,
+    });
+    metrics.flush();
+
+    /** The exception raised the severity, so its message is the one worth
+     * carrying — not whichever failure happened to arrive first. */
+    const [, detail] = (logger.error as jest.Mock).mock.calls[0];
+    expect(detail).toBe('socket hang up');
+  });
+
+  it('labels a phase mixed rather than mislabeling it as the first provider', () => {
+    const logger = createMockLogger();
+    const metrics = createSearchMetrics(logger);
+
+    metrics.recordRerank({
+      provider: 'chunker',
+      chunks: 0,
+      results: 0,
+      durationMs: 1,
+    });
+    metrics.recordRerank({
+      provider: 'jina',
+      chunks: 10,
+      results: 5,
+      durationMs: 1,
+    });
+    metrics.flush();
+
+    expect(lineOf(logger.debug)).toContain('rerank=mixed calls=2');
+  });
+
   it('bounds a provider-supplied model name inside the summary line', () => {
     const logger = createMockLogger();
     const metrics = createSearchMetrics(logger);
@@ -260,7 +330,7 @@ describe('createSearchMetrics', () => {
     metrics.flush();
 
     const line = lineOf(logger.debug);
-    expect(line).toContain('model=');
+    expect(line).toContain('model="');
     expect(line.length).toBeLessThan(200);
   });
 
