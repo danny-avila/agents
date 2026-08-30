@@ -20,13 +20,12 @@ import { createTokenCounter } from '@/utils/tokens';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { Run } from '@/run';
 import { formatAgentMessages } from '@/messages/format';
+import { buildSummaryCarrierText } from '@/summarization/shared';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { CustomAnthropic } from '@/llm/anthropic';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import * as providers from '@/llm/providers';
 import { hasAnyEnv, hasEnv, hasEveryEnv } from './spec.utils';
-
-const SUMMARY_WRAPPER_OVERHEAD_TOKENS = 33;
 
 /** Extract plain text from a SummaryContentBlock's content array (test helper). */
 function getSummaryText(summary: t.SummaryContentBlock | undefined): string {
@@ -1556,9 +1555,9 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
     expect(completePayload.summary!.type).toBe(ContentTypes.SUMMARY);
     expect(completePayload.summary!.tokenCount ?? 0).toBeGreaterThan(0);
 
-    const expectedTokenCount =
-      tokenCounter(new SystemMessage(KNOWN_SUMMARY)) +
-      SUMMARY_WRAPPER_OVERHEAD_TOKENS;
+    const expectedTokenCount = tokenCounter(
+      new HumanMessage(buildSummaryCarrierText(KNOWN_SUMMARY))
+    );
     expect(completePayload.summary!.tokenCount).toBe(expectedTokenCount);
 
     const summaryBlock = completePayload.summary!;
@@ -2680,9 +2679,9 @@ const hasAnyApiKey = hasAnyEnv(['ANTHROPIC_API_KEY', 'OPENAI_API_KEY']);
     const summaryText = getSummaryText(completePayload.summary);
     const reportedTokenCount = completePayload.summary!.tokenCount ?? 0;
 
-    const localTokenCount =
-      tokenCounter(new SystemMessage(summaryText)) +
-      SUMMARY_WRAPPER_OVERHEAD_TOKENS;
+    const localTokenCount = tokenCounter(
+      new HumanMessage(buildSummaryCarrierText(summaryText))
+    );
 
     console.log(
       `  Token match: reported=${reportedTokenCount}, local=${localTokenCount}`

@@ -3,19 +3,25 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import {
-  applySummarizationHistoryCache,
-  createSummarizeNode,
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
+  buildSummaryCarrierText,
+} from '@/summarization/shared';
+import {
+  applySummarizationHistoryCache,
   resolveBedrockCompactionCacheModel,
+  createSummarizeNode,
 } from '@/summarization/node';
 import { setFreshProviderMessageProvenance } from '@/messages/provenance';
+import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
 import { Constants, GraphEvents, Providers } from '@/common';
+import { registerProvider } from '@/llm/providerRegistry';
 import { AgentContext } from '@/agents/AgentContext';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
+import { FakeChatModel } from '@/llm/fake';
 
 describe('applySummarizationHistoryCache', () => {
   it('marks Anthropic history before the compaction instruction', () => {
@@ -2514,6 +2520,394 @@ describe('summarize node breaker capture', () => {
     expect(capturedSignals.length).toBeGreaterThan(0);
     for (const signal of capturedSignals) {
       expect(signal).toBe(entryBreaker.signal);
+    }
+  });
+
+  /** `shouldSummarizeOverflow` fires precisely when the host supplied no
+   *  tokenCounter, so this branch IS the overflow-recovery summary, and its
+   *  count is persisted and then reserved on the retry. It used to be a
+   *  four-characters-per-token guess, which understates CJK several-fold and
+   *  so under-reserved exactly where a repeat overflow is most likely. Korean
+   *  is the sample here because it is the worst measured case. */
+  it('measures the carrier with a real tokenizer when the host has none', async () => {
+    const summaryBody =
+      '사용자가 인증 미들웨어를 리팩터링하여 속도 제한 전에 토큰 검증이 이루어지도록 요청했습니다. 기존 핸들러를 읽어보니 순서가 뒤바뀌어 있었습니다.';
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel(summaryBody);
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext();
+    expect(agentContext.tokenCounter).toBeUndefined();
+    const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(setSummary).toHaveBeenCalled();
+    const [persistedText, persistedCount] = setSummary.mock.calls[0] as [
+      string,
+      number,
+    ];
+    const carrier = buildSummaryCarrierText(persistedText);
+    const counter = await createTokenCounter();
+
+    expect(persistedCount).toBe(counter(new HumanMessage(carrier)));
+    /* The guess this replaced. Asserting the gap keeps the test from passing
+     * if anyone reintroduces a character heuristic here. */
+    expect(persistedCount).toBeGreaterThan(Math.ceil(carrier.length / 4));
+  });
+
+  /** The carrier is re-injected into the AGENT's model, so the count has to be
+   *  denominated in the agent's tokenizer, not the summarizer's.
+   *  `summarizationConfig.model` is undefined for ordinary self-summarization,
+   *  so reading the model off the summarizer would silently measure an
+   *  Anthropic agent with `o200k_base` and understate it. */
+  it('measures with the receiving agent tokenizer, not the summarizer', async () => {
+    const summaryBody =
+      '사용자가 인증 미들웨어를 리팩터링하여 속도 제한 전에 토큰 검증이 이루어지도록 요청했습니다. 기존 핸들러를 읽어보니 순서가 뒤바뀌어 있었습니다.';
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel(summaryBody);
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext({
+      provider: Providers.ANTHROPIC,
+      clientOptions: { model: 'claude-sonnet-4' },
+    });
+    expect(agentContext.tokenCounter).toBeUndefined();
+    /* No dedicated summarizer model: the only model signal is the agent's. */
+    expect(agentContext.summarizationConfig?.model).toBeUndefined();
+    const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    const [persistedText, persistedCount] = setSummary.mock.calls[0] as [
+      string,
+      number,
+    ];
+    const carrier = new HumanMessage(buildSummaryCarrierText(persistedText));
+    const claudeCounter = await createTokenCounter('claude');
+    const openaiCounter = await createTokenCounter('o200k_base');
+
+    expect(persistedCount).toBe(claudeCounter(carrier));
+    /* Guards the actual defect: the two encodings must disagree here, or this
+     * test would pass just as well while measuring with the wrong one. */
+    expect(claudeCounter(carrier)).toBeGreaterThan(openaiCounter(carrier));
+  });
+
+  /** `Run.create` derives one counter from `agents[0]` and `StandardGraph`
+   *  hands it to every `AgentContext`, so a Claude agent sitting behind a GPT
+   *  first agent receives an `o200k_base` counter. Trusting it here measured
+   *  the carrier in the wrong units and under-reserved the persisted
+   *  checkpoint on the retry, which is the overflow this count exists to
+   *  prevent. */
+  it('ignores a shared counter built for another agent encoding', async () => {
+    const summaryBody =
+      '사용자가 인증 미들웨어를 리팩터링하여 속도 제한 전에 토큰 검증이 이루어지도록 요청했습니다. 기존 핸들러를 읽어보니 순서가 뒤바뀌어 있었습니다.';
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel(summaryBody);
+        }
+      } as never
+    );
+
+    const sharedCounter = await createTokenCounter(encodingForModel('gpt-4o'));
+    const agentContext = createAgentContext({
+      provider: Providers.ANTHROPIC,
+      clientOptions: { model: 'claude-sonnet-4' },
+      tokenCounter: sharedCounter,
+    });
+    const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    const [persistedText, persistedCount] = setSummary.mock.calls[0] as [
+      string,
+      number,
+    ];
+    const carrier = new HumanMessage(buildSummaryCarrierText(persistedText));
+    const claudeCounter = await createTokenCounter('claude');
+
+    expect(persistedCount).toBe(claudeCounter(carrier));
+    expect(persistedCount).toBeGreaterThan(sharedCounter(carrier));
+  });
+
+  /** The other half of the same rule: a counter the host built itself carries
+   *  no encoding stamp, and its units are the ones the host's own
+   *  `indexTokenCountMap` is denominated in, so it stays authoritative rather
+   *  than being second-guessed by a bundled tokenizer. */
+  it('keeps using a host-supplied counter of unknown encoding', async () => {
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel('Checkpoint body');
+        }
+      } as never
+    );
+
+    const hostCounter = jest.fn((): number => 4242);
+    const agentContext = createAgentContext({
+      provider: Providers.ANTHROPIC,
+      clientOptions: { model: 'claude-sonnet-4' },
+      tokenCounter: hostCounter,
+    });
+    const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(setSummary.mock.calls[0][1]).toBe(4242);
+  });
+
+  /** `modelName` is LangChain's alias for `model` and this repository
+   *  configures agents through both, so reading only `model` reported an
+   *  unconfigured model and fell through to the provider — which for a
+   *  Claude-backed OpenRouter agent means `o200k_base` and the same
+   *  under-reservation the receiving-agent fix exists to prevent. */
+  it('resolves the receiving model through the modelName alias', async () => {
+    const summaryBody =
+      '사용자가 인증 미들웨어를 리팩터링하여 속도 제한 전에 토큰 검증이 이루어지도록 요청했습니다. 기존 핸들러를 읽어보니 순서가 뒤바뀌어 있었습니다.';
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel(summaryBody);
+        }
+      } as never
+    );
+
+    /* OpenRouter, so the provider fallback cannot stand in for the model: it
+     * serves Claude alongside everything else and resolves to `o200k_base`. */
+    const agentContext = createAgentContext({
+      provider: Providers.OPENROUTER,
+      clientOptions: { modelName: 'anthropic/claude-sonnet-4' },
+    });
+    const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    const [persistedText, persistedCount] = setSummary.mock.calls[0] as [
+      string,
+      number,
+    ];
+    const carrier = new HumanMessage(buildSummaryCarrierText(persistedText));
+    const claudeCounter = await createTokenCounter('claude');
+    const openaiCounter = await createTokenCounter('o200k_base');
+
+    expect(persistedCount).toBe(claudeCounter(carrier));
+    expect(claudeCounter(carrier)).toBeGreaterThan(openaiCounter(carrier));
+  });
+
+  /** A host provider registered with `family: 'anthropic'` serves Claude under
+   *  whatever name and deployment alias the host chose, so an exact match on
+   *  the `ANTHROPIC` enum missed it and fell back to `o200k_base`. The rest of
+   *  the package reads the trait as a family (`isThinkingEnabled`), and the
+   *  tokenizer choice now does too. */
+  it('honors a registered anthropic family with no configured model', async () => {
+    const summaryBody =
+      '사용자가 인증 미들웨어를 리팩터링하여 속도 제한 전에 토큰 검증이 이루어지도록 요청했습니다. 기존 핸들러를 읽어보니 순서가 뒤바뀌어 있었습니다.';
+    const dispose = registerProvider({
+      provider: 'claude-host-summarization-test',
+      model: class extends FakeChatModel {
+        constructor() {
+          super({ responses: [summaryBody] });
+        }
+      },
+      family: 'anthropic',
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel(summaryBody);
+        }
+      } as never
+    );
+
+    try {
+      /* No model on either key: the provider is the only signal there is. */
+      const agentContext = createAgentContext({
+        provider: 'claude-host-summarization-test',
+        clientOptions: {},
+      });
+      const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+      const node = createSummarizeNode({
+        agentContext,
+        graph: mockGraph(),
+        generateStepId,
+      });
+
+      await node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+
+      const [persistedText, persistedCount] = setSummary.mock.calls[0] as [
+        string,
+        number,
+      ];
+      const carrier = new HumanMessage(buildSummaryCarrierText(persistedText));
+      const claudeCounter = await createTokenCounter('claude');
+      const openaiCounter = await createTokenCounter('o200k_base');
+
+      expect(persistedCount).toBe(claudeCounter(carrier));
+      expect(claudeCounter(carrier)).toBeGreaterThan(openaiCounter(carrier));
+    } finally {
+      dispose();
+    }
+  });
+
+  /** `encodingForModel` matches the substring `claude`, so an opaque
+   *  deployment alias reports `o200k_base` while proving nothing about the
+   *  model behind it. Treating that as the answer skipped the family lookup
+   *  entirely and under-reserved the CJK checkpoint by the same 1.9x the
+   *  family fix exists to prevent, including against the `o200k_base` counter
+   *  `Run.create` stamps from that same alias. */
+  it('honors a registered anthropic family behind an opaque model alias', async () => {
+    const summaryBody =
+      '사용자가 인증 미들웨어를 리팩터링하여 속도 제한 전에 토큰 검증이 이루어지도록 요청했습니다. 기존 핸들러를 읽어보니 순서가 뒤바뀌어 있었습니다.';
+    const dispose = registerProvider({
+      provider: 'claude-alias-summarization-test',
+      model: class extends FakeChatModel {
+        constructor() {
+          super({ responses: [summaryBody] });
+        }
+      },
+      family: 'anthropic',
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel(summaryBody);
+        }
+      } as never
+    );
+
+    try {
+      const sharedCounter = await createTokenCounter(
+        encodingForModel('production')
+      );
+      const agentContext = createAgentContext({
+        provider: 'claude-alias-summarization-test',
+        clientOptions: { model: 'production' },
+        tokenCounter: sharedCounter,
+      });
+      const setSummary = jest.spyOn(agentContext, 'setSummary');
+
+      const node = createSummarizeNode({
+        agentContext,
+        graph: mockGraph(),
+        generateStepId,
+      });
+
+      await node(
+        {
+          messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      );
+
+      const [persistedText, persistedCount] = setSummary.mock.calls[0] as [
+        string,
+        number,
+      ];
+      const carrier = new HumanMessage(buildSummaryCarrierText(persistedText));
+      const claudeCounter = await createTokenCounter('claude');
+
+      expect(persistedCount).toBe(claudeCounter(carrier));
+      expect(persistedCount).toBeGreaterThan(sharedCounter(carrier));
+    } finally {
+      dispose();
     }
   });
 });
