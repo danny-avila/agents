@@ -30,6 +30,7 @@ import type {
   ProviderName,
   CompactionSemanticIndex,
   CompactionSemanticIndexEntry,
+  CompactionSemanticIndexSnapshot,
 } from '@/types';
 import type {
   ProviderMessageAttribution,
@@ -53,22 +54,26 @@ import {
   setProviderMessageProvenance,
 } from './provenance';
 import {
+  snapshotCompactionSemanticIndex,
+  getCompactionSemanticIndexProvidedEntryCount,
+  setCompactionSemanticIndexProvidedEntryCount,
+} from '@/summarization/semanticIndex';
+import {
   compactToolContent,
   getToolContentCharLength,
   isAtomicToolContentBlock,
   serializeStructuredValueBounded,
 } from '@/utils/toolContent';
-import { setCompactionSemanticIndexProvidedEntryCount } from '@/summarization/semanticIndex';
-import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
-import { toLangChainContent, toLangChainMessageFields } from './langchain';
-import { flattenLegacyContent, isLegacyConvertible } from './content';
-import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import {
   Providers,
   ContentTypes,
   Constants,
   COMPACTION_SEMANTIC_INDEX_LIMITS,
 } from '@/common';
+import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
+import { toLangChainContent, toLangChainMessageFields } from './langchain';
+import { flattenLegacyContent, isLegacyConvertible } from './content';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { emitAgentLog } from '@/utils/events';
 
 interface MediaMessageParams {
@@ -389,7 +394,7 @@ interface FormatAssistantMessageOptions {
 
 type SourceContentPartIndices = number | readonly number[];
 
-interface FormatAgentMessagesOptions {
+export interface FormatAgentMessagesOptions {
   provider?: ProviderName;
   /** Emit flattenable text content as the joined string the legacy-content
    *  projection would produce, so the per-request `formatContentStrings` pass
@@ -410,6 +415,10 @@ interface FormatAgentMessagesOptions {
    *  the host identifies as semantic-label fields; business `intent`
    *  parameters must remain ordinary tool input. */
   compactionSemanticIndex?: {
+    /** Previously committed, serializable guidance to evolve with entries
+     *  derived from this payload. The formatter snapshots and validates
+     *  caller-owned data before scanning the new messages. */
+    baseSnapshot?: CompactionSemanticIndexSnapshot;
     intentToolNames?: ReadonlySet<string>;
   };
 }
@@ -533,9 +542,17 @@ type CompactionSemanticCoverageState = {
   >;
 };
 
+type CompactionSemanticRevisionFloor = {
+  entry: CompactionSemanticIndexEntry;
+  order: number;
+};
+
 type DerivedCompactionSemanticIndexCollector = {
   entries: CompactionSemanticIndexEntry[];
   entryCount: number;
+  baseEntryCount: number;
+  omittedBaseEntryCount: number;
+  baseRevisionFloors?: Map<number, CompactionSemanticRevisionFloor[]>;
   coverage?: CompactionSemanticCoverageState;
 };
 
@@ -554,11 +571,47 @@ const DERIVED_SEMANTIC_TYPE_HASH: Readonly<
   reasoning_label: 4,
 });
 
-function createDerivedCompactionSemanticIndexCollector(): DerivedCompactionSemanticIndexCollector {
-  return {
+function createDerivedCompactionSemanticIndexCollector(
+  baseSnapshot?: CompactionSemanticIndexSnapshot
+): DerivedCompactionSemanticIndexCollector {
+  const collector: DerivedCompactionSemanticIndexCollector = {
     entries: [],
     entryCount: 0,
+    baseEntryCount: 0,
+    omittedBaseEntryCount: 0,
   };
+  let baseEntries: CompactionSemanticIndex | undefined;
+  let serializedProvidedEntryCount: number | undefined;
+  try {
+    baseEntries = baseSnapshot?.entries;
+    serializedProvidedEntryCount = baseSnapshot?.providedEntryCount;
+  } catch {
+    return collector;
+  }
+  const snapshot = snapshotCompactionSemanticIndex(baseEntries);
+  if (snapshot == null) {
+    return collector;
+  }
+  const snapshotProvidedEntryCount =
+    getCompactionSemanticIndexProvidedEntryCount(snapshot);
+  const validSerializedProvidedEntryCount =
+    typeof serializedProvidedEntryCount === 'number' &&
+    Number.isSafeInteger(serializedProvidedEntryCount) &&
+    serializedProvidedEntryCount >= snapshotProvidedEntryCount;
+  const providedEntryCount =
+    validSerializedProvidedEntryCount &&
+    serializedProvidedEntryCount != null
+      ? serializedProvidedEntryCount
+      : snapshotProvidedEntryCount;
+  collector.omittedBaseEntryCount = Math.max(
+    0,
+    providedEntryCount - snapshot.length
+  );
+  for (let index = 0; index < snapshot.length; index++) {
+    appendDerivedCompactionSemanticEntry(collector, snapshot[index], true);
+  }
+  collector.baseEntryCount = collector.entryCount;
+  return collector;
 }
 
 function createCompactionSemanticCoverageState(): CompactionSemanticCoverageState {
@@ -635,6 +688,86 @@ function entriesHaveConflictingSemanticState(
     left.text.replace(/\s+/g, ' ').trim() !==
       right.text.replace(/\s+/g, ' ').trim()
   );
+}
+
+function findCompactionSemanticRevisionFloor(
+  collector: DerivedCompactionSemanticIndexCollector,
+  entry: CompactionSemanticIndexEntry,
+  identityHash: number
+): CompactionSemanticRevisionFloor | undefined {
+  return collector.baseRevisionFloors
+    ?.get(identityHash)
+    ?.find((floor) =>
+      entriesShareDerivedCompactionSemanticIdentity(floor.entry, entry)
+    );
+}
+
+function seedCompactionSemanticRevisionFloor(
+  collector: DerivedCompactionSemanticIndexCollector,
+  entry: CompactionSemanticIndexEntry,
+  order: number
+): void {
+  collector.baseRevisionFloors ??= new Map();
+  const identityHash = hashDerivedCompactionSemanticIdentity(entry);
+  const existing = findCompactionSemanticRevisionFloor(
+    collector,
+    entry,
+    identityHash
+  );
+  if (existing != null) {
+    if (entry.revision > existing.entry.revision) {
+      existing.entry = entry;
+      existing.order = order;
+    }
+    return;
+  }
+  const floor = { entry, order };
+  const bucket = collector.baseRevisionFloors.get(identityHash);
+  if (bucket == null) {
+    collector.baseRevisionFloors.set(identityHash, [floor]);
+    return;
+  }
+  bucket.push(floor);
+}
+
+function updateCompactionSemanticRevisionFloor(
+  collector: DerivedCompactionSemanticIndexCollector,
+  orderedEntry: OrderedCompactionSemanticIndexEntry
+): void {
+  const floor = findCompactionSemanticRevisionFloor(
+    collector,
+    orderedEntry.entry,
+    orderedEntry.identityHash
+  );
+  if (floor == null || orderedEntry.entry.revision <= floor.entry.revision) {
+    return;
+  }
+  floor.entry = orderedEntry.entry;
+  floor.order = orderedEntry.order;
+}
+
+function shouldRejectCompactionSemanticEntryBelowBaseFloor(
+  collector: DerivedCompactionSemanticIndexCollector,
+  orderedEntry: OrderedCompactionSemanticIndexEntry
+): boolean {
+  const floor = findCompactionSemanticRevisionFloor(
+    collector,
+    orderedEntry.entry,
+    orderedEntry.identityHash
+  );
+  if (floor == null || orderedEntry.order === floor.order) {
+    return false;
+  }
+  const currentBucket = collector.coverage?.latestByIdentityHash.get(
+    orderedEntry.identityHash
+  );
+  const current = currentBucket?.find(({ entry }) =>
+    entriesShareDerivedCompactionSemanticIdentity(entry, orderedEntry.entry)
+  );
+  if (current != null) {
+    return false;
+  }
+  return orderedEntry.entry.revision <= floor.entry.revision;
 }
 
 function retainCompactionSemanticEntry(
@@ -738,7 +871,8 @@ function renewCoverageBalancedCompactionSemanticEntry(
 
 function appendDerivedCompactionSemanticEntry(
   collector: DerivedCompactionSemanticIndexCollector,
-  entry: CompactionSemanticIndexEntry
+  entry: CompactionSemanticIndexEntry,
+  baseEntry = false
 ): void {
   let boundedEntry = entry;
   if (entry.status === 'pending') {
@@ -755,6 +889,14 @@ function appendDerivedCompactionSemanticEntry(
     collector.entries.length < COMPACTION_SEMANTIC_INDEX_LIMITS.maxInputEntries
   ) {
     collector.entries.push(boundedEntry);
+    if (!baseEntry && collector.baseRevisionFloors != null) {
+      updateCompactionSemanticRevisionFloor(collector, {
+        entry: boundedEntry,
+        identityHash: hashDerivedCompactionSemanticIdentity(boundedEntry),
+        order,
+        retentionCount: 0,
+      });
+    }
     return;
   }
   const orderedEntry = {
@@ -764,23 +906,54 @@ function appendDerivedCompactionSemanticEntry(
     retentionCount: 0,
   };
   if (collector.coverage == null) {
+    for (let order = 0; order < collector.baseEntryCount; order++) {
+      seedCompactionSemanticRevisionFloor(
+        collector,
+        collector.entries[order],
+        order
+      );
+    }
     collector.coverage = createCompactionSemanticCoverageState();
     for (let order = 0; order < collector.entries.length; order++) {
-      appendCoverageBalancedCompactionSemanticEntry(collector.coverage, {
+      const bufferedEntry = {
         entry: collector.entries[order],
         identityHash: hashDerivedCompactionSemanticIdentity(
           collector.entries[order]
         ),
         order,
         retentionCount: 0,
-      });
+      };
+      if (
+        shouldRejectCompactionSemanticEntryBelowBaseFloor(
+          collector,
+          bufferedEntry
+        )
+      ) {
+        continue;
+      }
+      appendCoverageBalancedCompactionSemanticEntry(
+        collector.coverage,
+        bufferedEntry
+      );
+      if (order >= collector.baseEntryCount) {
+        updateCompactionSemanticRevisionFloor(collector, bufferedEntry);
+      }
     }
     collector.entries = [];
+  }
+  if (
+    !baseEntry &&
+    shouldRejectCompactionSemanticEntryBelowBaseFloor(collector, orderedEntry)
+  ) {
+    return;
   }
   appendCoverageBalancedCompactionSemanticEntry(
     collector.coverage,
     orderedEntry
   );
+  if (!baseEntry) {
+    updateCompactionSemanticRevisionFloor(collector, orderedEntry);
+  }
 }
 
 function appendCoverageBalancedCompactionSemanticEntry(
@@ -843,18 +1016,25 @@ function appendCoverageBalancedCompactionSemanticEntry(
   );
 }
 
-function finalizeDerivedCompactionSemanticIndex(
+function finalizeDerivedCompactionSemanticIndexSnapshot(
   collector: DerivedCompactionSemanticIndexCollector | undefined
-): CompactionSemanticIndex | undefined {
-  if (collector == null || collector.entryCount === 0) {
+): CompactionSemanticIndexSnapshot | undefined {
+  if (
+    collector == null ||
+    (collector.entryCount === 0 && collector.omittedBaseEntryCount === 0)
+  ) {
     return undefined;
   }
+  const providedEntryCount = Math.min(
+    Number.MAX_SAFE_INTEGER,
+    collector.entryCount + collector.omittedBaseEntryCount
+  );
   if (collector.coverage == null) {
     setCompactionSemanticIndexProvidedEntryCount(
       collector.entries,
-      collector.entryCount
+      providedEntryCount
     );
-    return collector.entries;
+    return { entries: collector.entries, providedEntryCount };
   }
   const retained = new Map<number, CompactionSemanticIndexEntry>();
   const retain = (
@@ -873,8 +1053,8 @@ function finalizeDerivedCompactionSemanticIndex(
   const result = [...retained.entries()]
     .sort(([left], [right]) => left - right)
     .map(([, entry]) => entry);
-  setCompactionSemanticIndexProvidedEntryCount(result, collector.entryCount);
-  return result;
+  setCompactionSemanticIndexProvidedEntryCount(result, providedEntryCount);
+  return { entries: result, providedEntryCount };
 }
 
 function collectCompactionSemanticEntriesFromPart(
@@ -888,8 +1068,7 @@ function collectCompactionSemanticEntriesFromPart(
   parsedToolInput?: ToolCallPart['args']
 ): void {
   if (
-    sourceMessageId.length >
-      COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
+    sourceMessageId.length > COMPACTION_SEMANTIC_INDEX_LIMITS.maxIdentityChars
   ) {
     return;
   }
@@ -1017,14 +1196,14 @@ function collectCompactionSemanticEntriesFromPart(
     part.pending !== undefined && typeof part.pending !== 'boolean';
   const malformedText = typeof part.activity_label !== 'string';
   const malformedState = malformedPending || malformedText;
-  const text = typeof part.activity_label === 'string' ? part.activity_label : '';
+  const text =
+    typeof part.activity_label === 'string' ? part.activity_label : '';
   appendDerivedCompactionSemanticEntry(collector, {
     type: 'activity_phase',
     sourceMessageId,
     sourceContentIndex: activitySourceContentIndex,
     revision: revision ?? 0,
-    status:
-      part.pending === true || malformedPending ? 'pending' : 'committed',
+    status: part.pending === true || malformedPending ? 'pending' : 'committed',
     text,
     ...(malformedState ? { redacted: true } : {}),
   });
@@ -2627,6 +2806,8 @@ export const formatAgentMessages = (
   boundaryTokenAdjustment?: SummaryTokenAdjustment;
   /** Bounded semantic guidance derived during persisted-content analysis. */
   compactionSemanticIndex?: CompactionSemanticIndex;
+  /** Serializable continuation state for incrementally evolving the index. */
+  compactionSemanticIndexSnapshot?: CompactionSemanticIndexSnapshot;
 } => {
   const messages: Array<
     | RoleBearingMessage<HumanMessage>
@@ -2643,7 +2824,9 @@ export const formatAgentMessages = (
   const legacyContentEnabled = options?.legacyContent === true;
   const compactionSemanticIndexCollector =
     options?.compactionSemanticIndex != null
-      ? createDerivedCompactionSemanticIndexCollector()
+      ? createDerivedCompactionSemanticIndexCollector(
+        options.compactionSemanticIndex.baseSnapshot
+      )
       : undefined;
   /** Emission choke point: every formatted message enters the result here, so
    *  the legacy flatten happens once per message with no closing rescan. The
@@ -3246,6 +3429,10 @@ export const formatAgentMessages = (
     }
   }
 
+  const compactionSemanticIndexSnapshot =
+    finalizeDerivedCompactionSemanticIndexSnapshot(
+      compactionSemanticIndexCollector
+    );
   return {
     messages,
     indexTokenCountMap: indexTokenCountMap
@@ -3255,9 +3442,8 @@ export const formatAgentMessages = (
       ? { text: summaryBoundary.text, tokenCount: summaryBoundary.tokenCount }
       : undefined,
     boundaryTokenAdjustment,
-    compactionSemanticIndex: finalizeDerivedCompactionSemanticIndex(
-      compactionSemanticIndexCollector
-    ),
+    compactionSemanticIndex: compactionSemanticIndexSnapshot?.entries,
+    compactionSemanticIndexSnapshot,
   };
 };
 

@@ -193,10 +193,24 @@ owns enablement and identifies which tool `intent` fields are semantic labels.
 The index is appended only after cacheable raw history; it never replaces raw
 messages or makes generated labels authoritative.
 
+An **Incremental Compaction Semantic Index** evolves a previously committed,
+bounded index with labels from only the current persisted payload. Its
+serializable snapshot contains retained entries plus their cumulative supplied
+count so omission telemetry survives process boundaries. Model Context
+Reconstruction snapshots the prior entries, admits them chronologically through
+the same coverage-balanced collector, and derives the delta during its existing
+content pass. Work is independent of unbounded conversation length: `O(B +
+delta)`, where `B` is capped at 256. Invalid prior state degrades to delta-only
+derivation rather than disabling new guidance. Ephemeral revision floors for
+the bounded base prevent coverage omissions from admitting stale delta labels;
+they never become serialized collector state.
+
 See [ADR 0005](docs/adr/0005-pairing-balanced-compaction-ranges.md) for the
 range-selection and retention trade-offs.
 See [ADR 0007](docs/adr/0007-guide-compaction-with-a-bounded-semantic-index.md)
 for the index trust, ordering, and latency boundaries.
+See [ADR 0008](docs/adr/0008-evolve-compaction-guidance-from-warm-turn-deltas.md)
+for bounded warm-turn evolution and continuation ownership.
 See [ADR 0006](docs/adr/0006-align-compaction-with-provider-cache-prefixes.md)
 for the prompt-cache boundary and rejected predictive replay design.
 

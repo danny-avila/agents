@@ -156,6 +156,25 @@ describe('renderCompactionSemanticIndex', () => {
     });
   });
 
+  it('filters collector-unsafe identities and numeric coordinates while snapshotting', () => {
+    const valid = activityEntry({ text: 'valid snapshot entry' });
+    const snapshot = snapshotCompactionSemanticIndex([
+      activityEntry({ sourceMessageId: '   ' }),
+      activityEntry({ sourceContentIndex: -1 }),
+      activityEntry({ sourceContentIndex: Number.POSITIVE_INFINITY }),
+      activityEntry({ revision: -1 }),
+      activityEntry({ revision: Number.MAX_SAFE_INTEGER + 1 }),
+      valid,
+    ]);
+
+    expect(snapshot).toEqual([valid]);
+    expect(renderCompactionSemanticIndex(snapshot, messages)).toMatchObject({
+      providedEntryCount: 6,
+      entryCount: 1,
+      omittedEntryCount: 5,
+    });
+  });
+
   it('rejects malformed and out-of-range source references', () => {
     const index: CompactionSemanticIndex = [
       activityEntry({ sourceMessageId: '' }),
