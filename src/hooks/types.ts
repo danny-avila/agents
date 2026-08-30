@@ -634,6 +634,8 @@ export interface AggregatedHookResult {
    * `preventContinuation` do not overwrite the reason.
    */
   stopReason?: string;
+  /** True when any hook failed, including internal hooks with hidden diagnostics. */
+  hasHookFailures?: true;
   /** Error messages from hooks that threw; always present (possibly empty). */
   errors: string[];
 }

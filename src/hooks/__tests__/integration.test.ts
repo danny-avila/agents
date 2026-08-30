@@ -379,6 +379,30 @@ describe('Run-level hook integration', () => {
       );
     });
 
+    it('fails closed when an internal finalizer suppresses diagnostics', async () => {
+      const registry = new HookRegistry();
+      registry.register('StopFinalize', {
+        internal: true,
+        hooks: [
+          async (): Promise<StopHookOutput> => {
+            throw new Error('private claim failure');
+          },
+        ],
+      });
+
+      const run = await createRun(registry, 'failed-internal-admission');
+      run.Graph!.overrideTestModel(['first answer']);
+
+      await expect(
+        run.processStream(
+          { messages: [new HumanMessage('initial prompt')] },
+          callerConfig
+        )
+      ).rejects.toThrow(
+        'StopFinalize terminal admission failed: one or more internal finalizers failed'
+      );
+    });
+
     it('does not self-loop when Stop blocks without injectable content', async () => {
       const registry = new HookRegistry();
       let calls = 0;

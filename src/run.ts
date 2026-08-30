@@ -177,11 +177,15 @@ function advanceCheckpointCursor(
 }
 
 function assertFinalAdmissionSucceeded(result: AggregatedHookResult): void {
-  if (result.errors.length === 0) {
+  if (result.hasHookFailures !== true && result.errors.length === 0) {
     return;
   }
+  const detail =
+    result.errors.length > 0
+      ? result.errors.join('; ')
+      : 'one or more internal finalizers failed';
   throw new Error(
-    `StopFinalize terminal admission failed: ${result.errors.join('; ')}`
+    `StopFinalize terminal admission failed: ${detail}`
   );
 }
 
@@ -408,6 +412,27 @@ function getPersistedMessages(
 }
 
 type ResumeCommandUpdate = ConstructorParameters<typeof Command>[0]['update'];
+
+function overwriteResumeRunStepState(
+  command: Command,
+  state: t.RunStepResumeState
+): Command {
+  const overwrite = new Overwrite(state);
+  const update = Array.isArray(command.update)
+    ? [
+      ...command.update.filter(([key]) => key !== 'runStepState'),
+      ['runStepState', overwrite] as [string, unknown],
+    ]
+    : { ...(command.update ?? {}), runStepState: overwrite };
+  const resumed = new Command({
+    ...(command.graph == null ? {} : { graph: command.graph }),
+    ...(command.resume === undefined ? {} : { resume: command.resume }),
+    update,
+    ...(command.goto === undefined ? {} : { goto: command.goto }),
+  });
+  resumed.lc_direct_tool_output = command.lc_direct_tool_output;
+  return resumed;
+}
 
 function getResumeUpdateMessages(
   update: ResumeCommandUpdate
@@ -1184,11 +1209,16 @@ export class Run<_T extends t.BaseGraphState> {
       delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
       delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
     }
+    let overwriteLegacyResumeState = false;
     if (isResume) {
       await this.restoreInterruptFromCheckpoint(
         config,
         (inputs as Command).update
       );
+      if (graph.getStopContinuationExecutionId() === '') {
+        graph.startStopContinuationExecution(nanoid());
+        overwriteLegacyResumeState = this.hasCheckpointer;
+      }
     }
 
     /**
@@ -1369,13 +1399,18 @@ export class Run<_T extends t.BaseGraphState> {
     let terminalAt: number | undefined;
 
     const consumeStream = async (): Promise<void> => {
-      let streamInputs: t.IState | Command =
-        !isResume && this.hasCheckpointer
-          ? ({
-            ...(inputs as t.IState),
-            runStepState: new Overwrite(graph.createRunStepResumeState()),
-          } as unknown as t.IState)
-          : inputs;
+      let streamInputs: t.IState | Command = inputs;
+      if (!isResume && this.hasCheckpointer) {
+        streamInputs = {
+          ...(inputs as t.IState),
+          runStepState: new Overwrite(graph.createRunStepResumeState()),
+        } as unknown as t.IState;
+      } else if (overwriteLegacyResumeState) {
+        streamInputs = overwriteResumeRunStepState(
+          inputs as Command,
+          graph.createRunStepResumeState()
+        );
+      }
       let streamConfig = config;
 
       for (;;) {

@@ -1211,6 +1211,7 @@ describe('executeHooks', () => {
         matchQuery: 'Bash',
       });
       expect(result.errors).toHaveLength(0);
+      expect(result.hasHookFailures).toBe(true);
     });
 
     it('routes non-internal errors through an optional logger instead of console', async () => {

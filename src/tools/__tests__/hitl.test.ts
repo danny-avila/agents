@@ -40,6 +40,7 @@ import type {
 import type * as t from '@/types';
 import { Constants, Providers as providers, GraphEvents } from '@/common';
 import { getProviderMessageProvenance } from '@/messages/provenance';
+import { getRunStepResumeState } from '@/tools/runStepResume';
 import { HookRegistry, createToolPolicyHook } from '@/hooks';
 import * as events from '@/utils/events';
 import { askUserQuestion } from '@/hitl';
@@ -90,6 +91,48 @@ function mockEventDispatch(mockResults: t.ToolExecuteResult[]): void {
         (request.resolve as (r: t.ToolExecuteResult[]) => void)(mockResults);
       }
     });
+}
+
+async function stripStopContinuationExecutionIds(
+  checkpointer: MemorySaver,
+  threadId: string
+): Promise<void> {
+  for (const checkpoints of Object.values(
+    checkpointer.storage[threadId] ?? {}
+  )) {
+    for (const stored of Object.values(checkpoints)) {
+      const checkpoint = await checkpointer.serde.loadsTyped(
+        'json',
+        stored[0]
+      );
+      const runStepState = (
+        checkpoint as {
+          channel_values?: { runStepState?: t.RunStepResumeState };
+        }
+      ).channel_values?.runStepState;
+      if (runStepState != null) {
+        delete runStepState.stopContinuationExecutionId;
+        const [, serialized] = await checkpointer.serde.dumpsTyped(checkpoint);
+        stored[0] = serialized;
+      }
+    }
+  }
+  for (const [key, writes] of Object.entries(checkpointer.writes)) {
+    const [storedThreadId] = JSON.parse(key) as [string, string, string];
+    if (storedThreadId !== threadId) {
+      continue;
+    }
+    for (const stored of Object.values(writes)) {
+      const value = await checkpointer.serde.loadsTyped('json', stored[2]);
+      const runStepState = getRunStepResumeState(value);
+      if (runStepState == null) {
+        continue;
+      }
+      delete runStepState.stopContinuationExecutionId;
+      const [, serialized] = await checkpointer.serde.dumpsTyped(value);
+      stored[2] = serialized;
+    }
+  }
 }
 
 type MessagesUpdate = { messages: BaseMessage[] };
@@ -1391,8 +1434,20 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
       hooks: [
         async (input): Promise<StopHookOutput> => {
           stopInputs.push(input);
-          if (input.continuationCount > 0) {
+          if (input.continuationCount > 1) {
             return { decision: 'continue' };
+          }
+          if (input.continuationCount === 1) {
+            return {
+              decision: 'block',
+              injectedMessages: [
+                {
+                  role: 'user',
+                  content: 'post-upgrade steer',
+                  source: 'steer',
+                },
+              ],
+            };
           }
           run.Graph?.overrideTestModel(
             ['tool request', 'final answer'],
@@ -1433,7 +1488,7 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
       },
       hooks: registry,
       humanInTheLoop: { enabled: true },
-      maxStopContinuations: 1,
+      maxStopContinuations: 2,
       skipCleanup: true,
     });
     run.Graph?.overrideTestModel(['first answer']);
@@ -1447,6 +1502,10 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     expect(interrupt?.checkpointId).toEqual(expect.any(String));
     expect(interrupt?.checkpointId).not.toBe(seedCheckpointId);
     expect(stopInputs.map((input) => input.continuationCount)).toEqual([0]);
+    await stripStopContinuationExecutionIds(
+      checkpointer,
+      threadConfig.configurable.thread_id
+    );
 
     run = await RunClass.create<t.IState>({
       runId: 'warm-hitl-budget',
@@ -1466,10 +1525,13 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
       },
       hooks: registry,
       humanInTheLoop: { enabled: true },
-      maxStopContinuations: 1,
+      maxStopContinuations: 2,
       skipCleanup: true,
     });
-    run.Graph?.overrideTestModel(['final answer']);
+    run.Graph?.overrideTestModel([
+      'final answer',
+      'post-upgrade continued answer',
+    ]);
     await run.resume([{ type: 'approve' }], {
       ...config,
       configurable: {
@@ -1479,10 +1541,12 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     });
 
     expect(run.getInterrupt()).toBeUndefined();
-    expect(stopInputs.map((input) => input.continuationCount)).toEqual([0, 1]);
+    expect(stopInputs.map((input) => input.continuationCount)).toEqual([
+      0, 1, 2,
+    ]);
     expect(
       stopInputs.map((input) => input.continuationBudgetRemaining)
-    ).toEqual([1, 0]);
+    ).toEqual([2, 1, 0]);
   });
 
   it('Run.resume() forwards `update` so langgraph applies the channel edit through streamEvents', async () => {
