@@ -169,12 +169,18 @@ export function extractUsedBashToolNames(
   return usedTools;
 }
 
-const PYTHON_NON_CODE =
-  /("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|#[^\n]*)/g;
-const BASH_NON_CODE = /("(?:[^"\\]|\\.)*"|'[^']*'|(?:^|\s)#[^\n]*)/g;
+/* Interpolating constructs stay visible: an f-string expression and a bash
+ * command substitution are executable code, and blanking them would hide a real
+ * tool call. Bash double quotes interpolate, so only single quotes are erased. */
+const PYTHON_STRING_OR_COMMENT =
+  /([A-Za-z]*)("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|#[^\n]*/g;
+const BASH_STRING_OR_COMMENT = /'[^']*'|(?:^|\s)#[^\n]*/gm;
+
+const blankOut = (match: string): string => ' '.repeat(match.length);
 
 /**
- * Blanks comments and string literals so prose cannot be mistaken for a call.
+ * Blanks comments and non-interpolating string literals so prose cannot be
+ * mistaken for a call.
  *
  * Only reduces false positives — a name that survives may still not be a real
  * invocation. Runtimes enforce the caller boundary by defining stubs for the
@@ -184,8 +190,19 @@ export function stripNonCodeText(
   code: string,
   runtime: ProgrammaticRuntime
 ): string {
-  const pattern = runtime === 'bash' ? BASH_NON_CODE : PYTHON_NON_CODE;
-  return code.replace(pattern, (match) => ' '.repeat(match.length));
+  if (runtime === 'bash') {
+    return code.replace(BASH_STRING_OR_COMMENT, blankOut);
+  }
+
+  return code.replace(
+    PYTHON_STRING_OR_COMMENT,
+    (match: string, prefix?: string, literal?: string) => {
+      if (literal == null) {
+        return blankOut(match);
+      }
+      return prefix != null && /[fF]/.test(prefix) ? match : blankOut(match);
+    }
+  );
 }
 
 function matchesRuntimeIdentifier(

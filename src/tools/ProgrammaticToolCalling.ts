@@ -831,6 +831,12 @@ export async function runPlainExecution(args: {
   baseUrl: string;
   lang: 'bash' | 'py';
   code: string;
+  /**
+   * Forwarded so the model-supplied cap applies as soon as the Code API honors
+   * it on `/exec`; today that route reads only `user_id`, `lang`, `code` and
+   * `files`, leaving the sandbox's own run limit in force.
+   */
+  timeout?: number;
   sessionId?: string;
   files?: t.CodeEnvFile[];
   runtimeSessionHint?: string;
@@ -846,6 +852,7 @@ export async function runPlainExecution(args: {
         args.lang === 'py'
           ? wrapPythonForPlainExecution(args.code)
           : args.code,
+      ...(args.timeout != null ? { timeout: args.timeout } : {}),
       ...(args.sessionId != null && args.sessionId !== ''
         ? { session_id: args.sessionId }
         : {}),
@@ -1020,6 +1027,7 @@ export function createProgrammaticToolCallingTool(
             baseUrl,
             lang: 'py',
             code,
+            timeout,
             sessionId: session_id,
             files,
             runtimeSessionHint,

@@ -419,3 +419,55 @@ describe('runtimes that expose unselected tools keep requiring a manifest', () =
     ).toEqual([]);
   });
 });
+
+describe('interpolating constructs stay visible to derivation', () => {
+  const tools: t.LCTool[] = [
+    { name: 'calculator', allowed_callers: ['code_execution'] },
+  ];
+
+  it('keeps a python f-string expression', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'print(f"{await calculator(1)}")',
+        'python'
+      ).map((def) => def.name)
+    ).toEqual(['calculator']);
+  });
+
+  it('keeps a bash command substitution', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'echo "$(calculator \'{}\')"', 'bash').map(
+        (def) => def.name
+      )
+    ).toEqual(['calculator']);
+  });
+
+  it('still blanks a non-interpolating python literal', () => {
+    expect(stripNonCodeText('x = b"calculator("', 'python')).not.toContain(
+      'calculator'
+    );
+  });
+
+  it('still blanks bash single quotes and comments', () => {
+    expect(stripNonCodeText('echo \'calculator\'', 'bash')).not.toContain(
+      'calculator'
+    );
+    expect(stripNonCodeText('ls # calculator', 'bash')).not.toContain(
+      'calculator'
+    );
+  });
+});
+
+describe('timeout on the plain route', () => {
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  it('forwards the clamped timeout so it applies once /exec honors it', async () => {
+    await invokeBash({ code: 'ls /mnt/data', tool_manifest: [], timeout: 5000 });
+
+    expect(requests[0].url).toBe(`${BASE_URL}/exec`);
+    expect(requests[0].body.timeout).toBe(5000);
+  });
+});

@@ -386,6 +386,7 @@ export function createBashProgrammaticToolCallingTool(
             baseUrl,
             lang: 'bash',
             code,
+            timeout,
             sessionId: session_id,
             files,
             runtimeSessionHint,
