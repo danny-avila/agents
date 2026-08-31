@@ -250,6 +250,7 @@ function blankOutsideReplacementFields(literal: string): string {
 
 /* A bash comment opens only at the start of a word: after whitespace, or after
  * a control operator that ends the previous one. */
+const BASH_ASSIGNMENT_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const BASH_COMMAND_SEPARATOR = /[;&|()`\n]/;
 const BASH_WORD_START = /[\s;&|()`]/;
 
@@ -265,6 +266,7 @@ const BASH_WORD_START = /[\s;&|()`]/;
 function stripBashNonCodeText(code: string): string {
   const kept = code.split('');
   let atCommandStart = true;
+  let inAssignmentValue = false;
 
   const blankRange = (from: number, to: number): void => {
     for (let i = from; i < to; i++) {
@@ -318,9 +320,28 @@ function stripBashNonCodeText(code: string): string {
       continue;
     }
 
-    if (!/\s/.test(char)) {
-      atCommandStart = false;
+    if (/\s/.test(char)) {
+      if (inAssignmentValue) {
+        atCommandStart = true;
+        inAssignmentValue = false;
+      }
+      continue;
     }
+
+    /* Assignment words are prefixes, not the command: in `FOO=bar cmd`, the
+     * command position resumes once the value ends. The value is scanned
+     * normally — it can hold a substitution, as in `out=$(tool ...)`. */
+    if (atCommandStart) {
+      const assignment = BASH_ASSIGNMENT_PREFIX.exec(code.slice(i));
+      if (assignment != null) {
+        i += assignment[0].length - 1;
+        atCommandStart = false;
+        inAssignmentValue = true;
+        continue;
+      }
+    }
+
+    atCommandStart = false;
   }
 
   return kept.join('');

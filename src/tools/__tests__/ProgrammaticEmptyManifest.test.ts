@@ -724,3 +724,31 @@ describe('an injected empty tool context still runs tool-free code', () => {
     expect(requests[0].url).toBe(`${BASE_URL}/exec`);
   });
 });
+
+describe('assignment prefixes keep command position', () => {
+  const tools: t.LCTool[] = [
+    { name: 'calculator', allowed_callers: ['code_execution'] },
+  ];
+
+  it('keeps a quoted command after an assignment prefix', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'FOO=bar \'calculator\' \'{}\'', 'bash').map(
+        (def) => def.name
+      )
+    ).toEqual(['calculator']);
+  });
+
+  it('keeps an unquoted command after several prefixes', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'A=1 B=2 calculator \'{}\'', 'bash').map(
+        (def) => def.name
+      )
+    ).toEqual(['calculator']);
+  });
+
+  it('does not treat a later quoted argument as a command', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'FOO=bar echo \'calculator\'', 'bash')
+    ).toEqual([]);
+  });
+});
