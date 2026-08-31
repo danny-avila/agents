@@ -13,8 +13,8 @@ import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import {
   RunnableLambda,
   RunnableToolLike,
-  type RunnableConfig,
 } from '@langchain/core/runnables';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { Providers, GraphEvents, Constants } from '@/common';
