@@ -49,6 +49,7 @@ jest.mock('node-fetch', () => ({
 
 import { createBashProgrammaticToolCallingTool } from '../BashProgrammaticToolCalling';
 import { selectProgrammaticTools } from '../ProgrammaticCallerPolicy';
+import { createPythonProgram as createCloudflarePythonProgramForTest } from '../cloudflare/CloudflareProgrammaticToolCalling';
 import {
   createProgrammaticToolCallingTool,
   wrapPythonForPlainExecution,
@@ -433,38 +434,6 @@ describe('prose is not mistaken for a call', () => {
   });
 });
 
-describe('runtimes that expose unselected tools keep requiring a manifest', () => {
-  const allowedToolDefs: t.LCTool[] = [
-    { name: 'calculator', allowed_callers: ['code_execution'] },
-  ];
-  const disallowedToolDefs: t.LCTool[] = [{ name: 'write_file' }];
-
-  it('refuses to derive when stubs are defined unconditionally', () => {
-    expect(() =>
-      selectProgrammaticTools({
-        code: 'fn = globals()["write_file"]',
-        runtime: 'python',
-        allowedToolDefs,
-        disallowedToolDefs,
-        programmaticToolName: 'run_tools_with_code',
-        runtimeExposesUnselectedTools: true,
-      })
-    ).toThrow('requires a tool_manifest');
-  });
-
-  it('derives normally when the runtime gates its stubs', () => {
-    expect(
-      selectProgrammaticTools({
-        code: 'fn = globals()["write_file"]',
-        runtime: 'python',
-        allowedToolDefs,
-        disallowedToolDefs,
-        programmaticToolName: 'run_tools_with_code',
-      })
-    ).toEqual([]);
-  });
-});
-
 describe('interpolating constructs stay visible to derivation', () => {
   const tools: t.LCTool[] = [
     { name: 'calculator', allowed_callers: ['code_execution'] },
@@ -586,5 +555,89 @@ describe('nested replacement fields', () => {
     expect(
       deriveReferencedToolDefs(tools, 'print(f"{{calculator(x)}}")', 'python')
     ).toEqual([]);
+  });
+});
+
+describe('cloudflare python withholds unselected native tools', () => {
+  const build = (names: string[]): string =>
+    createCloudflarePythonProgramForTest(
+      'print(1)',
+      names.map((name) => ({ name })),
+      { shell: 'bash' } as never,
+      '/workspace'
+    );
+
+  it('pops every native tool the selection does not include', () => {
+    const program = build(['read_file']);
+
+    expect(program).toContain('globals().pop(_lc_withheld, None)');
+    expect(program).toContain('"write_file"');
+    expect(program).not.toMatch(/_lc_withheld in \[[^\]]*"read_file"/);
+  });
+
+  it('withholds all of them when nothing is selected', () => {
+    const program = build([]);
+
+    expect(program).toContain('"read_file"');
+    expect(program).toContain('"execute_code"');
+  });
+
+  it('emits no withdrawal when every native tool is selected', () => {
+    const program = build([
+      'read_file',
+      'write_file',
+      'edit_file',
+      'grep_search',
+      'glob_search',
+      'list_directory',
+      'compile_check',
+      'bash_tool',
+      'execute_code',
+    ]);
+
+    expect(program).not.toContain('_lc_withheld');
+  });
+});
+
+describe('quoting inside scanned regions', () => {
+  const tools: t.LCTool[] = [
+    { name: 'calculator', allowed_callers: ['code_execution'] },
+  ];
+
+  it('keeps a call after a quoted brace in a replacement field', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'print(f"{\'}\' + await calculator()}")',
+        'python'
+      ).map((def) => def.name)
+    ).toEqual(['calculator']);
+  });
+
+  it('keeps a command substitution after a literal hash in double quotes', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'echo "label # $(calculator \'{}\')"',
+        'bash'
+      ).map((def) => def.name)
+    ).toEqual(['calculator']);
+  });
+
+  it('still treats a real bash comment as prose', () => {
+    expect(deriveReferencedToolDefs(tools, 'ls # calculator', 'bash')).toEqual(
+      []
+    );
+    expect(
+      deriveReferencedToolDefs(tools, 'echo \'calculator\'', 'bash')
+    ).toEqual([]);
+  });
+
+  it('does not treat a hash inside a word as a comment', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'calculator#1', 'bash').map(
+        (def) => def.name
+      )
+    ).toEqual(['calculator']);
   });
 });

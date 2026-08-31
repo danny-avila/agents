@@ -176,7 +176,6 @@ export function extractUsedBashToolNames(
  * interpolate, so only single quotes are erased. */
 const PYTHON_STRING_OR_COMMENT =
   /([A-Za-z]*)("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|#[^\n]*/g;
-const BASH_STRING_OR_COMMENT = /'[^']*'|(?:^|\s)#[^\n]*/gm;
 
 const blankOut = (match: string): string => ' '.repeat(match.length);
 
@@ -184,24 +183,43 @@ const blankOut = (match: string): string => ' '.repeat(match.length);
  * Blanks an f-string literal except for its `{...}` replacement fields.
  *
  * Scans for balanced braces rather than matching a pattern: a replacement field
- * can contain dict and set literals, and a regex that stops at the first inner
- * brace would blank the surrounding call. Doubled braces are literal text. An
- * unterminated field is preserved — keeping too much only risks a loud
- * rejection, while dropping a real call breaks the run.
+ * can contain dict and set literals, and quoted braces inside it are text, not
+ * delimiters. Doubled braces are literal. An unterminated field is preserved —
+ * keeping too much only risks a loud rejection, while dropping a real call
+ * breaks the run.
  */
 function blankOutsideReplacementFields(literal: string): string {
   const kept = literal.split('').map(() => ' ');
   let depth = 0;
   let fieldStart = -1;
+  let quote = '';
+
+  const keepRange = (from: number, to: number): void => {
+    for (let i = from; i < to; i++) {
+      kept[i] = literal[i];
+    }
+  };
 
   for (let i = 0; i < literal.length; i++) {
     const char = literal[i];
 
-    if (depth === 0 && char === '{' && literal[i + 1] === '{') {
-      i++;
+    if (quote !== '') {
+      if (char === '\\') {
+        i++;
+        continue;
+      }
+      if (char === quote) {
+        quote = '';
+      }
       continue;
     }
-    if (depth === 0 && char === '}' && literal[i + 1] === '}') {
+
+    if (depth > 0 && (char === '"' || char === '\'')) {
+      quote = char;
+      continue;
+    }
+
+    if (depth === 0 && (char === '{' || char === '}') && literal[i + 1] === char) {
       i++;
       continue;
     }
@@ -217,17 +235,71 @@ function blankOutsideReplacementFields(literal: string): string {
     if (char === '}' && depth > 0) {
       depth--;
       if (depth === 0 && fieldStart >= 0) {
-        for (let j = fieldStart; j <= i; j++) {
-          kept[j] = literal[j];
-        }
+        keepRange(fieldStart, i + 1);
         fieldStart = -1;
       }
     }
   }
 
   if (depth > 0 && fieldStart >= 0) {
-    for (let j = fieldStart; j < literal.length; j++) {
-      kept[j] = literal[j];
+    keepRange(fieldStart, literal.length);
+  }
+
+  return kept.join('');
+}
+
+/**
+ * Blanks bash comments and single-quoted text.
+ *
+ * Double quotes interpolate, so their contents stay visible — including a
+ * command substitution that follows a literal `#`, which is text there rather
+ * than the start of a comment. A `#` only opens a comment at the start of a
+ * word outside quotes.
+ */
+function stripBashNonCodeText(code: string): string {
+  const kept = code.split('');
+  let inSingle = false;
+  let inDouble = false;
+
+  for (let i = 0; i < code.length; i++) {
+    const char = code[i];
+
+    if (inSingle) {
+      kept[i] = ' ';
+      if (char === '\'') {
+        inSingle = false;
+      }
+      continue;
+    }
+
+    if (char === '\\') {
+      i++;
+      continue;
+    }
+
+    if (inDouble) {
+      if (char === '"') {
+        inDouble = false;
+      }
+      continue;
+    }
+
+    if (char === '\'') {
+      inSingle = true;
+      kept[i] = ' ';
+      continue;
+    }
+
+    if (char === '"') {
+      inDouble = true;
+      continue;
+    }
+
+    if (char === '#' && (i === 0 || /\s/.test(code[i - 1]))) {
+      while (i < code.length && code[i] !== '\n') {
+        kept[i] = ' ';
+        i++;
+      }
     }
   }
 
@@ -247,7 +319,7 @@ export function stripNonCodeText(
   runtime: ProgrammaticRuntime
 ): string {
   if (runtime === 'bash') {
-    return code.replace(BASH_STRING_OR_COMMENT, blankOut);
+    return stripBashNonCodeText(code);
   }
 
   return code.replace(

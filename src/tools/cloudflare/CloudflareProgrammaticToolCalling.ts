@@ -989,7 +989,7 @@ main().catch((error) => {
 `.trim();
 }
 
-function createPythonProgram(
+export function createPythonProgram(
   userCode: string,
   toolDefs: t.LCTool[],
   config: t.CloudflareSandboxExecutionConfig,
@@ -1004,9 +1004,28 @@ function createPythonProgram(
     })
     .filter(Boolean)
     .join('\n');
+  /* The native source defines every tool unconditionally, so selection alone
+   * does not bound what user code can reach. Withdraw the unselected names
+   * after the aliases bind, which leaves each tool's private `_`-prefixed
+   * helpers intact — no native tool calls another by its public name. */
+  const selectedNativeNames = new Set(
+    toolDefs
+      .filter((def) => NATIVE_TOOL_NAMES.has(def.name))
+      .map((def) => def.name)
+  );
+  const withheldNativeNames = [...NATIVE_TOOL_NAMES].filter(
+    (name) => !selectedNativeNames.has(name)
+  );
+  const withholdNativeTools =
+    withheldNativeNames.length > 0
+      ? `for _lc_withheld in ${JSON.stringify(withheldNativeNames)}:\n` +
+        '    globals().pop(_lc_withheld, None)\n' +
+        'del _lc_withheld\n'
+      : '';
+
   return `${createPythonNativeToolSource(config, workspaceRoot)}
 ${aliases}
-
+${withholdNativeTools}
 async def __lc_user_main__():
 ${indent(userCode)}
 
@@ -1066,7 +1085,6 @@ async function runProgrammatic(args: {
     allowedToolDefs: toolDefs,
     disallowedToolDefs: toolCall.disallowedToolDefs,
     programmaticToolName,
-    runtimeExposesUnselectedTools: args.runtime === 'python',
   });
   const effectiveTools = filterNativeTools(selectedTools);
   const timeoutMs = clampExecutionTimeout(
