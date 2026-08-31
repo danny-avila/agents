@@ -48,7 +48,10 @@ jest.mock('node-fetch', () => ({
 }));
 
 import { createBashProgrammaticToolCallingTool } from '../BashProgrammaticToolCalling';
-import { createProgrammaticToolCallingTool } from '../ProgrammaticToolCalling';
+import {
+  createProgrammaticToolCallingTool,
+  wrapPythonForPlainExecution,
+} from '../ProgrammaticToolCalling';
 import { deriveReferencedToolDefs } from '../toolIdentifiers';
 import {
   createProgrammaticToolRegistry,
@@ -212,11 +215,12 @@ describe('omitted manifest with direct-only tools configured', () => {
     expect(requests).toHaveLength(0);
   });
 
-  it('never derives a direct-only tool from the code', async () => {
-    await invokeBash({ code: 'send_email \'{}\'' }, { disallowedToolDefs });
+  it('rejects a derived reference to a direct-only tool', async () => {
+    await expect(
+      invokeBash({ code: 'send_email \'{}\'' }, { disallowedToolDefs })
+    ).rejects.toThrow('not marked for code_execution');
 
-    expect(requests[0].url).toBe(`${BASE_URL}/exec`);
-    expect(requests[0].body.tools).toBeUndefined();
+    expect(requests).toHaveLength(0);
   });
 });
 
@@ -259,5 +263,85 @@ describe('deriveReferencedToolDefs', () => {
         (def) => def.name
       )
     ).toEqual(['calculator']);
+  });
+});
+
+describe('python plain route keeps the programmatic contract', () => {
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  it('wraps top-level await so it stays valid python', async () => {
+    await invokePython({
+      code: 'import asyncio\nawait asyncio.sleep(0)\nprint("done")',
+      tool_manifest: [],
+    });
+
+    const sent = requests[0].body.code as string;
+    expect(sent).toContain('async def __user_main__():');
+    expect(sent).toContain('    await asyncio.sleep(0)');
+    expect(sent).toContain('asyncio.run(__user_main__())');
+  });
+
+  it('leaves bash source untouched', async () => {
+    await invokeBash({ code: 'echo hi', tool_manifest: [] });
+
+    expect(requests[0].body.code).toBe('echo hi');
+  });
+
+  it('preserves blank lines when indenting', () => {
+    expect(wrapPythonForPlainExecution('a = 1\n\nprint(a)')).toContain(
+      '    a = 1\n\n    print(a)'
+    );
+  });
+});
+
+describe('tool context is still required to conclude no tools are needed', () => {
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  it('still reports a missing toolMap when nothing was injected', async () => {
+    await expect(
+      createBashProgrammaticToolCallingTool({ baseUrl: BASE_URL }).invoke({
+        code: 'get_weather \'{"city":"SF"}\'',
+      } as never)
+    ).rejects.toThrow('No toolMap provided');
+
+    expect(requests).toHaveLength(0);
+  });
+
+  it('runs tool-free code when only disallowed defs were injected', async () => {
+    await createBashProgrammaticToolCallingTool({ baseUrl: BASE_URL }).invoke(
+      {
+        name: 'run_tools_with_bash',
+        args: { code: 'ls /mnt/data' },
+        id: 'call-1',
+        type: 'tool_call',
+        disallowedToolDefs: [{ name: 'send_email' }],
+      } as never,
+      {} as never
+    );
+
+    expect(requests[0].url).toBe(`${BASE_URL}/exec`);
+  });
+});
+
+describe('ambiguous normalized identifiers', () => {
+  const colliding: t.LCTool[] = [
+    { name: 'report-tool', allowed_callers: ['code_execution'] },
+    { name: 'report_tool', allowed_callers: ['code_execution'] },
+  ];
+
+  it('keeps every colliding definition rather than picking by order', () => {
+    expect(
+      deriveReferencedToolDefs(colliding, 'report_tool \'{}\'', 'bash').map(
+        (def) => def.name
+      )
+    ).toEqual(['report-tool', 'report_tool']);
+  });
+
+  it('does not widen selection for an unreferenced collision', () => {
+    expect(deriveReferencedToolDefs(colliding, 'ls -la', 'bash')).toEqual([]);
   });
 });

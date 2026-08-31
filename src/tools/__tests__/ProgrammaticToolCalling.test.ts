@@ -953,8 +953,8 @@ for member in team:
       ).toEqual([]);
     });
 
-    it('never derives a direct-only tool the caller may not use', () => {
-      expect(
+    it('rejects a derived reference to a direct-only tool', () => {
+      expect(() =>
         selectProgrammaticTools({
           code: 'send_email(to="a@b.c")',
           runtime: 'python',
@@ -962,7 +962,7 @@ for member in team:
           disallowedToolDefs,
           programmaticToolName: 'run_tools_with_code',
         })
-      ).toEqual([]);
+      ).toThrow('not marked for code_execution');
     });
 
     it('rejects direct-only manifest entries before execution', () => {

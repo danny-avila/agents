@@ -302,22 +302,37 @@ export function createBashProgrammaticToolCallingTool(
         programmaticToolName,
       });
 
-      if (toolMap == null || toolMap.size === 0) {
-        throw new Error(
-          'No toolMap provided. ' +
-            'ToolNode should inject this from AgentContext when invoked through the graph.'
-        );
-      }
+      /* These guard the replay path only. A call that selected no tools never
+       * replays, and event-driven ToolNode configurations legitimately inject
+       * an empty toolMap/toolDefs, so requiring them here would re-break the
+       * tool-free call this route exists to serve. Injected context is still
+       * required to conclude that: with nothing injected at all, an empty
+       * selection means the host wired the tool up wrong, not that the code
+       * needs no tools. */
+      const needsNoTools =
+        effectiveTools.length === 0 &&
+        (params.tool_manifest?.length === 0 ||
+          (toolDefs?.length ?? 0) > 0 ||
+          (disallowedToolDefs?.length ?? 0) > 0);
 
-      if (toolDefs == null || toolDefs.length === 0) {
-        throw new Error(
-          'No tool definitions provided. ' +
-            'Either pass tools in the input or ensure ToolNode injects toolDefs.'
-        );
+      if (!needsNoTools) {
+        if (toolMap == null || toolMap.size === 0) {
+          throw new Error(
+            'No toolMap provided. ' +
+              'ToolNode should inject this from AgentContext when invoked through the graph.'
+          );
+        }
+
+        if (toolDefs == null || toolDefs.length === 0) {
+          throw new Error(
+            'No tool definitions provided. ' +
+              'Either pass tools in the input or ensure ToolNode injects toolDefs.'
+          );
+        }
       }
 
       const effectiveToolMap = projectProgrammaticToolMap(
-        toolMap,
+        toolMap ?? new Map(),
         effectiveTools
       );
 
@@ -332,7 +347,7 @@ export function createBashProgrammaticToolCallingTool(
           // eslint-disable-next-line no-console
           console.log(
             `[BashPTC Debug] Sending ${effectiveTools.length} tools to API ` +
-              `(selected from ${toolDefs.length})`
+              `(selected from ${toolDefs?.length ?? 0})`
           );
         }
 
@@ -366,7 +381,7 @@ export function createBashProgrammaticToolCallingTool(
 
         /* Raw `code`, not `preparedCode`: the `$!` guard exists for the
          * programmatic replay wrapper, which plain `/exec` never applies. */
-        if (effectiveTools.length === 0) {
+        if (needsNoTools) {
           return await runPlainExecution({
             baseUrl,
             lang: 'bash',

@@ -169,28 +169,17 @@ export function extractUsedBashToolNames(
   return usedTools;
 }
 
-function buildToolNameMap(
-  toolDefs: readonly t.LCTool[],
-  runtime: ProgrammaticRuntime
-): Map<string, string> {
-  const toolNameMap = new Map<string, string>();
-  for (const toolDef of toolDefs) {
-    toolNameMap.set(
-      normalizeToRuntimeIdentifier(toolDef.name, runtime),
-      toolDef.name
-    );
-  }
-  return toolNameMap;
-}
-
-export function extractUsedRuntimeToolNames(
+function matchesRuntimeIdentifier(
   code: string,
-  toolNameMap: Map<string, string>,
+  identifier: string,
   runtime: ProgrammaticRuntime
-): Set<string> {
-  return runtime === 'bash'
-    ? extractUsedBashToolNames(code, toolNameMap)
-    : extractUsedToolNames(code, toolNameMap);
+): boolean {
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern =
+    runtime === 'bash'
+      ? new RegExp(`\\b${escaped}\\b`)
+      : new RegExp(`\\b${escaped}\\s*\\(`);
+  return pattern.test(code);
 }
 
 /**
@@ -200,10 +189,11 @@ export function extractUsedRuntimeToolNames(
  * `filterToolsByUsage`, which falls back to the full set. Callers use the empty
  * result to recognize a call that needs no tool stubs at all.
  *
- * Detection is a conservative regex over normalized identifiers, so it can only
- * ever narrow the caller's own allowed set — a miss drops a stub and surfaces as
- * a plain "not defined"/"command not found" inside the sandbox, never as access
- * to a tool the caller was not already permitted to use.
+ * Detection is a conservative regex over normalized identifiers, so a miss only
+ * ever drops a stub and surfaces as a plain "not defined"/"command not found"
+ * inside the sandbox. Callers stay responsible for the caller-capability
+ * boundary: derive over the allowed and disallowed sets separately rather than
+ * treating an unmatched name as absent.
  */
 export function deriveReferencedToolDefs(
   toolDefs: readonly t.LCTool[],
@@ -214,11 +204,30 @@ export function deriveReferencedToolDefs(
     return [];
   }
 
-  const usedToolNames = extractUsedRuntimeToolNames(
-    code,
-    buildToolNameMap(toolDefs, runtime),
-    runtime
-  );
+  /* Names that normalize to the same identifier are kept together: the
+   * reference is genuinely ambiguous, and dropping one would silently dispatch
+   * by insertion order where sending both preserves existing behavior — the
+   * Code API rejects bash collisions outright. */
+  const namesByIdentifier = new Map<string, string[]>();
+  for (const toolDef of toolDefs) {
+    const identifier = normalizeToRuntimeIdentifier(toolDef.name, runtime);
+    const names = namesByIdentifier.get(identifier);
+    if (names != null) {
+      names.push(toolDef.name);
+      continue;
+    }
+    namesByIdentifier.set(identifier, [toolDef.name]);
+  }
+
+  const usedToolNames = new Set<string>();
+  for (const [identifier, names] of namesByIdentifier) {
+    if (!matchesRuntimeIdentifier(code, identifier, runtime)) {
+      continue;
+    }
+    for (const name of names) {
+      usedToolNames.add(name);
+    }
+  }
 
   if (usedToolNames.size === 0) {
     return [];

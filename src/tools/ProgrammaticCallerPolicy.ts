@@ -70,10 +70,25 @@ export function selectProgrammaticTools(args: {
   const requestedToolNames = args.requestedToolNames;
 
   if (requestedToolNames == null) {
-    if (disallowedToolDefs.length > 0) {
-      return deriveReferencedToolDefs(allowedToolDefs, args.code, args.runtime);
+    if (disallowedToolDefs.length === 0) {
+      return allowedToolDefs;
     }
-    return allowedToolDefs;
+
+    /* Derive over the disallowed set as well. A direct-only tool the code
+     * references must still be rejected: some runtimes define native tool
+     * functions unconditionally, so treating an unmatched name as absent would
+     * let the call reach one the caller may not use. */
+    const referencedDisallowed = deriveReferencedToolDefs(
+      disallowedToolDefs,
+      args.code,
+      args.runtime
+    );
+    assertDisallowedToolUsage(
+      new Set(referencedDisallowed.map((toolDef) => toolDef.name)),
+      args.programmaticToolName
+    );
+
+    return deriveReferencedToolDefs(allowedToolDefs, args.code, args.runtime);
   }
 
   const disallowedNames = new Set(
