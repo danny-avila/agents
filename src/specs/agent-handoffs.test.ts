@@ -1,6 +1,7 @@
 // src/specs/agent-handoffs.test.ts
 import { MemorySaver } from '@langchain/langgraph';
 import { DynamicStructuredTool } from '@langchain/core/tools';
+import { z } from 'zod';
 import {
   AIMessage,
   HumanMessage,
@@ -9,7 +10,11 @@ import {
 } from '@langchain/core/messages';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
-import type { RunnableConfig } from '@langchain/core/runnables';
+import {
+  RunnableLambda,
+  RunnableToolLike,
+  type RunnableConfig,
+} from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { Providers, GraphEvents, Constants } from '@/common';
@@ -50,6 +55,26 @@ const findToolByName = (
 ): t.GraphTools[0] | undefined => {
   return tools?.find((tool) => getToolName(tool) === name);
 };
+
+const createGraphTool = (name: string, output: string): t.GenericTool =>
+  new RunnableToolLike({
+    name,
+    description: `Test ${name} tool`,
+    schema: z.object({}),
+    bound: RunnableLambda.from(async (): Promise<string> => output),
+  });
+
+class MetadataCapturingToolNode extends ToolNode<t.BaseGraphState> {
+  observedConfig?: RunnableConfig;
+
+  protected override async run(
+    input: t.BaseGraphState,
+    config: RunnableConfig
+  ): Promise<t.BaseGraphState> {
+    this.observedConfig = config;
+    return input;
+  }
+}
 
 type HandoffModelScript = {
   promptMarker: string;
@@ -290,26 +315,19 @@ describe('Agent Handoffs Tests', () => {
     });
 
     it('should not expose an inbound handoff tool to its recipient', async () => {
-      const leakedTransferTool = new DynamicStructuredTool({
-        name: `${Constants.LC_TRANSFER_TO_}agent_b`,
-        description: 'Leaked transfer to agent B',
-        schema: { type: 'object', properties: {}, required: [] },
-        func: async (): Promise<string> => 'transferred',
-      });
-      const retainedGraphTool = new DynamicStructuredTool({
-        name: 'retained_graph_tool',
-        description: 'A non-handoff graph tool',
-        schema: { type: 'object', properties: {}, required: [] },
-        func: async (): Promise<string> => 'retained',
-      });
+      const leakedTransferTool = createGraphTool(
+        `${Constants.LC_TRANSFER_TO_}agent_b`,
+        'transferred'
+      );
+      const retainedGraphTool = createGraphTool(
+        'retained_graph_tool',
+        'retained'
+      );
       const agents: t.AgentInputs[] = [
         createBasicAgent('agent_a', 'You are agent A'),
         {
           ...createBasicAgent('agent_b', 'You are agent B'),
-          graphTools: [
-            leakedTransferTool as unknown as t.GenericTool,
-            retainedGraphTool as unknown as t.GenericTool,
-          ],
+          graphTools: [leakedTransferTool, retainedGraphTool],
         },
       ];
 
@@ -321,7 +339,9 @@ describe('Agent Handoffs Tests', () => {
         },
       ];
 
-      const run = await Run.create(createTestConfig(agents, edges));
+      const config = createTestConfig(agents, edges);
+      config.tokenCounter = () => 1;
+      const run = await Run.create(config);
 
       const agentBContext = (run.Graph as StandardGraph).agentContexts.get(
         'agent_b'
@@ -337,6 +357,37 @@ describe('Agent Handoffs Tests', () => {
       expect(
         findToolByName(agentBContext?.graphTools, 'retained_graph_tool')
       ).toBeDefined();
+      await agentBContext?.tokenCalculationPromise;
+      expect(agentBContext?.toolTokenCounts).not.toHaveProperty(
+        `${Constants.LC_TRANSFER_TO_}agent_b`
+      );
+      expect(agentBContext?.toolTokenCounts).toHaveProperty(
+        'retained_graph_tool'
+      );
+    });
+
+    it('stamps the owning agent on tool observation metadata', async () => {
+      const node = new MetadataCapturingToolNode({
+        tools: [],
+        executingAgentId: 'mateo',
+        executingAgentName: 'Mateo Serrano',
+        rootAgentId: 'leila',
+        rootAgentName: 'Leila Mensah',
+      });
+
+      await node.invoke(
+        { messages: [] },
+        { metadata: { requestId: 'request-1' } }
+      );
+
+      expect(node.observedConfig?.metadata).toMatchObject({
+        requestId: 'request-1',
+        agentId: 'mateo',
+        activeAgentId: 'mateo',
+        activeAgentName: 'Mateo Serrano',
+        rootAgentId: 'leila',
+        rootAgentName: 'Leila Mensah',
+      });
     });
   });
 

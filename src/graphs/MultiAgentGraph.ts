@@ -602,14 +602,19 @@ export class MultiAgentGraph extends StandardGraph {
   private createHandoffTools(): void {
     // Group handoff edges by source agent(s)
     const handoffsByAgent = new Map<string, t.GraphEdge[]>();
+    const tokenAccountingRefresh = new Set<string>();
 
     /** Transfer tool names are SDK-reserved. Remove externally supplied or
      * stale transfer tools before deriving the source agent's allowed set
      * from the graph edges below. */
     for (const agentContext of this.agentContexts.values()) {
+      const originalTools = agentContext.graphTools;
       const retainedTools = agentContext.graphTools?.filter(
         (graphTool) => !isTransferToolName(graphToolName(graphTool))
       );
+      if (retainedTools?.length !== originalTools?.length) {
+        tokenAccountingRefresh.add(agentContext.agentId);
+      }
       agentContext.graphTools =
         retainedTools != null && retainedTools.length > 0
           ? retainedTools
@@ -664,6 +669,29 @@ export class MultiAgentGraph extends StandardGraph {
       for (const handoffTool of handoffTools) {
         agentContext.graphTools.push(handoffTool);
       }
+      if (handoffTools.length > 0) {
+        tokenAccountingRefresh.add(agentId);
+      }
+    }
+
+    for (const agentId of tokenAccountingRefresh) {
+      const agentContext = this.agentContexts.get(agentId);
+      if (agentContext?.tokenCounter == null) {
+        continue;
+      }
+      const { tokenCounter, baseIndexTokenCountMap } = agentContext;
+      agentContext.tokenCalculationPromise = agentContext
+        .calculateInstructionTokens(tokenCounter)
+        .then(() => {
+          agentContext.updateTokenMapWithInstructions(baseIndexTokenCountMap);
+        })
+        .catch((err) => {
+          // eslint-disable-next-line no-console
+          console.error(
+            'Error recalculating instruction tokens after handoff tool updates:',
+            err
+          );
+        });
     }
   }
 
