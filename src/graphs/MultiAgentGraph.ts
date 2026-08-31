@@ -295,6 +295,21 @@ function withHandoffGroupMetadata(
   };
 }
 
+function withActiveAgentMetadata(
+  config: LangGraphRunnableConfig | undefined,
+  agentId: string,
+  agentName: string | undefined
+): LangGraphRunnableConfig {
+  return {
+    ...config,
+    metadata: {
+      ...config?.metadata,
+      activeAgentId: agentId,
+      ...(agentName == null ? {} : { activeAgentName: agentName }),
+    },
+  };
+}
+
 /**
  * MultiAgentGraph extends StandardGraph to support dynamic multi-agent workflows
  * with handoffs, fan-in/fan-out, and other composable patterns.
@@ -1288,10 +1303,16 @@ export class MultiAgentGraph extends StandardGraph {
       ): Promise<t.MultiAgentGraphState | Command> => {
         let result: t.MultiAgentGraphState;
         let inputMessages = state.messages;
-        const memberConfig =
+        const agentContext = this.agentContexts.get(agentId);
+        const recursionLimitedConfig =
           this.memberRecursionLimit == null
             ? config
             : { ...config, recursionLimit: this.memberRecursionLimit };
+        const memberConfig = withActiveAgentMetadata(
+          recursionLimitedConfig,
+          agentId,
+          agentContext?.name
+        );
 
         /**
          * Check if this agent is receiving a handoff.
@@ -1303,7 +1324,6 @@ export class MultiAgentGraph extends StandardGraph {
           state.messages,
           agentId
         );
-        const agentContext = this.agentContexts.get(agentId);
 
         if (
           handoffContext?.sourceAgentName != null &&
