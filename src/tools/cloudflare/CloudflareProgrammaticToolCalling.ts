@@ -1066,6 +1066,7 @@ async function runProgrammatic(args: {
     allowedToolDefs: toolDefs,
     disallowedToolDefs: toolCall.disallowedToolDefs,
     programmaticToolName,
+    runtimeExposesUnselectedTools: args.runtime === 'python',
   });
   const effectiveTools = filterNativeTools(selectedTools);
   const timeoutMs = clampExecutionTimeout(

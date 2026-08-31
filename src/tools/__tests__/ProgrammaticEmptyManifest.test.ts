@@ -48,11 +48,15 @@ jest.mock('node-fetch', () => ({
 }));
 
 import { createBashProgrammaticToolCallingTool } from '../BashProgrammaticToolCalling';
+import { selectProgrammaticTools } from '../ProgrammaticCallerPolicy';
 import {
   createProgrammaticToolCallingTool,
   wrapPythonForPlainExecution,
 } from '../ProgrammaticToolCalling';
-import { deriveReferencedToolDefs } from '../toolIdentifiers';
+import {
+  deriveReferencedToolDefs,
+  stripNonCodeText,
+} from '../toolIdentifiers';
 import {
   createProgrammaticToolRegistry,
   createGetWeatherTool,
@@ -343,5 +347,75 @@ describe('ambiguous normalized identifiers', () => {
 
   it('does not widen selection for an unreferenced collision', () => {
     expect(deriveReferencedToolDefs(colliding, 'ls -la', 'bash')).toEqual([]);
+  });
+});
+
+describe('prose is not mistaken for a call', () => {
+  const colliding: t.LCTool[] = [
+    { name: 'write_file', allowed_callers: ['code_execution'] },
+  ];
+
+  it('ignores python comments and string literals', () => {
+    expect(
+      deriveReferencedToolDefs(colliding, 'print("write_file(")', 'python')
+    ).toEqual([]);
+    expect(
+      deriveReferencedToolDefs(colliding, '# calls write_file(x)', 'python')
+    ).toEqual([]);
+  });
+
+  it('ignores bash comments and quoted text', () => {
+    expect(
+      deriveReferencedToolDefs(colliding, 'echo \'write_file\'', 'bash')
+    ).toEqual([]);
+    expect(
+      deriveReferencedToolDefs(colliding, '# write_file here', 'bash')
+    ).toEqual([]);
+  });
+
+  it('still matches a real invocation', () => {
+    expect(
+      deriveReferencedToolDefs(colliding, 'write_file(path="a")', 'python').map(
+        (def) => def.name
+      )
+    ).toEqual(['write_file']);
+  });
+
+  it('keeps code that follows a docstring', () => {
+    expect(stripNonCodeText('"""doc"""\nwrite_file(1)', 'python')).toContain(
+      'write_file(1)'
+    );
+  });
+});
+
+describe('runtimes that expose unselected tools keep requiring a manifest', () => {
+  const allowedToolDefs: t.LCTool[] = [
+    { name: 'calculator', allowed_callers: ['code_execution'] },
+  ];
+  const disallowedToolDefs: t.LCTool[] = [{ name: 'write_file' }];
+
+  it('refuses to derive when stubs are defined unconditionally', () => {
+    expect(() =>
+      selectProgrammaticTools({
+        code: 'fn = globals()["write_file"]',
+        runtime: 'python',
+        allowedToolDefs,
+        disallowedToolDefs,
+        programmaticToolName: 'run_tools_with_code',
+        runtimeExposesUnselectedTools: true,
+      })
+    ).toThrow('requires a tool_manifest');
+  });
+
+  it('derives normally when the runtime gates its stubs', () => {
+    expect(
+      selectProgrammaticTools({
+        code: 'fn = globals()["write_file"]',
+        runtime: 'python',
+        allowedToolDefs,
+        disallowedToolDefs,
+        programmaticToolName: 'run_tools_with_code',
+      })
+    ).toEqual([]);
   });
 });

@@ -169,6 +169,25 @@ export function extractUsedBashToolNames(
   return usedTools;
 }
 
+const PYTHON_NON_CODE =
+  /("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|#[^\n]*)/g;
+const BASH_NON_CODE = /("(?:[^"\\]|\\.)*"|'[^']*'|(?:^|\s)#[^\n]*)/g;
+
+/**
+ * Blanks comments and string literals so prose cannot be mistaken for a call.
+ *
+ * Only reduces false positives — a name that survives may still not be a real
+ * invocation. Runtimes enforce the caller boundary by defining stubs for the
+ * selected tools alone, so a residual miss costs a stub, not a permission.
+ */
+export function stripNonCodeText(
+  code: string,
+  runtime: ProgrammaticRuntime
+): string {
+  const pattern = runtime === 'bash' ? BASH_NON_CODE : PYTHON_NON_CODE;
+  return code.replace(pattern, (match) => ' '.repeat(match.length));
+}
+
 function matchesRuntimeIdentifier(
   code: string,
   identifier: string,
@@ -219,9 +238,10 @@ export function deriveReferencedToolDefs(
     namesByIdentifier.set(identifier, [toolDef.name]);
   }
 
+  const executableCode = stripNonCodeText(code, runtime);
   const usedToolNames = new Set<string>();
   for (const [identifier, names] of namesByIdentifier) {
-    if (!matchesRuntimeIdentifier(code, identifier, runtime)) {
+    if (!matchesRuntimeIdentifier(executableCode, identifier, runtime)) {
       continue;
     }
     for (const name of names) {

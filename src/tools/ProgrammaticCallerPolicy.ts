@@ -64,6 +64,14 @@ export function selectProgrammaticTools(args: {
   allowedToolDefs?: t.LCTool[];
   disallowedToolDefs?: t.LCTool[];
   programmaticToolName: string;
+  /**
+   * Set when the runtime defines tool functions the selection does not control,
+   * so stub absence cannot enforce the caller boundary. Cloudflare's Python
+   * program prepends every native tool unconditionally, and an indirect
+   * reference (`globals()["write_file"]`) is beyond what derivation can see —
+   * so the manifest stays required rather than derived there.
+   */
+  runtimeExposesUnselectedTools?: boolean;
 }): t.LCTool[] {
   const allowedToolDefs = args.allowedToolDefs ?? [];
   const disallowedToolDefs = args.disallowedToolDefs ?? [];
@@ -72,6 +80,13 @@ export function selectProgrammaticTools(args: {
   if (requestedToolNames == null) {
     if (disallowedToolDefs.length === 0) {
       return allowedToolDefs;
+    }
+
+    if (args.runtimeExposesUnselectedTools === true) {
+      throw new Error(
+        `"${args.programmaticToolName}" requires a tool_manifest when direct-only tools are configured. ` +
+          'List every registered tool name used by the submitted code in the tool_manifest field.'
+      );
     }
 
     /* Derive over the disallowed set as well. A direct-only tool the code
