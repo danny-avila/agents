@@ -193,6 +193,8 @@ function blankOutsideReplacementFields(literal: string): string {
   let depth = 0;
   let fieldStart = -1;
   let quote = '';
+  let quoteStart = -1;
+  const quotedSpans: Array<[number, number]> = [];
 
   const keepRange = (from: number, to: number): void => {
     for (let i = from; i < to; i++) {
@@ -209,6 +211,7 @@ function blankOutsideReplacementFields(literal: string): string {
         continue;
       }
       if (char === quote) {
+        quotedSpans.push([quoteStart, i + 1]);
         quote = '';
       }
       continue;
@@ -216,6 +219,7 @@ function blankOutsideReplacementFields(literal: string): string {
 
     if (depth > 0 && (char === '"' || char === '\'')) {
       quote = char;
+      quoteStart = i;
       continue;
     }
 
@@ -245,12 +249,22 @@ function blankOutsideReplacementFields(literal: string): string {
     keepRange(fieldStart, literal.length);
   }
 
+  /* A quoted token inside a replacement field is data, not a call. */
+  for (const [from, to] of quotedSpans) {
+    for (let i = from; i < to; i++) {
+      kept[i] = ' ';
+    }
+  }
+
   return kept.join('');
 }
 
 /* A bash comment opens only at the start of a word: after whitespace, or after
  * a control operator that ends the previous one. */
 const BASH_ASSIGNMENT_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*=/;
+/* Keywords that precede a command rather than being one. */
+const BASH_COMMAND_KEYWORD =
+  /^(?:if|then|elif|else|while|until|do|time|coproc|!)(?=\s|$)/;
 const BASH_COMMAND_SEPARATOR = /[;&|()`\n]/;
 const BASH_WORD_START = /[\s;&|()`]/;
 
@@ -332,6 +346,12 @@ function stripBashNonCodeText(code: string): string {
      * command position resumes once the value ends. The value is scanned
      * normally — it can hold a substitution, as in `out=$(tool ...)`. */
     if (atCommandStart) {
+      const keyword = BASH_COMMAND_KEYWORD.exec(code.slice(i));
+      if (keyword != null) {
+        i += keyword[0].length - 1;
+        continue;
+      }
+
       const assignment = BASH_ASSIGNMENT_PREFIX.exec(code.slice(i));
       if (assignment != null) {
         i += assignment[0].length - 1;

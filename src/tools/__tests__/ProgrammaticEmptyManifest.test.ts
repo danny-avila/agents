@@ -787,3 +787,57 @@ describe('aliased and higher-order tool references', () => {
     ).toEqual([]);
   });
 });
+
+describe('literals inside replacement fields are data', () => {
+  const tools: t.LCTool[] = [
+    { name: 'write_file', allowed_callers: ['code_execution'] },
+  ];
+
+  it('ignores a quoted tool name inside a replacement field', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'print(f"{\'write_file\'}")', 'python')
+    ).toEqual([]);
+  });
+
+  it('still sees the call around a quoted argument', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'print(f"{await write_file(path=\'a\')}")',
+        'python'
+      ).map((def) => def.name)
+    ).toEqual(['write_file']);
+  });
+});
+
+describe('bash control keywords keep command position', () => {
+  const tools: t.LCTool[] = [
+    { name: 'calculator', allowed_callers: ['code_execution'] },
+  ];
+
+  it('keeps a quoted command after if', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'if \'calculator\' \'{}\'; then echo ok; fi',
+        'bash'
+      ).map((def) => def.name)
+    ).toEqual(['calculator']);
+  });
+
+  it('keeps a quoted command after while and do', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'while \'calculator\' \'{}\'; do echo ok; done',
+        'bash'
+      ).map((def) => def.name)
+    ).toEqual(['calculator']);
+  });
+
+  it('still treats a quoted argument after a keyword as prose', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'if echo \'calculator\'; then :; fi', 'bash')
+    ).toEqual([]);
+  });
+});
