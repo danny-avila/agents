@@ -260,7 +260,7 @@ describe('deriveReferencedToolDefs', () => {
     ).toEqual(['calculator']);
   });
 
-  it('requires a call expression for python', () => {
+  it('ignores a python name that only appears in a comment', () => {
     expect(
       deriveReferencedToolDefs(allToolDefs, '# calculator is unused', 'python')
     ).toEqual([]);
@@ -749,6 +749,41 @@ describe('assignment prefixes keep command position', () => {
   it('does not treat a later quoted argument as a command', () => {
     expect(
       deriveReferencedToolDefs(tools, 'FOO=bar echo \'calculator\'', 'bash')
+    ).toEqual([]);
+  });
+});
+
+describe('aliased and higher-order tool references', () => {
+  const tools: t.LCTool[] = [
+    { name: 'calculator', allowed_callers: ['code_execution'] },
+  ];
+
+  it('selects a tool bound to another name', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'fn = calculator\nawait fn(a=1)',
+        'python'
+      ).map((def) => def.name)
+    ).toEqual(['calculator']);
+  });
+
+  it('selects a tool passed to a higher-order call', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'results = [await f(a=1) for f in (calculator,)]',
+        'python'
+      ).map((def) => def.name)
+    ).toEqual(['calculator']);
+  });
+
+  it('still ignores the name in a comment or literal', () => {
+    expect(
+      deriveReferencedToolDefs(tools, '# calculator unused', 'python')
+    ).toEqual([]);
+    expect(
+      deriveReferencedToolDefs(tools, 'x = "calculator"', 'python')
     ).toEqual([]);
   });
 });

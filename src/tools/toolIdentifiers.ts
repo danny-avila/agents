@@ -400,17 +400,13 @@ export function findNormalizedIdentifierCollision(
   return null;
 }
 
-function matchesRuntimeIdentifier(
-  code: string,
-  identifier: string,
-  runtime: ProgrammaticRuntime
-): boolean {
+function referencesIdentifier(code: string, identifier: string): boolean {
   const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern =
-    runtime === 'bash'
-      ? new RegExp(`\\b${escaped}\\b`)
-      : new RegExp(`\\b${escaped}\\s*\\(`);
-  return pattern.test(code);
+  /* A bare word, not a call expression: a tool can be aliased or passed on
+   * (`fn = calculator; await fn(a=1)`), and requiring `(` would drop the stub
+   * and break the run. Comments and literal text are already blanked, so what
+   * remains is code. Over-matching only adds a stub the sandbox ignores. */
+  return new RegExp(`\\b${escaped}\\b`).test(code);
 }
 
 /**
@@ -453,7 +449,7 @@ export function deriveReferencedToolDefs(
   const executableCode = stripNonCodeText(code, runtime);
   const usedToolNames = new Set<string>();
   for (const [identifier, names] of namesByIdentifier) {
-    if (!matchesRuntimeIdentifier(executableCode, identifier, runtime)) {
+    if (!referencesIdentifier(executableCode, identifier)) {
       continue;
     }
     for (const name of names) {
