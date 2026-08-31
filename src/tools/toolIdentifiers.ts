@@ -250,60 +250,76 @@ function blankOutsideReplacementFields(literal: string): string {
 
 /* A bash comment opens only at the start of a word: after whitespace, or after
  * a control operator that ends the previous one. */
+const BASH_COMMAND_SEPARATOR = /[;&|()`\n]/;
 const BASH_WORD_START = /[\s;&|()`]/;
 
 /**
  * Blanks bash comments and single-quoted text.
  *
- * Double quotes interpolate, so their contents stay visible — including a
- * command substitution that follows a literal `#`, which is text there rather
- * than the start of a comment. A `#` only opens a comment at the start of a
- * word outside quotes.
+ * Double quotes interpolate, so their contents stay visible — including a `#`
+ * inside them, which is literal text. A comment opens only at the start of a
+ * word outside quotes. Single-quoted text is prose in argument position but
+ * executable in command position, where quote removal happens before command
+ * lookup, so `'calculator' '{}'` still calls `calculator`.
  */
 function stripBashNonCodeText(code: string): string {
   const kept = code.split('');
-  let inSingle = false;
-  let inDouble = false;
+  let atCommandStart = true;
+
+  const blankRange = (from: number, to: number): void => {
+    for (let i = from; i < to; i++) {
+      kept[i] = ' ';
+    }
+  };
 
   for (let i = 0; i < code.length; i++) {
     const char = code[i];
 
-    if (inSingle) {
-      kept[i] = ' ';
-      if (char === '\'') {
-        inSingle = false;
-      }
-      continue;
-    }
-
     if (char === '\\') {
       i++;
-      continue;
-    }
-
-    if (inDouble) {
-      if (char === '"') {
-        inDouble = false;
-      }
-      continue;
-    }
-
-    if (char === '\'') {
-      inSingle = true;
-      kept[i] = ' ';
+      atCommandStart = false;
       continue;
     }
 
     if (char === '"') {
-      inDouble = true;
+      i++;
+      while (i < code.length && code[i] !== '"') {
+        i += code[i] === '\\' ? 2 : 1;
+      }
+      atCommandStart = false;
+      continue;
+    }
+
+    if (char === '\'') {
+      const start = i;
+      i++;
+      while (i < code.length && code[i] !== '\'') {
+        i++;
+      }
+      if (!atCommandStart) {
+        blankRange(start, Math.min(i + 1, code.length));
+      }
+      atCommandStart = false;
       continue;
     }
 
     if (char === '#' && (i === 0 || BASH_WORD_START.test(code[i - 1]))) {
+      const start = i;
       while (i < code.length && code[i] !== '\n') {
-        kept[i] = ' ';
         i++;
       }
+      blankRange(start, i);
+      atCommandStart = true;
+      continue;
+    }
+
+    if (BASH_COMMAND_SEPARATOR.test(char)) {
+      atCommandStart = true;
+      continue;
+    }
+
+    if (!/\s/.test(char)) {
+      atCommandStart = false;
     }
   }
 

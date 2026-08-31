@@ -946,14 +946,14 @@ export function createProgrammaticToolCallingTool(
        * replays, and event-driven ToolNode configurations legitimately inject
        * an empty toolMap/toolDefs, so requiring them here would re-break the
        * tool-free call this route exists to serve. Injected context is still
-       * required to conclude that: with nothing injected at all, an empty
-       * selection means the host wired the tool up wrong, not that the code
-       * needs no tools. */
+       * required to conclude that — but an injected empty context counts:
+       * ToolNode legitimately yields no code-execution tools. Only a call with
+       * nothing injected at all is treated as a host wiring mistake. */
       const needsNoTools =
         effectiveTools.length === 0 &&
         (params.tool_manifest?.length === 0 ||
-          (toolDefs?.length ?? 0) > 0 ||
-          (disallowedToolDefs?.length ?? 0) > 0);
+          toolDefs != null ||
+          disallowedToolDefs != null);
 
       if (!needsNoTools) {
         if (toolMap == null || toolMap.size === 0) {

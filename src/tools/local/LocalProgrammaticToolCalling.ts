@@ -598,8 +598,8 @@ async function runLocalProgrammaticTool(args: {
   const needsNoTools =
     selectedTools.length === 0 &&
     (args.params.tool_manifest?.length === 0 ||
-      (toolDefs?.length ?? 0) > 0 ||
-      (disallowedToolDefs?.length ?? 0) > 0);
+      toolDefs != null ||
+      disallowedToolDefs != null);
 
   if (!needsNoTools) {
     if (toolMap == null || toolMap.size === 0) {

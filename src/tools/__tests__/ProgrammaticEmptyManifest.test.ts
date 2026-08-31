@@ -674,3 +674,53 @@ describe('bash comments after control operators', () => {
     ).toEqual(['write_file']);
   });
 });
+
+describe('single-quoted words in command position', () => {
+  const tools: t.LCTool[] = [
+    { name: 'calculator', allowed_callers: ['code_execution'] },
+  ];
+
+  it('keeps a quoted command name', () => {
+    expect(
+      deriveReferencedToolDefs(tools, '\'calculator\' \'{}\'', 'bash').map(
+        (def) => def.name
+      )
+    ).toEqual(['calculator']);
+  });
+
+  it('keeps a quoted command name after a separator', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'echo ok; \'calculator\' \'{}\'', 'bash').map(
+        (def) => def.name
+      )
+    ).toEqual(['calculator']);
+  });
+
+  it('still treats a quoted argument as prose', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'echo \'calculator\'', 'bash')
+    ).toEqual([]);
+  });
+});
+
+describe('an injected empty tool context still runs tool-free code', () => {
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  it('routes to plain exec when ToolNode injects no nested tools', async () => {
+    await createBashProgrammaticToolCallingTool({ baseUrl: BASE_URL }).invoke(
+      {
+        name: 'run_tools_with_bash',
+        args: { code: 'ls /mnt/data' },
+        id: 'call-1',
+        type: 'tool_call',
+        toolMap: new Map(),
+        toolDefs: [],
+      } as never,
+      {} as never
+    );
+
+    expect(requests[0].url).toBe(`${BASE_URL}/exec`);
+  });
+});
