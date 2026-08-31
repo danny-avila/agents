@@ -548,3 +548,43 @@ describe('f-string literals are prose, replacement fields are code', () => {
     ).toEqual([]);
   });
 });
+
+describe('nested replacement fields', () => {
+  const tools: t.LCTool[] = [
+    { name: 'calculator', allowed_callers: ['code_execution'] },
+  ];
+
+  it('keeps a call whose arguments contain a dict literal', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'print(f"{await calculator(payload={\'x\': 1})}")',
+        'python'
+      ).map((def) => def.name)
+    ).toEqual(['calculator']);
+  });
+
+  it('keeps a call beside a separate replacement field', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'print(f"{name}: {await calculator({\'a\': [1, 2]})}")',
+        'python'
+      ).map((def) => def.name)
+    ).toEqual(['calculator']);
+  });
+
+  it('keeps an unterminated field rather than dropping a call', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'x = f"{calculator(1)"', 'python').map(
+        (def) => def.name
+      )
+    ).toEqual(['calculator']);
+  });
+
+  it('still blanks doubled braces around prose', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'print(f"{{calculator(x)}}")', 'python')
+    ).toEqual([]);
+  });
+});

@@ -177,25 +177,61 @@ export function extractUsedBashToolNames(
 const PYTHON_STRING_OR_COMMENT =
   /([A-Za-z]*)("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|#[^\n]*/g;
 const BASH_STRING_OR_COMMENT = /'[^']*'|(?:^|\s)#[^\n]*/gm;
-const PYTHON_REPLACEMENT_FIELD = /\{\{|\}\}|\{[^{}]*\}/g;
 
 const blankOut = (match: string): string => ' '.repeat(match.length);
 
-/** Blanks an f-string literal except for its `{...}` replacement fields. */
+/**
+ * Blanks an f-string literal except for its `{...}` replacement fields.
+ *
+ * Scans for balanced braces rather than matching a pattern: a replacement field
+ * can contain dict and set literals, and a regex that stops at the first inner
+ * brace would blank the surrounding call. Doubled braces are literal text. An
+ * unterminated field is preserved — keeping too much only risks a loud
+ * rejection, while dropping a real call breaks the run.
+ */
 function blankOutsideReplacementFields(literal: string): string {
-  let result = blankOut(literal);
-  let match: RegExpExecArray | null;
-  PYTHON_REPLACEMENT_FIELD.lastIndex = 0;
-  while ((match = PYTHON_REPLACEMENT_FIELD.exec(literal)) != null) {
-    if (match[0].length === 2) {
+  const kept = literal.split('').map(() => ' ');
+  let depth = 0;
+  let fieldStart = -1;
+
+  for (let i = 0; i < literal.length; i++) {
+    const char = literal[i];
+
+    if (depth === 0 && char === '{' && literal[i + 1] === '{') {
+      i++;
       continue;
     }
-    result =
-      result.slice(0, match.index) +
-      match[0] +
-      result.slice(match.index + match[0].length);
+    if (depth === 0 && char === '}' && literal[i + 1] === '}') {
+      i++;
+      continue;
+    }
+
+    if (char === '{') {
+      if (depth === 0) {
+        fieldStart = i;
+      }
+      depth++;
+      continue;
+    }
+
+    if (char === '}' && depth > 0) {
+      depth--;
+      if (depth === 0 && fieldStart >= 0) {
+        for (let j = fieldStart; j <= i; j++) {
+          kept[j] = literal[j];
+        }
+        fieldStart = -1;
+      }
+    }
   }
-  return result;
+
+  if (depth > 0 && fieldStart >= 0) {
+    for (let j = fieldStart; j < literal.length; j++) {
+      kept[j] = literal[j];
+    }
+  }
+
+  return kept.join('');
 }
 
 /**
