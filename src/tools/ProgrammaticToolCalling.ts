@@ -22,21 +22,30 @@ import {
   selectRuntimeSessionHint,
 } from './CodeExecutor';
 import {
-  clampCodeApiRunTimeoutMs,
-  createCodeApiRunTimeoutSchema,
-  resolveCodeApiRunTimeoutMs,
-} from './ptcTimeout';
-import {
   projectProgrammaticToolMap,
   resolveProgrammaticToolDefinitions,
   selectProgrammaticTools,
   type ProgrammaticInvocationParams,
 } from './ProgrammaticCallerPolicy';
+import {
+  clampCodeApiRunTimeoutMs,
+  createCodeApiRunTimeoutSchema,
+  resolveCodeApiRunTimeoutMs,
+} from './ptcTimeout';
+import {
+  extractUsedToolNames,
+  normalizeToPythonIdentifier,
+} from './toolIdentifiers';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 config();
+
+export {
+  extractUsedToolNames,
+  normalizeToPythonIdentifier,
+} from './toolIdentifiers';
 
 /** Default max round-trips to prevent infinite loops */
 const DEFAULT_MAX_ROUND_TRIPS = 20;
@@ -94,8 +103,9 @@ ${EXAMPLES}
 ${CORE_RULES}`;
 
 const TOOL_MANIFEST_DESCRIPTION =
-  'Exact registered tool names used by the code. Required when direct-only tools are configured; ' +
-  'validated before execution starts.';
+  'Exact registered tool names used by the code, validated before execution starts. ' +
+  'Omit it to have the runtime derive the manifest from the code; pass [] when the code ' +
+  'calls no tools at all.';
 
 export function createProgrammaticToolCallingSchema(
   maxRunTimeoutMs = DEFAULT_RUN_TIMEOUT_MS
@@ -148,45 +158,6 @@ export const ProgrammaticToolCallingDefinition = {
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/** Python reserved keywords that get `_tool` suffix in Code API */
-const PYTHON_KEYWORDS = new Set([
-  'False',
-  'None',
-  'True',
-  'and',
-  'as',
-  'assert',
-  'async',
-  'await',
-  'break',
-  'class',
-  'continue',
-  'def',
-  'del',
-  'elif',
-  'else',
-  'except',
-  'finally',
-  'for',
-  'from',
-  'global',
-  'if',
-  'import',
-  'in',
-  'is',
-  'lambda',
-  'nonlocal',
-  'not',
-  'or',
-  'pass',
-  'raise',
-  'return',
-  'try',
-  'while',
-  'with',
-  'yield',
-]);
 
 export type FetchSessionFilesScope =
   | { kind: 'skill'; id: string; version: number }
@@ -296,57 +267,6 @@ function normalizeSessionFile(
 }
 
 /**
- * Normalizes a tool name to Python identifier format.
- * Must match the Code API's `normalizePythonFunctionName` exactly:
- * 1. Replace hyphens and spaces with underscores
- * 2. Remove any other invalid characters
- * 3. Prefix with underscore if starts with number
- * 4. Append `_tool` if it's a Python keyword
- * @param name - The tool name to normalize
- * @returns Normalized Python-safe identifier
- */
-export function normalizeToPythonIdentifier(name: string): string {
-  let normalized = name.replace(/[-\s]/g, '_');
-
-  normalized = normalized.replace(/[^a-zA-Z0-9_]/g, '');
-
-  if (/^[0-9]/.test(normalized)) {
-    normalized = '_' + normalized;
-  }
-
-  if (PYTHON_KEYWORDS.has(normalized)) {
-    normalized = normalized + '_tool';
-  }
-
-  return normalized;
-}
-
-/**
- * Extracts tool names that are actually called in the Python code.
- * Handles hyphen/underscore conversion since Python identifiers use underscores.
- * @param code - The Python code to analyze
- * @param toolNameMap - Map from normalized Python name to original tool name
- * @returns Set of original tool names found in the code
- */
-export function extractUsedToolNames(
-  code: string,
-  toolNameMap: Map<string, string>
-): Set<string> {
-  const usedTools = new Set<string>();
-
-  for (const [pythonName, originalName] of toolNameMap) {
-    const escapedName = pythonName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp(`\\b${escapedName}\\s*\\(`, 'g');
-
-    if (pattern.test(code)) {
-      usedTools.add(originalName);
-    }
-  }
-
-  return usedTools;
-}
-
-/**
  * Filters tool definitions to only include tools actually used in the code.
  * Handles the hyphen-to-underscore conversion for Python compatibility.
  * @param toolDefs - All available tool definitions
@@ -361,8 +281,7 @@ export function filterToolsByUsage(
 ): t.LCTool[] {
   const toolNameMap = new Map<string, string>();
   for (const tool of toolDefs) {
-    const pythonName = normalizeToPythonIdentifier(tool.name);
-    toolNameMap.set(pythonName, tool.name);
+    toolNameMap.set(normalizeToPythonIdentifier(tool.name), tool.name);
   }
 
   const usedToolNames = extractUsedToolNames(code, toolNameMap);
@@ -874,6 +793,49 @@ export function formatCompletedResponse(
   ];
 }
 
+/**
+ * Runs code that references no tools through plain `/exec`.
+ *
+ * `/exec/programmatic` rejects an empty tool manifest outright, and the sandbox
+ * has nothing to inject for such a call anyway — no stubs, no replay round
+ * trips. Routing it here makes a tool-free programmatic call behave exactly like
+ * the equivalent `execute_code`, against every deployed Code API, instead of
+ * failing with a rejection the model cannot act on.
+ */
+export async function runPlainExecution(args: {
+  baseUrl: string;
+  lang: 'bash' | 'py';
+  code: string;
+  sessionId?: string;
+  files?: t.CodeEnvFile[];
+  runtimeSessionHint?: string;
+  proxy?: string;
+  authHeaders?: t.CodeApiAuthHeaders;
+  executionProfile?: t.CodeApiExecutionProfile;
+}): Promise<[string, t.ProgrammaticExecutionArtifact]> {
+  const response = await makeRequest(
+    buildCodeApiEndpoint(args.baseUrl, 'exec'),
+    {
+      lang: args.lang,
+      code: args.code,
+      ...(args.sessionId != null && args.sessionId !== ''
+        ? { session_id: args.sessionId }
+        : {}),
+      ...(args.files != null && args.files.length > 0
+        ? { files: args.files }
+        : {}),
+      ...(args.runtimeSessionHint != null
+        ? { runtime_session_hint: args.runtimeSessionHint }
+        : {}),
+    },
+    args.proxy,
+    args.authHeaders,
+    args.executionProfile
+  );
+
+  return formatCompletedResponse(response, args.code);
+}
+
 // ============================================================================
 // Tool Factory
 // ============================================================================
@@ -937,6 +899,8 @@ export function createProgrammaticToolCallingTool(
           ? toolCall.name
           : Constants.PROGRAMMATIC_TOOL_CALLING);
       const effectiveTools = selectProgrammaticTools({
+        code,
+        runtime: 'python',
         requestedToolNames: params.tool_manifest,
         allowedToolDefs: toolDefs,
         disallowedToolDefs,
@@ -1007,6 +971,20 @@ export function createProgrammaticToolCallingTool(
           selectedRuntimeSessionHint !== ''
             ? selectedRuntimeSessionHint
             : undefined;
+
+        if (effectiveTools.length === 0) {
+          return await runPlainExecution({
+            baseUrl,
+            lang: 'py',
+            code,
+            sessionId: session_id,
+            files,
+            runtimeSessionHint,
+            proxy,
+            authHeaders: initParams.authHeaders,
+            executionProfile: initParams.executionProfile,
+          });
+        }
 
         let response = await makeRequest(
           EXEC_ENDPOINT,

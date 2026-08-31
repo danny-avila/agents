@@ -1,4 +1,6 @@
+import type { ProgrammaticRuntime } from './toolIdentifiers';
 import type * as t from '@/types';
+import { deriveReferencedToolDefs } from './toolIdentifiers';
 
 export type ProgrammaticInvocationParams = {
   code: string;
@@ -19,10 +21,10 @@ export function projectProgrammaticToolMap(
   toolMap: t.ToolMap,
   selectedToolDefs: readonly t.LCTool[]
 ): t.ToolMap {
-  const selectedNames = new Set(selectedToolDefs.map((toolDef) => toolDef.name));
-  return new Map(
-    [...toolMap].filter(([name]) => selectedNames.has(name))
+  const selectedNames = new Set(
+    selectedToolDefs.map((toolDef) => toolDef.name)
   );
+  return new Map([...toolMap].filter(([name]) => selectedNames.has(name)));
 }
 
 export function assertDisallowedToolUsage(
@@ -43,7 +45,21 @@ export function assertDisallowedToolUsage(
   );
 }
 
+/**
+ * Resolves the tool manifest a programmatic call runs with.
+ *
+ * An omitted manifest is derived from the submitted code rather than rejected.
+ * Deriving can only narrow `allowedToolDefs`, so a direct-only tool still cannot
+ * be reached; the caller-facing invariant is unchanged. Rejecting instead cost a
+ * round trip on every call once any direct-only tool existed, and left tool-free
+ * code with no valid manifest to send at all.
+ *
+ * An empty result is meaningful, not an error: the code calls no tools, so it
+ * needs no stubs. Remote callers route that to plain `/exec`.
+ */
 export function selectProgrammaticTools(args: {
+  code: string;
+  runtime: ProgrammaticRuntime;
   requestedToolNames?: string[];
   allowedToolDefs?: t.LCTool[];
   disallowedToolDefs?: t.LCTool[];
@@ -55,10 +71,7 @@ export function selectProgrammaticTools(args: {
 
   if (requestedToolNames == null) {
     if (disallowedToolDefs.length > 0) {
-      throw new Error(
-        `"${args.programmaticToolName}" requires a tool_manifest when direct-only tools are configured. ` +
-          'List every registered tool name used by the submitted code in the tool_manifest field.'
-      );
+      return deriveReferencedToolDefs(allowedToolDefs, args.code, args.runtime);
     }
     return allowedToolDefs;
   }

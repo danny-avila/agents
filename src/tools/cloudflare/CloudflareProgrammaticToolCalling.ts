@@ -1060,6 +1060,8 @@ async function runProgrammatic(args: {
       ? Constants.BASH_PROGRAMMATIC_TOOL_CALLING
       : Constants.PROGRAMMATIC_TOOL_CALLING);
   const selectedTools = selectProgrammaticTools({
+    code: args.params.code,
+    runtime: args.runtime,
     requestedToolNames: args.params.tool_manifest,
     allowedToolDefs: toolDefs,
     disallowedToolDefs: toolCall.disallowedToolDefs,

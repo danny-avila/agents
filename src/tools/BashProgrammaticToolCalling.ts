@@ -14,11 +14,6 @@ import {
   selectRuntimeSessionHint,
 } from './CodeExecutor';
 import {
-  makeRequest,
-  executeTools,
-  formatCompletedResponse,
-} from './ProgrammaticToolCalling';
-import {
   projectProgrammaticToolMap,
   resolveProgrammaticToolDefinitions,
   selectProgrammaticTools,
@@ -29,10 +24,25 @@ import {
   createCodeApiRunTimeoutSchema,
   resolveCodeApiRunTimeoutMs,
 } from './ptcTimeout';
+import {
+  makeRequest,
+  executeTools,
+  runPlainExecution,
+  formatCompletedResponse,
+} from './ProgrammaticToolCalling';
+import {
+  extractUsedBashToolNames,
+  normalizeToBashIdentifier,
+} from './toolIdentifiers';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 config();
+
+export {
+  extractUsedBashToolNames,
+  normalizeToBashIdentifier,
+} from './toolIdentifiers';
 
 // ============================================================================
 // Constants
@@ -41,33 +51,6 @@ config();
 const DEFAULT_MAX_ROUND_TRIPS = 20;
 const DEFAULT_RUN_TIMEOUT_MS = resolveCodeApiRunTimeoutMs();
 const BASH_LAST_BACKGROUND_PID_GUARD = ': &\nwait "$!"';
-
-/** Bash reserved words that get `_tool` suffix when used as function names */
-const BASH_RESERVED = new Set([
-  'if',
-  'then',
-  'else',
-  'elif',
-  'fi',
-  'case',
-  'esac',
-  'for',
-  'while',
-  'until',
-  'do',
-  'done',
-  'in',
-  'function',
-  'select',
-  'time',
-  'coproc',
-  'declare',
-  'typeset',
-  'local',
-  'readonly',
-  'export',
-  'unset',
-]);
 
 // ============================================================================
 // Description Components
@@ -116,8 +99,9 @@ ${EXAMPLES}
 ${CORE_RULES}`;
 
 const TOOL_MANIFEST_DESCRIPTION =
-  'Exact registered tool names used by the code. Required when direct-only tools are configured; ' +
-  'validated before execution starts.';
+  'Exact registered tool names used by the code, validated before execution starts. ' +
+  'Omit it to have the runtime derive the manifest from the code; pass [] when the code ' +
+  'calls no tools at all.';
 
 // ============================================================================
 // Schema
@@ -217,51 +201,6 @@ export function normalizeBashToolResultsForReplay(
 // ============================================================================
 
 /**
- * Normalizes a tool name to a valid bash function identifier.
- * 1. Replace hyphens, spaces, dots with underscores
- * 2. Remove any other invalid characters
- * 3. Prefix with underscore if starts with number
- * 4. Append `_tool` if it's a bash reserved word
- */
-export function normalizeToBashIdentifier(name: string): string {
-  let normalized = name.replace(/[-\s.]/g, '_');
-  normalized = normalized.replace(/[^a-zA-Z0-9_]/g, '');
-
-  if (/^[0-9]/.test(normalized)) {
-    normalized = '_' + normalized;
-  }
-
-  if (BASH_RESERVED.has(normalized)) {
-    normalized = normalized + '_tool';
-  }
-
-  return normalized;
-}
-
-/**
- * Extracts tool names that are actually called in the bash code.
- * Bash functions are invoked as commands (no parentheses), so we match
- * the normalized name as a word boundary.
- */
-export function extractUsedBashToolNames(
-  code: string,
-  toolNameMap: Map<string, string>
-): Set<string> {
-  const usedTools = new Set<string>();
-
-  for (const [bashName, originalName] of toolNameMap) {
-    const escapedName = bashName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp(`\\b${escapedName}\\b`, 'g');
-
-    if (pattern.test(code)) {
-      usedTools.add(originalName);
-    }
-  }
-
-  return usedTools;
-}
-
-/**
  * Filters tool definitions to only include tools actually used in the bash code.
  */
 export function filterBashToolsByUsage(
@@ -355,6 +294,8 @@ export function createBashProgrammaticToolCallingTool(
           ? toolCall.name
           : Constants.BASH_PROGRAMMATIC_TOOL_CALLING);
       const effectiveTools = selectProgrammaticTools({
+        code,
+        runtime: 'bash',
         requestedToolNames: params.tool_manifest,
         allowedToolDefs: toolDefs,
         disallowedToolDefs,
@@ -422,6 +363,22 @@ export function createBashProgrammaticToolCallingTool(
           selectedRuntimeSessionHint !== ''
             ? selectedRuntimeSessionHint
             : undefined;
+
+        /* Raw `code`, not `preparedCode`: the `$!` guard exists for the
+         * programmatic replay wrapper, which plain `/exec` never applies. */
+        if (effectiveTools.length === 0) {
+          return await runPlainExecution({
+            baseUrl,
+            lang: 'bash',
+            code,
+            sessionId: session_id,
+            files,
+            runtimeSessionHint,
+            proxy,
+            authHeaders: initParams.authHeaders,
+            executionProfile: initParams.executionProfile,
+          });
+        }
 
         let response = await makeRequest(
           EXEC_ENDPOINT,

@@ -929,19 +929,47 @@ for member in team:
     ];
     const disallowedToolDefs = [{ name: 'send_email' }];
 
-    it('requires a manifest for mixed caller configurations', () => {
-      expect(() =>
+    it('derives the manifest from code for mixed caller configurations', () => {
+      expect(
         selectProgrammaticTools({
+          code: 'print(search(query="x"))',
+          runtime: 'python',
           allowedToolDefs,
           disallowedToolDefs,
           programmaticToolName: 'run_tools_with_code',
         })
-      ).toThrow('requires a tool_manifest');
+      ).toEqual([allowedToolDefs[0]]);
+    });
+
+    it('derives an empty manifest for code that calls no tools', () => {
+      expect(
+        selectProgrammaticTools({
+          code: 'import os\nprint(os.listdir("/mnt/data"))',
+          runtime: 'python',
+          allowedToolDefs,
+          disallowedToolDefs,
+          programmaticToolName: 'run_tools_with_code',
+        })
+      ).toEqual([]);
+    });
+
+    it('never derives a direct-only tool the caller may not use', () => {
+      expect(
+        selectProgrammaticTools({
+          code: 'send_email(to="a@b.c")',
+          runtime: 'python',
+          allowedToolDefs,
+          disallowedToolDefs,
+          programmaticToolName: 'run_tools_with_code',
+        })
+      ).toEqual([]);
     });
 
     it('rejects direct-only manifest entries before execution', () => {
       expect(() =>
         selectProgrammaticTools({
+          code: 'send_email(to="a@b.c")',
+          runtime: 'python',
           requestedToolNames: ['send_email'],
           allowedToolDefs,
           disallowedToolDefs,
@@ -953,6 +981,8 @@ for member in team:
     it('selects declared allowed tools without parsing code', () => {
       expect(
         selectProgrammaticTools({
+          code: '',
+          runtime: 'python',
           requestedToolNames: ['calculate', 'search', 'search'],
           allowedToolDefs,
           disallowedToolDefs,
@@ -961,9 +991,24 @@ for member in team:
       ).toEqual([allowedToolDefs[1], allowedToolDefs[0]]);
     });
 
+    it('honors an explicitly empty manifest', () => {
+      expect(
+        selectProgrammaticTools({
+          code: 'ls /mnt/data',
+          runtime: 'bash',
+          requestedToolNames: [],
+          allowedToolDefs,
+          disallowedToolDefs,
+          programmaticToolName: 'run_tools_with_bash',
+        })
+      ).toEqual([]);
+    });
+
     it('preserves the all-tools fallback when no direct-only tools exist', () => {
       expect(
         selectProgrammaticTools({
+          code: 'ls /mnt/data',
+          runtime: 'bash',
           allowedToolDefs,
           programmaticToolName: 'run_tools_with_code',
         })
@@ -984,9 +1029,9 @@ for member in team:
         ['send_email', emailTool],
       ]);
 
-      expect(
-        projectProgrammaticToolMap(toolMap, [{ name: 'search' }])
-      ).toEqual(new Map([['search', searchTool]]));
+      expect(projectProgrammaticToolMap(toolMap, [{ name: 'search' }])).toEqual(
+        new Map([['search', searchTool]])
+      );
     });
   });
 

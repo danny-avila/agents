@@ -583,6 +583,8 @@ async function runLocalProgrammaticTool(args: {
       ? Constants.BASH_PROGRAMMATIC_TOOL_CALLING
       : Constants.PROGRAMMATIC_TOOL_CALLING);
   const selectedTools = selectProgrammaticTools({
+    code: args.params.code,
+    runtime: args.runtime === 'bash' ? 'bash' : 'python',
     requestedToolNames: args.params.tool_manifest,
     allowedToolDefs: toolDefs,
     disallowedToolDefs,
