@@ -306,7 +306,10 @@ describe('Agent Handoffs Tests', () => {
         createBasicAgent('agent_a', 'You are agent A'),
         {
           ...createBasicAgent('agent_b', 'You are agent B'),
-          graphTools: [leakedTransferTool, retainedGraphTool],
+          graphTools: [
+            leakedTransferTool as unknown as t.GenericTool,
+            retainedGraphTool as unknown as t.GenericTool,
+          ],
         },
       ];
 
