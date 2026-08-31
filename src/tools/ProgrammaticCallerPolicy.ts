@@ -1,6 +1,9 @@
 import type { ProgrammaticRuntime } from './toolIdentifiers';
 import type * as t from '@/types';
-import { deriveReferencedToolDefs } from './toolIdentifiers';
+import {
+  deriveReferencedToolDefs,
+  findNormalizedIdentifierCollision,
+} from './toolIdentifiers';
 
 export type ProgrammaticInvocationParams = {
   code: string;
@@ -57,6 +60,23 @@ export function assertDisallowedToolUsage(
  * An empty result is meaningful, not an error: the code calls no tools, so it
  * needs no stubs. Remote callers route that to plain `/exec`.
  */
+function assertUnambiguousIdentifiers(
+  selectedToolDefs: readonly t.LCTool[],
+  runtime: ProgrammaticRuntime,
+  programmaticToolName: string
+): void {
+  const collision = findNormalizedIdentifierCollision(selectedToolDefs, runtime);
+  if (collision == null) {
+    return;
+  }
+
+  throw new Error(
+    `Tools "${collision.first}" and "${collision.second}" both become ` +
+      `"${collision.identifier}" in ${runtime}, so "${programmaticToolName}" ` +
+      'cannot tell which one the code means. Call them directly, or rename one.'
+  );
+}
+
 export function selectProgrammaticTools(args: {
   code: string;
   runtime: ProgrammaticRuntime;
@@ -103,7 +123,17 @@ export function selectProgrammaticTools(args: {
       args.programmaticToolName
     );
 
-    return deriveReferencedToolDefs(allowedToolDefs, args.code, args.runtime);
+    const derived = deriveReferencedToolDefs(
+      allowedToolDefs,
+      args.code,
+      args.runtime
+    );
+    assertUnambiguousIdentifiers(
+      derived,
+      args.runtime,
+      args.programmaticToolName
+    );
+    return derived;
   }
 
   const disallowedNames = new Set(
@@ -134,7 +164,13 @@ export function selectProgrammaticTools(args: {
     );
   }
 
-  return [...new Set(requestedToolNames)].map(
+  const selected = [...new Set(requestedToolNames)].map(
     (name) => allowedByName.get(name) as t.LCTool
   );
+  assertUnambiguousIdentifiers(
+    selected,
+    args.runtime,
+    args.programmaticToolName
+  );
+  return selected;
 }

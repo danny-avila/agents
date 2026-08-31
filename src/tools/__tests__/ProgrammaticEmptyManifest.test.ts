@@ -55,6 +55,7 @@ import {
 } from '../ProgrammaticToolCalling';
 import {
   deriveReferencedToolDefs,
+  findNormalizedIdentifierCollision,
   stripNonCodeText,
 } from '../toolIdentifiers';
 import {
@@ -337,12 +338,56 @@ describe('ambiguous normalized identifiers', () => {
     { name: 'report_tool', allowed_callers: ['code_execution'] },
   ];
 
-  it('keeps every colliding definition rather than picking by order', () => {
+  it('surfaces every colliding definition rather than picking by order', () => {
     expect(
       deriveReferencedToolDefs(colliding, 'report_tool \'{}\'', 'bash').map(
         (def) => def.name
       )
     ).toEqual(['report-tool', 'report_tool']);
+  });
+
+  it('reports the pair that collapses to one identifier', () => {
+    expect(findNormalizedIdentifierCollision(colliding, 'bash')).toEqual({
+      first: 'report-tool',
+      second: 'report_tool',
+      identifier: 'report_tool',
+    });
+  });
+
+  it('rejects an ambiguous derived selection', () => {
+    expect(() =>
+      selectProgrammaticTools({
+        code: 'report_tool \'{}\'',
+        runtime: 'bash',
+        allowedToolDefs: colliding,
+        disallowedToolDefs: [{ name: 'send_email' }],
+        programmaticToolName: 'run_tools_with_bash',
+      })
+    ).toThrow('cannot tell which one the code means');
+  });
+
+  it('rejects an ambiguous explicit manifest the same way', () => {
+    expect(() =>
+      selectProgrammaticTools({
+        code: 'report_tool \'{}\'',
+        runtime: 'bash',
+        requestedToolNames: ['report-tool', 'report_tool'],
+        allowedToolDefs: colliding,
+        programmaticToolName: 'run_tools_with_bash',
+      })
+    ).toThrow('cannot tell which one the code means');
+  });
+
+  it('accepts an unambiguous manifest naming one of the pair', () => {
+    expect(
+      selectProgrammaticTools({
+        code: 'report_tool \'{}\'',
+        runtime: 'bash',
+        requestedToolNames: ['report-tool'],
+        allowedToolDefs: colliding,
+        programmaticToolName: 'run_tools_with_bash',
+      }).map((def) => def.name)
+    ).toEqual(['report-tool']);
   });
 
   it('does not widen selection for an unreferenced collision', () => {
@@ -469,5 +514,37 @@ describe('timeout on the plain route', () => {
 
     expect(requests[0].url).toBe(`${BASE_URL}/exec`);
     expect(requests[0].body.timeout).toBe(5000);
+  });
+});
+
+describe('f-string literals are prose, replacement fields are code', () => {
+  const tools: t.LCTool[] = [
+    { name: 'write_file', allowed_callers: ['code_execution'] },
+  ];
+
+  it('ignores a tool name in the literal text of an f-string', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'print(f"example: write_file(path)")',
+        'python'
+      )
+    ).toEqual([]);
+  });
+
+  it('still sees a call inside a replacement field', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'print(f"{await write_file(path=1)}")',
+        'python'
+      ).map((def) => def.name)
+    ).toEqual(['write_file']);
+  });
+
+  it('treats doubled braces as literal text', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'print(f"{{write_file(x)}}")', 'python')
+    ).toEqual([]);
   });
 });

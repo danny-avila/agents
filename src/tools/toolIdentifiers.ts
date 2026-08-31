@@ -169,18 +169,38 @@ export function extractUsedBashToolNames(
   return usedTools;
 }
 
-/* Interpolating constructs stay visible: an f-string expression and a bash
- * command substitution are executable code, and blanking them would hide a real
- * tool call. Bash double quotes interpolate, so only single quotes are erased. */
+/* Interpolating constructs stay visible: an f-string replacement field and a
+ * bash command substitution are executable code, and blanking them would hide a
+ * real tool call. Everything else in the literal is prose and is erased, so
+ * `f"example: write_file(path)"` does not read as a call. Bash double quotes
+ * interpolate, so only single quotes are erased. */
 const PYTHON_STRING_OR_COMMENT =
   /([A-Za-z]*)("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|#[^\n]*/g;
 const BASH_STRING_OR_COMMENT = /'[^']*'|(?:^|\s)#[^\n]*/gm;
+const PYTHON_REPLACEMENT_FIELD = /\{\{|\}\}|\{[^{}]*\}/g;
 
 const blankOut = (match: string): string => ' '.repeat(match.length);
 
+/** Blanks an f-string literal except for its `{...}` replacement fields. */
+function blankOutsideReplacementFields(literal: string): string {
+  let result = blankOut(literal);
+  let match: RegExpExecArray | null;
+  PYTHON_REPLACEMENT_FIELD.lastIndex = 0;
+  while ((match = PYTHON_REPLACEMENT_FIELD.exec(literal)) != null) {
+    if (match[0].length === 2) {
+      continue;
+    }
+    result =
+      result.slice(0, match.index) +
+      match[0] +
+      result.slice(match.index + match[0].length);
+  }
+  return result;
+}
+
 /**
- * Blanks comments and non-interpolating string literals so prose cannot be
- * mistaken for a call.
+ * Blanks comments and the literal text of strings so prose cannot be mistaken
+ * for a call, while leaving interpolated expressions visible.
  *
  * Only reduces false positives — a name that survives may still not be a real
  * invocation. Runtimes enforce the caller boundary by defining stubs for the
@@ -200,9 +220,35 @@ export function stripNonCodeText(
       if (literal == null) {
         return blankOut(match);
       }
-      return prefix != null && /[fF]/.test(prefix) ? match : blankOut(match);
+      if (prefix == null || !/[fF]/.test(prefix)) {
+        return blankOut(match);
+      }
+      return blankOut(prefix) + blankOutsideReplacementFields(literal);
     }
   );
+}
+
+/**
+ * Returns the first pair of tool names that collapse to one runtime identifier.
+ *
+ * Stub generation binds by identifier, so two such tools are indistinguishable
+ * once emitted — the local Python wrapper defines both and the later one wins.
+ * Callers reject the selection rather than dispatch by declaration order.
+ */
+export function findNormalizedIdentifierCollision(
+  toolDefs: readonly t.LCTool[],
+  runtime: ProgrammaticRuntime
+): { first: string; second: string; identifier: string } | null {
+  const seen = new Map<string, string>();
+  for (const toolDef of toolDefs) {
+    const identifier = normalizeToRuntimeIdentifier(toolDef.name, runtime);
+    const prior = seen.get(identifier);
+    if (prior != null && prior !== toolDef.name) {
+      return { first: prior, second: toolDef.name, identifier };
+    }
+    seen.set(identifier, toolDef.name);
+  }
+  return null;
 }
 
 function matchesRuntimeIdentifier(
