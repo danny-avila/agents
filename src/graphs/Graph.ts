@@ -3815,6 +3815,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         parentMessageId: config.configurable?.requestBody?.parentMessageId,
         agentId,
         agentName: agentContext.name,
+        rootAgentId: this.defaultAgentId,
+        rootAgentName: this.agentContexts.get(this.defaultAgentId)?.name,
+        activeAgentId: agentId,
+        activeAgentName: agentContext.name,
       });
       let langfuseHandler: CallbackEntry | undefined;
       let invokeConfig = {

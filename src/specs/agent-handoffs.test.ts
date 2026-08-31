@@ -289,10 +289,25 @@ describe('Agent Handoffs Tests', () => {
       expect(handoffToolMessage?.content).toContain('transferred to agent_b');
     });
 
-    it('should not create handoff tool for agent without outgoing edges', async () => {
+    it('should not expose an inbound handoff tool to its recipient', async () => {
+      const leakedTransferTool = new DynamicStructuredTool({
+        name: `${Constants.LC_TRANSFER_TO_}agent_b`,
+        description: 'Leaked transfer to agent B',
+        schema: { type: 'object', properties: {}, required: [] },
+        func: async (): Promise<string> => 'transferred',
+      });
+      const retainedGraphTool = new DynamicStructuredTool({
+        name: 'retained_graph_tool',
+        description: 'A non-handoff graph tool',
+        schema: { type: 'object', properties: {}, required: [] },
+        func: async (): Promise<string> => 'retained',
+      });
       const agents: t.AgentInputs[] = [
         createBasicAgent('agent_a', 'You are agent A'),
-        createBasicAgent('agent_b', 'You are agent B'),
+        {
+          ...createBasicAgent('agent_b', 'You are agent B'),
+          graphTools: [leakedTransferTool, retainedGraphTool],
+        },
       ];
 
       const edges: t.GraphEdge[] = [
@@ -310,12 +325,15 @@ describe('Agent Handoffs Tests', () => {
       );
       expect(agentBContext).toBeDefined();
 
-      // Agent B should not have handoff tools (no outgoing edges)
+      // Agent B has no outgoing edge, so any inbound transfer is removed.
       const handoffTools = agentBContext?.graphTools?.filter((tool) => {
         const name = getToolName(tool);
         return name?.startsWith(Constants.LC_TRANSFER_TO_) ?? false;
       });
       expect(handoffTools?.length ?? 0).toBe(0);
+      expect(
+        findToolByName(agentBContext?.graphTools, 'retained_graph_tool')
+      ).toBeDefined();
     });
   });
 

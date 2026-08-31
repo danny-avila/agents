@@ -101,6 +101,14 @@ function isTransferToolName(name: unknown): boolean {
   );
 }
 
+function graphToolName(tool: unknown): string | undefined {
+  if (tool == null || typeof tool !== 'object' || !('name' in tool)) {
+    return undefined;
+  }
+  const { name } = tool;
+  return typeof name === 'string' ? name : undefined;
+}
+
 /**
  * Drop transfer `tool_use` content blocks from an AI message's array content.
  * Companion to the reception's tool-call filtering: array-content providers
@@ -594,6 +602,19 @@ export class MultiAgentGraph extends StandardGraph {
   private createHandoffTools(): void {
     // Group handoff edges by source agent(s)
     const handoffsByAgent = new Map<string, t.GraphEdge[]>();
+
+    /** Transfer tool names are SDK-reserved. Remove externally supplied or
+     * stale transfer tools before deriving the source agent's allowed set
+     * from the graph edges below. */
+    for (const agentContext of this.agentContexts.values()) {
+      const retainedTools = agentContext.graphTools?.filter(
+        (graphTool) => !isTransferToolName(graphToolName(graphTool))
+      );
+      agentContext.graphTools =
+        retainedTools != null && retainedTools.length > 0
+          ? retainedTools
+          : undefined;
+    }
 
     // Only process handoff edges for tool creation
     for (const edge of this.handoffEdges) {

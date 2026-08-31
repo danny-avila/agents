@@ -1311,6 +1311,10 @@ export class Run<_T extends t.BaseGraphState> {
       parentMessageId: config.configurable?.requestBody?.parentMessageId,
       agentId: graph.defaultAgentId,
       agentName: primaryContext?.name,
+      rootAgentId: graph.defaultAgentId,
+      rootAgentName: primaryContext?.name,
+      activeAgentId: graph.defaultAgentId,
+      activeAgentName: primaryContext?.name,
     });
     const traceName = config.runName ?? getLangfuseTraceName(traceMetadata);
     const streamLangfuseConfig = this.getStreamLangfuseConfig(graph);
