@@ -2620,6 +2620,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         // run_id); `executingAgentId` always identifies the owning agent.
         agentId: this.subagentScope ? agentContext?.agentId : undefined,
         executingAgentId: agentContext?.agentId,
+        executingAgentName: agentContext?.name,
+        rootAgentId: this.defaultAgentId,
+        rootAgentName: this.agentContexts.get(this.defaultAgentId)?.name,
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
         getDiscoveredToolNames: (): readonly string[] =>
@@ -2697,6 +2700,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       // hooks can attribute the batch even at the top level.
       agentId: this.subagentScope ? agentContext?.agentId : undefined,
       executingAgentId: agentContext?.agentId,
+      executingAgentName: agentContext?.name,
+      rootAgentId: this.defaultAgentId,
+      rootAgentName: this.agentContexts.get(this.defaultAgentId)?.name,
       toolCallStepIds: this.toolCallStepIds,
       errorHandler: (data, metadata): Promise<boolean> =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
@@ -3815,6 +3821,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         parentMessageId: config.configurable?.requestBody?.parentMessageId,
         agentId,
         agentName: agentContext.name,
+        rootAgentId: this.defaultAgentId,
+        rootAgentName: this.agentContexts.get(this.defaultAgentId)?.name,
+        activeAgentId: agentId,
+        activeAgentName: agentContext.name,
       });
       let langfuseHandler: CallbackEntry | undefined;
       let invokeConfig = {

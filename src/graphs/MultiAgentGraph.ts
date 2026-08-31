@@ -101,6 +101,14 @@ function isTransferToolName(name: unknown): boolean {
   );
 }
 
+function graphToolName(tool: unknown): string | undefined {
+  if (tool == null || typeof tool !== 'object' || !('name' in tool)) {
+    return undefined;
+  }
+  const { name } = tool;
+  return typeof name === 'string' ? name : undefined;
+}
+
 /**
  * Drop transfer `tool_use` content blocks from an AI message's array content.
  * Companion to the reception's tool-call filtering: array-content providers
@@ -283,6 +291,21 @@ function withHandoffGroupMetadata(
     metadata: {
       ...config?.metadata,
       [Constants.HANDOFF_GROUP_ID]: groupId ?? null,
+    },
+  };
+}
+
+function withActiveAgentMetadata(
+  config: LangGraphRunnableConfig | undefined,
+  agentId: string,
+  agentName: string | undefined
+): LangGraphRunnableConfig {
+  return {
+    ...config,
+    metadata: {
+      ...config?.metadata,
+      activeAgentId: agentId,
+      ...(agentName == null ? {} : { activeAgentName: agentName }),
     },
   };
 }
@@ -594,6 +617,24 @@ export class MultiAgentGraph extends StandardGraph {
   private createHandoffTools(): void {
     // Group handoff edges by source agent(s)
     const handoffsByAgent = new Map<string, t.GraphEdge[]>();
+    const tokenAccountingRefresh = new Set<string>();
+
+    /** Transfer tool names are SDK-reserved. Remove externally supplied or
+     * stale transfer tools before deriving the source agent's allowed set
+     * from the graph edges below. */
+    for (const agentContext of this.agentContexts.values()) {
+      const originalTools = agentContext.graphTools;
+      const retainedTools = agentContext.graphTools?.filter(
+        (graphTool) => !isTransferToolName(graphToolName(graphTool))
+      );
+      if (retainedTools?.length !== originalTools?.length) {
+        tokenAccountingRefresh.add(agentContext.agentId);
+      }
+      agentContext.graphTools =
+        retainedTools != null && retainedTools.length > 0
+          ? retainedTools
+          : undefined;
+    }
 
     // Only process handoff edges for tool creation
     for (const edge of this.handoffEdges) {
@@ -643,6 +684,29 @@ export class MultiAgentGraph extends StandardGraph {
       for (const handoffTool of handoffTools) {
         agentContext.graphTools.push(handoffTool);
       }
+      if (handoffTools.length > 0) {
+        tokenAccountingRefresh.add(agentId);
+      }
+    }
+
+    for (const agentId of tokenAccountingRefresh) {
+      const agentContext = this.agentContexts.get(agentId);
+      if (agentContext?.tokenCounter == null) {
+        continue;
+      }
+      const { tokenCounter, baseIndexTokenCountMap } = agentContext;
+      agentContext.tokenCalculationPromise = agentContext
+        .calculateInstructionTokens(tokenCounter)
+        .then(() => {
+          agentContext.updateTokenMapWithInstructions(baseIndexTokenCountMap);
+        })
+        .catch((err) => {
+          // eslint-disable-next-line no-console
+          console.error(
+            'Error recalculating instruction tokens after handoff tool updates:',
+            err
+          );
+        });
     }
   }
 
@@ -1239,10 +1303,16 @@ export class MultiAgentGraph extends StandardGraph {
       ): Promise<t.MultiAgentGraphState | Command> => {
         let result: t.MultiAgentGraphState;
         let inputMessages = state.messages;
-        const memberConfig =
+        const agentContext = this.agentContexts.get(agentId);
+        const recursionLimitedConfig =
           this.memberRecursionLimit == null
             ? config
             : { ...config, recursionLimit: this.memberRecursionLimit };
+        const memberConfig = withActiveAgentMetadata(
+          recursionLimitedConfig,
+          agentId,
+          agentContext?.name
+        );
 
         /**
          * Check if this agent is receiving a handoff.
@@ -1254,7 +1324,6 @@ export class MultiAgentGraph extends StandardGraph {
           state.messages,
           agentId
         );
-        const agentContext = this.agentContexts.get(agentId);
 
         if (
           handoffContext?.sourceAgentName != null &&

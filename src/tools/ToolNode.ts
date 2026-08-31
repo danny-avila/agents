@@ -738,6 +738,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * even where `agentId` (the subagent-scope marker) is undefined.
    */
   private executingAgentId?: string;
+  private executingAgentName?: string;
+  private rootAgentId?: string;
+  private rootAgentName?: string;
   /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
   private directToolNames?: Set<string>;
   /**
@@ -823,6 +826,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     eagerEventToolSuppressions,
     agentId,
     executingAgentId,
+    executingAgentName,
+    rootAgentId,
+    rootAgentName,
     directToolNames,
     interruptingToolNames,
     codeSessionToolNames,
@@ -902,6 +908,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // Default to agentId so callers constructing ToolNode directly (who pass the
     // existing agentId option) still get attribution without knowing the new option.
     this.executingAgentId = executingAgentId ?? agentId;
+    this.executingAgentName = executingAgentName;
+    this.rootAgentId = rootAgentId;
+    this.rootAgentName = rootAgentName;
     this.directToolNames = directToolNames;
     this.interruptingToolNames =
       interruptingToolNames != null && interruptingToolNames.size > 0
@@ -963,6 +972,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           metadata: {
             ...options?.metadata,
             agentId: this.executingAgentId,
+            activeAgentId: this.executingAgentId,
+            ...(this.executingAgentName == null
+              ? {}
+              : { activeAgentName: this.executingAgentName }),
+            ...(this.rootAgentId == null
+              ? {}
+              : { rootAgentId: this.rootAgentId }),
+            ...(this.rootAgentName == null
+              ? {}
+              : { rootAgentName: this.rootAgentName }),
           },
         };
     return withLangfuseRuntimeScope(

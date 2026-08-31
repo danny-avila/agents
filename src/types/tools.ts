@@ -148,6 +148,11 @@ export type ToolNodeOptions = {
   /** ID of the agent that owns this tool node, surfaced to hooks as `executingAgentId`
    * so a batch can be attributed to a specific agent even where `agentId` is undefined. */
   executingAgentId?: string;
+  /** Name of the agent that owns this tool node, used for active Langfuse attribution. */
+  executingAgentName?: string;
+  /** Root graph-agent identity retained alongside the currently executing tool owner. */
+  rootAgentId?: string;
+  rootAgentName?: string;
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
   /**

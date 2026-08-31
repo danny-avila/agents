@@ -104,6 +104,10 @@ describe('Langfuse trace metadata includes agentName', () => {
         parentMessageId: 'parent-789',
         agentId: 'agent_abc123',
         agentName: 'DWAINE',
+        rootAgentId: 'agent_abc123',
+        rootAgentName: 'DWAINE',
+        activeAgentId: 'agent_abc123',
+        activeAgentName: 'DWAINE',
       },
     });
   });
@@ -138,6 +142,10 @@ describe('Langfuse trace metadata includes agentName', () => {
         messageId: 'test-run-id',
         agentId: 'agent_abc123',
         agentName: 'DWAINE',
+        rootAgentId: 'agent_abc123',
+        rootAgentName: 'DWAINE',
+        activeAgentId: 'agent_abc123',
+        activeAgentName: 'DWAINE',
       },
       tags: ['librechat', 'agent', 'tenant:tenant-1'],
     });
@@ -148,6 +156,10 @@ describe('Langfuse trace metadata includes agentName', () => {
         messageId: 'test-run-id',
         agentId: 'agent_abc123',
         agentName: 'DWAINE',
+        rootAgentId: 'agent_abc123',
+        rootAgentName: 'DWAINE',
+        activeAgentId: 'agent_abc123',
+        activeAgentName: 'DWAINE',
       },
     });
   });

@@ -783,17 +783,29 @@ export function createLangfuseTraceMetadata({
   parentMessageId,
   agentId,
   agentName,
+  rootAgentId,
+  rootAgentName,
+  activeAgentId,
+  activeAgentName,
 }: {
   messageId?: unknown;
   parentMessageId?: unknown;
   agentId?: unknown;
   agentName?: unknown;
+  rootAgentId?: unknown;
+  rootAgentName?: unknown;
+  activeAgentId?: unknown;
+  activeAgentName?: unknown;
 }): LangfuseTraceMetadata {
   return createTraceMetadata({
     messageId,
     parentMessageId,
     agentId,
     agentName,
+    rootAgentId,
+    rootAgentName,
+    activeAgentId,
+    activeAgentName,
   });
 }
 
