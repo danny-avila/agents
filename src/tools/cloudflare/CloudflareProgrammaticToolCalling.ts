@@ -1007,7 +1007,13 @@ export function createPythonProgram(
   /* The native source defines every tool unconditionally, so selection alone
    * does not bound what user code can reach. Withdraw the unselected names
    * after the aliases bind, which leaves each tool's private `_`-prefixed
-   * helpers intact — no native tool calls another by its public name. */
+   * helpers intact — no native tool calls another by its public name.
+   *
+   * This bounds accidental reach, not a determined caller: the generated module
+   * imports `subprocess` at top level and user code runs in its globals, so
+   * `allowed_callers` is advisory in this runtime no matter what names are
+   * removed. Containment needs a restricted execution namespace, which is a
+   * separate change to how the program is generated. */
   const selectedNativeNames = new Set(
     toolDefs
       .filter((def) => NATIVE_TOOL_NAMES.has(def.name))

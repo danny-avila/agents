@@ -641,3 +641,36 @@ describe('quoting inside scanned regions', () => {
     ).toEqual(['calculator']);
   });
 });
+
+describe('bash comments after control operators', () => {
+  const tools: t.LCTool[] = [
+    { name: 'write_file', allowed_callers: ['code_execution'] },
+  ];
+
+  it('treats a comment straight after a semicolon as prose', () => {
+    expect(
+      deriveReferencedToolDefs(
+        tools,
+        'echo ok;# write_file is unavailable',
+        'bash'
+      )
+    ).toEqual([]);
+  });
+
+  it('treats a comment after a pipe or ampersand as prose', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'echo ok &# write_file here', 'bash')
+    ).toEqual([]);
+    expect(
+      deriveReferencedToolDefs(tools, 'echo ok |# write_file here', 'bash')
+    ).toEqual([]);
+  });
+
+  it('still keeps a call that follows a control operator', () => {
+    expect(
+      deriveReferencedToolDefs(tools, 'echo ok; write_file \'{}\'', 'bash').map(
+        (def) => def.name
+      )
+    ).toEqual(['write_file']);
+  });
+});

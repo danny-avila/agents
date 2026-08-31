@@ -248,6 +248,10 @@ function blankOutsideReplacementFields(literal: string): string {
   return kept.join('');
 }
 
+/* A bash comment opens only at the start of a word: after whitespace, or after
+ * a control operator that ends the previous one. */
+const BASH_WORD_START = /[\s;&|()`]/;
+
 /**
  * Blanks bash comments and single-quoted text.
  *
@@ -295,7 +299,7 @@ function stripBashNonCodeText(code: string): string {
       continue;
     }
 
-    if (char === '#' && (i === 0 || /\s/.test(code[i - 1]))) {
+    if (char === '#' && (i === 0 || BASH_WORD_START.test(code[i - 1]))) {
       while (i < code.length && code[i] !== '\n') {
         kept[i] = ' ';
         i++;
