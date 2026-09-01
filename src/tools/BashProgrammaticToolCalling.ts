@@ -14,6 +14,7 @@ import {
   selectRuntimeSessionHint,
 } from './CodeExecutor';
 import {
+  assertUnambiguousIdentifiers,
   projectProgrammaticToolMap,
   resolveProgrammaticToolDefinitions,
   selectProgrammaticTools,
@@ -356,7 +357,6 @@ export function createBashProgrammaticToolCallingTool(
           ? toolCall.name
           : Constants.BASH_PROGRAMMATIC_TOOL_CALLING);
       const effectiveTools = selectProgrammaticTools({
-        normalizeIdentifier: normalizeToBashIdentifier,
         requestedToolNames: params.tool_manifest,
         allowedToolDefs: toolDefs,
         disallowedToolDefs,
@@ -389,6 +389,12 @@ export function createBashProgrammaticToolCallingTool(
           );
         }
       }
+
+      assertUnambiguousIdentifiers(
+        effectiveTools,
+        normalizeToBashIdentifier,
+        programmaticToolName
+      );
 
       const effectiveToolMap = projectProgrammaticToolMap(
         toolMap ?? new Map(),

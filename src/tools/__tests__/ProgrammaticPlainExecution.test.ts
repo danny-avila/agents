@@ -52,7 +52,7 @@ import {
   normalizeToPythonIdentifier,
 } from '../ProgrammaticToolCalling';
 import { createBashProgrammaticToolCallingTool } from '../BashProgrammaticToolCalling';
-import { selectProgrammaticTools } from '../ProgrammaticCallerPolicy';
+import { assertUnambiguousIdentifiers } from '../ProgrammaticCallerPolicy';
 import {
   createProgrammaticToolRegistry,
   createGetWeatherTool,
@@ -257,35 +257,51 @@ describe('ambiguous runtime identifiers', () => {
     { name: 'report_tool', allowed_callers: ['code_execution'] },
   ];
 
-  it('rejects an explicit manifest naming both', () => {
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  it('rejects a stub set holding both', () => {
     expect(() =>
-      selectProgrammaticTools({
-        normalizeIdentifier: normalizeToPythonIdentifier,
-        requestedToolNames: ['report-tool', 'report_tool'],
-        allowedToolDefs: colliding,
-        programmaticToolName: 'run_tools_with_code',
-      })
+      assertUnambiguousIdentifiers(
+        colliding,
+        normalizeToPythonIdentifier,
+        'run_tools_with_code'
+      )
     ).toThrow('cannot tell which one the code means');
   });
 
-  it('rejects the all-tools fallback when it is ambiguous', () => {
+  it('accepts a stub set holding one of the pair', () => {
     expect(() =>
-      selectProgrammaticTools({
-        normalizeIdentifier: normalizeToPythonIdentifier,
-        allowedToolDefs: colliding,
-        programmaticToolName: 'run_tools_with_code',
-      })
-    ).toThrow('cannot tell which one the code means');
+      assertUnambiguousIdentifiers(
+        [colliding[0]],
+        normalizeToPythonIdentifier,
+        'run_tools_with_code'
+      )
+    ).not.toThrow();
   });
 
-  it('accepts a manifest naming one of the pair', () => {
-    expect(
-      selectProgrammaticTools({
-        normalizeIdentifier: normalizeToPythonIdentifier,
-        requestedToolNames: ['report-tool'],
-        allowedToolDefs: colliding,
-        programmaticToolName: 'run_tools_with_code',
-      }).map((def) => def.name)
-    ).toEqual(['report-tool']);
+  it('rejects before the request when the fallback is ambiguous', async () => {
+    const toolCallMap: t.ToolMap = new Map([
+      ['report-tool', createCalculatorTool()],
+    ]);
+
+    await expect(
+      invokeBash(
+        { code: 'report_tool \'{}\'' },
+        { toolMap: toolCallMap, toolDefs: colliding }
+      )
+    ).rejects.toThrow('cannot tell which one the code means');
+
+    expect(requests).toHaveLength(0);
+  });
+
+  it('does not reject a tool-free call that never emits stubs', async () => {
+    await invokeBash(
+      { code: 'ls /mnt/data', tool_manifest: [] },
+      { toolMap: new Map(), toolDefs: colliding }
+    );
+
+    expect(requests[0].url).toBe(`${BASE_URL}/exec`);
   });
 });

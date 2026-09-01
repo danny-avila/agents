@@ -932,7 +932,6 @@ for member in team:
     it('requires a manifest for mixed caller configurations', () => {
       expect(() =>
         selectProgrammaticTools({
-          normalizeIdentifier: normalizeToPythonIdentifier,
           allowedToolDefs,
           disallowedToolDefs,
           programmaticToolName: 'run_tools_with_code',
@@ -943,7 +942,6 @@ for member in team:
     it('rejects direct-only manifest entries before execution', () => {
       expect(() =>
         selectProgrammaticTools({
-          normalizeIdentifier: normalizeToPythonIdentifier,
           requestedToolNames: ['send_email'],
           allowedToolDefs,
           disallowedToolDefs,
@@ -955,7 +953,6 @@ for member in team:
     it('selects declared allowed tools without parsing code', () => {
       expect(
         selectProgrammaticTools({
-          normalizeIdentifier: normalizeToPythonIdentifier,
           requestedToolNames: ['calculate', 'search', 'search'],
           allowedToolDefs,
           disallowedToolDefs,
@@ -967,7 +964,6 @@ for member in team:
     it('preserves the all-tools fallback when no direct-only tools exist', () => {
       expect(
         selectProgrammaticTools({
-          normalizeIdentifier: normalizeToPythonIdentifier,
           allowedToolDefs,
           programmaticToolName: 'run_tools_with_code',
         })

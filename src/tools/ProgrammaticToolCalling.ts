@@ -22,6 +22,7 @@ import {
   selectRuntimeSessionHint,
 } from './CodeExecutor';
 import {
+  assertUnambiguousIdentifiers,
   projectProgrammaticToolMap,
   resolveProgrammaticToolDefinitions,
   selectProgrammaticTools,
@@ -1015,7 +1016,6 @@ export function createProgrammaticToolCallingTool(
           ? toolCall.name
           : Constants.PROGRAMMATIC_TOOL_CALLING);
       const effectiveTools = selectProgrammaticTools({
-        normalizeIdentifier: normalizeToPythonIdentifier,
         requestedToolNames: params.tool_manifest,
         allowedToolDefs: toolDefs,
         disallowedToolDefs,
@@ -1048,6 +1048,12 @@ export function createProgrammaticToolCallingTool(
           );
         }
       }
+
+      assertUnambiguousIdentifiers(
+        effectiveTools,
+        normalizeToPythonIdentifier,
+        programmaticToolName
+      );
 
       const effectiveToolMap = projectProgrammaticToolMap(
         toolMap ?? new Map(),

@@ -44,11 +44,15 @@ export function assertDisallowedToolUsage(
 }
 
 /**
- * Rejects a selection holding two tools that collapse to one runtime identifier.
+ * Rejects a stub set holding two tools that collapse to one runtime identifier.
  *
  * Stub generation binds by identifier, so such tools are indistinguishable once
- * emitted — the generated Python defines both and the later one wins. Failing
- * here beats dispatching by declaration order.
+ * emitted — the generated program defines both and the later one wins. Failing
+ * beats dispatching by declaration order.
+ *
+ * Called on the set each backend actually emits, not on the selection: a
+ * definition dropped before codegen never binds an identifier, so a collision
+ * among such definitions is not a conflict.
  */
 export function assertUnambiguousIdentifiers(
   selectedToolDefs: readonly t.LCTool[],
@@ -75,8 +79,6 @@ export function selectProgrammaticTools(args: {
   allowedToolDefs?: t.LCTool[];
   disallowedToolDefs?: t.LCTool[];
   programmaticToolName: string;
-  /** Runtime identifier a tool name binds to, used to reject ambiguity. */
-  normalizeIdentifier: (name: string) => string;
 }): t.LCTool[] {
   const allowedToolDefs = args.allowedToolDefs ?? [];
   const disallowedToolDefs = args.disallowedToolDefs ?? [];
@@ -89,11 +91,6 @@ export function selectProgrammaticTools(args: {
           'List every registered tool name used by the submitted code in the tool_manifest field.'
       );
     }
-    assertUnambiguousIdentifiers(
-      allowedToolDefs,
-      args.normalizeIdentifier,
-      args.programmaticToolName
-    );
     return allowedToolDefs;
   }
 
@@ -125,13 +122,7 @@ export function selectProgrammaticTools(args: {
     );
   }
 
-  const selected = [...new Set(requestedToolNames)].map(
+  return [...new Set(requestedToolNames)].map(
     (name) => allowedByName.get(name) as t.LCTool
   );
-  assertUnambiguousIdentifiers(
-    selected,
-    args.normalizeIdentifier,
-    args.programmaticToolName
-  );
-  return selected;
 }
