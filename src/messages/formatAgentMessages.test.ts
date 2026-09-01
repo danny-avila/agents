@@ -5484,12 +5484,11 @@ describe('formatAgentMessages', () => {
     expect(toolMessages[2].name).toBe('list_commits_mcp_github');
   });
 
-  it('should convert invalid tools to string while keeping valid tools as ToolMessages', () => {
+  it('omits invalid tools while keeping valid tools as ToolMessages', () => {
     /**
      * This test documents the hybrid behavior:
      * - Valid tools remain as proper AIMessage + ToolMessage structures
-     * - Invalid tools are converted to string and appended to text content
-     *   (preserving context without losing information)
+     * - Invalid tools and their outputs are omitted from model context
      */
     const tools = new Set(['calculator']);
     const payload = [
@@ -5538,19 +5537,19 @@ describe('formatAgentMessages', () => {
     );
     expect((result.messages[1] as ToolMessage).name).toBe('calculator');
 
-    /** The invalid tool should be converted to string in the content */
+    /** The invalid tool output must not become assistant-authored content */
     const aiContent = result.messages[0].content;
     const aiContentStr =
       typeof aiContent === 'string' ? aiContent : JSON.stringify(aiContent);
-    expect(aiContentStr).toContain('some_unknown_tool');
-    expect(aiContentStr).toContain('This is the result from unknown tool');
+    expect(aiContentStr).not.toContain('some_unknown_tool');
+    expect(aiContentStr).not.toContain('This is the result from unknown tool');
     expect(result.messages[0].additional_kwargs.provenance).toEqual({
       version: 1,
       parts: [
         {
           attribution: 'model',
           sourceMessageId: 'filtered-tool-row',
-          sourceContentPartIndices: [0, 2, 1],
+          sourceContentPartIndices: [0, 1],
         },
       ],
     });
@@ -5566,7 +5565,7 @@ describe('formatAgentMessages', () => {
     });
   });
 
-  it('keeps an output-less unavailable tool call model-attributed when flattened', () => {
+  it('omits an output-less unavailable tool call', () => {
     const { messages } = formatAgentMessages(
       [
         {
@@ -5589,17 +5588,7 @@ describe('formatAgentMessages', () => {
       new Set(['available_tool'])
     );
 
-    expect(messages).toHaveLength(1);
-    expect(messages[0].content).toEqual([
-      { type: ContentTypes.TEXT, text: 'Tool: unavailable_tool, ' },
-    ]);
-    expect(getProviderMessageProvenance(messages[0])?.parts).toEqual([
-      {
-        attribution: 'model',
-        sourceMessageId: 'output-less-filtered-tool-row',
-        sourceContentPartIndices: [0],
-      },
-    ]);
+    expect(messages).toHaveLength(0);
   });
 
   it('should simulate realistic deferred tools flow with tool_search', () => {
