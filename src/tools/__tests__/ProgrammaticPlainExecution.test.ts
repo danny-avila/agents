@@ -1,0 +1,291 @@
+import { describe, it, expect, jest, beforeEach } from '@jest/globals';
+import type * as t from '@/types';
+
+/* Mirrors codeapi's `/exec/programmatic` guard, which rejects an empty tool
+ * manifest outright: `if (!tools || tools.length === 0) -> 400`. Plain `/exec`
+ * has no such requirement. */
+type CapturedRequest = { url: string; body: Record<string, unknown> };
+const requests: CapturedRequest[] = [];
+
+jest.mock('node-fetch', () => ({
+  __esModule: true,
+  default: async (url: string, init?: { body?: string }) => {
+    const body = JSON.parse(init?.body ?? '{}') as { tools?: unknown[] };
+    requests.push({ url, body });
+
+    if (url.endsWith('/exec/programmatic')) {
+      if (!Array.isArray(body.tools) || body.tools.length === 0) {
+        return {
+          ok: false,
+          status: 400,
+          text: async () =>
+            '{"error":"Missing required field: tools (must be a non-empty array)"}',
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          status: 'completed',
+          session_id: 'programmatic-session',
+          stdout: 'programmatic',
+          stderr: '',
+          files: [],
+        }),
+      };
+    }
+
+    return {
+      ok: true,
+      json: async () => ({
+        session_id: 'plain-session',
+        stdout: 'plain',
+        stderr: '',
+        files: [],
+      }),
+    };
+  },
+}));
+
+import {
+  createProgrammaticToolCallingTool,
+  wrapPythonForPlainExecution,
+  normalizeToPythonIdentifier,
+} from '../ProgrammaticToolCalling';
+import { createBashProgrammaticToolCallingTool } from '../BashProgrammaticToolCalling';
+import { selectProgrammaticTools } from '../ProgrammaticCallerPolicy';
+import {
+  createProgrammaticToolRegistry,
+  createGetWeatherTool,
+  createCalculatorTool,
+} from '@/test/mockTools';
+
+const BASE_URL = 'https://code.example.test';
+
+const allToolDefs = Array.from(createProgrammaticToolRegistry().values());
+const toolMap: t.ToolMap = new Map([
+  ['get_weather', createGetWeatherTool()],
+  ['calculator', createCalculatorTool()],
+]);
+
+type ToolResult = {
+  content: string;
+  artifact?: t.ProgrammaticExecutionArtifact;
+};
+
+function invoke(
+  create: typeof createBashProgrammaticToolCallingTool,
+  name: string,
+  args: Record<string, unknown>,
+  toolCallExtras: Record<string, unknown> = { toolMap, toolDefs: allToolDefs }
+) {
+  return create({ baseUrl: BASE_URL }).invoke(
+    { name, args, id: 'call-1', type: 'tool_call', ...toolCallExtras } as never,
+    {} as never
+  );
+}
+
+const invokeBash = (
+  args: Record<string, unknown>,
+  extras?: Record<string, unknown>
+) =>
+  invoke(
+    createBashProgrammaticToolCallingTool,
+    'run_tools_with_bash',
+    args,
+    extras
+  );
+
+const invokePython = (
+  args: Record<string, unknown>,
+  extras?: Record<string, unknown>
+) =>
+  invoke(
+    createProgrammaticToolCallingTool,
+    'run_tools_with_code',
+    args,
+    extras
+  );
+
+describe('an empty tool manifest runs instead of being rejected', () => {
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  it('routes bash to plain /exec', async () => {
+    const result = (await invokeBash({
+      code: 'ls /mnt/data',
+      tool_manifest: [],
+    })) as ToolResult;
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0].url).toBe(`${BASE_URL}/exec`);
+    expect(requests[0].body).toMatchObject({
+      lang: 'bash',
+      code: 'ls /mnt/data',
+    });
+    expect(requests[0].body.tools).toBeUndefined();
+    expect(result.content).toContain('plain');
+  });
+
+  it('sends raw bash, without the replay `$!` guard', async () => {
+    await invokeBash({ code: 'set -u\necho hi', tool_manifest: [] });
+
+    expect(requests[0].body.code).toBe('set -u\necho hi');
+  });
+
+  it('routes python to plain /exec, keeping the async wrapper', async () => {
+    await invokePython({
+      code: 'import asyncio\nawait asyncio.sleep(0)\nprint("done")',
+      tool_manifest: [],
+    });
+
+    expect(requests[0].url).toBe(`${BASE_URL}/exec`);
+    expect(requests[0].body.lang).toBe('py');
+    const sent = requests[0].body.code as string;
+    expect(sent).toContain('async def __user_main__():');
+    expect(sent).toContain('    await asyncio.sleep(0)');
+    expect(sent).toContain('asyncio.run(__user_main__())');
+  });
+
+  it('preserves blank lines when wrapping python', () => {
+    expect(wrapPythonForPlainExecution('a = 1\n\nprint(a)')).toContain(
+      '    a = 1\n\n    print(a)'
+    );
+  });
+
+  it('carries session, files, hint and timeout onto the plain path', async () => {
+    const files: t.CodeEnvFile[] = [
+      {
+        kind: 'user',
+        id: 'file-1',
+        resource_id: 'user-1',
+        name: 'data.csv',
+        storage_session_id: 'prior',
+      },
+    ];
+
+    const result = (await invokeBash(
+      {
+        code: 'wc -l /mnt/data/data.csv',
+        tool_manifest: [],
+        timeout: 5000,
+      },
+      {
+        toolMap,
+        toolDefs: allToolDefs,
+        session_id: 'prior',
+        _injected_files: files,
+        _runtime_session_hint: 'hint-1',
+      }
+    )) as ToolResult;
+
+    expect(requests[0].body).toMatchObject({
+      session_id: 'prior',
+      files,
+      runtime_session_hint: 'hint-1',
+      timeout: 5000,
+    });
+    expect(result.artifact?.session_id).toBe('plain-session');
+  });
+});
+
+describe('behavior that stays as it was', () => {
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  it('still requires a manifest when direct-only tools exist', async () => {
+    await expect(
+      invokeBash(
+        { code: 'ls /mnt/data' },
+        {
+          toolMap,
+          toolDefs: allToolDefs,
+          disallowedToolDefs: [{ name: 'send_email' }],
+        }
+      )
+    ).rejects.toThrow('requires a tool_manifest');
+
+    expect(requests).toHaveLength(0);
+  });
+
+  it('still refuses a manifest naming a direct-only tool', async () => {
+    await expect(
+      invokeBash(
+        { code: 'send_email \'{}\'', tool_manifest: ['send_email'] },
+        {
+          toolMap,
+          toolDefs: allToolDefs,
+          disallowedToolDefs: [{ name: 'send_email' }],
+        }
+      )
+    ).rejects.toThrow('not marked for code_execution');
+  });
+
+  it('still sends the full manifest when none was requested', async () => {
+    await invokeBash({ code: 'ls /mnt/data' });
+
+    expect(requests[0].url).toBe(`${BASE_URL}/exec/programmatic`);
+    expect(
+      (requests[0].body.tools as t.LCTool[]).map((def) => def.name)
+    ).toEqual(allToolDefs.map((def) => def.name));
+  });
+
+  it('still reports a missing toolMap when nothing was injected', async () => {
+    await expect(
+      createBashProgrammaticToolCallingTool({ baseUrl: BASE_URL }).invoke({
+        code: 'get_weather \'{}\'',
+      } as never)
+    ).rejects.toThrow('No toolMap provided');
+
+    expect(requests).toHaveLength(0);
+  });
+
+  it('runs tool-free code when ToolNode injects an empty context', async () => {
+    await invokeBash(
+      { code: 'ls /mnt/data' },
+      { toolMap: new Map(), toolDefs: [] }
+    );
+
+    expect(requests[0].url).toBe(`${BASE_URL}/exec`);
+  });
+});
+
+describe('ambiguous runtime identifiers', () => {
+  const colliding: t.LCTool[] = [
+    { name: 'report-tool', allowed_callers: ['code_execution'] },
+    { name: 'report_tool', allowed_callers: ['code_execution'] },
+  ];
+
+  it('rejects an explicit manifest naming both', () => {
+    expect(() =>
+      selectProgrammaticTools({
+        normalizeIdentifier: normalizeToPythonIdentifier,
+        requestedToolNames: ['report-tool', 'report_tool'],
+        allowedToolDefs: colliding,
+        programmaticToolName: 'run_tools_with_code',
+      })
+    ).toThrow('cannot tell which one the code means');
+  });
+
+  it('rejects the all-tools fallback when it is ambiguous', () => {
+    expect(() =>
+      selectProgrammaticTools({
+        normalizeIdentifier: normalizeToPythonIdentifier,
+        allowedToolDefs: colliding,
+        programmaticToolName: 'run_tools_with_code',
+      })
+    ).toThrow('cannot tell which one the code means');
+  });
+
+  it('accepts a manifest naming one of the pair', () => {
+    expect(
+      selectProgrammaticTools({
+        normalizeIdentifier: normalizeToPythonIdentifier,
+        requestedToolNames: ['report-tool'],
+        allowedToolDefs: colliding,
+        programmaticToolName: 'run_tools_with_code',
+      }).map((def) => def.name)
+    ).toEqual(['report-tool']);
+  });
+});

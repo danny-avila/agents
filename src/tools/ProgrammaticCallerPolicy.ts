@@ -43,11 +43,40 @@ export function assertDisallowedToolUsage(
   );
 }
 
+/**
+ * Rejects a selection holding two tools that collapse to one runtime identifier.
+ *
+ * Stub generation binds by identifier, so such tools are indistinguishable once
+ * emitted — the generated Python defines both and the later one wins. Failing
+ * here beats dispatching by declaration order.
+ */
+export function assertUnambiguousIdentifiers(
+  selectedToolDefs: readonly t.LCTool[],
+  normalizeIdentifier: (name: string) => string,
+  programmaticToolName: string
+): void {
+  const seen = new Map<string, string>();
+  for (const toolDef of selectedToolDefs) {
+    const identifier = normalizeIdentifier(toolDef.name);
+    const prior = seen.get(identifier);
+    if (prior != null && prior !== toolDef.name) {
+      throw new Error(
+        `Tools "${prior}" and "${toolDef.name}" both become "${identifier}" in ` +
+          `the sandbox, so "${programmaticToolName}" cannot tell which one the ` +
+          'code means. Call them directly, or rename one.'
+      );
+    }
+    seen.set(identifier, toolDef.name);
+  }
+}
+
 export function selectProgrammaticTools(args: {
   requestedToolNames?: string[];
   allowedToolDefs?: t.LCTool[];
   disallowedToolDefs?: t.LCTool[];
   programmaticToolName: string;
+  /** Runtime identifier a tool name binds to, used to reject ambiguity. */
+  normalizeIdentifier: (name: string) => string;
 }): t.LCTool[] {
   const allowedToolDefs = args.allowedToolDefs ?? [];
   const disallowedToolDefs = args.disallowedToolDefs ?? [];
@@ -60,6 +89,11 @@ export function selectProgrammaticTools(args: {
           'List every registered tool name used by the submitted code in the tool_manifest field.'
       );
     }
+    assertUnambiguousIdentifiers(
+      allowedToolDefs,
+      args.normalizeIdentifier,
+      args.programmaticToolName
+    );
     return allowedToolDefs;
   }
 
@@ -91,7 +125,13 @@ export function selectProgrammaticTools(args: {
     );
   }
 
-  return [...new Set(requestedToolNames)].map(
+  const selected = [...new Set(requestedToolNames)].map(
     (name) => allowedByName.get(name) as t.LCTool
   );
+  assertUnambiguousIdentifiers(
+    selected,
+    args.normalizeIdentifier,
+    args.programmaticToolName
+  );
+  return selected;
 }
