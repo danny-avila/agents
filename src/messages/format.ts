@@ -2771,12 +2771,22 @@ function extractSkillName(args: unknown): string | undefined {
   return typeof name === 'string' && name !== '' ? name : undefined;
 }
 
+function isSdkManagedToolName(name: unknown): name is string {
+  return (
+    typeof name === 'string' &&
+    (name === Constants.SUBAGENT ||
+      name === 'conditional_transfer' ||
+      name.startsWith(Constants.LC_TRANSFER_TO_))
+  );
+}
+
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
  * @param payload - The array of messages to format.
  * @param indexTokenCountMap - Optional map of message indices to token counts.
- * @param tools - Optional set of tool names that are allowed in the request.
+ * @param tools - Optional set of host-managed tool names allowed in the request. SDK-managed tool
+ *   names are preserved independently.
  * @param skills - Optional map of skill name to body for reconstructing skill HumanMessages.
  * @param options - Optional formatting options (provider, skipSkillBodyNames).
  * @returns - Object containing formatted messages and updated indexTokenCountMap if provided.
@@ -2957,8 +2967,8 @@ export const formatAgentMessages = (
 
     /**
      * If tools set is provided, process tool_calls:
-     * - Keep valid tool_calls (tools in the set or dynamically discovered)
-     * - Convert invalid tool_calls to string representation for context preservation
+     * - Keep valid tool_calls (tools in the set, SDK-managed, or dynamically discovered)
+     * - Omit invalid tool_calls without exposing their output as assistant-authored text
      * - Dynamically expand the set when tool_search results are encountered
      */
     let processedMessage = message;
@@ -2977,8 +2987,6 @@ export const formatAgentMessages = (
         const filteredContent: typeof content = [];
         const filteredSourceContentPartIndices: SourceContentPartIndices[] = [];
         const invalidToolCallIds = new Set<string>();
-        const invalidToolStrings: string[] = [];
-        const invalidToolSourceContentPartIndices: number[] = [];
 
         for (let partIndex = 0; partIndex < content.length; partIndex++) {
           const part = content[partIndex] as
@@ -3029,7 +3037,10 @@ export const formatAgentMessages = (
             }
           }
 
-          if (discoveredTools.has(toolName)) {
+          if (
+            discoveredTools.has(toolName) ||
+            isSdkManagedToolName(toolName)
+          ) {
             filteredContent.push(part);
             filteredSourceContentPartIndices.push(partSourceContentIndices);
             if (
@@ -3042,20 +3053,11 @@ export const formatAgentMessages = (
                 (pendingSkillNames ??= new Set()).add(skillName);
               }
             }
-          } else {
-            /** Invalid tool - convert to string for context preservation */
-            if (
-              typeof part.tool_call.id === 'string' &&
-              part.tool_call.id !== ''
-            ) {
-              invalidToolCallIds.add(part.tool_call.id);
-            }
-            const output = part.tool_call.output ?? '';
-            invalidToolStrings.push(`Tool: ${toolName}, ${output}`);
-            appendSourceContentPartIndices(
-              invalidToolSourceContentPartIndices,
-              partSourceContentIndices
-            );
+          } else if (
+            typeof part.tool_call.id === 'string' &&
+            part.tool_call.id !== ''
+          ) {
+            invalidToolCallIds.add(part.tool_call.id);
           }
         }
 
@@ -3076,57 +3078,8 @@ export const formatAgentMessages = (
           }
         }
 
-        /** Append invalid tool strings to the content for context preservation */
-        if (invalidToolStrings.length > 0) {
-          /** Find the last text part or create one */
-          let lastTextPartIndex = -1;
-          for (let j = filteredContent.length - 1; j >= 0; j--) {
-            if (filteredContent[j].type === ContentTypes.TEXT) {
-              lastTextPartIndex = j;
-              break;
-            }
-          }
-
-          const invalidToolText = invalidToolStrings.join('\n');
-          if (lastTextPartIndex >= 0) {
-            const lastTextPart = filteredContent[lastTextPartIndex] as {
-              type: string;
-              [ContentTypes.TEXT]?: string;
-              text?: string;
-            };
-            const existingText =
-              lastTextPart[ContentTypes.TEXT] ?? lastTextPart.text ?? '';
-            filteredContent[lastTextPartIndex] = {
-              ...lastTextPart,
-              [ContentTypes.TEXT]: existingText
-                ? `${existingText}\n${invalidToolText}`
-                : invalidToolText,
-            };
-            const lastTextSourceContentPartIndices =
-              filteredSourceContentPartIndices[lastTextPartIndex];
-            filteredSourceContentPartIndices[lastTextPartIndex] = [
-              ...(typeof lastTextSourceContentPartIndices === 'number'
-                ? [lastTextSourceContentPartIndices]
-                : lastTextSourceContentPartIndices),
-              ...invalidToolSourceContentPartIndices,
-            ];
-          } else {
-            /** No text part exists, create one */
-            filteredContent.push({
-              type: ContentTypes.TEXT,
-              [ContentTypes.TEXT]: invalidToolText,
-            });
-            filteredSourceContentPartIndices.push(
-              invalidToolSourceContentPartIndices
-            );
-          }
-        }
-
         /** Use filtered content if we made any changes */
-        if (
-          filteredContent.length !== content.length ||
-          invalidToolStrings.length > 0
-        ) {
+        if (filteredContent.length !== content.length) {
           processedMessage = { ...message, content: filteredContent };
           processedSourceContentPartIndices = filteredSourceContentPartIndices;
         }
