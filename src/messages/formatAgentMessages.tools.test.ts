@@ -397,6 +397,7 @@ describe('formatAgentMessages with tools parameter', () => {
   it.each([
     ['subagent', Constants.SUBAGENT],
     ['handoff', `${Constants.LC_TRANSFER_TO_}researcher`],
+    ['conditional handoff', 'conditional_transfer'],
   ])('preserves an SDK-managed %s call as structured history', (_, toolName) => {
     const payload: TPayload = [
       { role: 'user', content: 'Delegate this task' },

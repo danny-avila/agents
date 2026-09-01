@@ -2771,6 +2771,15 @@ function extractSkillName(args: unknown): string | undefined {
   return typeof name === 'string' && name !== '' ? name : undefined;
 }
 
+function isSdkManagedToolName(name: unknown): name is string {
+  return (
+    typeof name === 'string' &&
+    (name === Constants.SUBAGENT ||
+      name === 'conditional_transfer' ||
+      name.startsWith(Constants.LC_TRANSFER_TO_))
+  );
+}
+
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
@@ -3028,11 +3037,10 @@ export const formatAgentMessages = (
             }
           }
 
-          const isSdkManagedTool =
-            toolName === Constants.SUBAGENT ||
-            (typeof toolName === 'string' &&
-              toolName.startsWith(Constants.LC_TRANSFER_TO_));
-          if (discoveredTools.has(toolName) || isSdkManagedTool) {
+          if (
+            discoveredTools.has(toolName) ||
+            isSdkManagedToolName(toolName)
+          ) {
             filteredContent.push(part);
             filteredSourceContentPartIndices.push(partSourceContentIndices);
             if (
