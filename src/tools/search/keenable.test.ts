@@ -101,6 +101,15 @@ describe('Keenable search API', () => {
     ]);
   });
 
+  it('emits an empty topStories array so shape-consuming callers do not crash', async () => {
+    mockedAxios.post.mockResolvedValueOnce(sampleResponse);
+
+    const searchAPI = createSearchAPI({ searchProvider: 'keenable' });
+    const result = await searchAPI.getSources({ query: 'typescript' });
+
+    expect(result.data?.topStories).toEqual([]);
+  });
+
   it('falls back to the description when the snippet is present but empty', async () => {
     mockedAxios.post.mockResolvedValueOnce({
       data: {

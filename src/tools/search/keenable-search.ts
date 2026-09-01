@@ -105,7 +105,7 @@ export const createKeenableAPI = (
         date: result.published_at,
       }));
 
-      return { success: true, data: { organic } };
+      return { success: true, data: { organic, topStories: [] } };
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
