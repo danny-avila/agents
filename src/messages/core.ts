@@ -224,6 +224,34 @@ function getAdditionalReasoningContent(
   return getReasoningDetailsText(additionalKwargs.reasoning_details);
 }
 
+/**
+ * True when a content block is a provider reasoning block: Anthropic
+ * `thinking` / `redacted_thinking`, Google `reasoning`, Bedrock
+ * `reasoning_content`, and the streamed delta variants that prefix each of
+ * those names.
+ *
+ * Shared rather than re-derived because two very different readers must agree
+ * on the same answer: the stream classifier, which decides what the host has
+ * been shown, and the preempt gate, which decides whether an accumulated turn
+ * holds anything worth keeping. A turn the host renders as thinking-only must
+ * never look like a visible answer to the gate.
+ *
+ * Prefix matching, not equality, because providers stream these as suffixed
+ * delta types. `reasoning_content` needs no clause of its own — it already
+ * carries the `reasoning` prefix.
+ */
+export function isReasoningContentBlock(block: { type?: string }): boolean {
+  const type = block.type;
+  if (type == null) {
+    return false;
+  }
+  return (
+    type.startsWith(ContentTypes.THINKING) ||
+    type.startsWith(ContentTypes.REASONING) ||
+    type === 'redacted_thinking'
+  );
+}
+
 function hasReasoningContent(content: BaseMessage['content']): boolean {
   if (!Array.isArray(content)) {
     return false;

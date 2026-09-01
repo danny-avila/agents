@@ -1463,6 +1463,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * another's turn.
    */
   pendingPreemptReturn = new Set<string>();
+  /**
+   * Agent IDs whose model turn a preempt DISCARDED rather than sealed. A
+   * discard returns no message, so the node cannot read
+   * `response_metadata.preempted` to learn a boundary is owed — this set is
+   * the only carrier.
+   *
+   * Keyed by agent for the same reason {@link pendingPreemptReturn} is: one
+   * graph instance serves every parallel agent, and a single flag would let
+   * whichever lane finished first consume another lane's boundary.
+   *
+   * Not derivable from `preemptSealInFlight`: an ordinary seal holds that slot
+   * too, and a claim that never reached its boundary would be indistinguishable
+   * from a discard.
+   */
+  private preemptRestartPending = new Set<string>();
 
   constructor(
     {
@@ -1712,6 +1727,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   private resetPreemptTurnState(): void {
     this.preemptSealBudgetUsed = 0;
     this.preemptSealInFlight = false;
+    this.preemptRestartPending.clear();
     this.pendingPreemptReturn.clear();
   }
 
@@ -1808,6 +1824,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /** Releases the seal slot once its boundary has resolved, win or lose. */
   releasePreemptSeal(): void {
     this.preemptSealInFlight = false;
+  }
+
+  /** See {@link preemptRestartPending}. Called from the model attempt. */
+  notePreemptRestart(agentId: string): void {
+    this.preemptRestartPending.add(agentId);
+  }
+
+  /**
+   * Reads and clears the lane's mark in one step, so a boundary is dispatched
+   * exactly once per discard even though the model node runs again immediately
+   * after.
+   */
+  private consumePreemptRestart(agentId: string): boolean {
+    return this.preemptRestartPending.delete(agentId);
   }
 
   getPreemptStats(): t.PreemptStats {
@@ -3907,6 +3937,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               {
                 request: preparedRequest,
                 context: this,
+                preemptAgentId: agentId,
               },
               invokeConfig
             )
@@ -4105,6 +4136,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 config: invokeConfig,
                 primaryError,
                 context: this,
+                preemptAgentId: agentId,
                 /**
                  * Lets the chain recognise a fallback overflow whose signature
                  * carries no reason of its own (Vertex AI's bare 400) and
@@ -4392,7 +4424,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           { force: true }
         );
       }
+      const preemptRestarted = this.consumePreemptRestart(agentId);
       if (
+        preemptRestarted ||
         (responseMessage as AIMessageChunk | undefined)?.response_metadata
           .preempted === true
       ) {
@@ -4434,12 +4468,26 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           return { messages: [...(result.messages ?? []), ...injected] };
         }
         /**
-         * Nothing to inject — the host cancelled or already drained. Do NOT
-         * self-loop: a trailing model turn with no new input is dropped by
-         * some Gemini models and read as prefill by Anthropic. Do NOT pretend
-         * the turn completed either; the answer really was cut short.
+         * Nothing to inject — the host cancelled or already drained.
+         *
+         * After a SEAL, do not self-loop: a trailing model turn with no new
+         * input is dropped by some Gemini models and read as prefill by
+         * Anthropic. Do not pretend the turn completed either; the answer
+         * really was cut short.
+         *
+         * After a RESTART there is no such trailing turn. The discard left
+         * graph state exactly as the model node found it, so returning to the
+         * node re-issues the same call — the only way the run can still
+         * produce an answer, and the honest outcome of an interrupt whose
+         * words were withdrawn before they landed. Bounded by the same seal
+         * budget, so a host stuck arming and cancelling cannot loop forever.
          */
         this.preemptEmptyBoundaries += 1;
+        if (preemptRestarted) {
+          this.pendingPreemptReturn.add(agentId);
+          this.cleanupSignalListener();
+          return result;
+        }
         this.preemptIncomplete = true;
       }
 

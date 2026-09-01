@@ -1,5 +1,11 @@
 import { AIMessageChunk } from '@langchain/core/messages';
-import { canSealPreempt, resolveMaxSeals } from './preempt';
+import {
+  canRestartPreempt,
+  canSealPreempt,
+  resolveMaxSeals,
+  resolvePreemptAction,
+  resolveRestartGraceMs,
+} from './preempt';
 
 /**
  * The budget is read by two consumers that interpret it differently — a
@@ -319,5 +325,212 @@ describe('canSealPreempt', () => {
         )
       ).toBe(true);
     });
+  });
+});
+
+describe('resolveRestartGraceMs', () => {
+  it('defaults when unset', () => {
+    expect(resolveRestartGraceMs(undefined)).toBe(2_000);
+  });
+
+  it('honors zero as a deliberate convert-immediately', () => {
+    expect(resolveRestartGraceMs(0)).toBe(0);
+  });
+
+  it('clamps a negative window rather than inverting the comparison', () => {
+    expect(resolveRestartGraceMs(-500)).toBe(0);
+  });
+
+  it('falls back rather than never converting', () => {
+    expect(resolveRestartGraceMs(NaN)).toBe(2_000);
+    expect(resolveRestartGraceMs(Infinity)).toBe(2_000);
+  });
+});
+
+/**
+ * The membership rule is a whitelist, so every case that is not recognizably
+ * reasoning must refuse. Refusing costs a slower interrupt; wrongly discarding
+ * destroys work the model already did.
+ */
+describe('canRestartPreempt', () => {
+  describe('discards', () => {
+    it('a stream that has produced nothing', () => {
+      expect(canRestartPreempt(undefined)).toBe(true);
+    });
+
+    it('an empty accumulation', () => {
+      expect(canRestartPreempt(chunk({ content: '' }))).toBe(true);
+      expect(canRestartPreempt(chunk({ content: [] }))).toBe(true);
+    });
+
+    it('whitespace a provider emitted before its first word', () => {
+      expect(canRestartPreempt(chunk({ content: '  \n' }))).toBe(true);
+    });
+
+    it('every provider spelling of a reasoning block', () => {
+      expect(
+        canRestartPreempt(
+          chunk({
+            content: [
+              { type: 'thinking', thinking: 'anthropic' },
+              { type: 'redacted_thinking', data: 'ciphertext' },
+              { type: 'reasoning', reasoning: 'google' },
+              { type: 'reasoning_content', reasoningText: { text: 'bedrock' } },
+            ],
+          })
+        )
+      ).toBe(true);
+    });
+  });
+
+  describe('refuses to discard', () => {
+    it('an answer the user can already read', () => {
+      expect(
+        canRestartPreempt(chunk({ content: [{ type: 'text', text: 'Hi' }] }))
+      ).toBe(false);
+    });
+
+    it('reasoning that has begun turning into text', () => {
+      expect(
+        canRestartPreempt(
+          chunk({
+            content: [
+              { type: 'thinking', thinking: 'almost' },
+              { type: 'text', text: 'The answer is' },
+            ],
+          })
+        )
+      ).toBe(false);
+    });
+
+    it('a tool call, whether complete or still streaming', () => {
+      expect(
+        canRestartPreempt(
+          chunk({
+            tool_calls: [{ id: 't1', name: 'search', args: {} }],
+          })
+        )
+      ).toBe(false);
+      expect(
+        canRestartPreempt(
+          chunk({
+            tool_call_chunks: [{ id: 't1', name: 'search', args: '{"q"' }],
+          })
+        )
+      ).toBe(false);
+    });
+
+    /**
+     * Assigned after construction because `AIMessageChunk` derives
+     * `invalid_tool_calls` from `tool_call_chunks` and drops a directly
+     * supplied array — the same reason the seal gate's own case does it.
+     */
+    it('a tool call the provider malformed', () => {
+      const malformed = chunk({ content: '' });
+      malformed.invalid_tool_calls = [
+        { id: 't1', name: 'search', args: '{oops', error: 'bad json' },
+      ];
+      expect(canRestartPreempt(malformed)).toBe(false);
+    });
+
+    /**
+     * The one place this is STRICTER than the seal gate. A seal may treat a
+     * settled server tool call as harmless, because the answer stays on the
+     * message. Re-issuing the request would run — and bill — that search again.
+     */
+    it('a server-side search the provider already ran and answered', () => {
+      expect(
+        canRestartPreempt(
+          chunk({
+            tool_calls: [{ id: 'srvtoolu_1', name: 'web_search', args: {} }],
+            content: [
+              {
+                type: 'web_search_tool_result',
+                tool_use_id: 'srvtoolu_1',
+                content: [],
+              },
+            ],
+          })
+        )
+      ).toBe(false);
+    });
+
+    it('an unrecognized block, rather than guessing it is disposable', () => {
+      expect(
+        canRestartPreempt(
+          chunk({
+            content: [{ type: 'image_url', image_url: { url: 'https://x/y' } }],
+          })
+        )
+      ).toBe(false);
+    });
+  });
+});
+
+describe('resolvePreemptAction', () => {
+  const thinking = chunk({
+    content: [{ type: 'thinking', thinking: 'working on it' }],
+  });
+  const answering = chunk({ content: [{ type: 'text', text: 'The answer' }] });
+
+  it('prefers a seal over a restart whenever one is available', () => {
+    expect(
+      resolvePreemptAction({
+        chunk: answering,
+        requestAgeMs: 60_000,
+        graceMs: 0,
+      })
+    ).toBe('seal');
+  });
+
+  it('holds a thinking turn inside the window, in case text is moments away', () => {
+    expect(
+      resolvePreemptAction({ chunk: thinking, requestAgeMs: 500, graceMs: 2000 })
+    ).toBe('none');
+  });
+
+  it('converts a thinking turn that outlives the window', () => {
+    expect(
+      resolvePreemptAction({
+        chunk: thinking,
+        requestAgeMs: 2000,
+        graceMs: 2000,
+      })
+    ).toBe('restart');
+  });
+
+  /**
+   * An empty accumulation does not prove the provider produced nothing — the
+   * stream buffers a chunk ahead of the consumer. Only silence that outlives
+   * the window does.
+   */
+  it('holds a silent turn inside the window, in case a chunk is in flight', () => {
+    expect(
+      resolvePreemptAction({
+        chunk: undefined,
+        requestAgeMs: 0,
+        graceMs: 2000,
+      })
+    ).toBe('none');
+  });
+
+  it('converts a silent turn that outlives the window', () => {
+    expect(
+      resolvePreemptAction({
+        chunk: undefined,
+        requestAgeMs: 2001,
+        graceMs: 2000,
+      })
+    ).toBe('restart');
+  });
+
+  it('never converts a turn holding work a restart would destroy', () => {
+    expect(
+      resolvePreemptAction({
+        chunk: chunk({ tool_calls: [{ id: 't1', name: 'search', args: {} }] }),
+        requestAgeMs: 60_000,
+        graceMs: 0,
+      })
+    ).toBe('none');
   });
 });

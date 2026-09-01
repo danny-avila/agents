@@ -16,6 +16,7 @@ import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { PreparedProviderRequest } from '@/llm/prepareProviderRequest';
 import type { ContextOverflowContext } from '@/utils/errors';
 import type { StreamLimitState } from '@/llm/streamLimits';
+import type { PreemptAction } from '@/llm/preempt';
 import type * as t from '@/types';
 import {
   enforceStreamLimitsForWireChunk,
@@ -38,6 +39,11 @@ import {
   prepareProviderRequest,
 } from '@/llm/prepareProviderRequest';
 import {
+  canRestartPreempt,
+  resolvePreemptAction,
+  resolveRestartGraceMs,
+} from '@/llm/preempt';
+import {
   getProviderFamily,
   providerUsesManualToolStream,
 } from '@/llm/providers';
@@ -48,7 +54,7 @@ import { resolveClientOptionsModel } from '@/llm/request';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
 import { appendCallbacks } from '@/utils/callbacks';
-import { canSealPreempt } from '@/llm/preempt';
+import { composeAbortSignals } from '@/utils/misc';
 import { initializeModel } from '@/llm/init';
 
 export {
@@ -590,6 +596,17 @@ function appendStreamChunk({
 interface AttemptInvokeCommonParams {
   context?: InvokeContext;
   onChunk?: OnChunk;
+  /**
+   * The agent lane this attempt belongs to, as the model node names it. Only
+   * read to record a discarded turn, which the node cannot otherwise detect —
+   * a discard returns no message to carry `response_metadata.preempted`.
+   *
+   * Keyed rather than global for the same reason `pendingPreemptReturn` is:
+   * `MultiAgentGraph` routes every parallel agent through ONE graph instance,
+   * so a shared flag would let whichever lane finished first consume another
+   * lane's boundary — and inject that lane's words into the wrong turn.
+   */
+  preemptAgentId?: string;
   /** Accounting owner for callers that deliberately pass no `context`
    * (summarization) — used ONLY for the attempt's accounting lease, never
    * for charge claims. */
@@ -691,6 +708,7 @@ export async function attemptInvoke(
         request: resolveAttemptRequest(params, stampedConfig),
         context: params.context,
         onChunk: params.onChunk,
+        preemptAgentId: params.preemptAgentId,
       },
       stampedConfig
     );
@@ -706,7 +724,11 @@ async function attemptInvokeBody(
     request,
     context,
     onChunk,
-  }: Pick<AttemptInvokeCommonParams, 'context' | 'onChunk'> & {
+    preemptAgentId,
+  }: Pick<
+    AttemptInvokeCommonParams,
+    'context' | 'onChunk' | 'preemptAgentId'
+  > & {
     request: PreparedProviderRequest;
   },
   config: RunnableConfig
@@ -747,11 +769,124 @@ async function attemptInvokeBody(
      * survive the bound runnable. The same handler owns the opt-in projection
      * invariant so enabled diagnostics do not stack a second model callback.
      */
-    const stream = await model.stream(messagesForProvider, invocationConfig);
     let finalChunk: AIMessageChunk | undefined;
-    let preempted = false;
+    let preemptAction: PreemptAction = 'none';
     const registeredStreamHandler =
       getRegisteredDefaultChatStreamHandler(context);
+    /**
+     * The wake channel is armed for the seal-capable branch only. The other
+     * two consume through readers that lag the accumulation — the same reason
+     * the per-chunk poll lives in that branch alone — and an `onChunk`
+     * consumer owns the stream outright.
+     *
+     * An unnamed lane disarms it too. A caller that supplies a preemption
+     * source but no `preemptAgentId` cannot have its discard routed back to
+     * the right model node, so it keeps today's behavior — the request waits
+     * for a boundary — rather than ending a turn nothing will resume.
+     */
+    const restartLane =
+      onChunk == null &&
+      registeredStreamHandler == null &&
+      context?.preemption?.subscribe != null
+        ? preemptAgentId
+        : undefined;
+    const restartController =
+      restartLane == null ? undefined : new AbortController();
+    /**
+     * Composed, never replaced: the run's own signal must keep tearing this
+     * stream down. `composeAbortSignals` collapses back to a single signal
+     * when there is nothing to compose.
+     */
+    const streamConfig =
+      restartController == null
+        ? invocationConfig
+        : {
+          ...invocationConfig,
+          signal: composeAbortSignals(
+            invocationConfig.signal,
+            restartController.signal
+          ),
+        };
+    const restartGraceMs = resolveRestartGraceMs(
+      context?.preemption?.restartGraceMs
+    );
+    /**
+     * When THIS attempt first saw the request, which is what the grace window
+     * is measured against. Recorded on first observation rather than on arm:
+     * the host's flag is level-triggered and may already have been true for a
+     * previous attempt, and a retry inheriting an aged request would discard
+     * its very first chunk.
+     */
+    let preemptRequestedAt: number | undefined;
+    let restartGraceTimer: ReturnType<typeof setTimeout> | undefined;
+    /**
+     * The wake is a hint; this is where the request is actually read. The
+     * shape is judged at the instant we look at it, and the teardown that
+     * follows is what makes any later chunk irrelevant — so a wake arriving
+     * once an answer has started, or one that loses the shared seal slot,
+     * leaves the stream untouched and waits for the ordinary boundary.
+     *
+     * A `seal` verdict is deliberately ignored here. Sealing KEEPS the
+     * accumulated turn, and only the chunk loop can hand it over intact; this
+     * path exists solely to end turns that have nothing to hand over.
+     *
+     * The self-rescheduling timer is what covers the silent window. Nothing
+     * else will look again — a provider that has gone quiet produces no chunk
+     * to poll on — so without it a request arriving mid-grace would wait out
+     * the whole turn, which is the stall this path exists to remove.
+     */
+    const evaluatePreemptRestart = (): boolean => {
+      if (restartController == null || preemptAction !== 'none') {
+        return false;
+      }
+      if (context?.shouldPreemptStream() !== true) {
+        return false;
+      }
+      preemptRequestedAt ??= Date.now();
+      const requestAgeMs = Date.now() - preemptRequestedAt;
+      const action = resolvePreemptAction({
+        chunk: finalChunk,
+        requestAgeMs,
+        graceMs: restartGraceMs,
+      });
+      if (action !== 'restart') {
+        if (
+          action === 'none' &&
+          restartGraceTimer == null &&
+          canRestartPreempt(finalChunk)
+        ) {
+          /**
+           * Scheduled for what is LEFT of the window, not a fresh one: the
+           * clock starts when the request is first seen, so a wake arriving
+           * mid-window must not push the conversion further out than a wake
+           * arriving at its start.
+           *
+           * The handle is released as the timer fires so a look that changes
+           * nothing — the shape moved, the host disarmed and re-armed — can
+           * still schedule the next one.
+           */
+          restartGraceTimer = setTimeout(() => {
+            restartGraceTimer = undefined;
+            evaluatePreemptRestart();
+          }, Math.max(0, restartGraceMs - requestAgeMs));
+          /** The grace is a fallback, never a reason to hold the process
+           *  open: a run that ends before the window elapses must not be kept
+           *  alive by a timer whose only job is to look again. */
+          restartGraceTimer.unref();
+        }
+        return false;
+      }
+      if (!context.claimPreemptSeal()) {
+        return false;
+      }
+      preemptAction = 'restart';
+      restartController.abort();
+      return true;
+    };
+    const unsubscribeWake =
+      restartController == null
+        ? undefined
+        : context?.preemption?.subscribe?.(evaluatePreemptRestart);
     /** A sibling's trip aborts the composed signal, but an adapter that
      * ignores cancellation keeps yielding — and text-only chunks with the
      * event cap off never throw in enforcement, so nothing else would stop
@@ -767,137 +902,181 @@ async function attemptInvokeBody(
       }
     };
 
-    if (onChunk) {
-      const attemptMetadata = config.metadata as
-        | Record<string, unknown>
-        | undefined;
-      for await (const chunk of stream) {
-        throwIfBreakerTripped();
-        /** An onChunk consumer replaces the stream handler entirely, so
-         * stream limits are enforced here for every such caller — public
-         * package consumers get no other accounting. The internal
-         * summarization onChunk charges producer-side itself and passes no
-         * context, precisely so this claim and its own never stack. */
-        if (context != null) {
-          enforceStreamLimitsForWireChunk({
-            graph: context,
-            metadata: attemptMetadata,
-            chunk,
-          });
-        }
-        await onChunk(chunk, attemptMetadata);
-        finalChunk = appendStreamChunk({
-          current: finalChunk,
-          next: chunk,
-          provider,
-        });
-      }
-    } else if (registeredStreamHandler == null) {
-      const metadata = config.metadata as Record<string, unknown> | undefined;
-      const streamHandler = new ChatModelStreamHandler();
-      for await (const chunk of stream) {
-        throwIfBreakerTripped();
-        const handlingChunk = getStreamHandlingChunk({
-          current: finalChunk,
-          next: chunk,
-          provider,
-        });
-        if (handlingChunk != null) {
-          await streamHandler.handle(
-            GraphEvents.CHAT_MODEL_STREAM,
-            { chunk: handlingChunk },
-            metadata,
-            context
-          );
-        } else if (context != null) {
-          /**
-           * A replay-skipped chunk yields no handling chunk, and in this
-           * local branch no `streamEvents` consumer judges the wire event
-           * either — yet a cumulative OpenRouter replay can still carry
-           * `tool_call_chunks` or complete `tool_calls` that are appended
-           * below. Charge the full limits (event budget and argument bytes)
-           * directly so neither cap can be bypassed. Consumer side: the
-           * local handler.handle call above claims as consumer, and one
-           * reused chunk object can alternate between these two arms.
-           */
-          enforceStreamLimitsForWireChunk({
-            graph: context,
-            metadata,
-            chunk,
-            side: 'consumer',
-          });
-        }
-        finalChunk = appendStreamChunk({
-          current: finalChunk,
-          next: chunk,
-          provider,
-        });
-        /**
-         * Only this loop may seal. The registered-handler branch below
-         * dispatches through `run.ts`'s decoupled `streamEvents` consumer,
-         * which can lag the accumulated chunk — sealing there would let the
-         * host index a content part the user has not been shown yet.
-         */
-        /**
-         * Cheap poll first, shape check second, budget claim last. The claim
-         * is what makes this safe under a parallel `MultiAgentGraph`: several
-         * agents share one graph and can each see the poll as true, but only
-         * one can take the slot, and a chunk that cannot seal never spends it.
-         */
-        if (
-          context?.shouldPreemptStream() === true &&
-          canSealPreempt(finalChunk) &&
-          context.claimPreemptSeal()
-        ) {
-          preempted = true;
-          break;
-        }
-      }
-    } else {
-      const metadata = config.metadata as Record<string, unknown> | undefined;
+    try {
       /**
-       * The original wire chunk still reaches the registered handler through
-       * `streamEvents` (where the late-reasoning skip discards it AFTER the
-       * event guard counts it), so this inline re-dispatch of the transformed
-       * chunk is marked to not consume a second event-budget slot. Allocated
-       * once per attempt, only when a transformation occurs.
+       * Subscribing is not enough on its own. `shouldPreempt` is
+       * level-triggered, so a request armed BEFORE this attempt began — during
+       * setup, or on a previous attempt a fallback replaced — is already true
+       * and will never produce another wake. Reading it once here is the
+       * difference between honoring that request and waiting out the turn.
+       *
+       * Read before the provider request is issued so the grace clock starts
+       * from the attempt's own beginning rather than from its first chunk. A
+       * host that set `restartGraceMs` to zero skips the call entirely here,
+       * having streamed nothing and opened no model run — which is why the
+       * close below is conditional.
        */
-      let redispatchMetadata: Record<string, unknown> | undefined;
-      for await (const chunk of stream) {
-        throwIfBreakerTripped();
-        /**
-         * Charged synchronously, ahead of the decoupled `streamEvents`
-         * reader that will echo this same chunk to the registered handler:
-         * a lagging reader would otherwise let an oversized complete call
-         * return to LangGraph and reach ToolNode before the queued handler
-         * throws. The chunk is marked so the echo skips accounting.
-         */
-        if (context != null) {
-          enforceStreamLimitsForWireChunk({ graph: context, metadata, chunk });
+      if (!evaluatePreemptRestart()) {
+        const stream = await model.stream(messagesForProvider, streamConfig);
+        if (onChunk) {
+          const attemptMetadata = config.metadata as
+            | Record<string, unknown>
+            | undefined;
+          for await (const chunk of stream) {
+            throwIfBreakerTripped();
+            /** An onChunk consumer replaces the stream handler entirely, so
+             * stream limits are enforced here for every such caller — public
+             * package consumers get no other accounting. The internal
+             * summarization onChunk charges producer-side itself and passes no
+             * context, precisely so this claim and its own never stack. */
+            if (context != null) {
+              enforceStreamLimitsForWireChunk({
+                graph: context,
+                metadata: attemptMetadata,
+                chunk,
+              });
+            }
+            await onChunk(chunk, attemptMetadata);
+            finalChunk = appendStreamChunk({
+              current: finalChunk,
+              next: chunk,
+              provider,
+            });
+          }
+        } else if (registeredStreamHandler == null) {
+          const metadata = config.metadata as Record<string, unknown> | undefined;
+          const streamHandler = new ChatModelStreamHandler();
+          for await (const chunk of stream) {
+            throwIfBreakerTripped();
+            const handlingChunk = getStreamHandlingChunk({
+              current: finalChunk,
+              next: chunk,
+              provider,
+            });
+            if (handlingChunk != null) {
+              await streamHandler.handle(
+                GraphEvents.CHAT_MODEL_STREAM,
+                { chunk: handlingChunk },
+                metadata,
+                context
+              );
+            } else if (context != null) {
+              /**
+               * A replay-skipped chunk yields no handling chunk, and in this
+               * local branch no `streamEvents` consumer judges the wire event
+               * either — yet a cumulative OpenRouter replay can still carry
+               * `tool_call_chunks` or complete `tool_calls` that are appended
+               * below. Charge the full limits (event budget and argument bytes)
+               * directly so neither cap can be bypassed. Consumer side: the
+               * local handler.handle call above claims as consumer, and one
+               * reused chunk object can alternate between these two arms.
+               */
+              enforceStreamLimitsForWireChunk({
+                graph: context,
+                metadata,
+                chunk,
+                side: 'consumer',
+              });
+            }
+            finalChunk = appendStreamChunk({
+              current: finalChunk,
+              next: chunk,
+              provider,
+            });
+            /**
+             * Only this loop may seal. The registered-handler branch below
+             * dispatches through `run.ts`'s decoupled `streamEvents` consumer,
+             * which can lag the accumulated chunk — sealing there would let the
+             * host index a content part the user has not been shown yet.
+             */
+            /**
+             * Cheap poll first, shape check second, budget claim last. The claim
+             * is what makes this safe under a parallel `MultiAgentGraph`: several
+             * agents share one graph and can each see the poll as true, but only
+             * one can take the slot, and a chunk that cannot seal never spends it.
+             *
+             * `resolvePreemptAction` prefers a seal wherever one is available,
+             * so a turn that already produced an answer keeps it. `restart` is
+             * reached only for an accumulation holding nothing but reasoning —
+             * the case a seal can never accept, and the reason an interrupt
+             * armed during a long thinking stretch used to wait for the whole
+             * turn.
+             */
+            if (context?.shouldPreemptStream() === true) {
+              preemptRequestedAt ??= Date.now();
+              const action = resolvePreemptAction({
+                chunk: finalChunk,
+                requestAgeMs: Date.now() - preemptRequestedAt,
+                graceMs: restartGraceMs,
+              });
+              if (action !== 'none' && context.claimPreemptSeal()) {
+                preemptAction = action;
+                break;
+              }
+            }
+          }
+        } else {
+          const metadata = config.metadata as Record<string, unknown> | undefined;
+          /**
+           * The original wire chunk still reaches the registered handler through
+           * `streamEvents` (where the late-reasoning skip discards it AFTER the
+           * event guard counts it), so this inline re-dispatch of the transformed
+           * chunk is marked to not consume a second event-budget slot. Allocated
+           * once per attempt, only when a transformation occurs.
+           */
+          let redispatchMetadata: Record<string, unknown> | undefined;
+          for await (const chunk of stream) {
+            throwIfBreakerTripped();
+            /**
+             * Charged synchronously, ahead of the decoupled `streamEvents`
+             * reader that will echo this same chunk to the registered handler:
+             * a lagging reader would otherwise let an oversized complete call
+             * return to LangGraph and reach ToolNode before the queued handler
+             * throws. The chunk is marked so the echo skips accounting.
+             */
+            if (context != null) {
+              enforceStreamLimitsForWireChunk({ graph: context, metadata, chunk });
+            }
+            const handlingChunk = getStreamHandlingChunk({
+              current: finalChunk,
+              next: chunk,
+              provider,
+            });
+            if (handlingChunk != null && handlingChunk !== chunk) {
+              redispatchMetadata ??= {
+                ...(metadata ?? {}),
+                [STREAM_LIMIT_REDISPATCH_KEY]: true,
+              };
+              await registeredStreamHandler.handle(
+                GraphEvents.CHAT_MODEL_STREAM,
+                { chunk: handlingChunk },
+                redispatchMetadata,
+                context
+              );
+            }
+            finalChunk = appendStreamChunk({
+              current: finalChunk,
+              next: chunk,
+              provider,
+            });
+          }
         }
-        const handlingChunk = getStreamHandlingChunk({
-          current: finalChunk,
-          next: chunk,
-          provider,
-        });
-        if (handlingChunk != null && handlingChunk !== chunk) {
-          redispatchMetadata ??= {
-            ...(metadata ?? {}),
-            [STREAM_LIMIT_REDISPATCH_KEY]: true,
-          };
-          await registeredStreamHandler.handle(
-            GraphEvents.CHAT_MODEL_STREAM,
-            { chunk: handlingChunk },
-            redispatchMetadata,
-            context
-          );
-        }
-        finalChunk = appendStreamChunk({
-          current: finalChunk,
-          next: chunk,
-          provider,
-        });
       }
+    } catch (error) {
+      /**
+       * A restart tears the provider stream down mid-flight, which surfaces
+       * as the composed signal's abort — from the iteration, or from stream
+       * creation when the request was already outstanding. Swallowed only when
+       * THIS attempt asked for it: `preemptAction` is set immediately before
+       * the abort and by nothing else, so a run-level abort, a tripped stream
+       * limit and every provider error still propagate.
+       */
+      if (preemptAction !== 'restart') {
+        throw error;
+      }
+    } finally {
+      unsubscribeWake?.();
+      clearTimeout(restartGraceTimer);
     }
 
     if (providerUsesManualToolStream(provider)) {
@@ -907,7 +1086,70 @@ async function attemptInvokeBody(
       );
     }
 
-    if (preempted && finalChunk != null) {
+    if (preemptAction === 'restart') {
+      /**
+       * The turn is thrown away, but a model run that OPENED still has to be
+       * closed:
+       * its callback span is open, and a host that renders from the stream
+       * has already drawn the reasoning that is about to vanish. The synthetic
+       * end carries `preemptDiscarded` so both can tell this apart from a seal
+       * — a seal's content survives into the next prompt, a discard's does
+       * not, and a host that keeps rendering it would show the user words the
+       * model no longer has.
+       *
+       * Usage is still synthesized from whatever accumulated. Those reasoning
+       * tokens were spent and billed; dropping them from the report would make
+       * an interrupted turn look free.
+       *
+       * Skipped entirely when the request never went out — a preempt already
+       * outstanding when the attempt began short-circuits above the provider
+       * call, so there is no open span and no stream for a host to unwind, and
+       * a synthetic end would announce a run that never started.
+       */
+      if (finalChunk != null || sealedRunId != null) {
+        const discardedChunk = finalChunk ?? new AIMessageChunk({ content: '' });
+        const responseMetadata = {
+          ...discardedChunk.response_metadata,
+          preempted: true,
+          preemptDiscarded: true,
+        };
+        discardedChunk.response_metadata = responseMetadata;
+        discardedChunk.lc_kwargs.response_metadata = responseMetadata;
+        /**
+         * No run id, deliberately. Tearing the stream down makes LangChain
+         * close the model run through its error path, so the native close a
+         * seal performs would find nothing to end and warn on every interrupt.
+         * The synthetic `CHAT_MODEL_END` is the right close here anyway: it is
+         * what tells a host rendering from the stream that the part it has been
+         * drawing is over, and `preemptDiscarded` on it is what says the part's
+         * content is gone rather than kept.
+         */
+        await endSealedModelRun(
+          context,
+          discardedChunk,
+          messagesForProvider,
+          undefined,
+          config,
+          model
+        );
+      }
+      /** Non-null on every path that can reach here: it is what armed the
+       *  controller in the first place. */
+      if (restartLane != null) {
+        context?.notePreemptRestart(restartLane);
+      }
+      /**
+       * No message reaches graph state, so the injected user turn lands
+       * directly after the previous one — which is what makes this safe on
+       * every provider: adjacent user turns are native on Anthropic, OpenAI
+       * and Gemini, and normalized by `coalesceAdjacentUserTurns` for the
+       * strict-alternation providers. A seal needs a non-empty assistant turn
+       * precisely because it leaves one behind; a discard leaves none.
+       */
+      return { messages: [] };
+    }
+
+    if (preemptAction === 'seal' && finalChunk != null) {
       const responseMetadata = {
         ...finalChunk.response_metadata,
         preempted: true,
@@ -1018,6 +1260,7 @@ export async function tryFallbackProviders({
   context,
   onChunk,
   streamLimitState,
+  preemptAgentId,
   overflowContext,
   prepareProviderRequest: prepareFallbackRequest,
   prepareProviderMessages,
@@ -1032,6 +1275,11 @@ export async function tryFallbackProviders({
   /** Accounting-lease owner forwarded to each fallback attempt (see
    * `AttemptInvokeParams.streamLimitState`). */
   streamLimitState?: StreamLimitState;
+  /** Forwarded so a fallback-served attempt records a discarded turn in the
+   * SAME lane the primary would have (see
+   * `AttemptInvokeParams.preemptAgentId`). Dropping it here would leave the
+   * node's boundary undispatched and the lane holding an empty turn. */
+  preemptAgentId?: string;
   /**
    * Prompt-size corroboration for signatures that are not self-describing.
    * Vertex AI's overflow is a bare `400` with no reason, so without this a
@@ -1147,6 +1395,7 @@ export async function tryFallbackProviders({
             context,
             onChunk,
             streamLimitState,
+            preemptAgentId,
           },
           fbConfig
         );
@@ -1159,6 +1408,7 @@ export async function tryFallbackProviders({
           context,
           onChunk,
           streamLimitState,
+          preemptAgentId,
         },
         fbConfig
       );

@@ -1,6 +1,11 @@
 // src/llm/preempt.ts
 import type { AIMessageChunk } from '@langchain/core/messages';
-import { ContentTypes, DEFAULT_MAX_SEALS } from '@/common';
+import {
+  ContentTypes,
+  DEFAULT_MAX_SEALS,
+  DEFAULT_PREEMPT_RESTART_GRACE_MS,
+} from '@/common';
+import { isReasoningContentBlock } from '@/messages/core';
 
 /**
  * Normalizes a host-supplied seal budget.
@@ -175,4 +180,120 @@ export function canSealPreempt(chunk: AIMessageChunk | undefined): boolean {
     return false;
   }
   return hasNonEmptyTextContent(chunk.content);
+}
+
+/**
+ * What a host's armed preempt request may do to the turn in flight.
+ *
+ * `seal` keeps the partial assistant turn and injects after it; `restart`
+ * throws the partial away and re-issues the model call with the injected turn
+ * appended to the prompt. They are not two flavors of the same move — one
+ * preserves work, the other deliberately discards it — so the decision is
+ * resolved once, here, rather than re-derived at each trigger.
+ */
+export type PreemptAction = 'none' | 'seal' | 'restart';
+
+/**
+ * True when the accumulated turn holds nothing a seal would have to preserve,
+ * so the whole model call can be thrown away and re-issued instead.
+ *
+ * The membership test is a WHITELIST: every content block must be a known
+ * reasoning block, and an unrecognized block refuses the restart. Blacklisting
+ * would silently discard whatever a future provider adds, and the failure is
+ * asymmetric — refusing costs the user a slower interrupt (exactly today's
+ * behavior), while wrongly discarding destroys work the model already did and
+ * the host may already have rendered.
+ *
+ * Tool machinery of any kind refuses, and deliberately without the settled-id
+ * allowance {@link canSealPreempt} makes: a settled `web_search_tool_result`
+ * means the provider already ran and billed a search, and re-issuing the call
+ * would run it again. A seal there is free; a restart is not.
+ *
+ * An accumulation that carries visible text is not handled here at all — the
+ * caller resolves `seal` first, because keeping the user's answer always beats
+ * discarding it.
+ *
+ * `undefined` — the provider has sent nothing at all — is the case this whole
+ * path exists for: it is the silent window between the request and the first
+ * chunk, where there is by definition nothing to lose.
+ */
+export function canRestartPreempt(chunk: AIMessageChunk | undefined): boolean {
+  if (chunk == null) {
+    return true;
+  }
+  if ((chunk.tool_calls?.length ?? 0) > 0) {
+    return false;
+  }
+  if ((chunk.tool_call_chunks?.length ?? 0) > 0) {
+    return false;
+  }
+  if ((chunk.invalid_tool_calls?.length ?? 0) > 0) {
+    return false;
+  }
+  const { content } = chunk;
+  if (typeof content === 'string') {
+    return content.trim() === '';
+  }
+  for (const block of content) {
+    if (!isReasoningContentBlock(block)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Normalizes a host-supplied restart grace, on the same rules as
+ * {@link resolveMaxSeals}: `0` is honored as "never wait", anything not finite
+ * falls back to the default. Negative values collapse to `0` rather than
+ * inverting the comparison in {@link resolvePreemptAction}.
+ */
+export function resolveRestartGraceMs(graceMs: number | undefined): number {
+  if (graceMs == null || !Number.isFinite(graceMs)) {
+    return DEFAULT_PREEMPT_RESTART_GRACE_MS;
+  }
+  return graceMs > 0 ? graceMs : 0;
+}
+
+/**
+ * The single decision point both preempt triggers share: the per-chunk poll in
+ * the stream loop, and the host wake-up that fires while the provider is
+ * silent.
+ *
+ * A SEAL is preferred wherever one is available, so a turn that has already
+ * produced an answer never loses it to a restart. A RESTART converts only once
+ * the request has outlived `graceMs`.
+ *
+ * The window is not politeness, it is correctness, and it applies to a silent
+ * provider exactly as it does to a reasoning one:
+ *  - reasoning usually precedes text by moments, and discarding a turn that
+ *    was about to become sealable trades a kept answer for a re-issued
+ *    request. Only a genuinely long thinking stretch — the one an interrupt
+ *    can otherwise wait out entirely — should convert.
+ *  - `chunk` is what the CONSUMER has accumulated, and the provider stream
+ *    buffers a chunk ahead of it. An empty accumulation therefore does not
+ *    prove the provider produced nothing; it can also mean the first chunk is
+ *    in flight. Converting on emptiness alone would discard that chunk — text
+ *    included — on a race no caller can see. A provider that is still silent a
+ *    window later has no such chunk outstanding.
+ *
+ * Non-mutating and allocation-free, like the poll that guards it: the seal
+ * budget is only spent once the caller acts on a non-`none` result.
+ */
+export function resolvePreemptAction({
+  chunk,
+  requestAgeMs,
+  graceMs,
+}: {
+  chunk: AIMessageChunk | undefined;
+  requestAgeMs: number;
+  graceMs: number;
+}): PreemptAction {
+  if (canSealPreempt(chunk)) {
+    return 'seal';
+  }
+  if (!canRestartPreempt(chunk)) {
+    return 'none';
+  }
+  return requestAgeMs >= graceMs ? 'restart' : 'none';
 }

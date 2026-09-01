@@ -19,6 +19,21 @@ export const DEFAULT_TOOL_TOKEN_MULTIPLIER = 1.4;
  * preemption-enabled run reserves.
  */
 export const DEFAULT_MAX_SEALS = 8;
+/**
+ * How long a preempt request waits for the turn to become sealable before it
+ * is allowed to discard the turn instead.
+ *
+ * Exists to keep a restart from stealing a seal that was about to happen: a
+ * model streaming reasoning is usually moments from its first text, and
+ * keeping that answer beats throwing the reasoning away. Only a request that
+ * outlives the window — a genuinely long thinking stretch — converts.
+ *
+ * Applies to a silent provider too. The accumulation a restart is judged
+ * against is what the consumer has seen, and the stream buffers a chunk ahead
+ * of it — so "nothing accumulated" can also mean "the first chunk is in
+ * flight", and converting on it would discard that chunk unseen.
+ */
+export const DEFAULT_PREEMPT_RESTART_GRACE_MS = 2_000;
 
 /**
  * Default ceiling on Stop-hook continuations within one Run. A blocking Stop

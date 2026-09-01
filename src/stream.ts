@@ -56,6 +56,7 @@ import {
 } from '@/utils/truncation';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
+import { isReasoningContentBlock } from '@/messages/core';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { composeAbortSignals } from '@/utils/misc';
 import { isGoogleLike } from '@/utils/llm';
@@ -454,15 +455,6 @@ function isTextContentPart(contentPart: t.MessageContentComplex): boolean {
   return contentPart.type?.startsWith(ContentTypes.TEXT) ?? false;
 }
 
-function isReasoningContentPart(contentPart: t.MessageContentComplex): boolean {
-  return (
-    (contentPart.type?.startsWith(ContentTypes.THINKING) ?? false) ||
-    (contentPart.type?.startsWith(ContentTypes.REASONING) ?? false) ||
-    (contentPart.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false) ||
-    contentPart.type === 'redacted_thinking'
-  );
-}
-
 function getReasoningTextFromContentPart(
   contentPart: t.MessageContentComplex
 ): string {
@@ -532,7 +524,7 @@ function shouldStartFreshMessageStepAfterGoogleServerSideTool({
   }
   return (
     content.every((c) => isTextContentPart(c)) ||
-    content.every((c) => isReasoningContentPart(c))
+    content.every((c) => isReasoningContentBlock(c))
   );
 }
 
@@ -649,7 +641,7 @@ async function dispatchGoogleServerSideToolStreamContent({
   }
   reasoningContent.push(
     ...content
-      .filter((contentPart) => isReasoningContentPart(contentPart))
+      .filter((contentPart) => isReasoningContentBlock(contentPart))
       .map((contentPart) => ({
         type: ContentTypes.THINK,
         think: getReasoningTextFromContentPart(contentPart),
@@ -2034,7 +2026,7 @@ hasToolCallChunks: ${hasToolCallChunks}
         },
         metadata
       );
-    } else if (content.every((c) => isReasoningContentPart(c))) {
+    } else if (content.every((c) => isReasoningContentBlock(c))) {
       await graph.dispatchReasoningDelta(
         stepId,
         {
