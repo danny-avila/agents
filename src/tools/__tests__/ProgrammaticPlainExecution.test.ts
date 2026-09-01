@@ -1,16 +1,29 @@
 import { describe, it, expect, jest, beforeEach } from '@jest/globals';
 import type * as t from '@/types';
 
+/** Wire body the programmatic tools post, for both sandbox routes. */
+type SandboxRequestBody = {
+  lang?: 'bash' | 'py';
+  code?: string;
+  tools?: t.LCTool[];
+  timeout?: number;
+  session_id?: string;
+  files?: t.CodeEnvFile[];
+  runtime_session_hint?: string;
+  continuation_token?: string;
+};
+
+type CapturedRequest = { url: string; body: SandboxRequestBody };
+
 /* Mirrors codeapi's `/exec/programmatic` guard, which rejects an empty tool
  * manifest outright: `if (!tools || tools.length === 0) -> 400`. Plain `/exec`
  * has no such requirement. */
-type CapturedRequest = { url: string; body: Record<string, unknown> };
 const requests: CapturedRequest[] = [];
 
 jest.mock('node-fetch', () => ({
   __esModule: true,
   default: async (url: string, init?: { body?: string }) => {
-    const body = JSON.parse(init?.body ?? '{}') as { tools?: unknown[] };
+    const body = JSON.parse(init?.body ?? '{}') as SandboxRequestBody;
     requests.push({ url, body });
 
     if (url.endsWith('/exec/programmatic')) {
@@ -67,43 +80,62 @@ const toolMap: t.ToolMap = new Map([
   ['calculator', createCalculatorTool()],
 ]);
 
+/** Model-authored arguments accepted by both programmatic tools. */
+type ProgrammaticArgs = {
+  code: string;
+  tool_manifest?: string[];
+  timeout?: number;
+};
+
+/** Context ToolNode injects onto the tool call. */
+type InjectedContext = {
+  toolMap?: t.ToolMap;
+  toolDefs?: t.LCTool[];
+  disallowedToolDefs?: t.LCTool[];
+  session_id?: string;
+  _injected_files?: t.CodeEnvFile[];
+  _runtime_session_hint?: string;
+};
+
 type ToolResult = {
   content: string;
   artifact?: t.ProgrammaticExecutionArtifact;
 };
 
+const DEFAULT_CONTEXT: InjectedContext = { toolMap, toolDefs: allToolDefs };
+
 function invoke(
   create: typeof createBashProgrammaticToolCallingTool,
   name: string,
-  args: Record<string, unknown>,
-  toolCallExtras: Record<string, unknown> = { toolMap, toolDefs: allToolDefs }
-) {
+  args: ProgrammaticArgs,
+  context: InjectedContext = DEFAULT_CONTEXT
+): Promise<unknown> {
   return create({ baseUrl: BASE_URL }).invoke(
-    { name, args, id: 'call-1', type: 'tool_call', ...toolCallExtras } as never,
+    { name, args, id: 'call-1', type: 'tool_call', ...context } as never,
     {} as never
   );
 }
 
 const invokeBash = (
-  args: Record<string, unknown>,
-  extras?: Record<string, unknown>
-) =>
+  args: ProgrammaticArgs,
+  context?: InjectedContext
+): Promise<unknown> =>
   invoke(
     createBashProgrammaticToolCallingTool,
     'run_tools_with_bash',
     args,
-    extras
+    context
   );
 
 const invokePython = (
-  args: Record<string, unknown>,
-  extras?: Record<string, unknown>
-) =>
+  args: ProgrammaticArgs,
+  context?: InjectedContext
+): Promise<unknown> =>
   invoke(
     createProgrammaticToolCallingTool,
     'run_tools_with_code',
     args,
-    extras
+    context
   );
 
 describe('an empty tool manifest runs instead of being rejected', () => {
@@ -171,8 +203,7 @@ describe('an empty tool manifest runs instead of being rejected', () => {
         timeout: 5000,
       },
       {
-        toolMap,
-        toolDefs: allToolDefs,
+        ...DEFAULT_CONTEXT,
         session_id: 'prior',
         _injected_files: files,
         _runtime_session_hint: 'hint-1',
@@ -198,11 +229,7 @@ describe('behavior that stays as it was', () => {
     await expect(
       invokeBash(
         { code: 'ls /mnt/data' },
-        {
-          toolMap,
-          toolDefs: allToolDefs,
-          disallowedToolDefs: [{ name: 'send_email' }],
-        }
+        { ...DEFAULT_CONTEXT, disallowedToolDefs: [{ name: 'send_email' }] }
       )
     ).rejects.toThrow('requires a tool_manifest');
 
@@ -213,11 +240,7 @@ describe('behavior that stays as it was', () => {
     await expect(
       invokeBash(
         { code: 'send_email \'{}\'', tool_manifest: ['send_email'] },
-        {
-          toolMap,
-          toolDefs: allToolDefs,
-          disallowedToolDefs: [{ name: 'send_email' }],
-        }
+        { ...DEFAULT_CONTEXT, disallowedToolDefs: [{ name: 'send_email' }] }
       )
     ).rejects.toThrow('not marked for code_execution');
   });
@@ -226,9 +249,9 @@ describe('behavior that stays as it was', () => {
     await invokeBash({ code: 'ls /mnt/data' });
 
     expect(requests[0].url).toBe(`${BASE_URL}/exec/programmatic`);
-    expect(
-      (requests[0].body.tools as t.LCTool[]).map((def) => def.name)
-    ).toEqual(allToolDefs.map((def) => def.name));
+    expect(requests[0].body.tools?.map((def) => def.name)).toEqual(
+      allToolDefs.map((def) => def.name)
+    );
   });
 
   it('still reports a missing toolMap when nothing was injected', async () => {
