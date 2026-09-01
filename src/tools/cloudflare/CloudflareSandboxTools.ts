@@ -2,8 +2,8 @@ import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import {
+  createCloudflareExecutionWorld,
   createCloudflareLocalExecutionConfig,
-  createCloudflareWorkspaceFS,
   executeCloudflareBash,
   executeCloudflareCode,
   formatCloudflareOutput,
@@ -161,7 +161,7 @@ export function createCloudflareCodingTools(
     options.checkpointer ??
     (config.fileCheckpointing === true
       ? createLocalFileCheckpointer({
-        fs: createCloudflareWorkspaceFS(config),
+        fs: createCloudflareExecutionWorld(config).fs,
       })
       : undefined);
   const tools = [
@@ -193,11 +193,12 @@ export function createCloudflareCodingToolBundle(
   config: t.CloudflareSandboxExecutionConfig,
   options: { checkpointer?: t.LocalFileCheckpointer } = {}
 ): CloudflareCodingToolBundle {
+  const world = createCloudflareExecutionWorld(config);
   const checkpointer =
     options.checkpointer ??
     (config.fileCheckpointing === true
       ? createLocalFileCheckpointer({
-        fs: createCloudflareWorkspaceFS(config),
+        fs: world.fs,
       })
       : undefined);
   return {

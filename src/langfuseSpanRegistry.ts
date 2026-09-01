@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
+import { context, trace } from '@opentelemetry/api';
 import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
-import type { Span } from '@opentelemetry/api';
+import type { Span, SpanContext } from '@opentelemetry/api';
 import type * as t from '@/types';
 import {
   hasLangfuseConfigCredentials,
@@ -16,7 +17,7 @@ import { isPresent } from '@/utils/misc';
  *
  * - Foreign spans (a host's own OpenTelemetry instrumentation, e.g. HTTP
  *   server spans on the global provider) are never exported to Langfuse —
- *   inheriting one orphans the trace root (its root/trace input-output
+ *   inheriting one orphans the trace root (its root-observation input/output
  *   shaping is skipped), collapses concurrent runs inside one request
  *   context into a single merged trace, and bypasses the seeded
  *   deterministic trace id generator.
@@ -30,6 +31,19 @@ import { isPresent } from '@/utils/misc';
  */
 const managedSpanDestinations = new WeakMap<Span, string>();
 
+type AnchoredSpan = {
+  destinationKey: string;
+  spanContext: SpanContext;
+};
+
+type TraceAnchorState = {
+  spans: Map<string, AnchoredSpan>;
+  spanIds: Set<string>;
+};
+
+const ROOT_TRACE_ANCHOR = '';
+const traceAnchorStates = new WeakMap<object, TraceAnchorState>();
+
 export function registerLangfuseManagedSpan(
   span: Span,
   destinationKey: string
@@ -41,6 +55,68 @@ export function getLangfuseManagedSpanDestination(
   span: Span
 ): string | undefined {
   return managedSpanDestinations.get(span);
+}
+
+/** Captures the first exported observation for a run and for each agent lane. */
+export function registerLangfuseTraceAnchorSpan(
+  anchor: object,
+  span: Span,
+  destinationKey: string,
+  agentId?: string
+): void {
+  let state = traceAnchorStates.get(anchor);
+  if (state == null) {
+    state = { spans: new Map<string, AnchoredSpan>(), spanIds: new Set() };
+    traceAnchorStates.set(anchor, state);
+  }
+  const spanContext = span.spanContext();
+  state.spanIds.add(spanContext.spanId);
+  const key = agentId ?? ROOT_TRACE_ANCHOR;
+  if (state.spans.has(key)) {
+    return;
+  }
+  state.spans.set(key, { destinationKey, spanContext });
+}
+
+/**
+ * Resolves the most specific safe parent available for auxiliary work. An
+ * active observation wins so labels emitted inside a tool or reasoning step
+ * stay beside their source; otherwise the run root anchors the label in the
+ * same trace. An agent lane is the fallback when its overlay exports to a
+ * different destination. Cross-destination parents are never returned.
+ */
+export function resolveLangfuseTraceAnchorParent(
+  anchor: object | undefined,
+  destinationKey: string | undefined,
+  agentId?: string
+): SpanContext | undefined {
+  if (anchor == null || destinationKey == null) {
+    return undefined;
+  }
+  const state = traceAnchorStates.get(anchor);
+  if (state == null) {
+    return undefined;
+  }
+  const agentSpan = agentId == null ? undefined : state.spans.get(agentId);
+  const rootSpan = state.spans.get(ROOT_TRACE_ANCHOR);
+  let anchoredSpan = rootSpan;
+  if (anchoredSpan?.destinationKey !== destinationKey) {
+    anchoredSpan = agentSpan;
+  }
+  if (anchoredSpan?.destinationKey !== destinationKey) {
+    return undefined;
+  }
+
+  const activeSpan = trace.getSpan(context.active());
+  if (
+    activeSpan != null &&
+    getLangfuseManagedSpanDestination(activeSpan) === destinationKey &&
+    activeSpan.spanContext().traceId === anchoredSpan.spanContext.traceId &&
+    state.spanIds.has(activeSpan.spanContext().spanId)
+  ) {
+    return activeSpan.spanContext();
+  }
+  return anchoredSpan.spanContext;
 }
 
 function resolveLangfuseEnvironment(
@@ -59,6 +135,12 @@ function resolveLangfuseEnvironment(
   return undefined;
 }
 
+function hasAdditionalHeaders(
+  headers?: Record<string, string>
+): headers is Record<string, string> {
+  return headers != null && Object.keys(headers).length > 0;
+}
+
 export function getLangfuseSpanProcessorParams(
   langfuse?: t.LangfuseConfig
 ): LangfuseSpanProcessorParams | undefined {
@@ -66,6 +148,9 @@ export function getLangfuseSpanProcessorParams(
     return undefined;
   }
   const environment = resolveLangfuseEnvironment(langfuse);
+  const additionalHeaders = hasAdditionalHeaders(langfuse?.additionalHeaders)
+    ? { additionalHeaders: langfuse.additionalHeaders }
+    : {};
   if (hasLangfuseConfigCredentials(langfuse)) {
     return {
       publicKey: langfuse.publicKey,
@@ -75,6 +160,7 @@ export function getLangfuseSpanProcessorParams(
       ...(langfuse.mediaUploadEnabled != null
         ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
         : {}),
+      ...additionalHeaders,
     };
   }
   if (hasLangfuseEnvConfig()) {
@@ -90,6 +176,7 @@ export function getLangfuseSpanProcessorParams(
       ...(langfuse?.mediaUploadEnabled != null
         ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
         : {}),
+      ...additionalHeaders,
     };
   }
   if (isPresent(langfuse?.baseUrl) && hasLangfuseEnvCredentials()) {
@@ -101,6 +188,7 @@ export function getLangfuseSpanProcessorParams(
       ...(langfuse.mediaUploadEnabled != null
         ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
         : {}),
+      ...additionalHeaders,
     };
   }
   return undefined;
@@ -113,11 +201,36 @@ function hashCacheKeyValue(value: string | undefined): string | undefined {
 }
 
 /**
+ * Order- and case-insensitive digest of the custom headers sent to a
+ * destination, so header maps that differ only in key order or header-name
+ * casing resolve to one destination instead of duplicating its exporter.
+ * Hashed because these values are credentials (proxy tokens, gateway keys).
+ * Absent and empty both yield `undefined`, keeping keys stable for the
+ * overwhelmingly common no-headers case.
+ */
+function hashAdditionalHeaders(
+  headers: Record<string, string> | undefined
+): string | undefined {
+  if (!hasAdditionalHeaders(headers)) {
+    return undefined;
+  }
+  const normalized = Object.entries(headers)
+    .map(([name, value]) => JSON.stringify([name.trim().toLowerCase(), value]))
+    .sort();
+  return hashCacheKeyValue(normalized.join('\n'));
+}
+
+/**
  * Identity of an export destination (project credentials + endpoint +
- * environment) only. Processor-level policies like `toolOutputTracing` are
- * deliberately excluded: two spans exporting to the same project under
- * different redaction settings still share a destination and may parent one
- * another.
+ * environment + custom headers) only. Processor-level policies like
+ * `toolOutputTracing` are deliberately excluded: two spans exporting to the
+ * same project under different redaction settings still share a destination
+ * and may parent one another.
+ *
+ * Custom headers are included because a gateway may route on them, making two
+ * otherwise-identical configs different projects. Treating them as part of the
+ * destination keeps a run from inheriting a parent span bound elsewhere, and
+ * keeps a rotated proxy credential from reusing the stale exporter.
  */
 export function getLangfuseDestinationKey(
   params: LangfuseSpanProcessorParams
@@ -127,6 +240,7 @@ export function getLangfuseDestinationKey(
     secretKeyHash: hashCacheKeyValue(params.secretKey),
     baseUrl: params.baseUrl,
     environment: params.environment,
+    additionalHeadersHash: hashAdditionalHeaders(params.additionalHeaders),
   });
 }
 

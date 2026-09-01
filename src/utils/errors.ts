@@ -12,7 +12,7 @@
  * into a forced summarization pass instead of surfacing the error.
  */
 import { ContextOverflowError } from '@langchain/core/errors';
-import type { Providers } from '@/common';
+import type { ProviderName } from '@/types';
 
 /**
  * Why the request was rejected. Both kinds are fixed by shrinking the
@@ -49,7 +49,7 @@ export interface ContextOverflowInfo {
   promptTokens?: number;
   /** Which layer produced the verdict. Surfaced in logs and asserted in tests. */
   source: 'langchain' | 'pattern';
-  provider?: Providers;
+  provider?: ProviderName;
 }
 
 interface OverflowPattern {
@@ -80,7 +80,7 @@ interface OverflowPattern {
 const CONTEXT_PRESSURE_RATIO = 0.8;
 
 export interface ContextOverflowContext {
-  provider?: Providers;
+  provider?: ProviderName;
   /** Our own estimate of the prompt size for the call that failed. */
   estimatedPromptTokens?: number;
   /** The budget we believed applied when we built that prompt. */

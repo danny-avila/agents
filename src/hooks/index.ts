@@ -9,7 +9,11 @@
 // `StandardGraph.createCallModel` (PreemptBoundary).
 export { HookRegistry } from './HookRegistry';
 export type { HookHaltSignal } from './HookRegistry';
-export { executeHooks, DEFAULT_HOOK_TIMEOUT_MS } from './executeHooks';
+export {
+  executeHooks,
+  mergeAggregatedHookResults,
+  DEFAULT_HOOK_TIMEOUT_MS,
+} from './executeHooks';
 /**
  * Feature probe for hosts: hook outputs support `injectedMessages`
  * (per-message graph-state injection at the `PostToolBatch` boundary).
@@ -28,6 +32,11 @@ export const HOOK_INJECTED_MESSAGES_CAPABLE = true;
  * the user as a dead button rather than as an unsupported feature.
  */
 export const HOOK_PREEMPT_BOUNDARY_CAPABLE = true;
+/**
+ * Feature probe for hosts: a blocking `Stop` hook can inject queued messages
+ * and continue within the same `Run.processStream` lifecycle.
+ */
+export const HOOK_STOP_CONTINUATION_CAPABLE = true;
 export {
   matchesQuery,
   hasNestedQuantifier,
@@ -71,6 +80,7 @@ export type {
   SubagentStartHookInput,
   SubagentStopHookInput,
   StopHookInput,
+  StopFinalizeHookInput,
   StopFailureHookInput,
   PreCompactHookInput,
   PostCompactHookInput,
@@ -85,6 +95,7 @@ export type {
   SubagentStartHookOutput,
   SubagentStopHookOutput,
   StopHookOutput,
+  StopFinalizeHookOutput,
   StopFailureHookOutput,
   PreCompactHookOutput,
   PostCompactHookOutput,

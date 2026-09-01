@@ -182,6 +182,26 @@ describe('HookRegistry', () => {
       expect(registry.getMatchers('PreToolUse', 'branch-b')).toEqual([matcher]);
     });
 
+    it('forks an isolated snapshot of global and session policy', () => {
+      const registry = new HookRegistry();
+      const global = makePreToolUseMatcher('global');
+      const session = makePreToolUseMatcher('session');
+      registry.register('PreToolUse', global);
+      registry.registerSession('source', 'PreToolUse', session);
+
+      const fork = registry.forkSession('source');
+      registry.clearSession('source');
+      registry.removeMatcher('PreToolUse', global);
+
+      expect(fork.getMatchers('PreToolUse', 'detached')).toEqual([
+        global,
+        session,
+      ]);
+      expect(fork.removeMatcher('PreToolUse', session)).toBe(true);
+      expect(fork.getMatchers('PreToolUse', 'detached')).toEqual([global]);
+      expect(registry.getMatchers('PreToolUse', 'source')).toEqual([]);
+    });
+
     it('copies pending one-shot approvals and clears them with the target session', () => {
       const registry = new HookRegistry();
       const approval = {
@@ -291,7 +311,7 @@ describe('HookRegistry', () => {
       expect(registry.hasResultAlteringHooks('run-1')).toBe(false);
     });
 
-    it('returns false when only observation hooks are registered', () => {
+    it('returns false when hooks cannot rewrite tool results', () => {
       const registry = new HookRegistry();
       registry.register('PostToolBatch', { hooks: [async () => ({})] });
       registry.register('Stop', { hooks: [async () => ({})] });

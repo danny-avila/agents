@@ -21,6 +21,14 @@ export const DEFAULT_TOOL_TOKEN_MULTIPLIER = 1.4;
 export const DEFAULT_MAX_SEALS = 8;
 
 /**
+ * Default ceiling on Stop-hook continuations within one Run. A blocking Stop
+ * hook can keep a naturally terminal run warm by injecting another user turn;
+ * the ceiling prevents a faulty hook or continuously arriving input from
+ * keeping one processStream call alive forever.
+ */
+export const DEFAULT_MAX_STOP_CONTINUATIONS = 8;
+
+/**
  * Per-hook timeout for `PreemptBoundary`, deliberately far above
  * `DEFAULT_HOOK_TIMEOUT_MS`. A host drain has already popped its queue and
  * persisted content by the time this fires, so a timeout does not cancel the
@@ -33,3 +41,23 @@ export const PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS = 120_000;
  * the stream config; a preemption-enabled run adds its seal budget on top.
  */
 export const DEFAULT_RECURSION_LIMIT = 50;
+
+/** Stable runtime names used for agent workflow observations. */
+export const STANDARD_GRAPH_RUN_NAME = 'AgentGraph';
+export const MULTI_AGENT_GRAPH_RUN_NAME = 'MultiAgentGraph';
+export const AGENT_MODEL_CALL_RUN_NAME = 'AgentModelCall';
+export const ACTIVITY_LABEL_RUN_NAME = 'StepLabel';
+export const REASONING_LABEL_RUN_NAME = 'ReasoningLabel';
+export const ACTIVITY_PHASE_RUN_NAME = 'MultiStepLabel';
+export const ACTIVITY_PHASE_LABEL_RUN_NAME = 'MultiStepLabelGeneration';
+
+/** Shared admission and rendering bounds for compaction navigation hints. */
+export const COMPACTION_SEMANTIC_INDEX_LIMITS = Object.freeze({
+  maxInputEntries: 256,
+  maxEntries: 64,
+  maxEntryChars: 512,
+  maxTotalChars: 4_096,
+  maxInputTextChars: 4_096,
+  maxIdentityChars: 512,
+  maxSourceContentIndex: 4_095,
+} as const);

@@ -141,7 +141,7 @@ These originated from direct Langfuse-team feedback (PRs #288, #316) and must su
 - **Stable, operation-describing span names.** `agent`, `tool-dispatch`, `llm` — never leak ephemeral agent ids (`agent=<provider__model>`) or provider class names (`ChatOpenAI`) into span names. The model belongs on the generation's model attribute; name-based logic downstream must not break when models switch.
 - **Correct observation types.** Agent trace roots and agent nodes are `agent` observations; tool dispatch is a `chain`; individual tool calls are `tool`; LLM calls are `generation`; title trace roots are `chain`.
 - **No plumbing noise.** LangGraph internals (`__start__` channel seeds, anonymous `RunnableLambda` pass-throughs) are dropped at export. A trace tree should read like the run's story — if a new node adds noise, extend the shaping/drop rules rather than shipping it raw.
-- **Trace input/output are the conversation, not the state.** Root input reduces to the user's question, output to the assistant's answer — never full serialized graph state. Tool-dispatch input is scoped to the pending tool calls.
+- **Root-observation input/output are the conversation, not the state.** Root input reduces to the user's question, output to the assistant's answer — never full serialized graph state. Tool-dispatch input is scoped to the pending tool calls. Do not emit deprecated trace-level input/output attributes.
 - **Control flow is not an error.** `GraphInterrupt` and `ParentCommand` end their traces as successful with `controlFlow` outputs, not as error traces.
 - **Usage/cost is accurate per provider.** e.g. Bedrock cache read/write tokens are folded into input tokens so Langfuse cost math is right.
 - **Redaction is honored everywhere tool output can surface** — tool spans, and any generation input that embeds tool results (e.g. the activity-label prompt).
@@ -153,7 +153,7 @@ These originated from direct Langfuse-team feedback (PRs #288, #316) and must su
 ### Verifying
 
 - Run the tracing specs after any change in this area: `npx jest langfuse deterministic-trace-id` (specs live in `src/specs/langfuse-*.test.ts` and `src/tools/__tests__/ToolNode.langfuse.test.ts`). New shaping rules get spec coverage in `langfuse-trace-shaping.test.ts`.
-- For structural changes, verify against a real Langfuse project: set `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`/`LANGFUSE_BASE_URL`, run an agent, and inspect the observation tree in the UI or via `GET /api/public/traces` — confirm span names, observation types, and root input/output match the invariants above.
+- For structural changes, verify against a real Langfuse project: set `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`/`LANGFUSE_BASE_URL`, run an agent, and inspect the observation tree in the UI or via the Observations API v2 filtered by trace ID — confirm span names, observation types, and root input/output match the invariants above.
 - For nontrivial Langfuse SDK work, use Langfuse's own agent-facing resources instead of guessing SDK behavior: the [Langfuse skill](https://github.com/langfuse/skills/tree/main/skills/langfuse), the docs MCP server (`https://langfuse.com/api/mcp`), and [llms.txt](https://langfuse.com/llms.txt).
 
 ---

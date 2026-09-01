@@ -20,10 +20,10 @@ import { Run } from '@/run';
  * 4. The parent incorporates the result and responds
  *
  * Usage:
- *   OPENAI_API_KEY=... npx ts-node -r tsconfig-paths/register src/scripts/multi-agent-subagent.ts
+ *   OPENAI_API_KEY=... npx tsx src/scripts/multi-agent-subagent.ts
  *
  * Or with Anthropic:
- *   ANTHROPIC_API_KEY=... npx ts-node -r tsconfig-paths/register src/scripts/multi-agent-subagent.ts --provider anthropic
+ *   ANTHROPIC_API_KEY=... npx tsx src/scripts/multi-agent-subagent.ts --provider anthropic
  */
 
 const useAnthropic =

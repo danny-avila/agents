@@ -1,4 +1,5 @@
 import type * as t from '@/types';
+import { getProviderFamily } from '@/llm/providerRegistry';
 import { Providers } from '@/common';
 
 /**
@@ -7,20 +8,21 @@ import { Providers } from '@/common';
  * and OpenAI-compat (modelKwargs.thinking).
  */
 export function isThinkingEnabled(
-  provider: Providers,
+  provider: t.ProviderName,
   clientOptions?: t.ClientOptions
 ): boolean {
   if (!clientOptions) return false;
+  const family = getProviderFamily(provider);
 
   if (
-    provider === Providers.ANTHROPIC &&
+    (provider === Providers.ANTHROPIC || family === 'anthropic') &&
     (clientOptions as t.AnthropicClientOptions).thinking != null
   ) {
     return true;
   }
 
   if (
-    provider === Providers.BEDROCK &&
+    (provider === Providers.BEDROCK || family === 'bedrock') &&
     (clientOptions as t.BedrockAnthropicInput).additionalModelRequestFields?.[
       'thinking'
     ] != null
@@ -29,7 +31,7 @@ export function isThinkingEnabled(
   }
 
   if (
-    provider === Providers.OPENAI &&
+    (provider === Providers.OPENAI || family === 'openai') &&
     (
       (clientOptions as t.OpenAIClientOptions).modelKwargs
         ?.thinking as t.AnthropicClientOptions['thinking']
@@ -42,14 +44,40 @@ export function isThinkingEnabled(
 }
 
 /**
+ * Model configured on client options, under whichever of the two keys carries
+ * it. LangChain accepts `modelName` as an alias for `model` and this package
+ * writes both (see `buildSummarizationClientConfig`), while hosts configure
+ * agents through either. Reading only one key therefore does not fail loudly:
+ * it reports an unconfigured model, and every caller here treats that as a cue
+ * to fall back to a default, so a Claude agent configured through the alias is
+ * silently handled as something else.
+ */
+export function resolveClientOptionsModel(
+  clientOptions: t.ClientOptions | undefined
+): string | undefined {
+  const options = clientOptions as
+    | { model?: unknown; modelName?: unknown }
+    | undefined;
+  if (typeof options?.model === 'string' && options.model !== '') {
+    return options.model;
+  }
+  if (typeof options?.modelName === 'string' && options.modelName !== '') {
+    return options.modelName;
+  }
+  return undefined;
+}
+
+/**
  * Returns the correct key for setting max output tokens on the model
  * constructor options.  Google/Vertex use `maxOutputTokens`, all others
  * use `maxTokens`.
  */
 export function getMaxOutputTokensKey(
-  provider: Providers | string
+  provider: t.ProviderName
 ): 'maxOutputTokens' | 'maxTokens' {
-  return provider === Providers.GOOGLE || provider === Providers.VERTEXAI
+  return provider === Providers.GOOGLE ||
+    provider === Providers.VERTEXAI ||
+    getProviderFamily(provider) === 'google'
     ? 'maxOutputTokens'
     : 'maxTokens';
 }

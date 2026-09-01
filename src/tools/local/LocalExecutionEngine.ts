@@ -21,6 +21,36 @@ const DEFAULT_MAX_OUTPUT_CHARS = 200000;
 const DEFAULT_MAX_SPAWNED_BYTES = 50 * 1024 * 1024;
 const DEFAULT_LOCAL_SESSION_ID = 'local';
 const DEFAULT_SHELL = process.platform === 'win32' ? 'bash.exe' : 'bash';
+const MAX_COMMAND_AVAILABILITY_ENVIRONMENTS = 16;
+const NEGATIVE_COMMAND_AVAILABILITY_TTL_MS = 5000;
+
+/** Produces a stable, non-plaintext key for environment-sensitive probes. */
+export function commandAvailabilityEnvCacheKey(
+  env: NodeJS.ProcessEnv | undefined
+): string {
+  if (env == null) {
+    return '';
+  }
+  const sorted = Object.keys(env)
+    .sort()
+    .map((key): [string, string | null] => [key, env[key] ?? null]);
+  return createHash('sha256').update(JSON.stringify(sorted)).digest('hex');
+}
+
+/** Adds a probe entry while bounding retained environment variants. */
+export function setCommandAvailabilityCacheEntry<T>(
+  cache: Map<string, T>,
+  key: string,
+  value: T
+): void {
+  if (!cache.has(key) && cache.size >= MAX_COMMAND_AVAILABILITY_ENVIRONMENTS) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) {
+      cache.delete(oldestKey);
+    }
+  }
+  cache.set(key, value);
+}
 
 // `(?:--\s+)?` before each destructive-target alternation: GNU/BSD
 // utilities accept `--` as an end-of-options marker, so `rm -rf -- /`
@@ -259,13 +289,34 @@ export function getWorkspaceRoots(config?: t.LocalExecutionConfig): string[] {
   return out;
 }
 
+/** Node-host execution world used when no backend override is configured. */
+export const nodeExecutionWorld: t.ExecutionWorld = Object.freeze({
+  spawn: spawn as t.LocalSpawn,
+  fs: nodeWorkspaceFS,
+  sandboxed: false,
+});
+
+/** Resolves filesystem and subprocess capabilities as one execution world. */
+export function getExecutionWorld(
+  config?: t.LocalExecutionConfig
+): t.ExecutionWorld {
+  if (config?.exec == null && config?.spawn == null) {
+    return nodeExecutionWorld;
+  }
+  return {
+    spawn: config.exec?.spawn ?? config.spawn ?? nodeExecutionWorld.spawn,
+    fs: config.exec?.fs ?? nodeExecutionWorld.fs,
+    sandboxed: config.exec?.sandboxed ?? false,
+  };
+}
+
 /**
  * Pluggable spawn resolver. Honours `local.exec.spawn` first, falls
  * back to the legacy top-level `local.spawn`, then to Node's
  * `child_process.spawn`. Centralised so engine swapping is one knob.
  */
 export function getSpawn(config?: t.LocalExecutionConfig): t.LocalSpawn {
-  return (config?.exec?.spawn ?? config?.spawn ?? spawn) as t.LocalSpawn;
+  return getExecutionWorld(config).spawn;
 }
 
 /**
@@ -274,7 +325,7 @@ export function getSpawn(config?: t.LocalExecutionConfig): t.LocalSpawn {
  * its own implementation here and inherits every file-touching tool.
  */
 export function getWorkspaceFS(config?: t.LocalExecutionConfig): WorkspaceFS {
-  return config?.exec?.fs ?? nodeWorkspaceFS;
+  return getExecutionWorld(config).fs;
 }
 
 /**
@@ -345,7 +396,7 @@ function maybeWarnSandboxOff(config: t.LocalExecutionConfig): void {
   if (
     sandboxOffWarned ||
     shouldUseLocalSandbox(config) ||
-    config.exec?.sandboxed === true
+    getExecutionWorld(config).sandboxed
   ) {
     return;
   }
@@ -902,6 +953,72 @@ export async function spawnLocalProcess(
       });
     });
   });
+}
+
+/** Result of a command-availability probe and whether its verdict is stable. */
+export type CommandAvailabilityProbe = {
+  available: boolean;
+  cacheable: boolean;
+  cacheUntil?: number;
+};
+
+async function isDurableCommandLookupError(
+  error: object,
+  config: t.LocalExecutionConfig
+): Promise<boolean> {
+  if (!('code' in error) || error.code !== 'ENOENT') {
+    return false;
+  }
+  try {
+    const cwd = getLocalCwd(config);
+    return (await getWorkspaceFS(config).stat(cwd)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Probes one executable without turning transient backend failures into
+ * permanent capability facts. Exit 126/127 is a definite unusable/missing
+ * executable. A native ENOENT is stable only when the current working
+ * directory exists; timeouts, transport failures, and ambiguous lookup
+ * failures are retried.
+ */
+export async function probeLocalCommandAvailability(
+  command: string,
+  args: string[],
+  config: t.LocalExecutionConfig
+): Promise<CommandAvailabilityProbe> {
+  try {
+    const result = await spawnLocalProcess(
+      command,
+      args,
+      { ...config, timeoutMs: 5000, sandbox: { enabled: false } },
+      { internal: true }
+    );
+    const available = result.exitCode === 0;
+    const durableNegative =
+      result.exitCode === 126 || result.exitCode === 127;
+    return {
+      available,
+      cacheable: available || durableNegative,
+      ...(durableNegative
+        ? { cacheUntil: Date.now() + NEGATIVE_COMMAND_AVAILABILITY_TTL_MS }
+        : {}),
+    };
+  } catch (error) {
+    const cacheable =
+      typeof error === 'object' &&
+      error != null &&
+      (await isDurableCommandLookupError(error, config));
+    return {
+      available: false,
+      cacheable,
+      ...(cacheable
+        ? { cacheUntil: Date.now() + NEGATIVE_COMMAND_AVAILABILITY_TTL_MS }
+        : {}),
+    };
+  }
 }
 
 export async function executeLocalBash(

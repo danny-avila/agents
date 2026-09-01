@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  HumanMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 import {
   describe,
   it,
@@ -29,10 +33,14 @@ import type {
   PostToolBatchHookInput,
   PostToolBatchHookOutput,
   RunStartHookOutput,
+  StopHookInput,
+  StopHookOutput,
   UserPromptSubmitHookOutput,
 } from '@/hooks';
 import type * as t from '@/types';
 import { Constants, Providers as providers, GraphEvents } from '@/common';
+import { getProviderMessageProvenance } from '@/messages/provenance';
+import { getRunStepResumeState } from '@/tools/runStepResume';
 import { HookRegistry, createToolPolicyHook } from '@/hooks';
 import * as events from '@/utils/events';
 import { askUserQuestion } from '@/hitl';
@@ -83,6 +91,48 @@ function mockEventDispatch(mockResults: t.ToolExecuteResult[]): void {
         (request.resolve as (r: t.ToolExecuteResult[]) => void)(mockResults);
       }
     });
+}
+
+async function stripStopContinuationExecutionIds(
+  checkpointer: MemorySaver,
+  threadId: string
+): Promise<void> {
+  for (const checkpoints of Object.values(
+    checkpointer.storage[threadId] ?? {}
+  )) {
+    for (const stored of Object.values(checkpoints)) {
+      const checkpoint = await checkpointer.serde.loadsTyped(
+        'json',
+        stored[0]
+      );
+      const runStepState = (
+        checkpoint as {
+          channel_values?: { runStepState?: t.RunStepResumeState };
+        }
+      ).channel_values?.runStepState;
+      if (runStepState != null) {
+        delete runStepState.stopContinuationExecutionId;
+        const [, serialized] = await checkpointer.serde.dumpsTyped(checkpoint);
+        stored[0] = serialized;
+      }
+    }
+  }
+  for (const [key, writes] of Object.entries(checkpointer.writes)) {
+    const [storedThreadId] = JSON.parse(key) as [string, string, string];
+    if (storedThreadId !== threadId) {
+      continue;
+    }
+    for (const stored of Object.values(writes)) {
+      const value = await checkpointer.serde.loadsTyped('json', stored[2]);
+      const runStepState = getRunStepResumeState(value);
+      if (runStepState == null) {
+        continue;
+      }
+      delete runStepState.stopContinuationExecutionId;
+      const [, serialized] = await checkpointer.serde.dumpsTyped(value);
+      stored[2] = serialized;
+    }
+  }
 }
 
 type MessagesUpdate = { messages: BaseMessage[] };
@@ -1147,10 +1197,8 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
       ],
     };
     const getState = jest.fn(
-      async (
-        _config: RunnableConfig,
-        _options?: { subgraphs?: boolean }
-      ) => persistedState
+      async (_config: RunnableConfig, _options?: { subgraphs?: boolean }) =>
+        persistedState
     );
     run.graphRunnable = { getState } as unknown as t.CompiledStateWorkflow;
     const processSpy = jest
@@ -1328,6 +1376,177 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
      * reason carried over from the previous pass. */
     expect(run.getInterrupt()).toBeUndefined();
     expect(run.getHaltReason()).toBeUndefined();
+  });
+
+  it('preserves the warm continuation budget across a HITL resume', async () => {
+    const { Run: RunClass } = await import('@/run');
+    const registry = new HookRegistry();
+    const stopInputs: StopHookInput[] = [];
+    let run: Awaited<ReturnType<typeof RunClass.create<t.IState>>>;
+    const checkpointer = new MemorySaver();
+    const toolCallId = 'abcdef0123456789abcdef0123456789';
+    const threadConfig = {
+      configurable: { thread_id: 'warm-hitl-budget-thread' },
+      version: 'v2' as const,
+    };
+    const seedRun = await RunClass.create<t.IState>({
+      runId: 'warm-hitl-budget-seed',
+      graphConfig: {
+        type: 'standard',
+        compileOptions: { checkpointer },
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+            tools: [createSchemaStub('echo')],
+          },
+        ],
+      },
+      skipCleanup: true,
+    });
+    seedRun.Graph?.overrideTestModel(['seed answer']);
+    await seedRun.processStream(
+      { messages: [new HumanMessage('seed prompt')] },
+      threadConfig
+    );
+    const seedTuple = await checkpointer.getTuple(threadConfig);
+    const seedCheckpointId = seedTuple?.config.configurable?.checkpoint_id;
+    expect(typeof seedCheckpointId).toBe('string');
+    const config = {
+      ...threadConfig,
+      configurable: {
+        ...threadConfig.configurable,
+        checkpoint_id: seedCheckpointId,
+      },
+    };
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review',
+        }),
+      ],
+    });
+    registry.register('Stop', {
+      hooks: [
+        async (input): Promise<StopHookOutput> => {
+          stopInputs.push(input);
+          if (input.continuationCount > 1) {
+            return { decision: 'continue' };
+          }
+          if (input.continuationCount === 1) {
+            return {
+              decision: 'block',
+              injectedMessages: [
+                {
+                  role: 'user',
+                  content: 'post-upgrade steer',
+                  source: 'steer',
+                },
+              ],
+            };
+          }
+          run.Graph?.overrideTestModel(
+            ['tool request', 'final answer'],
+            undefined,
+            [
+              {
+                id: toolCallId,
+                name: 'echo',
+                args: { command: 'continue' },
+                type: 'tool_call',
+              },
+            ]
+          );
+          return {
+            decision: 'block',
+            injectedMessages: [
+              { role: 'user', content: 'late steer', source: 'steer' },
+            ],
+          };
+        },
+      ],
+    });
+    run = await RunClass.create<t.IState>({
+      runId: 'warm-hitl-budget',
+      graphConfig: {
+        type: 'standard',
+        compileOptions: { checkpointer },
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+            tools: [createSchemaStub('echo')],
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+      maxStopContinuations: 2,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel(['first answer']);
+
+    await run.processStream(
+      { messages: [new HumanMessage('initial prompt')] },
+      config
+    );
+    const interrupt = run.getInterrupt();
+    expect(interrupt).toBeDefined();
+    expect(interrupt?.checkpointId).toEqual(expect.any(String));
+    expect(interrupt?.checkpointId).not.toBe(seedCheckpointId);
+    expect(stopInputs.map((input) => input.continuationCount)).toEqual([0]);
+    await stripStopContinuationExecutionIds(
+      checkpointer,
+      threadConfig.configurable.thread_id
+    );
+
+    run = await RunClass.create<t.IState>({
+      runId: 'warm-hitl-budget',
+      graphConfig: {
+        type: 'standard',
+        compileOptions: { checkpointer },
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+            tools: [createSchemaStub('echo')],
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+      maxStopContinuations: 2,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel([
+      'final answer',
+      'post-upgrade continued answer',
+    ]);
+    await run.resume([{ type: 'approve' }], {
+      ...config,
+      configurable: {
+        ...config.configurable,
+        checkpoint_id: interrupt?.checkpointId,
+      },
+    });
+
+    expect(run.getInterrupt()).toBeUndefined();
+    expect(stopInputs.map((input) => input.continuationCount)).toEqual([
+      0, 1, 2,
+    ]);
+    expect(
+      stopInputs.map((input) => input.continuationBudgetRemaining)
+    ).toEqual([2, 1, 0]);
   });
 
   it('Run.resume() forwards `update` so langgraph applies the channel edit through streamEvents', async () => {
@@ -1667,6 +1886,59 @@ describe('ToolNode HITL — additionalContext injection from hooks', () => {
     );
     expect(injected).toBeUndefined();
   });
+
+  it('marks mixed direct/event batch context as synthetic provenance', async () => {
+    mockEventDispatch([
+      { toolCallId: 'event_1', content: 'host-result', status: 'success' },
+    ]);
+    const direct = tool(async () => 'direct-result', {
+      name: 'direct_echo',
+      description: 'direct echo',
+      schema: z.object({ command: z.string() }),
+    }) as unknown as StructuredToolInterface;
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> => ({
+          decision: 'allow',
+          ...(input.toolName === 'direct_echo' && {
+            additionalContext: 'direct policy context',
+          }),
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [direct, createSchemaStub('event_echo')],
+      eventDrivenMode: true,
+      directToolNames: new Set(['direct_echo']),
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([
+        ['direct_1', 'step_direct_1'],
+        ['event_1', 'step_event_1'],
+      ]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: false },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'direct_1', name: 'direct_echo', args: { command: 'a' } },
+      { id: 'event_1', name: 'event_echo', args: { command: 'b' } },
+    ]);
+
+    const result = (await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'mixed-context-thread' } }
+    )) as { messages: BaseMessage[] };
+    const context = result.messages.find(
+      (message) =>
+        message.getType() === 'human' &&
+        String(message.content).includes('direct policy context')
+    );
+
+    expect(context).toBeDefined();
+    expect(getProviderMessageProvenance(context!)?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
+  });
 });
 
 describe('ToolNode HITL — PostToolBatch hook', () => {
@@ -1777,6 +2049,9 @@ describe('ToolNode HITL — PostToolBatch hook', () => {
     );
     expect(injected).toBeDefined();
     expect(String(injected!.content)).toContain('format the response as JSON');
+    expect(getProviderMessageProvenance(injected!)?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
   });
 
   it('PostToolBatch injectedMessages land as individual HumanMessages after the consolidated context', async () => {
@@ -1944,6 +2219,55 @@ describe('Run — preventContinuation honored for pre-stream hooks', () => {
   });
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('marks consolidated pre-stream hook context as synthetic provenance', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+    const { HumanMessage: HM } = await import('@langchain/core/messages');
+    const registry = new HookRegistry();
+    registry.register('RunStart', {
+      hooks: [
+        async (): Promise<RunStartHookOutput> => ({
+          additionalContext: 'runtime policy context',
+        }),
+      ],
+    });
+    const run = await Run.create<t.IState>({
+      runId: 'prestream-provenance',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: false },
+    });
+    const stateInputs = {
+      messages: [new HM('hello')],
+    } as t.IState;
+    const halted = await (
+      run as unknown as {
+        runPreStreamHooks: (
+          state: t.IState,
+          threadId: string,
+          config: Record<string, unknown>
+        ) => Promise<boolean>;
+      }
+    ).runPreStreamHooks(stateInputs, 'prestream-thread', {});
+
+    expect(halted).toBe(false);
+    expect(stateInputs.messages).toHaveLength(2);
+    expect(
+      getProviderMessageProvenance(stateInputs.messages[1])?.parts
+    ).toEqual([{ attribution: 'synthetic' }]);
   });
 
   it('returns undefined without invoking the graph when RunStart hook returns preventContinuation', async () => {

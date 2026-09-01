@@ -13,6 +13,7 @@ import type { GoogleAIToolType } from '@langchain/google-common';
 import type {
   SummarizationNodeInput,
   SummarizeCompleteEvent,
+  CompactionSemanticIndex,
   SummarizationConfig,
   SummarizeStartEvent,
   SummarizeDeltaEvent,
@@ -31,6 +32,7 @@ import type {
   ToolEndEvent,
   GenericTool,
   LCTool,
+  ToolExecutionConfig,
   ToolExecuteBatchRequest,
 } from '@/types/tools';
 import type {
@@ -39,9 +41,10 @@ import type {
   StreamPreemption,
   TokenBudgetBreakdown,
 } from '@/types/run';
-import type { Providers, Callback, GraphNodeKeys } from '@/common';
+import type { SubagentTaskConfig } from '@/types/subagentTasks';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
-import type { ClientOptions } from '@/types/llm';
+import type { ProviderClientOptionsConfig } from '@/types/llm';
+import type { Callback, GraphNodeKeys } from '@/common';
 
 /** Interface for bound model with stream and invoke methods */
 export interface ChatModel {
@@ -337,6 +340,8 @@ export type StandardGraphInput = {
   runId?: string;
   signal?: AbortSignal;
   agents: AgentInputs[];
+  /** Execution backend used to resolve the effective tool registry. */
+  toolExecution?: ToolExecutionConfig;
   langfuse?: LangfuseConfig;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
@@ -353,6 +358,12 @@ export type StandardGraphInput = {
    */
   subagentUsageSink?: SubagentUsageSink;
   /**
+   * Optional host-owned process-local task namespace for detached subagents.
+   * Presence enables `run_in_background` on the subagent tool. Child graphs
+   * do not inherit it, keeping background nesting disabled for the MVP.
+   */
+  subagentTasks?: SubagentTaskConfig;
+  /**
    * True when this graph IS a subagent child run (set by `SubagentExecutor`
    * when it constructs the child graph). Drives the hook-input `agentId`
    * subagent-scope marker: hook dispatches from this graph's tool nodes
@@ -363,10 +374,10 @@ export type StandardGraphInput = {
    */
   subagentScope?: boolean;
   /**
-   * Cooperative preemption, forwarded from `RunConfig.preemption`. Only ever
-   * set on the top-level graph: a steer targets the conversation, so subagent
-   * children must run to completion and `buildChildInputs` does not propagate
-   * this field.
+   * Cooperative preemption, forwarded from `RunConfig.preemption`. Ordinary
+   * child graphs do not inherit it. Detached subagent tasks may receive their
+   * own internal parent-control source so an interrupt can reuse the same
+   * provider-safe sealing path without targeting the top-level conversation.
    */
   preemption?: StreamPreemption;
   /**
@@ -604,6 +615,7 @@ export type SubagentUpdatePhase =
   | 'run_step_closed'
   | 'message_delta'
   | 'reasoning_delta'
+  | 'control'
   | 'stop'
   | 'error';
 
@@ -780,6 +792,17 @@ export interface LangfuseConfig {
    * payloads. Defaults to the Langfuse SDK behavior.
    */
   mediaUploadEnabled?: boolean;
+  /**
+   * Extra HTTP headers sent on every Langfuse export request (OTLP trace
+   * export and media uploads), for self-hosted instances behind an
+   * authenticating proxy or gateway.
+   *
+   * Deployment-level only: one exporter is shared by every span routed to a
+   * destination, so these cannot carry per-request or per-user identity.
+   * Headers participate in destination identity — see
+   * `getLangfuseDestinationKey`.
+   */
+  additionalHeaders?: Record<string, string>;
   metadata?: Record<string, string | number | boolean | null | undefined>;
   /**
    * Internal OTLP span attributes to attach to Langfuse observations before
@@ -803,7 +826,7 @@ export interface LangfuseConfig {
   deterministicTraceId?: boolean;
 }
 
-export interface AgentInputs {
+interface AgentInputFields {
   agentId: string;
   /**
    * Partition key for transient code-session ids and file refs. Agents with
@@ -818,12 +841,10 @@ export interface AgentInputs {
   toolEnd?: boolean;
   toolMap?: ToolMap;
   tools?: GraphTools;
-  provider: Providers;
   /** Stable/cacheable system instructions. */
   instructions?: string;
   streamBuffer?: number;
   maxContextTokens?: number;
-  clientOptions?: ClientOptions;
   /** Per-agent Langfuse tracing configuration. */
   langfuse?: LangfuseConfig;
   /** Dynamic system tail appended after stable instructions without provider cache markers. */
@@ -851,6 +872,14 @@ export interface AgentInputs {
   discoveredTools?: string[];
   summarizationEnabled?: boolean;
   summarizationConfig?: SummarizationConfig;
+  /**
+   * Optional host-supplied, user-visible guidance for compaction. The SDK
+   * validates, bounds, and scopes entries to the messages being compacted;
+   * raw conversation messages remain authoritative. Captured when the
+   * AgentContext is constructed; labels committed later in the same run are
+   * outside this construction-time interface.
+   */
+  compactionSemanticIndex?: CompactionSemanticIndex;
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
    *  Injected into the dynamic system tail via AgentContext. */
   initialSummary?: { text: string; tokenCount: number };
@@ -892,6 +921,8 @@ export interface AgentInputs {
    */
   graphTools?: GenericTool[];
 }
+
+export type AgentInputs = AgentInputFields & ProviderClientOptionsConfig;
 
 export interface ContextPruningConfig {
   enabled?: boolean;

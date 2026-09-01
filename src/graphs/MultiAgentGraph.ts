@@ -17,12 +17,21 @@ import {
 import type { BaseMessage, AIMessageChunk } from '@langchain/core/messages';
 import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type { ToolRuntime } from '@langchain/core/tools';
+import type { ProviderMessageProvenancePart } from '@/messages/provenance';
 import type { GraphFactoryDependencies } from '@/graphs/graphFactory';
 import type * as t from '@/types';
+import {
+  hasBijectiveProviderContentPartMapping,
+  inspectProviderMessageProvenance,
+  inspectProviderSourceMessageIds,
+  setInvalidProviderMessageProvenance,
+  setProviderMessageProvenance,
+  stampSyntheticProviderMessage,
+} from '@/messages/provenance';
 import { serializeToolContentBounded } from '@/utils/toolContent';
+import { Constants, MULTI_AGENT_GRAPH_RUN_NAME } from '@/common';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { StandardGraph } from './Graph';
-import { Constants } from '@/common';
 
 /** Pattern to extract instructions from transfer ToolMessage content */
 const HANDOFF_INSTRUCTIONS_PATTERN = /(?:Instructions?|Context):\s*(.+)/is;
@@ -36,10 +45,12 @@ const HANDOFF_INSTRUCTIONS_KEY = 'handoff_instructions';
  * message replayed out of the payload.
  */
 function buildRoutingPrompt(content: string): HumanMessage {
-  return new HumanMessage({
-    content,
-    additional_kwargs: { role: 'user', isMeta: true, source: 'routing' },
-  });
+  return stampSyntheticProviderMessage(
+    new HumanMessage({
+      content,
+      additional_kwargs: { role: 'user', isMeta: true, source: 'routing' },
+    })
+  );
 }
 
 function getHandoffInstructions(
@@ -90,6 +101,14 @@ function isTransferToolName(name: unknown): boolean {
   );
 }
 
+function graphToolName(tool: unknown): string | undefined {
+  if (tool == null || typeof tool !== 'object' || !('name' in tool)) {
+    return undefined;
+  }
+  const { name } = tool;
+  return typeof name === 'string' ? name : undefined;
+}
+
 /**
  * Drop transfer `tool_use` content blocks from an AI message's array content.
  * Companion to the reception's tool-call filtering: array-content providers
@@ -102,23 +121,137 @@ function isTransferToolName(name: unknown): boolean {
 function filterTransferToolUseBlocks(
   content: AIMessage['content'],
   transferToolCallIds: ReadonlySet<string>
-): AIMessage['content'] {
+): {
+  content: AIMessage['content'];
+  retainedContentPartIndices?: readonly number[];
+} {
   if (!Array.isArray(content)) {
-    return content;
+    return { content };
   }
-  return content.filter((block) => {
+  const filteredContent: typeof content = [];
+  const retainedContentPartIndices: number[] = [];
+  for (let index = 0; index < content.length; index++) {
+    const block = content[index];
     if (
-      typeof block !== 'object' ||
-      (block as { type?: string } | null)?.type !== 'tool_use'
+      typeof block === 'object' &&
+      (block as { type?: string } | null)?.type === 'tool_use'
     ) {
-      return true;
+      const toolUse = block as { id?: string; name?: string };
+      if (
+        (toolUse.id != null && transferToolCallIds.has(toolUse.id)) ||
+        isTransferToolName(toolUse.name)
+      ) {
+        continue;
+      }
     }
-    const toolUse = block as { id?: string; name?: string };
-    if (toolUse.id != null && transferToolCallIds.has(toolUse.id)) {
-      return false;
+    filteredContent.push(block);
+    retainedContentPartIndices.push(index);
+  }
+  return { content: filteredContent, retainedContentPartIndices };
+}
+
+/** Rebuild a handoff AI message without losing authorship for retained bytes. */
+function copyFilteredAIMessageProvenance(
+  source: AIMessage | AIMessageChunk,
+  target: AIMessage,
+  retainedContentPartIndices?: readonly number[]
+): AIMessage {
+  const sourceMessageIdsState = inspectProviderSourceMessageIds(source);
+  const provenanceState = inspectProviderMessageProvenance(source);
+  if (
+    provenanceState.status === 'invalid' ||
+    sourceMessageIdsState.status === 'invalid'
+  ) {
+    setInvalidProviderMessageProvenance(target);
+    return target;
+  }
+  const sourceMessageIds =
+    sourceMessageIdsState.status === 'valid'
+      ? sourceMessageIdsState.sourceMessageIds
+      : [];
+  if (provenanceState.status === 'absent') {
+    if (sourceMessageIds.length > 0) {
+      setProviderMessageProvenance(
+        target,
+        sourceMessageIds.map((sourceMessageId) => ({
+          attribution: 'model',
+          sourceMessageId,
+        }))
+      );
     }
-    return !isTransferToolName(toolUse.name);
-  });
+    return target;
+  }
+  const provenance = provenanceState.provenance;
+  const typedSourceMessageIds = new Set<string>();
+  for (const part of provenance.parts) {
+    if (part.sourceMessageId != null) {
+      typedSourceMessageIds.add(part.sourceMessageId);
+    }
+  }
+  const legacyParts: ProviderMessageProvenancePart[] = [];
+  for (const sourceMessageId of sourceMessageIds) {
+    if (!typedSourceMessageIds.has(sourceMessageId)) {
+      legacyParts.push({ attribution: 'model', sourceMessageId });
+    }
+  }
+  const setFilteredProvenance = (
+    parts: readonly ProviderMessageProvenancePart[]
+  ): void => {
+    if (legacyParts.length === 0) {
+      setProviderMessageProvenance(target, parts);
+      return;
+    }
+    const combinedParts = parts.slice();
+    for (const part of legacyParts) {
+      combinedParts.push(part);
+    }
+    setProviderMessageProvenance(target, combinedParts);
+  };
+  if (
+    retainedContentPartIndices == null ||
+    !Array.isArray(source.content) ||
+    retainedContentPartIndices.length === source.content.length
+  ) {
+    setFilteredProvenance(provenance.parts);
+    return target;
+  }
+
+  if (
+    !hasBijectiveProviderContentPartMapping(
+      provenance.parts,
+      source.content.length
+    )
+  ) {
+    /** An older or aggregate envelope cannot be mapped to current blocks.
+     * Preserve its conservative attribution instead of dropping tool lineage. */
+    setFilteredProvenance(provenance.parts);
+    return target;
+  }
+
+  const retainedParts: ProviderMessageProvenancePart[] = [];
+  const retainedContentPartIndexSet = new Set(retainedContentPartIndices);
+  for (const part of provenance.parts) {
+    if (part.sourceContentPartIndices == null) {
+      retainedParts.push(part);
+      continue;
+    }
+    const retainedSourceContentPartIndices: number[] = [];
+    for (const sourceContentPartIndex of part.sourceContentPartIndices) {
+      if (retainedContentPartIndexSet.has(sourceContentPartIndex)) {
+        retainedSourceContentPartIndices.push(sourceContentPartIndex);
+      }
+    }
+    if (retainedSourceContentPartIndices.length > 0) {
+      retainedParts.push({
+        ...part,
+        sourceContentPartIndices: retainedSourceContentPartIndices,
+      });
+    }
+  }
+  setFilteredProvenance(
+    retainedParts.length > 0 ? retainedParts : [{ attribution: 'model' }]
+  );
+  return target;
 }
 
 function isValidHandoffGroupId(value: unknown): value is number {
@@ -162,6 +295,21 @@ function withHandoffGroupMetadata(
   };
 }
 
+function withActiveAgentMetadata(
+  config: LangGraphRunnableConfig | undefined,
+  agentId: string,
+  agentName: string | undefined
+): LangGraphRunnableConfig {
+  return {
+    ...config,
+    metadata: {
+      ...config?.metadata,
+      activeAgentId: agentId,
+      ...(agentName == null ? {} : { activeAgentName: agentName }),
+    },
+  };
+}
+
 /**
  * MultiAgentGraph extends StandardGraph to support dynamic multi-agent workflows
  * with handoffs, fan-in/fan-out, and other composable patterns.
@@ -177,6 +325,7 @@ function withHandoffGroupMetadata(
  * OR continues its workflow (direct edges), but not both simultaneously.
  */
 export class MultiAgentGraph extends StandardGraph {
+  override readonly runName = MULTI_AGENT_GRAPH_RUN_NAME;
   private edges: t.GraphEdge[];
   private startingNodes: Set<string> = new Set();
   private directEdges: t.GraphEdge[] = [];
@@ -468,6 +617,24 @@ export class MultiAgentGraph extends StandardGraph {
   private createHandoffTools(): void {
     // Group handoff edges by source agent(s)
     const handoffsByAgent = new Map<string, t.GraphEdge[]>();
+    const tokenAccountingRefresh = new Set<string>();
+
+    /** Transfer tool names are SDK-reserved. Remove externally supplied or
+     * stale transfer tools before deriving the source agent's allowed set
+     * from the graph edges below. */
+    for (const agentContext of this.agentContexts.values()) {
+      const originalTools = agentContext.graphTools;
+      const retainedTools = agentContext.graphTools?.filter(
+        (graphTool) => !isTransferToolName(graphToolName(graphTool))
+      );
+      if (retainedTools?.length !== originalTools?.length) {
+        tokenAccountingRefresh.add(agentContext.agentId);
+      }
+      agentContext.graphTools =
+        retainedTools != null && retainedTools.length > 0
+          ? retainedTools
+          : undefined;
+    }
 
     // Only process handoff edges for tool creation
     for (const edge of this.handoffEdges) {
@@ -501,15 +668,45 @@ export class MultiAgentGraph extends StandardGraph {
       const handoffTools: t.GenericTool[] = [];
       const sourceAgentName = agentContext.name ?? agentId;
       for (const edge of edges) {
-        handoffTools.push(
-          ...this.createHandoffToolsForEdge(edge, agentId, sourceAgentName)
+        const edgeTools = this.createHandoffToolsForEdge(
+          edge,
+          agentId,
+          sourceAgentName
         );
+        for (const edgeTool of edgeTools) {
+          handoffTools.push(edgeTool);
+        }
       }
 
       if (!agentContext.graphTools) {
         agentContext.graphTools = [];
       }
-      agentContext.graphTools.push(...handoffTools);
+      for (const handoffTool of handoffTools) {
+        agentContext.graphTools.push(handoffTool);
+      }
+      if (handoffTools.length > 0) {
+        tokenAccountingRefresh.add(agentId);
+      }
+    }
+
+    for (const agentId of tokenAccountingRefresh) {
+      const agentContext = this.agentContexts.get(agentId);
+      if (agentContext?.tokenCounter == null) {
+        continue;
+      }
+      const { tokenCounter, baseIndexTokenCountMap } = agentContext;
+      agentContext.tokenCalculationPromise = agentContext
+        .calculateInstructionTokens(tokenCounter)
+        .then(() => {
+          agentContext.updateTokenMapWithInstructions(baseIndexTokenCountMap);
+        })
+        .catch((err) => {
+          // eslint-disable-next-line no-console
+          console.error(
+            'Error recalculating instruction tokens after handoff tool updates:',
+            err
+          );
+        });
     }
   }
 
@@ -700,11 +897,14 @@ export class MultiAgentGraph extends StandardGraph {
                    * Multiple tool calls - create filtered AIMessage with ONLY this call.
                    * This ensures valid message structure for parallel handoffs.
                    */
-                  const filteredAiMsg = new AIMessage({
-                    content: originalAiMsg.content,
-                    tool_calls: [thisToolCall],
-                    id: originalAiMsg.id,
-                  });
+                  const filteredAiMsg = copyFilteredAIMessageProvenance(
+                    originalAiMsg,
+                    new AIMessage({
+                      content: originalAiMsg.content,
+                      tool_calls: [thisToolCall],
+                      id: originalAiMsg.id,
+                    })
+                  );
 
                   filteredMessages = [
                     ...messages.slice(0, aiMessageIndex),
@@ -980,14 +1180,19 @@ export class MultiAgentGraph extends StandardGraph {
                * result in THIS recipient's state, so its id is never
                * collected, but its name still marks it.
                */
-              const filteredAiMsg = new AIMessage({
-                content: filterTransferToolUseBlocks(
-                  aiMsg.content,
-                  transferToolCallIds
-                ),
-                tool_calls: remainingToolCalls,
-                id: aiMsg.id,
-              });
+              const filteredContent = filterTransferToolUseBlocks(
+                aiMsg.content,
+                transferToolCallIds
+              );
+              const filteredAiMsg = copyFilteredAIMessageProvenance(
+                aiMsg,
+                new AIMessage({
+                  content: filteredContent.content,
+                  tool_calls: remainingToolCalls,
+                  id: aiMsg.id,
+                }),
+                filteredContent.retainedContentPartIndices
+              );
               filteredMessages.push(filteredAiMsg);
             }
             /** If no remaining content or tool calls, skip this message entirely */
@@ -1098,10 +1303,16 @@ export class MultiAgentGraph extends StandardGraph {
       ): Promise<t.MultiAgentGraphState | Command> => {
         let result: t.MultiAgentGraphState;
         let inputMessages = state.messages;
-        const memberConfig =
+        const agentContext = this.agentContexts.get(agentId);
+        const recursionLimitedConfig =
           this.memberRecursionLimit == null
             ? config
             : { ...config, recursionLimit: this.memberRecursionLimit };
+        const memberConfig = withActiveAgentMetadata(
+          recursionLimitedConfig,
+          agentId,
+          agentContext?.name
+        );
 
         /**
          * Check if this agent is receiving a handoff.
@@ -1113,7 +1324,6 @@ export class MultiAgentGraph extends StandardGraph {
           state.messages,
           agentId
         );
-        const agentContext = this.agentContexts.get(agentId);
 
         if (
           handoffContext?.sourceAgentName != null &&
@@ -1156,8 +1366,10 @@ export class MultiAgentGraph extends StandardGraph {
             if (lastMsg != null && lastMsg.getType() === 'tool') {
               messagesForAgent = [
                 ...filteredMessages,
-                new AIMessage(
-                  `[Processed tool result and transferring to ${agentId}]`
+                stampSyntheticProviderMessage(
+                  new AIMessage(
+                    `[Processed tool result and transferring to ${agentId}]`
+                  )
                 ),
                 buildRoutingPrompt(instructions),
               ];
@@ -1438,6 +1650,9 @@ export class MultiAgentGraph extends StandardGraph {
       }
     }
 
-    return builder.compile(this.compileOptions as unknown as never);
+    return builder.compile({
+      ...this.compileOptions,
+      name: MULTI_AGENT_GRAPH_RUN_NAME,
+    } as unknown as never);
   }
 }

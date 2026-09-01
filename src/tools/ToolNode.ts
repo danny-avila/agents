@@ -62,7 +62,6 @@ import {
   SUBAGENT_PARENT_BATCH_CONFIG_KEY,
   SUBAGENT_REPLAY_CONTROLLER,
 } from '@/tools/subagent/SubagentReplay';
-import { attachRunStepResumeState } from '@/tools/runStepResume';
 import {
   INTENT_ARG,
   readOutcomeFields,
@@ -72,6 +71,8 @@ import {
 } from '@/tools/intentArg';
 import {
   buildToolExecutionRequestPlan,
+  coerceArgsForSchema,
+  coerceRecordArgs,
   resolveRuntimeSessionHint,
   recordArgsEqual,
 } from '@/tools/eagerEventExecution';
@@ -95,8 +96,17 @@ import {
   resolveLocalToolRegistry,
   resolveLocalExecutionTools,
 } from '@/tools/local';
+import {
+  type CallerCapabilityProjection,
+  createCallerCapabilityProjectionSnapshot,
+  isToolDefinitionActive,
+  isProgrammaticControlTool,
+  mergeCallerCapabilityDefinitions,
+  resolveCallerCapabilityProjection,
+} from '@/tools/CallerCapabilities';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
+import { attachRunStepResumeState } from '@/tools/runStepResume';
 
 /** Host-facing batch requests must not carry the batch's breaker scope —
  * hosts spread `configurable` into their own run configs. */
@@ -110,6 +120,7 @@ function stripRunBreakerScope(
   return rest;
 }
 import { convertInjectedMessages } from '@/messages/injected';
+import { stampSyntheticProviderMessage } from '@/messages/provenance';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { RunnableCallable, composeAbortSignals } from '@/utils';
 import {
@@ -692,8 +703,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   >();
   /** Tool registry for filtering (lazy computation of programmatic maps) */
   private toolRegistry?: t.LCToolRegistry;
-  /** Cached programmatic tools (computed once on first PTC call) */
-  private programmaticCache?: t.ProgrammaticCache;
+  /** Schema-only definitions used when event mode has no runtime registry. */
+  private toolDefinitions?: t.LCToolRegistry;
+  /** Tool-map entries created or replaced by the local execution resolver. */
+  private localImplementationNames = new Set<string>();
+  /** Reads deferred-tool discovery state from the owning agent context. */
+  private getDiscoveredToolNames?: () => readonly string[];
   /** Reference to Graph's sessions map for automatic session injection */
   private sessions?: t.ToolSessionMap;
   /** Partition within `sessions` owned by this agent's execution profile. */
@@ -723,6 +738,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * even where `agentId` (the subagent-scope marker) is undefined.
    */
   private executingAgentId?: string;
+  private executingAgentName?: string;
+  private rootAgentId?: string;
+  private rootAgentName?: string;
   /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
   private directToolNames?: Set<string>;
   /**
@@ -797,6 +815,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     handleToolErrors,
     loadRuntimeTools,
     toolRegistry,
+    toolDefinitions,
+    getDiscoveredToolNames,
     sessions,
     codeSessionKey,
     eventDrivenMode,
@@ -806,6 +826,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     eagerEventToolSuppressions,
     agentId,
     executingAgentId,
+    executingAgentName,
+    rootAgentId,
+    rootAgentName,
     directToolNames,
     interruptingToolNames,
     codeSessionToolNames,
@@ -872,6 +895,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       toolRegistry,
       toolExecution,
     });
+    this.toolDefinitions = toolDefinitions;
+    this.getDiscoveredToolNames = getDiscoveredToolNames;
     this.sessions = sessions;
     this.codeSessionKey = codeSessionKey ?? Constants.EXECUTE_CODE;
     this.eventDrivenMode = eventDrivenMode ?? false;
@@ -883,6 +908,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // Default to agentId so callers constructing ToolNode directly (who pass the
     // existing agentId option) still get attribution without knowing the new option.
     this.executingAgentId = executingAgentId ?? agentId;
+    this.executingAgentName = executingAgentName;
+    this.rootAgentId = rootAgentId;
+    this.rootAgentName = rootAgentName;
     this.directToolNames = directToolNames;
     this.interruptingToolNames =
       interruptingToolNames != null && interruptingToolNames.size > 0
@@ -944,6 +972,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           metadata: {
             ...options?.metadata,
             agentId: this.executingAgentId,
+            activeAgentId: this.executingAgentId,
+            ...(this.executingAgentName == null
+              ? {}
+              : { activeAgentName: this.executingAgentName }),
+            ...(this.rootAgentId == null
+              ? {}
+              : { rootAgentId: this.rootAgentId }),
+            ...(this.rootAgentName == null
+              ? {}
+              : { rootAgentName: this.rootAgentName }),
           },
         };
     return withLangfuseRuntimeScope(
@@ -986,10 +1024,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const resolved = resolveLocalExecutionTools({
       toolMap: this.toolMap,
       toolExecution: this.toolExecution,
+      toolRegistry: this.toolRegistry,
       fileCheckpointer: this.fileCheckpointer,
     });
 
     this.toolMap = resolved.toolMap;
+    this.localImplementationNames = resolved.localImplementationNames;
     if (resolved.fileCheckpointer != null) {
       this.fileCheckpointer = resolved.fileCheckpointer;
     }
@@ -1001,7 +1041,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       ...(this.directToolNames ?? new Set<string>()),
       ...resolved.directToolNames,
     ]);
-    this.programmaticCache = undefined;
   }
 
   /**
@@ -1097,30 +1136,81 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.settledInterruptingResults.clear();
   }
 
-  /**
-   * Returns cached programmatic tools, computing once on first access.
-   * Single iteration builds both toolMap and toolDefs simultaneously.
-   */
-  private getProgrammaticTools(): { toolMap: t.ToolMap; toolDefs: t.LCTool[] } {
-    if (this.programmaticCache) return this.programmaticCache;
+  /** Returns the live caller projection used by direct and event execution. */
+  private getCallerCapabilityProjection(): CallerCapabilityProjection {
+    const discoveredToolNames = new Set(
+      this.getDiscoveredToolNames?.() ?? []
+    );
+    return resolveCallerCapabilityProjection(
+      mergeCallerCapabilityDefinitions(
+        this.toolDefinitions?.values(),
+        this.toolRegistry?.values()
+      ),
+      (toolDef) => isToolDefinitionActive(toolDef, discoveredToolNames)
+    );
+  }
 
+  private getToolParameterSchema(
+    toolName: string
+  ): t.JsonSchemaType | undefined {
+    return (
+      this.toolDefinitions?.get(toolName)?.parameters ??
+      this.toolRegistry?.get(toolName)?.parameters
+    );
+  }
+
+  private coerceEventToolArgs(
+    toolName: string,
+    args: unknown
+  ): Record<string, unknown> {
+    const recordArgs = coerceRecordArgs(args);
+    return coerceArgsForSchema(
+      recordArgs ?? (args as Record<string, unknown>),
+      this.getToolParameterSchema(toolName)
+    );
+  }
+
+  /** Serializes the live caller projection for event-driven hosts. */
+  private getCallerCapabilityProjectionSnapshot(): t.CallerCapabilityProjectionSnapshot {
+    return createCallerCapabilityProjectionSnapshot(
+      this.getCallerCapabilityProjection()
+    );
+  }
+
+  /** Returns active tools projected by their effective caller capabilities. */
+  private getProgrammaticTools(): t.ProgrammaticCache {
     const toolMap: t.ToolMap = new Map();
     const toolDefs: t.LCTool[] = [];
-
-    if (this.toolRegistry) {
-      for (const [name, toolDef] of this.toolRegistry) {
-        if (
-          (toolDef.allowed_callers ?? ['direct']).includes('code_execution')
-        ) {
-          toolDefs.push(toolDef);
-          const tool = this.toolMap.get(name);
-          if (tool) toolMap.set(name, tool);
-        }
+    const discoveredToolNames = new Set(
+      this.getDiscoveredToolNames?.() ?? []
+    );
+    const executableCapabilities = resolveCallerCapabilityProjection(
+      this.toolRegistry?.values() ?? [],
+      (toolDef) => isToolDefinitionActive(toolDef, discoveredToolNames)
+    );
+    for (const toolDef of executableCapabilities.codeExecutionTools) {
+      if (
+        this.eventDrivenMode &&
+        this.directToolNames?.has(toolDef.name) !== true &&
+        !this.localImplementationNames.has(toolDef.name)
+      ) {
+        continue;
+      }
+      const tool = this.toolMap.get(toolDef.name);
+      if (tool != null) {
+        toolMap.set(toolDef.name, tool);
+        toolDefs.push(toolDef);
       }
     }
+    const activeCapabilities = this.getCallerCapabilityProjection();
 
-    this.programmaticCache = { toolMap, toolDefs };
-    return this.programmaticCache;
+    return {
+      toolMap,
+      toolDefs,
+      disallowedToolDefs: activeCapabilities.directOnlyTools
+        .filter((toolDef) => !isProgrammaticControlTool(toolDef.name))
+        .map((toolDef) => ({ name: toolDef.name })),
+    };
   }
 
   /**
@@ -1331,11 +1421,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
         call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING
       ) {
-        const { toolMap, toolDefs } = this.getProgrammaticTools();
+        const { toolMap, toolDefs, disallowedToolDefs } =
+          this.getProgrammaticTools();
         invokeParams = {
           ...invokeParams,
           toolMap,
           toolDefs,
+          disallowedToolDefs,
+          programmaticToolName: call.name,
           // Plumb the hook context into the programmatic-tool path so
           // inner tool calls made via the in-process bridge can run
           // through `PreToolUse` (deny / updatedInput) before reaching
@@ -2706,7 +2799,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return {
         call,
         stepId: this.toolCallStepIds?.get(call.id!) ?? '',
-        args: resolvedArgs,
+        args: this.coerceEventToolArgs(call.name, resolvedArgs),
         batchIndex: batchIndices?.[i],
       };
     });
@@ -2950,7 +3043,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               entry.call.name
             ),
           });
-          entry.args = resolved as Record<string, unknown>;
+          entry.args = this.coerceEventToolArgs(
+            entry.call.name,
+            resolved as Record<string, unknown>
+          );
           if (entry.call.id != null) {
             if (unresolved.length > 0) {
               unresolvedByCallId.set(entry.call.id, unresolved);
@@ -2960,7 +3056,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           }
           return;
         }
-        entry.args = nextArgs;
+        entry.args = this.coerceEventToolArgs(entry.call.name, nextArgs);
       };
 
       const askEntries: Array<{
@@ -3317,6 +3413,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }),
         usageCount: this.toolUsageCount,
         invalidArgsBehavior: 'error-result',
+        getToolSchema: (toolName) => this.getToolParameterSchema(toolName),
         recordTurn: (toolName, reservedTurn, callId) => {
           this.recordEventToolPlanningTurn(
             toolName,
@@ -3444,6 +3541,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               // the eager path sends `agentContext.agentId` — this must
               // match it at the top level too.
               agentId: this.executingAgentId,
+              callerCapabilityProjection:
+                this.getCallerCapabilityProjectionSnapshot(),
               configurable: stripRunBreakerScope(
                   config.configurable as Record<string, unknown> | undefined
               ),
@@ -3927,10 +4026,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * a user message; `role` is metadata only.
        */
       injected.push(
-        new HumanMessage({
-          content: batchAdditionalContexts.join('\n\n'),
-          additional_kwargs: { role: 'system', source: 'hook' },
-        })
+        stampSyntheticProviderMessage(
+          new HumanMessage({
+            content: batchAdditionalContexts.join('\n\n'),
+            additional_kwargs: { role: 'system', source: 'hook' },
+          })
+        )
       );
     }
 
@@ -4423,13 +4524,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         directAdditionalContexts.length > 0
           ? [
             sendOutput,
-            new HumanMessage({
-              content: directAdditionalContexts.join('\n\n'),
-              // Match the event-driven path's marker so hosts /
-              // model-side annotators treat this as system intent
-              // rather than ordinary user text. Codex P2 [46].
-              additional_kwargs: { role: 'system', source: 'hook' },
-            }),
+            stampSyntheticProviderMessage(
+              new HumanMessage({
+                content: directAdditionalContexts.join('\n\n'),
+                // Match the event-driven path's marker so hosts /
+                // model-side annotators treat this as system intent
+                // rather than ordinary user text. Codex P2 [46].
+                additional_kwargs: { role: 'system', source: 'hook' },
+              })
+            ),
           ]
           : [sendOutput];
       await this.handleRunToolCompletions(
@@ -4477,7 +4580,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.toolMap =
           toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
         this.applyToolExecutionOverrides();
-        this.programmaticCache = undefined; // Invalidate cache on toolMap change
       }
 
       const filteredCalls =
@@ -4721,14 +4823,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const directInjected: BaseMessage[] =
           directAdditionalContexts.length > 0
             ? [
-              new HumanMessage({
-                content: directAdditionalContexts.join('\n\n'),
-                // System-role metadata to match the event-driven
-                // path so policy/recovery guidance is treated
-                // consistently regardless of whether the tool ran
-                // direct or dispatched. Codex P2 [46].
-                additional_kwargs: { role: 'system', source: 'hook' },
-              }),
+              stampSyntheticProviderMessage(
+                new HumanMessage({
+                  content: directAdditionalContexts.join('\n\n'),
+                  // System-role metadata to match the event-driven
+                  // path so policy/recovery guidance is treated
+                  // consistently regardless of whether the tool ran
+                  // direct or dispatched. Codex P2 [46].
+                  additional_kwargs: { role: 'system', source: 'hook' },
+                })
+              ),
             ]
             : [];
         outputs = [
@@ -4782,13 +4886,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               ...promotedPrefix,
               ...toolOutputs,
               ...invalidCallResults,
-              new HumanMessage({
-                content: directAdditionalContexts.join('\n\n'),
-                // Same system-role marker the event-driven path
-                // uses so direct vs dispatched is invisible to
-                // downstream consumers. Codex P2 [46].
-                additional_kwargs: { role: 'system', source: 'hook' },
-              }),
+              stampSyntheticProviderMessage(
+                new HumanMessage({
+                  content: directAdditionalContexts.join('\n\n'),
+                  // Same system-role marker the event-driven path
+                  // uses so direct vs dispatched is invisible to
+                  // downstream consumers. Codex P2 [46].
+                  additional_kwargs: { role: 'system', source: 'hook' },
+                })
+              ),
             ]
             : [...promotedPrefix, ...toolOutputs, ...invalidCallResults];
       }

@@ -1,6 +1,11 @@
 // src/specs/agent-handoffs.test.ts
+import { z } from 'zod';
 import { MemorySaver } from '@langchain/langgraph';
 import { DynamicStructuredTool } from '@langchain/core/tools';
+import {
+  RunnableLambda,
+  RunnableToolLike,
+} from '@langchain/core/runnables';
 import {
   AIMessage,
   HumanMessage,
@@ -50,6 +55,26 @@ const findToolByName = (
 ): t.GraphTools[0] | undefined => {
   return tools?.find((tool) => getToolName(tool) === name);
 };
+
+const createGraphTool = (name: string, output: string): t.GenericTool =>
+  new RunnableToolLike({
+    name,
+    description: `Test ${name} tool`,
+    schema: z.object({}),
+    bound: RunnableLambda.from(async (): Promise<string> => output),
+  });
+
+class MetadataCapturingToolNode extends ToolNode<t.BaseGraphState> {
+  observedConfig?: RunnableConfig;
+
+  protected override async run(
+    input: t.BaseGraphState,
+    config: RunnableConfig
+  ): Promise<t.BaseGraphState> {
+    this.observedConfig = config;
+    return input;
+  }
+}
 
 type HandoffModelScript = {
   promptMarker: string;
@@ -289,10 +314,21 @@ describe('Agent Handoffs Tests', () => {
       expect(handoffToolMessage?.content).toContain('transferred to agent_b');
     });
 
-    it('should not create handoff tool for agent without outgoing edges', async () => {
+    it('should not expose an inbound handoff tool to its recipient', async () => {
+      const leakedTransferTool = createGraphTool(
+        `${Constants.LC_TRANSFER_TO_}agent_b`,
+        'transferred'
+      );
+      const retainedGraphTool = createGraphTool(
+        'retained_graph_tool',
+        'retained'
+      );
       const agents: t.AgentInputs[] = [
         createBasicAgent('agent_a', 'You are agent A'),
-        createBasicAgent('agent_b', 'You are agent B'),
+        {
+          ...createBasicAgent('agent_b', 'You are agent B'),
+          graphTools: [leakedTransferTool, retainedGraphTool],
+        },
       ];
 
       const edges: t.GraphEdge[] = [
@@ -303,19 +339,55 @@ describe('Agent Handoffs Tests', () => {
         },
       ];
 
-      const run = await Run.create(createTestConfig(agents, edges));
+      const config = createTestConfig(agents, edges);
+      config.tokenCounter = () => 1;
+      const run = await Run.create(config);
 
       const agentBContext = (run.Graph as StandardGraph).agentContexts.get(
         'agent_b'
       );
       expect(agentBContext).toBeDefined();
 
-      // Agent B should not have handoff tools (no outgoing edges)
+      // Agent B has no outgoing edge, so any inbound transfer is removed.
       const handoffTools = agentBContext?.graphTools?.filter((tool) => {
         const name = getToolName(tool);
         return name?.startsWith(Constants.LC_TRANSFER_TO_) ?? false;
       });
       expect(handoffTools?.length ?? 0).toBe(0);
+      expect(
+        findToolByName(agentBContext?.graphTools, 'retained_graph_tool')
+      ).toBeDefined();
+      await agentBContext?.tokenCalculationPromise;
+      expect(agentBContext?.toolTokenCounts).not.toHaveProperty(
+        `${Constants.LC_TRANSFER_TO_}agent_b`
+      );
+      expect(agentBContext?.toolTokenCounts).toHaveProperty(
+        'retained_graph_tool'
+      );
+    });
+
+    it('stamps the owning agent on tool observation metadata', async () => {
+      const node = new MetadataCapturingToolNode({
+        tools: [],
+        executingAgentId: 'mateo',
+        executingAgentName: 'Mateo Serrano',
+        rootAgentId: 'leila',
+        rootAgentName: 'Leila Mensah',
+      });
+
+      await node.invoke(
+        { messages: [] },
+        { metadata: { requestId: 'request-1' } }
+      );
+
+      expect(node.observedConfig?.metadata).toMatchObject({
+        requestId: 'request-1',
+        agentId: 'mateo',
+        activeAgentId: 'mateo',
+        activeAgentName: 'Mateo Serrano',
+        rootAgentId: 'leila',
+        rootAgentName: 'Leila Mensah',
+      });
     });
   });
 

@@ -1,7 +1,6 @@
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { AssistantTextPhase } from '@/types/assistantPhase';
-import type { ClientOptions } from '@/types/llm';
-import type { Providers } from '@/common';
+import type { ClientOptions, ProviderName } from '@/types/llm';
 
 /** One tool call's contribution to the label payload (host-assembled). */
 export type ActivityLabelToolEntry = {
@@ -25,7 +24,7 @@ export type ActivityLabelToolEntry = {
  * `activity_label` content type's formatter exclusions.
  */
 export type RunActivityLabelOptions = {
-  provider: Providers;
+  provider: ProviderName;
   clientOptions?: ClientOptions;
   /**
    * Agent that executed the labeled batch. Selects that agent's Langfuse
@@ -62,8 +61,9 @@ export type RunActivityLabelOptions = {
   };
   /**
    * Seed for deterministic Langfuse trace ids (e.g. `${runId}-${slotIndex}`)
-   * so each batch's label gets a distinct, reproducible trace. When omitted,
-   * a per-run sequence keeps batches from collapsing into one trace.
+   * for a distinct, reproducible fallback trace when the source agent
+   * observation is unavailable. Normally the label is parented into the
+   * source agent trace instead.
    */
   traceSeed?: string;
 };
@@ -84,7 +84,7 @@ export type ActivityPhaseEntry = {
 
 /** Options for `Run.generateActivityPhaseLabel`. */
 export type RunActivityPhaseLabelOptions = {
-  provider: Providers;
+  provider: ProviderName;
   clientOptions?: ClientOptions;
   /**
    * Logical activities in run order. The SDK requires at least two so hosts
@@ -112,7 +112,7 @@ export type RunActivityPhaseLabelOptions = {
   traceSeed?: string;
   /** Stable source run identifier recorded on the phase observation. */
   sourceRunId?: string;
-  /** Source Langfuse trace id for linking this detached summary trace. */
+  /** Source Langfuse trace id retained as correlation metadata. */
   sourceTraceId?: string;
   /** Host response/message identifier recorded on the phase observation. */
   responseId?: string;

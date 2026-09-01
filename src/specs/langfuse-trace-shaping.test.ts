@@ -1,9 +1,15 @@
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import {
+  ACTIVITY_LABEL_RUN_NAME,
+  REASONING_LABEL_RUN_NAME,
+  ACTIVITY_PHASE_LABEL_RUN_NAME,
+} from '@/common';
+import {
   shapeLangfuseSpan,
   shouldDropLangfuseSpan,
 } from '@/langfuseTraceShaping';
+import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 
 type TestSpan = ReadableSpan & {
   name: string;
@@ -24,11 +30,13 @@ function createSpan(
 
 const INPUT = LangfuseOtelSpanAttributes.OBSERVATION_INPUT;
 const OUTPUT = LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT;
-const TRACE_INPUT = LangfuseOtelSpanAttributes.TRACE_INPUT;
-const TRACE_OUTPUT = LangfuseOtelSpanAttributes.TRACE_OUTPUT;
+const DEPRECATED_TRACE_INPUT = 'langfuse.trace.input';
+const DEPRECATED_TRACE_OUTPUT = 'langfuse.trace.output';
 const OBSERVATION_TYPE = LangfuseOtelSpanAttributes.OBSERVATION_TYPE;
 const TRACE_TAGS = LangfuseOtelSpanAttributes.TRACE_TAGS;
 const METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
+const METADATA_OPERATION = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${LANGFUSE_OPERATION_METADATA_KEY}`;
+const METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.compaction_semantic_index_entries`;
 
 /** The outer workflow node: a non-root LangGraph node span whose
  *  `langgraph_node` metadata equals its name. */
@@ -59,6 +67,72 @@ describe('shapeLangfuseSpan', () => {
     shapeLangfuseSpan(span);
     expect(span.name).toBe('agent');
     expect(span.attributes[OBSERVATION_TYPE]).toBe('agent');
+  });
+
+  it('names graph observations for the SDK runtime pattern', () => {
+    const standard = createSpan(
+      'LangGraph',
+      { [METADATA_LANGGRAPH_NODE]: 'agent_primary' },
+      'parent-1'
+    );
+    const multiAgent = createSpan('MultiAgentGraph', {
+      [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+    });
+
+    shapeLangfuseSpan(standard);
+    shapeLangfuseSpan(multiAgent);
+
+    expect(standard.name).toBe('AgentGraph');
+    expect(standard.attributes[OBSERVATION_TYPE]).toBe('agent');
+    expect(multiAgent.name).toBe('MultiAgentGraph');
+    expect(multiAgent.attributes[OBSERVATION_TYPE]).toBe('agent');
+  });
+
+  it('types agent-tagged graph roots nested beneath managed hosts', () => {
+    const standard = createSpan(
+      'AgentGraph',
+      {
+        [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
+        [INPUT]: JSON.stringify({
+          messages: [{ type: 'human', content: 'Inspect the nested run' }],
+        }),
+        [OUTPUT]: JSON.stringify({
+          messages: [{ type: 'ai', content: 'Nested run complete' }],
+        }),
+      },
+      'managed-host-span'
+    );
+
+    shapeLangfuseSpan(standard);
+
+    expect(standard.name).toBe('AgentGraph');
+    expect(standard.attributes[OBSERVATION_TYPE]).toBe('agent');
+    expect(standard.attributes[INPUT]).toBe('Inspect the nested run');
+    expect(standard.attributes[OUTPUT]).toBe('Nested run complete');
+    expect(standard.attributes[DEPRECATED_TRACE_INPUT]).toBeUndefined();
+    expect(standard.attributes[DEPRECATED_TRACE_OUTPUT]).toBeUndefined();
+  });
+
+  it('names the agent prompt-to-model sequence as an SDK operation', () => {
+    const span = createSpan(
+      'RunnableSequence',
+      { [METADATA_LANGGRAPH_NODE]: 'agent=openAI__gpt-5.4' },
+      'parent-1'
+    );
+
+    shapeLangfuseSpan(span);
+
+    expect(span.name).toBe('AgentModelCall');
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
+  });
+
+  it('does not rename unrelated runnable sequences', () => {
+    const span = createSpan('RunnableSequence', {}, 'parent-1');
+
+    shapeLangfuseSpan(span);
+
+    expect(span.name).toBe('RunnableSequence');
+    expect(span.attributes[OBSERVATION_TYPE]).toBeUndefined();
   });
 
   it('shapes tool nodes as stable dispatch chains with scoped call inputs', () => {
@@ -182,7 +256,10 @@ describe('shapeLangfuseSpan', () => {
     expect(JSON.parse(mixedSpan.attributes[INPUT] as string)).toEqual([
       { name: 'echo', args: { command: 'hi' } },
       { name: 'echo', args: '"raw unparsed' },
-      { name: 'unknown', args: 'nameless — included with the unknown fallback' },
+      {
+        name: 'unknown',
+        args: 'nameless — included with the unknown fallback',
+      },
     ]);
 
     const invalidOnly = [
@@ -231,7 +308,9 @@ describe('shapeLangfuseSpan', () => {
           {
             type: 'ai',
             id: 'ai_array_span',
-            tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+            tool_calls: [
+              { name: 'echo', args: { command: 'hi' }, id: 'tc_ok' },
+            ],
             invalid_tool_calls: [invalidCall],
           },
         ]),
@@ -250,7 +329,9 @@ describe('shapeLangfuseSpan', () => {
           messages: [
             {
               type: 'ai',
-              tool_calls: [{ name: 'echo', args: { command: 'hi' }, id: 'tc_ok' }],
+              tool_calls: [
+                { name: 'echo', args: { command: 'hi' }, id: 'tc_ok' },
+              ],
               invalid_tool_calls: [invalidCall],
             },
           ],
@@ -389,7 +470,7 @@ describe('shapeLangfuseSpan', () => {
     expect(span.name).toBe('bedrock__claude-sonnet-5___ClickHouse Agent');
   });
 
-  it('sets root span and trace input/output to the question and answer', () => {
+  it('sets root-observation input/output without deprecated trace input/output', () => {
     const span = createSpan('LibreChat Agent', {
       [TRACE_TAGS]: JSON.stringify(['librechat', 'agent']),
       [INPUT]: JSON.stringify({
@@ -404,12 +485,14 @@ describe('shapeLangfuseSpan', () => {
           { type: 'ai', content: 'A columnar OLAP database.' },
         ],
       }),
+      [DEPRECATED_TRACE_INPUT]: 'legacy question',
+      [DEPRECATED_TRACE_OUTPUT]: 'legacy answer',
     });
     shapeLangfuseSpan(span);
     expect(span.attributes[INPUT]).toBe('What is ClickHouse?');
-    expect(span.attributes[TRACE_INPUT]).toBe('What is ClickHouse?');
     expect(span.attributes[OUTPUT]).toBe('A columnar OLAP database.');
-    expect(span.attributes[TRACE_OUTPUT]).toBe('A columnar OLAP database.');
+    expect(span.attributes[DEPRECATED_TRACE_INPUT]).toBeUndefined();
+    expect(span.attributes[DEPRECATED_TRACE_OUTPUT]).toBeUndefined();
   });
 
   it('extracts answer text from content part arrays', () => {
@@ -444,11 +527,72 @@ describe('shapeLangfuseSpan', () => {
     expect(span.attributes[INPUT]).toBe(original);
   });
 
+  it('redacts semantic-index content while retaining compaction trace counts', () => {
+    const span = createSpan(
+      'ChatOpenAI',
+      {
+        [OBSERVATION_TYPE]: 'generation',
+        [METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES]: 1,
+        [INPUT]: JSON.stringify({
+          messages: [
+            {
+              type: 'human',
+              content:
+                '<compaction-semantic-index>raw history example</compaction-semantic-index>',
+            },
+            {
+              type: 'human',
+              content:
+                '<compaction-semantic-index>\n- activity_phase: secret label\n</compaction-semantic-index>\n\nCheckpoint prompt with <compaction-semantic-index>custom example</compaction-semantic-index>',
+            },
+          ],
+        }),
+      },
+      'parent-1'
+    );
+
+    shapeLangfuseSpan(span);
+
+    expect(span.attributes[METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES]).toBe(1);
+    expect(span.attributes[INPUT]).toContain(
+      '<compaction-semantic-index>raw history example</compaction-semantic-index>'
+    );
+    expect(span.attributes[INPUT]).toContain('Checkpoint prompt');
+    expect(span.attributes[INPUT]).toContain(
+      '<compaction-semantic-index>custom example</compaction-semantic-index>'
+    );
+    expect(span.attributes[INPUT]).toContain(
+      '<compaction-semantic-index redacted=\\"true\\" />'
+    );
+    expect(span.attributes[INPUT]).not.toContain('secret label');
+  });
+
+  it('does not redact a literal index example without positive metadata', () => {
+    const original = JSON.stringify({
+      messages: [
+        {
+          type: 'human',
+          content:
+            '<compaction-semantic-index>example</compaction-semantic-index>',
+        },
+      ],
+    });
+    const span = createSpan(
+      'ChatOpenAI',
+      { [OBSERVATION_TYPE]: 'generation', [INPUT]: original },
+      'parent-1'
+    );
+
+    shapeLangfuseSpan(span);
+
+    expect(span.attributes[INPUT]).toBe(original);
+  });
+
   it('preserves root attributes when extraction finds nothing', () => {
     const span = createSpan('LibreChat Agent', { [INPUT]: 'plain text' });
     shapeLangfuseSpan(span);
     expect(span.attributes[INPUT]).toBe('plain text');
-    expect(span.attributes[TRACE_INPUT]).toBe('plain text');
+    expect(span.attributes[DEPRECATED_TRACE_INPUT]).toBeUndefined();
   });
 
   it('renames generation spans to a provider-agnostic name', () => {
@@ -482,12 +626,12 @@ describe('shapeLangfuseSpan', () => {
     shapeLangfuseSpan(span);
 
     expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
-    expect(span.attributes[TRACE_INPUT]).toBe('Conversation text');
-    expect(span.attributes[TRACE_OUTPUT]).toBe('Conversation title');
+    expect(span.attributes[INPUT]).toBe('Conversation text');
+    expect(span.attributes[OUTPUT]).toBe('Conversation title');
   });
 
   it('marks activity-phase roots as chains even when tagged as agent work', () => {
-    const span = createSpan('summarize-activity-phase', {
+    const span = createSpan('MultiStepLabel', {
       [TRACE_TAGS]: JSON.stringify([
         'librechat',
         'activity-phase',
@@ -500,9 +644,10 @@ describe('shapeLangfuseSpan', () => {
 
     shapeLangfuseSpan(span);
 
+    expect(span.name).toBe('MultiStepLabel');
     expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
-    expect(span.attributes[TRACE_INPUT]).toBe('What changed?');
-    expect(span.attributes[TRACE_OUTPUT]).toBe(
+    expect(span.attributes[INPUT]).toBe('What changed?');
+    expect(span.attributes[OUTPUT]).toBe(
       'Reconciled the implementation and verified the fix'
     );
   });
@@ -538,11 +683,11 @@ describe('shapeLangfuseSpan', () => {
 
     expect(span.name).toBe('llm');
     expect(span.attributes[OBSERVATION_TYPE]).toBe('generation');
-    expect(span.attributes[TRACE_INPUT]).toBe('Generate a title');
-    expect(span.attributes[TRACE_OUTPUT]).toBe('A useful title');
+    expect(span.attributes[INPUT]).toBe('Generate a title');
+    expect(span.attributes[OUTPUT]).toBe('A useful title');
   });
 
-  it('keeps a generation root\'s full observation input while reducing trace input', () => {
+  it('keeps a generation root\'s full observation input/output', () => {
     /** The activity-label path: a bare model.invoke traces the generation
      *  as its own root, so the observation input is the ONLY record of
      *  the system prompt. The exact shape @langfuse/langchain exports. */
@@ -557,19 +702,64 @@ describe('shapeLangfuseSpan', () => {
     const span = createSpan('LibreChat Activity Label', {
       [OBSERVATION_TYPE]: 'generation',
       [TRACE_TAGS]: JSON.stringify(['librechat', 'activity-label']),
+      [METADATA_OPERATION]: ACTIVITY_LABEL_RUN_NAME,
       [INPUT]: originalInput,
       [OUTPUT]: originalOutput,
     });
 
     shapeLangfuseSpan(span);
 
-    expect(span.name).toBe('llm');
+    expect(span.name).toBe('StepLabel');
     expect(span.attributes[INPUT]).toBe(originalInput);
     expect(span.attributes[OUTPUT]).toBe(originalOutput);
-    expect(span.attributes[TRACE_INPUT]).toBe(
-      'Tool calls:\n- bash(ls) → ok\n\nLabel:'
+    expect(span.attributes[DEPRECATED_TRACE_INPUT]).toBeUndefined();
+    expect(span.attributes[DEPRECATED_TRACE_OUTPUT]).toBeUndefined();
+  });
+
+  it('names reasoning and phase-label generations by their role', () => {
+    const reasoning = createSpan(
+      'ChatOpenAI',
+      {
+        [OBSERVATION_TYPE]: 'generation',
+        [TRACE_TAGS]: JSON.stringify(['librechat', 'reasoning-label']),
+        [METADATA_OPERATION]: REASONING_LABEL_RUN_NAME,
+      },
+      'parent-1'
     );
-    expect(span.attributes[TRACE_OUTPUT]).toBe(originalOutput);
+    const phase = createSpan(
+      'ChatOpenAI',
+      {
+        [OBSERVATION_TYPE]: 'generation',
+        [TRACE_TAGS]: JSON.stringify(['librechat', 'activity-phase']),
+        [METADATA_OPERATION]: ACTIVITY_PHASE_LABEL_RUN_NAME,
+      },
+      'parent-1'
+    );
+
+    shapeLangfuseSpan(reasoning);
+    shapeLangfuseSpan(phase);
+
+    expect(reasoning.name).toBe('ReasoningLabel');
+    expect(phase.name).toBe('MultiStepLabelGeneration');
+  });
+
+  it('does not derive generation operation names from public tags alone', () => {
+    const tags = ['activity-label', 'reasoning-label', 'activity-phase'];
+
+    for (const tag of tags) {
+      const span = createSpan(
+        'ChatOpenAI',
+        {
+          [OBSERVATION_TYPE]: 'generation',
+          [TRACE_TAGS]: JSON.stringify(['librechat', 'agent', tag]),
+        },
+        'parent-1'
+      );
+
+      shapeLangfuseSpan(span);
+
+      expect(span.name).toBe('llm');
+    }
   });
 
   it('still reduces observation input on non-generation roots', () => {
@@ -586,6 +776,6 @@ describe('shapeLangfuseSpan', () => {
     shapeLangfuseSpan(span);
 
     expect(span.attributes[INPUT]).toBe('What is ClickHouse?');
-    expect(span.attributes[TRACE_INPUT]).toBe('What is ClickHouse?');
+    expect(span.attributes[DEPRECATED_TRACE_INPUT]).toBeUndefined();
   });
 });

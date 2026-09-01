@@ -1,8 +1,10 @@
 // src/graphs/__tests__/Graph.preemptSignal.test.ts
+import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
-import { Providers } from '@/common';
+import { getProviderMessageProvenance } from '@/messages/provenance';
 import { HookRegistry } from '@/hooks/HookRegistry';
 import { StandardGraph } from '../Graph';
+import { Providers } from '@/common';
 
 const makeAgent = (agentId: string): t.AgentInputs => ({
   agentId,
@@ -122,5 +124,25 @@ describe('PreemptBoundary abort-signal composition', () => {
     graph.callerSignal = new AbortController().signal;
     graph.clearHeavyState();
     expect(graph.callerSignal).toBeUndefined();
+  });
+
+  it('marks PreemptBoundary additional context as synthetic provenance', async () => {
+    const graph = new StandardGraph({
+      runId: 'run_1',
+      agents: [makeAgent('agent')],
+    });
+    const registry = new HookRegistry();
+    registry.register('PreemptBoundary', {
+      hooks: [async () => ({ additionalContext: 'resume policy context' })],
+    });
+    graph.hookRegistry = registry;
+
+    const result = await dispatchBoundary(graph);
+    const message = result.messages[0] as BaseMessage;
+
+    expect(message.content).toBe('resume policy context');
+    expect(getProviderMessageProvenance(message)?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
   });
 });

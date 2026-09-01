@@ -7,6 +7,7 @@ import type {
 import type * as t from '@/types';
 import {
   getLangfuseRuntimeConfig,
+  getLangfuseRuntimeContext,
   getLangfuseRuntimeToolOutputTracingConfig,
   getLangfuseScopeAgentId,
   getLangfuseScopeRunId,
@@ -27,6 +28,7 @@ export type ResolveLangfuseRuntimeScopeParams = {
   runLangfuse?: t.LangfuseConfig;
   langfuseOverlay?: t.LangfuseConfig;
   traceIdSeed?: string;
+  traceAnchor?: object;
   runId?: string;
   agentId?: string;
 };
@@ -45,6 +47,9 @@ const langfuseToolOutputTracingConfigKey = createContextKey(
 const langfuseConfigKey = createContextKey('librechat.langfuse.config');
 const langfuseTraceIdSeedKey = createContextKey(
   'librechat.langfuse.trace-id-seed'
+);
+const langfuseTraceAnchorKey = createContextKey(
+  'librechat.langfuse.trace-anchor'
 );
 const langfuseScopeRunIdKey = createContextKey('librechat.langfuse.run-id');
 const langfuseScopeAgentIdKey = createContextKey('librechat.langfuse.agent-id');
@@ -67,6 +72,17 @@ export function getOtelLangfuseConfig(
 export function getOtelTraceIdSeed(activeContext: Context): string | undefined {
   const value = activeContext.getValue(langfuseTraceIdSeedKey);
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+export function resolveLangfuseTraceAnchor(
+  activeContext: Context
+): object | undefined {
+  const runtimeAnchor = getLangfuseRuntimeContext()?.traceAnchor;
+  if (runtimeAnchor != null) {
+    return runtimeAnchor;
+  }
+  const value = activeContext.getValue(langfuseTraceAnchorKey);
+  return typeof value === 'object' && value != null ? value : undefined;
 }
 
 export function getOtelToolOutputTracingConfig(
@@ -168,6 +184,12 @@ export function withLangfuseRuntimeScope<T>(
   );
   activeContext = setOrClearContextValue(
     activeContext,
+    langfuseTraceAnchorKey,
+    scope.traceAnchor,
+    replace
+  );
+  activeContext = setOrClearContextValue(
+    activeContext,
     langfuseScopeRunIdKey,
     hasText(scope.runId) ? scope.runId : undefined,
     replace
@@ -194,6 +216,7 @@ export function resolveLangfuseRuntimeScope({
   runLangfuse,
   langfuseOverlay,
   traceIdSeed,
+  traceAnchor,
   runId,
   agentId,
 }: ResolveLangfuseRuntimeScopeParams): LangfuseRuntimeScope {
@@ -204,5 +227,12 @@ export function resolveLangfuseRuntimeScope({
   )
     ? undefined
     : resolveToolOutputTracingConfig(runLangfuse, langfuseOverlay);
-  return { langfuse, traceIdSeed, toolOutputTracing, runId, agentId };
+  return {
+    langfuse,
+    traceIdSeed,
+    traceAnchor,
+    toolOutputTracing,
+    runId,
+    agentId,
+  };
 }

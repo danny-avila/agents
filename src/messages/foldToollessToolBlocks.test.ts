@@ -7,6 +7,7 @@ import {
 } from '@langchain/core/messages';
 import type { ExtendedMessageContent } from '@/types';
 import {
+  compactSyntheticProviderContextMessage,
   foldToolBlocksForToollessAgent,
   isSyntheticProviderContextMessage,
 } from './format';
@@ -73,6 +74,19 @@ describe('foldToolBlocksForToollessAgent', () => {
       new HumanMessage('Search my files for "roadmap"'),
       new AIMessage({
         content: '',
+        additional_kwargs: {
+          sourceMessageId: 'assistant-row',
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'model',
+                sourceMessageId: 'assistant-row',
+                sourceContentPartIndices: [0],
+              },
+            ],
+          },
+        },
         tool_calls: [
           {
             id: 'call_1',
@@ -86,6 +100,19 @@ describe('foldToolBlocksForToollessAgent', () => {
         content: 'Found roadmap.md',
         tool_call_id: 'call_1',
         name: 'file_search',
+        additional_kwargs: {
+          sourceMessageId: 'assistant-row',
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'tool',
+                sourceMessageId: 'assistant-row',
+                sourceContentPartIndices: [0],
+              },
+            ],
+          },
+        },
       }),
     ];
 
@@ -100,12 +127,116 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(folded).toContain('file_search');
     expect(folded).toContain('roadmap');
     expect(folded).toContain('Found roadmap.md');
+    expect(result[1].additional_kwargs.sourceMessageIds).toEqual([
+      'assistant-row',
+    ]);
+    expect(result[1].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'synthetic' },
+        {
+          attribution: 'model',
+          sourceMessageId: 'assistant-row',
+          sourceContentPartIndices: [0],
+        },
+        {
+          attribution: 'tool',
+          sourceMessageId: 'assistant-row',
+          sourceContentPartIndices: [0],
+        },
+      ],
+    });
     expect(isSyntheticProviderContextMessage(result[1])).toBe(true);
     expect(
       isSyntheticProviderContextMessage(
         new HumanMessage('[Previous tool interaction] user-authored text')
       )
     ).toBe(false);
+  });
+
+  test('attributes unstamped retained sources by message role without ids', () => {
+    const result = foldToolBlocksForToollessAgent([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call', name: 'lookup', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'legacy tool bytes',
+        tool_call_id: 'call',
+      }),
+    ]);
+
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'model' },
+        { attribution: 'tool' },
+      ],
+    });
+  });
+
+  test('attributes validated legacy folded lineage by message role', () => {
+    const result = foldToolBlocksForToollessAgent([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call', name: 'lookup', args: {}, type: 'tool_call' },
+        ],
+        additional_kwargs: { sourceMessageId: 'assistant-row' },
+      }),
+      new ToolMessage({
+        content: 'legacy tool bytes',
+        tool_call_id: 'call',
+        additional_kwargs: { sourceMessageId: 'tool-row' },
+      }),
+    ]);
+
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'model', sourceMessageId: 'assistant-row' },
+        { attribution: 'tool', sourceMessageId: 'tool-row' },
+      ],
+    });
+  });
+
+  test.each([
+    ['malformed provenance', { provenance: { version: 1, parts: [null] } }],
+    [
+      'malformed legacy lineage',
+      { sourceMessageIds: { 0: 'forged', length: 1 } },
+    ],
+  ])('preserves %s invalidity when folding retained bytes', (_, additional_kwargs) => {
+    const sourceProvenance = (additional_kwargs as { provenance?: unknown })
+      .provenance;
+    const result = foldToolBlocksForToollessAgent([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call', name: 'lookup', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'untrusted tool bytes',
+        tool_call_id: 'call',
+        additional_kwargs,
+      }),
+    ]);
+
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: null,
+    });
+    expect(result[0].additional_kwargs.provenance).not.toBe(
+      sourceProvenance
+    );
+    expect(result[0].lc_kwargs.additional_kwargs).toBe(
+      result[0].additional_kwargs
+    );
   });
 
   test('folds historical tool content that precedes the last human turn (the reported bug)', () => {
@@ -529,6 +660,378 @@ describe('foldToolBlocksForToollessAgent', () => {
 
     expect(foldedText.length).toBeLessThanOrEqual(HARD_MAX_TOOL_RESULT_CHARS);
     expect(foldedText).toContain('additional folded context omitted');
+  });
+
+  test(
+    'folds a 150k-block tool result without call-argument spreading',
+    () => {
+      const blockCount = 150_000;
+      const repeatedBlock = { type: 'text', text: 'x' } as const;
+      const largeContent = new Array(blockCount).fill(repeatedBlock);
+      const toolMessage = new ToolMessage({
+        content: largeContent,
+        tool_call_id: 'large-result',
+        additional_kwargs: { sourceMessageId: 'large-tool-row' },
+      });
+      const messages = [
+        new HumanMessage('Run'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'large-result',
+              name: 'query',
+              args: {},
+              type: 'tool_call',
+            },
+          ],
+        }),
+        toolMessage,
+      ];
+
+      const result = foldToolBlocksForToollessAgent(messages);
+      const folded = result.find(isSyntheticProviderContextMessage)!;
+
+      expect(folded).toBeInstanceOf(HumanMessage);
+      expect(getTextContent(folded).length).toBeLessThanOrEqual(
+        HARD_MAX_TOOL_RESULT_CHARS
+      );
+      expect(toolMessage.content).toBe(largeContent);
+    },
+    30_000
+  );
+
+  test('omits source rows whose bytes do not survive the shared fold cap', () => {
+    const messages = [
+      new HumanMessage('Run both'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'first', name: 'query', args: {}, type: 'tool_call' },
+          { id: 'second', name: 'query', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'x'.repeat(HARD_MAX_TOOL_RESULT_CHARS * 2),
+        tool_call_id: 'first',
+        additional_kwargs: {
+          sourceMessageId: 'first-row',
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'tool',
+                sourceMessageId: 'first-row',
+                sourceContentPartIndices: [0],
+              },
+            ],
+          },
+        },
+      }),
+      new ToolMessage({
+        content: 'OMITTED-SECOND-MARKER',
+        tool_call_id: 'second',
+        additional_kwargs: {
+          sourceMessageId: 'second-row',
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'tool',
+                sourceMessageId: 'second-row',
+                sourceContentPartIndices: [0],
+              },
+            ],
+          },
+        },
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+    const folded = result.find(isSyntheticProviderContextMessage)!;
+
+    expect(getTextContent(folded)).not.toContain('OMITTED-SECOND-MARKER');
+    expect(folded.additional_kwargs.sourceMessageIds).toEqual(['first-row']);
+  });
+
+  test('retains only source part indices whose folded blocks survive the cap', () => {
+    const messages = [
+      new HumanMessage('Run'),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_call',
+            tool_call: {
+              id: 'first',
+              name: 'query',
+              args: {},
+              output: 'x'.repeat(HARD_MAX_TOOL_RESULT_CHARS * 2),
+            },
+          },
+          {
+            type: 'tool_call',
+            tool_call: {
+              id: 'second',
+              name: 'query',
+              args: {},
+              output: 'OMITTED-SECOND-PART',
+            },
+          },
+        ],
+        additional_kwargs: {
+          sourceMessageId: 'assistant-row',
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'model',
+                sourceMessageId: 'assistant-row',
+                sourceContentPartIndices: [0, 1],
+              },
+            ],
+          },
+        },
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+    const folded = result.find(isSyntheticProviderContextMessage)!;
+
+    expect(getTextContent(folded)).not.toContain('OMITTED-SECOND-PART');
+    expect(folded.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'synthetic' },
+        {
+          attribution: 'model',
+          sourceMessageId: 'assistant-row',
+          sourceContentPartIndices: [0],
+        },
+      ],
+    });
+  });
+
+  test.each([
+    ['duplicate', [[0], [0]]],
+    ['gapped/out-of-range', [[0], [2]]],
+    ['reordered', [[1], [0]]],
+  ])(
+    'handles a %s folded content mapping without ordinal attribution loss',
+    (mappingKind, sourceContentPartIndices) => {
+      const messages = [
+        new HumanMessage('Run'),
+        new AIMessage({
+          content: [
+            {
+              type: 'tool_call',
+              tool_call: {
+                id: 'first',
+                name: 'query',
+                args: {},
+                output: 'x'.repeat(HARD_MAX_TOOL_RESULT_CHARS * 2),
+              },
+            },
+            {
+              type: 'tool_call',
+              tool_call: {
+                id: 'second',
+                name: 'query',
+                args: {},
+                output: 'OMITTED-SECOND-PART',
+              },
+            },
+          ],
+          additional_kwargs: {
+            sourceMessageId: 'source-row',
+            provenance: {
+              version: 1,
+              parts: [
+                {
+                  attribution: 'model',
+                  sourceMessageId: 'source-row',
+                  sourceContentPartIndices: sourceContentPartIndices[0],
+                },
+                {
+                  attribution: 'user',
+                  sourceMessageId: 'source-row',
+                  sourceContentPartIndices: sourceContentPartIndices[1],
+                },
+              ],
+            },
+          },
+        }),
+      ];
+
+      const result = foldToolBlocksForToollessAgent(messages);
+      const folded = result.find(isSyntheticProviderContextMessage)!;
+
+      expect(getTextContent(folded)).not.toContain('OMITTED-SECOND-PART');
+      expect(folded.additional_kwargs.provenance).toEqual({
+        version: 1,
+        parts:
+          mappingKind === 'reordered'
+            ? [
+              { attribution: 'synthetic' },
+              {
+                attribution: 'user',
+                sourceMessageId: 'source-row',
+                sourceContentPartIndices: [0],
+              },
+            ]
+            : [
+              { attribution: 'synthetic' },
+              { attribution: 'model', sourceMessageId: 'source-row' },
+              { attribution: 'user', sourceMessageId: 'source-row' },
+            ],
+      });
+    }
+  );
+
+  test('drops indexed claims when parsed tool calls omit malformed raw entries', () => {
+    const messages = [
+      new HumanMessage('Run'),
+      new AIMessage({
+        content: '',
+        additional_kwargs: {
+          sourceMessageId: 'assistant-row',
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'model',
+                sourceMessageId: 'assistant-row',
+                sourceContentPartIndices: [0, 1],
+              },
+            ],
+          },
+          tool_calls: [
+            { id: 'malformed', type: 'function' },
+            {
+              id: 'valid',
+              type: 'function',
+              function: { name: 'query', arguments: '{}' },
+            },
+          ] as never,
+        },
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+    const folded = result.find(isSyntheticProviderContextMessage)!;
+
+    expect(getTextContent(folded)).toContain('[tool_call] query');
+    expect(folded.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'model', sourceMessageId: 'assistant-row' },
+      ],
+    });
+  });
+
+  test('drops ambiguous legacy source ids after partial folded compaction', () => {
+    const messages = [
+      new HumanMessage('Run'),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_call',
+            tool_call: {
+              id: 'first',
+              name: 'query',
+              args: {},
+              output: 'x'.repeat(HARD_MAX_TOOL_RESULT_CHARS * 2),
+            },
+          },
+          {
+            type: 'tool_call',
+            tool_call: {
+              id: 'second',
+              name: 'query',
+              args: {},
+              output: 'OMITTED-SECOND-PART',
+            },
+          },
+        ],
+        additional_kwargs: {
+          sourceMessageIds: ['first-row', 'second-row'],
+        },
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+    const folded = result.find(isSyntheticProviderContextMessage)!;
+
+    expect(getTextContent(folded)).not.toContain('OMITTED-SECOND-PART');
+    expect(folded.additional_kwargs.sourceMessageIds).toBeUndefined();
+    expect(folded.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'model' },
+      ],
+    });
+  });
+
+  test('drops ambiguous source ids when folded string content is truncated', () => {
+    const messages = [
+      new HumanMessage('Run'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'large', name: 'query', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'x'.repeat(HARD_MAX_TOOL_RESULT_CHARS * 2),
+        tool_call_id: 'large',
+        additional_kwargs: {
+          sourceMessageIds: ['first-row', 'second-row'],
+        },
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+    const folded = result.find(isSyntheticProviderContextMessage)!;
+
+    expect(folded.additional_kwargs.sourceMessageIds).toBeUndefined();
+    expect(folded.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'model' },
+        { attribution: 'tool' },
+      ],
+    });
+  });
+
+  test('fails closed when later overflow recovery compacts folded context', () => {
+    const folded = foldToolBlocksForToollessAgent([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call', name: 'query', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'sensitive tool output'.repeat(100),
+        tool_call_id: 'call',
+        additional_kwargs: { sourceMessageId: 'tool-row' },
+      }),
+    ])[0] as HumanMessage;
+
+    const compacted = compactSyntheticProviderContextMessage(folded, 20);
+
+    expect(isSyntheticProviderContextMessage(compacted)).toBe(true);
+    expect(compacted.additional_kwargs.sourceMessageIds).toBeUndefined();
+    expect(compacted.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'synthetic' },
+        { attribution: 'user' },
+        { attribution: 'tool' },
+      ],
+    });
   });
 
   test('does not emit an empty user message when an earlier fold exhausts the shared budget', () => {

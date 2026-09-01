@@ -7,7 +7,18 @@ import type {
   BaseMessageFields,
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
+import type { ExactTokenCountCache } from '@/llm/contextPressureMeter';
 import type * as t from '@/types';
+import {
+  type CallerCapabilityProjection,
+  allowsToolCaller,
+  applyCallerCapabilityDefinitionOverrides,
+  createCallerCapabilityProjectionSnapshot,
+  isToolDefinitionActive,
+  isProgrammaticControlTool,
+  mergeCallerCapabilityDefinitions,
+  resolveCallerCapabilityProjection,
+} from '@/tools/CallerCapabilities';
 import {
   addTailCacheControl,
   addCacheControlToStablePrefixMessages,
@@ -18,6 +29,12 @@ import {
   cloneMessage,
   type PromptCacheTtl,
 } from '@/messages/cache';
+import {
+  isProgrammaticRunnerAutoBound,
+  isProgrammaticRunnerResolvedDirectly,
+  resolveLocalImplementationNames,
+  resolveLocalToolRegistry,
+} from '@/tools/local/resolveLocalExecutionTools';
 import {
   DEFAULT_RESERVE_RATIO,
   ORIGINAL_CONTENT_MAX_CHARS,
@@ -32,6 +49,10 @@ import {
   Constants,
   Providers,
 } from '@/common';
+import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
+import { snapshotCompactionSemanticIndex } from '@/summarization/semanticIndex';
+import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
+import { buildSummaryCarrierText } from '@/summarization/shared';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
@@ -49,6 +70,20 @@ type AgentSystemContentBlock =
 
 type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
 
+type ProgrammaticToolInstructionTarget = {
+  name: string;
+  codeGuidance: string;
+  executesDirectly: boolean;
+};
+
+/**
+ * Consecutive summarization attempts that may return no usable summary before
+ * the run stops asking. Every such attempt spends a full model call over the
+ * whole history and leaves the message set exactly as it was, so the cap
+ * bounds spend as much as it bounds the compaction loop.
+ */
+const MAX_SUMMARIZATION_FAILURES = 3;
+
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
  */
@@ -59,7 +94,8 @@ export class AgentContext {
   static fromConfig(
     agentConfig: t.AgentInputs,
     tokenCounter?: t.TokenCounter,
-    indexTokenCountMap?: Record<string, number>
+    indexTokenCountMap?: Record<string, number>,
+    toolExecution?: t.ToolExecutionConfig
   ): AgentContext {
     const {
       agentId,
@@ -82,6 +118,7 @@ export class AgentContext {
       discoveredTools,
       summarizationEnabled,
       summarizationConfig,
+      compactionSemanticIndex,
       initialSummary,
       contextPruningConfig,
       maxToolResultChars,
@@ -103,6 +140,7 @@ export class AgentContext {
       tools,
       toolMap,
       toolRegistry,
+      toolExecution,
       toolDefinitions,
       instructions,
       additionalInstructions: additional_instructions,
@@ -114,11 +152,18 @@ export class AgentContext {
       discoveredTools,
       summarizationEnabled,
       summarizationConfig,
+      compactionSemanticIndex,
       contextPruningConfig,
       maxToolResultChars,
     });
 
-    agentContext._sourceInputs = agentConfig;
+    agentContext._sourceInputs =
+      compactionSemanticIndex == null
+        ? agentConfig
+        : {
+          ...agentConfig,
+          compactionSemanticIndex: agentContext.compactionSemanticIndex,
+        };
     agentContext.subagentConfigs = subagentConfigs;
     agentContext.maxSubagentDepth = maxSubagentDepth;
     /**
@@ -174,7 +219,7 @@ export class AgentContext {
   /** Human-readable name for this agent (used in handoff context). Falls back to agentId if not provided. */
   name?: string;
   /** Provider for this specific agent */
-  provider: Providers;
+  provider: t.ProviderName;
   /** Client options for this agent */
   clientOptions?: t.ClientOptions;
   /** Per-agent Langfuse tracing configuration. */
@@ -211,6 +256,8 @@ export class AgentContext {
   pruneMessages?: ReturnType<typeof createPruneMessages>;
   /** Token counter function for this agent */
   tokenCounter?: t.TokenCounter;
+  /** Exact stable-message counts reused by request-scoped context-pressure meters. */
+  readonly contextPressureTokenCounts?: ExactTokenCountCache;
   /** Token count for the system message (instructions text). */
   systemMessageTokens: number = 0;
   /** Token count for instruction text emitted outside the system message. */
@@ -269,6 +316,8 @@ export class AgentContext {
    * Used for tool search and programmatic tool calling.
    */
   toolRegistry?: t.LCToolRegistry;
+  /** Run-scoped backend used to identify auto-bound programmatic runners. */
+  private toolExecution?: t.ToolExecutionConfig;
   /**
    * Serializable tool definitions for event-driven execution.
    * When provided, ToolNode operates in event-driven mode.
@@ -315,6 +364,8 @@ export class AgentContext {
   summarizationEnabled?: boolean;
   /** Summarization runtime settings used by graph pruning hooks */
   summarizationConfig?: t.SummarizationConfig;
+  /** Host-supplied advisory guidance consumed only when compaction runs. */
+  compactionSemanticIndex?: t.CompactionSemanticIndex;
   /** Current summary text produced by the summarize node, integrated into system message */
   private summaryText?: string;
   /** Token count of the current summary (tracked for token accounting) */
@@ -326,6 +377,8 @@ export class AgentContext {
    * - `'none'`: no summary present
    */
   private _summaryLocation: 'system_prompt' | 'user_message' | 'none' = 'none';
+  /** Whether a mid-run summary must appear before every retained message. */
+  private summaryPrecedesMessages: boolean = false;
   /**
    * Durable summary that survives reset() calls. Set from initialSummary
    * during fromConfig() and updated by setSummary() so that the latest
@@ -334,6 +387,7 @@ export class AgentContext {
    */
   private _durableSummaryText?: string;
   private _durableSummaryTokenCount: number = 0;
+  private durableSummaryPrecedesMessages: boolean = false;
   /** Number of summarization cycles that have occurred for this agent context */
   private _summaryVersion: number = 0;
   /**
@@ -342,6 +396,13 @@ export class AgentContext {
    * Summarization is allowed to fire again only when new messages appear.
    */
   private _lastSummarizationMsgCount: number = 0;
+  /**
+   * Consecutive summarization attempts that produced no usable summary.
+   * An empty or failed summary leaves the message set exactly as it was, so
+   * the next prune cycle would ask again on identical state. Cleared by
+   * `setSummary` and by `reset()`.
+   */
+  private _summarizationFailures: number = 0;
   /**
    * Forced compactions performed after a provider rejected a prompt as too
    * large. Bounds the recovery loop so a model that keeps refusing cannot
@@ -385,6 +446,7 @@ export class AgentContext {
     tools,
     toolMap,
     toolRegistry,
+    toolExecution,
     toolDefinitions,
     instructions,
     additionalInstructions,
@@ -395,13 +457,14 @@ export class AgentContext {
     discoveredTools,
     summarizationEnabled,
     summarizationConfig,
+    compactionSemanticIndex,
     contextPruningConfig,
     maxToolResultChars,
   }: {
     agentId: string;
     codeSessionKey?: string;
     name?: string;
-    provider: Providers;
+    provider: t.ProviderName;
     clientOptions?: t.ClientOptions;
     langfuse?: t.LangfuseConfig;
     maxContextTokens?: number;
@@ -410,6 +473,7 @@ export class AgentContext {
     tools?: t.GraphTools;
     toolMap?: t.ToolMap;
     toolRegistry?: t.LCToolRegistry;
+    toolExecution?: t.ToolExecutionConfig;
     toolDefinitions?: t.LCTool[];
     instructions?: string;
     additionalInstructions?: string;
@@ -420,6 +484,7 @@ export class AgentContext {
     discoveredTools?: string[];
     summarizationEnabled?: boolean;
     summarizationConfig?: t.SummarizationConfig;
+    compactionSemanticIndex?: t.CompactionSemanticIndex;
     contextPruningConfig?: t.ContextPruningConfig;
     maxToolResultChars?: number;
   }) {
@@ -432,9 +497,17 @@ export class AgentContext {
     this.maxContextTokens = maxContextTokens;
     this.streamBuffer = streamBuffer;
     this.tokenCounter = tokenCounter;
+    this.contextPressureTokenCounts =
+      tokenCounter != null && isTokenCounterCacheCompatible(tokenCounter)
+        ? createExactTokenCountCache(tokenCounter)
+        : undefined;
     this.tools = tools;
     this.toolMap = toolMap;
-    this.toolRegistry = toolRegistry;
+    this.toolRegistry = resolveLocalToolRegistry({
+      toolRegistry,
+      toolExecution,
+    });
+    this.toolExecution = toolExecution;
     this.toolDefinitions = toolDefinitions;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
@@ -451,6 +524,11 @@ export class AgentContext {
     this.useLegacyContent = useLegacyContent ?? false;
     this.summarizationEnabled = summarizationEnabled;
     this.summarizationConfig = summarizationConfig;
+    if (compactionSemanticIndex != null) {
+      this.compactionSemanticIndex = snapshotCompactionSemanticIndex(
+        compactionSemanticIndex
+      );
+    }
     this.contextPruningConfig = contextPruningConfig;
     this.maxToolResultChars = maxToolResultChars;
 
@@ -461,37 +539,87 @@ export class AgentContext {
     }
   }
 
-  /**
-   * Builds instructions text for tools that are ONLY callable via programmatic code execution.
-   * These tools cannot be called directly by the LLM but are available through the
-   * configured programmatic tool.
-   *
-   * Includes:
-   * - Code_execution-only tools that are NOT deferred
-   * - Code_execution-only tools that ARE deferred but have been discovered via tool search
-   */
+  /** Builds the caller boundary and schemas for programmatic-only tools. */
   private buildProgrammaticOnlyToolsInstructions(): string {
-    if (!this.toolRegistry) return '';
+    const programmaticTools = this.getProgrammaticToolInstructionTargets();
+    if (programmaticTools.length === 0) return '';
+    const directProgrammaticTools = programmaticTools.filter(
+      (tool) => tool.executesDirectly
+    );
+    const eventProgrammaticTools = programmaticTools.filter(
+      (tool) => !tool.executesDirectly
+    );
+    const groups: Array<{
+      tools: ProgrammaticToolInstructionTarget[];
+      capabilities: CallerCapabilityProjection;
+      label: string;
+    }> = [];
+    if (directProgrammaticTools.length > 0) {
+      groups.push({
+        tools: directProgrammaticTools,
+        capabilities: this.getDirectProgrammaticCapabilityProjection(),
+        label: 'Direct programmatic runners',
+      });
+    }
+    if (eventProgrammaticTools.length > 0) {
+      groups.push({
+        tools: eventProgrammaticTools,
+        capabilities: this.getCallerCapabilityProjection(),
+        label: 'Event-dispatched programmatic runners',
+      });
+    }
+    if (groups.length === 0) {
+      return '';
+    }
+    const showGroupLabels = groups.length > 1;
+    return (
+      '\n\n## Programmatic Tool Calling' +
+      groups
+        .map(
+          ({ tools, capabilities, label }) =>
+            (showGroupLabels ? `\n\n### ${label}` : '') +
+            this.buildProgrammaticToolGroupInstructions(tools, capabilities)
+        )
+        .join('')
+    );
+  }
 
-    const programmaticOnlyTools: t.LCTool[] = [];
-    for (const [name, toolDef] of this.toolRegistry) {
-      const allowedCallers = toolDef.allowed_callers ?? ['direct'];
-      const isCodeExecutionOnly =
-        allowedCallers.includes('code_execution') &&
-        !allowedCallers.includes('direct');
+  private buildProgrammaticToolGroupInstructions(
+    programmaticTools: ProgrammaticToolInstructionTarget[],
+    capabilities: CallerCapabilityProjection
+  ): string {
+    const programmaticOnlyTools = capabilities.codeExecutionOnlyTools;
+    const programmaticToolNames = capabilities.codeExecutionTools.map(
+      (toolDef) => toolDef.name
+    );
+    const directOnlyToolNames = capabilities.directOnlyTools
+      .map((toolDef) => toolDef.name)
+      .filter((name) => !isProgrammaticControlTool(name));
 
-      if (!isCodeExecutionOnly) continue;
+    const programmaticRunnerNames = programmaticTools
+      .map((tool) => `\`${tool.name}\``)
+      .join(' or ');
+    const quotedProgrammaticNames =
+      programmaticToolNames.length > 0
+        ? programmaticToolNames.map((name) => `\`${name}\``).join(', ')
+        : 'none';
+    const directOnlyBoundary =
+      directOnlyToolNames.length > 0
+        ? `\nCall these tools directly; never list them in the \`tool_manifest\` or reference them inside ${programmaticRunnerNames}: ${directOnlyToolNames
+          .map((name) => `\`${name}\``)
+          .join(
+            ', '
+          )}. Every ${programmaticRunnerNames} call must include a \`tool_manifest\` containing the exact registered names used by its code; the manifest is validated before execution starts.`
+        : '';
+    const boundary =
+      '\n\n' +
+      `Only these tools may be invoked inside ${programmaticRunnerNames}: ${quotedProgrammaticNames}.` +
+      directOnlyBoundary;
 
-      const isDeferred = toolDef.defer_loading === true;
-      const isDiscovered = this.discoveredToolNames.has(name);
-      if (!isDeferred || isDiscovered) {
-        programmaticOnlyTools.push(toolDef);
-      }
+    if (programmaticOnlyTools.length === 0) {
+      return boundary;
     }
 
-    if (programmaticOnlyTools.length === 0) return '';
-
-    const programmaticTool = this.getProgrammaticToolInstructionTarget();
     const toolDescriptions = programmaticOnlyTools
       .map((tool) => {
         let desc = `- **${tool.name}**`;
@@ -506,41 +634,124 @@ export class AgentContext {
       .join('\n\n');
 
     return (
-      '\n\n## Programmatic-Only Tools\n\n' +
-      `The following tools are available exclusively through the \`${programmaticTool.name}\` tool. ` +
-      `You cannot call these tools directly; instead, use \`${programmaticTool.name}\` with ${programmaticTool.language} code that invokes them.\n\n` +
+      boundary +
+      '\n\n### Programmatic-Only Tools\n\n' +
+      `The following tools are available exclusively through ${programmaticRunnerNames}. ` +
+      `You cannot call these tools directly; instead, ${programmaticTools
+        .map(
+          (tool) =>
+            `use \`${tool.name}\` with ${tool.codeGuidance} that invokes them`
+        )
+        .join(', or ')}.\n\n` +
       toolDescriptions
     );
   }
 
-  private getProgrammaticToolInstructionTarget(): {
-    name: string;
-    language: 'bash' | 'Python';
-    } {
-    if (this.hasAvailableTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING)) {
-      return {
+  private getProgrammaticToolInstructionTargets(): ProgrammaticToolInstructionTarget[] {
+    const targets: ProgrammaticToolInstructionTarget[] = [];
+    if (
+      this.hasBoundTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING) ||
+      isProgrammaticRunnerAutoBound(
+        Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+        this.toolExecution
+      )
+    ) {
+      targets.push({
         name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
-        language: 'bash',
-      };
+        codeGuidance: 'Bash code',
+        executesDirectly: this.isProgrammaticRunnerDirectlyBound(
+          Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+        ),
+      });
     }
 
-    if (this.hasAvailableTool(Constants.PROGRAMMATIC_TOOL_CALLING)) {
-      return { name: Constants.PROGRAMMATIC_TOOL_CALLING, language: 'Python' };
+    if (
+      this.hasBoundTool(Constants.PROGRAMMATIC_TOOL_CALLING) ||
+      isProgrammaticRunnerAutoBound(
+        Constants.PROGRAMMATIC_TOOL_CALLING,
+        this.toolExecution
+      )
+    ) {
+      const localDefault =
+        this.toolExecution?.engine === 'local' ||
+        this.toolExecution?.engine === 'cloudflare-sandbox';
+      targets.push({
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        codeGuidance: localDefault
+          ? 'Bash code by default, or set `lang: "py"` to use Python code'
+          : 'Python code',
+        executesDirectly: this.isProgrammaticRunnerDirectlyBound(
+          Constants.PROGRAMMATIC_TOOL_CALLING
+        ),
+      });
     }
 
-    return { name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING, language: 'bash' };
+    return targets;
   }
 
-  private hasAvailableTool(name: string): boolean {
-    if (this.toolDefinitions?.some((tool) => tool.name === name) === true)
-      return true;
-    if (
-      this.tools?.some((tool) => 'name' in tool && tool.name === name) === true
-    ) {
-      return true;
+  /** Whether ToolNode executes this runner in-process instead of via an event. */
+  private isProgrammaticRunnerDirectlyBound(name: string): boolean {
+    return (
+      isProgrammaticRunnerResolvedDirectly(
+        name,
+        this.toolExecution,
+        this.toolDefinitions?.some((toolDef) => toolDef.name === name) === true
+      ) ||
+      this.graphTools?.some((tool) => 'name' in tool && tool.name === name) ===
+        true
+    );
+  }
+
+  /** Mirrors ToolNode's executable implementation gate for direct runners. */
+  private getDirectProgrammaticCapabilityProjection(): CallerCapabilityProjection {
+    const implementationNames = new Set<string>();
+    const isEventDriven = (this.toolDefinitions?.length ?? 0) > 0;
+    const resolverInputNames = new Set<string>();
+    if (isEventDriven) {
+      for (const toolDef of this.toolDefinitions ?? []) {
+        resolverInputNames.add(toolDef.name);
+      }
+    } else {
+      for (const tool of (this.tools as t.GenericTool[] | undefined) ?? []) {
+        if ('name' in tool && typeof tool.name === 'string') {
+          implementationNames.add(tool.name);
+          resolverInputNames.add(tool.name);
+        }
+      }
     }
-    if (this.toolMap?.has(name) === true) return true;
-    return this.toolRegistry?.has(name) === true;
+    for (const tool of (this.graphTools as t.GenericTool[] | undefined) ?? []) {
+      if ('name' in tool && typeof tool.name === 'string') {
+        implementationNames.add(tool.name);
+        resolverInputNames.add(tool.name);
+      }
+    }
+    for (const name of resolveLocalImplementationNames(
+      resolverInputNames,
+      this.toolExecution
+    )) {
+      implementationNames.add(name);
+    }
+    const activeCapabilities = this.getCallerCapabilityProjection();
+    const executableCapabilities = resolveCallerCapabilityProjection(
+      this.toolRegistry?.values() ?? [],
+      (toolDef) =>
+        implementationNames.has(toolDef.name) &&
+        isToolDefinitionActive(toolDef, this.discoveredToolNames)
+    );
+    return {
+      directTools: activeCapabilities.directTools,
+      directOnlyTools: activeCapabilities.directOnlyTools,
+      codeExecutionTools: executableCapabilities.codeExecutionTools,
+      codeExecutionOnlyTools: executableCapabilities.codeExecutionOnlyTools,
+    };
+  }
+
+  private hasBoundTool(name: string): boolean {
+    return (
+      this.getToolsForBinding()?.some(
+        (tool) => 'name' in tool && tool.name === name
+      ) === true
+    );
   }
 
   /**
@@ -757,11 +968,7 @@ export class AgentContext {
   private buildSummaryHumanMessage(
     promptCacheProvider: PromptCacheProvider | undefined
   ): HumanMessage {
-    const wrappedSummary =
-      '<summary>\n' +
-      (this.summaryText as string) +
-      '\n</summary>\n\n' +
-      'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
+    const wrappedSummary = buildSummaryCarrierText(this.summaryText as string);
 
     if (promptCacheProvider !== Providers.ANTHROPIC) {
       return new HumanMessage(wrappedSummary);
@@ -815,10 +1022,10 @@ export class AgentContext {
       return messages;
     }
 
-    const tailIndex = this.getPromptCacheDynamicTailIndex(
-      messages,
-      promptCacheProvider
-    );
+    const tailIndex =
+      this._summaryLocation === 'user_message' && this.summaryPrecedesMessages
+        ? 0
+        : this.getPromptCacheDynamicTailIndex(messages, promptCacheProvider);
     const stablePrefix = messages.slice(0, tailIndex);
     const trailingMessages = messages.slice(tailIndex);
     const cacheablePrefix = this.addStablePromptCacheMarkers(
@@ -1030,7 +1237,9 @@ export class AgentContext {
 
     this.summaryText = this._durableSummaryText;
     this.summaryTokenCount = this._durableSummaryTokenCount;
+    this.summaryPrecedesMessages = this.durableSummaryPrecedesMessages;
     this._lastSummarizationMsgCount = 0;
+    this._summarizationFailures = 0;
     this.lastCallUsage = undefined;
     this.totalTokensFresh = false;
     this.restoreContextBudgetAfterOverflow();
@@ -1071,9 +1280,21 @@ export class AgentContext {
     this.indexTokenCountMap = { ...baseTokenMap };
   }
 
+  /** Event definitions with matching runtime caller/defer metadata applied. */
+  getEffectiveToolDefinitions(): t.LCTool[] | undefined {
+    if (!this.toolDefinitions) {
+      return undefined;
+    }
+    return applyCallerCapabilityDefinitionOverrides(
+      this.toolDefinitions,
+      this.toolRegistry?.values()
+    );
+  }
+
   /** Active tool definitions for token accounting (excludes deferred-and-undiscovered entries). */
   private getActiveToolDefinitions(): t.LCTool[] {
-    if (!this.toolDefinitions) {
+    const effectiveToolDefinitions = this.getEffectiveToolDefinitions();
+    if (!effectiveToolDefinitions) {
       return [];
     }
     /**
@@ -1083,15 +1304,10 @@ export class AgentContext {
      * alone left programmatic-only definitions counted in
      * `toolSchemaTokens` even though they were never bound.
      */
-    return this.toolDefinitions.filter((def) => {
-      const allowedCallers = def.allowed_callers ?? ['direct'];
-      if (!allowedCallers.includes('direct')) {
-        return false;
-      }
-      return (
-        def.defer_loading !== true || this.discoveredToolNames.has(def.name)
-      );
-    });
+    return resolveCallerCapabilityProjection(
+      effectiveToolDefinitions,
+      (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
+    ).directTools;
   }
 
   /**
@@ -1280,13 +1496,20 @@ export class AgentContext {
     }
   }
 
-  setSummary(text: string, tokenCount: number): void {
+  setSummary(
+    text: string,
+    tokenCount: number,
+    options?: { precedesMessages?: boolean }
+  ): void {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
     this._summaryLocation = 'user_message';
+    this.summaryPrecedesMessages = options?.precedesMessages === true;
     this._durableSummaryText = text;
     this._durableSummaryTokenCount = tokenCount;
+    this.durableSummaryPrecedesMessages = this.summaryPrecedesMessages;
     this._summaryVersion += 1;
+    this._summarizationFailures = 0;
     this.systemRunnableStale = true;
     this.pruneMessages = undefined;
   }
@@ -1296,8 +1519,10 @@ export class AgentContext {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
     this._summaryLocation = 'system_prompt';
+    this.summaryPrecedesMessages = false;
     this._durableSummaryText = text;
     this._durableSummaryTokenCount = tokenCount;
+    this.durableSummaryPrecedesMessages = false;
     this._summaryVersion += 1;
     this.systemRunnableStale = true;
   }
@@ -1352,6 +1577,31 @@ export class AgentContext {
    */
   markSummarizationTriggered(msgCount: number): void {
     this._lastSummarizationMsgCount = msgCount;
+  }
+
+  /**
+   * Records a summarization attempt that produced no usable summary — an
+   * empty model response, or a provider failure the run declined to paper
+   * over with a metadata stub. Cleared by the next successful summary.
+   */
+  recordSummarizationFailure(): void {
+    this._summarizationFailures += 1;
+  }
+
+  get summarizationFailures(): number {
+    return this._summarizationFailures;
+  }
+
+  /**
+   * True once consecutive no-progress attempts reach {@link MAX_SUMMARIZATION_FAILURES}.
+   * A summarizer that has returned nothing this many times in a row will keep
+   * returning nothing: each empty result leaves the history unchanged, so the
+   * next prune cycle re-triggers on the same state and the run burns its
+   * recursion budget on empty summary steps. Summarization stays off for the
+   * remainder of the run; `reset()` restores it for the next one.
+   */
+  get summarizationExhausted(): boolean {
+    return this._summarizationFailures >= MAX_SUMMARIZATION_FAILURES;
   }
 
   get overflowRecoveryAttempts(): number {
@@ -1438,7 +1688,7 @@ export class AgentContext {
 
   /** Applies token calibration only when the observation came from this provider. */
   applyObservedOverflowCalibration(
-    provider: Providers | undefined,
+    provider: t.ProviderName | undefined,
     observedCalibrationRatio: number | undefined
   ): void {
     if (
@@ -1502,6 +1752,8 @@ export class AgentContext {
       this.summaryTokenCount = 0;
       this._durableSummaryText = undefined;
       this._durableSummaryTokenCount = 0;
+      this.summaryPrecedesMessages = false;
+      this.durableSummaryPrecedesMessages = false;
       this._summaryLocation = 'none';
       this.systemRunnableStale = true;
     }
@@ -1720,6 +1972,24 @@ export class AgentContext {
     return Array.from(this.discoveredToolNames);
   }
 
+  /** Returns the live projection shared by prompt and event execution. */
+  private getCallerCapabilityProjection(): CallerCapabilityProjection {
+    return resolveCallerCapabilityProjection(
+      mergeCallerCapabilityDefinitions(
+        this.toolDefinitions,
+        this.toolRegistry?.values()
+      ),
+      (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
+    );
+  }
+
+  /** Returns the SDK-owned active caller projection for event-driven hosts. */
+  getCallerCapabilityProjectionSnapshot(): t.CallerCapabilityProjectionSnapshot {
+    return createCallerCapabilityProjectionSnapshot(
+      this.getCallerCapabilityProjection()
+    );
+  }
+
   /**
    * Marks tools as discovered via tool search.
    * Discovered tools will be included in the next model binding.
@@ -1807,14 +2077,9 @@ export class AgentContext {
         return true;
       }
 
-      if (this.discoveredToolNames.has(tool.name)) {
-        const allowedCallers = toolDef.allowed_callers ?? ['direct'];
-        return allowedCallers.includes('direct');
-      }
-
-      const allowedCallers = toolDef.allowed_callers ?? ['direct'];
       return (
-        allowedCallers.includes('direct') && toolDef.defer_loading !== true
+        allowsToolCaller(toolDef, 'direct') &&
+        isToolDefinitionActive(toolDef, this.discoveredToolNames)
       );
     });
   }

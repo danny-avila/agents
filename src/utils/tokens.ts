@@ -6,6 +6,7 @@ import {
   isAtomicToolContentBlock,
   serializeStructuredValueBounded,
 } from './toolContent';
+import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { ContentTypes } from '@/common/enum';
 
 export type EncodingName = 'o200k_base' | 'claude';
@@ -120,6 +121,10 @@ const MAX_STRUCTURED_TOKENIZATION_CHARS = 200_000;
 /** One UTF-16 character can encode to several tokenizer pieces. */
 const MAX_TOKENS_PER_OMITTED_STRUCTURED_CHAR = 4;
 const MAX_STRUCTURED_SAFETY_INSPECTION_WORK = 10_000;
+/** Bounds BPE work per plain-text segment without omitting any text. */
+const MAX_TEXT_TOKENIZATION_CHARS = 8_192;
+/** Covers tokenizer segmentation changes on both sides of a chunk boundary. */
+const TEXT_TOKEN_CHUNK_BOUNDARY_SAFETY_TOKENS = 4;
 
 /**
  * Extracts image dimensions from the first bytes of a base64-encoded
@@ -886,22 +891,24 @@ function getBoundedTextTokenCount(
   value: string,
   getTokenCount: (text: string) => number
 ): number {
-  const preview =
-    value.length > MAX_STRUCTURED_TOKENIZATION_CHARS
-      ? value.slice(0, MAX_STRUCTURED_TOKENIZATION_CHARS)
-      : value;
-  const previewTokens = ensureSafeTokenMeasurement(
-    getTokenCount(preview),
-    'tokenizer'
-  );
-  const omittedChars = value.length - preview.length;
-  if (omittedChars <= 0) {
-    return previewTokens;
+  let numTokens = 0;
+  for (
+    let offset = 0;
+    offset < value.length;
+    offset += MAX_TEXT_TOKENIZATION_CHARS
+  ) {
+    const chunkTokens = ensureSafeTokenMeasurement(
+      getTokenCount(value.slice(offset, offset + MAX_TEXT_TOKENIZATION_CHARS)),
+      'tokenizer'
+    );
+    const boundaryTokens =
+      offset > 0 ? TEXT_TOKEN_CHUNK_BOUNDARY_SAFETY_TOKENS : 0;
+    numTokens = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      numTokens + chunkTokens + boundaryTokens
+    );
   }
-  return Math.min(
-    Number.MAX_SAFE_INTEGER,
-    previewTokens + omittedChars * MAX_TOKENS_PER_OMITTED_STRUCTURED_CHAR
-  );
+  return numTokens;
 }
 
 function getBoundedStructuredTokenCount(
@@ -1250,6 +1257,25 @@ export function apportionTokenCounts(
  */
 const CLAUDE_TOKEN_CORRECTION = 1.1;
 
+const tokenCounterEncodings = new WeakMap<
+  (message: BaseMessage) => number,
+  EncodingName
+>();
+
+/**
+ * Encoding a counter measures in, for counters built here.
+ *
+ * `undefined` for a counter the host supplied itself: unknown, not wrong. A
+ * caller that needs a count in a specific encoding can therefore tell "counts
+ * in the encoding I need" from "counts in a different one" without treating
+ * every foreign counter as suspect.
+ */
+export function encodingOfTokenCounter(
+  tokenCounter: (message: BaseMessage) => number
+): EncodingName | undefined {
+  return tokenCounterEncodings.get(tokenCounter);
+}
+
 /**
  * Creates a token counter function using the specified encoding.
  * Lazily loads the encoding data on first use via dynamic import.
@@ -1260,13 +1286,17 @@ export const createTokenCounter = async (
   const tok = await getTokenizer(encoding);
   const countTokens = (text: string): number => tok.count(text);
   const isClaude = encoding === 'claude';
-  return (message: BaseMessage): number => {
-    const count = getTokenCountForMessage(message, countTokens, encoding);
-    const correctedCount = isClaude
-      ? Math.ceil(count * CLAUDE_TOKEN_CORRECTION)
-      : count;
-    return ensureSafeTokenMeasurement(correctedCount, 'message');
-  };
+  const counter = markTokenCounterCacheCompatible(
+    (message: BaseMessage): number => {
+      const count = getTokenCountForMessage(message, countTokens, encoding);
+      const correctedCount = isClaude
+        ? Math.ceil(count * CLAUDE_TOKEN_CORRECTION)
+        : count;
+      return ensureSafeTokenMeasurement(correctedCount, 'message');
+    }
+  );
+  tokenCounterEncodings.set(counter, encoding);
+  return counter;
 };
 
 /** Utility to manage the token encoder lifecycle explicitly. */

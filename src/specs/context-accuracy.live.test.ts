@@ -12,12 +12,18 @@
  * BEDROCK_AWS_* creds; Bedrock's AWS SDK needs
  * NODE_OPTIONS='--experimental-vm-modules' under jest.
  */
+/* eslint-disable no-console */
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
 
 import { z } from 'zod';
+import Anthropic from '@anthropic-ai/sdk';
 import { tool } from '@langchain/core/tools';
-import { AIMessage, HumanMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  HumanMessage,
+  SystemMessage,
+} from '@langchain/core/messages';
 import { describe, expect, it, jest } from '@jest/globals';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
@@ -27,10 +33,14 @@ import { GraphEvents, Providers } from '@/common';
 import { ModelEndHandler } from '@/events';
 import { Run } from '@/run';
 
+function hasEnv(name: string): boolean {
+  const value = process.env[name];
+  return value != null && value !== '';
+}
+
 const shouldRunLive =
   process.env.RUN_CONTEXT_USAGE_LIVE_TESTS === '1' &&
-  process.env.ANTHROPIC_API_KEY != null &&
-  process.env.ANTHROPIC_API_KEY !== '';
+  hasEnv('ANTHROPIC_API_KEY');
 
 const describeIfLive = shouldRunLive ? describe : describe.skip;
 const modelName =
@@ -105,7 +115,7 @@ const providerMatrix: Array<{
 }> = [
   {
     name: 'google',
-    enabled: !!process.env.GOOGLE_API_KEY,
+    enabled: hasEnv('GOOGLE_API_KEY'),
     llmConfig: {
       provider: Providers.GOOGLE,
       model: process.env.GOOGLE_CONTEXT_LIVE_MODEL ?? 'gemini-2.5-flash',
@@ -118,8 +128,8 @@ const providerMatrix: Array<{
   {
     name: 'bedrock',
     enabled:
-      !!process.env.BEDROCK_AWS_ACCESS_KEY_ID &&
-      !!process.env.BEDROCK_AWS_SECRET_ACCESS_KEY,
+      hasEnv('BEDROCK_AWS_ACCESS_KEY_ID') &&
+      hasEnv('BEDROCK_AWS_SECRET_ACCESS_KEY'),
     llmConfig: {
       provider: Providers.BEDROCK,
       model:
@@ -152,6 +162,61 @@ describeIfLive('Context accuracy live integration', () => {
 
   afterAll(() => {
     TokenEncoderManager.reset();
+  });
+
+  it('matches Anthropic count_tokens for issue-sized context across cache placement', async () => {
+    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const claudeCounter = await createTokenCounter('claude');
+    const phrase = 'The quick brown fox jumps over the lazy dog. ';
+    const instructions = phrase
+      .repeat(Math.ceil(118_315 / phrase.length))
+      .slice(0, 118_315);
+    const fileContext = phrase
+      .repeat(Math.ceil(361_473 / phrase.length))
+      .slice(0, 361_473);
+    const joinedInstructions = `${instructions}\n\n${fileContext}`;
+    const userPrompt = 'test';
+
+    const [joinedProviderCount, splitProviderCount] = await Promise.all([
+      client.messages.countTokens({
+        model: modelName,
+        system: joinedInstructions,
+        messages: [{ role: 'user', content: userPrompt }],
+      }),
+      client.messages.countTokens({
+        model: modelName,
+        system: instructions,
+        messages: [
+          { role: 'user', content: userPrompt },
+          { role: 'user', content: fileContext },
+        ],
+      }),
+    ]);
+    const joinedLocalCount =
+      claudeCounter(new SystemMessage(joinedInstructions)) +
+      claudeCounter(new HumanMessage(userPrompt));
+    const splitLocalCount =
+      claudeCounter(new SystemMessage(instructions)) +
+      claudeCounter(new HumanMessage(userPrompt)) +
+      claudeCounter(new HumanMessage(fileContext));
+    const joinedRatio = joinedLocalCount / joinedProviderCount.input_tokens;
+    const splitRatio = splitLocalCount / splitProviderCount.input_tokens;
+
+    console.log('[ctx-accuracy] long-context local/provider ratios:', {
+      joinedRatio,
+      splitRatio,
+      joinedLocalCount,
+      splitLocalCount,
+      joinedProviderCount: joinedProviderCount.input_tokens,
+      splitProviderCount: splitProviderCount.input_tokens,
+    });
+    expect(joinedRatio).toBeGreaterThan(0.8);
+    expect(joinedRatio).toBeLessThan(1.2);
+    expect(splitRatio).toBeGreaterThan(0.8);
+    expect(splitRatio).toBeLessThan(1.2);
+    expect(joinedProviderCount.input_tokens).toBe(
+      splitProviderCount.input_tokens
+    );
   });
 
   it('tracks provider counts through a cached tool loop and tightens with calibration', async () => {

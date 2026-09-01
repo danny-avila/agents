@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto';
 import { describe, it, expect, beforeEach } from '@jest/globals';
 import { GraphInterrupt, MemorySaver } from '@langchain/langgraph';
+import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
@@ -8,6 +10,8 @@ import type {
   ResolvedSubagentConfig,
   ResolvedSingleAgentSubagentConfig,
   StandardGraphInput,
+  SubagentTaskStartRequest,
+  SubagentTaskStartResult,
   SubagentUpdateEvent,
   SubagentUsageEvent,
   ToolSessionMap,
@@ -17,6 +21,7 @@ import type {
 import type { StandardGraph } from '@/graphs/Graph';
 import {
   SubagentExecutor,
+  InMemorySubagentTaskStore,
   filterGraphSubagentResult,
   filterSubagentResult,
   resolveSubagentConfigs,
@@ -27,9 +32,11 @@ import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecuto
 import { SUBAGENT_PARENT_BATCH_CONFIG_KEY } from '../subagent/SubagentReplay';
 import { Constants, Providers, GraphEvents, StepTypes } from '@/common';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
+import { stableStringify } from '../eagerEventExecution';
 import { AgentContext } from '@/agents/AgentContext';
 import { HookRegistry } from '@/hooks/HookRegistry';
 import { HandlerRegistry } from '@/events';
+import { executeHooks } from '@/hooks';
 
 jest.setTimeout(15000);
 
@@ -422,6 +429,51 @@ describe('buildChildInputs', () => {
     expect(result.discoveredTools).toBeUndefined();
   });
 
+  it('scrubs a parent compaction index on self-spawn but keeps an explicit child index', () => {
+    const compactionSemanticIndex: NonNullable<
+      AgentInputs['compactionSemanticIndex']
+    > = [
+      {
+        type: 'activity_phase',
+        sourceMessageId: 'message-parent',
+        sourceContentIndex: 2,
+        revision: 1,
+        status: 'committed',
+        text: 'Parent-only activity',
+      },
+    ];
+    const inputsWithIndex: AgentInputs = {
+      ...parentAgentInputs,
+      compactionSemanticIndex,
+    };
+
+    expect(
+      buildChildInputs(
+        {
+          type: 'self',
+          name: 'Self',
+          description: 'd',
+          self: true,
+          agentInputs: { ...inputsWithIndex },
+        },
+        'child-self',
+        3
+      ).compactionSemanticIndex
+    ).toBeUndefined();
+    expect(
+      buildChildInputs(
+        {
+          type: 'researcher',
+          name: 'R',
+          description: 'd',
+          agentInputs: inputsWithIndex,
+        },
+        'child-explicit',
+        3
+      ).compactionSemanticIndex
+    ).toBe(compactionSemanticIndex);
+  });
+
   it('overrides agentId with the passed childAgentId', () => {
     const config: ResolvedSubagentConfig = {
       type: 'researcher',
@@ -436,6 +488,38 @@ describe('buildChildInputs', () => {
 
 describe('SubagentExecutor', () => {
   const config = makeConfig();
+
+  class ContinuationTaskStore extends InMemorySubagentTaskStore {
+    readonly supportsThreadContinuation = true;
+    readonly inputs: string[] = [];
+    readonly fingerprints: string[] = [];
+    readonly lineage: Array<{
+      parentRunId: string;
+      parentAgentId?: string;
+      parentToolCallId: string;
+      subagentKind: SubagentTaskStartRequest['subagentKind'];
+    }> = [];
+
+    start(request: SubagentTaskStartRequest): SubagentTaskStartResult {
+      this.inputs.push(request.input);
+      this.fingerprints.push(request.requestFingerprint ?? '');
+      this.lineage.push({
+        parentRunId: request.parentRunId,
+        ...(request.parentAgentId == null
+          ? {}
+          : { parentAgentId: request.parentAgentId }),
+        parentToolCallId: request.parentToolCallId,
+        subagentKind: request.subagentKind,
+      });
+      const threadId = request.threadId ?? 'new-child-thread';
+      return super.start({
+        ...request,
+        threadId,
+        run: (runtime) =>
+          request.run(runtime, [new HumanMessage('Saved child turn.')]),
+      });
+    }
+  }
 
   /**
    * Build a stub `createChildGraph` factory that returns a minimal
@@ -491,6 +575,805 @@ describe('SubagentExecutor', () => {
       ...overrides,
     });
   }
+
+  async function waitForTask(
+    store: InMemorySubagentTaskStore,
+    taskId: string,
+    predicate: (status: string) => boolean
+  ): Promise<void> {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const task = store.get('owner:conversation', taskId);
+      if (task != null && predicate(task.status)) {
+        return;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    throw new Error(`Timed out waiting for background task ${taskId}.`);
+  }
+
+  it('runs a detached child past parent cleanup and exposes its result once', async () => {
+    const store = new InMemorySubagentTaskStore();
+    let finish = (_value: { messages: BaseMessage[] }): void => undefined;
+    const invocation = new Promise<{ messages: BaseMessage[] }>((resolve) => {
+      finish = resolve;
+    });
+    const invoke = jest.fn(() => invocation);
+    const clearHeavyState = jest.fn();
+    let detachedGraph: StandardGraph | undefined;
+    const createDetachedChildGraphFactory = jest.fn(
+      () => (): StandardGraph => {
+        detachedGraph = {
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState,
+        } as unknown as StandardGraph;
+        return detachedGraph;
+      }
+    );
+    const fallbackFactory = jest.fn(
+      (): StandardGraph =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState,
+        }) as unknown as StandardGraph
+    );
+    const hookRegistry = new HookRegistry();
+    hookRegistry.registerSession('test-run', 'PreToolUse', {
+      hooks: [async (): Promise<Record<string, never>> => ({})],
+    });
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: fallbackFactory,
+      createDetachedChildGraphFactory,
+      hookRegistry,
+    });
+
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Research independently.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_background',
+      })
+    ) as { background_task_id: string; status: string };
+
+    expect(response.status).toBe('running');
+    expect(createDetachedChildGraphFactory).toHaveBeenCalledTimes(1);
+    const taskHookSessionId = `test-run:subagent-task:${response.background_task_id}`;
+    await waitForTask(
+      store,
+      response.background_task_id,
+      () => invoke.mock.calls.length > 0
+    );
+    const taskHookRegistry = detachedGraph?.hookRegistry;
+    expect(taskHookRegistry).toBeDefined();
+    expect(taskHookRegistry).not.toBe(hookRegistry);
+    expect(taskHookRegistry?.hasHookFor('PreToolUse', taskHookSessionId)).toBe(
+      true
+    );
+    hookRegistry.clearSession('test-run');
+    expect(taskHookRegistry?.hasHookFor('PreToolUse', taskHookSessionId)).toBe(
+      true
+    );
+    executor.clearHeavyState();
+    finish({ messages: [new AIMessage('detached result')] });
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'completed'
+    );
+
+    expect(
+      store.claim('owner:conversation', response.background_task_id)
+    ).toMatchObject({ status: 'completed', result: 'detached result' });
+    expect(
+      store.claim('owner:conversation', response.background_task_id)
+    ).toMatchObject({ status: 'claimed' });
+    expect(fallbackFactory).not.toHaveBeenCalled();
+    expect(clearHeavyState).toHaveBeenCalled();
+    expect(hookRegistry.hasHookFor('PreToolUse', 'test-run')).toBe(false);
+  });
+
+  it('replaces the ambient parent run config for detached child execution', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const parentController = new AbortController();
+    let observedSignal: AbortSignal | undefined;
+    let finish = (_value: { messages: BaseMessage[] }): void => undefined;
+    const invocation = new Promise<{ messages: BaseMessage[] }>((resolve) => {
+      finish = resolve;
+    });
+    const invoke = jest.fn(async () => {
+      observedSignal = AsyncLocalStorageProviderSingleton.getRunnableConfig()
+        ?.signal as AbortSignal | undefined;
+      return invocation;
+    });
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+
+    const response = await AsyncLocalStorageProviderSingleton.runWithConfig(
+      { signal: parentController.signal },
+      async () =>
+        JSON.parse(
+          executor.executeInBackground({
+            description: 'Outlive the parent turn.',
+            subagentType: 'researcher',
+            parentToolCallId: 'call_detached_signal',
+          })
+        ) as { background_task_id: string }
+    );
+    await waitForTask(
+      store,
+      response.background_task_id,
+      () => invoke.mock.calls.length > 0
+    );
+
+    parentController.abort();
+    expect(observedSignal).toBeDefined();
+    expect(observedSignal).not.toBe(parentController.signal);
+    expect(observedSignal?.aborted).toBe(false);
+
+    finish({ messages: [new AIMessage('detached result')] });
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'completed'
+    );
+  });
+
+  it('keeps detached siblings alive after their parent aborts', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const parentController = new AbortController();
+    const started = new Set<string>();
+    const createInvocation = (): {
+      promise: Promise<{ messages: BaseMessage[] }>;
+      finish: (value: { messages: BaseMessage[] }) => void;
+      signal?: AbortSignal;
+    } => {
+      let finish = (_value: { messages: BaseMessage[] }): void => undefined;
+      const promise = new Promise<{ messages: BaseMessage[] }>((resolve) => {
+        finish = resolve;
+      });
+      return { promise, finish };
+    };
+    const invocationByCall = new Map([
+      ['call_detached_first', createInvocation()],
+      ['call_detached_second', createInvocation()],
+    ]);
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (input): StandardGraph => {
+        const parentToolCallId =
+          input.subagentExecutionContext?.ancestry.at(-1)?.parentToolCallId;
+        if (parentToolCallId == null) {
+          throw new Error('Detached child invocation was not attributed.');
+        }
+        const invocation = invocationByCall.get(parentToolCallId);
+        if (invocation == null) {
+          throw new Error('Detached child invocation was not attributed.');
+        }
+        const attributedCallId = parentToolCallId;
+        const invoke = jest.fn(async () => {
+          invocation.signal =
+            AsyncLocalStorageProviderSingleton.getRunnableConfig()?.signal as
+              | AbortSignal
+              | undefined;
+          if (invocation.signal == null) {
+            throw new Error(
+              'Detached child did not receive a runnable signal.'
+            );
+          }
+          started.add(attributedCallId);
+          return invocation.promise;
+        });
+        return {
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        } as unknown as StandardGraph;
+      },
+    });
+
+    const responses = await AsyncLocalStorageProviderSingleton.runWithConfig(
+      { signal: parentController.signal },
+      async () =>
+        ['call_detached_first', 'call_detached_second'].map(
+          (parentToolCallId) =>
+            JSON.parse(
+              executor.executeInBackground({
+                description: 'Finish independently after the parent.',
+                subagentType: 'researcher',
+                parentToolCallId,
+              })
+            ) as { background_task_id: string }
+        )
+    );
+    await Promise.all(
+      responses.map((response) =>
+        waitForTask(
+          store,
+          response.background_task_id,
+          () => started.size === 2
+        )
+      )
+    );
+
+    parentController.abort();
+    const firstInvocation = invocationByCall.get('call_detached_first');
+    const secondInvocation = invocationByCall.get('call_detached_second');
+    if (firstInvocation == null || secondInvocation == null) {
+      throw new Error('Detached child invocation fixture is incomplete.');
+    }
+    if (firstInvocation.signal == null || secondInvocation.signal == null) {
+      throw new Error('Detached child runnable signal was not captured.');
+    }
+    const observedSignals = [firstInvocation.signal, secondInvocation.signal];
+    expect(observedSignals).toHaveLength(2);
+    expect(observedSignals).not.toContain(parentController.signal);
+    expect(new Set(observedSignals).size).toBe(2);
+    expect(observedSignals.every((signal) => signal.aborted === false)).toBe(
+      true
+    );
+
+    firstInvocation.finish({
+      messages: [new AIMessage('first detached result')],
+    });
+    await waitForTask(
+      store,
+      responses[0].background_task_id,
+      (status) => status === 'completed'
+    );
+    expect(secondInvocation.signal.aborted).toBe(false);
+    expect(
+      store.get('owner:conversation', responses[1].background_task_id)
+    ).toMatchObject({
+      status: 'running',
+    });
+    secondInvocation.finish({
+      messages: [new AIMessage('second detached result')],
+    });
+    await waitForTask(
+      store,
+      responses[1].background_task_id,
+      (status) => status === 'completed'
+    );
+
+    expect(
+      store.claim('owner:conversation', responses[0].background_task_id)
+    ).toMatchObject({
+      status: 'completed',
+      result: 'first detached result',
+    });
+    expect(
+      store.claim('owner:conversation', responses[1].background_task_id)
+    ).toMatchObject({
+      status: 'completed',
+      result: 'second detached result',
+    });
+  });
+
+  it('continues the same detached child for a queued parent message', async () => {
+    const store = new InMemorySubagentTaskStore();
+    let finishFirst = (_value: { messages: BaseMessage[] }): void => undefined;
+    const firstInvocation = new Promise<{ messages: BaseMessage[] }>(
+      (resolve) => {
+        finishFirst = resolve;
+      }
+    );
+    const invoke = jest
+      .fn()
+      .mockImplementationOnce(() => firstInvocation)
+      .mockResolvedValueOnce({ messages: [new AIMessage('second answer')] });
+    const resetValues = jest.fn();
+    let childInput: StandardGraphInput | undefined;
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (input): StandardGraph => {
+        childInput = input;
+        return {
+          createWorkflow: () => ({ invoke }),
+          resetValues,
+          clearHeavyState: jest.fn(),
+        } as unknown as StandardGraph;
+      },
+    });
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Start the analysis.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_queued',
+      })
+    ) as { background_task_id: string };
+    await waitForTask(
+      store,
+      response.background_task_id,
+      () => invoke.mock.calls.length > 0
+    );
+
+    expect(
+      store.control('owner:conversation', response.background_task_id, {
+        action: 'queue',
+        message: 'Now compare both sources.',
+      })
+    ).toMatchObject({ status: 'accepted' });
+    finishFirst({ messages: [new AIMessage('first answer')] });
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'completed'
+    );
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    const continuation = invoke.mock.calls[1][0] as {
+      messages: BaseMessage[];
+    };
+    expect(continuation.messages.at(-1)).toBeInstanceOf(HumanMessage);
+    expect(continuation.messages.at(-1)?.content).toBe(
+      'Now compare both sources.'
+    );
+    expect(resetValues).toHaveBeenCalledWith(true);
+    expect(childInput?.preemption).toBeDefined();
+    expect(
+      store.claim('owner:conversation', response.background_task_id)
+    ).toMatchObject({ status: 'completed', result: 'second answer' });
+  });
+
+  it('starts a fresh execution from a host-restored child thread', async () => {
+    const store = new ContinuationTaskStore();
+    const invoke = jest.fn().mockResolvedValue({
+      messages: [new AIMessage('continued answer')],
+    });
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Continue with the new evidence.',
+        subagentType: 'researcher',
+        subagentThreadId: 'child-thread',
+        parentToolCallId: 'call_continuation',
+      })
+    ) as {
+      background_task_id: string;
+      subagent_thread_id: string;
+    };
+
+    expect(response.subagent_thread_id).toBe('child-thread');
+    expect(store.inputs).toEqual(['Continue with the new evidence.']);
+    expect(store.lineage).toEqual([
+      {
+        parentRunId: 'test-run',
+        parentAgentId: 'parent-agent',
+        parentToolCallId: 'call_continuation',
+        subagentKind: 'agent',
+      },
+    ]);
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'completed'
+    );
+    const childInput = invoke.mock.calls[0][0] as { messages: BaseMessage[] };
+    expect(childInput.messages.map((message) => message.content)).toEqual([
+      'Saved child turn.',
+      'Continue with the new evidence.',
+    ]);
+  });
+
+  it('preserves the legacy fingerprint when no child thread is selected', () => {
+    const store = new ContinuationTaskStore();
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+    });
+
+    executor.executeInBackground({
+      description: 'Legacy detached task.',
+      subagentType: 'researcher',
+      parentToolCallId: 'call_legacy_fingerprint',
+    });
+
+    expect(store.fingerprints).toEqual([
+      createHash('sha256')
+        .update(
+          stableStringify({
+            description: 'Legacy detached task.',
+            subagentType: 'researcher',
+          })
+        )
+        .digest('hex'),
+    ]);
+  });
+
+  it('drains interrupt and steer controls through child-safe hook boundaries', async () => {
+    const store = new InMemorySubagentTaskStore();
+    let taskHookRegistry: HookRegistry | undefined;
+    let childGraph: StandardGraph | undefined;
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let childInput: StandardGraphInput | undefined;
+    const invoke = jest.fn(
+      async (
+        _input: unknown,
+        runnableConfig: { configurable?: Record<string, unknown> }
+      ): Promise<{ messages: BaseMessage[] }> => {
+        await gate;
+        taskHookRegistry = childGraph?.hookRegistry;
+        const runId = runnableConfig.configurable?.run_id as string;
+        expect(childInput?.preemption?.shouldPreempt()).toBe(true);
+        if (taskHookRegistry == null) {
+          throw new Error('Expected a task-local hook registry.');
+        }
+        const interrupted = await executeHooks({
+          registry: taskHookRegistry,
+          input: {
+            hook_event_name: 'PreemptBoundary',
+            runId,
+            agentId: 'child-agent',
+            executingAgentId: 'child-agent',
+            sealCount: 1,
+          },
+          sessionId: runId,
+        });
+        const steered = await executeHooks({
+          registry: taskHookRegistry,
+          input: {
+            hook_event_name: 'PostToolBatch',
+            runId,
+            agentId: 'child-agent',
+            executingAgentId: 'child-agent',
+            entries: [],
+          },
+          sessionId: runId,
+        });
+        const messages = [
+          ...interrupted.injectedMessages,
+          ...steered.injectedMessages,
+        ];
+        return {
+          messages: [
+            new AIMessage(messages.map((message) => message.content).join('|')),
+          ],
+        };
+      }
+    );
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (input): StandardGraph => {
+        childInput = input;
+        childGraph = {
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        } as unknown as StandardGraph;
+        return childGraph;
+      },
+    });
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Work until redirected.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_controlled',
+      })
+    ) as { background_task_id: string };
+    await waitForTask(
+      store,
+      response.background_task_id,
+      () => invoke.mock.calls.length > 0
+    );
+
+    store.control('owner:conversation', response.background_task_id, {
+      action: 'interrupt',
+      message: 'Summarize immediately.',
+    });
+    store.control('owner:conversation', response.background_task_id, {
+      action: 'steer',
+      message: 'Include the primary source.',
+    });
+    release();
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'completed'
+    );
+
+    expect(
+      store.claim('owner:conversation', response.background_task_id)
+    ).toMatchObject({
+      status: 'completed',
+      result: 'Summarize immediately.|Include the primary source.',
+    });
+  });
+
+  it('marks ordinary detached child failures as task errors', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: makeThrowingGraphFactory(new Error('provider failed')),
+    });
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Try the provider.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_failure',
+      })
+    ) as { background_task_id: string };
+
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'error'
+    );
+
+    expect(
+      store.claim('owner:conversation', response.background_task_id)
+    ).toMatchObject({ status: 'error', error: 'provider failed' });
+  });
+
+  it('reserves recursion headroom for every detached preemption seal', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const invoke = jest.fn().mockResolvedValue({
+      messages: [new AIMessage('done')],
+    });
+    const executor = createExecutor({
+      configs: new Map([
+        [config.type, makeConfig(config.type, { maxTurns: 2 })],
+      ]),
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Finish after interrupts.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_recursion_headroom',
+      })
+    ) as { background_task_id: string };
+
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'completed'
+    );
+
+    expect(invoke.mock.calls[0][1]).toMatchObject({
+      recursionLimit: 2 * 3 + 32,
+    });
+  });
+
+  it('cancels a detached child through its dedicated abort signal', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const invoke = jest.fn(
+      (_input: unknown, runnableConfig: { signal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          runnableConfig.signal?.addEventListener(
+            'abort',
+            () => reject(runnableConfig.signal?.reason),
+            { once: true }
+          );
+        })
+    );
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (): StandardGraph =>
+        ({
+          createWorkflow: () => ({ invoke }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph,
+    });
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Wait until cancelled.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_cancelled',
+      })
+    ) as { background_task_id: string };
+    await waitForTask(
+      store,
+      response.background_task_id,
+      () => invoke.mock.calls.length > 0
+    );
+
+    expect(
+      store.control('owner:conversation', response.background_task_id, {
+        action: 'cancel',
+      })
+    ).toMatchObject({ status: 'cancelled' });
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'cancelled'
+    );
+    expect(
+      store.get('owner:conversation', response.background_task_id)
+    ).toMatchObject({ status: 'cancelled' });
+  });
+
+  it('rejects changed arguments replayed under the same parent tool call', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+    });
+    const first = JSON.parse(
+      executor.executeInBackground({
+        description: 'Original task.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_conflict',
+      })
+    ) as { background_task_id: string };
+    const conflict = JSON.parse(
+      executor.executeInBackground({
+        description: 'Changed task.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_conflict',
+      })
+    ) as { status: string; message: string };
+
+    expect(conflict).toMatchObject({
+      status: 'rejected',
+      message:
+        'The same parent tool call ID was already used with different background subagent arguments.',
+    });
+    store.control('owner:conversation', first.background_task_id, {
+      action: 'cancel',
+    });
+  });
+
+  it('rejects a different child thread under the same parent tool call', () => {
+    const store = new ContinuationTaskStore();
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+    });
+    const first = JSON.parse(
+      executor.executeInBackground({
+        description: 'Continue the child.',
+        subagentType: 'researcher',
+        subagentThreadId: 'child-a',
+        parentToolCallId: 'call_thread_conflict',
+      })
+    ) as { background_task_id: string };
+    const conflict = JSON.parse(
+      executor.executeInBackground({
+        description: 'Continue the child.',
+        subagentType: 'researcher',
+        subagentThreadId: 'child-b',
+        parentToolCallId: 'call_thread_conflict',
+      })
+    ) as { status: string; message: string };
+
+    expect(conflict).toMatchObject({
+      status: 'rejected',
+      message:
+        'The same parent tool call ID was already used with different background subagent arguments.',
+    });
+    store.control('owner:conversation', first.background_task_id, {
+      action: 'cancel',
+    });
+  });
+
+  it('fails closed when detached execution is unavailable or not attributable', () => {
+    const disabled = JSON.parse(
+      createExecutor().executeInBackground({
+        description: 'Do not run.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_disabled',
+      })
+    ) as { status: string; message: string };
+    const store = new InMemorySubagentTaskStore();
+    const unattributed = JSON.parse(
+      createExecutor({
+        taskConfig: { store, scopeId: 'owner:conversation' },
+      }).executeInBackground({
+        description: 'Do not run.',
+        subagentType: 'researcher',
+      })
+    ) as { status: string; message: string };
+
+    expect(disabled).toMatchObject({
+      status: 'rejected',
+      message: 'Background subagent execution is not enabled for this run.',
+    });
+    expect(unattributed).toMatchObject({
+      status: 'rejected',
+      message: 'Background subagent execution requires a parent tool call ID.',
+    });
+    expect(store.list('owner:conversation')).toEqual([]);
+  });
+
+  it('fails closed when the host cannot restore child threads', () => {
+    const store = new InMemorySubagentTaskStore();
+    const result = JSON.parse(
+      createExecutor({
+        taskConfig: { store, scopeId: 'owner:conversation' },
+      }).executeInBackground({
+        description: 'Continue this child.',
+        subagentType: 'researcher',
+        subagentThreadId: 'child-thread',
+        parentToolCallId: 'call_unsupported_continuation',
+      })
+    ) as { status: string; message: string };
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      message: 'Child-thread continuation is not enabled by this host.',
+    });
+    expect(store.list('owner:conversation')).toEqual([]);
+  });
+
+  it('reports an unavailable child thread without misclassifying it as capacity', () => {
+    class RejectingContinuationStore extends ContinuationTaskStore {
+      override start(
+        request: SubagentTaskStartRequest
+      ): SubagentTaskStartResult {
+        if (request.threadId === 'missing-child') {
+          return { accepted: false, reason: 'thread_unavailable' };
+        }
+        return super.start(request);
+      }
+    }
+    const store = new RejectingContinuationStore();
+    const result = JSON.parse(
+      createExecutor({
+        taskConfig: { store, scopeId: 'owner:conversation' },
+      }).executeInBackground({
+        description: 'Continue this child.',
+        subagentType: 'researcher',
+        subagentThreadId: 'missing-child',
+        parentToolCallId: 'call_missing_continuation',
+      })
+    ) as { status: string; message: string };
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      message:
+        'The requested subagent thread is unavailable in this parent scope. Start a new subagent thread or choose one created by this parent for the same subagent type.',
+    });
+    expect(store.list('owner:conversation')).toEqual([]);
+  });
+
+  it('cancels a continuation task when its host omits the required thread ID', async () => {
+    class InvalidContinuationStore extends ContinuationTaskStore {
+      override start(
+        request: SubagentTaskStartRequest
+      ): SubagentTaskStartResult {
+        const started = super.start(request);
+        return started.accepted
+          ? { ...started, task: { ...started.task, threadId: undefined } }
+          : started;
+      }
+    }
+    const store = new InvalidContinuationStore();
+    const result = JSON.parse(
+      createExecutor({
+        taskConfig: { store, scopeId: 'owner:conversation' },
+      }).executeInBackground({
+        description: 'Start this child.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_missing_host_thread',
+      })
+    ) as { status: string; message: string };
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      message:
+        'The host accepted the subagent task without assigning its required thread ID.',
+    });
+    await Promise.resolve();
+    expect(store.list('owner:conversation')).toEqual([
+      expect.objectContaining({ status: 'cancelled' }),
+    ]);
+  });
 
   it('returns error for unknown subagent type', async () => {
     const executor = createExecutor();

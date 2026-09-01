@@ -313,6 +313,9 @@ function applyAggregatedResult(
   target.additionalContexts.push(...source.additionalContexts);
   target.injectedMessages.push(...source.injectedMessages);
   target.errors.push(...source.errors);
+  if (source.hasHookFailures === true) {
+    target.hasHookFailures = true;
+  }
   if (source.decision != null) {
     applyToolDecision(target, source.decision, source.reason);
   }
@@ -347,6 +350,19 @@ function combineAggregatedResults(
   return combined;
 }
 
+/** Deterministically fold results from serialized hook phases. */
+export function mergeAggregatedHookResults(
+  ...results: Array<AggregatedHookResult | undefined>
+): AggregatedHookResult | undefined {
+  let combined: AggregatedHookResult | undefined;
+  for (const result of results) {
+    if (result != null) {
+      combined = combineAggregatedResults(combined, result);
+    }
+  }
+  return combined;
+}
+
 function createPendingApprovalReplay(
   approvalResult: AggregatedHookResult,
   pendingApproval: AggregatedHookResult | undefined,
@@ -377,6 +393,7 @@ function fold(outcomes: readonly HookOutcome[]): {
   for (const outcome of outcomes) {
     const isOnceMatcher = outcome.matcher.once === true;
     if (outcome.error !== null) {
+      aggregated.hasHookFailures = true;
       if (outcome.matcher.internal !== true) {
         aggregated.errors.push(outcome.error);
       }
@@ -455,8 +472,9 @@ function fold(outcomes: readonly HookOutcome[]): {
  * ## Internal matchers
  *
  * A matcher with `internal: true` is excluded from both the `errors` array
- * and the logger output. Use it for infrastructure hooks whose failures
- * should not pollute user-visible diagnostics.
+ * and the logger output. `hasHookFailures` still records that the call was
+ * not fully successful, so fail-closed infrastructure boundaries can reject
+ * without exposing the suppressed diagnostic.
  *
  * ## Once semantics — atomic at-most-once
  *

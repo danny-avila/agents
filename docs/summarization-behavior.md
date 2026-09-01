@@ -82,7 +82,7 @@ After compaction, the message array is empty. On the next agent node turn:
 
 ### Summarization Invocation
 
-Raw conversation messages are sent to the LLM via `attemptInvoke` with the summarization instruction appended as the final HumanMessage. Tools are bound so providers that require tool definitions (e.g. Bedrock) accept the messages. This preserves the original message format and enables cache hits on the system prompt + tool definitions prefix.
+Raw conversation messages are sent to the LLM via `attemptInvoke` with the summarization instruction appended as the final HumanMessage. Tools are bound so providers that require tool definitions (e.g. Bedrock) accept the messages and cache-capable providers can reuse the tool-schema prefix. The summarization model does not currently pass through `AgentContext.systemRunnable`, so exact replay of the main request's full system + tools + messages prefix is not guaranteed.
 
 If the primary call fails, fallback providers are attempted (via `tryFallbackProviders`). If all providers fail, a metadata stub is generated mechanically — no LLM call, just tool names and message counts.
 
@@ -191,7 +191,7 @@ Masking uses `truncateToolResultContent` with a ~300 char limit, producing head+
 | `updatePrompt`     | `string`       | Built-in update prompt     | Custom prompt for re-compaction when a prior summary exists. Falls back to `prompt`.   |
 | `trigger`          | `object`       | Always on overflow         | When to fire summarization. See trigger types below.                                   |
 | `reserveRatio`     | `number (0-1)` | `0.05`                     | Fraction of token budget reserved as headroom. Pruning triggers at `budget * (1 - r)`. |
-| `maxSummaryTokens` | `number`       | `2048`                     | Max output tokens for the summarization model.                                         |
+| `maxSummaryTokens` | `number`       | Provider/client default    | Optional max output tokens for the summarization model.                                |
 | `contextPruning`   | `object`       | disabled                   | Position-based context pruning (only applies when summarization is disabled).          |
 
 ### Trigger types (`trigger` field)
@@ -215,6 +215,6 @@ Masking uses `truncateToolResultContent` with a ~300 char limit, producing head+
 
 ### `parameters` sub-fields (extracted before passing to LLM)
 
-| Field              | Type     | Default | Description                                     |
-| ------------------ | -------- | ------- | ----------------------------------------------- |
-| `maxSummaryTokens` | `number` | `2048`  | Can also be set here (same as top-level field). |
+| Field              | Type     | Default                 | Description                                     |
+| ------------------ | -------- | ----------------------- | ----------------------------------------------- |
+| `maxSummaryTokens` | `number` | Provider/client default | Can also be set here (same as top-level field). |

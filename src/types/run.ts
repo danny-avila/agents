@@ -10,6 +10,7 @@ import type {
   ToolOutputReferencesConfig,
   EagerEventToolExecutionConfig,
 } from '@/types/tools';
+import type { SubagentTaskConfig } from '@/types/subagentTasks';
 import type { HumanInTheLoopConfig } from '@/types/hitl';
 import type { HookRegistry } from '@/hooks';
 import type * as s from '@/types/stream';
@@ -21,7 +22,7 @@ import type * as l from '@/types/llm';
 export type ZodObjectAny = z.ZodObject<any, any, any, any>;
 export type BaseGraphConfig = {
   llmConfig: l.LLMConfig;
-  provider?: e.Providers;
+  provider?: l.ProviderName;
   clientOptions?: l.ClientOptions;
   /** Optional compile options for workflow.compile() */
   compileOptions?: g.CompileOptions;
@@ -46,7 +47,7 @@ export type SupervisedGraphConfig = BaseGraphConfig & {
   routingPolicies?: Array<{
     stage: string;
     agents?: string[];
-    model?: e.Providers;
+    model?: l.ProviderName;
     parallel?: boolean;
     /** Optional simple condition on content/tools */
     when?:
@@ -69,7 +70,7 @@ export type SupervisedGraphConfig = BaseGraphConfig & {
 
 export type RunTitleOptions = {
   inputText: string;
-  provider: e.Providers;
+  provider: l.ProviderName;
   contentParts: (s.MessageContentComplex | undefined)[];
   titlePrompt?: string;
   skipLanguage?: boolean;
@@ -235,6 +236,11 @@ export type RunConfig = {
    */
   subagentUsageSink?: g.SubagentUsageSink;
   /**
+   * Trusted process-local task namespace for detached subagent execution.
+   * Omit to preserve foreground-only subagent behavior.
+   */
+  subagentTasks?: SubagentTaskConfig;
+  /**
    * Pre-constructed hook registry for this run. Hooks fire at lifecycle
    * points in `processStream` (RunStart, UserPromptSubmit, Stop,
    * StopFailure) and around tool calls (PreToolUse, PostToolUse,
@@ -246,6 +252,14 @@ export type RunConfig = {
    * block to prevent leaks.
    */
   hooks?: HookRegistry;
+  /**
+   * Maximum number of times a `Stop` hook may keep this Run warm by returning
+   * `decision: 'block'` with messages to inject. Defaults to
+   * `DEFAULT_MAX_STOP_CONTINUATIONS`; non-finite values use the default and
+   * values at or below zero disable terminal continuation while preserving the
+   * final Stop notification.
+   */
+  maxStopContinuations?: number;
   /**
    * Opt-in cooperative preemption for this run. Requires a `hooks` registry
    * with a `PreemptBoundary` matcher — the seal only stops the stream, the

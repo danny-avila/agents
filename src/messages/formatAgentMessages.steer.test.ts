@@ -255,7 +255,12 @@ describe('formatAgentMessages steer replay', () => {
             type: 'web_search_tool_result',
             tool_use_id: useId,
             content: [
-              { type: 'web_search_result', url: 'https://example.com' },
+              {
+                type: 'web_search_result',
+                encrypted_content: 'ciphertext',
+                title: 'Docs',
+                url: 'https://example.com',
+              },
             ],
           } as unknown as Record<string, unknown>,
         ],

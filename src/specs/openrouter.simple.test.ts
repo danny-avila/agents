@@ -68,7 +68,7 @@ describeIf(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
    * Helper: run a reasoning test against a specific model with the given reasoning config.
    * Asserts that reasoning tokens are reported and content is produced.
    */
-  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+
   async function runReasoningTest(opts: {
     model: string;
     reasoning?: ChatOpenRouterCallOptions['reasoning'];

@@ -7,7 +7,6 @@ import type { AddressInfo } from 'net';
 import type * as t from '@/types';
 import {
   executeTools,
-  filterToolsByUsage,
   formatCompletedResponse,
   normalizeToPythonIdentifier,
   ProgrammaticToolCallingName,
@@ -17,9 +16,13 @@ import {
 import {
   BashProgrammaticToolCallingSchema,
   BashProgrammaticToolCallingDescription,
-  filterBashToolsByUsage,
   normalizeToBashIdentifier,
 } from '@/tools/BashProgrammaticToolCalling';
+import {
+  resolveProgrammaticToolDefinitions,
+  selectProgrammaticTools,
+  type ProgrammaticInvocationParams,
+} from '@/tools/ProgrammaticCallerPolicy';
 import {
   executeLocalBash,
   executeLocalCode,
@@ -150,15 +153,7 @@ function constantTimeEquals(a: string, b: string): boolean {
 
 type LocalProgrammaticRuntime = 'python' | 'bash';
 
-type LocalProgrammaticParams = {
-  code: string;
-  timeout?: number;
-  lang?: string;
-  runtime?: string;
-  language?: string;
-};
-
-type ToolFilter = (toolDefs: t.LCTool[], code: string) => t.LCTool[];
+type LocalProgrammaticParams = ProgrammaticInvocationParams;
 
 function resolveRuntime(
   params: LocalProgrammaticParams
@@ -547,17 +542,16 @@ ${code}
 
 function getProgrammaticContext(config?: {
   toolCall?: unknown;
-}): Partial<t.ProgrammaticCache> {
-  return (config?.toolCall ?? {}) as Partial<t.ProgrammaticCache>;
+}): Partial<t.ProgrammaticCache> & { tools?: t.LCTool[] } {
+  return (config?.toolCall ?? {}) as Partial<t.ProgrammaticCache> & {
+    tools?: t.LCTool[];
+  };
 }
 
 function createEffectiveToolMap(
   toolMap: t.ToolMap,
-  toolDefs: t.LCTool[],
-  code: string,
-  filterTools: ToolFilter
+  effectiveTools: t.LCTool[]
 ): { effectiveTools: t.LCTool[]; effectiveMap: t.ToolMap } {
-  const effectiveTools = filterTools(toolDefs, code);
   const effectiveMap = new Map<string, t.GenericTool>(
     effectiveTools
       .map((def) => {
@@ -578,9 +572,22 @@ async function runLocalProgrammaticTool(args: {
   localConfig: t.LocalExecutionConfig;
   runtime: LocalProgrammaticRuntime;
 }): Promise<[string, t.ProgrammaticExecutionArtifact]> {
-  const { toolMap, toolDefs, hookContext } = getProgrammaticContext(
-    args.config
-  );
+  const context = getProgrammaticContext(args.config);
+  const { toolMap, disallowedToolDefs, programmaticToolName, hookContext } =
+    context;
+  const toolDefs = resolveProgrammaticToolDefinitions(context);
+
+  const runnerName =
+    programmaticToolName ??
+    (args.runtime === 'bash'
+      ? Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+      : Constants.PROGRAMMATIC_TOOL_CALLING);
+  const selectedTools = selectProgrammaticTools({
+    requestedToolNames: args.params.tool_manifest,
+    allowedToolDefs: toolDefs,
+    disallowedToolDefs,
+    programmaticToolName: runnerName,
+  });
 
   if (toolMap == null || toolMap.size === 0) {
     throw new Error('No toolMap provided for local programmatic execution.');
@@ -593,9 +600,7 @@ async function runLocalProgrammaticTool(args: {
 
   const { effectiveTools, effectiveMap } = createEffectiveToolMap(
     toolMap,
-    toolDefs,
-    args.params.code,
-    args.runtime === 'bash' ? filterBashToolsByUsage : filterToolsByUsage
+    selectedTools
   );
   const bridge = await createToolBridge(effectiveMap, hookContext);
 

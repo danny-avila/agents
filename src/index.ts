@@ -43,6 +43,9 @@ export * from './hooks';
 /* Programmatic sessions */
 export * from './session';
 
+/* Event actors */
+export * from './eventActor';
+
 /* HITL helpers */
 export * from './hitl';
 
@@ -69,15 +72,21 @@ export {
 export type { Interrupt } from '@langchain/langgraph';
 
 /* LLM */
-export { CustomOpenAIClient } from './llm/openai';
-export { ChatOpenRouter } from './llm/openrouter';
+export { markTokenCounterCacheCompatible } from './llm/tokenCounterCacheCompatibility';
+/** Provider chat-model classes moved off the root barrel: importing any of them here
+ *  forced every host to pay that provider SDK's module init at boot. They remain
+ *  available from their own entries, e.g. `@librechat/agents/llm/openai`. */
 export type {
   OpenRouterReasoning,
   OpenRouterReasoningEffort,
   ChatOpenRouterCallOptions,
 } from './llm/openrouter';
 export { getChatModelClass } from './llm/providers';
-export { CustomChatMistralAI } from './llm/mistral';
+export { registerProvider } from './provider-registration';
+export type {
+  ProviderFamily,
+  ProviderRegistrationOptions,
+} from './provider-registration';
 export {
   smoothStream,
   resolveStreamDelay,
@@ -88,6 +97,14 @@ export type { SmoothItem, SmoothPiece } from './llm/stream/smoother';
 export { FakeChatModel, createFakeStreamingLLM } from './llm/fake';
 export { initializeModel } from './llm/init';
 export { attemptInvoke, tryFallbackProviders } from './llm/invoke';
+export { prepareProviderRequest } from './llm/prepareProviderRequest';
+export type {
+  PreparedProviderRequest,
+  PrepareProviderRequestParams,
+  ProviderMessageProjectionMode,
+  ProviderPayloadMeasurement,
+  ProviderRequestContext,
+} from './llm/prepareProviderRequest';
 export { canSealPreempt } from './llm/preempt';
 export { isThinkingEnabled, getMaxOutputTokensKey } from './llm/request';
 export {

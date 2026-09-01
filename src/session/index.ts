@@ -1,4 +1,5 @@
 export { AgentSession, createAgentSession } from './AgentSession';
+export { deriveMessages } from './deriveMessages';
 export { JsonlSessionStore, SessionManager } from './JsonlSessionStore';
 export { createRunHandlers } from './handlers';
 export {
@@ -42,3 +43,4 @@ export type {
   SessionSummaryEntry,
   SessionTreeNode,
 } from './types';
+export type { DerivedSessionMessages } from './deriveMessages';

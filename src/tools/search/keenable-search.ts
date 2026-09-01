@@ -16,6 +16,23 @@ const KEENABLE_DATE_RANGES: Record<DATE_RANGE, string> = {
   [DATE_RANGE.PAST_YEAR]: '1y',
 };
 
+/** Characters of page text kept per result. Keenable returns the whole page on
+ * every search result, an order of magnitude more than the other providers here
+ * return, which would crowd out the reranker and the LLM output budget. */
+const SNIPPET_MAX_LENGTH = 500;
+
+/** Keenable sends both `description` and `snippet` on every result: `snippet`
+ * carries the page text and `description` is the page's meta description, which
+ * is empty for most pages. Either field can arrive as an empty string, so the
+ * pick is on emptiness rather than nullishness: a `??` chain would keep an empty
+ * `snippet` over a `description` that does carry text. */
+function toSnippet(result: t.KeenableSearchResult): string {
+  const snippet = (result.snippet ?? '').replace(/\s+/g, ' ').trim();
+  const description = (result.description ?? '').replace(/\s+/g, ' ').trim();
+  const text = snippet !== '' ? snippet : description;
+  return text.slice(0, SNIPPET_MAX_LENGTH);
+}
+
 export const createKeenableAPI = (
   apiKey?: string,
   apiUrl?: string,
@@ -84,7 +101,7 @@ export const createKeenableAPI = (
       const organic: t.OrganicResult[] = rawResults.map((result) => ({
         title: result.title ?? '',
         link: result.url ?? '',
-        snippet: result.description ?? result.snippet ?? '',
+        snippet: toSnippet(result),
         date: result.published_at,
       }));
 

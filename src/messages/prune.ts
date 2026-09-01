@@ -13,6 +13,7 @@ import type {
 } from '@/types/stream';
 import type { ContextPruningConfig } from '@/types/graph';
 import type { TokenCounter } from '@/types/run';
+import type { ProviderName } from '@/types';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
@@ -29,6 +30,8 @@ import {
 import { resolveContextPruningSettings } from './contextPruningSettings';
 import { hasUnsafeStructuredSerialization } from '@/utils/tokens';
 import { ContentTypes, Providers, Constants } from '@/common';
+import { getProviderFamily } from '@/llm/providerRegistry';
+import { dropIncompleteToolStreamContent } from './core';
 import { applyContextPruning } from './contextPruning';
 import { toLangChainContent } from './langchain';
 
@@ -41,6 +44,28 @@ function sumTokenCounts(
     total += tokenMap[i] ?? 0;
   }
   return total;
+}
+
+function appendItems<T>(target: T[], source: readonly T[]): void {
+  for (const item of source) {
+    target.push(item);
+  }
+}
+
+/** Prepends in stable order without turning a large array into call arguments. */
+function prependItems<T>(target: T[], prefix: readonly T[]): void {
+  const prefixLength = prefix.length;
+  if (prefixLength === 0) {
+    return;
+  }
+  const originalLength = target.length;
+  target.length = prefixLength + originalLength;
+  for (let index = originalLength - 1; index >= 0; index--) {
+    target[prefixLength + index] = target[index];
+  }
+  for (let index = 0; index < prefixLength; index++) {
+    target[index] = prefix[index];
+  }
 }
 
 /** Default fraction of the token budget reserved as headroom (5 %). */
@@ -108,7 +133,7 @@ export function clampCalibrationRatio(ratio: number): number {
 }
 
 export type PruneMessagesFactoryParams = {
-  provider?: Providers;
+  provider?: ProviderName;
   maxTokens: number;
   /** Per-tool-result character cap applied while reconciling cached counts. */
   maxToolResultChars?: number;
@@ -953,7 +978,7 @@ export function getMessagesWithinTokenLimit({
   prunedMemory.reverse();
 
   if (messages.length > 0) {
-    prunedMemory.unshift(...messages);
+    prependItems(prunedMemory, messages);
   }
 
   remainingContextTokens -= currentTokenCount;
@@ -1070,7 +1095,6 @@ export function getMessagesWithinTokenLimit({
   if (startType != null && startType.length > 0 && newContext.length > 0) {
     let requiredTypeIndex = -1;
 
-    let totalTokens = 0;
     for (let i = newContext.length - 1; i >= 0; i--) {
       const currentType = newContext[i]?.getType() ?? '';
       if (
@@ -1081,12 +1105,9 @@ export function getMessagesWithinTokenLimit({
         requiredTypeIndex = i + 1;
         break;
       }
-      const originalIndex = originalLength - 1 - i;
-      totalTokens += indexTokenCountMap[originalIndex] ?? 0;
     }
 
     if (requiredTypeIndex > 0) {
-      currentTokenCount -= totalTokens;
       newContext = newContext.slice(0, requiredTypeIndex);
     }
   }
@@ -1390,6 +1411,47 @@ function cloneWithProjectedProperties<T extends object>(
     Object.getPrototypeOf(value),
     descriptors as PropertyDescriptorMap
   ) as T;
+}
+
+function cloneAIMessageWithProjectedStreamContent(
+  message: AIMessage | AIMessageChunk,
+  changes: Readonly<Record<string, unknown>>,
+  streamContent: AIMessage['content']
+): AIMessage | AIMessageChunk {
+  const descriptors = Object.getOwnPropertyDescriptors(message) as Record<
+    string,
+    PropertyDescriptor | undefined
+  >;
+  for (const [key, projectedValue] of Object.entries(changes)) {
+    const descriptor = descriptors[key];
+    descriptors[key] = {
+      configurable: descriptor?.configurable ?? true,
+      enumerable: descriptor?.enumerable ?? true,
+      value: projectedValue,
+      writable: descriptor?.writable ?? true,
+    };
+  }
+  const lcKwargs = descriptors.lc_kwargs;
+  if (
+    lcKwargs != null &&
+    'value' in lcKwargs &&
+    typeof lcKwargs.value === 'object' &&
+    lcKwargs.value != null
+  ) {
+    descriptors.lc_kwargs = {
+      ...lcKwargs,
+      value: {
+        ...(lcKwargs.value as Record<string, unknown>),
+        ...(message.response_metadata.output_version === 'v1'
+          ? { content: undefined, contentBlocks: streamContent }
+          : { content: streamContent }),
+      },
+    };
+  }
+  return Object.create(
+    Object.getPrototypeOf(message),
+    descriptors as PropertyDescriptorMap
+  ) as AIMessage | AIMessageChunk;
 }
 
 function createBoundedTruncationValue(
@@ -1855,9 +1917,10 @@ export function calculateMaxToolCallInputChars(
  * Returns the original array when no message changes and otherwise clones only
  * the array and AI messages whose inline input or `tool_calls` args changed.
  */
-export function projectToolCallInputs(
+function projectToolCallInputsInternal(
   messages: BaseMessage[],
-  maxInputChars: number
+  maxInputChars: number,
+  dropIncompleteStreamContent: boolean
 ): BaseMessage[] {
   const normalizedMaxInputChars = normalizeToolInputLimit(maxInputChars);
   let projectedMessages: BaseMessage[] | undefined;
@@ -1869,16 +1932,21 @@ export function projectToolCallInputs(
     }
 
     const aiMessage = message as AIMessage | AIMessageChunk;
-    let projectedContent = aiMessage.content;
-    let contentChanged = false;
-    if (Array.isArray(aiMessage.content)) {
-      const originalContent = aiMessage.content as MessageContentComplex[];
+    const streamContent = dropIncompleteStreamContent
+      ? dropIncompleteToolStreamContent(aiMessage.content)
+      : aiMessage.content;
+    let projectedContent = streamContent;
+    let contentChanged = streamContent !== aiMessage.content;
+    if (Array.isArray(streamContent)) {
+      const originalContent = streamContent as MessageContentComplex[];
       const mappedContent = originalContent.map((block) =>
         projectInlineToolInput(block, normalizedMaxInputChars)
       );
-      contentChanged = mappedContent.some(
-        (block, blockIndex) => block !== originalContent[blockIndex]
-      );
+      contentChanged =
+        contentChanged ||
+        mappedContent.some(
+          (block, blockIndex) => block !== originalContent[blockIndex]
+        );
       projectedContent = toLangChainContent(mappedContent);
     }
 
@@ -2000,16 +2068,43 @@ export function projectToolCallInputs(
       continue;
     }
 
-    const projectedMessage = cloneWithProjectedProperties(aiMessage, {
+    const changes = {
       content: projectedContent,
       tool_calls: projectedToolCalls.length > 0 ? projectedToolCalls : [],
       additional_kwargs: projectedAdditionalKwargs,
       response_metadata: projectedResponseMetadata,
-    });
+    };
+    const projectedMessage =
+      streamContent === aiMessage.content
+        ? cloneWithProjectedProperties(aiMessage, changes)
+        : cloneAIMessageWithProjectedStreamContent(
+          aiMessage,
+          changes,
+          streamContent
+        );
     projectedMessages ??= [...messages];
     projectedMessages[i] = projectedMessage;
   }
   return projectedMessages ?? messages;
+}
+
+/** Projects all historical tool-call input representations to bounded values. */
+export function projectToolCallInputs(
+  messages: BaseMessage[],
+  maxInputChars: number
+): BaseMessage[] {
+  return projectToolCallInputsInternal(messages, maxInputChars, false);
+}
+
+/**
+ * Derives provider-safe tool history in one pass by dropping incomplete stream
+ * content and bounding every provider-consumed tool-call input representation.
+ */
+export function projectToolMessagesForProvider(
+  messages: BaseMessage[],
+  maxInputChars: number
+): BaseMessage[] {
+  return projectToolCallInputsInternal(messages, maxInputChars, true);
 }
 
 export function preFlightTruncateToolCallInputs(params: {
@@ -2047,6 +2142,15 @@ type ThinkingBlocks = {
 };
 
 export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
+  const providerFamily =
+    factoryParams.provider == null
+      ? undefined
+      : getProviderFamily(factoryParams.provider);
+  const usesBedrockThinking =
+    factoryParams.provider === Providers.BEDROCK ||
+    providerFamily === 'bedrock';
+  const usesOpenAIThinking =
+    factoryParams.provider === Providers.OPENAI || providerFamily === 'openai';
   const indexTokenCountMap = { ...factoryParams.indexTokenCountMap };
   let lastTurnStartIndex = factoryParams.startIndex;
   let lastCutOffIndex = 0;
@@ -2134,10 +2238,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       };
     }
 
-    if (
-      factoryParams.provider === Providers.OPENAI &&
-      factoryParams.thinkingEnabled === true
-    ) {
+    if (usesOpenAIThinking && factoryParams.thinkingEnabled === true) {
       for (let i = lastTurnStartIndex; i < params.messages.length; i++) {
         const m = params.messages[i];
         if (
@@ -2711,10 +2812,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       thinkingEnabled: factoryParams.thinkingEnabled,
       tokenCounter: factoryParams.tokenCounter,
       instructionTokens: rawSpaceInstructionTokens,
-      reasoningType:
-        factoryParams.provider === Providers.BEDROCK
-          ? ContentTypes.REASONING_CONTENT
-          : ContentTypes.THINKING,
+      reasoningType: usesBedrockThinking
+        ? ContentTypes.REASONING_CONTENT
+        : ContentTypes.THINKING,
       thinkingStartIndex:
         factoryParams.thinkingEnabled === true
           ? runThinkingStartIndex
@@ -2753,7 +2853,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // tool results (otherwise the summary says "in progress" for a tool
     // call that already completed, causing the model to repeat it).
     if (droppedMessages.length > 0) {
-      messagesToRefine.push(...droppedMessages);
+      appendItems(messagesToRefine, droppedMessages);
     }
 
     // ---------------------------------------------------------------
@@ -2808,10 +2908,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         thinkingEnabled: factoryParams.thinkingEnabled,
         tokenCounter: factoryParams.tokenCounter,
         instructionTokens: currentInstructionTokens,
-        reasoningType:
-          factoryParams.provider === Providers.BEDROCK
-            ? ContentTypes.REASONING_CONTENT
-            : ContentTypes.THINKING,
+        reasoningType: usesBedrockThinking
+          ? ContentTypes.REASONING_CONTENT
+          : ContentTypes.THINKING,
         thinkingStartIndex:
           factoryParams.thinkingEnabled === true
             ? runThinkingStartIndex
@@ -2828,9 +2927,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       if (fadingRepaired.context.length > 0) {
         context = fadingRepaired.context;
         reclaimedTokens = fadingRepaired.reclaimedTokens;
-        messagesToRefine.push(...fadingRetry.messagesToRefine);
+        appendItems(messagesToRefine, fadingRetry.messagesToRefine);
         if (fadingRepaired.droppedMessages.length > 0) {
-          messagesToRefine.push(...fadingRepaired.droppedMessages);
+          appendItems(messagesToRefine, fadingRepaired.droppedMessages);
         }
 
         factoryParams.log?.('debug', 'Fallback fading recovered context', {
@@ -2945,10 +3044,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           thinkingEnabled: factoryParams.thinkingEnabled,
           tokenCounter: factoryParams.tokenCounter,
           instructionTokens: currentInstructionTokens,
-          reasoningType:
-            factoryParams.provider === Providers.BEDROCK
-              ? ContentTypes.REASONING_CONTENT
-              : ContentTypes.THINKING,
+          reasoningType: usesBedrockThinking
+            ? ContentTypes.REASONING_CONTENT
+            : ContentTypes.THINKING,
           thinkingStartIndex:
             factoryParams.thinkingEnabled === true
               ? runThinkingStartIndex
@@ -2964,9 +3062,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
         context = repaired.context;
         reclaimedTokens = repaired.reclaimedTokens;
-        messagesToRefine.push(...retryResult.messagesToRefine);
+        appendItems(messagesToRefine, retryResult.messagesToRefine);
         if (repaired.droppedMessages.length > 0) {
-          messagesToRefine.push(...repaired.droppedMessages);
+          appendItems(messagesToRefine, repaired.droppedMessages);
         }
 
         factoryParams.log?.('debug', 'Emergency truncation retry result', {

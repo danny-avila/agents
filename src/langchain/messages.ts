@@ -10,6 +10,8 @@ export {
   isAIMessage,
   isBaseMessage,
   isToolMessage,
+  mapChatMessagesToStoredMessages,
+  mapStoredMessagesToChatMessages,
 } from '@langchain/core/messages';
 
 export type {
@@ -17,5 +19,6 @@ export type {
   MessageContent,
   MessageContentText,
   MessageContentImageUrl,
+  StoredMessage,
   UsageMetadata,
 } from '@langchain/core/messages';

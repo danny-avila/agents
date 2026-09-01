@@ -1,5 +1,7 @@
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
+  createCloudflareExecutionWorld,
   createCloudflareWorkspaceFS,
   createCloudflareLocalExecutionConfig,
   execWithClientTimeout,
@@ -10,9 +12,13 @@ import {
   createCloudflareBashProgrammaticToolCallingTool,
   createCloudflareProgrammaticToolCallingTool,
 } from '../cloudflare/CloudflareProgrammaticToolCalling';
-import { isWorkspaceClientTimeoutError } from '../local/workspaceFS';
+import {
+  runPostEditSyntaxCheck,
+  _resetSyntaxCheckProbeCacheForTests,
+} from '../local/syntaxCheck';
 import { createCloudflareBridgeRuntime } from '../cloudflare/CloudflareBridgeRuntime';
 import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
+import { isWorkspaceClientTimeoutError } from '../local/workspaceFS';
 import { spawnLocalProcess } from '../local/LocalExecutionEngine';
 import { Constants } from '@/common';
 
@@ -57,6 +63,219 @@ function createRuntime(
     ...overrides,
   };
 }
+
+it('reuses one execution world for repeated Cloudflare tool bindings', () => {
+  const config: t.CloudflareSandboxExecutionConfig = {
+    sandbox: createRuntime(),
+  };
+
+  const firstWorld = createCloudflareExecutionWorld(config);
+  const secondWorld = createCloudflareExecutionWorld(config);
+  const localConfig = createCloudflareLocalExecutionConfig(config);
+
+  expect(secondWorld).toBe(firstWorld);
+  expect(localConfig.exec).toBe(firstWorld);
+  expect(firstWorld.sandboxed).toBe(true);
+  expect(Object.isFrozen(firstWorld.fs)).toBe(true);
+  expect(Object.isFrozen(firstWorld)).toBe(true);
+});
+
+it('rebuilds the world when captured Cloudflare settings change', async () => {
+  const config: t.CloudflareSandboxExecutionConfig = {
+    sandbox: createRuntime(),
+    workspaceRoot: '/first',
+    timeoutMs: 100,
+  };
+
+  const firstWorld = createCloudflareExecutionWorld(config);
+  config.workspaceRoot = '/second';
+  const secondWorld = createCloudflareExecutionWorld(config);
+  config.timeoutMs = 200;
+  const thirdWorld = createCloudflareExecutionWorld(config);
+
+  expect(secondWorld).not.toBe(firstWorld);
+  expect(thirdWorld).not.toBe(secondWorld);
+  await expect(secondWorld.fs.realpath('/second/file.ts')).resolves.toBe(
+    '/second/file.ts'
+  );
+  await expect(firstWorld.fs.realpath('/second/file.ts')).rejects.toThrow(
+    'outside the Cloudflare sandbox workspace'
+  );
+});
+
+it('preserves a prewarmed factory when creating the first world', async () => {
+  let factoryCalls = 0;
+  const runtime = createRuntime({ readFile: async () => 'ok' });
+  const config: t.CloudflareSandboxExecutionConfig = {
+    sandbox: async () => {
+      factoryCalls++;
+      return runtime;
+    },
+  };
+
+  await createCloudflareWorkspaceFS(config).readFile('/workspace/first.txt');
+  const world = createCloudflareExecutionWorld(config);
+  await world.fs.readFile('/workspace/second.txt');
+
+  expect(factoryCalls).toBe(1);
+});
+
+it('does not let a stale factory rejection evict its replacement', async () => {
+  let rejectFirst: ((error: Error) => void) | undefined;
+  const firstFactory = new Promise<t.CloudflareSandboxRuntime>(
+    (_resolve, reject) => {
+      rejectFirst = reject;
+    }
+  );
+  let replacementCalls = 0;
+  const replacement = createRuntime({ readFile: async () => 'replacement' });
+  const config: t.CloudflareSandboxExecutionConfig = {
+    sandbox: () => firstFactory,
+  };
+
+  const firstWorld = createCloudflareExecutionWorld(config);
+  const staleRead = firstWorld.fs.readFile('/workspace/stale.txt');
+  await Promise.resolve();
+  config.sandbox = async () => {
+    replacementCalls++;
+    return replacement;
+  };
+  const replacementWorld = createCloudflareExecutionWorld(config);
+  await expect(
+    replacementWorld.fs.readFile('/workspace/replacement.txt', 'utf8')
+  ).resolves.toBe('replacement');
+  rejectFirst?.(new Error('stale factory failed'));
+  await expect(staleRead).rejects.toThrow('stale factory failed');
+  await expect(
+    replacementWorld.fs.readFile('/workspace/reused.txt', 'utf8')
+  ).resolves.toBe('replacement');
+
+  expect(replacementCalls).toBe(1);
+});
+
+it('keeps remote capability probes warm across Cloudflare tool bindings', async () => {
+  _resetSyntaxCheckProbeCacheForTests();
+  let execCalls = 0;
+  const config: t.CloudflareSandboxExecutionConfig = {
+    sandbox: createRuntime({
+      exec: async () => {
+        execCalls++;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+    }),
+  };
+
+  const firstBinding = createCloudflareLocalExecutionConfig(config);
+  const secondBinding = createCloudflareLocalExecutionConfig(config);
+  await runPostEditSyntaxCheck('/workspace/first.js', firstBinding);
+  await runPostEditSyntaxCheck('/workspace/second.js', secondBinding);
+
+  expect(execCalls).toBe(3);
+});
+
+it('retries a transient capability-probe failure in a stable world', async () => {
+  _resetSyntaxCheckProbeCacheForTests();
+  let execCalls = 0;
+  const config: t.CloudflareSandboxExecutionConfig = {
+    sandbox: createRuntime({
+      exec: async () => {
+        execCalls++;
+        if (execCalls === 1) {
+          throw new Error('transient sandbox RPC failure');
+        }
+        if (execCalls === 2) {
+          return { exitCode: 0, stdout: 'v22', stderr: '' };
+        }
+        return { exitCode: 1, stdout: '', stderr: 'syntax error' };
+      },
+    }),
+  };
+
+  const first = await runPostEditSyntaxCheck(
+    '/workspace/first.js',
+    createCloudflareLocalExecutionConfig(config)
+  );
+  const second = await runPostEditSyntaxCheck(
+    '/workspace/second.js',
+    createCloudflareLocalExecutionConfig(config)
+  );
+
+  expect(first).toEqual({ ok: true });
+  expect(second).toEqual({
+    ok: false,
+    checker: 'node --check',
+    output: 'syntax error',
+  });
+  expect(execCalls).toBe(3);
+});
+
+it('reprobes an expired negative capability in a stateful world', async () => {
+  jest.useFakeTimers();
+  try {
+    jest.setSystemTime(0);
+    let execCalls = 0;
+    const config: t.CloudflareSandboxExecutionConfig = {
+      sandbox: createRuntime({
+        exec: async () => {
+          execCalls++;
+          if (execCalls === 1) {
+            return { exitCode: 127, stdout: '', stderr: 'node not found' };
+          }
+          if (execCalls === 2) {
+            return { exitCode: 0, stdout: 'v22', stderr: '' };
+          }
+          return { exitCode: 1, stdout: '', stderr: 'syntax error' };
+        },
+      }),
+    };
+
+    const first = await runPostEditSyntaxCheck(
+      '/workspace/first.js',
+      createCloudflareLocalExecutionConfig(config)
+    );
+    jest.setSystemTime(6000);
+    const second = await runPostEditSyntaxCheck(
+      '/workspace/second.js',
+      createCloudflareLocalExecutionConfig(config)
+    );
+
+    expect(first).toEqual({ ok: true });
+    expect(second).toEqual({
+      ok: false,
+      checker: 'node --check',
+      output: 'syntax error',
+    });
+    expect(execCalls).toBe(3);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+it('reports the invoked runner name for Cloudflare caller-policy failures', async () => {
+  const programmatic = createCloudflareProgrammaticToolCallingTool({
+    sandbox: createRuntime(),
+  });
+  const toolCall = {
+    id: 'cloudflare-ptc',
+    name: Constants.PROGRAMMATIC_TOOL_CALLING,
+    type: 'tool_call' as const,
+    args: {},
+    programmaticToolName: Constants.PROGRAMMATIC_TOOL_CALLING,
+    disallowedToolDefs: [{ name: 'direct_only_tool' }],
+  } satisfies ToolCall & Partial<t.ProgrammaticCache>;
+
+  await expect(
+    programmatic.invoke(
+      {
+        code: 'direct_only_tool \'{}\'',
+        tool_manifest: ['direct_only_tool'],
+      },
+      { toolCall }
+    )
+  ).rejects.toThrow(
+    'Tool "direct_only_tool" cannot be called from "run_tools_with_code"'
+  );
+});
 
 describe('Cloudflare sandbox execution backend', () => {
   it('normalizes trailing workspace slashes before clamping paths', async () => {

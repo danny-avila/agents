@@ -1,9 +1,15 @@
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
-import { Providers } from '@/common';
+import {
+  getProviderMessageProvenance,
+  getProviderSourceMessageIds,
+  PROVIDER_MESSAGE_PROVENANCE_LIMITS,
+  stampSyntheticProviderMessage,
+} from './provenance';
 import {
   coalesceAdjacentUserTurns,
   strictAlternationProviders,
 } from './alternation';
+import { Providers } from '@/common';
 
 describe('strictAlternationProviders', () => {
   it('covers the providers that reject consecutive user turns', () => {
@@ -99,12 +105,43 @@ describe('coalesceAdjacentUserTurns', () => {
     ]);
   });
 
+  it('does not invoke custom iterators while joining mixed human content', () => {
+    let iteratorReads = 0;
+    const blockContent = [{ type: 'text', text: 'blocks' }];
+    const messages = [
+      new HumanMessage({ content: 'plain' }),
+      new HumanMessage({ content: blockContent }),
+    ];
+    Object.defineProperty(blockContent, Symbol.iterator, {
+      configurable: true,
+      get: () => {
+        iteratorReads++;
+        return Array.prototype[Symbol.iterator];
+      },
+    });
+
+    const result = coalesceAdjacentUserTurns(messages);
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toEqual([
+      { type: 'text', text: 'plain' },
+      { type: 'text', text: 'blocks' },
+    ]);
+    expect(iteratorReads).toBe(0);
+  });
+
   /**
    * Both vendored converters merge adjacent tool-result runs themselves, and
    * folding one into a text turn would orphan the pairing.
    */
   it('never merges tool-result turns', () => {
     const result = coalesceAdjacentUserTurns([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 't1', name: 'lookup', args: {}, type: 'tool_call' },
+          { id: 't2', name: 'lookup', args: {}, type: 'tool_call' },
+        ],
+      }),
       new HumanMessage({
         content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }],
       }),
@@ -112,17 +149,91 @@ describe('coalesceAdjacentUserTurns', () => {
         content: [{ type: 'tool_result', tool_use_id: 't2', content: 'ok' }],
       }),
     ]);
-    expect(result).toHaveLength(2);
+    expect(result).toHaveLength(3);
   });
 
   it('never merges a tool-result turn into a text turn', () => {
+    const result = coalesceAdjacentUserTurns([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 't1', name: 'lookup', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new HumanMessage({
+        content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }],
+      }),
+      new HumanMessage({ content: 'steer' }),
+    ]);
+    expect(result).toHaveLength(3);
+  });
+
+  it('does not invoke custom iterators while pairing tool results', () => {
+    let iteratorReads = 0;
+    const toolCalls = [
+      { id: 't1', name: 'lookup', args: {}, type: 'tool_call' as const },
+    ];
+    const resultContent = [
+      { type: 'tool_result', tool_use_id: 't1', content: 'ok' },
+    ];
+    const messages = [
+      new AIMessage({ content: '', tool_calls: toolCalls }),
+      new HumanMessage({ content: resultContent }),
+      new HumanMessage({ content: 'steer' }),
+    ];
+    for (const array of [toolCalls, resultContent]) {
+      Object.defineProperty(array, Symbol.iterator, {
+        configurable: true,
+        get: () => {
+          iteratorReads++;
+          return Array.prototype[Symbol.iterator];
+        },
+      });
+    }
+
+    expect(coalesceAdjacentUserTurns(messages)).toHaveLength(3);
+    expect(iteratorReads).toBe(0);
+  });
+
+  it('coalesces an exact-looking unpaired tool result as user content', () => {
     const result = coalesceAdjacentUserTurns([
       new HumanMessage({
         content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }],
       }),
       new HumanMessage({ content: 'steer' }),
     ]);
-    expect(result).toHaveLength(2);
+
+    expect(result).toHaveLength(1);
+    expect(getProviderMessageProvenance(result[0])?.parts).toEqual([
+      { attribution: 'user' },
+      { attribution: 'user' },
+    ]);
+  });
+
+  it('exempts only the first result for a provider call id', () => {
+    const firstResult = new HumanMessage({
+      content: [{ type: 'tool_result', tool_use_id: 't1', content: 'first' }],
+    });
+    const result = coalesceAdjacentUserTurns([
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 't1', name: 'lookup', args: {}, type: 'tool_call' },
+        ],
+      }),
+      firstResult,
+      new HumanMessage({
+        content: [{ type: 'tool_result', tool_use_id: 't1', content: 'second' }],
+      }),
+      new HumanMessage({ content: 'steer' }),
+    ]);
+
+    expect(result).toHaveLength(3);
+    expect(result[1]).toBe(firstResult);
+    expect(getProviderMessageProvenance(result[2])?.parts).toEqual([
+      { attribution: 'user' },
+      { attribution: 'user' },
+    ]);
   });
 
   /**
@@ -146,8 +257,119 @@ describe('coalesceAdjacentUserTurns', () => {
       }),
     ]);
     expect(result).toHaveLength(1);
-    expect(result[0].additional_kwargs).toEqual({ role: 'user' });
+    expect(result[0].additional_kwargs).toMatchObject({ role: 'user' });
     expect(result[0].id).toBe('first-id');
+  });
+
+  it('retains every formatted source id in stable content order', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: 'first',
+        id: 'first-message',
+        additional_kwargs: {
+          sourceMessageId: 'first-message',
+          sourceMessageIds: ['first-message'],
+        },
+      }),
+      new HumanMessage({
+        content: 'middle',
+        additional_kwargs: {
+          sourceMessageId: 'middle-message',
+          sourceMessageIds: ['middle-message'],
+        },
+      }),
+      new HumanMessage({
+        content: 'last',
+        additional_kwargs: {
+          sourceMessageId: 'last-message',
+          sourceMessageIds: ['last-message'],
+        },
+      }),
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe('first-message');
+    expect(result[0].additional_kwargs.sourceMessageId).toBe('last-message');
+    expect(result[0].additional_kwargs.sourceMessageIds).toEqual([
+      'first-message',
+      'middle-message',
+      'last-message',
+    ]);
+  });
+
+  it('keeps user and synthetic contributors distinct across a merge', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: 'real user turn',
+        additional_kwargs: {
+          sourceMessageId: 'user-message',
+          sourceMessageIds: ['user-message'],
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'user',
+                sourceMessageId: 'user-message',
+                sourceContentPartIndices: [1],
+              },
+            ],
+          },
+        },
+      }),
+      stampSyntheticProviderMessage(
+        new HumanMessage({
+          content: 'skill body',
+          additional_kwargs: { isMeta: true, source: 'skill' },
+        })
+      ),
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'user',
+          sourceMessageId: 'user-message',
+          sourceContentPartIndices: [1],
+        },
+        { attribution: 'synthetic' },
+      ],
+    });
+    expect(result[0].additional_kwargs.sourceMessageIds).toEqual([
+      'user-message',
+    ]);
+  });
+
+  it('reconciles plural lineage when explicit legacy parts omit ids', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: 'legacy first',
+        additional_kwargs: {
+          sourceMessageIds: ['legacy-first'],
+          provenance: {
+            version: 1,
+            parts: [{ attribution: 'user' }],
+          },
+        },
+      }),
+      new HumanMessage({
+        content: 'second',
+        additional_kwargs: { sourceMessageId: 'second' },
+      }),
+    ]);
+
+    expect(result[0].additional_kwargs.sourceMessageIds).toEqual([
+      'legacy-first',
+      'second',
+    ]);
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'user', sourceMessageId: 'legacy-first' },
+        { attribution: 'user', sourceMessageId: 'second' },
+      ],
+    });
   });
 
   it('marks the merge meta when the trailing part is the volatile one', () => {
@@ -192,12 +414,313 @@ describe('coalesceAdjacentUserTurns', () => {
 
   it('excludes the camelCase toolResult variant too', () => {
     const result = coalesceAdjacentUserTurns([
+      new AIMessage({
+        content: [
+          {
+            type: 'toolUse',
+            toolUse: { toolUseId: 't1', name: 'lookup', input: {} },
+          },
+        ],
+      }),
       new HumanMessage({
-        content: [{ type: 'toolResult', toolResult: { content: 'ok' } }],
+        content: [
+          {
+            type: 'toolResult',
+            toolResult: { toolUseId: 't1', content: [{ text: 'ok' }] },
+          },
+        ],
       }),
       new HumanMessage({ content: 'steer' }),
     ]);
-    expect(result).toHaveLength(2);
+    expect(result).toHaveLength(3);
+  });
+
+  it('coalesces a LangChain server result presented as user content', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: [
+          {
+            type: 'server_tool_result',
+            tool_call_id: 'server-call',
+            status: 'success',
+            output: 'tool bytes',
+          },
+        ],
+      }),
+      new HumanMessage({ content: 'next turn' }),
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(getProviderMessageProvenance(result[0])?.parts).toEqual([
+      { attribution: 'user' },
+      { attribution: 'user' },
+    ]);
+  });
+
+  it('coalesces a Gemini code result presented as user content', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: [
+          {
+            type: 'codeExecutionResult',
+            codeExecutionResult: {
+              outcome: 'OUTCOME_OK',
+              output: 'tool bytes',
+            },
+          },
+        ],
+      }),
+      new HumanMessage({ content: 'next turn' }),
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(getProviderMessageProvenance(result[0])?.parts).toEqual([
+      { attribution: 'user' },
+      { attribution: 'user' },
+    ]);
+  });
+
+  it('does not trust arbitrary source metadata or tool-result suffixes', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: [{ type: 'attacker_tool_result', text: 'submitted text' }],
+        additional_kwargs: {
+          source: 'mobile',
+          sourceMessageId: 'first',
+        },
+      }),
+      new HumanMessage({
+        content: 'next',
+        additional_kwargs: { sourceMessageId: 'second' },
+      }),
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'user', sourceMessageId: 'first' },
+        { attribution: 'user', sourceMessageId: 'second' },
+      ],
+    });
+  });
+
+  it.each([
+    ['hook source', { source: 'hook' }],
+    ['skill source', { source: 'skill' }],
+    ['system source', { source: 'system' }],
+    ['meta flag', { isMeta: true }],
+    ['injected flag', { injected: true }],
+  ])('defaults an unstamped human with a caller-controlled %s to user', (_, metadata) => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: 'caller bytes',
+        additional_kwargs: {
+          ...metadata,
+          sourceMessageId: 'caller-row',
+        },
+      }),
+      new HumanMessage({
+        content: 'next',
+        additional_kwargs: { sourceMessageId: 'next-row' },
+      }),
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'user', sourceMessageId: 'caller-row' },
+        { attribution: 'user', sourceMessageId: 'next-row' },
+      ],
+    });
+  });
+
+  it.each([
+    [
+      'proxy-backed malformed',
+      () => ({
+        version: 1,
+        parts: new Proxy([{ attribution: 'synthetic' }], {
+          get(target, property, receiver) {
+            return property === 'length'
+              ? Number.NaN
+              : Reflect.get(target, property, receiver);
+          },
+        }),
+      }),
+    ],
+    [
+      'plain oversized',
+      () => ({
+        version: 1,
+        parts: Array.from(
+          { length: PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxParts + 1 },
+          () => ({ attribution: 'synthetic' })
+        ),
+      }),
+    ],
+  ])('preserves %s provenance invalidity across a human merge', (_, create) => {
+    const sourceProvenance = create();
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: 'caller bytes',
+        additional_kwargs: {
+          source: 'hook',
+          sourceMessageId: 'caller-row',
+          provenance: sourceProvenance,
+        },
+      }),
+      new HumanMessage({ content: 'next' }),
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: null,
+    });
+    expect(result[0].additional_kwargs.provenance).not.toBe(sourceProvenance);
+    expect(result[0].additional_kwargs.sourceMessageId).toBeUndefined();
+    expect(result[0].lc_kwargs.additional_kwargs).toBe(
+      result[0].additional_kwargs
+    );
+  });
+
+  it.each([
+    ['non-array', { 0: 'forged', length: 1 }],
+    [
+      'oversized',
+      new Array(
+        PROVIDER_MESSAGE_PROVENANCE_LIMITS.maxSourceMessageIds + 1
+      ).fill('forged'),
+    ],
+  ])('preserves %s legacy lineage invalidity across a human merge', (_, sourceMessageIds) => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: 'caller bytes',
+        additional_kwargs: { sourceMessageIds },
+      }),
+      new HumanMessage({ content: 'next' }),
+    ]);
+
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: null,
+    });
+    expect(result[0].additional_kwargs.provenance).not.toBe(sourceMessageIds);
+  });
+
+  it('keeps steer user attribution even when legacy metadata marks it meta', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: 'steer',
+        additional_kwargs: {
+          source: 'steer',
+          isMeta: true,
+          sourceMessageId: 'steer-row',
+        },
+      }),
+      new HumanMessage({
+        content: 'next',
+        additional_kwargs: { sourceMessageId: 'next-row' },
+      }),
+    ]);
+
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'user', sourceMessageId: 'steer-row' },
+        { attribution: 'user', sourceMessageId: 'next-row' },
+      ],
+    });
+  });
+
+  it('does not fabricate indexed mappings across plural legacy sources', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: [{ type: 'text', text: 'merged legacy bytes' }],
+        additional_kwargs: {
+          sourceMessageIds: ['first-row', 'second-row'],
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'user',
+                sourceContentPartIndices: [0],
+              },
+            ],
+          },
+        },
+      }),
+      new HumanMessage({
+        content: 'next',
+        additional_kwargs: { sourceMessageId: 'next-row' },
+      }),
+    ]);
+
+    expect(result[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        { attribution: 'user', sourceContentPartIndices: [0] },
+        { attribution: 'user', sourceMessageId: 'first-row' },
+        { attribution: 'user', sourceMessageId: 'second-row' },
+        { attribution: 'user', sourceMessageId: 'next-row' },
+      ],
+    });
+  });
+
+  it('does not attribute leading empty turns that add no provider bytes', () => {
+    const result = coalesceAdjacentUserTurns([
+      new HumanMessage({
+        content: '',
+        additional_kwargs: { sourceMessageId: 'empty-row' },
+      }),
+      new HumanMessage({
+        content: 'visible',
+        additional_kwargs: { sourceMessageId: 'visible-row' },
+      }),
+    ]);
+
+    expect(result[0].content).toBe('visible');
+    expect(getProviderSourceMessageIds(result[0])).toEqual(['visible-row']);
+  });
+
+  it('coalesces a large adjacent run in one pass without truncating lineage', () => {
+    const count = 4_000;
+    const messages = Array.from(
+      { length: count },
+      (_, index) =>
+        new HumanMessage({
+          content: [{ type: 'text', text: String(index) }],
+          additional_kwargs: { sourceMessageId: `source-${index}` },
+        })
+    );
+
+    const result = coalesceAdjacentUserTurns(messages);
+    const sourceMessageIds = getProviderSourceMessageIds(result[0]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toHaveLength(count);
+    expect(sourceMessageIds).toHaveLength(count);
+    expect(getProviderMessageProvenance(result[0])?.parts).toHaveLength(count);
+    expect(sourceMessageIds[0]).toBe('source-0');
+    expect(sourceMessageIds[count - 1]).toBe(`source-${count - 1}`);
+  });
+
+  it('coalesces a very large block array without call-argument spreading', () => {
+    const blockCount = 150_000;
+    const repeatedBlock = { type: 'text', text: 'x' } as const;
+    const largeContent = new Array(blockCount).fill(repeatedBlock);
+    const messages = [
+      new HumanMessage({ content: [{ type: 'text', text: 'first' }] }),
+      new HumanMessage({ content: largeContent }),
+    ];
+
+    const result = coalesceAdjacentUserTurns(messages);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toHaveLength(blockCount + 1);
+    expect(messages[1].content).toBe(largeContent);
   });
 
   it('does not mutate the input array or its messages', () => {

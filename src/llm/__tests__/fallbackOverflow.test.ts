@@ -7,6 +7,7 @@ import {
   getFallbackOverflowCandidates,
 } from '@/llm/invoke';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
+import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { Providers } from '@/common';
 import * as init from '@/llm/init';
 
@@ -49,6 +50,32 @@ const fallbacks: Array<{ provider: Providers }> = [
 describe('tryFallbackProviders surfacing', () => {
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('sends the exact prepared fallback request without projecting again', async () => {
+    const invocations: BaseMessage[][] = [];
+    const fallbackModel = {
+      invoke: async (preparedMessages: BaseMessage[]) => {
+        invocations.push(preparedMessages);
+        return new AIMessageChunk({ content: 'ok' });
+      },
+    } as unknown as ReturnType<typeof init.initializeModel>;
+    jest.spyOn(init, 'initializeModel').mockReturnValue(fallbackModel);
+    let preparedMessages: BaseMessage[] | undefined;
+
+    await tryFallbackProviders({
+      fallbacks: [{ provider: Providers.MISTRAL }],
+      messages,
+      primaryError: new Error('primary boom'),
+      prepareProviderRequest: (input) => {
+        const request = prepareProviderRequest(input);
+        preparedMessages = request.messages;
+        return request;
+      },
+    });
+
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]).toBe(preparedMessages);
   });
 
   it('throws the overflow even when a later fallback failed for another reason', async () => {

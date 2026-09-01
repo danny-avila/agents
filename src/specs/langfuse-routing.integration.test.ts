@@ -1,18 +1,27 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { HumanMessage } from '@langchain/core/messages';
+import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import type { SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { Context } from '@opentelemetry/api';
+import type { StopHookOutput } from '@/hooks';
 import type * as t from '@/types';
+import {
+  registerLangfuseManagedSpan,
+  resolveLangfuseDestinationKey,
+  resolveLangfuseTraceAnchorParent,
+} from '@/langfuseSpanRegistry';
 import { Constants, ContentTypes, Providers, TitleMethod } from '@/common';
 import { withLangfuseRuntimeScope } from '@/langfuseRuntimeScope';
 import { initializeLangfuseTracing } from '@/instrumentation';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
+import { createLangfuseHandler } from '@/langfuse';
 import * as providers from '@/llm/providers';
+import { HookRegistry } from '@/hooks';
 import { Run } from '@/run';
 
 type ProcessorParams = {
@@ -30,6 +39,7 @@ type SpanStartRecord = {
 };
 
 const spanStarts: SpanStartRecord[] = [];
+const endedSpans: MockSpan[] = [];
 let providerInput:
   | {
       spanProcessors?: SpanProcessor[];
@@ -79,6 +89,7 @@ function createMockSpan(
     attributes,
     addEvent: jest.fn(),
     end: jest.fn(() => {
+      endedSpans.push(span);
       for (const processor of providerInput?.spanProcessors ?? []) {
         processor.onEnd(span as never);
       }
@@ -492,7 +503,11 @@ async function runTenantSummarizationFlow(tenantId: string): Promise<void> {
           provider: Providers.OPENAI,
           clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
           instructions: 'Summarize when context is full.',
-          maxContextTokens: 120,
+          /* Under `compactingTokenCounter` a message costs its character
+           * count, so this sits between the summary's own carrier (~272) and
+           * the transcript (~397): high enough that the run survives its
+           * checkpoint, low enough that compaction still fires. */
+          maxContextTokens: 340,
           summarizationEnabled: true,
           summarizationConfig: {
             retainRecent: { turns: 0 },
@@ -533,6 +548,7 @@ describe('Langfuse per-run routing integration', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     spanStarts.length = 0;
+    endedSpans.length = 0;
     delete process.env.LANGFUSE_PUBLIC_KEY;
     delete process.env.LANGFUSE_SECRET_KEY;
     delete process.env.LANGFUSE_BASE_URL;
@@ -574,6 +590,37 @@ describe('Langfuse per-run routing integration', () => {
     });
   });
 
+  it('keeps caller run names from replacing the graph operation name', async () => {
+    const tenantId = 'tenant-caller-run-name';
+    const run = await Run.create<t.IState>({
+      runId: `routing-${tenantId}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [createAgent(tenantId)],
+      },
+      langfuse: tenantLangfuse(tenantId),
+      returnContent: true,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel(['Caller name preserved.'], 1);
+
+    await run.processStream(
+      { messages: [new HumanMessage('Keep the operation name stable.')] },
+      {
+        ...callerConfig,
+        runName: 'Host Agent Trace',
+        configurable: {
+          thread_id: `thread-${tenantId}`,
+          user_id: `user-${tenantId}`,
+        },
+      }
+    );
+
+    const starts = startsForTenant(tenantId);
+    expect(starts.some(({ name }) => name === 'AgentGraph')).toBe(true);
+    expect(starts.some(({ name }) => name === 'Host Agent Trace')).toBe(false);
+  });
+
   it('routes parallel root, model, tool, subagent, and title spans to each run config', async () => {
     await Promise.all([runTenantFlow('tenant-a'), runTenantFlow('tenant-b')]);
 
@@ -588,7 +635,8 @@ describe('Langfuse per-run routing integration', () => {
         starts,
         traceId: runTraceId,
         names: [
-          `LibreChat Agent: Parent ${tenantId}`,
+          'AgentGraph',
+          'AgentModelCall',
           'FakeChatModel',
           'echo',
           'subagent',
@@ -635,11 +683,7 @@ describe('Langfuse per-run routing integration', () => {
       expectNamedSpansUseTraceId({
         starts,
         traceId,
-        names: [
-          `LibreChat Agent: parent ${tenantId}`,
-          'FakeChatModel',
-          'subagent',
-        ],
+        names: ['AgentGraph', 'AgentModelCall', 'FakeChatModel', 'subagent'],
       });
       expect(
         starts.filter(
@@ -667,7 +711,7 @@ describe('Langfuse per-run routing integration', () => {
         starts,
         traceId: summaryTraceId,
         names: [
-          `LibreChat Agent: Parent ${tenantId}`,
+          'AgentGraph',
           'summarize=parent',
           'summarization:cache_hit_compaction',
           'FakeChatModel',
@@ -712,9 +756,7 @@ describe('Langfuse per-run routing integration', () => {
       )
     ).toHaveLength(0);
 
-    const agentRoot = starts.find(
-      (record) => record.name === `LibreChat Agent: Parent ${tenantId}`
-    );
+    const agentRoot = starts.find((record) => record.name === 'AgentGraph');
     expect(agentRoot?.traceId).toBe(traceIdFromSeed(`routing-${tenantId}`));
     expect(agentRoot?.parentSpanId).toBeUndefined();
 
@@ -746,7 +788,7 @@ describe('Langfuse per-run routing integration', () => {
       spanId: string;
     };
     const agentRoot = startsForTenant(tenantId).find(
-      (record) => record.name === `LibreChat Agent: Parent ${tenantId}`
+      (record) => record.name === 'AgentGraph'
     );
     expect(agentRoot?.traceId).toBe(hostSpanContext.traceId);
     expect(agentRoot?.parentSpanId).toBe(hostSpanContext.spanId);
@@ -777,11 +819,273 @@ describe('Langfuse per-run routing integration', () => {
       spanId: string;
     };
     const agentRoot = startsForTenant(runTenantId).find(
-      (record) => record.name === `LibreChat Agent: Parent ${runTenantId}`
+      (record) => record.name === 'AgentGraph'
     );
     expect(agentRoot?.traceId).toBe(traceIdFromSeed(`routing-${runTenantId}`));
     expect(agentRoot?.traceId).not.toBe(hostSpanContext.traceId);
     expect(agentRoot?.parentSpanId).toBeUndefined();
+  });
+
+  it('parents auxiliary label callbacks beneath the captured agent run', async () => {
+    const tenantId = 'tenant-label-parent';
+    const langfuse = tenantLangfuse(tenantId);
+    const traceAnchor = {};
+    initializeLangfuseTracing(langfuse);
+
+    let agentRoot: MockSpan | undefined;
+    withLangfuseRuntimeScope(
+      { langfuse, traceAnchor, runId: 'source-run' },
+      () => {
+        agentRoot = createMockSpan('AgentGraph');
+      }
+    );
+    const destinationKey = resolveLangfuseDestinationKey(langfuse) as string;
+    const rootActiveContext = otelTrace.setSpan(
+      otelContext.active(),
+      agentRoot as never
+    );
+    const hostSpan = createMockSpan('managed-host', rootActiveContext);
+    registerLangfuseManagedSpan(hostSpan as never, destinationKey);
+    let graphChild: MockSpan | undefined;
+    withLangfuseRuntimeScope(
+      { langfuse, traceAnchor, runId: 'source-run' },
+      () =>
+        otelContext.with(rootActiveContext, () => {
+          graphChild = createMockSpan('agent-child');
+        })
+    );
+    const hostParent = otelContext.with(
+      otelTrace.setSpan(otelContext.active(), hostSpan as never),
+      () => resolveLangfuseTraceAnchorParent(traceAnchor, destinationKey)
+    );
+    const childParent = otelContext.with(
+      otelTrace.setSpan(otelContext.active(), graphChild as never),
+      () => resolveLangfuseTraceAnchorParent(traceAnchor, destinationKey)
+    );
+    expect(hostParent?.spanId).toBe(agentRoot?.spanContext().spanId);
+    expect(childParent?.spanId).toBe(graphChild?.spanContext().spanId);
+    const parentSpanContext = resolveLangfuseTraceAnchorParent(
+      traceAnchor,
+      destinationKey
+    );
+    const labelHandler = createLangfuseHandler({
+      langfuse,
+      runId: 'label-run',
+      parentSpanContext,
+      tags: ['librechat', 'activity-label'],
+    });
+
+    await withLangfuseRuntimeScope(
+      { langfuse, runId: 'foreign-background-run' },
+      () =>
+        labelHandler?.handleChainStart(
+          { id: ['StepLabel'] } as never,
+          {},
+          'label-chain'
+        )
+    );
+
+    const label = startsForTenant(tenantId).find(
+      (record) => record.name === 'StepLabel'
+    );
+    const rootContext = agentRoot?.spanContext() as {
+      traceId: string;
+      spanId: string;
+    };
+    expect(label?.traceId).toBe(rootContext.traceId);
+    expect(label?.parentSpanId).toBe(rootContext.spanId);
+  });
+
+  it('restores an overlay agent lane after rejecting a foreign scope', async () => {
+    const rootLangfuse = tenantLangfuse('tenant-anchor-root');
+    const overlayLangfuse = tenantLangfuse('tenant-anchor-overlay');
+    const traceAnchor = {};
+    initializeLangfuseTracing(rootLangfuse);
+    initializeLangfuseTracing(overlayLangfuse);
+
+    withLangfuseRuntimeScope(
+      { langfuse: rootLangfuse, traceAnchor, runId: 'source-run' },
+      () => createMockSpan('AgentGraph')
+    );
+    const overlayHandler = createLangfuseHandler({
+      langfuse: overlayLangfuse,
+      traceAnchor,
+      agentId: 'overlay-agent',
+      runId: 'source-run',
+      tags: ['librechat', 'agent'],
+    });
+
+    await withLangfuseRuntimeScope(
+      { langfuse: rootLangfuse, runId: 'foreign-run' },
+      () =>
+        overlayHandler?.handleChainStart(
+          { id: ['AgentModelCall'] } as never,
+          {},
+          'overlay-chain'
+        )
+    );
+
+    const overlayParent = resolveLangfuseTraceAnchorParent(
+      traceAnchor,
+      resolveLangfuseDestinationKey(overlayLangfuse),
+      'overlay-agent'
+    );
+    const overlayStart = startsForTenant('tenant-anchor-overlay').find(
+      (record) => record.name === 'AgentModelCall'
+    );
+    expect(overlayParent?.spanId).toBe(overlayStart?.spanId);
+    expect(overlayParent?.traceId).toBe(overlayStart?.traceId);
+  });
+
+  it('rotates the captured root between fresh executions of one run', async () => {
+    const tenantId = 'tenant-anchor-rotation';
+    const langfuse = tenantLangfuse(tenantId);
+    const run = await Run.create<t.IState>({
+      runId: `routing-${tenantId}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [createAgent(tenantId)],
+      },
+      langfuse,
+      returnContent: true,
+      skipCleanup: true,
+    });
+    const execute = async (response: string): Promise<void> => {
+      run.Graph?.overrideTestModel([response]);
+      await run.processStream(
+        { messages: [new HumanMessage(response)] },
+        callerConfig
+      );
+    };
+
+    await execute('first execution');
+    const firstTraceAnchor = run.Graph?.langfuseTraceAnchor;
+    const firstScopeRunId = run.Graph?.langfuseScopeRunId;
+    const firstParent = resolveLangfuseTraceAnchorParent(
+      run.Graph?.langfuseTraceAnchor,
+      resolveLangfuseDestinationKey(langfuse)
+    );
+    await execute('second execution');
+    const secondTraceAnchor = run.Graph?.langfuseTraceAnchor;
+    const secondScopeRunId = run.Graph?.langfuseScopeRunId;
+    const secondParent = resolveLangfuseTraceAnchorParent(
+      run.Graph?.langfuseTraceAnchor,
+      resolveLangfuseDestinationKey(langfuse)
+    );
+    withLangfuseRuntimeScope(
+      {
+        langfuse,
+        traceAnchor: firstTraceAnchor,
+        runId: firstScopeRunId,
+      },
+      () => createMockSpan('late-first-execution-callback')
+    );
+    const secondParentAfterLateCallback = resolveLangfuseTraceAnchorParent(
+      secondTraceAnchor,
+      resolveLangfuseDestinationKey(langfuse)
+    );
+    const roots = startsForTenant(tenantId).filter(
+      (record) => record.name === 'AgentGraph' && record.parentSpanId == null
+    );
+
+    expect(roots).toHaveLength(2);
+    expect(firstParent?.spanId).toBe(roots[0].spanId);
+    expect(secondParent?.spanId).toBe(roots[1].spanId);
+    expect(secondParentAfterLateCallback?.spanId).toBe(roots[1].spanId);
+    expect(secondParent?.spanId).not.toBe(firstParent?.spanId);
+    expect(secondTraceAnchor).not.toBe(firstTraceAnchor);
+    expect(secondScopeRunId).not.toBe(firstScopeRunId);
+  });
+
+  it('keeps warm terminal continuations under one trace root', async () => {
+    const tenantId = 'tenant-warm-continuation';
+    const registry = new HookRegistry();
+    registry.register('Stop', {
+      hooks: [
+        async (input): Promise<StopHookOutput> =>
+          input.continuationCount === 0
+            ? {
+              decision: 'block',
+              injectedMessages: [
+                { role: 'user', content: 'late steer', source: 'steer' },
+              ],
+            }
+            : { decision: 'continue' },
+      ],
+    });
+    const run = await Run.create<t.IState>({
+      runId: `routing-${tenantId}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [createAgent(tenantId)],
+      },
+      langfuse: tenantLangfuse(tenantId),
+      hooks: registry,
+      returnContent: true,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel(['first answer', 'continued answer']);
+
+    await run.processStream(
+      { messages: [new HumanMessage('initial prompt')] },
+      callerConfig
+    );
+
+    const roots = startsForTenant(tenantId).filter(
+      (record) => record.name === 'AgentGraph' && record.parentSpanId == null
+    );
+    expect(roots).toHaveLength(1);
+    expect(
+      startsForTenant(tenantId).filter(
+        (record) => record.parentSpanId === roots[0].spanId
+      ).length
+    ).toBeGreaterThan(0);
+  });
+
+  it('marks the deferred root as failed when terminal admission fails', async () => {
+    const tenantId = 'tenant-terminal-admission-failure';
+    const registry = new HookRegistry();
+    registry.register('StopFinalize', {
+      hooks: [
+        async (): Promise<StopHookOutput> => {
+          throw new Error('terminal admission unavailable');
+        },
+      ],
+    });
+    const run = await Run.create<t.IState>({
+      runId: `routing-${tenantId}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [createAgent(tenantId)],
+      },
+      langfuse: tenantLangfuse(tenantId),
+      hooks: registry,
+      returnContent: true,
+      skipCleanup: true,
+    });
+    run.Graph?.overrideTestModel(['first answer']);
+
+    await expect(
+      run.processStream(
+        { messages: [new HumanMessage('initial prompt')] },
+        callerConfig
+      )
+    ).rejects.toThrow(
+      'StopFinalize terminal admission failed: terminal admission unavailable'
+    );
+
+    const root = endedSpans.find(
+      (span) =>
+        span.name === 'AgentGraph' &&
+        span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_LEVEL] ===
+          'ERROR'
+    );
+    expect(root).toBeDefined();
+    expect(
+      root?.attributes[
+        LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE
+      ]
+    ).toContain('terminal admission unavailable');
   });
 
   it('generates a scope stamp for directly-constructed graphs without a run id', async () => {

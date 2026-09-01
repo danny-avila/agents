@@ -22,6 +22,12 @@ export type ProgrammaticToolCallingJsonSchema = {
       minLength: number;
       description: string;
     };
+    tool_manifest: {
+      type: 'array';
+      items: { type: 'string' };
+      uniqueItems: true;
+      description: string;
+    };
     timeout: TimeoutSchema;
   };
   required: readonly ['code'];

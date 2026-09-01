@@ -43,6 +43,7 @@ import type { SeenScalarMetadata } from './streamMetadata';
 import type { HeaderValue, HeadersLike } from './types';
 import type { PromptCacheTtl } from '@/messages/cache';
 import {
+  OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY,
   OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
   projectOpenAIResponsesToolMessageContent,
   projectToolStreamContentForProvider,
@@ -57,14 +58,14 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
-import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
-import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
-import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
 import {
   hasReasoningKwargs,
   hasToolCallChunks,
   getReasoningKwargsText,
 } from '@/llm/stream/chunkAdapters';
+import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
+import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
+import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
@@ -606,6 +607,85 @@ function isResponsesReplayOutputItem(item: unknown): boolean {
   );
 }
 
+type ResponsesReasoningSlot = {
+  encrypted_content?: string;
+  id?: string;
+  status?: string;
+};
+
+function getResponsesReasoningSlot(
+  reasoning: unknown
+): ResponsesReasoningSlot | undefined {
+  return typeof reasoning === 'object' && reasoning != null
+    ? (reasoning as ResponsesReasoningSlot)
+    : undefined;
+}
+
+function isSealedReasoningSlot(
+  slot: ResponsesReasoningSlot | undefined
+): slot is ResponsesReasoningSlot & { encrypted_content: string } {
+  return (
+    typeof slot?.encrypted_content === 'string' &&
+    slot.encrypted_content.length > 0
+  );
+}
+
+function resolveActiveReasoningItemId(
+  incoming: ResponsesReasoningSlot | undefined,
+  carried: unknown
+): string | undefined {
+  if (typeof incoming?.id === 'string' && incoming.id.length > 0) {
+    return incoming.id;
+  }
+  return typeof carried === 'string' ? carried : undefined;
+}
+
+/**
+ * A single `additional_kwargs.reasoning` slot has to stand in for a turn that
+ * can emit many reasoning items, and the chunk merge folds it field by field:
+ * `encrypted_content` and `status` are strings, so they concatenate, while
+ * `id` takes whichever item arrived last. An interrupted turn replays from
+ * that slot, handing the provider one item id welded to every item's
+ * ciphertext — rejected as "Encrypted content could not be decrypted or
+ * parsed". Keep the slot describing whichever item most recently sealed, so
+ * the id, its ciphertext, and its status always come from the same item.
+ *
+ * `activeItemId` tracks the item currently streaming, which is the one a
+ * terminal `encrypted_content` belongs to: the slot's own id has already been
+ * pinned back to the last sealed item by an earlier merge.
+ */
+function resealReasoningItemBoundary(
+  combined: AIMessageChunk,
+  accumulated: ResponsesReasoningSlot | undefined,
+  incoming: ResponsesReasoningSlot | undefined,
+  activeItemId: string | undefined
+): void {
+  const merged = getResponsesReasoningSlot(
+    combined.additional_kwargs.reasoning
+  );
+  if (merged == null || incoming == null) {
+    return;
+  }
+  if (isSealedReasoningSlot(incoming)) {
+    combined.additional_kwargs.reasoning = {
+      ...merged,
+      id: activeItemId ?? merged.id,
+      encrypted_content: incoming.encrypted_content,
+      status: incoming.status,
+    };
+    return;
+  }
+  if (!isSealedReasoningSlot(accumulated)) {
+    return;
+  }
+  combined.additional_kwargs.reasoning = {
+    ...merged,
+    id: accumulated.id,
+    encrypted_content: accumulated.encrypted_content,
+    status: accumulated.status,
+  };
+}
+
 /**
  * LangChain's Responses converter places the authoritative terminal output in
  * response_metadata.output. Its chunk merge has no way to delete provisional
@@ -619,10 +699,26 @@ class ResponsesReplayAIMessageChunk extends AIMessageChunk {
   }
 
   override concat(chunk: AIMessageChunk): this {
+    const accumulated = getResponsesReasoningSlot(
+      this.additional_kwargs.reasoning
+    );
+    const incoming = getResponsesReasoningSlot(
+      chunk.additional_kwargs.reasoning
+    );
+    const activeItemId = resolveActiveReasoningItemId(
+      incoming,
+      this.additional_kwargs[OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY]
+    );
     const combined = super.concat(chunk);
+    resealReasoningItemBoundary(combined, accumulated, incoming, activeItemId);
+    if (activeItemId != null) {
+      combined.additional_kwargs[OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY] =
+        activeItemId;
+    }
     if (!Array.isArray(chunk.response_metadata.output)) {
       return combined;
     }
+    delete combined.additional_kwargs[OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY];
     delete combined.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY];
     const toolOutputs = combined.additional_kwargs.tool_outputs;
     if (!Array.isArray(toolOutputs)) {
@@ -823,6 +919,75 @@ function attachResponsesReplayPosition(
   chunk.message.lc_kwargs.additional_kwargs = additionalKwargs;
 }
 
+type ResponsesAnnotationsBoundaryEvent = {
+  type: OpenAIClient.Responses.ResponseStreamEvent['type'];
+  response?: {
+    output?: Array<{
+      type: string;
+      content?: Array<{
+        type: string;
+        annotations?: object[] | null;
+      }>;
+    }>;
+  };
+};
+
+/**
+ * The Responses API spec declares `annotations` required on `output_text`
+ * content parts, but some OpenAI-compatible gateways omit the field on the
+ * terminal `response.completed`/`response.incomplete` events. LangChain's
+ * converter calls `part.annotations.map(...)` unconditionally, so a missing
+ * field crashes the whole stream. Default it to `[]` before conversion.
+ */
+export function ensureResponsesOutputAnnotations(
+  event: ResponsesAnnotationsBoundaryEvent
+): void {
+  if (event.type !== 'response.completed' && event.type !== 'response.incomplete') {
+    return;
+  }
+  const output = event.response?.output;
+  if (!Array.isArray(output)) {
+    return;
+  }
+  for (const item of output) {
+    if (item.type !== 'message' || !Array.isArray(item.content)) {
+      continue;
+    }
+    for (const part of item.content) {
+      if (part.type === 'output_text' && !Array.isArray(part.annotations)) {
+        part.annotations = [];
+      }
+    }
+  }
+}
+
+function getResponsesStreamError(
+  event: OpenAIClient.Responses.ResponseStreamEvent
+): Error | undefined {
+  if (event.type === 'error') {
+    return new OpenAIClient.APIError(
+      undefined,
+      event,
+      event.message,
+      undefined
+    );
+  }
+  if (event.type !== 'response.failed') {
+    return;
+  }
+  if (event.response.error != null) {
+    return new OpenAIClient.APIError(
+      undefined,
+      event.response.error,
+      event.response.error.message,
+      undefined
+    );
+  }
+  return new OpenAIClient.OpenAIError(
+    `Response ${event.response.id} failed without error details.`
+  );
+}
+
 async function* convertLibreChatResponsesStream(
   stream: AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>,
   options: ResponsesStreamChunkOptions,
@@ -833,6 +998,11 @@ async function* convertLibreChatResponsesStream(
   try {
     for await (const event of stream) {
       options.signal?.throwIfAborted();
+      const streamError = getResponsesStreamError(event);
+      if (streamError != null) {
+        throw streamError;
+      }
+      ensureResponsesOutputAnnotations(event);
       const convertedChunk =
         convertResponsesDeltaToChatGenerationChunk(event) ??
         convertDroppedResponsesReplayOutput(event);
