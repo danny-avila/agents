@@ -22,16 +22,17 @@ import {
   selectRuntimeSessionHint,
 } from './CodeExecutor';
 import {
-  clampCodeApiRunTimeoutMs,
-  createCodeApiRunTimeoutSchema,
-  resolveCodeApiRunTimeoutMs,
-} from './ptcTimeout';
-import {
+  assertUnambiguousIdentifiers,
   projectProgrammaticToolMap,
   resolveProgrammaticToolDefinitions,
   selectProgrammaticTools,
   type ProgrammaticInvocationParams,
 } from './ProgrammaticCallerPolicy';
+import {
+  clampCodeApiRunTimeoutMs,
+  createCodeApiRunTimeoutSchema,
+  resolveCodeApiRunTimeoutMs,
+} from './ptcTimeout';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
@@ -95,7 +96,7 @@ ${CORE_RULES}`;
 
 const TOOL_MANIFEST_DESCRIPTION =
   'Exact registered tool names used by the code. Required when direct-only tools are configured; ' +
-  'validated before execution starts.';
+  'validated before execution starts. Pass [] when the code calls no tools at all.';
 
 export function createProgrammaticToolCallingSchema(
   maxRunTimeoutMs = DEFAULT_RUN_TIMEOUT_MS
@@ -874,6 +875,84 @@ export function formatCompletedResponse(
   ];
 }
 
+/**
+ * Mirrors the Code API's programmatic Python wrapper (`wrapUserCodeInAsync`).
+ *
+ * The programmatic contract promises top-level `await` works; plain `/exec`
+ * applies no wrapper, so forwarding source unchanged would turn valid
+ * programmatic input into a SyntaxError. The wrapper is self-contained, so a
+ * later divergence in the Code API's own copy cannot break this path.
+ */
+export function wrapPythonForPlainExecution(userCode: string): string {
+  const indented = userCode
+    .split('\n')
+    .map((line) => (line.trim() === '' ? '' : `    ${line}`))
+    .join('\n');
+
+  return (
+    'async def __user_main__():\n' +
+    '    """Auto-generated wrapper for user code to support top-level await"""\n' +
+    `${indented}\n` +
+    '\n' +
+    'if __name__ == "__main__":\n' +
+    '    import asyncio\n' +
+    '    asyncio.run(__user_main__())\n'
+  );
+}
+
+/**
+ * Runs code that selected no tools through plain `/exec`.
+ *
+ * `/exec/programmatic` rejects an empty tool manifest outright, and the sandbox
+ * has nothing to inject for such a call anyway — no stubs, no replay round
+ * trips. Routing it here makes a tool-free programmatic call behave exactly like
+ * the equivalent `execute_code`, against every deployed Code API, instead of
+ * failing with a rejection the model cannot act on.
+ */
+export async function runPlainExecution(args: {
+  baseUrl: string;
+  lang: 'bash' | 'py';
+  code: string;
+  /**
+   * Forwarded so the model-supplied cap applies as soon as the Code API honors
+   * it on `/exec`, which does not read `timeout` today. Session affinity and
+   * input files are honored there, so those ride the same body.
+   */
+  timeout?: number;
+  sessionId?: string;
+  files?: t.CodeEnvFile[];
+  runtimeSessionHint?: string;
+  proxy?: string;
+  authHeaders?: t.CodeApiAuthHeaders;
+  executionProfile?: t.CodeApiExecutionProfile;
+}): Promise<[string, t.ProgrammaticExecutionArtifact]> {
+  const response = await makeRequest(
+    buildCodeApiEndpoint(args.baseUrl, 'exec'),
+    {
+      lang: args.lang,
+      code:
+        args.lang === 'py'
+          ? wrapPythonForPlainExecution(args.code)
+          : args.code,
+      ...(args.timeout != null ? { timeout: args.timeout } : {}),
+      ...(args.sessionId != null && args.sessionId !== ''
+        ? { session_id: args.sessionId }
+        : {}),
+      ...(args.files != null && args.files.length > 0
+        ? { files: args.files }
+        : {}),
+      ...(args.runtimeSessionHint != null
+        ? { runtime_session_hint: args.runtimeSessionHint }
+        : {}),
+    },
+    args.proxy,
+    args.authHeaders,
+    args.executionProfile
+  );
+
+  return formatCompletedResponse(response, args.code);
+}
+
 // ============================================================================
 // Tool Factory
 // ============================================================================
@@ -943,22 +1022,41 @@ export function createProgrammaticToolCallingTool(
         programmaticToolName,
       });
 
-      if (toolMap == null || toolMap.size === 0) {
-        throw new Error(
-          'No toolMap provided. ' +
-            'ToolNode should inject this from AgentContext when invoked through the graph.'
-        );
+      /* These guard the replay path only. A call that selected no tools never
+       * replays, and event-driven ToolNode configurations legitimately inject
+       * an empty toolMap/toolDefs. Injected context is still required to
+       * conclude that — with nothing injected at all, an empty selection means
+       * the host wired the tool up wrong. */
+      const needsNoTools =
+        effectiveTools.length === 0 &&
+        (params.tool_manifest?.length === 0 ||
+          toolDefs != null ||
+          disallowedToolDefs != null);
+
+      if (!needsNoTools) {
+        if (toolMap == null || toolMap.size === 0) {
+          throw new Error(
+            'No toolMap provided. ' +
+              'ToolNode should inject this from AgentContext when invoked through the graph.'
+          );
+        }
+
+        if (toolDefs == null || toolDefs.length === 0) {
+          throw new Error(
+            'No tool definitions provided. ' +
+              'Either pass tools in the input or ensure ToolNode injects toolDefs.'
+          );
+        }
       }
 
-      if (toolDefs == null || toolDefs.length === 0) {
-        throw new Error(
-          'No tool definitions provided. ' +
-            'Either pass tools in the input or ensure ToolNode injects toolDefs.'
-        );
-      }
+      assertUnambiguousIdentifiers(
+        effectiveTools,
+        normalizeToPythonIdentifier,
+        programmaticToolName
+      );
 
       const effectiveToolMap = projectProgrammaticToolMap(
-        toolMap,
+        toolMap ?? new Map(),
         effectiveTools
       );
 
@@ -973,7 +1071,7 @@ export function createProgrammaticToolCallingTool(
           // eslint-disable-next-line no-console
           console.log(
             `[PTC Debug] Sending ${effectiveTools.length} tools to API ` +
-              `(selected from ${toolDefs.length})`
+              `(selected from ${toolDefs?.length ?? 0})`
           );
         }
 
@@ -1007,6 +1105,21 @@ export function createProgrammaticToolCallingTool(
           selectedRuntimeSessionHint !== ''
             ? selectedRuntimeSessionHint
             : undefined;
+
+        if (needsNoTools) {
+          return await runPlainExecution({
+            baseUrl,
+            lang: 'py',
+            code,
+            timeout,
+            sessionId: session_id,
+            files,
+            runtimeSessionHint,
+            proxy,
+            authHeaders: initParams.authHeaders,
+            executionProfile: initParams.executionProfile,
+          });
+        }
 
         let response = await makeRequest(
           EXEC_ENDPOINT,

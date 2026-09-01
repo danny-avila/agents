@@ -14,11 +14,7 @@ import {
   selectRuntimeSessionHint,
 } from './CodeExecutor';
 import {
-  makeRequest,
-  executeTools,
-  formatCompletedResponse,
-} from './ProgrammaticToolCalling';
-import {
+  assertUnambiguousIdentifiers,
   projectProgrammaticToolMap,
   resolveProgrammaticToolDefinitions,
   selectProgrammaticTools,
@@ -29,6 +25,12 @@ import {
   createCodeApiRunTimeoutSchema,
   resolveCodeApiRunTimeoutMs,
 } from './ptcTimeout';
+import {
+  makeRequest,
+  executeTools,
+  runPlainExecution,
+  formatCompletedResponse,
+} from './ProgrammaticToolCalling';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
@@ -117,7 +119,7 @@ ${CORE_RULES}`;
 
 const TOOL_MANIFEST_DESCRIPTION =
   'Exact registered tool names used by the code. Required when direct-only tools are configured; ' +
-  'validated before execution starts.';
+  'validated before execution starts. Pass [] when the code calls no tools at all.';
 
 // ============================================================================
 // Schema
@@ -361,22 +363,41 @@ export function createBashProgrammaticToolCallingTool(
         programmaticToolName,
       });
 
-      if (toolMap == null || toolMap.size === 0) {
-        throw new Error(
-          'No toolMap provided. ' +
-            'ToolNode should inject this from AgentContext when invoked through the graph.'
-        );
+      /* These guard the replay path only. A call that selected no tools never
+       * replays, and event-driven ToolNode configurations legitimately inject
+       * an empty toolMap/toolDefs. Injected context is still required to
+       * conclude that — with nothing injected at all, an empty selection means
+       * the host wired the tool up wrong. */
+      const needsNoTools =
+        effectiveTools.length === 0 &&
+        (params.tool_manifest?.length === 0 ||
+          toolDefs != null ||
+          disallowedToolDefs != null);
+
+      if (!needsNoTools) {
+        if (toolMap == null || toolMap.size === 0) {
+          throw new Error(
+            'No toolMap provided. ' +
+              'ToolNode should inject this from AgentContext when invoked through the graph.'
+          );
+        }
+
+        if (toolDefs == null || toolDefs.length === 0) {
+          throw new Error(
+            'No tool definitions provided. ' +
+              'Either pass tools in the input or ensure ToolNode injects toolDefs.'
+          );
+        }
       }
 
-      if (toolDefs == null || toolDefs.length === 0) {
-        throw new Error(
-          'No tool definitions provided. ' +
-            'Either pass tools in the input or ensure ToolNode injects toolDefs.'
-        );
-      }
+      assertUnambiguousIdentifiers(
+        effectiveTools,
+        normalizeToBashIdentifier,
+        programmaticToolName
+      );
 
       const effectiveToolMap = projectProgrammaticToolMap(
-        toolMap,
+        toolMap ?? new Map(),
         effectiveTools
       );
 
@@ -391,7 +412,7 @@ export function createBashProgrammaticToolCallingTool(
           // eslint-disable-next-line no-console
           console.log(
             `[BashPTC Debug] Sending ${effectiveTools.length} tools to API ` +
-              `(selected from ${toolDefs.length})`
+              `(selected from ${toolDefs?.length ?? 0})`
           );
         }
 
@@ -422,6 +443,23 @@ export function createBashProgrammaticToolCallingTool(
           selectedRuntimeSessionHint !== ''
             ? selectedRuntimeSessionHint
             : undefined;
+
+        /* Raw `code`, not `preparedCode`: the `$!` guard exists for the
+         * programmatic replay wrapper, which plain `/exec` never applies. */
+        if (needsNoTools) {
+          return await runPlainExecution({
+            baseUrl,
+            lang: 'bash',
+            code,
+            timeout,
+            sessionId: session_id,
+            files,
+            runtimeSessionHint,
+            proxy,
+            authHeaders: initParams.authHeaders,
+            executionProfile: initParams.executionProfile,
+          });
+        }
 
         let response = await makeRequest(
           EXEC_ENDPOINT,

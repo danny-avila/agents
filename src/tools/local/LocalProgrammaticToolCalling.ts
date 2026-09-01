@@ -589,17 +589,28 @@ async function runLocalProgrammaticTool(args: {
     programmaticToolName: runnerName,
   });
 
-  if (toolMap == null || toolMap.size === 0) {
-    throw new Error('No toolMap provided for local programmatic execution.');
-  }
-  if (toolDefs == null || toolDefs.length === 0) {
-    throw new Error(
-      'No tool definitions provided for local programmatic execution.'
-    );
+  /* The local program builder supports zero stubs, so a call that selected no
+   * tools needs neither a toolMap nor toolDefs. Injected context is still
+   * required to conclude that. */
+  const needsNoTools =
+    selectedTools.length === 0 &&
+    (args.params.tool_manifest?.length === 0 ||
+      toolDefs != null ||
+      disallowedToolDefs != null);
+
+  if (!needsNoTools) {
+    if (toolMap == null || toolMap.size === 0) {
+      throw new Error('No toolMap provided for local programmatic execution.');
+    }
+    if (toolDefs == null || toolDefs.length === 0) {
+      throw new Error(
+        'No tool definitions provided for local programmatic execution.'
+      );
+    }
   }
 
   const { effectiveTools, effectiveMap } = createEffectiveToolMap(
-    toolMap,
+    toolMap ?? new Map(),
     selectedTools
   );
   const bridge = await createToolBridge(effectiveMap, hookContext);

@@ -43,6 +43,37 @@ export function assertDisallowedToolUsage(
   );
 }
 
+/**
+ * Rejects a stub set holding two tools that collapse to one runtime identifier.
+ *
+ * Stub generation binds by identifier, so such tools are indistinguishable once
+ * emitted — the generated program defines both and the later one wins. Failing
+ * beats dispatching by declaration order.
+ *
+ * Called on the set each backend actually emits, not on the selection: a
+ * definition dropped before codegen never binds an identifier, so a collision
+ * among such definitions is not a conflict.
+ */
+export function assertUnambiguousIdentifiers(
+  selectedToolDefs: readonly t.LCTool[],
+  normalizeIdentifier: (name: string) => string,
+  programmaticToolName: string
+): void {
+  const seen = new Map<string, string>();
+  for (const toolDef of selectedToolDefs) {
+    const identifier = normalizeIdentifier(toolDef.name);
+    const prior = seen.get(identifier);
+    if (prior != null && prior !== toolDef.name) {
+      throw new Error(
+        `Tools "${prior}" and "${toolDef.name}" both become "${identifier}" in ` +
+          `the sandbox, so "${programmaticToolName}" cannot tell which one the ` +
+          'code means. Call them directly, or rename one.'
+      );
+    }
+    seen.set(identifier, toolDef.name);
+  }
+}
+
 export function selectProgrammaticTools(args: {
   requestedToolNames?: string[];
   allowedToolDefs?: t.LCTool[];
