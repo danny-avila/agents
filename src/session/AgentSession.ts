@@ -23,13 +23,13 @@ import type {
 } from './types';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
-import { deriveMessages } from './deriveMessages';
 import { createSummarizeNode } from '@/summarization/node';
 import { resolveStreamLimits } from '@/llm/streamLimits';
 import { JsonlSessionStore } from './JsonlSessionStore';
 import { AgentContext } from '@/agents/AgentContext';
 import { ContentTypes, GraphEvents } from '@/common';
 import { createRunId, createSessionId } from './ids';
+import { deriveMessages } from './deriveMessages';
 import { createRunHandlers } from './handlers';
 import { Run } from '@/run';
 
@@ -850,6 +850,8 @@ export class AgentSession {
   private runConfig: t.RunConfig;
   private store: JsonlSessionStore | undefined;
   private calibrationRatio: number | undefined;
+  private fadingTier: t.FadingTier | undefined;
+  private fadingTiers: t.FadingTiers | undefined;
   private checkpointing: SessionCheckpointingState;
   cwd: string;
   threadId: string;
@@ -866,6 +868,18 @@ export class AgentSession {
     this.threadId = params.threadId;
     this.store = params.store;
     this.checkpointing = params.checkpointing;
+    this.fadingTier =
+      params.runConfig.fadingTier == null
+        ? undefined
+        : { ...params.runConfig.fadingTier };
+    this.fadingTiers =
+      params.runConfig.fadingTiers == null
+        ? undefined
+        : Object.fromEntries(
+          Object.entries(params.runConfig.fadingTiers).map(
+            ([agentId, tier]) => [agentId, { ...tier }]
+          )
+        );
   }
 
   static async create(config: AgentSessionConfig): Promise<AgentSession> {
@@ -1094,6 +1108,8 @@ export class AgentSession {
         ),
         returnContent: true,
         calibrationRatio: this.calibrationRatio,
+        fadingTier: this.fadingTier,
+        fadingTiers: this.fadingTiers,
         customHandlers: {
           ...(this.runConfig.customHandlers ?? {}),
           ...handlerResult.handlers,
@@ -1116,6 +1132,8 @@ export class AgentSession {
         }
       }
       this.calibrationRatio = run.getCalibrationRatio();
+      this.fadingTier = run.getFadingTier();
+      this.fadingTiers = run.getFadingTiers();
       const interrupt = run.getInterrupt();
       const haltedReason = run.getHaltReason();
       if (interrupt) {
@@ -1424,6 +1442,8 @@ export class AgentSession {
       retainedEntryIds,
       summarizedEntryIds: summarized.map((entry) => entry.id),
     });
+    this.fadingTier = undefined;
+    this.fadingTiers = undefined;
     return summary;
   }
 
@@ -1465,6 +1485,8 @@ export class AgentSession {
         ),
         returnContent: true,
         calibrationRatio: this.calibrationRatio,
+        fadingTier: this.fadingTier,
+        fadingTiers: this.fadingTiers,
         customHandlers: {
           ...(this.runConfig.customHandlers ?? {}),
           ...handlerResult.handlers,
@@ -1478,6 +1500,8 @@ export class AgentSession {
         }
       }
       this.calibrationRatio = run.getCalibrationRatio();
+      this.fadingTier = run.getFadingTier();
+      this.fadingTiers = run.getFadingTiers();
       const interrupt = run.getInterrupt();
       const haltedReason = run.getHaltReason();
       if (interrupt) {

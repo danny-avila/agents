@@ -519,10 +519,15 @@ export class Run<_T extends t.BaseGraphState> {
       this.calibrationRatio = config.calibrationRatio;
     }
     if (config.fadingTier != null) {
-      this.fadingTier = config.fadingTier;
+      this.fadingTier = { ...config.fadingTier };
     }
     if (config.fadingTiers != null) {
-      this.fadingTiers = { ...config.fadingTiers };
+      this.fadingTiers = Object.fromEntries(
+        Object.entries(config.fadingTiers).map(([agentId, tier]) => [
+          agentId,
+          { ...tier },
+        ])
+      );
     }
 
     const handlerRegistry = new HandlerRegistry();
@@ -955,7 +960,7 @@ export class Run<_T extends t.BaseGraphState> {
    * `getFadingTiers()` so independent agent tiers are retained.
    */
   getFadingTier(): t.FadingTier | undefined {
-    return this.fadingTier;
+    return this.fadingTier == null ? undefined : { ...this.fadingTier };
   }
 
   /** Returns a defensive snapshot of latched tiers keyed by agent ID. */

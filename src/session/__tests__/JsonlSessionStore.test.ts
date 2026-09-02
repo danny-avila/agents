@@ -23,6 +23,8 @@ type MockRun = {
   getCalibrationRatio: jest.MockedFunction<
     Run<t.IState>['getCalibrationRatio']
   >;
+  getFadingTier: jest.MockedFunction<Run<t.IState>['getFadingTier']>;
+  getFadingTiers: jest.MockedFunction<Run<t.IState>['getFadingTiers']>;
   getInterrupt: jest.MockedFunction<Run<t.IState>['getInterrupt']>;
   getHaltReason: jest.MockedFunction<Run<t.IState>['getHaltReason']>;
   getChildCheckpointThreadIds: jest.MockedFunction<
@@ -46,6 +48,8 @@ function createMockRun(outputText = 'ok'): MockRun {
       .mockResolvedValue([{ type: 'text', text: outputText }]),
     getRunMessages: jest.fn(() => [new AIMessage(outputText)]),
     getCalibrationRatio: jest.fn(() => 1),
+    getFadingTier: jest.fn(() => undefined),
+    getFadingTiers: jest.fn(() => ({})),
     getInterrupt: jest.fn(() => undefined),
     getHaltReason: jest.fn(() => undefined),
     getChildCheckpointThreadIds: jest.fn(() => []),
@@ -1349,9 +1353,52 @@ describe('JsonlSessionStore', () => {
     expect(compaction?.data.retainedEntryIds).toEqual([]);
   });
 
+  it('clears persisted fading tiers after session compaction', async () => {
+    mockSummarizer('summary of prior work');
+    const mockRun = createMockRun('continued');
+    const capturedConfigs = mockRunCreate(mockRun);
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      fadingTier,
+      fadingTiers: { default: fadingTier },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    await store?.appendMessage(new HumanMessage('old'));
+    await store?.appendMessage(new AIMessage('old answer'));
+
+    await session.compact({ retainRecentTurns: 0 });
+    await session.run('continue after compaction');
+
+    expect(capturedConfigs[0].fadingTier).toBeUndefined();
+    expect(capturedConfigs[0].fadingTiers).toBeUndefined();
+  });
+
   it('carries calibration ratio forward after resumeInterrupt', async () => {
     const mockRun = createMockRun('resumed');
     mockRun.getCalibrationRatio.mockReturnValue(2);
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
     const capturedConfigs = mockRunCreate(mockRun);
     const session = await createAgentSession({
       cwd: dir,
@@ -1370,6 +1417,8 @@ describe('JsonlSessionStore', () => {
     await session.run('after resume');
 
     expect(capturedConfigs[1].calibrationRatio).toBe(2);
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
   });
 
   it('summarizes an abandoned branch before switching in place', async () => {

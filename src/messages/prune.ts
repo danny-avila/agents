@@ -2456,7 +2456,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     };
     for (let i = 0; i < params.messages.length; i++) {
       let message = params.messages[i];
-      const cachedCount = indexTokenCountMap[i];
+      let cachedCount = indexTokenCountMap[i];
       const messageType = message.getType();
       const messageRole = (message as BaseMessage & { role?: unknown }).role;
       const isAssistant = messageType === 'ai' || messageRole === 'assistant';
@@ -2468,6 +2468,13 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         if (canonicalized !== message) {
           message = canonicalized;
           params.messages[i] = message;
+          const canonicalizedCount = factoryParams.tokenCounter(message);
+          indexTokenCountMap[i] = canonicalizedCount;
+          totalTokens += canonicalizedCount - (cachedCount ?? 0);
+          cachedCount = canonicalizedCount;
+          if (i >= lastTurnStartIndex) {
+            newOutputs.add(i);
+          }
         }
         canonicalizedToolCallMessages.add(message);
       }
@@ -2488,6 +2495,13 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         if (projected !== message) {
           message = projected;
           params.messages[i] = message;
+          const projectedCount = factoryParams.tokenCounter(message);
+          indexTokenCountMap[i] = projectedCount;
+          totalTokens += projectedCount - (cachedCount ?? 0);
+          cachedCount = projectedCount;
+          if (i >= lastTurnStartIndex) {
+            newOutputs.add(i);
+          }
         }
         reconciledLegacyAiMessages.add(message);
         if (cachedCount !== undefined || i < lastTurnStartIndex) {

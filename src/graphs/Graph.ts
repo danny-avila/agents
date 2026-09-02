@@ -1545,8 +1545,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const restoredFadingTier =
         fadingTiers?.[agentConfig.agentId] ??
         (agentConfig.agentId === agents[0].agentId ? fadingTier : undefined);
-      if (restoredFadingTier != null) {
-        agentContext.fadingTier = restoredFadingTier;
+      if (
+        restoredFadingTier != null &&
+        (agentConfig.initialSummary?.text == null ||
+          agentConfig.initialSummary.text === '')
+      ) {
+        agentContext.fadingTier = { ...restoredFadingTier };
       }
 
       this.agentContexts.set(agentConfig.agentId, agentContext);
@@ -2568,7 +2572,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const context = this.agentContexts.get(this.defaultAgentId);
     const tier = context?.fadingTier;
     return isInformativeFadingTier(tier, context?.maxContextTokens)
-      ? tier
+      ? { ...tier }
       : undefined;
   }
 

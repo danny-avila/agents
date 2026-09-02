@@ -653,6 +653,31 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     expect(projectAtWindow(100_000)).toBe(projectAtWindow(200_000));
   });
 
+  it('recounts provider-bound inputs after fixed-cap canonicalization', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('fetch an oversized input'),
+      toolCallWithInput('hard-cap-input', 300_000),
+    ];
+    const inputCounter: TokenCounter = (message) =>
+      Math.ceil(serializeToolCallInputs(message).length / 4);
+    const originalCount = inputCounter(messages[1]);
+    const pruneMessages = createPruneMessages({
+      maxTokens: 1_000_000,
+      startIndex: messages.length,
+      tokenCounter: inputCounter,
+      indexTokenCountMap: {
+        0: inputCounter(messages[0]),
+        1: originalCount,
+      },
+      summarizationEnabled: false,
+    });
+
+    const result = pruneMessages({ messages });
+
+    expect(result.indexTokenCountMap[1]).toBe(inputCounter(messages[1]));
+    expect(result.indexTokenCountMap[1]).toBeLessThan(originalCount);
+  });
+
   it('retains canonical result provenance through position pruning', () => {
     const contextPruningConfig = {
       enabled: true,
@@ -802,5 +827,32 @@ describe('per-agent fading tier persistence', () => {
     });
     snapshot.worker.budgetTokens = 1;
     expect(graph.getFadingTiers().worker).toEqual(workerTier);
+    const singular = graph.getFadingTier();
+    expect(singular).toEqual(defaultTier);
+    if (singular != null) {
+      singular.budgetTokens = 1;
+    }
+    expect(graph.getFadingTier()).toEqual(defaultTier);
+  });
+
+  it('does not restore a pre-compaction tier onto an initial summary', () => {
+    const staleTier: FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const graph = new StandardGraph({
+      agents: [
+        {
+          ...graphAgent('default'),
+          initialSummary: { text: 'Compacted history', tokenCount: 10 },
+        },
+      ],
+      fadingTier: staleTier,
+      fadingTiers: { default: staleTier },
+    });
+
+    expect(graph.agentContexts.get('default')?.fadingTier).toBeUndefined();
   });
 });
