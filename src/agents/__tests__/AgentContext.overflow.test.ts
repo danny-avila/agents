@@ -1,3 +1,4 @@
+import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { AgentContext } from '@/agents/AgentContext';
 import { Providers } from '@/common';
@@ -24,6 +25,41 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.overflowRecoveryAttempts).toBe(1);
     /** Forces the pruner to be rebuilt against the corrected budget. */
     expect(context.pruneMessages).toBeUndefined();
+  });
+
+  it('keeps one provider projection per run and rebuilds it after overflow', () => {
+    const context = AgentContext.fromConfig(
+      {
+        agentId: 'overflow-agent',
+        provider: Providers.ANTHROPIC,
+        instructions: 'Test instructions',
+        maxContextTokens: 1_000_000,
+      } as Partial<t.AgentInputs> as t.AgentInputs,
+      () => 1
+    );
+    const canonical = [
+      new HumanMessage('canonical'),
+      new AIMessage({ content: [{ type: 'text', text: 'answer' }] }),
+    ];
+
+    const projection = context.getProviderProjectedMessages(canonical);
+    projection[0] = new HumanMessage('projected');
+    (projection[1].content as Array<{ text: string }>).unshift({
+      text: 'provider-only',
+    });
+    canonical.push(new HumanMessage('next'));
+
+    expect(context.getProviderProjectedMessages(canonical)).toBe(projection);
+    expect(projection).toHaveLength(3);
+    expect(canonical[0].content).toBe('canonical');
+    expect(canonical[1].content).toEqual([{ type: 'text', text: 'answer' }]);
+
+    context.applyContextBudgetCorrection(190_000, 274_468);
+    const rebuilt = context.getProviderProjectedMessages(canonical);
+
+    expect(rebuilt).not.toBe(projection);
+    expect(rebuilt[0]).toBe(canonical[0]);
+    expect(rebuilt[1].content).toEqual([{ type: 'text', text: 'answer' }]);
   });
 
   it('summarizes the first overflow when deterministic pruning is unavailable', () => {

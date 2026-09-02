@@ -277,8 +277,12 @@ export class AgentContext {
   resolvedInstructionOverhead?: number;
   private _pendingOriginalToolContent?: Map<number, string>;
   private pendingOriginalToolContentChars = 0;
-  /** Bounded pre-fading results retained when overflow recreates the pruner. */
-  canonicalToolContent = new Map<number, BaseMessage['content']>();
+  /** Provider-bound projection for this Run; graph messages remain canonical. */
+  private providerProjectedMessages?: BaseMessage[];
+  /** Canonical object identities corresponding to the projected slots. */
+  private providerProjectionSources?: BaseMessage[];
+  /** Recount after discarding a projection whose token map contains capped sizes. */
+  private providerProjectionRequiresRecount = false;
   /** Pre-masking tool content keyed by message index, consumed by the summarize node. */
   get pendingOriginalToolContent(): Map<number, string> | undefined {
     return this._pendingOriginalToolContent;
@@ -1229,6 +1233,7 @@ export class AgentContext {
     this.indexTokenCountMap = { ...this.baseIndexTokenCountMap };
     this.currentUsage = undefined;
     this.pruneMessages = undefined;
+    this.clearProviderProjection(false);
     this.lastStreamCall = undefined;
     this.tokenTypeSwitch = undefined;
     this.reasoningTransitionCount = 0;
@@ -1517,7 +1522,7 @@ export class AgentContext {
     this.systemRunnableStale = true;
     this.pruneMessages = undefined;
     this.fadingTier = undefined;
-    this.canonicalToolContent.clear();
+    this.clearProviderProjection(false);
   }
 
   /** Sets a cross-run summary that is injected into the system prompt. */
@@ -1533,7 +1538,7 @@ export class AgentContext {
     this.systemRunnableStale = true;
     this.pruneMessages = undefined;
     this.fadingTier = undefined;
-    this.canonicalToolContent.clear();
+    this.clearProviderProjection(false);
   }
 
   /**
@@ -1687,12 +1692,68 @@ export class AgentContext {
       this.maxContextTokens = budgetTokens;
     }
     this.pruneMessages = undefined;
+    this.clearProviderProjection(true);
     this._lastSummarizationMsgCount = 0;
     this._lastOverflowPromptTokens =
       promptTokens != null
         ? this.normalizePromptTokens(promptTokens)
         : promptTokens;
     this._overflowRecoveryAttempts += 1;
+  }
+
+  /**
+   * Returns the mutable provider projection for this Run while preserving the
+   * graph-owned messages as the canonical history. Appends are synchronized
+   * incrementally so the pruner's watermarks remain valid. Any rewritten or
+   * compacted canonical prefix starts a fresh projection and pruner.
+   */
+  getProviderProjectedMessages(messages: BaseMessage[]): BaseMessage[] {
+    const sources = this.providerProjectionSources;
+    let projection = this.providerProjectedMessages;
+    const prefixChanged =
+      sources != null &&
+      (messages.length < sources.length ||
+        sources.some((source, index) => messages[index] !== source));
+
+    if (projection == null || sources == null || prefixChanged) {
+      if (prefixChanged) {
+        this.pruneMessages = undefined;
+        this.providerProjectionRequiresRecount = true;
+      }
+      projection = messages.map((message) =>
+        Array.isArray(message.content)
+          ? cloneMessage(message, [...message.content])
+          : message
+      );
+      this.providerProjectedMessages = projection;
+      this.providerProjectionSources = [...messages];
+      if (this.providerProjectionRequiresRecount && this.tokenCounter != null) {
+        const recounted: Record<string, number> = {};
+        for (let i = 0; i < messages.length; i++) {
+          recounted[i] = this.tokenCounter(messages[i]);
+        }
+        this.indexTokenCountMap = recounted;
+        this.providerProjectionRequiresRecount = false;
+      }
+      return projection;
+    }
+
+    for (let i = sources.length; i < messages.length; i++) {
+      const message = messages[i];
+      sources.push(message);
+      projection.push(
+        Array.isArray(message.content)
+          ? cloneMessage(message, [...message.content])
+          : message
+      );
+    }
+    return projection;
+  }
+
+  private clearProviderProjection(recountOnNextUse: boolean): void {
+    this.providerProjectedMessages = undefined;
+    this.providerProjectionSources = undefined;
+    this.providerProjectionRequiresRecount = recountOnNextUse;
   }
 
   /** Applies token calibration only when the observation came from this provider. */

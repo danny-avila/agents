@@ -3103,6 +3103,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * same masking record the configured trigger preserves.
        */
       let prunedOriginalToolContent: Map<number, string> | undefined;
+      const canProjectContext =
+        agentContext.tokenCounter != null &&
+        agentContext.maxContextTokens != null;
+      const providerMessages = canProjectContext
+        ? agentContext.getProviderProjectedMessages(messages)
+        : messages;
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
@@ -3125,7 +3131,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           reserveRatio: agentContext.summarizationConfig?.reserveRatio,
           calibrationRatio: agentContext.calibrationRatio,
           fadingTier: agentContext.fadingTier,
-          canonicalToolContent: agentContext.canonicalToolContent,
           getInstructionTokens: () => agentContext.instructionTokens,
           log: (level, message, data) => {
             emitAgentLog(config, level, 'prune', message, data, {
@@ -3149,20 +3154,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           contextBudget,
           effectiveInstructionTokens,
         } = agentContext.pruneMessages({
-          messages,
+          messages: providerMessages,
+          canonicalMessages: messages,
           usageMetadata: agentContext.currentUsage,
           lastCallUsage: agentContext.lastCallUsage,
           totalTokensFresh: agentContext.totalTokensFresh,
         });
         prunedOriginalToolContent = newOriginalToolContent;
-        /**
-         * Masking rewrites tool content in `state.messages` in place, so this
-         * map is the only surviving copy of the full output. Persist it on
-         * every prune, not just when a summary is about to be written — the
-         * pruner closure that produced it is discarded on the next reset, and
-         * with it any chance of a later summary restoring the real content.
-         * AgentContext bounds what accumulates.
-         */
+        /** Preserve the masking record for the existing overflow/summarization
+         * path. The graph history itself remains canonical; only the provider
+         * projection above is rewritten by fading. */
         agentContext.preserveOriginalToolContent(newOriginalToolContent);
         agentContext.indexTokenCountMap = indexTokenCountMap;
         if (calibrationRatio != null && calibrationRatio > 0) {

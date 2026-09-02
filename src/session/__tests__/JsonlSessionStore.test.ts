@@ -1499,6 +1499,40 @@ describe('JsonlSessionStore', () => {
     expect(capturedConfigs[3].fadingTier).toEqual(alternateTier);
   });
 
+  it('bounds fading metadata retained for alternate checkpoint threads', async () => {
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    for (let i = 0; i < 65; i++) {
+      await session.run(`alternate ${i}`, { threadId: `thread-${i}` });
+    }
+    await session.run('oldest again', { threadId: 'thread-0' });
+    await session.run('newest again', { threadId: 'thread-64' });
+
+    expect(capturedConfigs[65].fadingTier).toBeUndefined();
+    expect(capturedConfigs[66].fadingTier).toEqual(fadingTier);
+  });
+
   it('summarizes an abandoned branch before switching in place', async () => {
     mockSummarizer('summary of abandoned branch');
     const session = await createAgentSession({

@@ -19,7 +19,6 @@ import {
   preFlightTruncateToolResults,
   createPruneMessages,
   projectToolCallInputs,
-  ORIGINAL_CONTENT_MAX_CHARS,
 } from '@/messages/prune';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { StandardGraph } from '@/graphs/Graph';
@@ -720,33 +719,33 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     expect(serialize(rebuilt[2])).toBe(escalatedBytes);
   });
 
-  it('retains bounded canonical results when overflow recreates the pruner', () => {
-    const messages = conversation([60_000]);
-    const canonicalToolContent = new Map<
-      number,
-      BaseMessage['content']
-    >();
+  it('recreates the provider projection from canonical graph messages after overflow', () => {
+    const canonicalMessages = conversation([60_000]);
+    const messages = [...canonicalMessages];
+    const originalResult = serialize(canonicalMessages[2]);
     const firstPruner = createPruneMessages({
       maxTokens,
       startIndex: 0,
       tokenCounter,
       indexTokenCountMap: countMap(messages),
       summarizationEnabled: false,
-      canonicalToolContent,
     });
-    const first = firstPruner({ messages });
-    expect(canonicalToolContent.get(2)).toBeDefined();
+    const first = firstPruner({ messages, canonicalMessages });
+    expect(serialize(canonicalMessages[2])).toBe(originalResult);
 
+    const correctedMessages = [...canonicalMessages];
     const correctedPruner = createPruneMessages({
       maxTokens: 20_000,
-      startIndex: messages.length,
+      startIndex: correctedMessages.length,
       tokenCounter,
-      indexTokenCountMap: countMap(messages),
+      indexTokenCountMap: countMap(correctedMessages),
       summarizationEnabled: false,
       fadingTier: first.fadingTier,
-      canonicalToolContent,
     });
-    const corrected = correctedPruner({ messages });
+    const corrected = correctedPruner({
+      messages: correctedMessages,
+      canonicalMessages,
+    });
 
     const rebuilt = conversation([60_000]);
     const freshPruner = createPruneMessages({
@@ -759,36 +758,30 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     });
     freshPruner({ messages: rebuilt });
 
-    expect(serialize(messages[2])).toBe(serialize(rebuilt[2]));
+    expect(serialize(correctedMessages[2])).toBe(serialize(rebuilt[2]));
+    expect(serialize(canonicalMessages[2])).toBe(originalResult);
   });
 
-  it('caps retained canonical result content across long histories', () => {
-    const messages = conversation(Array(8).fill(500_000));
-    const canonicalToolContent = new Map<
-      number,
-      BaseMessage['content']
-    >();
+  it('derives deeper tiers from canonical graph messages without mutating them', () => {
+    const canonicalMessages = conversation([60_000]);
+    const messages = [...canonicalMessages];
+    const originalResult = serialize(canonicalMessages[2]);
     const pruneMessages = createPruneMessages({
       maxTokens,
-      startIndex: messages.length,
+      startIndex: 0,
       tokenCounter,
       indexTokenCountMap: countMap(messages),
       summarizationEnabled: false,
-      canonicalToolContent,
     });
 
-    pruneMessages({ messages });
+    pruneMessages({ messages, canonicalMessages });
+    const firstProjection = serialize(messages[2]);
+    canonicalMessages.push(...round(1, 60_000), ...round(2, 60_000));
+    messages.push(...canonicalMessages.slice(messages.length));
+    pruneMessages({ messages, canonicalMessages });
 
-    const retainedChars = [...canonicalToolContent.values()].reduce(
-      (total, content) =>
-        total +
-        (typeof content === 'string'
-          ? content.length
-          : JSON.stringify(content).length),
-      0
-    );
-    expect(retainedChars).toBeLessThanOrEqual(ORIGINAL_CONTENT_MAX_CHARS);
-    expect(canonicalToolContent.size).toBeLessThan(8);
+    expect(serialize(messages[2])).not.toBe(firstProjection);
+    expect(serialize(canonicalMessages[2])).toBe(originalResult);
   });
 
   it('emergency truncation recovers on a clone without latching the tier', () => {

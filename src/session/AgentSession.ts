@@ -33,6 +33,9 @@ import { deriveMessages } from './deriveMessages';
 import { createRunHandlers } from './handlers';
 import { Run } from '@/run';
 
+/** Compact per-thread fading metadata retained for recently used checkpoints. */
+const MAX_ALTERNATE_THREAD_FADING_STATES = 64;
+
 function isBaseMessage(value: unknown): value is BaseMessage {
   return (
     value instanceof BaseMessage ||
@@ -927,9 +930,17 @@ export class AgentSession {
     fadingTier?: t.FadingTier;
     fadingTiers?: t.FadingTiers;
   } {
-    return threadId === this.threadId
-      ? { fadingTier: this.fadingTier, fadingTiers: this.fadingTiers }
-      : (this.alternateThreadFadingState.get(threadId) ?? {});
+    if (threadId === this.threadId) {
+      return { fadingTier: this.fadingTier, fadingTiers: this.fadingTiers };
+    }
+    const state = this.alternateThreadFadingState.get(threadId);
+    if (state == null) {
+      return {};
+    }
+    /** Refresh insertion order so the bounded map acts as an LRU. */
+    this.alternateThreadFadingState.delete(threadId);
+    this.alternateThreadFadingState.set(threadId, state);
+    return state;
   }
 
   private setFadingState(
@@ -942,10 +953,21 @@ export class AgentSession {
       this.fadingTiers = fadingTiers;
       return;
     }
+    this.alternateThreadFadingState.delete(threadId);
     this.alternateThreadFadingState.set(threadId, {
       fadingTier,
       fadingTiers,
     });
+    while (
+      this.alternateThreadFadingState.size >
+      MAX_ALTERNATE_THREAD_FADING_STATES
+    ) {
+      const oldestThreadId = this.alternateThreadFadingState.keys().next();
+      if (oldestThreadId.done === true) {
+        break;
+      }
+      this.alternateThreadFadingState.delete(oldestThreadId.value);
+    }
   }
 
   private clearFadingState(): void {

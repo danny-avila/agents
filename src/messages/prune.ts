@@ -47,6 +47,7 @@ import { ContentTypes, Providers, Constants } from '@/common';
 import { getProviderFamily } from '@/llm/providerRegistry';
 import { applyContextPruning } from './contextPruning';
 import { toLangChainContent } from './langchain';
+import { cloneMessage } from './cache';
 
 function sumTokenCounts(
   tokenMap: Record<string, number | undefined>,
@@ -178,8 +179,6 @@ export type PruneMessagesFactoryParams = {
    * current context window without losing their latched provenance.
    */
   fadingTier?: FadingTier | null;
-  /** Bounded canonical tool-result content retained across pruner recreation. */
-  canonicalToolContent?: Map<number, BaseMessage['content']>;
   /** Optional diagnostic log callback wired by the graph for observability. */
   log?: (
     level: 'debug' | 'info' | 'warn' | 'error',
@@ -188,6 +187,12 @@ export type PruneMessagesFactoryParams = {
   ) => void;
 };
 export type PruneMessagesParams = {
+  /**
+   * Immutable graph history corresponding index-for-index with `messages`.
+   * When supplied, provider projections always derive from this source rather
+   * than from an earlier, already-truncated projection.
+   */
+  canonicalMessages?: BaseMessage[];
   messages: BaseMessage[];
   usageMetadata?: Partial<UsageMetadata>;
   startType?: ReturnType<BaseMessage['getType']>;
@@ -1144,6 +1149,7 @@ export function checkValidNumber(value: unknown): value is number {
 }
 
 type FadingApplyParams = {
+  canonicalMessages?: BaseMessage[];
   messages: BaseMessage[];
   indexTokenCountMap: Record<string, number | undefined>;
   tokenCounter: TokenCounter;
@@ -1156,13 +1162,6 @@ type FadingApplyParams = {
   maskedFromIndex?: number;
   /** Original (pre-masking) content keyed by message index, captured for the summarizer. */
   originalContentStore?: Map<number, string>;
-  /** Canonical pre-fading content keyed by stable message index. */
-  canonicalContentStore?: Map<number, BaseMessage['content']>;
-  /** Called after storing newly captured canonical content. */
-  onCanonicalContentStored?: (
-    index: number,
-    content: BaseMessage['content']
-  ) => void;
   /** Called after storing a newly captured entry. */
   onContentStored?: (index: number, content: string) => void;
 };
@@ -1225,7 +1224,7 @@ export function applyFadingCaps(params: FadingApplyParams): FadingApplyResult {
       continue;
     }
     const canonicalContent =
-      params.canonicalContentStore?.get(i) ?? message.content;
+      params.canonicalMessages?.[i]?.content ?? message.content;
     const compacted = compactToolContent(canonicalContent, maxChars);
     if (!compacted.changed) {
       continue;
@@ -1246,13 +1245,6 @@ export function applyFadingCaps(params: FadingApplyParams): FadingApplyResult {
       message as ToolMessage,
       compacted.content
     );
-    if (
-      params.canonicalContentStore != null &&
-      !params.canonicalContentStore.has(i)
-    ) {
-      params.canonicalContentStore.set(i, canonicalContent);
-      params.onCanonicalContentStored?.(i, canonicalContent);
-    }
     messages[i] = cloned;
     indexTokenCountMap[i] = tokenCounter(cloned);
     if (consumed) {
@@ -1265,6 +1257,7 @@ export function applyFadingCaps(params: FadingApplyParams): FadingApplyResult {
   const inputs = Number.isFinite(caps.inputChars)
     ? applyToolCallInputCaps({
       messages,
+      canonicalMessages: params.canonicalMessages,
       maxInputChars: caps.inputChars,
       indexTokenCountMap,
       tokenCounter,
@@ -2218,6 +2211,7 @@ export function projectToolMessagesForProvider(
 }
 
 function applyToolCallInputCaps(params: {
+  canonicalMessages?: BaseMessage[];
   messages: BaseMessage[];
   maxInputChars: number;
   indexTokenCountMap: Record<string, number | undefined>;
@@ -2226,13 +2220,21 @@ function applyToolCallInputCaps(params: {
 }): number {
   const { messages, maxInputChars, indexTokenCountMap, tokenCounter } = params;
   const fromIndex = params.fromIndex ?? 0;
-  const projected = projectToolCallInputs(messages, maxInputChars, fromIndex);
-  if (projected === messages) {
+  const sourceMessages = params.canonicalMessages ?? messages;
+  const projected = projectToolCallInputs(
+    sourceMessages,
+    maxInputChars,
+    fromIndex
+  );
+  if (projected === sourceMessages) {
     return 0;
   }
 
   let truncatedCount = 0;
   for (let i = fromIndex; i < messages.length; i++) {
+    if (projected[i] === sourceMessages[i]) {
+      continue;
+    }
     if (projected[i] === messages[i]) {
       continue;
     }
@@ -2311,42 +2313,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
    *  pruner is recreated after summarization. */
   const originalToolContent = new Map<number, string>();
   let originalToolContentSize = 0;
-  /** Pre-fading content retained so every deeper tier derives from one source. */
-  const canonicalToolContent =
-    factoryParams.canonicalToolContent ??
-    new Map<number, BaseMessage['content']>();
-  const getCanonicalContentChars = (
-    content: BaseMessage['content']
-  ): number =>
-    serializeToolContentBounded(content, ORIGINAL_CONTENT_MAX_CHARS).length;
-  let canonicalToolContentChars = 0;
-  for (const content of canonicalToolContent.values()) {
-    canonicalToolContentChars += getCanonicalContentChars(content);
-  }
-  const enforceCanonicalContentCap = (): void => {
-    while (
-      canonicalToolContentChars > ORIGINAL_CONTENT_MAX_CHARS &&
-      canonicalToolContent.size > 0
-    ) {
-      const oldest = canonicalToolContent.keys().next();
-      if (oldest.done === true) {
-        break;
-      }
-      const removed = canonicalToolContent.get(oldest.value);
-      if (removed != null) {
-        canonicalToolContentChars -= getCanonicalContentChars(removed);
-      }
-      canonicalToolContent.delete(oldest.value);
-    }
-  };
-  enforceCanonicalContentCap();
-  const onCanonicalContentStored = (
-    _index: number,
-    content: BaseMessage['content']
-  ): void => {
-    canonicalToolContentChars += getCanonicalContentChars(content);
-    enforceCanonicalContentCap();
-  };
+  /** Canonical source retained only for this pruner/run when callers do not
+   * provide graph-owned history explicitly. Slots are references (with a
+   * shallow content-array clone where needed), not a second serialized copy. */
+  const capturedCanonicalMessages: BaseMessage[] = [];
   /** Latched fading tier; caps derive from it alone so bytes stay stable. */
   let fadingTier = seedFadingTier(
     factoryParams.maxTokens,
@@ -2379,6 +2349,23 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     /** Calibrated instruction overhead actually applied this call */
     effectiveInstructionTokens?: number;
   } {
+    if (params.canonicalMessages == null) {
+      for (
+        let i = capturedCanonicalMessages.length;
+        i < params.messages.length;
+        i++
+      ) {
+        const message = params.messages[i];
+        capturedCanonicalMessages[i] = Array.isArray(message.content)
+          ? cloneMessage(message, [...message.content])
+          : message;
+      }
+      if (capturedCanonicalMessages.length > params.messages.length) {
+        capturedCanonicalMessages.length = params.messages.length;
+      }
+    }
+    const canonicalMessages =
+      params.canonicalMessages ?? capturedCanonicalMessages;
     let newOriginalToolContent: Map<number, string> | undefined;
     if (params.messages.length === 0) {
       /** Post-compaction calls still invoke the model — report the same
@@ -2811,6 +2798,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     if (restoredTierPending) {
       restoredFading = applyFadingCaps({
         messages: params.messages,
+        canonicalMessages,
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
         caps: resolveFadingCaps(fadingTier, factoryParams.maxToolResultChars),
@@ -2819,8 +2807,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           factoryParams.summarizationEnabled === true
             ? originalToolContent
             : undefined,
-        canonicalContentStore: canonicalToolContent,
-        onCanonicalContentStored,
         onContentStored:
           factoryParams.summarizationEnabled === true
             ? storeOriginalToolContent
@@ -2860,6 +2846,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       }
       const result = applyFadingCaps({
         messages: params.messages,
+        canonicalMessages,
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
         caps: resolveFadingCaps(fadingTier, factoryParams.maxToolResultChars),
@@ -2870,8 +2857,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           factoryParams.summarizationEnabled === true
             ? originalToolContent
             : undefined,
-        canonicalContentStore: canonicalToolContent,
-        onCanonicalContentStored,
         onContentStored:
           factoryParams.summarizationEnabled === true
             ? storeOriginalToolContent
@@ -3087,12 +3072,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       try {
         const emergency = applyFadingCaps({
           messages: emergencyMessages,
+          canonicalMessages,
           indexTokenCountMap,
           tokenCounter: factoryParams.tokenCounter,
           caps: emergencyCaps,
           masked: emergencyTier.masked,
-          canonicalContentStore: canonicalToolContent,
-          onCanonicalContentStored,
         });
 
         factoryParams.log?.('info', 'Emergency truncation complete');
