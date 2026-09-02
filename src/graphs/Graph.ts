@@ -3175,6 +3175,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         } = agentContext.pruneMessages({
           messages: providerMessages,
           canonicalMessages: messages,
+          canonicalPrefixStable: true,
           usageMetadata: agentContext.currentUsage,
           lastCallUsage: agentContext.lastCallUsage,
           totalTokensFresh: agentContext.totalTokensFresh,

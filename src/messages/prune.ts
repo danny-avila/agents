@@ -193,6 +193,12 @@ export type PruneMessagesParams = {
    * than from an earlier, already-truncated projection.
    */
   canonicalMessages?: BaseMessage[];
+  /**
+   * The caller guarantees that an existing canonical prefix cannot have been
+   * rewritten since the previous call. Graph reducers provide this guarantee
+   * by invalidating and recreating the pruner on replacements/removals.
+   */
+  canonicalPrefixStable?: boolean;
   messages: BaseMessage[];
   usageMetadata?: Partial<UsageMetadata>;
   startType?: ReturnType<BaseMessage['getType']>;
@@ -2426,13 +2432,13 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           (source, index) => canonicalMessages[index] !== source
         )
       : canonicalMessages.length < priorWidthLength ||
-        (canonicalMessages.length === priorWidthLength
-          ? toolExchangeWidthSources.some(
-            (source, index) => canonicalMessages[index] !== source
-          )
-          : priorWidthLength > 0 &&
+        (params.canonicalPrefixStable === true
+          ? priorWidthLength > 0 &&
             canonicalMessages[priorWidthLength - 1] !==
-              toolExchangeWidthSources[priorWidthLength - 1]);
+              toolExchangeWidthSources[priorWidthLength - 1]
+          : toolExchangeWidthSources.some(
+            (source, index) => canonicalMessages[index] !== source
+          ));
     if (widthPrefixChanged) {
       maxToolExchangeWidth = 1;
       toolExchangeWidthThrough = 0;

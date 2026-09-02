@@ -2800,7 +2800,7 @@ export function hasNonEmptyTextContent(content: BaseMessage['content']): boolean
     return content.trim() !== '';
   }
   for (const block of content) {
-    if (block.type !== ContentTypes.TEXT) {
+    if (block.type !== ContentTypes.TEXT && block.type !== 'output_text') {
       continue;
     }
     const text = block[ContentTypes.TEXT];

@@ -1805,6 +1805,7 @@ export class AgentContext {
           this.providerProjectionSourceIds?.has(update.id) === true)
       ) {
         this.pruneMessages = undefined;
+        this.pendingOriginalToolContent = undefined;
         this.clearProviderProjection(true);
         return;
       }

@@ -89,6 +89,7 @@ describe('AgentContext overflow recovery state', () => {
     const appended = new HumanMessage({ id: 'human-2', content: 'next' });
 
     const updates = [replacement, appended];
+    context.pendingOriginalToolContent = new Map([[0, 'full original']]);
     context.invalidateProviderProjectionForMessageUpdates(updates);
     const nextCanonical = messagesStateReducer(canonical, updates);
     const rebuilt = context.getProviderProjectedMessages(nextCanonical);
@@ -100,6 +101,7 @@ describe('AgentContext overflow recovery state', () => {
       'next',
     ]);
     expect(context.indexTokenCountMap).toEqual({ 0: 1, 1: 200, 2: 1 });
+    expect(context.pendingOriginalToolContent).toBeUndefined();
   });
 
   it('accepts reducer message-like and empty updates during invalidation', () => {

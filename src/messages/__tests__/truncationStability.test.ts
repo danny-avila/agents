@@ -23,6 +23,7 @@ import {
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { ContentTypes, Providers } from '@/common';
 import { StandardGraph } from '@/graphs/Graph';
+import { hasNonEmptyTextContent } from '@/messages/core';
 
 const tokenCounter: TokenCounter = (message) => {
   const content = message.content;
@@ -507,6 +508,20 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     expect(serialize(messages[2])).toContain('truncated');
     expect(serialize(messages[2]).length).toBeLessThan(50_000);
     expect(serialize(canonicalMessages[2]).length).toBeGreaterThan(50_000);
+
+    canonicalMessages[2] = new ToolMessage({
+      content: `APPENDED:${'a'.repeat(50_000)}`,
+      tool_call_id: 'replace-canonical-result',
+    });
+    messages[2] = canonicalMessages[2];
+    const appended = new HumanMessage('next turn');
+    canonicalMessages.push(appended);
+    messages.push(appended);
+    pruneMessages({ messages, canonicalMessages });
+
+    expect(serialize(messages[2])).toContain('APPENDED:');
+    expect(serialize(messages[2])).toContain('truncated');
+    expect(serialize(messages[2]).length).toBeLessThan(50_000);
   });
 
   /** Mirrors a host that rebuilds full-content messages and a fresh pruner every run. */
@@ -1092,6 +1107,14 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
 });
 
 describe('isInformativeFadingTier', () => {
+  it('recognizes OpenAI Responses output text as substantive', () => {
+    expect(
+      hasNonEmptyTextContent([
+        { type: 'output_text', text: 'completed response' } as never,
+      ])
+    ).toBe(true);
+  });
+
   it('reports only tiers a host should persist', () => {
     expect(isInformativeFadingTier(undefined, 100_000)).toBe(false);
     expect(isInformativeFadingTier(createFadingTier(100_000), 100_000)).toBe(
