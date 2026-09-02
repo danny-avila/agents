@@ -338,6 +338,12 @@ export type RunConfig = {
    * conversation. Without this, the EMA resets to 1 on every new Run instance.
    */
   calibrationRatio?: number;
+  /**
+   * Context-fading tier from a previous run's contextMeta. Hosts should persist
+   * the value returned by `Run.getFadingTier()` and pass it back here so
+   * historical tool results keep the same truncated bytes across runs.
+   */
+  fadingTier?: g.FadingTier | null;
   /** Skip post-stream cleanup (clearHeavyState) — useful for tests that inspect graph state after processStream */
   skipCleanup?: boolean;
   /**

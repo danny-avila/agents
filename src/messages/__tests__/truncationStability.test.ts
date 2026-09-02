@@ -1,11 +1,21 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { FadingTier } from '@/types/graph';
 import type { TokenCounter } from '@/types/run';
 import {
-  calculateMaskedResultMaxChars,
+  fadingBudgetTokens,
+  fadingRungForBudget,
+  fadingRungForResultChars,
+  isFadingTier,
+  maxFadingRung,
+  resolveFadingCaps,
+  resolveFadingTier,
+  seedFadingTier,
+  createFadingTier,
+} from '@/messages/fading';
+import {
   maskConsumedToolResults,
   preFlightTruncateToolResults,
-  resolveFadingBudgetTokens,
   createPruneMessages,
 } from '@/messages/prune';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
@@ -51,9 +61,7 @@ function conversation(rounds: number[]): BaseMessage[] {
   return rounds.flatMap((chars, index) => round(index, chars));
 }
 
-function countMap(
-  messages: BaseMessage[]
-): Record<string, number | undefined> {
+function countMap(messages: BaseMessage[]): Record<string, number | undefined> {
   const map: Record<string, number | undefined> = {};
   for (let i = 0; i < messages.length; i++) {
     map[i] = tokenCounter(messages[i]);
@@ -61,24 +69,108 @@ function countMap(
   return map;
 }
 
-describe('resolveFadingBudgetTokens', () => {
-  it('scales the fixed context window by the discrete pressure band only', () => {
-    expect(resolveFadingBudgetTokens(100_000, 0.3)).toBe(100_000);
-    expect(resolveFadingBudgetTokens(100_000, 0.8)).toBe(100_000);
-    expect(resolveFadingBudgetTokens(100_000, 0.849)).toBe(100_000);
-    expect(resolveFadingBudgetTokens(100_000, 0.85)).toBe(50_000);
-    expect(resolveFadingBudgetTokens(100_000, 0.9)).toBe(20_000);
-    expect(resolveFadingBudgetTokens(100_000, 0.99)).toBe(5_000);
-    expect(resolveFadingBudgetTokens(2_000, 0.99)).toBe(1_024);
+describe('fading ladder', () => {
+  it('halves the budget per rung down to the floor', () => {
+    expect(fadingBudgetTokens(100_000, 0)).toBe(100_000);
+    expect(fadingBudgetTokens(100_000, 1)).toBe(50_000);
+    expect(fadingBudgetTokens(100_000, 3)).toBe(12_500);
+    expect(fadingBudgetTokens(100_000, 20)).toBe(170);
+    expect(fadingBudgetTokens(100, 5)).toBe(100);
+    expect(maxFadingRung(100_000)).toBe(10);
+    expect(maxFadingRung(100)).toBe(0);
   });
-});
 
-describe('calculateMaskedResultMaxChars', () => {
-  it('keeps a fixed fraction of the fresh-result cap with a floor', () => {
-    expect(calculateMaskedResultMaxChars(100_000)).toBe(
-      Math.floor(calculateMaxToolResultChars(100_000) * 0.1)
+  it('picks the shallowest rung that fits a budget or a result cap', () => {
+    expect(fadingRungForBudget(100_000, 100_000)).toBe(0);
+    expect(fadingRungForBudget(100_000, 60_000)).toBe(0);
+    expect(fadingRungForBudget(100_000, 9_400)).toBe(3);
+    expect(fadingRungForBudget(100_000, 0)).toBe(0);
+    expect(
+      calculateMaxToolResultChars(
+        fadingBudgetTokens(100_000, fadingRungForBudget(100_000, 9_400))
+      ) / 4
+    ).toBeLessThanOrEqual(9_400 / 2);
+    expect(fadingRungForResultChars(100_000, 200)).toBe(maxFadingRung(100_000));
+    expect(
+      calculateMaxToolResultChars(
+        fadingBudgetTokens(100_000, fadingRungForResultChars(100_000, 5_000))
+      )
+    ).toBeLessThanOrEqual(5_000);
+  });
+
+  it('validates and seeds persisted tiers', () => {
+    expect(isFadingTier({ v: 1, window: 100, rung: 2, masked: true })).toBe(
+      true
     );
-    expect(calculateMaskedResultMaxChars(1_024)).toBe(300);
+    expect(isFadingTier({ v: 2, window: 100, rung: 2, masked: true })).toBe(
+      false
+    );
+    expect(isFadingTier({ v: 1, window: 100, rung: 1.5, masked: true })).toBe(
+      false
+    );
+    expect(isFadingTier(null)).toBe(false);
+    expect(
+      seedFadingTier(100_000, { v: 1, window: 100_000, rung: 3, masked: true })
+    ).toEqual({
+      v: 1,
+      window: 100_000,
+      rung: 3,
+      masked: true,
+    });
+    expect(
+      seedFadingTier(100_000, { v: 1, window: 50_000, rung: 3, masked: true })
+    ).toEqual(createFadingTier(100_000));
+    expect(
+      seedFadingTier(100_000, {
+        v: 1,
+        window: 100_000,
+        rung: 99,
+        masked: false,
+      }).rung
+    ).toBe(maxFadingRung(100_000));
+  });
+
+  it('only deepens and never oscillates across a band threshold', () => {
+    const base = { effectiveRawTokens: 100_000, summarizationEnabled: false };
+    let tier = createFadingTier(100_000);
+    tier = resolveFadingTier(tier, { ...base, contextPressure: 0.5 });
+    expect(tier).toEqual(createFadingTier(100_000));
+    tier = resolveFadingTier(tier, { ...base, contextPressure: 0.86 });
+    expect(tier).toEqual({ v: 1, window: 100_000, rung: 1, masked: true });
+    const settled = tier;
+    tier = resolveFadingTier(tier, { ...base, contextPressure: 0.84 });
+    expect(tier).toBe(settled);
+    tier = resolveFadingTier(tier, { ...base, contextPressure: 0.86 });
+    expect(tier).toBe(settled);
+    tier = resolveFadingTier(tier, { ...base, contextPressure: 0.91 });
+    expect(tier.rung).toBe(2);
+    tier = resolveFadingTier(tier, { ...base, contextPressure: 0.3 });
+    expect(tier.rung).toBe(2);
+    expect(tier.masked).toBe(true);
+  });
+
+  it('fits a single result within the effective budget with summarization on', () => {
+    const tier = resolveFadingTier(createFadingTier(32_000), {
+      contextPressure: 0.3,
+      effectiveRawTokens: 9_400,
+      summarizationEnabled: true,
+    });
+    const caps = resolveFadingCaps(tier);
+    expect(caps.resultChars / 4).toBeLessThanOrEqual(9_400 / 2);
+    expect(caps.resultChars).toBe(
+      calculateMaxToolResultChars(caps.budgetTokens)
+    );
+    expect(caps.consumedChars).toBe(caps.resultChars);
+  });
+
+  it('masks consumed results to a fraction of the fresh cap with a floor', () => {
+    const masked: FadingTier = { v: 1, window: 100_000, rung: 0, masked: true };
+    const caps = resolveFadingCaps(masked);
+    expect(caps.consumedChars).toBe(Math.floor(caps.resultChars * 0.1));
+    expect(
+      resolveFadingCaps({ ...masked, window: 400, rung: 0 }).consumedChars
+    ).toBe(300);
+    expect(resolveFadingCaps(masked, 1_000).resultChars).toBe(1_000);
   });
 });
 
@@ -142,11 +234,23 @@ describe('maskConsumedToolResults stability', () => {
 describe('pruner keeps historical tool results byte-stable across turns', () => {
   const maxTokens = 40_000;
 
+  type TurnOptions = {
+    summarizationEnabled: boolean;
+    calibrationRatio: number;
+    fadingTier?: FadingTier;
+    instructionTokens?: number;
+  };
+
   /** Mirrors a host that rebuilds full-content messages and a fresh pruner every run. */
   function runTurn(
     messages: BaseMessage[],
-    options: { summarizationEnabled: boolean; calibrationRatio: number }
-  ): { early: string; pressure: number } {
+    options: TurnOptions
+  ): {
+    early: string;
+    pressure: number;
+    tier: FadingTier;
+    contextLength: number;
+  } {
     const pruneMessages = createPruneMessages({
       maxTokens,
       startIndex: messages.length,
@@ -154,9 +258,16 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
       indexTokenCountMap: countMap(messages),
       summarizationEnabled: options.summarizationEnabled,
       calibrationRatio: options.calibrationRatio,
+      fadingTier: options.fadingTier,
+      getInstructionTokens: () => options.instructionTokens ?? 0,
     });
     const result = pruneMessages({ messages });
-    return { early: serialize(messages[2]), pressure: result.contextPressure ?? 0 };
+    return {
+      early: serialize(messages[2]),
+      pressure: result.contextPressure ?? 0,
+      tier: result.fadingTier,
+      contextLength: result.context.length,
+    };
   }
 
   it('fit-to-budget truncation (summarization on) ignores calibration drift and growth', () => {
@@ -173,36 +284,86 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     ratios.forEach((calibrationRatio, index) => {
       const later = runTurn(
         conversation([60_000, ...Array(index + 1).fill(400)]),
-        { summarizationEnabled: true, calibrationRatio }
+        {
+          summarizationEnabled: true,
+          calibrationRatio,
+        }
       );
       expect(later.pressure).toBeLessThan(0.8);
       expect(later.early).toBe(first.early);
     });
   });
 
-  it('masking under pressure (summarization off) is stable within a band', () => {
+  it('masking under pressure (summarization off) is stable within a tier', () => {
     const history = [60_000, 48_000, 16_000];
     const first = runTurn(conversation(history), {
       summarizationEnabled: false,
       calibrationRatio: 1,
     });
     expect(first.pressure).toBeGreaterThanOrEqual(0.8);
-    expect(first.pressure).toBeLessThan(0.85);
+    expect(first.tier.masked).toBe(true);
     expect(first.early).toContain('truncated');
     expect(first.early.length).toBeLessThanOrEqual(
-      calculateMaskedResultMaxChars(maxTokens)
+      resolveFadingCaps(first.tier).consumedChars
     );
 
     const ratios = [1.01, 1.02, 1.03];
     ratios.forEach((calibrationRatio, index) => {
       const later = runTurn(
         conversation([...history, ...Array(index + 1).fill(200)]),
-        { summarizationEnabled: false, calibrationRatio }
+        {
+          summarizationEnabled: false,
+          calibrationRatio,
+        }
       );
-      expect(later.pressure).toBeGreaterThanOrEqual(0.8);
-      expect(later.pressure).toBeLessThan(0.85);
+      expect(later.tier).toEqual(first.tier);
       expect(later.early).toBe(first.early);
     });
+  });
+
+  it('a persisted tier reproduces the same bytes even when pressure falls below the threshold', () => {
+    const first = runTurn(conversation([60_000, 48_000, 16_000]), {
+      summarizationEnabled: false,
+      calibrationRatio: 1,
+    });
+    expect(first.tier.masked).toBe(true);
+
+    const seeded = runTurn(conversation([60_000, 48_000, 16_000]), {
+      summarizationEnabled: false,
+      calibrationRatio: 0.7,
+      fadingTier: first.tier,
+    });
+    expect(seeded.pressure).toBeLessThan(0.8);
+    expect(seeded.tier).toEqual(first.tier);
+    expect(seeded.early).toBe(first.early);
+
+    const unseeded = runTurn(conversation([60_000, 48_000, 16_000]), {
+      summarizationEnabled: false,
+      calibrationRatio: 0.7,
+    });
+    expect(unseeded.tier.masked).toBe(false);
+    expect(unseeded.early).not.toBe(first.early);
+  });
+
+  it('keeps a first context non-empty when instructions dominate a small window', () => {
+    const messages = conversation([38_400]);
+    const pruneMessages = createPruneMessages({
+      maxTokens: 32_000,
+      startIndex: messages.length,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: true,
+      calibrationRatio: 1,
+      getInstructionTokens: () => 21_000,
+    });
+    const result = pruneMessages({ messages });
+    expect(result.context.length).toBe(messages.length);
+    expect(result.messagesToRefine).toEqual([]);
+    expect(serialize(messages[2]).length).toBeLessThanOrEqual(
+      calculateMaxToolResultChars(
+        resolveFadingCaps(result.fadingTier).budgetTokens
+      )
+    );
   });
 
   it('holds bytes stable within one run while provider usage recalibrates', () => {
@@ -229,6 +390,7 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
       expect(result.calibrationRatio).not.toBe(previousRatio);
       previousRatio = result.calibrationRatio ?? previousRatio;
       expect(serialize(messages[2])).toBe(early);
+      expect(result.fadingTier).toEqual(first.fadingTier);
     }
   });
 });

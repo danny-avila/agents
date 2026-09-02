@@ -132,6 +132,22 @@ export interface ContextUsageEvent {
   calibrationRatio?: number;
 }
 
+/**
+ * Latched context-fading tier. Caps for historical tool results derive from
+ * `(window, rung, masked)` only, so carrying the tier across runs keeps their
+ * truncated bytes stable for prefix-based provider prompt caches. Hosts
+ * persist it beside `calibrationRatio` and pass it back via `RunConfig.fadingTier`.
+ */
+export interface FadingTier {
+  v: 1;
+  /** Context window the tier was derived for; a mismatch starts fresh. */
+  window: number;
+  /** Ladder position: the window is halved per rung. Never decreases. */
+  rung: number;
+  /** Whether observation masking has activated. Never deactivates. */
+  masked: boolean;
+}
+
 export interface EventHandler {
   handle(
     event: string,
@@ -346,6 +362,8 @@ export type StandardGraphInput = {
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
   calibrationRatio?: number;
+  /** Persisted fading tier from a previous run; see `FadingTier`. */
+  fadingTier?: FadingTier | null;
   /**
    * Receives a {@link SubagentUsageEvent} for every model call that reports
    * usage metadata inside a subagent child run spawned from this graph

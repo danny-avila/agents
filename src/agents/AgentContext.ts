@@ -271,6 +271,8 @@ export class AgentContext {
   deferredToolNames: string[] = [];
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
   calibrationRatio: number = 1;
+  /** Latched context-fading tier from the pruner — persisted across runs via contextMeta. */
+  fadingTier?: t.FadingTier;
   /** Provider-observed instruction overhead from the pruner's best-variance turn. */
   resolvedInstructionOverhead?: number;
   private _pendingOriginalToolContent?: Map<number, string>;
@@ -1512,6 +1514,7 @@ export class AgentContext {
     this._summarizationFailures = 0;
     this.systemRunnableStale = true;
     this.pruneMessages = undefined;
+    this.fadingTier = undefined;
   }
 
   /** Sets a cross-run summary that is injected into the system prompt. */
@@ -1904,6 +1907,7 @@ export class AgentContext {
       summarizationEnabled: this.summarizationEnabled,
       reserveRatio: this.summarizationConfig?.reserveRatio,
       calibrationRatio: opts?.calibrationRatio ?? this.calibrationRatio,
+      fadingTier: this.fadingTier,
       getInstructionTokens: () => this.instructionTokens,
     });
     const {

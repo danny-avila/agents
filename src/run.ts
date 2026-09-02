@@ -472,6 +472,7 @@ export class Run<_T extends t.BaseGraphState> {
   private subagentTasks?: t.SubagentTaskConfig;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
+  fadingTier?: t.FadingTier;
   graphRunnable?: t.CompiledStateWorkflow;
   Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
@@ -515,6 +516,9 @@ export class Run<_T extends t.BaseGraphState> {
     this.indexTokenCountMap = config.indexTokenCountMap;
     if (config.calibrationRatio != null && config.calibrationRatio > 0) {
       this.calibrationRatio = config.calibrationRatio;
+    }
+    if (config.fadingTier != null) {
+      this.fadingTier = config.fadingTier;
     }
 
     const handlerRegistry = new HandlerRegistry();
@@ -632,6 +636,7 @@ export class Run<_T extends t.BaseGraphState> {
         tokenCounter: this.tokenCounter,
         indexTokenCountMap: this.indexTokenCountMap,
         calibrationRatio: this.calibrationRatio,
+        fadingTier: this.fadingTier,
         subagentUsageSink: this.subagentUsageSink,
         subagentTasks: this.subagentTasks,
         preemption: this.preemption,
@@ -672,6 +677,7 @@ export class Run<_T extends t.BaseGraphState> {
         tokenCounter: this.tokenCounter,
         indexTokenCountMap: this.indexTokenCountMap,
         calibrationRatio: this.calibrationRatio,
+        fadingTier: this.fadingTier,
         subagentUsageSink: this.subagentUsageSink,
         subagentTasks: this.subagentTasks,
         preemption: this.preemption,
@@ -935,6 +941,16 @@ export class Run<_T extends t.BaseGraphState> {
    */
   getCalibrationRatio(): number {
     return this.calibrationRatio;
+  }
+
+  /**
+   * Returns the latched context-fading tier. Hosts should persist it beside the
+   * calibration ratio and pass it back as `RunConfig.fadingTier` on the next run
+   * for the same conversation so historical tool results keep the same
+   * truncated bytes, which is what keeps provider prompt-cache prefixes valid.
+   */
+  getFadingTier(): t.FadingTier | undefined {
+    return this.fadingTier;
   }
 
   getResolvedInstructionOverhead(): number | undefined {
@@ -1761,6 +1777,7 @@ export class Run<_T extends t.BaseGraphState> {
         : undefined;
 
       this.calibrationRatio = this.Graph.getCalibrationRatio();
+      this.fadingTier = this.Graph.getFadingTier();
 
       /**
        * Skip `clearHeavyState()` when the run paused on a clean HITL

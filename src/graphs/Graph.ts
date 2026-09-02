@@ -1491,6 +1491,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       tokenCounter,
       indexTokenCountMap,
       calibrationRatio,
+      fadingTier,
       subagentUsageSink,
       subagentTasks,
       subagentScope,
@@ -1538,6 +1539,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       );
       if (calibrationRatio != null && calibrationRatio > 0) {
         agentContext.calibrationRatio = calibrationRatio;
+      }
+      if (fadingTier != null) {
+        agentContext.fadingTier = fadingTier;
       }
 
       this.agentContexts.set(agentConfig.agentId, agentContext);
@@ -2551,6 +2555,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return context?.calibrationRatio ?? 1;
   }
 
+  /** Latched context-fading tier for the default agent; hosts persist it with the calibration ratio. */
+  getFadingTier(): t.FadingTier | undefined {
+    return this.agentContexts.get(this.defaultAgentId)?.fadingTier;
+  }
+
   getResolvedInstructionOverhead(): number | undefined {
     const context = this.agentContexts.get(this.defaultAgentId);
     return context?.resolvedInstructionOverhead;
@@ -3080,6 +3089,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           summarizationEnabled: agentContext.summarizationEnabled,
           reserveRatio: agentContext.summarizationConfig?.reserveRatio,
           calibrationRatio: agentContext.calibrationRatio,
+          fadingTier: agentContext.fadingTier,
           getInstructionTokens: () => agentContext.instructionTokens,
           log: (level, message, data) => {
             emitAgentLog(config, level, 'prune', message, data, {
@@ -3098,6 +3108,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           remainingContextTokens,
           newOriginalToolContent,
           calibrationRatio,
+          fadingTier,
           resolvedInstructionOverhead,
           contextBudget,
           effectiveInstructionTokens,
@@ -3121,6 +3132,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (calibrationRatio != null && calibrationRatio > 0) {
           agentContext.calibrationRatio = calibrationRatio;
         }
+        agentContext.fadingTier = fadingTier;
         if (resolvedInstructionOverhead != null) {
           agentContext.resolvedInstructionOverhead =
             resolvedInstructionOverhead;

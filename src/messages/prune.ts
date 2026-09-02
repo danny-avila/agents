@@ -11,22 +11,32 @@ import type {
   MessageContentComplex,
   ReasoningContentText,
 } from '@/types/stream';
-import type { ContextPruningConfig } from '@/types/graph';
+import type { ContextPruningConfig, FadingTier } from '@/types/graph';
+import type { FadingCaps, FadingSignals } from './fading';
 import type { TokenCounter } from '@/types/run';
 import type { ProviderName } from '@/types';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
-  getToolContentCharLength,
   isComputerCallOutputMessage,
   serializeStructuredValueBounded,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
+  HARD_MAX_TOOL_CALL_INPUT_CHARS,
   HARD_MAX_TOOL_RESULT_CHARS,
+  MIN_JSON_VALUE_CHARS,
+  calculateMaxToolCallInputChars,
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
+import {
+  MASKED_RESULT_MIN_CHARS,
+  fadingRungForResultChars,
+  resolveFadingCaps,
+  resolveFadingTier,
+  seedFadingTier,
+} from './fading';
 import { resolveContextPruningSettings } from './contextPruningSettings';
 import { hasUnsafeStructuredSerialization } from '@/utils/tokens';
 import { ContentTypes, Providers, Constants } from '@/common';
@@ -34,6 +44,8 @@ import { getProviderFamily } from '@/llm/providerRegistry';
 import { dropIncompleteToolStreamContent } from './core';
 import { applyContextPruning } from './contextPruning';
 import { toLangChainContent } from './langchain';
+
+export { calculateMaxToolCallInputChars } from '@/utils/truncation';
 
 function sumTokenCounts(
   tokenMap: Record<string, number | undefined>,
@@ -73,59 +85,6 @@ export const DEFAULT_RESERVE_RATIO = 0.05;
 
 /** Provider framing reserved for the assistant reply label. */
 export const REPLY_PRIMER_TOKENS = 3;
-
-/** Context pressure at which observation masking and context fading activate. */
-const PRESSURE_THRESHOLD_MASKING = 0.8;
-
-/** Pressure band thresholds paired with budget factors for progressive context fading. */
-const PRESSURE_BANDS: [number, number][] = [
-  [0.99, 0.05],
-  [0.9, 0.2],
-  [0.85, 0.5],
-  [0.8, 1.0],
-];
-
-/** Maximum character length for masked (consumed) tool results. */
-const MASKED_RESULT_MAX_CHARS = 300;
-
-/** Fraction of a fresh tool result's cap that a masked (consumed) result keeps. */
-const MASKED_RESULT_CAP_RATIO = 0.1;
-
-/**
- * Token budget that context fading derives its caps from: the fixed context
- * window scaled by the discrete pressure band.
- *
- * Deliberately independent of the calibration ratio, the instruction overhead
- * and the number of tool results in the conversation. Those move from call to
- * call, and a cap that follows them re-truncates historical tool results to a
- * slightly different length on every request — which invalidates prefix-based
- * provider prompt caches for the rest of the conversation once pressure
- * crosses the fading threshold. Within a band, a given tool result maps to the
- * same bytes on every call.
- */
-export function resolveFadingBudgetTokens(
-  maxTokens: number,
-  contextPressure: number
-): number {
-  const budgetFactor =
-    contextPressure >= PRESSURE_THRESHOLD_MASKING
-      ? (PRESSURE_BANDS.find(([threshold]) => contextPressure >= threshold)?.[1] ??
-        1.0)
-      : 1.0;
-  return Math.max(1024, Math.floor(maxTokens * budgetFactor));
-}
-
-/** Character cap for masked (consumed) tool results at the given fading budget. */
-export function calculateMaskedResultMaxChars(
-  fadingBudgetTokens: number
-): number {
-  return Math.max(
-    MASKED_RESULT_MAX_CHARS,
-    Math.floor(
-      calculateMaxToolResultChars(fadingBudgetTokens) * MASKED_RESULT_CAP_RATIO
-    )
-  );
-}
 
 /** Hard cap for the originalToolContent store (~2 MB estimated from char length). */
 export const ORIGINAL_CONTENT_MAX_CHARS = 2_000_000;
@@ -211,6 +170,12 @@ export type PruneMessagesFactoryParams = {
    * of waiting for the first provider response.  Ignored when <= 0.
    */
   calibrationRatio?: number;
+  /**
+   * Context-fading tier persisted from a previous run's contextMeta. Seeds the
+   * latched cap ladder so historical tool results keep the same truncated
+   * bytes across runs. Invalid values or a different context window start fresh.
+   */
+  fadingTier?: FadingTier | null;
   /** Optional diagnostic log callback wired by the graph for observability. */
   log?: (
     level: 'debug' | 'info' | 'warn' | 'error',
@@ -1174,18 +1139,147 @@ export function checkValidNumber(value: unknown): value is number {
   return typeof value === 'number' && !isNaN(value) && value > 0;
 }
 
+type FadingApplyParams = {
+  messages: BaseMessage[];
+  indexTokenCountMap: Record<string, number | undefined>;
+  tokenCounter: TokenCounter;
+  caps: Pick<FadingCaps, 'resultChars' | 'consumedChars' | 'inputChars'>;
+  /** Whether consumed results shrink to `caps.consumedChars`. */
+  masked: boolean;
+  /** First index to visit for fresh results and tool-call inputs. */
+  fromIndex?: number;
+  /** First consumed index to visit for masking. */
+  maskedFromIndex?: number;
+  /** Original (pre-masking) content keyed by message index, captured for the summarizer. */
+  originalContentStore?: Map<number, string>;
+  /** Called after storing a newly captured entry. */
+  onContentStored?: (index: number, content: string) => void;
+};
+
+export type FadingApplyResult = {
+  /** Fresh tool results rewritten. */
+  truncated: number;
+  /** Tool-call inputs rewritten. */
+  inputs: number;
+  /** Consumed tool results rewritten. */
+  masked: number;
+  /** Index of the newest AI message with text; tool results before it are consumed. */
+  consumedBoundary: number;
+};
+
+function hasTextContent(message: BaseMessage): boolean {
+  const { content } = message;
+  if (typeof content === 'string') {
+    return content.trim().length > 0;
+  }
+  return (
+    Array.isArray(content) &&
+    content.some(
+      (block) =>
+        typeof block === 'object' &&
+        (block as Record<string, unknown>).type === 'text' &&
+        typeof (block as Record<string, unknown>).text === 'string' &&
+        ((block as Record<string, unknown>).text as string).trim().length > 0
+    )
+  );
+}
+
+/**
+ * Index of the newest AI message with substantive text. Every ToolMessage
+ * before it has been answered by the model ("consumed"); results after it are
+ * still fresh. Scans backward, so the cost is bounded by the last turn.
+ */
+function findConsumedBoundary(messages: BaseMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.getType() === 'ai' && hasTextContent(message)) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+/**
+ * Applies a fading tier's caps in one forward pass. Consumed results (before
+ * the boundary) shrink to `consumedChars`, fresh results to `resultChars` and
+ * historical tool-call inputs to `inputChars`. Messages already within their
+ * cap keep object identity and token count, so at an unchanged tier the pass
+ * only touches what arrived since the watermarks. Truncation is a pure
+ * function of (content, cap), which is what keeps the bytes of a historical
+ * result identical from call to call.
+ */
+export function applyFadingCaps(params: FadingApplyParams): FadingApplyResult {
+  const { messages, indexTokenCountMap, tokenCounter, caps, masked } = params;
+  const fromIndex = params.fromIndex ?? 0;
+  const maskedFromIndex = params.maskedFromIndex ?? 0;
+  const consumedBoundary = masked ? findConsumedBoundary(messages) : 0;
+  const start = masked ? Math.min(fromIndex, maskedFromIndex) : fromIndex;
+  let truncated = 0;
+  let maskedCount = 0;
+
+  for (let i = start; i < messages.length; i++) {
+    const message = messages[i];
+    if (
+      message.getType() !== 'tool' ||
+      isComputerCallOutputMessage(message)
+    ) {
+      continue;
+    }
+    const consumed = masked && i < consumedBoundary;
+    if (consumed ? i < maskedFromIndex : i < fromIndex) {
+      continue;
+    }
+    const maxChars = consumed ? caps.consumedChars : caps.resultChars;
+    if (!Number.isFinite(maxChars)) {
+      continue;
+    }
+    const content = message.content;
+    const compacted = compactToolContent(content, maxChars);
+    if (!compacted.changed) {
+      continue;
+    }
+    if (
+      consumed &&
+      params.originalContentStore &&
+      !params.originalContentStore.has(i)
+    ) {
+      const original = serializeToolContentBounded(
+        content,
+        ORIGINAL_CONTENT_MAX_CHARS
+      );
+      params.originalContentStore.set(i, original);
+      params.onContentStored?.(i, original);
+    }
+    const cloned = cloneToolMessageWithContent(
+      message as ToolMessage,
+      compacted.content
+    );
+    messages[i] = cloned;
+    indexTokenCountMap[i] = tokenCounter(cloned);
+    if (consumed) {
+      maskedCount++;
+    } else {
+      truncated++;
+    }
+  }
+
+  const inputs = Number.isFinite(caps.inputChars)
+    ? applyToolCallInputCaps({
+      messages,
+      maxInputChars: caps.inputChars,
+      indexTokenCountMap,
+      tokenCounter,
+      fromIndex,
+    })
+    : 0;
+
+  return { truncated, inputs, masked: maskedCount, consumedBoundary };
+}
+
 /**
  * Observation masking: replaces consumed ToolMessage content with tight
- * head+tail truncations that serve as informative placeholders.
- *
- * A ToolMessage is "consumed" when a subsequent AI message exists that is NOT
- * purely tool calls — meaning the model has already read and acted on the
- * result. Unconsumed results (the latest tool outputs the model hasn't
- * responded to yet) are left intact so the model can still use them.
- *
- * AI messages are never masked — they contain the model's own reasoning and
- * conclusions, which is what prevents the model from repeating work after
- * its tool results are masked.
+ * head+tail truncations that serve as informative placeholders. Fresh results
+ * and tool-call inputs are left alone.
  *
  * @returns The number of tool messages that were masked.
  */
@@ -1194,10 +1288,7 @@ export function maskConsumedToolResults(params: {
   indexTokenCountMap: Record<string, number | undefined>;
   tokenCounter: TokenCounter;
   /** Character cap applied to every consumed result (never below
-   *  MASKED_RESULT_MAX_CHARS, which is also the default). The cap must stay
-   *  stable across calls for a given pressure band: one that depends on the
-   *  number of consumed results or on calibration re-truncates historical
-   *  results on every call and shifts provider prompt-cache prefixes. */
+   *  MASKED_RESULT_MIN_CHARS, which is also the default). */
   maxChars?: number;
   /** When provided, original (pre-masking) content is stored here keyed by
    *  message index — only for entries that actually get truncated. */
@@ -1205,100 +1296,28 @@ export function maskConsumedToolResults(params: {
   /** Called after storing a newly captured entry. */
   onContentStored?: (index: number, content: string) => void;
 }): number {
-  const { messages, indexTokenCountMap, tokenCounter } = params;
-  let maskedCount = 0;
-
-  // Pass 1 (backward): identify consumed tool message indices.
-  // A ToolMessage is "consumed" once we've seen a subsequent AI message with
-  // substantive text content (not just tool calls).
-  // Processed oldest first so originals are stored in eviction order.
-  let seenNonToolCallAI = false;
-  const consumedIndices: number[] = [];
-
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    const type = msg.getType();
-
-    if (type === 'ai') {
-      const hasText =
-        typeof msg.content === 'string'
-          ? msg.content.trim().length > 0
-          : Array.isArray(msg.content) &&
-            msg.content.some(
-              (b) =>
-                typeof b === 'object' &&
-                (b as Record<string, unknown>).type === 'text' &&
-                typeof (b as Record<string, unknown>).text === 'string' &&
-                ((b as Record<string, unknown>).text as string).trim().length >
-                  0
-            );
-      if (hasText) {
-        seenNonToolCallAI = true;
-      }
-    } else if (type === 'tool' && seenNonToolCallAI) {
-      consumedIndices.push(i);
-    }
-  }
-
-  if (consumedIndices.length === 0) {
-    return 0;
-  }
-
-  consumedIndices.reverse();
-
-  const maxChars = Math.max(
-    MASKED_RESULT_MAX_CHARS,
-    Math.floor(params.maxChars ?? MASKED_RESULT_MAX_CHARS)
-  );
-
-  for (const i of consumedIndices) {
-    const message = messages[i];
-    if (isComputerCallOutputMessage(message)) {
-      continue;
-    }
-    const content = message.content;
-
-    const compacted = compactToolContent(content, maxChars);
-    if (!compacted.changed) {
-      continue;
-    }
-
-    if (params.originalContentStore && !params.originalContentStore.has(i)) {
-      const original = serializeToolContentBounded(
-        content,
-        ORIGINAL_CONTENT_MAX_CHARS
-      );
-      params.originalContentStore.set(i, original);
-      if (params.onContentStored) {
-        params.onContentStored(i, original);
-      }
-    }
-
-    const cloned = cloneToolMessageWithContent(
-      message as ToolMessage,
-      compacted.content
-    );
-    messages[i] = cloned;
-    indexTokenCountMap[i] = tokenCounter(cloned);
-    maskedCount++;
-  }
-
-  return maskedCount;
+  return applyFadingCaps({
+    messages: params.messages,
+    indexTokenCountMap: params.indexTokenCountMap,
+    tokenCounter: params.tokenCounter,
+    caps: {
+      resultChars: Number.POSITIVE_INFINITY,
+      consumedChars: Math.max(
+        MASKED_RESULT_MIN_CHARS,
+        Math.floor(params.maxChars ?? MASKED_RESULT_MIN_CHARS)
+      ),
+      inputChars: Number.POSITIVE_INFINITY,
+    },
+    masked: true,
+    originalContentStore: params.originalContentStore,
+    onContentStored: params.onContentStored,
+  }).masked;
 }
 
 /**
  * Pre-flight truncation: truncates oversized ToolMessage content before the
- * main backward-iteration pruning runs. Unlike the ingestion guard (which caps
- * at tool-execution time), pre-flight truncation applies per-turn based on the
- * budget the caller derives from the current pressure band.
- *
- * Every tool result gets the same cap. A per-result cap that depended on the
- * result's position among all tool results would change for every historical
- * result each time a new tool call is appended, re-truncating already-sent
- * messages and invalidating prefix-based provider prompt caches on every turn.
- *
- * After truncation, recounts tokens via tokenCounter and updates indexTokenCountMap
- * so subsequent pruning works with accurate counts.
+ * main backward-iteration pruning runs, applying one cap derived from
+ * `maxContextTokens` to every tool result.
  *
  * @returns The number of tool messages that were truncated.
  */
@@ -1308,34 +1327,17 @@ export function preFlightTruncateToolResults(params: {
   indexTokenCountMap: Record<string, number | undefined>;
   tokenCounter: TokenCounter;
 }): number {
-  const { messages, maxContextTokens, indexTokenCountMap, tokenCounter } =
-    params;
-  const maxChars = calculateMaxToolResultChars(maxContextTokens);
-  let truncatedCount = 0;
-
-  for (let i = 0; i < messages.length; i++) {
-    const message = messages[i];
-    if (
-      message.getType() !== 'tool' ||
-      isComputerCallOutputMessage(message)
-    ) {
-      continue;
-    }
-
-    const compacted = compactToolContent(message.content, maxChars);
-    if (!compacted.changed) {
-      continue;
-    }
-    const cloned = cloneToolMessageWithContent(
-      message as ToolMessage,
-      compacted.content
-    );
-    messages[i] = cloned;
-    indexTokenCountMap[i] = tokenCounter(cloned);
-    truncatedCount++;
-  }
-
-  return truncatedCount;
+  return applyFadingCaps({
+    messages: params.messages,
+    indexTokenCountMap: params.indexTokenCountMap,
+    tokenCounter: params.tokenCounter,
+    caps: {
+      resultChars: calculateMaxToolResultChars(params.maxContextTokens),
+      consumedChars: Number.POSITIVE_INFINITY,
+      inputChars: Number.POSITIVE_INFINITY,
+    },
+    masked: false,
+  }).truncated;
 }
 
 /**
@@ -1351,8 +1353,6 @@ export function preFlightTruncateToolResults(params: {
  *
  * @returns The number of AI messages that had tool_use inputs truncated.
  */
-const HARD_MAX_TOOL_CALL_INPUT_CHARS = 200_000;
-const MIN_JSON_VALUE_CHARS = 4;
 const ACCESSOR_INPUT_PLACEHOLDER = '[Property accessor omitted]';
 
 type ToolInputProjection = {
@@ -1917,35 +1917,15 @@ function projectResponsesOutput(
   };
 }
 
-/** Per-input cap: 15% of context at ~4 chars/token, never above 200K chars. */
-export function calculateMaxToolCallInputChars(
-  maxContextTokens?: number
-): number {
-  if (maxContextTokens == null || maxContextTokens <= 0) {
-    return HARD_MAX_TOOL_CALL_INPUT_CHARS;
-  }
-  return Math.max(
-    MIN_JSON_VALUE_CHARS,
-    Math.min(
-      Math.floor(maxContextTokens * 0.15) * 4,
-      HARD_MAX_TOOL_CALL_INPUT_CHARS
-    )
-  );
-}
-
-/**
- * Projects historical tool-call inputs into a provider-safe bounded form.
- * Returns the original array when no message changes and otherwise clones only
- * the array and AI messages whose inline input or `tool_calls` args changed.
- */
 function projectToolCallInputsInternal(
   messages: BaseMessage[],
   maxInputChars: number,
-  dropIncompleteStreamContent: boolean
+  dropIncompleteStreamContent: boolean,
+  fromIndex = 0
 ): BaseMessage[] {
   const normalizedMaxInputChars = normalizeToolInputLimit(maxInputChars);
   let projectedMessages: BaseMessage[] | undefined;
-  for (let i = 0; i < messages.length; i++) {
+  for (let i = fromIndex; i < messages.length; i++) {
     const message = messages[i];
     const messageRole = (message as BaseMessage & { role?: unknown }).role;
     if (message.getType() !== 'ai' && messageRole !== 'assistant') {
@@ -2112,9 +2092,15 @@ function projectToolCallInputsInternal(
 /** Projects all historical tool-call input representations to bounded values. */
 export function projectToolCallInputs(
   messages: BaseMessage[],
-  maxInputChars: number
+  maxInputChars: number,
+  fromIndex = 0
 ): BaseMessage[] {
-  return projectToolCallInputsInternal(messages, maxInputChars, false);
+  return projectToolCallInputsInternal(
+    messages,
+    maxInputChars,
+    false,
+    fromIndex
+  );
 }
 
 /**
@@ -2128,22 +2114,22 @@ export function projectToolMessagesForProvider(
   return projectToolCallInputsInternal(messages, maxInputChars, true);
 }
 
-export function preFlightTruncateToolCallInputs(params: {
+function applyToolCallInputCaps(params: {
   messages: BaseMessage[];
-  maxContextTokens: number;
+  maxInputChars: number;
   indexTokenCountMap: Record<string, number | undefined>;
   tokenCounter: TokenCounter;
+  fromIndex?: number;
 }): number {
-  const { messages, maxContextTokens, indexTokenCountMap, tokenCounter } =
-    params;
-  const maxInputChars = calculateMaxToolCallInputChars(maxContextTokens);
-  const projected = projectToolCallInputs(messages, maxInputChars);
+  const { messages, maxInputChars, indexTokenCountMap, tokenCounter } = params;
+  const fromIndex = params.fromIndex ?? 0;
+  const projected = projectToolCallInputs(messages, maxInputChars, fromIndex);
   if (projected === messages) {
     return 0;
   }
 
   let truncatedCount = 0;
-  for (let i = 0; i < messages.length; i++) {
+  for (let i = fromIndex; i < messages.length; i++) {
     if (projected[i] === messages[i]) {
       continue;
     }
@@ -2152,6 +2138,20 @@ export function preFlightTruncateToolCallInputs(params: {
     truncatedCount++;
   }
   return truncatedCount;
+}
+
+export function preFlightTruncateToolCallInputs(params: {
+  messages: BaseMessage[];
+  maxContextTokens: number;
+  indexTokenCountMap: Record<string, number | undefined>;
+  tokenCounter: TokenCounter;
+}): number {
+  return applyToolCallInputCaps({
+    messages: params.messages,
+    maxInputChars: calculateMaxToolCallInputChars(params.maxContextTokens),
+    indexTokenCountMap: params.indexTokenCountMap,
+    tokenCounter: params.tokenCounter,
+  });
 }
 
 type ThinkingBlocks = {
@@ -2207,6 +2207,15 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
    *  pruner is recreated after summarization. */
   const originalToolContent = new Map<number, string>();
   let originalToolContentSize = 0;
+  /** Latched fading tier; caps derive from it alone so bytes stay stable. */
+  let fadingTier = seedFadingTier(
+    factoryParams.maxTokens,
+    factoryParams.fadingTier
+  );
+  /** Fresh results and inputs below this index already carry the tier's caps. */
+  let fadedThrough = 0;
+  /** Consumed results below this index already carry the tier's masked cap. */
+  let maskedThrough = 0;
   const contextPruningSettings = resolveContextPruningSettings(
     factoryParams.contextPruningConfig
   );
@@ -2221,6 +2230,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     originalToolContent?: Map<number, string>;
     newOriginalToolContent?: Map<number, string>;
     calibrationRatio?: number;
+    /** Latched fading tier after this call; hosts persist it beside calibrationRatio. */
+    fadingTier: FadingTier;
     resolvedInstructionOverhead?: number;
     /** Usable budget this call: maxTokens minus output reserve */
     contextBudget?: number;
@@ -2253,6 +2264,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           emptyBudget - emptyInstructionTokens - emptyReplyPrimerTokens
         ),
         calibrationRatio,
+        fadingTier,
         resolvedInstructionOverhead: bestInstructionOverhead,
         contextBudget: emptyBudget,
         effectiveInstructionTokens: emptyInstructionTokens,
@@ -2585,6 +2597,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         contextPressure:
           pruningBudget > 0 ? calibratedTotalTokens / pruningBudget : 0,
         calibrationRatio,
+        fadingTier,
         resolvedInstructionOverhead: bestInstructionOverhead,
         contextBudget: pruningBudget,
         effectiveInstructionTokens: currentInstructionTokens,
@@ -2593,26 +2606,18 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
     // ---------------------------------------------------------------------------
     // Progressive context fading — inspired by Claude Code's staged compaction.
-    // Below 80%: no modifications, tool results retain full size.
-    // Above 80%: graduated truncation with increasing aggression per pressure band.
-    // Consumed results (already answered by the model) fade first via masking.
-    //
-    //   80%: gentle — budget factor 1.0
-    //   85%: moderate — budget factor 0.50
-    //   90%: aggressive — budget factor 0.20
-    //   99%: emergency — budget factor 0.05, effectively placeholders
-    //
-    // Every cap is a function of the fixed context window and the band only
-    // (see resolveFadingBudgetTokens): within a band, a historical tool result
-    // maps to the same bytes on every call, so provider prompt-cache prefixes
-    // survive from turn to turn instead of being rewritten each request.
+    // Every cap comes from the latched fading tier (see ./fading.ts): the fit
+    // rung keeps a single tool result within the effective budget, pressure
+    // bands deepen the rung when summarization is off, and masking (80%+)
+    // shrinks consumed results the model has already answered. The tier only
+    // ever deepens, so a historical tool result maps to the same bytes on
+    // every call and provider prompt-cache prefixes survive from turn to turn;
+    // only escalation rewrites them.
     // ---------------------------------------------------------------------------
     totalTokens = sumTokenCounts(indexTokenCountMap, params.messages.length);
     calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
     const contextPressure =
       pruningBudget > 0 ? calibratedTotalTokens / pruningBudget : 0;
-    let preFlightResultCount = 0;
-    let preFlightInputCount = 0;
 
     // -----------------------------------------------------------------------
     // Observation masking (80%+ pressure, both paths):
@@ -2624,71 +2629,75 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // When summarization is enabled, snapshot messages first so the
     // summarizer can see the full originals when compaction fires.
     // -----------------------------------------------------------------------
-    let observationsMasked = 0;
-    const fadingBudgetTokens = resolveFadingBudgetTokens(
-      factoryParams.maxTokens,
-      contextPressure
-    );
+    const storeOriginalToolContent = (index: number, content: string): void => {
+      originalToolContentSize += content.length;
+      if (newOriginalToolContent == null) {
+        newOriginalToolContent = new Map();
+      }
+      newOriginalToolContent.set(index, content);
+      while (
+        originalToolContentSize > ORIGINAL_CONTENT_MAX_CHARS &&
+        originalToolContent.size > 0
+      ) {
+        const oldest = originalToolContent.keys().next();
+        if (oldest.done === true) {
+          break;
+        }
+        const removed = originalToolContent.get(oldest.value);
+        if (removed != null) {
+          originalToolContentSize -= removed.length;
+        }
+        originalToolContent.delete(oldest.value);
+      }
+    };
 
-    if (contextPressure >= PRESSURE_THRESHOLD_MASKING) {
-      observationsMasked = maskConsumedToolResults({
+    /** Advances the tier from the signals and applies its caps; escalation rescans everything. */
+    const fade = (signals: FadingSignals): FadingApplyResult => {
+      const nextTier = resolveFadingTier(fadingTier, signals);
+      if (nextTier !== fadingTier) {
+        fadingTier = nextTier;
+        fadedThrough = 0;
+        maskedThrough = 0;
+      }
+      const result = applyFadingCaps({
         messages: params.messages,
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
-        maxChars: calculateMaskedResultMaxChars(fadingBudgetTokens),
+        caps: resolveFadingCaps(fadingTier, factoryParams.maxToolResultChars),
+        masked: fadingTier.masked,
+        fromIndex: fadedThrough,
+        maskedFromIndex: maskedThrough,
         originalContentStore:
           factoryParams.summarizationEnabled === true
             ? originalToolContent
             : undefined,
         onContentStored:
           factoryParams.summarizationEnabled === true
-            ? (index: number, content: string): void => {
-              originalToolContentSize += content.length;
-              if (newOriginalToolContent == null) {
-                newOriginalToolContent = new Map();
-              }
-              newOriginalToolContent.set(index, content);
-              while (
-                originalToolContentSize > ORIGINAL_CONTENT_MAX_CHARS &&
-                  originalToolContent.size > 0
-              ) {
-                const oldest = originalToolContent.keys().next();
-                if (oldest.done === true) {
-                  break;
-                }
-                const removed = originalToolContent.get(oldest.value);
-                if (removed != null) {
-                  originalToolContentSize -= removed.length;
-                }
-                originalToolContent.delete(oldest.value);
-              }
-            }
+            ? storeOriginalToolContent
             : undefined,
       });
-      if (observationsMasked > 0) {
-        cumulativeRawSent = 0;
-        cumulativeProviderReported = 0;
-      }
+      fadedThrough = params.messages.length;
+      maskedThrough = result.consumedBoundary;
+      return result;
+    };
+
+    const fadingSignals: FadingSignals = {
+      contextPressure,
+      effectiveRawTokens:
+        calibrationRatio > 0
+          ? Math.floor(effectiveMaxTokens / calibrationRatio)
+          : effectiveMaxTokens,
+      summarizationEnabled: factoryParams.summarizationEnabled === true,
+    };
+    const faded = fade(fadingSignals);
+    const observationsMasked = faded.masked;
+    const preFlightResultCount = faded.truncated;
+    const preFlightInputCount = faded.inputs;
+    if (observationsMasked > 0) {
+      cumulativeRawSent = 0;
+      cumulativeProviderReported = 0;
     }
 
-    if (
-      contextPressure >= PRESSURE_THRESHOLD_MASKING &&
-      factoryParams.summarizationEnabled !== true
-    ) {
-      preFlightResultCount = preFlightTruncateToolResults({
-        messages: params.messages,
-        maxContextTokens: fadingBudgetTokens,
-        indexTokenCountMap,
-        tokenCounter: factoryParams.tokenCounter,
-      });
-
-      preFlightInputCount = preFlightTruncateToolCallInputs({
-        messages: params.messages,
-        maxContextTokens: fadingBudgetTokens,
-        indexTokenCountMap,
-        tokenCounter: factoryParams.tokenCounter,
-      });
-    }
     if (
       factoryParams.contextPruningConfig?.enabled === true &&
       factoryParams.summarizationEnabled !== true
@@ -2698,38 +2707,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
         resolvedSettings: contextPruningSettings,
-      });
-    }
-
-    // Fit-to-budget: when summarization is enabled and individual messages
-    // exceed the context window, truncate them so every message can fit in
-    // a single context slot.  Without this, oversized tool results (e.g.
-    // take_snapshot at 9K chars) cause empty context → emergency truncation
-    // → immediate re-summarization after just one tool call.
-    //
-    // This is NOT the pressure-scaled fading above — it only targets messages
-    // that individually exceed the window-derived cap, the same cap the
-    // ingestion guard applies at tool-execution time. It is deliberately not
-    // derived from the calibrated effective budget: that value moves with
-    // every provider response, and a cap that follows it re-truncates
-    // historical results to a different length on each call, invalidating
-    // provider prompt caches for the rest of the conversation.
-    if (
-      factoryParams.summarizationEnabled === true &&
-      factoryParams.maxTokens > 0
-    ) {
-      preFlightResultCount = preFlightTruncateToolResults({
-        messages: params.messages,
-        maxContextTokens: factoryParams.maxTokens,
-        indexTokenCountMap,
-        tokenCounter: factoryParams.tokenCounter,
-      });
-
-      preFlightInputCount = preFlightTruncateToolCallInputs({
-        messages: params.messages,
-        maxContextTokens: factoryParams.maxTokens,
-        indexTokenCountMap,
-        tokenCounter: factoryParams.tokenCounter,
       });
     }
 
@@ -2781,6 +2758,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           originalToolContent.size > 0 ? originalToolContent : undefined,
         newOriginalToolContent,
         calibrationRatio,
+        fadingTier,
         resolvedInstructionOverhead: bestInstructionOverhead,
         contextBudget: pruningBudget,
         effectiveInstructionTokens: currentInstructionTokens,
@@ -2855,52 +2833,49 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     }
 
     // ---------------------------------------------------------------
-    // Fallback fading: when summarization skipped fading earlier and
-    // pruning still produced an empty context, apply lossy pressure-band
-    // fading and retry.  This is a last resort before emergency truncation
-    // — the summarizer already saw the full messages, so fading the
-    // surviving context for the LLM is acceptable.
+    // Emergency truncation: if pruning produced an empty context but
+    // messages exist, deepen the fading tier until a per-message share of
+    // the effective budget (~4 chars/token, floor 200 chars) fits, apply
+    // it to the live messages and retry.  The tier latches, so the next
+    // call reproduces the same bytes instead of re-deriving them.
     // ---------------------------------------------------------------
     if (
       context.length === 0 &&
       params.messages.length > 0 &&
-      effectiveMaxTokens > 0 &&
-      factoryParams.summarizationEnabled === true
+      effectiveMaxTokens > 0
     ) {
-      const fadingBudget = Math.max(1024, effectiveMaxTokens);
+      const perMessageTokenBudget = Math.floor(
+        effectiveMaxTokens / Math.max(1, params.messages.length)
+      );
+      const emergencyMaxChars = Math.max(200, perMessageTokenBudget * 4);
+      const minRung = fadingRungForResultChars(
+        factoryParams.maxTokens,
+        emergencyMaxChars
+      );
 
       factoryParams.log?.(
-        'debug',
-        'Fallback fading — empty context with summarization',
+        'warn',
+        'Empty context, entering emergency truncation',
         {
           messageCount: params.messages.length,
-          effectiveMaxTokens,
-          fadingBudget,
+          effectiveMax: effectiveMaxTokens,
+          emergencyMaxChars,
+          rung: minRung,
         }
       );
 
-      const fadedMessages = [...params.messages];
-      const preFadingTokenCounts: Record<string, number | undefined> = {};
-      for (let i = 0; i < params.messages.length; i++) {
-        preFadingTokenCounts[i] = indexTokenCountMap[i];
-      }
+      const emergency = fade({ ...fadingSignals, minRung });
 
-      preFlightTruncateToolResults({
-        messages: fadedMessages,
-        maxContextTokens: fadingBudget,
-        indexTokenCountMap,
-        tokenCounter: factoryParams.tokenCounter,
-      });
-      preFlightTruncateToolCallInputs({
-        messages: fadedMessages,
-        maxContextTokens: fadingBudget,
-        indexTokenCountMap,
-        tokenCounter: factoryParams.tokenCounter,
+      factoryParams.log?.('info', 'Emergency truncation complete');
+      factoryParams.log?.('debug', 'Emergency truncation details', {
+        truncatedCount:
+          emergency.truncated + emergency.inputs + emergency.masked,
+        rung: fadingTier.rung,
       });
 
-      const fadingRetry = getMessagesWithinTokenLimit({
+      const retryResult = getMessagesWithinTokenLimit({
         maxContextTokens: pruningBudget,
-        messages: fadedMessages,
+        messages: params.messages,
         indexTokenCountMap,
         startType: params.startType,
         thinkingEnabled: factoryParams.thinkingEnabled,
@@ -2915,170 +2890,25 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             : undefined,
       });
 
-      const fadingRepaired = repairOrphanedToolMessages({
-        context: fadingRetry.context,
-        allMessages: fadedMessages,
+      const repaired = repairOrphanedToolMessages({
+        context: retryResult.context,
+        allMessages: params.messages,
         tokenCounter: factoryParams.tokenCounter,
         indexTokenCountMap,
       });
 
-      if (fadingRepaired.context.length > 0) {
-        context = fadingRepaired.context;
-        reclaimedTokens = fadingRepaired.reclaimedTokens;
-        appendItems(messagesToRefine, fadingRetry.messagesToRefine);
-        if (fadingRepaired.droppedMessages.length > 0) {
-          appendItems(messagesToRefine, fadingRepaired.droppedMessages);
-        }
-
-        factoryParams.log?.('debug', 'Fallback fading recovered context', {
-          contextLength: context.length,
-          messagesToRefineCount: messagesToRefine.length,
-          remainingTokens: fadingRetry.remainingContextTokens,
-        });
-
-        for (const [key, value] of Object.entries(preFadingTokenCounts)) {
-          indexTokenCountMap[key] = value;
-        }
-      } else {
-        for (const [key, value] of Object.entries(preFadingTokenCounts)) {
-          indexTokenCountMap[key] = value;
-        }
-      }
-    }
-
-    // ---------------------------------------------------------------
-    // Emergency truncation: if pruning produced an empty context but
-    // messages exist, aggressively truncate all tool_call inputs and
-    // tool results, then retry.  Budget is proportional to the
-    // effective token limit (~4 chars/token, spread across messages)
-    // with a floor of 200 chars so content is never completely blank.
-    // Uses head+tail so the model sees both what was called and the
-    // final outcome (e.g., return value at the end of a script eval).
-    // ---------------------------------------------------------------
-    if (
-      context.length === 0 &&
-      params.messages.length > 0 &&
-      effectiveMaxTokens > 0
-    ) {
-      const perMessageTokenBudget = Math.floor(
-        effectiveMaxTokens / Math.max(1, params.messages.length)
-      );
-      const emergencyMaxChars = Math.max(200, perMessageTokenBudget * 4);
-
-      factoryParams.log?.(
-        'warn',
-        'Empty context, entering emergency truncation',
-        {
-          messageCount: params.messages.length,
-          effectiveMax: effectiveMaxTokens,
-          emergencyMaxChars,
-        }
-      );
-
-      // Clone the messages array so emergency truncation doesn't permanently
-      // mutate graph state.  The originals remain intact for future turns
-      // where more budget may be available.  Also snapshot indexTokenCountMap
-      // entries so the closure doesn't retain stale (too-small) counts for
-      // the original un-truncated messages on the next turn.
-      const emergencyMessages = [...params.messages];
-      const preEmergencyTokenCounts: Record<string, number | undefined> = {};
-      for (let i = 0; i < params.messages.length; i++) {
-        preEmergencyTokenCounts[i] = indexTokenCountMap[i];
+      context = repaired.context;
+      reclaimedTokens = repaired.reclaimedTokens;
+      appendItems(messagesToRefine, retryResult.messagesToRefine);
+      if (repaired.droppedMessages.length > 0) {
+        appendItems(messagesToRefine, repaired.droppedMessages);
       }
 
-      try {
-        let emergencyTruncatedCount = 0;
-        for (let i = 0; i < emergencyMessages.length; i++) {
-          const message = emergencyMessages[i];
-          if (
-            message.getType() === 'tool' &&
-            !isComputerCallOutputMessage(message)
-          ) {
-            const content = message.content;
-            if (getToolContentCharLength(content) > emergencyMaxChars) {
-              const compacted = compactToolContent(content, emergencyMaxChars);
-              if (!compacted.changed) {
-                continue;
-              }
-              const cloned = cloneToolMessageWithContent(
-                message as ToolMessage,
-                compacted.content
-              );
-              emergencyMessages[i] = cloned;
-              indexTokenCountMap[i] = factoryParams.tokenCounter(cloned);
-              emergencyTruncatedCount++;
-            }
-          }
-        }
-
-        const projectedToolInputs = projectToolCallInputs(
-          emergencyMessages,
-          emergencyMaxChars
-        );
-        if (projectedToolInputs !== emergencyMessages) {
-          for (let i = 0; i < emergencyMessages.length; i++) {
-            if (projectedToolInputs[i] === emergencyMessages[i]) {
-              continue;
-            }
-            emergencyMessages[i] = projectedToolInputs[i];
-            indexTokenCountMap[i] = factoryParams.tokenCounter(
-              projectedToolInputs[i]
-            );
-            emergencyTruncatedCount++;
-          }
-        }
-
-        factoryParams.log?.('info', 'Emergency truncation complete');
-        factoryParams.log?.('debug', 'Emergency truncation details', {
-          truncatedCount: emergencyTruncatedCount,
-          emergencyMaxChars,
-        });
-
-        const retryResult = getMessagesWithinTokenLimit({
-          maxContextTokens: pruningBudget,
-          messages: emergencyMessages,
-          indexTokenCountMap,
-          startType: params.startType,
-          thinkingEnabled: factoryParams.thinkingEnabled,
-          tokenCounter: factoryParams.tokenCounter,
-          instructionTokens: currentInstructionTokens,
-          reasoningType: usesBedrockThinking
-            ? ContentTypes.REASONING_CONTENT
-            : ContentTypes.THINKING,
-          thinkingStartIndex:
-            factoryParams.thinkingEnabled === true
-              ? runThinkingStartIndex
-              : undefined,
-        });
-
-        const repaired = repairOrphanedToolMessages({
-          context: retryResult.context,
-          allMessages: emergencyMessages,
-          tokenCounter: factoryParams.tokenCounter,
-          indexTokenCountMap,
-        });
-
-        context = repaired.context;
-        reclaimedTokens = repaired.reclaimedTokens;
-        appendItems(messagesToRefine, retryResult.messagesToRefine);
-        if (repaired.droppedMessages.length > 0) {
-          appendItems(messagesToRefine, repaired.droppedMessages);
-        }
-
-        factoryParams.log?.('debug', 'Emergency truncation retry result', {
-          contextLength: context.length,
-          messagesToRefineCount: messagesToRefine.length,
-          remainingTokens: retryResult.remainingContextTokens,
-        });
-      } finally {
-        // Restore the closure's indexTokenCountMap to pre-emergency values so the
-        // next turn counts old messages at their original (un-truncated) size.
-        // The emergency-truncated counts were only needed for this turn's
-        // getMessagesWithinTokenLimit retry.
-        for (const [key, value] of Object.entries(preEmergencyTokenCounts)) {
-          indexTokenCountMap[key] = value;
-        }
-      }
+      factoryParams.log?.('debug', 'Emergency truncation retry result', {
+        contextLength: context.length,
+        messagesToRefineCount: messagesToRefine.length,
+        remainingTokens: retryResult.remainingContextTokens,
+      });
     }
 
     /** Scale raw-space remaining back to calibrated/provider units so it is
@@ -3116,6 +2946,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         originalToolContent.size > 0 ? originalToolContent : undefined,
       newOriginalToolContent,
       calibrationRatio,
+      fadingTier,
       resolvedInstructionOverhead: bestInstructionOverhead,
       contextBudget: pruningBudget,
       effectiveInstructionTokens: currentInstructionTokens,
