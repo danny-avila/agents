@@ -176,6 +176,31 @@ describe('ambiguous signatures require corroboration', () => {
     ).not.toBeNull();
   });
 
+  it('preserves summary-only recovery when local pressure is unknown', () => {
+    const error = new Error(
+      'request exceeds the context window or max output of every backend'
+    );
+
+    expect(
+      getContextOverflowInfo(error, { provider: Providers.ANTHROPIC })
+    ).not.toBeNull();
+  });
+
+  it('does not count Vertex output allowance as input-window pressure', () => {
+    const vertex = OVERFLOW_SIGNATURES.find(
+      (s) => s.requiresContextPressure === true
+    );
+
+    expect(
+      getContextOverflowInfo(vertex?.error, {
+        provider: Providers.VERTEXAI,
+        estimatedPromptTokens: 20_000,
+        configuredCompletionTokens: 190_000,
+        maxContextTokens: 200_000,
+      })
+    ).toBeNull();
+  });
+
   it('accepts definitive numberless Bedrock input errors without local pressure', () => {
     for (const model of [
       'us.anthropic.claude-sonnet-4-5-20250929-v1:0',

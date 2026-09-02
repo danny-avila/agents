@@ -4103,9 +4103,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             calibrationRatio: agentContext.calibrationRatio,
             instructionTokens: agentContext.instructionTokens,
             canSummarize: agentContext.summarizationEnabled === true,
-            configuredCompletionTokens: getConfiguredCompletionTokens(
-              fallbackContext?.clientOptions ?? agentContext.clientOptions
-            ),
+            configuredCompletionTokens:
+              localMeasurement != null
+                ? undefined
+                : getConfiguredCompletionTokens(
+                  fallbackContext != null
+                    ? fallbackContext.clientOptions
+                    : agentContext.clientOptions
+                ),
             attemptsSoFar: agentContext.overflowRecoveryAttempts,
           });
           if (recovery == null) {

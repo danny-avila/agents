@@ -13,6 +13,7 @@
  */
 import { ContextOverflowError } from '@langchain/core/errors';
 import type { ProviderName } from '@/types';
+import { Providers } from '@/common';
 
 /**
  * Why the request was rejected. Both kinds are fixed by shrinking the
@@ -380,7 +381,12 @@ function getContextPressure(
   ) {
     return undefined;
   }
-  const configuredCompletion = context?.configuredCompletionTokens;
+  const completionSharesContext =
+    context?.provider !== Providers.VERTEXAI &&
+    context?.provider !== Providers.GOOGLE;
+  const configuredCompletion = completionSharesContext
+    ? context?.configuredCompletionTokens
+    : undefined;
   const completion =
     configuredCompletion != null &&
     Number.isFinite(configuredCompletion) &&
@@ -477,7 +483,7 @@ export function getContextOverflowInfo(
   if (
     !langChainFlagged &&
     AMBIGUOUS_CONTEXT_OR_OUTPUT_RE.test(haystack) &&
-    !underContextPressure
+    contextPressure === false
   ) {
     return null;
   }
