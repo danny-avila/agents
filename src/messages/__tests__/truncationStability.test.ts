@@ -21,8 +21,8 @@ import {
   projectToolCallInputs,
 } from '@/messages/prune';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
+import { ContentTypes, Providers } from '@/common';
 import { StandardGraph } from '@/graphs/Graph';
-import { Providers } from '@/common';
 
 const tokenCounter: TokenCounter = (message) => {
   const content = message.content;
@@ -287,6 +287,8 @@ describe('fading ladder', () => {
       resolveFadingCaps({ ...masked, budgetTokens: 400 }).consumedChars
     ).toBe(300);
     expect(resolveFadingCaps(masked, 1_000).resultChars).toBe(1_000);
+    expect(resolveFadingCaps(masked, 0).resultChars).toBe(0);
+    expect(resolveFadingCaps(masked, 0).consumedChars).toBe(0);
   });
 });
 
@@ -782,6 +784,69 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
 
     expect(serialize(messages[2])).not.toBe(firstProjection);
     expect(serialize(canonicalMessages[2])).toBe(originalResult);
+  });
+
+  it('preserves OpenAI thinking normalization while capping canonical tool inputs', () => {
+    const canonicalMessages: BaseMessage[] = [
+      new HumanMessage('fetch'),
+      new AIMessage({
+        content: '',
+        additional_kwargs: {
+          reasoning_content: 'private reasoning',
+          provider_specific_fields: {
+            thinking_blocks: [
+              {
+                type: 'thinking',
+                thinking: 'private reasoning',
+                signature: 'signature',
+              },
+            ],
+          },
+        },
+        tool_calls: [
+          {
+            id: 'call-1',
+            name: 'fetch',
+            args: { query: 'q'.repeat(60_000) },
+            type: 'tool_call',
+          },
+        ],
+      }),
+    ];
+    const messages = [...canonicalMessages];
+    const pruneMessages = createPruneMessages({
+      provider: Providers.OPENAI,
+      maxTokens,
+      startIndex: 0,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: false,
+      thinkingEnabled: true,
+      fadingTier: {
+        v: 1,
+        budgetTokens: 10_000,
+        masked: false,
+        latched: true,
+      },
+    });
+
+    pruneMessages({ messages, canonicalMessages });
+
+    const projected = messages[1] as AIMessage;
+    expect(projected.content).toEqual([
+      expect.objectContaining({
+        type: ContentTypes.THINKING,
+        thinking: 'private reasoning',
+      }),
+    ]);
+    expect(projected.additional_kwargs.reasoning_content).toBeUndefined();
+    expect(JSON.stringify(projected.tool_calls?.[0].args)).toContain(
+      '_truncated'
+    );
+    expect(canonicalMessages[1].content).toBe('');
+    expect(
+      (canonicalMessages[1] as AIMessage).additional_kwargs.reasoning_content
+    ).toBe('private reasoning');
   });
 
   it('emergency truncation recovers on a clone without latching the tier', () => {

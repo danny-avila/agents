@@ -902,7 +902,7 @@ export class AgentSession {
       sessionId: explicitSessionId,
       ephemeral: normalized.ephemeral,
     });
-    return new AgentSession({
+    const session = new AgentSession({
       runConfig: normalized.runConfig,
       cwd: normalized.cwd,
       threadId: store?.header.id ?? explicitSessionId ?? createSessionId(),
@@ -912,6 +912,8 @@ export class AgentSession {
       ),
       store,
     });
+    session.restoreFadingStateFromStore();
+    return session;
   }
 
   get sessionPath(): string | undefined {
@@ -974,6 +976,53 @@ export class AgentSession {
     this.fadingTier = undefined;
     this.fadingTiers = undefined;
     this.alternateThreadFadingState.clear();
+  }
+
+  private restoreFadingStateFromStore(clearWhenMissing = false): void {
+    const states = this.store?.getFadingStates() ?? [];
+    if (states.length === 0) {
+      if (clearWhenMissing || this.store?.hasFadingState() === true) {
+        this.clearFadingState();
+      }
+      return;
+    }
+    this.clearFadingState();
+    /** Store returns newest first; replay oldest first to retain LRU order. */
+    for (let i = states.length - 1; i >= 0; i--) {
+      const state = states[i];
+      this.setFadingState(
+        state.threadId,
+        state.fadingTier == null ? undefined : { ...state.fadingTier },
+        state.fadingTiers == null
+          ? {}
+          : Object.fromEntries(
+            Object.entries(state.fadingTiers).map(([agentId, tier]) => [
+              agentId,
+              { ...tier },
+            ])
+          )
+      );
+    }
+  }
+
+  private async persistFadingState(threadId: string): Promise<void> {
+    const state = this.getFadingState(threadId);
+    await this.store?.appendFadingState({
+      threadId,
+      ...(state.fadingTier == null
+        ? {}
+        : { fadingTier: { ...state.fadingTier } }),
+      ...(state.fadingTiers == null
+        ? {}
+        : {
+          fadingTiers: Object.fromEntries(
+            Object.entries(state.fadingTiers).map(([agentId, tier]) => [
+              agentId,
+              { ...tier },
+            ])
+          ),
+        }),
+    });
   }
 
   async getLatestCheckpoint(
@@ -1195,6 +1244,7 @@ export class AgentSession {
         run.getFadingTier(),
         run.getFadingTiers()
       );
+      await this.persistFadingState(threadId);
       const interrupt = run.getInterrupt();
       const haltedReason = run.getHaltReason();
       if (interrupt) {
@@ -1306,13 +1356,13 @@ export class AgentSession {
       this.store = await JsonlSessionStore.open(sessions[0].path);
       this.cwd = this.store.header.cwd;
       this.threadId = this.store.header.id;
-      this.clearFadingState();
+      this.restoreFadingStateFromStore(true);
       return this;
     }
     this.store = await JsonlSessionStore.open(pathOrId);
     this.cwd = this.store.header.cwd;
     this.threadId = this.store.header.id;
-    this.clearFadingState();
+    this.restoreFadingStateFromStore(true);
     return this;
   }
 
@@ -1321,7 +1371,7 @@ export class AgentSession {
       throw new Error('Cannot clone an ephemeral session');
     }
     const store = await this.store.clone(options);
-    return new AgentSession({
+    const session = new AgentSession({
       runConfig: {
         ...this.runConfig,
         fadingTier: this.fadingTier,
@@ -1332,6 +1382,8 @@ export class AgentSession {
       checkpointing: this.checkpointing,
       store,
     });
+    await session.persistFadingState(session.threadId);
+    return session;
   }
 
   async fork(
@@ -1342,7 +1394,7 @@ export class AgentSession {
       throw new Error('Cannot fork an ephemeral session');
     }
     const store = await this.store.fork(entryId, options);
-    return new AgentSession({
+    const session = new AgentSession({
       runConfig: {
         ...this.runConfig,
         fadingTier: this.fadingTier,
@@ -1353,6 +1405,8 @@ export class AgentSession {
       checkpointing: this.checkpointing,
       store,
     });
+    await session.persistFadingState(session.threadId);
+    return session;
   }
 
   async branch(
@@ -1393,6 +1447,7 @@ export class AgentSession {
     }
     await store.setLeaf(leafId);
     this.clearFadingState();
+    await store.appendFadingState(null);
     await this.resetCheckpointThreads('branch');
   }
 
@@ -1515,6 +1570,7 @@ export class AgentSession {
       summarizedEntryIds: summarized.map((entry) => entry.id),
     });
     this.clearFadingState();
+    await store.appendFadingState(null);
     return summary;
   }
 
@@ -1577,6 +1633,7 @@ export class AgentSession {
         run.getFadingTier(),
         run.getFadingTiers()
       );
+      await this.persistFadingState(threadId);
       const interrupt = run.getInterrupt();
       const haltedReason = run.getHaltReason();
       if (interrupt) {

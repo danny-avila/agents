@@ -1453,6 +1453,50 @@ describe('JsonlSessionStore', () => {
     expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
   });
 
+  it('restores fading tiers when reopening a persisted session', async () => {
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('advance tier');
+    const reopened = await createAgentSession({
+      cwd: dir,
+      sessionPath: session.sessionPath,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await reopened.run('continue reopened session');
+
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
+  });
+
   it('keeps fading tiers isolated by checkpoint thread', async () => {
     const mockRun = createMockRun('continued');
     const mainTier: t.FadingTier = {

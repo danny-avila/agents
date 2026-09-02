@@ -26,6 +26,7 @@ import type {
   SessionRunEventEntry,
   SessionSummaryEntry,
   SessionStateEntry,
+  SessionFadingState,
   SessionTreeNode,
 } from './types';
 import {
@@ -371,6 +372,46 @@ export class JsonlSessionStore {
       type: 'session_state',
       parentId: leafId,
       data: { leafId },
+    });
+  }
+
+  getFadingStates(): SessionFadingState[] {
+    const states = new Map<string, SessionFadingState>();
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      const entry = this.entries[i];
+      if (
+        entry.type !== 'session_state' ||
+        !Object.prototype.hasOwnProperty.call(entry.data, 'fadingState')
+      ) {
+        continue;
+      }
+      if (entry.data.fadingState == null) {
+        break;
+      }
+      const state = entry.data.fadingState;
+      if (!states.has(state.threadId)) {
+        states.set(state.threadId, state);
+      }
+    }
+    return [...states.values()];
+  }
+
+  hasFadingState(): boolean {
+    return this.entries.some(
+      (entry) =>
+        entry.type === 'session_state' &&
+        Object.prototype.hasOwnProperty.call(entry.data, 'fadingState')
+    );
+  }
+
+  async appendFadingState(
+    fadingState: SessionStateEntry['data']['fadingState']
+  ): Promise<SessionStateEntry> {
+    const leafId = this.getLeafEntry()?.id ?? null;
+    return this.appendEntry<SessionStateEntry>({
+      type: 'session_state',
+      parentId: leafId,
+      data: { leafId, fadingState },
     });
   }
 

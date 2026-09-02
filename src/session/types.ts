@@ -116,10 +116,18 @@ export type SessionRunEventEntry = SessionEntryBase<
   }
 >;
 
+export interface SessionFadingState {
+  threadId: string;
+  fadingTier?: t.FadingTier;
+  fadingTiers?: t.FadingTiers;
+}
+
 export type SessionStateEntry = SessionEntryBase<
   'session_state',
   {
     leafId: string | null;
+    /** Latest compact fading state for one checkpoint thread; null clears all. */
+    fadingState?: SessionFadingState | null;
   }
 >;
 

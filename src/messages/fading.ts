@@ -150,7 +150,7 @@ export function resolveFadingCaps(
   const { budgetTokens } = tier;
   const windowResultChars = calculateMaxToolResultChars(budgetTokens);
   const resultChars =
-    maxToolResultChars != null && maxToolResultChars > 0
+    maxToolResultChars != null
       ? Math.min(windowResultChars, maxToolResultChars)
       : windowResultChars;
   const consumedChars = tier.masked

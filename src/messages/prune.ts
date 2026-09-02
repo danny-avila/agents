@@ -2238,8 +2238,37 @@ function applyToolCallInputCaps(params: {
     if (projected[i] === messages[i]) {
       continue;
     }
-    messages[i] = projected[i];
-    indexTokenCountMap[i] = tokenCounter(projected[i]);
+    const current = messages[i] as AIMessage;
+    const canonical = sourceMessages[i] as AIMessage;
+    const capped = projected[i] as AIMessage;
+    const changes: Record<string, unknown> = {};
+    if (capped.content !== canonical.content) {
+      changes.content = capped.content;
+    }
+    if (capped.tool_calls !== canonical.tool_calls) {
+      changes.tool_calls = capped.tool_calls;
+    }
+    const additionalKwargsChanges: Record<string, unknown> = {};
+    for (const key of ['tool_calls', 'function_call']) {
+      if (capped.additional_kwargs[key] !== canonical.additional_kwargs[key]) {
+        additionalKwargsChanges[key] = capped.additional_kwargs[key];
+      }
+    }
+    if (Object.keys(additionalKwargsChanges).length > 0) {
+      changes.additional_kwargs = cloneWithProjectedProperties(
+        current.additional_kwargs,
+        additionalKwargsChanges
+      );
+    }
+    if (capped.response_metadata.output !== canonical.response_metadata.output) {
+      changes.response_metadata = cloneWithProjectedProperties(
+        current.response_metadata,
+        { output: capped.response_metadata.output }
+      );
+    }
+    const merged = cloneWithProjectedProperties(current, changes);
+    messages[i] = merged;
+    indexTokenCountMap[i] = tokenCounter(merged);
     truncatedCount++;
   }
   return truncatedCount;
