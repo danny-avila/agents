@@ -1921,6 +1921,82 @@ describe('JsonlSessionStore', () => {
     expect(capturedConfigs[2].fadingTiers).toEqual({ default: deepTier });
   });
 
+  it('rejects a stale capture that started before a concurrent compaction', async () => {
+    const mockRun = createMockRun('continued');
+    const staleTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    let markResetStarted!: () => void;
+    let markStaleStarted!: () => void;
+    let releaseReset!: () => void;
+    let releaseStale!: () => void;
+    const resetStarted = new Promise<void>((resolve) => {
+      markResetStarted = resolve;
+    });
+    const staleStarted = new Promise<void>((resolve) => {
+      markStaleStarted = resolve;
+    });
+    const resetResult = new Promise<t.MessageContentComplex[]>((resolve) => {
+      releaseReset = () => resolve([{ type: 'text', text: 'reset' }]);
+    });
+    const staleResult = new Promise<t.MessageContentComplex[]>((resolve) => {
+      releaseStale = () => resolve([{ type: 'text', text: 'stale' }]);
+    });
+    mockRun.processStream
+      .mockImplementationOnce(async () => {
+        markResetStarted();
+        return resetResult;
+      })
+      .mockImplementationOnce(async () => {
+        markStaleStarted();
+        return staleResult;
+      })
+      .mockResolvedValue([{ type: 'text', text: 'after' }]);
+    mockRun.getFadingTier
+      .mockReturnValueOnce(undefined)
+      .mockReturnValueOnce(staleTier)
+      .mockReturnValue(undefined);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({})
+      .mockReturnValueOnce({ default: staleTier })
+      .mockReturnValue({});
+    mockRun.didResetFadingTier
+      .mockReturnValueOnce(true)
+      .mockReturnValue(false);
+    mockRun.getFadingTierResetAgentIds
+      .mockReturnValueOnce(['default'])
+      .mockReturnValue([]);
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    const resetRun = session.run('reset run');
+    await resetStarted;
+    const staleRun = session.run('stale run');
+    await staleStarted;
+    releaseReset();
+    await resetRun;
+    releaseStale();
+    await staleRun;
+    await session.run('after overlap');
+
+    expect(capturedConfigs[2].fadingTier).toBeUndefined();
+    expect(capturedConfigs[2].fadingTiers).toEqual({});
+  });
+
   it('bounds fading metadata retained for alternate checkpoint threads', async () => {
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {

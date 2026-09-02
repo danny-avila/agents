@@ -2799,13 +2799,33 @@ export function hasNonEmptyTextContent(content: BaseMessage['content']): boolean
   if (typeof content === 'string') {
     return content.trim() !== '';
   }
+  if (isProxy(content)) {
+    return false;
+  }
   for (const block of content) {
-    if (block.type !== ContentTypes.TEXT && block.type !== 'output_text') {
+    if (typeof block !== 'object' || isProxy(block)) {
       continue;
     }
-    const text = block[ContentTypes.TEXT];
-    if (typeof text === 'string' && text.trim() !== '') {
-      return true;
+    try {
+      const type = Object.getOwnPropertyDescriptor(block, 'type');
+      if (
+        type == null ||
+        !('value' in type) ||
+        (type.value !== ContentTypes.TEXT && type.value !== 'output_text')
+      ) {
+        continue;
+      }
+      const text = Object.getOwnPropertyDescriptor(block, ContentTypes.TEXT);
+      if (
+        text != null &&
+        'value' in text &&
+        typeof text.value === 'string' &&
+        text.value.trim() !== ''
+      ) {
+        return true;
+      }
+    } catch {
+      continue;
     }
   }
   return false;

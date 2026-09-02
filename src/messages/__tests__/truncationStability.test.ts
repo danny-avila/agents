@@ -1115,6 +1115,27 @@ describe('isInformativeFadingTier', () => {
     ).toBe(true);
   });
 
+  it('ignores proxied and accessor-backed text blocks safely', () => {
+    const accessorBlock = Object.defineProperty({}, 'type', {
+      get() {
+        throw new Error('type getter must not run');
+      },
+    });
+    const proxiedBlock = new Proxy(
+      { type: 'text', text: 'hidden' },
+      {
+        get() {
+          throw new Error('proxy getter must not run');
+        },
+      }
+    );
+
+    expect(
+      hasNonEmptyTextContent([accessorBlock, proxiedBlock] as never)
+    ).toBe(false);
+    expect(hasNonEmptyTextContent(new Proxy([], {}) as never)).toBe(false);
+  });
+
   it('reports only tiers a host should persist', () => {
     expect(isInformativeFadingTier(undefined, 100_000)).toBe(false);
     expect(isInformativeFadingTier(createFadingTier(100_000), 100_000)).toBe(
