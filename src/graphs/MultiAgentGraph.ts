@@ -1579,28 +1579,33 @@ export class MultiAgentGraph extends StandardGraph {
         builder.addNode(wrapperNodeId, async (state: t.BaseGraphState) => {
           let promptText: string | undefined;
           let effectiveExcludeResults = excludeResults;
+          const getMaxRoutingPromptChars = async (): Promise<number> => {
+            const destinationContext = this.agentContexts.get(destination);
+            if (destinationContext?.tokenCalculationPromise != null) {
+              await destinationContext.tokenCalculationPromise;
+            }
+            const availableMessageTokens =
+              destinationContext?.maxContextTokens == null
+                ? undefined
+                : destinationContext.getTokenBudgetBreakdown()
+                  .availableForMessages;
+            if (availableMessageTokens == null) {
+              return HARD_MAX_TOOL_RESULT_CHARS;
+            }
+            return availableMessageTokens <= 0
+              ? 0
+              : calculateMaxToolResultChars(availableMessageTokens);
+          };
 
           if (typeof prompt === 'function') {
-            promptText = await prompt(state.messages, this.startIndex);
+            promptText = serializeToolContentBounded(
+              await prompt(state.messages, this.startIndex),
+              await getMaxRoutingPromptChars()
+            );
           } else if (prompt != null) {
             if (prompt.includes('{results}')) {
               const resultsMessages = state.messages.slice(this.startIndex);
-              const destinationContext = this.agentContexts.get(destination);
-              if (destinationContext?.tokenCalculationPromise != null) {
-                await destinationContext.tokenCalculationPromise;
-              }
-              const availableMessageTokens =
-                destinationContext?.maxContextTokens == null
-                  ? undefined
-                  : destinationContext.getTokenBudgetBreakdown()
-                    .availableForMessages;
-              let maxRoutingPromptChars = HARD_MAX_TOOL_RESULT_CHARS;
-              if (availableMessageTokens != null) {
-                maxRoutingPromptChars =
-                  availableMessageTokens <= 0
-                    ? 0
-                    : calculateMaxToolResultChars(availableMessageTokens);
-              }
+              const maxRoutingPromptChars = await getMaxRoutingPromptChars();
               const resultsString = serializeToolContentBounded(
                 getBufferString(resultsMessages),
                 maxRoutingPromptChars

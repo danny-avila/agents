@@ -33,6 +33,13 @@ const makeStreamConfig = (threadId: string): t.WorkflowValuesStreamConfig => ({
   streamMode: 'values' as const,
 });
 
+const countMessageChars: t.TokenCounter = (message) =>
+  Math.ceil(
+    (typeof message.content === 'string'
+      ? message.content.length
+      : JSON.stringify(message.content).length) / 4
+  );
+
 const getAiContents = (messages: t.BaseGraphState['messages']): string[] =>
   messages
     .filter((message) => message.getType() === 'ai')
@@ -486,12 +493,7 @@ describe('LangGraph composition smoke tests', () => {
     const model = new CapturingChatModel([largeResult, 'done']);
     const graph = new MultiAgentGraph({
       runId: 'bounded-routing-results',
-      tokenCounter: (message) =>
-        Math.ceil(
-          (typeof message.content === 'string'
-            ? message.content.length
-            : JSON.stringify(message.content).length) / 4
-        ),
+      tokenCounter: countMessageChars,
       agents: [
         makeAgent('source'),
         {
@@ -517,6 +519,47 @@ describe('LangGraph composition smoke tests', () => {
       .invoke(
         { messages: [new HumanMessage('start')] },
         makeConfig('bounded-routing-results')
+      );
+
+    const routingPrompt = model.invocations[1].find(
+      (message) => message.additional_kwargs.source === 'routing'
+    );
+    expect(routingPrompt?.content).toEqual(expect.stringContaining('truncated'));
+    expect(String(routingPrompt?.content).length).toBeLessThan(500);
+    expect(largeResult).toContain('large routed result');
+  });
+
+  it('bounds routing text returned by prompt functions', async () => {
+    const largeResult = `BEGIN\n${'large routed result '.repeat(2000)}\nEND`;
+    const model = new CapturingChatModel([largeResult, 'done']);
+    const graph = new MultiAgentGraph({
+      runId: 'bounded-function-routing-results',
+      tokenCounter: countMessageChars,
+      agents: [
+        makeAgent('source'),
+        {
+          ...makeAgent('destination'),
+          instructions: 'routing instruction '.repeat(120),
+          maxContextTokens: 1000,
+        },
+      ],
+      edges: [
+        {
+          from: 'source',
+          to: 'destination',
+          edgeType: 'direct',
+          prompt: (messages) => getBufferString(messages),
+          excludeResults: true,
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('bounded-function-routing-results')
       );
 
     const routingPrompt = model.invocations[1].find(

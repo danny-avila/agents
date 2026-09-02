@@ -1233,6 +1233,7 @@ export class AgentContext {
    * Reset context for a new run
    */
   reset(options?: { preserveOriginalToolContent?: boolean }): void {
+    this._fadingTierReset = false;
     this.systemMessageTokens = 0;
     this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;

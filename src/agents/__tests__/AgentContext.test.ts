@@ -93,6 +93,16 @@ describe('AgentContext', () => {
   });
 
   describe('Summary carrier', () => {
+    it('clears the per-run fading reset signal on a fresh reset', () => {
+      const ctx = createBasicContext();
+
+      ctx.setSummary('compacted history', 10);
+      expect(ctx.fadingTierReset).toBe(true);
+
+      ctx.reset();
+      expect(ctx.fadingTierReset).toBe(false);
+    });
+
     /** The summary's stored token count is a measurement of the carrier built
      *  by `buildSummaryCarrierText`. If this context ever injected different
      *  text, every budget read against a persisted summary would be wrong by
