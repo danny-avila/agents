@@ -1132,7 +1132,7 @@ export class AgentSession {
       return mergeFadingTier(existing, incoming);
     };
     const resetAgentIds = new Set(run.getFadingTierResetAgentIds());
-    const nextTiers: t.FadingTiers = {};
+    const nextTiers: t.FadingTiers = Object.create(null) as t.FadingTiers;
     const allAgentIds = new Set([
       ...Object.keys(current.fadingTiers ?? {}),
       ...Object.keys(incomingTiers),

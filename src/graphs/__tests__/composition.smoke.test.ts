@@ -570,6 +570,37 @@ describe('LangGraph composition smoke tests', () => {
     expect(largeResult).toContain('large routed result');
   });
 
+  it('preserves an undefined function prompt as no routing message', async () => {
+    const model = new CapturingChatModel(['source result', 'done']);
+    const graph = new MultiAgentGraph({
+      runId: 'undefined-function-routing-prompt',
+      agents: [makeAgent('source'), makeAgent('destination')],
+      edges: [
+        {
+          from: 'source',
+          to: 'destination',
+          edgeType: 'direct',
+          prompt: () => undefined,
+          excludeResults: true,
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('undefined-function-routing-prompt')
+      );
+
+    expect(
+      model.invocations[1].some(
+        (message) => message.additional_kwargs.source === 'routing'
+      )
+    ).toBe(false);
+  });
+
   it.each([
     ['without a prompt wrapper', undefined],
     ['with a prompt wrapper', 'Summarize these results:\n{results}'],

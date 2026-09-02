@@ -1598,10 +1598,14 @@ export class MultiAgentGraph extends StandardGraph {
           };
 
           if (typeof prompt === 'function') {
-            promptText = serializeToolContentBounded(
-              await prompt(state.messages, this.startIndex),
-              await getMaxRoutingPromptChars()
-            );
+            const resolvedPrompt = await prompt(state.messages, this.startIndex);
+            promptText =
+              resolvedPrompt == null
+                ? undefined
+                : serializeToolContentBounded(
+                  resolvedPrompt,
+                  await getMaxRoutingPromptChars()
+                );
           } else if (prompt != null) {
             if (prompt.includes('{results}')) {
               const resultsMessages = state.messages.slice(this.startIndex);

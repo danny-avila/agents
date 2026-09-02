@@ -1622,6 +1622,40 @@ describe('JsonlSessionStore', () => {
     expect(capturedConfigs[2].fadingTiers).toEqual({});
   });
 
+  it('preserves prototype-named agent tiers across runs', async () => {
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTiers.mockReturnValue(
+      Object.fromEntries([['__proto__', fadingTier]])
+    );
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('capture prototype tier');
+    await session.run('reuse prototype tier');
+
+    expect(
+      Object.hasOwn(capturedConfigs[1].fadingTiers ?? {}, '__proto__')
+    ).toBe(true);
+    expect(capturedConfigs[1].fadingTiers?.['__proto__']).toEqual(fadingTier);
+  });
+
   it('restores fading tiers when reopening a persisted session', async () => {
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {
