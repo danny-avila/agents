@@ -397,14 +397,21 @@ export class JsonlSessionStore {
         break;
       }
       const state = entry.data.fadingState;
-      if (states.has(state.threadId)) {
+      const scopeKey = JSON.stringify([
+        state.threadId,
+        state.checkpointNs ?? '',
+      ]);
+      if (states.has(scopeKey)) {
         continue;
       }
-      if (state.threadId === mainThreadId) {
-        states.set(state.threadId, state);
+      if (
+        state.threadId === mainThreadId &&
+        (state.checkpointNs ?? '') === ''
+      ) {
+        states.set(scopeKey, state);
         mainFound = true;
       } else if (alternateCount < alternateLimit) {
-        states.set(state.threadId, state);
+        states.set(scopeKey, state);
         alternateCount += 1;
       }
       if (mainFound && alternateCount >= alternateLimit) {

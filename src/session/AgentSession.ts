@@ -369,6 +369,10 @@ function createCallerConfig(
   };
 }
 
+function fadingScopeKey(threadId: string, checkpointNs = ''): string {
+  return JSON.stringify([threadId, checkpointNs]);
+}
+
 function createCheckpointLookupConfig(config: RunnableConfig): RunnableConfig {
   const threadId = getConfigString(config, 'thread_id');
   if (threadId == null) {
@@ -928,35 +932,38 @@ export class AgentSession {
     return this.checkpointing.checkpointer;
   }
 
-  private getFadingState(threadId: string): {
+  private getFadingState(threadId: string, checkpointNs = ''): {
     fadingTier?: t.FadingTier;
     fadingTiers?: t.FadingTiers;
   } {
-    if (threadId === this.threadId) {
+    if (threadId === this.threadId && checkpointNs === '') {
       return { fadingTier: this.fadingTier, fadingTiers: this.fadingTiers };
     }
-    const state = this.alternateThreadFadingState.get(threadId);
+    const scopeKey = fadingScopeKey(threadId, checkpointNs);
+    const state = this.alternateThreadFadingState.get(scopeKey);
     if (state == null) {
       return {};
     }
     /** Refresh insertion order so the bounded map acts as an LRU. */
-    this.alternateThreadFadingState.delete(threadId);
-    this.alternateThreadFadingState.set(threadId, state);
+    this.alternateThreadFadingState.delete(scopeKey);
+    this.alternateThreadFadingState.set(scopeKey, state);
     return state;
   }
 
   private setFadingState(
     threadId: string,
+    checkpointNs: string,
     fadingTier: t.FadingTier | undefined,
     fadingTiers: t.FadingTiers
   ): void {
-    if (threadId === this.threadId) {
+    if (threadId === this.threadId && checkpointNs === '') {
       this.fadingTier = fadingTier;
       this.fadingTiers = fadingTiers;
       return;
     }
-    this.alternateThreadFadingState.delete(threadId);
-    this.alternateThreadFadingState.set(threadId, {
+    const scopeKey = fadingScopeKey(threadId, checkpointNs);
+    this.alternateThreadFadingState.delete(scopeKey);
+    this.alternateThreadFadingState.set(scopeKey, {
       fadingTier,
       fadingTiers,
     });
@@ -996,6 +1003,7 @@ export class AgentSession {
       const state = states[i];
       this.setFadingState(
         state.threadId,
+        state.checkpointNs ?? '',
         state.fadingTier == null ? undefined : { ...state.fadingTier },
         state.fadingTiers == null
           ? {}
@@ -1009,10 +1017,14 @@ export class AgentSession {
     }
   }
 
-  private async persistFadingState(threadId: string): Promise<void> {
-    const state = this.getFadingState(threadId);
+  private async persistFadingState(
+    threadId: string,
+    checkpointNs = ''
+  ): Promise<void> {
+    const state = this.getFadingState(threadId, checkpointNs);
     await this.store?.appendFadingState({
       threadId,
+      ...(checkpointNs === '' ? {} : { checkpointNs }),
       ...(state.fadingTier == null
         ? {}
         : { fadingTier: { ...state.fadingTier } }),
@@ -1031,15 +1043,17 @@ export class AgentSession {
 
   private async captureRunContextState(
     threadId: string,
+    checkpointNs: string,
     run: Run<t.IState>
   ): Promise<void> {
     this.calibrationRatio = run.getCalibrationRatio();
     this.setFadingState(
       threadId,
+      checkpointNs,
       run.getFadingTier(),
       run.getFadingTiers()
     );
-    await this.persistFadingState(threadId);
+    await this.persistFadingState(threadId, checkpointNs);
   }
 
   async getLatestCheckpoint(
@@ -1179,6 +1193,7 @@ export class AgentSession {
     const normalizedInput = normalizeInput(input);
     const inputMessages = normalizedInput.messages;
     const callerConfig = createCallerConfig(threadId, options);
+    const checkpointNs = getConfigString(callerConfig, 'checkpoint_ns') ?? '';
     const useCheckpointState = await this.hasCheckpointState(callerConfig);
     let parentId = this.store?.getLeafEntry()?.id ?? null;
     if (isSessionThread) {
@@ -1217,7 +1232,7 @@ export class AgentSession {
     const sessionState = deriveMessages(
       isSessionThread ? (this.store?.getPath() ?? []) : []
     );
-    const fadingState = this.getFadingState(threadId);
+    const fadingState = this.getFadingState(threadId, checkpointNs);
     let run: Run<t.IState> | undefined;
     let runContextCaptured = false;
     try {
@@ -1256,7 +1271,7 @@ export class AgentSession {
           await this.store?.appendMessage(message);
         }
       }
-      await this.captureRunContextState(threadId, run);
+      await this.captureRunContextState(threadId, checkpointNs, run);
       runContextCaptured = true;
       const interrupt = run.getInterrupt();
       const haltedReason = run.getHaltReason();
@@ -1308,7 +1323,7 @@ export class AgentSession {
       };
     } catch (error) {
       if (run != null && !runContextCaptured) {
-        await this.captureRunContextState(threadId, run);
+        await this.captureRunContextState(threadId, checkpointNs, run);
       }
       emitTerminalEvent({
         type: 'run.failed',
@@ -1602,6 +1617,7 @@ export class AgentSession {
       baseCallerConfig,
       getStoredCheckpointForConfig(this.store, threadId, baseCallerConfig)?.data
     );
+    const checkpointNs = getConfigString(callerConfig, 'checkpoint_ns') ?? '';
     await this.store?.appendRunEvent('run.started', undefined, {
       runId,
       threadId,
@@ -1614,7 +1630,7 @@ export class AgentSession {
     const sessionState = deriveMessages(
       isSessionThread ? (this.store?.getPath() ?? []) : []
     );
-    const fadingState = this.getFadingState(threadId);
+    const fadingState = this.getFadingState(threadId, checkpointNs);
     let run: Run<t.IState> | undefined;
     let runContextCaptured = false;
     try {
@@ -1644,7 +1660,7 @@ export class AgentSession {
           await this.store?.appendMessage(message);
         }
       }
-      await this.captureRunContextState(threadId, run);
+      await this.captureRunContextState(threadId, checkpointNs, run);
       runContextCaptured = true;
       const interrupt = run.getInterrupt();
       const haltedReason = run.getHaltReason();
@@ -1693,7 +1709,7 @@ export class AgentSession {
       };
     } catch (error) {
       if (run != null && !runContextCaptured) {
-        await this.captureRunContextState(threadId, run);
+        await this.captureRunContextState(threadId, checkpointNs, run);
       }
       await this.store?.appendRunEvent('run.failed', error, {
         runId,

@@ -1007,6 +1007,49 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     const again = pruneMessages({ messages, canonicalMessages });
     expect(again.fadingTier).toEqual(result.fadingTier);
   });
+
+  it('sizes parallel exchanges represented only by raw OpenAI tool calls', () => {
+    const ids = ['raw-1', 'raw-2', 'raw-3', 'raw-4'];
+    const rawToolCall = new AIMessage({
+      content: '',
+      tool_calls: [],
+    });
+    rawToolCall.additional_kwargs.tool_calls = ids.map((id) => ({
+      id,
+      type: 'function',
+      function: { name: 'fetch', arguments: '{}' },
+    }));
+    const canonicalMessages: BaseMessage[] = [
+      ...conversation(Array(20).fill(200)),
+      new HumanMessage('fetch everything at once'),
+      rawToolCall,
+      ...ids.map((id) => toolResult(id, 47_000)),
+    ];
+    const messages = [...canonicalMessages];
+    const pruneMessages = createPruneMessages({
+      provider: Providers.OPENAI,
+      maxTokens,
+      startIndex: messages.length,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: true,
+      calibrationRatio: 1,
+    });
+
+    const result = pruneMessages({ messages, canonicalMessages });
+
+    expect(result.context.length).toBeGreaterThan(0);
+    expect(result.fadingTier.budgetTokens).toBe(20_000);
+    for (const id of ids) {
+      expect(
+        result.context.some(
+          (message) =>
+            message.getType() === 'tool' &&
+            (message as ToolMessage).tool_call_id === id
+        )
+      ).toBe(true);
+    }
+  });
 });
 
 describe('isInformativeFadingTier', () => {

@@ -30,7 +30,10 @@ import {
 } from '@/messages/provenance';
 import { serializeToolContentBounded } from '@/utils/toolContent';
 import { Constants, MULTI_AGENT_GRAPH_RUN_NAME } from '@/common';
-import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import {
+  calculateMaxToolResultChars,
+  HARD_MAX_TOOL_RESULT_CHARS,
+} from '@/utils/truncation';
 import { StandardGraph } from './Graph';
 
 /** Pattern to extract instructions from transfer ToolMessage content */
@@ -1582,7 +1585,13 @@ export class MultiAgentGraph extends StandardGraph {
           } else if (prompt != null) {
             if (prompt.includes('{results}')) {
               const resultsMessages = state.messages.slice(this.startIndex);
-              const resultsString = getBufferString(resultsMessages);
+              const destinationContext = this.agentContexts.get(destination);
+              const resultsString = serializeToolContentBounded(
+                getBufferString(resultsMessages),
+                calculateMaxToolResultChars(
+                  destinationContext?.maxContextTokens
+                )
+              );
               const promptTemplate = PromptTemplate.fromTemplate(prompt);
               const result = await promptTemplate.invoke({
                 results: resultsString,

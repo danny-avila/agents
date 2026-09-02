@@ -118,6 +118,8 @@ export type SessionRunEventEntry = SessionEntryBase<
 
 export interface SessionFadingState {
   threadId: string;
+  /** LangGraph checkpoint namespace within `threadId`; empty when omitted. */
+  checkpointNs?: string;
   fadingTier?: t.FadingTier;
   fadingTiers?: t.FadingTiers;
 }

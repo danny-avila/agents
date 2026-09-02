@@ -1624,6 +1624,69 @@ describe('JsonlSessionStore', () => {
     expect(capturedConfigs[3].fadingTier).toEqual(alternateTier);
   });
 
+  it('keeps fading tiers isolated by checkpoint namespace', async () => {
+    const mockRun = createMockRun('continued');
+    const namespaceATier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const namespaceBTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier
+      .mockReturnValueOnce(namespaceATier)
+      .mockReturnValueOnce(namespaceBTier)
+      .mockReturnValue(namespaceATier);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({ default: namespaceATier })
+      .mockReturnValueOnce({ default: namespaceBTier })
+      .mockReturnValue({ default: namespaceATier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const namespaceOptions = (checkpointNs: string) => ({
+      config: { configurable: { checkpoint_ns: checkpointNs } },
+    });
+
+    await session.run('namespace A', namespaceOptions('namespace-a'));
+    await session.run('namespace B', namespaceOptions('namespace-b'));
+    const reopened = await createAgentSession({
+      cwd: dir,
+      sessionPath: session.sessionPath,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await reopened.run('namespace A again', namespaceOptions('namespace-a'));
+    await reopened.run('namespace B again', namespaceOptions('namespace-b'));
+
+    expect(capturedConfigs[0].fadingTier).toBeUndefined();
+    expect(capturedConfigs[1].fadingTier).toBeUndefined();
+    expect(capturedConfigs[2].fadingTier).toEqual(namespaceATier);
+    expect(capturedConfigs[3].fadingTier).toEqual(namespaceBTier);
+  });
+
   it('bounds fading metadata retained for alternate checkpoint threads', async () => {
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {

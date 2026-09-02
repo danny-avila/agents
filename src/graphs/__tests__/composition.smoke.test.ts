@@ -481,6 +481,42 @@ describe('LangGraph composition smoke tests', () => {
     expect(graph.getParallelGroupId('final')).toBeUndefined();
   });
 
+  it('bounds results before interpolating a routing prompt', async () => {
+    const largeResult = `BEGIN\n${'large routed result '.repeat(2000)}\nEND`;
+    const model = new CapturingChatModel([largeResult, 'done']);
+    const graph = new MultiAgentGraph({
+      runId: 'bounded-routing-results',
+      agents: [
+        makeAgent('source'),
+        { ...makeAgent('destination'), maxContextTokens: 1000 },
+      ],
+      edges: [
+        {
+          from: 'source',
+          to: 'destination',
+          edgeType: 'direct',
+          prompt: 'Review this result:\n{results}',
+          excludeResults: true,
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('bounded-routing-results')
+      );
+
+    const routingPrompt = model.invocations[1].find(
+      (message) => message.additional_kwargs.source === 'routing'
+    );
+    expect(routingPrompt?.content).toEqual(expect.stringContaining('truncated'));
+    expect(String(routingPrompt?.content).length).toBeLessThan(1300);
+    expect(largeResult).toContain('large routed result');
+  });
+
   it.each([
     ['without a prompt wrapper', undefined],
     ['with a prompt wrapper', 'Summarize these results:\n{results}'],

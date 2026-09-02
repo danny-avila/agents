@@ -235,6 +235,26 @@ function getToolCallIds(message: BaseMessage): Set<string> {
     }
   }
 
+  const rawToolCalls = readPropertyWithoutAccessors(
+    aiMessage.additional_kwargs,
+    'tool_calls'
+  );
+  if (
+    !rawToolCalls.accessor &&
+    Array.isArray(rawToolCalls.value) &&
+    !isProxy(rawToolCalls.value)
+  ) {
+    for (const toolCall of rawToolCalls.value) {
+      if (toolCall == null || typeof toolCall !== 'object') {
+        continue;
+      }
+      const id = getStringProperty(toolCall, 'id');
+      if (id != null && id.length > 0) {
+        ids.add(id);
+      }
+    }
+  }
+
   if (Array.isArray(aiMessage.content) && !isProxy(aiMessage.content)) {
     for (const part of aiMessage.content) {
       if (typeof part !== 'object') {
