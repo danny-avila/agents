@@ -1,9 +1,16 @@
-import axios from 'axios';
+import axios, { isAxiosError } from 'axios';
+import type { AxiosResponse } from 'axios';
 import type * as t from './types';
 import { createDefaultLogger, formatErrorForLog } from './utils';
 import { createSearchMetrics } from './metrics';
 
 const DEFAULT_JINA_API_URL = 'https://api.jina.ai/v1/rerank';
+const DEFAULT_VOYAGE_API_URL = 'https://api.voyageai.com/v1/rerank';
+const DEFAULT_VOYAGE_MODEL = 'rerank-2.5';
+const DEFAULT_VOYAGE_TIMEOUT_MS = 7000;
+const DEFAULT_VOYAGE_RETRY_DELAY_MS = 250;
+const MAX_VOYAGE_RETRY_DELAY_MS = 2000;
+const VOYAGE_RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 /** Every other network call in the search pipeline is bounded (scrapers,
  * search providers); rerank requests must be too, or a hung rerank API
@@ -299,6 +306,192 @@ export class CohereReranker extends BaseReranker {
   }
 }
 
+/** Voyage's hosted rerank API. Search remains available if the provider is
+ * unavailable: all provider, timeout, and response-shape failures fall back to
+ * the original source ordering. */
+export class VoyageReranker extends BaseReranker {
+  private apiUrl: string;
+  private model: string;
+  private timeout: number;
+  private httpAgent?: t.HttpAgent;
+  private httpsAgent?: t.HttpsAgent;
+
+  constructor({
+    apiKey = process.env.VOYAGE_API_KEY,
+    apiUrl = process.env.VOYAGE_API_URL != null &&
+    process.env.VOYAGE_API_URL !== ''
+      ? process.env.VOYAGE_API_URL
+      : DEFAULT_VOYAGE_API_URL,
+    model = process.env.VOYAGE_MODEL != null && process.env.VOYAGE_MODEL !== ''
+      ? process.env.VOYAGE_MODEL
+      : DEFAULT_VOYAGE_MODEL,
+    timeout = DEFAULT_VOYAGE_TIMEOUT_MS,
+    logger,
+    httpAgent,
+    httpsAgent,
+  }: {
+    apiKey?: string;
+    apiUrl?: string;
+    model?: string;
+    timeout?: number;
+    logger?: t.Logger;
+  } & t.HttpAgentConfig) {
+    super(logger);
+    this.apiKey = apiKey;
+    this.apiUrl = apiUrl;
+    this.model = model;
+    this.timeout = timeout;
+    this.httpAgent = httpAgent;
+    this.httpsAgent = httpsAgent;
+  }
+
+  async rerank(
+    query: string,
+    documents: string[],
+    topK: number = 5
+  ): Promise<t.Highlight[]> {
+    this.logger.debug(
+      `Reranking ${documents.length} chunks with Voyage using API URL: ${this.apiUrl}`
+    );
+
+    try {
+      if (this.apiKey == null || this.apiKey === '') {
+        this.logger.warn('VOYAGE_API_KEY is not set. Using default ranking.');
+        return this.getDefaultRanking(documents, topK);
+      }
+
+      const expectedResultCount = Math.max(
+        0,
+        Math.min(Math.floor(topK), documents.length)
+      );
+      if (expectedResultCount === 0) {
+        return [];
+      }
+
+      const response = await this.request(
+        query,
+        documents,
+        expectedResultCount
+      );
+      const results = response.data?.data;
+      if (!Array.isArray(results) || results.length !== expectedResultCount) {
+        this.logger.warn(
+          'Unexpected response format from Voyage API. Using default ranking.'
+        );
+        return this.getDefaultRanking(documents, topK);
+      }
+
+      const seenIndices = new Set<number>();
+      const validResults = results.every((result) => {
+        if (
+          !Number.isInteger(result.index) ||
+          result.index < 0 ||
+          result.index >= documents.length ||
+          !Number.isFinite(result.relevance_score) ||
+          seenIndices.has(result.index)
+        ) {
+          return false;
+        }
+        seenIndices.add(result.index);
+        return true;
+      });
+      if (!validResults) {
+        this.logger.warn(
+          'Invalid result data from Voyage API. Using default ranking.'
+        );
+        return this.getDefaultRanking(documents, topK);
+      }
+
+      this.logger.debug('Voyage rerank completed', {
+        model: this.model,
+        resultCount: results.length,
+        totalTokens: response.data?.usage?.total_tokens,
+      });
+      return results.map((result) => ({
+        text: documents[result.index],
+        score: result.relevance_score,
+      }));
+    } catch (error) {
+      this.logger.error(
+        'Error using Voyage reranker',
+        formatErrorForLog(error)
+      );
+      return this.getDefaultRanking(documents, topK);
+    }
+  }
+
+  private async request(
+    query: string,
+    documents: string[],
+    topK: number
+  ): Promise<AxiosResponse<t.VoyageRerankerResponse | undefined>> {
+    const requestData = {
+      model: this.model,
+      query,
+      documents,
+      top_k: topK,
+      return_documents: false,
+      truncation: false,
+    };
+    const requestConfig = {
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.apiKey}`,
+      },
+      timeout: this.timeout,
+      httpAgent: this.httpAgent,
+      httpsAgent: this.httpsAgent,
+    };
+
+    try {
+      return await axios.post<t.VoyageRerankerResponse | undefined>(
+        this.apiUrl,
+        requestData,
+        requestConfig
+      );
+    } catch (error) {
+      if (!this.isRetryable(error)) {
+        throw error;
+      }
+      await this.wait(this.getRetryDelay(error));
+      return axios.post<t.VoyageRerankerResponse | undefined>(
+        this.apiUrl,
+        requestData,
+        requestConfig
+      );
+    }
+  }
+
+  private isRetryable(error: unknown): boolean {
+    if (!isAxiosError(error)) {
+      return false;
+    }
+    return (
+      error.code === 'ECONNABORTED' ||
+      (error.response?.status != null &&
+        VOYAGE_RETRYABLE_STATUSES.has(error.response.status))
+    );
+  }
+
+  private getRetryDelay(error: unknown): number {
+    if (!isAxiosError(error)) {
+      return DEFAULT_VOYAGE_RETRY_DELAY_MS;
+    }
+    const headers = error.response?.headers;
+    const retryAfterSeconds = Number(
+      headers != null ? headers['retry-after'] : undefined
+    );
+    if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds < 0) {
+      return DEFAULT_VOYAGE_RETRY_DELAY_MS;
+    }
+    return Math.min(retryAfterSeconds * 1000, MAX_VOYAGE_RETRY_DELAY_MS);
+  }
+
+  private wait(milliseconds: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  }
+}
+
 /** rag_api's `/v1/rerank` contract caps candidates at 50 and `top_n` at 25;
  * violating either is a client bug, not a server error, so both are clamped
  * locally with a debug log instead of erroring. */
@@ -560,6 +753,9 @@ export const createReranker = (
     jinaApiKey?: string;
     jinaApiUrl?: string;
     cohereApiKey?: string;
+    voyageApiKey?: string;
+    voyageApiUrl?: string;
+    voyageModel?: string;
     ragApiUrl?: string;
     ragApiTokenSupplier?: t.RagApiTokenSupplier;
     ragApiProfile?: string;
@@ -572,6 +768,9 @@ export const createReranker = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    voyageApiKey,
+    voyageApiUrl,
+    voyageModel,
     ragApiUrl,
     ragApiTokenSupplier,
     ragApiProfile,
@@ -597,6 +796,16 @@ export const createReranker = (
   case 'cohere':
     return new CohereReranker({
       apiKey: cohereApiKey,
+      timeout: rerankerTimeout,
+      logger: defaultLogger,
+      httpAgent,
+      httpsAgent,
+    });
+  case 'voyage':
+    return new VoyageReranker({
+      apiKey: voyageApiKey,
+      apiUrl: voyageApiUrl,
+      model: voyageModel,
       timeout: rerankerTimeout,
       logger: defaultLogger,
       httpAgent,

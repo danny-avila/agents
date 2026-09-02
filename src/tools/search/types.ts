@@ -32,7 +32,13 @@ export type ScraperProvider =
   | 'tavily'
   | 'crw'
   | 'keenable';
-export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'rag-api' | 'none';
+export type RerankerType =
+  | 'infinity'
+  | 'jina'
+  | 'cohere'
+  | 'voyage'
+  | 'rag-api'
+  | 'none';
 
 export interface Highlight {
   score: number;
@@ -407,6 +413,18 @@ export interface RagApiRerankResponse {
   results: RagApiRerankResult[];
 }
 
+export interface VoyageRerankerResult {
+  index: number;
+  relevance_score: number;
+}
+
+export interface VoyageRerankerResponse {
+  data: VoyageRerankerResult[];
+  usage?: {
+    total_tokens?: number;
+  };
+}
+
 export type SafeSearchLevel = 0 | 1 | 2;
 
 export type Logger = WinstonLogger;
@@ -519,6 +537,9 @@ export interface SearchToolConfig
   jinaApiKey?: string;
   jinaApiUrl?: string;
   cohereApiKey?: string;
+  voyageApiKey?: string;
+  voyageApiUrl?: string;
+  voyageModel?: string;
   /** Base URL of the public `rag_api` service (`RAG_API_URL` env fallback).
    * Requests post to `${ragApiUrl}/v1/rerank`. */
   ragApiUrl?: string;
