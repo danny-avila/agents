@@ -1,6 +1,6 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
-import type { FadingTier } from '@/types/graph';
+import type { AgentInputs, FadingTier } from '@/types/graph';
 import type { TokenCounter } from '@/types/run';
 import {
   fadingBudgetTokens,
@@ -20,6 +20,8 @@ import {
   createPruneMessages,
 } from '@/messages/prune';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
+import { StandardGraph } from '@/graphs/Graph';
+import { Providers } from '@/common';
 
 const tokenCounter: TokenCounter = (message) => {
   const content = message.content;
@@ -108,19 +110,29 @@ describe('fading ladder', () => {
     expect(isFadingTier({ v: 1, budgetTokens: 100, masked: true })).toBe(true);
     expect(isFadingTier({ v: 2, budgetTokens: 100, masked: true })).toBe(false);
     expect(isFadingTier({ v: 1, budgetTokens: 0, masked: true })).toBe(false);
-    expect(isFadingTier({ v: 1, budgetTokens: 100, masked: 'yes' })).toBe(false);
+    expect(isFadingTier({ v: 1, budgetTokens: 100, masked: 'yes' })).toBe(
+      false
+    );
     expect(isFadingTier(null)).toBe(false);
-    expect(seedFadingTier(100_000, { v: 1, budgetTokens: 50_000, masked: true })).toEqual({
+    expect(
+      seedFadingTier(100_000, { v: 1, budgetTokens: 50_000, masked: true })
+    ).toEqual({
       v: 1,
       budgetTokens: 50_000,
       masked: true,
+      latched: true,
     });
-    expect(seedFadingTier(100_000, { v: 1, budgetTokens: 150_000, masked: false })).toEqual({
+    expect(
+      seedFadingTier(100_000, { v: 1, budgetTokens: 150_000, masked: false })
+    ).toEqual({
       v: 1,
       budgetTokens: 100_000,
       masked: false,
+      latched: true,
     });
-    expect(seedFadingTier(100_000, { rung: 3 })).toEqual(createFadingTier(100_000));
+    expect(seedFadingTier(100_000, { rung: 3 })).toEqual(
+      createFadingTier(100_000)
+    );
   });
 
   it('only deepens and never oscillates across a band threshold', () => {
@@ -130,7 +142,12 @@ describe('fading ladder', () => {
     tier = resolveFadingTier(tier, window, { ...base, contextPressure: 0.5 });
     expect(tier).toEqual(createFadingTier(window));
     tier = resolveFadingTier(tier, window, { ...base, contextPressure: 0.86 });
-    expect(tier).toEqual({ v: 1, budgetTokens: 50_000, masked: true });
+    expect(tier).toEqual({
+      v: 1,
+      budgetTokens: 50_000,
+      masked: true,
+      latched: true,
+    });
     const settled = tier;
     tier = resolveFadingTier(tier, window, { ...base, contextPressure: 0.84 });
     expect(tier).toBe(settled);
@@ -144,7 +161,12 @@ describe('fading ladder', () => {
   });
 
   it('survives a mid-run budget correction and the return to the normal window', () => {
-    const latched: FadingTier = { v: 1, budgetTokens: 100_000, masked: true };
+    const latched: FadingTier = {
+      v: 1,
+      budgetTokens: 100_000,
+      masked: true,
+      latched: true,
+    };
     const corrected = seedFadingTier(180_000, latched);
     expect(corrected).toEqual(latched);
     expect(
@@ -160,6 +182,24 @@ describe('fading ladder', () => {
     );
   });
 
+  it('keeps a restored tier informative after clamping to a smaller window', () => {
+    const restored = seedFadingTier(30_000, {
+      v: 1,
+      budgetTokens: 50_000,
+      masked: false,
+      latched: true,
+    });
+
+    expect(restored).toEqual({
+      v: 1,
+      budgetTokens: 30_000,
+      masked: false,
+      latched: true,
+    });
+    expect(isInformativeFadingTier(restored, 30_000)).toBe(true);
+    expect(seedFadingTier(100_000, restored)).toEqual(restored);
+  });
+
   it('fits a single result within half the effective budget with summarization on', () => {
     const tier = resolveFadingTier(createFadingTier(32_000), 32_000, {
       contextPressure: 0.3,
@@ -168,7 +208,9 @@ describe('fading ladder', () => {
     });
     const caps = resolveFadingCaps(tier);
     expect(caps.resultChars / 4).toBeLessThanOrEqual(9_400 / 2);
-    expect(caps.resultChars).toBe(calculateMaxToolResultChars(caps.budgetTokens));
+    expect(caps.resultChars).toBe(
+      calculateMaxToolResultChars(caps.budgetTokens)
+    );
     expect(caps.consumedChars).toBe(caps.resultChars);
   });
 
@@ -176,7 +218,9 @@ describe('fading ladder', () => {
     const masked: FadingTier = { v: 1, budgetTokens: 100_000, masked: true };
     const caps = resolveFadingCaps(masked);
     expect(caps.consumedChars).toBe(Math.floor(caps.resultChars * 0.1));
-    expect(resolveFadingCaps({ ...masked, budgetTokens: 400 }).consumedChars).toBe(300);
+    expect(
+      resolveFadingCaps({ ...masked, budgetTokens: 400 }).consumedChars
+    ).toBe(300);
     expect(resolveFadingCaps(masked, 1_000).resultChars).toBe(1_000);
   });
 });
@@ -252,7 +296,12 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
   function runTurn(
     messages: BaseMessage[],
     options: TurnOptions
-  ): { early: string; pressure: number; tier: FadingTier; contextLength: number } {
+  ): {
+    early: string;
+    pressure: number;
+    tier: FadingTier;
+    contextLength: number;
+  } {
     const pruneMessages = createPruneMessages({
       maxTokens,
       startIndex: messages.length,
@@ -278,14 +327,19 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
       calibrationRatio: 1,
     });
     expect(first.early).toContain('truncated');
-    expect(first.early.length).toBeLessThanOrEqual(calculateMaxToolResultChars(maxTokens));
+    expect(first.early.length).toBeLessThanOrEqual(
+      calculateMaxToolResultChars(maxTokens)
+    );
 
     const ratios = [1.03, 1.12, 1.25, 1.4];
     ratios.forEach((calibrationRatio, index) => {
-      const later = runTurn(conversation([60_000, ...Array(index + 1).fill(400)]), {
-        summarizationEnabled: true,
-        calibrationRatio,
-      });
+      const later = runTurn(
+        conversation([60_000, ...Array(index + 1).fill(400)]),
+        {
+          summarizationEnabled: true,
+          calibrationRatio,
+        }
+      );
       expect(later.pressure).toBeLessThan(0.8);
       expect(later.early).toBe(first.early);
     });
@@ -300,14 +354,19 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     expect(first.pressure).toBeGreaterThanOrEqual(0.8);
     expect(first.tier.masked).toBe(true);
     expect(first.early).toContain('truncated');
-    expect(first.early.length).toBeLessThanOrEqual(resolveFadingCaps(first.tier).consumedChars);
+    expect(first.early.length).toBeLessThanOrEqual(
+      resolveFadingCaps(first.tier).consumedChars
+    );
 
     const ratios = [1.01, 1.02, 1.03];
     ratios.forEach((calibrationRatio, index) => {
-      const later = runTurn(conversation([...history, ...Array(index + 1).fill(200)]), {
-        summarizationEnabled: false,
-        calibrationRatio,
-      });
+      const later = runTurn(
+        conversation([...history, ...Array(index + 1).fill(200)]),
+        {
+          summarizationEnabled: false,
+          calibrationRatio,
+        }
+      );
       expect(later.tier).toEqual(first.tier);
       expect(later.early).toBe(first.early);
     });
@@ -384,6 +443,37 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     }
   });
 
+  it('derives a deeper tier from canonical content instead of the prior tier output', () => {
+    const messages = conversation([60_000]);
+    const pruneMessages = createPruneMessages({
+      maxTokens,
+      startIndex: 0,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: false,
+    });
+    pruneMessages({ messages });
+    const firstTierBytes = serialize(messages[2]);
+
+    messages.push(...round(1, 60_000), ...round(2, 60_000));
+    const escalated = pruneMessages({ messages });
+    const escalatedBytes = serialize(messages[2]);
+    expect(escalatedBytes).not.toBe(firstTierBytes);
+
+    const rebuilt = conversation([60_000, 60_000, 60_000]);
+    const fresh = createPruneMessages({
+      maxTokens,
+      startIndex: rebuilt.length,
+      tokenCounter,
+      indexTokenCountMap: countMap(rebuilt),
+      summarizationEnabled: false,
+      fadingTier: escalated.fadingTier,
+    });
+    fresh({ messages: rebuilt });
+
+    expect(serialize(rebuilt[2])).toBe(escalatedBytes);
+  });
+
   it('emergency truncation recovers on a clone without latching the tier', () => {
     const ids = ['p1', 'p2', 'p3', 'p4'];
     const messages: BaseMessage[] = [
@@ -392,8 +482,9 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
       toolCall(...ids),
       ...ids.map((id) => toolResult(id, 47_000)),
     ];
-    const originalLengths = ids.map((_, index) =>
-      serialize(messages[messages.length - ids.length + index]).length
+    const originalLengths = ids.map(
+      (_, index) =>
+        serialize(messages[messages.length - ids.length + index]).length
     );
     const pruneMessages = createPruneMessages({
       maxTokens,
@@ -409,12 +500,14 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     expect(result.context.length).toBeGreaterThan(0);
     expect(result.fadingTier.budgetTokens).toBe(maxTokens);
     ids.forEach((_, index) => {
-      expect(serialize(messages[messages.length - ids.length + index]).length).toBe(
-        originalLengths[index]
-      );
+      expect(
+        serialize(messages[messages.length - ids.length + index]).length
+      ).toBe(originalLengths[index]);
     });
     const contextSet = new Set(result.context);
-    expect(result.messagesToRefine?.some((message) => contextSet.has(message))).toBe(false);
+    expect(
+      result.messagesToRefine?.some((message) => contextSet.has(message))
+    ).toBe(false);
 
     const again = pruneMessages({ messages });
     expect(again.fadingTier).toEqual(result.fadingTier);
@@ -424,9 +517,67 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
 describe('isInformativeFadingTier', () => {
   it('reports only tiers a host should persist', () => {
     expect(isInformativeFadingTier(undefined, 100_000)).toBe(false);
-    expect(isInformativeFadingTier(createFadingTier(100_000), 100_000)).toBe(false);
-    expect(isInformativeFadingTier({ v: 1, budgetTokens: 100_000, masked: true }, 100_000)).toBe(true);
-    expect(isInformativeFadingTier({ v: 1, budgetTokens: 50_000, masked: false }, 100_000)).toBe(true);
-    expect(isInformativeFadingTier({ v: 1, budgetTokens: 50_000, masked: false }, undefined)).toBe(false);
+    expect(isInformativeFadingTier(createFadingTier(100_000), 100_000)).toBe(
+      false
+    );
+    expect(
+      isInformativeFadingTier(
+        { v: 1, budgetTokens: 100_000, masked: true },
+        100_000
+      )
+    ).toBe(true);
+    expect(
+      isInformativeFadingTier(
+        { v: 1, budgetTokens: 50_000, masked: false },
+        100_000
+      )
+    ).toBe(true);
+    expect(
+      isInformativeFadingTier(
+        { v: 1, budgetTokens: 50_000, masked: false },
+        undefined
+      )
+    ).toBe(false);
+  });
+});
+
+describe('per-agent fading tier persistence', () => {
+  const graphAgent = (agentId: string): AgentInputs => ({
+    agentId,
+    provider: Providers.OPENAI,
+    instructions: agentId,
+    maxContextTokens: 100_000,
+  });
+
+  it('restores keyed tiers without applying the default tier to every agent', () => {
+    const defaultTier: FadingTier = {
+      v: 1,
+      budgetTokens: 50_000,
+      masked: false,
+      latched: true,
+    };
+    const workerTier: FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const graph = new StandardGraph({
+      agents: [
+        graphAgent('default'),
+        graphAgent('worker'),
+        graphAgent('unseeded'),
+      ],
+      fadingTier: defaultTier,
+      fadingTiers: { worker: workerTier },
+    });
+
+    expect(graph.agentContexts.get('default')?.fadingTier).toEqual(defaultTier);
+    expect(graph.agentContexts.get('worker')?.fadingTier).toEqual(workerTier);
+    expect(graph.agentContexts.get('unseeded')?.fadingTier).toBeUndefined();
+    expect(graph.getFadingTiers()).toEqual({
+      default: defaultTier,
+      worker: workerTier,
+    });
   });
 });

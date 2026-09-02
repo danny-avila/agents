@@ -473,6 +473,7 @@ export class Run<_T extends t.BaseGraphState> {
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
   fadingTier?: t.FadingTier;
+  fadingTiers: t.FadingTiers = {};
   graphRunnable?: t.CompiledStateWorkflow;
   Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
@@ -519,6 +520,9 @@ export class Run<_T extends t.BaseGraphState> {
     }
     if (config.fadingTier != null) {
       this.fadingTier = config.fadingTier;
+    }
+    if (config.fadingTiers != null) {
+      this.fadingTiers = { ...config.fadingTiers };
     }
 
     const handlerRegistry = new HandlerRegistry();
@@ -637,6 +641,7 @@ export class Run<_T extends t.BaseGraphState> {
         indexTokenCountMap: this.indexTokenCountMap,
         calibrationRatio: this.calibrationRatio,
         fadingTier: this.fadingTier,
+        fadingTiers: this.fadingTiers,
         subagentUsageSink: this.subagentUsageSink,
         subagentTasks: this.subagentTasks,
         preemption: this.preemption,
@@ -678,6 +683,7 @@ export class Run<_T extends t.BaseGraphState> {
         indexTokenCountMap: this.indexTokenCountMap,
         calibrationRatio: this.calibrationRatio,
         fadingTier: this.fadingTier,
+        fadingTiers: this.fadingTiers,
         subagentUsageSink: this.subagentUsageSink,
         subagentTasks: this.subagentTasks,
         preemption: this.preemption,
@@ -944,13 +950,17 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   /**
-   * Returns the latched context-fading tier. Hosts should persist it beside the
-   * calibration ratio and pass it back as `RunConfig.fadingTier` on the next run
-   * for the same conversation so historical tool results keep the same
-   * truncated bytes, which is what keeps provider prompt-cache prefixes valid.
+   * Returns the default agent's latched context-fading tier. Single-agent hosts
+   * may persist it beside the calibration ratio; multi-agent hosts should use
+   * `getFadingTiers()` so independent agent tiers are retained.
    */
   getFadingTier(): t.FadingTier | undefined {
     return this.fadingTier;
+  }
+
+  /** Returns a defensive snapshot of latched tiers keyed by agent ID. */
+  getFadingTiers(): t.FadingTiers {
+    return { ...this.fadingTiers };
   }
 
   getResolvedInstructionOverhead(): number | undefined {
@@ -1778,6 +1788,7 @@ export class Run<_T extends t.BaseGraphState> {
 
       this.calibrationRatio = this.Graph.getCalibrationRatio();
       this.fadingTier = this.Graph.getFadingTier();
+      this.fadingTiers = this.Graph.getFadingTiers();
 
       /**
        * Skip `clearHeavyState()` when the run paused on a clean HITL

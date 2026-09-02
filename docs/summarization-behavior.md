@@ -52,7 +52,7 @@ Every character cap applied to historical tool results (masking, pre-flight trun
 - **Pressure-band rungs** (summarization disabled only): +1 rung at 85 %, +2 at 90 %, +4 at 99 %.
 - **Masking** latches at 80 % pressure; consumed results then keep 10 % of the fresh cap (floor 300 chars).
 
-The tier is returned from every prune call and exposed as `Run.getFadingTier()`; hosts should persist it beside `calibrationRatio` and pass it back as `RunConfig.fadingTier` so stability holds across runs. The budget is absolute, so a mid-run budget correction or a return to the normal window keeps the tier; only compaction resets it.
+The tier is returned from every prune call. Single-agent hosts can use `Run.getFadingTier()` and `RunConfig.fadingTier`; multi-agent hosts should persist `Run.getFadingTiers()` and restore `RunConfig.fadingTiers` so each agent keeps its independent tier. The budget is absolute, so a mid-run budget correction or a return to the normal window keeps the tier; only compaction resets it.
 
 **Instruction overhead calibration**: The pruner also tracks `bestInstructionOverhead` — the best observed instruction token count from provider feedback. When the variance between the estimated and calibrated `toolSchemaTokens` exceeds 15% (`CALIBRATION_VARIANCE_THRESHOLD`), the calibrated value is applied to `AgentContext.toolSchemaTokens`. This corrects the local tool-schema estimate (which uses a static multiplier) against real provider behavior. After intra-run summarization, the calibrated overhead is preserved and seeded into the recreated pruner.
 

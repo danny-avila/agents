@@ -54,7 +54,6 @@ import {
   CALIBRATION_RATIO_MAX,
   createPruneMessages,
   projectToolMessagesForProvider,
-  calculateMaxToolCallInputChars,
   syncBudgetDerivedFields,
   addTailCacheControl,
   resolvePromptCacheTtl,
@@ -156,6 +155,7 @@ import { createContextPressureMeter } from '@/llm/contextPressureMeter';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
+import { calculateMaxToolCallInputChars } from '@/utils/truncation';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
@@ -1493,6 +1493,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       indexTokenCountMap,
       calibrationRatio,
       fadingTier,
+      fadingTiers,
       subagentUsageSink,
       subagentTasks,
       subagentScope,
@@ -1541,8 +1542,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (calibrationRatio != null && calibrationRatio > 0) {
         agentContext.calibrationRatio = calibrationRatio;
       }
-      if (fadingTier != null) {
-        agentContext.fadingTier = fadingTier;
+      const restoredFadingTier =
+        fadingTiers?.[agentConfig.agentId] ??
+        (agentConfig.agentId === agents[0].agentId ? fadingTier : undefined);
+      if (restoredFadingTier != null) {
+        agentContext.fadingTier = restoredFadingTier;
       }
 
       this.agentContexts.set(agentConfig.agentId, agentContext);
@@ -2563,7 +2567,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   getFadingTier(): t.FadingTier | undefined {
     const context = this.agentContexts.get(this.defaultAgentId);
     const tier = context?.fadingTier;
-    return isInformativeFadingTier(tier, context?.maxContextTokens) ? tier : undefined;
+    return isInformativeFadingTier(tier, context?.maxContextTokens)
+      ? tier
+      : undefined;
+  }
+
+  /** Latched context-fading tiers keyed by agent ID. */
+  getFadingTiers(): t.FadingTiers {
+    const tiers: t.FadingTiers = {};
+    for (const [agentId, context] of this.agentContexts) {
+      if (
+        isInformativeFadingTier(context.fadingTier, context.maxContextTokens)
+      ) {
+        tiers[agentId] = context.fadingTier;
+      }
+    }
+    return tiers;
   }
 
   getResolvedInstructionOverhead(): number | undefined {

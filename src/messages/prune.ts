@@ -16,13 +16,6 @@ import type { FadingCaps, FadingSignals } from './fading';
 import type { TokenCounter } from '@/types/run';
 import type { ProviderName } from '@/types';
 import {
-  cloneToolMessageWithContent,
-  compactToolContent,
-  isComputerCallOutputMessage,
-  serializeStructuredValueBounded,
-  serializeToolContentBounded,
-} from '@/utils/toolContent';
-import {
   HARD_MAX_TOOL_CALL_INPUT_CHARS,
   HARD_MAX_TOOL_RESULT_CHARS,
   MIN_JSON_VALUE_CHARS,
@@ -31,24 +24,29 @@ import {
   truncateToolResultContent,
 } from '@/utils/truncation';
 import {
+  cloneToolMessageWithContent,
+  compactToolContent,
+  isComputerCallOutputMessage,
+  serializeStructuredValueBounded,
+  serializeToolContentBounded,
+} from '@/utils/toolContent';
+import {
   MASKED_RESULT_MIN_CHARS,
   fadingRungForResultChars,
   resolveFadingCaps,
   resolveFadingTier,
   seedFadingTier,
 } from './fading';
-import { resolveContextPruningSettings } from './contextPruningSettings';
-import { hasUnsafeStructuredSerialization } from '@/utils/tokens';
-import { ContentTypes, Providers, Constants } from '@/common';
-import { getProviderFamily } from '@/llm/providerRegistry';
 import {
   dropIncompleteToolStreamContent,
   hasNonEmptyTextContent,
 } from './core';
+import { resolveContextPruningSettings } from './contextPruningSettings';
+import { hasUnsafeStructuredSerialization } from '@/utils/tokens';
+import { ContentTypes, Providers, Constants } from '@/common';
+import { getProviderFamily } from '@/llm/providerRegistry';
 import { applyContextPruning } from './contextPruning';
 import { toLangChainContent } from './langchain';
-
-export { calculateMaxToolCallInputChars } from '@/utils/truncation';
 
 function sumTokenCounts(
   tokenMap: Record<string, number | undefined>,
@@ -176,7 +174,8 @@ export type PruneMessagesFactoryParams = {
   /**
    * Context-fading tier persisted from a previous run's contextMeta. Seeds the
    * latched cap ladder so historical tool results keep the same truncated
-   * bytes across runs. Invalid values or a different context window start fresh.
+   * bytes across runs. Invalid values start fresh; valid values clamp to the
+   * current context window without losing their latched provenance.
    */
   fadingTier?: FadingTier | null;
   /** Optional diagnostic log callback wired by the graph for observability. */
@@ -1155,6 +1154,8 @@ type FadingApplyParams = {
   maskedFromIndex?: number;
   /** Original (pre-masking) content keyed by message index, captured for the summarizer. */
   originalContentStore?: Map<number, string>;
+  /** Canonical pre-fading content keyed by live message for tier escalation. */
+  canonicalContentStore?: WeakMap<BaseMessage, BaseMessage['content']>;
   /** Called after storing a newly captured entry. */
   onContentStored?: (index: number, content: string) => void;
 };
@@ -1205,10 +1206,7 @@ export function applyFadingCaps(params: FadingApplyParams): FadingApplyResult {
 
   for (let i = start; i < messages.length; i++) {
     const message = messages[i];
-    if (
-      message.getType() !== 'tool' ||
-      isComputerCallOutputMessage(message)
-    ) {
+    if (message.getType() !== 'tool' || isComputerCallOutputMessage(message)) {
       continue;
     }
     const consumed = masked && i < consumedBoundary;
@@ -1219,8 +1217,9 @@ export function applyFadingCaps(params: FadingApplyParams): FadingApplyResult {
     if (!Number.isFinite(maxChars)) {
       continue;
     }
-    const content = message.content;
-    const compacted = compactToolContent(content, maxChars);
+    const canonicalContent =
+      params.canonicalContentStore?.get(message) ?? message.content;
+    const compacted = compactToolContent(canonicalContent, maxChars);
     if (!compacted.changed) {
       continue;
     }
@@ -1230,7 +1229,7 @@ export function applyFadingCaps(params: FadingApplyParams): FadingApplyResult {
       !params.originalContentStore.has(i)
     ) {
       const original = serializeToolContentBounded(
-        content,
+        canonicalContent,
         ORIGINAL_CONTENT_MAX_CHARS
       );
       params.originalContentStore.set(i, original);
@@ -1240,6 +1239,7 @@ export function applyFadingCaps(params: FadingApplyParams): FadingApplyResult {
       message as ToolMessage,
       compacted.content
     );
+    params.canonicalContentStore?.set(cloned, canonicalContent);
     messages[i] = cloned;
     indexTokenCountMap[i] = tokenCounter(cloned);
     if (consumed) {
@@ -2193,6 +2193,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
    *  pruner is recreated after summarization. */
   const originalToolContent = new Map<number, string>();
   let originalToolContentSize = 0;
+  /** Pre-fading content retained so every deeper tier derives from one source. */
+  const canonicalToolContent = new WeakMap<
+    BaseMessage,
+    BaseMessage['content']
+  >();
   /** Latched fading tier; caps derive from it alone so bytes stay stable. */
   let fadingTier = seedFadingTier(
     factoryParams.maxTokens,
@@ -2661,6 +2666,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           factoryParams.summarizationEnabled === true
             ? originalToolContent
             : undefined,
+        canonicalContentStore: canonicalToolContent,
         onContentStored:
           factoryParams.summarizationEnabled === true
             ? storeOriginalToolContent

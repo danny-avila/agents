@@ -64,7 +64,7 @@ export function isFadingTier(value: unknown): value is FadingTier {
   if (typeof value !== 'object' || value === null) {
     return false;
   }
-  const { v, budgetTokens, masked } = value as Partial<
+  const { v, budgetTokens, masked, latched } = value as Partial<
     Record<keyof FadingTier, unknown>
   >;
   return (
@@ -72,7 +72,8 @@ export function isFadingTier(value: unknown): value is FadingTier {
     typeof budgetTokens === 'number' &&
     Number.isFinite(budgetTokens) &&
     budgetTokens > 0 &&
-    typeof masked === 'boolean'
+    typeof masked === 'boolean' &&
+    (latched === undefined || latched === true)
   );
 }
 
@@ -104,6 +105,7 @@ export function seedFadingTier(window: number, seed?: unknown): FadingTier {
     v: FADING_TIER_VERSION,
     budgetTokens: Math.min(seed.budgetTokens, window),
     masked: seed.masked,
+    latched: true,
   };
 }
 
@@ -206,7 +208,7 @@ export function resolveFadingTier(
   if (budgetTokens === tier.budgetTokens && masked === tier.masked) {
     return tier;
   }
-  return { v: FADING_TIER_VERSION, budgetTokens, masked };
+  return { v: FADING_TIER_VERSION, budgetTokens, masked, latched: true };
 }
 
 /**
@@ -221,5 +223,9 @@ export function isInformativeFadingTier(
   if (tier == null) {
     return false;
   }
-  return tier.masked || (window != null && window > 0 && tier.budgetTokens < window);
+  return (
+    tier.latched === true ||
+    tier.masked ||
+    (window != null && window > 0 && tier.budgetTokens < window)
+  );
 }

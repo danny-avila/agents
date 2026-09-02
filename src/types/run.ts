@@ -339,11 +339,15 @@ export type RunConfig = {
    */
   calibrationRatio?: number;
   /**
-   * Context-fading tier from a previous run's contextMeta. Hosts should persist
-   * the value returned by `Run.getFadingTier()` and pass it back here so
-   * historical tool results keep the same truncated bytes across runs.
+   * Default-agent fading tier retained for single-agent compatibility. New
+   * multi-agent integrations should use `fadingTiers`.
    */
   fadingTier?: g.FadingTier | null;
+  /**
+   * Context-fading tiers keyed by agent ID. Multi-agent hosts should persist
+   * the value returned by `Run.getFadingTiers()` and pass it back here.
+   */
+  fadingTiers?: g.FadingTiers | null;
   /** Skip post-stream cleanup (clearHeavyState) — useful for tests that inspect graph state after processStream */
   skipCleanup?: boolean;
   /**
