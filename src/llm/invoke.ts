@@ -833,6 +833,17 @@ async function attemptInvokeBody(
      *  initializer, and would narrow the comparison away as unreachable. */
     const restartDecided = (): boolean => preemptAction === 'restart';
     /**
+     * Whether the tear-down actually happened. Only an ABORT makes LangChain
+     * close the model run, through its error path; breaking the iterator fires
+     * neither end nor error callbacks. The two restart routes therefore need
+     * opposite closes, and the controller's own state is the exact record of
+     * which one ran — nothing else aborts it, and the run's signal is composed
+     * INTO the stream rather than into this.
+     */
+    const restartToreDownStream = (): boolean =>
+      restartController?.signal.aborted === true;
+
+    /**
      * The wake is a hint; this is where the request is actually read. The
      * shape is judged at the instant we look at it, and the teardown that
      * follows is what makes any later chunk irrelevant — so a wake arriving
@@ -912,7 +923,7 @@ async function attemptInvokeBody(
         }
         return false;
       }
-      if (!context.claimPreemptSeal()) {
+      if (!context.claimPreemptRestart()) {
         return false;
       }
       preemptAction = 'restart';
@@ -1095,10 +1106,13 @@ async function attemptInvokeBody(
                * its turns discarded, so its request waits for a seal exactly
                * as it does today.
                */
-              const permitted =
-                action === 'seal' ||
-                (action === 'restart' && restartLane != null);
-              if (permitted && context.claimPreemptSeal()) {
+              const claimed =
+                action === 'seal'
+                  ? context.claimPreemptSeal()
+                  : action === 'restart' &&
+                    restartLane != null &&
+                    context.claimPreemptRestart();
+              if (claimed) {
                 preemptAction = action;
                 break;
               }
@@ -1149,6 +1163,24 @@ async function attemptInvokeBody(
               provider,
             });
           }
+        }
+        /**
+         * The stream reached its natural end while a request was still armed
+         * and the turn still holds nothing worth keeping. The grace exists to
+         * avoid stealing a seal that was about to become possible — and the
+         * final shape is proof none was: no text ever arrived. Converting here
+         * spends no extra provider call (the stream is over) and spares the
+         * host a reasoning-only turn followed by its own steer, which is the
+         * shape the seal gate refuses to build in the first place.
+         */
+        if (
+          preemptAction === 'none' &&
+          restartLane != null &&
+          context?.shouldPreemptStream() === true &&
+          canRestartPreempt(finalChunk) &&
+          context.claimPreemptRestart()
+        ) {
+          preemptAction = 'restart';
         }
       }
     } catch (error) {
@@ -1217,7 +1249,15 @@ async function attemptInvokeBody(
           context,
           discardedChunk,
           messagesForProvider,
-          undefined,
+          /**
+           * Only an aborted run is already closed — LangChain took it through
+           * its error path, and the marker recorded above carries its usage
+           * there. A restart that merely BROKE the iterator fired no callback
+           * at all, so it closes natively here exactly as a seal does; passing
+           * no run id would leave that generation open forever and lose the
+           * discarded attempt's usage.
+           */
+          restartToreDownStream() ? undefined : sealedRunId,
           config,
           model
         );

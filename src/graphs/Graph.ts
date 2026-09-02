@@ -1416,6 +1416,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * cleanup runs.
    */
   preemptSealCount = 0;
+  /** Discards honored, counted apart from seals — see
+   *  {@link claimPreemptRestart}. */
+  preemptRestartCount = 0;
   /** Boundaries that produced nothing to inject, so the turn stopped early. */
   preemptEmptyBoundaries = 0;
   /**
@@ -1740,6 +1743,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   private resetPreemptTotals(): void {
     this.preemptSealCount = 0;
+    this.preemptRestartCount = 0;
     this.preemptEmptyBoundaries = 0;
     this.preemptIncomplete = false;
     this.preemptHaltReason = undefined;
@@ -1812,12 +1816,32 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * rather than sealing for a message it would never receive.
    */
   claimPreemptSeal(): boolean {
+    return this.claimPreemptSlot('seal');
+  }
+
+  /**
+   * The restart twin. It takes the SAME slot and spends the SAME budget —
+   * both moves end one model turn and cost one extra superstep, and the
+   * mutual exclusion argument above applies identically — but it is counted
+   * apart: a restart preserved no partial assistant message, so reporting it
+   * as a seal would tell every consumer of `getPreemptStats().seals` and the
+   * boundary hook's `sealCount` that a turn was kept when it was discarded.
+   */
+  claimPreemptRestart(): boolean {
+    return this.claimPreemptSlot('restart');
+  }
+
+  private claimPreemptSlot(kind: 'seal' | 'restart'): boolean {
     if (!this.canClaimPreemptSeal()) {
       return false;
     }
     this.preemptSealInFlight = true;
     this.preemptSealBudgetUsed += 1;
-    this.preemptSealCount += 1;
+    if (kind === 'seal') {
+      this.preemptSealCount += 1;
+      return true;
+    }
+    this.preemptRestartCount += 1;
     return true;
   }
 
@@ -1843,6 +1867,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   getPreemptStats(): t.PreemptStats {
     return {
       seals: this.preemptSealCount,
+      restarts: this.preemptRestartCount,
       emptyBoundaries: this.preemptEmptyBoundaries,
     };
   }

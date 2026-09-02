@@ -206,10 +206,13 @@ class UncooperativeModel extends PromptRecordingModel {
 class ThinkingOnlyModel extends PromptRecordingModel {
   override async *_streamResponseChunks(
     messages: BaseMessage[],
-    _options: this['ParsedCallOptions'],
-    _runManager?: CallbackManagerForLLMRun
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    this.recordPrompt(messages);
+    if (this.recordPrompt(messages) !== 1) {
+      yield* super._streamResponseChunks(messages, options, runManager);
+      return;
+    }
     yield thinkingChunk('first');
     this.onFirstStream();
     yield thinkingChunk('second');
@@ -550,6 +553,107 @@ describe('an adapter that ignores the abort', () => {
      *  not be. */
     expect(model.yielded).toBeLessThan(model.textChunks);
     expect(userTexts(model.prompts[1])).toEqual(['go', 'stop']);
+    expect(model.prompts[1].some((message) => message.getType() === 'ai')).toBe(
+      false
+    );
+  });
+});
+
+/**
+ * A restart preserves nothing, so reporting it as a seal would tell every
+ * consumer of these counters that a turn was kept when it was discarded.
+ */
+describe('preempt stats', () => {
+  it('counts a discard apart from a seal', async () => {
+    const host = createHost(0);
+    const model = new SilentThenAnsweringModel({
+      responses: [RESTARTED_RESPONSE],
+    });
+    const run = await createRestartRun({
+      runId: 'restart-stats',
+      preemption: host.preemption,
+      model,
+      hook: () => {
+        host.disarm();
+        return {
+          injectedMessages: [{ role: 'user' as const, content: 'be brief' }],
+        };
+      },
+    });
+    model.onFirstStream = host.arm;
+
+    await run.processStream(
+      { messages: [new HumanMessage('tell me a long story')] },
+      streamConfig
+    );
+
+    const stats = run.getPreemptStats();
+    expect(stats.restarts).toBe(1);
+    expect(stats.seals).toBe(0);
+    /** A restart boundary that DID inject is not an empty boundary either. */
+    expect(stats.emptyBoundaries).toBe(0);
+  });
+
+  it('does not count a reissued empty boundary as truncated', async () => {
+    const host = createHost(0);
+    const model = new SilentThenAnsweringModel({
+      responses: [RESTARTED_RESPONSE],
+    });
+    const run = await createRestartRun({
+      runId: 'restart-stats-empty',
+      preemption: host.preemption,
+      model,
+      hook: () => {
+        host.disarm();
+        return {};
+      },
+    });
+    model.onFirstStream = host.arm;
+
+    await run.processStream(
+      { messages: [new HumanMessage('tell me a long story')] },
+      streamConfig
+    );
+
+    expect(model.prompts).toHaveLength(2);
+    expect(run.getPreemptStats().emptyBoundaries).toBe(0);
+  });
+});
+
+/**
+ * The grace guards against stealing a seal that was about to become possible.
+ * A stream that ENDS while still discardable is proof none was coming, so the
+ * request must not be left for the terminal boundary — which would replay a
+ * reasoning-only turn followed by the steer, the very shape the seal gate
+ * refuses to build.
+ */
+describe('a discardable stream that ends inside the grace', () => {
+  it('still honors the armed request', async () => {
+    const host = createHost(60_000);
+    const model = new ThinkingOnlyModel({ responses: [RESTARTED_RESPONSE] });
+    const run = await createRestartRun({
+      runId: 'restart-natural-end',
+      preemption: host.preemption,
+      model,
+      hook: () => {
+        host.disarm();
+        return {
+          injectedMessages: [{ role: 'user' as const, content: 'stop there' }],
+        };
+      },
+    });
+    model.onFirstStream = host.arm;
+
+    await run.processStream(
+      { messages: [new HumanMessage('think it through')] },
+      streamConfig
+    );
+
+    expect(model.prompts).toHaveLength(2);
+    expect(userTexts(model.prompts[1])).toEqual([
+      'think it through',
+      'stop there',
+    ]);
     expect(model.prompts[1].some((message) => message.getType() === 'ai')).toBe(
       false
     );

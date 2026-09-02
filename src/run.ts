@@ -942,12 +942,20 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   /**
-   * Cooperative-seal counters for this run. `emptyBoundaries` is the one to
-   * watch: it counts seals whose `PreemptBoundary` produced nothing to
-   * inject, which ends the turn early and leaves the answer unfinished.
+   * Cooperative-preemption counters for this run. `emptyBoundaries` is the one
+   * to watch: it counts SEALS whose `PreemptBoundary` produced nothing to
+   * inject, which ends the turn early and leaves the answer unfinished. A
+   * restart that injects nothing simply reissues the call, so it is not
+   * counted there.
    */
   getPreemptStats(): t.PreemptStats {
-    return this.Graph?.getPreemptStats() ?? { seals: 0, emptyBoundaries: 0 };
+    return (
+      this.Graph?.getPreemptStats() ?? {
+        seals: 0,
+        restarts: 0,
+        emptyBoundaries: 0,
+      }
+    );
   }
 
   getToolCount(): number {

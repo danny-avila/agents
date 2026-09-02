@@ -217,9 +217,18 @@ export interface StreamPreemption {
   maxSeals?: number;
 }
 
-/** Seals honored and boundaries that had nothing to inject, per run. */
+/**
+ * Per run: seals honored, discards honored, and boundaries that had nothing to
+ * inject.
+ *
+ * `seals` counts only turns that were KEPT — a partial assistant message
+ * survived into the next prompt. `restarts` counts turns that were discarded
+ * and reissued, which preserve nothing, so a consumer classifying a run as
+ * "sealed" must not read them together.
+ */
 export type PreemptStats = {
   seals: number;
+  restarts: number;
   emptyBoundaries: number;
 };
 

@@ -338,13 +338,40 @@ export interface PreemptRestartedRun {
   recordedAt: number;
 }
 
+/**
+ * Armed while anything is recorded, so expiry does not depend on another
+ * restart arriving to trigger it. Without this the final burst before a quiet
+ * period would hold its messages for the life of the process — and a host that
+ * enables preemption without tracing never consumes a single record, so that
+ * burst is the common case, not the corner one.
+ *
+ * `unref`'d: reclaiming a few messages is never a reason to keep a process
+ * alive.
+ */
+let sweepTimer: ReturnType<typeof setTimeout> | undefined;
+
 function sweepExpiredRestartedRuns(now: number): void {
   for (const [runId, record] of preemptRestartedRuns) {
     if (now - record.recordedAt < PREEMPT_RESTARTED_RUN_TTL_MS) {
-      return;
+      break;
     }
     preemptRestartedRuns.delete(runId);
   }
+  if (preemptRestartedRuns.size === 0) {
+    if (sweepTimer != null) {
+      clearTimeout(sweepTimer);
+      sweepTimer = undefined;
+    }
+    return;
+  }
+  if (sweepTimer != null) {
+    return;
+  }
+  sweepTimer = setTimeout(() => {
+    sweepTimer = undefined;
+    sweepExpiredRestartedRuns(Date.now());
+  }, PREEMPT_RESTARTED_RUN_TTL_MS);
+  sweepTimer.unref();
 }
 
 /** Records a model run whose stream was torn down for a restart. */
@@ -353,8 +380,8 @@ export function notePreemptRestartedRun(
   message: AIMessageChunk
 ): void {
   const now = Date.now();
-  sweepExpiredRestartedRuns(now);
   preemptRestartedRuns.set(runId, { message, recordedAt: now });
+  sweepExpiredRestartedRuns(now);
 }
 
 /**
@@ -370,5 +397,9 @@ export function consumePreemptRestartedRun(
     return undefined;
   }
   preemptRestartedRuns.delete(runId);
+  if (preemptRestartedRuns.size === 0 && sweepTimer != null) {
+    clearTimeout(sweepTimer);
+    sweepTimer = undefined;
+  }
   return record;
 }
