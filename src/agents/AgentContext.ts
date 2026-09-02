@@ -283,6 +283,8 @@ export class AgentContext {
   private providerProjectionSources?: BaseMessage[];
   /** Canonical message IDs used to recognize reducer replacements in O(update). */
   private providerProjectionSourceIds?: Set<string>;
+  /** Conservative counts retained by canonical identity across a rebuild. */
+  private providerProjectionRecountFloors?: WeakMap<BaseMessage, number>;
   /** Recount after discarding a projection whose token map contains capped sizes. */
   private providerProjectionRequiresRecount = false;
   /** Pre-masking tool content keyed by message index, consumed by the summarize node. */
@@ -1724,7 +1726,7 @@ export class AgentContext {
     if (projection == null || sources == null || prefixChanged) {
       if (prefixChanged) {
         this.pruneMessages = undefined;
-        this.providerProjectionRequiresRecount = true;
+        this.prepareProviderProjectionRecount(sources);
       }
       projection = messages.map((message) =>
         Array.isArray(message.content)
@@ -1739,10 +1741,17 @@ export class AgentContext {
       if (this.providerProjectionRequiresRecount && this.tokenCounter != null) {
         const recounted: Record<string, number> = {};
         for (let i = 0; i < messages.length; i++) {
-          recounted[i] = this.tokenCounter(messages[i]);
+          const localCount = this.tokenCounter(messages[i]);
+          const conservativeFloor =
+            this.providerProjectionRecountFloors?.get(messages[i]);
+          recounted[i] =
+            conservativeFloor == null
+              ? localCount
+              : Math.max(localCount, conservativeFloor);
         }
         this.indexTokenCountMap = recounted;
         this.providerProjectionRequiresRecount = false;
+        this.providerProjectionRecountFloors = undefined;
       }
       return projection;
     }
@@ -1789,10 +1798,32 @@ export class AgentContext {
   }
 
   private clearProviderProjection(recountOnNextUse: boolean): void {
+    if (recountOnNextUse) {
+      this.prepareProviderProjectionRecount(this.providerProjectionSources);
+    } else {
+      this.providerProjectionRequiresRecount = false;
+      this.providerProjectionRecountFloors = undefined;
+    }
     this.providerProjectedMessages = undefined;
     this.providerProjectionSources = undefined;
     this.providerProjectionSourceIds = undefined;
-    this.providerProjectionRequiresRecount = recountOnNextUse;
+  }
+
+  private prepareProviderProjectionRecount(
+    sources: BaseMessage[] | undefined
+  ): void {
+    this.providerProjectionRequiresRecount = true;
+    if (sources == null) {
+      return;
+    }
+    const floors = new WeakMap<BaseMessage, number>();
+    for (let i = 0; i < sources.length; i++) {
+      const count = this.indexTokenCountMap[i];
+      if (count != null && Number.isFinite(count) && count >= 0) {
+        floors.set(sources[i], count);
+      }
+    }
+    this.providerProjectionRecountFloors = floors;
   }
 
   /** Applies token calibration only when the observation came from this provider. */

@@ -66,8 +66,18 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.getProviderProjectedMessages(canonical)).not.toBe(rebuilt);
   });
 
-  it('invalidates a projection when a reducer replacement also appends', () => {
-    const context = createContext(1_000_000);
+  it('invalidates a projection when a reducer replacement also appends', async () => {
+    const context = AgentContext.fromConfig(
+      {
+        agentId: 'overflow-agent',
+        provider: Providers.ANTHROPIC,
+        instructions: 'Test instructions',
+        maxContextTokens: 1_000_000,
+      } as Partial<t.AgentInputs> as t.AgentInputs,
+      () => 1,
+      { 0: 100, 1: 200 }
+    );
+    await context.tokenCalculationPromise;
     const original = new HumanMessage({ id: 'human-1', content: 'original' });
     const existingReply = new AIMessage({ id: 'ai-1', content: 'reply' });
     const canonical = [original, existingReply];
@@ -89,6 +99,7 @@ describe('AgentContext overflow recovery state', () => {
       'reply',
       'next',
     ]);
+    expect(context.indexTokenCountMap).toEqual({ 0: 1, 1: 200, 2: 1 });
   });
 
   it('summarizes the first overflow when deterministic pruning is unavailable', () => {
