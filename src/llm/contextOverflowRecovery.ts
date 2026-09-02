@@ -19,7 +19,10 @@
  */
 import type { ContextOverflowInfo } from '@/utils/errors';
 import type { ClientOptions, ProviderName } from '@/types';
-import { getContextOverflowInfo } from '@/utils/errors';
+import {
+  completionSharesContextWindow,
+  getContextOverflowInfo,
+} from '@/utils/errors';
 
 /** Fraction of the previous budget used when the provider named no ceiling. */
 const BLIND_SHRINK_RATIO = 0.7;
@@ -165,7 +168,10 @@ function reservedForCompletion(
    * retry at `prompt + maxTokens` and over the limit however far the prompt
    * is compacted.
    */
-  return isUsable(configuredCompletionTokens) ? configuredCompletionTokens : 0;
+  return completionSharesContextWindow(info.provider) &&
+    isUsable(configuredCompletionTokens)
+    ? configuredCompletionTokens
+    : 0;
 }
 
 function resolveTargetBudget(
@@ -199,7 +205,11 @@ function resolveTargetBudget(
   if (blindTarget == null) {
     return null;
   }
-  if (isUsable(maxContextTokens) && isUsable(configuredCompletionTokens)) {
+  if (
+    completionSharesContextWindow(info.provider) &&
+    isUsable(maxContextTokens) &&
+    isUsable(configuredCompletionTokens)
+  ) {
     const promptCeiling = maxContextTokens - configuredCompletionTokens;
     /** Even an empty prompt cannot fit when completion fills the window. */
     if (promptCeiling <= 0) {

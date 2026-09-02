@@ -90,6 +90,13 @@ export interface ContextOverflowContext {
   configuredCompletionTokens?: number;
 }
 
+/** Whether a provider charges requested output against its input window. */
+export function completionSharesContextWindow(
+  provider: ProviderName | undefined
+): boolean {
+  return provider !== Providers.VERTEXAI && provider !== Providers.GOOGLE;
+}
+
 /**
  * Ordered most-specific first; the first match wins. Patterns that capture
  * both numbers come before the bare-phrase fallbacks for the same provider so
@@ -381,10 +388,7 @@ function getContextPressure(
   ) {
     return undefined;
   }
-  const completionSharesContext =
-    context?.provider !== Providers.VERTEXAI &&
-    context?.provider !== Providers.GOOGLE;
-  const configuredCompletion = completionSharesContext
+  const configuredCompletion = completionSharesContextWindow(context?.provider)
     ? context?.configuredCompletionTokens
     : undefined;
   const completion =

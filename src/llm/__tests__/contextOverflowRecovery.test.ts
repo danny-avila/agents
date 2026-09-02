@@ -426,6 +426,20 @@ describe('planContextOverflowRecovery', () => {
     expect(plan?.budgetTokens).toBe(Math.floor(28_000 * 0.95));
   });
 
+  it('does not reserve Vertex output against its separate input window', () => {
+    const vertex = signatureFor('gemini-2.5-flash-lite');
+    const plan = planContextOverflowRecovery({
+      error: vertex.error,
+      provider: Providers.VERTEXAI,
+      maxContextTokens: 200_000,
+      estimatedPromptTokens: 190_000,
+      configuredCompletionTokens: 190_000,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan?.budgetTokens).toBe(Math.floor(190_000 * 0.7));
+  });
+
   it('successive recoveries keep shrinking', () => {
     const bedrock = signatureFor(
       'us.anthropic.claude-sonnet-4-5-20250929-v1:0'
