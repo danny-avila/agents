@@ -474,6 +474,8 @@ export class Run<_T extends t.BaseGraphState> {
   calibrationRatio: number = 1;
   fadingTier?: t.FadingTier;
   fadingTiers: t.FadingTiers = {};
+  private fadingTierReset: boolean = false;
+  private fadingTierResetAgentIds: string[] = [];
   graphRunnable?: t.CompiledStateWorkflow;
   Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
@@ -971,6 +973,16 @@ export class Run<_T extends t.BaseGraphState> {
         { ...tier },
       ])
     );
+  }
+
+  /** Agent IDs whose canonical history was compacted during this run. */
+  getFadingTierResetAgentIds(): string[] {
+    return [...this.fadingTierResetAgentIds];
+  }
+
+  /** Whether the default agent compacted canonical history during this run. */
+  didResetFadingTier(): boolean {
+    return this.fadingTierReset;
   }
 
   getResolvedInstructionOverhead(): number | undefined {
@@ -1799,6 +1811,8 @@ export class Run<_T extends t.BaseGraphState> {
       this.calibrationRatio = this.Graph.getCalibrationRatio();
       this.fadingTier = this.Graph.getFadingTier();
       this.fadingTiers = this.Graph.getFadingTiers();
+      this.fadingTierReset = this.Graph.didResetFadingTier();
+      this.fadingTierResetAgentIds = this.Graph.getFadingTierResetAgentIds();
 
       /**
        * Skip `clearHeavyState()` when the run paused on a clean HITL

@@ -407,6 +407,8 @@ export class AgentContext {
   private durableSummaryPrecedesMessages: boolean = false;
   /** Number of summarization cycles that have occurred for this agent context */
   private _summaryVersion: number = 0;
+  /** Whether this run compacted canonical history and reset its fading tier. */
+  private _fadingTierReset: boolean = false;
   /**
    * Message count at the time summarization was last triggered.
    * Used to prevent re-summarizing the same unchanged message set.
@@ -1527,6 +1529,7 @@ export class AgentContext {
     this._durableSummaryTokenCount = tokenCount;
     this.durableSummaryPrecedesMessages = this.summaryPrecedesMessages;
     this._summaryVersion += 1;
+    this._fadingTierReset = true;
     this._summarizationFailures = 0;
     this.systemRunnableStale = true;
     this.pruneMessages = undefined;
@@ -1579,6 +1582,10 @@ export class AgentContext {
 
   get summaryVersion(): number {
     return this._summaryVersion;
+  }
+
+  get fadingTierReset(): boolean {
+    return this._fadingTierReset;
   }
 
   /**

@@ -1594,12 +1594,13 @@ export class MultiAgentGraph extends StandardGraph {
                   ? undefined
                   : destinationContext.getTokenBudgetBreakdown()
                     .availableForMessages;
-              const maxRoutingPromptChars =
-                availableMessageTokens == null
-                  ? HARD_MAX_TOOL_RESULT_CHARS
-                  : availableMessageTokens <= 0
+              let maxRoutingPromptChars = HARD_MAX_TOOL_RESULT_CHARS;
+              if (availableMessageTokens != null) {
+                maxRoutingPromptChars =
+                  availableMessageTokens <= 0
                     ? 0
                     : calculateMaxToolResultChars(availableMessageTokens);
+              }
               const resultsString = serializeToolContentBounded(
                 getBufferString(resultsMessages),
                 maxRoutingPromptChars

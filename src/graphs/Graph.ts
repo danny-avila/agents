@@ -2602,6 +2602,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return Object.fromEntries(tiers);
   }
 
+  /** Agent IDs whose canonical history was compacted during this run. */
+  getFadingTierResetAgentIds(): string[] {
+    return Array.from(this.agentContexts)
+      .filter(([, context]) => context.fadingTierReset)
+      .map(([agentId]) => agentId);
+  }
+
+  /** Whether the default agent compacted canonical history during this run. */
+  didResetFadingTier(): boolean {
+    return (
+      this.agentContexts.get(this.defaultAgentId)?.fadingTierReset === true
+    );
+  }
+
   protected override createSubagentFadingResumeState(): Pick<
     SubagentGraphResumeState,
     'fadingTier' | 'fadingTiers'

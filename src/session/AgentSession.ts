@@ -905,6 +905,8 @@ export class AgentSession {
   private calibrationRatio: number | undefined;
   private fadingTier: t.FadingTier | undefined;
   private fadingTiers: t.FadingTiers | undefined;
+  private fadingRunSequence = 0;
+  private fadingResetSequences = new Map<string, Map<string, number>>();
   private alternateThreadFadingState = new Map<
     string,
     { fadingTier?: t.FadingTier; fadingTiers?: t.FadingTiers }
@@ -1014,6 +1016,10 @@ export class AgentSession {
       fadingTier: mergeFadingTier(current?.fadingTier, fadingTier),
       fadingTiers: mergeFadingTiers(current?.fadingTiers, fadingTiers),
     });
+    this.trimAlternateFadingStates();
+  }
+
+  private trimAlternateFadingStates(): void {
     while (
       this.alternateThreadFadingState.size >
       MAX_ALTERNATE_THREAD_FADING_STATES
@@ -1023,6 +1029,7 @@ export class AgentSession {
         break;
       }
       this.alternateThreadFadingState.delete(oldestThreadId.value);
+      this.fadingResetSequences.delete(oldestThreadId.value);
     }
   }
 
@@ -1030,6 +1037,7 @@ export class AgentSession {
     this.fadingTier = undefined;
     this.fadingTiers = undefined;
     this.alternateThreadFadingState.clear();
+    this.fadingResetSequences.clear();
   }
 
   private restoreFadingStateFromStore(clearWhenMissing = false): void {
@@ -1091,15 +1099,73 @@ export class AgentSession {
   private async captureRunContextState(
     threadId: string,
     checkpointNs: string,
-    run: Run<t.IState>
+    run: Run<t.IState>,
+    runSequence: number
   ): Promise<void> {
     this.calibrationRatio = run.getCalibrationRatio();
-    this.setFadingState(
-      threadId,
-      checkpointNs,
-      run.getFadingTier(),
-      run.getFadingTiers()
+    const current = this.getFadingState(threadId, checkpointNs);
+    const incomingTier = run.getFadingTier();
+    const incomingTiers = run.getFadingTiers();
+    const scopeKey = fadingScopeKey(threadId, checkpointNs);
+    let resetSequences = this.fadingResetSequences.get(scopeKey);
+    if (resetSequences == null) {
+      resetSequences = new Map();
+      this.fadingResetSequences.set(scopeKey, resetSequences);
+    }
+    const mergeCapturedTier = (
+      agentId: string,
+      existing: t.FadingTier | undefined,
+      incoming: t.FadingTier | undefined,
+      reset: boolean
+    ): t.FadingTier | undefined => {
+      const latestReset = resetSequences.get(agentId) ?? 0;
+      if (reset) {
+        if (runSequence < latestReset) {
+          return existing;
+        }
+        resetSequences.set(agentId, runSequence);
+        return incoming == null ? undefined : { ...incoming };
+      }
+      if (runSequence < latestReset) {
+        return existing;
+      }
+      return mergeFadingTier(existing, incoming);
+    };
+    const resetAgentIds = new Set(run.getFadingTierResetAgentIds());
+    const nextTiers: t.FadingTiers = {};
+    const allAgentIds = new Set([
+      ...Object.keys(current.fadingTiers ?? {}),
+      ...Object.keys(incomingTiers),
+      ...resetAgentIds,
+    ]);
+    for (const agentId of allAgentIds) {
+      const tier = mergeCapturedTier(
+        agentId,
+        current.fadingTiers?.[agentId],
+        incomingTiers[agentId],
+        resetAgentIds.has(agentId)
+      );
+      if (tier != null) {
+        nextTiers[agentId] = tier;
+      }
+    }
+    const nextTier = mergeCapturedTier(
+      '$default',
+      current.fadingTier,
+      incomingTier,
+      run.didResetFadingTier()
     );
+    if (threadId === this.threadId && checkpointNs === '') {
+      this.fadingTier = nextTier;
+      this.fadingTiers = nextTiers;
+    } else {
+      this.alternateThreadFadingState.delete(scopeKey);
+      this.alternateThreadFadingState.set(scopeKey, {
+        fadingTier: nextTier,
+        fadingTiers: nextTiers,
+      });
+      this.trimAlternateFadingStates();
+    }
     await this.persistFadingState(threadId, checkpointNs);
   }
 
@@ -1241,6 +1307,7 @@ export class AgentSession {
     const inputMessages = normalizedInput.messages;
     const callerConfig = createCallerConfig(threadId, options);
     const checkpointNs = getConfigString(callerConfig, 'checkpoint_ns') ?? '';
+    const fadingRunSequence = ++this.fadingRunSequence;
     const useCheckpointState = await this.hasCheckpointState(callerConfig);
     let parentId = this.store?.getLeafEntry()?.id ?? null;
     if (isSessionThread) {
@@ -1322,7 +1389,8 @@ export class AgentSession {
       await this.captureRunContextState(
         threadId,
         interrupt?.checkpointNs ?? checkpointNs,
-        run
+        run,
+        fadingRunSequence
       );
       runContextCaptured = true;
       const haltedReason = run.getHaltReason();
@@ -1374,7 +1442,12 @@ export class AgentSession {
       };
     } catch (error) {
       if (run != null && !runContextCaptured) {
-        await this.captureRunContextState(threadId, checkpointNs, run);
+        await this.captureRunContextState(
+          threadId,
+          checkpointNs,
+          run,
+          fadingRunSequence
+        );
       }
       emitTerminalEvent({
         type: 'run.failed',
@@ -1475,12 +1548,14 @@ export class AgentSession {
     if (!this.store) {
       throw new Error('Cannot fork an ephemeral session');
     }
+    const retainsActiveLeaf =
+      options.position === 'at' && this.store.getLeafEntry()?.id === entryId;
     const store = await this.store.fork(entryId, options);
     const session = new AgentSession({
       runConfig: {
         ...this.runConfig,
-        fadingTier: this.fadingTier,
-        fadingTiers: this.fadingTiers,
+        fadingTier: retainsActiveLeaf ? this.fadingTier : undefined,
+        fadingTiers: retainsActiveLeaf ? this.fadingTiers : undefined,
       },
       cwd: store.header.cwd,
       threadId: store.header.id,
@@ -1669,6 +1744,7 @@ export class AgentSession {
       getStoredCheckpointForConfig(this.store, threadId, baseCallerConfig)?.data
     );
     const checkpointNs = getConfigString(callerConfig, 'checkpoint_ns') ?? '';
+    const fadingRunSequence = ++this.fadingRunSequence;
     await this.store?.appendRunEvent('run.started', undefined, {
       runId,
       threadId,
@@ -1715,7 +1791,8 @@ export class AgentSession {
       await this.captureRunContextState(
         threadId,
         interrupt?.checkpointNs ?? checkpointNs,
-        run
+        run,
+        fadingRunSequence
       );
       runContextCaptured = true;
       const haltedReason = run.getHaltReason();
@@ -1764,7 +1841,12 @@ export class AgentSession {
       };
     } catch (error) {
       if (run != null && !runContextCaptured) {
-        await this.captureRunContextState(threadId, checkpointNs, run);
+        await this.captureRunContextState(
+          threadId,
+          checkpointNs,
+          run,
+          fadingRunSequence
+        );
       }
       await this.store?.appendRunEvent('run.failed', error, {
         runId,

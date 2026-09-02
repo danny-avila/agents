@@ -1314,12 +1314,68 @@ export function maskConsumedToolResults(params: {
   /** Character cap applied to every consumed result (never below
    *  MASKED_RESULT_MIN_CHARS, which is also the default). */
   maxChars?: number;
+  /** @deprecated Aggregate raw-token budget distributed by recency. Prefer
+   *  `maxChars` for byte-stable masking across otherwise identical calls. */
+  availableRawBudget?: number;
   /** When provided, original (pre-masking) content is stored here keyed by
    *  message index — only for entries that actually get truncated. */
   originalContentStore?: Map<number, string>;
   /** Called after storing a newly captured entry. */
   onContentStored?: (index: number, content: string) => void;
 }): number {
+  if (
+    params.maxChars == null &&
+    params.availableRawBudget != null &&
+    params.availableRawBudget > 0
+  ) {
+    const consumedBoundary = findConsumedBoundary(params.messages);
+    const consumedIndices: number[] = [];
+    for (let i = 0; i < consumedBoundary; i++) {
+      if (params.messages[i].getType() === 'tool') {
+        consumedIndices.push(i);
+      }
+    }
+    const count = consumedIndices.length;
+    const totalBudgetChars = params.availableRawBudget * 4;
+    let masked = 0;
+    for (let c = 0; c < count; c++) {
+      const i = consumedIndices[c];
+      const message = params.messages[i];
+      if (isComputerCallOutputMessage(message)) {
+        continue;
+      }
+      const position = count > 1 ? c / (count - 1) : 1;
+      const weight = 0.2 + 0.8 * position;
+      const totalWeight = count > 1 ? 0.6 * count : 1;
+      const maxChars = Math.max(
+        MASKED_RESULT_MIN_CHARS,
+        Math.floor((weight / totalWeight) * totalBudgetChars)
+      );
+      const compacted = compactToolContent(message.content, maxChars);
+      if (!compacted.changed) {
+        continue;
+      }
+      if (
+        params.originalContentStore != null &&
+        !params.originalContentStore.has(i)
+      ) {
+        const original = serializeToolContentBounded(
+          message.content,
+          ORIGINAL_CONTENT_MAX_CHARS
+        );
+        params.originalContentStore.set(i, original);
+        params.onContentStored?.(i, original);
+      }
+      const cloned = cloneToolMessageWithContent(
+        message as ToolMessage,
+        compacted.content
+      );
+      params.messages[i] = cloned;
+      params.indexTokenCountMap[i] = params.tokenCounter(cloned);
+      masked++;
+    }
+    return masked;
+  }
   return applyFadingCaps({
     messages: params.messages,
     indexTokenCountMap: params.indexTokenCountMap,

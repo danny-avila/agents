@@ -25,6 +25,10 @@ type MockRun = {
   >;
   getFadingTier: jest.MockedFunction<Run<t.IState>['getFadingTier']>;
   getFadingTiers: jest.MockedFunction<Run<t.IState>['getFadingTiers']>;
+  didResetFadingTier: jest.MockedFunction<Run<t.IState>['didResetFadingTier']>;
+  getFadingTierResetAgentIds: jest.MockedFunction<
+    Run<t.IState>['getFadingTierResetAgentIds']
+  >;
   getInterrupt: jest.MockedFunction<Run<t.IState>['getInterrupt']>;
   getHaltReason: jest.MockedFunction<Run<t.IState>['getHaltReason']>;
   getChildCheckpointThreadIds: jest.MockedFunction<
@@ -50,6 +54,8 @@ function createMockRun(outputText = 'ok'): MockRun {
     getCalibrationRatio: jest.fn(() => 1),
     getFadingTier: jest.fn(() => undefined),
     getFadingTiers: jest.fn(() => ({})),
+    didResetFadingTier: jest.fn(() => false),
+    getFadingTierResetAgentIds: jest.fn(() => []),
     getInterrupt: jest.fn(() => undefined),
     getHaltReason: jest.fn(() => undefined),
     getChildCheckpointThreadIds: jest.fn(() => []),
@@ -1532,6 +1538,88 @@ describe('JsonlSessionStore', () => {
 
     expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
     expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
+  });
+
+  it('only carries live fading tiers into a fork that retains the active leaf', async () => {
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('advance tier');
+    const leafId = session.getSessionStore()?.getLeafEntry()?.id ?? '';
+    const rewound = await session.fork(leafId, { cwd: dir });
+    await rewound.run('continue rewound fork');
+    const full = await session.fork(leafId, { cwd: dir, position: 'at' });
+    await full.run('continue full fork');
+
+    expect(capturedConfigs[1].fadingTier).toBeUndefined();
+    expect(capturedConfigs[1].fadingTiers).toBeUndefined();
+    expect(capturedConfigs[2].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[2].fadingTiers).toEqual({ default: fadingTier });
+  });
+
+  it('allows graph compaction to clear a persisted fading tier', async () => {
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier
+      .mockReturnValueOnce(fadingTier)
+      .mockReturnValue(undefined);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({ default: fadingTier })
+      .mockReturnValue({});
+    mockRun.didResetFadingTier
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true)
+      .mockReturnValue(false);
+    mockRun.getFadingTierResetAgentIds
+      .mockReturnValueOnce([])
+      .mockReturnValueOnce(['default'])
+      .mockReturnValue([]);
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('advance tier');
+    await session.run('compact history');
+    await session.run('after compaction');
+
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[2].fadingTier).toBeUndefined();
+    expect(capturedConfigs[2].fadingTiers).toEqual({});
   });
 
   it('restores fading tiers when reopening a persisted session', async () => {
