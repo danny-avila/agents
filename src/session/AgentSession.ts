@@ -370,6 +370,22 @@ function createCallerConfig(
   };
 }
 
+/** Generation key for one tier within a scope; `''` names the default tier. */
+function fadingGenerationKey(scopeKey: string, agentKey: string): string {
+  return JSON.stringify([scopeKey, agentKey]);
+}
+
+function fadingGenerationScope(generationKey: string): string {
+  const parsed: unknown = JSON.parse(generationKey);
+  return Array.isArray(parsed) && typeof parsed[0] === 'string' ? parsed[0] : '';
+}
+
+/** What a run saw when it started, so its capture can tell stale from current. */
+type FadingCaptureSnapshot = {
+  epoch: number;
+  generations: Map<string, number>;
+};
+
 function fadingScopeKey(threadId: string, checkpointNs = ''): string {
   return JSON.stringify([threadId, checkpointNs]);
 }
@@ -924,7 +940,10 @@ export class AgentSession {
   private calibrationRatio: number | undefined;
   private fadingTier: t.FadingTier | undefined;
   private fadingTiers: t.FadingTiers | undefined;
+  /** Reset generations keyed per scope and per tier (`''` for the default). */
   private fadingGenerations = new Map<string, number>();
+  /** Advances on every explicit history rewrite (branch, compact, restore). */
+  private fadingRewriteEpoch = 0;
   private alternateThreadFadingState = new Map<
     string,
     { fadingTier?: t.FadingTier; fadingTiers?: t.FadingTiers }
@@ -1047,7 +1066,11 @@ export class AgentSession {
         break;
       }
       this.alternateThreadFadingState.delete(oldestThreadId.value);
-      this.fadingGenerations.delete(oldestThreadId.value);
+      for (const key of [...this.fadingGenerations.keys()]) {
+        if (fadingGenerationScope(key) === oldestThreadId.value) {
+          this.fadingGenerations.delete(key);
+        }
+      }
     }
   }
 
@@ -1056,6 +1079,16 @@ export class AgentSession {
     this.fadingTiers = undefined;
     this.alternateThreadFadingState.clear();
     this.fadingGenerations.clear();
+    /** A run that started before the rewrite would otherwise re-persist tiers
+     * learned on a history that no longer exists once it completes. */
+    this.fadingRewriteEpoch += 1;
+  }
+
+  private snapshotFadingGenerations(): FadingCaptureSnapshot {
+    return {
+      epoch: this.fadingRewriteEpoch,
+      generations: new Map(this.fadingGenerations),
+    };
   }
 
   private restoreFadingStateFromStore(clearWhenMissing = false): void {
@@ -1117,17 +1150,30 @@ export class AgentSession {
     threadId: string,
     checkpointNs: string,
     run: Run<t.IState>,
-    runGeneration: number
+    snapshot: FadingCaptureSnapshot
   ): Promise<void> {
     this.calibrationRatio = run.getCalibrationRatio();
+    if (snapshot.epoch < this.fadingRewriteEpoch) {
+      return;
+    }
     const current = this.getFadingState(threadId, checkpointNs);
     const incomingTier = run.getFadingTier();
     const incomingTiers = run.getFadingTiers();
     const scopeKey = fadingScopeKey(threadId, checkpointNs);
-    const currentGeneration = this.fadingGenerations.get(scopeKey) ?? 0;
-    if (runGeneration < currentGeneration) {
-      return;
-    }
+    /** A tier whose generation moved after this run started was reset by a
+     * concurrent run; this run's view of it is obsolete, while its other
+     * agents' tiers remain valid escalations. */
+    const isStale = (agentKey: string): boolean => {
+      const key = fadingGenerationKey(scopeKey, agentKey);
+      return (
+        (snapshot.generations.get(key) ?? 0) <
+        (this.fadingGenerations.get(key) ?? 0)
+      );
+    };
+    const advanceGeneration = (agentKey: string): void => {
+      const key = fadingGenerationKey(scopeKey, agentKey);
+      this.fadingGenerations.set(key, (this.fadingGenerations.get(key) ?? 0) + 1);
+    };
     const mergeCapturedTier = (
       existing: t.FadingTier | undefined,
       incoming: t.FadingTier | undefined,
@@ -1138,11 +1184,7 @@ export class AgentSession {
       }
       return mergeFadingTier(existing, incoming);
     };
-    const didResetTier = run.didResetFadingTier();
     const resetAgentIds = new Set(run.getFadingTierResetAgentIds());
-    if (didResetTier || resetAgentIds.size > 0) {
-      this.fadingGenerations.set(scopeKey, currentGeneration + 1);
-    }
     const nextTiers: t.FadingTiers = Object.create(null) as t.FadingTiers;
     const allAgentIds = new Set([
       ...Object.keys(current.fadingTiers ?? {}),
@@ -1150,20 +1192,34 @@ export class AgentSession {
       ...resetAgentIds,
     ]);
     for (const agentId of allAgentIds) {
+      const existing = ownFadingTier(current.fadingTiers, agentId);
+      if (isStale(agentId)) {
+        if (existing != null) {
+          nextTiers[agentId] = existing;
+        }
+        continue;
+      }
+      const reset = resetAgentIds.has(agentId);
+      if (reset) {
+        advanceGeneration(agentId);
+      }
       const tier = mergeCapturedTier(
-        current.fadingTiers?.[agentId],
-        incomingTiers[agentId],
-        resetAgentIds.has(agentId)
+        existing,
+        ownFadingTier(incomingTiers, agentId),
+        reset
       );
       if (tier != null) {
         nextTiers[agentId] = tier;
       }
     }
-    const nextTier = mergeCapturedTier(
-      current.fadingTier,
-      incomingTier,
-      didResetTier
-    );
+    let nextTier = current.fadingTier;
+    if (!isStale('')) {
+      const didResetTier = run.didResetFadingTier();
+      if (didResetTier) {
+        advanceGeneration('');
+      }
+      nextTier = mergeCapturedTier(current.fadingTier, incomingTier, didResetTier);
+    }
     if (threadId === this.threadId && checkpointNs === '') {
       this.fadingTier = nextTier;
       this.fadingTiers = nextTiers;
@@ -1316,8 +1372,7 @@ export class AgentSession {
     const inputMessages = normalizedInput.messages;
     const callerConfig = createCallerConfig(threadId, options);
     const checkpointNs = getConfigString(callerConfig, 'checkpoint_ns') ?? '';
-    const fadingGeneration =
-      this.fadingGenerations.get(fadingScopeKey(threadId, checkpointNs)) ?? 0;
+    const fadingSnapshot = this.snapshotFadingGenerations();
     const useCheckpointState = await this.hasCheckpointState(callerConfig);
     let parentId = this.store?.getLeafEntry()?.id ?? null;
     if (isSessionThread) {
@@ -1400,7 +1455,7 @@ export class AgentSession {
         threadId,
         interrupt?.checkpointNs ?? checkpointNs,
         run,
-        fadingGeneration
+        fadingSnapshot
       );
       runContextCaptured = true;
       const haltedReason = run.getHaltReason();
@@ -1456,7 +1511,7 @@ export class AgentSession {
           threadId,
           checkpointNs,
           run,
-          fadingGeneration
+          fadingSnapshot
         );
       }
       emitTerminalEvent({
@@ -1754,8 +1809,7 @@ export class AgentSession {
       getStoredCheckpointForConfig(this.store, threadId, baseCallerConfig)?.data
     );
     const checkpointNs = getConfigString(callerConfig, 'checkpoint_ns') ?? '';
-    const fadingGeneration =
-      this.fadingGenerations.get(fadingScopeKey(threadId, checkpointNs)) ?? 0;
+    const fadingSnapshot = this.snapshotFadingGenerations();
     await this.store?.appendRunEvent('run.started', undefined, {
       runId,
       threadId,
@@ -1803,7 +1857,7 @@ export class AgentSession {
         threadId,
         interrupt?.checkpointNs ?? checkpointNs,
         run,
-        fadingGeneration
+        fadingSnapshot
       );
       runContextCaptured = true;
       const haltedReason = run.getHaltReason();
@@ -1856,7 +1910,7 @@ export class AgentSession {
           threadId,
           checkpointNs,
           run,
-          fadingGeneration
+          fadingSnapshot
         );
       }
       await this.store?.appendRunEvent('run.failed', error, {

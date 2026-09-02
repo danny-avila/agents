@@ -973,6 +973,29 @@ export class MultiAgentGraph extends StandardGraph {
    * @param agentId - The agent ID to check for handoff reception
    * @returns Object with filtered messages, extracted instructions, source agent, and parallel siblings
    */
+  /**
+   * Character cap for text injected into an agent's context as a routing or
+   * handoff prompt, derived from that agent's remaining message budget. Fading
+   * only shrinks tool content, so a prompt above this cap could overflow the
+   * agent's window or force the routing instruction out of its context.
+   */
+  private async resolveMaxRoutingPromptChars(agentId: string): Promise<number> {
+    const agentContext = this.agentContexts.get(agentId);
+    if (agentContext?.tokenCalculationPromise != null) {
+      await agentContext.tokenCalculationPromise;
+    }
+    const availableMessageTokens =
+      agentContext?.maxContextTokens == null
+        ? undefined
+        : agentContext.getTokenBudgetBreakdown().availableForMessages;
+    if (availableMessageTokens == null) {
+      return HARD_MAX_TOOL_RESULT_CHARS;
+    }
+    return availableMessageTokens <= 0
+      ? 0
+      : calculateMaxToolResultChars(availableMessageTokens);
+  }
+
   private processHandoffReception(
     messages: BaseMessage[],
     agentId: string
@@ -1361,6 +1384,12 @@ export class MultiAgentGraph extends StandardGraph {
            */
           const hasInstructions = instructions !== null && instructions !== '';
           if (hasInstructions) {
+            /** Bounded like a direct-edge routing prompt: a HumanMessage is
+             * not tool content, so fading could never shrink it later. */
+            const boundedInstructions = serializeToolContentBounded(
+              instructions,
+              await this.resolveMaxRoutingPromptChars(agentId)
+            );
             const lastMsg =
               filteredMessages.length > 0
                 ? filteredMessages[filteredMessages.length - 1]
@@ -1374,12 +1403,12 @@ export class MultiAgentGraph extends StandardGraph {
                     `[Processed tool result and transferring to ${agentId}]`
                   )
                 ),
-                buildRoutingPrompt(instructions),
+                buildRoutingPrompt(boundedInstructions),
               ];
             } else {
               messagesForAgent = [
                 ...filteredMessages,
-                buildRoutingPrompt(instructions),
+                buildRoutingPrompt(boundedInstructions),
               ];
             }
           }
@@ -1579,23 +1608,8 @@ export class MultiAgentGraph extends StandardGraph {
         builder.addNode(wrapperNodeId, async (state: t.BaseGraphState) => {
           let promptText: string | undefined;
           let effectiveExcludeResults = excludeResults;
-          const getMaxRoutingPromptChars = async (): Promise<number> => {
-            const destinationContext = this.agentContexts.get(destination);
-            if (destinationContext?.tokenCalculationPromise != null) {
-              await destinationContext.tokenCalculationPromise;
-            }
-            const availableMessageTokens =
-              destinationContext?.maxContextTokens == null
-                ? undefined
-                : destinationContext.getTokenBudgetBreakdown()
-                  .availableForMessages;
-            if (availableMessageTokens == null) {
-              return HARD_MAX_TOOL_RESULT_CHARS;
-            }
-            return availableMessageTokens <= 0
-              ? 0
-              : calculateMaxToolResultChars(availableMessageTokens);
-          };
+          const getMaxRoutingPromptChars = (): Promise<number> =>
+            this.resolveMaxRoutingPromptChars(destination);
 
           if (typeof prompt === 'function') {
             const resolvedPrompt = await prompt(state.messages, this.startIndex);

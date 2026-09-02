@@ -2105,6 +2105,133 @@ describe('JsonlSessionStore', () => {
     expect(capturedConfigs[2].fadingTiers).toEqual({});
   });
 
+  it('discards a capture from a run that started before an explicit history rewrite', async () => {
+    const mockRun = createMockRun('continued');
+    const preRewriteTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    let markStaleStarted!: () => void;
+    let releaseStale!: () => void;
+    const staleStarted = new Promise<void>((resolve) => {
+      markStaleStarted = resolve;
+    });
+    const staleResult = new Promise<t.MessageContentComplex[]>((resolve) => {
+      releaseStale = () => resolve([{ type: 'text', text: 'stale' }]);
+    });
+    mockRun.processStream
+      .mockResolvedValueOnce([{ type: 'text', text: 'seed' }])
+      .mockImplementationOnce(async () => {
+        markStaleStarted();
+        return staleResult;
+      })
+      .mockResolvedValue([{ type: 'text', text: 'after' }]);
+    mockRun.getFadingTier
+      .mockReturnValueOnce(undefined)
+      .mockReturnValueOnce(preRewriteTier)
+      .mockReturnValue(undefined);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({})
+      .mockReturnValueOnce({ default: preRewriteTier })
+      .mockReturnValue({});
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('seed run');
+    const firstEntryId = session.getSessionStore()?.getPath()[0]?.id;
+    expect(firstEntryId).toBeDefined();
+    const staleRun = session.run('stale run');
+    await staleStarted;
+    await session.branch(firstEntryId as string);
+    releaseStale();
+    await staleRun;
+    await session.run('after rewrite');
+
+    expect(capturedConfigs[2].fadingTier).toBeUndefined();
+    expect(capturedConfigs[2].fadingTiers ?? {}).toEqual({});
+  });
+
+  it('keeps a concurrent escalation from another agent when one agent resets', async () => {
+    const mockRun = createMockRun('continued');
+    const escalatedTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    let markResetStarted!: () => void;
+    let markEscalationStarted!: () => void;
+    let releaseReset!: () => void;
+    let releaseEscalation!: () => void;
+    const resetStarted = new Promise<void>((resolve) => {
+      markResetStarted = resolve;
+    });
+    const escalationStarted = new Promise<void>((resolve) => {
+      markEscalationStarted = resolve;
+    });
+    const resetResult = new Promise<t.MessageContentComplex[]>((resolve) => {
+      releaseReset = () => resolve([{ type: 'text', text: 'reset' }]);
+    });
+    const escalationResult = new Promise<t.MessageContentComplex[]>((resolve) => {
+      releaseEscalation = () => resolve([{ type: 'text', text: 'escalated' }]);
+    });
+    mockRun.processStream
+      .mockImplementationOnce(async () => {
+        markResetStarted();
+        return resetResult;
+      })
+      .mockImplementationOnce(async () => {
+        markEscalationStarted();
+        return escalationResult;
+      })
+      .mockResolvedValue([{ type: 'text', text: 'after' }]);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({})
+      .mockReturnValueOnce({ worker: escalatedTier })
+      .mockReturnValue({});
+    mockRun.getFadingTierResetAgentIds
+      .mockReturnValueOnce(['planner'])
+      .mockReturnValue([]);
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    const resetRun = session.run('planner compacts');
+    await resetStarted;
+    const escalationRun = session.run('worker escalates');
+    await escalationStarted;
+    releaseReset();
+    await resetRun;
+    releaseEscalation();
+    await escalationRun;
+    await session.run('after overlap');
+
+    expect(capturedConfigs[2].fadingTiers).toEqual({ worker: escalatedTier });
+  });
+
   it('bounds fading metadata retained for alternate checkpoint threads', async () => {
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {

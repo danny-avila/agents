@@ -2794,16 +2794,31 @@ export function findLastIndex<T>(
   return -1;
 }
 
+/** Reads an own data property without invoking accessors; `undefined` otherwise. */
+function readOwnDataProperty(target: object, key: PropertyKey): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    return descriptor != null && 'value' in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Whether message content carries non-whitespace text in any text block. */
 export function hasNonEmptyTextContent(content: BaseMessage['content']): boolean {
   if (typeof content === 'string') {
     return content.trim() !== '';
   }
-  if (isProxy(content)) {
+  if (!Array.isArray(content) || isProxy(content)) {
     return false;
   }
-  for (const block of content) {
-    if (typeof block !== 'object' || isProxy(block)) {
+  /** Index reads through own data descriptors: `for...of` would invoke a
+   * hostile `Symbol.iterator` or an accessor-backed element before any guard. */
+  const length = readOwnDataProperty(content, 'length');
+  const blockCount = typeof length === 'number' ? length : 0;
+  for (let i = 0; i < blockCount; i++) {
+    const block = readOwnDataProperty(content, i);
+    if (typeof block !== 'object' || block == null || isProxy(block)) {
       continue;
     }
     try {

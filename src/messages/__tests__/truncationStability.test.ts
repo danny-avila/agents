@@ -1340,3 +1340,43 @@ describe('fadingRungForExchangeChars', () => {
     expect(fadingRungForExchangeChars(window, 1)).toBe(maxFadingRung(window));
   });
 });
+
+describe('hasNonEmptyTextContent hostile iteration', () => {
+  it('never invokes iterators or accessors while scanning content blocks', () => {
+    const hostileIterator: unknown[] = [{ type: 'text', text: 'hidden' }];
+    Object.defineProperty(hostileIterator, Symbol.iterator, {
+      get() {
+        throw new Error('iterator invoked');
+      },
+    });
+    expect(
+      hasNonEmptyTextContent(hostileIterator as BaseMessage['content'])
+    ).toBe(true);
+
+    const accessorElement: unknown[] = [];
+    Object.defineProperty(accessorElement, 0, {
+      get() {
+        throw new Error('accessor invoked');
+      },
+      enumerable: true,
+    });
+    accessorElement.length = 2;
+    accessorElement[1] = { type: 'text', text: 'visible' };
+    expect(
+      hasNonEmptyTextContent(accessorElement as BaseMessage['content'])
+    ).toBe(true);
+
+    const accessorOnly: unknown[] = [];
+    Object.defineProperty(accessorOnly, 0, {
+      get() {
+        throw new Error('accessor invoked');
+      },
+    });
+    expect(hasNonEmptyTextContent(accessorOnly as BaseMessage['content'])).toBe(
+      false
+    );
+    expect(
+      hasNonEmptyTextContent({ type: 'text', text: 'x' } as unknown as BaseMessage['content'])
+    ).toBe(false);
+  });
+});

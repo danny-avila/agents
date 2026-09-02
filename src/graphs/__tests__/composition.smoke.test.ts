@@ -718,6 +718,77 @@ describe('LangGraph composition smoke tests', () => {
     }
   });
 
+  it('bounds handoff instructions to the destination budget', async () => {
+    const largeInstructions = `BEGIN\n${'large handoff instruction '.repeat(2000)}\nEND`;
+    class LargeHandoffChatModel extends FakeChatModel {
+      readonly invocations: BaseMessage[][] = [];
+      private invocationIndex = 0;
+
+      constructor() {
+        super({ responses: ['unused'] });
+      }
+
+      override async *_streamResponseChunks(
+        messages: BaseMessage[],
+        _options: this['ParsedCallOptions'],
+        runManager?: CallbackManagerForLLMRun
+      ): AsyncGenerator<ChatGenerationChunk> {
+        this.invocations.push(messages);
+        if (this.invocationIndex++ === 0) {
+          yield this._createResponseChunk('', [
+            {
+              id: 'transfer_large',
+              name: `${Constants.LC_TRANSFER_TO_}destination`,
+              args: JSON.stringify({ instructions: largeInstructions }),
+              index: 0,
+              type: 'tool_call_chunk',
+            },
+          ]);
+          void runManager?.handleLLMNewToken('');
+          return;
+        }
+        yield this._createResponseChunk('handoff complete');
+        void runManager?.handleLLMNewToken('handoff complete');
+      }
+    }
+    const model = new LargeHandoffChatModel();
+    const graph = new MultiAgentGraph({
+      runId: 'bounded-handoff-instructions',
+      tokenCounter: countMessageChars,
+      agents: [
+        makeAgent('source'),
+        {
+          ...makeAgent('destination'),
+          instructions: 'routing instruction '.repeat(120),
+          maxContextTokens: 1000,
+        },
+      ],
+      edges: [
+        {
+          from: 'source',
+          to: 'destination',
+          edgeType: 'handoff',
+          prompt: 'Provide transfer instructions.',
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('bounded-handoff-instructions')
+      );
+
+    const routingPrompt = model.invocations
+      .flat()
+      .find((message) => message.additional_kwargs.source === 'routing');
+    expect(routingPrompt?.content).toEqual(expect.stringContaining('truncated'));
+    expect(String(routingPrompt?.content).length).toBeLessThan(500);
+    expect(largeInstructions.length).toBeGreaterThan(40_000);
+  });
+
   it('compiles mixed handoff and direct routing from the same agent', () => {
     const graph = new MultiAgentGraph({
       runId: 'mixed-routing-smoke',
