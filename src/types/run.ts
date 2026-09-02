@@ -123,15 +123,23 @@ export type StandardGraphConfig = Omit<
 > & { type?: 'standard'; signal?: AbortSignal };
 
 /**
- * Cooperative mid-generation preemption. Lets a host seal the live model
- * stream at the next provider-safe token boundary — the run is never
- * aborted, the partial assistant turn is kept, and the graph self-loops
- * into a fresh model call once the `PreemptBoundary` hook has injected
- * whatever the host queued.
+ * Cooperative mid-generation preemption. Lets a host end the live model stream
+ * early and inject whatever it queued, in one of two ways:
+ *
+ *  - a SEAL, at the next provider-safe token boundary: the run is never
+ *    aborted, the partial assistant turn is kept, and the graph self-loops into
+ *    a fresh model call once the `PreemptBoundary` hook has injected.
+ *  - a RESTART, when the turn holds nothing worth keeping — no text, no tool
+ *    call, at most reasoning. The provider request IS torn down, its output is
+ *    discarded, and the model is called again with the injection appended to
+ *    the same prompt. Requires `subscribe`; see it for why the per-chunk poll
+ *    alone cannot reach this case.
  *
  * Preconditions the host MUST satisfy:
  *   - `shouldPreempt` is polled once per streamed chunk on the top-level
- *     graph. It must be synchronous, allocation-free and O(1) — never I/O.
+ *     graph, and once more per model attempt if `subscribe` is supplied — at
+ *     the attempt's start and on each wake. It must be synchronous,
+ *     allocation-free and O(1) — never I/O.
  *     It must also be LEVEL-TRIGGERED (non-consuming): the SDK never clears
  *     the host's request, and a true result is only honored once the
  *     accumulated chunk is provider-safe, so the predicate may be polled
@@ -169,15 +177,58 @@ export interface StreamPreemption {
    */
   shouldPreempt: () => boolean;
   /**
+   * Optional wake-up channel for the window where the poll cannot reach: a
+   * provider that has sent nothing yet, or that is streaming reasoning the
+   * seal gate will never accept. `shouldPreempt` is only read per chunk, so a
+   * request armed during a long silent stretch would otherwise wait for the
+   * whole turn.
+   *
+   * The SDK subscribes once per model attempt and calls the returned
+   * unsubscribe when the attempt ends. `wake` is a HINT, never the request
+   * itself: it wakes the SDK, which then re-reads `shouldPreempt` as the sole
+   * authority. That keeps the level-triggered contract above intact and makes
+   * spurious wakes free — a host may call it on every arm without tracking
+   * which ones the SDK already saw.
+   *
+   * A wake is only honored when the accumulated turn holds nothing worth
+   * keeping, and it is honored by DISCARDING that turn: the in-flight provider
+   * request is torn down, its partial output is dropped, the `PreemptBoundary`
+   * hook injects, and the model is called again with the injection appended.
+   * Reasoning tokens already spent are billed and lost, which is the trade the
+   * host is asking for. A turn that has produced visible text seals instead,
+   * through the ordinary per-chunk path, and a wake never discards it.
+   */
+  subscribe?: (wake: () => void) => () => void;
+  /**
+   * How long a request waits for the turn to become sealable before it may
+   * discard it instead. Defaults to `DEFAULT_PREEMPT_RESTART_GRACE_MS`; `0`
+   * converts as soon as the shape allows.
+   *
+   * The window keeps a restart from stealing a seal that was moments away, and
+   * from discarding a first chunk still in flight between the provider and the
+   * consumer. Both are why it applies to a silent turn as well as a thinking
+   * one.
+   */
+  restartGraceMs?: number;
+  /**
    * Max cooperative seals per run. Each seal costs one extra superstep, so
    * this also bounds the recursion-limit headroom the run reserves.
    */
   maxSeals?: number;
 }
 
-/** Seals honored and boundaries that had nothing to inject, per run. */
+/**
+ * Per run: seals honored, discards honored, and boundaries that had nothing to
+ * inject.
+ *
+ * `seals` counts only turns that were KEPT — a partial assistant message
+ * survived into the next prompt. `restarts` counts turns that were discarded
+ * and reissued, which preserve nothing, so a consumer classifying a run as
+ * "sealed" must not read them together.
+ */
 export type PreemptStats = {
   seals: number;
+  restarts: number;
   emptyBoundaries: number;
 };
 

@@ -1,6 +1,11 @@
 // src/llm/preempt.ts
 import type { AIMessageChunk } from '@langchain/core/messages';
-import { ContentTypes, DEFAULT_MAX_SEALS } from '@/common';
+import {
+  ContentTypes,
+  DEFAULT_MAX_SEALS,
+  DEFAULT_PREEMPT_RESTART_GRACE_MS,
+} from '@/common';
+import { isReasoningContentBlock } from '@/messages/core';
 
 /**
  * Normalizes a host-supplied seal budget.
@@ -120,6 +125,61 @@ function countOpenToolCalls(
 }
 
 /**
+ * True for a text block a provider emitted before it had anything to say.
+ *
+ * Whitespace-only string content is already accepted above, and the block form
+ * of the same thing must agree: several providers open their message with an
+ * empty text part, and rejecting it would leave a turn neither sealable nor
+ * discardable — an armed interrupt would then wait out the whole turn for the
+ * sake of a block carrying nothing.
+ */
+function isBlankTextBlock(block: { type?: string; text?: unknown }): boolean {
+  if (block.type !== ContentTypes.TEXT) {
+    return false;
+  }
+  return typeof block.text === 'string' && block.text.trim() === '';
+}
+
+/**
+ * True when an OpenAI Responses turn already carries provider-side tool output.
+ *
+ * Responses reports its built-in tools differently from every other shape this
+ * module checks: a completed web search, code interpreter run, or apply-patch
+ * lands in `additional_kwargs.tool_outputs` or the authoritative
+ * `response_metadata.output`, while `content` stays empty and the `tool_calls`
+ * arrays are never populated. The ordinary gates therefore see an empty turn
+ * and would call it disposable — and reissuing the prompt would run that tool
+ * a SECOND time, rebilling a search and repeating whatever a shell or
+ * apply-patch call already did to the world.
+ *
+ * `output` is inspected item by item rather than treated as fatal on sight,
+ * because a reasoning-only Responses turn populates it too at natural
+ * completion, and that turn is precisely the one a restart should be able to
+ * discard.
+ */
+function hasResponsesProviderOutput(chunk: AIMessageChunk): boolean {
+  if (chunk.additional_kwargs.tool_outputs != null) {
+    return true;
+  }
+  const metadata = chunk.response_metadata as {
+    tool_outputs?: unknown;
+    output?: unknown;
+  };
+  if (metadata.tool_outputs != null) {
+    return true;
+  }
+  if (!Array.isArray(metadata.output)) {
+    return false;
+  }
+  for (const item of metadata.output) {
+    if (!isReasoningContentBlock(item as { type?: string })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Cooperative mid-generation seal gate. Returns true ONLY when sealing here
  * yields a message sequence valid on EVERY supported provider:
  *  - non-whitespace TEXT content, so the FIRST injected user turn is preceded
@@ -175,4 +235,263 @@ export function canSealPreempt(chunk: AIMessageChunk | undefined): boolean {
     return false;
   }
   return hasNonEmptyTextContent(chunk.content);
+}
+
+/**
+ * What a host's armed preempt request may do to the turn in flight.
+ *
+ * `seal` keeps the partial assistant turn and injects after it; `restart`
+ * throws the partial away and re-issues the model call with the injected turn
+ * appended to the prompt. They are not two flavors of the same move — one
+ * preserves work, the other deliberately discards it — so the decision is
+ * resolved once, here, rather than re-derived at each trigger.
+ */
+export type PreemptAction = 'none' | 'seal' | 'restart';
+
+/**
+ * True when the accumulated turn holds nothing a seal would have to preserve,
+ * so the whole model call can be thrown away and re-issued instead.
+ *
+ * The membership test is a WHITELIST: every content block must be a known
+ * reasoning block, and an unrecognized block refuses the restart. Blacklisting
+ * would silently discard whatever a future provider adds, and the failure is
+ * asymmetric — refusing costs the user a slower interrupt (exactly today's
+ * behavior), while wrongly discarding destroys work the model already did and
+ * the host may already have rendered.
+ *
+ * Tool machinery of any kind refuses, and deliberately without the settled-id
+ * allowance {@link canSealPreempt} makes: a settled `web_search_tool_result`
+ * means the provider already ran and billed a search, and re-issuing the call
+ * would run it again. A seal there is free; a restart is not. The same
+ * argument covers Responses' sidecar shapes — see
+ * {@link hasResponsesProviderOutput}, which the ordinary tool-call gates
+ * cannot see at all.
+ *
+ * An accumulation that carries visible text is not handled here at all — the
+ * caller resolves `seal` first, because keeping the user's answer always beats
+ * discarding it.
+ *
+ * `undefined` — the provider has sent nothing at all — is the case this whole
+ * path exists for: it is the silent window between the request and the first
+ * chunk, where there is by definition nothing to lose.
+ */
+export function canRestartPreempt(chunk: AIMessageChunk | undefined): boolean {
+  if (chunk == null) {
+    return true;
+  }
+  if ((chunk.tool_calls?.length ?? 0) > 0) {
+    return false;
+  }
+  if ((chunk.tool_call_chunks?.length ?? 0) > 0) {
+    return false;
+  }
+  if ((chunk.invalid_tool_calls?.length ?? 0) > 0) {
+    return false;
+  }
+  if (hasResponsesProviderOutput(chunk)) {
+    return false;
+  }
+  const { content } = chunk;
+  if (typeof content === 'string') {
+    return content.trim() === '';
+  }
+  for (const block of content) {
+    if (isReasoningContentBlock(block) || isBlankTextBlock(block)) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Normalizes a host-supplied restart grace, on the same rules as
+ * {@link resolveMaxSeals}: `0` is honored as "never wait", anything not finite
+ * falls back to the default. Negative values collapse to `0` rather than
+ * inverting the comparison in {@link resolvePreemptAction}.
+ */
+export function resolveRestartGraceMs(graceMs: number | undefined): number {
+  if (graceMs == null || !Number.isFinite(graceMs)) {
+    return DEFAULT_PREEMPT_RESTART_GRACE_MS;
+  }
+  return graceMs > 0 ? graceMs : 0;
+}
+
+/**
+ * The single decision point both preempt triggers share: the per-chunk poll in
+ * the stream loop, and the host wake-up that fires while the provider is
+ * silent.
+ *
+ * A SEAL is preferred wherever one is available, so a turn that has already
+ * produced an answer never loses it to a restart. A RESTART converts only once
+ * the request has outlived `graceMs`.
+ *
+ * The window is not politeness, it is correctness, and it applies to a silent
+ * provider exactly as it does to a reasoning one:
+ *  - reasoning usually precedes text by moments, and discarding a turn that
+ *    was about to become sealable trades a kept answer for a re-issued
+ *    request. Only a genuinely long thinking stretch — the one an interrupt
+ *    can otherwise wait out entirely — should convert.
+ *  - `chunk` is what the CONSUMER has accumulated, and the provider stream
+ *    buffers a chunk ahead of it. An empty accumulation therefore does not
+ *    prove the provider produced nothing; it can also mean the first chunk is
+ *    in flight. Converting on emptiness alone would discard that chunk — text
+ *    included — on a race no caller can see. A provider that is still silent a
+ *    window later has no such chunk outstanding.
+ *
+ * Non-mutating and allocation-free, like the poll that guards it: the seal
+ * budget is only spent once the caller acts on a non-`none` result.
+ */
+export function resolvePreemptAction({
+  chunk,
+  requestAgeMs,
+  graceMs,
+}: {
+  chunk: AIMessageChunk | undefined;
+  requestAgeMs: number;
+  graceMs: number;
+}): PreemptAction {
+  if (canSealPreempt(chunk)) {
+    return 'seal';
+  }
+  if (!canRestartPreempt(chunk)) {
+    return 'none';
+  }
+  return requestAgeMs >= graceMs ? 'restart' : 'none';
+}
+
+/**
+ * How long a restarted model run stays recorded when nothing consumes it.
+ *
+ * The consumer is LangChain's error callback, dispatched on a non-awaited
+ * queue, so a marker may legitimately sit unread for a while. A COUNT cap
+ * cannot tell that apart from a leak: a burst of concurrent restarts would
+ * evict markers whose callbacks were still queued, and each eviction turns an
+ * expected restart back into an error in the host's traces — the very thing
+ * the marker exists to prevent. Age can tell them apart, so the bound is time.
+ *
+ * It is a LEAK bound, not a deadline: nothing here can observe when the
+ * callback queue drains, so the window is set far past any latency that queue
+ * exhibits rather than tuned to it. A stall long enough to outlast this has
+ * already broken every other time-based assumption in the run.
+ */
+const PREEMPT_RESTARTED_RUN_TTL_MS = 300_000;
+
+/**
+ * Model runs whose provider stream was torn down for a restart, with the
+ * accumulated turn so the close can carry its usage.
+ *
+ * Recorded rather than inferred from the thrown error: aborting makes the
+ * provider adapter raise whatever IT raises for cancellation, and matching on
+ * that shape would bind the tracing layer to per-provider error identity. The
+ * run id is unambiguous and already captured for the seal path.
+ *
+ * The message rides along because the run closes through the error path, which
+ * carries no output: without it a discarded attempt would report no usage at
+ * all, and the reasoning tokens the provider already billed would vanish from
+ * cost accounting. The later synthetic `CHAT_MODEL_END` cannot repair that —
+ * by then the generation is closed.
+ *
+ * Insertion-ordered, so expiry sweeps from the front and stops at the first
+ * live entry.
+ */
+const preemptRestartedRuns = new Map<string, PreemptRestartedRun>();
+
+/**
+ * The `llmOutput` a discarded attempt closes with, so a restart reads as
+ * control flow rather than as an ordinary generation — `AGENTS.md` states that
+ * control flow is not an error, and a discarded turn is not an answer either.
+ *
+ * Shared so every close route emits it: which trigger fired must not change
+ * how the run looks in a trace.
+ */
+export const PREEMPT_RESTART_CONTROL_FLOW = {
+  controlFlow: 'PreemptRestart',
+} as const;
+
+/** A torn-down model run awaiting its tracing close. */
+export interface PreemptRestartedRun {
+  /** The accumulated turn, carrying whatever usage was resolved for it. */
+  message: AIMessageChunk;
+  recordedAt: number;
+}
+
+/**
+ * Armed while anything is recorded, so expiry does not depend on another
+ * restart arriving to trigger it. Without this the final burst before a quiet
+ * period would hold its messages for the life of the process — and a host that
+ * enables preemption without tracing never consumes a single record, so that
+ * burst is the common case, not the corner one.
+ *
+ * `unref`'d: reclaiming a few messages is never a reason to keep a process
+ * alive.
+ */
+let sweepTimer: ReturnType<typeof setTimeout> | undefined;
+
+function sweepExpiredRestartedRuns(now: number): void {
+  for (const [runId, record] of preemptRestartedRuns) {
+    if (now - record.recordedAt < PREEMPT_RESTARTED_RUN_TTL_MS) {
+      break;
+    }
+    preemptRestartedRuns.delete(runId);
+  }
+  if (preemptRestartedRuns.size === 0) {
+    if (sweepTimer != null) {
+      clearTimeout(sweepTimer);
+      sweepTimer = undefined;
+    }
+    return;
+  }
+  if (sweepTimer != null) {
+    return;
+  }
+  sweepTimer = setTimeout(() => {
+    sweepTimer = undefined;
+    sweepExpiredRestartedRuns(Date.now());
+  }, PREEMPT_RESTARTED_RUN_TTL_MS);
+  sweepTimer.unref();
+}
+
+/** Records a model run whose stream was torn down for a restart. */
+export function notePreemptRestartedRun(
+  runId: string,
+  message: AIMessageChunk
+): void {
+  const now = Date.now();
+  preemptRestartedRuns.set(runId, { message, recordedAt: now });
+  sweepExpiredRestartedRuns(now);
+}
+
+/**
+ * The record for a run that ended because a preempt discarded it, or
+ * `undefined`.
+ *
+ * Deliberately NON-consuming. A run can be closed through more than one
+ * tracing handler — a run-level one plus another supplied through the model's
+ * own `clientOptions.callbacks`, which `endSealedModelRun` already composes
+ * for exactly that reason — and each receives the same `handleLLMError`. A
+ * read that deleted the record would let only the first handler recognize the
+ * restart, and every other destination would export the same expected abort as
+ * an error. Reuse is not a concern the way it would be for a counter: run ids
+ * are UUIDs, and the sweep is what reclaims them.
+ */
+export function readPreemptRestartedRun(
+  runId: string
+): PreemptRestartedRun | undefined {
+  return preemptRestartedRuns.get(runId);
+}
+
+/**
+ * Drops a record whose run turned out not to need it — the adapter ignored the
+ * abort, so the tear-down never reached LangChain's error path and the close
+ * happens manually instead.
+ */
+export function forgetPreemptRestartedRun(runId: string): void {
+  if (!preemptRestartedRuns.delete(runId)) {
+    return;
+  }
+  if (preemptRestartedRuns.size === 0 && sweepTimer != null) {
+    clearTimeout(sweepTimer);
+    sweepTimer = undefined;
+  }
 }

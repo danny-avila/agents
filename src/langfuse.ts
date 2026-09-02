@@ -39,6 +39,10 @@ import {
   registerLangfuseManagedSpan,
   resolveLangfuseDestinationKey,
 } from '@/langfuseSpanRegistry';
+import {
+  readPreemptRestartedRun,
+  PREEMPT_RESTART_CONTROL_FLOW,
+} from '@/llm/preempt';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
 
 export {
@@ -670,6 +674,55 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
       runId,
       parentRunId
     );
+  }
+
+  /**
+   * A cooperative restart tears the provider stream down mid-flight, so the
+   * adapter reports cancellation and LangChain closes the generation through
+   * this path. That is control flow, not a failure — the graph catches it,
+   * injects, and calls the model again — so it closes as a successful
+   * generation rather than polluting an otherwise healthy trace with a failed
+   * one.
+   *
+   * Keyed on the run id the tear-down recorded, not on the error's shape:
+   * every provider adapter raises its own cancellation error, and matching on
+   * those would make the invariant depend on which provider served the call.
+   */
+  override handleLLMError(
+    ...args: Parameters<CallbackHandler['handleLLMError']>
+  ): ReturnType<CallbackHandler['handleLLMError']> {
+    const [, runId, parentRunId] = args;
+    const restarted = readPreemptRestartedRun(runId);
+    if (restarted != null) {
+      /**
+       * Closed WITH the discarded turn, not as an empty end. The provider
+       * consumed the whole prompt and may have billed reasoning tokens before
+       * the tear-down, and this is the only close the generation will get —
+       * the synthetic `CHAT_MODEL_END` that follows is a host stream event and
+       * cannot reopen it. Routed through the override so Bedrock usage is
+       * normalized exactly as it is for an ordinary end.
+       *
+       * The generation text stays empty on purpose: a discarded turn produced
+       * no answer, and replaying its reasoning as output would read as one.
+       *
+       * The lookup does not consume the record: a run can be closed through
+       * several handlers at once, and each must reach this branch rather than
+       * the first one leaving the others to export an error.
+       */
+      const generation: ChatGeneration = {
+        text: '',
+        message: restarted.message,
+      };
+      return this.handleLLMEnd(
+        {
+          generations: [[generation]],
+          llmOutput: PREEMPT_RESTART_CONTROL_FLOW,
+        },
+        runId,
+        parentRunId
+      );
+    }
+    return super.handleLLMError(...args);
   }
 
   override handleToolStart(
