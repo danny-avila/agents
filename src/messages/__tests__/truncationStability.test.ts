@@ -3,8 +3,10 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { AgentInputs, FadingTier } from '@/types/graph';
 import type { TokenCounter } from '@/types/run';
 import {
+  FADING_MIN_BUDGET_TOKENS,
   fadingBudgetTokens,
   fadingRungForBudget,
+  fadingRungForExchangeChars,
   fadingRungForResultChars,
   isFadingTier,
   isInformativeFadingTier,
@@ -20,7 +22,10 @@ import {
   createPruneMessages,
   projectToolCallInputs,
 } from '@/messages/prune';
-import { calculateMaxToolResultChars } from '@/utils/truncation';
+import {
+  calculateMaxToolCallInputChars,
+  calculateMaxToolResultChars,
+} from '@/utils/truncation';
 import { ContentTypes, Providers } from '@/common';
 import { StandardGraph } from '@/graphs/Graph';
 import { hasNonEmptyTextContent } from '@/messages/core';
@@ -1211,6 +1216,21 @@ describe('per-agent fading tier persistence', () => {
     expect(graph.getFadingTier()).toEqual(defaultTier);
   });
 
+  it('ignores malformed restored tiers instead of reporting them back', () => {
+    const graph = new StandardGraph({
+      agents: [graphAgent('default'), graphAgent('worker')],
+      fadingTier: { v: 1, budgetTokens: Number.NaN, masked: true } as FadingTier,
+      fadingTiers: {
+        worker: { v: 1, budgetTokens: 'abc', masked: true } as unknown as FadingTier,
+      },
+    });
+
+    expect(graph.agentContexts.get('default')?.fadingTier).toBeUndefined();
+    expect(graph.agentContexts.get('worker')?.fadingTier).toBeUndefined();
+    expect(graph.getFadingTier()).toBeUndefined();
+    expect(graph.getFadingTiers()).toEqual({});
+  });
+
   it('restores a tier learned after a persistent initial summary', () => {
     const postSummaryTier: FadingTier = {
       v: 1,
@@ -1249,5 +1269,74 @@ describe('per-agent fading tier persistence', () => {
 
     expect(Object.hasOwn(graph.getFadingTiers(), '__proto__')).toBe(true);
     expect(graph.getFadingTiers()['__proto__']).toEqual(tier);
+  });
+});
+
+describe('seedFadingTier provenance', () => {
+  it('keeps a never-tightened seed fresh so a pruner rebuild cannot pin later runs', () => {
+    const fresh = createFadingTier(200_000);
+    const reseeded = seedFadingTier(200_000, fresh);
+    expect(reseeded).toEqual(fresh);
+    expect(reseeded.latched).toBeUndefined();
+    expect(isInformativeFadingTier(reseeded, 200_000)).toBe(false);
+  });
+
+  it('latches a seed that was tightened, masked, already latched, or clamped', () => {
+    expect(seedFadingTier(200_000, { v: 1, budgetTokens: 50_000, masked: false })).toEqual({
+      v: 1,
+      budgetTokens: 50_000,
+      masked: false,
+      latched: true,
+    });
+    expect(seedFadingTier(200_000, { v: 1, budgetTokens: 200_000, masked: true })).toEqual({
+      v: 1,
+      budgetTokens: 200_000,
+      masked: true,
+      latched: true,
+    });
+    expect(
+      seedFadingTier(200_000, { v: 1, budgetTokens: 200_000, masked: false, latched: true })
+    ).toEqual({ v: 1, budgetTokens: 200_000, masked: false, latched: true });
+    expect(seedFadingTier(8_000, { v: 1, budgetTokens: 200_000, masked: false })).toEqual({
+      v: 1,
+      budgetTokens: 8_000,
+      masked: false,
+      latched: true,
+    });
+  });
+
+  it('clamps a sub-floor budget up to the ladder floor so caps stay positive', () => {
+    const seeded = seedFadingTier(200_000, { v: 1, budgetTokens: 1, masked: false });
+    expect(seeded.budgetTokens).toBe(FADING_MIN_BUDGET_TOKENS);
+    expect(seeded.latched).toBe(true);
+    expect(resolveFadingCaps(seeded).resultChars).toBeGreaterThan(0);
+    expect(resolveFadingCaps(seeded).inputChars).toBeGreaterThan(0);
+  });
+});
+
+describe('fadingRungForExchangeChars', () => {
+  it('deepens until a result plus its input fit, even when the result cap is tiny', () => {
+    const window = 200_000;
+    const target = 8_000;
+    const exchangeChars = (rung: number, maxToolResultChars?: number): number => {
+      const budget = fadingBudgetTokens(window, rung);
+      const resultChars = calculateMaxToolResultChars(budget);
+      return (
+        (maxToolResultChars == null
+          ? resultChars
+          : Math.min(resultChars, maxToolResultChars)) +
+        calculateMaxToolCallInputChars(budget)
+      );
+    };
+    for (const cap of [undefined, 1_000, 8_000]) {
+      const rung = fadingRungForExchangeChars(window, target, cap);
+      expect(rung).toBeGreaterThan(0);
+      expect(exchangeChars(rung, cap)).toBeLessThanOrEqual(target);
+      expect(exchangeChars(rung - 1, cap)).toBeGreaterThan(target);
+    }
+    /** A result-only rung would stop at rung 0 for a tiny configured cap. */
+    expect(fadingRungForResultChars(window, target, 1_000)).toBe(0);
+    expect(fadingRungForExchangeChars(window, 10_000_000)).toBe(0);
+    expect(fadingRungForExchangeChars(window, 1)).toBe(maxFadingRung(window));
   });
 });

@@ -21,6 +21,7 @@ import type {
   SessionEntry,
   SessionForkOptions,
 } from './types';
+import { isFadingTier } from '@/messages/fading';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import { createSummarizeNode } from '@/summarization/node';
@@ -373,10 +374,14 @@ function fadingScopeKey(threadId: string, checkpointNs = ''): string {
   return JSON.stringify([threadId, checkpointNs]);
 }
 
+/** Merges two tiers monotonically. A malformed side (a corrupt store line or
+ * host input) is ignored rather than poisoning the budget with `NaN`. */
 function mergeFadingTier(
-  current: t.FadingTier | undefined,
-  incoming: t.FadingTier | undefined
+  currentTier: t.FadingTier | undefined,
+  incomingTier: t.FadingTier | undefined
 ): t.FadingTier | undefined {
+  const current = isFadingTier(currentTier) ? currentTier : undefined;
+  const incoming = isFadingTier(incomingTier) ? incomingTier : undefined;
   if (current == null) {
     return incoming == null ? undefined : { ...incoming };
   }
@@ -413,10 +418,24 @@ function mergeFadingTiers(
   ]);
   return Object.fromEntries(
     [...agentIds].flatMap((agentId) => {
-      const tier = mergeFadingTier(current?.[agentId], incoming?.[agentId]);
+      const tier = mergeFadingTier(
+        ownFadingTier(current, agentId),
+        ownFadingTier(incoming, agentId)
+      );
       return tier == null ? [] : [[agentId, tier]];
     })
   );
+}
+
+/** Reads an agent's tier as an own property, so an ID such as `constructor`
+ * never resolves through the prototype chain. */
+function ownFadingTier(
+  tiers: t.FadingTiers | undefined,
+  agentId: string
+): t.FadingTier | undefined {
+  return tiers != null && Object.prototype.hasOwnProperty.call(tiers, agentId)
+    ? tiers[agentId]
+    : undefined;
 }
 
 function createCheckpointLookupConfig(config: RunnableConfig): RunnableConfig {
@@ -1058,14 +1077,13 @@ export class AgentSession {
       this.setFadingState(
         state.threadId,
         state.checkpointNs ?? '',
-        state.fadingTier == null ? undefined : { ...state.fadingTier },
+        isFadingTier(state.fadingTier) ? { ...state.fadingTier } : undefined,
         state.fadingTiers == null
           ? {}
           : Object.fromEntries(
-            Object.entries(state.fadingTiers).map(([agentId, tier]) => [
-              agentId,
-              { ...tier },
-            ])
+            Object.entries(state.fadingTiers).flatMap(([agentId, tier]) =>
+              isFadingTier(tier) ? [[agentId, { ...tier }] as const] : []
+            )
           )
       );
     }

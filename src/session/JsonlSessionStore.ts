@@ -83,6 +83,16 @@ function parseLine(line: string): SessionHeader | SessionEntry | undefined {
   }
 }
 
+/** A `session_state` line may carry `data: null`; only an object can hold fading state. */
+function hasFadingStateField(entry: SessionStateEntry): boolean {
+  const data: unknown = entry.data;
+  return (
+    data != null &&
+    typeof data === 'object' &&
+    Object.prototype.hasOwnProperty.call(data, 'fadingState')
+  );
+}
+
 function createHeader(options: CreateSessionFileOptions): SessionHeader {
   return {
     type: 'session',
@@ -387,10 +397,7 @@ export class JsonlSessionStore {
     let mainFound = mainThreadId == null;
     for (let i = this.entries.length - 1; i >= 0; i--) {
       const entry = this.entries[i];
-      if (
-        entry.type !== 'session_state' ||
-        !Object.prototype.hasOwnProperty.call(entry.data, 'fadingState')
-      ) {
+      if (entry.type !== 'session_state' || !hasFadingStateField(entry)) {
         continue;
       }
       if (entry.data.fadingState == null) {
@@ -423,9 +430,7 @@ export class JsonlSessionStore {
 
   hasFadingState(): boolean {
     return this.entries.some(
-      (entry) =>
-        entry.type === 'session_state' &&
-        Object.prototype.hasOwnProperty.call(entry.data, 'fadingState')
+      (entry) => entry.type === 'session_state' && hasFadingStateField(entry)
     );
   }
 

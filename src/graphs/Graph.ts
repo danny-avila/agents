@@ -163,7 +163,7 @@ import { initializeLangfuseTracing } from '@/instrumentation';
 import { shouldTriggerSummarization } from '@/summarization';
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
-import { isInformativeFadingTier } from '@/messages/fading';
+import { isFadingTier, isInformativeFadingTier } from '@/messages/fading';
 import { createSummarizeNode } from '@/summarization/node';
 import { getTruncationStopReason } from '@/llm/truncation';
 import { messagesStateReducer } from '@/messages/reducer';
@@ -1562,7 +1562,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       /** A supplied tier is assumed to describe the supplied history. Hosts
        * must clear it when they create a new summary; this also permits tiers
        * learned on turns after a durable summary to survive subsequent Runs. */
-      if (restoredFadingTier != null) {
+      if (isFadingTier(restoredFadingTier)) {
         agentContext.fadingTier = { ...restoredFadingTier };
       }
 

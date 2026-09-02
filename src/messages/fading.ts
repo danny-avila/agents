@@ -100,9 +100,26 @@ export function seedFadingTier(window: number, seed?: unknown): FadingTier {
   if (!isFadingTier(seed)) {
     return createFadingTier(window);
   }
+  /** The ladder never produces a budget below its floor, so a persisted one
+   * is corrupt; clamping it up keeps every cap positive. */
+  const budgetTokens = Math.max(
+    floorBudgetTokens(window),
+    Math.min(seed.budgetTokens, window)
+  );
+  /** Only a tier that was tightened, masked, or clamped carries information.
+   * A fresh tier re-seeded through a pruner rebuild must stay fresh, or it
+   * would be reported and pin later runs to this window. */
+  const informative =
+    seed.latched === true ||
+    seed.masked ||
+    budgetTokens !== seed.budgetTokens ||
+    budgetTokens < window;
+  if (!informative) {
+    return createFadingTier(window);
+  }
   return {
     v: FADING_TIER_VERSION,
-    budgetTokens: Math.min(seed.budgetTokens, window),
+    budgetTokens,
     masked: seed.masked,
     latched: true,
   };
@@ -158,6 +175,31 @@ export function fadingRungForBudget(
         : Math.min(windowResultChars, maxToolResultChars);
     const inputChars = calculateMaxToolCallInputChars(budgetTokens);
     if (width * (resultChars + inputChars) <= targetChars) {
+      return rung;
+    }
+  }
+  return deepest;
+}
+
+/**
+ * Shallowest rung at which one complete tool exchange (a fresh result plus its
+ * call input) fits within `targetChars`. The emergency pass uses it so a small
+ * configured result cap cannot satisfy the target while inputs stay uncapped.
+ */
+export function fadingRungForExchangeChars(
+  window: number,
+  targetChars: number,
+  maxToolResultChars?: number
+): number {
+  const deepest = maxFadingRung(window);
+  for (let rung = 0; rung < deepest; rung++) {
+    const budgetTokens = fadingBudgetTokens(window, rung);
+    const windowResultChars = calculateMaxToolResultChars(budgetTokens);
+    const resultChars =
+      maxToolResultChars == null
+        ? windowResultChars
+        : Math.min(windowResultChars, maxToolResultChars);
+    if (resultChars + calculateMaxToolCallInputChars(budgetTokens) <= targetChars) {
       return rung;
     }
   }

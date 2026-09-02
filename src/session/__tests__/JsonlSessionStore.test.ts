@@ -1,7 +1,7 @@
 import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 import { MemorySaver } from '@langchain/langgraph';
-import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { appendFile, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import {
   AIMessage,
   HumanMessage,
@@ -141,6 +141,32 @@ describe('JsonlSessionStore', () => {
   afterEach(async () => {
     jest.restoreAllMocks();
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it('opens a file whose session_state line carries null data', async () => {
+    const path = join(dir, 'null-state.jsonl');
+    const store = await JsonlSessionStore.create({
+      path,
+      cwd: dir,
+      sessionId: 'session-null-state',
+    });
+    await store.appendMessage(new HumanMessage('hello'));
+    await appendFile(
+      path,
+      `${JSON.stringify({
+        type: 'session_state',
+        id: 'state-null',
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        data: null,
+      })}\n`,
+      'utf8'
+    );
+
+    const reopened = await JsonlSessionStore.open(path);
+
+    expect(reopened.hasFadingState()).toBe(false);
+    expect(reopened.getFadingStates('session-null-state')).toEqual([]);
   });
 
   it('stores messages as an append-only tree and restores the active path', async () => {
@@ -1258,6 +1284,88 @@ describe('JsonlSessionStore', () => {
       .find((checkpoint) => checkpoint.data.source === 'reset');
     expect(tuple).toBeUndefined();
     expect(reset?.data.reason).toBe('branch');
+  });
+
+  it('ignores a malformed persisted tier instead of poisoning later merges', async () => {
+    const sessionPath = join(dir, 'corrupt-tier.jsonl');
+    const store = await JsonlSessionStore.create({
+      path: sessionPath,
+      cwd: dir,
+      sessionId: 'corrupt-tier-session',
+    });
+    await store.appendFadingState({
+      threadId: store.header.id,
+      fadingTier: { v: 1, budgetTokens: 'abc', masked: true } as unknown as t.FadingTier,
+      fadingTiers: {
+        default: { v: 1, budgetTokens: Number.NaN, masked: true } as t.FadingTier,
+      },
+    });
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const mockRun = createMockRun('ok');
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      sessionPath,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('first');
+    await session.run('second');
+
+    expect(capturedConfigs[0].fadingTier).toBeUndefined();
+    expect(capturedConfigs[0].fadingTiers ?? {}).toEqual({});
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
+  });
+
+  it('persists a tier for an agent whose ID is an object prototype key', async () => {
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const mockRun = createMockRun('ok');
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({ worker: fadingTier })
+      .mockReturnValueOnce({ constructor: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('first');
+    await session.run('second');
+    await session.run('third');
+
+    const tiers = capturedConfigs[2].fadingTiers ?? {};
+    expect(Object.hasOwn(tiers, 'constructor')).toBe(true);
+    expect(tiers.constructor).toEqual(fadingTier);
+    expect(tiers.worker).toEqual(fadingTier);
   });
 
   it('records run.failed when resumeInterrupt throws', async () => {

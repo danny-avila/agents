@@ -31,7 +31,7 @@ import {
 } from '@/utils/toolContent';
 import {
   MASKED_RESULT_MIN_CHARS,
-  fadingRungForResultChars,
+  fadingRungForExchangeChars,
   isFadingTier,
   resolveFadingCaps,
   resolveFadingTier,
@@ -3199,7 +3199,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         factoryParams.maxTokens,
         {
           ...fadingSignals,
-          minRung: fadingRungForResultChars(
+          minRung: fadingRungForExchangeChars(
             factoryParams.maxTokens,
             emergencyMaxChars,
             factoryParams.maxToolResultChars

@@ -22,6 +22,7 @@ import type {
 } from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import { isFadingTier } from '@/messages/fading';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import type { StandardGraph } from '@/graphs/Graph';
@@ -520,15 +521,14 @@ export class Run<_T extends t.BaseGraphState> {
     if (config.calibrationRatio != null && config.calibrationRatio > 0) {
       this.calibrationRatio = config.calibrationRatio;
     }
-    if (config.fadingTier != null) {
+    if (isFadingTier(config.fadingTier)) {
       this.fadingTier = { ...config.fadingTier };
     }
     if (config.fadingTiers != null) {
       this.fadingTiers = Object.fromEntries(
-        Object.entries(config.fadingTiers).map(([agentId, tier]) => [
-          agentId,
-          { ...tier },
-        ])
+        Object.entries(config.fadingTiers).flatMap(([agentId, tier]) =>
+          isFadingTier(tier) ? [[agentId, { ...tier }] as const] : []
+        )
       );
     }
 

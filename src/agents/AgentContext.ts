@@ -1739,6 +1739,9 @@ export class AgentContext {
     if (projection == null || sources == null || prefixChanged) {
       if (prefixChanged) {
         this.pruneMessages = undefined;
+        /** The originals map is keyed by index; a rewritten prefix would let
+         * the summarizer restore one tool's bytes onto another message. */
+        this.pendingOriginalToolContent = undefined;
         this.prepareProviderProjectionRecount(sources);
       }
       projection = messages.map((message) =>

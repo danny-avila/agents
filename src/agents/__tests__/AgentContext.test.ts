@@ -2096,6 +2096,29 @@ describe('AgentContext', () => {
     });
   });
 
+  describe('provider projection rebuild', () => {
+    it('drops the index-keyed original tool content when the canonical prefix changes', () => {
+      const context = createBasicContext();
+      const tool = new ToolMessage({
+        content: 'result',
+        tool_call_id: 'call-1',
+        name: 'tool',
+      });
+      const first = [new HumanMessage('a'), tool];
+      context.getProviderProjectedMessages(first);
+      context.preserveOriginalToolContent(new Map([[1, 'original result']]));
+      expect(context.pendingOriginalToolContent?.get(1)).toBe('original result');
+
+      const shifted = [new HumanMessage('inserted'), ...first];
+      context.getProviderProjectedMessages(shifted);
+      expect(context.pendingOriginalToolContent).toBeUndefined();
+
+      context.preserveOriginalToolContent(new Map([[2, 'original result']]));
+      context.getProviderProjectedMessages([...shifted, new AIMessage('done')]);
+      expect(context.pendingOriginalToolContent?.get(2)).toBe('original result');
+    });
+  });
+
   describe('reset()', () => {
     it('retains the stable-message token cache across resets', async () => {
       const tokenCounter = await createTokenCounter();
