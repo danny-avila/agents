@@ -132,10 +132,12 @@ export function fadingRungForResultChars(
 }
 
 /**
- * Shallowest rung at which a single fresh tool result fits within
- * `FIT_SHARE` of `rawTokens`, the effective budget in raw token space.
- * This is the fit guarantee: summarization never sees an empty context
- * because one result alone overflowed the budget.
+ * Shallowest rung at which both halves of a historical tool exchange fit:
+ * the fresh result and its tool-call input must each stay within `FIT_SHARE`
+ * of `rawTokens`, the effective budget in raw token space. Together they fit
+ * the whole effective budget, preventing orphan repair from dropping a result
+ * merely because its matching input used the room left by a configured result
+ * cap.
  */
 export function fadingRungForBudget(
   window: number,
@@ -145,11 +147,24 @@ export function fadingRungForBudget(
   if (!(rawTokens > 0)) {
     return 0;
   }
-  return fadingRungForResultChars(
+  const targetChars = Math.floor(rawTokens * FIT_SHARE) * 4;
+  const resultRung = fadingRungForResultChars(
     window,
-    Math.floor(rawTokens * FIT_SHARE) * 4,
+    targetChars,
     maxToolResultChars
   );
+  const deepest = maxFadingRung(window);
+  let inputRung = deepest;
+  for (let rung = 0; rung < deepest; rung++) {
+    if (
+      calculateMaxToolCallInputChars(fadingBudgetTokens(window, rung)) <=
+      targetChars
+    ) {
+      inputRung = rung;
+      break;
+    }
+  }
+  return Math.max(resultRung, inputRung);
 }
 
 /** Character caps for a tier; a pure function of `(budgetTokens, masked)`. */
@@ -187,8 +202,8 @@ export function resolveFadingCaps(
  * can escalate once at a rung boundary but never oscillate. Returns the same
  * object when nothing changes.
  *
- * - The fit rung guarantees a single tool result fits half the effective
- *   budget, so summarization never sees an empty context.
+ * - The fit rung guarantees a tool result and its matching call input each fit
+ *   half the effective budget, so their pair cannot empty the context.
  * - Pressure bands add rungs on top of the fit rung when summarization is
  *   off, mirroring the staged budget factors of progressive context fading.
  * - A window larger than the latched budget (model switch) does not loosen

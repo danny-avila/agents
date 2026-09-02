@@ -157,8 +157,8 @@ describe('fading ladder', () => {
     expect(fadingRungForBudget(100_000, 100_000)).toBe(0);
     expect(fadingRungForBudget(100_000, 60_000)).toBe(0);
     expect(fadingRungForBudget(100_000, 9_400)).toBe(3);
-    expect(fadingRungForBudget(100_000, 9_400, 1_000)).toBe(0);
-    expect(fadingRungForBudget(100_000, 9_400, 0)).toBe(0);
+    expect(fadingRungForBudget(100_000, 9_400, 1_000)).toBe(2);
+    expect(fadingRungForBudget(100_000, 9_400, 0)).toBe(2);
     expect(fadingRungForBudget(100_000, 0)).toBe(0);
     expect(
       calculateMaxToolResultChars(
@@ -281,7 +281,7 @@ describe('fading ladder', () => {
     expect(caps.consumedChars).toBe(caps.resultChars);
   });
 
-  it('does not deepen the tier when a configured result cap already fits', () => {
+  it('does not over-deepen when a configured result cap already fits', () => {
     const tier = resolveFadingTier(
       createFadingTier(100_000),
       100_000,
@@ -293,10 +293,15 @@ describe('fading ladder', () => {
       1_000
     );
 
-    expect(tier).toEqual(createFadingTier(100_000));
+    expect(tier).toEqual({
+      v: 1,
+      budgetTokens: 25_000,
+      masked: false,
+      latched: true,
+    });
     expect(resolveFadingCaps(tier, 1_000)).toMatchObject({
       resultChars: 1_000,
-      inputChars: 60_000,
+      inputChars: 15_000,
     });
   });
 
