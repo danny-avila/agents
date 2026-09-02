@@ -24,6 +24,7 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.overflowRecoveryAttempts).toBe(1);
     /** Forces the pruner to be rebuilt against the corrected budget. */
     expect(context.pruneMessages).toBeUndefined();
+    expect(context.overflowRecoveryContextWindow).toBe(1_000_000);
   });
 
   it('summarizes the first overflow when deterministic pruning is unavailable', () => {

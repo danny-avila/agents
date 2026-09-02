@@ -4099,6 +4099,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               localMeasurement?.contextBudget ??
               fallbackContext?.maxContextTokens ??
               agentContext.maxContextTokens,
+            totalContextWindowTokens:
+              localMeasurement != null
+                ? localMeasurement.contextBudget
+                : (fallbackContext?.maxContextTokens ??
+                  agentContext.overflowRecoveryContextWindow),
             estimatedPromptTokens: recoveryPromptEstimate,
             calibrationRatio: agentContext.calibrationRatio,
             instructionTokens: agentContext.instructionTokens,

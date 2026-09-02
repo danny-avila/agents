@@ -236,6 +236,23 @@ describe('ambiguous signatures require corroboration', () => {
     expect(info?.limitTokens).toBe(200_000);
   });
 
+  it('prefers nested definitive numberless evidence over an ambiguous wrapper', () => {
+    const info = getContextOverflowInfo(
+      {
+        message:
+          'request exceeds the context window or max output of every backend',
+        cause: { code: 'context_length_exceeded' },
+      },
+      {
+        provider: Providers.ANTHROPIC,
+        estimatedPromptTokens: 34,
+        maxContextTokens: 828_400,
+      }
+    );
+
+    expect(info?.kind).toBe('context_window');
+  });
+
   it('accepts definitive numberless Bedrock input errors without local pressure', () => {
     for (const model of [
       'us.anthropic.claude-sonnet-4-5-20250929-v1:0',

@@ -105,6 +105,9 @@ export function completionSharesContextWindow(
  * a recoverable error still yields the numbers when the provider reported
  * them.
  */
+const AMBIGUOUS_GATEWAY_RE =
+  /(?:context window[\s\S]{0,80}\bor\b[\s\S]{0,80}max(?:imum)? output|max(?:imum)? output[\s\S]{0,80}\bor\b[\s\S]{0,80}context window)/i;
+
 const OVERFLOW_PATTERNS: readonly OverflowPattern[] = [
   /** Anthropic, and Bedrock's passthrough of the same upstream. */
   {
@@ -191,7 +194,7 @@ const OVERFLOW_PATTERNS: readonly OverflowPattern[] = [
   /** Gateway disjunction: corroborate unless a nested pattern reported facts. */
   {
     kind: 'context_window',
-    re: /(?:context window[\s\S]{0,80}\bor\b[\s\S]{0,80}max(?:imum)? output|max(?:imum)? output[\s\S]{0,80}\bor\b[\s\S]{0,80}context window)/i,
+    re: AMBIGUOUS_GATEWAY_RE,
     rejectsLowContextPressure: true,
   },
   /** OpenAI-compatible error code, and the phrases LangChain itself keys on. */
@@ -216,6 +219,22 @@ const OVERFLOW_PATTERNS: readonly OverflowPattern[] = [
     requiresContextPressure: true,
   },
 ] as const;
+
+function hasIndependentDefinitiveOverflow(parts: readonly string[]): boolean {
+  return parts.some((part) => {
+    const text = stripUrls(part);
+    if (AMBIGUOUS_GATEWAY_RE.test(text)) {
+      return false;
+    }
+    return OVERFLOW_PATTERNS.some(
+      (pattern) =>
+        pattern.kind === 'context_window' &&
+        pattern.requiresContextPressure !== true &&
+        pattern.rejectsLowContextPressure !== true &&
+        pattern.re.test(text)
+    );
+  });
+}
 
 /**
  * Errors that mention size or limits but are NOT recoverable by compaction.
@@ -279,30 +298,29 @@ function asRecord(value: unknown): NestedErrorShape | undefined {
  * LangChain's `ContextOverflowError` keeps the original API error under
  * `cause`, and the OpenAI SDK nests the body under `error`.
  */
-function collectErrorText(error: unknown, depth = 0): string {
+/** Keeps independently reported error fields separate for provenance checks. */
+function collectErrorTextParts(error: unknown, depth = 0): string[] {
   if (error == null || depth > MAX_CAUSE_DEPTH) {
-    return '';
+    return [];
   }
   if (typeof error === 'string') {
-    return error;
+    return [error];
   }
   const record = asRecord(error);
   if (record == null) {
-    return String(error);
+    return [String(error)];
   }
 
   const parts: string[] = [];
-  if (typeof record.message === 'string') {
-    parts.push(record.message);
-  }
-  for (const reason of [
+  for (const value of [
+    record.message,
     record.code,
     record.type,
     record.status,
     record.reason,
   ]) {
-    if (typeof reason === 'string') {
-      parts.push(reason);
+    if (typeof value === 'string') {
+      parts.push(value);
     }
   }
   for (const nested of [
@@ -312,22 +330,20 @@ function collectErrorText(error: unknown, depth = 0): string {
     record.data,
     record.response,
   ]) {
-    if (nested == null) {
-      continue;
-    }
-    parts.push(
-      typeof nested === 'string' ? nested : collectErrorText(nested, depth + 1)
-    );
+    parts.push(...collectErrorTextParts(nested, depth + 1));
   }
   if (parts.length === 0) {
     try {
-      /** Non-objects returned above, so this always yields a string. */
-      return JSON.stringify(error);
+      return [JSON.stringify(error)];
     } catch {
-      return String(error);
+      return [String(error)];
     }
   }
-  return parts.join(' ');
+  return parts;
+}
+
+function collectErrorText(error: unknown): string {
+  return collectErrorTextParts(error).join(' ');
 }
 
 /** Strips URLs so their path segments cannot trip the negative matchers. */
@@ -466,6 +482,7 @@ export function getContextOverflowInfo(
   context?: ContextOverflowContext
 ): ContextOverflowInfo | null {
   const provider = context?.provider;
+  const errorTextParts = collectErrorTextParts(error);
   const haystack = stripUrls(collectErrorText(error));
   if (haystack === '') {
     return null;
@@ -499,6 +516,9 @@ export function getContextOverflowInfo(
       pattern.rejectsLowContextPressure === true &&
       contextPressure === false
     ) {
+      if (hasIndependentDefinitiveOverflow(errorTextParts)) {
+        continue;
+      }
       return null;
     }
 

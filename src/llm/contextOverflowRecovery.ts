@@ -72,6 +72,11 @@ export interface OverflowRecoveryParams {
   provider: ProviderName;
   /** Budget in force when the rejected prompt was built. */
   maxContextTokens?: number;
+  /**
+   * Provider's unmodified total context window. Unlike `maxContextTokens`,
+   * this remains stable after a prior recovery retargets the prompt budget.
+   */
+  totalContextWindowTokens?: number;
   /** Our own estimate of the prompt we actually sent. */
   estimatedPromptTokens?: number;
   /** Provider/local calibration already applied to the prompt estimate. */
@@ -235,6 +240,7 @@ export function planContextOverflowRecovery({
   error,
   provider,
   maxContextTokens,
+  totalContextWindowTokens,
   estimatedPromptTokens,
   calibrationRatio,
   instructionTokens,
@@ -276,7 +282,7 @@ export function planContextOverflowRecovery({
 
   const target = resolveTargetBudget(
     info,
-    maxContextTokens,
+    totalContextWindowTokens ?? maxContextTokens,
     estimatedPromptTokens,
     configuredCompletionTokens
   );

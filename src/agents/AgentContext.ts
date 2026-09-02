@@ -1608,6 +1608,13 @@ export class AgentContext {
     return this._overflowRecoveryAttempts;
   }
 
+  /** Total provider window captured before recovery began retargeting the prompt budget. */
+  get overflowRecoveryContextWindow(): number | undefined {
+    return this._overflowRecoveryAttempts > 0
+      ? this._preOverflowMaxContextTokens
+      : this.maxContextTokens;
+  }
+
   shouldSummarizeOverflow(): boolean {
     return (
       this.summarizationEnabled === true &&
