@@ -160,6 +160,37 @@ describe('ambiguous signatures require corroboration', () => {
       })
     ).toBeNull();
   });
+
+  it('counts the completion allowance when corroborating an ambiguous match', () => {
+    const error = new Error(
+      'request exceeds the context window or max output of every backend'
+    );
+
+    expect(
+      getContextOverflowInfo(error, {
+        provider: Providers.ANTHROPIC,
+        estimatedPromptTokens: 70_000,
+        configuredCompletionTokens: 64_000,
+        maxContextTokens: 128_000,
+      })
+    ).not.toBeNull();
+  });
+
+  it('accepts definitive numberless Bedrock input errors without local pressure', () => {
+    for (const model of [
+      'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+      'us.amazon.nova-lite-v1:0',
+    ]) {
+      const signature = OVERFLOW_SIGNATURES.find((s) => s.model === model);
+      expect(
+        getContextOverflowInfo(signature?.error, {
+          provider: Providers.BEDROCK,
+          estimatedPromptTokens: 10,
+          maxContextTokens: 200_000,
+        })
+      ).not.toBeNull();
+    }
+  });
 });
 
 describe('prompt size is separated from completion-inclusive totals', () => {

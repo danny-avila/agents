@@ -379,6 +379,37 @@ describe('planContextOverflowRecovery', () => {
     expect(plan).toBeNull();
   });
 
+  it('recovers an ambiguous rejection when the full request is near the window', () => {
+    const plan = planContextOverflowRecovery({
+      error: new Error(
+        'request exceeds the context window or max output of every backend'
+      ),
+      provider: Providers.ANTHROPIC,
+      maxContextTokens: 128_000,
+      estimatedPromptTokens: 70_000,
+      configuredCompletionTokens: 64_000,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan).not.toBeNull();
+  });
+
+  it('declines numberless recovery when completion alone fills the window', () => {
+    const bedrock = signatureFor(
+      'us.anthropic.claude-sonnet-4-5-20250929-v1:0'
+    );
+    const plan = planContextOverflowRecovery({
+      error: bedrock.error,
+      provider: Providers.BEDROCK,
+      maxContextTokens: 64_000,
+      estimatedPromptTokens: 1_000,
+      configuredCompletionTokens: 64_000,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan).toBeNull();
+  });
+
   it('successive recoveries keep shrinking', () => {
     const bedrock = signatureFor(
       'us.anthropic.claude-sonnet-4-5-20250929-v1:0'

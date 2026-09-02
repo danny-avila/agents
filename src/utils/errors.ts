@@ -85,6 +85,8 @@ export interface ContextOverflowContext {
   estimatedPromptTokens?: number;
   /** The budget we believed applied when we built that prompt. */
   maxContextTokens?: number;
+  /** Completion allowance reserved against the same context window. */
+  configuredCompletionTokens?: number;
 }
 
 /**
@@ -220,6 +222,14 @@ const OUTPUT_LIMIT_RE =
   /max_?(?:completion_?)?tokens\s*(?:must be|is too|cannot|exceeds|too large|greater than)|maximum number of output tokens|max_tokens.*less than or equal/i;
 
 /**
+ * A gateway can emit this disjunction when no configured backend can accept
+ * the request. It does not say whether the input window or output allowance
+ * was binding, so local request pressure must corroborate it before pruning.
+ */
+const AMBIGUOUS_CONTEXT_OR_OUTPUT_RE =
+  /(?:context window[\s\S]{0,80}\bor\b[\s\S]{0,80}max(?:imum)? output|max(?:imum)? output[\s\S]{0,80}\bor\b[\s\S]{0,80}context window)/i;
+
+/**
  * Recovers the input-only figure from providers that quote a combined total
  * and then break it down — OpenRouter's "(56811 of text input, 16 in the
  * output)" and DeepSeek's "(1179652 in the messages, 16 in the completion)".
@@ -351,9 +361,10 @@ function resolvePromptTokens(
 }
 
 /**
- * True when the caller's own accounting says the failed prompt was close
+ * True when the caller's own accounting says the failed request was close
  * enough to the budget that an otherwise ambiguous provider error is best
- * explained by overflow.
+ * explained by overflow. The completion allowance shares the model context
+ * window, so pressure is based on the whole request rather than prompt alone.
  */
 function getContextPressure(
   context?: ContextOverflowContext
@@ -369,7 +380,14 @@ function getContextPressure(
   ) {
     return undefined;
   }
-  return estimated / budget >= CONTEXT_PRESSURE_RATIO;
+  const configuredCompletion = context?.configuredCompletionTokens;
+  const completion =
+    configuredCompletion != null &&
+    Number.isFinite(configuredCompletion) &&
+    configuredCompletion > 0
+      ? configuredCompletion
+      : 0;
+  return (estimated + completion) / budget >= CONTEXT_PRESSURE_RATIO;
 }
 
 function isLangChainOverflowError(error: unknown): boolean {
@@ -455,6 +473,15 @@ export function getContextOverflowInfo(
   const contextPressure = getContextPressure(context);
   const underContextPressure = contextPressure === true;
 
+  /** This gateway message names two incompatible causes and needs evidence. */
+  if (
+    !langChainFlagged &&
+    AMBIGUOUS_CONTEXT_OR_OUTPUT_RE.test(haystack) &&
+    !underContextPressure
+  ) {
+    return null;
+  }
+
   for (const pattern of OVERFLOW_PATTERNS) {
     const match = haystack.match(pattern.re);
     if (match == null) {
@@ -465,19 +492,6 @@ export function getContextOverflowInfo(
     }
     const limitTokens = readNumber(match, pattern.limitGroup);
     const requestedTokens = readNumber(match, pattern.requestedGroup);
-
-    /**
-     * A numberless text match cannot override direct evidence that the prompt
-     * is comfortably inside the configured window. Propagating the provider
-     * error is safer than discarding conversation history on a blind retry.
-     */
-    if (
-      limitTokens == null &&
-      requestedTokens == null &&
-      contextPressure === false
-    ) {
-      continue;
-    }
 
     /**
      * A token-bucket rejection is only unrecoverable-by-waiting when the

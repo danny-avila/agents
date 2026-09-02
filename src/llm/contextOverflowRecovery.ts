@@ -175,6 +175,14 @@ function resolveTargetBudget(
 
     return promptCeiling * CEILING_HEADROOM_RATIO;
   }
+  /** With no provider ceiling, the configured window is the only safe bound. */
+  if (
+    isUsable(maxContextTokens) &&
+    isUsable(configuredCompletionTokens) &&
+    configuredCompletionTokens >= maxContextTokens
+  ) {
+    return null;
+  }
   if (isUsable(estimatedPromptTokens)) {
     return estimatedPromptTokens * BLIND_SHRINK_RATIO;
   }
@@ -212,6 +220,7 @@ export function planContextOverflowRecovery({
     provider,
     estimatedPromptTokens,
     maxContextTokens,
+    configuredCompletionTokens,
   });
   if (info == null) {
     return null;
