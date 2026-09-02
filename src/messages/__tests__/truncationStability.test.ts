@@ -314,6 +314,39 @@ describe('preFlightTruncateToolResults stability', () => {
   });
 });
 
+describe('projectToolCallInputs proxy safety', () => {
+  it('sanitizes a proxied nested tool call without invoking its traps', () => {
+    const nestedToolCall = new Proxy(
+      {},
+      {
+        ownKeys: () => {
+          throw new Error('ownKeys trap must not run');
+        },
+        getOwnPropertyDescriptor: () => {
+          throw new Error('descriptor trap must not run');
+        },
+      }
+    );
+    const message = new AIMessage({
+      content: [
+        {
+          type: 'tool_call',
+          tool_call: nestedToolCall,
+        } as never,
+      ],
+    });
+
+    const [projected] = projectToolCallInputs([message], 1_000);
+    const block = projected.content[0] as unknown as {
+      tool_call: { args: unknown };
+    };
+
+    expect(block.tool_call).toEqual({
+      args: '[Property accessor omitted]',
+    });
+  });
+});
+
 describe('maskConsumedToolResults stability', () => {
   it('masks a consumed result to the same bytes however many consumed results exist', () => {
     const snapshots = [1, 3, 12].map((rounds) => {
@@ -965,8 +998,8 @@ describe('per-agent fading tier persistence', () => {
     expect(graph.getFadingTier()).toEqual(defaultTier);
   });
 
-  it('does not restore a pre-compaction tier onto an initial summary', () => {
-    const staleTier: FadingTier = {
+  it('restores a tier learned after a persistent initial summary', () => {
+    const postSummaryTier: FadingTier = {
       v: 1,
       budgetTokens: 25_000,
       masked: true,
@@ -979,11 +1012,13 @@ describe('per-agent fading tier persistence', () => {
           initialSummary: { text: 'Compacted history', tokenCount: 10 },
         },
       ],
-      fadingTier: staleTier,
-      fadingTiers: { default: staleTier },
+      fadingTier: postSummaryTier,
+      fadingTiers: { default: postSummaryTier },
     });
 
-    expect(graph.agentContexts.get('default')?.fadingTier).toBeUndefined();
+    expect(graph.agentContexts.get('default')?.fadingTier).toEqual(
+      postSummaryTier
+    );
   });
 
   it('round-trips prototype-sensitive agent IDs', () => {

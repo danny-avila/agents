@@ -1551,11 +1551,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       } else if (agentConfig.agentId === agents[0].agentId) {
         restoredFadingTier = fadingTier;
       }
-      if (
-        restoredFadingTier != null &&
-        (agentConfig.initialSummary?.text == null ||
-          agentConfig.initialSummary.text === '')
-      ) {
+      /** A supplied tier is assumed to describe the supplied history. Hosts
+       * must clear it when they create a new summary; this also permits tiers
+       * learned on turns after a durable summary to survive subsequent Runs. */
+      if (restoredFadingTier != null) {
         agentContext.fadingTier = { ...restoredFadingTier };
       }
 

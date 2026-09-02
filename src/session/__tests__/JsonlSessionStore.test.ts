@@ -1388,6 +1388,42 @@ describe('JsonlSessionStore', () => {
     expect(capturedConfigs[0].fadingTiers).toBeUndefined();
   });
 
+  it('carries a tier learned after compaction into the next summarized run', async () => {
+    mockSummarizer('summary of prior work');
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendMessage(new HumanMessage('old'));
+    await session.getSessionStore()?.appendMessage(new AIMessage('old answer'));
+
+    await session.compact({ retainRecentTurns: 0 });
+    await session.run('first post-compaction turn');
+    await session.run('second post-compaction turn');
+
+    expect(capturedConfigs[0].fadingTier).toBeUndefined();
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
+  });
+
   it('carries calibration ratio forward after resumeInterrupt', async () => {
     const mockRun = createMockRun('resumed');
     mockRun.getCalibrationRatio.mockReturnValue(2);

@@ -1714,8 +1714,10 @@ export class AgentContext {
     const prefixChanged =
       sources != null &&
       (messages.length < sources.length ||
-        (priorLength > 0 &&
-          messages[priorLength - 1] !== sources[priorLength - 1]));
+        (messages.length === priorLength
+          ? sources.some((source, index) => messages[index] !== source)
+          : priorLength > 0 &&
+            messages[priorLength - 1] !== sources[priorLength - 1]));
 
     if (projection == null || sources == null || prefixChanged) {
       if (prefixChanged) {

@@ -1690,10 +1690,9 @@ function projectInlineToolInput(
       nestedChanges
     );
     if (Object.keys(nestedChanges).length > 0) {
-      changes.tool_call = cloneWithProjectedProperties(
-        nestedProperty.value,
-        nestedChanges
-      );
+      changes.tool_call = isProxy(nestedProperty.value)
+        ? { args: ACCESSOR_INPUT_PLACEHOLDER }
+        : cloneWithProjectedProperties(nestedProperty.value, nestedChanges);
     } else if (!nestedProperty.own) {
       changes.tool_call = nestedProperty.value;
     }
