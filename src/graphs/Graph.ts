@@ -115,6 +115,7 @@ import {
   isLangfuseCallbackHandler,
 } from '@/langfuse';
 import {
+  getConfiguredCompletionTokens,
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
   translateRecoveryBudget,
@@ -453,26 +454,6 @@ function clearCurrentDeltaStepMarkers({
     graph.messageStepHasTextDeltas.delete(stepId);
     graph.reasoningStepHasDeltas.delete(stepId);
   }
-}
-
-/**
- * The completion allowance the caller configured, under whichever key the
- * provider's client uses. Providers count it against the same ceiling as the
- * prompt, so overflow recovery has to reserve it when the error did not
- * itemize the total.
- */
-function getConfiguredCompletionTokens(
-  clientOptions: t.ClientOptions | undefined
-): number | undefined {
-  const options = clientOptions as
-    | { maxTokens?: unknown; maxOutputTokens?: unknown }
-    | undefined;
-  for (const value of [options?.maxTokens, options?.maxOutputTokens]) {
-    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
-      return value;
-    }
-  }
-  return undefined;
 }
 
 /**
@@ -4200,6 +4181,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   provider: agentContext.provider,
                   estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
                   maxContextTokens: agentContext.maxContextTokens,
+                  configuredCompletionTokens: getConfiguredCompletionTokens(
+                    agentContext.clientOptions
+                  ),
                 },
                 prepareProviderRequest: ({
                   model: fallbackModel,

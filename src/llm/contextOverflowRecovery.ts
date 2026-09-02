@@ -18,7 +18,7 @@
  * provider-space budget.
  */
 import type { ContextOverflowInfo } from '@/utils/errors';
-import type { ProviderName } from '@/types';
+import type { ClientOptions, ProviderName } from '@/types';
 import { getContextOverflowInfo } from '@/utils/errors';
 
 /** Fraction of the previous budget used when the provider named no ceiling. */
@@ -95,6 +95,21 @@ export interface OverflowRecoveryParams {
 
 function isUsable(value: number | undefined): value is number {
   return value != null && Number.isFinite(value) && value > 0;
+}
+
+/** Reads the completion allowance under whichever key the client uses. */
+export function getConfiguredCompletionTokens(
+  clientOptions: ClientOptions | undefined
+): number | undefined {
+  const options = clientOptions as
+    | { maxTokens?: unknown; maxOutputTokens?: unknown }
+    | undefined;
+  for (const value of [options?.maxTokens, options?.maxOutputTokens]) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 /**

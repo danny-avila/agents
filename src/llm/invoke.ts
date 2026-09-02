@@ -55,6 +55,7 @@ import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
+import { getConfiguredCompletionTokens } from '@/llm/contextOverflowRecovery';
 import { appendCallbacks } from '@/utils/callbacks';
 import { composeAbortSignals } from '@/utils/misc';
 import { initializeModel } from '@/llm/init';
@@ -1669,6 +1670,9 @@ export async function tryFallbackProviders({
       const fallbackOverflowContext: ContextOverflowContext = {
         provider: fb.provider,
         maxContextTokens: fb.maxContextTokens,
+        configuredCompletionTokens: getConfiguredCompletionTokens(
+          fb.clientOptions
+        ),
         ...(overflowContext?.provider === fb.provider
           ? {
             estimatedPromptTokens: overflowContext.estimatedPromptTokens,
