@@ -64,6 +64,8 @@ export function applyContextPruning(params: {
   tokenCounter: TokenCounter;
   config?: ContextPruningConfig;
   resolvedSettings?: ContextPruningSettings;
+  /** Carries caller-owned provenance across immutable message replacement. */
+  onMessageCloned?: (source: BaseMessage, clone: BaseMessage) => void;
 }): ContextPruningResult {
   const {
     messages,
@@ -156,6 +158,7 @@ export function applyContextPruning(params: {
           message as ToolMessage,
           compacted.content
         );
+        params.onMessageCloned?.(message, cloned);
         messages[i] = cloned;
         indexTokenCountMap[i] = tokenCounter(cloned);
         softTrimmed++;
@@ -169,6 +172,7 @@ export function applyContextPruning(params: {
         message as ToolMessage,
         settings.hardClear.placeholder
       );
+      params.onMessageCloned?.(message, cloned);
       messages[i] = cloned;
       indexTokenCountMap[i] = tokenCounter(cloned);
       hardCleared++;
@@ -187,6 +191,7 @@ export function applyContextPruning(params: {
             settings.softTrim
           )
         );
+        params.onMessageCloned?.(message, cloned);
         messages[i] = cloned;
         indexTokenCountMap[i] = tokenCounter(cloned);
         softTrimmed++;

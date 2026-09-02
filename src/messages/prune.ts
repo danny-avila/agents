@@ -21,7 +21,6 @@ import {
   MIN_JSON_VALUE_CHARS,
   calculateMaxToolCallInputChars,
   calculateMaxToolResultChars,
-  truncateToolResultContent,
 } from '@/utils/truncation';
 import {
   cloneToolMessageWithContent,
@@ -1157,8 +1156,6 @@ type FadingApplyParams = {
   originalContentStore?: Map<number, string>;
   /** Canonical pre-fading content keyed by live message for tier escalation. */
   canonicalContentStore?: WeakMap<BaseMessage, BaseMessage['content']>;
-  /** Canonical pre-fading AI messages for tool-call input escalation. */
-  canonicalMessageStore?: WeakMap<BaseMessage, BaseMessage>;
   /** Called after storing a newly captured entry. */
   onContentStored?: (index: number, content: string) => void;
 };
@@ -1259,7 +1256,6 @@ export function applyFadingCaps(params: FadingApplyParams): FadingApplyResult {
       indexTokenCountMap,
       tokenCounter,
       fromIndex,
-      canonicalMessageStore: params.canonicalMessageStore,
     })
     : 0;
 
@@ -1465,14 +1461,19 @@ function cloneAIMessageWithProjectedStreamContent(
   ) as AIMessage | AIMessageChunk;
 }
 
+const TOOL_INPUT_TRUNCATION_MARKER = '… [truncated]\n';
+
 function createBoundedTruncationValue(
   preview: string,
   originalChars: number,
   maxChars: number
 ): unknown {
   const normalizedMaxChars = normalizeToolInputLimit(maxChars);
+  const canonicalPrefix = preview.startsWith(TOOL_INPUT_TRUNCATION_MARKER)
+    ? preview.slice(TOOL_INPUT_TRUNCATION_MARKER.length)
+    : preview;
   const emptyEnvelope = {
-    _truncated: '',
+    _truncated: TOOL_INPUT_TRUNCATION_MARKER,
     _originalChars: originalChars,
   };
   if (JSON.stringify(emptyEnvelope).length > normalizedMaxChars) {
@@ -1491,11 +1492,12 @@ function createBoundedTruncationValue(
   }
 
   let low = 0;
-  let high = Math.min(preview.length, normalizedMaxChars);
+  let high = Math.min(canonicalPrefix.length, normalizedMaxChars);
   while (low < high) {
     const next = Math.ceil((low + high) / 2);
     const candidate = {
-      _truncated: preview.slice(0, next),
+      _truncated:
+        TOOL_INPUT_TRUNCATION_MARKER + canonicalPrefix.slice(0, next),
       _originalChars: originalChars,
     };
     if (JSON.stringify(candidate).length <= normalizedMaxChars) {
@@ -1504,15 +1506,47 @@ function createBoundedTruncationValue(
       high = next - 1;
     }
   }
-  const truncationMarker = '… [truncated]';
-  const boundedPreview =
-    low < preview.length && low >= truncationMarker.length
-      ? preview.slice(0, low - truncationMarker.length) + truncationMarker
-      : preview.slice(0, low);
   return {
-    _truncated: boundedPreview,
+    // Keep the marker separate from a pure canonical prefix so another,
+    // slightly smaller cap can be derived without nesting the envelope.
+    _truncated:
+      TOOL_INPUT_TRUNCATION_MARKER + canonicalPrefix.slice(0, low),
     _originalChars: originalChars,
   };
+}
+
+function readBoundedTruncationValue(
+  input: unknown
+): { preview: string; originalChars: number } | undefined {
+  if (input == null || typeof input !== 'object' || isProxy(input)) {
+    return undefined;
+  }
+  try {
+    const prototype = Object.getPrototypeOf(input);
+    const keys = Object.keys(input);
+    if (
+      (prototype !== Object.prototype && prototype !== null) ||
+      keys.length !== 2 ||
+      !keys.includes('_truncated') ||
+      !keys.includes('_originalChars')
+    ) {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  const preview = readPropertyWithoutAccessors(input, '_truncated');
+  const originalChars = readPropertyWithoutAccessors(input, '_originalChars');
+  return preview.own &&
+    !preview.accessor &&
+    typeof preview.value === 'string' &&
+    originalChars.own &&
+    !originalChars.accessor &&
+    typeof originalChars.value === 'number' &&
+    Number.isFinite(originalChars.value) &&
+    originalChars.value >= 0
+    ? { preview: preview.value, originalChars: originalChars.value }
+    : undefined;
 }
 
 function projectToolInputWithinLimit(
@@ -1520,11 +1554,33 @@ function projectToolInputWithinLimit(
   maxChars: number
 ): ToolInputProjection {
   const normalizedMaxChars = normalizeToolInputLimit(maxChars);
-  const serialized = serializeStructuredValueBounded(input, normalizedMaxChars);
+  const priorTruncation = readBoundedTruncationValue(input);
+  if (priorTruncation != null) {
+    const serializedLength = serializeStructuredValueBounded(
+      input,
+      normalizedMaxChars
+    );
+    if (!serializedLength.truncated) {
+      return { value: input, changed: false };
+    }
+    return {
+      value: createBoundedTruncationValue(
+        priorTruncation.preview,
+        priorTruncation.originalChars,
+        normalizedMaxChars
+      ),
+      changed: true,
+    };
+  }
+  const serialized = serializeStructuredValueBounded(
+    input,
+    normalizedMaxChars,
+    normalizedMaxChars
+  );
   if (serialized.truncated) {
     return {
       value: createBoundedTruncationValue(
-        serialized.content,
+        serialized.prefix,
         serialized.originalChars,
         normalizedMaxChars
       ),
@@ -1561,13 +1617,14 @@ export function serializeToolCallInput(
   const projected = projectToolInputWithinLimit(input, normalizedMaxChars);
   const serialized = serializeStructuredValueBounded(
     projected.value,
+    normalizedMaxChars,
     normalizedMaxChars
   );
   if (!serialized.truncated) {
     return serialized.content === 'undefined' ? 'null' : serialized.content;
   }
   const fallback = createBoundedTruncationValue(
-    serialized.content,
+    serialized.prefix,
     serialized.originalChars,
     normalizedMaxChars
   );
@@ -1651,8 +1708,54 @@ function projectSerializedArguments(
   if (typeof value === 'string' && value.length <= normalizedMaxChars) {
     return { value, changed: false };
   }
+  if (
+    typeof value === 'string' &&
+    value.includes('"_truncated"') &&
+    value.includes('"_originalChars"')
+  ) {
+    try {
+      const priorTruncation = readBoundedTruncationValue(JSON.parse(value));
+      if (priorTruncation != null) {
+        return {
+          value: JSON.stringify(
+            createBoundedTruncationValue(
+              priorTruncation.preview,
+              priorTruncation.originalChars,
+              normalizedMaxChars
+            )
+          ),
+          changed: true,
+        };
+      }
+    } catch {
+      // Fall through to the accessor-safe serializer for malformed JSON.
+    }
+  }
   return {
     value: serializeToolCallInput(value, normalizedMaxChars),
+    changed: true,
+  };
+}
+
+const TRUNCATED_STRING_INPUT_PATTERN = /\n… \[truncated: (\d+) chars\]$/u;
+
+function projectStringInputWithinLimit(
+  value: string,
+  maxChars: number
+): { value: string; changed: boolean } {
+  const normalizedMaxChars = normalizeToolInputLimit(maxChars);
+  if (value.length <= normalizedMaxChars) {
+    return { value, changed: false };
+  }
+  const match = TRUNCATED_STRING_INPUT_PATTERN.exec(value);
+  const originalChars = match == null ? value.length : Number(match[1]);
+  const prefix = match == null ? value : value.slice(0, match.index);
+  const marker = `\n… [truncated: ${originalChars} chars]`;
+  return {
+    value:
+      marker.length >= normalizedMaxChars
+        ? prefix.slice(0, normalizedMaxChars)
+        : prefix.slice(0, normalizedMaxChars - marker.length) + marker,
     changed: true,
   };
 }
@@ -1873,10 +1976,7 @@ function projectResponsesOutput(
       } else if (type === 'custom_tool_call') {
         const value =
           typeof source === 'string'
-            ? truncateToolResultContent(
-              source,
-              normalizeToolInputLimit(maxChars)
-            )
+            ? projectStringInputWithinLimit(source, maxChars).value
             : serializeToolCallInput(source, maxChars);
         projectedInput = {
           value,
@@ -2110,28 +2210,19 @@ function applyToolCallInputCaps(params: {
   indexTokenCountMap: Record<string, number | undefined>;
   tokenCounter: TokenCounter;
   fromIndex?: number;
-  canonicalMessageStore?: WeakMap<BaseMessage, BaseMessage>;
 }): number {
   const { messages, maxInputChars, indexTokenCountMap, tokenCounter } = params;
   const fromIndex = params.fromIndex ?? 0;
-  let sources = messages;
-  if (params.canonicalMessageStore != null) {
-    sources = [...messages];
-    for (let i = fromIndex; i < messages.length; i++) {
-      sources[i] = params.canonicalMessageStore.get(messages[i]) ?? messages[i];
-    }
-  }
-  const projected = projectToolCallInputs(sources, maxInputChars, fromIndex);
-  if (projected === sources) {
+  const projected = projectToolCallInputs(messages, maxInputChars, fromIndex);
+  if (projected === messages) {
     return 0;
   }
 
   let truncatedCount = 0;
   for (let i = fromIndex; i < messages.length; i++) {
-    if (projected[i] === sources[i]) {
+    if (projected[i] === messages[i]) {
       continue;
     }
-    params.canonicalMessageStore?.set(projected[i], sources[i]);
     messages[i] = projected[i];
     indexTokenCountMap[i] = tokenCounter(projected[i]);
     truncatedCount++;
@@ -2195,6 +2286,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
    *  Self-seeds from provider observations within the run. */
   let bestInstructionOverhead: number | undefined;
   const reconciledLegacyAiMessages = new WeakSet<BaseMessage>();
+  const canonicalizedToolCallMessages = new WeakSet<BaseMessage>();
   let bestVarianceAbs = Infinity;
   /** Local estimate at the time bestInstructionOverhead was observed.
    *  Used to invalidate the cached overhead when instructions change
@@ -2211,8 +2303,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     BaseMessage,
     BaseMessage['content']
   >();
-  /** Pre-fading AI messages retained so deeper input caps share one source. */
-  const canonicalToolCallMessages = new WeakMap<BaseMessage, BaseMessage>();
   /** Latched fading tier; caps derive from it alone so bytes stay stable. */
   let fadingTier = seedFadingTier(
     factoryParams.maxTokens,
@@ -2370,6 +2460,17 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       const messageType = message.getType();
       const messageRole = (message as BaseMessage & { role?: unknown }).role;
       const isAssistant = messageType === 'ai' || messageRole === 'assistant';
+      if (isAssistant && !canonicalizedToolCallMessages.has(message)) {
+        const [canonicalized] = projectToolCallInputs(
+          [message],
+          HARD_MAX_TOOL_CALL_INPUT_CHARS
+        );
+        if (canonicalized !== message) {
+          message = canonicalized;
+          params.messages[i] = message;
+        }
+        canonicalizedToolCallMessages.add(message);
+      }
       const legacyFunctionCall = isAssistant
         ? readPropertyWithoutAccessors(
           message.additional_kwargs,
@@ -2661,7 +2762,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             ? originalToolContent
             : undefined,
         canonicalContentStore: canonicalToolContent,
-        canonicalMessageStore: canonicalToolCallMessages,
         onContentStored:
           factoryParams.summarizationEnabled === true
             ? storeOriginalToolContent
@@ -2712,7 +2812,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             ? originalToolContent
             : undefined,
         canonicalContentStore: canonicalToolContent,
-        canonicalMessageStore: canonicalToolCallMessages,
         onContentStored:
           factoryParams.summarizationEnabled === true
             ? storeOriginalToolContent
@@ -2749,6 +2848,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
         resolvedSettings: contextPruningSettings,
+        onMessageCloned: (source, clone) => {
+          const canonicalContent = canonicalToolContent.get(source);
+          if (canonicalContent !== undefined) {
+            canonicalToolContent.set(clone, canonicalContent);
+          }
+        },
       });
     }
 
@@ -2933,7 +3038,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           caps: emergencyCaps,
           masked: emergencyTier.masked,
           canonicalContentStore: canonicalToolContent,
-          canonicalMessageStore: canonicalToolCallMessages,
         });
 
         factoryParams.log?.('info', 'Emergency truncation complete');

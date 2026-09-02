@@ -18,6 +18,7 @@ import {
   maskConsumedToolResults,
   preFlightTruncateToolResults,
   createPruneMessages,
+  projectToolCallInputs,
 } from '@/messages/prune';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { StandardGraph } from '@/graphs/Graph';
@@ -84,6 +85,18 @@ function toolCallWithInput(id: string, chars: number): AIMessage {
           arguments: serialized,
         },
       ],
+    },
+  });
+}
+
+function legacyToolCallWithInput(chars: number): AIMessage {
+  return new AIMessage({
+    content: '',
+    additional_kwargs: {
+      function_call: {
+        name: 'fetch',
+        arguments: 'q'.repeat(chars),
+      },
     },
   });
 }
@@ -597,6 +610,88 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
       `truncated: ${originalChars} chars`
     );
     expect(second.newOriginalToolContent?.get(2)?.length).toBe(originalChars);
+  });
+
+  it('composes nearby tool-call input caps without retaining the source message', () => {
+    const source = toolCallWithInput('composable-input', 60_000);
+    const [firstProjection] = projectToolCallInputs([source], 30_000);
+    const [composedProjection] = projectToolCallInputs(
+      [firstProjection],
+      29_990
+    );
+    const [directProjection] = projectToolCallInputs([source], 29_990);
+
+    expect(serializeToolCallInputs(composedProjection)).toBe(
+      serializeToolCallInputs(directProjection)
+    );
+  });
+
+  it('restores legacy function calls identically across model windows', () => {
+    const tier: FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: false,
+      latched: true,
+    };
+    const projectAtWindow = (windowTokens: number): string => {
+      const messages: BaseMessage[] = [
+        new HumanMessage('fetch with legacy arguments'),
+        legacyToolCallWithInput(180_000),
+      ];
+      const pruneMessages = createPruneMessages({
+        maxTokens: windowTokens,
+        startIndex: messages.length,
+        tokenCounter,
+        indexTokenCountMap: countMap(messages),
+        summarizationEnabled: false,
+        fadingTier: tier,
+      });
+      pruneMessages({ messages });
+      return serializeToolCallInputs(messages[1]);
+    };
+
+    expect(projectAtWindow(100_000)).toBe(projectAtWindow(200_000));
+  });
+
+  it('retains canonical result provenance through position pruning', () => {
+    const contextPruningConfig = {
+      enabled: true,
+      keepLastAssistants: 1,
+      softTrimRatio: 0,
+      minPrunableToolChars: 1,
+      softTrim: { maxChars: 4_000, headChars: 1_500, tailChars: 1_500 },
+      hardClear: { enabled: false },
+    };
+    const messages = conversation([60_000]);
+    const pruneMessages = createPruneMessages({
+      maxTokens,
+      startIndex: 0,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: false,
+      contextPruningConfig,
+    });
+    pruneMessages({ messages });
+    const positionPruned = serialize(messages[2]);
+
+    messages.push(...round(1, 60_000), ...round(2, 60_000));
+    const escalated = pruneMessages({ messages });
+    const escalatedBytes = serialize(messages[2]);
+    expect(escalatedBytes).not.toBe(positionPruned);
+
+    const rebuilt = conversation([60_000, 60_000, 60_000]);
+    const fresh = createPruneMessages({
+      maxTokens,
+      startIndex: rebuilt.length,
+      tokenCounter,
+      indexTokenCountMap: countMap(rebuilt),
+      summarizationEnabled: false,
+      contextPruningConfig,
+      fadingTier: escalated.fadingTier,
+    });
+    fresh({ messages: rebuilt });
+
+    expect(serialize(rebuilt[2])).toBe(escalatedBytes);
   });
 
   it('emergency truncation recovers on a clone without latching the tier', () => {
