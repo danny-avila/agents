@@ -5079,7 +5079,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
-        reducer: messagesStateReducer,
+        reducer: (a, b) => {
+          agentContext.invalidateProviderProjectionForMessageUpdates(b);
+          return messagesStateReducer(a, b);
+        },
         default: () => [],
       }),
       summarizationRequest: Annotation<t.SummarizationNodeInput | undefined>({

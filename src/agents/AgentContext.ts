@@ -281,6 +281,8 @@ export class AgentContext {
   private providerProjectedMessages?: BaseMessage[];
   /** Canonical object identities corresponding to the projected slots. */
   private providerProjectionSources?: BaseMessage[];
+  /** Canonical message IDs used to recognize reducer replacements in O(update). */
+  private providerProjectionSourceIds?: Set<string>;
   /** Recount after discarding a projection whose token map contains capped sizes. */
   private providerProjectionRequiresRecount = false;
   /** Pre-masking tool content keyed by message index, consumed by the summarize node. */
@@ -1731,6 +1733,9 @@ export class AgentContext {
       );
       this.providerProjectedMessages = projection;
       this.providerProjectionSources = [...messages];
+      this.providerProjectionSourceIds = new Set(
+        messages.flatMap((message) => (message.id == null ? [] : [message.id]))
+      );
       if (this.providerProjectionRequiresRecount && this.tokenCounter != null) {
         const recounted: Record<string, number> = {};
         for (let i = 0; i < messages.length; i++) {
@@ -1745,6 +1750,9 @@ export class AgentContext {
     for (let i = sources.length; i < messages.length; i++) {
       const message = messages[i];
       sources.push(message);
+      if (message.id != null) {
+        this.providerProjectionSourceIds?.add(message.id);
+      }
       projection.push(
         Array.isArray(message.content)
           ? cloneMessage(message, [...message.content])
@@ -1754,9 +1762,36 @@ export class AgentContext {
     return projection;
   }
 
+  /**
+   * Invalidates the provider projection when a graph reducer update rewrites
+   * canonical history. Reducer updates expose replacements and removals before
+   * they are folded into a potentially longer array, avoiding a prefix scan on
+   * the normal append-only path.
+   */
+  invalidateProviderProjectionForMessageUpdates(
+    updates: BaseMessage | BaseMessage[]
+  ): void {
+    if (this.providerProjectionSources == null) {
+      return;
+    }
+    const updateList = Array.isArray(updates) ? updates : [updates];
+    for (const update of updateList) {
+      if (
+        update.getType() === 'remove' ||
+        (update.id != null &&
+          this.providerProjectionSourceIds?.has(update.id) === true)
+      ) {
+        this.pruneMessages = undefined;
+        this.clearProviderProjection(true);
+        return;
+      }
+    }
+  }
+
   private clearProviderProjection(recountOnNextUse: boolean): void {
     this.providerProjectedMessages = undefined;
     this.providerProjectionSources = undefined;
+    this.providerProjectionSourceIds = undefined;
     this.providerProjectionRequiresRecount = recountOnNextUse;
   }
 

@@ -2,6 +2,7 @@ import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { AgentContext } from '@/agents/AgentContext';
 import { Providers } from '@/common';
+import { messagesStateReducer } from '@/messages/reducer';
 
 /**
  * The overflow-recovery bookkeeping on AgentContext: the budget correction,
@@ -63,6 +64,31 @@ describe('AgentContext overflow recovery state', () => {
 
     canonical[canonical.length - 1] = new HumanMessage('rewritten tail');
     expect(context.getProviderProjectedMessages(canonical)).not.toBe(rebuilt);
+  });
+
+  it('invalidates a projection when a reducer replacement also appends', () => {
+    const context = createContext(1_000_000);
+    const original = new HumanMessage({ id: 'human-1', content: 'original' });
+    const existingReply = new AIMessage({ id: 'ai-1', content: 'reply' });
+    const canonical = [original, existingReply];
+    const projection = context.getProviderProjectedMessages(canonical);
+    const replacement = new HumanMessage({
+      id: 'human-1',
+      content: 'replacement',
+    });
+    const appended = new HumanMessage({ id: 'human-2', content: 'next' });
+
+    const updates = [replacement, appended];
+    context.invalidateProviderProjectionForMessageUpdates(updates);
+    const nextCanonical = messagesStateReducer(canonical, updates);
+    const rebuilt = context.getProviderProjectedMessages(nextCanonical);
+
+    expect(rebuilt).not.toBe(projection);
+    expect(rebuilt.map((message) => message.content)).toEqual([
+      'replacement',
+      'reply',
+      'next',
+    ]);
   });
 
   it('summarizes the first overflow when deterministic pruning is unavailable', () => {
