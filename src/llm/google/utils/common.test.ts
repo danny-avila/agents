@@ -153,6 +153,13 @@ describe('rejectsModelTurnPrefill', () => {
     expect(rejectsModelTurnPrefill('gemini-3.5-flash-lite')).toBe(true);
   });
 
+  test('reads a major-only Flash id as `.0`', () => {
+    expect(rejectsModelTurnPrefill('gemini-3-flash-preview')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-3-flash')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-4-flash')).toBe(true);
+    expect(rejectsModelTurnPrefill('models/gemini-4-flash-preview')).toBe(true);
+  });
+
   test('does not widen past Flash to other model lines', () => {
     expect(rejectsModelTurnPrefill('gemini-3.8-pro')).toBe(false);
     expect(rejectsModelTurnPrefill('gemini-4.0-pro-preview')).toBe(false);

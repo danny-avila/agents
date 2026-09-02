@@ -672,8 +672,13 @@ export function convertBaseMessagesToContent(
  */
 const NO_PREFILL_FLASH_MIN_VERSION = { major: 3, minor: 6 } as const;
 
-/** `gemini-<major>.<minor>-flash`, with optional suffixes (`-latest`, `-lite`). */
-const GEMINI_FLASH_VERSION_PATTERN = /^gemini-(\d+)\.(\d+)-flash(?:$|-)/;
+/**
+ * `gemini-<major>[.<minor>]-flash`, with optional suffixes (`-latest`, `-lite`).
+ * Google ships both forms — `gemini-3.7-flash` and the major-only
+ * `gemini-3-flash-preview` — so the minor component is optional and an omitted
+ * one reads as `.0`.
+ */
+const GEMINI_FLASH_VERSION_PATTERN = /^gemini-(\d+)(?:\.(\d+))?-flash(?:$|-)/;
 
 /**
  * Models that reject prefill despite predating
@@ -699,7 +704,7 @@ export function rejectsModelTurnPrefill(model?: string): boolean {
     return false;
   }
   const major = Number(match[1]);
-  const minor = Number(match[2]);
+  const minor = Number(match[2] || '0');
   if (major !== NO_PREFILL_FLASH_MIN_VERSION.major) {
     return major > NO_PREFILL_FLASH_MIN_VERSION.major;
   }
