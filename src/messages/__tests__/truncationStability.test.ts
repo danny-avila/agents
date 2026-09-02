@@ -46,6 +46,58 @@ function toolCall(...ids: string[]): AIMessage {
   });
 }
 
+function toolCallWithInput(id: string, chars: number): AIMessage {
+  const query = 'q'.repeat(chars);
+  const serialized = JSON.stringify({ query });
+  return new AIMessage({
+    content: [
+      {
+        type: 'tool_use',
+        id,
+        name: 'fetch',
+        input: { query },
+      },
+    ],
+    tool_calls: [
+      {
+        id,
+        name: 'fetch',
+        args: { query },
+        type: 'tool_call',
+      },
+    ],
+    additional_kwargs: {
+      tool_calls: [
+        {
+          id,
+          type: 'function',
+          function: { name: 'fetch', arguments: serialized },
+        },
+      ],
+    },
+    response_metadata: {
+      output: [
+        {
+          type: 'function_call',
+          call_id: id,
+          name: 'fetch',
+          arguments: serialized,
+        },
+      ],
+    },
+  });
+}
+
+function serializeToolCallInputs(message: BaseMessage): string {
+  const aiMessage = message as AIMessage;
+  return JSON.stringify({
+    content: aiMessage.content,
+    toolCalls: aiMessage.tool_calls,
+    additionalKwargs: aiMessage.additional_kwargs,
+    responseMetadata: aiMessage.response_metadata,
+  });
+}
+
 function toolResult(id: string, chars: number): ToolMessage {
   return new ToolMessage({
     content: `${id}:${'x'.repeat(chars)}`,
@@ -472,6 +524,51 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     fresh({ messages: rebuilt });
 
     expect(serialize(rebuilt[2])).toBe(escalatedBytes);
+  });
+
+  it('derives deeper tool-call input caps from canonical arguments', () => {
+    const initial = [
+      new HumanMessage('fetch with a large query'),
+      toolCallWithInput('large-input', 60_000),
+      toolResult('large-input', 100),
+      new AIMessage('query complete'),
+    ];
+    const messages: BaseMessage[] = [...initial];
+    const pruneMessages = createPruneMessages({
+      maxTokens,
+      startIndex: 0,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: false,
+    });
+    pruneMessages({ messages });
+    const firstTierInputs = serializeToolCallInputs(messages[1]);
+
+    messages.push(...round(1, 60_000), ...round(2, 60_000));
+    const escalated = pruneMessages({ messages });
+    const escalatedInputs = serializeToolCallInputs(messages[1]);
+    expect(escalatedInputs).not.toBe(firstTierInputs);
+
+    const rebuilt: BaseMessage[] = [
+      new HumanMessage('fetch with a large query'),
+      toolCallWithInput('large-input', 60_000),
+      toolResult('large-input', 100),
+      new AIMessage('query complete'),
+      ...round(1, 60_000),
+      ...round(2, 60_000),
+    ];
+    const fresh = createPruneMessages({
+      maxTokens,
+      startIndex: rebuilt.length,
+      tokenCounter,
+      indexTokenCountMap: countMap(rebuilt),
+      summarizationEnabled: false,
+      fadingTier: escalated.fadingTier,
+    });
+    const freshResult = fresh({ messages: rebuilt });
+
+    expect(freshResult.fadingTier).toEqual(escalated.fadingTier);
+    expect(serializeToolCallInputs(rebuilt[1])).toBe(escalatedInputs);
   });
 
   it('emergency truncation recovers on a clone without latching the tier', () => {

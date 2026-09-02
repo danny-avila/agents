@@ -33,6 +33,7 @@ import {
 import {
   MASKED_RESULT_MIN_CHARS,
   fadingRungForResultChars,
+  isFadingTier,
   resolveFadingCaps,
   resolveFadingTier,
   seedFadingTier,
@@ -1156,6 +1157,8 @@ type FadingApplyParams = {
   originalContentStore?: Map<number, string>;
   /** Canonical pre-fading content keyed by live message for tier escalation. */
   canonicalContentStore?: WeakMap<BaseMessage, BaseMessage['content']>;
+  /** Canonical pre-fading AI messages for tool-call input escalation. */
+  canonicalMessageStore?: WeakMap<BaseMessage, BaseMessage>;
   /** Called after storing a newly captured entry. */
   onContentStored?: (index: number, content: string) => void;
 };
@@ -1256,6 +1259,7 @@ export function applyFadingCaps(params: FadingApplyParams): FadingApplyResult {
       indexTokenCountMap,
       tokenCounter,
       fromIndex,
+      canonicalMessageStore: params.canonicalMessageStore,
     })
     : 0;
 
@@ -2106,19 +2110,28 @@ function applyToolCallInputCaps(params: {
   indexTokenCountMap: Record<string, number | undefined>;
   tokenCounter: TokenCounter;
   fromIndex?: number;
+  canonicalMessageStore?: WeakMap<BaseMessage, BaseMessage>;
 }): number {
   const { messages, maxInputChars, indexTokenCountMap, tokenCounter } = params;
   const fromIndex = params.fromIndex ?? 0;
-  const projected = projectToolCallInputs(messages, maxInputChars, fromIndex);
-  if (projected === messages) {
+  let sources = messages;
+  if (params.canonicalMessageStore != null) {
+    sources = [...messages];
+    for (let i = fromIndex; i < messages.length; i++) {
+      sources[i] = params.canonicalMessageStore.get(messages[i]) ?? messages[i];
+    }
+  }
+  const projected = projectToolCallInputs(sources, maxInputChars, fromIndex);
+  if (projected === sources) {
     return 0;
   }
 
   let truncatedCount = 0;
   for (let i = fromIndex; i < messages.length; i++) {
-    if (projected[i] === messages[i]) {
+    if (projected[i] === sources[i]) {
       continue;
     }
+    params.canonicalMessageStore?.set(projected[i], sources[i]);
     messages[i] = projected[i];
     indexTokenCountMap[i] = tokenCounter(projected[i]);
     truncatedCount++;
@@ -2198,11 +2211,14 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     BaseMessage,
     BaseMessage['content']
   >();
+  /** Pre-fading AI messages retained so deeper input caps share one source. */
+  const canonicalToolCallMessages = new WeakMap<BaseMessage, BaseMessage>();
   /** Latched fading tier; caps derive from it alone so bytes stay stable. */
   let fadingTier = seedFadingTier(
     factoryParams.maxTokens,
     factoryParams.fadingTier
   );
+  let restoredTierPending = isFadingTier(factoryParams.fadingTier);
   /** Fresh results and inputs below this index already carry the tier's caps. */
   let fadedThrough = 0;
   /** Consumed results below this index already carry the tier's masked cap. */
@@ -2548,16 +2564,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
     let calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
 
-    factoryParams.log?.('debug', 'Budget', {
-      maxTokens: factoryParams.maxTokens,
-      pruningBudget,
-      effectiveMax: effectiveMaxTokens,
-      instructionTokens: currentInstructionTokens,
-      messageCount: params.messages.length,
-      calibratedTotalTokens,
-      calibrationRatio: Math.round(calibrationRatio * 100) / 100,
-    });
-
     // When instructions alone consume the entire budget, no message can
     // fit regardless of truncation.  Short-circuit: yield all messages for
     // summarization and return an empty context so the Graph can route to
@@ -2605,11 +2611,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // every call and provider prompt-cache prefixes survive from turn to turn;
     // only escalation rewrites them.
     // ---------------------------------------------------------------------------
-    totalTokens = sumTokenCounts(indexTokenCountMap, params.messages.length);
-    calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
-    const contextPressure =
-      pruningBudget > 0 ? calibratedTotalTokens / pruningBudget : 0;
-
     // -----------------------------------------------------------------------
     // Observation masking (80%+ pressure, both paths):
     // Replace consumed ToolMessage content with tight head+tail placeholders.
@@ -2642,6 +2643,50 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       }
     };
 
+    let restoredFading: FadingApplyResult = {
+      truncated: 0,
+      inputs: 0,
+      masked: 0,
+      consumedBoundary: 0,
+    };
+    if (restoredTierPending) {
+      restoredFading = applyFadingCaps({
+        messages: params.messages,
+        indexTokenCountMap,
+        tokenCounter: factoryParams.tokenCounter,
+        caps: resolveFadingCaps(fadingTier, factoryParams.maxToolResultChars),
+        masked: fadingTier.masked,
+        originalContentStore:
+          factoryParams.summarizationEnabled === true
+            ? originalToolContent
+            : undefined,
+        canonicalContentStore: canonicalToolContent,
+        canonicalMessageStore: canonicalToolCallMessages,
+        onContentStored:
+          factoryParams.summarizationEnabled === true
+            ? storeOriginalToolContent
+            : undefined,
+      });
+      fadedThrough = params.messages.length;
+      maskedThrough = restoredFading.consumedBoundary;
+      restoredTierPending = false;
+    }
+
+    totalTokens = sumTokenCounts(indexTokenCountMap, params.messages.length);
+    calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
+    const contextPressure =
+      pruningBudget > 0 ? calibratedTotalTokens / pruningBudget : 0;
+
+    factoryParams.log?.('debug', 'Budget', {
+      maxTokens: factoryParams.maxTokens,
+      pruningBudget,
+      effectiveMax: effectiveMaxTokens,
+      instructionTokens: currentInstructionTokens,
+      messageCount: params.messages.length,
+      calibratedTotalTokens,
+      calibrationRatio: Math.round(calibrationRatio * 100) / 100,
+    });
+
     /** Advances the tier from the signals and applies its caps; escalation rescans everything. */
     const fade = (signals: FadingSignals): FadingApplyResult => {
       const nextTier = resolveFadingTier(
@@ -2667,6 +2712,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             ? originalToolContent
             : undefined,
         canonicalContentStore: canonicalToolContent,
+        canonicalMessageStore: canonicalToolCallMessages,
         onContentStored:
           factoryParams.summarizationEnabled === true
             ? storeOriginalToolContent
@@ -2686,9 +2732,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       summarizationEnabled: factoryParams.summarizationEnabled === true,
     };
     const faded = fade(fadingSignals);
-    const observationsMasked = faded.masked;
-    const preFlightResultCount = faded.truncated;
-    const preFlightInputCount = faded.inputs;
+    const observationsMasked = restoredFading.masked + faded.masked;
+    const preFlightResultCount = restoredFading.truncated + faded.truncated;
+    const preFlightInputCount = restoredFading.inputs + faded.inputs;
     if (observationsMasked > 0) {
       cumulativeRawSent = 0;
       cumulativeProviderReported = 0;
