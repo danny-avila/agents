@@ -415,6 +415,8 @@ export class AgentContext {
    * disturbing a `maxContextTokens` that no correction ever touched.
    */
   private _preOverflowMaxContextTokens?: number;
+  /** Stable total window used to distinguish it from the shrinking prompt budget. */
+  private _overflowRecoveryContextWindowTokens?: number;
   /**
    * Prompt size, normalized into the local counter's uncalibrated units, at
    * the last overflow correction. Keeping both measurements in the same units
@@ -1611,7 +1613,8 @@ export class AgentContext {
   /** Total provider window captured before recovery began retargeting the prompt budget. */
   get overflowRecoveryContextWindow(): number | undefined {
     return this._overflowRecoveryAttempts > 0
-      ? this._preOverflowMaxContextTokens
+      ? (this._overflowRecoveryContextWindowTokens ??
+          this._preOverflowMaxContextTokens)
       : this.maxContextTokens;
   }
 
@@ -1676,11 +1679,13 @@ export class AgentContext {
    */
   applyContextBudgetCorrection(
     budgetTokens: number | undefined,
-    promptTokens?: number
+    promptTokens?: number,
+    contextWindowTokens?: number
   ): void {
     if (this._overflowRecoveryAttempts === 0) {
       this._preOverflowMaxContextTokens = this.maxContextTokens;
     }
+    this._overflowRecoveryContextWindowTokens ??= contextWindowTokens;
     if (budgetTokens != null) {
       this.maxContextTokens = budgetTokens;
     }
@@ -1749,6 +1754,7 @@ export class AgentContext {
     }
     this.maxContextTokens = this._preOverflowMaxContextTokens;
     this._preOverflowMaxContextTokens = undefined;
+    this._overflowRecoveryContextWindowTokens = undefined;
     this._lastOverflowPromptTokens = undefined;
     this._overflowRecoveryAttempts = 0;
   }

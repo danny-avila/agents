@@ -222,10 +222,7 @@ const OVERFLOW_PATTERNS: readonly OverflowPattern[] = [
 
 function hasIndependentDefinitiveOverflow(parts: readonly string[]): boolean {
   return parts.some((part) => {
-    const text = stripUrls(part);
-    if (AMBIGUOUS_GATEWAY_RE.test(text)) {
-      return false;
-    }
+    const text = stripUrls(part).replace(AMBIGUOUS_GATEWAY_RE, ' ');
     return OVERFLOW_PATTERNS.some(
       (pattern) =>
         pattern.kind === 'context_window' &&

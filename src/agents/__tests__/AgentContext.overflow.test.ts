@@ -154,6 +154,19 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.overflowRecoveryAttempts).toBe(1);
   });
 
+  it('preserves a provider-learned window when none was configured', () => {
+    const context = createContext();
+    context.applyContextBudgetCorrection(26_600, 50_000, 128_000);
+
+    expect(context.overflowRecoveryContextWindow).toBe(128_000);
+
+    context.applyContextBudgetCorrection(14_000, 20_000);
+    expect(context.overflowRecoveryContextWindow).toBe(128_000);
+
+    context.reset();
+    expect(context.overflowRecoveryContextWindow).toBeUndefined();
+  });
+
   it('reports a stall when the prompt did not shrink', () => {
     const context = createContext(1_000_000);
     context.applyContextBudgetCorrection(190_000, 250_000);
