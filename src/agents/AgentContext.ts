@@ -1793,7 +1793,9 @@ export class AgentContext {
     if (this.providerProjectionSources == null) {
       return;
     }
-    const updateList = Array.isArray(updates) ? updates : [updates];
+    const updateList = (Array.isArray(updates) ? updates : [updates]) as Array<
+      BaseMessageLike | null | undefined
+    >;
     for (const rawUpdate of updateList) {
       if (rawUpdate == null) {
         continue;
