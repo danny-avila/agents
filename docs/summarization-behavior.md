@@ -46,13 +46,15 @@ All budget comparisons multiply raw counts by `calibrationRatio` to approximate 
 
 ### Fading Tier
 
-Every character cap applied to historical tool results (masking, pre-flight truncation, fit-to-budget) derives from one latched **fading tier** (`src/messages/fading.ts`): `{ budgetTokens, masked }`. The budget sits on a ladder that halves the context window per rung; the tier only ever shrinks and masking only ever activates. Because truncation is a pure function of (content, cap), a historical tool result maps to identical bytes on every call within a tier — which is what keeps prefix-based provider prompt caches (Anthropic's single tail breakpoint) valid from turn to turn. Only escalation and compaction rewrite the prefix.
+Every character cap applied to historical tool results (masking, pre-flight truncation, fit-to-budget) derives from one latched **fading tier** (`src/messages/fading.ts`): `{ v, budgetTokens, masked }`. The budget sits on a ladder that halves the context window per rung; the tier only ever shrinks and masking only ever activates. Because truncation is a pure function of (content, cap), a historical tool result maps to identical bytes on every call within a tier — which is what keeps prefix-based provider prompt caches (Anthropic's single tail breakpoint) valid from turn to turn. Only escalation and compaction rewrite the prefix.
 
-- **Fit rung**: the shallowest rung whose fresh-result cap fits within half the effective budget, so a single tool result can never leave the context empty.
+- **Fit rung**: the shallowest rung at which the widest observed parallel tool exchange (call inputs plus fresh results) fits within the effective budget, so a complete exchange can never leave the context empty or lose its results to orphan repair.
 - **Pressure-band rungs** (summarization disabled only): +1 rung at 85 %, +2 at 90 %, +4 at 99 %.
 - **Masking** latches at 80 % pressure; consumed results then keep 10 % of the fresh cap (floor 300 chars).
 
-The tier is returned from every prune call. Single-agent hosts can use `Run.getFadingTier()` and `RunConfig.fadingTier`; multi-agent hosts should persist `Run.getFadingTiers()` and restore `RunConfig.fadingTiers` so each agent keeps its independent tier. The budget is absolute, so a mid-run budget correction or a return to the normal window keeps the tier; only compaction resets it.
+Graph history stays canonical. The pruner keeps the original bytes of every capped tool result and input-capped AI message and builds a provider-facing projection per Run from them, so a deeper tier or masking re-derives from the original content and matches what a fresh Run seeded with the same tier derives from the host's stored messages. Restored tiers are validated at every boundary (`Run`, `StandardGraph`, `AgentSession`); an invalid or fresh seed starts fresh.
+
+The tier is returned from every prune call. Single-agent hosts can use `Run.getFadingTier()` and `RunConfig.fadingTier`; multi-agent hosts should persist `Run.getFadingTiers()` and restore `RunConfig.fadingTiers` so each agent keeps its independent tier. The budget is absolute, so a mid-run budget correction or a return to the normal window keeps the tier; only compaction resets it, and `Run.didResetFadingTier()` / `Run.getFadingTierResetAgentIds()` report that reset to hosts that merge tiers.
 
 **Instruction overhead calibration**: The pruner also tracks `bestInstructionOverhead` — the best observed instruction token count from provider feedback. When the variance between the estimated and calibrated `toolSchemaTokens` exceeds 15% (`CALIBRATION_VARIANCE_THRESHOLD`), the calibrated value is applied to `AgentContext.toolSchemaTokens`. This corrects the local tool-schema estimate (which uses a static multiplier) against real provider behavior. After intra-run summarization, the calibrated overhead is preserved and seeded into the recreated pruner.
 
@@ -62,7 +64,7 @@ The tier is returned from every prune call. Single-agent hosts can use `Run.getF
 
 ### Pipeline (every agent node turn)
 
-1. **Fit-to-budget truncation** (every turn): the fading tier's fit rung caps any individual tool result and tool-call input so it fits within half the effective budget. The cap is latched, so a historical result keeps the same bytes on later turns.
+1. **Fit-to-budget truncation** (every turn): the fading tier's fit rung caps every tool result and tool-call input so the widest observed parallel exchange fits within the effective budget. The cap is latched, so a historical result keeps the same bytes on later turns.
 
 2. **80%+ pressure — Observation masking**: Masking latches on the tier; consumed ToolMessages shrink to 10 % of the fresh cap (floor ~300 chars). Pre-masking snapshot saved so the summarizer can access un-masked originals later.
 
@@ -106,7 +108,7 @@ This prevents the model from continuing to roleplay or respond to the conversati
 
 ### Emergency Truncation
 
-If masking + fit-to-budget still produce an **empty context** (no messages fit at all), a deeper, temporary tier is derived from a per-message share of the effective budget and applied to a clone of the messages before pruning is retried. The latched tier is left alone: that share depends on the message count, and latching it would pin every future result to one transient event.
+If masking + fit-to-budget still produce an **empty context** (no messages fit at all), a deeper, temporary tier at which one complete tool exchange (result plus call input) fits within a per-message share of the effective budget is applied to a clone of the messages before pruning is retried. The latched tier is left alone: that share depends on the message count, and latching it would pin every future result to one transient event.
 
 ### Cross-Run Behavior
 
@@ -140,7 +142,7 @@ If masking + fit-to-budget still produce an **empty context** (no messages fit a
 
 5. **Pruning**: `getMessagesWithinTokenLimit` drops oldest messages to fit budget. Orphan repair strips unpaired tool_use/tool_result blocks.
 
-6. **Emergency truncation** (if pruning produces empty context): A temporary tier derived from the per-message share of the effective budget is applied to a clone, then pruning is retried. The latched tier is not changed.
+6. **Emergency truncation** (if pruning produces empty context): A temporary tier at which one complete tool exchange fits within the per-message share of the effective budget is applied to a clone, then pruning is retried. The latched tier is not changed.
 
 ### Key Difference from Enabled Path
 
