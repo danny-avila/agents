@@ -134,16 +134,15 @@ export interface ContextUsageEvent {
 
 /**
  * Latched context-fading tier. Caps for historical tool results derive from
- * `(window, rung, masked)` only, so carrying the tier across runs keeps their
+ * `(budgetTokens, masked)` only, so carrying the tier across runs keeps their
  * truncated bytes stable for prefix-based provider prompt caches. Hosts
  * persist it beside `calibrationRatio` and pass it back via `RunConfig.fadingTier`.
  */
 export interface FadingTier {
   v: 1;
-  /** Context window the tier was derived for; a mismatch starts fresh. */
-  window: number;
-  /** Ladder position: the window is halved per rung. Never decreases. */
-  rung: number;
+  /** Token budget the caps derive from, in raw token space. Never grows;
+   *  clamped to the current context window when seeded. */
+  budgetTokens: number;
   /** Whether observation masking has activated. Never deactivates. */
   masked: boolean;
 }

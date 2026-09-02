@@ -2793,3 +2793,20 @@ export function findLastIndex<T>(
   }
   return -1;
 }
+
+/** Whether message content carries non-whitespace text in any text block. */
+export function hasNonEmptyTextContent(content: BaseMessage['content']): boolean {
+  if (typeof content === 'string') {
+    return content.trim() !== '';
+  }
+  for (const block of content) {
+    if (block.type !== ContentTypes.TEXT) {
+      continue;
+    }
+    const text = block[ContentTypes.TEXT];
+    if (typeof text === 'string' && text.trim() !== '') {
+      return true;
+    }
+  }
+  return false;
+}

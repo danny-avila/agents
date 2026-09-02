@@ -31,10 +31,15 @@ function serialize(message: BaseMessage): string {
   return typeof content === 'string' ? content : JSON.stringify(content);
 }
 
-function toolCall(id: string): AIMessage {
+function toolCall(...ids: string[]): AIMessage {
   return new AIMessage({
     content: '',
-    tool_calls: [{ id, name: 'fetch', args: {}, type: 'tool_call' }],
+    tool_calls: ids.map((id) => ({
+      id,
+      name: 'fetch',
+      args: {},
+      type: 'tool_call' as const,
+    })),
   });
 }
 
@@ -99,77 +104,78 @@ describe('fading ladder', () => {
   });
 
   it('validates and seeds persisted tiers', () => {
-    expect(isFadingTier({ v: 1, window: 100, rung: 2, masked: true })).toBe(
-      true
-    );
-    expect(isFadingTier({ v: 2, window: 100, rung: 2, masked: true })).toBe(
-      false
-    );
-    expect(isFadingTier({ v: 1, window: 100, rung: 1.5, masked: true })).toBe(
-      false
-    );
+    expect(isFadingTier({ v: 1, budgetTokens: 100, masked: true })).toBe(true);
+    expect(isFadingTier({ v: 2, budgetTokens: 100, masked: true })).toBe(false);
+    expect(isFadingTier({ v: 1, budgetTokens: 0, masked: true })).toBe(false);
+    expect(isFadingTier({ v: 1, budgetTokens: 100, masked: 'yes' })).toBe(false);
     expect(isFadingTier(null)).toBe(false);
-    expect(
-      seedFadingTier(100_000, { v: 1, window: 100_000, rung: 3, masked: true })
-    ).toEqual({
+    expect(seedFadingTier(100_000, { v: 1, budgetTokens: 50_000, masked: true })).toEqual({
       v: 1,
-      window: 100_000,
-      rung: 3,
+      budgetTokens: 50_000,
       masked: true,
     });
-    expect(
-      seedFadingTier(100_000, { v: 1, window: 50_000, rung: 3, masked: true })
-    ).toEqual(createFadingTier(100_000));
-    expect(
-      seedFadingTier(100_000, {
-        v: 1,
-        window: 100_000,
-        rung: 99,
-        masked: false,
-      }).rung
-    ).toBe(maxFadingRung(100_000));
+    expect(seedFadingTier(100_000, { v: 1, budgetTokens: 150_000, masked: false })).toEqual({
+      v: 1,
+      budgetTokens: 100_000,
+      masked: false,
+    });
+    expect(seedFadingTier(100_000, { rung: 3 })).toEqual(createFadingTier(100_000));
   });
 
   it('only deepens and never oscillates across a band threshold', () => {
+    const window = 100_000;
     const base = { effectiveRawTokens: 100_000, summarizationEnabled: false };
-    let tier = createFadingTier(100_000);
-    tier = resolveFadingTier(tier, { ...base, contextPressure: 0.5 });
-    expect(tier).toEqual(createFadingTier(100_000));
-    tier = resolveFadingTier(tier, { ...base, contextPressure: 0.86 });
-    expect(tier).toEqual({ v: 1, window: 100_000, rung: 1, masked: true });
+    let tier = createFadingTier(window);
+    tier = resolveFadingTier(tier, window, { ...base, contextPressure: 0.5 });
+    expect(tier).toEqual(createFadingTier(window));
+    tier = resolveFadingTier(tier, window, { ...base, contextPressure: 0.86 });
+    expect(tier).toEqual({ v: 1, budgetTokens: 50_000, masked: true });
     const settled = tier;
-    tier = resolveFadingTier(tier, { ...base, contextPressure: 0.84 });
+    tier = resolveFadingTier(tier, window, { ...base, contextPressure: 0.84 });
     expect(tier).toBe(settled);
-    tier = resolveFadingTier(tier, { ...base, contextPressure: 0.86 });
+    tier = resolveFadingTier(tier, window, { ...base, contextPressure: 0.86 });
     expect(tier).toBe(settled);
-    tier = resolveFadingTier(tier, { ...base, contextPressure: 0.91 });
-    expect(tier.rung).toBe(2);
-    tier = resolveFadingTier(tier, { ...base, contextPressure: 0.3 });
-    expect(tier.rung).toBe(2);
+    tier = resolveFadingTier(tier, window, { ...base, contextPressure: 0.91 });
+    expect(tier.budgetTokens).toBe(25_000);
+    tier = resolveFadingTier(tier, window, { ...base, contextPressure: 0.3 });
+    expect(tier.budgetTokens).toBe(25_000);
     expect(tier.masked).toBe(true);
   });
 
-  it('fits a single result within the effective budget with summarization on', () => {
-    const tier = resolveFadingTier(createFadingTier(32_000), {
+  it('survives a mid-run budget correction and the return to the normal window', () => {
+    const latched: FadingTier = { v: 1, budgetTokens: 100_000, masked: true };
+    const corrected = seedFadingTier(180_000, latched);
+    expect(corrected).toEqual(latched);
+    expect(
+      resolveFadingTier(corrected, 180_000, {
+        contextPressure: 0.4,
+        effectiveRawTokens: 170_000,
+        summarizationEnabled: true,
+      })
+    ).toBe(corrected);
+    expect(seedFadingTier(200_000, corrected)).toEqual(latched);
+    expect(resolveFadingCaps(seedFadingTier(200_000, corrected))).toEqual(
+      resolveFadingCaps(latched)
+    );
+  });
+
+  it('fits a single result within half the effective budget with summarization on', () => {
+    const tier = resolveFadingTier(createFadingTier(32_000), 32_000, {
       contextPressure: 0.3,
       effectiveRawTokens: 9_400,
       summarizationEnabled: true,
     });
     const caps = resolveFadingCaps(tier);
     expect(caps.resultChars / 4).toBeLessThanOrEqual(9_400 / 2);
-    expect(caps.resultChars).toBe(
-      calculateMaxToolResultChars(caps.budgetTokens)
-    );
+    expect(caps.resultChars).toBe(calculateMaxToolResultChars(caps.budgetTokens));
     expect(caps.consumedChars).toBe(caps.resultChars);
   });
 
   it('masks consumed results to a fraction of the fresh cap with a floor', () => {
-    const masked: FadingTier = { v: 1, window: 100_000, rung: 0, masked: true };
+    const masked: FadingTier = { v: 1, budgetTokens: 100_000, masked: true };
     const caps = resolveFadingCaps(masked);
     expect(caps.consumedChars).toBe(Math.floor(caps.resultChars * 0.1));
-    expect(
-      resolveFadingCaps({ ...masked, window: 400, rung: 0 }).consumedChars
-    ).toBe(300);
+    expect(resolveFadingCaps({ ...masked, budgetTokens: 400 }).consumedChars).toBe(300);
     expect(resolveFadingCaps(masked, 1_000).resultChars).toBe(1_000);
   });
 });
@@ -245,12 +251,7 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
   function runTurn(
     messages: BaseMessage[],
     options: TurnOptions
-  ): {
-    early: string;
-    pressure: number;
-    tier: FadingTier;
-    contextLength: number;
-  } {
+  ): { early: string; pressure: number; tier: FadingTier; contextLength: number } {
     const pruneMessages = createPruneMessages({
       maxTokens,
       startIndex: messages.length,
@@ -276,19 +277,14 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
       calibrationRatio: 1,
     });
     expect(first.early).toContain('truncated');
-    expect(first.early.length).toBeLessThanOrEqual(
-      calculateMaxToolResultChars(maxTokens)
-    );
+    expect(first.early.length).toBeLessThanOrEqual(calculateMaxToolResultChars(maxTokens));
 
     const ratios = [1.03, 1.12, 1.25, 1.4];
     ratios.forEach((calibrationRatio, index) => {
-      const later = runTurn(
-        conversation([60_000, ...Array(index + 1).fill(400)]),
-        {
-          summarizationEnabled: true,
-          calibrationRatio,
-        }
-      );
+      const later = runTurn(conversation([60_000, ...Array(index + 1).fill(400)]), {
+        summarizationEnabled: true,
+        calibrationRatio,
+      });
       expect(later.pressure).toBeLessThan(0.8);
       expect(later.early).toBe(first.early);
     });
@@ -303,19 +299,14 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     expect(first.pressure).toBeGreaterThanOrEqual(0.8);
     expect(first.tier.masked).toBe(true);
     expect(first.early).toContain('truncated');
-    expect(first.early.length).toBeLessThanOrEqual(
-      resolveFadingCaps(first.tier).consumedChars
-    );
+    expect(first.early.length).toBeLessThanOrEqual(resolveFadingCaps(first.tier).consumedChars);
 
     const ratios = [1.01, 1.02, 1.03];
     ratios.forEach((calibrationRatio, index) => {
-      const later = runTurn(
-        conversation([...history, ...Array(index + 1).fill(200)]),
-        {
-          summarizationEnabled: false,
-          calibrationRatio,
-        }
-      );
+      const later = runTurn(conversation([...history, ...Array(index + 1).fill(200)]), {
+        summarizationEnabled: false,
+        calibrationRatio,
+      });
       expect(later.tier).toEqual(first.tier);
       expect(later.early).toBe(first.early);
     });
@@ -360,9 +351,7 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     expect(result.context.length).toBe(messages.length);
     expect(result.messagesToRefine).toEqual([]);
     expect(serialize(messages[2]).length).toBeLessThanOrEqual(
-      calculateMaxToolResultChars(
-        resolveFadingCaps(result.fadingTier).budgetTokens
-      )
+      resolveFadingCaps(result.fadingTier).resultChars
     );
   });
 
@@ -392,5 +381,41 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
       expect(serialize(messages[2])).toBe(early);
       expect(result.fadingTier).toEqual(first.fadingTier);
     }
+  });
+
+  it('emergency truncation recovers on a clone without latching the tier', () => {
+    const ids = ['p1', 'p2', 'p3', 'p4'];
+    const messages: BaseMessage[] = [
+      ...conversation(Array(20).fill(200)),
+      new HumanMessage('fetch everything at once'),
+      toolCall(...ids),
+      ...ids.map((id) => toolResult(id, 47_000)),
+    ];
+    const originalLengths = ids.map((_, index) =>
+      serialize(messages[messages.length - ids.length + index]).length
+    );
+    const pruneMessages = createPruneMessages({
+      maxTokens,
+      startIndex: messages.length,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: true,
+      calibrationRatio: 1,
+    });
+
+    const result = pruneMessages({ messages });
+
+    expect(result.context.length).toBeGreaterThan(0);
+    expect(result.fadingTier.budgetTokens).toBe(maxTokens);
+    ids.forEach((_, index) => {
+      expect(serialize(messages[messages.length - ids.length + index]).length).toBe(
+        originalLengths[index]
+      );
+    });
+    const contextSet = new Set(result.context);
+    expect(result.messagesToRefine?.some((message) => contextSet.has(message))).toBe(false);
+
+    const again = pruneMessages({ messages });
+    expect(again.fadingTier).toEqual(result.fadingTier);
   });
 });

@@ -9,7 +9,7 @@ export const FADING_TIER_VERSION = 1;
 /** Context pressure at which observation masking activates. */
 export const PRESSURE_THRESHOLD_MASKING = 0.8;
 
-/** Smallest token budget a rung can shrink to; keeps the emergency floor near 200 chars. */
+/** Smallest token budget the ladder can shrink to; keeps the emergency floor near 200 chars. */
 export const FADING_MIN_BUDGET_TOKENS = 170;
 
 /** Floor for masked (consumed) tool results. */
@@ -37,7 +37,7 @@ export type FadingSignals = {
   /** (pruningBudget − instruction tokens) ÷ calibrationRatio, in raw token space. */
   effectiveRawTokens: number;
   summarizationEnabled: boolean;
-  /** Recovery paths force at least this rung. */
+  /** Recovery paths force at least this rung on the current window's ladder. */
   minRung?: number;
 };
 
@@ -55,25 +55,23 @@ function floorBudgetTokens(window: number): number {
   return Math.min(FADING_MIN_BUDGET_TOKENS, window);
 }
 
+/** Tier for a conversation that has never faded: the whole window, nothing masked. */
 export function createFadingTier(window: number): FadingTier {
-  return { v: FADING_TIER_VERSION, window, rung: 0, masked: false };
+  return { v: FADING_TIER_VERSION, budgetTokens: window, masked: false };
 }
 
 export function isFadingTier(value: unknown): value is FadingTier {
   if (typeof value !== 'object' || value === null) {
     return false;
   }
-  const { v, window, rung, masked } = value as Partial<
+  const { v, budgetTokens, masked } = value as Partial<
     Record<keyof FadingTier, unknown>
   >;
   return (
     v === FADING_TIER_VERSION &&
-    typeof window === 'number' &&
-    Number.isFinite(window) &&
-    window > 0 &&
-    typeof rung === 'number' &&
-    Number.isInteger(rung) &&
-    rung >= 0 &&
+    typeof budgetTokens === 'number' &&
+    Number.isFinite(budgetTokens) &&
+    budgetTokens > 0 &&
     typeof masked === 'boolean'
   );
 }
@@ -93,18 +91,18 @@ export function fadingBudgetTokens(window: number, rung: number): number {
 }
 
 /**
- * Restores a tier persisted by the host. Anything invalid, or derived for a
- * different context window (model switch), starts fresh: the prefix cache is
- * invalid in that case anyway.
+ * Restores a tier persisted by the host. The budget is absolute, so a tier
+ * survives a mid-run budget correction and the return to the normal window
+ * on the next run; it is only clamped to the current window. Anything
+ * invalid starts fresh.
  */
 export function seedFadingTier(window: number, seed?: unknown): FadingTier {
-  if (!isFadingTier(seed) || seed.window !== window) {
+  if (!isFadingTier(seed)) {
     return createFadingTier(window);
   }
   return {
     v: FADING_TIER_VERSION,
-    window,
-    rung: Math.min(seed.rung, maxFadingRung(window)),
+    budgetTokens: Math.min(seed.budgetTokens, window),
     masked: seed.masked,
   };
 }
@@ -142,12 +140,12 @@ export function fadingRungForBudget(window: number, rawTokens: number): number {
   );
 }
 
-/** Character caps for a tier; a pure function of `(window, rung, masked)`. */
+/** Character caps for a tier; a pure function of `(budgetTokens, masked)`. */
 export function resolveFadingCaps(
   tier: FadingTier,
   maxToolResultChars?: number
 ): FadingCaps {
-  const budgetTokens = fadingBudgetTokens(tier.window, tier.rung);
+  const { budgetTokens } = tier;
   const windowResultChars = calculateMaxToolResultChars(budgetTokens);
   const resultChars =
     maxToolResultChars != null && maxToolResultChars > 0
@@ -171,21 +169,24 @@ export function resolveFadingCaps(
 }
 
 /**
- * Advances a tier from this call's signals. The rung only ever deepens and
- * masking only ever activates, which is the hysteresis: drift in calibration,
- * instruction overhead or message count can escalate once at a boundary but
- * never oscillate. Returns the same object when nothing changes.
+ * Advances a tier from this call's signals on the current window's ladder.
+ * The budget only ever shrinks and masking only ever activates, which is the
+ * hysteresis: drift in calibration, instruction overhead or message count
+ * can escalate once at a rung boundary but never oscillate. Returns the same
+ * object when nothing changes.
  *
- * - The fit rung guarantees a single tool result (30 % of the rung budget)
- *   fits the effective budget, so summarization never sees an empty context.
+ * - The fit rung guarantees a single tool result fits half the effective
+ *   budget, so summarization never sees an empty context.
  * - Pressure bands add rungs on top of the fit rung when summarization is
  *   off, mirroring the staged budget factors of progressive context fading.
+ * - A window larger than the latched budget (model switch) does not loosen
+ *   the tier; only compaction, which rewrites the prefix anyway, resets it.
  */
 export function resolveFadingTier(
   tier: FadingTier,
+  window: number,
   signals: FadingSignals
 ): FadingTier {
-  const { window } = tier;
   const fitRung = fadingRungForBudget(window, signals.effectiveRawTokens);
   const bandRung = signals.summarizationEnabled
     ? 0
@@ -194,12 +195,16 @@ export function resolveFadingTier(
     )?.[1] ?? 0);
   const rung = Math.min(
     maxFadingRung(window),
-    Math.max(tier.rung, fitRung + bandRung, signals.minRung ?? 0)
+    Math.max(fitRung + bandRung, signals.minRung ?? 0)
+  );
+  const budgetTokens = Math.min(
+    tier.budgetTokens,
+    fadingBudgetTokens(window, rung)
   );
   const masked =
     tier.masked || signals.contextPressure >= PRESSURE_THRESHOLD_MASKING;
-  if (rung === tier.rung && masked === tier.masked) {
+  if (budgetTokens === tier.budgetTokens && masked === tier.masked) {
     return tier;
   }
-  return { v: FADING_TIER_VERSION, window, rung, masked };
+  return { v: FADING_TIER_VERSION, budgetTokens, masked };
 }

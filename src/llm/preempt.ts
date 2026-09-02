@@ -5,7 +5,10 @@ import {
   DEFAULT_MAX_SEALS,
   DEFAULT_PREEMPT_RESTART_GRACE_MS,
 } from '@/common';
-import { isReasoningContentBlock } from '@/messages/core';
+import {
+  hasNonEmptyTextContent,
+  isReasoningContentBlock,
+} from '@/messages/core';
 
 /**
  * Normalizes a host-supplied seal budget.
@@ -33,22 +36,6 @@ export function resolveMaxSeals(maxSeals: number | undefined): number {
  * stripped or signed on several providers and cannot stand in for the visible
  * assistant turn a sealed sequence needs.
  */
-function hasNonEmptyTextContent(content: AIMessageChunk['content']): boolean {
-  if (typeof content === 'string') {
-    return content.trim() !== '';
-  }
-  for (const block of content) {
-    if (block.type !== ContentTypes.TEXT) {
-      continue;
-    }
-    const text = block[ContentTypes.TEXT];
-    if (typeof text === 'string' && text.trim() !== '') {
-      return true;
-    }
-  }
-  return false;
-}
-
 /**
  * True while a Gemini server-side tool call is still awaiting its response.
  *

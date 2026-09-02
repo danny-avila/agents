@@ -41,7 +41,10 @@ import { resolveContextPruningSettings } from './contextPruningSettings';
 import { hasUnsafeStructuredSerialization } from '@/utils/tokens';
 import { ContentTypes, Providers, Constants } from '@/common';
 import { getProviderFamily } from '@/llm/providerRegistry';
-import { dropIncompleteToolStreamContent } from './core';
+import {
+  dropIncompleteToolStreamContent,
+  hasNonEmptyTextContent,
+} from './core';
 import { applyContextPruning } from './contextPruning';
 import { toLangChainContent } from './langchain';
 
@@ -1167,23 +1170,6 @@ export type FadingApplyResult = {
   consumedBoundary: number;
 };
 
-function hasTextContent(message: BaseMessage): boolean {
-  const { content } = message;
-  if (typeof content === 'string') {
-    return content.trim().length > 0;
-  }
-  return (
-    Array.isArray(content) &&
-    content.some(
-      (block) =>
-        typeof block === 'object' &&
-        (block as Record<string, unknown>).type === 'text' &&
-        typeof (block as Record<string, unknown>).text === 'string' &&
-        ((block as Record<string, unknown>).text as string).trim().length > 0
-    )
-  );
-}
-
 /**
  * Index of the newest AI message with substantive text. Every ToolMessage
  * before it has been answered by the model ("consumed"); results after it are
@@ -1192,7 +1178,7 @@ function hasTextContent(message: BaseMessage): boolean {
 function findConsumedBoundary(messages: BaseMessage[]): number {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
-    if (message.getType() === 'ai' && hasTextContent(message)) {
+    if (message.getType() === 'ai' && hasNonEmptyTextContent(message.content)) {
       return i;
     }
   }
@@ -2653,7 +2639,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
     /** Advances the tier from the signals and applies its caps; escalation rescans everything. */
     const fade = (signals: FadingSignals): FadingApplyResult => {
-      const nextTier = resolveFadingTier(fadingTier, signals);
+      const nextTier = resolveFadingTier(
+        fadingTier,
+        factoryParams.maxTokens,
+        signals
+      );
       if (nextTier !== fadingTier) {
         fadingTier = nextTier;
         fadedThrough = 0;
@@ -2834,10 +2824,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
     // ---------------------------------------------------------------
     // Emergency truncation: if pruning produced an empty context but
-    // messages exist, deepen the fading tier until a per-message share of
-    // the effective budget (~4 chars/token, floor 200 chars) fits, apply
-    // it to the live messages and retry.  The tier latches, so the next
-    // call reproduces the same bytes instead of re-deriving them.
+    // messages exist, derive a deeper, temporary tier from a per-message
+    // share of the effective budget (~4 chars/token, floor 200 chars),
+    // apply it to a clone and retry.  The latched tier is left alone: this
+    // share depends on the message count, so latching it would pin every
+    // future result to one transient event.  The clone keeps graph state
+    // intact for later turns where more budget may be available.
     // ---------------------------------------------------------------
     if (
       context.length === 0 &&
@@ -2848,9 +2840,20 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         effectiveMaxTokens / Math.max(1, params.messages.length)
       );
       const emergencyMaxChars = Math.max(200, perMessageTokenBudget * 4);
-      const minRung = fadingRungForResultChars(
+      const emergencyTier = resolveFadingTier(
+        fadingTier,
         factoryParams.maxTokens,
-        emergencyMaxChars
+        {
+          ...fadingSignals,
+          minRung: fadingRungForResultChars(
+            factoryParams.maxTokens,
+            emergencyMaxChars
+          ),
+        }
+      );
+      const emergencyCaps = resolveFadingCaps(
+        emergencyTier,
+        factoryParams.maxToolResultChars
       );
 
       factoryParams.log?.(
@@ -2860,55 +2863,78 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           messageCount: params.messages.length,
           effectiveMax: effectiveMaxTokens,
           emergencyMaxChars,
-          rung: minRung,
+          budgetTokens: emergencyCaps.budgetTokens,
         }
       );
 
-      const emergency = fade({ ...fadingSignals, minRung });
-
-      factoryParams.log?.('info', 'Emergency truncation complete');
-      factoryParams.log?.('debug', 'Emergency truncation details', {
-        truncatedCount:
-          emergency.truncated + emergency.inputs + emergency.masked,
-        rung: fadingTier.rung,
-      });
-
-      const retryResult = getMessagesWithinTokenLimit({
-        maxContextTokens: pruningBudget,
-        messages: params.messages,
-        indexTokenCountMap,
-        startType: params.startType,
-        thinkingEnabled: factoryParams.thinkingEnabled,
-        tokenCounter: factoryParams.tokenCounter,
-        instructionTokens: currentInstructionTokens,
-        reasoningType: usesBedrockThinking
-          ? ContentTypes.REASONING_CONTENT
-          : ContentTypes.THINKING,
-        thinkingStartIndex:
-          factoryParams.thinkingEnabled === true
-            ? runThinkingStartIndex
-            : undefined,
-      });
-
-      const repaired = repairOrphanedToolMessages({
-        context: retryResult.context,
-        allMessages: params.messages,
-        tokenCounter: factoryParams.tokenCounter,
-        indexTokenCountMap,
-      });
-
-      context = repaired.context;
-      reclaimedTokens = repaired.reclaimedTokens;
-      appendItems(messagesToRefine, retryResult.messagesToRefine);
-      if (repaired.droppedMessages.length > 0) {
-        appendItems(messagesToRefine, repaired.droppedMessages);
+      const emergencyMessages = [...params.messages];
+      const preEmergencyTokenCounts: Record<string, number | undefined> = {};
+      for (let i = 0; i < params.messages.length; i++) {
+        preEmergencyTokenCounts[i] = indexTokenCountMap[i];
       }
 
-      factoryParams.log?.('debug', 'Emergency truncation retry result', {
-        contextLength: context.length,
-        messagesToRefineCount: messagesToRefine.length,
-        remainingTokens: retryResult.remainingContextTokens,
-      });
+      try {
+        const emergency = applyFadingCaps({
+          messages: emergencyMessages,
+          indexTokenCountMap,
+          tokenCounter: factoryParams.tokenCounter,
+          caps: emergencyCaps,
+          masked: emergencyTier.masked,
+        });
+
+        factoryParams.log?.('info', 'Emergency truncation complete');
+        factoryParams.log?.('debug', 'Emergency truncation details', {
+          truncatedCount:
+            emergency.truncated + emergency.inputs + emergency.masked,
+          budgetTokens: emergencyCaps.budgetTokens,
+        });
+
+        const retryResult = getMessagesWithinTokenLimit({
+          maxContextTokens: pruningBudget,
+          messages: emergencyMessages,
+          indexTokenCountMap,
+          startType: params.startType,
+          thinkingEnabled: factoryParams.thinkingEnabled,
+          tokenCounter: factoryParams.tokenCounter,
+          instructionTokens: currentInstructionTokens,
+          reasoningType: usesBedrockThinking
+            ? ContentTypes.REASONING_CONTENT
+            : ContentTypes.THINKING,
+          thinkingStartIndex:
+            factoryParams.thinkingEnabled === true
+              ? runThinkingStartIndex
+              : undefined,
+        });
+
+        const repaired = repairOrphanedToolMessages({
+          context: retryResult.context,
+          allMessages: emergencyMessages,
+          tokenCounter: factoryParams.tokenCounter,
+          indexTokenCountMap,
+        });
+
+        context = repaired.context;
+        reclaimedTokens = repaired.reclaimedTokens;
+        /** The retry supersedes the failed pass: messages now in context
+         *  must not also be handed to the summarizer. */
+        messagesToRefine.length = 0;
+        appendItems(messagesToRefine, retryResult.messagesToRefine);
+        if (repaired.droppedMessages.length > 0) {
+          appendItems(messagesToRefine, repaired.droppedMessages);
+        }
+
+        factoryParams.log?.('debug', 'Emergency truncation retry result', {
+          contextLength: context.length,
+          messagesToRefineCount: messagesToRefine.length,
+          remainingTokens: retryResult.remainingContextTokens,
+        });
+      } finally {
+        // Restore the closure's indexTokenCountMap to pre-emergency values so the
+        // next turn counts old messages at their original (un-truncated) size.
+        for (const [key, value] of Object.entries(preEmergencyTokenCounts)) {
+          indexTokenCountMap[key] = value;
+        }
+      }
     }
 
     /** Scale raw-space remaining back to calibrated/provider units so it is

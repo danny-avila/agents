@@ -44,6 +44,16 @@ Updated each turn from `usageMetadata.input_tokens` returned by the provider. Th
 
 All budget comparisons multiply raw counts by `calibrationRatio` to approximate provider space, while the `indexTokenCountMap` stays in raw-token space for stability.
 
+### Fading Tier
+
+Every character cap applied to historical tool results (masking, pre-flight truncation, fit-to-budget) derives from one latched **fading tier** (`src/messages/fading.ts`): `{ budgetTokens, masked }`. The budget sits on a ladder that halves the context window per rung; the tier only ever shrinks and masking only ever activates. Because truncation is a pure function of (content, cap), a historical tool result maps to identical bytes on every call within a tier — which is what keeps prefix-based provider prompt caches (Anthropic's single tail breakpoint) valid from turn to turn. Only escalation and compaction rewrite the prefix.
+
+- **Fit rung**: the shallowest rung whose fresh-result cap fits within half the effective budget, so a single tool result can never leave the context empty.
+- **Pressure-band rungs** (summarization disabled only): +1 rung at 85 %, +2 at 90 %, +4 at 99 %.
+- **Masking** latches at 80 % pressure; consumed results then keep 10 % of the fresh cap (floor 300 chars).
+
+The tier is returned from every prune call and exposed as `Run.getFadingTier()`; hosts should persist it beside `calibrationRatio` and pass it back as `RunConfig.fadingTier` so stability holds across runs. The budget is absolute, so a mid-run budget correction or a return to the normal window keeps the tier; only compaction resets it.
+
 **Instruction overhead calibration**: The pruner also tracks `bestInstructionOverhead` — the best observed instruction token count from provider feedback. When the variance between the estimated and calibrated `toolSchemaTokens` exceeds 15% (`CALIBRATION_VARIANCE_THRESHOLD`), the calibrated value is applied to `AgentContext.toolSchemaTokens`. This corrects the local tool-schema estimate (which uses a static multiplier) against real provider behavior. After intra-run summarization, the calibrated overhead is preserved and seeded into the recreated pruner.
 
 ---
@@ -52,11 +62,11 @@ All budget comparisons multiply raw counts by `calibrationRatio` to approximate 
 
 ### Pipeline (every agent node turn)
 
-1. **< 80% pressure**: No modifications. Messages pass through untouched.
+1. **Fit-to-budget truncation** (every turn): the fading tier's fit rung caps any individual tool result and tool-call input so it fits within half the effective budget. The cap is latched, so a historical result keeps the same bytes on later turns.
 
-2. **80%+ pressure — Observation masking**: Consumed ToolMessages masked to ~300 char placeholders. Pre-masking snapshot saved so the summarizer can access un-masked originals later.
+2. **80%+ pressure — Observation masking**: Masking latches on the tier; consumed ToolMessages shrink to 10 % of the fresh cap (floor ~300 chars). Pre-masking snapshot saved so the summarizer can access un-masked originals later.
 
-3. **Fit-to-budget truncation**: Any individual message still exceeding `effectiveMaxTokens` is truncated via `preFlightTruncateToolResults` / `preFlightTruncateToolCallInputs`. Uses 30% of effective budget as per-result cap with recency weighting.
+3. **Apply pass**: `applyFadingCaps` walks only the messages that arrived since the last call (or everything after an escalation) and rewrites the ones above their cap.
 
 4. **Pruning split**: `getMessagesWithinTokenLimit` determines which messages fit (`context`) and which overflow (`messagesToRefine`). Messages are kept newest-first.
 
@@ -94,9 +104,9 @@ The prompt is written in the tone of a user directing the assistant — assertiv
 
 This prevents the model from continuing to roleplay or respond to the conversation instead of producing a structured checkpoint.
 
-### Fallback Fading
+### Emergency Truncation
 
-If observation masking + fit-to-budget still produce an **empty context** (no messages fit at all), context pressure fading is applied as a fallback before emergency truncation. This uses the same pressure-band graduated truncation from the disabled path.
+If masking + fit-to-budget still produce an **empty context** (no messages fit at all), a deeper, temporary tier is derived from a per-message share of the effective budget and applied to a clone of the messages before pruning is retried. The latched tier is left alone: that share depends on the message count, and latching it would pin every future result to one transient event.
 
 ### Cross-Run Behavior
 
@@ -115,22 +125,22 @@ If observation masking + fit-to-budget still produce an **empty context** (no me
 
 2. **80%+ pressure — Observation masking**: Same consumed-only masking as the summarization-enabled path. Consumed ToolMessages masked, unconsumed left intact, AI messages untouched.
 
-3. **80%+ pressure — Context pressure fading**: Additional progressive truncation of remaining oversized tool results based on graduated pressure bands:
+3. **80%+ pressure — Context pressure fading**: The fading tier deepens by extra rungs on top of the fit rung, halving the cap budget per rung:
 
-   | Pressure | Budget factor | Effect                                        |
-   | -------- | ------------- | --------------------------------------------- |
-   | 80%      | 1.0           | Gentle — oldest results get light truncation  |
-   | 85%      | 0.5           | Moderate — older results shrink significantly |
-   | 90%      | 0.2           | Aggressive — most results heavily truncated   |
-   | 99%      | 0.05          | Emergency — effectively one-line placeholders |
+   | Pressure | Extra rungs | Budget factor |
+   | -------- | ----------- | ------------- |
+   | 80%      | 0           | 1.0           |
+   | 85%      | 1           | 0.5           |
+   | 90%      | 2           | 0.25          |
+   | 99%      | 4           | 0.0625        |
 
-   Recency weighting: oldest tool results get 20% of the budget factor, newest get 100%.
+   Every tool result shares one cap at a given tier; the consumed/fresh distinction from masking is the only per-message difference. The tier never relaxes, so a conversation hovering around a threshold does not flip between bands.
 
 4. **Position-based context pruning** (if `contextPruningConfig.enabled`): Additional position-based degradation of old tool results.
 
 5. **Pruning**: `getMessagesWithinTokenLimit` drops oldest messages to fit budget. Orphan repair strips unpaired tool_use/tool_result blocks.
 
-6. **Emergency truncation** (if pruning produces empty context): Proportional budget divided across all messages, aggressive head+tail truncation, retry pruning.
+6. **Emergency truncation** (if pruning produces empty context): A temporary tier derived from the per-message share of the effective budget is applied to a clone, then pruning is retried. The latched tier is not changed.
 
 ### Key Difference from Enabled Path
 
