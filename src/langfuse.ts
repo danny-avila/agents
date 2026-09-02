@@ -39,7 +39,10 @@ import {
   registerLangfuseManagedSpan,
   resolveLangfuseDestinationKey,
 } from '@/langfuseSpanRegistry';
-import { consumePreemptRestartedRun } from '@/llm/preempt';
+import {
+  consumePreemptRestartedRun,
+  PREEMPT_RESTART_CONTROL_FLOW,
+} from '@/llm/preempt';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
 
 export {
@@ -54,9 +57,6 @@ const GRAPH_INTERRUPT_CONTROL_FLOW = { controlFlow: 'GraphInterrupt' } as const;
 const GRAPH_INTERRUPT_TOOL_OUTPUT = JSON.stringify(
   GRAPH_INTERRUPT_CONTROL_FLOW
 );
-const PREEMPT_RESTART_CONTROL_FLOW = {
-  controlFlow: 'PreemptRestart',
-} as const;
 
 export type LangfuseTraceMetadata = Record<string, string>;
 export type LangfuseTraceAttributes = Record<string, string | number | boolean>;

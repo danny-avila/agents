@@ -4479,7 +4479,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
            * hosts use the counter for truncated-seal telemetry, and both
            * paths end the turn with nothing to resume from.
            */
-          if (injected.length === 0) {
+          /**
+           * Seals only. `emptyBoundaries` means a kept assistant turn that was
+           * truncated with nothing to resume from; a restart preserved no turn
+           * at all, so a halted one is not that — `preemptIncomplete` above
+           * already records that the answer never arrived.
+           */
+          if (injected.length === 0 && !preemptRestarted) {
             this.preemptEmptyBoundaries += 1;
           }
           this.cleanupSignalListener();

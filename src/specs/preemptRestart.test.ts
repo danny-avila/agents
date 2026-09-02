@@ -18,6 +18,7 @@ import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { LLMResult } from '@langchain/core/outputs';
 import type { HookCallback } from '@/hooks/types';
 import type * as t from '@/types';
 import { HookRegistry } from '@/hooks/HookRegistry';
@@ -53,7 +54,17 @@ const streamConfig = {
  * level-triggered and stays true until a boundary drains it, and `wake` is a
  * hint the SDK may act on or ignore.
  */
-function createHost(restartGraceMs: number): {
+function createHost(
+  restartGraceMs: number,
+  /**
+   * When false the channel is registered but never fired. That is not a broken
+   * host — a wake that arrives while the shape is not yet discardable declines
+   * and never comes again — and it is the only deterministic way to reach the
+   * per-chunk trigger, which ends the stream by BREAKING the iterator rather
+   * than aborting it.
+   */
+  deliverWakes = true
+): {
   arm: () => void;
   disarm: () => void;
   preemption: t.StreamPreemption;
@@ -63,6 +74,9 @@ function createHost(restartGraceMs: number): {
   return {
     arm: (): void => {
       armed = true;
+      if (!deliverWakes) {
+        return;
+      }
       for (const wake of wakes) {
         wake();
       }
@@ -657,5 +671,126 @@ describe('a discardable stream that ends inside the grace', () => {
     expect(model.prompts[1].some((message) => message.getType() === 'ai')).toBe(
       false
     );
+  });
+});
+
+/**
+ * Each way a restart can end the stream leaves the model run in a different
+ * state, and closing one the way another needs either double-closes a finished
+ * run or leaves an open one behind.
+ */
+describe('restart close routes', () => {
+  it('does not close a run the stream already finished', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation();
+    try {
+      const host = createHost(60_000);
+      const model = new ThinkingOnlyModel({ responses: [RESTARTED_RESPONSE] });
+      const run = await createRestartRun({
+        runId: 'restart-no-double-close',
+        preemption: host.preemption,
+        model,
+        hook: () => {
+          host.disarm();
+          return {
+            injectedMessages: [{ role: 'user' as const, content: 'stop' }],
+          };
+        },
+      });
+      model.onFirstStream = host.arm;
+
+      await run.processStream(
+        { messages: [new HumanMessage('think')] },
+        streamConfig
+      );
+
+      expect(model.prompts).toHaveLength(2);
+      /**
+       * The natural end already emitted its own close. A second attempt finds
+       * no run to end and falls back with this warning, which is the
+       * observable signature of getting the route wrong.
+       */
+      expect(
+        warn.mock.calls.filter(([message]) =>
+          String(message).includes('Native close of the sealed model run')
+        )
+      ).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('marks a manually closed restart as control flow', async () => {
+    const outputs: Array<Record<string, unknown> | undefined> = [];
+    const host = createHost(0, false);
+    const model = new ThinkingThenAnsweringModel({
+      responses: [RESTARTED_RESPONSE],
+    });
+    const run = await createRestartRun({
+      runId: 'restart-control-flow-output',
+      preemption: host.preemption,
+      model,
+      hook: () => {
+        host.disarm();
+        return {
+          injectedMessages: [{ role: 'user' as const, content: 'stop' }],
+        };
+      },
+    });
+    model.onFirstStream = host.arm;
+
+    await run.processStream(
+      { messages: [new HumanMessage('think it through')] },
+      {
+        ...streamConfig,
+        callbacks: [
+          {
+            handleLLMEnd: (output: LLMResult): void => {
+              outputs.push(output.llmOutput as Record<string, unknown>);
+            },
+          },
+        ],
+      }
+    );
+
+    /**
+     * A discarded turn must not read as an ordinary generation just because
+     * the per-chunk trigger fired instead of the wake.
+     */
+    expect(outputs).toContainEqual(
+      expect.objectContaining({ controlFlow: 'PreemptRestart' })
+    );
+  });
+});
+
+/**
+ * A halted restart truncates nothing that was kept, so it is not the
+ * truncated-seal signal hosts persist on. `preemptIncomplete` already records
+ * that the answer never arrived.
+ */
+describe('a restart boundary that halts', () => {
+  it('is not counted as an empty boundary', async () => {
+    const host = createHost(0);
+    const model = new SilentThenAnsweringModel({
+      responses: [RESTARTED_RESPONSE],
+    });
+    const run = await createRestartRun({
+      runId: 'restart-halted',
+      preemption: host.preemption,
+      model,
+      hook: () => {
+        host.disarm();
+        return { preventContinuation: true };
+      },
+    });
+    model.onFirstStream = host.arm;
+
+    await run.processStream(
+      { messages: [new HumanMessage('tell me a long story')] },
+      streamConfig
+    );
+
+    const stats = run.getPreemptStats();
+    expect(stats.restarts).toBe(1);
+    expect(stats.emptyBoundaries).toBe(0);
   });
 });

@@ -331,6 +331,18 @@ const PREEMPT_RESTARTED_RUN_TTL_MS = 60_000;
  */
 const preemptRestartedRuns = new Map<string, PreemptRestartedRun>();
 
+/**
+ * The `llmOutput` a discarded attempt closes with, so a restart reads as
+ * control flow rather than as an ordinary generation — `AGENTS.md` states that
+ * control flow is not an error, and a discarded turn is not an answer either.
+ *
+ * Shared so every close route emits it: which trigger fired must not change
+ * how the run looks in a trace.
+ */
+export const PREEMPT_RESTART_CONTROL_FLOW = {
+  controlFlow: 'PreemptRestart',
+} as const;
+
 /** A torn-down model run awaiting its tracing close. */
 export interface PreemptRestartedRun {
   /** The accumulated turn, carrying whatever usage was resolved for it. */

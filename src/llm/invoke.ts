@@ -37,6 +37,7 @@ import {
 import {
   canRestartPreempt,
   notePreemptRestartedRun,
+  PREEMPT_RESTART_CONTROL_FLOW,
   resolvePreemptAction,
   resolveRestartGraceMs,
 } from '@/llm/preempt';
@@ -508,7 +509,14 @@ async function endSealedModelRun(
   prompt: BaseMessage[],
   llmRunId: string | undefined,
   config?: RunnableConfig,
-  model?: t.ChatModel
+  model?: t.ChatModel,
+  /**
+   * Shapes the close for a DISCARDED turn. A seal's output is the partial
+   * answer it kept; a restart kept nothing, and marking it here is what keeps
+   * the two restart routes reading alike in a trace — the aborted one is
+   * relabelled through the tracing callback, and this is the manual twin.
+   */
+  llmOutput: Record<string, unknown> = {}
 ): Promise<void> {
   const metadata = config?.metadata as Record<string, unknown> | undefined;
   synthesizeSealedUsage(context, chunk, prompt, metadata);
@@ -548,7 +556,7 @@ async function endSealedModelRun(
         };
         await runManager.handleLLMEnd({
           generations: [[generation]],
-          llmOutput: {},
+          llmOutput,
         });
         return;
       }
@@ -833,15 +841,20 @@ async function attemptInvokeBody(
      *  initializer, and would narrow the comparison away as unreachable. */
     const restartDecided = (): boolean => preemptAction === 'restart';
     /**
-     * Whether the tear-down actually happened. Only an ABORT makes LangChain
-     * close the model run, through its error path; breaking the iterator fires
-     * neither end nor error callbacks. The two restart routes therefore need
-     * opposite closes, and the controller's own state is the exact record of
-     * which one ran — nothing else aborts it, and the run's signal is composed
-     * INTO the stream rather than into this.
+     * How the stream ended when a restart was chosen, because each way leaves
+     * the model run in a different state and needs a different close:
+     *  - `aborted`: LangChain closed it through its error path, where the
+     *    marker relabels it and supplies the discarded attempt's usage.
+     *  - `broke`: the iterator was closed early, which fires NEITHER end nor
+     *    error callbacks, so this is the one route that must close natively.
+     *  - `exhausted`: the stream finished on its own, so LangChain already
+     *    emitted its end. Closing again would warn and change nothing — and
+     *    the generation is honestly an ordinary completed one, since nothing
+     *    was torn down; only the turn built on it is being discarded.
      */
-    const restartToreDownStream = (): boolean =>
-      restartController?.signal.aborted === true;
+    let restartRoute: 'aborted' | 'broke' | 'exhausted' | undefined;
+    /** Only `broke` leaves a run for this attempt to close itself. */
+    const restartNeedsNativeClose = (): boolean => restartRoute === 'broke';
 
     /**
      * The wake is a hint; this is where the request is actually read. The
@@ -869,6 +882,10 @@ async function attemptInvokeBody(
         return preemptAction === 'restart';
       }
       if (context?.shouldPreemptStream() !== true) {
+        /** The request was withdrawn. Forget when it arrived, or a NEW request
+         *  later in this same attempt would inherit the old clock and convert
+         *  without ever getting its grace. */
+        preemptRequestedAt = undefined;
         return false;
       }
       /** A chunk is mid-dispatch to the host, so `finalChunk` describes only
@@ -950,6 +967,7 @@ async function attemptInvokeBody(
         );
         notePreemptRestartedRun(sealedRunId, finalChunk);
       }
+      restartRoute = 'aborted';
       restartController.abort();
       return true;
     };
@@ -1089,7 +1107,11 @@ async function attemptInvokeBody(
              * armed during a long thinking stretch used to wait for the whole
              * turn.
              */
-            if (context?.shouldPreemptStream() === true) {
+            if (context?.shouldPreemptStream() !== true) {
+              /** Withdrawn: forget the clock, so a later request in this same
+               *  attempt still gets its own grace. */
+              preemptRequestedAt = undefined;
+            } else {
               preemptRequestedAt ??= Date.now();
               const action = resolvePreemptAction({
                 chunk: finalChunk,
@@ -1114,6 +1136,9 @@ async function attemptInvokeBody(
                     context.claimPreemptRestart();
               if (claimed) {
                 preemptAction = action;
+                if (action === 'restart') {
+                  restartRoute = 'broke';
+                }
                 break;
               }
             }
@@ -1181,6 +1206,7 @@ async function attemptInvokeBody(
           context.claimPreemptRestart()
         ) {
           preemptAction = 'restart';
+          restartRoute = 'exhausted';
         }
       }
     } catch (error) {
@@ -1250,16 +1276,15 @@ async function attemptInvokeBody(
           discardedChunk,
           messagesForProvider,
           /**
-           * Only an aborted run is already closed — LangChain took it through
-           * its error path, and the marker recorded above carries its usage
-           * there. A restart that merely BROKE the iterator fired no callback
-           * at all, so it closes natively here exactly as a seal does; passing
-           * no run id would leave that generation open forever and lose the
-           * discarded attempt's usage.
+           * See {@link restartRoute}: only the broken iterator leaves a run
+           * with no close of its own. An aborted run was closed through the
+           * error path and an exhausted one through its natural end, and
+           * closing either again would find nothing to end.
            */
-          restartToreDownStream() ? undefined : sealedRunId,
+          restartNeedsNativeClose() ? sealedRunId : undefined,
           config,
-          model
+          model,
+          PREEMPT_RESTART_CONTROL_FLOW
         );
       }
       /** Non-null on every path that can reach here: it arms the controller
