@@ -410,6 +410,22 @@ describe('planContextOverflowRecovery', () => {
     expect(plan).toBeNull();
   });
 
+  it('caps numberless recovery by the completion-adjusted window', () => {
+    const bedrock = signatureFor(
+      'us.anthropic.claude-sonnet-4-5-20250929-v1:0'
+    );
+    const plan = planContextOverflowRecovery({
+      error: bedrock.error,
+      provider: Providers.BEDROCK,
+      maxContextTokens: 128_000,
+      estimatedPromptTokens: 50_000,
+      configuredCompletionTokens: 100_000,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan?.budgetTokens).toBe(Math.floor(28_000 * 0.95));
+  });
+
   it('successive recoveries keep shrinking', () => {
     const bedrock = signatureFor(
       'us.anthropic.claude-sonnet-4-5-20250929-v1:0'

@@ -190,21 +190,27 @@ function resolveTargetBudget(
 
     return promptCeiling * CEILING_HEADROOM_RATIO;
   }
-  /** With no provider ceiling, the configured window is the only safe bound. */
-  if (
-    isUsable(maxContextTokens) &&
-    isUsable(configuredCompletionTokens) &&
-    configuredCompletionTokens >= maxContextTokens
-  ) {
+  let blindTarget: number | undefined;
+  if (isUsable(estimatedPromptTokens)) {
+    blindTarget = estimatedPromptTokens * BLIND_SHRINK_RATIO;
+  } else if (isUsable(maxContextTokens)) {
+    blindTarget = maxContextTokens * BLIND_SHRINK_RATIO;
+  }
+  if (blindTarget == null) {
     return null;
   }
-  if (isUsable(estimatedPromptTokens)) {
-    return estimatedPromptTokens * BLIND_SHRINK_RATIO;
+  if (isUsable(maxContextTokens) && isUsable(configuredCompletionTokens)) {
+    const promptCeiling = maxContextTokens - configuredCompletionTokens;
+    /** Even an empty prompt cannot fit when completion fills the window. */
+    if (promptCeiling <= 0) {
+      return null;
+    }
+    return Math.min(
+      blindTarget,
+      promptCeiling * CEILING_HEADROOM_RATIO
+    );
   }
-  if (isUsable(maxContextTokens)) {
-    return maxContextTokens * BLIND_SHRINK_RATIO;
-  }
-  return null;
+  return blindTarget;
 }
 
 /**
