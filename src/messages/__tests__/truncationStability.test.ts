@@ -470,6 +470,45 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     expect(serialize(messages[2])).not.toContain('OLD:');
   });
 
+  it('reapplies a latched tier after explicit canonical prefix replacement', () => {
+    const canonicalMessages: BaseMessage[] = [
+      new HumanMessage('fetch'),
+      toolCall('replace-canonical-result'),
+      new ToolMessage({
+        content: `OLD:${'o'.repeat(50_000)}`,
+        tool_call_id: 'replace-canonical-result',
+      }),
+      new AIMessage('done'),
+    ];
+    const messages = [...canonicalMessages];
+    const pruneMessages = createPruneMessages({
+      maxTokens: 10_000,
+      startIndex: 0,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: false,
+      fadingTier: {
+        v: 1,
+        budgetTokens: 5000,
+        masked: true,
+        latched: true,
+      },
+    });
+
+    pruneMessages({ messages, canonicalMessages });
+    canonicalMessages[2] = new ToolMessage({
+      content: `NEW:${'n'.repeat(50_000)}`,
+      tool_call_id: 'replace-canonical-result',
+    });
+    messages[2] = canonicalMessages[2];
+    pruneMessages({ messages, canonicalMessages });
+
+    expect(serialize(messages[2])).toContain('NEW:');
+    expect(serialize(messages[2])).toContain('truncated');
+    expect(serialize(messages[2]).length).toBeLessThan(50_000);
+    expect(serialize(canonicalMessages[2]).length).toBeGreaterThan(50_000);
+  });
+
   /** Mirrors a host that rebuilds full-content messages and a fresh pruner every run. */
   function runTurn(
     messages: BaseMessage[],

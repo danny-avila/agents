@@ -2437,6 +2437,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       maxToolExchangeWidth = 1;
       toolExchangeWidthThrough = 0;
       toolExchangeWidthSources = [];
+      fadedThrough = 0;
+      maskedThrough = 0;
+      originalToolContent.clear();
+      originalToolContentSize = 0;
     }
     for (
       let i = toolExchangeWidthThrough;

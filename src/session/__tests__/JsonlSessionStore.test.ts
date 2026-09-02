@@ -1687,6 +1687,56 @@ describe('JsonlSessionStore', () => {
     expect(capturedConfigs[3].fadingTier).toEqual(namespaceBTier);
   });
 
+  it('persists an interrupted tier under the interrupt checkpoint namespace', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('interrupted');
+    const nestedTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(nestedTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: nestedTier });
+    mockRun.getInterrupt.mockReturnValueOnce({
+      interruptId: 'nested-interrupt',
+      threadId: 'nested-thread',
+      checkpointId: 'nested-checkpoint',
+      checkpointNs: 'nested-namespace',
+      payload: {
+        type: 'tool_approval',
+        action_requests: [],
+        review_configs: [],
+      },
+    });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'nested-checkpoint',
+      checkpointNs: 'nested-namespace',
+    });
+
+    await session.run('pause in nested namespace');
+    await session.resumeInterrupt([{ type: 'approve' }]);
+
+    expect(capturedConfigs[1].fadingTier).toEqual(nestedTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: nestedTier });
+  });
+
   it('bounds fading metadata retained for alternate checkpoint threads', async () => {
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {

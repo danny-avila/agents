@@ -102,6 +102,39 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.indexTokenCountMap).toEqual({ 0: 1, 1: 200, 2: 1 });
   });
 
+  it('accepts reducer message-like and empty updates during invalidation', () => {
+    const context = AgentContext.fromConfig(
+      {
+        agentId: 'overflow-agent',
+        provider: Providers.ANTHROPIC,
+        instructions: 'Test instructions',
+        maxContextTokens: 1_000_000,
+      } as Partial<t.AgentInputs> as t.AgentInputs,
+      () => 1
+    );
+    const canonical = [
+      new HumanMessage({ id: 'human-1', content: 'original' }),
+    ];
+    const projection = context.getProviderProjectedMessages(canonical);
+    const replacement = {
+      id: 'human-1',
+      role: 'user' as const,
+      content: 'replacement',
+    };
+
+    expect(() =>
+      context.invalidateProviderProjectionForMessageUpdates([
+        undefined,
+        replacement,
+      ])
+    ).not.toThrow();
+    const nextCanonical = messagesStateReducer(canonical, replacement);
+
+    expect(context.getProviderProjectedMessages(nextCanonical)).not.toBe(
+      projection
+    );
+  });
+
   it('summarizes the first overflow when deterministic pruning is unavailable', () => {
     const context = createContext(1_000_000);
     context.summarizationEnabled = true;

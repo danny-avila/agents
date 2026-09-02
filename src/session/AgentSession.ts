@@ -1271,9 +1271,13 @@ export class AgentSession {
           await this.store?.appendMessage(message);
         }
       }
-      await this.captureRunContextState(threadId, checkpointNs, run);
-      runContextCaptured = true;
       const interrupt = run.getInterrupt();
+      await this.captureRunContextState(
+        threadId,
+        interrupt?.checkpointNs ?? checkpointNs,
+        run
+      );
+      runContextCaptured = true;
       const haltedReason = run.getHaltReason();
       if (interrupt) {
         emitTerminalEvent({ type: 'run.interrupted' });
@@ -1660,9 +1664,13 @@ export class AgentSession {
           await this.store?.appendMessage(message);
         }
       }
-      await this.captureRunContextState(threadId, checkpointNs, run);
-      runContextCaptured = true;
       const interrupt = run.getInterrupt();
+      await this.captureRunContextState(
+        threadId,
+        interrupt?.checkpointNs ?? checkpointNs,
+        run
+      );
+      runContextCaptured = true;
       const haltedReason = run.getHaltReason();
       if (interrupt) {
         await this.store?.appendRunEvent('run.interrupted', interrupt, {

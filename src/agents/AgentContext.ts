@@ -1,10 +1,15 @@
 /* eslint-disable no-console */
 import { RunnableLambda } from '@langchain/core/runnables';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import {
+  HumanMessage,
+  SystemMessage,
+  coerceMessageLikeToMessage,
+} from '@langchain/core/messages';
 import type {
   UsageMetadata,
   BaseMessage,
   BaseMessageFields,
+  BaseMessageLike,
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ExactTokenCountCache } from '@/llm/contextPressureMeter';
@@ -1778,13 +1783,22 @@ export class AgentContext {
    * the normal append-only path.
    */
   invalidateProviderProjectionForMessageUpdates(
-    updates: BaseMessage | BaseMessage[]
+    updates:
+      | BaseMessage
+      | BaseMessageLike
+      | Array<BaseMessage | BaseMessageLike | null | undefined>
+      | null
+      | undefined
   ): void {
     if (this.providerProjectionSources == null) {
       return;
     }
     const updateList = Array.isArray(updates) ? updates : [updates];
-    for (const update of updateList) {
+    for (const rawUpdate of updateList) {
+      if (rawUpdate == null) {
+        continue;
+      }
+      const update = coerceMessageLikeToMessage(rawUpdate);
       if (
         update.getType() === 'remove' ||
         (update.id != null &&
