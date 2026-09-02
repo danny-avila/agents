@@ -1603,14 +1603,33 @@ describe('JsonlSessionStore', () => {
       },
     });
 
+    await session.run('main');
     for (let i = 0; i < 65; i++) {
       await session.run(`alternate ${i}`, { threadId: `thread-${i}` });
     }
-    await session.run('oldest again', { threadId: 'thread-0' });
-    await session.run('newest again', { threadId: 'thread-64' });
+    expect(
+      session
+        .getSessionStore()
+        ?.getFadingStates(session.threadId, 64)
+    ).toHaveLength(65);
+    const reopened = await createAgentSession({
+      cwd: dir,
+      sessionPath: session.sessionPath,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await reopened.run('oldest again', { threadId: 'thread-0' });
+    await reopened.run('newest again', { threadId: 'thread-64' });
 
-    expect(capturedConfigs[65].fadingTier).toBeUndefined();
-    expect(capturedConfigs[66].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[66].fadingTier).toBeUndefined();
+    expect(capturedConfigs[67].fadingTier).toEqual(fadingTier);
   });
 
   it('summarizes an abandoned branch before switching in place', async () => {

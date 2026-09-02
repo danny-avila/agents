@@ -375,8 +375,16 @@ export class JsonlSessionStore {
     });
   }
 
-  getFadingStates(): SessionFadingState[] {
+  getFadingStates(
+    mainThreadId?: string,
+    maxAlternateStates = Number.POSITIVE_INFINITY
+  ): SessionFadingState[] {
     const states = new Map<string, SessionFadingState>();
+    const alternateLimit = Number.isFinite(maxAlternateStates)
+      ? Math.max(0, Math.floor(maxAlternateStates))
+      : Number.POSITIVE_INFINITY;
+    let alternateCount = 0;
+    let mainFound = mainThreadId == null;
     for (let i = this.entries.length - 1; i >= 0; i--) {
       const entry = this.entries[i];
       if (
@@ -389,8 +397,18 @@ export class JsonlSessionStore {
         break;
       }
       const state = entry.data.fadingState;
-      if (!states.has(state.threadId)) {
+      if (states.has(state.threadId)) {
+        continue;
+      }
+      if (state.threadId === mainThreadId) {
         states.set(state.threadId, state);
+        mainFound = true;
+      } else if (alternateCount < alternateLimit) {
+        states.set(state.threadId, state);
+        alternateCount += 1;
+      }
+      if (mainFound && alternateCount >= alternateLimit) {
+        break;
       }
     }
     return [...states.values()];

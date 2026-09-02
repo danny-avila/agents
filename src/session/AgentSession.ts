@@ -979,7 +979,11 @@ export class AgentSession {
   }
 
   private restoreFadingStateFromStore(clearWhenMissing = false): void {
-    const states = this.store?.getFadingStates() ?? [];
+    const states =
+      this.store?.getFadingStates(
+        this.threadId,
+        MAX_ALTERNATE_THREAD_FADING_STATES
+      ) ?? [];
     if (states.length === 0) {
       if (clearWhenMissing || this.store?.hasFadingState() === true) {
         this.clearFadingState();

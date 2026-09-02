@@ -269,6 +269,32 @@ function getToolCallIds(message: BaseMessage): Set<string> {
   return ids;
 }
 
+function getMaxToolExchangeWidth(messages: BaseMessage[]): number {
+  let width = 1;
+  for (const message of messages) {
+    const messageRole = (message as BaseMessage & { role?: unknown }).role;
+    if (message.getType() !== 'ai' && messageRole !== 'assistant') {
+      continue;
+    }
+    const aiMessage = message as AIMessage;
+    const contentCallCount = Array.isArray(aiMessage.content)
+      ? aiMessage.content.filter(
+        (part) =>
+          typeof part === 'object' &&
+          ((part as { type?: unknown }).type === 'tool_use' ||
+            (part as { type?: unknown }).type === 'tool_call')
+      ).length
+      : 0;
+    width = Math.max(
+      width,
+      getToolCallIds(message).size,
+      aiMessage.tool_calls?.length ?? 0,
+      contentCallCount
+    );
+  }
+  return width;
+}
+
 type ResponsesToolOutputSource = {
   source: 'response_metadata' | 'tool_outputs';
   items: unknown[];
@@ -2903,6 +2929,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           ? Math.floor(effectiveMaxTokens / calibrationRatio)
           : effectiveMaxTokens,
       summarizationEnabled: factoryParams.summarizationEnabled === true,
+      toolExchangeWidth: getMaxToolExchangeWidth(canonicalMessages),
     };
     const faded = fade(fadingSignals);
     const observationsMasked = restoredFading.masked + faded.masked;

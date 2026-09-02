@@ -157,8 +157,9 @@ describe('fading ladder', () => {
     expect(fadingRungForBudget(100_000, 100_000)).toBe(0);
     expect(fadingRungForBudget(100_000, 60_000)).toBe(0);
     expect(fadingRungForBudget(100_000, 9_400)).toBe(3);
-    expect(fadingRungForBudget(100_000, 9_400, 1_000)).toBe(2);
-    expect(fadingRungForBudget(100_000, 9_400, 0)).toBe(2);
+    expect(fadingRungForBudget(100_000, 9_400, 1_000)).toBe(1);
+    expect(fadingRungForBudget(100_000, 9_400, 0)).toBe(1);
+    expect(fadingRungForBudget(100_000, 9_400, 1_000, 3)).toBe(3);
     expect(fadingRungForBudget(100_000, 0)).toBe(0);
     expect(
       calculateMaxToolResultChars(
@@ -267,14 +268,14 @@ describe('fading ladder', () => {
     expect(seedFadingTier(100_000, restored)).toEqual(restored);
   });
 
-  it('fits a single result within half the effective budget with summarization on', () => {
+  it('fits a complete tool exchange within the effective budget', () => {
     const tier = resolveFadingTier(createFadingTier(32_000), 32_000, {
       contextPressure: 0.3,
       effectiveRawTokens: 9_400,
       summarizationEnabled: true,
     });
     const caps = resolveFadingCaps(tier);
-    expect(caps.resultChars / 4).toBeLessThanOrEqual(9_400 / 2);
+    expect((caps.resultChars + caps.inputChars) / 4).toBeLessThanOrEqual(9_400);
     expect(caps.resultChars).toBe(
       calculateMaxToolResultChars(caps.budgetTokens)
     );
@@ -295,14 +296,36 @@ describe('fading ladder', () => {
 
     expect(tier).toEqual({
       v: 1,
-      budgetTokens: 25_000,
+      budgetTokens: 50_000,
       masked: false,
       latched: true,
     });
     expect(resolveFadingCaps(tier, 1_000)).toMatchObject({
       resultChars: 1_000,
-      inputChars: 15_000,
+      inputChars: 30_000,
     });
+  });
+
+  it('fits every input and result in the widest parallel exchange', () => {
+    const rawTokens = 9_400;
+    const width = 3;
+    const tier = resolveFadingTier(
+      createFadingTier(100_000),
+      100_000,
+      {
+        contextPressure: 0.3,
+        effectiveRawTokens: rawTokens,
+        summarizationEnabled: true,
+        toolExchangeWidth: width,
+      },
+      1_000
+    );
+    const caps = resolveFadingCaps(tier, 1_000);
+
+    expect(tier.budgetTokens).toBe(12_500);
+    expect(width * (caps.inputChars + caps.resultChars)).toBeLessThanOrEqual(
+      rawTokens * 4
+    );
   });
 
   it('masks consumed results to a fraction of the fresh cap with a floor', () => {
@@ -908,17 +931,20 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     ).toBe('private reasoning');
   });
 
-  it('emergency truncation recovers on a clone without latching the tier', () => {
+  it('latches a stable tier for a parallel exchange before emergency pruning', () => {
     const ids = ['p1', 'p2', 'p3', 'p4'];
-    const messages: BaseMessage[] = [
+    const canonicalMessages: BaseMessage[] = [
       ...conversation(Array(20).fill(200)),
       new HumanMessage('fetch everything at once'),
       toolCall(...ids),
       ...ids.map((id) => toolResult(id, 47_000)),
     ];
+    const messages = [...canonicalMessages];
     const originalLengths = ids.map(
       (_, index) =>
-        serialize(messages[messages.length - ids.length + index]).length
+        serialize(
+          canonicalMessages[canonicalMessages.length - ids.length + index]
+        ).length
     );
     const pruneMessages = createPruneMessages({
       maxTokens,
@@ -929,13 +955,19 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
       calibrationRatio: 1,
     });
 
-    const result = pruneMessages({ messages });
+    const result = pruneMessages({ messages, canonicalMessages });
 
     expect(result.context.length).toBeGreaterThan(0);
-    expect(result.fadingTier.budgetTokens).toBe(maxTokens);
+    expect(result.fadingTier.budgetTokens).toBe(20_000);
+    const caps = resolveFadingCaps(result.fadingTier);
     ids.forEach((_, index) => {
       expect(
         serialize(messages[messages.length - ids.length + index]).length
+      ).toBeLessThanOrEqual(caps.resultChars);
+      expect(
+        serialize(
+          canonicalMessages[canonicalMessages.length - ids.length + index]
+        ).length
       ).toBe(originalLengths[index]);
     });
     const contextSet = new Set(result.context);
@@ -943,7 +975,7 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
       result.messagesToRefine?.some((message) => contextSet.has(message))
     ).toBe(false);
 
-    const again = pruneMessages({ messages });
+    const again = pruneMessages({ messages, canonicalMessages });
     expect(again.fadingTier).toEqual(result.fadingTier);
   });
 });

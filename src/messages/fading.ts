@@ -18,9 +18,6 @@ export const MASKED_RESULT_MIN_CHARS = 300;
 /** Fraction of a fresh result's cap that a masked (consumed) result keeps. */
 const MASKED_RESULT_CAP_RATIO = 0.1;
 
-/** Largest share of the effective budget a single fresh tool result may occupy. */
-const FIT_SHARE = 0.5;
-
 /**
  * Pressure bands expressed as extra rungs on top of the fit rung, so the
  * budget factors land at ×0.5 (85 %), ×0.25 (90 %) and ×0.0625 (99 %).
@@ -37,6 +34,8 @@ export type FadingSignals = {
   /** (pruningBudget − instruction tokens) ÷ calibrationRatio, in raw token space. */
   effectiveRawTokens: number;
   summarizationEnabled: boolean;
+  /** Largest number of parallel calls observed in one assistant exchange. */
+  toolExchangeWidth?: number;
   /** Recovery paths force at least this rung on the current window's ladder. */
   minRung?: number;
 };
@@ -132,39 +131,37 @@ export function fadingRungForResultChars(
 }
 
 /**
- * Shallowest rung at which both halves of a historical tool exchange fit:
- * the fresh result and its tool-call input must each stay within `FIT_SHARE`
- * of `rawTokens`, the effective budget in raw token space. Together they fit
- * the whole effective budget, preventing orphan repair from dropping a result
- * merely because its matching input used the room left by a configured result
- * cap.
+ * Shallowest rung at which the configured number of parallel tool-call inputs
+ * and fresh results fit together within `rawTokens`, the effective budget in
+ * raw token space. This prevents orphan repair from dropping results merely
+ * because their shared assistant message used the room left by a configured
+ * result cap.
  */
 export function fadingRungForBudget(
   window: number,
   rawTokens: number,
-  maxToolResultChars?: number
+  maxToolResultChars?: number,
+  toolExchangeWidth = 1
 ): number {
   if (!(rawTokens > 0)) {
     return 0;
   }
-  const targetChars = Math.floor(rawTokens * FIT_SHARE) * 4;
-  const resultRung = fadingRungForResultChars(
-    window,
-    targetChars,
-    maxToolResultChars
-  );
+  const targetChars = Math.floor(rawTokens) * 4;
+  const width = Math.max(1, Math.floor(toolExchangeWidth));
   const deepest = maxFadingRung(window);
-  let inputRung = deepest;
   for (let rung = 0; rung < deepest; rung++) {
-    if (
-      calculateMaxToolCallInputChars(fadingBudgetTokens(window, rung)) <=
-      targetChars
-    ) {
-      inputRung = rung;
-      break;
+    const budgetTokens = fadingBudgetTokens(window, rung);
+    const windowResultChars = calculateMaxToolResultChars(budgetTokens);
+    const resultChars =
+      maxToolResultChars == null
+        ? windowResultChars
+        : Math.min(windowResultChars, maxToolResultChars);
+    const inputChars = calculateMaxToolCallInputChars(budgetTokens);
+    if (width * (resultChars + inputChars) <= targetChars) {
+      return rung;
     }
   }
-  return Math.max(resultRung, inputRung);
+  return deepest;
 }
 
 /** Character caps for a tier; a pure function of `(budgetTokens, masked)`. */
@@ -202,8 +199,8 @@ export function resolveFadingCaps(
  * can escalate once at a rung boundary but never oscillate. Returns the same
  * object when nothing changes.
  *
- * - The fit rung guarantees a tool result and its matching call input each fit
- *   half the effective budget, so their pair cannot empty the context.
+ * - The fit rung guarantees the widest observed parallel tool exchange fits
+ *   the effective budget as a complete input/result batch.
  * - Pressure bands add rungs on top of the fit rung when summarization is
  *   off, mirroring the staged budget factors of progressive context fading.
  * - A window larger than the latched budget (model switch) does not loosen
@@ -218,7 +215,8 @@ export function resolveFadingTier(
   const fitRung = fadingRungForBudget(
     window,
     signals.effectiveRawTokens,
-    maxToolResultChars
+    maxToolResultChars,
+    signals.toolExchangeWidth
   );
   const bandRung = signals.summarizationEnabled
     ? 0
