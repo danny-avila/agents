@@ -488,7 +488,11 @@ describe('LangGraph composition smoke tests', () => {
       runId: 'bounded-routing-results',
       agents: [
         makeAgent('source'),
-        { ...makeAgent('destination'), maxContextTokens: 1000 },
+        {
+          ...makeAgent('destination'),
+          instructions: 'routing instruction '.repeat(120),
+          maxContextTokens: 1000,
+        },
       ],
       edges: [
         {
@@ -513,7 +517,7 @@ describe('LangGraph composition smoke tests', () => {
       (message) => message.additional_kwargs.source === 'routing'
     );
     expect(routingPrompt?.content).toEqual(expect.stringContaining('truncated'));
-    expect(String(routingPrompt?.content).length).toBeLessThan(1300);
+    expect(String(routingPrompt?.content).length).toBeLessThan(500);
     expect(largeResult).toContain('large routed result');
   });
 

@@ -373,6 +373,52 @@ function fadingScopeKey(threadId: string, checkpointNs = ''): string {
   return JSON.stringify([threadId, checkpointNs]);
 }
 
+function mergeFadingTier(
+  current: t.FadingTier | undefined,
+  incoming: t.FadingTier | undefined
+): t.FadingTier | undefined {
+  if (current == null) {
+    return incoming == null ? undefined : { ...incoming };
+  }
+  if (incoming == null) {
+    return { ...current };
+  }
+  const budgetTokens = Math.min(
+    current.budgetTokens,
+    incoming.budgetTokens
+  );
+  const masked = current.masked || incoming.masked;
+  const latched =
+    current.latched === true ||
+    incoming.latched === true ||
+    budgetTokens !== current.budgetTokens ||
+    budgetTokens !== incoming.budgetTokens ||
+    masked !== current.masked ||
+    masked !== incoming.masked;
+  return {
+    v: 1,
+    budgetTokens,
+    masked,
+    ...(latched ? { latched: true } : {}),
+  };
+}
+
+function mergeFadingTiers(
+  current: t.FadingTiers | undefined,
+  incoming: t.FadingTiers | undefined
+): t.FadingTiers {
+  const agentIds = new Set([
+    ...Object.keys(current ?? {}),
+    ...Object.keys(incoming ?? {}),
+  ]);
+  return Object.fromEntries(
+    [...agentIds].flatMap((agentId) => {
+      const tier = mergeFadingTier(current?.[agentId], incoming?.[agentId]);
+      return tier == null ? [] : [[agentId, tier]];
+    })
+  );
+}
+
 function createCheckpointLookupConfig(config: RunnableConfig): RunnableConfig {
   const threadId = getConfigString(config, 'thread_id');
   if (threadId == null) {
@@ -957,15 +1003,16 @@ export class AgentSession {
     fadingTiers: t.FadingTiers
   ): void {
     if (threadId === this.threadId && checkpointNs === '') {
-      this.fadingTier = fadingTier;
-      this.fadingTiers = fadingTiers;
+      this.fadingTier = mergeFadingTier(this.fadingTier, fadingTier);
+      this.fadingTiers = mergeFadingTiers(this.fadingTiers, fadingTiers);
       return;
     }
     const scopeKey = fadingScopeKey(threadId, checkpointNs);
+    const current = this.alternateThreadFadingState.get(scopeKey);
     this.alternateThreadFadingState.delete(scopeKey);
     this.alternateThreadFadingState.set(scopeKey, {
-      fadingTier,
-      fadingTiers,
+      fadingTier: mergeFadingTier(current?.fadingTier, fadingTier),
+      fadingTiers: mergeFadingTiers(current?.fadingTiers, fadingTiers),
     });
     while (
       this.alternateThreadFadingState.size >

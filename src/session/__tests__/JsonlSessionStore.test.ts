@@ -1737,6 +1737,68 @@ describe('JsonlSessionStore', () => {
     expect(capturedConfigs[1].fadingTiers).toEqual({ default: nestedTier });
   });
 
+  it('merges overlapping run tiers monotonically', async () => {
+    const mockRun = createMockRun('continued');
+    const deepTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    const staleTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 50_000,
+      masked: false,
+    };
+    let markSlowStarted!: () => void;
+    let releaseSlow!: () => void;
+    const slowStarted = new Promise<void>((resolve) => {
+      markSlowStarted = resolve;
+    });
+    const slowResult = new Promise<t.MessageContentComplex[]>((resolve) => {
+      releaseSlow = () => resolve([{ type: 'text', text: 'slow' }]);
+    });
+    mockRun.processStream
+      .mockImplementationOnce(async () => {
+        markSlowStarted();
+        return slowResult;
+      })
+      .mockResolvedValue([{ type: 'text', text: 'fast' }]);
+    mockRun.getFadingTier
+      .mockReturnValueOnce(deepTier)
+      .mockReturnValueOnce(staleTier)
+      .mockReturnValue(deepTier);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({ default: deepTier })
+      .mockReturnValueOnce({ default: staleTier })
+      .mockReturnValue({ default: deepTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    const slowRun = session.run('slow run');
+    await slowStarted;
+    await session.run('fast run');
+    releaseSlow();
+    await slowRun;
+    await session.run('after overlap');
+
+    expect(capturedConfigs[0].fadingTier).toBeUndefined();
+    expect(capturedConfigs[1].fadingTier).toBeUndefined();
+    expect(capturedConfigs[2].fadingTier).toEqual(deepTier);
+    expect(capturedConfigs[2].fadingTiers).toEqual({ default: deepTier });
+  });
+
   it('bounds fading metadata retained for alternate checkpoint threads', async () => {
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {

@@ -1586,9 +1586,20 @@ export class MultiAgentGraph extends StandardGraph {
             if (prompt.includes('{results}')) {
               const resultsMessages = state.messages.slice(this.startIndex);
               const destinationContext = this.agentContexts.get(destination);
-              const maxRoutingPromptChars = calculateMaxToolResultChars(
-                destinationContext?.maxContextTokens
-              );
+              if (destinationContext?.tokenCalculationPromise != null) {
+                await destinationContext.tokenCalculationPromise;
+              }
+              const availableMessageTokens =
+                destinationContext?.maxContextTokens == null
+                  ? undefined
+                  : destinationContext.getTokenBudgetBreakdown()
+                    .availableForMessages;
+              const maxRoutingPromptChars =
+                availableMessageTokens == null
+                  ? HARD_MAX_TOOL_RESULT_CHARS
+                  : availableMessageTokens <= 0
+                    ? 0
+                    : calculateMaxToolResultChars(availableMessageTokens);
               const resultsString = serializeToolContentBounded(
                 getBufferString(resultsMessages),
                 maxRoutingPromptChars
