@@ -1348,10 +1348,11 @@ async function attemptInvokeBody(
           );
         } else {
           /**
-           * See {@link restartRoute}: only the broken iterator leaves a run
-           * with no close of its own. An aborted run was closed through
-           * LangChain's error path, where the marker relabels it and supplies
-           * this usage, so it takes the synthetic close instead.
+           * Both cut-short routes come here and both pass the run id: see
+           * {@link restartNeedsNativeClose} for why the run's state is not
+           * observable and the close has to work either way. An aborted run
+           * that WAS already closed falls through to the synthetic event,
+           * where the marker relabels it and supplies this usage.
            */
           await endSealedModelRun(
             context,
