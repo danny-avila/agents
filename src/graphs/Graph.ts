@@ -4065,9 +4065,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             fallbackContext ?? getFallbackErrorContext(error);
           return (
             getLocalProviderOverflowMeasurement(error)?.estimatedPromptTokens ??
-            (resolvedFallbackContext == null
-              ? estimatedPromptTokens
-              : undefined)
+            resolvedFallbackContext?.estimatedPromptTokens ??
+            (resolvedFallbackContext == null ? estimatedPromptTokens : undefined)
           );
         };
 

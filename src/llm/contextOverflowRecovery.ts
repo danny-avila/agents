@@ -256,7 +256,7 @@ export function planContextOverflowRecovery({
   const info = getContextOverflowInfo(error, {
     provider,
     estimatedPromptTokens,
-    maxContextTokens,
+    maxContextTokens: totalContextWindowTokens ?? maxContextTokens,
     configuredCompletionTokens,
   });
   if (info == null) {
