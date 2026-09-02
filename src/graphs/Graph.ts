@@ -2579,7 +2579,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (
         isInformativeFadingTier(context.fadingTier, context.maxContextTokens)
       ) {
-        tiers[agentId] = context.fadingTier;
+        tiers[agentId] = { ...context.fadingTier };
       }
     }
     return tiers;

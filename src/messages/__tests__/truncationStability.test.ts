@@ -795,9 +795,12 @@ describe('per-agent fading tier persistence', () => {
     expect(graph.agentContexts.get('default')?.fadingTier).toEqual(defaultTier);
     expect(graph.agentContexts.get('worker')?.fadingTier).toEqual(workerTier);
     expect(graph.agentContexts.get('unseeded')?.fadingTier).toBeUndefined();
-    expect(graph.getFadingTiers()).toEqual({
+    const snapshot = graph.getFadingTiers();
+    expect(snapshot).toEqual({
       default: defaultTier,
       worker: workerTier,
     });
+    snapshot.worker.budgetTokens = 1;
+    expect(graph.getFadingTiers().worker).toEqual(workerTier);
   });
 });

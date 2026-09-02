@@ -960,7 +960,12 @@ export class Run<_T extends t.BaseGraphState> {
 
   /** Returns a defensive snapshot of latched tiers keyed by agent ID. */
   getFadingTiers(): t.FadingTiers {
-    return { ...this.fadingTiers };
+    return Object.fromEntries(
+      Object.entries(this.fadingTiers).map(([agentId, tier]) => [
+        agentId,
+        { ...tier },
+      ])
+    );
   }
 
   getResolvedInstructionOverhead(): number | undefined {
