@@ -2865,7 +2865,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       const nextTier = resolveFadingTier(
         fadingTier,
         factoryParams.maxTokens,
-        signals
+        signals,
+        factoryParams.maxToolResultChars
       );
       if (nextTier !== fadingTier) {
         fadingTier = nextTier;
@@ -3071,9 +3072,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           ...fadingSignals,
           minRung: fadingRungForResultChars(
             factoryParams.maxTokens,
-            emergencyMaxChars
+            emergencyMaxChars,
+            factoryParams.maxToolResultChars
           ),
-        }
+        },
+        factoryParams.maxToolResultChars
       );
       const emergencyCaps = resolveFadingCaps(
         emergencyTier,

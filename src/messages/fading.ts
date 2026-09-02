@@ -112,14 +112,19 @@ export function seedFadingTier(window: number, seed?: unknown): FadingTier {
 /** Shallowest rung whose fresh-result cap is at most `targetChars`. */
 export function fadingRungForResultChars(
   window: number,
-  targetChars: number
+  targetChars: number,
+  maxToolResultChars?: number
 ): number {
   const deepest = maxFadingRung(window);
   for (let rung = 0; rung < deepest; rung++) {
-    if (
-      calculateMaxToolResultChars(fadingBudgetTokens(window, rung)) <=
-      targetChars
-    ) {
+    const windowResultChars = calculateMaxToolResultChars(
+      fadingBudgetTokens(window, rung)
+    );
+    const effectiveResultChars =
+      maxToolResultChars == null
+        ? windowResultChars
+        : Math.min(windowResultChars, maxToolResultChars);
+    if (effectiveResultChars <= targetChars) {
       return rung;
     }
   }
@@ -132,13 +137,18 @@ export function fadingRungForResultChars(
  * This is the fit guarantee: summarization never sees an empty context
  * because one result alone overflowed the budget.
  */
-export function fadingRungForBudget(window: number, rawTokens: number): number {
+export function fadingRungForBudget(
+  window: number,
+  rawTokens: number,
+  maxToolResultChars?: number
+): number {
   if (!(rawTokens > 0)) {
     return 0;
   }
   return fadingRungForResultChars(
     window,
-    Math.floor(rawTokens * FIT_SHARE) * 4
+    Math.floor(rawTokens * FIT_SHARE) * 4,
+    maxToolResultChars
   );
 }
 
@@ -187,9 +197,14 @@ export function resolveFadingCaps(
 export function resolveFadingTier(
   tier: FadingTier,
   window: number,
-  signals: FadingSignals
+  signals: FadingSignals,
+  maxToolResultChars?: number
 ): FadingTier {
-  const fitRung = fadingRungForBudget(window, signals.effectiveRawTokens);
+  const fitRung = fadingRungForBudget(
+    window,
+    signals.effectiveRawTokens,
+    maxToolResultChars
+  );
   const bandRung = signals.summarizationEnabled
     ? 0
     : (PRESSURE_BAND_RUNGS.find(
