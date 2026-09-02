@@ -19,6 +19,7 @@ import {
   preFlightTruncateToolResults,
   createPruneMessages,
   projectToolCallInputs,
+  ORIGINAL_CONTENT_MAX_CHARS,
 } from '@/messages/prune';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { StandardGraph } from '@/graphs/Graph';
@@ -719,6 +720,77 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     expect(serialize(rebuilt[2])).toBe(escalatedBytes);
   });
 
+  it('retains bounded canonical results when overflow recreates the pruner', () => {
+    const messages = conversation([60_000]);
+    const canonicalToolContent = new Map<
+      number,
+      BaseMessage['content']
+    >();
+    const firstPruner = createPruneMessages({
+      maxTokens,
+      startIndex: 0,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: false,
+      canonicalToolContent,
+    });
+    const first = firstPruner({ messages });
+    expect(canonicalToolContent.get(2)).toBeDefined();
+
+    const correctedPruner = createPruneMessages({
+      maxTokens: 20_000,
+      startIndex: messages.length,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: false,
+      fadingTier: first.fadingTier,
+      canonicalToolContent,
+    });
+    const corrected = correctedPruner({ messages });
+
+    const rebuilt = conversation([60_000]);
+    const freshPruner = createPruneMessages({
+      maxTokens: 20_000,
+      startIndex: rebuilt.length,
+      tokenCounter,
+      indexTokenCountMap: countMap(rebuilt),
+      summarizationEnabled: false,
+      fadingTier: corrected.fadingTier,
+    });
+    freshPruner({ messages: rebuilt });
+
+    expect(serialize(messages[2])).toBe(serialize(rebuilt[2]));
+  });
+
+  it('caps retained canonical result content across long histories', () => {
+    const messages = conversation(Array(8).fill(500_000));
+    const canonicalToolContent = new Map<
+      number,
+      BaseMessage['content']
+    >();
+    const pruneMessages = createPruneMessages({
+      maxTokens,
+      startIndex: messages.length,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: false,
+      canonicalToolContent,
+    });
+
+    pruneMessages({ messages });
+
+    const retainedChars = [...canonicalToolContent.values()].reduce(
+      (total, content) =>
+        total +
+        (typeof content === 'string'
+          ? content.length
+          : JSON.stringify(content).length),
+      0
+    );
+    expect(retainedChars).toBeLessThanOrEqual(ORIGINAL_CONTENT_MAX_CHARS);
+    expect(canonicalToolContent.size).toBeLessThan(8);
+  });
+
   it('emergency truncation recovers on a clone without latching the tier', () => {
     const ids = ['p1', 'p2', 'p3', 'p4'];
     const messages: BaseMessage[] = [
@@ -854,5 +926,22 @@ describe('per-agent fading tier persistence', () => {
     });
 
     expect(graph.agentContexts.get('default')?.fadingTier).toBeUndefined();
+  });
+
+  it('round-trips prototype-sensitive agent IDs', () => {
+    const tier: FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const fadingTiers = Object.fromEntries([['__proto__', tier]]);
+    const graph = new StandardGraph({
+      agents: [graphAgent('__proto__')],
+      fadingTiers,
+    });
+
+    expect(Object.hasOwn(graph.getFadingTiers(), '__proto__')).toBe(true);
+    expect(graph.getFadingTiers()['__proto__']).toEqual(tier);
   });
 });

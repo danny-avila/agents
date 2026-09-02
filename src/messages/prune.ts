@@ -178,6 +178,8 @@ export type PruneMessagesFactoryParams = {
    * current context window without losing their latched provenance.
    */
   fadingTier?: FadingTier | null;
+  /** Bounded canonical tool-result content retained across pruner recreation. */
+  canonicalToolContent?: Map<number, BaseMessage['content']>;
   /** Optional diagnostic log callback wired by the graph for observability. */
   log?: (
     level: 'debug' | 'info' | 'warn' | 'error',
@@ -1154,8 +1156,13 @@ type FadingApplyParams = {
   maskedFromIndex?: number;
   /** Original (pre-masking) content keyed by message index, captured for the summarizer. */
   originalContentStore?: Map<number, string>;
-  /** Canonical pre-fading content keyed by live message for tier escalation. */
-  canonicalContentStore?: WeakMap<BaseMessage, BaseMessage['content']>;
+  /** Canonical pre-fading content keyed by stable message index. */
+  canonicalContentStore?: Map<number, BaseMessage['content']>;
+  /** Called after storing newly captured canonical content. */
+  onCanonicalContentStored?: (
+    index: number,
+    content: BaseMessage['content']
+  ) => void;
   /** Called after storing a newly captured entry. */
   onContentStored?: (index: number, content: string) => void;
 };
@@ -1218,7 +1225,7 @@ export function applyFadingCaps(params: FadingApplyParams): FadingApplyResult {
       continue;
     }
     const canonicalContent =
-      params.canonicalContentStore?.get(message) ?? message.content;
+      params.canonicalContentStore?.get(i) ?? message.content;
     const compacted = compactToolContent(canonicalContent, maxChars);
     if (!compacted.changed) {
       continue;
@@ -1239,7 +1246,13 @@ export function applyFadingCaps(params: FadingApplyParams): FadingApplyResult {
       message as ToolMessage,
       compacted.content
     );
-    params.canonicalContentStore?.set(cloned, canonicalContent);
+    if (
+      params.canonicalContentStore != null &&
+      !params.canonicalContentStore.has(i)
+    ) {
+      params.canonicalContentStore.set(i, canonicalContent);
+      params.onCanonicalContentStored?.(i, canonicalContent);
+    }
     messages[i] = cloned;
     indexTokenCountMap[i] = tokenCounter(cloned);
     if (consumed) {
@@ -2299,10 +2312,41 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
   const originalToolContent = new Map<number, string>();
   let originalToolContentSize = 0;
   /** Pre-fading content retained so every deeper tier derives from one source. */
-  const canonicalToolContent = new WeakMap<
-    BaseMessage,
-    BaseMessage['content']
-  >();
+  const canonicalToolContent =
+    factoryParams.canonicalToolContent ??
+    new Map<number, BaseMessage['content']>();
+  const getCanonicalContentChars = (
+    content: BaseMessage['content']
+  ): number =>
+    serializeToolContentBounded(content, ORIGINAL_CONTENT_MAX_CHARS).length;
+  let canonicalToolContentChars = 0;
+  for (const content of canonicalToolContent.values()) {
+    canonicalToolContentChars += getCanonicalContentChars(content);
+  }
+  const enforceCanonicalContentCap = (): void => {
+    while (
+      canonicalToolContentChars > ORIGINAL_CONTENT_MAX_CHARS &&
+      canonicalToolContent.size > 0
+    ) {
+      const oldest = canonicalToolContent.keys().next();
+      if (oldest.done === true) {
+        break;
+      }
+      const removed = canonicalToolContent.get(oldest.value);
+      if (removed != null) {
+        canonicalToolContentChars -= getCanonicalContentChars(removed);
+      }
+      canonicalToolContent.delete(oldest.value);
+    }
+  };
+  enforceCanonicalContentCap();
+  const onCanonicalContentStored = (
+    _index: number,
+    content: BaseMessage['content']
+  ): void => {
+    canonicalToolContentChars += getCanonicalContentChars(content);
+    enforceCanonicalContentCap();
+  };
   /** Latched fading tier; caps derive from it alone so bytes stay stable. */
   let fadingTier = seedFadingTier(
     factoryParams.maxTokens,
@@ -2776,6 +2820,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             ? originalToolContent
             : undefined,
         canonicalContentStore: canonicalToolContent,
+        onCanonicalContentStored,
         onContentStored:
           factoryParams.summarizationEnabled === true
             ? storeOriginalToolContent
@@ -2826,6 +2871,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             ? originalToolContent
             : undefined,
         canonicalContentStore: canonicalToolContent,
+        onCanonicalContentStored,
         onContentStored:
           factoryParams.summarizationEnabled === true
             ? storeOriginalToolContent
@@ -2862,12 +2908,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
         resolvedSettings: contextPruningSettings,
-        onMessageCloned: (source, clone) => {
-          const canonicalContent = canonicalToolContent.get(source);
-          if (canonicalContent !== undefined) {
-            canonicalToolContent.set(clone, canonicalContent);
-          }
-        },
       });
     }
 
@@ -3052,6 +3092,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           caps: emergencyCaps,
           masked: emergencyTier.masked,
           canonicalContentStore: canonicalToolContent,
+          onCanonicalContentStored,
         });
 
         factoryParams.log?.('info', 'Emergency truncation complete');

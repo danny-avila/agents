@@ -277,6 +277,8 @@ export class AgentContext {
   resolvedInstructionOverhead?: number;
   private _pendingOriginalToolContent?: Map<number, string>;
   private pendingOriginalToolContentChars = 0;
+  /** Bounded pre-fading results retained when overflow recreates the pruner. */
+  canonicalToolContent = new Map<number, BaseMessage['content']>();
   /** Pre-masking tool content keyed by message index, consumed by the summarize node. */
   get pendingOriginalToolContent(): Map<number, string> | undefined {
     return this._pendingOriginalToolContent;
@@ -1515,6 +1517,7 @@ export class AgentContext {
     this.systemRunnableStale = true;
     this.pruneMessages = undefined;
     this.fadingTier = undefined;
+    this.canonicalToolContent.clear();
   }
 
   /** Sets a cross-run summary that is injected into the system prompt. */
@@ -1528,6 +1531,9 @@ export class AgentContext {
     this.durableSummaryPrecedesMessages = false;
     this._summaryVersion += 1;
     this.systemRunnableStale = true;
+    this.pruneMessages = undefined;
+    this.fadingTier = undefined;
+    this.canonicalToolContent.clear();
   }
 
   /**

@@ -1542,9 +1542,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (calibrationRatio != null && calibrationRatio > 0) {
         agentContext.calibrationRatio = calibrationRatio;
       }
-      const restoredFadingTier =
-        fadingTiers?.[agentConfig.agentId] ??
-        (agentConfig.agentId === agents[0].agentId ? fadingTier : undefined);
+      let restoredFadingTier: t.FadingTier | null | undefined;
+      if (
+        fadingTiers != null &&
+        Object.prototype.hasOwnProperty.call(fadingTiers, agentConfig.agentId)
+      ) {
+        restoredFadingTier = fadingTiers[agentConfig.agentId];
+      } else if (agentConfig.agentId === agents[0].agentId) {
+        restoredFadingTier = fadingTier;
+      }
       if (
         restoredFadingTier != null &&
         (agentConfig.initialSummary?.text == null ||
@@ -2578,15 +2584,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   /** Latched context-fading tiers keyed by agent ID. */
   getFadingTiers(): t.FadingTiers {
-    const tiers: t.FadingTiers = {};
+    const tiers: Array<[string, t.FadingTier]> = [];
     for (const [agentId, context] of this.agentContexts) {
       if (
         isInformativeFadingTier(context.fadingTier, context.maxContextTokens)
       ) {
-        tiers[agentId] = { ...context.fadingTier };
+        tiers.push([agentId, { ...context.fadingTier }]);
       }
     }
-    return tiers;
+    return Object.fromEntries(tiers);
   }
 
   getResolvedInstructionOverhead(): number | undefined {
@@ -3119,6 +3125,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           reserveRatio: agentContext.summarizationConfig?.reserveRatio,
           calibrationRatio: agentContext.calibrationRatio,
           fadingTier: agentContext.fadingTier,
+          canonicalToolContent: agentContext.canonicalToolContent,
           getInstructionTokens: () => agentContext.instructionTokens,
           log: (level, message, data) => {
             emitAgentLog(config, level, 'prune', message, data, {

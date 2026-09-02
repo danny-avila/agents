@@ -1421,6 +1421,84 @@ describe('JsonlSessionStore', () => {
     expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
   });
 
+  it('carries live fading tiers into cloned sessions', async () => {
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('advance tier');
+    const cloned = await session.clone({ cwd: dir });
+    await cloned.run('continue clone');
+
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
+  });
+
+  it('keeps fading tiers isolated by checkpoint thread', async () => {
+    const mockRun = createMockRun('continued');
+    const mainTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const alternateTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier
+      .mockReturnValueOnce(mainTier)
+      .mockReturnValueOnce(alternateTier)
+      .mockReturnValue(mainTier);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({ default: mainTier })
+      .mockReturnValueOnce({ default: alternateTier })
+      .mockReturnValue({ default: mainTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('main');
+    await session.run('alternate', { threadId: 'alternate-thread' });
+    await session.run('main again');
+    await session.run('alternate again', { threadId: 'alternate-thread' });
+
+    expect(capturedConfigs[1].fadingTier).toBeUndefined();
+    expect(capturedConfigs[2].fadingTier).toEqual(mainTier);
+    expect(capturedConfigs[3].fadingTier).toEqual(alternateTier);
+  });
+
   it('summarizes an abandoned branch before switching in place', async () => {
     mockSummarizer('summary of abandoned branch');
     const session = await createAgentSession({

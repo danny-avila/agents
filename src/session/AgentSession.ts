@@ -852,6 +852,10 @@ export class AgentSession {
   private calibrationRatio: number | undefined;
   private fadingTier: t.FadingTier | undefined;
   private fadingTiers: t.FadingTiers | undefined;
+  private alternateThreadFadingState = new Map<
+    string,
+    { fadingTier?: t.FadingTier; fadingTiers?: t.FadingTiers }
+  >();
   private checkpointing: SessionCheckpointingState;
   cwd: string;
   threadId: string;
@@ -917,6 +921,37 @@ export class AgentSession {
 
   getCheckpointer(): BaseCheckpointSaver | undefined {
     return this.checkpointing.checkpointer;
+  }
+
+  private getFadingState(threadId: string): {
+    fadingTier?: t.FadingTier;
+    fadingTiers?: t.FadingTiers;
+  } {
+    return threadId === this.threadId
+      ? { fadingTier: this.fadingTier, fadingTiers: this.fadingTiers }
+      : (this.alternateThreadFadingState.get(threadId) ?? {});
+  }
+
+  private setFadingState(
+    threadId: string,
+    fadingTier: t.FadingTier | undefined,
+    fadingTiers: t.FadingTiers
+  ): void {
+    if (threadId === this.threadId) {
+      this.fadingTier = fadingTier;
+      this.fadingTiers = fadingTiers;
+      return;
+    }
+    this.alternateThreadFadingState.set(threadId, {
+      fadingTier,
+      fadingTiers,
+    });
+  }
+
+  private clearFadingState(): void {
+    this.fadingTier = undefined;
+    this.fadingTiers = undefined;
+    this.alternateThreadFadingState.clear();
   }
 
   async getLatestCheckpoint(
@@ -1094,6 +1129,7 @@ export class AgentSession {
     const sessionState = deriveMessages(
       isSessionThread ? (this.store?.getPath() ?? []) : []
     );
+    const fadingState = this.getFadingState(threadId);
     let run: Run<t.IState> | undefined;
     try {
       const runConfig: t.RunConfig = {
@@ -1108,8 +1144,8 @@ export class AgentSession {
         ),
         returnContent: true,
         calibrationRatio: this.calibrationRatio,
-        fadingTier: this.fadingTier,
-        fadingTiers: this.fadingTiers,
+        fadingTier: fadingState.fadingTier,
+        fadingTiers: fadingState.fadingTiers,
         customHandlers: {
           ...(this.runConfig.customHandlers ?? {}),
           ...handlerResult.handlers,
@@ -1132,8 +1168,11 @@ export class AgentSession {
         }
       }
       this.calibrationRatio = run.getCalibrationRatio();
-      this.fadingTier = run.getFadingTier();
-      this.fadingTiers = run.getFadingTiers();
+      this.setFadingState(
+        threadId,
+        run.getFadingTier(),
+        run.getFadingTiers()
+      );
       const interrupt = run.getInterrupt();
       const haltedReason = run.getHaltReason();
       if (interrupt) {
@@ -1245,11 +1284,13 @@ export class AgentSession {
       this.store = await JsonlSessionStore.open(sessions[0].path);
       this.cwd = this.store.header.cwd;
       this.threadId = this.store.header.id;
+      this.clearFadingState();
       return this;
     }
     this.store = await JsonlSessionStore.open(pathOrId);
     this.cwd = this.store.header.cwd;
     this.threadId = this.store.header.id;
+    this.clearFadingState();
     return this;
   }
 
@@ -1259,7 +1300,11 @@ export class AgentSession {
     }
     const store = await this.store.clone(options);
     return new AgentSession({
-      runConfig: this.runConfig,
+      runConfig: {
+        ...this.runConfig,
+        fadingTier: this.fadingTier,
+        fadingTiers: this.fadingTiers,
+      },
       cwd: store.header.cwd,
       threadId: store.header.id,
       checkpointing: this.checkpointing,
@@ -1276,7 +1321,11 @@ export class AgentSession {
     }
     const store = await this.store.fork(entryId, options);
     return new AgentSession({
-      runConfig: this.runConfig,
+      runConfig: {
+        ...this.runConfig,
+        fadingTier: this.fadingTier,
+        fadingTiers: this.fadingTiers,
+      },
       cwd: store.header.cwd,
       threadId: store.header.id,
       checkpointing: this.checkpointing,
@@ -1321,6 +1370,7 @@ export class AgentSession {
       return;
     }
     await store.setLeaf(leafId);
+    this.clearFadingState();
     await this.resetCheckpointThreads('branch');
   }
 
@@ -1442,8 +1492,7 @@ export class AgentSession {
       retainedEntryIds,
       summarizedEntryIds: summarized.map((entry) => entry.id),
     });
-    this.fadingTier = undefined;
-    this.fadingTiers = undefined;
+    this.clearFadingState();
     return summary;
   }
 
@@ -1471,6 +1520,7 @@ export class AgentSession {
     const sessionState = deriveMessages(
       isSessionThread ? (this.store?.getPath() ?? []) : []
     );
+    const fadingState = this.getFadingState(threadId);
     let run: Run<t.IState> | undefined;
     try {
       run = await Run.create<t.IState>({
@@ -1485,8 +1535,8 @@ export class AgentSession {
         ),
         returnContent: true,
         calibrationRatio: this.calibrationRatio,
-        fadingTier: this.fadingTier,
-        fadingTiers: this.fadingTiers,
+        fadingTier: fadingState.fadingTier,
+        fadingTiers: fadingState.fadingTiers,
         customHandlers: {
           ...(this.runConfig.customHandlers ?? {}),
           ...handlerResult.handlers,
@@ -1500,8 +1550,11 @@ export class AgentSession {
         }
       }
       this.calibrationRatio = run.getCalibrationRatio();
-      this.fadingTier = run.getFadingTier();
-      this.fadingTiers = run.getFadingTiers();
+      this.setFadingState(
+        threadId,
+        run.getFadingTier(),
+        run.getFadingTiers()
+      );
       const interrupt = run.getInterrupt();
       const haltedReason = run.getHaltReason();
       if (interrupt) {
