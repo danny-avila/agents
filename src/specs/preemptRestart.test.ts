@@ -163,6 +163,45 @@ class ThinkingThenAnsweringModel extends PromptRecordingModel {
   }
 }
 
+/**
+ * Ignores cancellation entirely — `stream` is overridden so LangChain's own
+ * signal handling never runs, leaving the SDK's consumer loop as the only
+ * thing that can stop it. That is the adapter the abort cannot be trusted
+ * against, and the buffered-chunk case behaves the same way from the loop's
+ * side. `yielded` records how far it got before the consumer closed it.
+ */
+class UncooperativeModel extends PromptRecordingModel {
+  yielded = 0;
+  readonly textChunks = 40;
+
+  override stream(
+    input: Parameters<FakeChatModel['stream']>[0],
+    options?: Parameters<FakeChatModel['stream']>[1]
+  ): ReturnType<FakeChatModel['stream']> {
+    const messages = Array.isArray(input) ? (input as BaseMessage[]) : [];
+    if (this.recordPrompt(messages) !== 1) {
+      return super.stream(input, options);
+    }
+    const countYield = (): void => {
+      this.yielded += 1;
+    };
+    const arm = (): void => this.onFirstStream();
+    const { textChunks } = this;
+    async function* uncooperative(): AsyncGenerator<AIMessageChunk> {
+      yield new AIMessageChunk({
+        content: [{ type: 'thinking', thinking: 'deciding' }],
+      });
+      countYield();
+      arm();
+      for (let i = 0; i < textChunks; i++) {
+        yield new AIMessageChunk({ content: 'x' });
+        countYield();
+      }
+    }
+    return uncooperative() as unknown as ReturnType<FakeChatModel['stream']>;
+  }
+}
+
 /** Streams reasoning and then ends, never producing text. */
 class ThinkingOnlyModel extends PromptRecordingModel {
   override async *_streamResponseChunks(
@@ -475,5 +514,44 @@ describe('seal-only hosts', () => {
 
     expect(model.prompts).toHaveLength(1);
     expect(boundaries).toHaveLength(0);
+  });
+});
+
+/**
+ * The abort is a request, not a guarantee. An adapter that ignores it — or one
+ * whose iterator hands over a chunk buffered before it landed — would keep
+ * feeding the host text it is about to be told was discarded, and in the
+ * ignoring case would hold the boundary until the whole response finished.
+ */
+describe('an adapter that ignores the abort', () => {
+  it('stops being consumed as soon as the restart is decided', async () => {
+    const host = createHost(0);
+    const model = new UncooperativeModel({ responses: [RESTARTED_RESPONSE] });
+    const run = await createRestartRun({
+      runId: 'restart-uncooperative',
+      preemption: host.preemption,
+      model,
+      hook: () => {
+        host.disarm();
+        return {
+          injectedMessages: [{ role: 'user' as const, content: 'stop' }],
+        };
+      },
+    });
+    model.onFirstStream = host.arm;
+
+    await run.processStream(
+      { messages: [new HumanMessage('go')] },
+      streamConfig
+    );
+
+    expect(model.prompts).toHaveLength(2);
+    /** A couple of chunks may already be in flight; the whole response must
+     *  not be. */
+    expect(model.yielded).toBeLessThan(model.textChunks);
+    expect(userTexts(model.prompts[1])).toEqual(['go', 'stop']);
+    expect(model.prompts[1].some((message) => message.getType() === 'ai')).toBe(
+      false
+    );
   });
 });

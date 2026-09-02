@@ -828,6 +828,10 @@ async function attemptInvokeBody(
      *  yet been folded into `finalChunk`. See the guard in
      *  {@link evaluatePreemptRestart}. */
     let dispatchingChunk = false;
+    /** Read through a call so the check sees the value the wake handler
+     *  writes: control-flow analysis at the loop head still holds the
+     *  initializer, and would narrow the comparison away as unreachable. */
+    const restartDecided = (): boolean => preemptAction === 'restart';
     /**
      * The wake is a hint; this is where the request is actually read. The
      * shape is judged at the instant we look at it, and the teardown that
@@ -912,11 +916,28 @@ async function attemptInvokeBody(
         return false;
       }
       preemptAction = 'restart';
-      /** Recorded BEFORE the abort: the adapter's cancellation error can reach
-       *  the tracing callback synchronously, and a run marked afterwards would
-       *  already have closed as a failure. */
+      /**
+       * Recorded BEFORE the abort: the adapter's cancellation error can reach
+       * the tracing callback synchronously, and a run marked afterwards would
+       * already have closed as a failure.
+       *
+       * `sealedRunId` being set is also what proves the request went OUT, so
+       * charging the prompt against it is honest. Usage is resolved here, onto
+       * the same chunk the discard reports later — the run closes through the
+       * error path, which carries no output, so a marker without it would make
+       * every restart look free. `synthesizeSealedUsage` no-ops when the
+       * provider already streamed usage, and again when the discard path runs,
+       * so this is one computation, not two.
+       */
       if (sealedRunId != null) {
-        notePreemptRestartedRun(sealedRunId);
+        finalChunk ??= new AIMessageChunk({ content: '' });
+        synthesizeSealedUsage(
+          context,
+          finalChunk,
+          messagesForProvider,
+          config.metadata as Record<string, unknown> | undefined
+        );
+        notePreemptRestartedRun(sealedRunId, finalChunk);
       }
       restartController.abort();
       return true;
@@ -986,6 +1007,18 @@ async function attemptInvokeBody(
           const streamHandler = new ChatModelStreamHandler();
           for await (const chunk of stream) {
             throwIfBreakerTripped();
+            /**
+             * The decision is final, so stop consuming here rather than
+             * trusting the adapter to honor the abort. An adapter that ignores
+             * cancellation — or one whose iterator hands over a chunk buffered
+             * before the abort landed — would otherwise keep dispatching text
+             * the host is about to be told was discarded, and in the ignoring
+             * case would hold the boundary until the whole response finished:
+             * exactly the stall a restart exists to end.
+             */
+            if (restartDecided()) {
+              break;
+            }
             const handlingChunk = getStreamHandlingChunk({
               current: finalChunk,
               next: chunk,

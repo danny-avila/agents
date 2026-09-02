@@ -692,9 +692,28 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     ...args: Parameters<CallbackHandler['handleLLMError']>
   ): ReturnType<CallbackHandler['handleLLMError']> {
     const [, runId, parentRunId] = args;
-    if (consumePreemptRestartedRun(runId)) {
-      return super.handleLLMEnd(
-        { generations: [], llmOutput: PREEMPT_RESTART_CONTROL_FLOW },
+    const restarted = consumePreemptRestartedRun(runId);
+    if (restarted != null) {
+      /**
+       * Closed WITH the discarded turn, not as an empty end. The provider
+       * consumed the whole prompt and may have billed reasoning tokens before
+       * the tear-down, and this is the only close the generation will get —
+       * the synthetic `CHAT_MODEL_END` that follows is a host stream event and
+       * cannot reopen it. Routed through the override so Bedrock usage is
+       * normalized exactly as it is for an ordinary end.
+       *
+       * The generation text stays empty on purpose: a discarded turn produced
+       * no answer, and replaying its reasoning as output would read as one.
+       */
+      const generation: ChatGeneration = {
+        text: '',
+        message: restarted.message,
+      };
+      return this.handleLLMEnd(
+        {
+          generations: [[generation]],
+          llmOutput: PREEMPT_RESTART_CONTROL_FLOW,
+        },
         runId,
         parentRunId
       );

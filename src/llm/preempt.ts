@@ -299,47 +299,76 @@ export function resolvePreemptAction({
 }
 
 /**
- * How many restarted model-run ids stay recorded. Each entry lives only until
- * the tracing callback for that run consumes it, so the cap is a leak bound
- * for hosts that run no tracing at all — not a working-set size.
+ * How long a restarted model run stays recorded when nothing consumes it.
+ *
+ * The consumer is LangChain's error callback, which is dispatched on a
+ * non-awaited queue, so a marker may legitimately sit unread for a moment. A
+ * COUNT cap cannot tell that apart from a leak: a burst of concurrent restarts
+ * would evict markers whose callbacks were still queued, and each eviction
+ * turns an expected restart back into an error in the host's traces — the very
+ * thing the marker exists to prevent. Age can tell them apart, so the bound is
+ * time.
  */
-const PREEMPT_RESTARTED_RUN_LIMIT = 64;
+const PREEMPT_RESTARTED_RUN_TTL_MS = 60_000;
 
 /**
- * Model-run ids whose provider stream was torn down for a restart.
+ * Model runs whose provider stream was torn down for a restart, with the
+ * accumulated turn so the close can carry its usage.
  *
  * Recorded rather than inferred from the thrown error: aborting makes the
  * provider adapter raise whatever IT raises for cancellation, and matching on
  * that shape would bind the tracing layer to per-provider error identity. The
  * run id is unambiguous and already captured for the seal path.
  *
- * Consumed by the tracing callback so an expected restart closes as control
- * flow instead of a failed generation — `AGENTS.md` states plainly that
- * control flow is not an error, and a run cannot both be the interrupt the
- * user asked for and an error in their traces.
+ * The message rides along because the run closes through the error path, which
+ * carries no output: without it a discarded attempt would report no usage at
+ * all, and the reasoning tokens the provider already billed would vanish from
+ * cost accounting. The later synthetic `CHAT_MODEL_END` cannot repair that —
+ * by then the generation is closed.
  *
- * Insertion-ordered eviction bounds it: the oldest entry goes rather than the
- * newest being refused, so a long-lived process with tracing disabled cannot
- * grow this without limit and cannot start silently dropping new ids either.
+ * Insertion-ordered, so expiry sweeps from the front and stops at the first
+ * live entry.
  */
-const preemptRestartedRuns = new Set<string>();
+const preemptRestartedRuns = new Map<string, PreemptRestartedRun>();
+
+/** A torn-down model run awaiting its tracing close. */
+export interface PreemptRestartedRun {
+  /** The accumulated turn, carrying whatever usage was resolved for it. */
+  message: AIMessageChunk;
+  recordedAt: number;
+}
+
+function sweepExpiredRestartedRuns(now: number): void {
+  for (const [runId, record] of preemptRestartedRuns) {
+    if (now - record.recordedAt < PREEMPT_RESTARTED_RUN_TTL_MS) {
+      return;
+    }
+    preemptRestartedRuns.delete(runId);
+  }
+}
 
 /** Records a model run whose stream was torn down for a restart. */
-export function notePreemptRestartedRun(runId: string): void {
-  if (preemptRestartedRuns.size >= PREEMPT_RESTARTED_RUN_LIMIT) {
-    const oldest = preemptRestartedRuns.values().next().value;
-    if (oldest != null) {
-      preemptRestartedRuns.delete(oldest);
-    }
-  }
-  preemptRestartedRuns.add(runId);
+export function notePreemptRestartedRun(
+  runId: string,
+  message: AIMessageChunk
+): void {
+  const now = Date.now();
+  sweepExpiredRestartedRuns(now);
+  preemptRestartedRuns.set(runId, { message, recordedAt: now });
 }
 
 /**
- * True when this model run ended because a preempt discarded it. Consuming:
- * the run closes exactly once, and a stale id must not reclassify a later
- * genuine failure on a reused id.
+ * The record for a run that ended because a preempt discarded it, or
+ * `undefined`. Consuming: the run closes exactly once, and a stale id must not
+ * reclassify a later genuine failure on a reused id.
  */
-export function consumePreemptRestartedRun(runId: string): boolean {
-  return preemptRestartedRuns.delete(runId);
+export function consumePreemptRestartedRun(
+  runId: string
+): PreemptRestartedRun | undefined {
+  const record = preemptRestartedRuns.get(runId);
+  if (record == null) {
+    return undefined;
+  }
+  preemptRestartedRuns.delete(runId);
+  return record;
 }

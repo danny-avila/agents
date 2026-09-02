@@ -544,27 +544,46 @@ describe('resolvePreemptAction', () => {
  * that never consume it.
  */
 describe('preempt-restarted run records', () => {
-  it('reports a recorded run exactly once', () => {
-    notePreemptRestartedRun('run-a');
-    expect(consumePreemptRestartedRun('run-a')).toBe(true);
-    expect(consumePreemptRestartedRun('run-a')).toBe(false);
+  it('reports a recorded run exactly once, with its turn', () => {
+    const message = chunk({ content: 'thinking' });
+    notePreemptRestartedRun('run-a', message);
+
+    expect(consumePreemptRestartedRun('run-a')?.message).toBe(message);
+    expect(consumePreemptRestartedRun('run-a')).toBeUndefined();
   });
 
   it('does not claim a run it never recorded', () => {
-    expect(consumePreemptRestartedRun('run-never-restarted')).toBe(false);
+    expect(consumePreemptRestartedRun('run-never-restarted')).toBeUndefined();
   });
 
   /**
-   * Nothing consumes these when tracing is off, so the set must not grow
-   * without limit — and it must evict the OLDEST rather than refuse the
-   * newest, or a long-lived process would silently stop recognizing new
-   * restarts while holding stale ids forever.
+   * The consumer is a non-awaited callback, so a burst of concurrent restarts
+   * must NOT push each other out: an evicted marker closes its generation as
+   * an error, which is the failure the marker exists to prevent.
    */
-  it('evicts the oldest record rather than refusing new ones', () => {
-    for (let i = 0; i < 80; i++) {
-      notePreemptRestartedRun(`bulk-${i}`);
+  it('keeps every record while its callback could still fire', () => {
+    for (let i = 0; i < 500; i++) {
+      notePreemptRestartedRun(`bulk-${i}`, chunk({ content: '' }));
     }
-    expect(consumePreemptRestartedRun('bulk-0')).toBe(false);
-    expect(consumePreemptRestartedRun('bulk-79')).toBe(true);
+
+    expect(consumePreemptRestartedRun('bulk-0')).toBeDefined();
+    expect(consumePreemptRestartedRun('bulk-499')).toBeDefined();
+  });
+
+  /** Age is what separates a queued callback from a leak. */
+  it('expires a record nothing ever consumed', () => {
+    const realNow = Date.now;
+    try {
+      const base = realNow();
+      Date.now = () => base;
+      notePreemptRestartedRun('stale', chunk({ content: '' }));
+      Date.now = () => base + 60_001;
+      notePreemptRestartedRun('fresh', chunk({ content: '' }));
+
+      expect(consumePreemptRestartedRun('stale')).toBeUndefined();
+      expect(consumePreemptRestartedRun('fresh')).toBeDefined();
+    } finally {
+      Date.now = realNow;
+    }
   });
 });

@@ -4482,12 +4482,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * words were withdrawn before they landed. Bounded by the same seal
          * budget, so a host stuck arming and cancelling cannot loop forever.
          */
-        this.preemptEmptyBoundaries += 1;
         if (preemptRestarted) {
+          /**
+           * NOT counted as an empty boundary. That counter means a seal that
+           * ended the turn early with nothing to resume from — hosts read it
+           * as truncated-answer telemetry — and this branch is the opposite:
+           * the call is reissued and the run goes on to produce a complete
+           * answer. Counting it here would make a successful restart look like
+           * a truncated one in every host that persists on that signal.
+           */
           this.pendingPreemptReturn.add(agentId);
           this.cleanupSignalListener();
           return result;
         }
+        this.preemptEmptyBoundaries += 1;
         this.preemptIncomplete = true;
       }
 
