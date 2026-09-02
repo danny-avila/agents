@@ -363,6 +363,22 @@ describe('planContextOverflowRecovery', () => {
     expect(plan).toBeNull();
   });
 
+  it('does not collapse a healthy context budget after an ambiguous rejection', () => {
+    const plan = planContextOverflowRecovery({
+      error: new Error(
+        'request exceeds the context window or max output of every backend'
+      ),
+      provider: Providers.ANTHROPIC,
+      maxContextTokens: 828_400,
+      estimatedPromptTokens: 34,
+      configuredCompletionTokens: 128_000,
+      canSummarize: true,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan).toBeNull();
+  });
+
   it('successive recoveries keep shrinking', () => {
     const bedrock = signatureFor(
       'us.anthropic.claude-sonnet-4-5-20250929-v1:0'

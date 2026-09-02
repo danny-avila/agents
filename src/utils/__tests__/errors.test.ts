@@ -146,6 +146,20 @@ describe('ambiguous signatures require corroboration', () => {
     });
     expect(info?.limitTokens).toBe(1_048_576);
   });
+
+  it('does not trust a numberless text match that contradicts local accounting', () => {
+    const error = new Error(
+      'request exceeds the context window or max output of every backend'
+    );
+
+    expect(
+      getContextOverflowInfo(error, {
+        provider: Providers.ANTHROPIC,
+        estimatedPromptTokens: 34,
+        maxContextTokens: 828_400,
+      })
+    ).toBeNull();
+  });
 });
 
 describe('prompt size is separated from completion-inclusive totals', () => {

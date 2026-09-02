@@ -355,7 +355,9 @@ function resolvePromptTokens(
  * enough to the budget that an otherwise ambiguous provider error is best
  * explained by overflow.
  */
-function hasContextPressure(context?: ContextOverflowContext): boolean {
+function getContextPressure(
+  context?: ContextOverflowContext
+): boolean | undefined {
   const estimated = context?.estimatedPromptTokens;
   const budget = context?.maxContextTokens;
   if (
@@ -365,7 +367,7 @@ function hasContextPressure(context?: ContextOverflowContext): boolean {
     !Number.isFinite(budget) ||
     budget <= 0
   ) {
-    return false;
+    return undefined;
   }
   return estimated / budget >= CONTEXT_PRESSURE_RATIO;
 }
@@ -450,7 +452,8 @@ export function getContextOverflowInfo(
     return null;
   }
 
-  const underContextPressure = hasContextPressure(context);
+  const contextPressure = getContextPressure(context);
+  const underContextPressure = contextPressure === true;
 
   for (const pattern of OVERFLOW_PATTERNS) {
     const match = haystack.match(pattern.re);
@@ -462,6 +465,19 @@ export function getContextOverflowInfo(
     }
     const limitTokens = readNumber(match, pattern.limitGroup);
     const requestedTokens = readNumber(match, pattern.requestedGroup);
+
+    /**
+     * A numberless text match cannot override direct evidence that the prompt
+     * is comfortably inside the configured window. Propagating the provider
+     * error is safer than discarding conversation history on a blind retry.
+     */
+    if (
+      limitTokens == null &&
+      requestedTokens == null &&
+      contextPressure === false
+    ) {
+      continue;
+    }
 
     /**
      * A token-bucket rejection is only unrecoverable-by-waiting when the
