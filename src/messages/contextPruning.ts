@@ -60,6 +60,8 @@ export interface ContextPruningResult {
  */
 export function applyContextPruning(params: {
   messages: BaseMessage[];
+  /** Full graph history used only to decide whether a projected result is eligible. */
+  canonicalMessages?: BaseMessage[];
   indexTokenCountMap: Record<string, number | undefined>;
   tokenCounter: TokenCounter;
   config?: ContextPruningConfig;
@@ -138,7 +140,11 @@ export function applyContextPruning(params: {
     }
     const content = message.content;
     const contentLength = getToolContentCharLength(content);
-    if (contentLength < settings.minPrunableToolChars) {
+    const eligibilityContent = params.canonicalMessages?.[i]?.content ?? content;
+    if (
+      getToolContentCharLength(eligibilityContent) <
+      settings.minPrunableToolChars
+    ) {
       continue;
     }
 

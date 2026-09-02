@@ -2457,6 +2457,12 @@ export class SubagentExecutor {
       streamLimits: this.streamLimits,
       subagentScope: true,
       subagentExecutionContext: childExecutionContext,
+      ...(resumeExecution?.graphState.fadingTier == null
+        ? {}
+        : { fadingTier: resumeExecution.graphState.fadingTier }),
+      ...(resumeExecution?.graphState.fadingTiers == null
+        ? {}
+        : { fadingTiers: resumeExecution.graphState.fadingTiers }),
       /**
        * Forwarded so the child graph's own `SubagentExecutor` (created in
        * its `createAgentNode` when `allowNested` keeps subagentConfigs)

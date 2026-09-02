@@ -222,24 +222,32 @@ function getToolCallIds(message: BaseMessage): Set<string> {
 
   const ids = new Set<string>();
   const aiMessage = message as AIMessage;
-  for (const toolCall of aiMessage.tool_calls ?? []) {
-    if (typeof toolCall.id === 'string' && toolCall.id.length > 0) {
-      ids.add(toolCall.id);
+  const toolCalls = aiMessage.tool_calls;
+  if (Array.isArray(toolCalls) && !isProxy(toolCalls)) {
+    for (const toolCall of toolCalls) {
+      if (typeof toolCall !== 'object') {
+        continue;
+      }
+      const id = getStringProperty(toolCall, 'id');
+      if (id != null && id.length > 0) {
+        ids.add(id);
+      }
     }
   }
 
-  if (Array.isArray(aiMessage.content)) {
+  if (Array.isArray(aiMessage.content) && !isProxy(aiMessage.content)) {
     for (const part of aiMessage.content) {
       if (typeof part !== 'object') {
         continue;
       }
-      const record = part as { type?: unknown; id?: unknown };
+      const type = getStringProperty(part, 'type');
+      const id = getStringProperty(part, 'id');
       if (
-        (record.type === 'tool_use' || record.type === 'tool_call') &&
-        typeof record.id === 'string' &&
-        record.id.length > 0
+        (type === 'tool_use' || type === 'tool_call') &&
+        id != null &&
+        id.length > 0
       ) {
-        ids.add(record.id);
+        ids.add(id);
       }
     }
   }
@@ -250,49 +258,21 @@ function getToolCallIds(message: BaseMessage): Set<string> {
       if (item == null || typeof item !== 'object') {
         continue;
       }
-      const record = item as {
-        type?: unknown;
-        call_id?: unknown;
-      };
+      const type = getStringProperty(item, 'type');
+      const callId = getStringProperty(item, 'call_id');
       if (
-        (record.type === 'function_call' ||
-          record.type === 'custom_tool_call' ||
-          record.type === 'computer_call') &&
-        typeof record.call_id === 'string' &&
-        record.call_id !== ''
+        (type === 'function_call' ||
+          type === 'custom_tool_call' ||
+          type === 'computer_call') &&
+        callId != null &&
+        callId !== ''
       ) {
-        ids.add(record.call_id);
+        ids.add(callId);
       }
     }
   }
 
   return ids;
-}
-
-function getMaxToolExchangeWidth(messages: BaseMessage[]): number {
-  let width = 1;
-  for (const message of messages) {
-    const messageRole = (message as BaseMessage & { role?: unknown }).role;
-    if (message.getType() !== 'ai' && messageRole !== 'assistant') {
-      continue;
-    }
-    const aiMessage = message as AIMessage;
-    const contentCallCount = Array.isArray(aiMessage.content)
-      ? aiMessage.content.filter(
-        (part) =>
-          typeof part === 'object' &&
-          ((part as { type?: unknown }).type === 'tool_use' ||
-            (part as { type?: unknown }).type === 'tool_call')
-      ).length
-      : 0;
-    width = Math.max(
-      width,
-      getToolCallIds(message).size,
-      aiMessage.tool_calls?.length ?? 0,
-      contentCallCount
-    );
-  }
-  return width;
 }
 
 type ResponsesToolOutputSource = {
@@ -2377,6 +2357,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     factoryParams.fadingTier
   );
   let restoredTierPending = isFadingTier(factoryParams.fadingTier);
+  /** Widest exchange seen so far; updated only from the appended suffix. */
+  let maxToolExchangeWidth = 1;
+  let toolExchangeWidthThrough = 0;
   /** Fresh results and inputs below this index already carry the tier's caps. */
   let fadedThrough = 0;
   /** Consumed results below this index already carry the tier's masked cap. */
@@ -2420,6 +2403,21 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     }
     const canonicalMessages =
       params.canonicalMessages ?? capturedCanonicalMessages;
+    if (canonicalMessages.length < toolExchangeWidthThrough) {
+      maxToolExchangeWidth = 1;
+      toolExchangeWidthThrough = 0;
+    }
+    for (
+      let i = toolExchangeWidthThrough;
+      i < canonicalMessages.length;
+      i++
+    ) {
+      maxToolExchangeWidth = Math.max(
+        maxToolExchangeWidth,
+        getToolCallIds(canonicalMessages[i]).size
+      );
+    }
+    toolExchangeWidthThrough = canonicalMessages.length;
     let newOriginalToolContent: Map<number, string> | undefined;
     if (params.messages.length === 0) {
       /** Post-compaction calls still invoke the model — report the same
@@ -2929,7 +2927,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           ? Math.floor(effectiveMaxTokens / calibrationRatio)
           : effectiveMaxTokens,
       summarizationEnabled: factoryParams.summarizationEnabled === true,
-      toolExchangeWidth: getMaxToolExchangeWidth(canonicalMessages),
+      toolExchangeWidth: maxToolExchangeWidth,
     };
     const faded = fade(fadingSignals);
     const observationsMasked = restoredFading.masked + faded.masked;
@@ -2946,6 +2944,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     ) {
       applyContextPruning({
         messages: params.messages,
+        canonicalMessages,
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
         resolvedSettings: contextPruningSettings,

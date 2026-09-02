@@ -1071,6 +1071,13 @@ export abstract class Graph<
     return [...threadIds];
   }
 
+  protected createSubagentFadingResumeState(): Pick<
+    SubagentGraphResumeState,
+    'fadingTier' | 'fadingTiers'
+    > {
+    return {};
+  }
+
   createSubagentResumeState(runId: string): SubagentGraphResumeState {
     return {
       toolCallSteps: [...this.toolCallStepIds].map(([toolCallId, stepId]) => ({
@@ -1108,6 +1115,7 @@ export abstract class Graph<
       ],
       eagerToolSuppressions: [...this.eagerEventToolSuppressions],
       runStepState: this.createRunStepResumeState(),
+      ...this.createSubagentFadingResumeState(),
       ...(this._toolOutputRegistry == null
         ? {}
         : {
@@ -2592,6 +2600,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
     }
     return Object.fromEntries(tiers);
+  }
+
+  protected override createSubagentFadingResumeState(): Pick<
+    SubagentGraphResumeState,
+    'fadingTier' | 'fadingTiers'
+    > {
+    const fadingTier = this.getFadingTier();
+    const fadingTiers = this.getFadingTiers();
+    return {
+      ...(fadingTier == null ? {} : { fadingTier }),
+      ...(Object.keys(fadingTiers).length === 0 ? {} : { fadingTiers }),
+    };
   }
 
   getResolvedInstructionOverhead(): number | undefined {

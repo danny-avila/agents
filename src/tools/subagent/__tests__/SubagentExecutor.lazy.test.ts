@@ -2047,10 +2047,23 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     const parentToolCallId = 'call_legacy_eager';
     const resumeExecution = makeResumeExecution(parentToolCallId, configId);
     delete resumeExecution.subagentType;
+    resumeExecution.graphState.fadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    resumeExecution.graphState.fadingTiers = {
+      'eager-child': resumeExecution.graphState.fadingTier,
+    };
+    let observedInput: StandardGraphInput | undefined;
     const executor = createExecutor([eagerConfig], {
       checkpointer: new MemorySaver(),
       humanInTheLoop: { enabled: true },
-      createChildGraph: makeRecoveredGraph,
+      createChildGraph: (input) => {
+        observedInput = input;
+        return makeRecoveredGraph();
+      },
     });
     const forkTarget = executor as unknown as {
       forkCheckpointSnapshot: () => Promise<void>;
@@ -2073,6 +2086,12 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     });
 
     expect(result.content).toBe('persisted result');
+    expect(observedInput?.fadingTier).toEqual(
+      resumeExecution.graphState.fadingTier
+    );
+    expect(observedInput?.fadingTiers).toEqual(
+      resumeExecution.graphState.fadingTiers
+    );
   });
 
   it('preserves nested lazy descriptors and decrements the child depth', async () => {

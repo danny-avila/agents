@@ -181,4 +181,53 @@ describe('applyContextPruning', () => {
     expect(messages[2]).toBe(computerOutput);
     expect(messages[2].content).toBe(screenshot);
   });
+
+  it('keeps canonical-size eligibility after fading rebuilds a result', () => {
+    const canonicalMessages: BaseMessage[] = [
+      new HumanMessage('old question'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'tc-old',
+            name: 'fetch',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'x'.repeat(100_000),
+        tool_call_id: 'tc-old',
+      }),
+      new AIMessage('old answer'),
+      new HumanMessage('new question'),
+      new AIMessage('new answer'),
+    ];
+    const messages = [...canonicalMessages];
+    messages[2] = new ToolMessage({
+      content: 'x'.repeat(25_000),
+      tool_call_id: 'tc-old',
+    });
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+
+    const result = applyContextPruning({
+      messages,
+      canonicalMessages,
+      indexTokenCountMap,
+      tokenCounter: charCounter,
+      config: {
+        enabled: true,
+        keepLastAssistants: 1,
+        softTrimRatio: 0,
+        hardClearRatio: 0,
+        minPrunableToolChars: 50_000,
+        softTrim: { maxChars: 10_000, headChars: 4_000, tailChars: 2_000 },
+        hardClear: { enabled: true, placeholder: '[cleared]' },
+      },
+    });
+
+    expect(result.hardCleared).toBe(1);
+    expect(messages[2].content).toBe('[cleared]');
+  });
 });
