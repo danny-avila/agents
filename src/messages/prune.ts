@@ -2416,6 +2416,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     if (widthPrefixChanged) {
       maxToolExchangeWidth = 1;
       toolExchangeWidthThrough = 0;
+      toolExchangeWidthSources = [];
     }
     for (
       let i = toolExchangeWidthThrough;
@@ -2426,9 +2427,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         maxToolExchangeWidth,
         getToolCallIds(canonicalMessages[i]).size
       );
+      toolExchangeWidthSources[i] = canonicalMessages[i];
     }
     toolExchangeWidthThrough = canonicalMessages.length;
-    toolExchangeWidthSources = [...canonicalMessages];
     let newOriginalToolContent: Map<number, string> | undefined;
     if (params.messages.length === 0) {
       /** Post-compaction calls still invoke the model — report the same
