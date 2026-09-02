@@ -35,14 +35,15 @@ import {
   modifyDeltaProperties,
 } from '@/messages';
 import {
-  assertPreparedProviderRequestFor,
-  prepareProviderRequest,
-} from '@/llm/prepareProviderRequest';
-import {
   canRestartPreempt,
+  notePreemptRestartedRun,
   resolvePreemptAction,
   resolveRestartGraceMs,
 } from '@/llm/preempt';
+import {
+  assertPreparedProviderRequestFor,
+  prepareProviderRequest,
+} from '@/llm/prepareProviderRequest';
 import {
   getProviderFamily,
   providerUsesManualToolStream,
@@ -115,6 +116,10 @@ export type OnChunk = (
   chunk: AIMessageChunk,
   metadata?: Record<string, unknown>
 ) => void | Promise<void>;
+
+/** Node coerces a `setTimeout` delay past this to 1ms, so a longer grace is
+ *  reached by chaining rather than by one out-of-range timer. */
+const MAX_TIMEOUT_MS = 2_147_483_647;
 
 /** Unique per-model-attempt sequence; see the stamp in `attemptInvoke`. */
 let streamLimitAttemptSeq = 0;
@@ -819,6 +824,10 @@ async function attemptInvokeBody(
      */
     let preemptRequestedAt: number | undefined;
     let restartGraceTimer: ReturnType<typeof setTimeout> | undefined;
+    /** True while a chunk is being handed to the stream handler and has not
+     *  yet been folded into `finalChunk`. See the guard in
+     *  {@link evaluatePreemptRestart}. */
+    let dispatchingChunk = false;
     /**
      * The wake is a hint; this is where the request is actually read. The
      * shape is judged at the instant we look at it, and the teardown that
@@ -836,10 +845,23 @@ async function attemptInvokeBody(
      * the whole turn, which is the stall this path exists to remove.
      */
     const evaluatePreemptRestart = (): boolean => {
+      /** Reports whether a restart IS decided, not whether this call decided
+       *  it. A synchronous wake during `subscribe` can settle the action
+       *  before the pre-call read runs, and a caller that only learned "I did
+       *  not convert" would go on to issue a provider request against an
+       *  already-aborted signal. */
       if (restartController == null || preemptAction !== 'none') {
-        return false;
+        return preemptAction === 'restart';
       }
       if (context?.shouldPreemptStream() !== true) {
+        return false;
+      }
+      /** A chunk is mid-dispatch to the host, so `finalChunk` describes only
+       *  the chunks BEFORE it. Judging the turn now could read a text chunk
+       *  the host has already been shown as an empty turn and discard it. The
+       *  per-chunk poll runs immediately after the append with the complete
+       *  accumulation, so nothing is lost by declining here. */
+      if (dispatchingChunk) {
         return false;
       }
       preemptRequestedAt ??= Date.now();
@@ -865,10 +887,20 @@ async function attemptInvokeBody(
            * nothing — the shape moved, the host disarmed and re-armed — can
            * still schedule the next one.
            */
-          restartGraceTimer = setTimeout(() => {
-            restartGraceTimer = undefined;
-            evaluatePreemptRestart();
-          }, Math.max(0, restartGraceMs - requestAgeMs));
+          restartGraceTimer = setTimeout(
+            () => {
+              restartGraceTimer = undefined;
+              evaluatePreemptRestart();
+            },
+            /**
+             * Clamped, then CHAINED: a delay past Node's ceiling silently
+             * becomes 1ms, and this timer reschedules itself, so an
+             * out-of-range grace would spin at ~1ms for the life of the
+             * stream. Each firing re-reads the real age, so the requested
+             * deadline survives being reached in several hops.
+             */
+            Math.min(MAX_TIMEOUT_MS, Math.max(0, restartGraceMs - requestAgeMs))
+          );
           /** The grace is a fallback, never a reason to hold the process
            *  open: a run that ends before the window elapses must not be kept
            *  alive by a timer whose only job is to look again. */
@@ -880,6 +912,12 @@ async function attemptInvokeBody(
         return false;
       }
       preemptAction = 'restart';
+      /** Recorded BEFORE the abort: the adapter's cancellation error can reach
+       *  the tracing callback synchronously, and a run marked afterwards would
+       *  already have closed as a failure. */
+      if (sealedRunId != null) {
+        notePreemptRestartedRun(sealedRunId);
+      }
       restartController.abort();
       return true;
     };
@@ -954,12 +992,17 @@ async function attemptInvokeBody(
               provider,
             });
             if (handlingChunk != null) {
-              await streamHandler.handle(
-                GraphEvents.CHAT_MODEL_STREAM,
-                { chunk: handlingChunk },
-                metadata,
-                context
-              );
+              dispatchingChunk = true;
+              try {
+                await streamHandler.handle(
+                  GraphEvents.CHAT_MODEL_STREAM,
+                  { chunk: handlingChunk },
+                  metadata,
+                  context
+                );
+              } finally {
+                dispatchingChunk = false;
+              }
             } else if (context != null) {
               /**
                * A replay-skipped chunk yields no handling chunk, and in this
@@ -1009,7 +1052,20 @@ async function attemptInvokeBody(
                 requestAgeMs: Date.now() - preemptRequestedAt,
                 graceMs: restartGraceMs,
               });
-              if (action !== 'none' && context.claimPreemptSeal()) {
+              /**
+               * A restart needs the lane that names where its boundary is
+               * owed. Without one — a host still on the seal-only contract,
+               * which supplies no `subscribe` — the discard would return no
+               * message AND record no lane, so the node would dispatch no
+               * boundary, inject nothing, and end the turn empty with the
+               * steer still queued. Such a host also never opted into having
+               * its turns discarded, so its request waits for a seal exactly
+               * as it does today.
+               */
+              const permitted =
+                action === 'seal' ||
+                (action === 'restart' && restartLane != null);
+              if (permitted && context.claimPreemptSeal()) {
                 preemptAction = action;
                 break;
               }
@@ -1133,8 +1189,9 @@ async function attemptInvokeBody(
           model
         );
       }
-      /** Non-null on every path that can reach here: it is what armed the
-       *  controller in the first place. */
+      /** Non-null on every path that can reach here: it arms the controller
+       *  the wake path needs, and the per-chunk path refuses a restart
+       *  without it. */
       if (restartLane != null) {
         context?.notePreemptRestart(restartLane);
       }

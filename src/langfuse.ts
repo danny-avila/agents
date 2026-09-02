@@ -39,6 +39,7 @@ import {
   registerLangfuseManagedSpan,
   resolveLangfuseDestinationKey,
 } from '@/langfuseSpanRegistry';
+import { consumePreemptRestartedRun } from '@/llm/preempt';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
 
 export {
@@ -53,6 +54,9 @@ const GRAPH_INTERRUPT_CONTROL_FLOW = { controlFlow: 'GraphInterrupt' } as const;
 const GRAPH_INTERRUPT_TOOL_OUTPUT = JSON.stringify(
   GRAPH_INTERRUPT_CONTROL_FLOW
 );
+const PREEMPT_RESTART_CONTROL_FLOW = {
+  controlFlow: 'PreemptRestart',
+} as const;
 
 export type LangfuseTraceMetadata = Record<string, string>;
 export type LangfuseTraceAttributes = Record<string, string | number | boolean>;
@@ -670,6 +674,32 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
       runId,
       parentRunId
     );
+  }
+
+  /**
+   * A cooperative restart tears the provider stream down mid-flight, so the
+   * adapter reports cancellation and LangChain closes the generation through
+   * this path. That is control flow, not a failure — the graph catches it,
+   * injects, and calls the model again — so it closes as a successful
+   * generation rather than polluting an otherwise healthy trace with a failed
+   * one.
+   *
+   * Keyed on the run id the tear-down recorded, not on the error's shape:
+   * every provider adapter raises its own cancellation error, and matching on
+   * those would make the invariant depend on which provider served the call.
+   */
+  override handleLLMError(
+    ...args: Parameters<CallbackHandler['handleLLMError']>
+  ): ReturnType<CallbackHandler['handleLLMError']> {
+    const [, runId, parentRunId] = args;
+    if (consumePreemptRestartedRun(runId)) {
+      return super.handleLLMEnd(
+        { generations: [], llmOutput: PREEMPT_RESTART_CONTROL_FLOW },
+        runId,
+        parentRunId
+      );
+    }
+    return super.handleLLMError(...args);
   }
 
   override handleToolStart(

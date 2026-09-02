@@ -163,6 +163,20 @@ class ThinkingThenAnsweringModel extends PromptRecordingModel {
   }
 }
 
+/** Streams reasoning and then ends, never producing text. */
+class ThinkingOnlyModel extends PromptRecordingModel {
+  override async *_streamResponseChunks(
+    messages: BaseMessage[],
+    _options: this['ParsedCallOptions'],
+    _runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    this.recordPrompt(messages);
+    yield thinkingChunk('first');
+    this.onFirstStream();
+    yield thinkingChunk('second');
+  }
+}
+
 /** Streams reasoning first, then real text — the turn a seal must win. */
 class ThinkingThenTextModel extends PromptRecordingModel {
   override async *_streamResponseChunks(
@@ -178,6 +192,24 @@ class ThinkingThenTextModel extends PromptRecordingModel {
     this.onFirstStream();
     yield* super._streamResponseChunks(messages, options, runManager);
   }
+}
+
+/** A host on the seal-only contract: armed, but with no wake channel. */
+function createSealOnlyHost(): {
+  arm: () => void;
+  disarm: () => void;
+  preemption: t.StreamPreemption;
+  } {
+  let armed = false;
+  return {
+    arm: (): void => {
+      armed = true;
+    },
+    disarm: (): void => {
+      armed = false;
+    },
+    preemption: { shouldPreempt: () => armed, maxSeals: 2 },
+  };
 }
 
 async function createRestartRun(options: {
@@ -370,5 +402,78 @@ describe('cooperative restart (end-to-end via Run)', () => {
      */
     expect(model.prompts).toHaveLength(2);
     expect(userTexts(model.prompts[1])).toEqual(['tell me a long story']);
+  });
+});
+
+/**
+ * Everything a restart depends on is opt-in through `subscribe`, and the lane
+ * it names is where the discard's boundary gets dispatched. Without it a
+ * discard would return no message AND record no lane, so the node would inject
+ * nothing and end the turn empty with the steer still queued.
+ */
+describe('seal-only hosts', () => {
+  it('never discards a thinking turn when no wake channel was supplied', async () => {
+    const host = createSealOnlyHost();
+    const model = new ThinkingThenTextModel({
+      responses: ['Partial answer.', RESTARTED_RESPONSE],
+    });
+    const run = await createRestartRun({
+      runId: 'seal-only-no-restart',
+      preemption: host.preemption,
+      model,
+      hook: () => {
+        host.disarm();
+        return {
+          injectedMessages: [{ role: 'user' as const, content: 'go on' }],
+        };
+      },
+    });
+    model.onFirstStream = host.arm;
+
+    await run.processStream(
+      { messages: [new HumanMessage('think then answer')] },
+      streamConfig
+    );
+
+    expect(model.prompts).toHaveLength(2);
+    /**
+     * Sealed, not discarded: the resumed prompt carries the partial assistant
+     * answer. An empty `messages[1]` with no assistant turn would mean the
+     * turn was thrown away with no boundary to catch it.
+     */
+    expect(model.prompts[1].some((message) => message.getType() === 'ai')).toBe(
+      true
+    );
+  });
+
+  /**
+   * The turn a seal can never accept, on a host that cannot restart. It must
+   * end as an ordinary reasoning-only turn — one model call, no boundary — and
+   * NOT be discarded into an empty turn with the steer still queued.
+   */
+  it('lets a thinking-only turn finish rather than discarding it', async () => {
+    const host = createSealOnlyHost();
+    const model = new ThinkingOnlyModel({ responses: [RESTARTED_RESPONSE] });
+    const boundaries: number[] = [];
+    const run = await createRestartRun({
+      runId: 'seal-only-thinking-only',
+      preemption: host.preemption,
+      model,
+      hook: () => {
+        boundaries.push(model.prompts.length);
+        return {
+          injectedMessages: [{ role: 'user' as const, content: 'stop there' }],
+        };
+      },
+    });
+    model.onFirstStream = host.arm;
+
+    await run.processStream(
+      { messages: [new HumanMessage('think it through')] },
+      streamConfig
+    );
+
+    expect(model.prompts).toHaveLength(1);
+    expect(boundaries).toHaveLength(0);
   });
 });

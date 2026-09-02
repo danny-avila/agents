@@ -297,3 +297,49 @@ export function resolvePreemptAction({
   }
   return requestAgeMs >= graceMs ? 'restart' : 'none';
 }
+
+/**
+ * How many restarted model-run ids stay recorded. Each entry lives only until
+ * the tracing callback for that run consumes it, so the cap is a leak bound
+ * for hosts that run no tracing at all — not a working-set size.
+ */
+const PREEMPT_RESTARTED_RUN_LIMIT = 64;
+
+/**
+ * Model-run ids whose provider stream was torn down for a restart.
+ *
+ * Recorded rather than inferred from the thrown error: aborting makes the
+ * provider adapter raise whatever IT raises for cancellation, and matching on
+ * that shape would bind the tracing layer to per-provider error identity. The
+ * run id is unambiguous and already captured for the seal path.
+ *
+ * Consumed by the tracing callback so an expected restart closes as control
+ * flow instead of a failed generation — `AGENTS.md` states plainly that
+ * control flow is not an error, and a run cannot both be the interrupt the
+ * user asked for and an error in their traces.
+ *
+ * Insertion-ordered eviction bounds it: the oldest entry goes rather than the
+ * newest being refused, so a long-lived process with tracing disabled cannot
+ * grow this without limit and cannot start silently dropping new ids either.
+ */
+const preemptRestartedRuns = new Set<string>();
+
+/** Records a model run whose stream was torn down for a restart. */
+export function notePreemptRestartedRun(runId: string): void {
+  if (preemptRestartedRuns.size >= PREEMPT_RESTARTED_RUN_LIMIT) {
+    const oldest = preemptRestartedRuns.values().next().value;
+    if (oldest != null) {
+      preemptRestartedRuns.delete(oldest);
+    }
+  }
+  preemptRestartedRuns.add(runId);
+}
+
+/**
+ * True when this model run ended because a preempt discarded it. Consuming:
+ * the run closes exactly once, and a stale id must not reclassify a later
+ * genuine failure on a reused id.
+ */
+export function consumePreemptRestartedRun(runId: string): boolean {
+  return preemptRestartedRuns.delete(runId);
+}

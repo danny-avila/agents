@@ -2,6 +2,8 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import {
   canRestartPreempt,
   canSealPreempt,
+  consumePreemptRestartedRun,
+  notePreemptRestartedRun,
   resolveMaxSeals,
   resolvePreemptAction,
   resolveRestartGraceMs,
@@ -532,5 +534,37 @@ describe('resolvePreemptAction', () => {
         graceMs: 0,
       })
     ).toBe('none');
+  });
+});
+
+/**
+ * The tracing layer keys on the run id rather than the thrown error, because
+ * every provider adapter raises its own cancellation shape. That makes the
+ * record's lifecycle the whole contract: exactly once, and bounded for hosts
+ * that never consume it.
+ */
+describe('preempt-restarted run records', () => {
+  it('reports a recorded run exactly once', () => {
+    notePreemptRestartedRun('run-a');
+    expect(consumePreemptRestartedRun('run-a')).toBe(true);
+    expect(consumePreemptRestartedRun('run-a')).toBe(false);
+  });
+
+  it('does not claim a run it never recorded', () => {
+    expect(consumePreemptRestartedRun('run-never-restarted')).toBe(false);
+  });
+
+  /**
+   * Nothing consumes these when tracing is off, so the set must not grow
+   * without limit — and it must evict the OLDEST rather than refuse the
+   * newest, or a long-lived process would silently stop recognizing new
+   * restarts while holding stale ids forever.
+   */
+  it('evicts the oldest record rather than refusing new ones', () => {
+    for (let i = 0; i < 80; i++) {
+      notePreemptRestartedRun(`bulk-${i}`);
+    }
+    expect(consumePreemptRestartedRun('bulk-0')).toBe(false);
+    expect(consumePreemptRestartedRun('bulk-79')).toBe(true);
   });
 });
