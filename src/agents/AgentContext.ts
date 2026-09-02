@@ -1710,10 +1710,12 @@ export class AgentContext {
   getProviderProjectedMessages(messages: BaseMessage[]): BaseMessage[] {
     const sources = this.providerProjectionSources;
     let projection = this.providerProjectedMessages;
+    const priorLength = sources?.length ?? 0;
     const prefixChanged =
       sources != null &&
       (messages.length < sources.length ||
-        sources.some((source, index) => messages[index] !== source));
+        (priorLength > 0 &&
+          messages[priorLength - 1] !== sources[priorLength - 1]));
 
     if (projection == null || sources == null || prefixChanged) {
       if (prefixChanged) {

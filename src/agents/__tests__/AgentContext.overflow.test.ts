@@ -60,6 +60,9 @@ describe('AgentContext overflow recovery state', () => {
     expect(rebuilt).not.toBe(projection);
     expect(rebuilt[0]).toBe(canonical[0]);
     expect(rebuilt[1].content).toEqual([{ type: 'text', text: 'answer' }]);
+
+    canonical[canonical.length - 1] = new HumanMessage('rewritten tail');
+    expect(context.getProviderProjectedMessages(canonical)).not.toBe(rebuilt);
   });
 
   it('summarizes the first overflow when deterministic pruning is unavailable', () => {
