@@ -13,7 +13,7 @@
  */
 import { ContextOverflowError } from '@langchain/core/errors';
 import type { ProviderName } from '@/types';
-import { Providers } from '@/common';
+import { getProviderFamily } from '@/llm/providers';
 
 /**
  * Why the request was rejected. Both kinds are fixed by shrinking the
@@ -71,6 +71,8 @@ interface OverflowPattern {
    * untouched rather than triggering a needless compaction.
    */
   readonly requiresContextPressure?: boolean;
+  /** Reject this otherwise-valid pattern only when local accounting contradicts it. */
+  readonly rejectsLowContextPressure?: boolean;
 }
 
 /**
@@ -94,7 +96,7 @@ export interface ContextOverflowContext {
 export function completionSharesContextWindow(
   provider: ProviderName | undefined
 ): boolean {
-  return provider !== Providers.VERTEXAI && provider !== Providers.GOOGLE;
+  return provider == null || getProviderFamily(provider) !== 'google';
 }
 
 /**
@@ -186,6 +188,12 @@ const OVERFLOW_PATTERNS: readonly OverflowPattern[] = [
     kind: 'context_window',
     re: /\binput (?:is )?too long(?: for requested model)?\b/i,
   },
+  /** Gateway disjunction: corroborate unless a nested pattern reported facts. */
+  {
+    kind: 'context_window',
+    re: /(?:context window[\s\S]{0,80}\bor\b[\s\S]{0,80}max(?:imum)? output|max(?:imum)? output[\s\S]{0,80}\bor\b[\s\S]{0,80}context window)/i,
+    rejectsLowContextPressure: true,
+  },
   /** OpenAI-compatible error code, and the phrases LangChain itself keys on. */
   {
     kind: 'context_window',
@@ -228,14 +236,6 @@ const NON_RECOVERABLE_RE =
  */
 const OUTPUT_LIMIT_RE =
   /max_?(?:completion_?)?tokens\s*(?:must be|is too|cannot|exceeds|too large|greater than)|maximum number of output tokens|max_tokens.*less than or equal/i;
-
-/**
- * A gateway can emit this disjunction when no configured backend can accept
- * the request. It does not say whether the input window or output allowance
- * was binding, so local request pressure must corroborate it before pruning.
- */
-const AMBIGUOUS_CONTEXT_OR_OUTPUT_RE =
-  /(?:context window[\s\S]{0,80}\bor\b[\s\S]{0,80}max(?:imum)? output|max(?:imum)? output[\s\S]{0,80}\bor\b[\s\S]{0,80}context window)/i;
 
 /**
  * Recovers the input-only figure from providers that quote a combined total
@@ -483,15 +483,6 @@ export function getContextOverflowInfo(
   const contextPressure = getContextPressure(context);
   const underContextPressure = contextPressure === true;
 
-  /** This gateway message names two incompatible causes and needs evidence. */
-  if (
-    !langChainFlagged &&
-    AMBIGUOUS_CONTEXT_OR_OUTPUT_RE.test(haystack) &&
-    contextPressure === false
-  ) {
-    return null;
-  }
-
   for (const pattern of OVERFLOW_PATTERNS) {
     const match = haystack.match(pattern.re);
     if (match == null) {
@@ -502,6 +493,14 @@ export function getContextOverflowInfo(
     }
     const limitTokens = readNumber(match, pattern.limitGroup);
     const requestedTokens = readNumber(match, pattern.requestedGroup);
+
+    if (
+      !langChainFlagged &&
+      pattern.rejectsLowContextPressure === true &&
+      contextPressure === false
+    ) {
+      return null;
+    }
 
     /**
      * A token-bucket rejection is only unrecoverable-by-waiting when the

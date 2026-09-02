@@ -1,10 +1,13 @@
 import { describe, expect, it } from '@jest/globals';
 import {
+  completionSharesContextWindow,
   getContextOverflowInfo,
   isLikelyContextOverflowError,
   isContextOverflowError,
   extractErrorMessage,
 } from '@/utils/errors';
+import { registerProvider } from '@/llm/providers';
+import { FakeChatModel } from '@/llm/fake';
 import {
   OVERFLOW_SIGNATURES,
   NON_OVERFLOW_SIGNATURES,
@@ -199,6 +202,38 @@ describe('ambiguous signatures require corroboration', () => {
         maxContextTokens: 200_000,
       })
     ).toBeNull();
+  });
+
+  it('honors the family of a registered Google-compatible provider', () => {
+    const provider = 'context-google-family-test' as never;
+    const dispose = registerProvider({
+      provider,
+      model: FakeChatModel as never,
+      family: 'google',
+    });
+    try {
+      expect(completionSharesContextWindow(provider)).toBe(false);
+    } finally {
+      dispose();
+    }
+  });
+
+  it('prefers nested numeric evidence over an ambiguous outer message', () => {
+    const info = getContextOverflowInfo(
+      {
+        message:
+          'request exceeds the context window or max output of every backend',
+        cause: new Error('prompt is too long: 210000 tokens > 200000 maximum'),
+      },
+      {
+        provider: Providers.ANTHROPIC,
+        estimatedPromptTokens: 34,
+        maxContextTokens: 828_400,
+      }
+    );
+
+    expect(info?.requestedTokens).toBe(210_000);
+    expect(info?.limitTokens).toBe(200_000);
   });
 
   it('accepts definitive numberless Bedrock input errors without local pressure', () => {
