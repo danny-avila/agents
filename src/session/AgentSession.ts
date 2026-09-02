@@ -1029,6 +1029,19 @@ export class AgentSession {
     });
   }
 
+  private async captureRunContextState(
+    threadId: string,
+    run: Run<t.IState>
+  ): Promise<void> {
+    this.calibrationRatio = run.getCalibrationRatio();
+    this.setFadingState(
+      threadId,
+      run.getFadingTier(),
+      run.getFadingTiers()
+    );
+    await this.persistFadingState(threadId);
+  }
+
   async getLatestCheckpoint(
     options: AgentSessionCheckpointLookupOptions = {}
   ): Promise<AgentSessionCheckpointReference | undefined> {
@@ -1206,6 +1219,7 @@ export class AgentSession {
     );
     const fadingState = this.getFadingState(threadId);
     let run: Run<t.IState> | undefined;
+    let runContextCaptured = false;
     try {
       const runConfig: t.RunConfig = {
         ...this.runConfig,
@@ -1242,13 +1256,8 @@ export class AgentSession {
           await this.store?.appendMessage(message);
         }
       }
-      this.calibrationRatio = run.getCalibrationRatio();
-      this.setFadingState(
-        threadId,
-        run.getFadingTier(),
-        run.getFadingTiers()
-      );
-      await this.persistFadingState(threadId);
+      await this.captureRunContextState(threadId, run);
+      runContextCaptured = true;
       const interrupt = run.getInterrupt();
       const haltedReason = run.getHaltReason();
       if (interrupt) {
@@ -1298,6 +1307,9 @@ export class AgentSession {
         threadId,
       };
     } catch (error) {
+      if (run != null && !runContextCaptured) {
+        await this.captureRunContextState(threadId, run);
+      }
       emitTerminalEvent({
         type: 'run.failed',
         data: error instanceof Error ? error.message : String(error),
@@ -1604,6 +1616,7 @@ export class AgentSession {
     );
     const fadingState = this.getFadingState(threadId);
     let run: Run<t.IState> | undefined;
+    let runContextCaptured = false;
     try {
       run = await Run.create<t.IState>({
         ...this.runConfig,
@@ -1631,13 +1644,8 @@ export class AgentSession {
           await this.store?.appendMessage(message);
         }
       }
-      this.calibrationRatio = run.getCalibrationRatio();
-      this.setFadingState(
-        threadId,
-        run.getFadingTier(),
-        run.getFadingTiers()
-      );
-      await this.persistFadingState(threadId);
+      await this.captureRunContextState(threadId, run);
+      runContextCaptured = true;
       const interrupt = run.getInterrupt();
       const haltedReason = run.getHaltReason();
       if (interrupt) {
@@ -1684,6 +1692,9 @@ export class AgentSession {
         threadId,
       };
     } catch (error) {
+      if (run != null && !runContextCaptured) {
+        await this.captureRunContextState(threadId, run);
+      }
       await this.store?.appendRunEvent('run.failed', error, {
         runId,
         threadId,

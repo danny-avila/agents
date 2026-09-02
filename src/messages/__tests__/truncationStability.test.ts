@@ -441,6 +441,35 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     instructionTokens?: number;
   };
 
+  it('uses a same-length caller replacement as the new canonical result', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('fetch'),
+      toolCall('replace-result'),
+      new ToolMessage({
+        content: `OLD:${'o'.repeat(100)}`,
+        tool_call_id: 'replace-result',
+      }),
+      new AIMessage('done'),
+    ];
+    const pruneMessages = createPruneMessages({
+      maxTokens: 10_000,
+      startIndex: 0,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: false,
+    });
+
+    pruneMessages({ messages });
+    messages[2] = new ToolMessage({
+      content: `NEW:${'n'.repeat(50_000)}`,
+      tool_call_id: 'replace-result',
+    });
+    pruneMessages({ messages });
+
+    expect(serialize(messages[2])).toContain('NEW:');
+    expect(serialize(messages[2])).not.toContain('OLD:');
+  });
+
   /** Mirrors a host that rebuilds full-content messages and a fresh pruner every run. */
   function runTurn(
     messages: BaseMessage[],

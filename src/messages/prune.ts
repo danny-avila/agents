@@ -2347,10 +2347,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
    *  pruner is recreated after summarization. */
   const originalToolContent = new Map<number, string>();
   let originalToolContentSize = 0;
-  /** Canonical source retained only for this pruner/run when callers do not
-   * provide graph-owned history explicitly. Slots are references (with a
-   * shallow content-array clone where needed), not a second serialized copy. */
-  const capturedCanonicalMessages: BaseMessage[] = [];
+  /** Recovers canonical sources for direct callers that reuse this mutating
+   * projection without passing graph-owned history explicitly. */
+  const canonicalByProjection = new WeakMap<BaseMessage, BaseMessage>();
   /** Latched fading tier; caps derive from it alone so bytes stay stable. */
   let fadingTier = seedFadingTier(
     factoryParams.maxTokens,
@@ -2360,6 +2359,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
   /** Widest exchange seen so far; updated only from the appended suffix. */
   let maxToolExchangeWidth = 1;
   let toolExchangeWidthThrough = 0;
+  let toolExchangeWidthSources: BaseMessage[] = [];
   /** Fresh results and inputs below this index already carry the tier's caps. */
   let fadedThrough = 0;
   /** Consumed results below this index already carry the tier's masked cap. */
@@ -2386,24 +2386,34 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     /** Calibrated instruction overhead actually applied this call */
     effectiveInstructionTokens?: number;
   } {
-    if (params.canonicalMessages == null) {
-      for (
-        let i = capturedCanonicalMessages.length;
-        i < params.messages.length;
-        i++
-      ) {
-        const message = params.messages[i];
-        capturedCanonicalMessages[i] = Array.isArray(message.content)
+    const suppliedCanonicalMessages = params.canonicalMessages;
+    const derivesCanonicalHistory = suppliedCanonicalMessages == null;
+    const canonicalMessages =
+      suppliedCanonicalMessages ??
+      params.messages.map((message) => {
+        const recovered = canonicalByProjection.get(message);
+        if (recovered != null) {
+          return recovered;
+        }
+        return Array.isArray(message.content)
           ? cloneMessage(message, [...message.content])
           : message;
-      }
-      if (capturedCanonicalMessages.length > params.messages.length) {
-        capturedCanonicalMessages.length = params.messages.length;
-      }
-    }
-    const canonicalMessages =
-      params.canonicalMessages ?? capturedCanonicalMessages;
-    if (canonicalMessages.length < toolExchangeWidthThrough) {
+      });
+    const priorWidthLength = toolExchangeWidthSources.length;
+    const widthPrefixChanged = derivesCanonicalHistory
+      ? canonicalMessages.length < priorWidthLength ||
+        toolExchangeWidthSources.some(
+          (source, index) => canonicalMessages[index] !== source
+        )
+      : canonicalMessages.length < priorWidthLength ||
+        (canonicalMessages.length === priorWidthLength
+          ? toolExchangeWidthSources.some(
+            (source, index) => canonicalMessages[index] !== source
+          )
+          : priorWidthLength > 0 &&
+            canonicalMessages[priorWidthLength - 1] !==
+              toolExchangeWidthSources[priorWidthLength - 1]);
+    if (widthPrefixChanged) {
       maxToolExchangeWidth = 1;
       toolExchangeWidthThrough = 0;
     }
@@ -2418,6 +2428,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       );
     }
     toolExchangeWidthThrough = canonicalMessages.length;
+    toolExchangeWidthSources = [...canonicalMessages];
     let newOriginalToolContent: Map<number, string> | undefined;
     if (params.messages.length === 0) {
       /** Post-compaction calls still invoke the model — report the same
@@ -2949,6 +2960,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         tokenCounter: factoryParams.tokenCounter,
         resolvedSettings: contextPruningSettings,
       });
+    }
+    if (derivesCanonicalHistory) {
+      for (let i = 0; i < params.messages.length; i++) {
+        canonicalByProjection.set(params.messages[i], canonicalMessages[i]);
+      }
     }
 
     const preTruncationTotalTokens = totalTokens;

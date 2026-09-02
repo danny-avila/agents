@@ -1256,8 +1256,16 @@ describe('JsonlSessionStore', () => {
 
   it('records run.failed when resumeInterrupt throws', async () => {
     const mockRun = createMockRun('unused');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
     mockRun.resume.mockRejectedValue(new Error('resume failed'));
-    mockRunCreate(mockRun);
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
     const session = await createAgentSession({
       cwd: dir,
       runId: 'template-run',
@@ -1284,6 +1292,43 @@ describe('JsonlSessionStore', () => {
       .filter((entry) => entry.type === 'run_event')
       .map((entry) => entry.data.event);
     expect(events).toEqual(['run.started', 'run.failed']);
+    await session.run('after failed resume');
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
+  });
+
+  it('persists fading tiers when processStream throws', async () => {
+    const mockRun = createMockRun('unused');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    mockRun.processStream.mockRejectedValueOnce(new Error('run failed'));
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await expect(session.run('fail after fading')).rejects.toThrow(
+      'run failed'
+    );
+    await session.run('continue');
+
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
   });
 
   it('compacts into a summary plus retained active path', async () => {
