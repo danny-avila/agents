@@ -2932,6 +2932,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           tokenCounter: factoryParams.tokenCounter,
           caps: emergencyCaps,
           masked: emergencyTier.masked,
+          canonicalContentStore: canonicalToolContent,
+          canonicalMessageStore: canonicalToolCallMessages,
         });
 
         factoryParams.log?.('info', 'Emergency truncation complete');

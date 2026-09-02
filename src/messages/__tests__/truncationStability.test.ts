@@ -571,6 +571,34 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     expect(serializeToolCallInputs(rebuilt[1])).toBe(escalatedInputs);
   });
 
+  it('snapshots the true original for the summarizer when a capped result is masked later', () => {
+    const originalChars = serialize(conversation([60_000])[2]).length;
+    const messages = conversation([60_000]);
+    const pruneMessages = createPruneMessages({
+      maxTokens,
+      startIndex: 0,
+      tokenCounter,
+      indexTokenCountMap: countMap(messages),
+      summarizationEnabled: true,
+      calibrationRatio: 1,
+      getInstructionTokens: () => 0,
+    });
+    const first = pruneMessages({ messages });
+    expect(first.fadingTier.masked).toBe(false);
+    expect(serialize(messages[2]).length).toBeLessThan(originalChars);
+
+    messages.push(...round(1, 40_000), ...round(2, 40_000));
+    const second = pruneMessages({ messages });
+    expect(second.fadingTier.masked).toBe(true);
+    expect(serialize(messages[2]).length).toBeLessThanOrEqual(
+      resolveFadingCaps(second.fadingTier).consumedChars
+    );
+    expect(serialize(messages[2])).toContain(
+      `truncated: ${originalChars} chars`
+    );
+    expect(second.newOriginalToolContent?.get(2)?.length).toBe(originalChars);
+  });
+
   it('emergency truncation recovers on a clone without latching the tier', () => {
     const ids = ['p1', 'p2', 'p3', 'p4'];
     const messages: BaseMessage[] = [
