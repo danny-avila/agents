@@ -577,7 +577,7 @@ describe('preempt-restarted run records', () => {
       const base = realNow();
       Date.now = () => base;
       notePreemptRestartedRun('stale', chunk({ content: '' }));
-      Date.now = () => base + 60_001;
+      Date.now = () => base + 300_001;
       notePreemptRestartedRun('fresh', chunk({ content: '' }));
 
       expect(consumePreemptRestartedRun('stale')).toBeUndefined();

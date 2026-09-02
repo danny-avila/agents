@@ -853,6 +853,14 @@ async function attemptInvokeBody(
      *    was torn down; only the turn built on it is being discarded.
      */
     let restartRoute: 'aborted' | 'broke' | 'exhausted' | undefined;
+    /**
+     * Cleared when the attempt returns. A host may deliver its wake through a
+     * queue or a message bus, so one can already be in flight when the
+     * unsubscribe runs — and a late claim would take the seal slot, abort a
+     * finished controller, and never reach a boundary to release it, blocking
+     * every later preemption in the run.
+     */
+    let attemptActive = true;
     /** Only `broke` leaves a run for this attempt to close itself. */
     const restartNeedsNativeClose = (): boolean => restartRoute === 'broke';
 
@@ -878,6 +886,9 @@ async function attemptInvokeBody(
        *  before the pre-call read runs, and a caller that only learned "I did
        *  not convert" would go on to issue a provider request against an
        *  already-aborted signal. */
+      if (!attemptActive) {
+        return false;
+      }
       if (restartController == null || preemptAction !== 'none') {
         return preemptAction === 'restart';
       }
@@ -922,7 +933,19 @@ async function attemptInvokeBody(
           restartGraceTimer = setTimeout(
             () => {
               restartGraceTimer = undefined;
-              evaluatePreemptRestart();
+              /**
+               * Contained, because this frame has no invocation to reject
+               * into: a host predicate that throws here would surface as an
+               * uncaught exception and can take the process down, while the
+               * same throw from the per-chunk poll is held by the attempt's
+               * promise. The cost of swallowing is one missed look, and a
+               * predicate that throws has no request to honor anyway.
+               */
+              try {
+                evaluatePreemptRestart();
+              } catch {
+                /** empty */
+              }
             },
             /**
              * Clamped, then CHAINED: a delay past Node's ceiling silently
@@ -1218,10 +1241,15 @@ async function attemptInvokeBody(
        * the abort and by nothing else, so a run-level abort, a tripped stream
        * limit and every provider error still propagate.
        */
-      if (preemptAction !== 'restart') {
+      const ownAbort =
+        restartRoute === 'aborted' &&
+        !(error instanceof StreamLimitExceededError) &&
+        config.signal?.aborted !== true;
+      if (!ownAbort) {
         throw error;
       }
     } finally {
+      attemptActive = false;
       unsubscribeWake?.();
       clearTimeout(restartGraceTimer);
     }
@@ -1262,30 +1290,43 @@ async function attemptInvokeBody(
         };
         discardedChunk.response_metadata = responseMetadata;
         discardedChunk.lc_kwargs.response_metadata = responseMetadata;
-        /**
-         * No run id, deliberately. Tearing the stream down makes LangChain
-         * close the model run through its error path, so the native close a
-         * seal performs would find nothing to end and warn on every interrupt.
-         * The synthetic `CHAT_MODEL_END` is the right close here anyway: it is
-         * what tells a host rendering from the stream that the part it has been
-         * drawing is over, and `preemptDiscarded` on it is what says the part's
-         * content is gone rather than kept.
-         */
-        await endSealedModelRun(
-          context,
-          discardedChunk,
-          messagesForProvider,
+        if (restartRoute === 'exhausted') {
+          /**
+           * The stream finished on its own, so the host has ALREADY had this
+           * turn's model-end, with its usage. Replaying it through
+           * `endSealedModelRun` would charge the same tokens twice in any host
+           * accumulating usage from that event. What the host still needs is
+           * the one thing the natural end could not say — that the turn it
+           * just completed is being thrown away — so that notification carries
+           * the marker and nothing else.
+           */
+          await safeDispatchCustomEvent(
+            GraphEvents.CHAT_MODEL_END,
+            {
+              output: new AIMessageChunk({
+                content: '',
+                response_metadata: responseMetadata,
+              }),
+            },
+            config
+          );
+        } else {
           /**
            * See {@link restartRoute}: only the broken iterator leaves a run
-           * with no close of its own. An aborted run was closed through the
-           * error path and an exhausted one through its natural end, and
-           * closing either again would find nothing to end.
+           * with no close of its own. An aborted run was closed through
+           * LangChain's error path, where the marker relabels it and supplies
+           * this usage, so it takes the synthetic close instead.
            */
-          restartNeedsNativeClose() ? sealedRunId : undefined,
-          config,
-          model,
-          PREEMPT_RESTART_CONTROL_FLOW
-        );
+          await endSealedModelRun(
+            context,
+            discardedChunk,
+            messagesForProvider,
+            restartNeedsNativeClose() ? sealedRunId : undefined,
+            config,
+            model,
+            PREEMPT_RESTART_CONTROL_FLOW
+          );
+        }
       }
       /** Non-null on every path that can reach here: it arms the controller
        *  the wake path needs, and the per-chunk path refuses a restart

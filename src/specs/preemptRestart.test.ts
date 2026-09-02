@@ -22,8 +22,8 @@ import type { LLMResult } from '@langchain/core/outputs';
 import type { HookCallback } from '@/hooks/types';
 import type * as t from '@/types';
 import { HookRegistry } from '@/hooks/HookRegistry';
+import { GraphEvents, Providers } from '@/common';
 import { FakeChatModel } from '@/llm/fake';
-import { Providers } from '@/common';
 import { Run } from '@/run';
 
 const RESTARTED_RESPONSE = 'Answering the steer instead.';
@@ -289,6 +289,14 @@ async function createRestartRun(options: {
     },
     hooks: registry,
     preemption: options.preemption,
+    /**
+     * Required for a discarded turn to report usage at all: a turn that ends
+     * early never receives the provider's usage chunk, so the synthetic close
+     * falls back to this counter. Without one the whole usage path silently
+     * no-ops and any test watching it proves nothing.
+     */
+    tokenCounter: (message: BaseMessage): number =>
+      Math.ceil(JSON.stringify(message.content).length / 4),
     returnContent: true,
     skipCleanup: true,
   });
@@ -719,6 +727,66 @@ describe('restart close routes', () => {
     }
   });
 
+  /**
+   * A stream that finished on its own already gave the host its model-end,
+   * with usage. Replaying that event would charge the discarded attempt's
+   * tokens twice in any host accumulating from it.
+   */
+  it('does not replay model-end usage after natural exhaustion', async () => {
+    const modelEnds: Array<Record<string, unknown> | undefined> = [];
+    const host = createHost(60_000);
+    const model = new ThinkingOnlyModel({ responses: [RESTARTED_RESPONSE] });
+    const run = await createRestartRun({
+      runId: 'restart-no-duplicate-usage',
+      preemption: host.preemption,
+      model,
+      hook: () => {
+        host.disarm();
+        return {
+          injectedMessages: [{ role: 'user' as const, content: 'stop' }],
+        };
+      },
+    });
+    model.onFirstStream = host.arm;
+
+    await run.processStream(
+      { messages: [new HumanMessage('think')] },
+      {
+        ...streamConfig,
+        callbacks: [
+          {
+            /**
+             * The synthetic close is dispatched as a CUSTOM event, which is
+             * how hosts accumulating usage receive it — `handleLLMEnd` never
+             * sees it, so watching that channel would miss the duplicate
+             * entirely.
+             */
+            handleCustomEvent: (
+              event: string,
+              data: { output?: AIMessageChunk }
+            ): void => {
+              if (event === GraphEvents.CHAT_MODEL_END) {
+                modelEnds.push(
+                  data.output?.usage_metadata as unknown as Record<
+                    string,
+                    unknown
+                  >
+                );
+              }
+            },
+          },
+        ],
+      }
+    );
+
+    expect(model.prompts).toHaveLength(2);
+    /**
+     * The natural end already reported this turn through LangChain. A
+     * synthetic close carrying usage on top of it is the duplicate charge.
+     */
+    expect(modelEnds.filter((usage) => usage != null)).toHaveLength(0);
+  });
+
   it('marks a manually closed restart as control flow', async () => {
     const outputs: Array<Record<string, unknown> | undefined> = [];
     const host = createHost(0, false);
@@ -792,5 +860,51 @@ describe('a restart boundary that halts', () => {
     const stats = run.getPreemptStats();
     expect(stats.restarts).toBe(1);
     expect(stats.emptyBoundaries).toBe(0);
+  });
+});
+
+/**
+ * A restart must never swallow a genuine failure that landed at the same
+ * moment. The catch exists for one thing — the abort this attempt issued —
+ * and a stream-limit trip or a real cancellation has to keep travelling.
+ */
+describe('a failure concurrent with a restart', () => {
+  it('propagates a run cancellation rather than restarting through it', async () => {
+    const host = createHost(0);
+    const controller = new AbortController();
+    let boundaries = 0;
+    const model = new SilentThenAnsweringModel({
+      responses: [RESTARTED_RESPONSE],
+    });
+    const run = await createRestartRun({
+      runId: 'restart-concurrent-cancel',
+      preemption: host.preemption,
+      model,
+      hook: () => {
+        boundaries += 1;
+        return {
+          injectedMessages: [{ role: 'user' as const, content: 'stop' }],
+        };
+      },
+    });
+    model.onFirstStream = (): void => {
+      controller.abort();
+      host.arm();
+    };
+
+    await expect(
+      run.processStream({ messages: [new HumanMessage('go')] }, {
+        ...streamConfig,
+        signal: controller.signal,
+      })
+    ).rejects.toBeDefined();
+
+    /**
+     * The discriminator: swallowing the cancellation lets the node reach its
+     * boundary and consume the queued injection on a run the caller already
+     * cancelled. Nothing downstream of the model node may run at all.
+     */
+    expect(boundaries).toBe(0);
+    expect(model.prompts).toHaveLength(1);
   });
 });

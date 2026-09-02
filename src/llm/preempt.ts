@@ -301,15 +301,19 @@ export function resolvePreemptAction({
 /**
  * How long a restarted model run stays recorded when nothing consumes it.
  *
- * The consumer is LangChain's error callback, which is dispatched on a
- * non-awaited queue, so a marker may legitimately sit unread for a moment. A
- * COUNT cap cannot tell that apart from a leak: a burst of concurrent restarts
- * would evict markers whose callbacks were still queued, and each eviction
- * turns an expected restart back into an error in the host's traces — the very
- * thing the marker exists to prevent. Age can tell them apart, so the bound is
- * time.
+ * The consumer is LangChain's error callback, dispatched on a non-awaited
+ * queue, so a marker may legitimately sit unread for a while. A COUNT cap
+ * cannot tell that apart from a leak: a burst of concurrent restarts would
+ * evict markers whose callbacks were still queued, and each eviction turns an
+ * expected restart back into an error in the host's traces — the very thing
+ * the marker exists to prevent. Age can tell them apart, so the bound is time.
+ *
+ * It is a LEAK bound, not a deadline: nothing here can observe when the
+ * callback queue drains, so the window is set far past any latency that queue
+ * exhibits rather than tuned to it. A stall long enough to outlast this has
+ * already broken every other time-based assumption in the run.
  */
-const PREEMPT_RESTARTED_RUN_TTL_MS = 60_000;
+const PREEMPT_RESTARTED_RUN_TTL_MS = 300_000;
 
 /**
  * Model runs whose provider stream was torn down for a restart, with the
