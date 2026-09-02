@@ -2102,6 +2102,35 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * unreachable — each step registers its calls before any completion can
    * reference it — and the mechanism was removed.)
    */
+  /**
+   * Closes the lane's open message step as `cancelled` when a preempt discards
+   * the turn that step belongs to.
+   *
+   * Without it the step is closed `completed` by the discard's own model-end,
+   * so `getRunSteps()` and every run-step subscriber keep reasoning the
+   * replacement prompt does not contain — the graph state forgets the attempt
+   * while the step view still shows it as a finished one.
+   *
+   * Only for turns that were CUT SHORT. A turn whose stream reached its own
+   * end really did complete, and its step is already closed by then; the
+   * terminal-status guard in {@link closeRunStep} leaves that alone.
+   */
+  async cancelOpenMessageStep(
+    metadata?: Record<string, unknown>
+  ): Promise<void> {
+    const stepId = this.openMessageStepByAgent.get(
+      this.getStepAgentKey(metadata)
+    );
+    if (stepId == null) {
+      return;
+    }
+    try {
+      await this.closeRunStep(stepId, 'cancelled', { metadata });
+    } catch (_e) {
+      /** A step-view detail must never take down the run it describes. */
+    }
+  }
+
   async closeRunStep(
     stepId: string,
     status: Exclude<t.RunStepStatus, 'in_progress'>,

@@ -516,7 +516,14 @@ async function endSealedModelRun(
    * the two restart routes reading alike in a trace — the aborted one is
    * relabelled through the tracing callback, and this is the manual twin.
    */
-  llmOutput: Record<string, unknown> = {}
+  llmOutput: Record<string, unknown> = {},
+  /**
+   * Set when the run was probably closed already, so a failed native close is
+   * the expected outcome rather than a fault. The synthetic fallback below is
+   * the real close in that case, and warning on every interrupt would bury the
+   * failures that do matter.
+   */
+  nativeCloseOptional = false
 ): Promise<void> {
   const metadata = config?.metadata as Record<string, unknown> | undefined;
   synthesizeSealedUsage(context, chunk, prompt, metadata);
@@ -565,11 +572,13 @@ async function endSealedModelRun(
        * A sealed answer that reaches the user is worth more than a tidy
        * trace. Fall through to the custom event rather than failing the run.
        */
-      // eslint-disable-next-line no-console
-      console.warn(
-        '[attemptInvoke] Native close of the sealed model run failed; falling back to a custom event:',
-        e instanceof Error ? e.message : e
-      );
+      if (!nativeCloseOptional) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[attemptInvoke] Native close of the sealed model run failed; falling back to a custom event:',
+          e instanceof Error ? e.message : e
+        );
+      }
     }
   }
   await safeDispatchCustomEvent(
@@ -861,8 +870,24 @@ async function attemptInvokeBody(
      * every later preemption in the run.
      */
     let attemptActive = true;
-    /** Only `broke` leaves a run for this attempt to close itself. */
-    const restartNeedsNativeClose = (): boolean => restartRoute === 'broke';
+    /**
+     * Only an exhausted stream leaves nothing for this attempt to close: it
+     * emitted its own end. Both other routes attempt the native close, because
+     * whether the run is still open is NOT observable from here — an adapter
+     * that ignores the abort keeps it open, while one that honors it (or that
+     * simply hands over a chunk buffered before the abort landed) has already
+     * closed it through the error path. `endSealedModelRun` degrades to the
+     * synthetic event when the run is gone, which is what makes both right.
+     */
+    const restartNeedsNativeClose = (): boolean => restartRoute !== 'exhausted';
+    /**
+     * An aborted run is EXPECTED to be closed already, so a failed native
+     * close is the normal outcome there and must not warn on every interrupt.
+     * A broken iterator fired no callback at all, so a failure is worth
+     * hearing about.
+     */
+    const restartCloseMayHaveHappened = (): boolean =>
+      restartRoute === 'aborted';
 
     /**
      * The wake is a hint; this is where the request is actually read. The
@@ -1281,6 +1306,17 @@ async function attemptInvokeBody(
        * call, so there is no open span and no stream for a host to unwind, and
        * a synthetic end would announce a run that never started.
        */
+      if (restartRoute !== 'exhausted') {
+        /**
+         * The step really was cut short, so it closes `cancelled` before the
+         * model-end below can close it `completed`. An exhausted turn is left
+         * alone: its stream reached its own end, and the step describing it is
+         * already closed and honest — only the turn built on it is discarded.
+         */
+        await context?.cancelOpenMessageStep(
+          config.metadata as Record<string, unknown> | undefined
+        );
+      }
       if (finalChunk != null || sealedRunId != null) {
         const discardedChunk = finalChunk ?? new AIMessageChunk({ content: '' });
         const responseMetadata = {
@@ -1324,7 +1360,8 @@ async function attemptInvokeBody(
             restartNeedsNativeClose() ? sealedRunId : undefined,
             config,
             model,
-            PREEMPT_RESTART_CONTROL_FLOW
+            PREEMPT_RESTART_CONTROL_FLOW,
+            restartCloseMayHaveHappened()
           );
         }
       }

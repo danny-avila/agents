@@ -908,3 +908,49 @@ describe('a failure concurrent with a restart', () => {
     expect(model.prompts).toHaveLength(1);
   });
 });
+
+/**
+ * Graph state forgets a discarded attempt, but the run-step view is a separate
+ * projection: left alone it closes the attempt `completed`, so subscribers keep
+ * showing reasoning the replacement prompt does not contain.
+ */
+describe('run steps for a discarded attempt', () => {
+  it('leaves no step open behind it', async () => {
+    const host = createHost(0);
+    const model = new ThinkingThenAnsweringModel({
+      responses: [RESTARTED_RESPONSE],
+    });
+    const run = await createRestartRun({
+      runId: 'restart-run-steps',
+      preemption: host.preemption,
+      model,
+      hook: () => {
+        host.disarm();
+        return {
+          injectedMessages: [{ role: 'user' as const, content: 'stop' }],
+        };
+      },
+    });
+    model.onFirstStream = host.arm;
+
+    await run.processStream(
+      { messages: [new HumanMessage('think it through')] },
+      streamConfig
+    );
+
+    /**
+     * The reachable invariant. A step the discard cut short must not stay
+     * `in_progress` — subscribers would show the withdrawn attempt as still
+     * running. Whether such a step exists at all depends on what the provider
+     * streamed before the interrupt, so this asserts the property rather than
+     * a particular step count.
+     */
+    const statuses = (run.Graph?.getRunSteps() ?? []).map(
+      (step) => step.status
+    );
+    expect(statuses.length).toBeGreaterThan(0);
+    expect(
+      statuses.filter((status) => status == null || status === 'in_progress')
+    ).toHaveLength(0);
+  });
+});

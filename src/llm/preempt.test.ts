@@ -2,9 +2,10 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import {
   canRestartPreempt,
   canSealPreempt,
-  consumePreemptRestartedRun,
+  forgetPreemptRestartedRun,
   notePreemptRestartedRun,
   resolveMaxSeals,
+  readPreemptRestartedRun,
   resolvePreemptAction,
   resolveRestartGraceMs,
 } from './preempt';
@@ -369,6 +370,32 @@ describe('canRestartPreempt', () => {
       expect(canRestartPreempt(chunk({ content: '  \n' }))).toBe(true);
     });
 
+    /** The block form of the same thing, which several providers send. */
+    it('a blank text block opening the message', () => {
+      expect(
+        canRestartPreempt(
+          chunk({
+            content: [
+              { type: 'text', text: '' },
+              { type: 'thinking', thinking: 'working' },
+            ],
+          })
+        )
+      ).toBe(true);
+    });
+
+    /**
+     * A reasoning-only Responses turn populates `output` too at natural
+     * completion, and that is exactly the turn a restart should discard.
+     */
+    it('a Responses turn whose authoritative output is reasoning only', () => {
+      const reasoningOnly = chunk({ content: [] });
+      reasoningOnly.response_metadata = {
+        output: [{ type: 'reasoning', id: 'rs_1' }],
+      };
+      expect(canRestartPreempt(reasoningOnly)).toBe(true);
+    });
+
     it('every provider spelling of a reasoning block', () => {
       expect(
         canRestartPreempt(
@@ -455,6 +482,26 @@ describe('canRestartPreempt', () => {
           })
         )
       ).toBe(false);
+    });
+
+    /**
+     * Responses reports its built-in tools nowhere the ordinary gates look:
+     * `content` stays empty and `tool_calls` is never populated, so without
+     * this the turn reads as disposable and reissuing would run a completed
+     * search — or a shell/apply-patch call — a second time.
+     */
+    it('a completed OpenAI Responses tool output', () => {
+      const withSidecar = chunk({ content: [] });
+      withSidecar.additional_kwargs.tool_outputs = [
+        { type: 'web_search_call', id: 'ws_1', status: 'completed' },
+      ];
+      expect(canRestartPreempt(withSidecar)).toBe(false);
+
+      const withAuthoritativeOutput = chunk({ content: [] });
+      withAuthoritativeOutput.response_metadata = {
+        output: [{ type: 'code_interpreter_call', id: 'ci_1' }],
+      };
+      expect(canRestartPreempt(withAuthoritativeOutput)).toBe(false);
     });
 
     it('an unrecognized block, rather than guessing it is disposable', () => {
@@ -544,16 +591,28 @@ describe('resolvePreemptAction', () => {
  * that never consume it.
  */
 describe('preempt-restarted run records', () => {
-  it('reports a recorded run exactly once, with its turn', () => {
+  /**
+   * A run can be closed through several tracing handlers at once, so every
+   * read must see the record — a consuming read would let the first handler
+   * recognize the restart and leave the rest exporting an error.
+   */
+  it('reports a recorded run to every reader, with its turn', () => {
     const message = chunk({ content: 'thinking' });
     notePreemptRestartedRun('run-a', message);
 
-    expect(consumePreemptRestartedRun('run-a')?.message).toBe(message);
-    expect(consumePreemptRestartedRun('run-a')).toBeUndefined();
+    expect(readPreemptRestartedRun('run-a')?.message).toBe(message);
+    expect(readPreemptRestartedRun('run-a')?.message).toBe(message);
   });
 
   it('does not claim a run it never recorded', () => {
-    expect(consumePreemptRestartedRun('run-never-restarted')).toBeUndefined();
+    expect(readPreemptRestartedRun('run-never-restarted')).toBeUndefined();
+  });
+
+  it('forgets a record whose run closed another way', () => {
+    notePreemptRestartedRun('run-manual', chunk({ content: '' }));
+    forgetPreemptRestartedRun('run-manual');
+
+    expect(readPreemptRestartedRun('run-manual')).toBeUndefined();
   });
 
   /**
@@ -566,8 +625,8 @@ describe('preempt-restarted run records', () => {
       notePreemptRestartedRun(`bulk-${i}`, chunk({ content: '' }));
     }
 
-    expect(consumePreemptRestartedRun('bulk-0')).toBeDefined();
-    expect(consumePreemptRestartedRun('bulk-499')).toBeDefined();
+    expect(readPreemptRestartedRun('bulk-0')).toBeDefined();
+    expect(readPreemptRestartedRun('bulk-499')).toBeDefined();
   });
 
   /** Age is what separates a queued callback from a leak. */
@@ -580,8 +639,8 @@ describe('preempt-restarted run records', () => {
       Date.now = () => base + 300_001;
       notePreemptRestartedRun('fresh', chunk({ content: '' }));
 
-      expect(consumePreemptRestartedRun('stale')).toBeUndefined();
-      expect(consumePreemptRestartedRun('fresh')).toBeDefined();
+      expect(readPreemptRestartedRun('stale')).toBeUndefined();
+      expect(readPreemptRestartedRun('fresh')).toBeDefined();
     } finally {
       Date.now = realNow;
     }

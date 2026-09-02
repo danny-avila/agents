@@ -40,7 +40,7 @@ import {
   resolveLangfuseDestinationKey,
 } from '@/langfuseSpanRegistry';
 import {
-  consumePreemptRestartedRun,
+  readPreemptRestartedRun,
   PREEMPT_RESTART_CONTROL_FLOW,
 } from '@/llm/preempt';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
@@ -692,7 +692,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     ...args: Parameters<CallbackHandler['handleLLMError']>
   ): ReturnType<CallbackHandler['handleLLMError']> {
     const [, runId, parentRunId] = args;
-    const restarted = consumePreemptRestartedRun(runId);
+    const restarted = readPreemptRestartedRun(runId);
     if (restarted != null) {
       /**
        * Closed WITH the discarded turn, not as an empty end. The provider
@@ -704,6 +704,10 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
        *
        * The generation text stays empty on purpose: a discarded turn produced
        * no answer, and replaying its reasoning as output would read as one.
+       *
+       * The lookup does not consume the record: a run can be closed through
+       * several handlers at once, and each must reach this branch rather than
+       * the first one leaving the others to export an error.
        */
       const generation: ChatGeneration = {
         text: '',

@@ -125,6 +125,61 @@ function countOpenToolCalls(
 }
 
 /**
+ * True for a text block a provider emitted before it had anything to say.
+ *
+ * Whitespace-only string content is already accepted above, and the block form
+ * of the same thing must agree: several providers open their message with an
+ * empty text part, and rejecting it would leave a turn neither sealable nor
+ * discardable — an armed interrupt would then wait out the whole turn for the
+ * sake of a block carrying nothing.
+ */
+function isBlankTextBlock(block: { type?: string; text?: unknown }): boolean {
+  if (block.type !== ContentTypes.TEXT) {
+    return false;
+  }
+  return typeof block.text === 'string' && block.text.trim() === '';
+}
+
+/**
+ * True when an OpenAI Responses turn already carries provider-side tool output.
+ *
+ * Responses reports its built-in tools differently from every other shape this
+ * module checks: a completed web search, code interpreter run, or apply-patch
+ * lands in `additional_kwargs.tool_outputs` or the authoritative
+ * `response_metadata.output`, while `content` stays empty and the `tool_calls`
+ * arrays are never populated. The ordinary gates therefore see an empty turn
+ * and would call it disposable — and reissuing the prompt would run that tool
+ * a SECOND time, rebilling a search and repeating whatever a shell or
+ * apply-patch call already did to the world.
+ *
+ * `output` is inspected item by item rather than treated as fatal on sight,
+ * because a reasoning-only Responses turn populates it too at natural
+ * completion, and that turn is precisely the one a restart should be able to
+ * discard.
+ */
+function hasResponsesProviderOutput(chunk: AIMessageChunk): boolean {
+  if (chunk.additional_kwargs.tool_outputs != null) {
+    return true;
+  }
+  const metadata = chunk.response_metadata as {
+    tool_outputs?: unknown;
+    output?: unknown;
+  };
+  if (metadata.tool_outputs != null) {
+    return true;
+  }
+  if (!Array.isArray(metadata.output)) {
+    return false;
+  }
+  for (const item of metadata.output) {
+    if (!isReasoningContentBlock(item as { type?: string })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Cooperative mid-generation seal gate. Returns true ONLY when sealing here
  * yields a message sequence valid on EVERY supported provider:
  *  - non-whitespace TEXT content, so the FIRST injected user turn is preceded
@@ -207,7 +262,10 @@ export type PreemptAction = 'none' | 'seal' | 'restart';
  * Tool machinery of any kind refuses, and deliberately without the settled-id
  * allowance {@link canSealPreempt} makes: a settled `web_search_tool_result`
  * means the provider already ran and billed a search, and re-issuing the call
- * would run it again. A seal there is free; a restart is not.
+ * would run it again. A seal there is free; a restart is not. The same
+ * argument covers Responses' sidecar shapes — see
+ * {@link hasResponsesProviderOutput}, which the ordinary tool-call gates
+ * cannot see at all.
  *
  * An accumulation that carries visible text is not handled here at all — the
  * caller resolves `seal` first, because keeping the user's answer always beats
@@ -230,14 +288,18 @@ export function canRestartPreempt(chunk: AIMessageChunk | undefined): boolean {
   if ((chunk.invalid_tool_calls?.length ?? 0) > 0) {
     return false;
   }
+  if (hasResponsesProviderOutput(chunk)) {
+    return false;
+  }
   const { content } = chunk;
   if (typeof content === 'string') {
     return content.trim() === '';
   }
   for (const block of content) {
-    if (!isReasoningContentBlock(block)) {
-      return false;
+    if (isReasoningContentBlock(block) || isBlankTextBlock(block)) {
+      continue;
     }
+    return false;
   }
   return true;
 }
@@ -402,20 +464,34 @@ export function notePreemptRestartedRun(
 
 /**
  * The record for a run that ended because a preempt discarded it, or
- * `undefined`. Consuming: the run closes exactly once, and a stale id must not
- * reclassify a later genuine failure on a reused id.
+ * `undefined`.
+ *
+ * Deliberately NON-consuming. A run can be closed through more than one
+ * tracing handler — a run-level one plus another supplied through the model's
+ * own `clientOptions.callbacks`, which `endSealedModelRun` already composes
+ * for exactly that reason — and each receives the same `handleLLMError`. A
+ * read that deleted the record would let only the first handler recognize the
+ * restart, and every other destination would export the same expected abort as
+ * an error. Reuse is not a concern the way it would be for a counter: run ids
+ * are UUIDs, and the sweep is what reclaims them.
  */
-export function consumePreemptRestartedRun(
+export function readPreemptRestartedRun(
   runId: string
 ): PreemptRestartedRun | undefined {
-  const record = preemptRestartedRuns.get(runId);
-  if (record == null) {
-    return undefined;
+  return preemptRestartedRuns.get(runId);
+}
+
+/**
+ * Drops a record whose run turned out not to need it — the adapter ignored the
+ * abort, so the tear-down never reached LangChain's error path and the close
+ * happens manually instead.
+ */
+export function forgetPreemptRestartedRun(runId: string): void {
+  if (!preemptRestartedRuns.delete(runId)) {
+    return;
   }
-  preemptRestartedRuns.delete(runId);
   if (preemptRestartedRuns.size === 0 && sweepTimer != null) {
     clearTimeout(sweepTimer);
     sweepTimer = undefined;
   }
-  return record;
 }
