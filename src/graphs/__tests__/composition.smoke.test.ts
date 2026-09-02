@@ -486,6 +486,12 @@ describe('LangGraph composition smoke tests', () => {
     const model = new CapturingChatModel([largeResult, 'done']);
     const graph = new MultiAgentGraph({
       runId: 'bounded-routing-results',
+      tokenCounter: (message) =>
+        Math.ceil(
+          (typeof message.content === 'string'
+            ? message.content.length
+            : JSON.stringify(message.content).length) / 4
+        ),
       agents: [
         makeAgent('source'),
         {
