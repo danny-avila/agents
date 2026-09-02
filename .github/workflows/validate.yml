@@ -88,6 +88,9 @@ jobs:
       - name: Test circular dependency checker
         run: npm run test:circular-deps
 
+      - name: Test provider-flake classifier
+        run: npm run test:provider-flake
+
       - name: Check circular dependencies
         run: npm run check:circular-deps
 
@@ -113,7 +116,7 @@ jobs:
           key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: Run unit tests (shard ${{ matrix.shard }}/4)
-        run: npx jest --shard=${{ matrix.shard }}/4 --maxWorkers=50% --testPathIgnorePatterns=title.memory-leak.test.ts --testPathIgnorePatterns=llm.spec.ts --testPathIgnorePatterns=integration.test.ts --testPathIgnorePatterns=specs/summarization.test.ts
+        run: node config/provider-flake.mjs --shard=${{ matrix.shard }}/4 --maxWorkers=50% --testPathIgnorePatterns=title.memory-leak.test.ts --testPathIgnorePatterns=llm.spec.ts --testPathIgnorePatterns=integration.test.ts --testPathIgnorePatterns=specs/summarization.test.ts
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
@@ -159,7 +162,7 @@ jobs:
           key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: Run summarization tests (${{ matrix.group }})
-        run: npx jest src/specs/summarization.test.ts -t "${{ matrix.pattern }}" --maxWorkers=50%
+        run: node config/provider-flake.mjs src/specs/summarization.test.ts -t "${{ matrix.pattern }}" --maxWorkers=50%
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test

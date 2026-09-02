@@ -193,6 +193,7 @@
     "build:dev": "tsdown",
     "check:circular-deps": "node config/circular-deps.mjs",
     "test:circular-deps": "node --test config/circular-deps.test.mjs",
+    "test:provider-flake": "node --test config/provider-flake.test.mjs",
     "sort-imports": "node scripts/sort-imports.ts",
     "sort-imports:check": "node scripts/sort-imports.ts --check",
     "start": "node dist/esm/main.js",
