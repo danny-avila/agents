@@ -7,6 +7,7 @@ import {
   fadingRungForBudget,
   fadingRungForResultChars,
   isFadingTier,
+  isInformativeFadingTier,
   maxFadingRung,
   resolveFadingCaps,
   resolveFadingTier,
@@ -417,5 +418,15 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
 
     const again = pruneMessages({ messages });
     expect(again.fadingTier).toEqual(result.fadingTier);
+  });
+});
+
+describe('isInformativeFadingTier', () => {
+  it('reports only tiers a host should persist', () => {
+    expect(isInformativeFadingTier(undefined, 100_000)).toBe(false);
+    expect(isInformativeFadingTier(createFadingTier(100_000), 100_000)).toBe(false);
+    expect(isInformativeFadingTier({ v: 1, budgetTokens: 100_000, masked: true }, 100_000)).toBe(true);
+    expect(isInformativeFadingTier({ v: 1, budgetTokens: 50_000, masked: false }, 100_000)).toBe(true);
+    expect(isInformativeFadingTier({ v: 1, budgetTokens: 50_000, masked: false }, undefined)).toBe(false);
   });
 });

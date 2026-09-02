@@ -163,6 +163,7 @@ import { initializeLangfuseTracing } from '@/instrumentation';
 import { shouldTriggerSummarization } from '@/summarization';
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
+import { isInformativeFadingTier } from '@/messages/fading';
 import { createSummarizeNode } from '@/summarization/node';
 import { getTruncationStopReason } from '@/llm/truncation';
 import { messagesStateReducer } from '@/messages/reducer';
@@ -2555,9 +2556,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return context?.calibrationRatio ?? 1;
   }
 
-  /** Latched context-fading tier for the default agent; hosts persist it with the calibration ratio. */
+  /**
+   * Latched context-fading tier for the default agent, or undefined while it
+   * is still fresh. Hosts persist it beside the calibration ratio.
+   */
   getFadingTier(): t.FadingTier | undefined {
-    return this.agentContexts.get(this.defaultAgentId)?.fadingTier;
+    const context = this.agentContexts.get(this.defaultAgentId);
+    const tier = context?.fadingTier;
+    return isInformativeFadingTier(tier, context?.maxContextTokens) ? tier : undefined;
   }
 
   getResolvedInstructionOverhead(): number | undefined {

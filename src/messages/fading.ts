@@ -208,3 +208,18 @@ export function resolveFadingTier(
   }
   return { v: FADING_TIER_VERSION, budgetTokens, masked };
 }
+
+/**
+ * Whether a tier carries information a host should persist: masking has
+ * activated or the budget sits below the pruner's window. A fresh tier only
+ * seeds what the next run derives on its own.
+ */
+export function isInformativeFadingTier(
+  tier: FadingTier | undefined,
+  window: number | undefined
+): tier is FadingTier {
+  if (tier == null) {
+    return false;
+  }
+  return tier.masked || (window != null && window > 0 && tier.budgetTokens < window);
+}
