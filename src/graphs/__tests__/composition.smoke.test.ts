@@ -495,7 +495,7 @@ describe('LangGraph composition smoke tests', () => {
           from: 'source',
           to: 'destination',
           edgeType: 'direct',
-          prompt: 'Review this result:\n{results}',
+          prompt: `${'large static prefix '.repeat(1000)}\n{results}\n{results}`,
           excludeResults: true,
         },
       ],

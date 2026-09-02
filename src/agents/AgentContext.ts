@@ -286,8 +286,8 @@ export class AgentContext {
   private providerProjectedMessages?: BaseMessage[];
   /** Canonical object identities corresponding to the projected slots. */
   private providerProjectionSources?: BaseMessage[];
-  /** Canonical message IDs used to recognize reducer replacements in O(update). */
-  private providerProjectionSourceIds?: Set<string>;
+  /** Canonical messages by ID, used to distinguish identity replay from replacement. */
+  private providerProjectionSourcesById?: Map<string, BaseMessage>;
   /** Conservative counts retained by canonical identity across a rebuild. */
   private providerProjectionRecountFloors?: WeakMap<BaseMessage, number>;
   /** Recount after discarding a projection whose token map contains capped sizes. */
@@ -1740,8 +1740,10 @@ export class AgentContext {
       );
       this.providerProjectedMessages = projection;
       this.providerProjectionSources = [...messages];
-      this.providerProjectionSourceIds = new Set(
-        messages.flatMap((message) => (message.id == null ? [] : [message.id]))
+      this.providerProjectionSourcesById = new Map(
+        messages.flatMap((message) =>
+          message.id == null ? [] : [[message.id, message] as const]
+        )
       );
       if (this.providerProjectionRequiresRecount && this.tokenCounter != null) {
         const recounted: Record<string, number> = {};
@@ -1765,7 +1767,7 @@ export class AgentContext {
       const message = messages[i];
       sources.push(message);
       if (message.id != null) {
-        this.providerProjectionSourceIds?.add(message.id);
+        this.providerProjectionSourcesById?.set(message.id, message);
       }
       projection.push(
         Array.isArray(message.content)
@@ -1801,10 +1803,13 @@ export class AgentContext {
         continue;
       }
       const update = coerceMessageLikeToMessage(rawUpdate);
+      const priorSource =
+        update.id == null
+          ? undefined
+          : this.providerProjectionSourcesById?.get(update.id);
       if (
         update.getType() === 'remove' ||
-        (update.id != null &&
-          this.providerProjectionSourceIds?.has(update.id) === true)
+        (priorSource != null && priorSource !== update)
       ) {
         this.pruneMessages = undefined;
         this.pendingOriginalToolContent = undefined;
@@ -1823,7 +1828,7 @@ export class AgentContext {
     }
     this.providerProjectedMessages = undefined;
     this.providerProjectionSources = undefined;
-    this.providerProjectionSourceIds = undefined;
+    this.providerProjectionSourcesById = undefined;
   }
 
   private prepareProviderProjectionRecount(

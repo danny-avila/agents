@@ -88,6 +88,9 @@ describe('AgentContext overflow recovery state', () => {
     });
     const appended = new HumanMessage({ id: 'human-2', content: 'next' });
 
+    context.invalidateProviderProjectionForMessageUpdates(canonical);
+    expect(context.getProviderProjectedMessages(canonical)).toBe(projection);
+
     const updates = [replacement, appended];
     context.pendingOriginalToolContent = new Map([[0, 'full original']]);
     context.invalidateProviderProjectionForMessageUpdates(updates);

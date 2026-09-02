@@ -1586,17 +1586,21 @@ export class MultiAgentGraph extends StandardGraph {
             if (prompt.includes('{results}')) {
               const resultsMessages = state.messages.slice(this.startIndex);
               const destinationContext = this.agentContexts.get(destination);
+              const maxRoutingPromptChars = calculateMaxToolResultChars(
+                destinationContext?.maxContextTokens
+              );
               const resultsString = serializeToolContentBounded(
                 getBufferString(resultsMessages),
-                calculateMaxToolResultChars(
-                  destinationContext?.maxContextTokens
-                )
+                maxRoutingPromptChars
               );
               const promptTemplate = PromptTemplate.fromTemplate(prompt);
               const result = await promptTemplate.invoke({
                 results: resultsString,
               });
-              promptText = result.value;
+              promptText = serializeToolContentBounded(
+                result.value,
+                maxRoutingPromptChars
+              );
               effectiveExcludeResults =
                 excludeResults !== false && promptText !== '';
             } else {
