@@ -10,6 +10,7 @@ import { createKeenableAPI } from './keenable-search';
 import { createTavilyAPI } from './tavily-search';
 import { createSearchMetrics } from './metrics';
 import { createCrwAPI } from './crw-search';
+import { createYouAPI } from './you-search';
 import { BaseReranker } from './rerankers';
 
 /** Engines queried when `searxngSearchOptions.engines` is not configured. */
@@ -534,6 +535,9 @@ export const createSearchAPI = (
     crwApiKey,
     crwApiUrl,
     crwSearchOptions,
+    youApiKey,
+    youApiUrl,
+    youSearchOptions,
     httpAgent,
     httpsAgent,
   } = config;
@@ -566,9 +570,15 @@ export const createSearchAPI = (
       httpAgent: httpAgent ?? crwSearchOptions?.httpAgent,
       httpsAgent: httpsAgent ?? crwSearchOptions?.httpsAgent,
     });
+  } else if (searchProvider.toLowerCase() === 'you') {
+    return createYouAPI(youApiKey, youApiUrl, {
+      ...youSearchOptions,
+      httpAgent: httpAgent ?? youSearchOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? youSearchOptions?.httpsAgent,
+    });
   } else {
     throw new Error(
-      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', 'tavily', 'keenable', or 'crw'`
+      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', 'tavily', 'keenable', 'crw', or 'you'`
     );
   }
 };
