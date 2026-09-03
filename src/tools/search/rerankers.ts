@@ -4,6 +4,7 @@ import { createDefaultLogger, formatErrorForLog } from './utils';
 import { createSearchMetrics } from './metrics';
 
 const DEFAULT_JINA_API_URL = 'https://api.jina.ai/v1/rerank';
+const DEFAULT_COHERE_API_URL = 'https://api.cohere.com/v2/rerank';
 
 /** Every other network call in the search pipeline is bounded (scrapers,
  * search providers); rerank requests must be too, or a hung rerank API
@@ -14,6 +15,11 @@ const getDefaultJinaApiUrl = (): string =>
   process.env.JINA_API_URL != null && process.env.JINA_API_URL !== ''
     ? process.env.JINA_API_URL
     : DEFAULT_JINA_API_URL;
+
+const getDefaultCohereApiUrl = (): string =>
+  process.env.COHERE_API_URL != null && process.env.COHERE_API_URL !== ''
+    ? process.env.COHERE_API_URL
+    : DEFAULT_COHERE_API_URL;
 
 export abstract class BaseReranker {
   protected apiKey: string | undefined;
@@ -219,23 +225,27 @@ export class JinaReranker extends BaseReranker {
 
 export class CohereReranker extends BaseReranker {
   readonly provider = 'cohere';
+  private apiUrl: string;
   private timeout: number;
   private httpAgent?: t.HttpAgent;
   private httpsAgent?: t.HttpsAgent;
 
   constructor({
     apiKey = process.env.COHERE_API_KEY,
+    apiUrl = getDefaultCohereApiUrl(),
     timeout = DEFAULT_RERANKER_TIMEOUT,
     logger,
     httpAgent,
     httpsAgent,
   }: {
     apiKey?: string;
+    apiUrl?: string;
     timeout?: number;
     logger?: t.Logger;
   } & t.HttpAgentConfig) {
     super(logger);
     this.apiKey = apiKey;
+    this.apiUrl = apiUrl;
     this.timeout = timeout;
     this.httpAgent = httpAgent;
     this.httpsAgent = httpsAgent;
@@ -263,7 +273,7 @@ export class CohereReranker extends BaseReranker {
       };
 
       const response = await axios.post<t.CohereRerankerResponse | undefined>(
-        'https://api.cohere.com/v2/rerank',
+        this.apiUrl,
         requestData,
         {
           headers: {
@@ -560,6 +570,7 @@ export const createReranker = (
     jinaApiKey?: string;
     jinaApiUrl?: string;
     cohereApiKey?: string;
+    cohereApiUrl?: string;
     ragApiUrl?: string;
     ragApiTokenSupplier?: t.RagApiTokenSupplier;
     ragApiProfile?: string;
@@ -572,6 +583,7 @@ export const createReranker = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    cohereApiUrl,
     ragApiUrl,
     ragApiTokenSupplier,
     ragApiProfile,
@@ -597,6 +609,7 @@ export const createReranker = (
   case 'cohere':
     return new CohereReranker({
       apiKey: cohereApiKey,
+      apiUrl: cohereApiUrl,
       timeout: rerankerTimeout,
       logger: defaultLogger,
       httpAgent,
