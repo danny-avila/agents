@@ -970,9 +970,6 @@ function convertHumanMessageToConverseMessage(
   if (typeof msg.content === 'string') {
     appendSerializableBedrockTextBlock(contentBlocks, msg.content);
   } else if (Array.isArray(msg.content)) {
-    // One pass. Text goes through the serializer, which drops a blank block and folds
-    // whitespace-only text into the preceding text block so prose spacing survives;
-    // every other block converts inline.
     for (const block of msg.content) {
       if (
         block.type === 'text' &&
@@ -990,16 +987,24 @@ function convertHumanMessageToConverseMessage(
     }
   }
 
-  // Bedrock rejects a blank text block and an empty user message alike
-  // (`The text field in the ContentBlock object at messages.N.content.0 is blank`),
-  // and the rejection fences the whole conversation on every retry. A promptless send
-  // — attachment, no typed text — reaches here as exactly that shape. Mirror the
-  // assistant path: fall back to the placeholder if nothing serializable remains.
-  if (contentBlocks.length === 0) {
-    contentBlocks.push({ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER });
-  }
-
   return { role: 'user', content: contentBlocks };
+}
+
+/**
+ * Bedrock rejects an empty user message just as it rejects a blank text block
+ * (`The text field in the ContentBlock object at messages.N.content.0 is blank`), and the
+ * rejection fences the whole conversation on every retry. A promptless send — attachment, no
+ * typed text — serializes to exactly that. Applied only once a user group is complete: an
+ * empty human turn adjacent to a tool result merges into it below, and a per-message
+ * placeholder would inject a synthetic `_` into an otherwise valid message.
+ */
+function finalizeUserMessage(message: BedrockMessage): void {
+  if (
+    message.role === 'user' &&
+    (message.content == null || message.content.length === 0)
+  ) {
+    message.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
+  }
 }
 
 /**
@@ -1132,12 +1137,18 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
       if (lastMessage.role === 'user' && curr.role === 'user') {
         lastMessage.content = lastMessage.content?.concat(curr.content ?? []);
       } else {
+        finalizeUserMessage(lastMessage);
         acc.push(curr);
       }
       return acc;
     },
     []
   );
+  if (combinedConverseMessages.length > 0) {
+    finalizeUserMessage(
+      combinedConverseMessages[combinedConverseMessages.length - 1]
+    );
+  }
 
   return { converseMessages: combinedConverseMessages, converseSystem };
 }

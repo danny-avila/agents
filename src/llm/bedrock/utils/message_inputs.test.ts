@@ -704,6 +704,26 @@ describe('convertToConverseMessages — blank user content', () => {
     });
   });
 
+  it('does not inject the placeholder into a merged user group', () => {
+    const { converseMessages } = convertToConverseMessages([
+      new HumanMessage('hello'),
+      new HumanMessage(''),
+    ]);
+    expect(converseMessages).toEqual([
+      { role: 'user', content: [{ text: 'hello' }] },
+    ]);
+  });
+
+  it('applies the placeholder when an entire user group is empty', () => {
+    const { converseMessages } = convertToConverseMessages([
+      new HumanMessage(''),
+      new HumanMessage('   '),
+    ]);
+    expect(converseMessages).toEqual([
+      { role: 'user', content: [{ text: '_' }] },
+    ]);
+  });
+
   it('keeps non-blank user text unchanged', () => {
     const { converseMessages } = convertToConverseMessages([
       new HumanMessage('hello'),
