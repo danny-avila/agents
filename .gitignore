@@ -2,6 +2,7 @@
 node_modules/
 dist/
 .env
+.env*
 *.log
 *outputs.json
 *_output.txt
