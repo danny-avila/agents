@@ -744,6 +744,60 @@ describe('convertToConverseMessages — blank user content', () => {
     expect(content[1]).toEqual({ text: '_' });
   });
 
+  it('keeps whitespace that precedes the first text fragment', () => {
+    const { converseMessages } = convertToConverseMessages([
+      new HumanMessage({
+        content: [
+          { type: 'text', text: ' ' },
+          { type: 'text', text: 'hello' },
+        ],
+      }),
+    ]);
+    expect(converseMessages[0]).toEqual({
+      role: 'user',
+      content: [{ text: ' hello' }],
+    });
+  });
+
+  it('keeps whitespace between media and the text that follows it', () => {
+    const { converseMessages } = convertToConverseMessages([
+      new HumanMessage({
+        content: [
+          {
+            type: 'image_url',
+            image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' },
+          },
+          { type: 'text', text: ' ' },
+          { type: 'text', text: 'hello' },
+        ],
+      }),
+    ]);
+    const content = converseMessages[0].content ?? [];
+    expect(content).toHaveLength(2);
+    expect(content[0]).toHaveProperty('image');
+    expect(content[1]).toEqual({ text: ' hello' });
+  });
+
+  it('adds the document text block to a merged group only when no member had text', () => {
+    const { converseMessages } = convertToConverseMessages([
+      new HumanMessage('read this'),
+      new HumanMessage({
+        content: [
+          {
+            type: 'file',
+            source_type: 'base64',
+            mime_type: 'application/pdf',
+            data: 'JVBERi0xLjQK',
+          },
+        ],
+      }),
+    ]);
+    const content = converseMessages[0].content ?? [];
+    expect(content).toHaveLength(2);
+    expect(content[0]).toEqual({ text: 'read this' });
+    expect(content[1]).toHaveProperty('document');
+  });
+
   it('keeps non-blank user text unchanged', () => {
     const { converseMessages } = convertToConverseMessages([
       new HumanMessage('hello'),

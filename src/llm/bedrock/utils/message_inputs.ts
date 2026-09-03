@@ -58,6 +58,15 @@ const FOREIGN_SERVER_TOOL_TYPES = ['toolCall', 'toolResponse'];
  * also has no tool calls, fall back to this placeholder text.
  */
 const BEDROCK_EMPTY_TEXT_PLACEHOLDER = '_';
+/**
+ * Whether a converted user message carries top-level text and document blocks, recorded
+ * during its single conversion pass and OR-ed through merging so finalization never
+ * rescans content.
+ */
+const userGroupShape = new WeakMap<
+  BedrockMessage,
+  { hasText: boolean; hasDocument: boolean }
+>();
 
 /**
  * Convert a LangChain reasoning block to a Bedrock reasoning block.
@@ -966,28 +975,46 @@ function convertHumanMessageToConverseMessage(
   msg: BaseMessage
 ): BedrockMessage {
   const contentBlocks: BedrockContentBlock[] = [];
+  let hasText = false;
+  let hasDocument = false;
+  // Whitespace with nothing before it to fold into is held until the next text fragment,
+  // so `[' ', 'hello']` and `[image, ' ', 'hello']` keep their leading space instead of
+  // losing it; whitespace left over at the end has nothing to attach to and is dropped.
+  let pendingWhitespace = '';
+  const appendText = (text: string): void => {
+    const candidate = pendingWhitespace + text;
+    if (appendSerializableBedrockTextBlock(contentBlocks, candidate)) {
+      hasText = true;
+      pendingWhitespace = '';
+      return;
+    }
+    pendingWhitespace = candidate;
+  };
 
   if (typeof msg.content === 'string') {
-    appendSerializableBedrockTextBlock(contentBlocks, msg.content);
+    appendText(msg.content);
   } else if (Array.isArray(msg.content)) {
     for (const block of msg.content) {
       if (
         block.type === 'text' &&
         typeof (block as { text?: unknown }).text === 'string'
       ) {
-        appendSerializableBedrockTextBlock(
-          contentBlocks,
-          (block as { text: string }).text
-        );
+        appendText((block as { text: string }).text);
         continue;
       }
-      contentBlocks.push(
-        convertLangChainContentBlockToConverseContentBlock({ block })
-      );
+      const converted = convertLangChainContentBlockToConverseContentBlock({
+        block,
+      });
+      if ('document' in converted) {
+        hasDocument = true;
+      }
+      contentBlocks.push(converted);
     }
   }
 
-  return { role: 'user', content: contentBlocks };
+  const message: BedrockMessage = { role: 'user', content: contentBlocks };
+  userGroupShape.set(message, { hasText, hasDocument });
+  return message;
 }
 
 /**
@@ -1002,25 +1029,16 @@ function finalizeUserMessage(message: BedrockMessage): void {
   if (message.role !== 'user') {
     return;
   }
-  const content = message.content ?? [];
-  if (content.length === 0) {
+  if (message.content == null || message.content.length === 0) {
     message.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
     return;
   }
   // Converse also requires a text block in any message that carries a document block. A
   // promptless document upload arrives as blank text plus the document; the blank is
   // dropped during conversion, so supply the placeholder if no text survived.
-  let hasText = false;
-  let hasDocument = false;
-  for (const block of content) {
-    if ('text' in block) {
-      hasText = true;
-    } else if ('document' in block) {
-      hasDocument = true;
-    }
-  }
-  if (hasDocument && !hasText) {
-    message.content = [...content, { text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
+  const shape = userGroupShape.get(message);
+  if (shape != null && shape.hasDocument && !shape.hasText) {
+    message.content.push({ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER });
   }
 }
 
@@ -1153,6 +1171,17 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
       const lastMessage = acc[acc.length - 1];
       if (lastMessage.role === 'user' && curr.role === 'user') {
         lastMessage.content = lastMessage.content?.concat(curr.content ?? []);
+        const lastShape = userGroupShape.get(lastMessage);
+        const nextShape = userGroupShape.get(curr);
+        if (lastShape != null || nextShape != null) {
+          userGroupShape.set(lastMessage, {
+            hasText:
+              (lastShape?.hasText ?? false) || (nextShape?.hasText ?? false),
+            hasDocument:
+              (lastShape?.hasDocument ?? false) ||
+              (nextShape?.hasDocument ?? false),
+          });
+        }
       } else {
         finalizeUserMessage(lastMessage);
         acc.push(curr);
