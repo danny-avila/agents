@@ -519,6 +519,7 @@ export interface SearchToolConfig
   jinaApiKey?: string;
   jinaApiUrl?: string;
   cohereApiKey?: string;
+  cohereApiUrl?: string;
   /** Base URL of the public `rag_api` service (`RAG_API_URL` env fallback).
    * Requests post to `${ragApiUrl}/v1/rerank`. */
   ragApiUrl?: string;

@@ -20,8 +20,8 @@ import { createFirecrawlScraper } from './firecrawl';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { createCrwScraper } from './crw-scraper';
 import { expandHighlights } from './highlights';
-import { formatResultsForLLM } from './format';
 import { createSearchMetrics } from './metrics';
+import { formatResultsForLLM } from './format';
 import { createDefaultLogger } from './utils';
 import { createReranker } from './rerankers';
 import { Constants } from '@/common';
@@ -514,6 +514,7 @@ export const createSearchTool = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    cohereApiUrl,
     ragApiUrl,
     ragApiTokenSupplier,
     ragApiProfile,
@@ -637,6 +638,7 @@ export const createSearchTool = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    cohereApiUrl,
     ragApiUrl,
     ragApiTokenSupplier,
     ragApiProfile,
