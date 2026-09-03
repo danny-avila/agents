@@ -724,6 +724,26 @@ describe('convertToConverseMessages — blank user content', () => {
     ]);
   });
 
+  it('adds a text block to a promptless document upload, which Converse requires', () => {
+    const { converseMessages } = convertToConverseMessages([
+      new HumanMessage({
+        content: [
+          { type: 'text', text: '' },
+          {
+            type: 'file',
+            source_type: 'base64',
+            mime_type: 'application/pdf',
+            data: 'JVBERi0xLjQK',
+          },
+        ],
+      }),
+    ]);
+    const content = converseMessages[0].content ?? [];
+    expect(content).toHaveLength(2);
+    expect(content[0]).toHaveProperty('document');
+    expect(content[1]).toEqual({ text: '_' });
+  });
+
   it('keeps non-blank user text unchanged', () => {
     const { converseMessages } = convertToConverseMessages([
       new HumanMessage('hello'),

@@ -999,11 +999,28 @@ function convertHumanMessageToConverseMessage(
  * placeholder would inject a synthetic `_` into an otherwise valid message.
  */
 function finalizeUserMessage(message: BedrockMessage): void {
-  if (
-    message.role === 'user' &&
-    (message.content == null || message.content.length === 0)
-  ) {
+  if (message.role !== 'user') {
+    return;
+  }
+  const content = message.content ?? [];
+  if (content.length === 0) {
     message.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
+    return;
+  }
+  // Converse also requires a text block in any message that carries a document block. A
+  // promptless document upload arrives as blank text plus the document; the blank is
+  // dropped during conversion, so supply the placeholder if no text survived.
+  let hasText = false;
+  let hasDocument = false;
+  for (const block of content) {
+    if ('text' in block) {
+      hasText = true;
+    } else if ('document' in block) {
+      hasDocument = true;
+    }
+  }
+  if (hasDocument && !hasText) {
+    message.content = [...content, { text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
   }
 }
 
