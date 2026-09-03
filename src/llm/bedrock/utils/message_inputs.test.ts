@@ -648,3 +648,53 @@ describe('convertToConverseMessages — user-role run merging', () => {
     ]);
   });
 });
+
+describe('convertToConverseMessages — blank user content', () => {
+  it('replaces an empty-string user message with the placeholder instead of a blank text block', () => {
+    const { converseMessages } = convertToConverseMessages([
+      new HumanMessage(''),
+    ]);
+    expect(converseMessages[0]).toEqual({
+      role: 'user',
+      content: [{ text: '_' }],
+    });
+  });
+
+  it('replaces whitespace-only user text with the placeholder', () => {
+    const { converseMessages } = convertToConverseMessages([
+      new HumanMessage('   '),
+    ]);
+    expect(converseMessages[0]).toEqual({
+      role: 'user',
+      content: [{ text: '_' }],
+    });
+  });
+
+  it('drops a blank text block from an image-only user message and keeps the image', () => {
+    const { converseMessages } = convertToConverseMessages([
+      new HumanMessage({
+        content: [
+          { type: 'text', text: '' },
+          {
+            type: 'image_url',
+            image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' },
+          },
+        ],
+      }),
+    ]);
+    const content = converseMessages[0].content ?? [];
+    expect(content).toHaveLength(1);
+    expect(content[0]).toHaveProperty('image');
+    expect(content.some((block) => 'text' in block)).toBe(false);
+  });
+
+  it('keeps non-blank user text unchanged', () => {
+    const { converseMessages } = convertToConverseMessages([
+      new HumanMessage('hello'),
+    ]);
+    expect(converseMessages[0]).toEqual({
+      role: 'user',
+      content: [{ text: 'hello' }],
+    });
+  });
+});

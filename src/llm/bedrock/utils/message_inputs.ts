@@ -971,14 +971,36 @@ function convertHumanMessageToConverseMessage(
   };
 
   if (typeof msg.content === 'string') {
-    userMessage.content = [{ text: msg.content }];
+    userMessage.content = isBlankText(msg.content)
+      ? []
+      : [{ text: msg.content }];
   } else if (Array.isArray(msg.content)) {
-    userMessage.content = msg.content.map((block) =>
-      convertLangChainContentBlockToConverseContentBlock({ block })
-    );
+    userMessage.content = msg.content
+      .map((block) =>
+        convertLangChainContentBlockToConverseContentBlock({ block })
+      )
+      .filter((block) => !isBlankTextBlock(block));
+  }
+
+  // Bedrock rejects a blank text block and an empty user message alike
+  // (`The text field in the ContentBlock object at messages.N.content.0 is blank`),
+  // and the rejection fences the whole conversation on every retry. A promptless send
+  // — attachment, no typed text — reaches here as exactly that shape. Mirror the
+  // assistant path: drop the blank, and fall back to the placeholder if nothing remains.
+  if (userMessage.content == null || userMessage.content.length === 0) {
+    userMessage.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
   }
 
   return userMessage;
+}
+
+function isBlankText(text: string): boolean {
+  return text.trim() === '';
+}
+
+function isBlankTextBlock(block: BedrockContentBlock): boolean {
+  const text = (block as { text?: unknown }).text;
+  return typeof text === 'string' && isBlankText(text);
 }
 
 /**
