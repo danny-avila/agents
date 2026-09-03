@@ -151,6 +151,7 @@ import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
+import { isFadingTier, isInformativeFadingTier } from '@/messages/fading';
 import { createContextPressureMeter } from '@/llm/contextPressureMeter';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
@@ -163,7 +164,6 @@ import { initializeLangfuseTracing } from '@/instrumentation';
 import { shouldTriggerSummarization } from '@/summarization';
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
-import { isFadingTier, isInformativeFadingTier } from '@/messages/fading';
 import { createSummarizeNode } from '@/summarization/node';
 import { getTruncationStopReason } from '@/llm/truncation';
 import { messagesStateReducer } from '@/messages/reducer';
@@ -3992,6 +3992,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         rootAgentName: this.agentContexts.get(this.defaultAgentId)?.name,
         activeAgentId: agentId,
         activeAgentName: agentContext.name,
+        endpoint: agentContext.endpoint,
       });
       let langfuseHandler: CallbackEntry | undefined;
       let invokeConfig = {

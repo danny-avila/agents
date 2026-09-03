@@ -104,6 +104,7 @@ export class AgentContext {
   ): AgentContext {
     const {
       agentId,
+      endpoint,
       codeSessionKey,
       name,
       provider,
@@ -135,6 +136,7 @@ export class AgentContext {
 
     const agentContext = new AgentContext({
       agentId,
+      endpoint,
       codeSessionKey,
       name: name ?? agentId,
       provider,
@@ -219,6 +221,8 @@ export class AgentContext {
 
   /** Agent identifier */
   agentId: string;
+  /** Logical endpoint selected by the host before provider resolution. */
+  endpoint: string;
   /** Partition for this agent's transient code session and file refs. */
   codeSessionKey?: string;
   /** Human-readable name for this agent (used in handoff context). Falls back to agentId if not provided. */
@@ -454,6 +458,7 @@ export class AgentContext {
 
   constructor({
     agentId,
+    endpoint,
     codeSessionKey,
     name,
     provider,
@@ -481,6 +486,7 @@ export class AgentContext {
     maxToolResultChars,
   }: {
     agentId: string;
+    endpoint?: string;
     codeSessionKey?: string;
     name?: string;
     provider: t.ProviderName;
@@ -508,6 +514,7 @@ export class AgentContext {
     maxToolResultChars?: number;
   }) {
     this.agentId = agentId;
+    this.endpoint = endpoint ?? provider;
     this.codeSessionKey = codeSessionKey;
     this.name = name;
     this.provider = provider;
