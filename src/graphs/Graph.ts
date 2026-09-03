@@ -3992,6 +3992,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         rootAgentName: this.agentContexts.get(this.defaultAgentId)?.name,
         activeAgentId: agentId,
         activeAgentName: agentContext.name,
+        endpoint: agentContext.endpoint,
+        model: preparedRequest.modelId,
+        provider: agentContext.provider,
+        resolvedProvider: agentContext.provider,
       });
       let langfuseHandler: CallbackEntry | undefined;
       let invokeConfig = {

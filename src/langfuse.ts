@@ -840,6 +840,10 @@ export function createLangfuseTraceMetadata({
   rootAgentName,
   activeAgentId,
   activeAgentName,
+  endpoint,
+  model,
+  provider,
+  resolvedProvider,
 }: {
   messageId?: unknown;
   parentMessageId?: unknown;
@@ -849,6 +853,10 @@ export function createLangfuseTraceMetadata({
   rootAgentName?: unknown;
   activeAgentId?: unknown;
   activeAgentName?: unknown;
+  endpoint?: unknown;
+  model?: unknown;
+  provider?: unknown;
+  resolvedProvider?: unknown;
 }): LangfuseTraceMetadata {
   return createTraceMetadata({
     messageId,
@@ -859,6 +867,10 @@ export function createLangfuseTraceMetadata({
     rootAgentName,
     activeAgentId,
     activeAgentName,
+    endpoint,
+    model,
+    provider,
+    resolvedProvider,
   });
 }
 

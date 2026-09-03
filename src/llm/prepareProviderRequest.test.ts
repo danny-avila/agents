@@ -11,6 +11,7 @@ import {
   prepareProviderRequest,
 } from '@/llm/prepareProviderRequest';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import { attemptInvoke } from '@/llm/invoke';
 import { Providers } from '@/common';
 
@@ -40,6 +41,184 @@ function createCapturingModel(): CapturingModel {
 }
 
 describe('prepareProviderRequest', () => {
+  it.each([
+    ['CSV', 'csv'],
+    ['XLSX', 'xlsx'],
+  ])(
+    'removes a persisted Bedrock %s block for OpenAI while retaining extracted file context',
+    (_label, format) => {
+      const { model } = createCapturingModel();
+      const document = {
+        type: 'document',
+        document: {
+          name: `sales.${format}`,
+          format,
+          source: {
+            bytes: { type: 'Buffer', data: [99, 111, 108, 49, 10] },
+          },
+        },
+      };
+      const source = new HumanMessage({
+        content: [
+          { type: 'text', text: 'Attached document(s):\ncol1\nvalue' },
+          document,
+        ],
+      });
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [source],
+        provider: Providers.OPENAI,
+      });
+
+      expect(request.messages[0]).not.toBe(source);
+      expect(request.messages[0].content).toEqual([
+        { type: 'text', text: 'Attached document(s):\ncol1\nvalue' },
+      ]);
+      expect(_convertMessagesToOpenAIParams(request.messages)).toEqual([
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Attached document(s):\ncol1\nvalue' },
+          ],
+        },
+      ]);
+      expect(source.content).toEqual([
+        { type: 'text', text: 'Attached document(s):\ncol1\nvalue' },
+        document,
+      ]);
+    }
+  );
+
+  it('reprojects a persisted Bedrock PDF and preserves image content for OpenAI', () => {
+    const { model } = createCapturingModel();
+    const pdf = {
+      type: 'document',
+      document: {
+        name: 'report.pdf',
+        format: 'pdf',
+        source: { bytes: { type: 'Buffer', data: [37, 80, 68, 70] } },
+      },
+    };
+    const image = {
+      type: 'image_url',
+      image_url: { url: 'data:image/png;base64,AA==' },
+    };
+    const source = new HumanMessage({ content: [pdf, image] });
+
+    const request = prepareProviderRequest({
+      model: model as t.ChatModel,
+      messages: [source],
+      provider: Providers.OPENAI,
+    });
+
+    expect(request.messages[0].content).toEqual([
+      {
+        type: 'file',
+        source_type: 'base64',
+        mime_type: 'application/pdf',
+        data: 'JVBERg==',
+        metadata: { name: 'report.pdf' },
+      },
+      image,
+    ]);
+    expect(_convertMessagesToOpenAIParams(request.messages)).toEqual([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'file',
+            file: {
+              file_data: 'data:application/pdf;base64,JVBERg==',
+              filename: 'report.pdf',
+            },
+          },
+          image,
+        ],
+      },
+    ]);
+    expect(source.content).toEqual([pdf, image]);
+  });
+
+  it('filters a canonical spreadsheet descriptor at the same final projection seam', () => {
+    const { model } = createCapturingModel();
+    const source = new HumanMessage({
+      content: [
+        { type: 'text', text: 'Attached document(s):\nRevenue: 42' },
+        {
+          type: 'file',
+          source_type: 'base64',
+          mime_type:
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          data: 'UEs=',
+          metadata: { name: 'sales.xlsx' },
+        },
+      ],
+    });
+
+    const request = prepareProviderRequest({
+      model: model as t.ChatModel,
+      messages: [source],
+      provider: Providers.OPENAI,
+    });
+
+    expect(request.messages[0].content).toEqual([
+      { type: 'text', text: 'Attached document(s):\nRevenue: 42' },
+    ]);
+    expect(source.content).toHaveLength(2);
+  });
+
+  it('does not scan or re-encode Bedrock-native documents for a Bedrock target', () => {
+    const { model } = createCapturingModel();
+    const document = {
+      type: 'document',
+      document: {
+        name: 'sales.csv',
+        format: 'csv',
+        source: { bytes: new Uint8Array([99, 111, 108, 49]) },
+      },
+    };
+    const source = new HumanMessage({ content: [document] });
+
+    const request = prepareProviderRequest({
+      model: model as t.ChatModel,
+      messages: [source],
+      provider: Providers.BEDROCK,
+    });
+
+    expect(request.messages[0]).toBe(source);
+    expect(request.messages[0].content[0]).toBe(document);
+  });
+
+  it('keeps an attachment-only turn valid when its binary block is unsupported', () => {
+    const { model } = createCapturingModel();
+    const source = new HumanMessage({
+      content: [
+        {
+          type: 'document',
+          document: {
+            name: 'sales.xlsx',
+            format: 'xlsx',
+            source: { bytes: { type: 'Buffer', data: [80, 75] } },
+          },
+        },
+      ],
+    });
+
+    const request = prepareProviderRequest({
+      model: model as t.ChatModel,
+      messages: [source],
+      provider: Providers.OPENAI,
+    });
+
+    expect(request.messages[0].content).toEqual([
+      {
+        type: 'text',
+        text: '[Attachment omitted because its binary format is unsupported by this provider.]',
+      },
+    ]);
+  });
+
   it('measures and sends the exact prepared message array without re-projection', async () => {
     const { model, invocations } = createCapturingModel();
     const source = [

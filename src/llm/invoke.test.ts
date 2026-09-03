@@ -19,8 +19,8 @@ import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/messag
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { convertMessageContentToParts } from '@/llm/google/utils/common';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
-import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { toLangChainContent } from '@/messages/langchain';
 import { Constants, Providers } from '@/common';
 import { ToolNode } from '@/tools/ToolNode';
@@ -32,6 +32,7 @@ import { ChatOpenAI } from '@/llm/openai';
  * extending the real `BaseChatModel` would pull in too much surface.
  */
 type StubModel = {
+  model?: string;
   _useResponsesApi?: (options?: unknown) => boolean;
   defaultOptions?: unknown;
   last?: unknown;
@@ -1019,6 +1020,7 @@ describe('invocation attribution metadata', () => {
   it('stamps INVOKED_PROVIDER on the config passed to the model', async () => {
     const capturedConfigs: unknown[] = [];
     const model: StubModel = {
+      model: 'claude-opus-4-8',
       invoke: jest.fn(
         async (_m: BaseMessage[], config?: unknown): Promise<AIMessage> => {
           capturedConfigs.push(config);
@@ -1034,7 +1036,15 @@ describe('invocation attribution metadata', () => {
         /** A ChatOpenAI-derived provider — `ls_provider` would lie here. */
         provider: Providers.DEEPSEEK,
       },
-      { configurable: { run_id: 'run-attr' }, metadata: { existing: true } }
+      {
+        configurable: { run_id: 'run-attr' },
+        metadata: {
+          existing: true,
+          endpoint: 'DWAINE',
+          rootAgentId: 'sales-copilot',
+          activeAgentId: 'dwaine',
+        },
+      }
     );
 
     const config = capturedConfigs[0] as {
@@ -1043,6 +1053,14 @@ describe('invocation attribution metadata', () => {
     expect(config.metadata?.[Constants.INVOKED_PROVIDER]).toBe(
       Providers.DEEPSEEK
     );
+    expect(config.metadata).toMatchObject({
+      endpoint: 'DWAINE',
+      model: 'claude-opus-4-8',
+      provider: Providers.DEEPSEEK,
+      resolvedProvider: Providers.DEEPSEEK,
+      rootAgentId: 'sales-copilot',
+      activeAgentId: 'dwaine',
+    });
     /** Pre-existing metadata is preserved, not replaced. */
     expect(config.metadata?.existing).toBe(true);
   });

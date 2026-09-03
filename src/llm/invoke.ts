@@ -692,11 +692,27 @@ export async function attemptInvoke(
   config?: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
   const provider = resolveAttemptProvider(params);
-  const stampedConfig: RunnableConfig = {
+  const providerStampedConfig: RunnableConfig = {
     ...config,
     metadata: {
       ...(config?.metadata ?? {}),
       [Constants.INVOKED_PROVIDER]: provider,
+      provider,
+      resolvedProvider: provider,
+    },
+  };
+  const request = resolveAttemptRequest(params, providerStampedConfig);
+  const stampedConfig: RunnableConfig = {
+    ...providerStampedConfig,
+    metadata: {
+      ...providerStampedConfig.metadata,
+      [Constants.INVOKED_PROVIDER]: provider,
+      ...(request.modelId == null
+        ? {}
+        : {
+          [Constants.INVOKED_MODEL]: request.modelId,
+          model: request.modelId,
+        }),
       /**
        * One `attemptInvoke` call is one model attempt; primary, fallback,
        * and retry attempts within a node otherwise share the same langgraph
@@ -727,7 +743,7 @@ export async function attemptInvoke(
   try {
     return await attemptInvokeBody(
       {
-        request: resolveAttemptRequest(params, stampedConfig),
+        request,
         context: params.context,
         onChunk: params.onChunk,
         preemptAgentId: params.preemptAgentId,

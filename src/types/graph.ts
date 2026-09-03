@@ -853,6 +853,8 @@ export interface LangfuseConfig {
 
 interface AgentInputFields {
   agentId: string;
+  /** Logical endpoint selected by the host before provider resolution. */
+  endpoint?: string;
   /**
    * Partition key for transient code-session ids and file refs. Agents with
    * the same key share those refs; different execution profiles/scopes must
