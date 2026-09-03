@@ -81,6 +81,14 @@ describe('getContextOverflowInfo — errors compaction cannot fix', () => {
         })
       ).toBeNull();
     }
+
+    expect(
+      isLikelyContextOverflowError(
+        new Error(
+          'token count exceeds the context window or max output of every backend'
+        )
+      )
+    ).toBe(false);
   });
 });
 

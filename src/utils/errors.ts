@@ -537,7 +537,11 @@ export function isLikelyContextOverflowError(
     return true;
   }
   const haystack = stripUrls(collectErrorText(error));
-  if (haystack === '' || OUTPUT_LIMIT_RE.test(haystack)) {
+  if (
+    haystack === '' ||
+    AMBIGUOUS_CONTEXT_OR_OUTPUT_RE.test(haystack) ||
+    OUTPUT_LIMIT_RE.test(haystack)
+  ) {
     return false;
   }
   if (NON_RECOVERABLE_RE.test(haystack)) {
