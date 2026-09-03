@@ -1,13 +1,10 @@
 import { describe, expect, it } from '@jest/globals';
 import {
-  completionSharesContextWindow,
   getContextOverflowInfo,
   isLikelyContextOverflowError,
   isContextOverflowError,
   extractErrorMessage,
 } from '@/utils/errors';
-import { registerProvider } from '@/llm/providers';
-import { FakeChatModel } from '@/llm/fake';
 import {
   OVERFLOW_SIGNATURES,
   NON_OVERFLOW_SIGNATURES,
@@ -68,6 +65,22 @@ describe('getContextOverflowInfo — errors compaction cannot fix', () => {
     expect(getContextOverflowInfo(new Error('socket hang up'))).toBeNull();
     expect(getContextOverflowInfo(undefined)).toBeNull();
     expect(getContextOverflowInfo(null)).toBeNull();
+  });
+
+  it('does not compact when a gateway cannot distinguish context from output', () => {
+    const error = new Error(
+      'request exceeds the context window or max output of every backend'
+    );
+
+    for (const estimatedPromptTokens of [34, 800_000]) {
+      expect(
+        getContextOverflowInfo(error, {
+          provider: Providers.ANTHROPIC,
+          estimatedPromptTokens,
+          maxContextTokens: 828_400,
+        })
+      ).toBeNull();
+    }
   });
 });
 
@@ -148,144 +161,6 @@ describe('ambiguous signatures require corroboration', () => {
       provider: Providers.VERTEXAI,
     });
     expect(info?.limitTokens).toBe(1_048_576);
-  });
-
-  it('does not trust a numberless text match that contradicts local accounting', () => {
-    const error = new Error(
-      'request exceeds the context window or max output of every backend'
-    );
-
-    expect(
-      getContextOverflowInfo(error, {
-        provider: Providers.ANTHROPIC,
-        estimatedPromptTokens: 34,
-        maxContextTokens: 828_400,
-      })
-    ).toBeNull();
-  });
-
-  it('counts the completion allowance when corroborating an ambiguous match', () => {
-    const error = new Error(
-      'request exceeds the context window or max output of every backend'
-    );
-
-    expect(
-      getContextOverflowInfo(error, {
-        provider: Providers.ANTHROPIC,
-        estimatedPromptTokens: 70_000,
-        configuredCompletionTokens: 64_000,
-        maxContextTokens: 128_000,
-      })
-    ).not.toBeNull();
-  });
-
-  it('preserves summary-only recovery when local pressure is unknown', () => {
-    const error = new Error(
-      'request exceeds the context window or max output of every backend'
-    );
-
-    expect(
-      getContextOverflowInfo(error, { provider: Providers.ANTHROPIC })
-    ).not.toBeNull();
-  });
-
-  it('does not count Vertex output allowance as input-window pressure', () => {
-    const vertex = OVERFLOW_SIGNATURES.find(
-      (s) => s.requiresContextPressure === true
-    );
-
-    expect(
-      getContextOverflowInfo(vertex?.error, {
-        provider: Providers.VERTEXAI,
-        estimatedPromptTokens: 20_000,
-        configuredCompletionTokens: 190_000,
-        maxContextTokens: 200_000,
-      })
-    ).toBeNull();
-  });
-
-  it('honors the family of a registered Google-compatible provider', () => {
-    const provider = 'context-google-family-test' as never;
-    const dispose = registerProvider({
-      provider,
-      model: FakeChatModel as never,
-      family: 'google',
-    });
-    try {
-      expect(completionSharesContextWindow(provider)).toBe(false);
-    } finally {
-      dispose();
-    }
-  });
-
-  it('prefers nested numeric evidence over an ambiguous outer message', () => {
-    const info = getContextOverflowInfo(
-      {
-        message:
-          'request exceeds the context window or max output of every backend',
-        cause: new Error('prompt is too long: 210000 tokens > 200000 maximum'),
-      },
-      {
-        provider: Providers.ANTHROPIC,
-        estimatedPromptTokens: 34,
-        maxContextTokens: 828_400,
-      }
-    );
-
-    expect(info?.requestedTokens).toBe(210_000);
-    expect(info?.limitTokens).toBe(200_000);
-  });
-
-  it('prefers nested definitive numberless evidence over an ambiguous wrapper', () => {
-    const info = getContextOverflowInfo(
-      {
-        message:
-          'request exceeds the context window or max output of every backend',
-        cause: { code: 'context_length_exceeded' },
-      },
-      {
-        provider: Providers.ANTHROPIC,
-        estimatedPromptTokens: 34,
-        maxContextTokens: 828_400,
-      }
-    );
-
-    expect(info?.kind).toBe('context_window');
-  });
-
-  it('recognizes a definitive code co-located with an ambiguous message', () => {
-    const info = getContextOverflowInfo(
-      {
-        body: JSON.stringify({
-          code: 'context_length_exceeded',
-          message:
-            'request exceeds the context window or max output of every backend',
-        }),
-      },
-      {
-        provider: Providers.ANTHROPIC,
-        estimatedPromptTokens: 34,
-        maxContextTokens: 828_400,
-      }
-    );
-
-    expect(info?.kind).toBe('context_window');
-  });
-
-  it('accepts definitive numberless Bedrock input errors without local pressure', () => {
-    for (const model of [
-      'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
-      'us.amazon.nova-lite-v1:0',
-    ]) {
-      const signature = OVERFLOW_SIGNATURES.find((s) => s.model === model);
-      expect(
-        getContextOverflowInfo(signature?.error, {
-          provider: Providers.BEDROCK,
-          estimatedPromptTokens: 10,
-          maxContextTokens: 200_000,
-        })
-      ).not.toBeNull();
-    }
   });
 });
 

@@ -115,7 +115,6 @@ import {
   isLangfuseCallbackHandler,
 } from '@/langfuse';
 import {
-  getConfiguredCompletionTokens,
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
   translateRecoveryBudget,
@@ -454,6 +453,26 @@ function clearCurrentDeltaStepMarkers({
     graph.messageStepHasTextDeltas.delete(stepId);
     graph.reasoningStepHasDeltas.delete(stepId);
   }
+}
+
+/**
+ * The completion allowance the caller configured, under whichever key the
+ * provider's client uses. Providers count it against the same ceiling as the
+ * prompt, so overflow recovery has to reserve it when the error did not
+ * itemize the total.
+ */
+function getConfiguredCompletionTokens(
+  clientOptions: t.ClientOptions | undefined
+): number | undefined {
+  const options = clientOptions as
+    | { maxTokens?: unknown; maxOutputTokens?: unknown }
+    | undefined;
+  for (const value of [options?.maxTokens, options?.maxOutputTokens]) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -2858,7 +2877,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     config,
     originalToolContent,
     estimatedPromptTokens,
-    contextWindowTokens,
   }: {
     recovery: OverflowRecoveryPlan;
     agentContext: AgentContext;
@@ -2868,8 +2886,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     originalToolContent?: Map<number, string>;
     /** Size of the rejected prompt, recorded to detect a correction that changed nothing. */
     estimatedPromptTokens?: number;
-    /** Stable total window learned for the primary agent model. */
-    contextWindowTokens?: number;
   }): Partial<t.AgentSubgraphState> {
     const previousBudget = agentContext.maxContextTokens;
     /**
@@ -2884,8 +2900,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     agentContext.preserveOriginalToolContent(originalToolContent);
     agentContext.applyContextBudgetCorrection(
       recovery.budgetTokens,
-      estimatedPromptTokens,
-      contextWindowTokens
+      estimatedPromptTokens
     );
     agentContext.applyObservedOverflowCalibration(
       recovery.info.provider,
@@ -4065,8 +4080,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             fallbackContext ?? getFallbackErrorContext(error);
           return (
             getLocalProviderOverflowMeasurement(error)?.estimatedPromptTokens ??
-            resolvedFallbackContext?.estimatedPromptTokens ??
-            (resolvedFallbackContext == null ? estimatedPromptTokens : undefined)
+            (resolvedFallbackContext == null
+              ? estimatedPromptTokens
+              : undefined)
           );
         };
 
@@ -4095,31 +4111,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           if (agentContext.overflowRecoveryStalled(recoveryPromptEstimate)) {
             return null;
           }
-          let activeContextBudget = agentContext.maxContextTokens;
-          let totalContextWindow = agentContext.overflowRecoveryContextWindow;
-          let recoveryClientOptions = agentContext.clientOptions;
-          if (fallbackContext != null) {
-            activeContextBudget = fallbackContext.maxContextTokens;
-            totalContextWindow = fallbackContext.maxContextTokens;
-            recoveryClientOptions = fallbackContext.clientOptions;
-          }
-          if (localMeasurement != null) {
-            activeContextBudget = localMeasurement.contextBudget;
-            totalContextWindow = localMeasurement.contextBudget;
-          }
           const recovery = planContextOverflowRecovery({
             error,
             provider: fallbackContext?.provider ?? agentContext.provider,
-            maxContextTokens: activeContextBudget,
-            totalContextWindowTokens: totalContextWindow,
+            maxContextTokens:
+              localMeasurement?.contextBudget ??
+              fallbackContext?.maxContextTokens ??
+              agentContext.maxContextTokens,
             estimatedPromptTokens: recoveryPromptEstimate,
             calibrationRatio: agentContext.calibrationRatio,
             instructionTokens: agentContext.instructionTokens,
             canSummarize: agentContext.summarizationEnabled === true,
-            configuredCompletionTokens:
-              localMeasurement != null
-                ? undefined
-                : getConfiguredCompletionTokens(recoveryClientOptions),
+            configuredCompletionTokens: getConfiguredCompletionTokens(
+              fallbackContext?.clientOptions ?? agentContext.clientOptions
+            ),
             attemptsSoFar: agentContext.overflowRecoveryAttempts,
           });
           if (recovery == null) {
@@ -4161,11 +4166,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             config,
             originalToolContent: prunedOriginalToolContent,
             estimatedPromptTokens: recoveryPromptEstimate,
-            contextWindowTokens:
-              recovery.info.kind === 'context_window'
-                ? (recovery.info.limitTokens ??
-                  agentContext.overflowRecoveryContextWindow)
-                : agentContext.overflowRecoveryContextWindow,
           });
         }
         /**
@@ -4200,9 +4200,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   provider: agentContext.provider,
                   estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
                   maxContextTokens: agentContext.maxContextTokens,
-                  configuredCompletionTokens: getConfiguredCompletionTokens(
-                    agentContext.clientOptions
-                  ),
                 },
                 prepareProviderRequest: ({
                   model: fallbackModel,

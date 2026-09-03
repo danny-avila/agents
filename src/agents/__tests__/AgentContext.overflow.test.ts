@@ -24,7 +24,6 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.overflowRecoveryAttempts).toBe(1);
     /** Forces the pruner to be rebuilt against the corrected budget. */
     expect(context.pruneMessages).toBeUndefined();
-    expect(context.overflowRecoveryContextWindow).toBe(1_000_000);
   });
 
   it('summarizes the first overflow when deterministic pruning is unavailable', () => {
@@ -152,19 +151,6 @@ describe('AgentContext overflow recovery state', () => {
 
     expect(context.maxContextTokens).toBeUndefined();
     expect(context.overflowRecoveryAttempts).toBe(1);
-  });
-
-  it('preserves a provider-learned window when none was configured', () => {
-    const context = createContext();
-    context.applyContextBudgetCorrection(26_600, 50_000, 128_000);
-
-    expect(context.overflowRecoveryContextWindow).toBe(128_000);
-
-    context.applyContextBudgetCorrection(14_000, 20_000);
-    expect(context.overflowRecoveryContextWindow).toBe(128_000);
-
-    context.reset();
-    expect(context.overflowRecoveryContextWindow).toBeUndefined();
   });
 
   it('reports a stall when the prompt did not shrink', () => {

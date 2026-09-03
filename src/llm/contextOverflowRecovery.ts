@@ -18,11 +18,8 @@
  * provider-space budget.
  */
 import type { ContextOverflowInfo } from '@/utils/errors';
-import type { ClientOptions, ProviderName } from '@/types';
-import {
-  completionSharesContextWindow,
-  getContextOverflowInfo,
-} from '@/utils/errors';
+import type { ProviderName } from '@/types';
+import { getContextOverflowInfo } from '@/utils/errors';
 
 /** Fraction of the previous budget used when the provider named no ceiling. */
 const BLIND_SHRINK_RATIO = 0.7;
@@ -72,11 +69,6 @@ export interface OverflowRecoveryParams {
   provider: ProviderName;
   /** Budget in force when the rejected prompt was built. */
   maxContextTokens?: number;
-  /**
-   * Provider's unmodified total context window. Unlike `maxContextTokens`,
-   * this remains stable after a prior recovery retargets the prompt budget.
-   */
-  totalContextWindowTokens?: number;
   /** Our own estimate of the prompt we actually sent. */
   estimatedPromptTokens?: number;
   /** Provider/local calibration already applied to the prompt estimate. */
@@ -103,21 +95,6 @@ export interface OverflowRecoveryParams {
 
 function isUsable(value: number | undefined): value is number {
   return value != null && Number.isFinite(value) && value > 0;
-}
-
-/** Reads the completion allowance under whichever key the client uses. */
-export function getConfiguredCompletionTokens(
-  clientOptions: ClientOptions | undefined
-): number | undefined {
-  const options = clientOptions as
-    | { maxTokens?: unknown; maxOutputTokens?: unknown }
-    | undefined;
-  for (const value of [options?.maxTokens, options?.maxOutputTokens]) {
-    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
-      return value;
-    }
-  }
-  return undefined;
 }
 
 /**
@@ -173,10 +150,7 @@ function reservedForCompletion(
    * retry at `prompt + maxTokens` and over the limit however far the prompt
    * is compacted.
    */
-  return completionSharesContextWindow(info.provider) &&
-    isUsable(configuredCompletionTokens)
-    ? configuredCompletionTokens
-    : 0;
+  return isUsable(configuredCompletionTokens) ? configuredCompletionTokens : 0;
 }
 
 function resolveTargetBudget(
@@ -201,31 +175,13 @@ function resolveTargetBudget(
 
     return promptCeiling * CEILING_HEADROOM_RATIO;
   }
-  let blindTarget: number | undefined;
   if (isUsable(estimatedPromptTokens)) {
-    blindTarget = estimatedPromptTokens * BLIND_SHRINK_RATIO;
-  } else if (isUsable(maxContextTokens)) {
-    blindTarget = maxContextTokens * BLIND_SHRINK_RATIO;
+    return estimatedPromptTokens * BLIND_SHRINK_RATIO;
   }
-  if (blindTarget == null) {
-    return null;
+  if (isUsable(maxContextTokens)) {
+    return maxContextTokens * BLIND_SHRINK_RATIO;
   }
-  if (
-    completionSharesContextWindow(info.provider) &&
-    isUsable(maxContextTokens) &&
-    isUsable(configuredCompletionTokens)
-  ) {
-    const promptCeiling = maxContextTokens - configuredCompletionTokens;
-    /** Even an empty prompt cannot fit when completion fills the window. */
-    if (promptCeiling <= 0) {
-      return null;
-    }
-    return Math.min(
-      blindTarget,
-      promptCeiling * CEILING_HEADROOM_RATIO
-    );
-  }
-  return blindTarget;
+  return null;
 }
 
 /**
@@ -240,7 +196,6 @@ export function planContextOverflowRecovery({
   error,
   provider,
   maxContextTokens,
-  totalContextWindowTokens,
   estimatedPromptTokens,
   calibrationRatio,
   instructionTokens,
@@ -256,8 +211,7 @@ export function planContextOverflowRecovery({
   const info = getContextOverflowInfo(error, {
     provider,
     estimatedPromptTokens,
-    maxContextTokens: totalContextWindowTokens ?? maxContextTokens,
-    configuredCompletionTokens,
+    maxContextTokens,
   });
   if (info == null) {
     return null;
@@ -282,7 +236,7 @@ export function planContextOverflowRecovery({
 
   const target = resolveTargetBudget(
     info,
-    totalContextWindowTokens ?? maxContextTokens,
+    maxContextTokens,
     estimatedPromptTokens,
     configuredCompletionTokens
   );

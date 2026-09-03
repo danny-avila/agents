@@ -162,7 +162,6 @@ describe('tryFallbackProviders surfacing', () => {
       provider: Providers.VERTEXAI,
       clientOptions: undefined,
       maxContextTokens: 32_000,
-      estimatedPromptTokens: 50_000,
     });
   });
 
@@ -214,28 +213,6 @@ describe('tryFallbackProviders surfacing', () => {
 
     const attribution = getFallbackErrorContext(thrown);
     expect(attribution?.provider).toBe(Providers.ANTHROPIC);
-  });
-
-  it('retains the provider-projected fallback prompt measurement', async () => {
-    const fallbackOverflow = signatureError('claude-haiku-4-5-20251001');
-    stubModels([fallbackOverflow]);
-
-    const thrown = await tryFallbackProviders({
-      fallbacks: [{ provider: Providers.ANTHROPIC }],
-      messages,
-      primaryError: new Error('primary boom'),
-      prepareProviderRequest: (input) =>
-        prepareProviderRequest({
-          ...input,
-          measure: () => ({
-            fits: true,
-            projectedMessageTokens: 11,
-            effectiveInstructionTokens: 7,
-          }),
-        }),
-    }).catch((error: unknown) => error);
-
-    expect(getFallbackErrorContext(thrown)?.estimatedPromptTokens).toBe(18);
   });
 
   it('retains every fallback overflow candidate', async () => {

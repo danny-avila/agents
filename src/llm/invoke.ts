@@ -55,7 +55,6 @@ import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { getContextOverflowInfo } from '@/utils/errors';
-import { getConfiguredCompletionTokens } from '@/llm/contextOverflowRecovery';
 import { appendCallbacks } from '@/utils/callbacks';
 import { composeAbortSignals } from '@/utils/misc';
 import { initializeModel } from '@/llm/init';
@@ -1434,8 +1433,6 @@ export interface FallbackErrorContext {
   provider: t.ProviderName;
   clientOptions?: t.ClientOptions;
   maxContextTokens?: number;
-  /** Prompt size measured after projection into this fallback's wire format. */
-  estimatedPromptTokens?: number;
 }
 
 export interface FallbackOverflowCandidate {
@@ -1562,7 +1559,6 @@ export async function tryFallbackProviders({
     ? primaryError
     : undefined;
   for (const fb of fallbacks) {
-    let preparedRequest: PreparedProviderRequest | undefined;
     try {
       const fbModel = initializeModel({
         provider: fb.provider,
@@ -1595,7 +1591,7 @@ export async function tryFallbackProviders({
         maxContextTokens: fb.maxContextTokens,
         config: fbConfig,
       };
-      preparedRequest = await prepareFallbackRequest?.(preparationInput);
+      const preparedRequest = await prepareFallbackRequest?.(preparationInput);
       if (preparedRequest != null) {
         assertPreparedProviderRequestFor(
           preparedRequest,
@@ -1670,34 +1666,20 @@ export async function tryFallbackProviders({
         throw config.signal.reason;
       }
       lastError = e;
-      const fallbackMeasurement = preparedRequest?.measurement;
-      const measuredPromptTokens =
-        fallbackMeasurement?.projectedMessageTokens != null &&
-        fallbackMeasurement.effectiveInstructionTokens != null
-          ? fallbackMeasurement.projectedMessageTokens +
-            fallbackMeasurement.effectiveInstructionTokens
-          : undefined;
-      const fallbackPromptTokens =
-        measuredPromptTokens ??
-        (overflowContext?.provider === fb.provider
-          ? overflowContext.estimatedPromptTokens
-          : undefined);
       const fallbackOverflowContext: ContextOverflowContext = {
         provider: fb.provider,
         maxContextTokens: fb.maxContextTokens,
-        configuredCompletionTokens: getConfiguredCompletionTokens(
-          fb.clientOptions
-        ),
-        estimatedPromptTokens: fallbackPromptTokens,
+        ...(overflowContext?.provider === fb.provider
+          ? {
+            estimatedPromptTokens: overflowContext.estimatedPromptTokens,
+          }
+          : {}),
       };
       if (isOverflow(e, fallbackOverflowContext)) {
         const errorContext: FallbackErrorContext = {
           provider: fb.provider,
           clientOptions: fb.clientOptions,
           maxContextTokens: fb.maxContextTokens,
-          ...(fallbackPromptTokens != null
-            ? { estimatedPromptTokens: fallbackPromptTokens }
-            : {}),
         };
         attachFallbackErrorContext(e, errorContext);
         overflowCandidates.push({ error: e, context: errorContext });

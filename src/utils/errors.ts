@@ -13,7 +13,6 @@
  */
 import { ContextOverflowError } from '@langchain/core/errors';
 import type { ProviderName } from '@/types';
-import { getProviderFamily } from '@/llm/providers';
 
 /**
  * Why the request was rejected. Both kinds are fixed by shrinking the
@@ -71,8 +70,6 @@ interface OverflowPattern {
    * untouched rather than triggering a needless compaction.
    */
   readonly requiresContextPressure?: boolean;
-  /** Reject this otherwise-valid pattern only when local accounting contradicts it. */
-  readonly rejectsLowContextPressure?: boolean;
 }
 
 /**
@@ -88,15 +85,6 @@ export interface ContextOverflowContext {
   estimatedPromptTokens?: number;
   /** The budget we believed applied when we built that prompt. */
   maxContextTokens?: number;
-  /** Completion allowance reserved against the same context window. */
-  configuredCompletionTokens?: number;
-}
-
-/** Whether a provider charges requested output against its input window. */
-export function completionSharesContextWindow(
-  provider: ProviderName | undefined
-): boolean {
-  return provider == null || getProviderFamily(provider) !== 'google';
 }
 
 /**
@@ -105,9 +93,6 @@ export function completionSharesContextWindow(
  * a recoverable error still yields the numbers when the provider reported
  * them.
  */
-const AMBIGUOUS_GATEWAY_RE =
-  /(?:context window[\s\S]{0,80}\bor\b[\s\S]{0,80}max(?:imum)? output|max(?:imum)? output[\s\S]{0,80}\bor\b[\s\S]{0,80}context window)/i;
-
 const OVERFLOW_PATTERNS: readonly OverflowPattern[] = [
   /** Anthropic, and Bedrock's passthrough of the same upstream. */
   {
@@ -191,12 +176,6 @@ const OVERFLOW_PATTERNS: readonly OverflowPattern[] = [
     kind: 'context_window',
     re: /\binput (?:is )?too long(?: for requested model)?\b/i,
   },
-  /** Gateway disjunction: corroborate unless a nested pattern reported facts. */
-  {
-    kind: 'context_window',
-    re: AMBIGUOUS_GATEWAY_RE,
-    rejectsLowContextPressure: true,
-  },
   /** OpenAI-compatible error code, and the phrases LangChain itself keys on. */
   {
     kind: 'context_window',
@@ -220,19 +199,6 @@ const OVERFLOW_PATTERNS: readonly OverflowPattern[] = [
   },
 ] as const;
 
-function hasIndependentDefinitiveOverflow(parts: readonly string[]): boolean {
-  return parts.some((part) => {
-    const text = stripUrls(part).replace(AMBIGUOUS_GATEWAY_RE, ' ');
-    return OVERFLOW_PATTERNS.some(
-      (pattern) =>
-        pattern.kind === 'context_window' &&
-        pattern.requiresContextPressure !== true &&
-        pattern.rejectsLowContextPressure !== true &&
-        pattern.re.test(text)
-    );
-  });
-}
-
 /**
  * Errors that mention size or limits but are NOT recoverable by compaction.
  * Checked before the positive patterns.
@@ -252,6 +218,14 @@ const NON_RECOVERABLE_RE =
  */
 const OUTPUT_LIMIT_RE =
   /max_?(?:completion_?)?tokens\s*(?:must be|is too|cannot|exceeds|too large|greater than)|maximum number of output tokens|max_tokens.*less than or equal/i;
+
+/**
+ * A gateway can report this disjunction without saying whether the prompt or
+ * requested output caused the rejection. Compaction is unsafe in that case:
+ * shrinking a healthy prompt cannot fix an invalid output allowance.
+ */
+const AMBIGUOUS_CONTEXT_OR_OUTPUT_RE =
+  /(?:context window[\s\S]{0,80}\bor\b[\s\S]{0,80}max(?:imum)? output|max(?:imum)? output[\s\S]{0,80}\bor\b[\s\S]{0,80}context window)/i;
 
 /**
  * Recovers the input-only figure from providers that quote a combined total
@@ -295,29 +269,30 @@ function asRecord(value: unknown): NestedErrorShape | undefined {
  * LangChain's `ContextOverflowError` keeps the original API error under
  * `cause`, and the OpenAI SDK nests the body under `error`.
  */
-/** Keeps independently reported error fields separate for provenance checks. */
-function collectErrorTextParts(error: unknown, depth = 0): string[] {
+function collectErrorText(error: unknown, depth = 0): string {
   if (error == null || depth > MAX_CAUSE_DEPTH) {
-    return [];
+    return '';
   }
   if (typeof error === 'string') {
-    return [error];
+    return error;
   }
   const record = asRecord(error);
   if (record == null) {
-    return [String(error)];
+    return String(error);
   }
 
   const parts: string[] = [];
-  for (const value of [
-    record.message,
+  if (typeof record.message === 'string') {
+    parts.push(record.message);
+  }
+  for (const reason of [
     record.code,
     record.type,
     record.status,
     record.reason,
   ]) {
-    if (typeof value === 'string') {
-      parts.push(value);
+    if (typeof reason === 'string') {
+      parts.push(reason);
     }
   }
   for (const nested of [
@@ -327,20 +302,22 @@ function collectErrorTextParts(error: unknown, depth = 0): string[] {
     record.data,
     record.response,
   ]) {
-    parts.push(...collectErrorTextParts(nested, depth + 1));
+    if (nested == null) {
+      continue;
+    }
+    parts.push(
+      typeof nested === 'string' ? nested : collectErrorText(nested, depth + 1)
+    );
   }
   if (parts.length === 0) {
     try {
-      return [JSON.stringify(error)];
+      /** Non-objects returned above, so this always yields a string. */
+      return JSON.stringify(error);
     } catch {
-      return [String(error)];
+      return String(error);
     }
   }
-  return parts;
-}
-
-function collectErrorText(error: unknown): string {
-  return collectErrorTextParts(error).join(' ');
+  return parts.join(' ');
 }
 
 /** Strips URLs so their path segments cannot trip the negative matchers. */
@@ -382,14 +359,11 @@ function resolvePromptTokens(
 }
 
 /**
- * True when the caller's own accounting says the failed request was close
+ * True when the caller's own accounting says the failed prompt was close
  * enough to the budget that an otherwise ambiguous provider error is best
- * explained by overflow. The completion allowance shares the model context
- * window, so pressure is based on the whole request rather than prompt alone.
+ * explained by overflow.
  */
-function getContextPressure(
-  context?: ContextOverflowContext
-): boolean | undefined {
+function hasContextPressure(context?: ContextOverflowContext): boolean {
   const estimated = context?.estimatedPromptTokens;
   const budget = context?.maxContextTokens;
   if (
@@ -399,18 +373,9 @@ function getContextPressure(
     !Number.isFinite(budget) ||
     budget <= 0
   ) {
-    return undefined;
+    return false;
   }
-  const configuredCompletion = completionSharesContextWindow(context?.provider)
-    ? context?.configuredCompletionTokens
-    : undefined;
-  const completion =
-    configuredCompletion != null &&
-    Number.isFinite(configuredCompletion) &&
-    configuredCompletion > 0
-      ? configuredCompletion
-      : 0;
-  return (estimated + completion) / budget >= CONTEXT_PRESSURE_RATIO;
+  return estimated / budget >= CONTEXT_PRESSURE_RATIO;
 }
 
 function isLangChainOverflowError(error: unknown): boolean {
@@ -479,9 +444,12 @@ export function getContextOverflowInfo(
   context?: ContextOverflowContext
 ): ContextOverflowInfo | null {
   const provider = context?.provider;
-  const errorTextParts = collectErrorTextParts(error);
   const haystack = stripUrls(collectErrorText(error));
   if (haystack === '') {
+    return null;
+  }
+
+  if (AMBIGUOUS_CONTEXT_OR_OUTPUT_RE.test(haystack)) {
     return null;
   }
 
@@ -494,8 +462,7 @@ export function getContextOverflowInfo(
     return null;
   }
 
-  const contextPressure = getContextPressure(context);
-  const underContextPressure = contextPressure === true;
+  const underContextPressure = hasContextPressure(context);
 
   for (const pattern of OVERFLOW_PATTERNS) {
     const match = haystack.match(pattern.re);
@@ -507,17 +474,6 @@ export function getContextOverflowInfo(
     }
     const limitTokens = readNumber(match, pattern.limitGroup);
     const requestedTokens = readNumber(match, pattern.requestedGroup);
-
-    if (
-      !langChainFlagged &&
-      pattern.rejectsLowContextPressure === true &&
-      contextPressure === false
-    ) {
-      if (hasIndependentDefinitiveOverflow(errorTextParts)) {
-        continue;
-      }
-      return null;
-    }
 
     /**
      * A token-bucket rejection is only unrecoverable-by-waiting when the
