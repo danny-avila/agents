@@ -1105,6 +1105,9 @@ describe('invocation attribution metadata', () => {
     expect(config.metadata?.[Constants.INVOKED_PROVIDER]).toBe(
       Providers.ANTHROPIC
     );
+    expect(config.metadata?.model).toBe('claude-fallback-1');
+    expect(config.metadata?.provider).toBe(Providers.ANTHROPIC);
+    expect(config.metadata?.resolvedProvider).toBe(Providers.ANTHROPIC);
 
     jest.dontMock('@/llm/init');
     jest.resetModules();

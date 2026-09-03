@@ -702,16 +702,21 @@ export async function attemptInvoke(
     },
   };
   const request = resolveAttemptRequest(params, providerStampedConfig);
+  const configuredModel = providerStampedConfig.metadata?.[
+    Constants.INVOKED_MODEL
+  ];
+  const modelId =
+    request.modelId ??
+    (typeof configuredModel === 'string' ? configuredModel : undefined);
   const stampedConfig: RunnableConfig = {
     ...providerStampedConfig,
     metadata: {
       ...providerStampedConfig.metadata,
-      [Constants.INVOKED_PROVIDER]: provider,
-      ...(request.modelId == null
+      ...(modelId == null
         ? {}
         : {
-          [Constants.INVOKED_MODEL]: request.modelId,
-          model: request.modelId,
+          [Constants.INVOKED_MODEL]: modelId,
+          model: modelId,
         }),
       /**
        * One `attemptInvoke` call is one model attempt; primary, fallback,

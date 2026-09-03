@@ -284,12 +284,21 @@ function shouldRetainStandardFile(
   provider: t.ProviderName,
   mimeType: string
 ): boolean {
+  const normalizedMimeType = mimeType.split(';', 1)[0].trim().toLowerCase();
   if (
     provider === Providers.ANTHROPIC ||
-    getProviderFamily(provider) === 'anthropic' ||
-    isOpenAILike(provider)
+    getProviderFamily(provider) === 'anthropic'
   ) {
-    return mimeType === 'application/pdf';
+    return (
+      normalizedMimeType === 'application/pdf' ||
+      normalizedMimeType === 'image/jpeg' ||
+      normalizedMimeType === 'image/png' ||
+      normalizedMimeType === 'image/gif' ||
+      normalizedMimeType === 'image/webp'
+    );
+  }
+  if (isOpenAILike(provider)) {
+    return normalizedMimeType === 'application/pdf';
   }
   return true;
 }
@@ -311,6 +320,29 @@ function canProjectBedrockDocument(
   return false;
 }
 
+function isBlankTextBlock(block: ProviderContentBlock): boolean {
+  return (
+    block.type === 'text' &&
+    'text' in block &&
+    typeof block.text === 'string' &&
+    block.text.trim() === ''
+  );
+}
+
+function copyUsableContentPrefix(
+  sourceContent: ProviderContentBlock[],
+  end: number
+): ProviderContentBlock[] {
+  const content: ProviderContentBlock[] = [];
+  for (let index = 0; index < end; index++) {
+    const block = sourceContent[index];
+    if (!isBlankTextBlock(block)) {
+      content.push(block);
+    }
+  }
+  return content;
+}
+
 /** Reprojects persisted provider-native attachments without changing history. */
 function projectAttachmentsForProvider(
   messages: BaseMessage[],
@@ -330,7 +362,6 @@ function projectAttachmentsForProvider(
     }
     const sourceContent = message.content as ProviderContentBlock[];
     let content: ProviderContentBlock[] | undefined;
-    let removedCount = 0;
     for (let blockIndex = 0; blockIndex < sourceContent.length; blockIndex++) {
       const block = sourceContent[blockIndex];
       if (isStandardFileBlock(block)) {
@@ -338,26 +369,25 @@ function projectAttachmentsForProvider(
           content?.push(block);
           continue;
         }
-        content ??= sourceContent.slice(0, blockIndex);
-        removedCount++;
+        content ??= copyUsableContentPrefix(sourceContent, blockIndex);
         continue;
       }
       if (!isBedrockDocumentBlock(block)) {
-        content?.push(block);
+        if (content != null && !isBlankTextBlock(block)) {
+          content.push(block);
+        }
         continue;
       }
-      content ??= sourceContent.slice(0, blockIndex);
+      content ??= copyUsableContentPrefix(sourceContent, blockIndex);
       const mimeType = BEDROCK_DOCUMENT_MIME_TYPES[block.document.format];
       if (
         mimeType == null ||
         !canProjectBedrockDocument(provider, mimeType)
       ) {
-        removedCount++;
         continue;
       }
       const standardFile = toStandardFileBlock(block);
       if (standardFile == null) {
-        removedCount++;
         continue;
       }
       content.push(standardFile);
@@ -365,7 +395,7 @@ function projectAttachmentsForProvider(
     if (content == null) {
       continue;
     }
-    if (content.length === 0 && removedCount > 0) {
+    if (content.length === 0) {
       content.push({ type: 'text', text: OMITTED_ATTACHMENT_TEXT });
     }
     projected ??= [...messages];

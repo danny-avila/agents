@@ -168,6 +168,44 @@ describe('prepareProviderRequest', () => {
     expect(source.content).toHaveLength(2);
   });
 
+  it('retains canonical Anthropic PDF and image files with parameterized MIME types', () => {
+    const { model } = createCapturingModel();
+    const supportedFiles = [
+      {
+        type: 'file',
+        source_type: 'base64',
+        mime_type: 'application/pdf; charset=binary',
+        data: 'JVBERg==',
+      },
+      {
+        type: 'file',
+        source_type: 'base64',
+        mime_type: 'image/png; name=chart.png',
+        data: 'iVBORw==',
+      },
+    ];
+    const source = new HumanMessage({
+      content: [
+        ...supportedFiles,
+        {
+          type: 'file',
+          source_type: 'base64',
+          mime_type: 'application/vnd.ms-excel',
+          data: '0M8R4A==',
+        },
+      ],
+    });
+
+    const request = prepareProviderRequest({
+      model: model as t.ChatModel,
+      messages: [source],
+      provider: Providers.ANTHROPIC,
+    });
+
+    expect(request.messages[0].content).toEqual(supportedFiles);
+    expect(source.content).toHaveLength(3);
+  });
+
   it('does not scan or re-encode Bedrock-native documents for a Bedrock target', () => {
     const { model } = createCapturingModel();
     const document = {
@@ -194,6 +232,7 @@ describe('prepareProviderRequest', () => {
     const { model } = createCapturingModel();
     const source = new HumanMessage({
       content: [
+        { type: 'text', text: '' },
         {
           type: 'document',
           document: {
