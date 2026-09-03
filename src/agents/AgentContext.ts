@@ -560,6 +560,9 @@ export class AgentContext {
 
   /** Builds the caller boundary and schemas for programmatic-only tools. */
   private buildProgrammaticOnlyToolsInstructions(): string {
+    if (this.usesNativeProgrammaticToolCalling()) {
+      return '';
+    }
     const programmaticTools = this.getProgrammaticToolInstructionTargets();
     if (programmaticTools.length === 0) return '';
     const directProgrammaticTools = programmaticTools.filter(
@@ -602,7 +605,6 @@ export class AgentContext {
         .join('')
     );
   }
-
   private buildProgrammaticToolGroupInstructions(
     programmaticTools: ProgrammaticToolInstructionTarget[],
     capabilities: CallerCapabilityProjection
@@ -1312,23 +1314,25 @@ export class AgentContext {
     );
   }
 
-  /** Active tool definitions for token accounting (excludes deferred-and-undiscovered entries). */
+  /** Active tool definitions for binding and token accounting. */
   private getActiveToolDefinitions(): t.LCTool[] {
     const effectiveToolDefinitions = this.getEffectiveToolDefinitions();
     if (!effectiveToolDefinitions) {
       return [];
     }
     /**
-     * Mirror `getEventDrivenToolsForBinding`'s gate: a definition is only
-     * bound to the model when its `allowed_callers` include `'direct'` and
-     * (if deferred) it has been discovered. Filtering by `defer_loading`
-     * alone left programmatic-only definitions counted in
-     * `toolSchemaTokens` even though they were never bound.
+     * Mirror `getEventDrivenToolsForBinding`'s gate. Ordinarily a definition
+     * is bound only when it allows `direct`; native PTC also binds active
+     * `code_execution`-only definitions so the OpenAI adapter can expose them
+     * as programmatic callers. Deferred definitions still require discovery.
      */
-    return resolveCallerCapabilityProjection(
+    const capabilities = resolveCallerCapabilityProjection(
       effectiveToolDefinitions,
       (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
-    ).directTools;
+    );
+    return this.usesNativeProgrammaticToolCalling()
+      ? [...capabilities.directTools, ...capabilities.codeExecutionOnlyTools]
+      : capabilities.directTools;
   }
 
   /**
@@ -2241,6 +2245,8 @@ export class AgentContext {
 
   /** Filters tool instances for binding based on registry config */
   private filterToolsForBinding(tools: t.GraphTools): t.GraphTools {
+    const nativeProgrammaticToolCalling =
+      this.usesNativeProgrammaticToolCalling();
     return tools.filter((tool) => {
       if (!('name' in tool)) {
         return true;
@@ -2251,10 +2257,34 @@ export class AgentContext {
         return true;
       }
 
-      return (
-        allowsToolCaller(toolDef, 'direct') &&
-        isToolDefinitionActive(toolDef, this.discoveredToolNames)
-      );
+      const allowsDirect = allowsToolCaller(toolDef, 'direct');
+      const allowsCodeExecution = allowsToolCaller(toolDef, 'code_execution');
+      const shouldBind =
+        (allowsDirect ||
+          (nativeProgrammaticToolCalling && allowsCodeExecution)) &&
+        isToolDefinitionActive(toolDef, this.discoveredToolNames);
+      if (!shouldBind) {
+        return false;
+      }
+
+      if (nativeProgrammaticToolCalling && allowsCodeExecution) {
+        const boundTool = tool as t.GenericTool & {
+          metadata?: Record<string, unknown>;
+        };
+        boundTool.metadata = {
+          ...boundTool.metadata,
+          allowed_callers: [...(toolDef.allowed_callers ?? ['direct'])],
+        };
+      }
+      return true;
     });
+  }
+
+  private usesNativeProgrammaticToolCalling(): boolean {
+    const options = this.clientOptions as t.OpenAIClientOptions | undefined;
+    return (
+      options?.nativeProgrammaticToolCalling === true &&
+      options.useResponsesApi === true
+    );
   }
 }

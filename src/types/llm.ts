@@ -81,6 +81,7 @@ export type GoogleThinkingConfig = {
 export type ManagedRequestOptions = {
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
+  nativeProgrammaticToolCalling?: boolean;
 };
 /**
  * Adaptive stream-smoothing configuration shared by every provider client.
