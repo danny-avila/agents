@@ -974,13 +974,7 @@ function convertHumanMessageToConverseMessage(
     // whitespace-only text into the preceding text block so prose spacing survives;
     // every other block converts inline.
     for (const block of msg.content) {
-      if (typeof block === 'string') {
-        appendSerializableBedrockTextBlock(contentBlocks, block);
-        continue;
-      }
       if (
-        typeof block === 'object' &&
-        block != null &&
         block.type === 'text' &&
         typeof (block as { text?: unknown }).text === 'string'
       ) {
