@@ -21,12 +21,12 @@ import {
   sanitizeOrphanToolBlocks,
   enforceOriginalContentCap,
   ORIGINAL_CONTENT_MAX_CHARS,
-  calculateMaxToolCallInputChars,
   createPruneMessages,
   projectToolCallInputs,
   projectToolMessagesForProvider,
   serializeToolCallInput,
 } from '@/messages/prune';
+import { calculateMaxToolCallInputChars } from '@/utils/truncation';
 import { projectToolStreamContentForProvider } from '@/messages/core';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { ensureThinkingBlockInMessages } from '@/messages/format';

@@ -13,6 +13,8 @@ export interface ProjectAgentContextUsageParams {
   indexTokenCountMap?: Record<string, number>;
   /** Provider-calibrated ratio from a prior snapshot, applied as a static seed. */
   calibrationRatio?: number;
+  /** Persisted fading tier for this agent, applied to the projected branch. */
+  fadingTier?: t.FadingTier;
   /** Execution backend used to synthesize the live effective tool registry. */
   toolExecution?: t.ToolExecutionConfig;
   runId?: string;
@@ -34,6 +36,7 @@ export async function projectAgentContextUsage({
   tokenCounter,
   indexTokenCountMap,
   calibrationRatio,
+  fadingTier,
   toolExecution,
   runId,
   agentId,
@@ -44,6 +47,7 @@ export async function projectAgentContextUsage({
     indexTokenCountMap,
     toolExecution
   );
+  context.fadingTier = fadingTier;
   await context.tokenCalculationPromise;
   return context.projectContextUsage(messages, {
     runId,

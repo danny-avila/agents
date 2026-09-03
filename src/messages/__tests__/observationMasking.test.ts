@@ -300,6 +300,28 @@ describe('maskConsumedToolResults', () => {
     expect(originalContentStore.get(2)).toContain('truncated');
   });
 
+  it('preserves the legacy aggregate masking budget', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('hello'),
+      aiToolCall('tc_old'),
+      toolMsg('A'.repeat(5_000), 'tool', 'tc_old'),
+      aiToolCall('tc_new'),
+      toolMsg('B'.repeat(5_000), 'tool', 'tc_new'),
+      aiWithText('done'),
+    ];
+
+    const count = maskConsumedToolResults({
+      messages,
+      indexTokenCountMap: {},
+      tokenCounter: charCounter,
+      availableRawBudget: 500,
+    });
+
+    expect(count).toBe(2);
+    expect((messages[2].content as string).length).toBeLessThanOrEqual(350);
+    expect((messages[4].content as string).length).toBeGreaterThan(1_000);
+  });
+
   it('handles empty messages array', () => {
     const map: Record<string, number | undefined> = {};
     const count = maskConsumedToolResults({

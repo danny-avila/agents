@@ -1,7 +1,7 @@
 import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 import { MemorySaver } from '@langchain/langgraph';
-import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { appendFile, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import {
   AIMessage,
   HumanMessage,
@@ -22,6 +22,12 @@ type MockRun = {
   getRunMessages: jest.MockedFunction<Run<t.IState>['getRunMessages']>;
   getCalibrationRatio: jest.MockedFunction<
     Run<t.IState>['getCalibrationRatio']
+  >;
+  getFadingTier: jest.MockedFunction<Run<t.IState>['getFadingTier']>;
+  getFadingTiers: jest.MockedFunction<Run<t.IState>['getFadingTiers']>;
+  didResetFadingTier: jest.MockedFunction<Run<t.IState>['didResetFadingTier']>;
+  getFadingTierResetAgentIds: jest.MockedFunction<
+    Run<t.IState>['getFadingTierResetAgentIds']
   >;
   getInterrupt: jest.MockedFunction<Run<t.IState>['getInterrupt']>;
   getHaltReason: jest.MockedFunction<Run<t.IState>['getHaltReason']>;
@@ -46,6 +52,10 @@ function createMockRun(outputText = 'ok'): MockRun {
       .mockResolvedValue([{ type: 'text', text: outputText }]),
     getRunMessages: jest.fn(() => [new AIMessage(outputText)]),
     getCalibrationRatio: jest.fn(() => 1),
+    getFadingTier: jest.fn(() => undefined),
+    getFadingTiers: jest.fn(() => ({})),
+    didResetFadingTier: jest.fn(() => false),
+    getFadingTierResetAgentIds: jest.fn(() => []),
     getInterrupt: jest.fn(() => undefined),
     getHaltReason: jest.fn(() => undefined),
     getChildCheckpointThreadIds: jest.fn(() => []),
@@ -131,6 +141,32 @@ describe('JsonlSessionStore', () => {
   afterEach(async () => {
     jest.restoreAllMocks();
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it('opens a file whose session_state line carries null data', async () => {
+    const path = join(dir, 'null-state.jsonl');
+    const store = await JsonlSessionStore.create({
+      path,
+      cwd: dir,
+      sessionId: 'session-null-state',
+    });
+    await store.appendMessage(new HumanMessage('hello'));
+    await appendFile(
+      path,
+      `${JSON.stringify({
+        type: 'session_state',
+        id: 'state-null',
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        data: null,
+      })}\n`,
+      'utf8'
+    );
+
+    const reopened = await JsonlSessionStore.open(path);
+
+    expect(reopened.hasFadingState()).toBe(false);
+    expect(reopened.getFadingStates('session-null-state')).toEqual([]);
   });
 
   it('stores messages as an append-only tree and restores the active path', async () => {
@@ -1250,10 +1286,100 @@ describe('JsonlSessionStore', () => {
     expect(reset?.data.reason).toBe('branch');
   });
 
+  it('ignores a malformed persisted tier instead of poisoning later merges', async () => {
+    const sessionPath = join(dir, 'corrupt-tier.jsonl');
+    const store = await JsonlSessionStore.create({
+      path: sessionPath,
+      cwd: dir,
+      sessionId: 'corrupt-tier-session',
+    });
+    await store.appendFadingState({
+      threadId: store.header.id,
+      fadingTier: { v: 1, budgetTokens: 'abc', masked: true } as unknown as t.FadingTier,
+      fadingTiers: {
+        default: { v: 1, budgetTokens: Number.NaN, masked: true } as t.FadingTier,
+      },
+    });
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const mockRun = createMockRun('ok');
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      sessionPath,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('first');
+    await session.run('second');
+
+    expect(capturedConfigs[0].fadingTier).toBeUndefined();
+    expect(capturedConfigs[0].fadingTiers ?? {}).toEqual({});
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
+  });
+
+  it('persists a tier for an agent whose ID is an object prototype key', async () => {
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const mockRun = createMockRun('ok');
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({ worker: fadingTier })
+      .mockReturnValueOnce({ constructor: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('first');
+    await session.run('second');
+    await session.run('third');
+
+    const tiers = capturedConfigs[2].fadingTiers ?? {};
+    expect(Object.hasOwn(tiers, 'constructor')).toBe(true);
+    expect(tiers.constructor).toEqual(fadingTier);
+    expect(tiers.worker).toEqual(fadingTier);
+  });
+
   it('records run.failed when resumeInterrupt throws', async () => {
     const mockRun = createMockRun('unused');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
     mockRun.resume.mockRejectedValue(new Error('resume failed'));
-    mockRunCreate(mockRun);
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
     const session = await createAgentSession({
       cwd: dir,
       runId: 'template-run',
@@ -1280,6 +1406,43 @@ describe('JsonlSessionStore', () => {
       .filter((entry) => entry.type === 'run_event')
       .map((entry) => entry.data.event);
     expect(events).toEqual(['run.started', 'run.failed']);
+    await session.run('after failed resume');
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
+  });
+
+  it('persists fading tiers when processStream throws', async () => {
+    const mockRun = createMockRun('unused');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    mockRun.processStream.mockRejectedValueOnce(new Error('run failed'));
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await expect(session.run('fail after fading')).rejects.toThrow(
+      'run failed'
+    );
+    await session.run('continue');
+
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
   });
 
   it('compacts into a summary plus retained active path', async () => {
@@ -1349,9 +1512,88 @@ describe('JsonlSessionStore', () => {
     expect(compaction?.data.retainedEntryIds).toEqual([]);
   });
 
+  it('clears persisted fading tiers after session compaction', async () => {
+    mockSummarizer('summary of prior work');
+    const mockRun = createMockRun('continued');
+    const capturedConfigs = mockRunCreate(mockRun);
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      fadingTier,
+      fadingTiers: { default: fadingTier },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    await store?.appendMessage(new HumanMessage('old'));
+    await store?.appendMessage(new AIMessage('old answer'));
+
+    await session.compact({ retainRecentTurns: 0 });
+    await session.run('continue after compaction');
+
+    expect(capturedConfigs[0].fadingTier).toBeUndefined();
+    expect(capturedConfigs[0].fadingTiers).toBeUndefined();
+  });
+
+  it('carries a tier learned after compaction into the next summarized run', async () => {
+    mockSummarizer('summary of prior work');
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendMessage(new HumanMessage('old'));
+    await session.getSessionStore()?.appendMessage(new AIMessage('old answer'));
+
+    await session.compact({ retainRecentTurns: 0 });
+    await session.run('first post-compaction turn');
+    await session.run('second post-compaction turn');
+
+    expect(capturedConfigs[0].fadingTier).toBeUndefined();
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
+  });
+
   it('carries calibration ratio forward after resumeInterrupt', async () => {
     const mockRun = createMockRun('resumed');
     mockRun.getCalibrationRatio.mockReturnValue(2);
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
     const capturedConfigs = mockRunCreate(mockRun);
     const session = await createAgentSession({
       cwd: dir,
@@ -1370,6 +1612,677 @@ describe('JsonlSessionStore', () => {
     await session.run('after resume');
 
     expect(capturedConfigs[1].calibrationRatio).toBe(2);
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
+  });
+
+  it('carries live fading tiers into cloned sessions', async () => {
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('advance tier');
+    const cloned = await session.clone({ cwd: dir });
+    await cloned.run('continue clone');
+
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
+  });
+
+  it('only carries live fading tiers into a fork that retains the active leaf', async () => {
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('advance tier');
+    const leafId = session.getSessionStore()?.getLeafEntry()?.id ?? '';
+    const rewound = await session.fork(leafId, { cwd: dir });
+    await rewound.run('continue rewound fork');
+    const full = await session.fork(leafId, { cwd: dir, position: 'at' });
+    await full.run('continue full fork');
+
+    expect(capturedConfigs[1].fadingTier).toBeUndefined();
+    expect(capturedConfigs[1].fadingTiers).toBeUndefined();
+    expect(capturedConfigs[2].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[2].fadingTiers).toEqual({ default: fadingTier });
+  });
+
+  it('allows graph compaction to clear a persisted fading tier', async () => {
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier
+      .mockReturnValueOnce(fadingTier)
+      .mockReturnValue(undefined);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({ default: fadingTier })
+      .mockReturnValue({});
+    mockRun.didResetFadingTier
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true)
+      .mockReturnValue(false);
+    mockRun.getFadingTierResetAgentIds
+      .mockReturnValueOnce([])
+      .mockReturnValueOnce(['default'])
+      .mockReturnValue([]);
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('advance tier');
+    await session.run('compact history');
+    await session.run('after compaction');
+
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[2].fadingTier).toBeUndefined();
+    expect(capturedConfigs[2].fadingTiers).toEqual({});
+  });
+
+  it('preserves prototype-named agent tiers across runs', async () => {
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTiers.mockReturnValue(
+      Object.fromEntries([['__proto__', fadingTier]])
+    );
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('capture prototype tier');
+    await session.run('reuse prototype tier');
+
+    expect(
+      Object.hasOwn(capturedConfigs[1].fadingTiers ?? {}, '__proto__')
+    ).toBe(true);
+    expect(capturedConfigs[1].fadingTiers?.['__proto__']).toEqual(fadingTier);
+  });
+
+  it('restores fading tiers when reopening a persisted session', async () => {
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('advance tier');
+    const reopened = await createAgentSession({
+      cwd: dir,
+      sessionPath: session.sessionPath,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await reopened.run('continue reopened session');
+
+    expect(capturedConfigs[1].fadingTier).toEqual(fadingTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: fadingTier });
+  });
+
+  it('keeps fading tiers isolated by checkpoint thread', async () => {
+    const mockRun = createMockRun('continued');
+    const mainTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const alternateTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier
+      .mockReturnValueOnce(mainTier)
+      .mockReturnValueOnce(alternateTier)
+      .mockReturnValue(mainTier);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({ default: mainTier })
+      .mockReturnValueOnce({ default: alternateTier })
+      .mockReturnValue({ default: mainTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('main');
+    await session.run('alternate', { threadId: 'alternate-thread' });
+    await session.run('main again');
+    await session.run('alternate again', { threadId: 'alternate-thread' });
+
+    expect(capturedConfigs[1].fadingTier).toBeUndefined();
+    expect(capturedConfigs[2].fadingTier).toEqual(mainTier);
+    expect(capturedConfigs[3].fadingTier).toEqual(alternateTier);
+  });
+
+  it('keeps fading tiers isolated by checkpoint namespace', async () => {
+    const mockRun = createMockRun('continued');
+    const namespaceATier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    const namespaceBTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier
+      .mockReturnValueOnce(namespaceATier)
+      .mockReturnValueOnce(namespaceBTier)
+      .mockReturnValue(namespaceATier);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({ default: namespaceATier })
+      .mockReturnValueOnce({ default: namespaceBTier })
+      .mockReturnValue({ default: namespaceATier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const namespaceOptions = (checkpointNs: string) => ({
+      config: { configurable: { checkpoint_ns: checkpointNs } },
+    });
+
+    await session.run('namespace A', namespaceOptions('namespace-a'));
+    await session.run('namespace B', namespaceOptions('namespace-b'));
+    const reopened = await createAgentSession({
+      cwd: dir,
+      sessionPath: session.sessionPath,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await reopened.run('namespace A again', namespaceOptions('namespace-a'));
+    await reopened.run('namespace B again', namespaceOptions('namespace-b'));
+
+    expect(capturedConfigs[0].fadingTier).toBeUndefined();
+    expect(capturedConfigs[1].fadingTier).toBeUndefined();
+    expect(capturedConfigs[2].fadingTier).toEqual(namespaceATier);
+    expect(capturedConfigs[3].fadingTier).toEqual(namespaceBTier);
+  });
+
+  it('persists an interrupted tier under the interrupt checkpoint namespace', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('interrupted');
+    const nestedTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(nestedTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: nestedTier });
+    mockRun.getInterrupt.mockReturnValueOnce({
+      interruptId: 'nested-interrupt',
+      threadId: 'nested-thread',
+      checkpointId: 'nested-checkpoint',
+      checkpointNs: 'nested-namespace',
+      payload: {
+        type: 'tool_approval',
+        action_requests: [],
+        review_configs: [],
+      },
+    });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'nested-checkpoint',
+      checkpointNs: 'nested-namespace',
+    });
+
+    await session.run('pause in nested namespace');
+    await session.resumeInterrupt([{ type: 'approve' }]);
+
+    expect(capturedConfigs[1].fadingTier).toEqual(nestedTier);
+    expect(capturedConfigs[1].fadingTiers).toEqual({ default: nestedTier });
+  });
+
+  it('merges overlapping run tiers monotonically', async () => {
+    const mockRun = createMockRun('continued');
+    const deepTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    const staleTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 50_000,
+      masked: false,
+    };
+    let markSlowStarted!: () => void;
+    let releaseSlow!: () => void;
+    const slowStarted = new Promise<void>((resolve) => {
+      markSlowStarted = resolve;
+    });
+    const slowResult = new Promise<t.MessageContentComplex[]>((resolve) => {
+      releaseSlow = () => resolve([{ type: 'text', text: 'slow' }]);
+    });
+    mockRun.processStream
+      .mockImplementationOnce(async () => {
+        markSlowStarted();
+        return slowResult;
+      })
+      .mockResolvedValue([{ type: 'text', text: 'fast' }]);
+    mockRun.getFadingTier
+      .mockReturnValueOnce(deepTier)
+      .mockReturnValueOnce(staleTier)
+      .mockReturnValue(deepTier);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({ default: deepTier })
+      .mockReturnValueOnce({ default: staleTier })
+      .mockReturnValue({ default: deepTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    const slowRun = session.run('slow run');
+    await slowStarted;
+    await session.run('fast run');
+    releaseSlow();
+    await slowRun;
+    await session.run('after overlap');
+
+    expect(capturedConfigs[0].fadingTier).toBeUndefined();
+    expect(capturedConfigs[1].fadingTier).toBeUndefined();
+    expect(capturedConfigs[2].fadingTier).toEqual(deepTier);
+    expect(capturedConfigs[2].fadingTiers).toEqual({ default: deepTier });
+  });
+
+  it('rejects a stale capture that started before a concurrent compaction', async () => {
+    const mockRun = createMockRun('continued');
+    const staleTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    let markResetStarted!: () => void;
+    let markStaleStarted!: () => void;
+    let releaseReset!: () => void;
+    let releaseStale!: () => void;
+    const resetStarted = new Promise<void>((resolve) => {
+      markResetStarted = resolve;
+    });
+    const staleStarted = new Promise<void>((resolve) => {
+      markStaleStarted = resolve;
+    });
+    const resetResult = new Promise<t.MessageContentComplex[]>((resolve) => {
+      releaseReset = () => resolve([{ type: 'text', text: 'reset' }]);
+    });
+    const staleResult = new Promise<t.MessageContentComplex[]>((resolve) => {
+      releaseStale = () => resolve([{ type: 'text', text: 'stale' }]);
+    });
+    mockRun.processStream
+      .mockImplementationOnce(async () => {
+        markResetStarted();
+        return resetResult;
+      })
+      .mockImplementationOnce(async () => {
+        markStaleStarted();
+        return staleResult;
+      })
+      .mockResolvedValue([{ type: 'text', text: 'after' }]);
+    mockRun.getFadingTier
+      .mockReturnValueOnce(undefined)
+      .mockReturnValueOnce(staleTier)
+      .mockReturnValue(undefined);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({})
+      .mockReturnValueOnce({ default: staleTier })
+      .mockReturnValue({});
+    mockRun.didResetFadingTier
+      .mockReturnValueOnce(true)
+      .mockReturnValue(false);
+    mockRun.getFadingTierResetAgentIds
+      .mockReturnValueOnce(['default'])
+      .mockReturnValue([]);
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    const resetRun = session.run('reset run');
+    await resetStarted;
+    const staleRun = session.run('stale run');
+    await staleStarted;
+    releaseReset();
+    await resetRun;
+    releaseStale();
+    await staleRun;
+    await session.run('after overlap');
+
+    expect(capturedConfigs[2].fadingTier).toBeUndefined();
+    expect(capturedConfigs[2].fadingTiers).toEqual({});
+  });
+
+  it('discards a capture from a run that started before an explicit history rewrite', async () => {
+    const mockRun = createMockRun('continued');
+    const preRewriteTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    let markStaleStarted!: () => void;
+    let releaseStale!: () => void;
+    const staleStarted = new Promise<void>((resolve) => {
+      markStaleStarted = resolve;
+    });
+    const staleResult = new Promise<t.MessageContentComplex[]>((resolve) => {
+      releaseStale = () => resolve([{ type: 'text', text: 'stale' }]);
+    });
+    mockRun.processStream
+      .mockResolvedValueOnce([{ type: 'text', text: 'seed' }])
+      .mockImplementationOnce(async () => {
+        markStaleStarted();
+        return staleResult;
+      })
+      .mockResolvedValue([{ type: 'text', text: 'after' }]);
+    mockRun.getFadingTier
+      .mockReturnValueOnce(undefined)
+      .mockReturnValueOnce(preRewriteTier)
+      .mockReturnValue(undefined);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({})
+      .mockReturnValueOnce({ default: preRewriteTier })
+      .mockReturnValue({});
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('seed run');
+    const firstEntryId = session.getSessionStore()?.getPath()[0]?.id;
+    expect(firstEntryId).toBeDefined();
+    const staleRun = session.run('stale run');
+    await staleStarted;
+    await session.branch(firstEntryId as string);
+    releaseStale();
+    await staleRun;
+    await session.run('after rewrite');
+
+    expect(capturedConfigs[2].fadingTier).toBeUndefined();
+    expect(capturedConfigs[2].fadingTiers ?? {}).toEqual({});
+  });
+
+  it('keeps a concurrent escalation from another agent when one agent resets', async () => {
+    const mockRun = createMockRun('continued');
+    const escalatedTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 12_500,
+      masked: true,
+      latched: true,
+    };
+    let markResetStarted!: () => void;
+    let markEscalationStarted!: () => void;
+    let releaseReset!: () => void;
+    let releaseEscalation!: () => void;
+    const resetStarted = new Promise<void>((resolve) => {
+      markResetStarted = resolve;
+    });
+    const escalationStarted = new Promise<void>((resolve) => {
+      markEscalationStarted = resolve;
+    });
+    const resetResult = new Promise<t.MessageContentComplex[]>((resolve) => {
+      releaseReset = () => resolve([{ type: 'text', text: 'reset' }]);
+    });
+    const escalationResult = new Promise<t.MessageContentComplex[]>((resolve) => {
+      releaseEscalation = () => resolve([{ type: 'text', text: 'escalated' }]);
+    });
+    mockRun.processStream
+      .mockImplementationOnce(async () => {
+        markResetStarted();
+        return resetResult;
+      })
+      .mockImplementationOnce(async () => {
+        markEscalationStarted();
+        return escalationResult;
+      })
+      .mockResolvedValue([{ type: 'text', text: 'after' }]);
+    mockRun.getFadingTiers
+      .mockReturnValueOnce({})
+      .mockReturnValueOnce({ worker: escalatedTier })
+      .mockReturnValue({});
+    mockRun.getFadingTierResetAgentIds
+      .mockReturnValueOnce(['planner'])
+      .mockReturnValue([]);
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    const resetRun = session.run('planner compacts');
+    await resetStarted;
+    const escalationRun = session.run('worker escalates');
+    await escalationStarted;
+    releaseReset();
+    await resetRun;
+    releaseEscalation();
+    await escalationRun;
+    await session.run('after overlap');
+
+    expect(capturedConfigs[2].fadingTiers).toEqual({ worker: escalatedTier });
+  });
+
+  it('bounds fading metadata retained for alternate checkpoint threads', async () => {
+    const mockRun = createMockRun('continued');
+    const fadingTier: t.FadingTier = {
+      v: 1,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    mockRun.getFadingTier.mockReturnValue(fadingTier);
+    mockRun.getFadingTiers.mockReturnValue({ default: fadingTier });
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('main');
+    for (let i = 0; i < 65; i++) {
+      await session.run(`alternate ${i}`, { threadId: `thread-${i}` });
+    }
+    expect(
+      session
+        .getSessionStore()
+        ?.getFadingStates(session.threadId, 64)
+    ).toHaveLength(65);
+    const reopened = await createAgentSession({
+      cwd: dir,
+      sessionPath: session.sessionPath,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await reopened.run('oldest again', { threadId: 'thread-0' });
+    await reopened.run('newest again', { threadId: 'thread-64' });
+
+    expect(capturedConfigs[66].fadingTier).toBeUndefined();
+    expect(capturedConfigs[67].fadingTier).toEqual(fadingTier);
   });
 
   it('summarizes an abandoned branch before switching in place', async () => {

@@ -3,8 +3,7 @@ import {
   _convertMessagesToOpenAIParams,
   _convertMessagesToOpenAIResponsesParams,
 } from './index';
-import { calculateMaxToolCallInputChars } from '@/messages/prune';
-import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { calculateMaxToolCallInputChars, HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 
 describe('_convertMessagesToOpenAIParams', () => {
   it('includes reasoning_content for assistant messages in tool-call context when requested', () => {

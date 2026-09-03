@@ -93,6 +93,16 @@ describe('AgentContext', () => {
   });
 
   describe('Summary carrier', () => {
+    it('clears the per-run fading reset signal on a fresh reset', () => {
+      const ctx = createBasicContext();
+
+      ctx.setSummary('compacted history', 10);
+      expect(ctx.fadingTierReset).toBe(true);
+
+      ctx.reset();
+      expect(ctx.fadingTierReset).toBe(false);
+    });
+
     /** The summary's stored token count is a measurement of the carrier built
      *  by `buildSummaryCarrierText`. If this context ever injected different
      *  text, every budget read against a persisted summary would be wrong by
@@ -2083,6 +2093,29 @@ describe('AgentContext', () => {
       expect(ctx.toolSchemaTokens).toBeGreaterThan(0);
       expect(ctx.toolTokenCounts?.deferred).toBeGreaterThan(0);
       expect(ctx.deferredToolNames).toContain('deferred');
+    });
+  });
+
+  describe('provider projection rebuild', () => {
+    it('drops the index-keyed original tool content when the canonical prefix changes', () => {
+      const context = createBasicContext();
+      const tool = new ToolMessage({
+        content: 'result',
+        tool_call_id: 'call-1',
+        name: 'tool',
+      });
+      const first = [new HumanMessage('a'), tool];
+      context.getProviderProjectedMessages(first);
+      context.preserveOriginalToolContent(new Map([[1, 'original result']]));
+      expect(context.pendingOriginalToolContent?.get(1)).toBe('original result');
+
+      const shifted = [new HumanMessage('inserted'), ...first];
+      context.getProviderProjectedMessages(shifted);
+      expect(context.pendingOriginalToolContent).toBeUndefined();
+
+      context.preserveOriginalToolContent(new Map([[2, 'original result']]));
+      context.getProviderProjectedMessages([...shifted, new AIMessage('done')]);
+      expect(context.pendingOriginalToolContent?.get(2)).toBe('original result');
     });
   });
 

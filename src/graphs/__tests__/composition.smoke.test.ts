@@ -33,6 +33,13 @@ const makeStreamConfig = (threadId: string): t.WorkflowValuesStreamConfig => ({
   streamMode: 'values' as const,
 });
 
+const countMessageChars: t.TokenCounter = (message) =>
+  Math.ceil(
+    (typeof message.content === 'string'
+      ? message.content.length
+      : JSON.stringify(message.content).length) / 4
+  );
+
 const getAiContents = (messages: t.BaseGraphState['messages']): string[] =>
   messages
     .filter((message) => message.getType() === 'ai')
@@ -481,6 +488,119 @@ describe('LangGraph composition smoke tests', () => {
     expect(graph.getParallelGroupId('final')).toBeUndefined();
   });
 
+  it('bounds results before interpolating a routing prompt', async () => {
+    const largeResult = `BEGIN\n${'large routed result '.repeat(2000)}\nEND`;
+    const model = new CapturingChatModel([largeResult, 'done']);
+    const graph = new MultiAgentGraph({
+      runId: 'bounded-routing-results',
+      tokenCounter: countMessageChars,
+      agents: [
+        makeAgent('source'),
+        {
+          ...makeAgent('destination'),
+          instructions: 'routing instruction '.repeat(120),
+          maxContextTokens: 1000,
+        },
+      ],
+      edges: [
+        {
+          from: 'source',
+          to: 'destination',
+          edgeType: 'direct',
+          prompt: `${'large static prefix '.repeat(1000)}\n{results}\n{results}`,
+          excludeResults: true,
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('bounded-routing-results')
+      );
+
+    const routingPrompt = model.invocations[1].find(
+      (message) => message.additional_kwargs.source === 'routing'
+    );
+    expect(routingPrompt?.content).toEqual(expect.stringContaining('truncated'));
+    expect(String(routingPrompt?.content).length).toBeLessThan(500);
+    expect(largeResult).toContain('large routed result');
+  });
+
+  it('bounds routing text returned by prompt functions', async () => {
+    const largeResult = `BEGIN\n${'large routed result '.repeat(2000)}\nEND`;
+    const model = new CapturingChatModel([largeResult, 'done']);
+    const graph = new MultiAgentGraph({
+      runId: 'bounded-function-routing-results',
+      tokenCounter: countMessageChars,
+      agents: [
+        makeAgent('source'),
+        {
+          ...makeAgent('destination'),
+          instructions: 'routing instruction '.repeat(120),
+          maxContextTokens: 1000,
+        },
+      ],
+      edges: [
+        {
+          from: 'source',
+          to: 'destination',
+          edgeType: 'direct',
+          prompt: (messages) => getBufferString(messages),
+          excludeResults: true,
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('bounded-function-routing-results')
+      );
+
+    const routingPrompt = model.invocations[1].find(
+      (message) => message.additional_kwargs.source === 'routing'
+    );
+    expect(routingPrompt?.content).toEqual(expect.stringContaining('truncated'));
+    expect(String(routingPrompt?.content).length).toBeLessThan(500);
+    expect(largeResult).toContain('large routed result');
+  });
+
+  it('preserves an undefined function prompt as no routing message', async () => {
+    const model = new CapturingChatModel(['source result', 'done']);
+    const graph = new MultiAgentGraph({
+      runId: 'undefined-function-routing-prompt',
+      agents: [makeAgent('source'), makeAgent('destination')],
+      edges: [
+        {
+          from: 'source',
+          to: 'destination',
+          edgeType: 'direct',
+          prompt: () => undefined,
+          excludeResults: true,
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('undefined-function-routing-prompt')
+      );
+
+    expect(
+      model.invocations[1].some(
+        (message) => message.additional_kwargs.source === 'routing'
+      )
+    ).toBe(false);
+  });
+
   it.each([
     ['without a prompt wrapper', undefined],
     ['with a prompt wrapper', 'Summarize these results:\n{results}'],
@@ -596,6 +716,77 @@ describe('LangGraph composition smoke tests', () => {
         'response-3'
       );
     }
+  });
+
+  it('bounds handoff instructions to the destination budget', async () => {
+    const largeInstructions = `BEGIN\n${'large handoff instruction '.repeat(2000)}\nEND`;
+    class LargeHandoffChatModel extends FakeChatModel {
+      readonly invocations: BaseMessage[][] = [];
+      private invocationIndex = 0;
+
+      constructor() {
+        super({ responses: ['unused'] });
+      }
+
+      override async *_streamResponseChunks(
+        messages: BaseMessage[],
+        _options: this['ParsedCallOptions'],
+        runManager?: CallbackManagerForLLMRun
+      ): AsyncGenerator<ChatGenerationChunk> {
+        this.invocations.push(messages);
+        if (this.invocationIndex++ === 0) {
+          yield this._createResponseChunk('', [
+            {
+              id: 'transfer_large',
+              name: `${Constants.LC_TRANSFER_TO_}destination`,
+              args: JSON.stringify({ instructions: largeInstructions }),
+              index: 0,
+              type: 'tool_call_chunk',
+            },
+          ]);
+          void runManager?.handleLLMNewToken('');
+          return;
+        }
+        yield this._createResponseChunk('handoff complete');
+        void runManager?.handleLLMNewToken('handoff complete');
+      }
+    }
+    const model = new LargeHandoffChatModel();
+    const graph = new MultiAgentGraph({
+      runId: 'bounded-handoff-instructions',
+      tokenCounter: countMessageChars,
+      agents: [
+        makeAgent('source'),
+        {
+          ...makeAgent('destination'),
+          instructions: 'routing instruction '.repeat(120),
+          maxContextTokens: 1000,
+        },
+      ],
+      edges: [
+        {
+          from: 'source',
+          to: 'destination',
+          edgeType: 'handoff',
+          prompt: 'Provide transfer instructions.',
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('bounded-handoff-instructions')
+      );
+
+    const routingPrompt = model.invocations
+      .flat()
+      .find((message) => message.additional_kwargs.source === 'routing');
+    expect(routingPrompt?.content).toEqual(expect.stringContaining('truncated'));
+    expect(String(routingPrompt?.content).length).toBeLessThan(500);
+    expect(largeInstructions.length).toBeGreaterThan(40_000);
   });
 
   it('compiles mixed handoff and direct routing from the same agent', () => {

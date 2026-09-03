@@ -2793,3 +2793,55 @@ export function findLastIndex<T>(
   }
   return -1;
 }
+
+/** Reads an own data property without invoking accessors; `undefined` otherwise. */
+function readOwnDataProperty(target: object, key: PropertyKey): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    return descriptor != null && 'value' in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether message content carries non-whitespace text in any text block. */
+export function hasNonEmptyTextContent(content: BaseMessage['content']): boolean {
+  if (typeof content === 'string') {
+    return content.trim() !== '';
+  }
+  if (!Array.isArray(content) || isProxy(content)) {
+    return false;
+  }
+  /** Index reads through own data descriptors: `for...of` would invoke a
+   * hostile `Symbol.iterator` or an accessor-backed element before any guard. */
+  const length = readOwnDataProperty(content, 'length');
+  const blockCount = typeof length === 'number' ? length : 0;
+  for (let i = 0; i < blockCount; i++) {
+    const block = readOwnDataProperty(content, i);
+    if (typeof block !== 'object' || block == null || isProxy(block)) {
+      continue;
+    }
+    try {
+      const type = Object.getOwnPropertyDescriptor(block, 'type');
+      if (
+        type == null ||
+        !('value' in type) ||
+        (type.value !== ContentTypes.TEXT && type.value !== 'output_text')
+      ) {
+        continue;
+      }
+      const text = Object.getOwnPropertyDescriptor(block, ContentTypes.TEXT);
+      if (
+        text != null &&
+        'value' in text &&
+        typeof text.value === 'string' &&
+        text.value.trim() !== ''
+      ) {
+        return true;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}

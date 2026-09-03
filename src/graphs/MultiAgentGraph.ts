@@ -30,7 +30,10 @@ import {
 } from '@/messages/provenance';
 import { serializeToolContentBounded } from '@/utils/toolContent';
 import { Constants, MULTI_AGENT_GRAPH_RUN_NAME } from '@/common';
-import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import {
+  calculateMaxToolResultChars,
+  HARD_MAX_TOOL_RESULT_CHARS,
+} from '@/utils/truncation';
 import { StandardGraph } from './Graph';
 
 /** Pattern to extract instructions from transfer ToolMessage content */
@@ -970,6 +973,29 @@ export class MultiAgentGraph extends StandardGraph {
    * @param agentId - The agent ID to check for handoff reception
    * @returns Object with filtered messages, extracted instructions, source agent, and parallel siblings
    */
+  /**
+   * Character cap for text injected into an agent's context as a routing or
+   * handoff prompt, derived from that agent's remaining message budget. Fading
+   * only shrinks tool content, so a prompt above this cap could overflow the
+   * agent's window or force the routing instruction out of its context.
+   */
+  private async resolveMaxRoutingPromptChars(agentId: string): Promise<number> {
+    const agentContext = this.agentContexts.get(agentId);
+    if (agentContext?.tokenCalculationPromise != null) {
+      await agentContext.tokenCalculationPromise;
+    }
+    const availableMessageTokens =
+      agentContext?.maxContextTokens == null
+        ? undefined
+        : agentContext.getTokenBudgetBreakdown().availableForMessages;
+    if (availableMessageTokens == null) {
+      return HARD_MAX_TOOL_RESULT_CHARS;
+    }
+    return availableMessageTokens <= 0
+      ? 0
+      : calculateMaxToolResultChars(availableMessageTokens);
+  }
+
   private processHandoffReception(
     messages: BaseMessage[],
     agentId: string
@@ -1358,6 +1384,12 @@ export class MultiAgentGraph extends StandardGraph {
            */
           const hasInstructions = instructions !== null && instructions !== '';
           if (hasInstructions) {
+            /** Bounded like a direct-edge routing prompt: a HumanMessage is
+             * not tool content, so fading could never shrink it later. */
+            const boundedInstructions = serializeToolContentBounded(
+              instructions,
+              await this.resolveMaxRoutingPromptChars(agentId)
+            );
             const lastMsg =
               filteredMessages.length > 0
                 ? filteredMessages[filteredMessages.length - 1]
@@ -1371,12 +1403,12 @@ export class MultiAgentGraph extends StandardGraph {
                     `[Processed tool result and transferring to ${agentId}]`
                   )
                 ),
-                buildRoutingPrompt(instructions),
+                buildRoutingPrompt(boundedInstructions),
               ];
             } else {
               messagesForAgent = [
                 ...filteredMessages,
-                buildRoutingPrompt(instructions),
+                buildRoutingPrompt(boundedInstructions),
               ];
             }
           }
@@ -1576,18 +1608,34 @@ export class MultiAgentGraph extends StandardGraph {
         builder.addNode(wrapperNodeId, async (state: t.BaseGraphState) => {
           let promptText: string | undefined;
           let effectiveExcludeResults = excludeResults;
+          const getMaxRoutingPromptChars = (): Promise<number> =>
+            this.resolveMaxRoutingPromptChars(destination);
 
           if (typeof prompt === 'function') {
-            promptText = await prompt(state.messages, this.startIndex);
+            const resolvedPrompt = await prompt(state.messages, this.startIndex);
+            promptText =
+              resolvedPrompt == null
+                ? undefined
+                : serializeToolContentBounded(
+                  resolvedPrompt,
+                  await getMaxRoutingPromptChars()
+                );
           } else if (prompt != null) {
             if (prompt.includes('{results}')) {
               const resultsMessages = state.messages.slice(this.startIndex);
-              const resultsString = getBufferString(resultsMessages);
+              const maxRoutingPromptChars = await getMaxRoutingPromptChars();
+              const resultsString = serializeToolContentBounded(
+                getBufferString(resultsMessages),
+                maxRoutingPromptChars
+              );
               const promptTemplate = PromptTemplate.fromTemplate(prompt);
               const result = await promptTemplate.invoke({
                 results: resultsString,
               });
-              promptText = result.value;
+              promptText = serializeToolContentBounded(
+                result.value,
+                maxRoutingPromptChars
+              );
               effectiveExcludeResults =
                 excludeResults !== false && promptText !== '';
             } else {

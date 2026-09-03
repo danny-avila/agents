@@ -54,7 +54,6 @@ import {
   CALIBRATION_RATIO_MAX,
   createPruneMessages,
   projectToolMessagesForProvider,
-  calculateMaxToolCallInputChars,
   syncBudgetDerivedFields,
   addTailCacheControl,
   resolvePromptCacheTtl,
@@ -156,6 +155,7 @@ import { createContextPressureMeter } from '@/llm/contextPressureMeter';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
+import { calculateMaxToolCallInputChars } from '@/utils/truncation';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
@@ -163,6 +163,7 @@ import { initializeLangfuseTracing } from '@/instrumentation';
 import { shouldTriggerSummarization } from '@/summarization';
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
+import { isFadingTier, isInformativeFadingTier } from '@/messages/fading';
 import { createSummarizeNode } from '@/summarization/node';
 import { getTruncationStopReason } from '@/llm/truncation';
 import { messagesStateReducer } from '@/messages/reducer';
@@ -1070,6 +1071,13 @@ export abstract class Graph<
     return [...threadIds];
   }
 
+  protected createSubagentFadingResumeState(): Pick<
+    SubagentGraphResumeState,
+    'fadingTier' | 'fadingTiers'
+    > {
+    return {};
+  }
+
   createSubagentResumeState(runId: string): SubagentGraphResumeState {
     return {
       toolCallSteps: [...this.toolCallStepIds].map(([toolCallId, stepId]) => ({
@@ -1107,6 +1115,7 @@ export abstract class Graph<
       ],
       eagerToolSuppressions: [...this.eagerEventToolSuppressions],
       runStepState: this.createRunStepResumeState(),
+      ...this.createSubagentFadingResumeState(),
       ...(this._toolOutputRegistry == null
         ? {}
         : {
@@ -1491,6 +1500,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       tokenCounter,
       indexTokenCountMap,
       calibrationRatio,
+      fadingTier,
+      fadingTiers,
       subagentUsageSink,
       subagentTasks,
       subagentScope,
@@ -1538,6 +1549,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       );
       if (calibrationRatio != null && calibrationRatio > 0) {
         agentContext.calibrationRatio = calibrationRatio;
+      }
+      let restoredFadingTier: t.FadingTier | null | undefined;
+      if (
+        fadingTiers != null &&
+        Object.prototype.hasOwnProperty.call(fadingTiers, agentConfig.agentId)
+      ) {
+        restoredFadingTier = fadingTiers[agentConfig.agentId];
+      } else if (agentConfig.agentId === agents[0].agentId) {
+        restoredFadingTier = fadingTier;
+      }
+      /** A supplied tier is assumed to describe the supplied history. Hosts
+       * must clear it when they create a new summary; this also permits tiers
+       * learned on turns after a durable summary to survive subsequent Runs. */
+      if (isFadingTier(restoredFadingTier)) {
+        agentContext.fadingTier = { ...restoredFadingTier };
       }
 
       this.agentContexts.set(agentConfig.agentId, agentContext);
@@ -2551,6 +2577,57 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return context?.calibrationRatio ?? 1;
   }
 
+  /**
+   * Latched context-fading tier for the default agent, or undefined while it
+   * is still fresh. Hosts persist it beside the calibration ratio.
+   */
+  getFadingTier(): t.FadingTier | undefined {
+    const context = this.agentContexts.get(this.defaultAgentId);
+    const tier = context?.fadingTier;
+    return isInformativeFadingTier(tier, context?.maxContextTokens)
+      ? { ...tier }
+      : undefined;
+  }
+
+  /** Latched context-fading tiers keyed by agent ID. */
+  getFadingTiers(): t.FadingTiers {
+    const tiers: Array<[string, t.FadingTier]> = [];
+    for (const [agentId, context] of this.agentContexts) {
+      if (
+        isInformativeFadingTier(context.fadingTier, context.maxContextTokens)
+      ) {
+        tiers.push([agentId, { ...context.fadingTier }]);
+      }
+    }
+    return Object.fromEntries(tiers);
+  }
+
+  /** Agent IDs whose canonical history was compacted during this run. */
+  getFadingTierResetAgentIds(): string[] {
+    return Array.from(this.agentContexts)
+      .filter(([, context]) => context.fadingTierReset)
+      .map(([agentId]) => agentId);
+  }
+
+  /** Whether the default agent compacted canonical history during this run. */
+  didResetFadingTier(): boolean {
+    return (
+      this.agentContexts.get(this.defaultAgentId)?.fadingTierReset === true
+    );
+  }
+
+  protected override createSubagentFadingResumeState(): Pick<
+    SubagentGraphResumeState,
+    'fadingTier' | 'fadingTiers'
+    > {
+    const fadingTier = this.getFadingTier();
+    const fadingTiers = this.getFadingTiers();
+    return {
+      ...(fadingTier == null ? {} : { fadingTier }),
+      ...(Object.keys(fadingTiers).length === 0 ? {} : { fadingTiers }),
+    };
+  }
+
   getResolvedInstructionOverhead(): number | undefined {
     const context = this.agentContexts.get(this.defaultAgentId);
     return context?.resolvedInstructionOverhead;
@@ -3059,6 +3136,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * same masking record the configured trigger preserves.
        */
       let prunedOriginalToolContent: Map<number, string> | undefined;
+      const canProjectContext =
+        agentContext.tokenCounter != null &&
+        agentContext.maxContextTokens != null;
+      const providerMessages = canProjectContext
+        ? agentContext.getProviderProjectedMessages(messages)
+        : messages;
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
@@ -3080,6 +3163,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           summarizationEnabled: agentContext.summarizationEnabled,
           reserveRatio: agentContext.summarizationConfig?.reserveRatio,
           calibrationRatio: agentContext.calibrationRatio,
+          fadingTier: agentContext.fadingTier,
           getInstructionTokens: () => agentContext.instructionTokens,
           log: (level, message, data) => {
             emitAgentLog(config, level, 'prune', message, data, {
@@ -3098,29 +3182,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           remainingContextTokens,
           newOriginalToolContent,
           calibrationRatio,
+          fadingTier,
           resolvedInstructionOverhead,
           contextBudget,
           effectiveInstructionTokens,
         } = agentContext.pruneMessages({
-          messages,
+          messages: providerMessages,
+          canonicalMessages: messages,
+          canonicalPrefixStable: true,
           usageMetadata: agentContext.currentUsage,
           lastCallUsage: agentContext.lastCallUsage,
           totalTokensFresh: agentContext.totalTokensFresh,
         });
         prunedOriginalToolContent = newOriginalToolContent;
-        /**
-         * Masking rewrites tool content in `state.messages` in place, so this
-         * map is the only surviving copy of the full output. Persist it on
-         * every prune, not just when a summary is about to be written — the
-         * pruner closure that produced it is discarded on the next reset, and
-         * with it any chance of a later summary restoring the real content.
-         * AgentContext bounds what accumulates.
-         */
+        /** Preserve the masking record for the existing overflow/summarization
+         * path. The graph history itself remains canonical; only the provider
+         * projection above is rewritten by fading. */
         agentContext.preserveOriginalToolContent(newOriginalToolContent);
         agentContext.indexTokenCountMap = indexTokenCountMap;
         if (calibrationRatio != null && calibrationRatio > 0) {
           agentContext.calibrationRatio = calibrationRatio;
         }
+        agentContext.fadingTier = fadingTier;
         if (resolvedInstructionOverhead != null) {
           agentContext.resolvedInstructionOverhead =
             resolvedInstructionOverhead;
@@ -5031,7 +5114,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
-        reducer: messagesStateReducer,
+        reducer: (a, b) => {
+          agentContext.invalidateProviderProjectionForMessageUpdates(b);
+          return messagesStateReducer(a, b);
+        },
         default: () => [],
       }),
       summarizationRequest: Annotation<t.SummarizationNodeInput | undefined>({

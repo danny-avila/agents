@@ -2,7 +2,13 @@ import type { ToolCall, ToolMessage } from '@langchain/core/messages/tool';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import type { ToolApprovalReplaySnapshot } from '@/hooks';
-import type { RunStepResumeState, ToolSessionContext } from '@/types';
+import type {
+  FadingTier,
+  FadingTiers,
+  RunStepResumeState,
+  ToolSessionContext,
+} from '@/types';
+import { isFadingTier } from '@/messages/fading';
 import {
   attachRunStepResumeState,
   getRunStepResumeState,
@@ -65,6 +71,8 @@ export interface SubagentGraphResumeState {
   eagerToolSuppressions: string[];
   runStepState?: RunStepResumeState;
   toolOutputReferences?: ToolOutputReferenceState;
+  fadingTier?: FadingTier;
+  fadingTiers?: FadingTiers;
 }
 
 /** Private checkpoint payload linking a parent pause to an exact child state. */
@@ -301,7 +309,12 @@ function isGraphResumeState(value: unknown): value is SubagentGraphResumeState {
     (state.runStepState != null &&
       !isRunStepResumeState(state.runStepState)) ||
     (state.toolOutputReferences != null &&
-      !isToolOutputReferenceState(state.toolOutputReferences))
+      !isToolOutputReferenceState(state.toolOutputReferences)) ||
+    (state.fadingTier != null && !isFadingTier(state.fadingTier)) ||
+    (state.fadingTiers != null &&
+      (typeof state.fadingTiers !== 'object' ||
+        Array.isArray(state.fadingTiers) ||
+        !Object.values(state.fadingTiers).every(isFadingTier)))
   ) {
     return false;
   }

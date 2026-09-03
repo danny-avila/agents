@@ -132,6 +132,27 @@ export interface ContextUsageEvent {
   calibrationRatio?: number;
 }
 
+/**
+ * Latched context-fading tier. Caps for historical tool results derive from
+ * `(budgetTokens, masked)` only, so carrying the tier across runs keeps their
+ * truncated bytes stable for prefix-based provider prompt caches. Hosts
+ * persist it beside `calibrationRatio` and pass it back via
+ * `RunConfig.fadingTiers[agentId]`.
+ */
+export interface FadingTier {
+  v: 1;
+  /** Token budget the caps derive from, in raw token space. Never grows;
+   *  clamped to the current context window when seeded. */
+  budgetTokens: number;
+  /** Whether observation masking has activated. Never deactivates. */
+  masked: boolean;
+  /** Whether this tier was reduced, masked, or restored from host state. */
+  latched?: true;
+}
+
+/** Latched fading tiers keyed by agent ID. */
+export type FadingTiers = Record<string, FadingTier>;
+
 export interface EventHandler {
   handle(
     event: string,
@@ -346,6 +367,10 @@ export type StandardGraphInput = {
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
   calibrationRatio?: number;
+  /** Persisted default-agent tier retained for single-agent compatibility. */
+  fadingTier?: FadingTier | null;
+  /** Persisted fading tiers keyed by agent ID. */
+  fadingTiers?: FadingTiers | null;
   /**
    * Receives a {@link SubagentUsageEvent} for every model call that reports
    * usage metadata inside a subagent child run spawned from this graph

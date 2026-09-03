@@ -22,6 +22,7 @@ import type {
 } from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import { isFadingTier } from '@/messages/fading';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import type { StandardGraph } from '@/graphs/Graph';
@@ -472,6 +473,10 @@ export class Run<_T extends t.BaseGraphState> {
   private subagentTasks?: t.SubagentTaskConfig;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
+  fadingTier?: t.FadingTier;
+  fadingTiers: t.FadingTiers = {};
+  private fadingTierReset: boolean = false;
+  private fadingTierResetAgentIds: string[] = [];
   graphRunnable?: t.CompiledStateWorkflow;
   Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
@@ -515,6 +520,16 @@ export class Run<_T extends t.BaseGraphState> {
     this.indexTokenCountMap = config.indexTokenCountMap;
     if (config.calibrationRatio != null && config.calibrationRatio > 0) {
       this.calibrationRatio = config.calibrationRatio;
+    }
+    if (isFadingTier(config.fadingTier)) {
+      this.fadingTier = { ...config.fadingTier };
+    }
+    if (config.fadingTiers != null) {
+      this.fadingTiers = Object.fromEntries(
+        Object.entries(config.fadingTiers).flatMap(([agentId, tier]) =>
+          isFadingTier(tier) ? [[agentId, { ...tier }] as const] : []
+        )
+      );
     }
 
     const handlerRegistry = new HandlerRegistry();
@@ -632,6 +647,8 @@ export class Run<_T extends t.BaseGraphState> {
         tokenCounter: this.tokenCounter,
         indexTokenCountMap: this.indexTokenCountMap,
         calibrationRatio: this.calibrationRatio,
+        fadingTier: this.fadingTier,
+        fadingTiers: this.fadingTiers,
         subagentUsageSink: this.subagentUsageSink,
         subagentTasks: this.subagentTasks,
         preemption: this.preemption,
@@ -672,6 +689,8 @@ export class Run<_T extends t.BaseGraphState> {
         tokenCounter: this.tokenCounter,
         indexTokenCountMap: this.indexTokenCountMap,
         calibrationRatio: this.calibrationRatio,
+        fadingTier: this.fadingTier,
+        fadingTiers: this.fadingTiers,
         subagentUsageSink: this.subagentUsageSink,
         subagentTasks: this.subagentTasks,
         preemption: this.preemption,
@@ -935,6 +954,35 @@ export class Run<_T extends t.BaseGraphState> {
    */
   getCalibrationRatio(): number {
     return this.calibrationRatio;
+  }
+
+  /**
+   * Returns the default agent's latched context-fading tier. Single-agent hosts
+   * may persist it beside the calibration ratio; multi-agent hosts should use
+   * `getFadingTiers()` so independent agent tiers are retained.
+   */
+  getFadingTier(): t.FadingTier | undefined {
+    return this.fadingTier == null ? undefined : { ...this.fadingTier };
+  }
+
+  /** Returns a defensive snapshot of latched tiers keyed by agent ID. */
+  getFadingTiers(): t.FadingTiers {
+    return Object.fromEntries(
+      Object.entries(this.fadingTiers).map(([agentId, tier]) => [
+        agentId,
+        { ...tier },
+      ])
+    );
+  }
+
+  /** Agent IDs whose canonical history was compacted during this run. */
+  getFadingTierResetAgentIds(): string[] {
+    return [...this.fadingTierResetAgentIds];
+  }
+
+  /** Whether the default agent compacted canonical history during this run. */
+  didResetFadingTier(): boolean {
+    return this.fadingTierReset;
   }
 
   getResolvedInstructionOverhead(): number | undefined {
@@ -1761,6 +1809,10 @@ export class Run<_T extends t.BaseGraphState> {
         : undefined;
 
       this.calibrationRatio = this.Graph.getCalibrationRatio();
+      this.fadingTier = this.Graph.getFadingTier();
+      this.fadingTiers = this.Graph.getFadingTiers();
+      this.fadingTierReset = this.Graph.didResetFadingTier();
+      this.fadingTierResetAgentIds = this.Graph.getFadingTierResetAgentIds();
 
       /**
        * Skip `clearHeavyState()` when the run paused on a clean HITL

@@ -384,6 +384,92 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
     expect(alignedCacheRead).toBeGreaterThan(0);
   }, 180_000);
 
+  test('fresh runs reuse a persisted fading tier without mutating canonical tool history', async () => {
+    const tokenCounter = await createTokenCounter();
+    const largeToolResult = `BEGIN-LIVE-PAYLOAD\n${'stable provider payload '.repeat(
+      3000
+    )}\nEND-LIVE-PAYLOAD`;
+    const buildHistory = (): BaseMessage[] => [
+      new HumanMessage('Inspect the synthetic provider payload.'),
+      new AIMessage({
+        content: 'I inspected the payload.',
+        tool_calls: [
+          {
+            id: 'live_fading_tool_call',
+            name: 'inspect_payload',
+            args: { source: 'live-regression' },
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: largeToolResult,
+        tool_call_id: 'live_fading_tool_call',
+        name: 'inspect_payload',
+      }),
+      new AIMessage('The inspection completed successfully.'),
+      new HumanMessage('Reply with exactly OK.'),
+    ];
+    const executeRun = async (
+      history: BaseMessage[],
+      fadingTier?: t.FadingTier,
+      calibrationRatio?: number
+    ): Promise<Run<t.IState>> => {
+      const run = await Run.create<t.IState>({
+        runId: `anthropic-live-fading-${Date.now()}-${Math.random()}`,
+        graphConfig: {
+          type: 'standard',
+          llmConfig: {
+            ...getLLMConfig(Providers.ANTHROPIC),
+            model: 'claude-haiku-4-5',
+            streaming: false,
+            maxTokens: 32,
+            temperature: 0,
+          },
+          tools: [],
+          instructions: 'Reply with exactly OK and do not call tools.',
+          maxContextTokens: 4000,
+          summarizationEnabled: false,
+        },
+        returnContent: true,
+        tokenCounter,
+        indexTokenCountMap: buildIndexTokenCountMap(history, tokenCounter),
+        fadingTier,
+        fadingTiers:
+          fadingTier == null ? undefined : { default: fadingTier },
+        calibrationRatio,
+      });
+      await run.processStream(
+        { messages: history },
+        {
+          configurable: { thread_id: run.id },
+          recursionLimit: 10,
+          streamMode: 'values',
+          version: 'v2',
+        } as any
+      );
+      expect(run.getRunMessages()?.length ?? 0).toBeGreaterThan(0);
+      return run;
+    };
+
+    const firstHistory = buildHistory();
+    const firstRun = await executeRun(firstHistory);
+    const firstTier = firstRun.getFadingTier();
+
+    expect(firstHistory[2].content).toBe(largeToolResult);
+    expect(firstTier?.latched).toBe(true);
+    expect(firstTier?.masked).toBe(true);
+
+    const secondHistory = buildHistory();
+    const secondRun = await executeRun(
+      secondHistory,
+      firstTier,
+      firstRun.getCalibrationRatio()
+    );
+
+    expect(secondHistory[2].content).toBe(largeToolResult);
+    expect(secondRun.getFadingTier()).toEqual(firstTier);
+  }, 180_000);
+
   test('heavy multi-turn with tool calls triggers and survives summarization', async () => {
     const spies = createSpies();
     let collectedUsage: UsageMetadata[] = [];

@@ -1,4 +1,4 @@
-import { AIMessage, HumanMessage } from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { projectAgentContextUsage } from '../projection';
 import { Providers } from '@/common';
@@ -95,6 +95,43 @@ describe('projectAgentContextUsage', () => {
 
     expect(withExecution!.breakdown.instructionTokens).toBeGreaterThan(
       withoutExecution!.breakdown.instructionTokens
+    );
+  });
+
+  it('applies a persisted fading tier to the projected branch', async () => {
+    const messages = [
+      new HumanMessage('fetch the report'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call-1', name: 'fetch', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'x'.repeat(60_000),
+        tool_call_id: 'call-1',
+      }),
+      new AIMessage('report received'),
+    ];
+    const withoutTier = await projectAgentContextUsage({
+      agent: agent(100_000),
+      messages,
+      tokenCounter: countByChars,
+    });
+    const withTier = await projectAgentContextUsage({
+      agent: agent(100_000),
+      messages,
+      tokenCounter: countByChars,
+      fadingTier: {
+        v: 1,
+        budgetTokens: 10_000,
+        masked: true,
+        latched: true,
+      },
+    });
+
+    expect(withTier!.remainingContextTokens).toBeGreaterThan(
+      withoutTier!.remainingContextTokens!
     );
   });
 });

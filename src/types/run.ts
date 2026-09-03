@@ -338,6 +338,16 @@ export type RunConfig = {
    * conversation. Without this, the EMA resets to 1 on every new Run instance.
    */
   calibrationRatio?: number;
+  /**
+   * Default-agent fading tier retained for single-agent compatibility. New
+   * multi-agent integrations should use `fadingTiers`.
+   */
+  fadingTier?: g.FadingTier | null;
+  /**
+   * Context-fading tiers keyed by agent ID. Multi-agent hosts should persist
+   * the value returned by `Run.getFadingTiers()` and pass it back here.
+   */
+  fadingTiers?: g.FadingTiers | null;
   /** Skip post-stream cleanup (clearHeavyState) — useful for tests that inspect graph state after processStream */
   skipCleanup?: boolean;
   /**

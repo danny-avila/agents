@@ -1,10 +1,15 @@
 /* eslint-disable no-console */
 import { RunnableLambda } from '@langchain/core/runnables';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import {
+  HumanMessage,
+  SystemMessage,
+  coerceMessageLikeToMessage,
+} from '@langchain/core/messages';
 import type {
   UsageMetadata,
   BaseMessage,
   BaseMessageFields,
+  BaseMessageLike,
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ExactTokenCountCache } from '@/llm/contextPressureMeter';
@@ -271,10 +276,22 @@ export class AgentContext {
   deferredToolNames: string[] = [];
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
   calibrationRatio: number = 1;
+  /** Latched context-fading tier from the pruner — persisted across runs via contextMeta. */
+  fadingTier?: t.FadingTier;
   /** Provider-observed instruction overhead from the pruner's best-variance turn. */
   resolvedInstructionOverhead?: number;
   private _pendingOriginalToolContent?: Map<number, string>;
   private pendingOriginalToolContentChars = 0;
+  /** Provider-bound projection for this Run; graph messages remain canonical. */
+  private providerProjectedMessages?: BaseMessage[];
+  /** Canonical object identities corresponding to the projected slots. */
+  private providerProjectionSources?: BaseMessage[];
+  /** Canonical messages by ID, used to distinguish identity replay from replacement. */
+  private providerProjectionSourcesById?: Map<string, BaseMessage>;
+  /** Conservative counts retained by canonical identity across a rebuild. */
+  private providerProjectionRecountFloors?: WeakMap<BaseMessage, number>;
+  /** Recount after discarding a projection whose token map contains capped sizes. */
+  private providerProjectionRequiresRecount = false;
   /** Pre-masking tool content keyed by message index, consumed by the summarize node. */
   get pendingOriginalToolContent(): Map<number, string> | undefined {
     return this._pendingOriginalToolContent;
@@ -390,6 +407,8 @@ export class AgentContext {
   private durableSummaryPrecedesMessages: boolean = false;
   /** Number of summarization cycles that have occurred for this agent context */
   private _summaryVersion: number = 0;
+  /** Whether this run compacted canonical history and reset its fading tier. */
+  private _fadingTierReset: boolean = false;
   /**
    * Message count at the time summarization was last triggered.
    * Used to prevent re-summarizing the same unchanged message set.
@@ -1214,6 +1233,7 @@ export class AgentContext {
    * Reset context for a new run
    */
   reset(options?: { preserveOriginalToolContent?: boolean }): void {
+    this._fadingTierReset = false;
     this.systemMessageTokens = 0;
     this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;
@@ -1225,6 +1245,7 @@ export class AgentContext {
     this.indexTokenCountMap = { ...this.baseIndexTokenCountMap };
     this.currentUsage = undefined;
     this.pruneMessages = undefined;
+    this.clearProviderProjection(false);
     this.lastStreamCall = undefined;
     this.tokenTypeSwitch = undefined;
     this.reasoningTransitionCount = 0;
@@ -1509,9 +1530,12 @@ export class AgentContext {
     this._durableSummaryTokenCount = tokenCount;
     this.durableSummaryPrecedesMessages = this.summaryPrecedesMessages;
     this._summaryVersion += 1;
+    this._fadingTierReset = true;
     this._summarizationFailures = 0;
     this.systemRunnableStale = true;
     this.pruneMessages = undefined;
+    this.fadingTier = undefined;
+    this.clearProviderProjection(false);
   }
 
   /** Sets a cross-run summary that is injected into the system prompt. */
@@ -1525,6 +1549,9 @@ export class AgentContext {
     this.durableSummaryPrecedesMessages = false;
     this._summaryVersion += 1;
     this.systemRunnableStale = true;
+    this.pruneMessages = undefined;
+    this.fadingTier = undefined;
+    this.clearProviderProjection(false);
   }
 
   /**
@@ -1556,6 +1583,10 @@ export class AgentContext {
 
   get summaryVersion(): number {
     return this._summaryVersion;
+  }
+
+  get fadingTierReset(): boolean {
+    return this._fadingTierReset;
   }
 
   /**
@@ -1678,12 +1709,154 @@ export class AgentContext {
       this.maxContextTokens = budgetTokens;
     }
     this.pruneMessages = undefined;
+    this.clearProviderProjection(true);
     this._lastSummarizationMsgCount = 0;
     this._lastOverflowPromptTokens =
       promptTokens != null
         ? this.normalizePromptTokens(promptTokens)
         : promptTokens;
     this._overflowRecoveryAttempts += 1;
+  }
+
+  /**
+   * Returns the mutable provider projection for this Run while preserving the
+   * graph-owned messages as the canonical history. Appends are synchronized
+   * incrementally so the pruner's watermarks remain valid. Any rewritten or
+   * compacted canonical prefix starts a fresh projection and pruner.
+   */
+  getProviderProjectedMessages(messages: BaseMessage[]): BaseMessage[] {
+    const sources = this.providerProjectionSources;
+    let projection = this.providerProjectedMessages;
+    const priorLength = sources?.length ?? 0;
+    const prefixChanged =
+      sources != null &&
+      (messages.length < sources.length ||
+        (messages.length === priorLength
+          ? sources.some((source, index) => messages[index] !== source)
+          : priorLength > 0 &&
+            messages[priorLength - 1] !== sources[priorLength - 1]));
+
+    if (projection == null || sources == null || prefixChanged) {
+      if (prefixChanged) {
+        this.pruneMessages = undefined;
+        /** The originals map is keyed by index; a rewritten prefix would let
+         * the summarizer restore one tool's bytes onto another message. */
+        this.pendingOriginalToolContent = undefined;
+        this.prepareProviderProjectionRecount(sources);
+      }
+      projection = messages.map((message) =>
+        Array.isArray(message.content)
+          ? cloneMessage(message, [...message.content])
+          : message
+      );
+      this.providerProjectedMessages = projection;
+      this.providerProjectionSources = [...messages];
+      this.providerProjectionSourcesById = new Map(
+        messages.flatMap((message) =>
+          message.id == null ? [] : [[message.id, message] as const]
+        )
+      );
+      if (this.providerProjectionRequiresRecount && this.tokenCounter != null) {
+        const recounted: Record<string, number> = {};
+        for (let i = 0; i < messages.length; i++) {
+          const localCount = this.tokenCounter(messages[i]);
+          const conservativeFloor =
+            this.providerProjectionRecountFloors?.get(messages[i]);
+          recounted[i] =
+            conservativeFloor == null
+              ? localCount
+              : Math.max(localCount, conservativeFloor);
+        }
+        this.indexTokenCountMap = recounted;
+        this.providerProjectionRequiresRecount = false;
+        this.providerProjectionRecountFloors = undefined;
+      }
+      return projection;
+    }
+
+    for (let i = sources.length; i < messages.length; i++) {
+      const message = messages[i];
+      sources.push(message);
+      if (message.id != null) {
+        this.providerProjectionSourcesById?.set(message.id, message);
+      }
+      projection.push(
+        Array.isArray(message.content)
+          ? cloneMessage(message, [...message.content])
+          : message
+      );
+    }
+    return projection;
+  }
+
+  /**
+   * Invalidates the provider projection when a graph reducer update rewrites
+   * canonical history. Reducer updates expose replacements and removals before
+   * they are folded into a potentially longer array, avoiding a prefix scan on
+   * the normal append-only path.
+   */
+  invalidateProviderProjectionForMessageUpdates(
+    updates:
+      | BaseMessage
+      | BaseMessageLike
+      | Array<BaseMessage | BaseMessageLike | null | undefined>
+      | null
+      | undefined
+  ): void {
+    if (this.providerProjectionSources == null) {
+      return;
+    }
+    const updateList = (Array.isArray(updates) ? updates : [updates]) as Array<
+      BaseMessageLike | null | undefined
+    >;
+    for (const rawUpdate of updateList) {
+      if (rawUpdate == null) {
+        continue;
+      }
+      const update = coerceMessageLikeToMessage(rawUpdate);
+      const priorSource =
+        update.id == null
+          ? undefined
+          : this.providerProjectionSourcesById?.get(update.id);
+      if (
+        update.getType() === 'remove' ||
+        (priorSource != null && priorSource !== update)
+      ) {
+        this.pruneMessages = undefined;
+        this.pendingOriginalToolContent = undefined;
+        this.clearProviderProjection(true);
+        return;
+      }
+    }
+  }
+
+  private clearProviderProjection(recountOnNextUse: boolean): void {
+    if (recountOnNextUse) {
+      this.prepareProviderProjectionRecount(this.providerProjectionSources);
+    } else {
+      this.providerProjectionRequiresRecount = false;
+      this.providerProjectionRecountFloors = undefined;
+    }
+    this.providerProjectedMessages = undefined;
+    this.providerProjectionSources = undefined;
+    this.providerProjectionSourcesById = undefined;
+  }
+
+  private prepareProviderProjectionRecount(
+    sources: BaseMessage[] | undefined
+  ): void {
+    this.providerProjectionRequiresRecount = true;
+    if (sources == null) {
+      return;
+    }
+    const floors = new WeakMap<BaseMessage, number>();
+    for (let i = 0; i < sources.length; i++) {
+      const count = this.indexTokenCountMap[i];
+      if (count != null && Number.isFinite(count) && count >= 0) {
+        floors.set(sources[i], count);
+      }
+    }
+    this.providerProjectionRecountFloors = floors;
   }
 
   /** Applies token calibration only when the observation came from this provider. */
@@ -1904,6 +2077,7 @@ export class AgentContext {
       summarizationEnabled: this.summarizationEnabled,
       reserveRatio: this.summarizationConfig?.reserveRatio,
       calibrationRatio: opts?.calibrationRatio ?? this.calibrationRatio,
+      fadingTier: this.fadingTier,
       getInstructionTokens: () => this.instructionTokens,
     });
     const {
