@@ -220,6 +220,14 @@ const OUTPUT_LIMIT_RE =
   /max_?(?:completion_?)?tokens\s*(?:must be|is too|cannot|exceeds|too large|greater than)|maximum number of output tokens|max_tokens.*less than or equal/i;
 
 /**
+ * A gateway can report this disjunction without saying whether the prompt or
+ * requested output caused the rejection. Compaction is unsafe in that case:
+ * shrinking a healthy prompt cannot fix an invalid output allowance.
+ */
+const AMBIGUOUS_CONTEXT_OR_OUTPUT_RE =
+  /(?:context window[\s\S]{0,80}\bor\b[\s\S]{0,80}max(?:imum)? output|max(?:imum)? output[\s\S]{0,80}\bor\b[\s\S]{0,80}context window)/i;
+
+/**
  * Recovers the input-only figure from providers that quote a combined total
  * and then break it down — OpenRouter's "(56811 of text input, 16 in the
  * output)" and DeepSeek's "(1179652 in the messages, 16 in the completion)".
@@ -441,6 +449,10 @@ export function getContextOverflowInfo(
     return null;
   }
 
+  if (AMBIGUOUS_CONTEXT_OR_OUTPUT_RE.test(haystack)) {
+    return null;
+  }
+
   if (OUTPUT_LIMIT_RE.test(haystack)) {
     return null;
   }
@@ -525,7 +537,11 @@ export function isLikelyContextOverflowError(
     return true;
   }
   const haystack = stripUrls(collectErrorText(error));
-  if (haystack === '' || OUTPUT_LIMIT_RE.test(haystack)) {
+  if (
+    haystack === '' ||
+    AMBIGUOUS_CONTEXT_OR_OUTPUT_RE.test(haystack) ||
+    OUTPUT_LIMIT_RE.test(haystack)
+  ) {
     return false;
   }
   if (NON_RECOVERABLE_RE.test(haystack)) {

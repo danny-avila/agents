@@ -66,6 +66,30 @@ describe('getContextOverflowInfo — errors compaction cannot fix', () => {
     expect(getContextOverflowInfo(undefined)).toBeNull();
     expect(getContextOverflowInfo(null)).toBeNull();
   });
+
+  it('does not compact when a gateway cannot distinguish context from output', () => {
+    const error = new Error(
+      'request exceeds the context window or max output of every backend'
+    );
+
+    for (const estimatedPromptTokens of [34, 800_000]) {
+      expect(
+        getContextOverflowInfo(error, {
+          provider: Providers.ANTHROPIC,
+          estimatedPromptTokens,
+          maxContextTokens: 828_400,
+        })
+      ).toBeNull();
+    }
+
+    expect(
+      isLikelyContextOverflowError(
+        new Error(
+          'token count exceeds the context window or max output of every backend'
+        )
+      )
+    ).toBe(false);
+  });
 });
 
 describe('token-bucket rejections', () => {
