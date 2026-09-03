@@ -965,42 +965,47 @@ function convertFromV1ToChatBedrockConverseMessage(
 function convertHumanMessageToConverseMessage(
   msg: BaseMessage
 ): BedrockMessage {
-  const userMessage: BedrockMessage = {
-    role: 'user',
-    content: [],
-  };
+  const contentBlocks: BedrockContentBlock[] = [];
 
   if (typeof msg.content === 'string') {
-    userMessage.content = isBlankText(msg.content)
-      ? []
-      : [{ text: msg.content }];
+    appendSerializableBedrockTextBlock(contentBlocks, msg.content);
   } else if (Array.isArray(msg.content)) {
-    userMessage.content = msg.content
-      .map((block) =>
+    // One pass. Text goes through the serializer, which drops a blank block and folds
+    // whitespace-only text into the preceding text block so prose spacing survives;
+    // every other block converts inline.
+    for (const block of msg.content) {
+      if (typeof block === 'string') {
+        appendSerializableBedrockTextBlock(contentBlocks, block);
+        continue;
+      }
+      if (
+        typeof block === 'object' &&
+        block != null &&
+        block.type === 'text' &&
+        typeof (block as { text?: unknown }).text === 'string'
+      ) {
+        appendSerializableBedrockTextBlock(
+          contentBlocks,
+          (block as { text: string }).text
+        );
+        continue;
+      }
+      contentBlocks.push(
         convertLangChainContentBlockToConverseContentBlock({ block })
-      )
-      .filter((block) => !isBlankTextBlock(block));
+      );
+    }
   }
 
   // Bedrock rejects a blank text block and an empty user message alike
   // (`The text field in the ContentBlock object at messages.N.content.0 is blank`),
   // and the rejection fences the whole conversation on every retry. A promptless send
   // — attachment, no typed text — reaches here as exactly that shape. Mirror the
-  // assistant path: drop the blank, and fall back to the placeholder if nothing remains.
-  if (userMessage.content == null || userMessage.content.length === 0) {
-    userMessage.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
+  // assistant path: fall back to the placeholder if nothing serializable remains.
+  if (contentBlocks.length === 0) {
+    contentBlocks.push({ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER });
   }
 
-  return userMessage;
-}
-
-function isBlankText(text: string): boolean {
-  return text.trim() === '';
-}
-
-function isBlankTextBlock(block: BedrockContentBlock): boolean {
-  const text = (block as { text?: unknown }).text;
-  return typeof text === 'string' && isBlankText(text);
+  return { role: 'user', content: contentBlocks };
 }
 
 /**

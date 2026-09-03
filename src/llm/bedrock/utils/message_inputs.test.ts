@@ -688,6 +688,22 @@ describe('convertToConverseMessages — blank user content', () => {
     expect(content.some((block) => 'text' in block)).toBe(false);
   });
 
+  it('folds whitespace-only text into the preceding block instead of dropping it', () => {
+    const { converseMessages } = convertToConverseMessages([
+      new HumanMessage({
+        content: [
+          { type: 'text', text: 'hello' },
+          { type: 'text', text: ' ' },
+          { type: 'text', text: 'world' },
+        ],
+      }),
+    ]);
+    expect(converseMessages[0]).toEqual({
+      role: 'user',
+      content: [{ text: 'hello ' }, { text: 'world' }],
+    });
+  });
+
   it('keeps non-blank user text unchanged', () => {
     const { converseMessages } = convertToConverseMessages([
       new HumanMessage('hello'),
