@@ -83,9 +83,15 @@ export type ManagedRequestOptions = {
   safety_identifier?: string;
   /**
    * Declares that this client talks to the first-party OpenAI or Azure surface.
-   * Gates the model-specific request constraints documented only for it —
-   * currently GPT-6 Astra's Responses-only tool calls, rejected sampling
-   * parameters, and unsupported reasoning efforts — and defaults to off.
+   * Gates the model-specific request *shaping* documented only for it —
+   * currently GPT-6 Astra's rejected sampling and logprob parameters, its
+   * unsupported reasoning efforts, and the encrypted reasoning it supports —
+   * and defaults to off.
+   *
+   * Shaping only. Which API serves the turn is not decided here: GPT-6 Astra
+   * serves tool calls only from the Responses API, and a caller wanting them
+   * must select it with `useResponsesApi`, alongside the rest of the request
+   * shaping that depends on which API is in use.
    *
    * Declared rather than inferred from a base URL: only the caller knows
    * whether a URL is a faithful first-party route, a gateway, or a proxy with

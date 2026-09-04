@@ -1260,9 +1260,13 @@ function getGatedReasoningParams(
   model: string,
   astraRulesApply: boolean,
   baseReasoning: OpenAIClient.Reasoning | undefined,
-  options?: ReasoningCallOptions
+  options?: ReasoningCallOptions,
+  servedModel?: string
 ): OpenAIClient.Reasoning | undefined {
-  if (!isReasoningModel(model)) {
+  // Azure addresses a deployment, so `model` can be an alias that no model
+  // pattern recognizes. Resolve against what the deployment actually serves,
+  // or this returns before the Astra effort substitution ever runs.
+  if (!isReasoningModel(servedModel ?? model)) {
     return;
   }
   return getReasoningParams(astraRulesApply, baseReasoning, options);
@@ -2497,7 +2501,8 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
       this.model,
       this.astraRulesApply,
       this.reasoning,
-      options
+      options,
+      this.servedModel
     );
   }
 
@@ -2735,7 +2740,8 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       this.model,
       this.astraRulesApply,
       this.reasoning,
-      options
+      options,
+      this.servedModel
     );
   }
 
@@ -2964,7 +2970,8 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
       this.model,
       this.astraRulesApply,
       this.reasoning,
-      options
+      options,
+      this.servedModel
     );
   }
 

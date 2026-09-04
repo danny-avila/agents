@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 
 import {
+  AzureChatOpenAI,
   ChatOpenAI,
   addChatCacheBreakpoints,
   addResponseCacheBreakpoints,
@@ -424,6 +425,26 @@ describe('GPT-6 Astra request constraints', () => {
     } as never) as Record<string, unknown>;
     expect(params.temperature).toBe(0.7);
     expect(params.reasoning_effort).toBe('none');
+  });
+
+  it('substitutes effort on an Azure deployment alias serving Astra', () => {
+    /**
+     * Only the Azure delegates run the reasoning-model guard, which resolves a
+     * model pattern before any Astra handling. A deployment alias matches no
+     * pattern, so without the served model it returns early and the effort is
+     * dropped rather than substituted.
+     */
+    const azure = new AzureChatOpenAI({
+      azureOpenAIApiKey: 'test',
+      azureOpenAIApiDeploymentName: 'my-astra-deployment',
+      azureOpenAIApiVersion: '2024-08-01-preview',
+      firstPartyEndpoint: true,
+      servedModel: 'gpt-6-astra',
+    });
+    const params = azure.invocationParams({
+      reasoningEffort: 'none',
+    } as never) as Record<string, unknown>;
+    expect(params.reasoning_effort).toBe('low');
   });
 
   it('leaves other models untouched', () => {
