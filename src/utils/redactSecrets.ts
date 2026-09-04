@@ -33,23 +33,34 @@ function redactUrlCredentials(value: string): string {
 
 /** Credential shapes that survive key-name redaction because they live inside
  * free text — an error message, a stack frame, or a rejected request's body
- * echoing the header that was sent. Deliberately shape-based rather than
- * keyword-based: prose naming a secret ("failed to load secret signing-key") is
- * the operator's main clue and must survive. */
+ * echoing the header that was sent. Every pattern is deliberately shape-based
+ * rather than "a word containing `key`": prose that merely NAMES a secret
+ * ("failed to load secret signing-key") is the operator's main clue and must
+ * survive, and an unanchored keyword scan backtracks catastrophically on a long
+ * body. Each alternation is literal and each quantifier owns a disjoint
+ * character class, so matching stays linear in the length of the input.
+ *
+ * A whole header line is redacted rather than its scheme's payload, since
+ * `Digest` and `Cookie` carry credentials across a parameter list instead of one
+ * opaque blob. Replacements never emit a character a value pattern can start
+ * with, which keeps redaction idempotent under repeated passes. */
+const AUTH_HEADER_RE =
+  /\b(authorization|proxy-authorization|set-cookie|cookie)(\s*:\s*)[^\r\n]*/gi;
 const AUTH_SCHEME_RE =
-  /\b(Bearer|Basic|Digest|Token)\s+[A-Za-z0-9\-._~+/]{8,}={0,2}/gi;
+  /\b(Bearer|Basic|Token)\s+[A-Za-z0-9\-._~+/]{8,}={0,2}/gi;
 const JWT_RE = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]+/g;
 const EMBEDDED_URL_CREDENTIALS_RE =
-  /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi;
+  /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+(?::[^\s/@]+)?@/gi;
 const CREDENTIAL_ASSIGNMENT_RE =
-  /("?[A-Za-z0-9_-]*(?:key|token|secret|credential|password|signature|auth)[A-Za-z0-9_-]*"?\s*[=:]\s*)"?[^\s,;&"'}\])]+"?/gi;
+  /\b((?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|client[_-]?secret|authorization|credential|password|passwd|signature|secret|cookie|token|key)"?\s*[=:]\s*)("?)[^\s,;&"'}\])[]+/gi;
 
 export function redactSecretText(value: string): string {
   return value
+    .replace(AUTH_HEADER_RE, `$1$2${REDACTED_VALUE}`)
     .replace(EMBEDDED_URL_CREDENTIALS_RE, `$1${REDACTED_VALUE}@`)
     .replace(AUTH_SCHEME_RE, `$1 ${REDACTED_VALUE}`)
     .replace(JWT_RE, REDACTED_VALUE)
-    .replace(CREDENTIAL_ASSIGNMENT_RE, `$1${REDACTED_VALUE}`);
+    .replace(CREDENTIAL_ASSIGNMENT_RE, `$1$2${REDACTED_VALUE}`);
 }
 
 /** Recursively removes credentials from structured diagnostic payloads. */

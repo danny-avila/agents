@@ -85,4 +85,55 @@ describe('redactSecrets', () => {
 
     expect(redactSecrets(value)).toEqual(value);
   });
+
+  it('redacts a whole credential-bearing header line, parameter lists included', () => {
+    const value = {
+      body: [
+        'Authorization: Digest username="Mufasa", realm="x", nonce="dcd98", response="6629fae49393a05397450978507c4ef1"',
+        'Cookie: session=abcdef123456',
+        'X-Request-Id: req-42',
+      ].join('\n'),
+    };
+
+    const serialized = JSON.stringify(redactSecrets(value));
+
+    expect(serialized).not.toContain('Mufasa');
+    expect(serialized).not.toContain('6629fae49393a05397450978507c4ef1');
+    expect(serialized).not.toContain('abcdef123456');
+    expect(serialized).toContain('X-Request-Id: req-42');
+  });
+
+  it('redacts a username-only credential in an embedded URL', () => {
+    const value = {
+      message: 'request to https://live-token@example.com/private failed',
+    };
+
+    const serialized = JSON.stringify(redactSecrets(value));
+
+    expect(serialized).not.toContain('live-token');
+    expect(serialized).toContain('example.com/private');
+  });
+
+  it('leaves an already-redacted payload unchanged', () => {
+    const value = {
+      body: '{"error":"unauthorized","token":"abc123def456","status":401}',
+      message: 'Authorization: Bearer sk-live-abcdef123456 rejected',
+    };
+
+    const once = redactSecrets(value) as typeof value;
+
+    expect(redactSecrets(once)).toEqual(once);
+    expect(once.body).toContain('"status":401');
+    expect(once.body).not.toContain('abc123def456');
+  });
+
+  it('scans a large body in linear time', () => {
+    const body = 'akey'.repeat(50_000);
+
+    const started = process.hrtime.bigint();
+    redactSecrets({ body });
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+    expect(elapsedMs).toBeLessThan(250);
+  });
 });
