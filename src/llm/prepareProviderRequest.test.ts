@@ -45,7 +45,7 @@ describe('prepareProviderRequest', () => {
     ['CSV', 'csv'],
     ['XLSX', 'xlsx'],
   ])(
-    'removes a persisted Bedrock %s block for OpenAI while retaining extracted file context',
+    'recovers an existing Bedrock %s chat after its agent moves to an OpenAI-compatible endpoint',
     (_label, format) => {
       const { model } = createCapturingModel();
       const document = {
@@ -65,12 +65,19 @@ describe('prepareProviderRequest', () => {
         ],
       });
 
+      const bedrockRequest = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [source],
+        provider: Providers.BEDROCK,
+      });
       const request = prepareProviderRequest({
         model: model as t.ChatModel,
         messages: [source],
         provider: Providers.OPENAI,
       });
 
+      expect(bedrockRequest.messages[0]).toBe(source);
+      expect(bedrockRequest.messages[0].content[1]).toBe(document);
       expect(request.messages[0]).not.toBe(source);
       expect(request.messages[0].content).toEqual([
         { type: 'text', text: 'Attached document(s):\ncol1\nvalue' },
