@@ -239,6 +239,10 @@ export function formatResultsForLLM(
 
   const references: t.ResultReference[] = [];
 
+  if (results.error != null && results.error !== '') {
+    outputLines.push(`Search failed: ${results.error}`);
+  }
+
   // Organic (web) results
   if (results.organic?.length != null && results.organic.length > 0) {
     addSection(`Web Results, Turn ${turn}`);
