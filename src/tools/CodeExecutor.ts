@@ -2,7 +2,13 @@ import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
+import type { Readable } from 'node:stream';
+import type { CodeApiMethod } from '@/tools/diagnostics';
 import type * as t from '@/types';
+import {
+  describeCodeApiError,
+  logCodeApiDiagnostic,
+} from '@/tools/diagnostics';
 import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
@@ -119,8 +125,7 @@ export const CodeExecutionToolSchema = {
   required: ['lang', 'code'],
 } as const;
 
-export const CODE_API_EXPECTED_PROFILE_HEADER =
-  'X-CodeAPI-Expected-Profile';
+export const CODE_API_EXPECTED_PROFILE_HEADER = 'X-CodeAPI-Expected-Profile';
 
 type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
@@ -221,7 +226,8 @@ export function buildCodeApiExecutionErrorMessage(response: {
 }
 
 export async function resolveCodeApiAuthHeaders(
-  authHeaders?: t.CodeApiAuthHeaders
+  authHeaders?: t.CodeApiAuthHeaders,
+  options?: { recoverable?: boolean }
 ): Promise<t.CodeApiAuthHeaderMap> {
   if (authHeaders == null) {
     return {};
@@ -230,7 +236,15 @@ export async function resolveCodeApiAuthHeaders(
     try {
       const resolvedHeaders = await authHeaders();
       return resolvedHeaders;
-    } catch {
+    } catch (error) {
+      if (options?.recoverable !== true) {
+        logCodeApiDiagnostic(
+          'CodeExecutor',
+          'error',
+          'auth header resolution failed; the Code API request was never sent',
+          describeCodeApiError(error)
+        );
+      }
       throw new CodeApiRequestError(CODE_API_AUTHORIZATION_ERROR_MESSAGE);
     }
   }
@@ -250,18 +264,73 @@ export function addCodeApiExecutionProfileHeader(
   };
 }
 
-export async function buildCodeApiHttpErrorMessage(
-  _method: string,
-  _endpoint: string,
-  response: { status: number; text: () => Promise<string> }
-): Promise<string> {
-  let responseBody = '';
+type CodeApiErrorResponse = {
+  status: number;
+  text: () => Promise<string>;
+  /** node-fetch types this as `NodeJS.ReadableStream`, which does not declare
+   * `destroy`; every runtime instance is a `Readable`, and a test double may
+   * supply nothing at all. */
+  body?: NodeJS.ReadableStream | null;
+};
+
+/**
+ * Only the 429 branch reads the body, and node-fetch keeps the stream and its
+ * socket alive until something does. Repeated backend failures would otherwise
+ * accumulate connections holding payloads this module deliberately discards.
+ */
+function discardResponseBody(response: CodeApiErrorResponse): void {
+  const body = response.body;
+  if (body == null || !('destroy' in body)) {
+    return;
+  }
+  const destroy = (body as NodeJS.ReadableStream & Partial<Readable>).destroy;
+  if (typeof destroy !== 'function') {
+    return;
+  }
   try {
-    responseBody = await response.text();
+    destroy.call(body);
   } catch {
-    responseBody = '';
+    /* Already finished or not destroyable; nothing is being held open. */
+  }
+}
+
+export async function buildCodeApiHttpErrorMessage(
+  method: CodeApiMethod,
+  _endpoint: string,
+  response: CodeApiErrorResponse,
+  options?: { recoverable?: boolean; profile?: t.CodeApiExecutionProfile }
+): Promise<string> {
+  /* Logged before the body is touched. A non-OK response can leave a chunked
+     body open, and there is no read timeout here, so draining first would
+     withhold the diagnostic indefinitely for exactly the backend it identifies.
+     The body itself is never logged — it is upstream free text that can echo
+     the header that was sent — and the endpoint is host-configured, so the
+     backend is named by the profile this module chose rather than by its
+     address. A recoverable caller reports its own outcome; logging here too
+     would raise an error-level alert for a lookup that succeeds by returning
+     nothing. */
+  if (options?.recoverable !== true) {
+    logCodeApiDiagnostic(
+      'CodeExecutor',
+      response.status === 429 ? 'warn' : 'error',
+      'Code API rejected the request',
+      {
+        method,
+        profile: options?.profile ?? 'unset',
+        status: response.status,
+      }
+    );
+  }
+  if (response.status !== 429) {
+    discardResponseBody(response);
   }
   if (response.status === 429) {
+    let responseBody = '';
+    try {
+      responseBody = await response.text();
+    } catch {
+      responseBody = '';
+    }
     const retryAfterSeconds = getRetryAfterSeconds(responseBody);
     return retryAfterSeconds != null
       ? `Code execution is temporarily rate-limited. Retry after ${retryAfterSeconds} seconds.`
@@ -445,9 +514,11 @@ function createCodeExecutionTool(
         session_id.length > 0 &&
         !Array.isArray(postData.files)
       ) {
-        // eslint-disable-next-line no-console
-        console.debug(
-          `[CodeExecutor] No injected files for session_id=${session_id} — exec will run without input files`
+        logCodeApiDiagnostic(
+          'CodeExecutor',
+          'debug',
+          'session carried no injected files; exec will run without input files',
+          { files: 'none' }
         );
       }
 
@@ -474,7 +545,9 @@ function createCodeExecutionTool(
         const response = await fetch(execEndpoint, fetchOptions);
         if (!response.ok) {
           throw new CodeApiRequestError(
-            await buildCodeApiHttpErrorMessage('POST', execEndpoint, response)
+            await buildCodeApiHttpErrorMessage('POST', execEndpoint, response, {
+              profile: executionProfile,
+            })
           );
         }
 

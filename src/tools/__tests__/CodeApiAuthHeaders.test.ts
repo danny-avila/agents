@@ -1,5 +1,12 @@
 import fetch from 'node-fetch';
-import { beforeEach, describe, expect, it, jest } from '@jest/globals';
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  jest,
+} from '@jest/globals';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { RequestInit } from 'node-fetch';
 import type * as t from '@/types';
@@ -117,9 +124,19 @@ function toolMap(): t.ToolMap {
 }
 
 describe('CodeAPI auth header injection', () => {
+  let errorSpy: jest.SpiedFunction<typeof console.error>;
+  let warnSpy: jest.SpiedFunction<typeof console.warn>;
+
   beforeEach(() => {
     fetchMock.mockReset();
     fetchMock.mockResolvedValue(completedResponse());
+    errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
   });
 
   it('resolves static and dynamic auth header params', async () => {
@@ -185,6 +202,63 @@ describe('CodeAPI auth header injection', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('logs which branch failed and the code path, never the error text', async () => {
+    const authHeaders = jest.fn(async () => {
+      throw new SyntaxError(
+        'Unexpected token \'M\', ..."d":MIIEvgIBAD"... is not valid JSON'
+      );
+    });
+    const tool = createCodeExecutionTool({ authHeaders });
+
+    const error = await tool
+      .invoke({ lang: 'py', code: 'print(1)' })
+      .catch((caught: unknown) => caught);
+
+    expect((error as Error).message).not.toContain('MIIEvgIBAD');
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const [logged, detail] = errorSpy.mock.calls[0];
+    expect(logged).toBe(
+      '[CodeExecutor] auth header resolution failed; the Code API request was never sent'
+    );
+    expect(detail).toEqual({ type: 'SyntaxError' });
+    expect(JSON.stringify(detail)).not.toContain('MIIEvgIBAD');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('classifies past an accessor trap, which it never reaches', async () => {
+    const hostile = new Proxy(new Error('boom'), {
+      get(): never {
+        throw new Error('accessor exploded');
+      },
+    });
+    const tool = createCodeExecutionTool({
+      authHeaders: () => Promise.reject(hostile),
+    });
+
+    await tool.invoke({ lang: 'py', code: 'print(1)' }).catch(() => undefined);
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls[0][1]).toEqual({ type: 'Error' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('still logs when classification itself throws', async () => {
+    const hostile = new Proxy(new Error('boom'), {
+      getPrototypeOf(): never {
+        throw new Error('prototype exploded');
+      },
+    });
+    const tool = createCodeExecutionTool({
+      authHeaders: () => Promise.reject(hostile),
+    });
+
+    await tool.invoke({ lang: 'py', code: 'print(1)' }).catch(() => undefined);
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls[0][1]).toEqual({ type: 'UndescribableError' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('forwards Authorization for direct code execution', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ session_id: 'session_123', stdout: '1\n' })
@@ -224,18 +298,12 @@ describe('CodeAPI auth header injection', () => {
       statefulSessions: true,
     });
 
-    await defaultTool.invoke(
-      { lang: 'py', code: 'print(1)' },
-      {
-        toolCall: { _runtime_session_hint: 'graph-wide-hint' },
-      } as unknown as RunnableConfig
-    );
-    await statefulTool.invoke(
-      { lang: 'py', code: 'print(1)' },
-      {
-        toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
-      } as unknown as RunnableConfig
-    );
+    await defaultTool.invoke({ lang: 'py', code: 'print(1)' }, {
+      toolCall: { _runtime_session_hint: 'graph-wide-hint' },
+    } as unknown as RunnableConfig);
+    await statefulTool.invoke({ lang: 'py', code: 'print(1)' }, {
+      toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
+    } as unknown as RunnableConfig);
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       'https://code-default.example.com/exec'
@@ -329,12 +397,9 @@ describe('CodeAPI auth header injection', () => {
       statefulSessions: true,
     });
 
-    await tool.invoke(
-      { command: 'echo 1' },
-      {
-        toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
-      } as unknown as RunnableConfig
-    );
+    await tool.invoke({ command: 'echo 1' }, {
+      toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
+    } as unknown as RunnableConfig);
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       'https://code-stateful.example.com/exec'
@@ -385,6 +450,266 @@ describe('CodeAPI auth header injection', () => {
       expect((error as Error).message).not.toContain('Invalid bearer token');
     }
   );
+
+  it.each([401, 403])(
+    'logs the status and authority behind the %s authorization error, never the body',
+    async (status) => {
+      fetchMock.mockResolvedValueOnce(
+        errorResponse(
+          status,
+          '{"received":"Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1In0.c2ln"}'
+        )
+      );
+      const tool = createBashExecutionTool({
+        baseUrl: 'https://gateway.example/v1',
+        executionProfile: 'stateful',
+      });
+
+      await tool.invoke({ command: 'echo 1' }).catch(() => undefined);
+
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const [logged, detail] = errorSpy.mock.calls[0];
+      expect(logged).toBe('[CodeExecutor] Code API rejected the request');
+      expect(detail).toEqual({
+        method: 'POST',
+        profile: 'stateful',
+        status,
+      });
+      expect(JSON.stringify(detail)).not.toContain('eyJhbGciOiJSUzI1NiJ9');
+    }
+  );
+
+  it('names the backend by profile, never by its configured address', async () => {
+    fetchMock.mockResolvedValueOnce(errorResponse(500, 'upstream exploded'));
+    const tool = createBashExecutionTool({
+      baseUrl: 'https://MIIEvgIBAD.gateway.example/t/MIIEvgIBAD/v1',
+    });
+
+    await tool.invoke({ command: 'echo 1' }).catch(() => undefined);
+
+    expect(errorSpy.mock.calls[0][1]).toEqual({
+      method: 'POST',
+      profile: 'unset',
+      status: 500,
+    });
+    expect(JSON.stringify(errorSpy.mock.calls[0][1])).not.toContain(
+      'MIIEvgIBAD'
+    );
+  });
+
+  it('classifies a failed session file lookup instead of quoting it', async () => {
+    const files = await fetchSessionFiles(
+      'https://gateway.example/v1',
+      'session_123',
+      undefined,
+      () => {
+        throw new SyntaxError(
+          'bad JWK ..."d":MIIEvgIBAD"... is not valid JSON'
+        );
+      }
+    );
+
+    expect(files).toEqual([]);
+    /* The resolver has already normalized the callback's SyntaxError into a
+       CodeApiRequestError by this point; the classification is deliberately
+       whatever reached the catch, never text quoted from it. */
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[ProgrammaticToolCalling] session file lookup failed; continuing without input files',
+      { type: 'Error' }
+    );
+    expect(JSON.stringify(warnSpy.mock.calls)).not.toContain('MIIEvgIBAD');
+    expect(JSON.stringify(warnSpy.mock.calls)).not.toContain('session_123');
+  });
+
+  it('carries no host text into any diagnostic, across every failure mode', async () => {
+    const secret = 'MIIEvgIBADANBgkqhkiG9w0BAQEF';
+    const debugSpy = jest
+      .spyOn(console, 'debug')
+      .mockImplementation(() => undefined);
+
+    const forged = new Error(`parse failed\n    at ${secret}`);
+    forged.name = secret;
+    await createCodeExecutionTool({
+      authHeaders: () => Promise.reject(forged),
+    })
+      .invoke({ lang: 'py', code: 'print(1)' })
+      .catch(() => undefined);
+
+    fetchMock.mockResolvedValueOnce(
+      errorResponse(401, `{"received":"Bearer ${secret}"}`)
+    );
+    await createBashExecutionTool({
+      baseUrl: `https://${secret}.gateway.example/t/${secret}/v1`,
+    })
+      .invoke({ command: 'echo 1' })
+      .catch(() => undefined);
+
+    await createCodeExecutionTool({ session_id: secret })
+      .invoke({ lang: 'py', code: 'print(1)' }, {
+        toolCall: { session_id: secret },
+      } as unknown as RunnableConfig)
+      .catch(() => undefined);
+
+    const logged = JSON.stringify([
+      errorSpy.mock.calls,
+      warnSpy.mock.calls,
+      debugSpy.mock.calls,
+    ]);
+    expect(logged).not.toContain(secret);
+    expect(logged).toContain('[CodeExecutor]');
+    debugSpy.mockRestore();
+  });
+
+  it('routes the bash programmatic executor through the same guard', async () => {
+    const debugSpy = jest
+      .spyOn(console, 'debug')
+      .mockImplementation(() => undefined);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ status: 'completed', session_id: 's', stdout: 'ok' })
+    );
+
+    await createBashProgrammaticToolCallingTool()
+      .invoke({ code: 'lookup_user "{}"' }, {
+        toolCall: {
+          name: 'bash_programmatic_code_execution',
+          args: {},
+          toolMap: toolMap(),
+          toolDefs,
+          session_id: 'MIIEvgIBADANBgkqhkiG9w0BAQEF',
+        },
+      } as unknown as RunnableConfig)
+      .catch(() => undefined);
+
+    expect(debugSpy).toHaveBeenCalledWith(
+      '[BashProgrammaticToolCalling] session carried no injected files; exec will run without input files',
+      { files: 'none' }
+    );
+    expect(JSON.stringify(debugSpy.mock.calls)).not.toContain('MIIEvgIBAD');
+    debugSpy.mockRestore();
+  });
+
+  it('discards a body it will never read, and keeps the one it will', async () => {
+    const destroy = jest.fn();
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      body: { destroy },
+      text: jest.fn(async () => ''),
+    });
+    await createBashExecutionTool()
+      .invoke({ command: 'echo 1' })
+      .catch(() => undefined);
+
+    expect(destroy).toHaveBeenCalledTimes(1);
+
+    const rateLimitedDestroy = jest.fn();
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 429,
+      body: { destroy: rateLimitedDestroy },
+      text: jest.fn(async () =>
+        JSON.stringify({ error: 'rate_limited', retry_after_seconds: 3 })
+      ),
+    });
+    const error = await createBashExecutionTool()
+      .invoke({ command: 'echo 1' })
+      .catch((caught: unknown) => caught);
+
+    expect(rateLimitedDestroy).not.toHaveBeenCalled();
+    expect((error as Error).message).toContain('Retry after 3 seconds');
+  });
+
+  it('logs the rejection before the response body is drained', async () => {
+    let releaseBody: (value: string) => void = () => undefined;
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      text: jest.fn(
+        () =>
+          new Promise<string>((resolve) => {
+            releaseBody = resolve;
+          })
+      ),
+    });
+    const tool = createBashExecutionTool({ executionProfile: 'default' });
+
+    const pending = tool.invoke({ command: 'echo 1' }).catch(() => undefined);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[CodeExecutor] Code API rejected the request',
+      { method: 'POST', profile: 'default', status: 503 }
+    );
+
+    releaseBody('');
+    await pending;
+  });
+
+  it.each([
+    [
+      'a writable name',
+      () => Object.assign(new Error('boom'), { name: 'MIIEvgIBAD' }),
+    ],
+    [
+      'a message that forges a stack frame',
+      () => new Error('failed\n    at MIIEvgIBAD'),
+    ],
+  ])('logs no host text from %s', async (_label, build) => {
+    const tool = createCodeExecutionTool({
+      authHeaders: () => Promise.reject(build()),
+    });
+
+    await tool.invoke({ lang: 'py', code: 'print(1)' }).catch(() => undefined);
+
+    expect(errorSpy.mock.calls[0][1]).toEqual({ type: 'Error' });
+    expect(JSON.stringify(errorSpy.mock.calls[0][1])).not.toContain(
+      'MIIEvgIBAD'
+    );
+  });
+
+  it('leaves a recoverable file lookup to report an auth failure once', async () => {
+    const files = await fetchSessionFiles(
+      'https://gateway.example/v1',
+      'session_123',
+      undefined,
+      () => {
+        throw new Error('signing key is not configured');
+      }
+    );
+
+    expect(files).toEqual([]);
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('leaves a recoverable file lookup to report its own outcome', async () => {
+    fetchMock.mockResolvedValueOnce(errorResponse(404, 'no such session'));
+
+    const files = await fetchSessionFiles(
+      'https://gateway.example/v1',
+      'session_123'
+    );
+
+    expect(files).toEqual([]);
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs rate-limited rejections at warn so retries do not read as failures', async () => {
+    fetchMock.mockResolvedValueOnce(
+      errorResponse(429, JSON.stringify({ error: 'rate_limited' }))
+    );
+    const tool = createBashExecutionTool();
+
+    await tool.invoke({ command: 'echo 1' }).catch(() => undefined);
+
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toBe(
+      '[CodeExecutor] Code API rejected the request'
+    );
+  });
 
   it('preserves only a bounded retry delay from CodeAPI rate-limit failures', async () => {
     fetchMock.mockResolvedValueOnce(

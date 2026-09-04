@@ -33,6 +33,10 @@ import {
   createCodeApiRunTimeoutSchema,
   resolveCodeApiRunTimeoutMs,
 } from './ptcTimeout';
+import {
+  describeCodeApiError,
+  logCodeApiDiagnostic,
+} from '@/tools/diagnostics';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
@@ -449,7 +453,9 @@ export async function fetchSessionFiles(
       }
     }
     const filesEndpoint = `${baseUrl}/files/${encodeURIComponent(sessionId)}?${query.toString()}`;
-    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
+    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders, {
+      recoverable: true,
+    });
     const fetchOptions: RequestInit = {
       method: 'GET',
       headers: {
@@ -466,7 +472,9 @@ export async function fetchSessionFiles(
     const response = await fetch(filesEndpoint, fetchOptions);
     if (!response.ok) {
       throw new Error(
-        await buildCodeApiHttpErrorMessage('GET', filesEndpoint, response)
+        await buildCodeApiHttpErrorMessage('GET', filesEndpoint, response, {
+          recoverable: true,
+        })
       );
     }
 
@@ -479,9 +487,11 @@ export async function fetchSessionFiles(
       .filter(isCodeApiSessionFileWire)
       .map((file) => normalizeSessionFile(file, sessionId, scope));
   } catch (error) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      `Failed to fetch files for session: ${sessionId}, ${(error as Error).message}`
+    logCodeApiDiagnostic(
+      'ProgrammaticToolCalling',
+      'warn',
+      'session file lookup failed; continuing without input files',
+      describeCodeApiError(error)
     );
     return [];
   }
@@ -525,7 +535,9 @@ export async function makeRequest(
 
     if (!response.ok) {
       throw new CodeApiRequestError(
-        await buildCodeApiHttpErrorMessage('POST', endpoint, response)
+        await buildCodeApiHttpErrorMessage('POST', endpoint, response, {
+          profile: executionProfile,
+        })
       );
     }
 
@@ -931,9 +943,7 @@ export async function runPlainExecution(args: {
     {
       lang: args.lang,
       code:
-        args.lang === 'py'
-          ? wrapPythonForPlainExecution(args.code)
-          : args.code,
+        args.lang === 'py' ? wrapPythonForPlainExecution(args.code) : args.code,
       ...(args.timeout != null ? { timeout: args.timeout } : {}),
       ...(args.sessionId != null && args.sessionId !== ''
         ? { session_id: args.sessionId }
@@ -1085,9 +1095,11 @@ export function createProgrammaticToolCallingTool(
         if (_injected_files && _injected_files.length > 0) {
           files = _injected_files;
         } else if (session_id != null && session_id.length > 0) {
-          // eslint-disable-next-line no-console
-          console.debug(
-            `[ProgrammaticToolCalling] No injected files for session_id=${session_id} — exec will run without input files`
+          logCodeApiDiagnostic(
+            'ProgrammaticToolCalling',
+            'debug',
+            'session carried no injected files; exec will run without input files',
+            { files: 'none' }
           );
         }
 
