@@ -11,6 +11,9 @@ const DEFAULT_MAX_LLM_OUTPUT_CHARS = 50000;
  *  this we drop it whole rather than emit a useless sliver. */
 const MIN_PARTIAL_HIGHLIGHT_CHARS = 200;
 
+export const MISSING_SEARCH_RESULT_DATA_ERROR =
+  'Search provider returned no result data';
+
 /** Resolves the per-search highlight budget from config, the
  *  `SEARCH_MAX_LLM_OUTPUT_CHARS` env var, or the default (50,000 chars). */
 export function resolveMaxLLMOutputChars(maxOutputChars?: number): number {
@@ -224,7 +227,7 @@ export function formatResultsForLLM(
 ): { output: string; references: t.ResultReference[] } {
   if (results == null) {
     return {
-      output: 'Search failed: Search provider returned no result data',
+      output: `Search failed: ${MISSING_SEARCH_RESULT_DATA_ERROR}`,
       references: [],
     };
   }

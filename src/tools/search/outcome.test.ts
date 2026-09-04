@@ -1,11 +1,17 @@
 import { describe, it, expect } from '@jest/globals';
 import type * as t from './types';
-import { resolveSearchOutcome } from './tool';
+import { normalizeSearchResultData, resolveSearchOutcome } from './tool';
 
 const data = (partial: Partial<t.SearchResultData>): t.SearchResultData =>
   ({ turn: 0, ...partial }) as t.SearchResultData;
 
 describe('resolveSearchOutcome', () => {
+  test.each([null, undefined])('normalizes %p result data as a failure', (result) => {
+    expect(resolveSearchOutcome(normalizeSearchResultData(result), 'oauth')).toBe(
+      'Search failed for "oauth"'
+    );
+  });
+
   it('authors a FAILURE label when the processor caught an error', () => {
     expect(
       resolveSearchOutcome(
