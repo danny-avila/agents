@@ -4,8 +4,8 @@ import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
-import { redactSecrets, redactSecretText } from '@/utils/redactSecrets';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
+import { redactSecrets } from '@/utils/redactSecrets';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { EnvVar, Constants } from '@/common';
 
@@ -136,39 +136,56 @@ export const CODE_API_INVALID_REQUEST_ERROR_MESSAGE =
 export const CODE_API_RATE_LIMITED_ERROR_MESSAGE =
   'Code execution is temporarily rate-limited. Please retry shortly.';
 
-const MAX_LOGGED_RESPONSE_BODY_CHARS = 500;
+const MAX_LOGGED_STACK_FRAMES = 10;
 
 type CodeApiErrorDiagnostic = {
-  name?: string;
-  message: string;
-  stack?: string;
+  name: string;
+  frames?: string;
 };
 
 type CodeApiRejectionDiagnostic = {
   method: string;
   endpoint: string;
   status: number;
-  body: string;
 };
 
+/**
+ * Names the failing error type and the code path that produced it, and nothing
+ * else. An error's message is host-authored free text that can carry the very
+ * credential this module exists to keep out of reach — a malformed signing key,
+ * for instance, surfaces as a `SyntaxError` whose message quotes an excerpt of
+ * the key source. Stack frames are code locations rather than payload, so they
+ * survive; the leading line is dropped because V8 begins a stack with the
+ * message. Property reads are guarded because an exotic rejection can throw
+ * from an accessor, which would otherwise lose the log and the rejection both.
+ */
 function describeCodeApiError(error: unknown): CodeApiErrorDiagnostic {
-  if (!(error instanceof Error)) {
-    return { message: String(error) };
+  try {
+    if (!(error instanceof Error)) {
+      return { name: typeof error };
+    }
+    const frames = error.stack
+      ?.split('\n')
+      .filter((line) => /^\s+at /.test(line))
+      .slice(0, MAX_LOGGED_STACK_FRAMES)
+      .join('\n');
+    return {
+      name: error.name,
+      ...(frames != null && frames !== '' ? { frames } : {}),
+    };
+  } catch {
+    return { name: 'UndescribableError' };
   }
-  return {
-    name: error.name,
-    message: error.message,
-    ...(error.stack != null ? { stack: error.stack } : {}),
-  };
 }
 
 /**
  * The messages above are deliberately detail-free so infrastructure never
  * reaches the model, which also means a failure's cause survives nowhere else.
  * This is the operator's only copy: console is the SDK's diagnostic channel (a
- * winston logger is the host's concern). `redactSecrets` scrubs both
- * credential-bearing keys and credential shapes embedded in free text, since a
- * rejected request's body can echo the header that was sent.
+ * winston logger is the host's concern). What is recorded is confined to values
+ * this module produced or chose — never upstream or host free text — so the
+ * diagnostic cannot become the leak the sanitization prevents. `redactSecrets`
+ * still runs, since a configured base URL may embed credentials.
  */
 function logCodeApiDiagnostic(
   level: 'warn' | 'error',
@@ -309,20 +326,13 @@ export async function buildCodeApiHttpErrorMessage(
   } catch {
     responseBody = '';
   }
+  /* The response body is deliberately absent: it is upstream free text that
+     can echo the header that was sent, and the status distinguishes the
+     failure modes on its own. */
   logCodeApiDiagnostic(
     response.status === 429 ? 'warn' : 'error',
     'Code API rejected the request',
-    {
-      method,
-      endpoint,
-      status: response.status,
-      /* Scrubbed before truncation so a cut cannot strand a partial
-         credential that no longer matches a redaction pattern. */
-      body: redactSecretText(responseBody).slice(
-        0,
-        MAX_LOGGED_RESPONSE_BODY_CHARS
-      ),
-    }
+    { method, endpoint, status: response.status }
   );
   if (response.status === 429) {
     const retryAfterSeconds = getRetryAfterSeconds(responseBody);

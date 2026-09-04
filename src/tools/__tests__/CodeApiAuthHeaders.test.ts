@@ -202,10 +202,10 @@ describe('CodeAPI auth header injection', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('logs the auth-header failure cause the model never receives', async () => {
+  it('logs which branch failed and the code path, never the error text', async () => {
     const authHeaders = jest.fn(async () => {
-      throw new Error(
-        'credential helper failed for secret codeapi-signing-key in namespace internal-auth'
+      throw new SyntaxError(
+        'Unexpected token \'M\', ..."d":MIIEvgIBAD"... is not valid JSON'
       );
     });
     const tool = createCodeExecutionTool({ authHeaders });
@@ -214,20 +214,34 @@ describe('CodeAPI auth header injection', () => {
       .invoke({ lang: 'py', code: 'print(1)' })
       .catch((caught: unknown) => caught);
 
-    expect((error as Error).message).not.toContain('codeapi-signing-key');
+    expect((error as Error).message).not.toContain('MIIEvgIBAD');
     expect(errorSpy).toHaveBeenCalledTimes(1);
     const [logged, detail] = errorSpy.mock.calls[0];
     expect(logged).toBe(
       '[CodeExecutor] auth header resolution failed; the Code API request was never sent'
     );
-    expect(detail).toEqual(
-      expect.objectContaining({
-        name: 'Error',
-        message:
-          'credential helper failed for secret codeapi-signing-key in namespace internal-auth',
-        stack: expect.stringContaining('credential helper failed'),
-      })
-    );
+    expect(detail).toEqual({
+      name: 'SyntaxError',
+      frames: expect.stringContaining('    at '),
+    });
+    expect(JSON.stringify(detail)).not.toContain('MIIEvgIBAD');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('describes a rejection whose accessors throw without losing the log', async () => {
+    const hostile = new Proxy(new Error('boom'), {
+      get(): never {
+        throw new Error('accessor exploded');
+      },
+    });
+    const tool = createCodeExecutionTool({
+      authHeaders: () => Promise.reject(hostile),
+    });
+
+    await tool.invoke({ lang: 'py', code: 'print(1)' }).catch(() => undefined);
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls[0][1]).toEqual({ name: 'UndescribableError' });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -424,12 +438,12 @@ describe('CodeAPI auth header injection', () => {
   );
 
   it.each([401, 403])(
-    'logs the status, endpoint and body behind the %s authorization error',
+    'logs the status and endpoint behind the %s authorization error, never the body',
     async (status) => {
       fetchMock.mockResolvedValueOnce(
         errorResponse(
           status,
-          'Invalid bearer token for codeapi.internal.svc.cluster.local'
+          '{"received":"Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1In0.c2ln"}'
         )
       );
       const tool = createBashExecutionTool();
@@ -443,27 +457,10 @@ describe('CodeAPI auth header injection', () => {
         method: 'POST',
         endpoint: expect.stringContaining('/exec'),
         status,
-        body: 'Invalid bearer token for codeapi.internal.svc.cluster.local',
       });
+      expect(JSON.stringify(detail)).not.toContain('eyJhbGciOiJSUzI1NiJ9');
     }
   );
-
-  it('keeps a credential echoed by the rejection body out of the log', async () => {
-    fetchMock.mockResolvedValueOnce(
-      errorResponse(
-        401,
-        '{"error":"unauthorized","received":"Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2ln"}'
-      )
-    );
-    const tool = createBashExecutionTool();
-
-    await tool.invoke({ command: 'echo 1' }).catch(() => undefined);
-
-    const detail = JSON.stringify(errorSpy.mock.calls[0][1]);
-    expect(detail).not.toContain('eyJhbGciOiJSUzI1NiJ9');
-    expect(detail).toContain('unauthorized');
-    expect(detail).toContain('401');
-  });
 
   it('logs rate-limited rejections at warn so retries do not read as failures', async () => {
     fetchMock.mockResolvedValueOnce(
