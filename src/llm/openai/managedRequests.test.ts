@@ -371,6 +371,19 @@ describe('GPT-6 Astra request constraints', () => {
     expect((params.reasoning as { effort?: string } | undefined)?.effort).toBe('low');
   });
 
+  it.each([
+    ['the default port written explicitly', 'https://api.openai.com:443/v1'],
+    ['a mixed-case host', 'https://API.OpenAI.com/v1'],
+  ])('applies the gates for a first-party URL spelled with %s', (_label, baseURL) => {
+    const model = astra({ configuration: { baseURL } });
+    const params = model.invocationParams({
+      tools: [tool],
+      reasoningEffort: 'none',
+    } as never) as Record<string, unknown>;
+    expect('max_output_tokens' in params).toBe(true);
+    expect(params).not.toHaveProperty('temperature');
+  });
+
   it('leaves other models untouched', () => {
     const model = new ChatOpenAI({
       model: 'gpt-5.6',

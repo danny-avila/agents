@@ -1733,7 +1733,7 @@ export class CustomAzureOpenAIClient extends AzureOpenAIClient {
   }
 }
 
-const OFFICIAL_OPENAI_BASE_URL_PATTERN = /^https:\/\/api\.openai\.com(\/|$)/;
+const OFFICIAL_OPENAI_HOSTNAME = 'api.openai.com';
 
 /**
  * Official OpenAI (api.openai.com) and Azure OpenAI Chat Completions streams
@@ -1769,7 +1769,22 @@ function isOfficialOpenAIBaseURL(baseURL: string | null | undefined): boolean {
   if (effectiveBaseURL == null || effectiveBaseURL === '') {
     return true;
   }
-  return OFFICIAL_OPENAI_BASE_URL_PATTERN.test(effectiveBaseURL);
+  // Compared through the URL parser rather than textually: it normalizes the
+  // host case and drops the default :443, both of which spell the same
+  // first-party endpoint, while keeping a lookalike host such as
+  // `api.openai.com.example.net` a distinct hostname. A non-default port is
+  // someone else's listener, so it stays proxied.
+  let parsed: URL;
+  try {
+    parsed = new URL(effectiveBaseURL);
+  } catch {
+    return false;
+  }
+  return (
+    parsed.protocol === 'https:' &&
+    parsed.hostname === OFFICIAL_OPENAI_HOSTNAME &&
+    parsed.port === ''
+  );
 }
 
 const AZURE_FIRST_PARTY_BASE_PATH_PATTERN =
