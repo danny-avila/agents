@@ -391,6 +391,41 @@ describe('GPT-6 Astra request constraints', () => {
     expect(params.reasoning_effort).toBe('none');
   });
 
+  it('keys off the served model when `model` is a deployment alias', () => {
+    /**
+     * Azure addresses a deployment, so callers set `model` to the deployment
+     * name. Without the declared identity the SDK sees an alias and shapes
+     * nothing.
+     */
+    const deployed = new ChatOpenAI({
+      model: 'my-astra-deployment',
+      apiKey: 'test-key',
+      firstPartyEndpoint: true,
+      servedModel: 'gpt-6-astra',
+      temperature: 0.7,
+    });
+    const params = deployed.invocationParams({
+      reasoningEffort: 'none',
+    } as never) as Record<string, unknown>;
+    expect(params).not.toHaveProperty('temperature');
+    expect(params.reasoning_effort).toBe('low');
+  });
+
+  it('does not shape a deployment serving some other model', () => {
+    const other = new ChatOpenAI({
+      model: 'my-deployment',
+      apiKey: 'test-key',
+      firstPartyEndpoint: true,
+      servedModel: 'gpt-5.6',
+      temperature: 0.7,
+    });
+    const params = other.invocationParams({
+      reasoningEffort: 'none',
+    } as never) as Record<string, unknown>;
+    expect(params.temperature).toBe(0.7);
+    expect(params.reasoning_effort).toBe('none');
+  });
+
   it('leaves other models untouched', () => {
     const model = new ChatOpenAI({
       model: 'gpt-5.6',
