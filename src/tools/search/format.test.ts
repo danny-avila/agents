@@ -242,6 +242,12 @@ describe('formatResultsForLLM highlight budget', () => {
 });
 
 describe('formatResultsForLLM on a failed search', () => {
+  test.each([null, undefined])('handles %p result data', (results) => {
+    expect(formatResultsForLLM(0, results).output).toBe(
+      'Search failed: Search provider returned no result data'
+    );
+  });
+
   test('tells the model the search failed instead of returning an empty output', () => {
     const results: t.SearchResultData = {
       organic: [],

@@ -219,9 +219,16 @@ function formatSource(
 
 export function formatResultsForLLM(
   turn: number,
-  results: t.SearchResultData,
+  results?: t.SearchResultData | null,
   maxOutputChars?: number
 ): { output: string; references: t.ResultReference[] } {
+  if (results == null) {
+    return {
+      output: 'Search failed: Search provider returned no result data',
+      references: [],
+    };
+  }
+
   /** Bound highlight content to the per-search budget before formatting */
   const trimmedHighlights = trimHighlightsToBudget(
     results,
