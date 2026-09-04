@@ -813,8 +813,11 @@ function promoteToolObservationMetadata(
     if (typeof value === 'number' && !Number.isFinite(value)) {
       continue;
     }
-    attributes[`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${key}`] =
-      value;
+    const attributeKey = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${key}`;
+    if (Object.prototype.hasOwnProperty.call(attributes, attributeKey)) {
+      continue;
+    }
+    attributes[attributeKey] = value;
     promoted += 1;
   }
 }

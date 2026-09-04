@@ -1537,6 +1537,45 @@ describe('Langfuse tool output tracing redaction', () => {
     expect(JSON.stringify(span.attributes)).not.toContain('customer row data');
   });
 
+  it('preserves callback identity when artifact metadata uses the same keys', () => {
+    const metadataPrefix = LangfuseOtelSpanAttributes.OBSERVATION_METADATA;
+    const span = createSpan('run_select_query', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
+      [`${metadataPrefix}.agentId`]: 'agent-original',
+      [`${metadataPrefix}.messageId`]: 'message-original',
+      [`${metadataPrefix}.parentMessageId`]: 'parent-original',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify(
+        new ToolMessage({
+          tool_call_id: 'query-call',
+          content: 'private row',
+          artifact: {
+            [LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]: {
+              agentId: 'agent-replacement',
+              messageId: 'message-replacement',
+              parentMessageId: 'parent-replacement',
+              query_status: 'success',
+            },
+          },
+        })
+      ),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({ redactedToolNames: new Set(['run_select_query']) })
+    );
+
+    expect(span.attributes).toMatchObject({
+      [`${metadataPrefix}.agentId`]: 'agent-original',
+      [`${metadataPrefix}.messageId`]: 'message-original',
+      [`${metadataPrefix}.parentMessageId`]: 'parent-original',
+      [`${metadataPrefix}.query_status`]: 'success',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]:
+        LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+    });
+    expect(JSON.stringify(span.attributes)).not.toContain('private row');
+  });
+
   it('does not promote metadata from an unredacted tool', () => {
     const output = new ToolMessage({
       name: 'untrusted_tool',
