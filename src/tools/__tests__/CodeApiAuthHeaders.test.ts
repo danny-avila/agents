@@ -1,5 +1,12 @@
 import fetch from 'node-fetch';
-import { beforeEach, describe, expect, it, jest } from '@jest/globals';
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  jest,
+} from '@jest/globals';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { RequestInit } from 'node-fetch';
 import type * as t from '@/types';
@@ -117,9 +124,19 @@ function toolMap(): t.ToolMap {
 }
 
 describe('CodeAPI auth header injection', () => {
+  let errorSpy: jest.SpiedFunction<typeof console.error>;
+  let warnSpy: jest.SpiedFunction<typeof console.warn>;
+
   beforeEach(() => {
     fetchMock.mockReset();
     fetchMock.mockResolvedValue(completedResponse());
+    errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
   });
 
   it('resolves static and dynamic auth header params', async () => {
@@ -185,6 +202,35 @@ describe('CodeAPI auth header injection', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('logs the auth-header failure cause the model never receives', async () => {
+    const authHeaders = jest.fn(async () => {
+      throw new Error(
+        'credential helper failed for secret codeapi-signing-key in namespace internal-auth'
+      );
+    });
+    const tool = createCodeExecutionTool({ authHeaders });
+
+    const error = await tool
+      .invoke({ lang: 'py', code: 'print(1)' })
+      .catch((caught: unknown) => caught);
+
+    expect((error as Error).message).not.toContain('codeapi-signing-key');
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const [logged, detail] = errorSpy.mock.calls[0];
+    expect(logged).toBe(
+      '[CodeExecutor] auth header resolution failed; the Code API request was never sent'
+    );
+    expect(detail).toEqual(
+      expect.objectContaining({
+        name: 'Error',
+        message:
+          'credential helper failed for secret codeapi-signing-key in namespace internal-auth',
+        stack: expect.stringContaining('credential helper failed'),
+      })
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('forwards Authorization for direct code execution', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ session_id: 'session_123', stdout: '1\n' })
@@ -224,18 +270,12 @@ describe('CodeAPI auth header injection', () => {
       statefulSessions: true,
     });
 
-    await defaultTool.invoke(
-      { lang: 'py', code: 'print(1)' },
-      {
-        toolCall: { _runtime_session_hint: 'graph-wide-hint' },
-      } as unknown as RunnableConfig
-    );
-    await statefulTool.invoke(
-      { lang: 'py', code: 'print(1)' },
-      {
-        toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
-      } as unknown as RunnableConfig
-    );
+    await defaultTool.invoke({ lang: 'py', code: 'print(1)' }, {
+      toolCall: { _runtime_session_hint: 'graph-wide-hint' },
+    } as unknown as RunnableConfig);
+    await statefulTool.invoke({ lang: 'py', code: 'print(1)' }, {
+      toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
+    } as unknown as RunnableConfig);
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       'https://code-default.example.com/exec'
@@ -329,12 +369,9 @@ describe('CodeAPI auth header injection', () => {
       statefulSessions: true,
     });
 
-    await tool.invoke(
-      { command: 'echo 1' },
-      {
-        toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
-      } as unknown as RunnableConfig
-    );
+    await tool.invoke({ command: 'echo 1' }, {
+      toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
+    } as unknown as RunnableConfig);
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       'https://code-stateful.example.com/exec'
@@ -385,6 +422,46 @@ describe('CodeAPI auth header injection', () => {
       expect((error as Error).message).not.toContain('Invalid bearer token');
     }
   );
+
+  it.each([401, 403])(
+    'logs the status, endpoint and body behind the %s authorization error',
+    async (status) => {
+      fetchMock.mockResolvedValueOnce(
+        errorResponse(
+          status,
+          'Invalid bearer token for codeapi.internal.svc.cluster.local'
+        )
+      );
+      const tool = createBashExecutionTool();
+
+      await tool.invoke({ command: 'echo 1' }).catch(() => undefined);
+
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const [logged, detail] = errorSpy.mock.calls[0];
+      expect(logged).toBe('[CodeExecutor] Code API rejected the request');
+      expect(detail).toEqual({
+        method: 'POST',
+        endpoint: expect.stringContaining('/exec'),
+        status,
+        body: 'Invalid bearer token for codeapi.internal.svc.cluster.local',
+      });
+    }
+  );
+
+  it('logs rate-limited rejections at warn so retries do not read as failures', async () => {
+    fetchMock.mockResolvedValueOnce(
+      errorResponse(429, JSON.stringify({ error: 'rate_limited' }))
+    );
+    const tool = createBashExecutionTool();
+
+    await tool.invoke({ command: 'echo 1' }).catch(() => undefined);
+
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toBe(
+      '[CodeExecutor] Code API rejected the request'
+    );
+  });
 
   it('preserves only a bounded retry delay from CodeAPI rate-limit failures', async () => {
     fetchMock.mockResolvedValueOnce(

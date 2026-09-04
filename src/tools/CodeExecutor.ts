@@ -5,6 +5,7 @@ import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
+import { redactSecrets } from '@/utils/redactSecrets';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { EnvVar, Constants } from '@/common';
 
@@ -119,8 +120,7 @@ export const CodeExecutionToolSchema = {
   required: ['lang', 'code'],
 } as const;
 
-export const CODE_API_EXPECTED_PROFILE_HEADER =
-  'X-CodeAPI-Expected-Profile';
+export const CODE_API_EXPECTED_PROFILE_HEADER = 'X-CodeAPI-Expected-Profile';
 
 type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
@@ -135,6 +135,48 @@ export const CODE_API_INVALID_REQUEST_ERROR_MESSAGE =
   'The code execution request was rejected. Please check the tool input and try again.';
 export const CODE_API_RATE_LIMITED_ERROR_MESSAGE =
   'Code execution is temporarily rate-limited. Please retry shortly.';
+
+const MAX_LOGGED_RESPONSE_BODY_CHARS = 500;
+
+type CodeApiErrorDiagnostic = {
+  name?: string;
+  message: string;
+  stack?: string;
+};
+
+type CodeApiRejectionDiagnostic = {
+  method: string;
+  endpoint: string;
+  status: number;
+  body: string;
+};
+
+function describeCodeApiError(error: unknown): CodeApiErrorDiagnostic {
+  if (!(error instanceof Error)) {
+    return { message: String(error) };
+  }
+  return {
+    name: error.name,
+    message: error.message,
+    ...(error.stack != null ? { stack: error.stack } : {}),
+  };
+}
+
+/**
+ * The messages above are deliberately detail-free so infrastructure never
+ * reaches the model, which also means a failure's cause survives nowhere else.
+ * This is the operator's only copy: console is the SDK's diagnostic channel (a
+ * winston logger is the host's concern), and the payload is redacted because a
+ * rejected request's body can echo the credentials that were sent.
+ */
+function logCodeApiDiagnostic(
+  level: 'warn' | 'error',
+  message: string,
+  detail: CodeApiErrorDiagnostic | CodeApiRejectionDiagnostic
+): void {
+  // eslint-disable-next-line no-console
+  console[level](`[CodeExecutor] ${message}`, redactSecrets(detail));
+}
 
 const SAFE_CODE_API_EXECUTION_ERROR_DETAILS: Readonly<
   Partial<Record<string, string>>
@@ -230,7 +272,12 @@ export async function resolveCodeApiAuthHeaders(
     try {
       const resolvedHeaders = await authHeaders();
       return resolvedHeaders;
-    } catch {
+    } catch (error) {
+      logCodeApiDiagnostic(
+        'error',
+        'auth header resolution failed; the Code API request was never sent',
+        describeCodeApiError(error)
+      );
       throw new CodeApiRequestError(CODE_API_AUTHORIZATION_ERROR_MESSAGE);
     }
   }
@@ -251,8 +298,8 @@ export function addCodeApiExecutionProfileHeader(
 }
 
 export async function buildCodeApiHttpErrorMessage(
-  _method: string,
-  _endpoint: string,
+  method: string,
+  endpoint: string,
   response: { status: number; text: () => Promise<string> }
 ): Promise<string> {
   let responseBody = '';
@@ -261,6 +308,16 @@ export async function buildCodeApiHttpErrorMessage(
   } catch {
     responseBody = '';
   }
+  logCodeApiDiagnostic(
+    response.status === 429 ? 'warn' : 'error',
+    'Code API rejected the request',
+    {
+      method,
+      endpoint,
+      status: response.status,
+      body: responseBody.slice(0, MAX_LOGGED_RESPONSE_BODY_CHARS),
+    }
+  );
   if (response.status === 429) {
     const retryAfterSeconds = getRetryAfterSeconds(responseBody);
     return retryAfterSeconds != null
