@@ -257,7 +257,9 @@ describe('GPT-6 Astra request constraints', () => {
     }
   });
 
-  const astra = (fields: Record<string, unknown> = {}) =>
+  type AstraFields = ConstructorParameters<typeof ChatOpenAI>[0];
+
+  const astra = (fields: AstraFields = {}) =>
     new ChatOpenAI({
       model: 'gpt-6-astra',
       apiKey: 'test-key',
@@ -293,9 +295,8 @@ describe('GPT-6 Astra request constraints', () => {
   });
 
   it('drops the rejected logprobs include on Responses, keeping the rest', () => {
-    const model = astra();
+    const model = astra({ useResponsesApi: true });
     const params = model.invocationParams({
-      tools: [tool],
       include: ['message.output_text.logprobs', 'reasoning.encrypted_content'],
     } as never) as { include?: unknown[] };
     expect(params.include).toEqual(
@@ -308,27 +309,35 @@ describe('GPT-6 Astra request constraints', () => {
 
   /**
    * The two paths carry effort under different keys: Chat Completions emits the
-   * scalar `reasoning_effort`, Responses the nested `reasoning.effort`.
+   * scalar `reasoning_effort`, Responses the nested `reasoning.effort`. Which
+   * API serves the turn is the caller's choice, so each shape is selected
+   * explicitly here rather than inferred from the presence of tools.
    */
-  const effortOf = (options: Record<string, unknown>): string | undefined => {
-    const params = astra().invocationParams(options as never) as {
-      reasoning_effort?: string;
-      reasoning?: { effort?: string };
-    };
-    return params.reasoning_effort ?? params.reasoning?.effort;
-  };
+  const completionsEffort = (effort: string): string | undefined =>
+    (
+      astra().invocationParams({ reasoningEffort: effort } as never) as {
+        reasoning_effort?: string;
+      }
+    ).reasoning_effort;
 
-  it('substitutes the reasoning efforts the model rejects with low', () => {
+  const responsesEffort = (effort: string): string | undefined =>
+    (
+      astra({ useResponsesApi: true }).invocationParams({
+        reasoningEffort: effort,
+      } as never) as { reasoning?: { effort?: string } }
+    ).reasoning?.effort;
+
+  it('substitutes the reasoning efforts the model rejects on both APIs', () => {
     for (const effort of ['none', 'minimal'] as const) {
-      expect(effortOf({ reasoningEffort: effort })).toBe('low');
-      expect(effortOf({ reasoningEffort: effort, tools: [tool] })).toBe('low');
+      expect(completionsEffort(effort)).toBe('low');
+      expect(responsesEffort(effort)).toBe('low');
     }
   });
 
-  it('passes supported reasoning efforts through unchanged', () => {
+  it('passes supported reasoning efforts through unchanged on both APIs', () => {
     for (const effort of ['low', 'medium', 'high', 'xhigh', 'max'] as const) {
-      expect(effortOf({ reasoningEffort: effort })).toBe(effort);
-      expect(effortOf({ reasoningEffort: effort, tools: [tool] })).toBe(effort);
+      expect(completionsEffort(effort)).toBe(effort);
+      expect(responsesEffort(effort)).toBe(effort);
     }
   });
 
