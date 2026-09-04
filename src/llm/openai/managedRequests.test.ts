@@ -195,7 +195,9 @@ describe('managed GPT-5.6 request fields', () => {
   });
 
   it('does not request encrypted reasoning for an undeclared Astra endpoint', () => {
-    expect(shouldIncludeEncryptedReasoning('gpt-6-astra', {}, false)).toBe(false);
+    expect(shouldIncludeEncryptedReasoning('gpt-6-astra', {}, false)).toBe(
+      false
+    );
   });
 });
 
@@ -303,10 +305,9 @@ describe('GPT-6 Astra request constraints', () => {
   });
 
   it('strips logprobs on Chat Completions', () => {
-    const params = astra({ logprobs: true }).invocationParams({}) as Record<
-      string,
-      unknown
-    >;
+    const params = astra({ logprobs: true }).invocationParams(
+      {}
+    ) as ProbedRequestParams;
     expect(params).not.toHaveProperty('logprobs');
   });
 
