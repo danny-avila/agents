@@ -53,4 +53,36 @@ describe('redactSecrets', () => {
     expect(serialized).not.toContain('user');
     expect(serialized).not.toContain('pass');
   });
+
+  it('redacts credential shapes embedded in diagnostic free text', () => {
+    const value = {
+      message: 'rejected Bearer sk-live-abcdef123456 at the gateway',
+      stack:
+        'eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl expired',
+      body: '{"error":"unauthorized","token":"abc123def456"}',
+      detail: 'connect https://user:pass@codeapi.internal/exec failed',
+    };
+
+    const serialized = JSON.stringify(redactSecrets(value));
+
+    expect(serialized).not.toContain('sk-live-abcdef123456');
+    expect(serialized).not.toContain('eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0');
+    expect(serialized).not.toContain('abc123def456');
+    expect(serialized).not.toContain('user:pass');
+    expect(serialized).toContain('at the gateway');
+    expect(serialized).toContain('expired');
+    expect(serialized).toContain('unauthorized');
+    expect(serialized).toContain('codeapi.internal');
+  });
+
+  it('keeps prose that names a secret without carrying one', () => {
+    const value = {
+      message:
+        'credential helper failed for secret codeapi-signing-key in namespace internal-auth',
+      body: '{"error":"rate_limited","retry_after_seconds":8.2}',
+      stack: 'at Object.signJwt (/app/dist/index.cjs:1234:5)',
+    };
+
+    expect(redactSecrets(value)).toEqual(value);
+  });
 });

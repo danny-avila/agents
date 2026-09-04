@@ -4,8 +4,8 @@ import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
+import { redactSecrets, redactSecretText } from '@/utils/redactSecrets';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
-import { redactSecrets } from '@/utils/redactSecrets';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { EnvVar, Constants } from '@/common';
 
@@ -166,8 +166,9 @@ function describeCodeApiError(error: unknown): CodeApiErrorDiagnostic {
  * The messages above are deliberately detail-free so infrastructure never
  * reaches the model, which also means a failure's cause survives nowhere else.
  * This is the operator's only copy: console is the SDK's diagnostic channel (a
- * winston logger is the host's concern), and the payload is redacted because a
- * rejected request's body can echo the credentials that were sent.
+ * winston logger is the host's concern). `redactSecrets` scrubs both
+ * credential-bearing keys and credential shapes embedded in free text, since a
+ * rejected request's body can echo the header that was sent.
  */
 function logCodeApiDiagnostic(
   level: 'warn' | 'error',
@@ -315,7 +316,12 @@ export async function buildCodeApiHttpErrorMessage(
       method,
       endpoint,
       status: response.status,
-      body: responseBody.slice(0, MAX_LOGGED_RESPONSE_BODY_CHARS),
+      /* Scrubbed before truncation so a cut cannot strand a partial
+         credential that no longer matches a redaction pattern. */
+      body: redactSecretText(responseBody).slice(
+        0,
+        MAX_LOGGED_RESPONSE_BODY_CHARS
+      ),
     }
   );
   if (response.status === 429) {

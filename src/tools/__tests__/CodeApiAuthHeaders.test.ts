@@ -448,6 +448,23 @@ describe('CodeAPI auth header injection', () => {
     }
   );
 
+  it('keeps a credential echoed by the rejection body out of the log', async () => {
+    fetchMock.mockResolvedValueOnce(
+      errorResponse(
+        401,
+        '{"error":"unauthorized","received":"Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2ln"}'
+      )
+    );
+    const tool = createBashExecutionTool();
+
+    await tool.invoke({ command: 'echo 1' }).catch(() => undefined);
+
+    const detail = JSON.stringify(errorSpy.mock.calls[0][1]);
+    expect(detail).not.toContain('eyJhbGciOiJSUzI1NiJ9');
+    expect(detail).toContain('unauthorized');
+    expect(detail).toContain('401');
+  });
+
   it('logs rate-limited rejections at warn so retries do not read as failures', async () => {
     fetchMock.mockResolvedValueOnce(
       errorResponse(429, JSON.stringify({ error: 'rate_limited' }))
