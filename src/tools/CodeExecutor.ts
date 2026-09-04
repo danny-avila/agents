@@ -136,11 +136,8 @@ export const CODE_API_INVALID_REQUEST_ERROR_MESSAGE =
 export const CODE_API_RATE_LIMITED_ERROR_MESSAGE =
   'Code execution is temporarily rate-limited. Please retry shortly.';
 
-const MAX_LOGGED_STACK_FRAMES = 10;
-
 type CodeApiErrorDiagnostic = {
-  name: string;
-  frames?: string;
+  type: string;
 };
 
 type CodeApiRejectionDiagnostic = {
@@ -149,44 +146,44 @@ type CodeApiRejectionDiagnostic = {
   status: number;
 };
 
-/** Error names are class identifiers; anything else is host-authored text. */
-const ERROR_NAME_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/;
+/** Locally owned labels. Every value is a literal in this file or one of the
+ * fixed strings `typeof` returns, so nothing read from the rejection reaches
+ * the log. */
+const KNOWN_ERROR_TYPES: ReadonlyArray<readonly [string, new () => Error]> = [
+  ['SyntaxError', SyntaxError],
+  ['TypeError', TypeError],
+  ['RangeError', RangeError],
+  ['ReferenceError', ReferenceError],
+  ['URIError', URIError],
+  ['EvalError', EvalError],
+];
 
 /**
- * Names the failing error type and the code path that produced it, and nothing
- * else. An error's message is host-authored free text that can carry the very
- * credential this module exists to keep out of reach — a malformed signing key,
- * for instance, surfaces as a `SyntaxError` whose message quotes an excerpt of
- * the key source. `name` is kept only when it is shaped like the class
- * identifier it is supposed to be, and stack frames are code locations rather
- * than payload; the leading line is dropped because V8 begins a stack with the
- * message. Both fields are still read from the rejection, so a host that
- * deliberately forges a stack can put text in `frames` — that is the same trust
- * boundary as a host that throws its credential in the first place, and it is
- * the reason nothing here is claimed to be secret-free by construction. Reads
- * are guarded because an exotic rejection can throw from an accessor, which
- * would otherwise lose the log and the rejection both.
+ * Classifies the failure without reading anything off it. `message`, `name` and
+ * `stack` are all host-authored: a message can carry the credential this module
+ * exists to protect (a malformed signing key surfaces as a `SyntaxError` quoting
+ * an excerpt of the key), `name` is writable and an opaque credential can be
+ * identifier-shaped, and `stack` begins with the message — so a message
+ * containing a newline and `    at ` puts its own text through any frame filter,
+ * with no stack overwrite involved. What survives is the built-in type, which
+ * still separates a malformed key config from a transport failure and is the
+ * lead the diagnostic exists to give. Reads are guarded because an exotic
+ * rejection can throw from an accessor, which would otherwise lose the log and
+ * the rejection both.
  */
 function describeCodeApiError(error: unknown): CodeApiErrorDiagnostic {
   try {
     if (!(error instanceof Error)) {
-      return { name: typeof error };
+      return { type: typeof error };
     }
-    const name = error.name;
-    const frames = error.stack
-      ?.split('\n')
-      .filter((line) => /^\s+at /.test(line))
-      .slice(0, MAX_LOGGED_STACK_FRAMES)
-      .join('\n');
-    return {
-      name:
-        typeof name === 'string' && ERROR_NAME_PATTERN.test(name)
-          ? name
-          : 'UnnamedError',
-      ...(frames != null && frames !== '' ? { frames } : {}),
-    };
+    for (const [label, constructor] of KNOWN_ERROR_TYPES) {
+      if (error instanceof constructor) {
+        return { type: label };
+      }
+    }
+    return { type: 'Error' };
   } catch {
-    return { name: 'UndescribableError' };
+    return { type: 'UndescribableError' };
   }
 }
 
@@ -307,7 +304,8 @@ export function buildCodeApiExecutionErrorMessage(response: {
 }
 
 export async function resolveCodeApiAuthHeaders(
-  authHeaders?: t.CodeApiAuthHeaders
+  authHeaders?: t.CodeApiAuthHeaders,
+  options?: { recoverable?: boolean }
 ): Promise<t.CodeApiAuthHeaderMap> {
   if (authHeaders == null) {
     return {};
@@ -317,11 +315,13 @@ export async function resolveCodeApiAuthHeaders(
       const resolvedHeaders = await authHeaders();
       return resolvedHeaders;
     } catch (error) {
-      logCodeApiDiagnostic(
-        'error',
-        'auth header resolution failed; the Code API request was never sent',
-        describeCodeApiError(error)
-      );
+      if (options?.recoverable !== true) {
+        logCodeApiDiagnostic(
+          'error',
+          'auth header resolution failed; the Code API request was never sent',
+          describeCodeApiError(error)
+        );
+      }
       throw new CodeApiRequestError(CODE_API_AUTHORIZATION_ERROR_MESSAGE);
     }
   }

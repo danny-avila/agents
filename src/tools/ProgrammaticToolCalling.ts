@@ -449,7 +449,9 @@ export async function fetchSessionFiles(
       }
     }
     const filesEndpoint = `${baseUrl}/files/${encodeURIComponent(sessionId)}?${query.toString()}`;
-    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
+    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders, {
+      recoverable: true,
+    });
     const fetchOptions: RequestInit = {
       method: 'GET',
       headers: {

@@ -220,15 +220,12 @@ describe('CodeAPI auth header injection', () => {
     expect(logged).toBe(
       '[CodeExecutor] auth header resolution failed; the Code API request was never sent'
     );
-    expect(detail).toEqual({
-      name: 'SyntaxError',
-      frames: expect.stringContaining('    at '),
-    });
+    expect(detail).toEqual({ type: 'SyntaxError' });
     expect(JSON.stringify(detail)).not.toContain('MIIEvgIBAD');
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('describes a rejection whose accessors throw without losing the log', async () => {
+  it('classifies past an accessor trap, which it never reaches', async () => {
     const hostile = new Proxy(new Error('boom'), {
       get(): never {
         throw new Error('accessor exploded');
@@ -241,7 +238,24 @@ describe('CodeAPI auth header injection', () => {
     await tool.invoke({ lang: 'py', code: 'print(1)' }).catch(() => undefined);
 
     expect(errorSpy).toHaveBeenCalledTimes(1);
-    expect(errorSpy.mock.calls[0][1]).toEqual({ name: 'UndescribableError' });
+    expect(errorSpy.mock.calls[0][1]).toEqual({ type: 'Error' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('still logs when classification itself throws', async () => {
+    const hostile = new Proxy(new Error('boom'), {
+      getPrototypeOf(): never {
+        throw new Error('prototype exploded');
+      },
+    });
+    const tool = createCodeExecutionTool({
+      authHeaders: () => Promise.reject(hostile),
+    });
+
+    await tool.invoke({ lang: 'py', code: 'print(1)' }).catch(() => undefined);
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls[0][1]).toEqual({ type: 'UndescribableError' });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -482,18 +496,42 @@ describe('CodeAPI auth header injection', () => {
     );
   });
 
-  it('replaces an error name that is not a class identifier', async () => {
-    const forged = new Error('boom');
-    forged.name = 'Bearer MIIEvgIBAD leaked through name';
+  it.each([
+    [
+      'a writable name',
+      () => Object.assign(new Error('boom'), { name: 'MIIEvgIBAD' }),
+    ],
+    [
+      'a message that forges a stack frame',
+      () => new Error('failed\n    at MIIEvgIBAD'),
+    ],
+  ])('logs no host text from %s', async (_label, build) => {
     const tool = createCodeExecutionTool({
-      authHeaders: () => Promise.reject(forged),
+      authHeaders: () => Promise.reject(build()),
     });
 
     await tool.invoke({ lang: 'py', code: 'print(1)' }).catch(() => undefined);
 
-    const detail = errorSpy.mock.calls[0][1] as { name: string };
-    expect(detail.name).toBe('UnnamedError');
-    expect(JSON.stringify(detail)).not.toContain('MIIEvgIBAD');
+    expect(errorSpy.mock.calls[0][1]).toEqual({ type: 'Error' });
+    expect(JSON.stringify(errorSpy.mock.calls[0][1])).not.toContain(
+      'MIIEvgIBAD'
+    );
+  });
+
+  it('leaves a recoverable file lookup to report an auth failure once', async () => {
+    const files = await fetchSessionFiles(
+      'https://gateway.example/v1',
+      'session_123',
+      undefined,
+      () => {
+        throw new Error('signing key is not configured');
+      }
+    );
+
+    expect(files).toEqual([]);
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('leaves a recoverable file lookup to report its own outcome', async () => {
