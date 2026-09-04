@@ -1410,7 +1410,7 @@ const hasOpenAI = hasEnv('OPENAI_API_KEY');
 
     // Squeeze hard — OpenAI tool-schema overhead is lower than Anthropic,
     // so we need tighter budgets to force pruning + summarization.
-    run = await createRun(800);
+    run = await createRun(1200);
     await runTurn(
       { run, conversationHistory },
       'Calculate 999999 / 7 with calculator. Remind me of prior results too.',
@@ -1419,7 +1419,7 @@ const hasOpenAI = hasEnv('OPENAI_API_KEY');
     logTurn('T6', conversationHistory);
 
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(600);
+      run = await createRun(1200);
       await runTurn(
         { run, conversationHistory },
         'What is 50 + 50? Calculator.',
@@ -1429,7 +1429,7 @@ const hasOpenAI = hasEnv('OPENAI_API_KEY');
     }
 
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(400);
+      run = await createRun(1000);
       await runTurn(
         { run, conversationHistory },
         'What is 1+1? Calculator.',
