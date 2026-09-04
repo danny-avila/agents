@@ -136,4 +136,37 @@ describe('redactSecrets', () => {
 
     expect(elapsedMs).toBeLessThan(250);
   });
+
+  it('redacts a header map that reaches us JSON-serialized, escapes included', () => {
+    const value = {
+      body: '{"Authorization":"Digest username=\\"Mufasa\\", response=\\"6629fae4\\"","Cookie":"theme=light; session=abcdef123456","status":401}',
+    };
+
+    const redacted = redactSecrets(value) as typeof value;
+
+    expect(redacted.body).not.toContain('Mufasa');
+    expect(redacted.body).not.toContain('6629fae4');
+    expect(redacted.body).not.toContain('abcdef123456');
+    expect(redacted.body).toContain('"status":401');
+  });
+
+  it('redacts a short scheme value but not the prose that names one', () => {
+    const value = {
+      message: 'authentication failed for Basic dTpw',
+      detail: 'Bearer token expired at 04:00',
+    };
+
+    const redacted = redactSecrets(value) as typeof value;
+
+    expect(redacted.message).not.toContain('dTpw');
+    expect(redacted.detail).toBe('Bearer token expired at 04:00');
+  });
+
+  it('stops an empty credential header at its own line', () => {
+    const value = { body: 'Authorization:\nX-Request-Id: req-42' };
+
+    const redacted = redactSecrets(value) as typeof value;
+
+    expect(redacted.body).toContain('X-Request-Id: req-42');
+  });
 });
