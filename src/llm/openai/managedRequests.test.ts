@@ -228,6 +228,34 @@ describe('GPT-6 Astra model detection', () => {
 });
 
 describe('GPT-6 Astra request constraints', () => {
+  /**
+   * The endpoint gate falls back to `OPENAI_BASE_URL` when no `baseURL` is
+   * configured, so a developer or CI shell pointing at a compatibility gateway
+   * would otherwise turn every gate off and fail these tests for a reason that
+   * has nothing to do with the implementation. Isolated the same way the
+   * sequential-tool-call suite does.
+   */
+  const ISOLATED_ENV_VARS = ['OPENAI_BASE_URL'];
+  const originalEnv = new Map(
+    ISOLATED_ENV_VARS.map((name) => [name, process.env[name]])
+  );
+
+  beforeEach(() => {
+    for (const name of ISOLATED_ENV_VARS) {
+      delete process.env[name];
+    }
+  });
+
+  afterAll(() => {
+    for (const [name, value] of originalEnv) {
+      if (value == null) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+  });
+
   const astra = (fields: Record<string, unknown> = {}) =>
     new ChatOpenAI({ model: 'gpt-6-astra', apiKey: 'test-key', ...fields });
 

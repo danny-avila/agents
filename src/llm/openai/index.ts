@@ -621,7 +621,9 @@ function stripUnsupportedAstraParams<T extends object>(
  * Responses API, and unlike a config-time check this runs with the resolved
  * call options, so non-tool turns keep their Chat Completions path.
  */
-function hasBoundTools(options?: { tools?: unknown }): boolean {
+function hasBoundTools(options?: {
+  tools?: t.ChatOpenAICallOptions['tools'];
+}): boolean {
   return Array.isArray(options?.tools) && options.tools.length > 0;
 }
 
