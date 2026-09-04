@@ -81,6 +81,18 @@ export type GoogleThinkingConfig = {
 export type ManagedRequestOptions = {
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
+  /**
+   * Declares that this client talks to the first-party OpenAI or Azure surface.
+   * Gates the model-specific request constraints documented only for it —
+   * currently GPT-6 Astra's Responses-only tool calls, rejected sampling
+   * parameters, and unsupported reasoning efforts — and defaults to off.
+   *
+   * Declared rather than inferred from a base URL: only the caller knows
+   * whether a URL is a faithful first-party route, a gateway, or a proxy with
+   * its own semantics, and every gate it controls removes capability, so
+   * guessing wrong silently degrades an endpoint the SDK cannot see.
+   */
+  firstPartyEndpoint?: boolean;
 };
 /**
  * Adaptive stream-smoothing configuration shared by every provider client.

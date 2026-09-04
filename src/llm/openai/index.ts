@@ -2813,9 +2813,22 @@ function withLibreChatOpenAIFields(
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   protected firstPartyEndpoint?: boolean;
 
+  /**
+   * Whether both request delegates are the LibreChat ones. `withLibreChatOpenAIFields`
+   * keeps a caller-supplied `completions`/`responses` instead of building its own,
+   * and the parameter stripping and effort substitution live inside the LibreChat
+   * delegates. Routing to an injected Responses delegate would therefore send the
+   * very parameters Astra rejects — worse than not routing at all — so the routing
+   * gate stands down unless the delegates that enforce the rest are in place.
+   */
+  private readonly ownsRequestDelegates: boolean;
+
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApply(this.model, this.firstPartyEndpoint);
+    return (
+      this.ownsRequestDelegates &&
+      astraRulesApply(this.model, this.firstPartyEndpoint)
+    );
   }
 
   _lc_stream_delay: number;
@@ -2823,7 +2836,10 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   constructor(
     fields?: LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
   ) {
+    const ownsRequestDelegates =
+      fields?.completions == null && fields?.responses == null;
     super(withLibreChatOpenAIFields(fields));
+    this.ownsRequestDelegates = ownsRequestDelegates;
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
   }

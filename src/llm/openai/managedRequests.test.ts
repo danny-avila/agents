@@ -1,5 +1,7 @@
 import OpenAI from 'openai';
 
+import { ChatOpenAIResponses } from '@langchain/openai';
+
 import {
   ChatOpenAI,
   addChatCacheBreakpoints,
@@ -410,6 +412,36 @@ describe('GPT-6 Astra request constraints', () => {
     } as never) as Record<string, unknown>;
     expect(params.temperature).toBe(0.7);
     expect(params.reasoning_effort).toBe('none');
+  });
+
+  it('stands down when a caller injects its own request delegates', () => {
+    /**
+     * Parameter stripping and effort substitution live in the LibreChat
+     * delegates. Routing to an injected Responses delegate would send exactly
+     * the parameters Astra rejects, so the routing gate must not fire alone.
+     */
+    const injected = new ChatOpenAI({
+      model: 'gpt-6-astra',
+      apiKey: 'test-key',
+      firstPartyEndpoint: true,
+      temperature: 0.7,
+      responses: new ChatOpenAIResponses({
+        model: 'gpt-6-astra',
+        apiKey: 'test-key',
+      }),
+    });
+    const params = injected.invocationParams({
+      tools: [tool],
+      reasoningEffort: 'none',
+    } as never) as Record<string, unknown>;
+    /**
+     * Routing stands down, so the turn stays on Chat Completions and a tool call
+     * fails with the provider's own error rather than a silently invalid
+     * Responses request. The delegates still owned here keep enforcing what they
+     * can — the completions path strips the rejected parameters as usual.
+     */
+    expect('max_output_tokens' in params).toBe(false);
+    expect(params).not.toHaveProperty('temperature');
   });
 
   it('leaves other models untouched', () => {
