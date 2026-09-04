@@ -204,6 +204,42 @@ describe('Chat Completions sequential tool-call seal stamping', () => {
     );
   });
 
+  test.each([
+    [
+      'a mixed-case Azure host',
+      'https://RESOURCE.OPENAI.AZURE.COM/openai/deployments',
+    ],
+    [
+      'a mixed-case cognitive services host',
+      'https://Resource.CognitiveServices.Azure.com/openai/deployments',
+    ],
+  ])('stamps Azure deltas for %s', (_label, azureOpenAIBasePath) => {
+    const model = new AzureChatOpenAI({
+      azureOpenAIApiKey: 'test',
+      azureOpenAIApiDeploymentName: 'test-deployment',
+      azureOpenAIApiVersion: '2024-08-01-preview',
+      azureOpenAIBasePath,
+    });
+    const message = convertDelta(model, toolCallDelta);
+    expect(adapterOf(message)).toBe(
+      OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER
+    );
+  });
+
+  test.each([
+    ['a plaintext scheme', 'http://resource.openai.azure.com/openai'],
+    ['an unparseable value', 'not a url'],
+  ])('does not stamp Azure deltas for %s', (_label, azureOpenAIBasePath) => {
+    const model = new AzureChatOpenAI({
+      azureOpenAIApiKey: 'test',
+      azureOpenAIApiDeploymentName: 'test-deployment',
+      azureOpenAIApiVersion: '2024-08-01-preview',
+      azureOpenAIBasePath,
+    });
+    const message = convertDelta(model, toolCallDelta);
+    expect(adapterOf(message)).toBeUndefined();
+  });
+
   test('does not stamp Azure deltas routed through a proxy base path', () => {
     const model = new AzureChatOpenAI({
       azureOpenAIApiKey: 'test',

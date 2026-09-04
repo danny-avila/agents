@@ -556,20 +556,22 @@ function substituteUnsupportedAstraEffort(
 }
 
 /** Rejected inside the Responses `include` array. */
-const GPT_6_ASTRA_UNSUPPORTED_INCLUDE = 'message.output_text.logprobs';
+const GPT_6_ASTRA_UNSUPPORTED_INCLUDE: OpenAIClient.Responses.ResponseIncludable =
+  'message.output_text.logprobs';
 
 /**
- * The subset of a request GPT-6 Astra rejects. Declared as optional fields so
- * each key can be deleted from a request object whose concrete type marks it
- * required.
+ * The subset of a request GPT-6 Astra rejects, taken from the SDK's own request
+ * types so the stripping boundary keeps their constraints. Every member is
+ * optional so a key can be deleted from a request object whose concrete type
+ * marks it required.
  */
-type AstraStrippableParams = {
-  temperature?: unknown;
-  top_p?: unknown;
-  top_logprobs?: unknown;
-  logprobs?: unknown;
-  include?: unknown[];
-};
+type AstraStrippableParams = Partial<
+  Pick<
+    OpenAIClient.Chat.Completions.ChatCompletionCreateParams,
+    'temperature' | 'top_p' | 'logprobs' | 'top_logprobs'
+  >
+> &
+  Partial<Pick<OpenAIClient.Responses.ResponseCreateParams, 'include'>>;
 
 /**
  * Removes the sampling and logprob parameters GPT-6 Astra rejects.
@@ -1787,8 +1789,11 @@ function isOfficialOpenAIBaseURL(baseURL: string | null | undefined): boolean {
   );
 }
 
-const AZURE_FIRST_PARTY_BASE_PATH_PATTERN =
-  /^https:\/\/[^/]+\.(openai\.azure\.com|cognitiveservices\.azure\.com|api\.cognitive\.microsoft\.com)(:\d+)?(\/|$)/;
+const AZURE_FIRST_PARTY_HOST_SUFFIXES = [
+  '.openai.azure.com',
+  '.cognitiveservices.azure.com',
+  '.api.cognitive.microsoft.com',
+] as const;
 
 /**
  * Azure OpenAI is first-party when requests resolve to an instance-name
@@ -1808,7 +1813,22 @@ function isFirstPartyAzureEndpoint(args: {
   if (args.azureOpenAIBasePath == null || args.azureOpenAIBasePath === '') {
     return true;
   }
-  return AZURE_FIRST_PARTY_BASE_PATH_PATTERN.test(args.azureOpenAIBasePath);
+  // Parsed rather than matched textually, for the reason given on
+  // `isOfficialOpenAIBaseURL`: the host case carries no meaning, so an
+  // equivalent mixed-case spelling must not read as a proxy. Any port is
+  // accepted here, as the previous pattern did.
+  let parsed: URL;
+  try {
+    parsed = new URL(args.azureOpenAIBasePath);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') {
+    return false;
+  }
+  return AZURE_FIRST_PARTY_HOST_SUFFIXES.some((suffix) =>
+    parsed.hostname.endsWith(suffix)
+  );
 }
 
 /**
