@@ -497,6 +497,69 @@ describe('CodeAPI auth header injection', () => {
     );
   });
 
+  it('classifies a failed session file lookup instead of quoting it', async () => {
+    const files = await fetchSessionFiles(
+      'https://gateway.example/v1',
+      'session_123',
+      undefined,
+      () => {
+        throw new SyntaxError(
+          'bad JWK ..."d":MIIEvgIBAD"... is not valid JSON'
+        );
+      }
+    );
+
+    expect(files).toEqual([]);
+    /* The resolver has already normalized the callback's SyntaxError into a
+       CodeApiRequestError by this point; the classification is deliberately
+       whatever reached the catch, never text quoted from it. */
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[ProgrammaticToolCalling] session file lookup failed; continuing without input files',
+      { type: 'Error' }
+    );
+    expect(JSON.stringify(warnSpy.mock.calls)).not.toContain('MIIEvgIBAD');
+    expect(JSON.stringify(warnSpy.mock.calls)).not.toContain('session_123');
+  });
+
+  it('carries no host text into any diagnostic, across every failure mode', async () => {
+    const secret = 'MIIEvgIBADANBgkqhkiG9w0BAQEF';
+    const debugSpy = jest
+      .spyOn(console, 'debug')
+      .mockImplementation(() => undefined);
+
+    const forged = new Error(`parse failed\n    at ${secret}`);
+    forged.name = secret;
+    await createCodeExecutionTool({
+      authHeaders: () => Promise.reject(forged),
+    })
+      .invoke({ lang: 'py', code: 'print(1)' })
+      .catch(() => undefined);
+
+    fetchMock.mockResolvedValueOnce(
+      errorResponse(401, `{"received":"Bearer ${secret}"}`)
+    );
+    await createBashExecutionTool({
+      baseUrl: `https://${secret}.gateway.example/t/${secret}/v1`,
+    })
+      .invoke({ command: 'echo 1' })
+      .catch(() => undefined);
+
+    await createCodeExecutionTool({ session_id: secret })
+      .invoke({ lang: 'py', code: 'print(1)' }, {
+        toolCall: { session_id: secret },
+      } as unknown as RunnableConfig)
+      .catch(() => undefined);
+
+    const logged = JSON.stringify([
+      errorSpy.mock.calls,
+      warnSpy.mock.calls,
+      debugSpy.mock.calls,
+    ]);
+    expect(logged).not.toContain(secret);
+    expect(logged).toContain('[CodeExecutor]');
+    debugSpy.mockRestore();
+  });
+
   it('logs the rejection before the response body is drained', async () => {
     let releaseBody: (value: string) => void = () => undefined;
     fetchMock.mockResolvedValueOnce({

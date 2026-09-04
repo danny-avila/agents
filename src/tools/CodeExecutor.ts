@@ -2,10 +2,14 @@ import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
+import type { CodeApiMethod } from '@/tools/diagnostics';
 import type * as t from '@/types';
+import {
+  describeCodeApiError,
+  logCodeApiDiagnostic,
+} from '@/tools/diagnostics';
 import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
-import { redactSecrets } from '@/utils/redactSecrets';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { EnvVar, Constants } from '@/common';
 
@@ -136,75 +140,6 @@ export const CODE_API_INVALID_REQUEST_ERROR_MESSAGE =
 export const CODE_API_RATE_LIMITED_ERROR_MESSAGE =
   'Code execution is temporarily rate-limited. Please retry shortly.';
 
-type CodeApiErrorDiagnostic = {
-  type: string;
-};
-
-type CodeApiRejectionDiagnostic = {
-  method: string;
-  profile: string;
-  status: number;
-};
-
-/** Locally owned labels. Every value is a literal in this file or one of the
- * fixed strings `typeof` returns, so nothing read from the rejection reaches
- * the log. */
-const KNOWN_ERROR_TYPES: ReadonlyArray<readonly [string, new () => Error]> = [
-  ['SyntaxError', SyntaxError],
-  ['TypeError', TypeError],
-  ['RangeError', RangeError],
-  ['ReferenceError', ReferenceError],
-  ['URIError', URIError],
-  ['EvalError', EvalError],
-];
-
-/**
- * Classifies the failure without reading anything off it. `message`, `name` and
- * `stack` are all host-authored: a message can carry the credential this module
- * exists to protect (a malformed signing key surfaces as a `SyntaxError` quoting
- * an excerpt of the key), `name` is writable and an opaque credential can be
- * identifier-shaped, and `stack` begins with the message — so a message
- * containing a newline and `    at ` puts its own text through any frame filter,
- * with no stack overwrite involved. What survives is the built-in type, which
- * still separates a malformed key config from a transport failure and is the
- * lead the diagnostic exists to give. Reads are guarded because an exotic
- * rejection can throw from an accessor, which would otherwise lose the log and
- * the rejection both.
- */
-function describeCodeApiError(error: unknown): CodeApiErrorDiagnostic {
-  try {
-    if (!(error instanceof Error)) {
-      return { type: typeof error };
-    }
-    for (const [label, constructor] of KNOWN_ERROR_TYPES) {
-      if (error instanceof constructor) {
-        return { type: label };
-      }
-    }
-    return { type: 'Error' };
-  } catch {
-    return { type: 'UndescribableError' };
-  }
-}
-
-/**
- * The messages above are deliberately detail-free so infrastructure never
- * reaches the model, which also means a failure's cause survives nowhere else.
- * This is the operator's only copy: console is the SDK's diagnostic channel (a
- * winston logger is the host's concern). What is recorded is confined to values
- * this module produced or chose — never upstream or host free text — so the
- * diagnostic cannot become the leak the sanitization prevents. `redactSecrets`
- * still runs, since a configured base URL may embed credentials.
- */
-function logCodeApiDiagnostic(
-  level: 'warn' | 'error',
-  message: string,
-  detail: CodeApiErrorDiagnostic | CodeApiRejectionDiagnostic
-): void {
-  // eslint-disable-next-line no-console
-  console[level](`[CodeExecutor] ${message}`, redactSecrets(detail));
-}
-
 const SAFE_CODE_API_EXECUTION_ERROR_DETAILS: Readonly<
   Partial<Record<string, string>>
 > = {
@@ -303,6 +238,7 @@ export async function resolveCodeApiAuthHeaders(
     } catch (error) {
       if (options?.recoverable !== true) {
         logCodeApiDiagnostic(
+          'CodeExecutor',
           'error',
           'auth header resolution failed; the Code API request was never sent',
           describeCodeApiError(error)
@@ -328,7 +264,7 @@ export function addCodeApiExecutionProfileHeader(
 }
 
 export async function buildCodeApiHttpErrorMessage(
-  method: string,
+  method: CodeApiMethod,
   _endpoint: string,
   response: { status: number; text: () => Promise<string> },
   options?: { recoverable?: boolean; profile?: t.CodeApiExecutionProfile }
@@ -344,6 +280,7 @@ export async function buildCodeApiHttpErrorMessage(
      nothing. */
   if (options?.recoverable !== true) {
     logCodeApiDiagnostic(
+      'CodeExecutor',
       response.status === 429 ? 'warn' : 'error',
       'Code API rejected the request',
       {
@@ -543,9 +480,11 @@ function createCodeExecutionTool(
         session_id.length > 0 &&
         !Array.isArray(postData.files)
       ) {
-        // eslint-disable-next-line no-console
-        console.debug(
-          `[CodeExecutor] No injected files for session_id=${session_id} — exec will run without input files`
+        logCodeApiDiagnostic(
+          'CodeExecutor',
+          'debug',
+          'session carried no injected files; exec will run without input files',
+          { files: 'none' }
         );
       }
 
