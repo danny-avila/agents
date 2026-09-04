@@ -541,14 +541,14 @@ const GPT_6_ASTRA_UNSUPPORTED_EFFORTS = new Set(['none', 'minimal']);
 const GPT_6_ASTRA_EFFORT_FALLBACK = 'low' as const;
 
 function substituteUnsupportedAstraEffort(
-  model: string,
+  astraRulesApply: boolean,
   reasoning: OpenAIClient.Reasoning | undefined
 ): OpenAIClient.Reasoning | undefined {
   const effort = reasoning?.effort;
   if (
     effort == null ||
-    !GPT_6_ASTRA_UNSUPPORTED_EFFORTS.has(effort) ||
-    !isGpt6AstraModel(model)
+    !astraRulesApply ||
+    !GPT_6_ASTRA_UNSUPPORTED_EFFORTS.has(effort)
   ) {
     return reasoning;
   }
@@ -580,11 +580,11 @@ type AstraStrippableParams = {
  * only; the Responses equivalent rides inside `include`.
  */
 function stripUnsupportedAstraParams<T extends object>(
-  model: string,
+  astraRulesApply: boolean,
   params: T,
   endpoint: 'completions' | 'responses'
 ): T {
-  if (!isGpt6AstraModel(model)) {
+  if (!astraRulesApply) {
     return params;
   }
   const next = { ...params };
@@ -629,7 +629,8 @@ export function shouldIncludeEncryptedReasoning(
   params: {
     store?: boolean | null;
     reasoning?: unknown;
-  }
+  },
+  astraRulesApply = false
 ): boolean {
   const reasoningContext = (
     params.reasoning as
@@ -637,7 +638,7 @@ export function shouldIncludeEncryptedReasoning(
       | undefined
   )?.context;
   return (
-    (/^gpt-5\.6(?:-|$)/i.test(model) || isGpt6AstraModel(model)) &&
+    (/^gpt-5\.6(?:-|$)/i.test(model) || astraRulesApply) &&
     (params.store === false || reasoningContext !== 'current_turn')
   );
 }
@@ -1229,7 +1230,7 @@ function getExposedOpenAIClient(
 }
 
 function getReasoningParams(
-  model: string,
+  astraRulesApply: boolean,
   baseReasoning: OpenAIClient.Reasoning | undefined,
   options?: ReasoningCallOptions
 ): OpenAIClient.Reasoning | undefined {
@@ -1255,18 +1256,19 @@ function getReasoningParams(
       effort: options.reasoningEffort,
     };
   }
-  return substituteUnsupportedAstraEffort(model, reasoning);
+  return substituteUnsupportedAstraEffort(astraRulesApply, reasoning);
 }
 
 function getGatedReasoningParams(
   model: string,
+  astraRulesApply: boolean,
   baseReasoning: OpenAIClient.Reasoning | undefined,
   options?: ReasoningCallOptions
 ): OpenAIClient.Reasoning | undefined {
   if (!isReasoningModel(model)) {
     return;
   }
-  return getReasoningParams(model, baseReasoning, options);
+  return getReasoningParams(astraRulesApply, baseReasoning, options);
 }
 
 function isObject(value: unknown): value is object {
@@ -1794,7 +1796,37 @@ function isFirstPartyAzureEndpoint(args: {
   return AZURE_FIRST_PARTY_BASE_PATH_PATTERN.test(args.azureOpenAIBasePath);
 }
 
+/**
+ * Whether the GPT-6 Astra request rules apply to this request.
+ *
+ * Both halves must hold: the model is Astra, *and* the request actually reaches
+ * the first-party surface those rules describe. A custom `baseURL` (or the
+ * `OPENAI_BASE_URL` fallback) means a proxy owns the contract, exactly as
+ * {@link isOfficialOpenAIBaseURL} already gates the first-party stream
+ * adapter. Every Astra gate removes capability, so applying one to an endpoint
+ * whose semantics are unknown silently degrades it.
+ */
+function astraRulesApplyToOpenAI(
+  model: string,
+  baseURL: string | null | undefined
+): boolean {
+  return isGpt6AstraModel(model) && isOfficialOpenAIBaseURL(baseURL);
+}
+
+/** Azure variant: first-party Azure endpoints only, per {@link isFirstPartyAzureEndpoint}. */
+function astraRulesApplyToAzure(
+  model: string,
+  args: { baseURL: string | null | undefined; azureOpenAIBasePath: string | undefined }
+): boolean {
+  return isGpt6AstraModel(model) && isFirstPartyAzureEndpoint(args);
+}
+
 class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
+  /** @see {@link astraRulesApplyToOpenAI} */
+  protected get astraRulesApply(): boolean {
+    return astraRulesApplyToOpenAI(this.model, this.clientConfig.baseURL);
+  }
+
   private includeReasoningContent?: boolean;
   private includeReasoningDetails?: boolean;
   private convertReasoningDetailsToContent?: boolean;
@@ -1819,7 +1851,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   ): ReturnType<OriginalChatOpenAICompletions['invocationParams']> {
     return stripIntentFromStrictTools(
       stripUnsupportedAstraParams(
-        this.model,
+        this.astraRulesApply,
         applyManagedRequestParams(super.invocationParams(options, extra), {
           promptCacheExplicit: this.promptCacheExplicit,
           safetyIdentifier: this.safetyIdentifier,
@@ -1832,7 +1864,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getReasoningParams(this.model, this.reasoning, options);
+    return getReasoningParams(this.astraRulesApply, this.reasoning, options);
   }
 
   _getClientOptions(
@@ -2224,6 +2256,11 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 }
 
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
+  /** @see {@link astraRulesApplyToOpenAI} */
+  protected get astraRulesApply(): boolean {
+    return astraRulesApplyToOpenAI(this.model, this.clientConfig.baseURL);
+  }
+
   private promptCacheExplicit?: boolean;
   private responsesPromptCache?: boolean;
   private responsesPromptCacheTtl?: PromptCacheTtl;
@@ -2271,7 +2308,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
         cache_control: cacheControl,
       }),
     };
-    if (shouldIncludeEncryptedReasoning(this.model, params)) {
+    if (shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)) {
       params.include = [
         ...new Set([
           ...(params.include ?? []),
@@ -2280,7 +2317,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
       ];
     }
     return stripIntentFromStrictTools(
-      stripUnsupportedAstraParams(this.model, params, 'responses')
+      stripUnsupportedAstraParams(this.astraRulesApply, params, 'responses')
     );
   }
 
@@ -2364,7 +2401,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getReasoningParams(this.model, this.reasoning, options);
+    return getReasoningParams(this.astraRulesApply, this.reasoning, options);
   }
 
   _getClientOptions(
@@ -2375,6 +2412,14 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
 }
 
 class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions {
+  /** @see {@link astraRulesApplyToAzure} */
+  protected get astraRulesApply(): boolean {
+    return astraRulesApplyToAzure(this.model, {
+      baseURL: this.clientConfig.baseURL,
+      azureOpenAIBasePath: this.azureOpenAIBasePath,
+    });
+  }
+
   private promptCacheExplicit?: boolean;
   private safetyIdentifier?: string;
 
@@ -2390,7 +2435,7 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
   ): ReturnType<OriginalAzureChatOpenAICompletions['invocationParams']> {
     return stripIntentFromStrictTools(
       stripUnsupportedAstraParams(
-        this.model,
+        this.astraRulesApply,
         applyManagedRequestParams(super.invocationParams(options, extra), {
           promptCacheExplicit: this.promptCacheExplicit,
           safetyIdentifier: this.safetyIdentifier,
@@ -2403,7 +2448,12 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getGatedReasoningParams(this.model, this.reasoning, options);
+    return getGatedReasoningParams(
+      this.model,
+      this.astraRulesApply,
+      this.reasoning,
+      options
+    );
   }
 
   protected _convertCompletionsDeltaToBaseMessageChunk(
@@ -2517,6 +2567,14 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
 }
 
 class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
+  /** @see {@link astraRulesApplyToAzure} */
+  protected get astraRulesApply(): boolean {
+    return astraRulesApplyToAzure(this.model, {
+      baseURL: this.clientConfig.baseURL,
+      azureOpenAIBasePath: this.azureOpenAIBasePath,
+    });
+  }
+
   private promptCacheExplicit?: boolean;
   private safetyIdentifier?: string;
 
@@ -2533,7 +2591,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       promptCacheExplicit: this.promptCacheExplicit,
       safetyIdentifier: this.safetyIdentifier,
     });
-    if (shouldIncludeEncryptedReasoning(this.model, params)) {
+    if (shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)) {
       params.include = [
         ...new Set([
           ...(params.include ?? []),
@@ -2542,7 +2600,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       ];
     }
     return stripIntentFromStrictTools(
-      stripUnsupportedAstraParams(this.model, params, 'responses')
+      stripUnsupportedAstraParams(this.astraRulesApply, params, 'responses')
     );
   }
 
@@ -2626,7 +2684,12 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getGatedReasoningParams(this.model, this.reasoning, options);
+    return getGatedReasoningParams(
+      this.model,
+      this.astraRulesApply,
+      this.reasoning,
+      options
+    );
   }
 
   _getClientOptions(
@@ -2706,6 +2769,11 @@ function withLibreChatOpenAIFields(
 }
 
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
+  /** @see {@link astraRulesApplyToOpenAI} */
+  protected get astraRulesApply(): boolean {
+    return astraRulesApplyToOpenAI(this.model, this.clientConfig.baseURL);
+  }
+
   _lc_stream_delay: number;
 
   constructor(
@@ -2734,7 +2802,7 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   protected _useResponsesApi(
     options: this['ParsedCallOptions'] | undefined
   ): boolean {
-    if (isGpt6AstraModel(this.model) && hasBoundTools(options)) {
+    if (this.astraRulesApply && hasBoundTools(options)) {
       return true;
     }
     return super._useResponsesApi(options);
@@ -2777,7 +2845,7 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getReasoningParams(this.model, this.reasoning, options);
+    return getReasoningParams(this.astraRulesApply, this.reasoning, options);
   }
 
   protected _getReasoningParams(
@@ -2820,6 +2888,14 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
 }
 
 export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
+  /** @see {@link astraRulesApplyToAzure} */
+  protected get astraRulesApply(): boolean {
+    return astraRulesApplyToAzure(this.model, {
+      baseURL: this.clientConfig.baseURL,
+      azureOpenAIBasePath: this.azureOpenAIBasePath,
+    });
+  }
+
   _lc_stream_delay: number;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
@@ -2848,7 +2924,7 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   protected _useResponsesApi(
     options: this['ParsedCallOptions'] | undefined
   ): boolean {
-    if (isGpt6AstraModel(this.model) && hasBoundTools(options)) {
+    if (this.astraRulesApply && hasBoundTools(options)) {
       return true;
     }
     return super._useResponsesApi(options);
@@ -2864,7 +2940,12 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getGatedReasoningParams(this.model, this.reasoning, options);
+    return getGatedReasoningParams(
+      this.model,
+      this.astraRulesApply,
+      this.reasoning,
+      options
+    );
   }
 
   protected _getReasoningParams(

@@ -182,13 +182,19 @@ describe('managed GPT-5.6 request fields', () => {
     expect(shouldIncludeEncryptedReasoning('gpt-5.5', {})).toBe(false);
   });
 
-  it('requests encrypted reasoning for GPT-6 Astra', () => {
-    expect(shouldIncludeEncryptedReasoning('gpt-6-astra', {})).toBe(true);
+  it('requests encrypted reasoning for GPT-6 Astra on a first-party endpoint', () => {
+    expect(shouldIncludeEncryptedReasoning('gpt-6-astra', {}, true)).toBe(true);
     expect(
-      shouldIncludeEncryptedReasoning('gpt-6-astra', {
-        reasoning: { context: 'current_turn' },
-      })
+      shouldIncludeEncryptedReasoning(
+        'gpt-6-astra',
+        { reasoning: { context: 'current_turn' } },
+        true
+      )
     ).toBe(false);
+  });
+
+  it('does not request encrypted reasoning for Astra behind a proxy', () => {
+    expect(shouldIncludeEncryptedReasoning('gpt-6-astra', {}, false)).toBe(false);
   });
 });
 
@@ -331,6 +337,38 @@ describe('GPT-6 Astra request constraints', () => {
     expect('max_output_tokens' in params).toBe(false);
     expect(params.temperature).toBe(0.7);
     expect(params.reasoning_effort).toBe('none');
+  });
+
+  it('leaves Astra behind a custom baseURL on every gate', () => {
+    const proxied = new ChatOpenAI({
+      model: 'gpt-6-astra',
+      apiKey: 'test-key',
+      temperature: 0.7,
+      configuration: { baseURL: 'https://gateway.internal/v1' },
+    });
+    const params = proxied.invocationParams({
+      tools: [tool],
+      reasoningEffort: 'none',
+    } as never) as Record<string, unknown>;
+    /** A bare Astra id still reaches a proxy whose contract is not OpenAI's. */
+    expect('max_output_tokens' in params).toBe(false);
+    expect(params.temperature).toBe(0.7);
+    expect(params.reasoning_effort).toBe('none');
+  });
+
+  it('applies every gate on the first-party endpoint', () => {
+    const direct = new ChatOpenAI({
+      model: 'gpt-6-astra',
+      apiKey: 'test-key',
+      temperature: 0.7,
+    });
+    const params = direct.invocationParams({
+      tools: [tool],
+      reasoningEffort: 'none',
+    } as never) as Record<string, unknown>;
+    expect('max_output_tokens' in params).toBe(true);
+    expect(params).not.toHaveProperty('temperature');
+    expect((params.reasoning as { effort?: string } | undefined)?.effort).toBe('low');
   });
 
   it('leaves other models untouched', () => {
