@@ -119,8 +119,7 @@ export const CodeExecutionToolSchema = {
   required: ['lang', 'code'],
 } as const;
 
-export const CODE_API_EXPECTED_PROFILE_HEADER =
-  'X-CodeAPI-Expected-Profile';
+export const CODE_API_EXPECTED_PROFILE_HEADER = 'X-CodeAPI-Expected-Profile';
 
 type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
@@ -149,10 +148,28 @@ const SAFE_CODE_API_EXECUTION_ERROR_DETAILS: Readonly<
 };
 
 export class CodeApiRequestError extends Error {
-  constructor(message = CODE_API_UNAVAILABLE_ERROR_MESSAGE) {
+  constructor(
+    message = CODE_API_UNAVAILABLE_ERROR_MESSAGE,
+    options?: { cause?: unknown }
+  ) {
     super(message);
     this.name = 'CodeApiRequestError';
+    if (options?.cause !== undefined) {
+      this.cause = options.cause;
+    }
   }
+}
+
+const MAX_LOGGED_RESPONSE_BODY_CHARS = 512;
+
+/** Keeps a pathological error body from dominating the log line. */
+function truncateCodeApiResponseBody(responseBody: string): string {
+  if (responseBody === '') {
+    return '<empty body>';
+  }
+  return responseBody.length <= MAX_LOGGED_RESPONSE_BODY_CHARS
+    ? responseBody
+    : `${responseBody.slice(0, MAX_LOGGED_RESPONSE_BODY_CHARS)}... [truncated]`;
 }
 
 function getRetryAfterSeconds(responseBody: string): number | undefined {
@@ -230,8 +247,20 @@ export async function resolveCodeApiAuthHeaders(
     try {
       const resolvedHeaders = await authHeaders();
       return resolvedHeaders;
-    } catch {
-      throw new CodeApiRequestError(CODE_API_AUTHORIZATION_ERROR_MESSAGE);
+    } catch (error) {
+      /* The model-facing message stays credential-free by design, so this is
+       * the only place the real reason survives. Discarding it made the two
+       * paths that share that message — a callback that threw before any
+       * request was sent, and a Code API that answered 401/403 — impossible
+       * to tell apart from production data. */
+      // eslint-disable-next-line no-console
+      console.error(
+        '[CodeExecutor] Code API auth-header resolution failed; no request was sent',
+        error
+      );
+      throw new CodeApiRequestError(CODE_API_AUTHORIZATION_ERROR_MESSAGE, {
+        cause: error,
+      });
     }
   }
   return authHeaders;
@@ -251,8 +280,8 @@ export function addCodeApiExecutionProfileHeader(
 }
 
 export async function buildCodeApiHttpErrorMessage(
-  _method: string,
-  _endpoint: string,
+  method: string,
+  endpoint: string,
   response: { status: number; text: () => Promise<string> }
 ): Promise<string> {
   let responseBody = '';
@@ -261,6 +290,16 @@ export async function buildCodeApiHttpErrorMessage(
   } catch {
     responseBody = '';
   }
+  /* Everything below collapses a status and a body into one of five fixed
+   * sentences the model is allowed to see. The operator needs what the model
+   * must not, and this is the last frame that still holds it. Rate limiting
+   * is the one routine rejection here, so it stays a warning. */
+  // eslint-disable-next-line no-console
+  const log = response.status === 429 ? console.warn : console.error;
+  log(
+    `[CodeExecutor] Code API rejected ${method} ${endpoint} with ${response.status}: ` +
+      truncateCodeApiResponseBody(responseBody)
+  );
   if (response.status === 429) {
     const retryAfterSeconds = getRetryAfterSeconds(responseBody);
     return retryAfterSeconds != null

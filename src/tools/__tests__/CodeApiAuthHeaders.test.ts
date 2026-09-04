@@ -1,8 +1,21 @@
 import fetch from 'node-fetch';
-import { beforeEach, describe, expect, it, jest } from '@jest/globals';
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  jest,
+} from '@jest/globals';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { RequestInit } from 'node-fetch';
 import type * as t from '@/types';
+import {
+  createCodeExecutionTool,
+  resolveCodeApiAuthHeaders,
+  buildCodeApiHttpErrorMessage,
+  CODE_API_AUTHORIZATION_ERROR_MESSAGE,
+} from '../CodeExecutor';
 import {
   createLocalProgrammaticToolCallingTool,
   createLocalBashProgrammaticToolCallingTool,
@@ -18,10 +31,6 @@ import {
   makeRequest,
 } from '../ProgrammaticToolCalling';
 import { createBashProgrammaticToolCallingTool } from '../BashProgrammaticToolCalling';
-import {
-  createCodeExecutionTool,
-  resolveCodeApiAuthHeaders,
-} from '../CodeExecutor';
 import { createBashExecutionTool } from '../BashExecutor';
 
 jest.mock('node-fetch', () => ({
@@ -224,18 +233,12 @@ describe('CodeAPI auth header injection', () => {
       statefulSessions: true,
     });
 
-    await defaultTool.invoke(
-      { lang: 'py', code: 'print(1)' },
-      {
-        toolCall: { _runtime_session_hint: 'graph-wide-hint' },
-      } as unknown as RunnableConfig
-    );
-    await statefulTool.invoke(
-      { lang: 'py', code: 'print(1)' },
-      {
-        toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
-      } as unknown as RunnableConfig
-    );
+    await defaultTool.invoke({ lang: 'py', code: 'print(1)' }, {
+      toolCall: { _runtime_session_hint: 'graph-wide-hint' },
+    } as unknown as RunnableConfig);
+    await statefulTool.invoke({ lang: 'py', code: 'print(1)' }, {
+      toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
+    } as unknown as RunnableConfig);
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       'https://code-default.example.com/exec'
@@ -329,12 +332,9 @@ describe('CodeAPI auth header injection', () => {
       statefulSessions: true,
     });
 
-    await tool.invoke(
-      { command: 'echo 1' },
-      {
-        toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
-      } as unknown as RunnableConfig
-    );
+    await tool.invoke({ command: 'echo 1' }, {
+      toolCall: { _runtime_session_hint: 'wrong-agent-hint' },
+    } as unknown as RunnableConfig);
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       'https://code-stateful.example.com/exec'
@@ -1022,6 +1022,95 @@ describe('CodeAPI auth header injection', () => {
         }),
       })
     );
+  });
+
+  describe('the cause behind the sanitized authorization error', () => {
+    /**
+     * Two unrelated situations answer the model with one sentence: an
+     * auth-header callback that threw before any request was sent, and a Code
+     * API that answered 401/403. The sentence must stay credential-free, so
+     * the log and the thrown error's `cause` are the only places the real
+     * reason can survive. Without both, a recurring production failure has no
+     * attributable root cause — an upstream service logging nothing is equally
+     * consistent with either path.
+     */
+    let errorSpy: ReturnType<typeof jest.spyOn>;
+
+    beforeEach(() => {
+      errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      errorSpy.mockRestore();
+    });
+
+    it('logs and preserves the auth-header failure it replaces', async () => {
+      const underlying = new Error(
+        'credential helper failed for secret codeapi-signing-key in namespace internal-auth'
+      );
+
+      const error = await resolveCodeApiAuthHeaders(async () => {
+        throw underlying;
+      }).catch((caught: unknown) => caught);
+
+      expect((error as Error).message).toBe(
+        CODE_API_AUTHORIZATION_ERROR_MESSAGE
+      );
+      expect((error as Error).cause).toBe(underlying);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('auth-header resolution failed'),
+        underlying
+      );
+    });
+
+    it('logs the status, route and body behind an HTTP rejection', async () => {
+      const message = await buildCodeApiHttpErrorMessage(
+        'POST',
+        'https://code.example.com/exec',
+        {
+          status: 403,
+          text: async () => '{"error":"Unauthorized"}',
+        }
+      );
+
+      expect(message).toBe(CODE_API_AUTHORIZATION_ERROR_MESSAGE);
+      const logged = String(errorSpy.mock.calls[0]?.[0]);
+      expect(logged).toContain('403');
+      expect(logged).toContain('POST https://code.example.com/exec');
+      expect(logged).toContain('Unauthorized');
+    });
+
+    it('reports a rate limit as a warning, not an error', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      await buildCodeApiHttpErrorMessage(
+        'POST',
+        'https://code.example.com/exec',
+        {
+          status: 429,
+          text: async () => '{"error":"rate_limited","retry_after_seconds":5}',
+        }
+      );
+
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(String(warnSpy.mock.calls[0]?.[0])).toContain('429');
+      warnSpy.mockRestore();
+    });
+
+    it('truncates a pathological error body instead of logging all of it', async () => {
+      await buildCodeApiHttpErrorMessage(
+        'POST',
+        'https://code.example.com/exec',
+        {
+          status: 500,
+          text: async () => 'x'.repeat(4096),
+        }
+      );
+
+      const logged = String(errorSpy.mock.calls[0]?.[0]);
+      expect(logged).toContain('[truncated]');
+      expect(logged.length).toBeLessThan(1024);
+    });
   });
 
   it('preserves the legacy fetchSessionFiles proxy/auth argument order', async () => {
