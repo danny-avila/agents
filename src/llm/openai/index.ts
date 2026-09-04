@@ -618,17 +618,6 @@ function stripUnsupportedAstraParams<T extends object>(
   return next;
 }
 
-/**
- * Whether this turn binds tools. GPT-6 Astra serves tool calls only from the
- * Responses API, and unlike a config-time check this runs with the resolved
- * call options, so non-tool turns keep their Chat Completions path.
- */
-function hasBoundTools(options?: {
-  tools?: t.ChatOpenAICallOptions['tools'];
-}): boolean {
-  return Array.isArray(options?.tools) && options.tools.length > 0;
-}
-
 /** @internal */
 export function shouldIncludeEncryptedReasoning(
   model: string,
@@ -1836,7 +1825,12 @@ function isFirstPartyAzureEndpoint(args: {
 }
 
 /**
- * Whether the GPT-6 Astra request rules apply to this request.
+ * Whether the GPT-6 Astra request-shaping rules apply to this request.
+ *
+ * Shaping only: which API serves the turn is the caller's decision, made where
+ * the rest of the request is shaped. These rules cover what the model rejects
+ * on either API — sampling and logprob parameters, unsupported reasoning
+ * efforts — plus the encrypted reasoning it supports.
  *
  * Both halves must hold: the SDK knows the model is Astra, and the caller has
  * declared that this client talks to the first-party endpoint those rules
@@ -2813,22 +2807,9 @@ function withLibreChatOpenAIFields(
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   protected firstPartyEndpoint?: boolean;
 
-  /**
-   * Whether both request delegates are the LibreChat ones. `withLibreChatOpenAIFields`
-   * keeps a caller-supplied `completions`/`responses` instead of building its own,
-   * and the parameter stripping and effort substitution live inside the LibreChat
-   * delegates. Routing to an injected Responses delegate would therefore send the
-   * very parameters Astra rejects — worse than not routing at all — so the routing
-   * gate stands down unless the delegates that enforce the rest are in place.
-   */
-  private readonly ownsRequestDelegates: boolean;
-
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return (
-      this.ownsRequestDelegates &&
-      astraRulesApply(this.model, this.firstPartyEndpoint)
-    );
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   _lc_stream_delay: number;
@@ -2836,10 +2817,7 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   constructor(
     fields?: LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
   ) {
-    const ownsRequestDelegates =
-      fields?.completions == null && fields?.responses == null;
     super(withLibreChatOpenAIFields(fields));
-    this.ownsRequestDelegates = ownsRequestDelegates;
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
   }
@@ -2850,23 +2828,6 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
       this.responses as OpenAIClientDelegate,
       this._useResponsesApi(undefined)
     ) as CustomOpenAIClient;
-  }
-
-  /**
-   * GPT-6 Astra serves tool calls only from the Responses API — Chat
-   * Completions rejects a tool-bearing request. Routing is decided here rather
-   * than at configuration time because `options.tools` is only resolved once
-   * tools are bound, so a non-tool turn keeps its Chat Completions path
-   * instead of being routed defensively.
-   * @see https://developers.openai.com/api/docs/guides/latest-model
-   */
-  protected _useResponsesApi(
-    options: this['ParsedCallOptions'] | undefined
-  ): boolean {
-    if (this.astraRulesApply && hasBoundTools(options)) {
-      return true;
-    }
-    return super._useResponsesApi(options);
   }
   static lc_name(): string {
     return 'LibreChatOpenAI';
@@ -2972,23 +2933,6 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
       this.responses as OpenAIClientDelegate,
       this._useResponsesApi(undefined)
     ) as CustomOpenAIClient;
-  }
-
-  /**
-   * GPT-6 Astra serves tool calls only from the Responses API — Chat
-   * Completions rejects a tool-bearing request. Routing is decided here rather
-   * than at configuration time because `options.tools` is only resolved once
-   * tools are bound, so a non-tool turn keeps its Chat Completions path
-   * instead of being routed defensively.
-   * @see https://developers.openai.com/api/docs/guides/latest-model
-   */
-  protected _useResponsesApi(
-    options: this['ParsedCallOptions'] | undefined
-  ): boolean {
-    if (this.astraRulesApply && hasBoundTools(options)) {
-      return true;
-    }
-    return super._useResponsesApi(options);
   }
 
   static lc_name(): 'LibreChatAzureOpenAI' {

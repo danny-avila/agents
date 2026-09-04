@@ -1,7 +1,5 @@
 import OpenAI from 'openai';
 
-import { ChatOpenAIResponses } from '@langchain/openai';
-
 import {
   ChatOpenAI,
   addChatCacheBreakpoints,
@@ -275,23 +273,6 @@ describe('GPT-6 Astra request constraints', () => {
     },
   };
 
-  it('routes tool-bearing turns to the Responses API', () => {
-    const model = astra();
-    expect(model.invocationParams({ tools: [tool] })).toMatchObject({
-      model: 'gpt-6-astra',
-    });
-    // Responses builds `max_output_tokens`; Completions builds
-    // `max_completion_tokens`. The key present identifies the chosen path.
-    expect(
-      'max_output_tokens' in model.invocationParams({ tools: [tool] })
-    ).toBe(true);
-  });
-
-  it('keeps non-tool turns on Chat Completions', () => {
-    const params = astra().invocationParams({});
-    expect('max_output_tokens' in params).toBe(false);
-  });
-
   it('strips sampling parameters the model rejects', () => {
     const model = astra({ temperature: 0.7, topP: 0.9, topLogprobs: 3 });
     for (const options of [{}, { tools: [tool] }]) {
@@ -374,30 +355,26 @@ describe('GPT-6 Astra request constraints', () => {
     expect(params.reasoning_effort).toBe('none');
   });
 
-  it('applies no gate when the caller has not declared a first-party endpoint', () => {
+  it('shapes nothing when the caller has not declared a first-party endpoint', () => {
     const undeclared = new ChatOpenAI({
       model: 'gpt-6-astra',
       apiKey: 'test-key',
       temperature: 0.7,
     });
     const params = undeclared.invocationParams({
-      tools: [tool],
       reasoningEffort: 'none',
     } as never) as Record<string, unknown>;
-    /** Default off: Chat Completions kept, sampling kept, `none` not rewritten. */
-    expect('max_output_tokens' in params).toBe(false);
+    /** Default off: sampling kept, `none` not rewritten. */
     expect(params.temperature).toBe(0.7);
     expect(params.reasoning_effort).toBe('none');
   });
 
-  it('applies every gate once the endpoint is declared', () => {
+  it('shapes the request once the endpoint is declared', () => {
     const params = astra({ temperature: 0.7 }).invocationParams({
-      tools: [tool],
       reasoningEffort: 'none',
     } as never) as Record<string, unknown>;
-    expect('max_output_tokens' in params).toBe(true);
     expect(params).not.toHaveProperty('temperature');
-    expect((params.reasoning as { effort?: string } | undefined)?.effort).toBe('low');
+    expect(params.reasoning_effort).toBe('low');
   });
 
   it('declaring the endpoint does not widen the gates to another model', () => {
@@ -412,36 +389,6 @@ describe('GPT-6 Astra request constraints', () => {
     } as never) as Record<string, unknown>;
     expect(params.temperature).toBe(0.7);
     expect(params.reasoning_effort).toBe('none');
-  });
-
-  it('stands down when a caller injects its own request delegates', () => {
-    /**
-     * Parameter stripping and effort substitution live in the LibreChat
-     * delegates. Routing to an injected Responses delegate would send exactly
-     * the parameters Astra rejects, so the routing gate must not fire alone.
-     */
-    const injected = new ChatOpenAI({
-      model: 'gpt-6-astra',
-      apiKey: 'test-key',
-      firstPartyEndpoint: true,
-      temperature: 0.7,
-      responses: new ChatOpenAIResponses({
-        model: 'gpt-6-astra',
-        apiKey: 'test-key',
-      }),
-    });
-    const params = injected.invocationParams({
-      tools: [tool],
-      reasoningEffort: 'none',
-    } as never) as Record<string, unknown>;
-    /**
-     * Routing stands down, so the turn stays on Chat Completions and a tool call
-     * fails with the provider's own error rather than a silently invalid
-     * Responses request. The delegates still owned here keep enforcing what they
-     * can — the completions path strips the rejected parameters as usual.
-     */
-    expect('max_output_tokens' in params).toBe(false);
-    expect(params).not.toHaveProperty('temperature');
   });
 
   it('leaves other models untouched', () => {
