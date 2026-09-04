@@ -93,6 +93,11 @@ export type ManagedRequestOptions = {
    * must select it with `useResponsesApi`, alongside the rest of the request
    * shaping that depends on which API is in use.
    *
+   * The shaping runs inside this SDK's own request delegates. A caller that
+   * supplies its own `completions` or `responses` delegate replaces that
+   * construction and owns the request shaping for it — this flag cannot reach
+   * inside a delegate it did not build.
+   *
    * Declared rather than inferred from a base URL: only the caller knows
    * whether a URL is a faithful first-party route, a gateway, or a proxy with
    * its own semantics, and every gate it controls removes capability, so
