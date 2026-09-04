@@ -512,23 +512,22 @@ export function addResponseCacheBreakpoints(
  * therefore silently degrades a sibling model that never needed it, so the
  * match stays narrow until OpenAI documents the same rules more widely.
  *
- * A provider/deployment prefix (`openai/gpt-6-astra`, `azure/gpt-6-astra`) is
- * stripped first so gateway-style ids resolve.
+ * Deliberately does NOT match a `provider/` prefixed id such as
+ * `openai/gpt-6-astra`. A slash means a proxy is doing the routing, and the
+ * proxy's contract is not OpenAI's: `ChatOpenRouter` extends this class, and on
+ * OpenRouter `effort: 'none'` is a *supported* value meaning "disable
+ * reasoning" (it maps to `include_reasoning: false`). Substituting it with
+ * `low` there would silently turn reasoning off into reasoning on, and forcing
+ * the Responses API would change the endpoint shape a proxy may not serve. Bare
+ * ids reach the first-party OpenAI and Azure surfaces these rules describe.
  * @see https://developers.openai.com/api/docs/models/gpt-6-astra
  * @see https://developers.openai.com/api/docs/guides/latest-model
  */
 const GPT_6_ASTRA_PATTERN = /^gpt-6-astra(?:-|$)/i;
 
-function normalizeOpenAIModelId(model?: string): string {
-  if (model == null || model === '') {
-    return '';
-  }
-  return model.toLowerCase().split('/').pop() ?? '';
-}
-
 /** @internal */
 export function isGpt6AstraModel(model?: string): boolean {
-  return GPT_6_ASTRA_PATTERN.test(normalizeOpenAIModelId(model));
+  return model != null && GPT_6_ASTRA_PATTERN.test(model.toLowerCase());
 }
 
 /**

@@ -193,12 +193,10 @@ describe('managed GPT-5.6 request fields', () => {
 });
 
 describe('GPT-6 Astra model detection', () => {
-  it('matches the documented id, snapshots and provider prefixes', () => {
+  it('matches the documented id and its snapshots', () => {
     expect(isGpt6AstraModel('gpt-6-astra')).toBe(true);
     expect(isGpt6AstraModel('gpt-6-astra-2026-04-30')).toBe(true);
     expect(isGpt6AstraModel('GPT-6-Astra')).toBe(true);
-    expect(isGpt6AstraModel('openai/gpt-6-astra')).toBe(true);
-    expect(isGpt6AstraModel('azure/gpt-6-astra')).toBe(true);
   });
 
   it('does not widen to the rest of the gpt-6 family or near-miss ids', () => {
@@ -209,6 +207,17 @@ describe('GPT-6 Astra model detection', () => {
     expect(isGpt6AstraModel('not-gpt-6-astra')).toBe(false);
     expect(isGpt6AstraModel(undefined)).toBe(false);
     expect(isGpt6AstraModel('')).toBe(false);
+  });
+
+  /**
+   * A `provider/` prefix means a proxy owns the request contract. `ChatOpenRouter`
+   * extends `ChatOpenAI`, so matching a prefixed id would apply OpenAI's rules to
+   * OpenRouter — where `effort: 'none'` is a supported value meaning "disable
+   * reasoning", not an error to substitute away.
+   */
+  it('does not match proxy-routed ids', () => {
+    expect(isGpt6AstraModel('openai/gpt-6-astra')).toBe(false);
+    expect(isGpt6AstraModel('openrouter/openai/gpt-6-astra')).toBe(false);
   });
 });
 
@@ -305,6 +314,22 @@ describe('GPT-6 Astra request constraints', () => {
     const params = model.invocationParams({
       reasoningEffort: 'none',
     } as never) as { reasoning_effort?: string };
+    expect(params.reasoning_effort).toBe('none');
+  });
+
+  it('leaves a proxy-routed Astra id alone on every gate', () => {
+    const proxied = new ChatOpenAI({
+      model: 'openai/gpt-6-astra',
+      apiKey: 'test-key',
+      temperature: 0.7,
+    });
+    const params = proxied.invocationParams({
+      tools: [tool],
+      reasoningEffort: 'none',
+    } as never) as Record<string, unknown>;
+    /** Chat Completions path retained, sampling kept, `none` not substituted. */
+    expect('max_output_tokens' in params).toBe(false);
+    expect(params.temperature).toBe(0.7);
     expect(params.reasoning_effort).toBe('none');
   });
 
