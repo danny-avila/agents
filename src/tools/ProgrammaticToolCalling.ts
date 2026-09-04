@@ -529,7 +529,9 @@ export async function makeRequest(
 
     if (!response.ok) {
       throw new CodeApiRequestError(
-        await buildCodeApiHttpErrorMessage('POST', endpoint, response)
+        await buildCodeApiHttpErrorMessage('POST', endpoint, response, {
+          profile: executionProfile,
+        })
       );
     }
 

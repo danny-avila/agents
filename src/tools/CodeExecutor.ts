@@ -142,7 +142,7 @@ type CodeApiErrorDiagnostic = {
 
 type CodeApiRejectionDiagnostic = {
   method: string;
-  host: string;
+  profile: string;
   status: number;
 };
 
@@ -184,20 +184,6 @@ function describeCodeApiError(error: unknown): CodeApiErrorDiagnostic {
     return { type: 'Error' };
   } catch {
     return { type: 'UndescribableError' };
-  }
-}
-
-/**
- * Only the authority is logged. A configured base URL can carry a capability in
- * its path, and the files route puts a session id in one, so the full endpoint
- * is host text; the authority is what actually answers the question a rejection
- * raises — which backend refused this call.
- */
-function describeEndpointHost(endpoint: string): string {
-  try {
-    return new URL(endpoint).host;
-  } catch {
-    return 'unparsed';
   }
 }
 
@@ -343,33 +329,37 @@ export function addCodeApiExecutionProfileHeader(
 
 export async function buildCodeApiHttpErrorMessage(
   method: string,
-  endpoint: string,
+  _endpoint: string,
   response: { status: number; text: () => Promise<string> },
-  options?: { recoverable?: boolean }
+  options?: { recoverable?: boolean; profile?: t.CodeApiExecutionProfile }
 ): Promise<string> {
-  let responseBody = '';
-  try {
-    responseBody = await response.text();
-  } catch {
-    responseBody = '';
-  }
-  /* The response body is deliberately absent: it is upstream free text that
-     can echo the header that was sent, and the status distinguishes the
-     failure modes on its own. A recoverable caller reports its own outcome —
-     logging here too would raise an error-level alert for a lookup that
-     succeeds by returning nothing. */
+  /* Logged before the body is touched. A non-OK response can leave a chunked
+     body open, and there is no read timeout here, so draining first would
+     withhold the diagnostic indefinitely for exactly the backend it identifies.
+     The body itself is never logged — it is upstream free text that can echo
+     the header that was sent — and the endpoint is host-configured, so the
+     backend is named by the profile this module chose rather than by its
+     address. A recoverable caller reports its own outcome; logging here too
+     would raise an error-level alert for a lookup that succeeds by returning
+     nothing. */
   if (options?.recoverable !== true) {
     logCodeApiDiagnostic(
       response.status === 429 ? 'warn' : 'error',
       'Code API rejected the request',
       {
         method,
-        host: describeEndpointHost(endpoint),
+        profile: options?.profile ?? 'unset',
         status: response.status,
       }
     );
   }
   if (response.status === 429) {
+    let responseBody = '';
+    try {
+      responseBody = await response.text();
+    } catch {
+      responseBody = '';
+    }
     const retryAfterSeconds = getRetryAfterSeconds(responseBody);
     return retryAfterSeconds != null
       ? `Code execution is temporarily rate-limited. Retry after ${retryAfterSeconds} seconds.`
@@ -582,7 +572,9 @@ function createCodeExecutionTool(
         const response = await fetch(execEndpoint, fetchOptions);
         if (!response.ok) {
           throw new CodeApiRequestError(
-            await buildCodeApiHttpErrorMessage('POST', execEndpoint, response)
+            await buildCodeApiHttpErrorMessage('POST', execEndpoint, response, {
+              profile: executionProfile,
+            })
           );
         }
 

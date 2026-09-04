@@ -278,7 +278,9 @@ function createBashExecutionTool(
         const response = await fetch(execEndpoint, fetchOptions);
         if (!response.ok) {
           throw new CodeApiRequestError(
-            await buildCodeApiHttpErrorMessage('POST', execEndpoint, response)
+            await buildCodeApiHttpErrorMessage('POST', execEndpoint, response, {
+              profile: executionProfile,
+            })
           );
         }
 

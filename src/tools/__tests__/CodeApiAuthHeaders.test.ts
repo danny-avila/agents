@@ -462,6 +462,7 @@ describe('CodeAPI auth header injection', () => {
       );
       const tool = createBashExecutionTool({
         baseUrl: 'https://gateway.example/v1',
+        executionProfile: 'stateful',
       });
 
       await tool.invoke({ command: 'echo 1' }).catch(() => undefined);
@@ -471,29 +472,55 @@ describe('CodeAPI auth header injection', () => {
       expect(logged).toBe('[CodeExecutor] Code API rejected the request');
       expect(detail).toEqual({
         method: 'POST',
-        host: 'gateway.example',
+        profile: 'stateful',
         status,
       });
       expect(JSON.stringify(detail)).not.toContain('eyJhbGciOiJSUzI1NiJ9');
     }
   );
 
-  it('logs the backend authority without the capability in its path', async () => {
+  it('names the backend by profile, never by its configured address', async () => {
     fetchMock.mockResolvedValueOnce(errorResponse(500, 'upstream exploded'));
     const tool = createBashExecutionTool({
-      baseUrl: 'https://gateway.example/t/MIIEvgIBAD/v1',
+      baseUrl: 'https://MIIEvgIBAD.gateway.example/t/MIIEvgIBAD/v1',
     });
 
     await tool.invoke({ command: 'echo 1' }).catch(() => undefined);
 
     expect(errorSpy.mock.calls[0][1]).toEqual({
       method: 'POST',
-      host: 'gateway.example',
+      profile: 'unset',
       status: 500,
     });
     expect(JSON.stringify(errorSpy.mock.calls[0][1])).not.toContain(
       'MIIEvgIBAD'
     );
+  });
+
+  it('logs the rejection before the response body is drained', async () => {
+    let releaseBody: (value: string) => void = () => undefined;
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      text: jest.fn(
+        () =>
+          new Promise<string>((resolve) => {
+            releaseBody = resolve;
+          })
+      ),
+    });
+    const tool = createBashExecutionTool({ executionProfile: 'default' });
+
+    const pending = tool.invoke({ command: 'echo 1' }).catch(() => undefined);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[CodeExecutor] Code API rejected the request',
+      { method: 'POST', profile: 'default', status: 503 }
+    );
+
+    releaseBody('');
+    await pending;
   });
 
   it.each([
