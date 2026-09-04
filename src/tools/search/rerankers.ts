@@ -21,6 +21,23 @@ const getDefaultCohereApiUrl = (): string =>
     ? process.env.COHERE_API_URL
     : DEFAULT_COHERE_API_URL;
 
+/**
+ * Ranking used whenever no reranker scores the chunks: the candidates' own
+ * order, capped at `topK`, with a neutral score.
+ *
+ * Exported because it is not only a *fallback*. With `rerankerType: 'none'`
+ * there is no reranker to fall back from, and the search pipeline needs the
+ * same ranking to hand the scraped text downstream — see `getHighlights` in
+ * `./search`.
+ */
+export const getDefaultRanking = (
+  documents: string[],
+  topK: number
+): t.Highlight[] =>
+  documents
+    .slice(0, Math.min(topK, documents.length))
+    .map((doc) => ({ text: doc, score: 0 }));
+
 export abstract class BaseReranker {
   protected apiKey: string | undefined;
   protected logger: t.Logger;
@@ -51,9 +68,7 @@ export abstract class BaseReranker {
     documents: string[],
     topK: number
   ): t.Highlight[] {
-    return documents
-      .slice(0, Math.min(topK, documents.length))
-      .map((doc) => ({ text: doc, score: 0 }));
+    return getDefaultRanking(documents, topK);
   }
 
   /** A direct caller has no enclosing search to fold into, so one

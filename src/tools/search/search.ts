@@ -10,7 +10,7 @@ import { createKeenableAPI } from './keenable-search';
 import { createTavilyAPI } from './tavily-search';
 import { createSearchMetrics } from './metrics';
 import { createCrwAPI } from './crw-search';
-import { BaseReranker } from './rerankers';
+import { BaseReranker, getDefaultRanking } from './rerankers';
 
 /** Engines queried when `searxngSearchOptions.engines` is not configured. */
 const DEFAULT_SEARXNG_ENGINES = 'google,bing,duckduckgo';
@@ -144,9 +144,20 @@ function createSourceUpdateCallback(sourceMap: Map<string, t.ValidSource>) {
   };
 }
 
+/** Provider label for the metrics summary when reranking is switched off.
+ * `undefined` would be indistinguishable from a reranker that never ran. */
+const NO_RERANKER_PROVIDER = 'none';
+
 /** Returns undefined without logging when there is nothing to rank: an empty
- * scrape is already counted by the scrape summary, and a missing reranker is
- * reported once at tool construction rather than once per source. */
+ * scrape is already counted by the scrape summary.
+ *
+ * A *missing* reranker is not the same as nothing to rank. `rerankerType:
+ * 'none'` is a schema-valid opt-out, and `createReranker` returns `undefined`
+ * for it by design. Returning `undefined` here as well would leave the source
+ * without highlights, and `expandHighlights` then strips its content — the
+ * search would answer with links and no text at all. So the chunks are handed
+ * on in their original order via `getDefaultRanking`, exactly what every
+ * reranker's own failure path already does. */
 const getHighlights = async ({
   query,
   content,
@@ -164,7 +175,7 @@ const getHighlights = async ({
   maxContentLength?: number;
   chunkOptions?: { chunkSize: number; chunkOverlap: number };
 }): Promise<t.Highlight[] | undefined> => {
-  if (!content || !reranker) {
+  if (!content) {
     return;
   }
 
@@ -181,7 +192,7 @@ const getHighlights = async ({
     );
   } catch (error) {
     metrics.recordRerank({
-      provider: reranker.provider,
+      provider: reranker?.provider ?? NO_RERANKER_PROVIDER,
       chunks: 0,
       results: 0,
       durationMs: Date.now() - chunkStartedAt,
@@ -189,6 +200,20 @@ const getHighlights = async ({
       error: formatErrorForLog(error),
     });
     return;
+  }
+
+  /** Reranking is switched off, so the chunks pass through unscored. Recorded
+   * like any other rerank so the search summary still accounts for the source;
+   * it carries no `reason`, because nothing failed. */
+  if (!reranker) {
+    const highlights = getDefaultRanking(documents, topResults);
+    metrics.recordRerank({
+      provider: NO_RERANKER_PROVIDER,
+      chunks: documents.length,
+      results: highlights.length,
+      durationMs: Date.now() - chunkStartedAt,
+    });
+    return highlights;
   }
 
   const rerankStartedAt = Date.now();
