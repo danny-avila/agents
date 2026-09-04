@@ -1,8 +1,10 @@
 import OpenAI from 'openai';
 
 import {
+  ChatOpenAI,
   addChatCacheBreakpoints,
   addResponseCacheBreakpoints,
+  isGpt6AstraModel,
   shouldIncludeEncryptedReasoning,
 } from './index';
 
@@ -178,5 +180,141 @@ describe('managed GPT-5.6 request fields', () => {
       })
     ).toBe(true);
     expect(shouldIncludeEncryptedReasoning('gpt-5.5', {})).toBe(false);
+  });
+
+  it('requests encrypted reasoning for GPT-6 Astra', () => {
+    expect(shouldIncludeEncryptedReasoning('gpt-6-astra', {})).toBe(true);
+    expect(
+      shouldIncludeEncryptedReasoning('gpt-6-astra', {
+        reasoning: { context: 'current_turn' },
+      })
+    ).toBe(false);
+  });
+});
+
+describe('GPT-6 Astra model detection', () => {
+  it('matches the documented id, snapshots and provider prefixes', () => {
+    expect(isGpt6AstraModel('gpt-6-astra')).toBe(true);
+    expect(isGpt6AstraModel('gpt-6-astra-2026-04-30')).toBe(true);
+    expect(isGpt6AstraModel('GPT-6-Astra')).toBe(true);
+    expect(isGpt6AstraModel('openai/gpt-6-astra')).toBe(true);
+    expect(isGpt6AstraModel('azure/gpt-6-astra')).toBe(true);
+  });
+
+  it('does not widen to the rest of the gpt-6 family or near-miss ids', () => {
+    expect(isGpt6AstraModel('gpt-6')).toBe(false);
+    expect(isGpt6AstraModel('gpt-6-mini')).toBe(false);
+    expect(isGpt6AstraModel('gpt-6-astral')).toBe(false);
+    expect(isGpt6AstraModel('gpt-5.6')).toBe(false);
+    expect(isGpt6AstraModel('not-gpt-6-astra')).toBe(false);
+    expect(isGpt6AstraModel(undefined)).toBe(false);
+    expect(isGpt6AstraModel('')).toBe(false);
+  });
+});
+
+describe('GPT-6 Astra request constraints', () => {
+  const astra = (fields: Record<string, unknown> = {}) =>
+    new ChatOpenAI({ model: 'gpt-6-astra', apiKey: 'test-key', ...fields });
+
+  const tool = {
+    type: 'function' as const,
+    function: {
+      name: 'get_weather',
+      description: 'Get the weather',
+      parameters: { type: 'object', properties: {} },
+    },
+  };
+
+  it('routes tool-bearing turns to the Responses API', () => {
+    const model = astra();
+    expect(model.invocationParams({ tools: [tool] })).toMatchObject({
+      model: 'gpt-6-astra',
+    });
+    // Responses builds `max_output_tokens`; Completions builds
+    // `max_completion_tokens`. The key present identifies the chosen path.
+    expect(
+      'max_output_tokens' in model.invocationParams({ tools: [tool] })
+    ).toBe(true);
+  });
+
+  it('keeps non-tool turns on Chat Completions', () => {
+    const params = astra().invocationParams({});
+    expect('max_output_tokens' in params).toBe(false);
+  });
+
+  it('strips sampling parameters the model rejects', () => {
+    const model = astra({ temperature: 0.7, topP: 0.9, topLogprobs: 3 });
+    for (const options of [{}, { tools: [tool] }]) {
+      const params = model.invocationParams(options) as Record<string, unknown>;
+      expect(params).not.toHaveProperty('temperature');
+      expect(params).not.toHaveProperty('top_p');
+      expect(params).not.toHaveProperty('top_logprobs');
+    }
+  });
+
+  it('strips logprobs on Chat Completions', () => {
+    const params = astra({ logprobs: true }).invocationParams({}) as Record<
+      string,
+      unknown
+    >;
+    expect(params).not.toHaveProperty('logprobs');
+  });
+
+  it('drops the rejected logprobs include on Responses, keeping the rest', () => {
+    const model = astra();
+    const params = model.invocationParams({
+      tools: [tool],
+      include: ['message.output_text.logprobs', 'reasoning.encrypted_content'],
+    } as never) as { include?: unknown[] };
+    expect(params.include).toEqual(
+      expect.not.arrayContaining(['message.output_text.logprobs'])
+    );
+    expect(params.include).toEqual(
+      expect.arrayContaining(['reasoning.encrypted_content'])
+    );
+  });
+
+  /**
+   * The two paths carry effort under different keys: Chat Completions emits the
+   * scalar `reasoning_effort`, Responses the nested `reasoning.effort`.
+   */
+  const effortOf = (options: Record<string, unknown>): string | undefined => {
+    const params = astra().invocationParams(options as never) as {
+      reasoning_effort?: string;
+      reasoning?: { effort?: string };
+    };
+    return params.reasoning_effort ?? params.reasoning?.effort;
+  };
+
+  it('substitutes the reasoning efforts the model rejects with low', () => {
+    for (const effort of ['none', 'minimal'] as const) {
+      expect(effortOf({ reasoningEffort: effort })).toBe('low');
+      expect(effortOf({ reasoningEffort: effort, tools: [tool] })).toBe('low');
+    }
+  });
+
+  it('passes supported reasoning efforts through unchanged', () => {
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max'] as const) {
+      expect(effortOf({ reasoningEffort: effort })).toBe(effort);
+      expect(effortOf({ reasoningEffort: effort, tools: [tool] })).toBe(effort);
+    }
+  });
+
+  it('leaves rejected efforts alone on other models', () => {
+    const model = new ChatOpenAI({ model: 'gpt-5.6', apiKey: 'test-key' });
+    const params = model.invocationParams({
+      reasoningEffort: 'none',
+    } as never) as { reasoning_effort?: string };
+    expect(params.reasoning_effort).toBe('none');
+  });
+
+  it('leaves other models untouched', () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5.6',
+      apiKey: 'test-key',
+      temperature: 0.7,
+    });
+    const params = model.invocationParams({}) as Record<string, unknown>;
+    expect(params.temperature).toBe(0.7);
   });
 });

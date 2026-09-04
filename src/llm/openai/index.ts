@@ -503,6 +503,127 @@ export function addResponseCacheBreakpoints(
   );
 }
 
+/**
+ * GPT-6 Astra, matched on the model id rather than a `gpt-6` family cutoff.
+ *
+ * OpenAI documents these constraints for Astra specifically, and every gate
+ * keyed off this helper *removes* capability — it forces the Responses API,
+ * drops sampling parameters, and lowers reasoning effort. A false positive
+ * therefore silently degrades a sibling model that never needed it, so the
+ * match stays narrow until OpenAI documents the same rules more widely.
+ *
+ * A provider/deployment prefix (`openai/gpt-6-astra`, `azure/gpt-6-astra`) is
+ * stripped first so gateway-style ids resolve.
+ * @see https://developers.openai.com/api/docs/models/gpt-6-astra
+ * @see https://developers.openai.com/api/docs/guides/latest-model
+ */
+const GPT_6_ASTRA_PATTERN = /^gpt-6-astra(?:-|$)/i;
+
+function normalizeOpenAIModelId(model?: string): string {
+  if (model == null || model === '') {
+    return '';
+  }
+  return model.toLowerCase().split('/').pop() ?? '';
+}
+
+/** @internal */
+export function isGpt6AstraModel(model?: string): boolean {
+  return GPT_6_ASTRA_PATTERN.test(normalizeOpenAIModelId(model));
+}
+
+/**
+ * Reasoning efforts GPT-6 Astra does not accept, mapped to the level OpenAI
+ * recommends migrating to. `none` is rejected outright and `minimal` is not
+ * offered; the migration guide says to "start with `low` and compare results".
+ * Substituting keeps a stored agent configuration usable instead of failing
+ * the turn on a value the previous model accepted.
+ */
+const GPT_6_ASTRA_UNSUPPORTED_EFFORTS = new Set(['none', 'minimal']);
+const GPT_6_ASTRA_EFFORT_FALLBACK = 'low' as const;
+
+function substituteUnsupportedAstraEffort(
+  model: string,
+  reasoning: OpenAIClient.Reasoning | undefined
+): OpenAIClient.Reasoning | undefined {
+  const effort = reasoning?.effort;
+  if (
+    effort == null ||
+    !GPT_6_ASTRA_UNSUPPORTED_EFFORTS.has(effort) ||
+    !isGpt6AstraModel(model)
+  ) {
+    return reasoning;
+  }
+  return { ...reasoning, effort: GPT_6_ASTRA_EFFORT_FALLBACK };
+}
+
+/** Rejected inside the Responses `include` array. */
+const GPT_6_ASTRA_UNSUPPORTED_INCLUDE = 'message.output_text.logprobs';
+
+/**
+ * The subset of a request GPT-6 Astra rejects. Declared as optional fields so
+ * each key can be deleted from a request object whose concrete type marks it
+ * required.
+ */
+type AstraStrippableParams = {
+  temperature?: unknown;
+  top_p?: unknown;
+  top_logprobs?: unknown;
+  logprobs?: unknown;
+  include?: unknown[];
+};
+
+/**
+ * Removes the sampling and logprob parameters GPT-6 Astra rejects.
+ *
+ * LangChain's request builders emit `temperature` and `top_p` from instance
+ * fields unconditionally, so leaving them unset upstream is not enough — they
+ * are stripped after `super.invocationParams`. `logprobs` is Chat Completions
+ * only; the Responses equivalent rides inside `include`.
+ */
+function stripUnsupportedAstraParams<T extends object>(
+  model: string,
+  params: T,
+  endpoint: 'completions' | 'responses'
+): T {
+  if (!isGpt6AstraModel(model)) {
+    return params;
+  }
+  const next = { ...params };
+  const record = next as AstraStrippableParams;
+  delete record.temperature;
+  delete record.top_p;
+  delete record.top_logprobs;
+  if (endpoint === 'completions') {
+    delete record.logprobs;
+    return next;
+  }
+  const include = record.include;
+  if (!Array.isArray(include)) {
+    return next;
+  }
+  const filtered = include.filter(
+    (entry) => entry !== GPT_6_ASTRA_UNSUPPORTED_INCLUDE
+  );
+  if (filtered.length === include.length) {
+    return next;
+  }
+  if (filtered.length === 0) {
+    delete record.include;
+  } else {
+    record.include = filtered;
+  }
+  return next;
+}
+
+/**
+ * Whether this turn binds tools. GPT-6 Astra serves tool calls only from the
+ * Responses API, and unlike a config-time check this runs with the resolved
+ * call options, so non-tool turns keep their Chat Completions path.
+ */
+function hasBoundTools(options?: { tools?: unknown }): boolean {
+  return Array.isArray(options?.tools) && options.tools.length > 0;
+}
+
 /** @internal */
 export function shouldIncludeEncryptedReasoning(
   model: string,
@@ -517,7 +638,7 @@ export function shouldIncludeEncryptedReasoning(
       | undefined
   )?.context;
   return (
-    /^gpt-5\.6(?:-|$)/i.test(model) &&
+    (/^gpt-5\.6(?:-|$)/i.test(model) || isGpt6AstraModel(model)) &&
     (params.store === false || reasoningContext !== 'current_turn')
   );
 }
@@ -1109,6 +1230,7 @@ function getExposedOpenAIClient(
 }
 
 function getReasoningParams(
+  model: string,
   baseReasoning: OpenAIClient.Reasoning | undefined,
   options?: ReasoningCallOptions
 ): OpenAIClient.Reasoning | undefined {
@@ -1134,7 +1256,7 @@ function getReasoningParams(
       effort: options.reasoningEffort,
     };
   }
-  return reasoning;
+  return substituteUnsupportedAstraEffort(model, reasoning);
 }
 
 function getGatedReasoningParams(
@@ -1145,7 +1267,7 @@ function getGatedReasoningParams(
   if (!isReasoningModel(model)) {
     return;
   }
-  return getReasoningParams(baseReasoning, options);
+  return getReasoningParams(model, baseReasoning, options);
 }
 
 function isObject(value: unknown): value is object {
@@ -1697,17 +1819,21 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     extra?: { streaming?: boolean }
   ): ReturnType<OriginalChatOpenAICompletions['invocationParams']> {
     return stripIntentFromStrictTools(
-      applyManagedRequestParams(super.invocationParams(options, extra), {
-        promptCacheExplicit: this.promptCacheExplicit,
-        safetyIdentifier: this.safetyIdentifier,
-      })
+      stripUnsupportedAstraParams(
+        this.model,
+        applyManagedRequestParams(super.invocationParams(options, extra), {
+          promptCacheExplicit: this.promptCacheExplicit,
+          safetyIdentifier: this.safetyIdentifier,
+        }),
+        'completions'
+      )
     );
   }
 
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getReasoningParams(this.reasoning, options);
+    return getReasoningParams(this.model, this.reasoning, options);
   }
 
   _getClientOptions(
@@ -2154,7 +2280,9 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
         ]),
       ];
     }
-    return stripIntentFromStrictTools(params);
+    return stripIntentFromStrictTools(
+      stripUnsupportedAstraParams(this.model, params, 'responses')
+    );
   }
 
   async completionWithRetry(
@@ -2237,7 +2365,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getReasoningParams(this.reasoning, options);
+    return getReasoningParams(this.model, this.reasoning, options);
   }
 
   _getClientOptions(
@@ -2262,10 +2390,14 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
     extra?: { streaming?: boolean }
   ): ReturnType<OriginalAzureChatOpenAICompletions['invocationParams']> {
     return stripIntentFromStrictTools(
-      applyManagedRequestParams(super.invocationParams(options, extra), {
-        promptCacheExplicit: this.promptCacheExplicit,
-        safetyIdentifier: this.safetyIdentifier,
-      })
+      stripUnsupportedAstraParams(
+        this.model,
+        applyManagedRequestParams(super.invocationParams(options, extra), {
+          promptCacheExplicit: this.promptCacheExplicit,
+          safetyIdentifier: this.safetyIdentifier,
+        }),
+        'completions'
+      )
     );
   }
 
@@ -2410,7 +2542,9 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
         ]),
       ];
     }
-    return stripIntentFromStrictTools(params);
+    return stripIntentFromStrictTools(
+      stripUnsupportedAstraParams(this.model, params, 'responses')
+    );
   }
 
   async completionWithRetry(
@@ -2589,6 +2723,23 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
       this._useResponsesApi(undefined)
     ) as CustomOpenAIClient;
   }
+
+  /**
+   * GPT-6 Astra serves tool calls only from the Responses API — Chat
+   * Completions rejects a tool-bearing request. Routing is decided here rather
+   * than at configuration time because `options.tools` is only resolved once
+   * tools are bound, so a non-tool turn keeps its Chat Completions path
+   * instead of being routed defensively.
+   * @see https://developers.openai.com/api/docs/guides/latest-model
+   */
+  protected _useResponsesApi(
+    options: this['ParsedCallOptions'] | undefined
+  ): boolean {
+    if (isGpt6AstraModel(this.model) && hasBoundTools(options)) {
+      return true;
+    }
+    return super._useResponsesApi(options);
+  }
   static lc_name(): string {
     return 'LibreChatOpenAI';
   }
@@ -2627,7 +2778,7 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getReasoningParams(this.reasoning, options);
+    return getReasoningParams(this.model, this.reasoning, options);
   }
 
   protected _getReasoningParams(
@@ -2686,6 +2837,24 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
       this._useResponsesApi(undefined)
     ) as CustomOpenAIClient;
   }
+
+  /**
+   * GPT-6 Astra serves tool calls only from the Responses API — Chat
+   * Completions rejects a tool-bearing request. Routing is decided here rather
+   * than at configuration time because `options.tools` is only resolved once
+   * tools are bound, so a non-tool turn keeps its Chat Completions path
+   * instead of being routed defensively.
+   * @see https://developers.openai.com/api/docs/guides/latest-model
+   */
+  protected _useResponsesApi(
+    options: this['ParsedCallOptions'] | undefined
+  ): boolean {
+    if (isGpt6AstraModel(this.model) && hasBoundTools(options)) {
+      return true;
+    }
+    return super._useResponsesApi(options);
+  }
+
   static lc_name(): 'LibreChatAzureOpenAI' {
     return 'LibreChatAzureOpenAI';
   }
