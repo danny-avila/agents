@@ -1,7 +1,6 @@
 import OpenAI from 'openai';
 
 import {
-  AzureChatOpenAI,
   ChatOpenAI,
   addChatCacheBreakpoints,
   addResponseCacheBreakpoints,
@@ -416,61 +415,6 @@ describe('GPT-6 Astra request constraints', () => {
     } as never) as ProbedRequestParams;
     expect(params.temperature).toBe(0.7);
     expect(params.reasoning_effort).toBe('none');
-  });
-
-  it('keys off the served model when `model` is a deployment alias', () => {
-    /**
-     * Azure addresses a deployment, so callers set `model` to the deployment
-     * name. Without the declared identity the SDK sees an alias and shapes
-     * nothing.
-     */
-    const deployed = new ChatOpenAI({
-      model: 'my-astra-deployment',
-      apiKey: 'test-key',
-      firstPartyEndpoint: true,
-      servedModel: 'gpt-6-astra',
-      temperature: 0.7,
-    });
-    const params = deployed.invocationParams({
-      reasoningEffort: 'none',
-    } as never) as ProbedRequestParams;
-    expect(params).not.toHaveProperty('temperature');
-    expect(params.reasoning_effort).toBe('low');
-  });
-
-  it('does not shape a deployment serving some other model', () => {
-    const other = new ChatOpenAI({
-      model: 'my-deployment',
-      apiKey: 'test-key',
-      firstPartyEndpoint: true,
-      servedModel: 'gpt-5.6',
-      temperature: 0.7,
-    });
-    const params = other.invocationParams({
-      reasoningEffort: 'none',
-    } as never) as ProbedRequestParams;
-    expect(params.temperature).toBe(0.7);
-    expect(params.reasoning_effort).toBe('none');
-  });
-
-  it('substitutes effort on an Azure deployment alias serving Astra', () => {
-    /**
-     * Only the Azure delegates run the reasoning-model guard, which resolves a
-     * model pattern before any Astra handling. A deployment alias matches no
-     * pattern, so without the served model it returns early and the effort is
-     * dropped rather than substituted.
-     */
-    const azure = new AzureChatOpenAI({
-      azureOpenAIApiKey: 'test',
-      azureOpenAIApiDeploymentName: 'my-astra-deployment',
-      azureOpenAIApiVersion: '2024-08-01-preview',
-      firstPartyEndpoint: true,
-      servedModel: 'gpt-6-astra',
-    });
-    const params = azure.invocationParams({
-      reasoningEffort: 'none',
-    } as never) as ProbedRequestParams;
-    expect(params.reasoning_effort).toBe('low');
   });
 
   it('leaves other models untouched', () => {

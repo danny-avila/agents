@@ -104,17 +104,6 @@ export type ManagedRequestOptions = {
    * guessing wrong silently degrades an endpoint the SDK cannot see.
    */
   firstPartyEndpoint?: boolean;
-  /**
-   * The model actually serving this request, when `model` carries something
-   * else. Azure addresses a deployment rather than a model, so callers set
-   * `model` to the deployment name and the served model is otherwise
-   * unknowable here — the model-specific request constraints above key off
-   * this when it is given.
-   *
-   * Declared for the same reason as `firstPartyEndpoint`: only the caller knows
-   * which model a deployment alias resolves to.
-   */
-  servedModel?: string;
 };
 /**
  * Adaptive stream-smoothing configuration shared by every provider client.

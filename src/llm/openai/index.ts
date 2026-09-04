@@ -123,7 +123,6 @@ type OpenAIClientConfig = NonNullable<
 type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   _lc_stream_delay?: number;
   firstPartyEndpoint?: boolean;
-  servedModel?: string;
   includeReasoningContent?: boolean;
   includeReasoningDetails?: boolean;
   convertReasoningDetailsToContent?: boolean;
@@ -136,7 +135,6 @@ type LibreChatOpenAIFields = t.ChatOpenAIFields & {
 type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & {
   _lc_stream_delay?: number;
   firstPartyEndpoint?: boolean;
-  servedModel?: string;
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
 };
@@ -1260,13 +1258,9 @@ function getGatedReasoningParams(
   model: string,
   astraRulesApply: boolean,
   baseReasoning: OpenAIClient.Reasoning | undefined,
-  options?: ReasoningCallOptions,
-  servedModel?: string
+  options?: ReasoningCallOptions
 ): OpenAIClient.Reasoning | undefined {
-  // Azure addresses a deployment, so `model` can be an alias that no model
-  // pattern recognizes. Resolve against what the deployment actually serves,
-  // or this returns before the Astra effort substitution ever runs.
-  if (!isReasoningModel(servedModel ?? model)) {
+  if (!isReasoningModel(model)) {
     return;
   }
   return getReasoningParams(astraRulesApply, baseReasoning, options);
@@ -1852,19 +1846,17 @@ function isFirstPartyAzureEndpoint(args: {
  */
 function astraRulesApply(
   model: string,
-  firstPartyEndpoint: boolean | undefined,
-  servedModel: string | undefined
+  firstPartyEndpoint: boolean | undefined
 ): boolean {
-  return firstPartyEndpoint === true && isGpt6AstraModel(servedModel ?? model);
+  return firstPartyEndpoint === true && isGpt6AstraModel(model);
 }
 
 class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   protected firstPartyEndpoint?: boolean;
-  protected servedModel?: string;
 
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApply(this.model, this.firstPartyEndpoint, this.servedModel);
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   private includeReasoningContent?: boolean;
@@ -1883,7 +1875,6 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     this.preserveToolCacheControl = fields?.preserveToolCacheControl;
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
-    this.servedModel = fields?.servedModel;
     this.safetyIdentifier = fields?.safety_identifier;
   }
 
@@ -2299,11 +2290,10 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   protected firstPartyEndpoint?: boolean;
-  protected servedModel?: string;
 
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApply(this.model, this.firstPartyEndpoint, this.servedModel);
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   private promptCacheExplicit?: boolean;
@@ -2315,7 +2305,6 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
-    this.servedModel = fields?.servedModel;
     this.responsesPromptCache = fields?.responsesPromptCache;
     this.responsesPromptCacheTtl = fields?.responsesPromptCacheTtl;
     this.safetyIdentifier = fields?.safety_identifier;
@@ -2460,11 +2449,10 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
 
 class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions {
   protected firstPartyEndpoint?: boolean;
-  protected servedModel?: string;
 
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApply(this.model, this.firstPartyEndpoint, this.servedModel);
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   private promptCacheExplicit?: boolean;
@@ -2474,7 +2462,6 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
-    this.servedModel = fields?.servedModel;
     this.safetyIdentifier = fields?.safety_identifier;
   }
 
@@ -2501,8 +2488,7 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
       this.model,
       this.astraRulesApply,
       this.reasoning,
-      options,
-      this.servedModel
+      options
     );
   }
 
@@ -2618,11 +2604,10 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
 
 class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
   protected firstPartyEndpoint?: boolean;
-  protected servedModel?: string;
 
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApply(this.model, this.firstPartyEndpoint, this.servedModel);
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   private promptCacheExplicit?: boolean;
@@ -2632,7 +2617,6 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
-    this.servedModel = fields?.servedModel;
     this.safetyIdentifier = fields?.safety_identifier;
   }
 
@@ -2740,8 +2724,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       this.model,
       this.astraRulesApply,
       this.reasoning,
-      options,
-      this.servedModel
+      options
     );
   }
 
@@ -2823,11 +2806,10 @@ function withLibreChatOpenAIFields(
 
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   protected firstPartyEndpoint?: boolean;
-  protected servedModel?: string;
 
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApply(this.model, this.firstPartyEndpoint, this.servedModel);
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   _lc_stream_delay: number;
@@ -2838,7 +2820,6 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
     super(withLibreChatOpenAIFields(fields));
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
-    this.servedModel = fields?.servedModel;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2930,11 +2911,10 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
 
 export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   protected firstPartyEndpoint?: boolean;
-  protected servedModel?: string;
 
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApply(this.model, this.firstPartyEndpoint, this.servedModel);
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   _lc_stream_delay: number;
@@ -2945,7 +2925,6 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
     this.responses = new LibreChatAzureOpenAIResponses(fields);
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
-    this.servedModel = fields?.servedModel;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2970,8 +2949,7 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
       this.model,
       this.astraRulesApply,
       this.reasoning,
-      options,
-      this.servedModel
+      options
     );
   }
 
