@@ -122,6 +122,7 @@ type OpenAIClientConfig = NonNullable<
 >;
 type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   _lc_stream_delay?: number;
+  firstPartyEndpoint?: boolean;
   includeReasoningContent?: boolean;
   includeReasoningDetails?: boolean;
   convertReasoningDetailsToContent?: boolean;
@@ -133,6 +134,7 @@ type LibreChatOpenAIFields = t.ChatOpenAIFields & {
 };
 type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & {
   _lc_stream_delay?: number;
+  firstPartyEndpoint?: boolean;
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
 };
@@ -1836,32 +1838,31 @@ function isFirstPartyAzureEndpoint(args: {
 /**
  * Whether the GPT-6 Astra request rules apply to this request.
  *
- * Both halves must hold: the model is Astra, *and* the request actually reaches
- * the first-party surface those rules describe. A custom `baseURL` (or the
- * `OPENAI_BASE_URL` fallback) means a proxy owns the contract, exactly as
- * {@link isOfficialOpenAIBaseURL} already gates the first-party stream
- * adapter. Every Astra gate removes capability, so applying one to an endpoint
- * whose semantics are unknown silently degrades it.
+ * Both halves must hold: the SDK knows the model is Astra, and the caller has
+ * declared that this client talks to the first-party endpoint those rules
+ * describe. The endpoint half is *declared* rather than inferred from a base
+ * URL: only the caller knows whether a given URL is a faithful first-party
+ * route, a gateway, or a proxy with its own semantics, and every gate here
+ * removes capability — forcing Responses, dropping parameters, lowering effort
+ * — so guessing wrong silently degrades an endpoint the SDK cannot see.
+ *
+ * Defaults to off. An undeclared client keeps its existing behavior and a
+ * misconfigured Astra call fails with the provider's own error, which names the
+ * remedy, rather than being silently rewritten.
  */
-function astraRulesApplyToOpenAI(
+function astraRulesApply(
   model: string,
-  baseURL: string | null | undefined
+  firstPartyEndpoint: boolean | undefined
 ): boolean {
-  return isGpt6AstraModel(model) && isOfficialOpenAIBaseURL(baseURL);
-}
-
-/** Azure variant: first-party Azure endpoints only, per {@link isFirstPartyAzureEndpoint}. */
-function astraRulesApplyToAzure(
-  model: string,
-  args: { baseURL: string | null | undefined; azureOpenAIBasePath: string | undefined }
-): boolean {
-  return isGpt6AstraModel(model) && isFirstPartyAzureEndpoint(args);
+  return firstPartyEndpoint === true && isGpt6AstraModel(model);
 }
 
 class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
-  /** @see {@link astraRulesApplyToOpenAI} */
+  protected firstPartyEndpoint?: boolean;
+
+  /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApplyToOpenAI(this.model, this.clientConfig.baseURL);
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   private includeReasoningContent?: boolean;
@@ -1879,6 +1880,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
       fields?.convertReasoningDetailsToContent;
     this.preserveToolCacheControl = fields?.preserveToolCacheControl;
     this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.firstPartyEndpoint = fields?.firstPartyEndpoint;
     this.safetyIdentifier = fields?.safety_identifier;
   }
 
@@ -2293,9 +2295,11 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 }
 
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
-  /** @see {@link astraRulesApplyToOpenAI} */
+  protected firstPartyEndpoint?: boolean;
+
+  /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApplyToOpenAI(this.model, this.clientConfig.baseURL);
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   private promptCacheExplicit?: boolean;
@@ -2306,6 +2310,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   constructor(fields?: LibreChatOpenAIFields) {
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.firstPartyEndpoint = fields?.firstPartyEndpoint;
     this.responsesPromptCache = fields?.responsesPromptCache;
     this.responsesPromptCacheTtl = fields?.responsesPromptCacheTtl;
     this.safetyIdentifier = fields?.safety_identifier;
@@ -2449,12 +2454,11 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
 }
 
 class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions {
-  /** @see {@link astraRulesApplyToAzure} */
+  protected firstPartyEndpoint?: boolean;
+
+  /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApplyToAzure(this.model, {
-      baseURL: this.clientConfig.baseURL,
-      azureOpenAIBasePath: this.azureOpenAIBasePath,
-    });
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   private promptCacheExplicit?: boolean;
@@ -2463,6 +2467,7 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
   constructor(fields?: LibreChatAzureOpenAIFields) {
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.firstPartyEndpoint = fields?.firstPartyEndpoint;
     this.safetyIdentifier = fields?.safety_identifier;
   }
 
@@ -2604,12 +2609,11 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
 }
 
 class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
-  /** @see {@link astraRulesApplyToAzure} */
+  protected firstPartyEndpoint?: boolean;
+
+  /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApplyToAzure(this.model, {
-      baseURL: this.clientConfig.baseURL,
-      azureOpenAIBasePath: this.azureOpenAIBasePath,
-    });
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   private promptCacheExplicit?: boolean;
@@ -2618,6 +2622,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
   constructor(fields?: LibreChatAzureOpenAIFields) {
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.firstPartyEndpoint = fields?.firstPartyEndpoint;
     this.safetyIdentifier = fields?.safety_identifier;
   }
 
@@ -2806,9 +2811,11 @@ function withLibreChatOpenAIFields(
 }
 
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
-  /** @see {@link astraRulesApplyToOpenAI} */
+  protected firstPartyEndpoint?: boolean;
+
+  /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApplyToOpenAI(this.model, this.clientConfig.baseURL);
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   _lc_stream_delay: number;
@@ -2818,6 +2825,7 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   ) {
     super(withLibreChatOpenAIFields(fields));
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
+    this.firstPartyEndpoint = fields?.firstPartyEndpoint;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2925,12 +2933,11 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
 }
 
 export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
-  /** @see {@link astraRulesApplyToAzure} */
+  protected firstPartyEndpoint?: boolean;
+
+  /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
-    return astraRulesApplyToAzure(this.model, {
-      baseURL: this.clientConfig.baseURL,
-      azureOpenAIBasePath: this.azureOpenAIBasePath,
-    });
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
   _lc_stream_delay: number;
@@ -2940,6 +2947,7 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
     this.completions = new LibreChatAzureOpenAICompletions(fields);
     this.responses = new LibreChatAzureOpenAIResponses(fields);
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
+    this.firstPartyEndpoint = fields?.firstPartyEndpoint;
   }
 
   public get exposedClient(): CustomOpenAIClient {

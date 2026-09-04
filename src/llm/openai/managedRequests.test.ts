@@ -182,7 +182,7 @@ describe('managed GPT-5.6 request fields', () => {
     expect(shouldIncludeEncryptedReasoning('gpt-5.5', {})).toBe(false);
   });
 
-  it('requests encrypted reasoning for GPT-6 Astra on a first-party endpoint', () => {
+  it('requests encrypted reasoning for GPT-6 Astra on a declared endpoint', () => {
     expect(shouldIncludeEncryptedReasoning('gpt-6-astra', {}, true)).toBe(true);
     expect(
       shouldIncludeEncryptedReasoning(
@@ -193,7 +193,7 @@ describe('managed GPT-5.6 request fields', () => {
     ).toBe(false);
   });
 
-  it('does not request encrypted reasoning for Astra behind a proxy', () => {
+  it('does not request encrypted reasoning for an undeclared Astra endpoint', () => {
     expect(shouldIncludeEncryptedReasoning('gpt-6-astra', {}, false)).toBe(false);
   });
 });
@@ -257,7 +257,12 @@ describe('GPT-6 Astra request constraints', () => {
   });
 
   const astra = (fields: Record<string, unknown> = {}) =>
-    new ChatOpenAI({ model: 'gpt-6-astra', apiKey: 'test-key', ...fields });
+    new ChatOpenAI({
+      model: 'gpt-6-astra',
+      apiKey: 'test-key',
+      firstPartyEndpoint: true,
+      ...fields,
+    });
 
   const tool = {
     type: 'function' as const,
@@ -367,30 +372,24 @@ describe('GPT-6 Astra request constraints', () => {
     expect(params.reasoning_effort).toBe('none');
   });
 
-  it('leaves Astra behind a custom baseURL on every gate', () => {
-    const proxied = new ChatOpenAI({
+  it('applies no gate when the caller has not declared a first-party endpoint', () => {
+    const undeclared = new ChatOpenAI({
       model: 'gpt-6-astra',
       apiKey: 'test-key',
       temperature: 0.7,
-      configuration: { baseURL: 'https://gateway.internal/v1' },
     });
-    const params = proxied.invocationParams({
+    const params = undeclared.invocationParams({
       tools: [tool],
       reasoningEffort: 'none',
     } as never) as Record<string, unknown>;
-    /** A bare Astra id still reaches a proxy whose contract is not OpenAI's. */
+    /** Default off: Chat Completions kept, sampling kept, `none` not rewritten. */
     expect('max_output_tokens' in params).toBe(false);
     expect(params.temperature).toBe(0.7);
     expect(params.reasoning_effort).toBe('none');
   });
 
-  it('applies every gate on the first-party endpoint', () => {
-    const direct = new ChatOpenAI({
-      model: 'gpt-6-astra',
-      apiKey: 'test-key',
-      temperature: 0.7,
-    });
-    const params = direct.invocationParams({
+  it('applies every gate once the endpoint is declared', () => {
+    const params = astra({ temperature: 0.7 }).invocationParams({
       tools: [tool],
       reasoningEffort: 'none',
     } as never) as Record<string, unknown>;
@@ -399,17 +398,18 @@ describe('GPT-6 Astra request constraints', () => {
     expect((params.reasoning as { effort?: string } | undefined)?.effort).toBe('low');
   });
 
-  it.each([
-    ['the default port written explicitly', 'https://api.openai.com:443/v1'],
-    ['a mixed-case host', 'https://API.OpenAI.com/v1'],
-  ])('applies the gates for a first-party URL spelled with %s', (_label, baseURL) => {
-    const model = astra({ configuration: { baseURL } });
-    const params = model.invocationParams({
-      tools: [tool],
+  it('declaring the endpoint does not widen the gates to another model', () => {
+    const other = new ChatOpenAI({
+      model: 'gpt-5.6',
+      apiKey: 'test-key',
+      temperature: 0.7,
+      firstPartyEndpoint: true,
+    });
+    const params = other.invocationParams({
       reasoningEffort: 'none',
     } as never) as Record<string, unknown>;
-    expect('max_output_tokens' in params).toBe(true);
-    expect(params).not.toHaveProperty('temperature');
+    expect(params.temperature).toBe(0.7);
+    expect(params.reasoning_effort).toBe('none');
   });
 
   it('leaves other models untouched', () => {
