@@ -31,6 +31,7 @@ import {
   runPlainExecution,
   formatCompletedResponse,
 } from './ProgrammaticToolCalling';
+import { logCodeApiDiagnostic } from '@/tools/diagnostics';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
@@ -423,9 +424,11 @@ export function createBashProgrammaticToolCallingTool(
         if (_injected_files && _injected_files.length > 0) {
           files = _injected_files;
         } else if (session_id != null && session_id.length > 0) {
-          // eslint-disable-next-line no-console
-          console.debug(
-            `[BashProgrammaticToolCalling] No injected files for session_id=${session_id} — exec will run without input files`
+          logCodeApiDiagnostic(
+            'BashProgrammaticToolCalling',
+            'debug',
+            'session carried no injected files; exec will run without input files',
+            { files: 'none' }
           );
         }
 

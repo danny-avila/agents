@@ -560,6 +560,65 @@ describe('CodeAPI auth header injection', () => {
     debugSpy.mockRestore();
   });
 
+  it('routes the bash programmatic executor through the same guard', async () => {
+    const debugSpy = jest
+      .spyOn(console, 'debug')
+      .mockImplementation(() => undefined);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ status: 'completed', session_id: 's', stdout: 'ok' })
+    );
+
+    await createBashProgrammaticToolCallingTool()
+      .invoke({ code: 'lookup_user "{}"' }, {
+        toolCall: {
+          name: 'bash_programmatic_code_execution',
+          args: {},
+          toolMap: toolMap(),
+          toolDefs,
+          session_id: 'MIIEvgIBADANBgkqhkiG9w0BAQEF',
+        },
+      } as unknown as RunnableConfig)
+      .catch(() => undefined);
+
+    expect(debugSpy).toHaveBeenCalledWith(
+      '[BashProgrammaticToolCalling] session carried no injected files; exec will run without input files',
+      { files: 'none' }
+    );
+    expect(JSON.stringify(debugSpy.mock.calls)).not.toContain('MIIEvgIBAD');
+    debugSpy.mockRestore();
+  });
+
+  it('discards a body it will never read, and keeps the one it will', async () => {
+    const destroy = jest.fn();
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      body: { destroy },
+      text: jest.fn(async () => ''),
+    });
+    await createBashExecutionTool()
+      .invoke({ command: 'echo 1' })
+      .catch(() => undefined);
+
+    expect(destroy).toHaveBeenCalledTimes(1);
+
+    const rateLimitedDestroy = jest.fn();
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 429,
+      body: { destroy: rateLimitedDestroy },
+      text: jest.fn(async () =>
+        JSON.stringify({ error: 'rate_limited', retry_after_seconds: 3 })
+      ),
+    });
+    const error = await createBashExecutionTool()
+      .invoke({ command: 'echo 1' })
+      .catch((caught: unknown) => caught);
+
+    expect(rateLimitedDestroy).not.toHaveBeenCalled();
+    expect((error as Error).message).toContain('Retry after 3 seconds');
+  });
+
   it('logs the rejection before the response body is drained', async () => {
     let releaseBody: (value: string) => void = () => undefined;
     fetchMock.mockResolvedValueOnce({

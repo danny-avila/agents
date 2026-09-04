@@ -2,6 +2,7 @@ import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
+import type { Readable } from 'node:stream';
 import type { CodeApiMethod } from '@/tools/diagnostics';
 import type * as t from '@/types';
 import {
@@ -263,10 +264,40 @@ export function addCodeApiExecutionProfileHeader(
   };
 }
 
+type CodeApiErrorResponse = {
+  status: number;
+  text: () => Promise<string>;
+  /** node-fetch types this as `NodeJS.ReadableStream`, which does not declare
+   * `destroy`; every runtime instance is a `Readable`, and a test double may
+   * supply nothing at all. */
+  body?: NodeJS.ReadableStream | null;
+};
+
+/**
+ * Only the 429 branch reads the body, and node-fetch keeps the stream and its
+ * socket alive until something does. Repeated backend failures would otherwise
+ * accumulate connections holding payloads this module deliberately discards.
+ */
+function discardResponseBody(response: CodeApiErrorResponse): void {
+  const body = response.body;
+  if (body == null || !('destroy' in body)) {
+    return;
+  }
+  const destroy = (body as NodeJS.ReadableStream & Partial<Readable>).destroy;
+  if (typeof destroy !== 'function') {
+    return;
+  }
+  try {
+    destroy.call(body);
+  } catch {
+    /* Already finished or not destroyable; nothing is being held open. */
+  }
+}
+
 export async function buildCodeApiHttpErrorMessage(
   method: CodeApiMethod,
   _endpoint: string,
-  response: { status: number; text: () => Promise<string> },
+  response: CodeApiErrorResponse,
   options?: { recoverable?: boolean; profile?: t.CodeApiExecutionProfile }
 ): Promise<string> {
   /* Logged before the body is touched. A non-OK response can leave a chunked
@@ -289,6 +320,9 @@ export async function buildCodeApiHttpErrorMessage(
         status: response.status,
       }
     );
+  }
+  if (response.status !== 429) {
+    discardResponseBody(response);
   }
   if (response.status === 429) {
     let responseBody = '';

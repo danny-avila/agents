@@ -88,7 +88,8 @@ export function describeCodeApiError(error: unknown): {
 type CodeApiDiagnosticSource =
   | 'CodeExecutor'
   | 'BashExecutor'
-  | 'ProgrammaticToolCalling';
+  | 'ProgrammaticToolCalling'
+  | 'BashProgrammaticToolCalling';
 
 /**
  * Console is the SDK's diagnostic channel; a winston logger is the host's
