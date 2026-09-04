@@ -438,7 +438,7 @@ describe('CodeAPI auth header injection', () => {
   );
 
   it.each([401, 403])(
-    'logs the status and endpoint behind the %s authorization error, never the body',
+    'logs the status and authority behind the %s authorization error, never the body',
     async (status) => {
       fetchMock.mockResolvedValueOnce(
         errorResponse(
@@ -446,7 +446,9 @@ describe('CodeAPI auth header injection', () => {
           '{"received":"Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1In0.c2ln"}'
         )
       );
-      const tool = createBashExecutionTool();
+      const tool = createBashExecutionTool({
+        baseUrl: 'https://gateway.example/v1',
+      });
 
       await tool.invoke({ command: 'echo 1' }).catch(() => undefined);
 
@@ -455,12 +457,57 @@ describe('CodeAPI auth header injection', () => {
       expect(logged).toBe('[CodeExecutor] Code API rejected the request');
       expect(detail).toEqual({
         method: 'POST',
-        endpoint: expect.stringContaining('/exec'),
+        host: 'gateway.example',
         status,
       });
       expect(JSON.stringify(detail)).not.toContain('eyJhbGciOiJSUzI1NiJ9');
     }
   );
+
+  it('logs the backend authority without the capability in its path', async () => {
+    fetchMock.mockResolvedValueOnce(errorResponse(500, 'upstream exploded'));
+    const tool = createBashExecutionTool({
+      baseUrl: 'https://gateway.example/t/MIIEvgIBAD/v1',
+    });
+
+    await tool.invoke({ command: 'echo 1' }).catch(() => undefined);
+
+    expect(errorSpy.mock.calls[0][1]).toEqual({
+      method: 'POST',
+      host: 'gateway.example',
+      status: 500,
+    });
+    expect(JSON.stringify(errorSpy.mock.calls[0][1])).not.toContain(
+      'MIIEvgIBAD'
+    );
+  });
+
+  it('replaces an error name that is not a class identifier', async () => {
+    const forged = new Error('boom');
+    forged.name = 'Bearer MIIEvgIBAD leaked through name';
+    const tool = createCodeExecutionTool({
+      authHeaders: () => Promise.reject(forged),
+    });
+
+    await tool.invoke({ lang: 'py', code: 'print(1)' }).catch(() => undefined);
+
+    const detail = errorSpy.mock.calls[0][1] as { name: string };
+    expect(detail.name).toBe('UnnamedError');
+    expect(JSON.stringify(detail)).not.toContain('MIIEvgIBAD');
+  });
+
+  it('leaves a recoverable file lookup to report its own outcome', async () => {
+    fetchMock.mockResolvedValueOnce(errorResponse(404, 'no such session'));
+
+    const files = await fetchSessionFiles(
+      'https://gateway.example/v1',
+      'session_123'
+    );
+
+    expect(files).toEqual([]);
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
 
   it('logs rate-limited rejections at warn so retries do not read as failures', async () => {
     fetchMock.mockResolvedValueOnce(

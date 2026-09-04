@@ -466,7 +466,9 @@ export async function fetchSessionFiles(
     const response = await fetch(filesEndpoint, fetchOptions);
     if (!response.ok) {
       throw new Error(
-        await buildCodeApiHttpErrorMessage('GET', filesEndpoint, response)
+        await buildCodeApiHttpErrorMessage('GET', filesEndpoint, response, {
+          recoverable: true,
+        })
       );
     }
 
@@ -931,9 +933,7 @@ export async function runPlainExecution(args: {
     {
       lang: args.lang,
       code:
-        args.lang === 'py'
-          ? wrapPythonForPlainExecution(args.code)
-          : args.code,
+        args.lang === 'py' ? wrapPythonForPlainExecution(args.code) : args.code,
       ...(args.timeout != null ? { timeout: args.timeout } : {}),
       ...(args.sessionId != null && args.sessionId !== ''
         ? { session_id: args.sessionId }

@@ -145,36 +145,62 @@ type CodeApiErrorDiagnostic = {
 
 type CodeApiRejectionDiagnostic = {
   method: string;
-  endpoint: string;
+  host: string;
   status: number;
 };
+
+/** Error names are class identifiers; anything else is host-authored text. */
+const ERROR_NAME_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/;
 
 /**
  * Names the failing error type and the code path that produced it, and nothing
  * else. An error's message is host-authored free text that can carry the very
  * credential this module exists to keep out of reach — a malformed signing key,
  * for instance, surfaces as a `SyntaxError` whose message quotes an excerpt of
- * the key source. Stack frames are code locations rather than payload, so they
- * survive; the leading line is dropped because V8 begins a stack with the
- * message. Property reads are guarded because an exotic rejection can throw
- * from an accessor, which would otherwise lose the log and the rejection both.
+ * the key source. `name` is kept only when it is shaped like the class
+ * identifier it is supposed to be, and stack frames are code locations rather
+ * than payload; the leading line is dropped because V8 begins a stack with the
+ * message. Both fields are still read from the rejection, so a host that
+ * deliberately forges a stack can put text in `frames` — that is the same trust
+ * boundary as a host that throws its credential in the first place, and it is
+ * the reason nothing here is claimed to be secret-free by construction. Reads
+ * are guarded because an exotic rejection can throw from an accessor, which
+ * would otherwise lose the log and the rejection both.
  */
 function describeCodeApiError(error: unknown): CodeApiErrorDiagnostic {
   try {
     if (!(error instanceof Error)) {
       return { name: typeof error };
     }
+    const name = error.name;
     const frames = error.stack
       ?.split('\n')
       .filter((line) => /^\s+at /.test(line))
       .slice(0, MAX_LOGGED_STACK_FRAMES)
       .join('\n');
     return {
-      name: error.name,
+      name:
+        typeof name === 'string' && ERROR_NAME_PATTERN.test(name)
+          ? name
+          : 'UnnamedError',
       ...(frames != null && frames !== '' ? { frames } : {}),
     };
   } catch {
     return { name: 'UndescribableError' };
+  }
+}
+
+/**
+ * Only the authority is logged. A configured base URL can carry a capability in
+ * its path, and the files route puts a session id in one, so the full endpoint
+ * is host text; the authority is what actually answers the question a rejection
+ * raises — which backend refused this call.
+ */
+function describeEndpointHost(endpoint: string): string {
+  try {
+    return new URL(endpoint).host;
+  } catch {
+    return 'unparsed';
   }
 }
 
@@ -318,7 +344,8 @@ export function addCodeApiExecutionProfileHeader(
 export async function buildCodeApiHttpErrorMessage(
   method: string,
   endpoint: string,
-  response: { status: number; text: () => Promise<string> }
+  response: { status: number; text: () => Promise<string> },
+  options?: { recoverable?: boolean }
 ): Promise<string> {
   let responseBody = '';
   try {
@@ -328,12 +355,20 @@ export async function buildCodeApiHttpErrorMessage(
   }
   /* The response body is deliberately absent: it is upstream free text that
      can echo the header that was sent, and the status distinguishes the
-     failure modes on its own. */
-  logCodeApiDiagnostic(
-    response.status === 429 ? 'warn' : 'error',
-    'Code API rejected the request',
-    { method, endpoint, status: response.status }
-  );
+     failure modes on its own. A recoverable caller reports its own outcome —
+     logging here too would raise an error-level alert for a lookup that
+     succeeds by returning nothing. */
+  if (options?.recoverable !== true) {
+    logCodeApiDiagnostic(
+      response.status === 429 ? 'warn' : 'error',
+      'Code API rejected the request',
+      {
+        method,
+        host: describeEndpointHost(endpoint),
+        status: response.status,
+      }
+    );
+  }
   if (response.status === 429) {
     const retryAfterSeconds = getRetryAfterSeconds(responseBody);
     return retryAfterSeconds != null
