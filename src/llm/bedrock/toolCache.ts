@@ -4,7 +4,11 @@ import type { OpenAIClient } from '@langchain/openai';
 import type { DocumentType } from '@smithy/types';
 import type { GraphTools } from '@/types';
 import { buildBedrockCachePoint, type PromptCacheTtl } from '@/messages/cache';
-import { _convertToOpenAITool } from '@/llm/openai';
+import { requireInternalModule } from '@/lazyRequire';
+
+/** Loads with the first Bedrock request rather than alongside every graph. */
+const convertToOpenAITool: typeof import('@/llm/openai')._convertToOpenAITool = (...args) =>
+  requireInternalModule<typeof import('@/llm/openai')>('llm/openai/index')._convertToOpenAITool(...args);
 
 const BEDROCK_TOOL_CACHE_MARKER = '__lc_bedrock_cache_point_after';
 const BEDROCK_TOOL_CACHE_DISABLED_MARKER = '__lc_bedrock_skip_tool_cache';
@@ -77,7 +81,7 @@ function toBedrockTool(tool: unknown): BedrockToolWithCacheMarker {
   }
 
   return openAIToBedrockTool(
-    _convertToOpenAITool(tool as BindToolsInput) as OpenAIFunctionTool
+    convertToOpenAITool(tool as BindToolsInput) as OpenAIFunctionTool
   ) as BedrockToolWithCacheMarker;
 }
 

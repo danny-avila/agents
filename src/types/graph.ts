@@ -13,6 +13,7 @@ import type { GoogleAIToolType } from '@langchain/google-common';
 import type {
   SummarizationNodeInput,
   SummarizeCompleteEvent,
+  CompactionSemanticIndex,
   SummarizationConfig,
   SummarizeStartEvent,
   SummarizeDeltaEvent,
@@ -31,6 +32,7 @@ import type {
   ToolEndEvent,
   GenericTool,
   LCTool,
+  ToolExecutionConfig,
   ToolExecuteBatchRequest,
 } from '@/types/tools';
 import type {
@@ -39,10 +41,10 @@ import type {
   StreamPreemption,
   TokenBudgetBreakdown,
 } from '@/types/run';
-import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { SubagentTaskConfig } from '@/types/subagentTasks';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
-import type { ClientOptions } from '@/types/llm';
+import type { ProviderClientOptionsConfig } from '@/types/llm';
+import type { Callback, GraphNodeKeys } from '@/common';
 
 /** Interface for bound model with stream and invoke methods */
 export interface ChatModel {
@@ -129,6 +131,27 @@ export interface ContextUsageEvent {
   /** EMA ratio of provider-reported vs locally estimated token counts */
   calibrationRatio?: number;
 }
+
+/**
+ * Latched context-fading tier. Caps for historical tool results derive from
+ * `(budgetTokens, masked)` only, so carrying the tier across runs keeps their
+ * truncated bytes stable for prefix-based provider prompt caches. Hosts
+ * persist it beside `calibrationRatio` and pass it back via
+ * `RunConfig.fadingTiers[agentId]`.
+ */
+export interface FadingTier {
+  v: 1;
+  /** Token budget the caps derive from, in raw token space. Never grows;
+   *  clamped to the current context window when seeded. */
+  budgetTokens: number;
+  /** Whether observation masking has activated. Never deactivates. */
+  masked: boolean;
+  /** Whether this tier was reduced, masked, or restored from host state. */
+  latched?: true;
+}
+
+/** Latched fading tiers keyed by agent ID. */
+export type FadingTiers = Record<string, FadingTier>;
 
 export interface EventHandler {
   handle(
@@ -338,10 +361,16 @@ export type StandardGraphInput = {
   runId?: string;
   signal?: AbortSignal;
   agents: AgentInputs[];
+  /** Execution backend used to resolve the effective tool registry. */
+  toolExecution?: ToolExecutionConfig;
   langfuse?: LangfuseConfig;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
   calibrationRatio?: number;
+  /** Persisted default-agent tier retained for single-agent compatibility. */
+  fadingTier?: FadingTier | null;
+  /** Persisted fading tiers keyed by agent ID. */
+  fadingTiers?: FadingTiers | null;
   /**
    * Receives a {@link SubagentUsageEvent} for every model call that reports
    * usage metadata inside a subagent child run spawned from this graph
@@ -611,6 +640,7 @@ export type SubagentUpdatePhase =
   | 'run_step_closed'
   | 'message_delta'
   | 'reasoning_delta'
+  | 'control'
   | 'stop'
   | 'error';
 
@@ -821,8 +851,10 @@ export interface LangfuseConfig {
   deterministicTraceId?: boolean;
 }
 
-export interface AgentInputs {
+interface AgentInputFields {
   agentId: string;
+  /** Logical endpoint selected by the host before provider resolution. */
+  endpoint?: string;
   /**
    * Partition key for transient code-session ids and file refs. Agents with
    * the same key share those refs; different execution profiles/scopes must
@@ -836,12 +868,10 @@ export interface AgentInputs {
   toolEnd?: boolean;
   toolMap?: ToolMap;
   tools?: GraphTools;
-  provider: Providers;
   /** Stable/cacheable system instructions. */
   instructions?: string;
   streamBuffer?: number;
   maxContextTokens?: number;
-  clientOptions?: ClientOptions;
   /** Per-agent Langfuse tracing configuration. */
   langfuse?: LangfuseConfig;
   /** Dynamic system tail appended after stable instructions without provider cache markers. */
@@ -869,6 +899,14 @@ export interface AgentInputs {
   discoveredTools?: string[];
   summarizationEnabled?: boolean;
   summarizationConfig?: SummarizationConfig;
+  /**
+   * Optional host-supplied, user-visible guidance for compaction. The SDK
+   * validates, bounds, and scopes entries to the messages being compacted;
+   * raw conversation messages remain authoritative. Captured when the
+   * AgentContext is constructed; labels committed later in the same run are
+   * outside this construction-time interface.
+   */
+  compactionSemanticIndex?: CompactionSemanticIndex;
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
    *  Injected into the dynamic system tail via AgentContext. */
   initialSummary?: { text: string; tokenCount: number };
@@ -910,6 +948,8 @@ export interface AgentInputs {
    */
   graphTools?: GenericTool[];
 }
+
+export type AgentInputs = AgentInputFields & ProviderClientOptionsConfig;
 
 export interface ContextPruningConfig {
   enabled?: boolean;

@@ -56,6 +56,7 @@ import {
 } from '@/utils/truncation';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
+import { isReasoningContentBlock } from '@/messages/core';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { composeAbortSignals } from '@/utils/misc';
 import { isGoogleLike } from '@/utils/llm';
@@ -454,15 +455,6 @@ function isTextContentPart(contentPart: t.MessageContentComplex): boolean {
   return contentPart.type?.startsWith(ContentTypes.TEXT) ?? false;
 }
 
-function isReasoningContentPart(contentPart: t.MessageContentComplex): boolean {
-  return (
-    (contentPart.type?.startsWith(ContentTypes.THINKING) ?? false) ||
-    (contentPart.type?.startsWith(ContentTypes.REASONING) ?? false) ||
-    (contentPart.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false) ||
-    contentPart.type === 'redacted_thinking'
-  );
-}
-
 function getReasoningTextFromContentPart(
   contentPart: t.MessageContentComplex
 ): string {
@@ -532,7 +524,7 @@ function shouldStartFreshMessageStepAfterGoogleServerSideTool({
   }
   return (
     content.every((c) => isTextContentPart(c)) ||
-    content.every((c) => isReasoningContentPart(c))
+    content.every((c) => isReasoningContentBlock(c))
   );
 }
 
@@ -649,7 +641,7 @@ async function dispatchGoogleServerSideToolStreamContent({
   }
   reasoningContent.push(
     ...content
-      .filter((contentPart) => isReasoningContentPart(contentPart))
+      .filter((contentPart) => isReasoningContentBlock(contentPart))
       .map((contentPart) => ({
         type: ContentTypes.THINK,
         think: getReasoningTextFromContentPart(contentPart),
@@ -736,6 +728,12 @@ function createEagerToolExecutionPlan(args: {
   if (candidateToolCalls.length === 0) {
     return [];
   }
+  const toolSchemas = new Map(
+    agentContext?.toolDefinitions?.map(({ name, parameters }) => [
+      name,
+      parameters,
+    ])
+  );
 
   // Eager execution must preserve ToolNode batch semantics exactly for every
   // unstarted call. If any candidate cannot be planned, fall back for that
@@ -770,6 +768,7 @@ function createEagerToolExecutionPlan(args: {
       ),
     })),
     usageCount: graph.getEagerEventToolUsageCount(agentContext?.agentId),
+    getToolSchema: (toolName) => toolSchemas.get(toolName),
   });
   if (plan == null) {
     return undefined;
@@ -820,6 +819,11 @@ function startEagerToolExecutions(args: {
       toolCalls: entries.map((entry) => entry.request),
       userId: graph.config?.configurable?.user_id as string | undefined,
       agentId: agentContext?.agentId,
+      callerCapabilityProjection: (
+        agentContext as
+          | Partial<Pick<AgentContext, 'getCallerCapabilityProjectionSnapshot'>>
+          | undefined
+      )?.getCallerCapabilityProjectionSnapshot?.(),
       configurable: graph.config?.configurable as
         | Record<string, unknown>
         | undefined,
@@ -1321,7 +1325,7 @@ export function getChunkContent({
   reasoningKey,
 }: {
   chunk?: Partial<AIMessageChunk>;
-  provider?: Providers;
+  provider?: t.ProviderName;
   reasoningKey: 'reasoning_content' | 'reasoning';
 }): string | t.MessageContentComplex[] | undefined {
   if (
@@ -1845,7 +1849,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     if (Array.isArray(content) && content.every(isTextContentPart)) {
       const contentGroups = splitAssistantTextContentByPhase(content);
-      const currentStepId = graph.stepKeyIds?.get(stepKey)?.at(-1);
+      const currentStepId = graph.stepKeyIds.get(stepKey)?.at(-1);
       const currentStep =
         currentStepId == null ? undefined : graph.getRunStep(currentStepId);
       const currentPhase =
@@ -2022,7 +2026,7 @@ hasToolCallChunks: ${hasToolCallChunks}
         },
         metadata
       );
-    } else if (content.every((c) => isReasoningContentPart(c))) {
+    } else if (content.every((c) => isReasoningContentBlock(c))) {
       await graph.dispatchReasoningDelta(
         stepId,
         {

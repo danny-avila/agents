@@ -1,17 +1,17 @@
 // src/types/tools.ts
-import type { StructuredToolInterface } from '@langchain/core/tools';
 import type {
   RunnableConfig,
   RunnableToolLike,
 } from '@langchain/core/runnables';
+import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
-import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
-import type { RunBreakerScope } from '@/llm/streamLimits';
 import type {
   MessageContentComplex,
   RunStepResumeState,
   ToolErrorData,
 } from './stream';
+import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { HumanInTheLoopConfig } from './hitl';
 import type { LangfuseConfig } from './graph';
 import type { HookRegistry } from '@/hooks';
@@ -133,6 +133,8 @@ export type ToolNodeOptions = {
   ) => Promise<boolean | void>;
   /** Tool registry for lazy computation of programmatic tools and tool search */
   toolRegistry?: LCToolRegistry;
+  /** Returns the owning agent's currently discovered deferred tool names. */
+  getDiscoveredToolNames?: () => readonly string[];
   /** Reference to Graph's sessions map for automatic session injection */
   sessions?: ToolSessionMap;
   /** Partition within `sessions` used by this agent's code tools. */
@@ -146,6 +148,11 @@ export type ToolNodeOptions = {
   /** ID of the agent that owns this tool node, surfaced to hooks as `executingAgentId`
    * so a batch can be attributed to a specific agent even where `agentId` is undefined. */
   executingAgentId?: string;
+  /** Name of the agent that owns this tool node, used for active Langfuse attribution. */
+  executingAgentName?: string;
+  /** Root graph-agent identity retained alongside the currently executing tool owner. */
+  rootAgentId?: string;
+  rootAgentName?: string;
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
   /**
@@ -555,6 +562,19 @@ export type ToolCallRequest = {
   runtimeSessionHint?: string;
 };
 
+/**
+ * Serializable view of the active tools grouped by their effective caller
+ * capabilities. Event-driven hosts use this snapshot to preserve the SDK's
+ * live deferred-tool discovery state without reimplementing its policy.
+ */
+export type CallerCapabilityProjectionSnapshot = {
+  version: 1;
+  directToolNames: string[];
+  codeExecutionToolNames: string[];
+  directOnlyToolNames: string[];
+  codeExecutionOnlyToolNames: string[];
+};
+
 /** Batch request containing ALL tool calls for a graph step */
 export type ToolExecuteBatchRequest = {
   /** All tool calls from the AIMessage */
@@ -563,6 +583,11 @@ export type ToolExecuteBatchRequest = {
   userId?: string;
   /** Agent ID for context */
   agentId?: string;
+  /**
+   * SDK-owned snapshot of the active caller capability projection. Optional
+   * so older event handlers remain compatible with newer SDKs.
+   */
+  callerCapabilityProjection?: CallerCapabilityProjectionSnapshot;
   /** Runtime configurable from RunnableConfig (includes user, userMCPAuthMap, etc.) */
   configurable?: Record<string, unknown>;
   /** Runtime metadata from RunnableConfig (includes thread_id, run_id, provider, etc.) */
@@ -800,47 +825,35 @@ export type LocalWorkspaceConfig = {
 };
 
 /**
- * Engine-agnostic execution seam. Default uses Node's
- * `child_process.spawn` and `fs/promises`. A future engine (e.g.
- * stateful remote sandbox) supplies its own `spawn` and `fs` and
- * inherits every tool factory unchanged.
+ * One execution world shared by filesystem and subprocess operations.
+ * Backend identity is stable so capability probes remain warm when tool
+ * bundles are rebuilt for later agent bindings.
+ */
+export interface ExecutionWorld {
+  /** Launches a process inside this world's filesystem namespace. */
+  readonly spawn: LocalSpawn;
+  /** Reads and writes the same namespace observed by `spawn`. */
+  readonly fs: Readonly<import('@/tools/local/workspaceFS').WorkspaceFS>;
+  /** Whether the world already enforces a sandbox boundary. */
+  readonly sandboxed: boolean;
+}
+
+/**
+ * Backward-compatible partial execution-world override. Omitted fields use
+ * the Node host world; remote backends should provide the complete trio.
  *
- * **Important — pair `spawn` and `fs` together.** Most file-touching
- * surfaces in the local engine route through `getWorkspaceFS(config)`
- * so a host can transparently swap in a remote/in-memory FS. A small
- * set of helpers — currently the `execute_code` non-bash temp-file
- * write (Codex P2 [48]) — still uses host `fs/promises` directly to
- * stage source on disk before invoking the spawn. If you override
- * `spawn` to point at a remote runtime (SSH, container, etc.) you
- * MUST also override `fs` with the corresponding remote
- * implementation; otherwise temp source files written to the host
- * `/tmp` won't be visible to the remote interpreter and `py`/`js`/
- * `ts`/etc. executions will fail. (Bash-style executions go through
- * `executeLocalBash` which doesn't stage temp files, so they're
- * unaffected.)
+ * Non-bash `execute_code` still stages source through the host temporary
+ * directory. Remote runtimes should use their dedicated execution engine for
+ * that tool until temporary lifecycle operations join this seam.
  *
- * Threat-model note: the regex-based command validators
- * (`dangerousCommandPatterns`, `quotedDestructivePatterns`, etc.) and
- * the workspace policy hook are documented as best-effort tripwires.
- * The hard security boundary is `local.sandbox.enabled: true` (which
- * wraps execution in `@anthropic-ai/sandbox-runtime`); for adversarial-
- * model threat models, do NOT rely on the regex layer alone.
+ * Command validators and workspace policies are best-effort tripwires. For an
+ * adversarial-model threat model, use a backend sandbox boundary rather than
+ * relying on validation alone.
  */
 export type LocalExecConfig = {
-  /** Pluggable spawn (for SSH, container, remote workers, etc.). */
-  spawn?: LocalSpawn;
-  /**
-   * Pluggable filesystem (for remote-workspace engines). Pair with
-   * `spawn` — see the type-level note above on why both should be
-   * overridden together for non-host engines.
-   */
-  fs?: import('@/tools/local/workspaceFS').WorkspaceFS;
-  /**
-   * Set by custom execution backends that already provide their own
-   * sandbox boundary. Suppresses the local host-sandbox warning while
-   * preserving the warning for plain host `child_process` execution.
-   */
-  sandboxed?: boolean;
+  -readonly [Key in keyof ExecutionWorld]?: Key extends 'fs'
+    ? import('@/tools/local/workspaceFS').WorkspaceFS
+    : ExecutionWorld[Key];
 };
 
 export type LocalExecutionConfig = {
@@ -1171,6 +1184,15 @@ export type ToolExecutionConfig = {
 export type ProgrammaticCache = {
   toolMap: ToolMap;
   toolDefs: LCTool[];
+  /** Actual outer runner name used for caller-policy diagnostics. */
+  programmaticToolName?: string;
+  /**
+   * Known tools that cannot be invoked from programmatic execution. Kept
+   * separate from `toolDefs` so the Programmatic Tool Manifest can be
+   * validated before the execution runtime starts without exposing their
+   * schemas to that runtime.
+   */
+  disallowedToolDefs?: LCTool[];
   /**
    * Hook context plumbed through by ToolNode for the local
    * programmatic-tool path so the in-process bridge can run

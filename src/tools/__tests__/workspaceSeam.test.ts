@@ -10,9 +10,13 @@ import {
   jest,
 } from '@jest/globals';
 import type { WorkspaceFS } from '../local/workspaceFS';
+import type * as t from '@/types';
 import {
+  commandAvailabilityEnvCacheKey,
+  getExecutionWorld,
   resolveWorkspacePathSafe,
   getWorkspaceFS,
+  setCommandAvailabilityCacheEntry,
 } from '../local/LocalExecutionEngine';
 import { createLocalCodingToolBundle } from '../local/LocalCodingTools';
 import { nodeWorkspaceFS } from '../local/workspaceFS';
@@ -93,6 +97,47 @@ describe('workspace seam', () => {
   });
 
   describe('WorkspaceFS seam', () => {
+    it('resolves the default filesystem and subprocess as one world', () => {
+      const world = getExecutionWorld({ workspace: { root: workspace } });
+
+      expect(world.fs).toBe(nodeWorkspaceFS);
+      expect(world.spawn).toBe(getExecutionWorld().spawn);
+      expect(world.sandboxed).toBe(false);
+      expect(Object.isFrozen(world.fs)).toBe(true);
+      expect(Object.isFrozen(world)).toBe(true);
+    });
+
+    it('keeps the public override config incrementally mutable', () => {
+      const world = getExecutionWorld();
+      const config: t.LocalExecConfig = {};
+
+      config.spawn = world.spawn;
+      config.fs = { ...nodeWorkspaceFS } as WorkspaceFS;
+      config.sandboxed = true;
+
+      expect(config.spawn).toBe(world.spawn);
+      expect(config.sandboxed).toBe(true);
+    });
+
+    it('bounds hashed command-availability environment entries', () => {
+      const cache = new Map<string, number>();
+      for (let index = 0; index < 17; index++) {
+        setCommandAvailabilityCacheEntry(cache, `environment-${index}`, index);
+      }
+      const secret = 'credential-that-must-not-be-retained';
+      const key = commandAvailabilityEnvCacheKey({ TOKEN: secret, PATH: '/bin' });
+
+      expect(cache.size).toBe(16);
+      expect(cache.has('environment-0')).toBe(false);
+      expect(key).not.toContain(secret);
+      expect(key).toBe(
+        commandAvailabilityEnvCacheKey({ PATH: '/bin', TOKEN: secret })
+      );
+      expect(commandAvailabilityEnvCacheKey({})).not.toBe(
+        commandAvailabilityEnvCacheKey({ PATH: undefined })
+      );
+    });
+
     it('defaults to the Node host fs when nothing is supplied', () => {
       expect(getWorkspaceFS({ workspace: { root: workspace } })).toBe(
         nodeWorkspaceFS

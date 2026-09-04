@@ -12,7 +12,7 @@
  * into a forced summarization pass instead of surfacing the error.
  */
 import { ContextOverflowError } from '@langchain/core/errors';
-import type { Providers } from '@/common';
+import type { ProviderName } from '@/types';
 
 /**
  * Why the request was rejected. Both kinds are fixed by shrinking the
@@ -49,7 +49,7 @@ export interface ContextOverflowInfo {
   promptTokens?: number;
   /** Which layer produced the verdict. Surfaced in logs and asserted in tests. */
   source: 'langchain' | 'pattern';
-  provider?: Providers;
+  provider?: ProviderName;
 }
 
 interface OverflowPattern {
@@ -80,7 +80,7 @@ interface OverflowPattern {
 const CONTEXT_PRESSURE_RATIO = 0.8;
 
 export interface ContextOverflowContext {
-  provider?: Providers;
+  provider?: ProviderName;
   /** Our own estimate of the prompt size for the call that failed. */
   estimatedPromptTokens?: number;
   /** The budget we believed applied when we built that prompt. */
@@ -218,6 +218,14 @@ const NON_RECOVERABLE_RE =
  */
 const OUTPUT_LIMIT_RE =
   /max_?(?:completion_?)?tokens\s*(?:must be|is too|cannot|exceeds|too large|greater than)|maximum number of output tokens|max_tokens.*less than or equal/i;
+
+/**
+ * A gateway can report this disjunction without saying whether the prompt or
+ * requested output caused the rejection. Compaction is unsafe in that case:
+ * shrinking a healthy prompt cannot fix an invalid output allowance.
+ */
+const AMBIGUOUS_CONTEXT_OR_OUTPUT_RE =
+  /(?:context window[\s\S]{0,80}\bor\b[\s\S]{0,80}max(?:imum)? output|max(?:imum)? output[\s\S]{0,80}\bor\b[\s\S]{0,80}context window)/i;
 
 /**
  * Recovers the input-only figure from providers that quote a combined total
@@ -441,6 +449,10 @@ export function getContextOverflowInfo(
     return null;
   }
 
+  if (AMBIGUOUS_CONTEXT_OR_OUTPUT_RE.test(haystack)) {
+    return null;
+  }
+
   if (OUTPUT_LIMIT_RE.test(haystack)) {
     return null;
   }
@@ -525,7 +537,11 @@ export function isLikelyContextOverflowError(
     return true;
   }
   const haystack = stripUrls(collectErrorText(error));
-  if (haystack === '' || OUTPUT_LIMIT_RE.test(haystack)) {
+  if (
+    haystack === '' ||
+    AMBIGUOUS_CONTEXT_OR_OUTPUT_RE.test(haystack) ||
+    OUTPUT_LIMIT_RE.test(haystack)
+  ) {
     return false;
   }
   if (NON_RECOVERABLE_RE.test(haystack)) {

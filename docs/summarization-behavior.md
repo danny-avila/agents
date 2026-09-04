@@ -44,6 +44,18 @@ Updated each turn from `usageMetadata.input_tokens` returned by the provider. Th
 
 All budget comparisons multiply raw counts by `calibrationRatio` to approximate provider space, while the `indexTokenCountMap` stays in raw-token space for stability.
 
+### Fading Tier
+
+Every character cap applied to historical tool results (masking, pre-flight truncation, fit-to-budget) derives from one latched **fading tier** (`src/messages/fading.ts`): `{ v, budgetTokens, masked }`. The budget sits on a ladder that halves the context window per rung; the tier only ever shrinks and masking only ever activates. Because truncation is a pure function of (content, cap), a historical tool result maps to identical bytes on every call within a tier — which is what keeps prefix-based provider prompt caches (Anthropic's single tail breakpoint) valid from turn to turn. Only escalation and compaction rewrite the prefix.
+
+- **Fit rung**: the shallowest rung at which the widest observed parallel tool exchange (call inputs plus fresh results) fits within the effective budget, so a complete exchange can never leave the context empty or lose its results to orphan repair.
+- **Pressure-band rungs** (summarization disabled only): +1 rung at 85 %, +2 at 90 %, +4 at 99 %.
+- **Masking** latches at 80 % pressure; consumed results then keep 10 % of the fresh cap (floor 300 chars).
+
+Graph history stays canonical. The pruner keeps the original bytes of every capped tool result and input-capped AI message and builds a provider-facing projection per Run from them, so a deeper tier or masking re-derives from the original content and matches what a fresh Run seeded with the same tier derives from the host's stored messages. Restored tiers are validated at every boundary (`Run`, `StandardGraph`, `AgentSession`); an invalid or fresh seed starts fresh.
+
+The tier is returned from every prune call. Single-agent hosts can use `Run.getFadingTier()` and `RunConfig.fadingTier`; multi-agent hosts should persist `Run.getFadingTiers()` and restore `RunConfig.fadingTiers` so each agent keeps its independent tier. The budget is absolute, so a mid-run budget correction or a return to the normal window keeps the tier; only compaction resets it, and `Run.didResetFadingTier()` / `Run.getFadingTierResetAgentIds()` report that reset to hosts that merge tiers.
+
 **Instruction overhead calibration**: The pruner also tracks `bestInstructionOverhead` — the best observed instruction token count from provider feedback. When the variance between the estimated and calibrated `toolSchemaTokens` exceeds 15% (`CALIBRATION_VARIANCE_THRESHOLD`), the calibrated value is applied to `AgentContext.toolSchemaTokens`. This corrects the local tool-schema estimate (which uses a static multiplier) against real provider behavior. After intra-run summarization, the calibrated overhead is preserved and seeded into the recreated pruner.
 
 ---
@@ -52,11 +64,11 @@ All budget comparisons multiply raw counts by `calibrationRatio` to approximate 
 
 ### Pipeline (every agent node turn)
 
-1. **< 80% pressure**: No modifications. Messages pass through untouched.
+1. **Fit-to-budget truncation** (every turn): the fading tier's fit rung caps every tool result and tool-call input so the widest observed parallel exchange fits within the effective budget. The cap is latched, so a historical result keeps the same bytes on later turns.
 
-2. **80%+ pressure — Observation masking**: Consumed ToolMessages masked to ~300 char placeholders. Pre-masking snapshot saved so the summarizer can access un-masked originals later.
+2. **80%+ pressure — Observation masking**: Masking latches on the tier; consumed ToolMessages shrink to 10 % of the fresh cap (floor ~300 chars). Pre-masking snapshot saved so the summarizer can access un-masked originals later.
 
-3. **Fit-to-budget truncation**: Any individual message still exceeding `effectiveMaxTokens` is truncated via `preFlightTruncateToolResults` / `preFlightTruncateToolCallInputs`. Uses 30% of effective budget as per-result cap with recency weighting.
+3. **Apply pass**: `applyFadingCaps` walks only the messages that arrived since the last call (or everything after an escalation) and rewrites the ones above their cap.
 
 4. **Pruning split**: `getMessagesWithinTokenLimit` determines which messages fit (`context`) and which overflow (`messagesToRefine`). Messages are kept newest-first.
 
@@ -82,7 +94,7 @@ After compaction, the message array is empty. On the next agent node turn:
 
 ### Summarization Invocation
 
-Raw conversation messages are sent to the LLM via `attemptInvoke` with the summarization instruction appended as the final HumanMessage. Tools are bound so providers that require tool definitions (e.g. Bedrock) accept the messages. This preserves the original message format and enables cache hits on the system prompt + tool definitions prefix.
+Raw conversation messages are sent to the LLM via `attemptInvoke` with the summarization instruction appended as the final HumanMessage. Tools are bound so providers that require tool definitions (e.g. Bedrock) accept the messages and cache-capable providers can reuse the tool-schema prefix. The summarization model does not currently pass through `AgentContext.systemRunnable`, so exact replay of the main request's full system + tools + messages prefix is not guaranteed.
 
 If the primary call fails, fallback providers are attempted (via `tryFallbackProviders`). If all providers fail, a metadata stub is generated mechanically — no LLM call, just tool names and message counts.
 
@@ -94,9 +106,9 @@ The prompt is written in the tone of a user directing the assistant — assertiv
 
 This prevents the model from continuing to roleplay or respond to the conversation instead of producing a structured checkpoint.
 
-### Fallback Fading
+### Emergency Truncation
 
-If observation masking + fit-to-budget still produce an **empty context** (no messages fit at all), context pressure fading is applied as a fallback before emergency truncation. This uses the same pressure-band graduated truncation from the disabled path.
+If masking + fit-to-budget still produce an **empty context** (no messages fit at all), a deeper, temporary tier at which one complete tool exchange (result plus call input) fits within a per-message share of the effective budget is applied to a clone of the messages before pruning is retried. The latched tier is left alone: that share depends on the message count, and latching it would pin every future result to one transient event.
 
 ### Cross-Run Behavior
 
@@ -115,22 +127,22 @@ If observation masking + fit-to-budget still produce an **empty context** (no me
 
 2. **80%+ pressure — Observation masking**: Same consumed-only masking as the summarization-enabled path. Consumed ToolMessages masked, unconsumed left intact, AI messages untouched.
 
-3. **80%+ pressure — Context pressure fading**: Additional progressive truncation of remaining oversized tool results based on graduated pressure bands:
+3. **80%+ pressure — Context pressure fading**: The fading tier deepens by extra rungs on top of the fit rung, halving the cap budget per rung:
 
-   | Pressure | Budget factor | Effect                                        |
-   | -------- | ------------- | --------------------------------------------- |
-   | 80%      | 1.0           | Gentle — oldest results get light truncation  |
-   | 85%      | 0.5           | Moderate — older results shrink significantly |
-   | 90%      | 0.2           | Aggressive — most results heavily truncated   |
-   | 99%      | 0.05          | Emergency — effectively one-line placeholders |
+   | Pressure | Extra rungs | Budget factor |
+   | -------- | ----------- | ------------- |
+   | 80%      | 0           | 1.0           |
+   | 85%      | 1           | 0.5           |
+   | 90%      | 2           | 0.25          |
+   | 99%      | 4           | 0.0625        |
 
-   Recency weighting: oldest tool results get 20% of the budget factor, newest get 100%.
+   Every tool result shares one cap at a given tier; the consumed/fresh distinction from masking is the only per-message difference. The tier never relaxes, so a conversation hovering around a threshold does not flip between bands.
 
 4. **Position-based context pruning** (if `contextPruningConfig.enabled`): Additional position-based degradation of old tool results.
 
 5. **Pruning**: `getMessagesWithinTokenLimit` drops oldest messages to fit budget. Orphan repair strips unpaired tool_use/tool_result blocks.
 
-6. **Emergency truncation** (if pruning produces empty context): Proportional budget divided across all messages, aggressive head+tail truncation, retry pruning.
+6. **Emergency truncation** (if pruning produces empty context): A temporary tier at which one complete tool exchange fits within the per-message share of the effective budget is applied to a clone, then pruning is retried. The latched tier is not changed.
 
 ### Key Difference from Enabled Path
 
@@ -191,7 +203,7 @@ Masking uses `truncateToolResultContent` with a ~300 char limit, producing head+
 | `updatePrompt`     | `string`       | Built-in update prompt     | Custom prompt for re-compaction when a prior summary exists. Falls back to `prompt`.   |
 | `trigger`          | `object`       | Always on overflow         | When to fire summarization. See trigger types below.                                   |
 | `reserveRatio`     | `number (0-1)` | `0.05`                     | Fraction of token budget reserved as headroom. Pruning triggers at `budget * (1 - r)`. |
-| `maxSummaryTokens` | `number`       | `2048`                     | Max output tokens for the summarization model.                                         |
+| `maxSummaryTokens` | `number`       | Provider/client default    | Optional max output tokens for the summarization model.                                |
 | `contextPruning`   | `object`       | disabled                   | Position-based context pruning (only applies when summarization is disabled).          |
 
 ### Trigger types (`trigger` field)
@@ -215,6 +227,6 @@ Masking uses `truncateToolResultContent` with a ~300 char limit, producing head+
 
 ### `parameters` sub-fields (extracted before passing to LLM)
 
-| Field              | Type     | Default | Description                                     |
-| ------------------ | -------- | ------- | ----------------------------------------------- |
-| `maxSummaryTokens` | `number` | `2048`  | Can also be set here (same as top-level field). |
+| Field              | Type     | Default                 | Description                                     |
+| ------------------ | -------- | ----------------------- | ----------------------------------------------- |
+| `maxSummaryTokens` | `number` | Provider/client default | Can also be set here (same as top-level field). |

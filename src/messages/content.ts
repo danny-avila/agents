@@ -3,6 +3,7 @@ import type {
   MessageContentComplex,
 } from '@langchain/core/messages';
 import { ContentTypes } from '@/common';
+import { cloneMessage } from './cache';
 
 /**
  * Whether {@link formatContentStrings} will flatten this message's content:
@@ -19,6 +20,20 @@ export const isLegacyConvertible = (message: BaseMessage): boolean => {
     return false;
   }
   return message.content.every((block) => block.type === ContentTypes.TEXT);
+};
+
+/** Joins the text of {@link isLegacyConvertible} content blocks into the exact
+ *  string {@link formatContentStrings} has always produced for them. */
+export const flattenLegacyContent = (
+  blocks: MessageContentComplex[]
+): string => {
+  const content = blocks.reduce((acc, curr) => {
+    if (curr.type === ContentTypes.TEXT) {
+      return `${acc}${curr[ContentTypes.TEXT] ?? ''}\n`;
+    }
+    return acc;
+  }, '');
+  return content.trim();
 };
 
 /**
@@ -38,17 +53,12 @@ export const formatContentStrings = (
       continue;
     }
 
-    // Reduce text types to a single string
-    const blocks = message.content as MessageContentComplex[];
-    const content = blocks.reduce((acc, curr) => {
-      if (curr.type === ContentTypes.TEXT) {
-        return `${acc}${curr[ContentTypes.TEXT] || ''}\n`;
-      }
-      return acc;
-    }, '');
-
-    message.content = content.trim();
-    result.push(message);
+    result.push(
+      cloneMessage(
+        message,
+        flattenLegacyContent(message.content as MessageContentComplex[])
+      )
+    );
   }
 
   return result;

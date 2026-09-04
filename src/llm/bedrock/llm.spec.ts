@@ -1349,7 +1349,9 @@ describe('convertToConverseMessages', () => {
       ]);
 
       const content = result.converseMessages[0].content!;
-      expect(content).toHaveLength(1);
+      expect(content).toHaveLength(2);
+      // Converse requires a text block alongside document blocks; it is appended last.
+      expect(content[1]).toEqual({ text: '_' });
       const documentBlock = expectDocumentBlock(content[0]);
       expect(documentBlock.document.format).toBe('pdf');
       expect(documentBlock.document.name).toBeDefined();
@@ -1397,7 +1399,9 @@ describe('convertToConverseMessages', () => {
       ]);
 
       const content = result.converseMessages[0].content!;
-      expect(content).toHaveLength(2);
+      expect(content).toHaveLength(3);
+      // Converse requires a text block alongside document blocks; it is appended last.
+      expect(content[2]).toEqual({ text: '_' });
       const firstDocument = expectDocumentBlock(content[0]);
       const secondDocument = expectDocumentBlock(content[1]);
       expect(firstDocument.document.name).toBeDefined();

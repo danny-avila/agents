@@ -14,6 +14,13 @@ import {
   selectRuntimeSessionHint,
 } from './CodeExecutor';
 import {
+  assertUnambiguousIdentifiers,
+  projectProgrammaticToolMap,
+  resolveProgrammaticToolDefinitions,
+  selectProgrammaticTools,
+  type ProgrammaticInvocationParams,
+} from './ProgrammaticCallerPolicy';
+import {
   clampCodeApiRunTimeoutMs,
   createCodeApiRunTimeoutSchema,
   resolveCodeApiRunTimeoutMs,
@@ -21,8 +28,10 @@ import {
 import {
   makeRequest,
   executeTools,
+  runPlainExecution,
   formatCompletedResponse,
 } from './ProgrammaticToolCalling';
+import { logCodeApiDiagnostic } from '@/tools/diagnostics';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
@@ -34,6 +43,7 @@ config();
 
 const DEFAULT_MAX_ROUND_TRIPS = 20;
 const DEFAULT_RUN_TIMEOUT_MS = resolveCodeApiRunTimeoutMs();
+const BASH_LAST_BACKGROUND_PID_GUARD = ': &\nwait "$!"';
 
 /** Bash reserved words that get `_tool` suffix when used as function names */
 const BASH_RESERVED = new Set([
@@ -108,6 +118,10 @@ ${EXAMPLES}
 
 ${CORE_RULES}`;
 
+const TOOL_MANIFEST_DESCRIPTION =
+  'Exact registered tool names used by the code. Required when direct-only tools are configured; ' +
+  'validated before execution starts. Pass [] when the code calls no tools at all.';
+
 // ============================================================================
 // Schema
 // ============================================================================
@@ -123,6 +137,12 @@ export function createBashProgrammaticToolCallingSchema(
         type: 'string',
         minLength: 1,
         description: CODE_PARAM_DESCRIPTION,
+      },
+      tool_manifest: {
+        type: 'array',
+        items: { type: 'string' },
+        uniqueItems: true,
+        description: TOOL_MANIFEST_DESCRIPTION,
       },
       timeout: createCodeApiRunTimeoutSchema(maxRunTimeoutMs),
     },
@@ -154,6 +174,14 @@ export const BashProgrammaticToolCallingDefinition = {
   description: BashProgrammaticToolCallingDescription,
   schema: BashProgrammaticToolCallingSchema,
 } as const;
+
+function prepareBashProgrammaticCode(code: string): string {
+  /* The Code API's generated Bash wrapper reads `$!` after user code. A user
+   * `set -u` makes that expansion fail when no background process has run.
+   * Seed and reap a no-op job before user code so strict mode remains active
+   * for the payload while the wrapper can safely read its special parameter. */
+  return `${BASH_LAST_BACKGROUND_PID_GUARD}\n${code}`;
+}
 
 function maybeParseJsonResultString(result: unknown): unknown {
   if (typeof result !== 'string') {
@@ -302,8 +330,9 @@ export function createBashProgrammaticToolCallingTool(
 
   return tool(
     async (rawParams, config) => {
-      const params = rawParams as { code: string; timeout?: number };
+      const params = rawParams as ProgrammaticInvocationParams;
       const { code } = params;
+      const preparedCode = prepareBashProgrammaticCode(code);
       const timeout = clampCodeApiRunTimeoutMs(params.timeout, maxRunTimeoutMs);
 
       const toolCall = (config.toolCall ?? {}) as ToolCall &
@@ -314,40 +343,77 @@ export function createBashProgrammaticToolCallingTool(
         };
       const {
         toolMap,
-        toolDefs,
+        disallowedToolDefs,
         session_id,
         _injected_files,
         _runtime_session_hint,
       } = toolCall;
+      const toolDefs = resolveProgrammaticToolDefinitions(
+        toolCall as typeof toolCall & { tools?: t.LCTool[] }
+      );
 
-      if (toolMap == null || toolMap.size === 0) {
-        throw new Error(
-          'No toolMap provided. ' +
-            'ToolNode should inject this from AgentContext when invoked through the graph.'
-        );
+      const programmaticToolName =
+        toolCall.programmaticToolName ??
+        (typeof toolCall.name === 'string' && toolCall.name !== ''
+          ? toolCall.name
+          : Constants.BASH_PROGRAMMATIC_TOOL_CALLING);
+      const effectiveTools = selectProgrammaticTools({
+        requestedToolNames: params.tool_manifest,
+        allowedToolDefs: toolDefs,
+        disallowedToolDefs,
+        programmaticToolName,
+      });
+
+      /* These guard the replay path only. A call that selected no tools never
+       * replays, and event-driven ToolNode configurations legitimately inject
+       * an empty toolMap/toolDefs. Injected context is still required to
+       * conclude that — with nothing injected at all, an empty selection means
+       * the host wired the tool up wrong. */
+      const needsNoTools =
+        effectiveTools.length === 0 &&
+        (params.tool_manifest?.length === 0 ||
+          toolDefs != null ||
+          disallowedToolDefs != null);
+
+      if (!needsNoTools) {
+        if (toolMap == null || toolMap.size === 0) {
+          throw new Error(
+            'No toolMap provided. ' +
+              'ToolNode should inject this from AgentContext when invoked through the graph.'
+          );
+        }
+
+        if (toolDefs == null || toolDefs.length === 0) {
+          throw new Error(
+            'No tool definitions provided. ' +
+              'Either pass tools in the input or ensure ToolNode injects toolDefs.'
+          );
+        }
       }
 
-      if (toolDefs == null || toolDefs.length === 0) {
-        throw new Error(
-          'No tool definitions provided. ' +
-            'Either pass tools in the input or ensure ToolNode injects toolDefs.'
-        );
-      }
+      assertUnambiguousIdentifiers(
+        effectiveTools,
+        normalizeToBashIdentifier,
+        programmaticToolName
+      );
+
+      const effectiveToolMap = projectProgrammaticToolMap(
+        toolMap ?? new Map(),
+        effectiveTools
+      );
 
       let roundTrip = 0;
 
       try {
         // ====================================================================
-        // Phase 1: Filter tools and make initial request
+        // Phase 1: Send the validated tool manifest with the initial request
         // ====================================================================
-
-        const effectiveTools = filterBashToolsByUsage(toolDefs, code, debug);
 
         if (debug) {
           // eslint-disable-next-line no-console
           console.log(
             `[BashPTC Debug] Sending ${effectiveTools.length} tools to API ` +
-              `(filtered from ${toolDefs.length})`
+              `(selected from ${toolDefs?.length ?? 0})`
           );
         }
 
@@ -358,9 +424,11 @@ export function createBashProgrammaticToolCallingTool(
         if (_injected_files && _injected_files.length > 0) {
           files = _injected_files;
         } else if (session_id != null && session_id.length > 0) {
-          // eslint-disable-next-line no-console
-          console.debug(
-            `[BashProgrammaticToolCalling] No injected files for session_id=${session_id} — exec will run without input files`
+          logCodeApiDiagnostic(
+            'BashProgrammaticToolCalling',
+            'debug',
+            'session carried no injected files; exec will run without input files',
+            { files: 'none' }
           );
         }
 
@@ -379,11 +447,28 @@ export function createBashProgrammaticToolCallingTool(
             ? selectedRuntimeSessionHint
             : undefined;
 
+        /* Raw `code`, not `preparedCode`: the `$!` guard exists for the
+         * programmatic replay wrapper, which plain `/exec` never applies. */
+        if (needsNoTools) {
+          return await runPlainExecution({
+            baseUrl,
+            lang: 'bash',
+            code,
+            timeout,
+            sessionId: session_id,
+            files,
+            runtimeSessionHint,
+            proxy,
+            authHeaders: initParams.authHeaders,
+            executionProfile: initParams.executionProfile,
+          });
+        }
+
         let response = await makeRequest(
           EXEC_ENDPOINT,
           {
             lang: 'bash',
-            code,
+            code: preparedCode,
             tools: effectiveTools,
             session_id,
             timeout,
@@ -422,7 +507,7 @@ export function createBashProgrammaticToolCallingTool(
           const toolResults = normalizeBashToolResultsForReplay(
             await executeTools(
               response.tool_calls ?? [],
-              toolMap,
+              effectiveToolMap,
               Constants.BASH_PROGRAMMATIC_TOOL_CALLING
             )
           );

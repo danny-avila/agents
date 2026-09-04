@@ -21,11 +21,13 @@ import {
   sanitizeOrphanToolBlocks,
   enforceOriginalContentCap,
   ORIGINAL_CONTENT_MAX_CHARS,
-  calculateMaxToolCallInputChars,
   createPruneMessages,
   projectToolCallInputs,
+  projectToolMessagesForProvider,
   serializeToolCallInput,
 } from '@/messages/prune';
+import { calculateMaxToolCallInputChars } from '@/utils/truncation';
+import { projectToolStreamContentForProvider } from '@/messages/core';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { ensureThinkingBlockInMessages } from '@/messages/format';
 import { Providers, ContentTypes } from '@/common';
@@ -1439,6 +1441,53 @@ describe('Prune Messages Tests', () => {
   });
 
   describe('projectToolCallInputs', () => {
+    it('matches sequential stream and tool-input projection in one pass', () => {
+      const messages: BaseMessage[] = [
+        new HumanMessage('Use the tool.'),
+        new AIMessageChunk({
+          content: [
+            { type: 'text', text: '' },
+            {
+              type: 'tool_use',
+              id: 'call-1',
+              name: 'search',
+              input: { query: 'x'.repeat(2_000) },
+            },
+          ],
+          tool_calls: [
+            {
+              id: 'call-1',
+              name: 'search',
+              args: { query: 'x'.repeat(2_000) },
+            },
+          ],
+        }),
+      ];
+
+      const sequential = projectToolCallInputs(
+        projectToolStreamContentForProvider(messages),
+        200
+      );
+      const derived = projectToolMessagesForProvider(messages, 200);
+
+      expect(derived).toEqual(sequential);
+      expect(derived[1]).not.toBe(sequential[1]);
+      expect(derived[1]).not.toBe(messages[1]);
+    });
+
+    it('returns the original array when stream content and inputs are safe', () => {
+      const messages: BaseMessage[] = [
+        new AIMessage({
+          content: [{ type: 'text', text: 'Calling search.' }],
+          tool_calls: [
+            { id: 'call-1', name: 'search', args: { query: 'safe' } },
+          ],
+        }),
+      ];
+
+      expect(projectToolMessagesForProvider(messages, 200)).toBe(messages);
+    });
+
     it('uses the shared 15%-of-context cap with a 200K ceiling', () => {
       expect(calculateMaxToolCallInputChars()).toBe(200_000);
       expect(calculateMaxToolCallInputChars(0)).toBe(200_000);

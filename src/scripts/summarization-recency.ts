@@ -15,9 +15,7 @@
  * resolve.  The Bedrock AWS SDK in particular captures credentials
  * during module init.  Run with the dotenv preload + override flag:
  *
- *   DOTENV_CONFIG_OVERRIDE=true node -r dotenv/config \
- *     --loader ./tsconfig-paths-bootstrap.mjs \
- *     --experimental-specifier-resolution=node \
+ *   DOTENV_CONFIG_OVERRIDE=true tsx -r dotenv/config \
  *     ./src/scripts/summarization-recency.ts --provider all
  */
 import { config as loadEnv } from 'dotenv';

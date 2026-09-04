@@ -124,7 +124,7 @@ describe('JinaReranker', () => {
   });
 
   describe('rerank method', () => {
-    it('should log the API URL being used', async () => {
+    it('should post to the configured API URL', async () => {
       const customUrl = 'https://test-jina-endpoint.com/v1/rerank';
       const reranker = new JinaReranker({
         apiKey: 'test-key',
@@ -132,21 +132,56 @@ describe('JinaReranker', () => {
         logger: mockLogger,
       });
 
-      const logSpy = jest
-        .spyOn(mockLogger, 'debug')
-        .mockImplementation(() => mockLogger);
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
       jest.spyOn(mockLogger, 'error').mockImplementation(() => mockLogger);
-      jest
+      const postSpy = jest
         .spyOn(axios, 'post')
         .mockRejectedValueOnce(new Error('Network error'));
 
       await reranker.rerank('test query', ['document1', 'document2'], 2);
 
-      expect(logSpy).toHaveBeenCalledWith(
-        expect.stringContaining(
-          `Reranking 2 chunks with Jina using API URL: ${customUrl}`
-        )
+      expect(postSpy).toHaveBeenCalledWith(
+        customUrl,
+        expect.objectContaining({ top_n: 2 }),
+        expect.anything()
       );
+    });
+
+    it('should keep a ranking when the response omits the usage telemetry', async () => {
+      const reranker = new JinaReranker({
+        apiKey: 'test-key',
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      const warnSpy = jest
+        .spyOn(mockLogger, 'warn')
+        .mockImplementation(() => mockLogger);
+      const errorSpy = jest
+        .spyOn(mockLogger, 'error')
+        .mockImplementation(() => mockLogger);
+      // A Jina-compatible endpoint may return results with no `usage` block.
+      jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: {
+          model: 'custom-reranker',
+          results: [
+            { index: 1, relevance_score: 0.9 },
+            { index: 0, relevance_score: 0.4 },
+          ],
+        },
+      });
+
+      const result = await reranker.rerank(
+        'test query',
+        ['document1', 'document2'],
+        2
+      );
+
+      expect(result).toEqual([
+        { text: 'document2', score: 0.9 },
+        { text: 'document1', score: 0.4 },
+      ]);
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(errorSpy).not.toHaveBeenCalled();
     });
 
     it('should log compact Axios errors without request internals', async () => {
@@ -180,7 +215,7 @@ describe('JinaReranker', () => {
         { text: 'document2', score: 0 },
       ]);
       expect(errorSpy).toHaveBeenCalledWith(
-        'Error using Jina reranker',
+        expect.stringContaining('rerank=jina calls=1'),
         expect.objectContaining({
           code: 'ERR_BAD_RESPONSE',
           message: 'Request failed with status code 500',

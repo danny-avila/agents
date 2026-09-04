@@ -58,14 +58,14 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
-import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
-import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
-import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
 import {
   hasReasoningKwargs,
   hasToolCallChunks,
   getReasoningKwargsText,
 } from '@/llm/stream/chunkAdapters';
+import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
+import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
+import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
@@ -122,6 +122,7 @@ type OpenAIClientConfig = NonNullable<
 >;
 type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   _lc_stream_delay?: number;
+  firstPartyEndpoint?: boolean;
   includeReasoningContent?: boolean;
   includeReasoningDetails?: boolean;
   convertReasoningDetailsToContent?: boolean;
@@ -133,6 +134,7 @@ type LibreChatOpenAIFields = t.ChatOpenAIFields & {
 };
 type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & {
   _lc_stream_delay?: number;
+  firstPartyEndpoint?: boolean;
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
 };
@@ -503,13 +505,127 @@ export function addResponseCacheBreakpoints(
   );
 }
 
+/**
+ * GPT-6 Astra, matched on the model id rather than a `gpt-6` family cutoff.
+ *
+ * OpenAI documents these constraints for Astra specifically, and every gate
+ * keyed off this helper *removes* capability — it forces the Responses API,
+ * drops sampling parameters, and lowers reasoning effort. A false positive
+ * therefore silently degrades a sibling model that never needed it, so the
+ * match stays narrow until OpenAI documents the same rules more widely.
+ *
+ * Deliberately does NOT match a `provider/` prefixed id such as
+ * `openai/gpt-6-astra`. A slash means a proxy is doing the routing, and the
+ * proxy's contract is not OpenAI's: `ChatOpenRouter` extends this class, and on
+ * OpenRouter `effort: 'none'` is a *supported* value meaning "disable
+ * reasoning" (it maps to `include_reasoning: false`). Substituting it with
+ * `low` there would silently turn reasoning off into reasoning on, and forcing
+ * the Responses API would change the endpoint shape a proxy may not serve. Bare
+ * ids reach the first-party OpenAI and Azure surfaces these rules describe.
+ * @see https://developers.openai.com/api/docs/models/gpt-6-astra
+ * @see https://developers.openai.com/api/docs/guides/latest-model
+ */
+const GPT_6_ASTRA_PATTERN = /^gpt-6-astra(?:-|$)/i;
+
+/** @internal */
+export function isGpt6AstraModel(model?: string): boolean {
+  return model != null && GPT_6_ASTRA_PATTERN.test(model.toLowerCase());
+}
+
+/**
+ * Reasoning efforts GPT-6 Astra does not accept, mapped to the level OpenAI
+ * recommends migrating to. `none` is rejected outright and `minimal` is not
+ * offered; the migration guide says to "start with `low` and compare results".
+ * Substituting keeps a stored agent configuration usable instead of failing
+ * the turn on a value the previous model accepted.
+ */
+const GPT_6_ASTRA_UNSUPPORTED_EFFORTS = new Set(['none', 'minimal']);
+const GPT_6_ASTRA_EFFORT_FALLBACK = 'low' as const;
+
+function substituteUnsupportedAstraEffort(
+  astraRulesApply: boolean,
+  reasoning: OpenAIClient.Reasoning | undefined
+): OpenAIClient.Reasoning | undefined {
+  const effort = reasoning?.effort;
+  if (
+    effort == null ||
+    !astraRulesApply ||
+    !GPT_6_ASTRA_UNSUPPORTED_EFFORTS.has(effort)
+  ) {
+    return reasoning;
+  }
+  return { ...reasoning, effort: GPT_6_ASTRA_EFFORT_FALLBACK };
+}
+
+/** Rejected inside the Responses `include` array. */
+const GPT_6_ASTRA_UNSUPPORTED_INCLUDE: OpenAIClient.Responses.ResponseIncludable =
+  'message.output_text.logprobs';
+
+/**
+ * The subset of a request GPT-6 Astra rejects, taken from the SDK's own request
+ * types so the stripping boundary keeps their constraints. Every member is
+ * optional so a key can be deleted from a request object whose concrete type
+ * marks it required.
+ */
+type AstraStrippableParams = Partial<
+  Pick<
+    OpenAIClient.Chat.Completions.ChatCompletionCreateParams,
+    'temperature' | 'top_p' | 'logprobs' | 'top_logprobs'
+  >
+> &
+  Partial<Pick<OpenAIClient.Responses.ResponseCreateParams, 'include'>>;
+
+/**
+ * Removes the sampling and logprob parameters GPT-6 Astra rejects.
+ *
+ * LangChain's request builders emit `temperature` and `top_p` from instance
+ * fields unconditionally, so leaving them unset upstream is not enough — they
+ * are stripped after `super.invocationParams`. `logprobs` is Chat Completions
+ * only; the Responses equivalent rides inside `include`.
+ */
+function stripUnsupportedAstraParams<T extends object>(
+  astraRulesApply: boolean,
+  params: T,
+  endpoint: 'completions' | 'responses'
+): T {
+  if (!astraRulesApply) {
+    return params;
+  }
+  const next = { ...params };
+  const record = next as AstraStrippableParams;
+  delete record.temperature;
+  delete record.top_p;
+  delete record.top_logprobs;
+  if (endpoint === 'completions') {
+    delete record.logprobs;
+    return next;
+  }
+  const include = record.include;
+  if (!Array.isArray(include)) {
+    return next;
+  }
+  const filtered = include.filter(
+    (entry) => entry !== GPT_6_ASTRA_UNSUPPORTED_INCLUDE
+  );
+  if (filtered.length === include.length) {
+    return next;
+  }
+  if (filtered.length === 0) {
+    delete record.include;
+  } else {
+    record.include = filtered;
+  }
+  return next;
+}
+
 /** @internal */
 export function shouldIncludeEncryptedReasoning(
   model: string,
   params: {
     store?: boolean | null;
     reasoning?: unknown;
-  }
+  },
+  astraRulesApply = false
 ): boolean {
   const reasoningContext = (
     params.reasoning as
@@ -517,7 +633,7 @@ export function shouldIncludeEncryptedReasoning(
       | undefined
   )?.context;
   return (
-    /^gpt-5\.6(?:-|$)/i.test(model) &&
+    (/^gpt-5\.6(?:-|$)/i.test(model) || astraRulesApply) &&
     (params.store === false || reasoningContext !== 'current_turn')
   );
 }
@@ -919,6 +1035,75 @@ function attachResponsesReplayPosition(
   chunk.message.lc_kwargs.additional_kwargs = additionalKwargs;
 }
 
+type ResponsesAnnotationsBoundaryEvent = {
+  type: OpenAIClient.Responses.ResponseStreamEvent['type'];
+  response?: {
+    output?: Array<{
+      type: string;
+      content?: Array<{
+        type: string;
+        annotations?: object[] | null;
+      }>;
+    }>;
+  };
+};
+
+/**
+ * The Responses API spec declares `annotations` required on `output_text`
+ * content parts, but some OpenAI-compatible gateways omit the field on the
+ * terminal `response.completed`/`response.incomplete` events. LangChain's
+ * converter calls `part.annotations.map(...)` unconditionally, so a missing
+ * field crashes the whole stream. Default it to `[]` before conversion.
+ */
+export function ensureResponsesOutputAnnotations(
+  event: ResponsesAnnotationsBoundaryEvent
+): void {
+  if (event.type !== 'response.completed' && event.type !== 'response.incomplete') {
+    return;
+  }
+  const output = event.response?.output;
+  if (!Array.isArray(output)) {
+    return;
+  }
+  for (const item of output) {
+    if (item.type !== 'message' || !Array.isArray(item.content)) {
+      continue;
+    }
+    for (const part of item.content) {
+      if (part.type === 'output_text' && !Array.isArray(part.annotations)) {
+        part.annotations = [];
+      }
+    }
+  }
+}
+
+function getResponsesStreamError(
+  event: OpenAIClient.Responses.ResponseStreamEvent
+): Error | undefined {
+  if (event.type === 'error') {
+    return new OpenAIClient.APIError(
+      undefined,
+      event,
+      event.message,
+      undefined
+    );
+  }
+  if (event.type !== 'response.failed') {
+    return;
+  }
+  if (event.response.error != null) {
+    return new OpenAIClient.APIError(
+      undefined,
+      event.response.error,
+      event.response.error.message,
+      undefined
+    );
+  }
+  return new OpenAIClient.OpenAIError(
+    `Response ${event.response.id} failed without error details.`
+  );
+}
+
 async function* convertLibreChatResponsesStream(
   stream: AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>,
   options: ResponsesStreamChunkOptions,
@@ -929,6 +1114,11 @@ async function* convertLibreChatResponsesStream(
   try {
     for await (const event of stream) {
       options.signal?.throwIfAborted();
+      const streamError = getResponsesStreamError(event);
+      if (streamError != null) {
+        throw streamError;
+      }
+      ensureResponsesOutputAnnotations(event);
       const convertedChunk =
         convertResponsesDeltaToChatGenerationChunk(event) ??
         convertDroppedResponsesReplayOutput(event);
@@ -1035,6 +1225,7 @@ function getExposedOpenAIClient(
 }
 
 function getReasoningParams(
+  astraRulesApply: boolean,
   baseReasoning: OpenAIClient.Reasoning | undefined,
   options?: ReasoningCallOptions
 ): OpenAIClient.Reasoning | undefined {
@@ -1060,18 +1251,19 @@ function getReasoningParams(
       effort: options.reasoningEffort,
     };
   }
-  return reasoning;
+  return substituteUnsupportedAstraEffort(astraRulesApply, reasoning);
 }
 
 function getGatedReasoningParams(
   model: string,
+  astraRulesApply: boolean,
   baseReasoning: OpenAIClient.Reasoning | undefined,
   options?: ReasoningCallOptions
 ): OpenAIClient.Reasoning | undefined {
   if (!isReasoningModel(model)) {
     return;
   }
-  return getReasoningParams(baseReasoning, options);
+  return getReasoningParams(astraRulesApply, baseReasoning, options);
 }
 
 function isObject(value: unknown): value is object {
@@ -1536,7 +1728,7 @@ export class CustomAzureOpenAIClient extends AzureOpenAIClient {
   }
 }
 
-const OFFICIAL_OPENAI_BASE_URL_PATTERN = /^https:\/\/api\.openai\.com(\/|$)/;
+const OFFICIAL_OPENAI_HOSTNAME = 'api.openai.com';
 
 /**
  * Official OpenAI (api.openai.com) and Azure OpenAI Chat Completions streams
@@ -1572,11 +1764,29 @@ function isOfficialOpenAIBaseURL(baseURL: string | null | undefined): boolean {
   if (effectiveBaseURL == null || effectiveBaseURL === '') {
     return true;
   }
-  return OFFICIAL_OPENAI_BASE_URL_PATTERN.test(effectiveBaseURL);
+  // Compared through the URL parser rather than textually: it normalizes the
+  // host case and drops the default :443, both of which spell the same
+  // first-party endpoint, while keeping a lookalike host such as
+  // `api.openai.com.example.net` a distinct hostname. A non-default port is
+  // someone else's listener, so it stays proxied.
+  let parsed: URL;
+  try {
+    parsed = new URL(effectiveBaseURL);
+  } catch {
+    return false;
+  }
+  return (
+    parsed.protocol === 'https:' &&
+    parsed.hostname === OFFICIAL_OPENAI_HOSTNAME &&
+    parsed.port === ''
+  );
 }
 
-const AZURE_FIRST_PARTY_BASE_PATH_PATTERN =
-  /^https:\/\/[^/]+\.(openai\.azure\.com|cognitiveservices\.azure\.com|api\.cognitive\.microsoft\.com)(:\d+)?(\/|$)/;
+const AZURE_FIRST_PARTY_HOST_SUFFIXES = [
+  '.openai.azure.com',
+  '.cognitiveservices.azure.com',
+  '.api.cognitive.microsoft.com',
+] as const;
 
 /**
  * Azure OpenAI is first-party when requests resolve to an instance-name
@@ -1596,10 +1806,59 @@ function isFirstPartyAzureEndpoint(args: {
   if (args.azureOpenAIBasePath == null || args.azureOpenAIBasePath === '') {
     return true;
   }
-  return AZURE_FIRST_PARTY_BASE_PATH_PATTERN.test(args.azureOpenAIBasePath);
+  // Parsed rather than matched textually, for the reason given on
+  // `isOfficialOpenAIBaseURL`: the host case carries no meaning, so an
+  // equivalent mixed-case spelling must not read as a proxy. Any port is
+  // accepted here, as the previous pattern did.
+  let parsed: URL;
+  try {
+    parsed = new URL(args.azureOpenAIBasePath);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') {
+    return false;
+  }
+  return AZURE_FIRST_PARTY_HOST_SUFFIXES.some((suffix) =>
+    parsed.hostname.endsWith(suffix)
+  );
+}
+
+/**
+ * Whether the GPT-6 Astra request-shaping rules apply to this request.
+ *
+ * Shaping only: which API serves the turn is the caller's decision, made where
+ * the rest of the request is shaped. These rules cover what the model rejects
+ * on either API — sampling and logprob parameters, unsupported reasoning
+ * efforts — plus the encrypted reasoning it supports.
+ *
+ * Both halves must hold: the SDK knows the model is Astra, and the caller has
+ * declared that this client talks to the first-party endpoint those rules
+ * describe. The endpoint half is *declared* rather than inferred from a base
+ * URL: only the caller knows whether a given URL is a faithful first-party
+ * route, a gateway, or a proxy with its own semantics, and every gate here
+ * removes capability — forcing Responses, dropping parameters, lowering effort
+ * — so guessing wrong silently degrades an endpoint the SDK cannot see.
+ *
+ * Defaults to off. An undeclared client keeps its existing behavior and a
+ * misconfigured Astra call fails with the provider's own error, which names the
+ * remedy, rather than being silently rewritten.
+ */
+function astraRulesApply(
+  model: string,
+  firstPartyEndpoint: boolean | undefined
+): boolean {
+  return firstPartyEndpoint === true && isGpt6AstraModel(model);
 }
 
 class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
+  protected firstPartyEndpoint?: boolean;
+
+  /** @see {@link astraRulesApply} */
+  protected get astraRulesApply(): boolean {
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
+  }
+
   private includeReasoningContent?: boolean;
   private includeReasoningDetails?: boolean;
   private convertReasoningDetailsToContent?: boolean;
@@ -1615,6 +1874,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
       fields?.convertReasoningDetailsToContent;
     this.preserveToolCacheControl = fields?.preserveToolCacheControl;
     this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.firstPartyEndpoint = fields?.firstPartyEndpoint;
     this.safetyIdentifier = fields?.safety_identifier;
   }
 
@@ -1623,17 +1883,21 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     extra?: { streaming?: boolean }
   ): ReturnType<OriginalChatOpenAICompletions['invocationParams']> {
     return stripIntentFromStrictTools(
-      applyManagedRequestParams(super.invocationParams(options, extra), {
-        promptCacheExplicit: this.promptCacheExplicit,
-        safetyIdentifier: this.safetyIdentifier,
-      })
+      stripUnsupportedAstraParams(
+        this.astraRulesApply,
+        applyManagedRequestParams(super.invocationParams(options, extra), {
+          promptCacheExplicit: this.promptCacheExplicit,
+          safetyIdentifier: this.safetyIdentifier,
+        }),
+        'completions'
+      )
     );
   }
 
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getReasoningParams(this.reasoning, options);
+    return getReasoningParams(this.astraRulesApply, this.reasoning, options);
   }
 
   _getClientOptions(
@@ -2025,6 +2289,13 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 }
 
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
+  protected firstPartyEndpoint?: boolean;
+
+  /** @see {@link astraRulesApply} */
+  protected get astraRulesApply(): boolean {
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
+  }
+
   private promptCacheExplicit?: boolean;
   private responsesPromptCache?: boolean;
   private responsesPromptCacheTtl?: PromptCacheTtl;
@@ -2033,6 +2304,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   constructor(fields?: LibreChatOpenAIFields) {
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.firstPartyEndpoint = fields?.firstPartyEndpoint;
     this.responsesPromptCache = fields?.responsesPromptCache;
     this.responsesPromptCacheTtl = fields?.responsesPromptCacheTtl;
     this.safetyIdentifier = fields?.safety_identifier;
@@ -2072,7 +2344,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
         cache_control: cacheControl,
       }),
     };
-    if (shouldIncludeEncryptedReasoning(this.model, params)) {
+    if (shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)) {
       params.include = [
         ...new Set([
           ...(params.include ?? []),
@@ -2080,7 +2352,9 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
         ]),
       ];
     }
-    return stripIntentFromStrictTools(params);
+    return stripIntentFromStrictTools(
+      stripUnsupportedAstraParams(this.astraRulesApply, params, 'responses')
+    );
   }
 
   async completionWithRetry(
@@ -2163,7 +2437,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getReasoningParams(this.reasoning, options);
+    return getReasoningParams(this.astraRulesApply, this.reasoning, options);
   }
 
   _getClientOptions(
@@ -2174,12 +2448,20 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
 }
 
 class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions {
+  protected firstPartyEndpoint?: boolean;
+
+  /** @see {@link astraRulesApply} */
+  protected get astraRulesApply(): boolean {
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
+  }
+
   private promptCacheExplicit?: boolean;
   private safetyIdentifier?: string;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.firstPartyEndpoint = fields?.firstPartyEndpoint;
     this.safetyIdentifier = fields?.safety_identifier;
   }
 
@@ -2188,17 +2470,26 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
     extra?: { streaming?: boolean }
   ): ReturnType<OriginalAzureChatOpenAICompletions['invocationParams']> {
     return stripIntentFromStrictTools(
-      applyManagedRequestParams(super.invocationParams(options, extra), {
-        promptCacheExplicit: this.promptCacheExplicit,
-        safetyIdentifier: this.safetyIdentifier,
-      })
+      stripUnsupportedAstraParams(
+        this.astraRulesApply,
+        applyManagedRequestParams(super.invocationParams(options, extra), {
+          promptCacheExplicit: this.promptCacheExplicit,
+          safetyIdentifier: this.safetyIdentifier,
+        }),
+        'completions'
+      )
     );
   }
 
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getGatedReasoningParams(this.model, this.reasoning, options);
+    return getGatedReasoningParams(
+      this.model,
+      this.astraRulesApply,
+      this.reasoning,
+      options
+    );
   }
 
   protected _convertCompletionsDeltaToBaseMessageChunk(
@@ -2312,12 +2603,20 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
 }
 
 class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
+  protected firstPartyEndpoint?: boolean;
+
+  /** @see {@link astraRulesApply} */
+  protected get astraRulesApply(): boolean {
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
+  }
+
   private promptCacheExplicit?: boolean;
   private safetyIdentifier?: string;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.firstPartyEndpoint = fields?.firstPartyEndpoint;
     this.safetyIdentifier = fields?.safety_identifier;
   }
 
@@ -2328,7 +2627,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       promptCacheExplicit: this.promptCacheExplicit,
       safetyIdentifier: this.safetyIdentifier,
     });
-    if (shouldIncludeEncryptedReasoning(this.model, params)) {
+    if (shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)) {
       params.include = [
         ...new Set([
           ...(params.include ?? []),
@@ -2336,7 +2635,9 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
         ]),
       ];
     }
-    return stripIntentFromStrictTools(params);
+    return stripIntentFromStrictTools(
+      stripUnsupportedAstraParams(this.astraRulesApply, params, 'responses')
+    );
   }
 
   async completionWithRetry(
@@ -2419,7 +2720,12 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getGatedReasoningParams(this.model, this.reasoning, options);
+    return getGatedReasoningParams(
+      this.model,
+      this.astraRulesApply,
+      this.reasoning,
+      options
+    );
   }
 
   _getClientOptions(
@@ -2499,6 +2805,13 @@ function withLibreChatOpenAIFields(
 }
 
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
+  protected firstPartyEndpoint?: boolean;
+
+  /** @see {@link astraRulesApply} */
+  protected get astraRulesApply(): boolean {
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
+  }
+
   _lc_stream_delay: number;
 
   constructor(
@@ -2506,6 +2819,7 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   ) {
     super(withLibreChatOpenAIFields(fields));
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
+    this.firstPartyEndpoint = fields?.firstPartyEndpoint;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2553,7 +2867,7 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getReasoningParams(this.reasoning, options);
+    return getReasoningParams(this.astraRulesApply, this.reasoning, options);
   }
 
   protected _getReasoningParams(
@@ -2596,6 +2910,13 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
 }
 
 export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
+  protected firstPartyEndpoint?: boolean;
+
+  /** @see {@link astraRulesApply} */
+  protected get astraRulesApply(): boolean {
+    return astraRulesApply(this.model, this.firstPartyEndpoint);
+  }
+
   _lc_stream_delay: number;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
@@ -2603,6 +2924,7 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
     this.completions = new LibreChatAzureOpenAICompletions(fields);
     this.responses = new LibreChatAzureOpenAIResponses(fields);
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
+    this.firstPartyEndpoint = fields?.firstPartyEndpoint;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2612,6 +2934,7 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
       this._useResponsesApi(undefined)
     ) as CustomOpenAIClient;
   }
+
   static lc_name(): 'LibreChatAzureOpenAI' {
     return 'LibreChatAzureOpenAI';
   }
@@ -2622,7 +2945,12 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    return getGatedReasoningParams(this.model, this.reasoning, options);
+    return getGatedReasoningParams(
+      this.model,
+      this.astraRulesApply,
+      this.reasoning,
+      options
+    );
   }
 
   protected _getReasoningParams(

@@ -1,6 +1,8 @@
+import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { AgentContext } from '@/agents/AgentContext';
 import { Providers } from '@/common';
+import { messagesStateReducer } from '@/messages/reducer';
 
 /**
  * The overflow-recovery bookkeeping on AgentContext: the budget correction,
@@ -24,6 +26,118 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.overflowRecoveryAttempts).toBe(1);
     /** Forces the pruner to be rebuilt against the corrected budget. */
     expect(context.pruneMessages).toBeUndefined();
+  });
+
+  it('keeps one provider projection per run and rebuilds it after overflow', () => {
+    const context = AgentContext.fromConfig(
+      {
+        agentId: 'overflow-agent',
+        provider: Providers.ANTHROPIC,
+        instructions: 'Test instructions',
+        maxContextTokens: 1_000_000,
+      } as Partial<t.AgentInputs> as t.AgentInputs,
+      () => 1
+    );
+    const canonical = [
+      new HumanMessage('canonical'),
+      new AIMessage({ content: [{ type: 'text', text: 'answer' }] }),
+    ];
+
+    const projection = context.getProviderProjectedMessages(canonical);
+    projection[0] = new HumanMessage('projected');
+    (projection[1].content as Array<{ text: string }>).unshift({
+      text: 'provider-only',
+    });
+    canonical.push(new HumanMessage('next'));
+
+    expect(context.getProviderProjectedMessages(canonical)).toBe(projection);
+    expect(projection).toHaveLength(3);
+    expect(canonical[0].content).toBe('canonical');
+    expect(canonical[1].content).toEqual([{ type: 'text', text: 'answer' }]);
+
+    context.applyContextBudgetCorrection(190_000, 274_468);
+    const rebuilt = context.getProviderProjectedMessages(canonical);
+
+    expect(rebuilt).not.toBe(projection);
+    expect(rebuilt[0]).toBe(canonical[0]);
+    expect(rebuilt[1].content).toEqual([{ type: 'text', text: 'answer' }]);
+
+    canonical[canonical.length - 1] = new HumanMessage('rewritten tail');
+    expect(context.getProviderProjectedMessages(canonical)).not.toBe(rebuilt);
+  });
+
+  it('invalidates a projection when a reducer replacement also appends', async () => {
+    const context = AgentContext.fromConfig(
+      {
+        agentId: 'overflow-agent',
+        provider: Providers.ANTHROPIC,
+        instructions: 'Test instructions',
+        maxContextTokens: 1_000_000,
+      } as Partial<t.AgentInputs> as t.AgentInputs,
+      () => 1,
+      { 0: 100, 1: 200 }
+    );
+    await context.tokenCalculationPromise;
+    const original = new HumanMessage({ id: 'human-1', content: 'original' });
+    const existingReply = new AIMessage({ id: 'ai-1', content: 'reply' });
+    const canonical = [original, existingReply];
+    const projection = context.getProviderProjectedMessages(canonical);
+    const replacement = new HumanMessage({
+      id: 'human-1',
+      content: 'replacement',
+    });
+    const appended = new HumanMessage({ id: 'human-2', content: 'next' });
+
+    context.invalidateProviderProjectionForMessageUpdates(canonical);
+    expect(context.getProviderProjectedMessages(canonical)).toBe(projection);
+
+    const updates = [replacement, appended];
+    context.pendingOriginalToolContent = new Map([[0, 'full original']]);
+    context.invalidateProviderProjectionForMessageUpdates(updates);
+    const nextCanonical = messagesStateReducer(canonical, updates);
+    const rebuilt = context.getProviderProjectedMessages(nextCanonical);
+
+    expect(rebuilt).not.toBe(projection);
+    expect(rebuilt.map((message) => message.content)).toEqual([
+      'replacement',
+      'reply',
+      'next',
+    ]);
+    expect(context.indexTokenCountMap).toEqual({ 0: 1, 1: 200, 2: 1 });
+    expect(context.pendingOriginalToolContent).toBeUndefined();
+  });
+
+  it('accepts reducer message-like and empty updates during invalidation', () => {
+    const context = AgentContext.fromConfig(
+      {
+        agentId: 'overflow-agent',
+        provider: Providers.ANTHROPIC,
+        instructions: 'Test instructions',
+        maxContextTokens: 1_000_000,
+      } as Partial<t.AgentInputs> as t.AgentInputs,
+      () => 1
+    );
+    const canonical = [
+      new HumanMessage({ id: 'human-1', content: 'original' }),
+    ];
+    const projection = context.getProviderProjectedMessages(canonical);
+    const replacement = {
+      id: 'human-1',
+      role: 'user' as const,
+      content: 'replacement',
+    };
+
+    expect(() =>
+      context.invalidateProviderProjectionForMessageUpdates([
+        undefined,
+        replacement,
+      ])
+    ).not.toThrow();
+    const nextCanonical = messagesStateReducer(canonical, replacement);
+
+    expect(context.getProviderProjectedMessages(nextCanonical)).not.toBe(
+      projection
+    );
   });
 
   it('summarizes the first overflow when deterministic pruning is unavailable', () => {

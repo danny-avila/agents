@@ -152,3 +152,28 @@ export function truncateToolResultContent(
 
   return content.slice(0, headEnd) + indicator + content.slice(tailStart);
 }
+
+/** Absolute hard cap on a single tool-call input (characters). */
+export const HARD_MAX_TOOL_CALL_INPUT_CHARS = 200_000;
+
+/** Smallest JSON value a truncated tool-call input can shrink to. */
+export const MIN_JSON_VALUE_CHARS = 4;
+
+/**
+ * Computes the max tool-call input size for a context window: 15 % of the
+ * window in estimated characters (~4 chars/token), capped at 200K.
+ */
+export function calculateMaxToolCallInputChars(
+  maxContextTokens?: number
+): number {
+  if (maxContextTokens == null || maxContextTokens <= 0) {
+    return HARD_MAX_TOOL_CALL_INPUT_CHARS;
+  }
+  return Math.max(
+    MIN_JSON_VALUE_CHARS,
+    Math.min(
+      Math.floor(maxContextTokens * 0.15) * 4,
+      HARD_MAX_TOOL_CALL_INPUT_CHARS
+    )
+  );
+}

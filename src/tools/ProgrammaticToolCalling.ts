@@ -22,10 +22,21 @@ import {
   selectRuntimeSessionHint,
 } from './CodeExecutor';
 import {
+  assertUnambiguousIdentifiers,
+  projectProgrammaticToolMap,
+  resolveProgrammaticToolDefinitions,
+  selectProgrammaticTools,
+  type ProgrammaticInvocationParams,
+} from './ProgrammaticCallerPolicy';
+import {
   clampCodeApiRunTimeoutMs,
   createCodeApiRunTimeoutSchema,
   resolveCodeApiRunTimeoutMs,
 } from './ptcTimeout';
+import {
+  describeCodeApiError,
+  logCodeApiDiagnostic,
+} from '@/tools/diagnostics';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
@@ -87,6 +98,10 @@ ${EXAMPLES}
 
 ${CORE_RULES}`;
 
+const TOOL_MANIFEST_DESCRIPTION =
+  'Exact registered tool names used by the code. Required when direct-only tools are configured; ' +
+  'validated before execution starts. Pass [] when the code calls no tools at all.';
+
 export function createProgrammaticToolCallingSchema(
   maxRunTimeoutMs = DEFAULT_RUN_TIMEOUT_MS
 ): ProgrammaticToolCallingJsonSchema {
@@ -98,6 +113,12 @@ export function createProgrammaticToolCallingSchema(
         type: 'string',
         minLength: 1,
         description: CODE_PARAM_DESCRIPTION,
+      },
+      tool_manifest: {
+        type: 'array',
+        items: { type: 'string' },
+        uniqueItems: true,
+        description: TOOL_MANIFEST_DESCRIPTION,
       },
       timeout: createCodeApiRunTimeoutSchema(maxRunTimeoutMs),
     },
@@ -432,7 +453,9 @@ export async function fetchSessionFiles(
       }
     }
     const filesEndpoint = `${baseUrl}/files/${encodeURIComponent(sessionId)}?${query.toString()}`;
-    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
+    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders, {
+      recoverable: true,
+    });
     const fetchOptions: RequestInit = {
       method: 'GET',
       headers: {
@@ -449,7 +472,9 @@ export async function fetchSessionFiles(
     const response = await fetch(filesEndpoint, fetchOptions);
     if (!response.ok) {
       throw new Error(
-        await buildCodeApiHttpErrorMessage('GET', filesEndpoint, response)
+        await buildCodeApiHttpErrorMessage('GET', filesEndpoint, response, {
+          recoverable: true,
+        })
       );
     }
 
@@ -462,9 +487,11 @@ export async function fetchSessionFiles(
       .filter(isCodeApiSessionFileWire)
       .map((file) => normalizeSessionFile(file, sessionId, scope));
   } catch (error) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      `Failed to fetch files for session: ${sessionId}, ${(error as Error).message}`
+    logCodeApiDiagnostic(
+      'ProgrammaticToolCalling',
+      'warn',
+      'session file lookup failed; continuing without input files',
+      describeCodeApiError(error)
     );
     return [];
   }
@@ -508,7 +535,9 @@ export async function makeRequest(
 
     if (!response.ok) {
       throw new CodeApiRequestError(
-        await buildCodeApiHttpErrorMessage('POST', endpoint, response)
+        await buildCodeApiHttpErrorMessage('POST', endpoint, response, {
+          profile: executionProfile,
+        })
       );
     }
 
@@ -858,6 +887,82 @@ export function formatCompletedResponse(
   ];
 }
 
+/**
+ * Mirrors the Code API's programmatic Python wrapper (`wrapUserCodeInAsync`).
+ *
+ * The programmatic contract promises top-level `await` works; plain `/exec`
+ * applies no wrapper, so forwarding source unchanged would turn valid
+ * programmatic input into a SyntaxError. The wrapper is self-contained, so a
+ * later divergence in the Code API's own copy cannot break this path.
+ */
+export function wrapPythonForPlainExecution(userCode: string): string {
+  const indented = userCode
+    .split('\n')
+    .map((line) => (line.trim() === '' ? '' : `    ${line}`))
+    .join('\n');
+
+  return (
+    'async def __user_main__():\n' +
+    '    """Auto-generated wrapper for user code to support top-level await"""\n' +
+    `${indented}\n` +
+    '\n' +
+    'if __name__ == "__main__":\n' +
+    '    import asyncio\n' +
+    '    asyncio.run(__user_main__())\n'
+  );
+}
+
+/**
+ * Runs code that selected no tools through plain `/exec`.
+ *
+ * `/exec/programmatic` rejects an empty tool manifest outright, and the sandbox
+ * has nothing to inject for such a call anyway — no stubs, no replay round
+ * trips. Routing it here makes a tool-free programmatic call behave exactly like
+ * the equivalent `execute_code`, against every deployed Code API, instead of
+ * failing with a rejection the model cannot act on.
+ */
+export async function runPlainExecution(args: {
+  baseUrl: string;
+  lang: 'bash' | 'py';
+  code: string;
+  /**
+   * Forwarded so the model-supplied cap applies as soon as the Code API honors
+   * it on `/exec`, which does not read `timeout` today. Session affinity and
+   * input files are honored there, so those ride the same body.
+   */
+  timeout?: number;
+  sessionId?: string;
+  files?: t.CodeEnvFile[];
+  runtimeSessionHint?: string;
+  proxy?: string;
+  authHeaders?: t.CodeApiAuthHeaders;
+  executionProfile?: t.CodeApiExecutionProfile;
+}): Promise<[string, t.ProgrammaticExecutionArtifact]> {
+  const response = await makeRequest(
+    buildCodeApiEndpoint(args.baseUrl, 'exec'),
+    {
+      lang: args.lang,
+      code:
+        args.lang === 'py' ? wrapPythonForPlainExecution(args.code) : args.code,
+      ...(args.timeout != null ? { timeout: args.timeout } : {}),
+      ...(args.sessionId != null && args.sessionId !== ''
+        ? { session_id: args.sessionId }
+        : {}),
+      ...(args.files != null && args.files.length > 0
+        ? { files: args.files }
+        : {}),
+      ...(args.runtimeSessionHint != null
+        ? { runtime_session_hint: args.runtimeSessionHint }
+        : {}),
+    },
+    args.proxy,
+    args.authHeaders,
+    args.executionProfile
+  );
+
+  return formatCompletedResponse(response, args.code);
+}
+
 // ============================================================================
 // Tool Factory
 // ============================================================================
@@ -893,7 +998,7 @@ export function createProgrammaticToolCallingTool(
 
   return tool(
     async (rawParams, config) => {
-      const params = rawParams as { code: string; timeout?: number };
+      const params = rawParams as ProgrammaticInvocationParams;
       const { code } = params;
       const timeout = clampCodeApiRunTimeoutMs(params.timeout, maxRunTimeoutMs);
 
@@ -906,40 +1011,77 @@ export function createProgrammaticToolCallingTool(
         };
       const {
         toolMap,
-        toolDefs,
+        disallowedToolDefs,
         session_id,
         _injected_files,
         _runtime_session_hint,
       } = toolCall;
+      const toolDefs = resolveProgrammaticToolDefinitions(
+        toolCall as typeof toolCall & { tools?: t.LCTool[] }
+      );
 
-      if (toolMap == null || toolMap.size === 0) {
-        throw new Error(
-          'No toolMap provided. ' +
-            'ToolNode should inject this from AgentContext when invoked through the graph.'
-        );
+      const programmaticToolName =
+        toolCall.programmaticToolName ??
+        (typeof toolCall.name === 'string' && toolCall.name !== ''
+          ? toolCall.name
+          : Constants.PROGRAMMATIC_TOOL_CALLING);
+      const effectiveTools = selectProgrammaticTools({
+        requestedToolNames: params.tool_manifest,
+        allowedToolDefs: toolDefs,
+        disallowedToolDefs,
+        programmaticToolName,
+      });
+
+      /* These guard the replay path only. A call that selected no tools never
+       * replays, and event-driven ToolNode configurations legitimately inject
+       * an empty toolMap/toolDefs. Injected context is still required to
+       * conclude that — with nothing injected at all, an empty selection means
+       * the host wired the tool up wrong. */
+      const needsNoTools =
+        effectiveTools.length === 0 &&
+        (params.tool_manifest?.length === 0 ||
+          toolDefs != null ||
+          disallowedToolDefs != null);
+
+      if (!needsNoTools) {
+        if (toolMap == null || toolMap.size === 0) {
+          throw new Error(
+            'No toolMap provided. ' +
+              'ToolNode should inject this from AgentContext when invoked through the graph.'
+          );
+        }
+
+        if (toolDefs == null || toolDefs.length === 0) {
+          throw new Error(
+            'No tool definitions provided. ' +
+              'Either pass tools in the input or ensure ToolNode injects toolDefs.'
+          );
+        }
       }
 
-      if (toolDefs == null || toolDefs.length === 0) {
-        throw new Error(
-          'No tool definitions provided. ' +
-            'Either pass tools in the input or ensure ToolNode injects toolDefs.'
-        );
-      }
+      assertUnambiguousIdentifiers(
+        effectiveTools,
+        normalizeToPythonIdentifier,
+        programmaticToolName
+      );
+
+      const effectiveToolMap = projectProgrammaticToolMap(
+        toolMap ?? new Map(),
+        effectiveTools
+      );
 
       let roundTrip = 0;
 
       try {
         // ====================================================================
-        // Phase 1: Filter tools and make initial request
+        // Phase 1: Send the validated tool manifest with the initial request
         // ====================================================================
-
-        const effectiveTools = filterToolsByUsage(toolDefs, code, debug);
 
         if (debug) {
           // eslint-disable-next-line no-console
           console.log(
             `[PTC Debug] Sending ${effectiveTools.length} tools to API ` +
-              `(filtered from ${toolDefs.length})`
+              `(selected from ${toolDefs?.length ?? 0})`
           );
         }
 
@@ -953,9 +1095,11 @@ export function createProgrammaticToolCallingTool(
         if (_injected_files && _injected_files.length > 0) {
           files = _injected_files;
         } else if (session_id != null && session_id.length > 0) {
-          // eslint-disable-next-line no-console
-          console.debug(
-            `[ProgrammaticToolCalling] No injected files for session_id=${session_id} — exec will run without input files`
+          logCodeApiDiagnostic(
+            'ProgrammaticToolCalling',
+            'debug',
+            'session carried no injected files; exec will run without input files',
+            { files: 'none' }
           );
         }
 
@@ -973,6 +1117,21 @@ export function createProgrammaticToolCallingTool(
           selectedRuntimeSessionHint !== ''
             ? selectedRuntimeSessionHint
             : undefined;
+
+        if (needsNoTools) {
+          return await runPlainExecution({
+            baseUrl,
+            lang: 'py',
+            code,
+            timeout,
+            sessionId: session_id,
+            files,
+            runtimeSessionHint,
+            proxy,
+            authHeaders: initParams.authHeaders,
+            executionProfile: initParams.executionProfile,
+          });
+        }
 
         let response = await makeRequest(
           EXEC_ENDPOINT,
@@ -1015,7 +1174,7 @@ export function createProgrammaticToolCallingTool(
 
           const toolResults = await executeTools(
             response.tool_calls ?? [],
-            toolMap
+            effectiveToolMap
           );
 
           response = await makeRequest(

@@ -600,6 +600,9 @@ function prepareChildInputs({
     initialSummary: undefined,
     discoveredTools: undefined,
     graphTools: self ? undefined : agentInputs.graphTools,
+    compactionSemanticIndex: self
+      ? undefined
+      : agentInputs.compactionSemanticIndex,
   };
   if (allowNested) {
     childInputs.maxSubagentDepth = Math.max(0, parentMaxDepth - 1);

@@ -1,6 +1,7 @@
 /* eslint-disable no-console */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { config } from 'dotenv';
+import { performance } from 'node:perf_hooks';
 config();
 import { Calculator } from '@/tools/Calculator';
 import {
@@ -19,11 +20,12 @@ import { createTokenCounter } from '@/utils/tokens';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { Run } from '@/run';
 import { formatAgentMessages } from '@/messages/format';
+import { buildSummaryCarrierText } from '@/summarization/shared';
+import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
+import { CustomAnthropic } from '@/llm/anthropic';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import * as providers from '@/llm/providers';
 import { hasAnyEnv, hasEnv, hasEveryEnv } from './spec.utils';
-
-const SUMMARY_WRAPPER_OVERHEAD_TOKENS = 33;
 
 /** Extract plain text from a SummaryContentBlock's content array (test helper). */
 function getSummaryText(summary: t.SummaryContentBlock | undefined): string {
@@ -305,6 +307,168 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
     'never compute in your head. Keep explanations concise (2-3 sentences max).',
     'When summarizing prior work, list each calculation and its result.',
   ].join(' ');
+
+  test('cache-aligned summarization reuses the normal tool prefix', async () => {
+    const nonce = `${Date.now()}-${Math.random()}`;
+    const description = `${nonce} ${'stable cache benchmark token '.repeat(180)}`;
+    const tools = Array.from({ length: 8 }, (_, index) => ({
+      name: `cache_probe_${index}`,
+      description,
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          value: { type: 'string' },
+        },
+      },
+    })) as t.GraphTools;
+    const preparedTools = prepareToolsForPromptCache({
+      provider: Providers.ANTHROPIC,
+      clientOptions: { promptCache: true },
+      tools,
+      isDeferred: () => false,
+    });
+    const createModel = (
+      boundTools: t.GraphTools
+    ): ReturnType<CustomAnthropic['bindTools']> =>
+      new CustomAnthropic({
+        model: 'claude-haiku-4-5',
+        anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+        maxTokens: 8,
+        temperature: 0,
+      }).bindTools(boundTools);
+
+    const prime = await createModel(preparedTools ?? tools).invoke([
+      new HumanMessage('Prime the normal request tool prefix. Reply OK.'),
+    ]);
+    const primeCacheCreation =
+      prime.usage_metadata?.input_token_details?.cache_creation ?? 0;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    const baselineStartedAt = performance.now();
+    const baseline = await createModel(tools).invoke([
+      new HumanMessage('Baseline compaction request. Reply OK.'),
+    ]);
+    const baselineLatencyMs = performance.now() - baselineStartedAt;
+
+    const alignedStartedAt = performance.now();
+    const aligned = await createModel(preparedTools ?? tools).invoke([
+      new HumanMessage('Cache-aligned compaction request. Reply OK.'),
+    ]);
+    const alignedLatencyMs = performance.now() - alignedStartedAt;
+
+    const baselineCacheRead =
+      baseline.usage_metadata?.input_token_details?.cache_read ?? 0;
+    const alignedCacheRead =
+      aligned.usage_metadata?.input_token_details?.cache_read ?? 0;
+    console.log(
+      `  Compaction tool-prefix benchmark: ${JSON.stringify({
+        prime: {
+          cacheCreationInputTokens: primeCacheCreation,
+          inputTokens: prime.usage_metadata?.input_tokens,
+        },
+        baseline: {
+          cacheReadInputTokens: baselineCacheRead,
+          inputTokens: baseline.usage_metadata?.input_tokens,
+          latencyMs: Math.round(baselineLatencyMs),
+        },
+        aligned: {
+          cacheReadInputTokens: alignedCacheRead,
+          inputTokens: aligned.usage_metadata?.input_tokens,
+          latencyMs: Math.round(alignedLatencyMs),
+        },
+      })}`
+    );
+
+    expect(primeCacheCreation).toBeGreaterThan(0);
+    expect(alignedCacheRead).toBeGreaterThan(baselineCacheRead);
+    expect(alignedCacheRead).toBeGreaterThan(0);
+  }, 180_000);
+
+  test('fresh runs reuse a persisted fading tier without mutating canonical tool history', async () => {
+    const tokenCounter = await createTokenCounter();
+    const largeToolResult = `BEGIN-LIVE-PAYLOAD\n${'stable provider payload '.repeat(
+      3000
+    )}\nEND-LIVE-PAYLOAD`;
+    const buildHistory = (): BaseMessage[] => [
+      new HumanMessage('Inspect the synthetic provider payload.'),
+      new AIMessage({
+        content: 'I inspected the payload.',
+        tool_calls: [
+          {
+            id: 'live_fading_tool_call',
+            name: 'inspect_payload',
+            args: { source: 'live-regression' },
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: largeToolResult,
+        tool_call_id: 'live_fading_tool_call',
+        name: 'inspect_payload',
+      }),
+      new AIMessage('The inspection completed successfully.'),
+      new HumanMessage('Reply with exactly OK.'),
+    ];
+    const executeRun = async (
+      history: BaseMessage[],
+      fadingTier?: t.FadingTier,
+      calibrationRatio?: number
+    ): Promise<Run<t.IState>> => {
+      const run = await Run.create<t.IState>({
+        runId: `anthropic-live-fading-${Date.now()}-${Math.random()}`,
+        graphConfig: {
+          type: 'standard',
+          llmConfig: {
+            ...getLLMConfig(Providers.ANTHROPIC),
+            model: 'claude-haiku-4-5',
+            streaming: false,
+            maxTokens: 32,
+            temperature: 0,
+          },
+          tools: [],
+          instructions: 'Reply with exactly OK and do not call tools.',
+          maxContextTokens: 4000,
+          summarizationEnabled: false,
+        },
+        returnContent: true,
+        tokenCounter,
+        indexTokenCountMap: buildIndexTokenCountMap(history, tokenCounter),
+        fadingTier,
+        fadingTiers:
+          fadingTier == null ? undefined : { default: fadingTier },
+        calibrationRatio,
+      });
+      await run.processStream(
+        { messages: history },
+        {
+          configurable: { thread_id: run.id },
+          recursionLimit: 10,
+          streamMode: 'values',
+          version: 'v2',
+        } as any
+      );
+      expect(run.getRunMessages()?.length ?? 0).toBeGreaterThan(0);
+      return run;
+    };
+
+    const firstHistory = buildHistory();
+    const firstRun = await executeRun(firstHistory);
+    const firstTier = firstRun.getFadingTier();
+
+    expect(firstHistory[2].content).toBe(largeToolResult);
+    expect(firstTier?.latched).toBe(true);
+    expect(firstTier?.masked).toBe(true);
+
+    const secondHistory = buildHistory();
+    const secondRun = await executeRun(
+      secondHistory,
+      firstTier,
+      firstRun.getCalibrationRatio()
+    );
+
+    expect(secondHistory[2].content).toBe(largeToolResult);
+    expect(secondRun.getFadingTier()).toEqual(firstTier);
+  }, 180_000);
 
   test('heavy multi-turn with tool calls triggers and survives summarization', async () => {
     const spies = createSpies();
@@ -1477,9 +1641,9 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
     expect(completePayload.summary!.type).toBe(ContentTypes.SUMMARY);
     expect(completePayload.summary!.tokenCount ?? 0).toBeGreaterThan(0);
 
-    const expectedTokenCount =
-      tokenCounter(new SystemMessage(KNOWN_SUMMARY)) +
-      SUMMARY_WRAPPER_OVERHEAD_TOKENS;
+    const expectedTokenCount = tokenCounter(
+      new HumanMessage(buildSummaryCarrierText(KNOWN_SUMMARY))
+    );
     expect(completePayload.summary!.tokenCount).toBe(expectedTokenCount);
 
     const summaryBlock = completePayload.summary!;
@@ -2601,9 +2765,9 @@ const hasAnyApiKey = hasAnyEnv(['ANTHROPIC_API_KEY', 'OPENAI_API_KEY']);
     const summaryText = getSummaryText(completePayload.summary);
     const reportedTokenCount = completePayload.summary!.tokenCount ?? 0;
 
-    const localTokenCount =
-      tokenCounter(new SystemMessage(summaryText)) +
-      SUMMARY_WRAPPER_OVERHEAD_TOKENS;
+    const localTokenCount = tokenCounter(
+      new HumanMessage(buildSummaryCarrierText(summaryText))
+    );
 
     console.log(
       `  Token match: reported=${reportedTokenCount}, local=${localTokenCount}`
@@ -3819,5 +3983,123 @@ describe('Large tool result surviving context — no double summarization (no AP
     console.log(
       `  Double-summarization prevented: ${startCalls <= 1 ? 'YES' : 'NO'}`
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Empty summarizer output must not loop (FakeListChatModel — no API keys)
+// ---------------------------------------------------------------------------
+
+describe('Empty summarizer output (no API keys)', () => {
+  jest.setTimeout(60_000);
+
+  const SUMMARIZER_MODEL = 'summarizer-that-returns-nothing';
+  const AGENT_REPLY = 'Here is the answer to your final question.';
+  const streamConfig = {
+    configurable: { thread_id: 'empty-summary-loop' },
+    recursionLimit: 25,
+    streamMode: 'values',
+    version: 'v2' as const,
+  };
+
+  let getChatModelClassSpy: jest.SpyInstance;
+  const originalGetChatModelClass = providers.getChatModelClass;
+  let summarizerCallCount = 0;
+
+  beforeEach(() => {
+    summarizerCallCount = 0;
+    getChatModelClassSpy = jest
+      .spyOn(providers, 'getChatModelClass')
+      .mockImplementation(((provider: Providers) => {
+        if (provider !== Providers.OPENAI) {
+          return originalGetChatModelClass(provider);
+        }
+        return class extends FakeListChatModel {
+          constructor(options: any) {
+            const isSummarizer = options?.model === SUMMARIZER_MODEL;
+            if (isSummarizer) {
+              summarizerCallCount++;
+            }
+            super({ responses: [isSummarizer ? '' : AGENT_REPLY] });
+          }
+        } as any;
+      }) as typeof providers.getChatModelClass);
+  });
+
+  afterEach(() => {
+    getChatModelClassSpy.mockRestore();
+  });
+
+  test('a summarizer returning nothing does not loop the run to its recursion cap', async () => {
+    const spies = createSpies();
+    const tokenCounter = await createTokenCounter();
+
+    const padding = 'x'.repeat(400);
+    const conversationHistory: BaseMessage[] = [];
+    for (let i = 0; i < 10; i++) {
+      conversationHistory.push(new HumanMessage(`Question ${i}${padding}`));
+      conversationHistory.push(new AIMessage(`Answer ${i}${padding}`));
+    }
+    conversationHistory.push(new HumanMessage('Final question'));
+
+    const indexTokenCountMap = buildIndexTokenCountMap(
+      conversationHistory,
+      tokenCounter
+    );
+
+    const { aggregateContent } = createContentAggregator();
+    const collectedUsage: UsageMetadata[] = [];
+
+    const run = await Run.create<t.IState>({
+      runId: `empty-summary-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: getLLMConfig(Providers.OPENAI),
+        instructions: 'You are a helpful assistant.',
+        maxContextTokens: 600,
+        summarizationEnabled: true,
+        summarizationConfig: {
+          provider: Providers.OPENAI,
+          model: SUMMARIZER_MODEL,
+        },
+      },
+      returnContent: true,
+      customHandlers: buildHandlers(collectedUsage, aggregateContent, spies),
+      tokenCounter,
+      indexTokenCountMap,
+    });
+
+    let error: Error | undefined;
+    try {
+      await run.processStream(
+        { messages: conversationHistory },
+        streamConfig as any
+      );
+    } catch (err) {
+      error = err as Error;
+    }
+
+    const startCalls = spies.onSummarizeStartSpy.mock.calls.length;
+    console.log(
+      `  Empty-summary attempts: ${startCalls}, summarizer model calls: ${summarizerCallCount}`
+    );
+
+    /**
+     * The regression: an empty summary compacts nothing, so the agent node
+     * saw the same unchanged state and re-triggered — the run spent its whole
+     * recursion budget on empty summary steps and died on GraphRecursionError.
+     */
+    expect(error?.message ?? '').not.toMatch(/[Rr]ecursion/);
+    expect(startCalls).toBeLessThanOrEqual(3);
+    expect(summarizerCallCount).toBeLessThanOrEqual(3);
+
+    /** Nothing empty was committed as the run's summary. */
+    const summarizedContent = spies.onSummarizeCompleteSpy.mock.calls.flat();
+    for (const data of summarizedContent) {
+      const summary = (data as t.SummarizeCompleteEvent).summary;
+      if (summary != null) {
+        expect(summary.content?.length ?? 0).toBeGreaterThan(0);
+      }
+    }
   });
 });

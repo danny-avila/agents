@@ -18,6 +18,7 @@ import {
   resolveCodeApiAuthHeaders,
   selectRuntimeSessionHint,
 } from './CodeExecutor';
+import { logCodeApiDiagnostic } from '@/tools/diagnostics';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
@@ -249,9 +250,11 @@ function createBashExecutionTool(
         session_id.length > 0 &&
         !Array.isArray(postData.files)
       ) {
-        // eslint-disable-next-line no-console
-        console.debug(
-          `[BashExecutor] No injected files for session_id=${session_id} — exec will run without input files`
+        logCodeApiDiagnostic(
+          'BashExecutor',
+          'debug',
+          'session carried no injected files; exec will run without input files',
+          { files: 'none' }
         );
       }
 
@@ -278,7 +281,9 @@ function createBashExecutionTool(
         const response = await fetch(execEndpoint, fetchOptions);
         if (!response.ok) {
           throw new CodeApiRequestError(
-            await buildCodeApiHttpErrorMessage('POST', execEndpoint, response)
+            await buildCodeApiHttpErrorMessage('POST', execEndpoint, response, {
+              profile: executionProfile,
+            })
           );
         }
 

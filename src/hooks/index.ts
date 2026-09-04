@@ -9,7 +9,11 @@
 // `StandardGraph.createCallModel` (PreemptBoundary).
 export { HookRegistry } from './HookRegistry';
 export type { HookHaltSignal } from './HookRegistry';
-export { executeHooks, DEFAULT_HOOK_TIMEOUT_MS } from './executeHooks';
+export {
+  executeHooks,
+  mergeAggregatedHookResults,
+  DEFAULT_HOOK_TIMEOUT_MS,
+} from './executeHooks';
 /**
  * Feature probe for hosts: hook outputs support `injectedMessages`
  * (per-message graph-state injection at the `PostToolBatch` boundary).
@@ -28,6 +32,26 @@ export const HOOK_INJECTED_MESSAGES_CAPABLE = true;
  * the user as a dead button rather than as an unsupported feature.
  */
 export const HOOK_PREEMPT_BOUNDARY_CAPABLE = true;
+/**
+ * Feature probe for hosts: a blocking `Stop` hook can inject queued messages
+ * and continue within the same `Run.processStream` lifecycle.
+ */
+export const HOOK_STOP_CONTINUATION_CAPABLE = true;
+/**
+ * Feature probe for hosts: a preempt request can also be honored BEFORE the
+ * turn has produced anything to keep — the in-flight model call is discarded
+ * and re-issued with the boundary's injection appended, and
+ * `StreamPreemption.subscribe` wakes the SDK during the silent window where
+ * the per-chunk poll cannot reach.
+ *
+ * Separate from {@link HOOK_PREEMPT_BOUNDARY_CAPABLE} because the two answer
+ * different questions for the user-facing control. An SDK with only the
+ * boundary can seal a turn that is already writing an answer, but an interrupt
+ * armed while the model is still thinking waits for the whole turn — so a host
+ * that probed the wrong flag would promise an interrupt it cannot deliver in
+ * exactly the window users reach for it most.
+ */
+export const HOOK_PREEMPT_RESTART_CAPABLE = true;
 export {
   matchesQuery,
   hasNestedQuantifier,
@@ -71,6 +95,7 @@ export type {
   SubagentStartHookInput,
   SubagentStopHookInput,
   StopHookInput,
+  StopFinalizeHookInput,
   StopFailureHookInput,
   PreCompactHookInput,
   PostCompactHookInput,
@@ -85,6 +110,7 @@ export type {
   SubagentStartHookOutput,
   SubagentStopHookOutput,
   StopHookOutput,
+  StopFinalizeHookOutput,
   StopFailureHookOutput,
   PreCompactHookOutput,
   PostCompactHookOutput,

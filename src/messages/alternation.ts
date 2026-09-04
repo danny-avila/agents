@@ -1,6 +1,22 @@
 // src/messages/alternation.ts
 import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage, MessageContent } from '@langchain/core/messages';
+import type { ProviderMessageProvenancePart } from './provenance';
+import type { ProviderToolCallIndex } from './toolResultTypes';
+import {
+  appendProviderToolCallDescriptor,
+  consumeProviderToolResultPair,
+  getBoundedProviderPairingArrayProperty,
+  getProviderAIMessageToolCallDescriptor,
+  getProviderToolCallPartDescriptor,
+  getProviderToolResultPartDescriptor,
+} from './toolResultTypes';
+import {
+  inspectProviderMessageProvenance,
+  inspectProviderSourceMessageIds,
+  setInvalidProviderMessageProvenance,
+  setProviderMessageProvenance,
+} from './provenance';
 import { Providers } from '@/common';
 
 /**
@@ -19,22 +35,57 @@ export const strictAlternationProviders: ReadonlySet<Providers> = new Set([
   Providers.MISTRALAI,
 ]);
 
-const TOOL_RESULT_TYPES = new Set(['tool_result', 'toolResult']);
-
 /**
  * True when every block is a tool result. Both vendored converters already
  * merge adjacent runs of these, and folding one into a text turn would break
  * the tool pairing they depend on — so they are left alone here.
  */
-function isToolResultMessage(message: BaseMessage): boolean {
-  const { content } = message;
-  if (typeof content === 'string' || content.length === 0) {
+function collectProviderToolCalls(message: BaseMessage): ProviderToolCallIndex {
+  const calls: ProviderToolCallIndex = new Map();
+  const content = getBoundedProviderPairingArrayProperty(message, 'content');
+  if (content != null) {
+    for (let index = 0; index < content.length; index++) {
+      const descriptor = getProviderToolCallPartDescriptor(content[index]);
+      if (descriptor != null) {
+        appendProviderToolCallDescriptor(calls, descriptor);
+      }
+    }
+  }
+  const toolCalls = getBoundedProviderPairingArrayProperty(
+    message,
+    'tool_calls'
+  );
+  if (toolCalls != null) {
+    for (let index = 0; index < toolCalls.length; index++) {
+      const descriptor = getProviderAIMessageToolCallDescriptor(
+        toolCalls[index]
+      );
+      if (descriptor != null) {
+        appendProviderToolCallDescriptor(calls, descriptor);
+      }
+    }
+  }
+  return calls;
+}
+
+function isToolResultMessage(
+  message: BaseMessage,
+  pairedToolCalls: ProviderToolCallIndex
+): boolean {
+  const content = getBoundedProviderPairingArrayProperty(message, 'content');
+  if (content == null || content.length === 0) {
     return false;
   }
-  return content.every(
-    (block) =>
-      typeof block.type === 'string' && TOOL_RESULT_TYPES.has(block.type)
-  );
+  for (let index = 0; index < content.length; index++) {
+    const descriptor = getProviderToolResultPartDescriptor(content[index]);
+    if (
+      descriptor?.allowHumanMessagePairing !== true ||
+      !consumeProviderToolResultPair(descriptor, pairedToolCalls)
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function toBlocks(content: MessageContent): Exclude<MessageContent, string> {
@@ -44,14 +95,97 @@ function toBlocks(content: MessageContent): Exclude<MessageContent, string> {
   return content;
 }
 
-function joinContent(
-  left: MessageContent,
-  right: MessageContent
-): MessageContent {
-  if (typeof left === 'string' && typeof right === 'string') {
-    return left === '' ? right : `${left}\n\n${right}`;
+function joinStringContents(
+  messages: readonly BaseMessage[],
+  endIndex = messages.length
+): string {
+  const contents: string[] = [];
+  for (let index = 0; index < endIndex; index++) {
+    const content = messages[index].content as string;
+    if (contents.length === 0 && content === '') {
+      continue;
+    }
+    contents.push(content);
   }
-  return [...toBlocks(left), ...toBlocks(right)];
+  return contents.join('\n\n');
+}
+
+function joinContents(messages: readonly BaseMessage[]): MessageContent {
+  const firstArrayIndex = messages.findIndex((message) =>
+    Array.isArray(message.content)
+  );
+  if (firstArrayIndex === -1) {
+    return joinStringContents(messages);
+  }
+
+  const prefix = joinStringContents(messages, firstArrayIndex);
+  const blocks: Exclude<MessageContent, string> = [];
+  const appendBlocks = (content: MessageContent): void => {
+    const contentBlocks = toBlocks(content);
+    for (let index = 0; index < contentBlocks.length; index++) {
+      blocks.push(contentBlocks[index]);
+    }
+  };
+  appendBlocks(prefix);
+  for (let index = firstArrayIndex; index < messages.length; index++) {
+    appendBlocks(messages[index].content);
+  }
+  return blocks;
+}
+
+function getHumanMessageProvenanceParts(
+  message: BaseMessage
+): ProviderMessageProvenancePart[] | null {
+  const provenanceState = inspectProviderMessageProvenance(message);
+  const sourceMessageIdsState = inspectProviderSourceMessageIds(message);
+  if (
+    provenanceState.status === 'invalid' ||
+    sourceMessageIdsState.status === 'invalid'
+  ) {
+    return null;
+  }
+  const sourceMessageIds =
+    sourceMessageIdsState.status === 'valid'
+      ? sourceMessageIdsState.sourceMessageIds
+      : [];
+  if (provenanceState.status === 'valid') {
+    const parts = [...provenanceState.provenance.parts];
+    const representedSourceIds = new Set<string>();
+    for (const part of parts) {
+      if (part.sourceMessageId != null) {
+        representedSourceIds.add(part.sourceMessageId);
+      }
+    }
+    const missingSourceIds = sourceMessageIds.filter(
+      (sourceMessageId) => !representedSourceIds.has(sourceMessageId)
+    );
+    if (
+      parts.length === 1 &&
+      parts[0].sourceMessageId == null &&
+      missingSourceIds.length === 1
+    ) {
+      return missingSourceIds.map((sourceMessageId) => ({
+        ...parts[0],
+        sourceMessageId,
+      }));
+    }
+    for (const sourceMessageId of missingSourceIds) {
+      parts.push({ attribution: 'user', sourceMessageId });
+    }
+    return parts;
+  }
+  return sourceMessageIds.length > 0
+    ? sourceMessageIds.map((sourceMessageId) => ({
+      attribution: 'user' as const,
+      sourceMessageId,
+    }))
+    : [{ attribution: 'user' }];
+}
+
+function hasProviderVisibleContent(message: BaseMessage): boolean {
+  return typeof message.content === 'string'
+    ? message.content.length > 0
+    : message.content.length > 0;
 }
 
 /**
@@ -66,25 +200,66 @@ function joinContent(
 export function coalesceAdjacentUserTurns(
   messages: BaseMessage[]
 ): BaseMessage[] {
-  const result: BaseMessage[] = [];
-  let mergedAny = false;
-  for (const message of messages) {
-    const previous = result[result.length - 1];
-    const mergeable =
-      result.length > 0 &&
-      previous.getType() === 'human' &&
-      message.getType() === 'human' &&
-      !isToolResultMessage(previous) &&
-      !isToolResultMessage(message);
-
-    if (!mergeable) {
-      result.push(message);
+  let result: BaseMessage[] | null = null;
+  let pairedToolCalls: ProviderToolCallIndex = new Map();
+  let index = 0;
+  while (index < messages.length) {
+    const first = messages[index];
+    if (first.getType() === 'ai') {
+      pairedToolCalls = collectProviderToolCalls(first);
+      result?.push(first);
+      index++;
       continue;
     }
-    mergedAny = true;
+    if (first.getType() !== 'human') {
+      result?.push(first);
+      index++;
+      continue;
+    }
+    if (isToolResultMessage(first, pairedToolCalls)) {
+      result?.push(first);
+      index++;
+      continue;
+    }
 
-    result[result.length - 1] = new HumanMessage({
-      content: joinContent(previous.content, message.content),
+    let endIndex = index + 1;
+    while (
+      endIndex < messages.length &&
+      messages[endIndex].getType() === 'human' &&
+      !isToolResultMessage(messages[endIndex], pairedToolCalls)
+    ) {
+      endIndex++;
+    }
+    if (endIndex === index + 1) {
+      result?.push(first);
+      pairedToolCalls = new Map();
+      index = endIndex;
+      continue;
+    }
+    result ??= messages.slice(0, index);
+    const run = messages.slice(index, endIndex);
+    const last = run[run.length - 1];
+    const provenanceParts: ProviderMessageProvenancePart[] = [];
+    let hasInvalidProvenance = false;
+    for (const message of run) {
+      if (!hasProviderVisibleContent(message)) {
+        continue;
+      }
+      const messageProvenanceParts = getHumanMessageProvenanceParts(message);
+      if (messageProvenanceParts == null) {
+        hasInvalidProvenance = true;
+        continue;
+      }
+      for (const part of messageProvenanceParts) {
+        provenanceParts.push(part);
+      }
+    }
+    if (provenanceParts.length === 0) {
+      provenanceParts.push({ attribution: 'user' });
+    }
+
+    const mergedMessage = new HumanMessage({
+      content: joinContents(run),
       /**
        * The LATER turn's kwargs, deliberately. The one provider-path consumer
        * of these flags is the prompt-cache tail anchor, and it reasons
@@ -96,9 +271,17 @@ export function coalesceAdjacentUserTurns(
        * skill body must not pin the cache to the volatile body. The first
        * turn's id is kept so origin tracking can re-attach by key.
        */
-      additional_kwargs: message.additional_kwargs,
-      ...(previous.id != null && { id: previous.id }),
+      additional_kwargs: { ...last.additional_kwargs },
+      ...(first.id != null && { id: first.id }),
     });
+    if (hasInvalidProvenance) {
+      setInvalidProviderMessageProvenance(mergedMessage);
+    } else {
+      setProviderMessageProvenance(mergedMessage, provenanceParts);
+    }
+    result.push(mergedMessage);
+    pairedToolCalls = new Map();
+    index = endIndex;
   }
   /**
    * Identity on the no-merge path. The pass runs twice for a primary
@@ -108,5 +291,5 @@ export function coalesceAdjacentUserTurns(
    * the SAME array rather than reallocating a context-sized copy, and
    * callers can cheaply detect "nothing changed" by identity.
    */
-  return mergedAny ? result : messages;
+  return result ?? messages;
 }

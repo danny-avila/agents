@@ -2,7 +2,7 @@ import { HumanMessage, AIMessage, ToolMessage } from '@langchain/core/messages';
 import type { TPayload } from '@/types';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { formatAgentMessages } from './format';
-import { ContentTypes } from '@/common';
+import { Constants, ContentTypes } from '@/common';
 
 describe('formatAgentMessages with tools parameter', () => {
   it('should process messages normally when tools is not provided', () => {
@@ -299,7 +299,7 @@ describe('formatAgentMessages with tools parameter', () => {
 
     const result = formatAgentMessages(payload, undefined, allowedTools);
 
-    // Should keep valid tool (calculator) and convert invalid (check_weather) to string
+    // Should keep the valid tool and omit the invalid tool without rewriting its output as text
     expect(result.messages).toHaveLength(3);
     expect(result.messages[0]).toBeInstanceOf(HumanMessage);
     expect(result.messages[1]).toBeInstanceOf(AIMessage);
@@ -311,9 +311,8 @@ describe('formatAgentMessages with tools parameter', () => {
       'calculator'
     );
 
-    // The content should include invalid tool as string
-    expect(result.messages[1].content).toContain('check_weather');
-    expect(result.messages[1].content).toContain('Sunny, 75°F');
+    expect(result.messages[1].content).not.toContain('check_weather');
+    expect(result.messages[1].content).not.toContain('Sunny, 75°F');
 
     // The ToolMessage should be for calculator
     expect((result.messages[2] as ToolMessage).name).toBe('calculator');
@@ -369,7 +368,7 @@ describe('formatAgentMessages with tools parameter', () => {
     expect(result.indexTokenCountMap?.[1]).toBe(40);
   });
 
-  it('should convert invalid tool to text content when no other content exists', () => {
+  it('omits an invalid tool and its output when no other content exists', () => {
     const payload: TPayload = [
       {
         role: 'assistant',
@@ -392,19 +391,42 @@ describe('formatAgentMessages with tools parameter', () => {
 
     const result = formatAgentMessages(payload, undefined, allowedTools);
 
-    // Should create an AIMessage with the invalid tool converted to text
-    expect(result.messages).toHaveLength(1);
-    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages).toHaveLength(0);
+  });
 
-    // The AIMessage should have no tool_calls (all were invalid)
-    expect((result.messages[0] as AIMessage).tool_calls).toHaveLength(0);
+  it.each([
+    ['subagent', Constants.SUBAGENT],
+    ['handoff', `${Constants.LC_TRANSFER_TO_}researcher`],
+    ['conditional handoff', 'conditional_transfer'],
+  ])('preserves an SDK-managed %s call as structured history', (_, toolName) => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Delegate this task' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'managed_1',
+              name: toolName,
+              args: '{}',
+              output: 'completed',
+            },
+          },
+        ],
+      },
+    ];
 
-    // The content should contain the invalid tool info
-    const content = result.messages[0].content;
-    const contentStr =
-      typeof content === 'string' ? content : JSON.stringify(content);
-    expect(contentStr).toContain('check_weather');
-    expect(contentStr).toContain('Sunny, 75°F');
+    const result = formatAgentMessages(payload, undefined, new Set());
+
+    expect(result.messages).toHaveLength(3);
+    expect((result.messages[1] as AIMessage).tool_calls).toEqual([
+      expect.objectContaining({ id: 'managed_1', name: toolName }),
+    ]);
+    expect(result.messages[1].content).not.toContain(`Tool: ${toolName}`);
+    expect(result.messages[2]).toBeInstanceOf(ToolMessage);
+    expect((result.messages[2] as ToolMessage).name).toBe(toolName);
+    expect(result.messages[2].content).toBe('completed');
   });
 
   it('should handle complex sequences with multiple tool calls', () => {
@@ -478,11 +500,11 @@ describe('formatAgentMessages with tools parameter', () => {
 
     const result = formatAgentMessages(payload, undefined, allowedTools);
 
-    // With selective filtering: valid tools are kept, invalid tools are converted to string
+    // With selective filtering, valid tools are kept and invalid tools are omitted
     // 1. HumanMessage
     // 2. AIMessage (search tool_call)
     // 3. ToolMessage (search result)
-    // 4. AIMessage (text + invalid weather tool as string, no tool_calls)
+    // 4. AIMessage (text only; invalid weather tool omitted)
     // 5. AIMessage (calculator tool_call)
     // 6. ToolMessage (calculator result)
     // 7. AIMessage (final text)
@@ -492,7 +514,7 @@ describe('formatAgentMessages with tools parameter', () => {
     expect(result.messages[0]).toBeInstanceOf(HumanMessage);
     expect(result.messages[1]).toBeInstanceOf(AIMessage); // Search message
     expect(result.messages[2]).toBeInstanceOf(ToolMessage); // Search tool response
-    expect(result.messages[3]).toBeInstanceOf(AIMessage); // Weather message (tool converted to string)
+    expect(result.messages[3]).toBeInstanceOf(AIMessage); // Weather text
     expect(result.messages[4]).toBeInstanceOf(AIMessage); // Calculator message
     expect(result.messages[5]).toBeInstanceOf(ToolMessage); // Calculator tool response
     expect(result.messages[6]).toBeInstanceOf(AIMessage); // Final message
@@ -503,15 +525,15 @@ describe('formatAgentMessages with tools parameter', () => {
       'search'
     );
 
-    // Check that weather message has no tool_calls but contains the invalid tool as text
+    // Check that weather output is not rewritten as assistant-authored text
     expect((result.messages[3] as AIMessage).tool_calls).toHaveLength(0);
     const weatherContent = result.messages[3].content;
     const weatherContentStr =
       typeof weatherContent === 'string'
         ? weatherContent
         : JSON.stringify(weatherContent);
-    expect(weatherContentStr).toContain('check_weather');
-    expect(weatherContentStr).toContain('Sunny');
+    expect(weatherContentStr).not.toContain('check_weather');
+    expect(weatherContentStr).not.toContain('Sunny');
 
     // Check that calculator tool was kept
     expect((result.messages[4] as AIMessage).tool_calls).toHaveLength(1);

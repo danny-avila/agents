@@ -48,11 +48,13 @@ import {
   OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
 import {
+  HARD_MAX_TOOL_RESULT_CHARS,
   calculateMaxToolCallInputChars,
+} from '@/utils/truncation';
+import {
   projectToolCallInputs,
   serializeToolCallInput,
 } from '@/messages/prune';
-import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { toLangChainContent } from '@/messages/langchain';
 
 export type { OpenAICallOptions, OpenAIChatInput };

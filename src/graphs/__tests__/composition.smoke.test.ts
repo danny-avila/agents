@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { tool } from '@langchain/core/tools';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { HumanMessage, getBufferString } from '@langchain/core/messages';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
@@ -6,6 +8,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
+import { getProviderMessageProvenance } from '@/messages/provenance';
 import { MultiAgentGraph } from '../MultiAgentGraph';
 import { Constants, Providers } from '@/common';
 import { FakeChatModel } from '@/llm/fake';
@@ -29,6 +32,13 @@ const makeStreamConfig = (threadId: string): t.WorkflowValuesStreamConfig => ({
   ...makeConfig(threadId),
   streamMode: 'values' as const,
 });
+
+const countMessageChars: t.TokenCounter = (message) =>
+  Math.ceil(
+    (typeof message.content === 'string'
+      ? message.content.length
+      : JSON.stringify(message.content).length) / 4
+  );
 
 const getAiContents = (messages: t.BaseGraphState['messages']): string[] =>
   messages
@@ -92,6 +102,45 @@ class GatedMessageCountChatModel extends FakeChatModel {
     const output = `response-${this.responseIndex++}`;
     yield this._createResponseChunk(output);
     void runManager?.handleLLMNewToken(output);
+  }
+}
+
+class HandoffBridgeChatModel extends FakeChatModel {
+  readonly invocations: BaseMessage[][] = [];
+  private invocationIndex = 0;
+
+  constructor() {
+    super({ responses: ['unused'] });
+  }
+
+  override async *_streamResponseChunks(
+    messages: BaseMessage[],
+    _options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    this.invocations.push(messages);
+    const invocationIndex = this.invocationIndex++;
+    if (invocationIndex < 2) {
+      const call =
+        invocationIndex === 0
+          ? { id: 'lookup_1', name: 'lookup', args: '{}' }
+          : {
+            id: 'transfer_1',
+            name: `${Constants.LC_TRANSFER_TO_}B`,
+            args: JSON.stringify({ instructions: 'Take over.' }),
+          };
+      yield this._createResponseChunk('', [
+        {
+          ...call,
+          index: 0,
+          type: 'tool_call_chunk',
+        },
+      ]);
+      void runManager?.handleLLMNewToken('');
+      return;
+    }
+    yield this._createResponseChunk('handoff complete');
+    void runManager?.handleLLMNewToken('handoff complete');
   }
 }
 
@@ -321,6 +370,13 @@ describe('LangGraph composition smoke tests', () => {
     const previousPromptCount =
       downstreamPrompt.match(/Human: Previous context:/g)?.length ?? 0;
     expect(previousPromptCount).toBe(1);
+    const routingPrompt = model.invocations[2].find(
+      (message) => message.additional_kwargs.source === 'routing'
+    );
+    expect(routingPrompt).toBeDefined();
+    expect(getProviderMessageProvenance(routingPrompt!)?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
   });
 
   it('compiles and invokes a handoff edge using graph-managed transfer tools', async () => {
@@ -350,6 +406,61 @@ describe('LangGraph composition smoke tests', () => {
     expect(getAiContents(result.messages)).toContain('handoff complete');
   });
 
+  it('marks handoff routing prompts and tool-tail assistant bridges as synthetic', async () => {
+    const lookup = tool(async () => 'lookup result', {
+      name: 'lookup',
+      description: 'lookup',
+      schema: z.object({}),
+    });
+    const model = new HandoffBridgeChatModel();
+    const graph = new MultiAgentGraph({
+      runId: 'handoff-provenance-smoke',
+      agents: [
+        { ...makeAgent('A'), graphTools: [lookup] },
+        makeAgent('B'),
+      ],
+      edges: [
+        {
+          from: 'A',
+          to: 'B',
+          edgeType: 'handoff',
+          prompt: 'Provide transfer instructions.',
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('handoff-provenance-smoke')
+      );
+
+    const recipientMessages = model.invocations.find((messages) =>
+      messages.some(
+        (message) => message.additional_kwargs.source === 'routing'
+      )
+    );
+    const routingPrompt = recipientMessages?.find(
+      (message) => message.additional_kwargs.source === 'routing'
+    );
+    const bridge = recipientMessages?.find(
+      (message) =>
+        message.getType() === 'ai' &&
+        String(message.content).startsWith('[Processed tool result')
+    );
+
+    expect(routingPrompt).toBeDefined();
+    expect(bridge).toBeDefined();
+    expect(getProviderMessageProvenance(routingPrompt!)?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
+    expect(getProviderMessageProvenance(bridge!)?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
+  });
+
   it('compiles fan-out/fan-in direct composition with prompt wrapping', () => {
     const graph = new MultiAgentGraph({
       runId: 'fan-in-smoke',
@@ -375,6 +486,119 @@ describe('LangGraph composition smoke tests', () => {
     expect(graph.getParallelGroupId('left')).toBe(1);
     expect(graph.getParallelGroupId('right')).toBe(1);
     expect(graph.getParallelGroupId('final')).toBeUndefined();
+  });
+
+  it('bounds results before interpolating a routing prompt', async () => {
+    const largeResult = `BEGIN\n${'large routed result '.repeat(2000)}\nEND`;
+    const model = new CapturingChatModel([largeResult, 'done']);
+    const graph = new MultiAgentGraph({
+      runId: 'bounded-routing-results',
+      tokenCounter: countMessageChars,
+      agents: [
+        makeAgent('source'),
+        {
+          ...makeAgent('destination'),
+          instructions: 'routing instruction '.repeat(120),
+          maxContextTokens: 1000,
+        },
+      ],
+      edges: [
+        {
+          from: 'source',
+          to: 'destination',
+          edgeType: 'direct',
+          prompt: `${'large static prefix '.repeat(1000)}\n{results}\n{results}`,
+          excludeResults: true,
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('bounded-routing-results')
+      );
+
+    const routingPrompt = model.invocations[1].find(
+      (message) => message.additional_kwargs.source === 'routing'
+    );
+    expect(routingPrompt?.content).toEqual(expect.stringContaining('truncated'));
+    expect(String(routingPrompt?.content).length).toBeLessThan(500);
+    expect(largeResult).toContain('large routed result');
+  });
+
+  it('bounds routing text returned by prompt functions', async () => {
+    const largeResult = `BEGIN\n${'large routed result '.repeat(2000)}\nEND`;
+    const model = new CapturingChatModel([largeResult, 'done']);
+    const graph = new MultiAgentGraph({
+      runId: 'bounded-function-routing-results',
+      tokenCounter: countMessageChars,
+      agents: [
+        makeAgent('source'),
+        {
+          ...makeAgent('destination'),
+          instructions: 'routing instruction '.repeat(120),
+          maxContextTokens: 1000,
+        },
+      ],
+      edges: [
+        {
+          from: 'source',
+          to: 'destination',
+          edgeType: 'direct',
+          prompt: (messages) => getBufferString(messages),
+          excludeResults: true,
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('bounded-function-routing-results')
+      );
+
+    const routingPrompt = model.invocations[1].find(
+      (message) => message.additional_kwargs.source === 'routing'
+    );
+    expect(routingPrompt?.content).toEqual(expect.stringContaining('truncated'));
+    expect(String(routingPrompt?.content).length).toBeLessThan(500);
+    expect(largeResult).toContain('large routed result');
+  });
+
+  it('preserves an undefined function prompt as no routing message', async () => {
+    const model = new CapturingChatModel(['source result', 'done']);
+    const graph = new MultiAgentGraph({
+      runId: 'undefined-function-routing-prompt',
+      agents: [makeAgent('source'), makeAgent('destination')],
+      edges: [
+        {
+          from: 'source',
+          to: 'destination',
+          edgeType: 'direct',
+          prompt: () => undefined,
+          excludeResults: true,
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('undefined-function-routing-prompt')
+      );
+
+    expect(
+      model.invocations[1].some(
+        (message) => message.additional_kwargs.source === 'routing'
+      )
+    ).toBe(false);
   });
 
   it.each([
@@ -492,6 +716,77 @@ describe('LangGraph composition smoke tests', () => {
         'response-3'
       );
     }
+  });
+
+  it('bounds handoff instructions to the destination budget', async () => {
+    const largeInstructions = `BEGIN\n${'large handoff instruction '.repeat(2000)}\nEND`;
+    class LargeHandoffChatModel extends FakeChatModel {
+      readonly invocations: BaseMessage[][] = [];
+      private invocationIndex = 0;
+
+      constructor() {
+        super({ responses: ['unused'] });
+      }
+
+      override async *_streamResponseChunks(
+        messages: BaseMessage[],
+        _options: this['ParsedCallOptions'],
+        runManager?: CallbackManagerForLLMRun
+      ): AsyncGenerator<ChatGenerationChunk> {
+        this.invocations.push(messages);
+        if (this.invocationIndex++ === 0) {
+          yield this._createResponseChunk('', [
+            {
+              id: 'transfer_large',
+              name: `${Constants.LC_TRANSFER_TO_}destination`,
+              args: JSON.stringify({ instructions: largeInstructions }),
+              index: 0,
+              type: 'tool_call_chunk',
+            },
+          ]);
+          void runManager?.handleLLMNewToken('');
+          return;
+        }
+        yield this._createResponseChunk('handoff complete');
+        void runManager?.handleLLMNewToken('handoff complete');
+      }
+    }
+    const model = new LargeHandoffChatModel();
+    const graph = new MultiAgentGraph({
+      runId: 'bounded-handoff-instructions',
+      tokenCounter: countMessageChars,
+      agents: [
+        makeAgent('source'),
+        {
+          ...makeAgent('destination'),
+          instructions: 'routing instruction '.repeat(120),
+          maxContextTokens: 1000,
+        },
+      ],
+      edges: [
+        {
+          from: 'source',
+          to: 'destination',
+          edgeType: 'handoff',
+          prompt: 'Provide transfer instructions.',
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('bounded-handoff-instructions')
+      );
+
+    const routingPrompt = model.invocations
+      .flat()
+      .find((message) => message.additional_kwargs.source === 'routing');
+    expect(routingPrompt?.content).toEqual(expect.stringContaining('truncated'));
+    expect(String(routingPrompt?.content).length).toBeLessThan(500);
+    expect(largeInstructions.length).toBeGreaterThan(40_000);
   });
 
   it('compiles mixed handoff and direct routing from the same agent', () => {

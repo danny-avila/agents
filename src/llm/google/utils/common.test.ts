@@ -120,7 +120,9 @@ describe('rejectsModelTurnPrefill', () => {
     expect(rejectsModelTurnPrefill('gemini-3.6-flash')).toBe(true);
     expect(rejectsModelTurnPrefill('gemini-3.5-flash-lite')).toBe(true);
     expect(rejectsModelTurnPrefill('models/gemini-3.6-flash')).toBe(true);
-    expect(rejectsModelTurnPrefill('models/gemini-3.7-flash-latest')).toBe(true);
+    expect(rejectsModelTurnPrefill('models/gemini-3.7-flash-latest')).toBe(
+      true
+    );
     expect(rejectsModelTurnPrefill('google/gemini-3.5-flash-lite-latest')).toBe(
       true
     );
@@ -132,6 +134,37 @@ describe('rejectsModelTurnPrefill', () => {
     expect(rejectsModelTurnPrefill('gemini-3-pro-preview')).toBe(false);
     expect(rejectsModelTurnPrefill(undefined)).toBe(false);
     expect(rejectsModelTurnPrefill('')).toBe(false);
+  });
+
+  test('covers Flash releases newer than the cutoff without an entry', () => {
+    expect(rejectsModelTurnPrefill('gemini-3.8-flash')).toBe(true);
+    expect(rejectsModelTurnPrefill('gemini-3.9-flash')).toBe(true);
+    expect(rejectsModelTurnPrefill('gemini-3.10-flash')).toBe(true);
+    expect(rejectsModelTurnPrefill('gemini-4.0-flash')).toBe(true);
+    expect(rejectsModelTurnPrefill('models/gemini-3.8-flash-latest')).toBe(
+      true
+    );
+    expect(rejectsModelTurnPrefill('google/gemini-3.8-flash-lite')).toBe(true);
+  });
+
+  test('splits the 3.5 generation, where only Flash-Lite rejects prefill', () => {
+    expect(rejectsModelTurnPrefill('gemini-3.5-flash')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-3.5-flash-latest')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-3.5-flash-lite')).toBe(true);
+  });
+
+  test('reads a major-only Flash id as `.0`', () => {
+    expect(rejectsModelTurnPrefill('gemini-3-flash-preview')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-3-flash')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-4-flash')).toBe(true);
+    expect(rejectsModelTurnPrefill('models/gemini-4-flash-preview')).toBe(true);
+  });
+
+  test('does not widen past Flash to other model lines', () => {
+    expect(rejectsModelTurnPrefill('gemini-3.8-pro')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-4.0-pro-preview')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-3.7-flashy')).toBe(false);
+    expect(rejectsModelTurnPrefill('not-gemini-3.8-flash')).toBe(false);
   });
 });
 

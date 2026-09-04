@@ -2,6 +2,7 @@
 import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { InjectedMessage } from '@/types/tools';
+import { setProviderMessageProvenance } from './provenance';
 import { toLangChainContent } from './langchain';
 import { ContentTypes } from '@/common';
 
@@ -70,12 +71,14 @@ export function convertInjectedMessages(
     if (msg.source != null) additional_kwargs.source = msg.source;
     if (msg.skillName != null) additional_kwargs.skillName = msg.skillName;
 
-    converted.push(
-      new HumanMessage({
-        content: toLangChainContent(msg.content),
-        additional_kwargs,
-      })
-    );
+    const message = new HumanMessage({
+      content: toLangChainContent(msg.content),
+      additional_kwargs,
+    });
+    setProviderMessageProvenance(message, [
+      { attribution: msg.source === 'steer' ? 'user' : 'synthetic' },
+    ]);
+    converted.push(message);
   }
   return converted;
 }

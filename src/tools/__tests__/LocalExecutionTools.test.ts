@@ -20,7 +20,9 @@ import {
   readFile as fsReadFile,
 } from 'fs/promises';
 import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { WorkspaceFS } from '../local/workspaceFS';
 import type * as t from '@/types';
 import {
   executeLocalBash,
@@ -29,6 +31,10 @@ import {
   _resetLocalEngineWarningsForTests,
 } from '../local/LocalExecutionEngine';
 import {
+  resolveLocalToolRegistry,
+  resolveLocalToolsForBinding,
+} from '../local/resolveLocalExecutionTools';
+import {
   createLocalCodingToolBundle,
   _resetRipgrepCacheForTests,
 } from '../local/LocalCodingTools';
@@ -36,10 +42,10 @@ import {
   runPostEditSyntaxCheck,
   _resetSyntaxCheckProbeCacheForTests,
 } from '../local/syntaxCheck';
-import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
-import { WorkspaceClientTimeoutError } from '../local/workspaceFS';
-import type { WorkspaceFS } from '../local/workspaceFS';
+import { createLocalProgrammaticToolCallingTool } from '../local/LocalProgrammaticToolCalling';
 import { LocalFileCheckpointerImpl } from '../local/FileCheckpointer';
+import { getProviderMessageProvenance } from '@/messages/provenance';
+import { WorkspaceClientTimeoutError } from '../local/workspaceFS';
 import { createCompileCheckTool } from '../local/CompileCheckTool';
 import { runBashAstChecks } from '../local/bashAst';
 import { Constants, Providers } from '@/common';
@@ -48,6 +54,30 @@ import { ToolNode } from '../ToolNode';
 const hasPython3 = spawnSync('python3', ['--version']).status === 0;
 
 const tempDirs: string[] = [];
+
+it('reports the invoked runner name for local caller-policy failures', async () => {
+  const programmatic = createLocalProgrammaticToolCallingTool();
+  const toolCall = {
+    id: 'local-ptc',
+    name: Constants.PROGRAMMATIC_TOOL_CALLING,
+    type: 'tool_call' as const,
+    args: {},
+    programmaticToolName: Constants.PROGRAMMATIC_TOOL_CALLING,
+    disallowedToolDefs: [{ name: 'direct_only_tool' }],
+  } satisfies ToolCall & Partial<t.ProgrammaticCache>;
+
+  await expect(
+    programmatic.invoke(
+      {
+        code: 'direct_only_tool \'{}\'',
+        tool_manifest: ['direct_only_tool'],
+      },
+      { toolCall }
+    )
+  ).rejects.toThrow(
+    'Tool "direct_only_tool" cannot be called from "run_tools_with_code"'
+  );
+});
 
 async function createTempDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'lc-local-tools-'));
@@ -143,6 +173,70 @@ describe('local execution tools', () => {
         'list_directory',
       ])
     );
+  });
+
+  it('preserves host caller restrictions for synthesized coding tools', () => {
+    const registry = resolveLocalToolRegistry({
+      toolRegistry: new Map([
+        [
+          'write_file',
+          { name: 'write_file', allowed_callers: ['direct'] },
+        ],
+      ]),
+      toolExecution: { engine: 'local' },
+    });
+
+    expect(registry?.get('write_file')?.allowed_callers).toEqual(['direct']);
+  });
+
+  it('does not directly bind synthesized tools overridden as code-only', () => {
+    const registry = resolveLocalToolRegistry({
+      toolRegistry: new Map([
+        [
+          'write_file',
+          { name: 'write_file', allowed_callers: ['code_execution'] },
+        ],
+      ]),
+      toolExecution: { engine: 'local' },
+    });
+    const tools = resolveLocalToolsForBinding({
+      toolExecution: { engine: 'local' },
+      toolRegistry: registry,
+    }) as t.GenericTool[];
+
+    expect(tools.map((localTool) => localTool.name)).not.toContain(
+      'write_file'
+    );
+  });
+
+  it('binds a deferred synthesized tool only after discovery', () => {
+    const registry = resolveLocalToolRegistry({
+      toolRegistry: new Map([
+        [
+          'write_file',
+          {
+            name: 'write_file',
+            allowed_callers: ['direct', 'code_execution'],
+            defer_loading: true,
+          },
+        ],
+      ]),
+      toolExecution: { engine: 'local' },
+    });
+    const undiscovered = resolveLocalToolsForBinding({
+      toolExecution: { engine: 'local' },
+      toolRegistry: registry,
+    }) as t.GenericTool[];
+    const discovered = resolveLocalToolsForBinding({
+      toolExecution: { engine: 'local' },
+      toolRegistry: registry,
+      discoveredToolNames: new Set(['write_file']),
+    }) as t.GenericTool[];
+
+    expect(undiscovered.map((toolDef) => toolDef.name)).not.toContain(
+      'write_file'
+    );
+    expect(discovered.map((toolDef) => toolDef.name)).toContain('write_file');
   });
 
   it('updates existing code tool bindings when auto-binding is disabled', () => {
@@ -826,6 +920,116 @@ describe('codex review fixes', () => {
         .find((t_) => t_.name === 'grep_search')!
         .invoke({ pattern: 'needle' });
       expect(String(bResult)).toContain('needle');
+    });
+
+    it('retries a transient ripgrep probe failure on the same backend', async () => {
+      _resetRipgrepCacheForTests();
+      const realSpawn = (
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      let probeCalls = 0;
+      let searchCalls = 0;
+      const transientBackend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'rg' && args[0] === '--version') {
+          probeCalls++;
+          return realSpawn(
+            'sh',
+            ['-c', probeCalls === 1 ? 'exit 1' : 'exit 0'],
+            opts
+          );
+        }
+        if (cmd === 'rg') {
+          searchCalls++;
+          return realSpawn('sh', ['-c', 'printf \'file.ts:1:needle\\n\''], opts);
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+      const cwd = await createTempDir();
+      await fsWriteFile(join(cwd, 'file.ts'), 'needle\n', 'utf8');
+      const grep = createLocalCodingToolBundle({
+        cwd,
+        exec: { spawn: transientBackend },
+      }).tools.find((tool) => tool.name === 'grep_search')!;
+
+      const first = await grep.invoke({ pattern: 'needle' });
+      const second = await grep.invoke({ pattern: 'needle' });
+
+      expect(JSON.stringify(first)).toContain('needle');
+      expect(JSON.stringify(second)).toContain('needle');
+      expect(probeCalls).toBe(2);
+      expect(searchCalls).toBe(1);
+    });
+
+    it('caches a native ENOENT ripgrep verdict on the same backend', async () => {
+      _resetRipgrepCacheForTests();
+      const realSpawn = (
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      let probeCalls = 0;
+      const missingBackend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'rg') {
+          probeCalls++;
+          return realSpawn(`missing-rg-${process.pid}`, args, opts);
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+      const cwd = await createTempDir();
+      await fsWriteFile(join(cwd, 'file.ts'), 'needle\n', 'utf8');
+      const grep = createLocalCodingToolBundle({
+        cwd,
+        exec: { spawn: missingBackend },
+      }).tools.find((tool) => tool.name === 'grep_search')!;
+
+      const first = await grep.invoke({ pattern: 'needle' });
+      const second = await grep.invoke({ pattern: 'needle' });
+
+      expect(JSON.stringify(first)).toContain('needle');
+      expect(JSON.stringify(second)).toContain('needle');
+      expect(probeCalls).toBe(1);
+    });
+
+    it('does not cache ENOENT from a missing working directory', async () => {
+      _resetSyntaxCheckProbeCacheForTests();
+      const realSpawn = (
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      let probeCalls = 0;
+      const backend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'node' && args[0] === '--version') {
+          probeCalls++;
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+      const cwd = await createTempDir();
+      const sourcePath = join(cwd, 'valid.js');
+      await fsWriteFile(sourcePath, 'const valid = true;\n', 'utf8');
+
+      await runPostEditSyntaxCheck(sourcePath, {
+        cwd: join(cwd, 'missing'),
+        exec: { spawn: backend },
+      });
+      await runPostEditSyntaxCheck(sourcePath, {
+        cwd,
+        exec: { spawn: backend },
+      });
+      await runPostEditSyntaxCheck(sourcePath, {
+        cwd,
+        exec: { spawn: backend },
+      });
+
+      expect(probeCalls).toBe(2);
     });
   });
 
@@ -2467,6 +2671,9 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
           m.content.includes('SEND-CTX')
       );
       expect(found).toBeDefined();
+      expect(getProviderMessageProvenance(found!)?.parts).toEqual([
+        { attribution: 'synthetic' },
+      ]);
     });
   });
 
@@ -2576,6 +2783,9 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
         role: 'system',
         source: 'hook',
       });
+      expect(getProviderMessageProvenance(human!)?.parts).toEqual([
+        { attribution: 'synthetic' },
+      ]);
     });
   });
 

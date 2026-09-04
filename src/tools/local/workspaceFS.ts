@@ -92,10 +92,9 @@ export interface WorkspaceFS {
  * Returned by `getWorkspaceFS(config)` when the host hasn't supplied
  * an override on `local.exec.fs`.
  */
-export const nodeWorkspaceFS: WorkspaceFS = {
+export const nodeWorkspaceFS = Object.freeze<WorkspaceFS>({
   // The runtime impl ignores the encoding-vs-buffer distinction; the
   // overload signatures above are what callers see.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   readFile: ((path: string, encoding?: 'utf8') =>
     encoding != null
       ? fsReadFile(path, encoding)
@@ -113,4 +112,4 @@ export const nodeWorkspaceFS: WorkspaceFS = {
   realpath: (path) => fsRealpath(path),
   unlink: (path) => fsUnlink(path),
   open: (path, flags) => fsOpen(path, flags),
-};
+});

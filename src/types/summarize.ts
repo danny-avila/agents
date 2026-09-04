@@ -1,5 +1,5 @@
 import type { SummaryContentBlock } from '@/types/stream';
-import type { Providers } from '@/common';
+import type { ProviderName } from '@/types/llm';
 
 export type SummarizationTrigger = {
   type:
@@ -11,31 +11,86 @@ export type SummarizationTrigger = {
 };
 
 /**
- * Controls how many recent messages are preserved verbatim during
- * compaction.  The most recent user-led turn is always preserved
- * regardless of these caps, so a single oversized first message is
- * never destroyed by summarization.
+ * Controls how much recent context is preserved verbatim during compaction.
+ * User-turn boundaries are preferred. Under context pressure, older closed
+ * tool units inside an otherwise indivisible turn may be summarized while a
+ * token-priced recent tail is retained. A lone user payload stays intact.
  */
 export type RetainRecentConfig = {
   /**
-   * Maximum number of recent user-led turns to keep in the tail.  A turn
-   * begins at a HumanMessage and includes every following AIMessage and
-   * ToolMessage up to (but not including) the next HumanMessage.  Cutting
-   * at turn boundaries guarantees tool_use / tool_result pairs are never
-   * split.  Set to `0` to disable the recency window (legacy behavior:
-   * summarize everything).  Defaults to `2`.
+   * Maximum number of recent user-led turns to keep in the tail. A turn begins
+   * at a user-authored HumanMessage and includes every following AIMessage and
+   * tool result up to the next user-authored HumanMessage. Provider-native
+   * HumanMessages containing only tool results remain in the current turn.
+   * Set to `0` to disable the recency window (legacy behavior: summarize
+   * everything). Defaults to `2`.
    */
   turns?: number;
   /**
-   * Optional cap on retained-recent tokens beyond the most recent turn.
-   * Older turns are added whole only while cumulative tokens stay below
-   * the cap.  Defaults to undefined (no cap; bounded only by `turns`).
+   * Optional retained-recent token budget. Older turns are added whole only
+   * while cumulative tokens stay below the cap. If a tool-heavy history has
+   * no compactable turn-level head, this is also the minimum recent tail kept
+   * behind a pairing-balanced intra-turn cut. When omitted, that fallback
+   * retains 16% of the configured context window.
    */
   tokens?: number;
 };
 
+export type CompactionSemanticIndexStatus = 'committed' | 'pending';
+
+type CompactionSemanticIndexEntryBase = {
+  /** Persisted message that owns the indexed content. */
+  sourceMessageId: string;
+  /** Zero-based content-part index within the persisted source message. */
+  sourceContentIndex: number;
+  /** Monotonic host revision for this logical entry. */
+  revision: number;
+  /** Only committed entries may guide compaction. */
+  status: CompactionSemanticIndexStatus;
+  /** User-visible semantic guidance. Hidden reasoning must never be supplied. */
+  text: string;
+  /** Omits the entry entirely when host policy redacts its source. */
+  redacted?: boolean;
+};
+
+export type CompactionToolSemanticIndexEntry =
+  CompactionSemanticIndexEntryBase & {
+    type: 'tool_intent' | 'tool_outcome';
+    toolCallId: string;
+  };
+
+export type CompactionActivitySemanticIndexEntry =
+  CompactionSemanticIndexEntryBase & {
+    type: 'activity_phase';
+  };
+
+export type CompactionReasoningSemanticIndexEntry =
+  CompactionSemanticIndexEntryBase & {
+    type: 'reasoning_label';
+    /** Stable identity shared by every user-visible label revision. */
+    reasoningStepId: string;
+  };
+
+/**
+ * Source-addressed navigation hints for the compaction model. Entries remain
+ * advisory: raw messages are always sent and remain authoritative.
+ */
+export type CompactionSemanticIndexEntry =
+  | CompactionToolSemanticIndexEntry
+  | CompactionActivitySemanticIndexEntry
+  | CompactionReasoningSemanticIndexEntry;
+
+export type CompactionSemanticIndex = readonly CompactionSemanticIndexEntry[];
+
+/** Serializable continuation state for a bounded compaction semantic index. */
+export type CompactionSemanticIndexSnapshot = {
+  entries: CompactionSemanticIndex;
+  /** Cumulative entries supplied before validation and bounded retention. */
+  providedEntryCount: number;
+};
+
 export type SummarizationConfig = {
-  provider?: Providers;
+  provider?: ProviderName;
   model?: string;
   parameters?: Record<string, unknown>;
   prompt?: string;
@@ -94,6 +149,10 @@ export interface SummarizeStartEvent {
   messagesToRefineCount: number;
   /** Which summarization cycle this is (1-based, increments each time summarization fires) */
   summaryVersion: number;
+  /** Committed, source-valid semantic hints included in the request. */
+  semanticIndexEntryCount?: number;
+  /** Serialized semantic-index characters included in the request. */
+  semanticIndexCharCount?: number;
 }
 
 export interface SummarizeDeltaEvent {

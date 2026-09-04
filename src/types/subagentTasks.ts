@@ -12,6 +12,28 @@ export type SubagentTaskStatus =
 /** Where a pending parent message may enter the child run. */
 export type SubagentTaskBoundary = 'preempt' | 'tool' | 'turn';
 
+/**
+ * Lifecycle of one parent-to-child message after the task store accepts it.
+ * Hosts may render a transient `submitted` state before this authoritative
+ * receipt exists; that transport state is intentionally not persisted here.
+ */
+export type SubagentTaskControlReceiptStatus =
+  | 'accepted'
+  | 'applied'
+  | 'rejected'
+  | 'failed';
+
+/** Bounded authoritative receipt for one steer, queue, or interrupt command. */
+export interface SubagentTaskControlReceipt {
+  controlId: string;
+  action: 'steer' | 'queue' | 'interrupt';
+  status: SubagentTaskControlReceiptStatus;
+  createdAt: number;
+  updatedAt: number;
+  boundary?: SubagentTaskBoundary;
+  reason?: 'withdrawn' | 'task_completed' | 'task_cancelled' | 'task_failed';
+}
+
 /** Parent-to-child control operations accepted while a task is running. */
 export type SubagentTaskControlCommand =
   | { action: 'steer' | 'queue' | 'interrupt'; message: string }
@@ -42,6 +64,12 @@ export interface SubagentTaskSnapshot {
   resultAvailable: boolean;
   resultClaimed: boolean;
   pendingControls: number;
+  /**
+   * Bounded receipts emitted by stores that support authoritative control
+   * tracking. Optional so legacy and custom stores remain compatible during
+   * rolling upgrades.
+   */
+  controlReceipts?: SubagentTaskControlReceipt[];
   progress?: SubagentTaskProgress;
   error?: string;
 }

@@ -34,6 +34,7 @@ import type {
 import type {
   GraphFactory,
   GraphFactoryDependencies,
+  GraphFactoryRequest,
 } from '@/graphs/graphFactory';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
 import type { FallbackErrorContext } from '@/llm/invoke';
@@ -49,31 +50,39 @@ import {
   addBedrockTailCacheControl,
   projectArtifactPayload,
   formatContentStrings,
+  cloneMessage,
   CALIBRATION_RATIO_MAX,
-  REPLY_PRIMER_TOKENS,
   createPruneMessages,
-  projectToolCallInputs,
-  calculateMaxToolCallInputChars,
-  projectToolStreamContentForProvider,
+  projectToolMessagesForProvider,
   syncBudgetDerivedFields,
   addTailCacheControl,
   resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
-  supportsBedrockToolCache,
   isSyntheticProviderContextMessage,
+  compactSyntheticProviderContextMessage,
   getMessageId,
   getMessageCreationContentMetadata,
   splitAssistantTextContentByPhase,
   makeIsDeferred,
-  partitionAndMarkAnthropicToolCache,
   DEFAULT_RETAIN_RECENT_TURNS,
+  resolveIntraTurnRetainTokens,
   splitAtRecencyBoundary,
   convertInjectedMessages,
   coalesceAdjacentUserTurns,
-  strictAlternationProviders,
   appendPredecessorHandoffCue,
-  removePredecessorHandoffCue,
+  stampSyntheticProviderMessage,
 } from '@/messages';
+import {
+  Constants,
+  GraphNodeKeys,
+  ContentTypes,
+  GraphEvents,
+  Providers,
+  StepTypes,
+  STANDARD_GRAPH_RUN_NAME,
+  AGENT_MODEL_CALL_RUN_NAME,
+  PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
+} from '@/common';
 import {
   resetIfNotEmpty,
   isAnthropicLike,
@@ -85,14 +94,6 @@ import {
   joinKeys,
   sleep,
 } from '@/utils';
-import {
-  attemptInvoke,
-  tryFallbackProviders,
-  getFallbackErrorContext,
-  getFallbackOverflowCandidates,
-  projectMessagesForProvider,
-  resolveServingModelId,
-} from '@/llm/invoke';
 import {
   resolveStreamLimits,
   StreamLimitExceededError,
@@ -107,15 +108,6 @@ import {
   normalizeSubagentConfigEntries,
 } from '@/tools/subagent';
 import {
-  Constants,
-  GraphNodeKeys,
-  ContentTypes,
-  GraphEvents,
-  Providers,
-  StepTypes,
-  PREEMPT_BOUNDARY_HOOK_TIMEOUT_MS,
-} from '@/common';
-import {
   createLangfuseHandler,
   createLangfuseTraceMetadata,
   disposeLangfuseHandler,
@@ -127,15 +119,16 @@ import {
   translateRecoveryBudget,
 } from '@/llm/contextOverflowRecovery';
 import {
+  attemptInvoke,
+  tryFallbackProviders,
+  getFallbackErrorContext,
+  getFallbackOverflowCandidates,
+} from '@/llm/invoke';
+import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
-import {
-  compactToolContent,
-  getToolContentCharLength,
-  serializeToolContentBounded,
-} from '@/utils/toolContent';
 import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
@@ -145,25 +138,34 @@ import {
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
 import {
+  getToolContentCharLength,
+  serializeToolContentBounded,
+} from '@/utils/toolContent';
+import {
   appendCallbacks,
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
-import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
-import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
+import { isFadingTier, isInformativeFadingTier } from '@/messages/fading';
+import { createContextPressureMeter } from '@/llm/contextPressureMeter';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
+import { calculateMaxToolCallInputChars } from '@/utils/truncation';
+import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
+import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { initializeLangfuseTracing } from '@/instrumentation';
 import { shouldTriggerSummarization } from '@/summarization';
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
+import { getTruncationStopReason } from '@/llm/truncation';
 import { messagesStateReducer } from '@/messages/reducer';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
@@ -321,7 +323,7 @@ function isGoogleServerSideToolMessageContentPart(
 }
 
 function hasGoogleServerSideToolDeltaContent(
-  provider: Providers | undefined,
+  provider: t.ProviderName | undefined,
   content: t.MessageDelta['content']
 ): content is t.MessageContentComplex[] {
   return (
@@ -334,7 +336,7 @@ function hasGoogleServerSideToolDeltaContent(
 }
 
 function getMessageDeltaContent(
-  provider: Providers | undefined,
+  provider: t.ProviderName | undefined,
   content: MessageContent | undefined
 ): t.MessageDelta['content'] | undefined {
   if (content == null) {
@@ -410,7 +412,9 @@ function getCurrentStepIds({
     if (stepKey !== baseStepKey && !stepKey.startsWith(`${baseStepKey}_`)) {
       continue;
     }
-    currentStepIds.push(...stepIds);
+    for (const stepId of stepIds) {
+      currentStepIds.push(stepId);
+    }
   }
   return currentStepIds;
 }
@@ -545,7 +549,7 @@ async function dispatchTextMessageContent({
 }: {
   graph: Graph<t.BaseGraphState>;
   stepKey: string;
-  provider?: Providers;
+  provider?: t.ProviderName;
   content: t.MessageDelta['content'];
   metadata: Record<string, unknown>;
 }): Promise<boolean> {
@@ -768,6 +772,9 @@ export abstract class Graph<
   contentData: t.RunStep[] = [];
   protected nextContentIndex = 0;
   protected runStepStateRevision = 0;
+  protected stopContinuationCount = 0;
+  protected stopContinuationExecutionId = '';
+  protected streamSegment = 0;
   stepKeyIds: Map<string, string[]> = new Map<string, string[]>();
   contentIndexMap: Map<string, number> = new Map();
   toolCallStepIds: Map<string, string> = new Map();
@@ -897,6 +904,9 @@ export abstract class Graph<
     this.contentData = [];
     this.nextContentIndex = 0;
     this.runStepStateRevision = 0;
+    this.stopContinuationCount = 0;
+    this.stopContinuationExecutionId = '';
+    this.streamSegment = 0;
     this.contentIndexMap = new Map();
     this.stepKeyIds = new Map();
     this.toolCallStepIds.clear();
@@ -1061,6 +1071,13 @@ export abstract class Graph<
     return [...threadIds];
   }
 
+  protected createSubagentFadingResumeState(): Pick<
+    SubagentGraphResumeState,
+    'fadingTier' | 'fadingTiers'
+    > {
+    return {};
+  }
+
   createSubagentResumeState(runId: string): SubagentGraphResumeState {
     return {
       toolCallSteps: [...this.toolCallStepIds].map(([toolCallId, stepId]) => ({
@@ -1098,6 +1115,7 @@ export abstract class Graph<
       ],
       eagerToolSuppressions: [...this.eagerEventToolSuppressions],
       runStepState: this.createRunStepResumeState(),
+      ...this.createSubagentFadingResumeState(),
       ...(this._toolOutputRegistry == null
         ? {}
         : {
@@ -1260,6 +1278,7 @@ export abstract class Graph<
 }
 
 export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
+  readonly runName: string = STANDARD_GRAPH_RUN_NAME;
   overrideModel?: t.ChatModel;
   private subagentModelOverride?: t.ChatModel;
   private readonly graphFactory: GraphFactory;
@@ -1286,10 +1305,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * component: public run ids are unrestricted and may repeat across
    * concurrently executing runs (retries, duplicate submissions,
    * tenant-local message ids), and equal stamps would let those runs adopt
-   * each other's scopes. One graph instance = one execution's stamp, shared
-   * by the stream handler and every graph-level scope of that execution.
+   * each other's scopes. Fresh stream executions rotate this stamp; resumes
+   * retain it so the continuation stays in the interrupted execution.
    */
-  readonly langfuseScopeRunId: string;
+  langfuseScopeRunId: string;
+  /** Opaque key for parenting post-processing observations to this run. */
+  langfuseTraceAnchor: object = {};
   /**
    * Boundary between historical messages (loaded from conversation state)
    * and messages produced during the current run.  Set once in the state
@@ -1404,6 +1425,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * cleanup runs.
    */
   preemptSealCount = 0;
+  /** Discards honored, counted apart from seals — see
+   *  {@link claimPreemptRestart}. */
+  preemptRestartCount = 0;
   /** Boundaries that produced nothing to inject, so the turn stopped early. */
   preemptEmptyBoundaries = 0;
   /**
@@ -1421,6 +1445,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   preemptIncomplete = false;
   /**
+   * True when `routeMessage` sent a turn to `END` because the last AI
+   * message carries no tool call, AND the provider reports it stopped for
+   * hitting the output token ceiling (`getTruncationStopReason`). Plain-text
+   * and reasoning turns cut off this way carry no tool call for
+   * `assertNotTruncatedToolCall` to catch, so `toolsCondition` reads them as
+   * an ordinary finished turn otherwise — hosts read this flag to persist
+   * the turn as unfinished instead of a silently truncated "complete" answer.
+   *
+   * Deliberately separate from `preemptIncomplete`/`preemptHaltReason`: this
+   * has no interaction with the preempt/seal machinery (in particular the
+   * `preemptHaltReason` check at each model node's entry), so setting it
+   * cannot suppress an unrelated agent's turn in a multi-agent graph.
+   */
+  outputTruncatedIncomplete = false;
+  /**
    * `stopReason` from a `PreemptBoundary` hook that halted the turn.
    *
    * Clearing the registry halt is what keeps the sealed turn alive, but the
@@ -1436,6 +1475,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * another's turn.
    */
   pendingPreemptReturn = new Set<string>();
+  /**
+   * Agent IDs whose model turn a preempt DISCARDED rather than sealed. A
+   * discard returns no message, so the node cannot read
+   * `response_metadata.preempted` to learn a boundary is owed — this set is
+   * the only carrier.
+   *
+   * Keyed by agent for the same reason {@link pendingPreemptReturn} is: one
+   * graph instance serves every parallel agent, and a single flag would let
+   * whichever lane finished first consume another lane's boundary.
+   *
+   * Not derivable from `preemptSealInFlight`: an ordinary seal holds that slot
+   * too, and a claim that never reached its boundary would be indistinguishable
+   * from a discard.
+   */
+  private preemptRestartPending = new Set<string>();
 
   constructor(
     {
@@ -1446,12 +1500,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       tokenCounter,
       indexTokenCountMap,
       calibrationRatio,
+      fadingTier,
+      fadingTiers,
       subagentUsageSink,
       subagentTasks,
       subagentScope,
       subagentExecutionContext,
       preemption,
       streamLimits,
+      toolExecution,
     }: t.StandardGraphInput,
     dependencies?: GraphFactoryDependencies
   ) {
@@ -1477,6 +1534,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.subagentExecutionContext = subagentExecutionContext;
     this.preemption = preemption;
     this.streamLimits = resolveStreamLimits(streamLimits);
+    this.toolExecution = toolExecution;
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -1486,16 +1544,38 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const agentContext = AgentContext.fromConfig(
         agentConfig,
         tokenCounter,
-        indexTokenCountMap
+        indexTokenCountMap,
+        toolExecution
       );
       if (calibrationRatio != null && calibrationRatio > 0) {
         agentContext.calibrationRatio = calibrationRatio;
+      }
+      let restoredFadingTier: t.FadingTier | null | undefined;
+      if (
+        fadingTiers != null &&
+        Object.prototype.hasOwnProperty.call(fadingTiers, agentConfig.agentId)
+      ) {
+        restoredFadingTier = fadingTiers[agentConfig.agentId];
+      } else if (agentConfig.agentId === agents[0].agentId) {
+        restoredFadingTier = fadingTier;
+      }
+      /** A supplied tier is assumed to describe the supplied history. Hosts
+       * must clear it when they create a new summary; this also permits tiers
+       * learned on turns after a durable summary to survive subsequent Runs. */
+      if (isFadingTier(restoredFadingTier)) {
+        agentContext.fadingTier = { ...restoredFadingTier };
       }
 
       this.agentContexts.set(agentConfig.agentId, agentContext);
     }
 
     this.defaultAgentId = agents[0].agentId;
+  }
+
+  /** Rotates the Langfuse identities that must never cross fresh executions. */
+  startFreshLangfuseExecution(): void {
+    this.langfuseTraceAnchor = {};
+    this.langfuseScopeRunId = `${this.runId ?? 'graph'}:${nanoid()}`;
   }
 
   /* Init */
@@ -1507,6 +1587,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.cachedRunMessages = undefined;
     this.cachedDiscoveredTools = undefined;
     this.config = resetIfNotEmpty(this.config, undefined);
+    this.stopContinuationCount = 0;
+    this.stopContinuationExecutionId = '';
+    this.streamSegment = 0;
     if (keepContent !== true) {
       this.contentData = resetIfNotEmpty(this.contentData, []);
       this.nextContentIndex = 0;
@@ -1673,6 +1756,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   private resetPreemptTurnState(): void {
     this.preemptSealBudgetUsed = 0;
     this.preemptSealInFlight = false;
+    this.preemptRestartPending.clear();
     this.pendingPreemptReturn.clear();
   }
 
@@ -1685,9 +1769,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   private resetPreemptTotals(): void {
     this.preemptSealCount = 0;
+    this.preemptRestartCount = 0;
     this.preemptEmptyBoundaries = 0;
     this.preemptIncomplete = false;
     this.preemptHaltReason = undefined;
+    this.outputTruncatedIncomplete = false;
   }
 
   /**
@@ -1756,12 +1842,32 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * rather than sealing for a message it would never receive.
    */
   claimPreemptSeal(): boolean {
+    return this.claimPreemptSlot('seal');
+  }
+
+  /**
+   * The restart twin. It takes the SAME slot and spends the SAME budget —
+   * both moves end one model turn and cost one extra superstep, and the
+   * mutual exclusion argument above applies identically — but it is counted
+   * apart: a restart preserved no partial assistant message, so reporting it
+   * as a seal would tell every consumer of `getPreemptStats().seals` and the
+   * boundary hook's `sealCount` that a turn was kept when it was discarded.
+   */
+  claimPreemptRestart(): boolean {
+    return this.claimPreemptSlot('restart');
+  }
+
+  private claimPreemptSlot(kind: 'seal' | 'restart'): boolean {
     if (!this.canClaimPreemptSeal()) {
       return false;
     }
     this.preemptSealInFlight = true;
     this.preemptSealBudgetUsed += 1;
-    this.preemptSealCount += 1;
+    if (kind === 'seal') {
+      this.preemptSealCount += 1;
+      return true;
+    }
+    this.preemptRestartCount += 1;
     return true;
   }
 
@@ -1770,9 +1876,24 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.preemptSealInFlight = false;
   }
 
+  /** See {@link preemptRestartPending}. Called from the model attempt. */
+  notePreemptRestart(agentId: string): void {
+    this.preemptRestartPending.add(agentId);
+  }
+
+  /**
+   * Reads and clears the lane's mark in one step, so a boundary is dispatched
+   * exactly once per discard even though the model node runs again immediately
+   * after.
+   */
+  private consumePreemptRestart(agentId: string): boolean {
+    return this.preemptRestartPending.delete(agentId);
+  }
+
   getPreemptStats(): t.PreemptStats {
     return {
       seals: this.preemptSealCount,
+      restarts: this.preemptRestartCount,
       emptyBoundaries: this.preemptEmptyBoundaries,
     };
   }
@@ -1804,6 +1925,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       version: 1,
       revision: this.runStepStateRevision,
       nextIndex: this.nextContentIndex,
+      stopContinuationCount: this.stopContinuationCount,
+      ...(this.stopContinuationExecutionId === ''
+        ? {}
+        : {
+          stopContinuationExecutionId: this.stopContinuationExecutionId,
+        }),
+      streamSegment: this.streamSegment,
       toolCallSteps: [...this.toolCallStepIds].map(([toolCallId, stepId]) => ({
         toolCallId,
         stepId,
@@ -1823,6 +1951,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
     this.nextContentIndex = state.nextIndex;
     this.runStepStateRevision = state.revision;
+    this.stopContinuationCount = state.stopContinuationCount ?? 0;
+    this.stopContinuationExecutionId =
+      state.stopContinuationExecutionId ?? '';
+    this.streamSegment = state.streamSegment ?? 0;
     for (const { toolCallId, stepId } of state.toolCallSteps) {
       this.toolCallStepIds.set(toolCallId, stepId);
     }
@@ -1855,6 +1987,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return this.contentData[index];
     }
     return undefined;
+  }
+
+  getStopContinuationCount(): number {
+    return this.stopContinuationCount;
+  }
+
+  setStopContinuationCount(count: number): void {
+    this.stopContinuationCount = count;
+  }
+
+  getStopContinuationExecutionId(): string {
+    return this.stopContinuationExecutionId;
+  }
+
+  startStopContinuationExecution(executionId: string): void {
+    this.stopContinuationExecutionId = executionId;
+  }
+
+  getStreamSegment(): number {
+    return this.streamSegment;
+  }
+
+  advanceStreamSegment(): void {
+    this.streamSegment += 1;
   }
 
   /**
@@ -1972,6 +2128,35 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * unreachable — each step registers its calls before any completion can
    * reference it — and the mechanism was removed.)
    */
+  /**
+   * Closes the lane's open message step as `cancelled` when a preempt discards
+   * the turn that step belongs to.
+   *
+   * Without it the step is closed `completed` by the discard's own model-end,
+   * so `getRunSteps()` and every run-step subscriber keep reasoning the
+   * replacement prompt does not contain — the graph state forgets the attempt
+   * while the step view still shows it as a finished one.
+   *
+   * Only for turns that were CUT SHORT. A turn whose stream reached its own
+   * end really did complete, and its step is already closed by then; the
+   * terminal-status guard in {@link closeRunStep} leaves that alone.
+   */
+  async cancelOpenMessageStep(
+    metadata?: Record<string, unknown>
+  ): Promise<void> {
+    const stepId = this.openMessageStepByAgent.get(
+      this.getStepAgentKey(metadata)
+    );
+    if (stepId == null) {
+      return;
+    }
+    try {
+      await this.closeRunStep(stepId, 'cancelled', { metadata });
+    } catch (_e) {
+      /** A step-view detail must never take down the run it describes. */
+    }
+  }
+
   async closeRunStep(
     stepId: string,
     status: Exclude<t.RunStepStatus, 'in_progress'>,
@@ -2305,6 +2490,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       metadata.langgraph_node as string,
       metadata.langgraph_step as number,
       checkpointNs,
+      this.streamSegment,
     ];
 
     return keyList;
@@ -2389,6 +2575,57 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   getCalibrationRatio(): number {
     const context = this.agentContexts.get(this.defaultAgentId);
     return context?.calibrationRatio ?? 1;
+  }
+
+  /**
+   * Latched context-fading tier for the default agent, or undefined while it
+   * is still fresh. Hosts persist it beside the calibration ratio.
+   */
+  getFadingTier(): t.FadingTier | undefined {
+    const context = this.agentContexts.get(this.defaultAgentId);
+    const tier = context?.fadingTier;
+    return isInformativeFadingTier(tier, context?.maxContextTokens)
+      ? { ...tier }
+      : undefined;
+  }
+
+  /** Latched context-fading tiers keyed by agent ID. */
+  getFadingTiers(): t.FadingTiers {
+    const tiers: Array<[string, t.FadingTier]> = [];
+    for (const [agentId, context] of this.agentContexts) {
+      if (
+        isInformativeFadingTier(context.fadingTier, context.maxContextTokens)
+      ) {
+        tiers.push([agentId, { ...context.fadingTier }]);
+      }
+    }
+    return Object.fromEntries(tiers);
+  }
+
+  /** Agent IDs whose canonical history was compacted during this run. */
+  getFadingTierResetAgentIds(): string[] {
+    return Array.from(this.agentContexts)
+      .filter(([, context]) => context.fadingTierReset)
+      .map(([agentId]) => agentId);
+  }
+
+  /** Whether the default agent compacted canonical history during this run. */
+  didResetFadingTier(): boolean {
+    return (
+      this.agentContexts.get(this.defaultAgentId)?.fadingTierReset === true
+    );
+  }
+
+  protected override createSubagentFadingResumeState(): Pick<
+    SubagentGraphResumeState,
+    'fadingTier' | 'fadingTiers'
+    > {
+    const fadingTier = this.getFadingTier();
+    const fadingTiers = this.getFadingTiers();
+    return {
+      ...(fadingTier == null ? {} : { fadingTier }),
+      ...(Object.keys(fadingTiers).length === 0 ? {} : { fadingTiers }),
+    };
   }
 
   getResolvedInstructionOverhead(): number | undefined {
@@ -2544,8 +2781,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         // run_id); `executingAgentId` always identifies the owning agent.
         agentId: this.subagentScope ? agentContext?.agentId : undefined,
         executingAgentId: agentContext?.agentId,
+        executingAgentName: agentContext?.name,
+        rootAgentId: this.defaultAgentId,
+        rootAgentName: this.agentContexts.get(this.defaultAgentId)?.name,
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
+        getDiscoveredToolNames: (): readonly string[] =>
+          agentContext?.getDiscoveredTools() ?? [],
         hookRegistry: this.hookRegistry,
         humanInTheLoop: this.humanInTheLoop,
         eagerEventToolExecution: this.eagerEventToolExecution,
@@ -2619,10 +2861,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       // hooks can attribute the batch even at the top level.
       agentId: this.subagentScope ? agentContext?.agentId : undefined,
       executingAgentId: agentContext?.agentId,
+      executingAgentName: agentContext?.name,
+      rootAgentId: this.defaultAgentId,
+      rootAgentName: this.agentContexts.get(this.defaultAgentId)?.name,
       toolCallStepIds: this.toolCallStepIds,
       errorHandler: (data, metadata): Promise<boolean> =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
+      getDiscoveredToolNames: (): readonly string[] =>
+        agentContext?.getDiscoveredTools() ?? [],
       sessions: this.sessions,
       codeSessionKey: agentContext?.codeSessionKey,
       toolExecution: this.toolExecution,
@@ -2768,6 +3015,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     };
   }
 
+  private getPreparedToolsForBinding(
+    agentContext: AgentContext,
+    provider: t.ProviderName = agentContext.provider,
+    clientOptions: t.ClientOptions | undefined = agentContext.clientOptions
+  ): t.GraphTools | undefined {
+    const tools = resolveLocalToolsForBinding({
+      tools: agentContext.getToolsForBinding(),
+      toolExecution: this.toolExecution,
+      toolRegistry: agentContext.toolRegistry,
+      discoveredToolNames: new Set(agentContext.getDiscoveredTools()),
+    });
+    return prepareToolsForPromptCache({
+      provider,
+      clientOptions,
+      tools,
+      isDeferred: makeIsDeferred(agentContext.getEffectiveToolDefinitions()),
+    });
+  }
+
   createCallModel(agentId = 'default') {
     return async (
       state: t.AgentSubgraphState,
@@ -2825,11 +3091,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.markToolsAsDiscovered(discoveredNames);
       }
 
-      const rawToolsForBinding = resolveLocalToolsForBinding({
-        tools: agentContext.getToolsForBinding(),
-        toolExecution: this.toolExecution,
-      });
-
       /**
        * Anthropic prompt-cache breakpoint on the tool definitions.
        *
@@ -2843,66 +3104,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * Discovered deferred tools that arrive across turns sit *after*
        * the breakpoint and don't invalidate the prefix.
        */
-      let toolsForBinding = rawToolsForBinding;
-      if (
-        agentContext.provider === Providers.ANTHROPIC &&
-        (agentContext.clientOptions as t.AnthropicClientOptions | undefined)
-          ?.promptCache === true
-      ) {
-        toolsForBinding =
-          partitionAndMarkAnthropicToolCache(
-            rawToolsForBinding,
-            makeIsDeferred(agentContext.toolDefinitions),
-            resolvePromptCacheTtl(
-              (
-                agentContext.clientOptions as
-                  | t.AnthropicClientOptions
-                  | undefined
-              )?.promptCacheTtl
-            )
-          ) ?? rawToolsForBinding;
-      } else if (
-        agentContext.provider === Providers.OPENROUTER &&
-        (
-          agentContext.clientOptions as
-            | t.ProviderOptionsMap[Providers.OPENROUTER]
-            | undefined
-        )?.promptCache === true
-      ) {
-        toolsForBinding =
-          partitionAndMarkOpenRouterToolCache(
-            rawToolsForBinding,
-            makeIsDeferred(agentContext.toolDefinitions),
-            resolvePromptCacheTtl(
-              (
-                agentContext.clientOptions as
-                  | t.ProviderOptionsMap[Providers.OPENROUTER]
-                  | undefined
-              )?.promptCacheTtl
-            )
-          ) ?? rawToolsForBinding;
-      } else if (
-        agentContext.provider === Providers.BEDROCK &&
-        (
-          agentContext.clientOptions as
-            | t.BedrockAnthropicClientOptions
-            | undefined
-        )?.promptCache === true
-      ) {
-        const bedrockModel = (
-          agentContext.clientOptions as { model?: string } | undefined
-        )?.model;
-        // An omitted model falls back to LangChain's default Claude model (which
-        // supports tool caching); only an explicit non-Claude model (e.g. Nova)
-        // skips tool marking so its stray marker never leaks into toolConfig.
-        if (bedrockModel == null || supportsBedrockToolCache(bedrockModel)) {
-          toolsForBinding =
-            partitionAndMarkBedrockToolCache(
-              rawToolsForBinding,
-              makeIsDeferred(agentContext.toolDefinitions)
-            ) ?? rawToolsForBinding;
-        }
-      }
+      const toolsForBinding = this.getPreparedToolsForBinding(agentContext);
 
       let model =
         this.overrideModel ??
@@ -2913,7 +3115,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         });
 
       if (agentContext.systemRunnable) {
-        model = agentContext.systemRunnable.pipe(model as Runnable);
+        model = agentContext.systemRunnable
+          .pipe(model as Runnable)
+          .withConfig({ runName: AGENT_MODEL_CALL_RUN_NAME });
       }
 
       if (agentContext.tokenCalculationPromise) {
@@ -2932,6 +3136,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * same masking record the configured trigger preserves.
        */
       let prunedOriginalToolContent: Map<number, string> | undefined;
+      const canProjectContext =
+        agentContext.tokenCounter != null &&
+        agentContext.maxContextTokens != null;
+      const providerMessages = canProjectContext
+        ? agentContext.getProviderProjectedMessages(messages)
+        : messages;
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
@@ -2953,6 +3163,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           summarizationEnabled: agentContext.summarizationEnabled,
           reserveRatio: agentContext.summarizationConfig?.reserveRatio,
           calibrationRatio: agentContext.calibrationRatio,
+          fadingTier: agentContext.fadingTier,
           getInstructionTokens: () => agentContext.instructionTokens,
           log: (level, message, data) => {
             emitAgentLog(config, level, 'prune', message, data, {
@@ -2971,29 +3182,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           remainingContextTokens,
           newOriginalToolContent,
           calibrationRatio,
+          fadingTier,
           resolvedInstructionOverhead,
           contextBudget,
           effectiveInstructionTokens,
         } = agentContext.pruneMessages({
-          messages,
+          messages: providerMessages,
+          canonicalMessages: messages,
+          canonicalPrefixStable: true,
           usageMetadata: agentContext.currentUsage,
           lastCallUsage: agentContext.lastCallUsage,
           totalTokensFresh: agentContext.totalTokensFresh,
         });
         prunedOriginalToolContent = newOriginalToolContent;
-        /**
-         * Masking rewrites tool content in `state.messages` in place, so this
-         * map is the only surviving copy of the full output. Persist it on
-         * every prune, not just when a summary is about to be written — the
-         * pruner closure that produced it is discarded on the next reset, and
-         * with it any chance of a later summary restoring the real content.
-         * AgentContext bounds what accumulates.
-         */
+        /** Preserve the masking record for the existing overflow/summarization
+         * path. The graph history itself remains canonical; only the provider
+         * projection above is rewritten by fading. */
         agentContext.preserveOriginalToolContent(newOriginalToolContent);
         agentContext.indexTokenCountMap = indexTokenCountMap;
         if (calibrationRatio != null && calibrationRatio > 0) {
           agentContext.calibrationRatio = calibrationRatio;
         }
+        agentContext.fadingTier = fadingTier;
         if (resolvedInstructionOverhead != null) {
           agentContext.resolvedInstructionOverhead =
             resolvedInstructionOverhead;
@@ -3053,9 +3263,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           messagesToRefine.length > 0;
 
         if (hasPrunedMessages) {
-          const shouldSkip = agentContext.shouldSkipSummarization(
-            messages.length
-          );
+          const shouldSkip =
+            agentContext.summarizationExhausted ||
+            agentContext.shouldSkipSummarization(messages.length);
           const triggerResult =
             !shouldSkip &&
             shouldTriggerSummarization({
@@ -3112,6 +3322,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 messageCount: messages.length,
                 messagesToRefineCount: messagesToRefine.length,
                 contextLength: context.length,
+                summarizationFailures: agentContext.summarizationFailures,
+                summarizationExhausted: agentContext.summarizationExhausted,
               },
               { runId: this.runId, agentId }
             );
@@ -3125,105 +3337,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * baseline, then attribute it across retained messages. Provider
        * transforms can shrink one message while expanding or adding another;
        * per-origin accounting prevents that unrelated shrink from canceling
-       * the expansion. Raw counts are frozen before in-place formatters run.
+       * the expansion. Exact counts are memoized across repeated projections.
        */
-      let providerMessageBaseline:
-        | Array<{ rawTokens: number; accountingWeight: number }>
-        | undefined;
-      const providerMessageOrigins = new WeakMap<BaseMessage, number>();
-      if (contextUsage != null && agentContext.tokenCounter != null) {
-        const sourceIndices = new WeakMap<BaseMessage, number>();
-        for (let i = 0; i < messages.length; i++) {
-          sourceIndices.set(messages[i], i);
-        }
-        providerMessageBaseline = messagesToUse.map((message, index) => {
-          const rawTokens = agentContext.tokenCounter!(message);
-          const sourceIndex = sourceIndices.get(message);
-          const indexedTokens =
-            sourceIndex != null
-              ? agentContext.indexTokenCountMap[sourceIndex]
-              : undefined;
-          const accountingWeight =
-            indexedTokens != null &&
-            Number.isFinite(indexedTokens) &&
-            indexedTokens >= 0
-              ? indexedTokens
-              : rawTokens;
-          if (!providerMessageOrigins.has(message)) {
-            providerMessageOrigins.set(message, index);
-          }
-          return { rawTokens, accountingWeight };
-        });
-      }
-
-      const getProviderMessageOriginKey = (
-        message: BaseMessage
-      ): string | undefined => {
-        const type = message.getType();
-        if (
-          message instanceof ToolMessage &&
-          typeof message.tool_call_id === 'string' &&
-          message.tool_call_id.length > 0
-        ) {
-          return `tool:call:${message.tool_call_id}`;
-        }
-        if (typeof message.id === 'string' && message.id.length > 0) {
-          return `${type}:id:${message.id}`;
-        }
-        return undefined;
-      };
-
-      /**
-       * Provider projections clone messages. Preserve their baseline origin
-       * without writing tracking metadata onto the wire. Synthetic fold
-       * messages intentionally remain unattributed and are charged in full.
-       */
-      const trackProviderMessageOrigins = (
-        before: BaseMessage[],
-        after: BaseMessage[]
-      ): BaseMessage[] => {
-        if (providerMessageBaseline == null || before === after) {
-          return after;
-        }
-        if (before.length === after.length) {
-          for (let i = 0; i < after.length; i++) {
-            const origin = providerMessageOrigins.get(before[i]);
-            if (
-              origin != null &&
-              !providerMessageOrigins.has(after[i]) &&
-              before[i].getType() === after[i].getType() &&
-              !isSyntheticProviderContextMessage(after[i])
-            ) {
-              providerMessageOrigins.set(after[i], origin);
-            }
-          }
-          return after;
-        }
-
-        const keyedOrigins = new Map<string, number | null>();
-        for (const message of before) {
-          const origin = providerMessageOrigins.get(message);
-          const key = getProviderMessageOriginKey(message);
-          if (origin == null || key == null) {
-            continue;
-          }
-          keyedOrigins.set(key, keyedOrigins.has(key) ? null : origin);
-        }
-        for (const message of after) {
-          if (
-            providerMessageOrigins.has(message) ||
-            isSyntheticProviderContextMessage(message)
-          ) {
-            continue;
-          }
-          const key = getProviderMessageOriginKey(message);
-          const origin = key != null ? keyedOrigins.get(key) : undefined;
-          if (origin != null) {
-            providerMessageOrigins.set(message, origin);
-          }
-        }
-        return after;
-      };
+      const contextPressure = createContextPressureMeter({
+        tokenCounter: agentContext.tokenCounter,
+        tokenCountCache: agentContext.contextPressureTokenCounts,
+        sourceMessages: messages,
+        retainedMessages: messagesToUse,
+        indexTokenCountMap: agentContext.indexTokenCountMap,
+        contextUsage,
+        instructionTokens: agentContext.instructionTokens,
+        calibrationRatio: agentContext.calibrationRatio,
+      });
+      const trackProviderMessageOrigins = contextPressure.trackProjection;
 
       if (agentContext.useLegacyContent) {
         const before = finalMessages;
@@ -3236,15 +3362,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const maxProviderToolResultChars =
         agentContext.maxToolResultChars ??
         calculateMaxToolResultChars(agentContext.maxContextTokens);
-      const beforeToolStreamProjection = finalMessages;
-      finalMessages = trackProviderMessageOrigins(
-        beforeToolStreamProjection,
-        projectToolStreamContentForProvider(beforeToolStreamProjection)
-      );
       const beforeToolInputProjection = finalMessages;
       finalMessages = trackProviderMessageOrigins(
         beforeToolInputProjection,
-        projectToolCallInputs(
+        projectToolMessagesForProvider(
           beforeToolInputProjection,
           calculateMaxToolCallInputChars(agentContext.maxContextTokens)
         )
@@ -3271,8 +3392,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         typeof lastMessageX.content === 'string'
       ) {
         const trimmed = lastMessageX.content.trim();
-        finalMessages[finalMessages.length - 2].content =
-          trimmed.length > 0 ? [{ type: 'text' as const, text: trimmed }] : '';
+        const before = finalMessages;
+        finalMessages = [...before];
+        finalMessages[finalMessages.length - 2] = cloneMessage(
+          lastMessageX,
+          trimmed.length > 0 ? [{ type: 'text' as const, text: trimmed }] : ''
+        );
+        finalMessages = trackProviderMessageOrigins(before, finalMessages);
       }
 
       const localProviderOverflowMeasurements = new WeakMap<
@@ -3282,123 +3408,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           estimatedPromptTokens: number;
         }
       >();
-      const measureProviderPayload = (
-        candidate: BaseMessage[],
-        contextBudgetOverride?: number,
-        forceRawRecount = false
-      ): {
-        fits: boolean;
-        projectedMessageTokens?: number;
-        availableMessageTokens?: number;
-        contextBudget?: number;
-        effectiveInstructionTokens?: number;
-      } => {
-        const contextBudget =
-          contextBudgetOverride ?? contextUsage?.contextBudget;
-        const effectiveInstructionTokens =
-          contextUsage?.effectiveInstructionTokens ??
-          (forceRawRecount ? agentContext.instructionTokens : undefined);
-        if (
-          agentContext.tokenCounter == null ||
-          contextBudget == null ||
-          effectiveInstructionTokens == null
-        ) {
-          return { fits: true };
-        }
-        const availableMessageTokens = Math.max(
-          0,
-          contextBudget - effectiveInstructionTokens
-        );
-        let usageRatio =
-          agentContext.calibrationRatio > 0 ? agentContext.calibrationRatio : 1;
-        if (
-          contextUsage?.calibrationRatio != null &&
-          contextUsage.calibrationRatio > 0
-        ) {
-          usageRatio = contextUsage.calibrationRatio;
-        }
-        if (forceRawRecount) {
-          usageRatio = Math.max(1, usageRatio);
-        }
-        const baselineRemaining = contextUsage?.remainingContextTokens;
-        const accountedMessageTokens =
-          !forceRawRecount &&
-          providerMessageBaseline != null &&
-          baselineRemaining != null &&
-          Number.isFinite(baselineRemaining)
-            ? availableMessageTokens -
-              Math.min(availableMessageTokens, Math.max(0, baselineRemaining))
-            : undefined;
-
-        let projectedMessageTokens: number;
-        if (accountedMessageTokens != null && providerMessageBaseline != null) {
-          const replyPrimerTokens = Math.round(
-            REPLY_PRIMER_TOKENS * usageRatio
-          );
-          const rawWeights: Record<string, number> = {};
-          let totalWeight = 0;
-          for (let i = 0; i < providerMessageBaseline.length; i++) {
-            const weight = providerMessageBaseline[i].accountingWeight;
-            rawWeights[i] = weight;
-            totalWeight += weight;
-          }
-          const attributableTokens =
-            totalWeight > 0
-              ? Math.min(
-                Math.max(0, accountedMessageTokens - replyPrimerTokens),
-                Math.round(totalWeight * usageRatio)
-              )
-              : 0;
-          const apportionedTokens =
-            totalWeight > 0
-              ? apportionTokenCounts(
-                rawWeights,
-                attributableTokens / totalWeight,
-                attributableTokens
-              )
-              : {};
-          const attributedByOrigin = providerMessageBaseline.map(
-            (_, origin) => apportionedTokens[origin] || 0
-          );
-          projectedMessageTokens = Math.max(
-            replyPrimerTokens,
-            accountedMessageTokens - attributableTokens
-          );
-          let newRawTokens = 0;
-          const usedOrigins = new Set<number>();
-          for (const message of candidate) {
-            const rawTokens = agentContext.tokenCounter(message);
-            const origin = providerMessageOrigins.get(message);
-            if (origin == null || usedOrigins.has(origin)) {
-              newRawTokens += rawTokens;
-              continue;
-            }
-            usedOrigins.add(origin);
-            projectedMessageTokens += Math.max(
-              0,
-              attributedByOrigin[origin] +
-                Math.round(
-                  (rawTokens - providerMessageBaseline[origin].rawTokens) *
-                    usageRatio
-                )
-            );
-          }
-          projectedMessageTokens += Math.round(newRawTokens * usageRatio);
-        } else {
-          let rawTokens = REPLY_PRIMER_TOKENS;
-          for (const message of candidate) {
-            rawTokens += agentContext.tokenCounter(message);
-          }
-          projectedMessageTokens = Math.round(rawTokens * usageRatio);
-        }
-        return {
-          fits: projectedMessageTokens <= availableMessageTokens,
-          projectedMessageTokens,
-          availableMessageTokens,
-          contextBudget,
-          effectiveInstructionTokens,
-        };
-      };
+      const measureProviderPayload = contextPressure.measure;
 
       const createProviderPayloadOverflowError = ({
         projection,
@@ -3406,7 +3416,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         info,
       }: {
         projection: ReturnType<typeof measureProviderPayload>;
-        provider?: Providers;
+        provider?: t.ProviderName;
         info: string;
       }): ContextOverflowError => {
         const error = new ContextOverflowError(
@@ -3540,17 +3550,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const buildCandidate = (scale: number): BaseMessage[] => {
           const compacted = [...candidate];
           for (const { index, message, chars } of synthetic) {
-            const content = compactToolContent(
-              message.content,
+            compacted[index] = compactSyntheticProviderContextMessage(
+              message,
               Math.floor(chars * scale)
-            ).content;
-            compacted[index] = new HumanMessage({
-              content,
-              id: message.id,
-              name: message.name,
-              additional_kwargs: message.additional_kwargs,
-              response_metadata: message.response_metadata,
-            });
+            );
           }
           return compacted;
         };
@@ -3684,7 +3687,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * drop messages, so coalescing has to see its output, and it is the
        * last shaping step before the cache breakpoint is chosen.
        */
-      if (strictAlternationProviders.has(agentContext.provider)) {
+      if (providerRequiresStrictAlternation(agentContext.provider)) {
         /**
          * Wrapped like every other provider transform: the merged message is
          * a NEW object, and without re-attachment the final pre-invoke
@@ -3760,10 +3763,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         finalMessages = trackProviderMessageOrigins(
           beforeSanitizeMessages,
           sanitizeOrphanToolBlocks(beforeSanitizeMessages, (source, clone) => {
-            const origin = providerMessageOrigins.get(source);
-            if (origin != null) {
-              providerMessageOrigins.set(clone, origin);
-            }
+            contextPressure.trackClone(source, clone);
           })
         );
         if (finalMessages.length !== beforeSanitize) {
@@ -3836,23 +3836,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       const fallbackBaseMessages = finalMessages;
       const beforeFinalProviderProjection = fallbackBaseMessages;
-      finalMessages = trackProviderMessageOrigins(
-        beforeFinalProviderProjection,
-        projectMessagesForProvider({
-          model: (this.overrideModel ?? model) as t.ChatModel,
-          messages: beforeFinalProviderProjection,
-          provider: agentContext.provider,
-          maxToolResultChars: maxProviderToolResultChars,
-          callOptions: config,
-        })
-      );
+      const preparedRequest = prepareProviderRequest({
+        model: (this.overrideModel ?? model) as t.ChatModel,
+        messages: beforeFinalProviderProjection,
+        provider: agentContext.provider,
+        context: this,
+        config,
+        maxToolResultChars: maxProviderToolResultChars,
+        measure: (preparedMessages) =>
+          measureProviderPayload(
+            trackProviderMessageOrigins(
+              beforeFinalProviderProjection,
+              preparedMessages
+            )
+          ),
+      });
+      finalMessages = preparedRequest.messages;
 
       /**
        * Prompt-cache placement and orphan sanitization are provider-wire
        * transforms too. Re-measure after both so no content added after the
        * earlier artifact/synthetic compaction decision can bypass the guard.
        */
-      finalProjection = measureProviderPayload(finalMessages);
+      finalProjection =
+        preparedRequest.measurement ?? measureProviderPayload(finalMessages);
       const preInvokeContextOverflowError = !finalProjection.fits
         ? createProviderPayloadOverflowError({
           projection: finalProjection,
@@ -3981,6 +3988,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         parentMessageId: config.configurable?.requestBody?.parentMessageId,
         agentId,
         agentName: agentContext.name,
+        rootAgentId: this.defaultAgentId,
+        rootAgentName: this.agentContexts.get(this.defaultAgentId)?.name,
+        activeAgentId: agentId,
+        activeAgentName: agentContext.name,
+        endpoint: agentContext.endpoint,
       });
       let langfuseHandler: CallbackEntry | undefined;
       let invokeConfig = {
@@ -4010,6 +4022,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           tags: ['librechat', 'agent'],
           traceIdSeed:
             langfuse?.deterministicTraceId === true ? this.runId : undefined,
+          traceAnchor: this.langfuseTraceAnchor,
+          agentId,
           runId: this.langfuseScopeRunId,
           toolOutputTracing: hasToolOutputTracingConfig(
             this.langfuse,
@@ -4052,16 +4066,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,
             langfuseOverlay: agentContext.langfuse,
+            traceAnchor: this.langfuseTraceAnchor,
             runId: this.langfuseScopeRunId,
             agentId,
           }),
           () =>
             attemptInvoke(
               {
-                model: (this.overrideModel ?? model) as t.ChatModel,
-                messages: finalMessages,
-                provider: agentContext.provider,
+                request: preparedRequest,
                 context: this,
+                preemptAgentId: agentId,
               },
               invokeConfig
             )
@@ -4113,6 +4127,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          */
         const estimatedPromptTokens = getEstimatedPromptTokens(contextUsage);
 
+        const recencyTokenCounter =
+          agentContext.contextPressureTokenCounts?.count ??
+          agentContext.tokenCounter;
         const canSummarizeOverflow =
           agentContext.summarizationEnabled === true &&
           splitAtRecencyBoundary(messages, {
@@ -4120,7 +4137,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               agentContext.summarizationConfig?.retainRecent?.turns ??
               DEFAULT_RETAIN_RECENT_TURNS,
             tokens: agentContext.summarizationConfig?.retainRecent?.tokens,
-            tokenCounter: agentContext.tokenCounter,
+            tokenCounter: recencyTokenCounter,
+            intraTurnTokens: resolveIntraTurnRetainTokens({
+              tokens: agentContext.summarizationConfig?.retainRecent?.tokens,
+              maxContextTokens: agentContext.maxContextTokens,
+            }),
           }).head.length > 0;
 
         const getLocalProviderOverflowMeasurement = (
@@ -4253,6 +4274,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 config: invokeConfig,
                 primaryError,
                 context: this,
+                preemptAgentId: agentId,
                 /**
                  * Lets the chain recognise a fallback overflow whose signature
                  * carries no reason of its own (Vertex AI's bare 400) and
@@ -4263,7 +4285,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
                   maxContextTokens: agentContext.maxContextTokens,
                 },
-                prepareProviderMessages: ({
+                prepareProviderRequest: ({
                   model: fallbackModel,
                   messages: fallbackMessages,
                   provider: fallbackProvider,
@@ -4275,36 +4297,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                     calculateMaxToolResultChars(
                       fallbackMaxContextTokens ?? agentContext.maxContextTokens
                     );
-                  /**
-                   * Serving-provider cue shaping BEFORE the fallback payload
-                   * is measured: a Claude fallback behind a tolerant primary
-                   * gains the cue inside the guarded projection (a prompt
-                   * within the cue's cost of the fallback budget must take
-                   * the recovery path, not ship oversized), and a tolerant
-                   * fallback behind an Anthropic primary sheds the baked cue
-                   * before it is measured against the tighter budget. The
-                   * attemptInvoke funnel pass then finds nothing to change.
-                   */
-                  const cueShapedFallbackMessages = trackProviderMessageOrigins(
-                    fallbackMessages,
-                    isAnthropicLike(fallbackProvider, {
-                      model: resolveServingModelId(fallbackModel),
-                    })
-                      ? appendPredecessorHandoffCue(fallbackMessages, (m) =>
-                        this.isRunProducedMessage(m)
-                      )
-                      : removePredecessorHandoffCue(fallbackMessages)
-                  );
-                  const projectedFallbackMessages = trackProviderMessageOrigins(
-                    cueShapedFallbackMessages,
-                    projectMessagesForProvider({
-                      model: fallbackModel,
-                      messages: cueShapedFallbackMessages,
-                      provider: fallbackProvider,
-                      maxToolResultChars: fallbackToolResultChars,
-                      callOptions: fallbackConfig,
-                    })
-                  );
                   const primaryContextBudget = contextUsage?.contextBudget;
                   const fallbackContextBudget =
                     fallbackMaxContextTokens == null
@@ -4313,11 +4305,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                         primaryContextBudget ?? fallbackMaxContextTokens,
                         fallbackMaxContextTokens
                       );
-                  const projection = measureProviderPayload(
-                    projectedFallbackMessages,
-                    fallbackContextBudget,
-                    true
-                  );
+                  const preparedFallbackRequest = prepareProviderRequest({
+                    model: fallbackModel,
+                    messages: fallbackMessages,
+                    provider: fallbackProvider,
+                    context: this,
+                    config: fallbackConfig,
+                    maxToolResultChars: fallbackToolResultChars,
+                    measure: (preparedMessages) =>
+                      measureProviderPayload(
+                        trackProviderMessageOrigins(
+                          fallbackMessages,
+                          preparedMessages
+                        ),
+                        {
+                          contextBudget: fallbackContextBudget,
+                          forceRawRecount: true,
+                        }
+                      ),
+                  });
+                  const projection =
+                    preparedFallbackRequest.measurement ??
+                    measureProviderPayload(preparedFallbackRequest.messages, {
+                      contextBudget: fallbackContextBudget,
+                      forceRawRecount: true,
+                    });
                   if (!projection.fits) {
                     throw createProviderPayloadOverflowError({
                       projection,
@@ -4325,7 +4337,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       info: 'Fallback provider message formatting exceeded the context budget before invocation.',
                     });
                   }
-                  return projectedFallbackMessages;
+                  return preparedFallbackRequest;
                 },
               })
           );
@@ -4550,7 +4562,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           { force: true }
         );
       }
+      const preemptRestarted = this.consumePreemptRestart(agentId);
       if (
+        preemptRestarted ||
         (responseMessage as AIMessageChunk | undefined)?.response_metadata
           .preempted === true
       ) {
@@ -4578,7 +4592,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
            * hosts use the counter for truncated-seal telemetry, and both
            * paths end the turn with nothing to resume from.
            */
-          if (injected.length === 0) {
+          /**
+           * Seals only. `emptyBoundaries` means a kept assistant turn that was
+           * truncated with nothing to resume from; a restart preserved no turn
+           * at all, so a halted one is not that — `preemptIncomplete` above
+           * already records that the answer never arrived.
+           */
+          if (injected.length === 0 && !preemptRestarted) {
             this.preemptEmptyBoundaries += 1;
           }
           this.cleanupSignalListener();
@@ -4592,11 +4612,33 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           return { messages: [...(result.messages ?? []), ...injected] };
         }
         /**
-         * Nothing to inject — the host cancelled or already drained. Do NOT
-         * self-loop: a trailing model turn with no new input is dropped by
-         * some Gemini models and read as prefill by Anthropic. Do NOT pretend
-         * the turn completed either; the answer really was cut short.
+         * Nothing to inject — the host cancelled or already drained.
+         *
+         * After a SEAL, do not self-loop: a trailing model turn with no new
+         * input is dropped by some Gemini models and read as prefill by
+         * Anthropic. Do not pretend the turn completed either; the answer
+         * really was cut short.
+         *
+         * After a RESTART there is no such trailing turn. The discard left
+         * graph state exactly as the model node found it, so returning to the
+         * node re-issues the same call — the only way the run can still
+         * produce an answer, and the honest outcome of an interrupt whose
+         * words were withdrawn before they landed. Bounded by the same seal
+         * budget, so a host stuck arming and cancelling cannot loop forever.
          */
+        if (preemptRestarted) {
+          /**
+           * NOT counted as an empty boundary. That counter means a seal that
+           * ended the turn early with nothing to resume from — hosts read it
+           * as truncated-answer telemetry — and this branch is the opposite:
+           * the call is reissued and the run goes on to produce a complete
+           * answer. Counting it here would make a successful restart look like
+           * a truncated one in every host that persists on that signal.
+           */
+          this.pendingPreemptReturn.add(agentId);
+          this.cleanupSignalListener();
+          return result;
+        }
         this.preemptEmptyBoundaries += 1;
         this.preemptIncomplete = true;
       }
@@ -4709,15 +4751,26 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     );
     if (contexts.length > 0) {
       injected.push(
-        new HumanMessage({
-          content: contexts.join('\n\n'),
-          additional_kwargs: { role: 'system', isMeta: true, source: 'hook' },
-        })
+        stampSyntheticProviderMessage(
+          new HumanMessage({
+            content: contexts.join('\n\n'),
+            additional_kwargs: {
+              role: 'system',
+              isMeta: true,
+              source: 'hook',
+            },
+          })
+        )
       );
     }
     if (result.injectedMessages.length > 0) {
       try {
-        injected.push(...convertInjectedMessages(result.injectedMessages));
+        const convertedMessages = convertInjectedMessages(
+          result.injectedMessages
+        );
+        for (const convertedMessage of convertedMessages) {
+          injected.push(convertedMessage);
+        }
       } catch (e) {
         console.warn(
           '[StandardGraph] Failed to convert PreemptBoundary injectedMessages:',
@@ -4789,7 +4842,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           };
           const checkpointer = this.compileOptions?.checkpointer;
           return (request): StandardGraph => {
-            const childGraph = graphFactory(request);
+            const configuredRequest: GraphFactoryRequest =
+              request.kind === 'multi-agent'
+                ? {
+                  kind: 'multi-agent',
+                  input: {
+                    ...request.input,
+                    toolExecution: runtimeConfig.toolExecution,
+                  },
+                }
+                : {
+                  kind: 'standard',
+                  input: {
+                    ...request.input,
+                    toolExecution: runtimeConfig.toolExecution,
+                  },
+                };
+            const childGraph = graphFactory(configuredRequest);
             if (subagentModelOverride != null) {
               childGraph.overrideModel = subagentModelOverride;
               childGraph.setSubagentModelOverride(subagentModelOverride);
@@ -4845,94 +4914,98 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           createChildGraphByKind: createConfiguredChildGraph,
           createDetachedChildGraphFactory: (
             parentHandlerRegistry
-          ): GraphFactory =>
-            snapshotChildGraphFactory(parentHandlerRegistry),
+          ): GraphFactory => snapshotChildGraphFactory(parentHandlerRegistry),
         });
         this.registerSubagentExecutor(executor);
 
-        const subagentTool = tool(async (rawInput, config) => {
-          const input = rawInput as {
-            description?: string;
-            subagent_type?: string;
-            subagent_thread_id?: string;
-            run_in_background?: boolean;
-          };
-          const description =
-            typeof input.description === 'string' &&
-            input.description.trim().length > 0
-              ? input.description
-              : DEFAULT_SUBAGENT_DESCRIPTION;
-          const subagentType =
-            typeof input.subagent_type === 'string' ? input.subagent_type : '';
-          const subagentThreadId =
-            typeof input.subagent_thread_id === 'string' &&
-            input.subagent_thread_id.trim() !== ''
-              ? input.subagent_thread_id.trim()
-              : undefined;
-          const threadId = config.configurable?.thread_id as string | undefined;
-          /** Surface the parent call id so child checkpoints, interrupts, and
-           * update events remain correlated across replay and resume. */
-          const toolRuntime = config as {
-            toolCallId?: string;
-            toolCall?: { id?: string };
-          };
-          const toolCall = toolRuntime.toolCall;
-          let parentToolCallId: string | undefined;
-          if (
-            typeof toolRuntime.toolCallId === 'string' &&
-            toolRuntime.toolCallId !== ''
-          ) {
-            parentToolCallId = toolRuntime.toolCallId;
-          } else if (typeof toolCall?.id === 'string' && toolCall.id !== '') {
-            parentToolCallId = toolCall.id;
-          }
-          /** The parent tool batch's entry-captured scope (stamped by
-           * ToolNode before PreToolUse hooks) — binds this child to the
-           * run that dispatched it, not to whatever controller a reset
-           * installed while the hooks were awaited. */
-          const batchScope = config.configurable?.[
-            RUN_BREAKER_SCOPE_CONFIG_KEY
-          ] as RunBreakerScope | undefined;
-          const executeParams = {
-            description,
-            subagentType,
-            threadId,
-            signal: config.signal,
-            parentToolCallId,
-            breaker: batchScope?.controller,
-            /**
-             * Forward the parent's `configurable` so host-set fields
-             * (`requestBody`, `user`, etc.) propagate into the child
-             * workflow. The executor scrubs run-identity fields before
-             * forwarding — see `SubagentExecuteParams.parentConfigurable`.
-             */
-            parentConfigurable: config.configurable as
-              | Record<string, unknown>
-              | undefined,
-          };
-          if (input.run_in_background === true) {
-            return executor.executeInBackground({
-              ...executeParams,
-              ...(subagentThreadId == null
-                ? {}
-                : { subagentThreadId }),
-            });
-          }
-          if (subagentThreadId != null) {
-            return JSON.stringify({
-              status: 'rejected',
-              tool: Constants.SUBAGENT,
-              message:
-                'Child-thread continuation requires run_in_background.',
-            });
-          }
-          const result = await executor.execute(executeParams);
-          return result.content;
-        }, buildSubagentToolParams(executableConfigs, {
-          background: this.subagentTasks != null,
-          threadContinuation:
-            this.subagentTasks?.store.supportsThreadContinuation === true,
-        }));
+        const subagentTool = tool(
+          async (rawInput, config) => {
+            const input = rawInput as {
+              description?: string;
+              subagent_type?: string;
+              subagent_thread_id?: string;
+              run_in_background?: boolean;
+            };
+            const description =
+              typeof input.description === 'string' &&
+              input.description.trim().length > 0
+                ? input.description
+                : DEFAULT_SUBAGENT_DESCRIPTION;
+            const subagentType =
+              typeof input.subagent_type === 'string'
+                ? input.subagent_type
+                : '';
+            const subagentThreadId =
+              typeof input.subagent_thread_id === 'string' &&
+              input.subagent_thread_id.trim() !== ''
+                ? input.subagent_thread_id.trim()
+                : undefined;
+            const threadId = config.configurable?.thread_id as
+              | string
+              | undefined;
+            /** Surface the parent call id so child checkpoints, interrupts, and
+             * update events remain correlated across replay and resume. */
+            const toolRuntime = config as {
+              toolCallId?: string;
+              toolCall?: { id?: string };
+            };
+            const toolCall = toolRuntime.toolCall;
+            let parentToolCallId: string | undefined;
+            if (
+              typeof toolRuntime.toolCallId === 'string' &&
+              toolRuntime.toolCallId !== ''
+            ) {
+              parentToolCallId = toolRuntime.toolCallId;
+            } else if (typeof toolCall?.id === 'string' && toolCall.id !== '') {
+              parentToolCallId = toolCall.id;
+            }
+            /** The parent tool batch's entry-captured scope (stamped by
+             * ToolNode before PreToolUse hooks) — binds this child to the
+             * run that dispatched it, not to whatever controller a reset
+             * installed while the hooks were awaited. */
+            const batchScope = config.configurable?.[
+              RUN_BREAKER_SCOPE_CONFIG_KEY
+            ] as RunBreakerScope | undefined;
+            const executeParams = {
+              description,
+              subagentType,
+              threadId,
+              signal: config.signal,
+              parentToolCallId,
+              breaker: batchScope?.controller,
+              /**
+               * Forward the parent's `configurable` so host-set fields
+               * (`requestBody`, `user`, etc.) propagate into the child
+               * workflow. The executor scrubs run-identity fields before
+               * forwarding — see `SubagentExecuteParams.parentConfigurable`.
+               */
+              parentConfigurable: config.configurable as
+                | Record<string, unknown>
+                | undefined,
+            };
+            if (input.run_in_background === true) {
+              return executor.executeInBackground({
+                ...executeParams,
+                ...(subagentThreadId == null ? {} : { subagentThreadId }),
+              });
+            }
+            if (subagentThreadId != null) {
+              return JSON.stringify({
+                status: 'rejected',
+                tool: Constants.SUBAGENT,
+                message:
+                  'Child-thread continuation requires run_in_background.',
+              });
+            }
+            const result = await executor.execute(executeParams);
+            return result.content;
+          },
+          buildSubagentToolParams(executableConfigs, {
+            background: this.subagentTasks != null,
+            threadContinuation:
+              this.subagentTasks?.store.supportsThreadContinuation === true,
+          })
+        );
         const replayableSubagentTool = subagentTool as typeof subagentTool &
           ReplayableSubagentTool;
         replayableSubagentTool[SUBAGENT_REPLAY_CONTROLLER] = {
@@ -5017,16 +5090,35 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (state.summarizationRequest != null) {
         return summarizeNode;
       }
-      return toolsCondition(
+      const decision = toolsCondition(
         state as t.BaseGraphState,
         toolNode,
         this.invokedToolIds
       );
+      /**
+       * `toolsCondition` only looks at `tool_calls` — a plain-text/reasoning
+       * turn cut off by the output token ceiling has none, so it reads as an
+       * ordinary finished turn and routes here to END. Flag it so hosts can
+       * tell a genuinely finished answer from one the model never got to
+       * complete. See `outputTruncatedIncomplete` for why this stays clear
+       * of the preempt/seal halt fields.
+       */
+      if (decision === END) {
+        const { messages } = state as t.BaseGraphState;
+        const lastMessage = messages[messages.length - 1];
+        if (getTruncationStopReason(lastMessage) != null) {
+          this.outputTruncatedIncomplete = true;
+        }
+      }
+      return decision;
     };
 
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
-        reducer: messagesStateReducer,
+        reducer: (a, b) => {
+          agentContext.invalidateProviderProjectionForMessageUpdates(b);
+          return messagesStateReducer(a, b);
+        },
         default: () => [],
       }),
       summarizationRequest: Annotation<t.SummarizationNodeInput | undefined>({
@@ -5072,6 +5164,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             runId: this.runId,
             isMultiAgent: this.isMultiAgentGraph(),
             hookRegistry: this.hookRegistry,
+            getToolsForBinding: (
+              provider: t.ProviderName,
+              clientOptions: t.ClientOptions | undefined
+            ): t.GraphTools | undefined =>
+              this.getPreparedToolsForBinding(
+                agentContext,
+                provider,
+                clientOptions
+              ),
             /**
              * Live references (both maps are cleared in place, never
              * replaced), so summarization streams share the run's event
@@ -5218,7 +5319,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       .addEdge(summarizeNode, agentNode)
       .addEdge(toolNode, agentContext.toolEnd ? END : agentNode);
 
-    return workflow.compile();
+    return workflow.compile({ name: STANDARD_GRAPH_RUN_NAME });
   }
 
   createWorkflow(): t.CompiledStateWorkflow {
@@ -5247,11 +5348,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         >,
         { ends: [END] }
       )
-      .addEdge(START, this.defaultAgentId)
-      // LangGraph compile() types are overly strict for opt-in options
-      .compile(this.compileOptions as unknown as never);
+      .addEdge(START, this.defaultAgentId);
 
-    return workflow;
+    // LangGraph compile() types are overly strict for opt-in options
+    return workflow.compile({
+      ...this.compileOptions,
+      name: STANDARD_GRAPH_RUN_NAME,
+    } as unknown as never);
   }
 
   /**

@@ -29,6 +29,10 @@ import {
   _convertMessagesToOpenAIParams,
   _convertMessagesToOpenAIResponsesParams,
 } from '@/llm/openai/utils';
+import {
+  getProviderMessageProvenance,
+  setProviderMessageProvenance,
+} from './provenance';
 import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { Constants, ContentTypes, Providers } from '@/common';
 import { serializeToolContent } from '@/utils/toolContent';
@@ -137,6 +141,7 @@ describe('formatAgentMessages', () => {
       { role: 'user', content: 'Old user message' },
       { role: 'assistant', content: 'Old assistant message' },
       {
+        messageId: 'summary-boundary-row',
         role: 'assistant',
         content: [
           { type: ContentTypes.TEXT, text: 'Covered by summary' },
@@ -169,6 +174,16 @@ describe('formatAgentMessages', () => {
     ).toMatchObject({
       type: ContentTypes.TEXT,
       text: 'Preserved tail',
+    });
+    expect(result.messages[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'model',
+          sourceMessageId: 'summary-boundary-row',
+          sourceContentPartIndices: [2],
+        },
+      ],
     });
     expect(result.indexTokenCountMap?.[0]).toBeLessThan(18);
     expect(result.indexTokenCountMap?.[0]).toBeGreaterThan(0);
@@ -751,6 +766,7 @@ describe('formatAgentMessages', () => {
         content: 'Search first, then calculate 19 * 23.',
       },
       {
+        messageId: 'server-tool-row',
         role: 'assistant',
         content: [
           {
@@ -834,6 +850,34 @@ describe('formatAgentMessages', () => {
     expect(serverToolUseIndex).toBeGreaterThanOrEqual(0);
     expect(serverResultIndex).toBeGreaterThan(serverToolUseIndex);
     expect(calculatorToolUseIndex).toBeGreaterThan(serverResultIndex);
+    const serverResultMessage = messages.find(
+      (message) =>
+        message instanceof AIMessage &&
+        Array.isArray(message.content) &&
+        (message.content as MessageContentComplex[]).some(
+          (block) => block.type === 'web_search_tool_result'
+        )
+    );
+    expect(serverResultMessage?.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'model',
+          sourceMessageId: 'server-tool-row',
+          sourceContentPartIndices: [0, 1],
+        },
+        {
+          attribution: 'tool',
+          sourceMessageId: 'server-tool-row',
+          sourceContentPartIndices: [2],
+        },
+        {
+          attribution: 'model',
+          sourceMessageId: 'server-tool-row',
+          sourceContentPartIndices: [3, 4],
+        },
+      ],
+    });
     expect(
       messages.some(
         (message) =>
@@ -1051,6 +1095,19 @@ describe('formatAgentMessages', () => {
 
     expect(serverToolUseIndex).toBeGreaterThanOrEqual(0);
     expect(serverResultIndex).toBeGreaterThan(serverToolUseIndex);
+    expect(
+      messages.flatMap(
+        (message) =>
+          getProviderMessageProvenance(message)?.parts.filter((part) =>
+            part.sourceContentPartIndices?.includes(1) === true
+          ) ?? []
+      )
+    ).toEqual([
+      {
+        attribution: 'model',
+        sourceContentPartIndices: [0, 1, 2],
+      },
+    ]);
     expect(
       messages.some(
         (message) =>
@@ -1611,6 +1668,89 @@ describe('formatAgentMessages', () => {
     expect(formattedMessages).not.toBe(originalMessages);
   });
 
+  it('adds unindexed tool lineage only when Anthropic artifact bytes survive projection', () => {
+    const toolMessage = new ToolMessage({
+      content: [{ type: ContentTypes.TEXT, text: 'base' }],
+      tool_call_id: 'call_artifact_lineage',
+      name: 'render',
+      additional_kwargs: {
+        provenance: {
+          version: 1,
+          parts: [
+            {
+              attribution: 'tool',
+              sourceMessageId: 'stored-tool-row',
+              sourceContentPartIndices: [3],
+            },
+          ],
+        },
+        sourceMessageId: 'stored-tool-row',
+        sourceMessageIds: ['stored-tool-row'],
+      },
+      artifact: {
+        content: [{ type: ContentTypes.TEXT, text: 'artifact' }],
+      },
+    });
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_artifact_lineage',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      toolMessage,
+    ];
+
+    const projected = projectAnthropicArtifactContent(messages, 100);
+    const projectedTool = projected[1] as ToolMessage;
+
+    expect(getProviderMessageProvenance(projectedTool)?.parts).toEqual([
+      {
+        attribution: 'tool',
+        sourceMessageId: 'stored-tool-row',
+        sourceContentPartIndices: [3],
+      },
+      { attribution: 'tool', sourceMessageId: 'stored-tool-row' },
+    ]);
+    expect(projectedTool.lc_kwargs.additional_kwargs).toBe(
+      projectedTool.additional_kwargs
+    );
+    expect(getProviderMessageProvenance(toolMessage)?.parts).toEqual([
+      {
+        attribution: 'tool',
+        sourceMessageId: 'stored-tool-row',
+        sourceContentPartIndices: [3],
+      },
+    ]);
+
+    const capped = projectAnthropicArtifactContent(messages, 4)[1];
+    expect(getProviderMessageProvenance(capped)?.parts).toEqual([
+      {
+        attribution: 'tool',
+        sourceMessageId: 'stored-tool-row',
+        sourceContentPartIndices: [3],
+      },
+    ]);
+
+    formatAnthropicArtifactContent(messages);
+    expect(getProviderMessageProvenance(toolMessage)?.parts).toEqual([
+      {
+        attribution: 'tool',
+        sourceMessageId: 'stored-tool-row',
+        sourceContentPartIndices: [3],
+      },
+      { attribution: 'tool', sourceMessageId: 'stored-tool-row' },
+    ]);
+    expect(toolMessage.lc_kwargs.additional_kwargs).toBe(
+      toolMessage.additional_kwargs
+    );
+  });
+
   it('caps Anthropic artifact expansion after pruning', () => {
     const toolMessage = new ToolMessage({
       content: 'short result',
@@ -1662,6 +1802,20 @@ describe('formatAgentMessages', () => {
       new ToolMessage({
         content: 'short result',
         tool_call_id: 'call_artifact_payload',
+        additional_kwargs: {
+          sourceMessageId: 'stored-tool-row',
+          sourceMessageIds: ['stored-tool-row'],
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'tool',
+                sourceMessageId: 'stored-tool-row',
+                sourceContentPartIndices: [3],
+              },
+            ],
+          },
+        },
         artifact: {
           content: [
             { type: ContentTypes.TEXT, text: 'artifact'.repeat(1_000) },
@@ -1679,7 +1833,285 @@ describe('formatAgentMessages', () => {
     );
     expect(messages).toHaveLength(2);
     expect((messages[1] as ToolMessage).content).toBe('short result');
+    expect(formatted[1].additional_kwargs).not.toBe(
+      messages[1].additional_kwargs
+    );
+    expect(messages[1].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'tool',
+          sourceMessageId: 'stored-tool-row',
+          sourceContentPartIndices: [3],
+        },
+      ],
+    });
+    expect(payload.additional_kwargs.sourceMessageIds).toEqual([
+      'stored-tool-row',
+    ]);
+    expect(payload.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'tool',
+          sourceMessageId: 'stored-tool-row',
+          sourceContentPartIndices: [3],
+        },
+        {
+          attribution: 'tool',
+          sourceMessageId: 'stored-tool-row',
+        },
+      ],
+    });
     expect(projectArtifactPayload(formatted, 200)).toBe(formatted);
+  });
+
+  it('stamps only artifact source parts that survive the aggregate cap', () => {
+    const createToolMessage = (
+      toolCallId: string,
+      sourceMessageId: string,
+      content: ToolMessage['content'],
+      artifact: string,
+      sourceContentPartIndices: number[]
+    ): ToolMessage =>
+      new ToolMessage({
+        content,
+        tool_call_id: toolCallId,
+        artifact: { content: artifact },
+        additional_kwargs: {
+          sourceMessageId,
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'tool',
+                sourceMessageId,
+                sourceContentPartIndices,
+              },
+            ],
+          },
+        },
+      });
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          { id: 'first', name: 'render', args: {}, type: 'tool_call' },
+          { id: 'second', name: 'render', args: {}, type: 'tool_call' },
+        ],
+      }),
+      createToolMessage(
+        'first',
+        'first-row',
+        [
+          { type: ContentTypes.TEXT, text: 'A'.repeat(1_000) },
+          { type: ContentTypes.TEXT, text: 'OMITTED-FIRST-PART' },
+        ],
+        'omitted first artifact',
+        [0, 1]
+      ),
+      createToolMessage(
+        'second',
+        'second-row',
+        'OMITTED-SECOND-RESULT',
+        'omitted second artifact',
+        [0]
+      ),
+    ];
+
+    const formatted = projectArtifactPayload(messages, 80);
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+    const payloadText = serializeToolContent(payload.content);
+
+    expect(payloadText).not.toContain('OMITTED-FIRST-PART');
+    expect(payloadText).not.toContain('OMITTED-SECOND-RESULT');
+    expect(payload.additional_kwargs.sourceMessageIds).toEqual(['first-row']);
+    expect(payload.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'tool',
+          sourceMessageId: 'first-row',
+          sourceContentPartIndices: [0],
+        },
+      ],
+    });
+  });
+
+  it.each([
+    ['duplicate', [[0], [0]]],
+    ['gapped/out-of-range', [[0], [2]]],
+    ['reordered', [[1], [0]]],
+  ])(
+    'handles a %s artifact mapping without ordinal lineage loss',
+    (mappingKind, sourceContentPartIndices) => {
+      const messages = [
+        new AIMessageChunk({
+          content: '',
+          tool_calls: [
+            { id: 'ambiguous', name: 'render', args: {}, type: 'tool_call' },
+          ],
+        }),
+        new ToolMessage({
+          content: [
+            { type: ContentTypes.TEXT, text: 'A'.repeat(1_000) },
+            { type: ContentTypes.TEXT, text: 'OMITTED-SECOND' },
+          ],
+          tool_call_id: 'ambiguous',
+          artifact: { content: 'omitted artifact' },
+          additional_kwargs: {
+            sourceMessageIds: ['first-row', 'second-row'],
+            provenance: {
+              version: 1,
+              parts: [
+                {
+                  attribution: 'model',
+                  sourceMessageId: 'first-row',
+                  sourceContentPartIndices: sourceContentPartIndices[0],
+                },
+                {
+                  attribution: 'user',
+                  sourceMessageId: 'second-row',
+                  sourceContentPartIndices: sourceContentPartIndices[1],
+                },
+              ],
+            },
+          },
+        }),
+      ];
+
+      const formatted = projectArtifactPayload(messages, 80);
+      const payload = formatted[formatted.length - 1] as HumanMessage;
+
+      expect(serializeToolContent(payload.content)).not.toContain(
+        'OMITTED-SECOND'
+      );
+      expect(payload.additional_kwargs.sourceMessageIds).toEqual(
+        mappingKind === 'reordered' ? ['second-row'] : undefined
+      );
+      expect(payload.additional_kwargs.provenance).toEqual({
+        version: 1,
+        parts:
+          mappingKind === 'reordered'
+            ? [
+              {
+                attribution: 'tool',
+                sourceMessageId: 'second-row',
+                sourceContentPartIndices: [0],
+              },
+            ]
+            : [{ attribution: 'tool' }],
+      });
+    }
+  );
+
+  it('skips empty artifact blocks without dropping later visible blocks', () => {
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          { id: 'empty-first', name: 'render', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: [
+          { type: ContentTypes.TEXT, text: '' },
+          { type: ContentTypes.TEXT, text: 'SECOND-BLOCK' },
+        ],
+        tool_call_id: 'empty-first',
+        artifact: { content: 'ARTIFACT' },
+        additional_kwargs: {
+          sourceMessageId: 'tool-row',
+          provenance: {
+            version: 1,
+            parts: [
+              {
+                attribution: 'tool',
+                sourceMessageId: 'tool-row',
+                sourceContentPartIndices: [0, 1],
+              },
+            ],
+          },
+        },
+      }),
+    ];
+
+    const formatted = projectArtifactPayload(messages, 1_000);
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+
+    expect(serializeToolContent(payload.content)).toContain('SECOND-BLOCK');
+    expect(serializeToolContent(payload.content)).toContain('ARTIFACT');
+    expect(payload.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'tool',
+          sourceMessageId: 'tool-row',
+          sourceContentPartIndices: [1],
+        },
+        { attribution: 'tool', sourceMessageId: 'tool-row' },
+      ],
+    });
+  });
+
+  it('drops ambiguous legacy source ids after partial artifact compaction', () => {
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          { id: 'legacy', name: 'render', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: [
+          { type: ContentTypes.TEXT, text: 'A'.repeat(1_000) },
+          { type: ContentTypes.TEXT, text: 'OMITTED-SECOND' },
+        ],
+        tool_call_id: 'legacy',
+        artifact: { content: 'omitted artifact' },
+        additional_kwargs: { sourceMessageIds: ['first-row', 'second-row'] },
+      }),
+    ];
+
+    const formatted = projectArtifactPayload(messages, 80);
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+
+    expect(serializeToolContent(payload.content)).not.toContain(
+      'OMITTED-SECOND'
+    );
+    expect(payload.additional_kwargs.sourceMessageIds).toBeUndefined();
+    expect(payload.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [{ attribution: 'tool' }],
+    });
+  });
+
+  it('drops ambiguous source ids after partial scalar artifact projection', () => {
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          { id: 'scalar', name: 'render', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'A'.repeat(1_000),
+        tool_call_id: 'scalar',
+        artifact: { content: 'omitted artifact' },
+        additional_kwargs: {
+          sourceMessageIds: ['first-row', 'second-row'],
+        },
+      }),
+    ];
+
+    const formatted = projectArtifactPayload(messages, 80);
+    const payload = formatted[formatted.length - 1] as HumanMessage;
+
+    expect(payload.additional_kwargs.sourceMessageIds).toBeUndefined();
+    expect(payload.additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [{ attribution: 'tool' }],
+    });
   });
 
   it('bounds artifact block arrays without spreading them into call arguments', () => {
@@ -4587,6 +5019,39 @@ describe('formatAgentMessages', () => {
     ]);
   });
 
+  it('marks a provider-only computer screenshot omission as synthetic', () => {
+    const computerOutput = new ToolMessage({
+      content: 'data:image/png;base64,AA==',
+      tool_call_id: 'call_computer_omitted',
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+    setProviderMessageProvenance(computerOutput, [
+      {
+        attribution: 'tool',
+        sourceMessageId: 'computer-output-row',
+        sourceContentPartIndices: [0],
+      },
+    ]);
+
+    const messages = [computerOutput];
+    const projected = projectComputerCallOutputsToText(messages);
+
+    expect(projected).not.toBe(messages);
+    expect(projected[0].content).toBe(
+      '[Computer screenshot omitted for this provider]'
+    );
+    expect(getProviderMessageProvenance(projected[0])?.parts).toEqual([
+      { attribution: 'synthetic' },
+    ]);
+    expect(getProviderMessageProvenance(computerOutput)?.parts).toEqual([
+      {
+        attribution: 'tool',
+        sourceMessageId: 'computer-output-row',
+        sourceContentPartIndices: [0],
+      },
+    ]);
+  });
+
   it('canonicalizes real OpenAI file-backed computer screenshots on the production converter path', () => {
     const computerCall = new AIMessage({
       content: '',
@@ -5019,16 +5484,16 @@ describe('formatAgentMessages', () => {
     expect(toolMessages[2].name).toBe('list_commits_mcp_github');
   });
 
-  it('should convert invalid tools to string while keeping valid tools as ToolMessages', () => {
+  it('omits invalid tools while keeping valid tools as ToolMessages', () => {
     /**
      * This test documents the hybrid behavior:
      * - Valid tools remain as proper AIMessage + ToolMessage structures
-     * - Invalid tools are converted to string and appended to text content
-     *   (preserving context without losing information)
+     * - Invalid tools and their outputs are omitted from model context
      */
     const tools = new Set(['calculator']);
     const payload = [
       {
+        messageId: 'filtered-tool-row',
         role: 'assistant',
         content: [
           {
@@ -5072,12 +5537,58 @@ describe('formatAgentMessages', () => {
     );
     expect((result.messages[1] as ToolMessage).name).toBe('calculator');
 
-    /** The invalid tool should be converted to string in the content */
+    /** The invalid tool output must not become assistant-authored content */
     const aiContent = result.messages[0].content;
     const aiContentStr =
       typeof aiContent === 'string' ? aiContent : JSON.stringify(aiContent);
-    expect(aiContentStr).toContain('some_unknown_tool');
-    expect(aiContentStr).toContain('This is the result from unknown tool');
+    expect(aiContentStr).not.toContain('some_unknown_tool');
+    expect(aiContentStr).not.toContain('This is the result from unknown tool');
+    expect(result.messages[0].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'model',
+          sourceMessageId: 'filtered-tool-row',
+          sourceContentPartIndices: [0, 1],
+        },
+      ],
+    });
+    expect(result.messages[1].additional_kwargs.provenance).toEqual({
+      version: 1,
+      parts: [
+        {
+          attribution: 'tool',
+          sourceMessageId: 'filtered-tool-row',
+          sourceContentPartIndices: [1],
+        },
+      ],
+    });
+  });
+
+  it('omits an output-less unavailable tool call', () => {
+    const { messages } = formatAgentMessages(
+      [
+        {
+          role: 'assistant',
+          messageId: 'output-less-filtered-tool-row',
+          content: [
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'unavailable-tool',
+                name: 'unavailable_tool',
+                args: '{}',
+                output: '',
+              },
+            },
+          ],
+        },
+      ],
+      undefined,
+      new Set(['available_tool'])
+    );
+
+    expect(messages).toHaveLength(0);
   });
 
   it('should simulate realistic deferred tools flow with tool_search', () => {

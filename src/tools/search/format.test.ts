@@ -240,3 +240,46 @@ describe('formatResultsForLLM highlight budget', () => {
     expect(output).toContain('_[1 additional highlight omitted to fit the context budget');
   });
 });
+
+describe('formatResultsForLLM on a failed search', () => {
+  test.each([null, undefined])('handles %p result data', (results) => {
+    expect(formatResultsForLLM(0, results).output).toBe(
+      'Search failed: Search provider returned no result data'
+    );
+  });
+
+  test('tells the model the search failed instead of returning an empty output', () => {
+    const results: t.SearchResultData = {
+      organic: [],
+      topStories: [],
+      images: [],
+      videos: [],
+      news: [],
+      relatedSearches: [],
+      error: 'search provider request failed',
+    };
+
+    const { output, references } = formatResultsForLLM(0, results, 50000);
+
+    expect(output).toBe('Search failed: search provider request failed');
+    expect(references).toEqual([]);
+  });
+
+  test('keeps any partial results after the failure notice', () => {
+    const results: t.SearchResultData = {
+      organic: [makeOrganic('https://a.com', [highlight('A')])],
+      error: 'news lookup failed',
+    };
+
+    const { output } = formatResultsForLLM(0, results, 50000);
+
+    expect(output).toMatch(/^Search failed: news lookup failed/);
+    expect(output).toContain('=== Web Results, Turn 0 ===');
+  });
+
+  test('ignores an empty-string error', () => {
+    const results: t.SearchResultData = { organic: [], error: '' };
+
+    expect(formatResultsForLLM(0, results, 50000).output).toBe('');
+  });
+});

@@ -2,30 +2,42 @@
 import { nanoid } from 'nanoid';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
-import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
-import {
-  Command,
-  INTERRUPT,
-  MemorySaver,
-  isInterrupted,
-} from '@langchain/langgraph';
 import {
   AIMessage,
   BaseMessage,
   HumanMessage,
   SystemMessage,
 } from '@langchain/core/messages';
+import {
+  Command,
+  INTERRUPT,
+  MemorySaver,
+  Overwrite,
+  isInterrupted,
+} from '@langchain/langgraph';
 import type {
   MessageContentComplex,
   UsageMetadata,
 } from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import { isFadingTier } from '@/messages/fading';
+import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import type { StandardGraph } from '@/graphs/Graph';
-import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
+import {
+  Callback,
+  GraphEvents,
+  TitleMethod,
+  ACTIVITY_LABEL_RUN_NAME,
+  REASONING_LABEL_RUN_NAME,
+  ACTIVITY_PHASE_RUN_NAME,
+  ACTIVITY_PHASE_LABEL_RUN_NAME,
+  DEFAULT_MAX_STOP_CONTINUATIONS,
+  DEFAULT_RECURSION_LIMIT,
+} from '@/common';
 import {
   requireValidSubagentResumeManifest,
   stripSubagentResumeManifest,
@@ -59,6 +71,10 @@ import {
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import {
+  resolveLangfuseDestinationKey,
+  resolveLangfuseTraceAnchorParent,
+} from '@/langfuseSpanRegistry';
+import {
   appendCallbacks,
   filterCallbacks,
   findCallback,
@@ -73,26 +89,35 @@ import {
   stripRunStepResumeState,
 } from '@/tools/runStepResume';
 import {
-  Callback,
-  GraphEvents,
-  TitleMethod,
-  DEFAULT_RECURSION_LIMIT,
-} from '@/common';
-import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
+import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
+import { stampSyntheticProviderMessage } from '@/messages/provenance';
+import { isOpenAILike, isLibreChatOpenAIModel } from '@/utils/llm';
+import { executeHooks, mergeAggregatedHookResults } from '@/hooks';
+import { convertInjectedMessages } from '@/messages/injected';
 import { initializeLangfuseTracing } from './instrumentation';
 import { seedRunInitialSessions } from '@/utils/toolSessions';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
+import { resolveClientOptionsModel } from '@/llm/request';
 import { createGraph } from '@/graphs/createGraph';
 import { resolveMaxSeals } from '@/llm/preempt';
+import { isBuiltRuntime } from '@/lazyRequire';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
-import { isOpenAILike } from '@/utils/llm';
-import { executeHooks } from '@/hooks';
+
+/** Source-mode runs have no dist siblings for the lazy-loading seam, so every
+ *  lazily loadable module is imported through the active loader before the
+ *  first model resolves. The built package never enters this branch. */
+async function ensureSourceModeProviders(): Promise<void> {
+  if (isBuiltRuntime()) {
+    return;
+  }
+  await import('@/llm/providers.eager');
+}
 
 export const defaultOmitOptions = new Set([
   'stream',
@@ -110,6 +135,61 @@ export const defaultOmitOptions = new Set([
 const ACTIVITY_LABEL_TRACE_NAME = 'LibreChat Activity Label';
 const ACTIVITY_PHASE_TRACE_NAME = 'LibreChat Activity Phase';
 const REASONING_LABEL_TRACE_NAME = 'LibreChat Reasoning Label';
+const OUTPUT_TRUNCATED_HALT_REASON = 'output_truncated';
+
+function resolveMaxStopContinuations(value: number | undefined): number {
+  if (value == null || !Number.isFinite(value)) {
+    return DEFAULT_MAX_STOP_CONTINUATIONS;
+  }
+  return Math.max(0, Math.floor(value));
+}
+
+function materializeStopContinuation(
+  result: AggregatedHookResult
+): BaseMessage[] {
+  const messages: BaseMessage[] = [];
+  const contexts = result.additionalContexts.filter(
+    (context) => context.trim() !== ''
+  );
+  if (contexts.length > 0) {
+    messages.push(
+      stampSyntheticProviderMessage(
+        new HumanMessage({
+          content: contexts.join('\n\n'),
+          additional_kwargs: {
+            role: 'system',
+            isMeta: true,
+            source: 'hook',
+          },
+        })
+      )
+    );
+  }
+  messages.push(...convertInjectedMessages(result.injectedMessages));
+  return messages;
+}
+
+function advanceCheckpointCursor(
+  config: t.RunStreamConfig
+): t.RunStreamConfig {
+  const configurable = { ...config.configurable };
+  delete configurable.checkpoint_id;
+  delete configurable.checkpoint_map;
+  return { ...config, configurable };
+}
+
+function assertFinalAdmissionSucceeded(result: AggregatedHookResult): void {
+  if (result.hasHookFailures !== true && result.errors.length === 0) {
+    return;
+  }
+  const detail =
+    result.errors.length > 0
+      ? result.errors.join('; ')
+      : 'one or more internal finalizers failed';
+  throw new Error(
+    `StopFinalize terminal admission failed: ${detail}`
+  );
+}
 
 const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_AGENT_UPDATE,
@@ -207,7 +287,10 @@ function getInterruptHookSessionId(payload: unknown): string | undefined {
 
 type InterruptStateSnapshot = {
   config?: RunnableConfig;
-  values?: { messages?: BaseMessage[] };
+  values?: {
+    messages?: BaseMessage[];
+    runStepState?: t.RunStepResumeState;
+  };
   tasks?: Array<{
     interrupts?: Array<{ id?: string; value?: unknown }>;
     state?: RunnableConfig | InterruptStateSnapshot;
@@ -220,9 +303,78 @@ type WorkflowWithStateHistory = {
     options?: { subgraphs?: boolean }
   ): Promise<InterruptStateSnapshot>;
   getStateHistory?(
-    config: RunnableConfig
+    config: RunnableConfig,
+    options?: { filter?: Record<string, unknown>; limit?: number }
   ): AsyncIterableIterator<InterruptStateSnapshot>;
 };
+
+async function resolveCompletedSegmentConfig(
+  workflow: t.CompiledStateWorkflow,
+  config: t.RunStreamConfig,
+  executionId: string,
+  streamSegment: number
+): Promise<t.RunStreamConfig> {
+  const stateWorkflow = workflow as t.CompiledStateWorkflow &
+    WorkflowWithStateHistory;
+  const stateHistory = stateWorkflow.getStateHistory;
+  if (typeof stateHistory !== 'function') {
+    throw new Error(
+      'Cannot continue a checkpointed run without exact state history.'
+    );
+  }
+  const lookup = advanceCheckpointCursor(config);
+
+  const resolveSnapshot = (
+    snapshot: InterruptStateSnapshot | undefined
+  ): t.RunStreamConfig | undefined => {
+    if (snapshot == null) {
+      return undefined;
+    }
+    const runStepState =
+      snapshot.values?.runStepState ??
+      snapshot.tasks
+        ?.flatMap((task) => task.interrupts ?? [])
+        .map((pendingInterrupt) =>
+          getRunStepResumeState(pendingInterrupt.value)
+        )
+        .find((state): state is t.RunStepResumeState => state != null);
+    if (
+      runStepState?.stopContinuationExecutionId !== executionId ||
+      runStepState.streamSegment !== streamSegment
+    ) {
+      return undefined;
+    }
+    const checkpointId = snapshot.config?.configurable?.checkpoint_id;
+    if (typeof checkpointId !== 'string' || checkpointId.length === 0) {
+      return undefined;
+    }
+    return {
+      ...config,
+      configurable: {
+        ...config.configurable,
+        ...snapshot.config?.configurable,
+      },
+    };
+  };
+
+  if (typeof stateWorkflow.getState === 'function') {
+    const latest = await stateWorkflow.getState(lookup);
+    const latestConfig = resolveSnapshot(latest);
+    if (latestConfig != null) {
+      return latestConfig;
+    }
+  }
+
+  for await (const snapshot of stateHistory.call(workflow, lookup)) {
+    const snapshotConfig = resolveSnapshot(snapshot);
+    if (snapshotConfig != null) {
+      return snapshotConfig;
+    }
+  }
+  throw new Error(
+    'Cannot identify the checkpoint committed by the completed graph segment.'
+  );
+}
 
 function getFirstPersistedInterrupt(
   snapshot: InterruptStateSnapshot
@@ -263,6 +415,27 @@ function getPersistedMessages(
 
 type ResumeCommandUpdate = ConstructorParameters<typeof Command>[0]['update'];
 
+function overwriteResumeRunStepState(
+  command: Command,
+  state: t.RunStepResumeState
+): Command {
+  const overwrite = new Overwrite(state);
+  const update = Array.isArray(command.update)
+    ? [
+      ...command.update.filter(([key]) => key !== 'runStepState'),
+      ['runStepState', overwrite] as [string, unknown],
+    ]
+    : { ...(command.update ?? {}), runStepState: overwrite };
+  const resumed = new Command({
+    ...(command.graph == null ? {} : { graph: command.graph }),
+    ...(command.resume === undefined ? {} : { resume: command.resume }),
+    update,
+    ...(command.goto === undefined ? {} : { goto: command.goto }),
+  });
+  resumed.lc_direct_tool_output = command.lc_direct_tool_output;
+  return resumed;
+}
+
 function getResumeUpdateMessages(
   update: ResumeCommandUpdate
 ): BaseMessage[] | undefined {
@@ -295,10 +468,15 @@ export class Run<_T extends t.BaseGraphState> {
   private toolExecution?: t.ToolExecutionConfig;
   private subagentUsageSink?: t.SubagentUsageSink;
   private preemption?: t.StreamPreemption;
+  private maxStopContinuations: number;
   private streamLimits?: t.StreamLimits;
   private subagentTasks?: t.SubagentTaskConfig;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
+  fadingTier?: t.FadingTier;
+  fadingTiers: t.FadingTiers = {};
+  private fadingTierReset: boolean = false;
+  private fadingTierResetAgentIds: string[] = [];
   graphRunnable?: t.CompiledStateWorkflow;
   Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
@@ -343,6 +521,16 @@ export class Run<_T extends t.BaseGraphState> {
     if (config.calibrationRatio != null && config.calibrationRatio > 0) {
       this.calibrationRatio = config.calibrationRatio;
     }
+    if (isFadingTier(config.fadingTier)) {
+      this.fadingTier = { ...config.fadingTier };
+    }
+    if (config.fadingTiers != null) {
+      this.fadingTiers = Object.fromEntries(
+        Object.entries(config.fadingTiers).flatMap(([agentId, tier]) =>
+          isFadingTier(tier) ? [[agentId, { ...tier }] as const] : []
+        )
+      );
+    }
 
     const handlerRegistry = new HandlerRegistry();
 
@@ -366,6 +554,9 @@ export class Run<_T extends t.BaseGraphState> {
     this.subagentUsageSink = config.subagentUsageSink;
     this.subagentTasks = config.subagentTasks;
     this.preemption = config.preemption;
+    this.maxStopContinuations = resolveMaxStopContinuations(
+      config.maxStopContinuations
+    );
     this.streamLimits = config.streamLimits;
 
     if (!config.graphConfig) {
@@ -442,7 +633,7 @@ export class Run<_T extends t.BaseGraphState> {
         provider,
         clientOptions,
         agentId: 'default',
-      };
+      } as t.AgentInputs;
       signal = legacySignal;
     }
 
@@ -456,10 +647,13 @@ export class Run<_T extends t.BaseGraphState> {
         tokenCounter: this.tokenCounter,
         indexTokenCountMap: this.indexTokenCountMap,
         calibrationRatio: this.calibrationRatio,
+        fadingTier: this.fadingTier,
+        fadingTiers: this.fadingTiers,
         subagentUsageSink: this.subagentUsageSink,
         subagentTasks: this.subagentTasks,
         preemption: this.preemption,
         streamLimits: this.streamLimits,
+        toolExecution: this.toolExecution,
       },
     });
     /** Propagate compile options from graph config */
@@ -495,10 +689,13 @@ export class Run<_T extends t.BaseGraphState> {
         tokenCounter: this.tokenCounter,
         indexTokenCountMap: this.indexTokenCountMap,
         calibrationRatio: this.calibrationRatio,
+        fadingTier: this.fadingTier,
+        fadingTiers: this.fadingTiers,
         subagentUsageSink: this.subagentUsageSink,
         subagentTasks: this.subagentTasks,
         preemption: this.preemption,
         streamLimits: this.streamLimits,
+        toolExecution: this.toolExecution,
       },
     });
 
@@ -690,10 +887,12 @@ export class Run<_T extends t.BaseGraphState> {
        * it into the agent's `instructions` config instead.
        */
       stateInputs.messages.push(
-        new HumanMessage({
-          content: preStreamContexts.join('\n\n'),
-          additional_kwargs: { role: 'system', source: 'hook' },
-        })
+        stampSyntheticProviderMessage(
+          new HumanMessage({
+            content: preStreamContexts.join('\n\n'),
+            additional_kwargs: { role: 'system', source: 'hook' },
+          })
+        )
       );
     }
 
@@ -703,12 +902,17 @@ export class Run<_T extends t.BaseGraphState> {
   static async create<T extends t.BaseGraphState>(
     config: t.RunConfig
   ): Promise<Run<T>> {
-    /** Create tokenCounter if indexTokenCountMap is provided but tokenCounter is not */
+    await ensureSourceModeProviders();
+    /** Create tokenCounter if indexTokenCountMap is provided but tokenCounter is
+     *  not. The model is read through both option keys: `modelName` is
+     *  LangChain's alias for `model`, so consulting one alone would give a
+     *  Claude-backed agent an `o200k_base` counter and undercount every message
+     *  it measures. */
     if (config.indexTokenCountMap && !config.tokenCounter) {
       const gc = config.graphConfig;
       const clientOpts =
         'agents' in gc ? gc.agents[0]?.clientOptions : gc.clientOptions;
-      const model = (clientOpts as { model?: string } | undefined)?.model ?? '';
+      const model = resolveClientOptionsModel(clientOpts) ?? '';
       config.tokenCounter = await createTokenCounter(encodingForModel(model));
     }
     return new Run<T>(config);
@@ -752,21 +956,70 @@ export class Run<_T extends t.BaseGraphState> {
     return this.calibrationRatio;
   }
 
+  /**
+   * Returns the default agent's latched context-fading tier. Single-agent hosts
+   * may persist it beside the calibration ratio; multi-agent hosts should use
+   * `getFadingTiers()` so independent agent tiers are retained.
+   */
+  getFadingTier(): t.FadingTier | undefined {
+    return this.fadingTier == null ? undefined : { ...this.fadingTier };
+  }
+
+  /** Returns a defensive snapshot of latched tiers keyed by agent ID. */
+  getFadingTiers(): t.FadingTiers {
+    return Object.fromEntries(
+      Object.entries(this.fadingTiers).map(([agentId, tier]) => [
+        agentId,
+        { ...tier },
+      ])
+    );
+  }
+
+  /** Agent IDs whose canonical history was compacted during this run. */
+  getFadingTierResetAgentIds(): string[] {
+    return [...this.fadingTierResetAgentIds];
+  }
+
+  /** Whether the default agent compacted canonical history during this run. */
+  didResetFadingTier(): boolean {
+    return this.fadingTierReset;
+  }
+
   getResolvedInstructionOverhead(): number | undefined {
     return this.Graph?.getResolvedInstructionOverhead();
   }
 
   /**
-   * Cooperative-seal counters for this run. `emptyBoundaries` is the one to
-   * watch: it counts seals whose `PreemptBoundary` produced nothing to
-   * inject, which ends the turn early and leaves the answer unfinished.
+   * Cooperative-preemption counters for this run. `emptyBoundaries` is the one
+   * to watch: it counts SEALS whose `PreemptBoundary` produced nothing to
+   * inject, which ends the turn early and leaves the answer unfinished. A
+   * restart that injects nothing simply reissues the call, so it is not
+   * counted there.
    */
   getPreemptStats(): t.PreemptStats {
-    return this.Graph?.getPreemptStats() ?? { seals: 0, emptyBoundaries: 0 };
+    return (
+      this.Graph?.getPreemptStats() ?? {
+        seals: 0,
+        restarts: 0,
+        emptyBoundaries: 0,
+      }
+    );
   }
 
   getToolCount(): number {
     return this.Graph?.getToolCount() ?? 0;
+  }
+
+  /**
+   * True when the run's last turn ended at `END` because the provider hit
+   * its output token ceiling while producing plain text/reasoning — no tool
+   * call, so `assertNotTruncatedToolCall` never sees it and the graph reads
+   * the turn as an ordinary completion. Hosts check this alongside
+   * `getPreemptStats()` / `getHaltReason()` to decide whether to persist the
+   * response as unfinished instead of a silently truncated "complete" one.
+   */
+  getOutputTruncated(): boolean {
+    return this.Graph?.outputTruncatedIncomplete ?? false;
   }
 
   /**
@@ -986,6 +1239,9 @@ export class Run<_T extends t.BaseGraphState> {
      * instead of `inputs.messages`.
      */
     const isResume = inputs instanceof Command;
+    if (!isResume) {
+      graph.startFreshLangfuseExecution();
+    }
     const stateInputs = isResume ? undefined : (inputs as t.IState);
     if (stateInputs != null) {
       this.activityPhaseTraceInput = findActivityPhaseTraceInput(
@@ -1014,11 +1270,16 @@ export class Run<_T extends t.BaseGraphState> {
       delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
       delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
     }
+    let overwriteLegacyResumeState = false;
     if (isResume) {
       await this.restoreInterruptFromCheckpoint(
         config,
         (inputs as Command).update
       );
+      if (graph.getStopContinuationExecutionId() === '') {
+        graph.startStopContinuationExecution(nanoid());
+        overwriteLegacyResumeState = this.hasCheckpointer;
+      }
     }
 
     /**
@@ -1069,6 +1330,7 @@ export class Run<_T extends t.BaseGraphState> {
             checkpointId === '' ? 0 : ++this.checkpointForkSeq,
           ]);
       graph.resetValues(streamOptions?.keepContent, checkpointScope);
+      graph.startStopContinuationExecution(nanoid());
     }
     this._interrupt = undefined;
     this._haltedReason = undefined;
@@ -1105,6 +1367,10 @@ export class Run<_T extends t.BaseGraphState> {
       parentMessageId: config.configurable?.requestBody?.parentMessageId,
       agentId: graph.defaultAgentId,
       agentName: primaryContext?.name,
+      rootAgentId: graph.defaultAgentId,
+      rootAgentName: primaryContext?.name,
+      activeAgentId: graph.defaultAgentId,
+      activeAgentName: primaryContext?.name,
     });
     const traceName = config.runName ?? getLangfuseTraceName(traceMetadata);
     const streamLangfuseConfig = this.getStreamLangfuseConfig(graph);
@@ -1116,6 +1382,7 @@ export class Run<_T extends t.BaseGraphState> {
         streamLangfuseConfig?.deterministicTraceId === true
           ? this.id
           : undefined,
+      traceAnchor: graph.langfuseTraceAnchor,
       // The graph's per-execution stamp, NOT the public run id: public ids
       // may repeat across concurrent executions (retries, tenant-local
       // message ids), and equal stamps defeat foreign-scope rejection.
@@ -1131,7 +1398,9 @@ export class Run<_T extends t.BaseGraphState> {
         streamLangfuseConfig?.deterministicTraceId === true
           ? this.id
           : undefined,
+      traceAnchor: graph.langfuseTraceAnchor,
       runId: graph.langfuseScopeRunId,
+      deferRootRunId: this.id,
       // The aggregate multi-agent policy from the runtime scope — the
       // handler must restore THIS (not the primary agent's config-derived
       // policy) when rejecting a foreign scope.
@@ -1139,7 +1408,6 @@ export class Run<_T extends t.BaseGraphState> {
       traceName,
     });
     if (langfuseHandler != null) {
-      config.runName = traceName;
       config.callbacks = appendCallbacks(config.callbacks, [langfuseHandler]);
     }
 
@@ -1147,6 +1415,7 @@ export class Run<_T extends t.BaseGraphState> {
       throw new Error('Run ID not provided');
     }
 
+    config.runId = this.id;
     config.run_id = this.id;
     config.configurable = Object.assign(config.configurable ?? {}, {
       run_id: this.id,
@@ -1195,187 +1464,209 @@ export class Run<_T extends t.BaseGraphState> {
     let terminalAt: number | undefined;
 
     const consumeStream = async (): Promise<void> => {
-      /**
-       * `streamEvents` accepts both state inputs and `Command` (resume) at
-       * runtime, but our `CompiledStateWorkflow` type narrows the first
-       * arg to `BaseGraphState`. Cast on the call so the resume path
-       * type-checks without widening the wrapper for every caller.
-       */
-      const stream = graphRunnable.streamEvents(inputs as t.IState, config, {
-        raiseError: true,
+      let streamInputs: t.IState | Command = inputs;
+      if (!isResume && this.hasCheckpointer) {
+        streamInputs = {
+          ...(inputs as t.IState),
+          runStepState: new Overwrite(graph.createRunStepResumeState()),
+        } as unknown as t.IState;
+      } else if (overwriteLegacyResumeState) {
+        streamInputs = overwriteResumeRunStepState(
+          inputs as Command,
+          graph.createRunStepResumeState()
+        );
+      }
+      let streamConfig = config;
+
+      for (;;) {
         /**
-         * Prevent EventStreamCallbackHandler from processing custom events.
-         * Custom events are already handled via our createCustomEventCallback()
-         * which routes them through the handlerRegistry.
-         * Without this flag, EventStreamCallbackHandler throws errors when
-         * custom events are dispatched for run IDs not in its internal map
-         * (due to timing issues in parallel execution or after run cleanup).
+         * `streamEvents` accepts both state inputs and `Command` (resume) at
+         * runtime, but our `CompiledStateWorkflow` type narrows the first
+         * arg to `BaseGraphState`. Cast on the call so the resume path
+         * type-checks without widening the wrapper for every caller.
          */
-        ignoreCustomEvent: true,
-      });
+        const stream = graphRunnable.streamEvents(
+          streamInputs as t.IState,
+          { ...streamConfig, runName: graph.runName },
+          {
+            raiseError: true,
+            /** Custom events are handled by createCustomEventCallback(). */
+            ignoreCustomEvent: true,
+          }
+        );
 
-      for await (const event of stream) {
-        const { data, metadata, ...info } = event;
+        for await (const event of stream) {
+          const { data, metadata, ...info } = event;
+          const eventName: t.EventName = info.event;
 
-        const eventName: t.EventName = info.event;
+          if (CUSTOM_GRAPH_EVENTS.has(eventName)) {
+            continue;
+          }
 
-        /** Skip custom events as they're handled by our callback */
-        if (CUSTOM_GRAPH_EVENTS.has(eventName)) {
-          continue;
-        }
+          if (
+            this._interrupt == null &&
+            data.chunk != null &&
+            isInterrupted<unknown>(data.chunk)
+          ) {
+            const interrupts = data.chunk[INTERRUPT];
+            if (interrupts.length > 0) {
+              const first = interrupts[0];
+              this._interrupt = {
+                interruptId: first.id ?? '',
+                threadId,
+                payload: first.value,
+              };
+            }
+          }
 
-        /**
-         * Detect interrupts surfaced by LangGraph as a synthetic
-         * `__interrupt__` field on the streamed chunk and stash the
-         * first one for the host to read via `run.getInterrupt()`
-         * once the stream drains. Captured as `unknown` because the
-         * SDK does not validate the runtime payload shape — the
-         * built-in ToolNode raises a `HumanInterruptPayload`
-         * (`tool_approval` / `ask_user_question`), but custom nodes
-         * can pass any payload to `interrupt()`. Callers narrow with
-         * the `isToolApprovalInterrupt` / `isAskUserQuestionInterrupt`
-         * guards or assert via `getInterrupt<T>()`.
-         */
-        if (
-          this._interrupt == null &&
-          data.chunk != null &&
-          isInterrupted<unknown>(data.chunk)
-        ) {
-          const interrupts = data.chunk[INTERRUPT];
-          if (interrupts.length > 0) {
-            const first = interrupts[0];
-            /**
-             * Capture the interrupt unconditionally — `interrupt(null)`
-             * and `interrupt(undefined)` are valid pauses (a custom
-             * node may want to pause without metadata) and the host
-             * still needs to know the run is awaiting resume. Gating
-             * on `payload != null` would silently downgrade a paused
-             * run to "completed" and let the `Stop` hook fire,
-             * breaking host resume handling.
-             */
-            this._interrupt = {
-              interruptId: first.id ?? '',
-              threadId,
-              payload: first.value,
-            };
+          const modelEndAt =
+            eventName === GraphEvents.CHAT_MODEL_END ? Date.now() : undefined;
+          const handler = this.handlerRegistry?.getHandler(eventName);
+          if (handler) {
+            await handler.handle(eventName, data, metadata, this.Graph);
+          }
+
+          if (eventName === GraphEvents.CHAT_MODEL_END && this.Graph != null) {
+            await this.Graph.closeOpenMessageStep(metadata, modelEndAt);
+          }
+
+          const haltSignal = this.hookRegistry?.getHaltSignal(this.id);
+          if (haltSignal != null) {
+            this._haltedReason = haltSignal.reason;
+            break;
           }
         }
 
-        /**
-         * Stamped before the handler runs: the close below happens after an
-         * arbitrarily slow host handler resolves, and the step's duration
-         * should end when the model did, not when the host finished with it.
-         */
-        const modelEndAt =
-          eventName === GraphEvents.CHAT_MODEL_END ? Date.now() : undefined;
-        const handler = this.handlerRegistry?.getHandler(eventName);
-        if (handler) {
-          await handler.handle(eventName, data, metadata, this.Graph);
+        terminalAt = Date.now();
+
+        if (this._interrupt != null) {
+          const interruptConfig = this.hasCheckpointer
+            ? advanceCheckpointCursor(streamConfig)
+            : streamConfig;
+          await this.resolveInterruptResumeConfig(interruptConfig);
+          return;
+        }
+        if (this._haltedReason != null) {
+          return;
         }
 
-        /**
-         * A finished model call ends its lane's open message step. Placed
-         * here — not in `ModelEndHandler` — because hosts replace the
-         * CHAT_MODEL_END handler with their own instance, which would
-         * silently drop the close.
-         */
-        if (eventName === GraphEvents.CHAT_MODEL_END && this.Graph != null) {
-          await this.Graph.closeOpenMessageStep(metadata, modelEndAt);
+        let stopReason = graph.preemptHaltReason;
+        if (stopReason == null && graph.preemptIncomplete) {
+          stopReason = 'preempt_incomplete';
+        }
+        if (stopReason == null && graph.outputTruncatedIncomplete) {
+          stopReason = OUTPUT_TRUNCATED_HALT_REASON;
         }
 
-        /**
-         * Mid-flight halt: any hook (PreToolUse, PostToolUse,
-         * PostToolBatch, SubagentStart/Stop, PreCompact, PostCompact)
-         * that returned `preventContinuation: true` raises a halt
-         * signal on the registry via `executeHooks`. We poll between
-         * stream events and break out as soon as one is set so the
-         * graph doesn't take another model turn after the halting
-         * operation completes.
-         *
-         * This `break` is NOT graceful, despite what a `continue: false`
-         * reading suggests. Leaving the `for await` calls the iterator's
-         * `return()`, which cancels the reader
-         * (`@langchain/core/utils/stream`), and langgraph's stream wrapper
-         * turns that cancel into `_abortController.abort()`
-         * (`pregel/stream.js`). The in-flight model call or tool batch is
-         * torn down where it stands — it does not finish first.
-         *
-         * A halt is therefore the wrong tool for "stop generating but keep
-         * what you have". That is what `RunConfig.preemption` is for: it
-         * seals the stream at a provider-safe boundary and keeps the run.
-         */
-        const haltSignal = this.hookRegistry?.getHaltSignal(this.id);
-        if (haltSignal != null) {
-          this._haltedReason = haltSignal.reason;
-          break;
+        const stopMessages = graph.getRunMessages() ?? stateInputs?.messages ?? [];
+        const stopContinuationCount = graph.getStopContinuationCount();
+        const continuationBudgetRemaining = Math.max(
+          0,
+          this.maxStopContinuations - stopContinuationCount
+        );
+        let stopResult: AggregatedHookResult | undefined;
+        if (this.hookRegistry?.hasHookFor('Stop', this.id) === true) {
+          stopResult = await executeHooks({
+            registry: this.hookRegistry,
+            input: {
+              hook_event_name: 'Stop',
+              runId: this.id,
+              threadId,
+              agentId: graph.defaultAgentId,
+              messages: stopMessages,
+              stopReason,
+              stopHookActive: stopContinuationCount > 0,
+              continuationCount: stopContinuationCount,
+              continuationBudgetRemaining,
+            },
+            sessionId: this.id,
+            signal: config.signal,
+          }).catch((): undefined => undefined);
         }
-      }
 
-      terminalAt = Date.now();
+        if (this.hookRegistry?.hasHookFor('StopFinalize', this.id) === true) {
+          const stopInjected =
+            stopResult == null ? [] : materializeStopContinuation(stopResult);
+          const continuationPrevented =
+            stopReason != null || stopResult?.preventContinuation === true;
+          const finalized = await executeHooks({
+            registry: this.hookRegistry,
+            input: {
+              hook_event_name: 'StopFinalize',
+              runId: this.id,
+              threadId,
+              agentId: graph.defaultAgentId,
+              messages: stopMessages,
+              stopReason,
+              stopHookActive: stopContinuationCount > 0,
+              continuationCount: stopContinuationCount,
+              continuationBudgetRemaining,
+              continuationPlanned:
+                !continuationPrevented &&
+                stopResult?.stopDecision === 'block' &&
+                stopInjected.length > 0 &&
+                continuationBudgetRemaining > 0,
+              continuationPrevented,
+            },
+            sessionId: this.id,
+            signal: config.signal,
+          });
+          assertFinalAdmissionSucceeded(finalized);
+          stopResult = mergeAggregatedHookResults(stopResult, finalized);
+        }
 
-      if (this._interrupt != null) {
-        await this.resolveInterruptResumeConfig(config);
-      }
+        if (stopResult?.preventContinuation === true) {
+          this._haltedReason =
+            stopResult.stopReason ?? stopResult.reason ?? 'preventContinuation';
+          return;
+        }
 
-      /**
-       * Skip the Stop hook when the run paused on a HITL interrupt
-       * (still pending human input) or was halted by a hook (the host
-       * already chose to stop, so a Stop hook firing now would be
-       * misleading). The host fires Stop on the resumed-and-completed
-       * run instead.
-       */
-      if (
-        this._interrupt == null &&
-        this._haltedReason == null &&
-        this.hookRegistry?.hasHookFor('Stop', this.id) === true
-      ) {
-        await executeHooks({
-          registry: this.hookRegistry,
-          input: {
-            hook_event_name: 'Stop',
-            runId: this.id,
-            threadId,
-            agentId: graph.defaultAgentId,
-            messages: graph.getRunMessages() ?? stateInputs?.messages ?? [],
+        const requestsContinuation =
+          stopReason == null && stopResult?.stopDecision === 'block';
+        if (requestsContinuation && stopResult != null) {
+          const injected = materializeStopContinuation(stopResult);
+          if (injected.length > 0) {
+            if (stopContinuationCount >= this.maxStopContinuations) {
+              throw new Error(
+                'Stop hook attempted to inject messages after the terminal continuation budget was exhausted.'
+              );
+            }
+            const completedSegmentConfig = this.hasCheckpointer
+              ? await resolveCompletedSegmentConfig(
+                graphRunnable,
+                streamConfig,
+                graph.getStopContinuationExecutionId(),
+                graph.getStreamSegment()
+              )
+              : streamConfig;
+            const nextContinuationCount = stopContinuationCount + 1;
+            graph.setStopContinuationCount(nextContinuationCount);
+            graph.advanceStreamSegment();
             /**
-             * A seal whose boundary ended the turn early must say so. The
-             * hook-supplied reason wins when a `PreemptBoundary` hook halted
-             * with one — a persistence/audit `Stop` hook should record the
-             * actual cause, not the generic label — and `preempt_incomplete`
-             * is reserved for the boundary that simply had nothing to inject.
+             * A checkpointer already owns the completed graph state, so only
+             * the delta is submitted. Without one, each invocation starts from
+             * empty state and must be seeded with the live full transcript.
+             * Graph sidecars and the outer Run stay intact in both cases.
              */
-            stopReason:
-              graph.preemptHaltReason ??
-              (graph.preemptIncomplete ? 'preempt_incomplete' : undefined),
-            stopHookActive: false, // will be true when stop is triggered by a hook (Phase 2)
-          },
-          sessionId: this.id,
-        }).catch(() => {
-          /* Stop hook errors must not masquerade as stream failures */
-        });
-      }
+            streamInputs = {
+              messages: this.hasCheckpointer
+                ? injected
+                : [...graph.messages, ...injected],
+              runStepState: graph.createRunStepResumeState(),
+            };
+            streamConfig = completedSegmentConfig;
+            continue;
+          }
+        }
 
-      /**
-       * A `PreemptBoundary` hook that returned `preventContinuation` has its
-       * registry halt cleared by the graph — that is what stops the halt from
-       * cancelling the stream before the sealed turn commits — so the reason
-       * is carried across on the graph instead. Surfaced here, AFTER the
-       * `Stop` dispatch above, so the host still receives a completion signal
-       * to persist the partial answer with while `getHaltReason()` correctly
-       * reports that a hook stopped the run rather than the model finishing.
-       *
-       * An empty boundary — sealed, but nothing to inject because the host's
-       * queue was drained or cancelled in the meantime — cut the answer short
-       * just as surely, only without a hook-supplied reason. It surfaces
-       * through the same channel under the same name the `Stop` dispatch
-       * already used for its `stopReason`, so terminal consumers
-       * (`AgentSession` emits `run.halted`, not `run.completed`) cannot
-       * finalize a truncated answer as a natural finish.
-       */
-      if (this._haltedReason == null && graph.preemptHaltReason != null) {
-        this._haltedReason = graph.preemptHaltReason;
-      } else if (this._haltedReason == null && graph.preemptIncomplete) {
-        this._haltedReason = 'preempt_incomplete';
+        if (graph.preemptHaltReason != null) {
+          this._haltedReason = graph.preemptHaltReason;
+        } else if (graph.preemptIncomplete) {
+          this._haltedReason = 'preempt_incomplete';
+        } else if (graph.outputTruncatedIncomplete) {
+          this._haltedReason = OUTPUT_TRUNCATED_HALT_REASON;
+        }
+        return;
       }
     };
 
@@ -1399,6 +1690,10 @@ export class Run<_T extends t.BaseGraphState> {
     } catch (err) {
       terminalAt = Date.now();
       streamThrew = true;
+      await langfuseHandler?.handleChainError(
+        err instanceof Error ? err : new Error(String(err)),
+        this.id
+      );
       /**
        * Corroborate cancellation against an actually-aborted signal. A
        * provider SDK or host handler can reject with an `AbortError` while
@@ -1514,6 +1809,10 @@ export class Run<_T extends t.BaseGraphState> {
         : undefined;
 
       this.calibrationRatio = this.Graph.getCalibrationRatio();
+      this.fadingTier = this.Graph.getFadingTier();
+      this.fadingTiers = this.Graph.getFadingTiers();
+      this.fadingTierReset = this.Graph.didResetFadingTier();
+      this.fadingTierResetAgentIds = this.Graph.getFadingTierResetAgentIds();
 
       /**
        * Skip `clearHeavyState()` when the run paused on a clean HITL
@@ -1581,13 +1880,16 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   /**
-   * Returns the reason a hook halted the run via
-   * `preventContinuation: true`, or `undefined` if no hook halted.
+   * Returns why the run ended without a natural completion, or `undefined`
+   * when it completed normally. Reasons include hook- and prompt-driven
+   * halts, `preempt_incomplete` when a cooperative seal ended the turn
+   * without continuation content, and `output_truncated` when the provider
+   * stopped a plain-text/reasoning response at its output-token ceiling.
    *
    * Hosts inspect this after `processStream` returns to distinguish a
-   * natural completion (`undefined`) from a hook-driven halt (a
-   * truthy string). Independent from `getInterrupt()` — a halted run
-   * has no interrupt; an interrupted run has no halt reason.
+   * natural completion from a terminal partial response. Independent from
+   * `getInterrupt()` — a halted run has no interrupt; an interrupted run has
+   * no halt reason.
    */
   getHaltReason(): string | undefined {
     return this._haltedReason;
@@ -1800,7 +2102,8 @@ export class Run<_T extends t.BaseGraphState> {
       return;
     }
     this.Graph?.restoreRunStepResumeState(
-      getRunStepResumeState(persistedInterrupt.value)
+      getRunStepResumeState(persistedInterrupt.value) ??
+        snapshot.values?.runStepState
     );
     const persistedMessages = getPersistedMessages(snapshot);
     if (persistedMessages != null) {
@@ -1952,10 +2255,7 @@ export class Run<_T extends t.BaseGraphState> {
       clientOptions,
     }) as t.ChatModelInstance;
 
-    if (
-      isOpenAILike(provider) &&
-      (model instanceof ChatOpenAI || model instanceof AzureChatOpenAI)
-    ) {
+    if (isOpenAILike(provider) && isLibreChatOpenAIModel(model)) {
       model.temperature = (clientOptions as t.OpenAIClientOptions | undefined)
         ?.temperature as number;
       model.topP = (clientOptions as t.OpenAIClientOptions | undefined)
@@ -2123,6 +2423,7 @@ export class Run<_T extends t.BaseGraphState> {
     const labelAgentName =
       labelAgentId == null ? undefined : labelContext?.name;
     const labelMetadata: Record<string, unknown> = {
+      [LANGFUSE_OPERATION_METADATA_KEY]: ACTIVITY_LABEL_RUN_NAME,
       sourceRunId: this.id,
       responseId: this.id,
       activityIndex: labelIndex,
@@ -2132,7 +2433,7 @@ export class Run<_T extends t.BaseGraphState> {
       ...(labelAgentId == null ? {} : { agentId: labelAgentId }),
       ...(labelAgentName == null ? {} : { agentName: labelAgentName }),
     };
-    const traceMetadata = {
+    const traceMetadata: Record<string, string> = {
       ...createLangfuseTraceMetadata({
         messageId: 'activity-label-' + this.id,
         parentMessageId: labelParentMessageId,
@@ -2150,16 +2451,9 @@ export class Run<_T extends t.BaseGraphState> {
       labelContext?.langfuse
     );
     initializeLangfuseTracing(labelLangfuseConfig);
-    /** Seed policy, threading two constraints:
-     *  1. `runWithLangfuseRuntimeContext` SPREADS the surrounding context, so
-     *     an absent seed INHERITS the parent run's and collapses every label
-     *     into that trace. When a parent seed is active we must override it
-     *     with a per-label one.
-     *  2. Without deterministic tracing there is no parent seed, and forcing
-     *     one here would make label trace ids deterministic when neither
-     *     `processStream` nor `generateTitle` are — so leave it unset.
-     *  Seeded when determinism is opted into OR a parent seed is live;
-     *  otherwise unseeded, matching the other generation paths. */
+    /** A captured source observation parents the label in the agent trace.
+     *  The distinct seed remains the standalone fallback when labeling runs
+     *  before tracing starts or against another Langfuse destination. */
     const inheritedTraceSeed = getTraceIdSeed();
     const labelTraceSeed =
       labelLangfuseConfig?.deterministicTraceId === true ||
@@ -2174,6 +2468,15 @@ export class Run<_T extends t.BaseGraphState> {
       traceIdSeed: labelTraceSeed,
       runId: labelScopeRunId,
     });
+    const labelParentSpanContext = resolveLangfuseTraceAnchorParent(
+      this.Graph?.langfuseTraceAnchor,
+      resolveLangfuseDestinationKey(labelLangfuseConfig),
+      labelAgentId
+    );
+    if (labelParentSpanContext != null) {
+      labelMetadata.sourceTraceId = labelParentSpanContext.traceId;
+      traceMetadata.sourceTraceId = labelParentSpanContext.traceId;
+    }
     /** Handler only when a session id resolved from
      *  `chainOptions.configurable.thread_id`: without it the label call has
      *  no conversation identity, and tracing it would create an orphan
@@ -2187,15 +2490,18 @@ export class Run<_T extends t.BaseGraphState> {
         langfuse: labelLangfuseConfig,
         userId: labelUserId,
         sessionId: labelSessionId,
-        traceMetadata,
+        traceMetadata:
+          labelParentSpanContext == null ? traceMetadata : undefined,
         tags: labelTags,
         traceIdSeed:
           labelLangfuseConfig?.deterministicTraceId === true
             ? labelTraceSeed
             : undefined,
+        parentSpanContext: labelParentSpanContext,
+        inheritTraceIdentity: labelParentSpanContext != null,
         runId: labelScopeRunId,
         toolOutputTracing: labelRuntimeScope.toolOutputTracing,
-        traceName: labelRunName,
+        traceName: labelParentSpanContext == null ? labelRunName : undefined,
       });
     }
     if (labelLangfuseHandler != null) {
@@ -2297,9 +2603,11 @@ export class Run<_T extends t.BaseGraphState> {
           langfuse: labelLangfuseConfig,
           userId: labelUserId,
           sessionId: labelSessionId,
-          traceName: labelRunName,
-          traceMetadata,
+          traceName: labelParentSpanContext == null ? labelRunName : undefined,
+          traceMetadata:
+            labelParentSpanContext == null ? traceMetadata : undefined,
           tags: labelTags,
+          inheritTraceIdentity: labelParentSpanContext != null,
         },
         () =>
           model.invoke(
@@ -2457,6 +2765,7 @@ export class Run<_T extends t.BaseGraphState> {
     const resolvedSourceRunId = sourceRunId ?? this.id;
     const reasoningResponseId = responseId ?? this.id;
     const reasoningMetadata: Record<string, unknown> = {
+      [LANGFUSE_OPERATION_METADATA_KEY]: REASONING_LABEL_RUN_NAME,
       sourceRunId: resolvedSourceRunId,
       ...(sourceTraceId == null ? {} : { sourceTraceId }),
       responseId: reasoningResponseId,
@@ -2470,7 +2779,7 @@ export class Run<_T extends t.BaseGraphState> {
       ...(reasoningAgentId == null ? {} : { agentId: reasoningAgentId }),
       ...(reasoningAgentName == null ? {} : { agentName: reasoningAgentName }),
     };
-    const traceMetadata = {
+    const traceMetadata: Record<string, string> = {
       ...createLangfuseTraceMetadata({
         messageId: `reasoning-label-${reasoningResponseId}`,
         parentMessageId: reasoningParentMessageId,
@@ -2512,21 +2821,40 @@ export class Run<_T extends t.BaseGraphState> {
       traceIdSeed: reasoningTraceSeed,
       runId: reasoningScopeRunId,
     });
+    const candidateReasoningParent = resolveLangfuseTraceAnchorParent(
+      this.Graph?.langfuseTraceAnchor,
+      resolveLangfuseDestinationKey(reasoningLangfuseConfig),
+      reasoningAgentId
+    );
+    const reasoningParentSpanContext =
+      resolvedSourceRunId === this.id &&
+      (sourceTraceId == null ||
+        sourceTraceId === candidateReasoningParent?.traceId)
+        ? candidateReasoningParent
+        : undefined;
+    if (reasoningParentSpanContext != null) {
+      reasoningMetadata.sourceTraceId = reasoningParentSpanContext.traceId;
+      traceMetadata.sourceTraceId = reasoningParentSpanContext.traceId;
+    }
     let reasoningLangfuseHandler: CallbackEntry | undefined;
     if (reasoningSessionId != null) {
       reasoningLangfuseHandler = createLangfuseHandler({
         langfuse: reasoningLangfuseConfig,
         userId: reasoningUserId,
         sessionId: reasoningSessionId,
-        traceMetadata,
+        traceMetadata:
+          reasoningParentSpanContext == null ? traceMetadata : undefined,
         tags: reasoningTags,
         traceIdSeed:
           reasoningLangfuseConfig?.deterministicTraceId === true
             ? reasoningTraceSeed
             : undefined,
+        parentSpanContext: reasoningParentSpanContext,
+        inheritTraceIdentity: reasoningParentSpanContext != null,
         runId: reasoningScopeRunId,
         toolOutputTracing: reasoningRuntimeScope.toolOutputTracing,
-        traceName: reasoningRunName,
+        traceName:
+          reasoningParentSpanContext == null ? reasoningRunName : undefined,
       });
     }
     if (reasoningLangfuseHandler != null) {
@@ -2585,9 +2913,12 @@ export class Run<_T extends t.BaseGraphState> {
           langfuse: reasoningLangfuseConfig,
           userId: reasoningUserId,
           sessionId: reasoningSessionId,
-          traceName: reasoningRunName,
-          traceMetadata,
+          traceName:
+            reasoningParentSpanContext == null ? reasoningRunName : undefined,
+          traceMetadata:
+            reasoningParentSpanContext == null ? traceMetadata : undefined,
           tags: reasoningTags,
+          inheritTraceIdentity: reasoningParentSpanContext != null,
         },
         () =>
           model.invoke(
@@ -2638,9 +2969,10 @@ export class Run<_T extends t.BaseGraphState> {
 
   /**
    * Generates one parent summary for two or more logical activities. The
-   * summary model is traced as a dedicated activity-phase chain root in the
-   * conversation session, with the model callback recorded as its generation
-   * child. No session id means no phase trace, avoiding orphan observations.
+   * summary model is traced as an activity-phase chain beneath the source
+   * agent run, with the model callback recorded as its generation child. It
+   * falls back to a dedicated trace when no source observation is available.
+   * No session id means no phase trace, avoiding orphan observations.
    */
   async generateActivityPhaseLabel({
     provider,
@@ -2771,6 +3103,7 @@ export class Run<_T extends t.BaseGraphState> {
     const phaseParentMessageId =
       phaseChainOptions.configurable?.requestBody?.parentMessageId;
     const phaseMetadata: Record<string, unknown> = {
+      [LANGFUSE_OPERATION_METADATA_KEY]: ACTIVITY_PHASE_LABEL_RUN_NAME,
       sourceRunId: sourceRunId ?? this.id,
       ...(sourceTraceId == null ? {} : { sourceTraceId }),
       responseId: phaseMessageId,
@@ -2785,7 +3118,7 @@ export class Run<_T extends t.BaseGraphState> {
       ...(phaseAgentName == null ? {} : { agentName: phaseAgentName }),
       ...(closingTextPhase == null ? {} : { closingTextPhase }),
     };
-    const traceMetadata = {
+    const traceMetadata: Record<string, string> = {
       ...createLangfuseTraceMetadata({
         messageId: phaseMessageId,
         parentMessageId: phaseParentMessageId,
@@ -2826,6 +3159,19 @@ export class Run<_T extends t.BaseGraphState> {
       traceIdSeed: phaseTraceSeed,
       runId: phaseScopeRunId,
     });
+    const candidatePhaseParent = resolveLangfuseTraceAnchorParent(
+      this.Graph?.langfuseTraceAnchor,
+      resolveLangfuseDestinationKey(phaseLangfuseConfig)
+    );
+    const phaseParentSpanContext =
+      (sourceRunId == null || sourceRunId === this.id) &&
+      (sourceTraceId == null || sourceTraceId === candidatePhaseParent?.traceId)
+        ? candidatePhaseParent
+        : undefined;
+    if (phaseParentSpanContext != null) {
+      phaseMetadata.sourceTraceId = phaseParentSpanContext.traceId;
+      traceMetadata.sourceTraceId = phaseParentSpanContext.traceId;
+    }
     let phaseLangfuseHandler: CallbackEntry | undefined;
     const sourceUserText =
       this.activityPhaseTraceInput ??
@@ -2835,15 +3181,18 @@ export class Run<_T extends t.BaseGraphState> {
         langfuse: phaseLangfuseConfig,
         userId: phaseUserId,
         sessionId: phaseSessionId,
-        traceMetadata,
+        traceMetadata:
+          phaseParentSpanContext == null ? traceMetadata : undefined,
         tags: phaseTags,
         traceIdSeed:
           phaseLangfuseConfig?.deterministicTraceId === true
             ? phaseTraceSeed
             : undefined,
+        parentSpanContext: phaseParentSpanContext,
+        inheritTraceIdentity: phaseParentSpanContext != null,
         runId: phaseScopeRunId,
         toolOutputTracing: phaseRuntimeScope.toolOutputTracing,
-        traceName: phaseTraceName,
+        traceName: phaseParentSpanContext == null ? phaseTraceName : undefined,
       });
     }
     if (phaseLangfuseHandler != null) {
@@ -2864,7 +3213,7 @@ export class Run<_T extends t.BaseGraphState> {
     const invokeConfig = Object.assign({}, phaseChainOptions, {
       run_id: phaseRunId,
       runId: phaseRunId,
-      runName: 'summarize-activity-phase',
+      runName: ACTIVITY_PHASE_RUN_NAME,
       tags: [...new Set([...(phaseChainOptions.tags ?? []), ...phaseTags])],
       metadata: {
         ...(phaseChainOptions.metadata ?? {}),
@@ -2943,7 +3292,7 @@ export class Run<_T extends t.BaseGraphState> {
           ? { label, messages: [new AIMessage(label)] }
           : { messages: [] };
       },
-    }).withConfig({ runName: 'summarize-activity-phase' });
+    }).withConfig({ runName: ACTIVITY_PHASE_RUN_NAME });
 
     try {
       const result = await withLangfuseRuntimeScope(phaseRuntimeScope, () =>
@@ -2952,9 +3301,12 @@ export class Run<_T extends t.BaseGraphState> {
             langfuse: phaseLangfuseConfig,
             userId: phaseUserId,
             sessionId: phaseSessionId,
-            traceName: phaseTraceName,
-            traceMetadata,
+            traceName:
+              phaseParentSpanContext == null ? phaseTraceName : undefined,
+            traceMetadata:
+              phaseParentSpanContext == null ? traceMetadata : undefined,
             tags: phaseTags,
+            inheritTraceIdentity: phaseParentSpanContext != null,
           },
           () =>
             phaseRunnable.invoke(

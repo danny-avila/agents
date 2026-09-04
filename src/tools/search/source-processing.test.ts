@@ -1,6 +1,7 @@
 import type * as t from './types';
 import { executeParallelSearches } from './tool';
 import { createSourceProcessor } from './search';
+import { createSearchMetrics } from './metrics';
 import { expandHighlights } from './highlights';
 import { BaseReranker } from './rerankers';
 
@@ -13,6 +14,7 @@ const silentLogger = {
 } as t.Logger;
 
 class RecordingReranker extends BaseReranker {
+  readonly provider = 'recording';
   public rerankCalls: string[][] = [];
   public topKCalls: number[] = [];
 
@@ -23,11 +25,15 @@ class RecordingReranker extends BaseReranker {
   async rerank(
     _query: string,
     documents: string[],
-    topK: number = 5
+    topK: number = 5,
+    metrics?: t.SearchMetrics
   ): Promise<t.Highlight[]> {
     this.rerankCalls.push(documents);
     this.topKCalls.push(topK);
-    return this.getDefaultRanking(documents, topK);
+    return this.complete(
+      this.beginRerank(documents, topK, metrics),
+      this.getDefaultRanking(documents, topK)
+    );
   }
 }
 
@@ -503,6 +509,8 @@ describe('executeParallelSearches topStories dedupe', () => {
       videos: false,
       news: true,
       logger: silentLogger,
+      provider: 'serper',
+      metrics: createSearchMetrics(silentLogger),
     });
 
     expect(merged.data?.topStories?.map((story) => story.link)).toEqual([
@@ -512,5 +520,347 @@ describe('executeParallelSearches topStories dedupe', () => {
     ]);
     expect(merged.data?.topStories?.[0].title).toBe('Story for https://n1.com');
     expect(merged.data?.news).toBeUndefined();
+  });
+});
+
+describe('createSourceProcessor log volume', () => {
+  const createCountingLogger = (): t.Logger =>
+    ({
+      error: jest.fn(),
+      warn: jest.fn(),
+      info: jest.fn(),
+      debug: jest.fn(),
+    }) as unknown as t.Logger;
+
+  const createMixedScraper = (
+    okLinks: string[],
+    failingLinks: Map<string, string>
+  ): t.BaseScraper => ({
+    scrapeUrl: async (url: string): Promise<[string, t.AnyScraperResponse]> => {
+      const failure = failingLinks.get(url);
+      if (failure != null) {
+        return [url, { success: false, error: failure }];
+      }
+      return [
+        url,
+        {
+          success: true,
+          data: { markdown: okLinks.includes(url) ? makeLongContent(4000) : '' },
+        },
+      ];
+    },
+    extractContent: (
+      response: t.AnyScraperResponse
+    ): [string, undefined | t.References] => [
+      (response as t.FirecrawlScrapeResponse).data?.markdown ?? '',
+      undefined,
+    ],
+    extractMetadata: (): t.GenericScrapeMetadata => ({}),
+  });
+
+  test('summarizes an eight-source search in one line per phase', async () => {
+    const logger = createCountingLogger();
+    const okLinks = Array.from({ length: 6 }, (_, i) => `https://ok${i}.com`);
+    const failing = new Map([
+      ['https://bad0.com', 'Request failed with status code 403'],
+      ['https://bad1.com', 'timeout of 7500ms exceeded'],
+    ]);
+    const links = [...okLinks, ...failing.keys()];
+    const processor = createSourceProcessor(
+      { reranker: new RecordingReranker(), logger },
+      createMixedScraper(okLinks, failing)
+    );
+
+    await processor.processSources({
+      query: 'test query',
+      proMode: true,
+      onGetHighlights: undefined,
+      news: false,
+      numElements: links.length,
+      result: {
+        success: true,
+        data: { organic: links.map((link) => makeOrganic(link)) },
+      },
+    });
+
+    /** Eight links formerly logged a scrape line plus three reranker lines
+     * each; the whole call must now cost one line per phase. */
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(logger.warn).not.toHaveBeenCalled();
+
+    const scrapeLine = String((logger.error as jest.Mock).mock.calls[0][0]);
+    expect(scrapeLine).toContain('links=8 ok=6');
+    expect(scrapeLine).toContain(
+      'failed=2 reasons={http_403:1,timeout:1}'
+    );
+
+    const rerankLine = String((logger.debug as jest.Mock).mock.calls[0][0]);
+    expect(rerankLine).toContain('rerank=recording calls=6');
+  });
+
+  test('attributes a rejecting reranker to the reranker, not the chunker', async () => {
+    const logger = createCountingLogger();
+    class RejectingReranker extends BaseReranker {
+      readonly provider = 'custom';
+      constructor() {
+        super(silentLogger);
+      }
+      async rerank(): Promise<t.Highlight[]> {
+        throw new Error('custom reranker exploded');
+      }
+    }
+    const link = 'https://a.com';
+    const processor = createSourceProcessor(
+      { reranker: new RejectingReranker(), logger },
+      createFakeScraper({ [link]: makeLongContent(2000) })
+    );
+
+    await processor.processSources({
+      query: 'test query',
+      proMode: true,
+      onGetHighlights: undefined,
+      news: false,
+      numElements: 1,
+      result: { success: true, data: { organic: [makeOrganic(link)] } },
+    });
+
+    /** Splitting succeeded, so the chunk count is real and the reason must
+     * point at the reranker rather than the chunker. */
+    const summary = (logger.error as jest.Mock).mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.includes('[web_search] rerank'));
+    expect(summary).toContain('rerank=custom calls=1');
+    expect(summary).toContain('reasons={error:1}');
+    expect(summary).not.toContain('chunk_error');
+    expect(summary).not.toContain('chunks=0');
+  });
+
+  test('counts every link of a batch scrape that never returned responses', async () => {
+    const logger = createCountingLogger();
+    const links = ['https://a.com', 'https://b.com', 'https://c.com'];
+    const scraper: t.BaseScraper = {
+      scrapeUrl: async (url: string): Promise<[string, t.AnyScraperResponse]> => [
+        url,
+        { success: true, data: { markdown: 'unused' } },
+      ],
+      scrapeUrls: async (): Promise<Array<[string, t.AnyScraperResponse]>> => {
+        throw new Error('connect ECONNREFUSED 127.0.0.1:3002');
+      },
+      extractContent: (): [string, undefined] => ['', undefined],
+      extractMetadata: (): t.GenericScrapeMetadata => ({}),
+    };
+    const processor = createSourceProcessor(
+      { reranker: new RecordingReranker(), logger },
+      scraper
+    );
+
+    await processor.processSources({
+      query: 'test query',
+      proMode: true,
+      onGetHighlights: undefined,
+      news: false,
+      numElements: links.length,
+      result: {
+        success: true,
+        data: { organic: links.map((link) => makeOrganic(link)) },
+      },
+    });
+
+    /** A wholly failed batch must not read like a search that scraped
+     * nothing: the summary has to show the attempt and the outage. */
+    const summary = (logger.error as jest.Mock).mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.includes('[web_search] scrape'));
+    expect(summary).toContain('links=3 ok=0');
+    expect(summary).toContain('failed=3 reasons={connection:3}');
+  });
+
+  test('flushes to the owning collector instead of logging itself', async () => {
+    const logger = createCountingLogger();
+    const metrics = createSearchMetrics(logger);
+    const link = 'https://a.com';
+    const processor = createSourceProcessor(
+      { reranker: new RecordingReranker(), logger },
+      createFakeScraper({ [link]: makeLongContent(2000) })
+    );
+
+    await processor.processSources({
+      query: 'test query',
+      proMode: true,
+      onGetHighlights: undefined,
+      news: false,
+      numElements: 1,
+      metrics,
+      result: { success: true, data: { organic: [makeOrganic(link)] } },
+    });
+
+    expect(logger.debug).not.toHaveBeenCalled();
+
+    metrics.flush();
+    expect(logger.debug).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('executeParallelSearches call contract', () => {
+  const createMockLogger = (): t.Logger =>
+    ({
+      error: jest.fn(),
+      warn: jest.fn(),
+      info: jest.fn(),
+      debug: jest.fn(),
+    }) as unknown as t.Logger;
+
+  const okResult: t.SearchResult = {
+    success: true,
+    data: { organic: [makeOrganic('https://a.com')] },
+  };
+
+  test('summarizes itself when called with only the legacy arguments', async () => {
+    const logger = createMockLogger();
+    const searchAPI = { getSources: async (): Promise<t.SearchResult> => okResult };
+
+    const merged = await executeParallelSearches({
+      searchAPI,
+      query: 'test query',
+      safeSearch: 1,
+      images: false,
+      videos: false,
+      news: false,
+      logger,
+    });
+
+    expect(merged.success).toBe(true);
+    /** No collector supplied, so this call owns and flushes its own. */
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    expect(String((logger.debug as jest.Mock).mock.calls[0][0])).toContain(
+      'search=unknown queries=1'
+    );
+  });
+
+  test('rethrows the main search error object rather than a wrapped copy', async () => {
+    const logger = createMockLogger();
+    class ProviderError extends Error {}
+    const failure = new ProviderError('provider exploded');
+    const searchAPI = {
+      getSources: async (): Promise<t.SearchResult> => {
+        throw failure;
+      },
+    };
+
+    await expect(
+      executeParallelSearches({
+        searchAPI,
+        query: 'test query',
+        safeSearch: 1,
+        images: false,
+        videos: false,
+        news: false,
+        logger,
+      })
+    ).rejects.toBe(failure);
+
+    /** A rejected query was error-level before it was aggregated. */
+    expect(logger.warn).not.toHaveBeenCalled();
+    const [line, detail] = (logger.error as jest.Mock).mock.calls[0];
+    expect(String(line)).toContain('failed=1 reasons={web:other:1}');
+    expect(detail).toBe('provider exploded');
+  });
+
+  test('counts a row shared by organic and topStories once', async () => {
+    const logger = createMockLogger();
+    /** The SearXNG shape: both collections built from the same rows. */
+    const shared: t.SearchResult = {
+      success: true,
+      data: {
+        organic: [
+          makeOrganic('https://a.com'),
+          makeOrganic('https://news.com'),
+          makeOrganic('https://c.com'),
+        ],
+        topStories: [makeStory('https://news.com')],
+      },
+    };
+    const searchAPI = { getSources: async (): Promise<t.SearchResult> => shared };
+
+    await executeParallelSearches({
+      searchAPI,
+      query: 'test query',
+      safeSearch: 1,
+      images: false,
+      videos: false,
+      news: false,
+      logger,
+      provider: 'searxng',
+    });
+
+    expect(String((logger.debug as jest.Mock).mock.calls[0][0])).toContain(
+      'results={web:3}'
+    );
+  });
+
+  test('records a slow sibling failure even when the main search rejects first', async () => {
+    const logger = createMockLogger();
+    const failure = new Error('main provider exploded');
+    const searchAPI = {
+      getSources: async (
+        params: t.GetSourcesParams
+      ): Promise<t.SearchResult> => {
+        if (params.type !== 'images') {
+          throw failure;
+        }
+        // Settles well after the main search has already rejected.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return { success: false, error: 'timeout of 10000ms exceeded' };
+      },
+    };
+
+    await expect(
+      executeParallelSearches({
+        searchAPI,
+        query: 'test query',
+        safeSearch: 1,
+        images: true,
+        videos: false,
+        news: false,
+        logger,
+        provider: 'serper',
+      })
+    ).rejects.toBe(failure);
+
+    /** The summary must not be flushed while a sibling is still in flight,
+     * or that provider's failure is lost from the aggregate entirely. */
+    const line = String((logger.error as jest.Mock).mock.calls[0][0]);
+    expect(line).toContain('queries=2');
+    expect(line).toContain('failed=2');
+    expect(line).toContain('images:timeout:1');
+    expect(line).toContain('web:other:1');
+  });
+
+  test('keeps a sub-search failure off the error channel', async () => {
+    const logger = createMockLogger();
+    const searchAPI = {
+      getSources: async (params: t.GetSourcesParams): Promise<t.SearchResult> =>
+        params.type === 'news'
+          ? { success: false, error: 'timeout of 10000ms exceeded' }
+          : okResult,
+    };
+
+    const merged = await executeParallelSearches({
+      searchAPI,
+      query: 'test query',
+      safeSearch: 1,
+      images: false,
+      videos: false,
+      news: true,
+      logger,
+      provider: 'serper',
+    });
+
+    expect(merged.success).toBe(true);
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(String((logger.warn as jest.Mock).mock.calls[0][0])).toContain(
+      'failed=1 reasons={news:timeout:1}'
+    );
   });
 });

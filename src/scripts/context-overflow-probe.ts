@@ -7,8 +7,7 @@
  * guessed phrases.
  *
  * Run:
- *   DOTENV_CONFIG_PATH=/path/to/.env node --loader ./tsconfig-paths-bootstrap.mjs \
- *     --experimental-specifier-resolution=node ./src/scripts/context-overflow-probe.ts
+ *   DOTENV_CONFIG_PATH=/path/to/.env tsx ./src/scripts/context-overflow-probe.ts
  *
  * Flags:
  *   --only <provider[,provider]>  restrict to given providers
@@ -22,6 +21,7 @@
  * providers do not bill the prompt. The `confirm` tier still overshoots by a
  * wide margin so an expensive model can never accidentally accept the prompt.
  */
+import '@/llm/providers.eager';
 import { writeFileSync } from 'fs';
 import { config as loadEnv } from 'dotenv';
 import { HumanMessage } from '@langchain/core/messages';
@@ -918,7 +918,7 @@ async function runProbe(
   try {
     const model = initializeModel({
       provider: target.provider,
-      clientOptions: buildClientOptions(target),
+      clientOptions: buildClientOptions(target) as t.BuiltInClientOptions,
     }) as t.ChatModel;
 
     if (mode === 'invoke' || model.stream == null) {
