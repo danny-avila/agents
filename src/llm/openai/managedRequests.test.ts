@@ -259,6 +259,22 @@ describe('GPT-6 Astra request constraints', () => {
 
   type AstraFields = ConstructorParameters<typeof ChatOpenAI>[0];
 
+  /**
+   * The request fields these tests assert on, across both APIs. Named rather
+   * than probed through `Record<string, unknown>` so a renamed or mistyped
+   * field is a compile error instead of a silently absent expectation.
+   */
+  type ProbedRequestParams = {
+    temperature?: number | null;
+    top_p?: number | null;
+    logprobs?: boolean | null;
+    top_logprobs?: number | null;
+    max_output_tokens?: number | null;
+    reasoning_effort?: string;
+    reasoning?: { effort?: string };
+    include?: OpenAI.Responses.ResponseIncludable[];
+  };
+
   const astra = (fields: AstraFields = {}) =>
     new ChatOpenAI({
       model: 'gpt-6-astra',
@@ -279,7 +295,7 @@ describe('GPT-6 Astra request constraints', () => {
   it('strips sampling parameters the model rejects', () => {
     const model = astra({ temperature: 0.7, topP: 0.9, topLogprobs: 3 });
     for (const options of [{}, { tools: [tool] }]) {
-      const params = model.invocationParams(options) as Record<string, unknown>;
+      const params = model.invocationParams(options) as ProbedRequestParams;
       expect(params).not.toHaveProperty('temperature');
       expect(params).not.toHaveProperty('top_p');
       expect(params).not.toHaveProperty('top_logprobs');
@@ -298,7 +314,7 @@ describe('GPT-6 Astra request constraints', () => {
     const model = astra({ useResponsesApi: true });
     const params = model.invocationParams({
       include: ['message.output_text.logprobs', 'reasoning.encrypted_content'],
-    } as never) as { include?: unknown[] };
+    } as never) as ProbedRequestParams;
     expect(params.include).toEqual(
       expect.not.arrayContaining(['message.output_text.logprobs'])
     );
@@ -324,7 +340,7 @@ describe('GPT-6 Astra request constraints', () => {
     (
       astra({ useResponsesApi: true }).invocationParams({
         reasoningEffort: effort,
-      } as never) as { reasoning?: { effort?: string } }
+      } as never) as ProbedRequestParams
     ).reasoning?.effort;
 
   it('substitutes the reasoning efforts the model rejects on both APIs', () => {
@@ -345,7 +361,7 @@ describe('GPT-6 Astra request constraints', () => {
     const model = new ChatOpenAI({ model: 'gpt-5.6', apiKey: 'test-key' });
     const params = model.invocationParams({
       reasoningEffort: 'none',
-    } as never) as { reasoning_effort?: string };
+    } as never) as ProbedRequestParams;
     expect(params.reasoning_effort).toBe('none');
   });
 
@@ -358,7 +374,7 @@ describe('GPT-6 Astra request constraints', () => {
     const params = proxied.invocationParams({
       tools: [tool],
       reasoningEffort: 'none',
-    } as never) as Record<string, unknown>;
+    } as never) as ProbedRequestParams;
     /** Chat Completions path retained, sampling kept, `none` not substituted. */
     expect('max_output_tokens' in params).toBe(false);
     expect(params.temperature).toBe(0.7);
@@ -373,7 +389,7 @@ describe('GPT-6 Astra request constraints', () => {
     });
     const params = undeclared.invocationParams({
       reasoningEffort: 'none',
-    } as never) as Record<string, unknown>;
+    } as never) as ProbedRequestParams;
     /** Default off: sampling kept, `none` not rewritten. */
     expect(params.temperature).toBe(0.7);
     expect(params.reasoning_effort).toBe('none');
@@ -382,7 +398,7 @@ describe('GPT-6 Astra request constraints', () => {
   it('shapes the request once the endpoint is declared', () => {
     const params = astra({ temperature: 0.7 }).invocationParams({
       reasoningEffort: 'none',
-    } as never) as Record<string, unknown>;
+    } as never) as ProbedRequestParams;
     expect(params).not.toHaveProperty('temperature');
     expect(params.reasoning_effort).toBe('low');
   });
@@ -396,7 +412,7 @@ describe('GPT-6 Astra request constraints', () => {
     });
     const params = other.invocationParams({
       reasoningEffort: 'none',
-    } as never) as Record<string, unknown>;
+    } as never) as ProbedRequestParams;
     expect(params.temperature).toBe(0.7);
     expect(params.reasoning_effort).toBe('none');
   });
@@ -416,7 +432,7 @@ describe('GPT-6 Astra request constraints', () => {
     });
     const params = deployed.invocationParams({
       reasoningEffort: 'none',
-    } as never) as Record<string, unknown>;
+    } as never) as ProbedRequestParams;
     expect(params).not.toHaveProperty('temperature');
     expect(params.reasoning_effort).toBe('low');
   });
@@ -431,7 +447,7 @@ describe('GPT-6 Astra request constraints', () => {
     });
     const params = other.invocationParams({
       reasoningEffort: 'none',
-    } as never) as Record<string, unknown>;
+    } as never) as ProbedRequestParams;
     expect(params.temperature).toBe(0.7);
     expect(params.reasoning_effort).toBe('none');
   });
@@ -452,7 +468,7 @@ describe('GPT-6 Astra request constraints', () => {
     });
     const params = azure.invocationParams({
       reasoningEffort: 'none',
-    } as never) as Record<string, unknown>;
+    } as never) as ProbedRequestParams;
     expect(params.reasoning_effort).toBe('low');
   });
 
@@ -462,7 +478,7 @@ describe('GPT-6 Astra request constraints', () => {
       apiKey: 'test-key',
       temperature: 0.7,
     });
-    const params = model.invocationParams({}) as Record<string, unknown>;
+    const params = model.invocationParams({}) as ProbedRequestParams;
     expect(params.temperature).toBe(0.7);
   });
 });
