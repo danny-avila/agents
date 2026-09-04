@@ -21,7 +21,10 @@ import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { createCrwScraper } from './crw-scraper';
 import { expandHighlights } from './highlights';
 import { createSearchMetrics } from './metrics';
-import { formatResultsForLLM } from './format';
+import {
+  formatResultsForLLM,
+  MISSING_SEARCH_RESULT_DATA_ERROR,
+} from './format';
 import { createDefaultLogger } from './utils';
 import { createReranker } from './rerankers';
 import { Constants } from '@/common';
@@ -64,6 +67,12 @@ export function resolveSearchOutcome(
     return undefined;
   }
   return `Found ${count} result${count === 1 ? '' : 's'} for "${query}"`;
+}
+
+export function normalizeSearchResultData(
+  result: t.SearchResultData | null | undefined
+): t.SearchResultData {
+  return result ?? { error: MISSING_SEARCH_RESULT_DATA_ERROR };
 }
 
 /** Distinct rows across the main search's two collections. SearXNG derives
@@ -431,12 +440,13 @@ function createTool({
         }),
       });
       const turn = runnableConfig.toolCall?.turn ?? 0;
+      const resultData = normalizeSearchResultData(searchResult);
       const { output, references } = formatResultsForLLM(
         turn,
-        searchResult,
+        resultData,
         maxOutputChars
       );
-      const data: t.SearchResultData = { turn, ...searchResult, references };
+      const data: t.SearchResultData = { turn, ...resultData, references };
       const outcome = resolveSearchOutcome(data, query);
       return [
         output,
