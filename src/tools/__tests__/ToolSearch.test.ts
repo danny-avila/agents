@@ -1266,6 +1266,23 @@ describe('resolveServerFilters', () => {
     expect(resolveServerFilters(['github'], both).resolved).toEqual(['github']);
   });
 
+  it('keeps every candidate when registered names share a canonical form', () => {
+    /** `foo-bar` and `foobar` are indistinguishable once separators are
+     * dropped, so an inexact request must not silently pick one. */
+    const ambiguous = ['foo-bar', 'foobar'];
+    expect(resolveServerFilters(['FOOBAR'], ambiguous).resolved).toEqual([
+      'foo-bar',
+      'foobar',
+    ]);
+  });
+
+  it('still prefers an exact name over an ambiguous canonical form', () => {
+    const ambiguous = ['foo-bar', 'foobar'];
+    expect(resolveServerFilters(['foobar'], ambiguous).resolved).toEqual([
+      'foobar',
+    ]);
+  });
+
   it('reports a name that matches nothing', () => {
     expect(resolveServerFilters(['nope'], available)).toEqual({
       resolved: [],
@@ -1345,6 +1362,35 @@ describe('tool_search mcp_server filtering', () => {
 
     expect(String(output)).toContain('run_select_query_mcp_clickhouse');
     expect(String(output)).not.toContain('create_issue_mcp_github');
+  });
+
+  it('distinguishes a server with nothing left to search from an unknown one', async () => {
+    /** Every Slack tool is already loaded, so it is registered but has nothing
+     * deferred; saying it does not exist would be wrong. */
+    const mixed = new Map(
+      [
+        { name: 'send_message_mcp_slack', defer_loading: false },
+        { name: 'create_issue_mcp_github', defer_loading: true },
+      ].map((tool) => [
+        tool.name,
+        {
+          ...tool,
+          description: tool.name,
+          parameters: { type: 'object', properties: {} },
+        },
+      ])
+    );
+
+    const output = String(
+      await createToolSearch({
+        mode: 'local',
+        toolRegistry: mixed as never,
+      }).invoke({ query: 'anything', mcp_server: 'slack' })
+    );
+
+    expect(output).toContain('no tools left to search');
+    expect(output).toContain('slack');
+    expect(output).not.toContain('No MCP server matched');
   });
 
   it('names the available servers when the filter matches none', async () => {

@@ -206,6 +206,11 @@ function withoutMcpPrefix(canonical: string): string {
  * mcp-prefix-stripped form. Trying them in that order keeps a deployment that
  * runs both `github` and `mcp-github` unambiguous: each resolves to itself.
  *
+ * Several registered names can still share one canonical form (`foo-bar` and
+ * `foobar`). An inexact request cannot choose between them, so every candidate
+ * is returned rather than whichever was seen first: a superset is recoverable
+ * by reading the tool names, an arbitrary pick is not.
+ *
  * @param requested - Server names as supplied by the caller
  * @param available - Server names present in the tool registry
  * @returns The registry names to filter by, and any request that matched none
@@ -215,11 +220,14 @@ function resolveServerFilters(
   available: string[]
 ): { resolved: string[]; unresolved: string[] } {
   const exact = new Set(available);
-  const canonical = new Map<string, string>();
+  const canonical = new Map<string, string[]>();
   for (const name of available) {
     const key = canonicalizeServerName(name);
-    if (!canonical.has(key)) {
-      canonical.set(key, name);
+    const bucket = canonical.get(key);
+    if (bucket === undefined) {
+      canonical.set(key, [name]);
+    } else {
+      bucket.push(name);
     }
   }
 
@@ -233,12 +241,12 @@ function resolveServerFilters(
     const key = canonicalizeServerName(want);
     const direct = canonical.get(key);
     if (direct !== undefined) {
-      resolved.push(direct);
+      resolved.push(...direct);
       continue;
     }
     const stripped = canonical.get(withoutMcpPrefix(key));
     if (stripped !== undefined) {
-      resolved.push(stripped);
+      resolved.push(...stripped);
       continue;
     }
     unresolved.push(want);
@@ -1060,22 +1068,53 @@ ${mcpNote}${toolsListSection}
       }
 
       const toolsArray: t.LCTool[] = Array.from(toolRegistry.values());
-      const searchable = toolsArray.filter(
-        (lcTool) => onlyDeferred !== true || lcTool.defer_loading === true
-      );
-      const availableServers = Array.from(
-        new Set(
-          searchable
-            .map((lcTool) => extractMcpServerName(lcTool.name))
-            .filter((name): name is string => name !== undefined)
-        )
-      ).sort();
+      /** One pass builds the searchable subset and, only when a server filter
+       * needs them, the two server indexes. An unfiltered search is the hot
+       * path and pays for none of the server bookkeeping. */
+      const searchable: t.LCTool[] = [];
+      const registeredServers = hasServerFilter ? new Set<string>() : undefined;
+      const searchableServers = hasServerFilter ? new Set<string>() : undefined;
+      for (const lcTool of toolsArray) {
+        const server =
+          registeredServers === undefined
+            ? undefined
+            : extractMcpServerName(lcTool.name);
+        if (server !== undefined) {
+          registeredServers?.add(server);
+        }
+        if (onlyDeferred === true && lcTool.defer_loading !== true) {
+          continue;
+        }
+        searchable.push(lcTool);
+        if (server !== undefined) {
+          searchableServers?.add(server);
+        }
+      }
 
-      /** A near-miss on the server name filters instead of returning nothing. */
-      const { resolved: activeServers, unresolved: unknownServers } =
+      const availableServers =
+        searchableServers === undefined
+          ? []
+          : Array.from(searchableServers).sort();
+
+      /** Resolve against every registered server, not just the searchable ones,
+       * so a server whose tools are all loaded already is reported as having
+       * nothing left to search instead of as a name that does not exist. */
+      const { resolved: matchedServers, unresolved: unknownServers } =
         hasServerFilter
-          ? resolveServerFilters(serverFilters, availableServers)
+          ? resolveServerFilters(
+            serverFilters,
+            registeredServers === undefined
+              ? []
+              : Array.from(registeredServers)
+          )
           : { resolved: [], unresolved: [] };
+
+      const activeServers = matchedServers.filter(
+        (name) => searchableServers?.has(name) === true
+      );
+      const idleServers = matchedServers.filter(
+        (name) => searchableServers?.has(name) !== true
+      );
 
       const deferredTools: t.ToolMetadata[] = searchable
         .filter((lcTool) => {
@@ -1101,12 +1140,27 @@ ${mcpNote}${toolsListSection}
         if (searchable.length === 0) {
           message =
             'No tools available to search. The tool registry is empty or no deferred tools are registered.';
-        } else if (hasServerFilter && unknownServers.length > 0) {
-          const available =
-            availableServers.length > 0
-              ? availableServers.join(', ')
-              : '(none registered)';
-          message = `No tools matched MCP server(s): ${unknownServers.join(', ')}. Available server(s): ${available}.`;
+        } else if (
+          hasServerFilter &&
+          (unknownServers.length > 0 || idleServers.length > 0)
+        ) {
+          const parts: string[] = [];
+          if (unknownServers.length > 0) {
+            parts.push(`No MCP server matched: ${unknownServers.join(', ')}.`);
+          }
+          if (idleServers.length > 0) {
+            parts.push(
+              `Registered with no tools left to search: ${idleServers.join(', ')}.`
+            );
+          }
+          parts.push(
+            `Server(s) with searchable tools: ${
+              availableServers.length > 0
+                ? availableServers.join(', ')
+                : '(none)'
+            }.`
+          );
+          message = parts.join(' ');
         } else {
           const serverMsg = hasServerFilter
             ? ` from MCP server(s): ${serverFilters.join(', ')}`
@@ -1121,7 +1175,9 @@ ${mcpNote}${toolsListSection}
               total_searched: 0,
               pattern: query,
               mcp_server: serverFilters,
-              available_mcp_servers: availableServers,
+              ...(hasServerFilter
+                ? { available_mcp_servers: availableServers }
+                : {}),
             },
           },
         ];
