@@ -53,6 +53,57 @@ function fixture(hookRegistry?: HookRegistry) {
 }
 
 describe('ToolNode prepared subagent adoption', () => {
+  it('parents each early tool beneath its own dispatch chain', async () => {
+    const f = fixture();
+    const chains: Array<{ id: string; name?: string; input: unknown }> = [];
+    const parents: Array<string | undefined> = [];
+    const tracedConfig = {
+      ...config,
+      runId: '00000000-0000-4000-8000-000000000001',
+      callbacks: [
+        {
+          handleChainStart: (
+            _chain: unknown,
+            input: unknown,
+            id: string,
+            _parent?: string,
+            _tags?: string[],
+            _metadata?: Record<string, unknown>,
+            _type?: string,
+            name?: string
+          ) => {
+            chains.push({ id, name, input });
+          },
+          handleToolStart: (
+            _tool: unknown,
+            _input: string,
+            _id: string,
+            parent?: string
+          ) => {
+            parents.push(parent);
+          },
+        },
+      ],
+    };
+    f.prepared.begin('attempt');
+    f.node.prestartSubagent(call, 'attempt', tracedConfig, 4);
+    await f.started;
+    expect(parents).toHaveLength(1);
+    const dispatch = chains.find((chain) => chain.id === parents[0]);
+    expect(dispatch?.name).toBe('tools=parent');
+    expect(dispatch?.id).not.toBe(tracedConfig.runId);
+    expect(dispatch?.input).toEqual({
+      messages: [expect.objectContaining({ tool_calls: [call] })],
+    });
+    f.prepared.finish('attempt', [call]);
+    f.finish('research complete');
+    await f.node.invoke(
+      [new AIMessage({ content: '', tool_calls: [call] })],
+      tracedConfig
+    );
+    expect(parents).toHaveLength(1);
+  });
+
   it('runs once before the batch and still registers the final output reference', async () => {
     const f = fixture();
     f.prepared.begin('attempt');

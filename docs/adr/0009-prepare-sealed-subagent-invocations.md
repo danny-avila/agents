@@ -71,3 +71,7 @@ limit, not a new process-wide limit for all foreground subagents.
   child activity can appear before the parent finishes generating sibling calls.
 - Tests exercise actual streamed model and child graphs, plus cancellation,
   argument changes, duplicate admission, capacity and ToolNode adoption.
+
+### Trace ownership
+
+Each early invocation opens a singleton tool-dispatch chain before starting its tool and child graph. The normal completed batch collects that result and dispatches deferred calls. This represents the actual streaming timeline without reparenting spans or transferring ownership of a future graph-node span. The dispatch uses the attempt-owned callbacks and the executing agent’s tracing scope, and its input contains only that call.

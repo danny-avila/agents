@@ -1,5 +1,6 @@
 import { nanoid } from 'nanoid';
 import { ToolCall } from '@langchain/core/messages/tool';
+import { RunnableLambda } from '@langchain/core/runnables';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
   AIMessage,
@@ -1367,23 +1368,31 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const turn = this.toolUsageCount.get(call.name) ?? 0;
         this.toolUsageCount.set(call.name, turn + 1);
         this.directPathTurns.set(call.id!, turn);
+        // An early call is its own dispatch, before the completed batch exists.
+        // Give it a real chain parent instead of borrowing the model's callback
+        // parent or attempting to reparent already-exported observations later.
         return this.withToolScope(capturedConfig, (scopedConfig) =>
-          this.invokeWithRuntime(
-            tool,
-            {
-              ...preparedCall,
-              type: 'tool_call',
-              turn,
-              stepId: this.toolCallStepIds?.get(call.id!),
-            },
-            preparedCall,
-            {
-              ...scopedConfig,
-              signal: composeAbortSignals(
-                signal,
-                composeAbortSignals(config.signal, scope?.controller.signal)
-              ),
-            }
+          RunnableLambda.from(async (_input, dispatchConfig) =>
+            this.invokeWithRuntime(
+              tool,
+              {
+                ...preparedCall,
+                type: 'tool_call',
+                turn,
+                stepId: this.toolCallStepIds?.get(call.id!),
+              },
+              preparedCall,
+              {
+                ...dispatchConfig,
+                signal: composeAbortSignals(
+                  signal,
+                  composeAbortSignals(config.signal, scope?.controller.signal)
+                ),
+              }
+            )
+          ).invoke(
+            { messages: [new AIMessage({ content: '', tool_calls: [preparedCall] })] },
+            { ...scopedConfig, runId: undefined, runName: `tools=${this.executingAgentId ?? ''}` }
           )
         );
       }
