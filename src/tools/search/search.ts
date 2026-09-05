@@ -8,6 +8,7 @@ import {
 } from './utils';
 import { createKeenableAPI } from './keenable-search';
 import { createTavilyAPI } from './tavily-search';
+import { createExaAPI } from './exa-search';
 import { createSearchMetrics } from './metrics';
 import { createCrwAPI } from './crw-search';
 import { BaseReranker, getDefaultRanking } from './rerankers';
@@ -556,6 +557,9 @@ export const createSearchAPI = (
     keenableApiKey,
     keenableApiUrl,
     keenableSearchOptions,
+    exaApiKey,
+    exaApiUrl,
+    exaSearchOptions,
     crwApiKey,
     crwApiUrl,
     crwSearchOptions,
@@ -591,9 +595,11 @@ export const createSearchAPI = (
       httpAgent: httpAgent ?? crwSearchOptions?.httpAgent,
       httpsAgent: httpsAgent ?? crwSearchOptions?.httpsAgent,
     });
+  } else if (searchProvider.toLowerCase() === 'exa') {
+    return createExaAPI(exaApiKey, exaApiUrl, exaSearchOptions);
   } else {
     throw new Error(
-      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', 'tavily', 'keenable', or 'crw'`
+      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', 'tavily', 'keenable', 'crw', or 'exa'`
     );
   }
 };
