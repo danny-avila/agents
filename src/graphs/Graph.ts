@@ -146,6 +146,7 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
+import { PreparedSubagents, PreparedSubagentError } from '@/tools/preparedSubagents';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
@@ -898,6 +899,7 @@ export abstract class Graph<
    * Call after a run completes and content has been extracted.
    */
   clearHeavyState(): void {
+    this.preparedSubagents.clear();
     this.config = undefined;
     this.signal = undefined;
     this.callerSignal = undefined;
@@ -1239,6 +1241,8 @@ export abstract class Graph<
     restoreSubagentResumeState(state: SubagentToolNodeResumeState): void;
   }> = new Set();
   private _subagentExecutors = new Set<SubagentExecutor>();
+  readonly preparedSubagents = new PreparedSubagents();
+  protected readonly subagentToolNodes = new Map<string, CustomToolNode<t.BaseGraphState>>();
   public getOrCreateFileCheckpointer(): t.LocalFileCheckpointer | undefined {
     // Return the cached instance unconditionally if one exists. The
     // toolExecution check below decides whether to *create* a new
@@ -1397,16 +1401,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * paths must not run in that state. */
   protected resolveTrippedBreakerReason(
     breakerSignal: AbortSignal = this.breakerAbort.signal
-  ): StreamLimitExceededError | undefined {
+  ): StreamLimitExceededError | PreparedSubagentError | undefined {
     if (
       breakerSignal.aborted &&
-      breakerSignal.reason instanceof StreamLimitExceededError
+      (breakerSignal.reason instanceof StreamLimitExceededError || breakerSignal.reason instanceof PreparedSubagentError)
     ) {
       return breakerSignal.reason;
     }
     if (
       this.signal?.aborted === true &&
-      this.signal.reason instanceof StreamLimitExceededError
+      (this.signal.reason instanceof StreamLimitExceededError || this.signal.reason instanceof PreparedSubagentError)
     ) {
       return this.signal.reason;
     }
@@ -1581,6 +1585,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /* Init */
 
   resetValues(keepContent?: boolean, checkpointScope?: string): void {
+    this.preparedSubagents.clear();
     this.resetSubagentCheckpointThreadIds();
     this.messages = [];
     this.hasRestoredCheckpointMessages = false;
@@ -2717,6 +2722,48 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   /* Graph */
 
+  canPrestartSubagents(agentContext?: AgentContext): boolean {
+    if (
+      this.eagerEventToolExecution?.enabled !== true ||
+      (this.eagerEventToolExecution.maxPendingSubagents ?? 4) <= 0 ||
+      this.compileOptions?.checkpointer != null ||
+      this.humanInTheLoop?.enabled === true ||
+      (this.interruptingToolNames?.length ?? 0) > 0 ||
+      agentContext == null ||
+      !this.subagentToolNodes.has(agentContext.agentId)
+    ) {
+      return false;
+    }
+    const graphTools = agentContext.graphTools as t.GenericTool[] | undefined;
+    return (
+      graphTools?.length === 1 &&
+      graphTools[0].name === Constants.SUBAGENT &&
+      SUBAGENT_REPLAY_CONTROLLER in graphTools[0]
+    );
+  }
+
+  prestartSubagent(
+    call: ToolCall,
+    attempt: string,
+    agentContext?: AgentContext
+  ): void {
+    if (
+      !this.canPrestartSubagents(agentContext) ||
+      this.config == null ||
+      agentContext == null
+    ) {
+      return;
+    }
+    this.subagentToolNodes
+      .get(agentContext.agentId)
+      ?.prestartSubagent(
+        call,
+        attempt,
+        this.config,
+        this.eagerEventToolExecution?.maxPendingSubagents ?? 4
+      );
+  }
+
   initializeTools({
     currentTools,
     currentToolMap,
@@ -2791,6 +2838,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         hookRegistry: this.hookRegistry,
         humanInTheLoop: this.humanInTheLoop,
         eagerEventToolExecution: this.eagerEventToolExecution,
+        preparedSubagents: this.preparedSubagents,
         codeSessionToolNames: this.codeSessionToolNames,
         eagerEventToolExecutions: this.eagerEventToolExecutions,
         eagerEventToolUsageCount: this.getEagerEventToolUsageCount(
@@ -2816,6 +2864,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
       this.registerCompiledToolNode(node);
+      if (agentContext != null) {
+        this.subagentToolNodes.set(agentContext.agentId, node);
+      }
       return node;
     }
 
@@ -4092,7 +4143,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * succeeding fallback would resolve a run the public contract says
          * must reject. Rethrow before any recovery path.
          */
-        if (primaryError instanceof StreamLimitExceededError) {
+        if (
+          primaryError instanceof StreamLimitExceededError ||
+          primaryError instanceof PreparedSubagentError
+        ) {
           /** Tripped before rethrowing so parallel agent nodes' in-flight
            * model calls and subagents stop while the rejection propagates. */
           attemptBreaker.abort(primaryError);
@@ -4342,7 +4396,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               })
           );
         } catch (fallbackError) {
-          if (fallbackError instanceof StreamLimitExceededError) {
+          if (
+            fallbackError instanceof StreamLimitExceededError ||
+            fallbackError instanceof PreparedSubagentError
+          ) {
             /** Same treatment as the primary path: a fallback stream that
              * trips the breaker must stop parallel agent nodes' model calls
              * and subagents before the rejection propagates. */
