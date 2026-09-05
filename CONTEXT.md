@@ -297,3 +297,12 @@ cancellation, output, and command results remain invocation-scoped.
 
 See [ADR 0002](docs/adr/0002-stable-execution-worlds.md) for the adapter
 identity and compatibility boundary.
+
+## Prepared Subagent Invocations
+
+A **Prepared Subagent Invocation** is a foreground built-in subagent invocation
+started after its provider seals the arguments but before the parent model
+attempt completes. It is owned by that attempt and the executing agent, bound
+to the tool-call ID and canonical arguments, and adopted once by ToolNode for
+normal result processing. It is process-local and is not a Durable Subagent
+Execution replay mechanism. See [ADR 0009](docs/adr/0009-prepare-sealed-subagent-invocations.md).

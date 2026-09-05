@@ -15,6 +15,7 @@ import {
   requiresStreamLimitAccounting,
   StreamLimitExceededError,
   STREAM_LIMIT_EPOCH_KEY,
+  resolveGenerationKey,
 } from '@/llm/streamLimits';
 import {
   getStreamedToolCallSeal,
@@ -56,6 +57,7 @@ import {
 } from '@/utils/truncation';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
+import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { isReasoningContentBlock } from '@/messages/core';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { composeAbortSignals } from '@/utils/misc';
@@ -1319,6 +1321,65 @@ function startReadyStreamedEagerToolExecutions(args: {
   });
 }
 
+/** Shares provider sealing/parsing with event tools, but never relaxes their batch guard. */
+function startPreparedSubagents(
+  graph: StandardGraph,
+  agentContext: AgentContext | undefined,
+  chunk: Partial<AIMessageChunk>,
+  metadata?: Record<string, unknown>
+): void {
+  const attempt = resolveGenerationKey(metadata);
+  if (
+    (graph as Partial<StandardGraph>).canPrestartSubagents?.(agentContext) !==
+      true ||
+    graph.preparedSubagents.isOpen(attempt) !== true ||
+    graph.hookRegistry?.hasResultAlteringHooks(
+      graph.preparedSubagents.getConfig(attempt)?.configurable?.run_id
+    ) === true
+  ) {
+    return;
+  }
+  let calls: ToolCall[];
+  if (hasOnArrivalToolCallSeal(chunk) && (chunk.tool_calls?.length ?? 0) > 0) {
+    calls = chunk.tool_calls!;
+  } else {
+    const seal = getStreamedToolCallSeal(chunk.response_metadata);
+    const allowSequentialSeal =
+      canPrestartSequentialStreamedToolChunks(agentContext) ||
+      streamedToolCallAdapterAllowsSequentialSeal(chunk.response_metadata);
+    if (!hasExplicitStreamedToolCallSeals(chunk) && !allowSequentialSeal) {
+      return;
+    }
+    const stepKey = `prepared:${attempt}`;
+    recordEagerToolCallChunks({
+      graph,
+      stepKey,
+      toolCallChunks: chunk.tool_call_chunks ?? [],
+      seal,
+    });
+    calls = getStreamedReadyToolCalls({
+      graph,
+      stepKey,
+      toolCallChunks: chunk.tool_call_chunks,
+      seal,
+      allowSequentialSeal,
+    });
+    pruneEagerToolCallChunkStates({
+      graph,
+      stepKey,
+      toolCallIds: new Set(calls.map((call) => call.id!)),
+    });
+  }
+  for (const call of calls) {
+    if (
+      call.name === Constants.SUBAGENT &&
+      !hasToolOutputReference(call.args)
+    ) {
+      graph.prestartSubagent(call, attempt, agentContext);
+    }
+  }
+}
+
 export function getChunkContent({
   chunk,
   provider,
@@ -1597,7 +1658,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       if (
         eventBreaker != null &&
         eventBreaker.signal.aborted &&
-        eventBreaker.signal.reason instanceof StreamLimitExceededError
+        (eventBreaker.signal.reason instanceof StreamLimitExceededError || eventBreaker.signal.reason instanceof PreparedSubagentError)
       ) {
         throw eventBreaker.signal.reason;
       }
@@ -1743,6 +1804,9 @@ export class ChatModelStreamHandler implements t.EventHandler {
         return;
       }
       throwIfRunBreakerTripped();
+      if (hasOnArrivalToolCallSeal(chunk)) {
+        startPreparedSubagents(graph, agentContext, chunk, metadata);
+      }
       if (hasFinalToolCallSignal(chunk)) {
         startEagerToolExecutions({
           graph,
@@ -1837,6 +1901,11 @@ export class ChatModelStreamHandler implements t.EventHandler {
           sealAll: hasFinalToolCallSignal(chunk),
         });
       }
+    }
+
+    if (!hasOnArrivalToolCallSeal(chunk) && !runScopeInvalidated()) {
+      throwIfRunBreakerTripped();
+      startPreparedSubagents(graph, agentContext, chunk, metadata);
     }
 
     if (isEmptyContent) {

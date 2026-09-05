@@ -11,6 +11,7 @@ import type {
   ToolErrorData,
 } from './stream';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { HumanInTheLoopConfig } from './hitl';
 import type { LangfuseConfig } from './graph';
@@ -56,6 +57,13 @@ export type EagerEventToolExecutionConfig = {
    * execution with final args.
    */
   excludeToolNames?: string[];
+  /**
+   * Maximum retained early foreground subagent invocations per graph. Defaults
+   * to 4; 0 disables them. Checkpoints, parent tool hooks, background calls and
+   * control-flow graph tools retain normal batch execution. Once a child has
+   * started, a failed/revised model attempt fails instead of automatically retrying.
+   */
+  maxPendingSubagents?: number;
 };
 
 export type EagerEventToolExecutionOutcome =
@@ -290,6 +298,8 @@ export type ToolNodeOptions = {
    * controller.
    */
   getRunScope?: () => RunBreakerScope;
+  /** Internal graph-owned prepared invocation registry. */
+  preparedSubagents?: PreparedSubagents;
   /** SDK-owned checkpoint bridge for open run-step lifecycle state. */
   restoreRunStepResumeState?: (
     state?: RunStepResumeState,

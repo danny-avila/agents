@@ -1,5 +1,6 @@
 import { nanoid } from 'nanoid';
 import { ToolCall } from '@langchain/core/messages/tool';
+import { RunnableLambda } from '@langchain/core/runnables';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
   AIMessage,
@@ -46,8 +47,17 @@ import type {
   PostToolBatchEntry,
   ToolApprovalReplayKey,
 } from '@/hooks';
+import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
+import {
+  type CallerCapabilityProjection,
+  createCallerCapabilityProjectionSnapshot,
+  isToolDefinitionActive,
+  isProgrammaticControlTool,
+  mergeCallerCapabilityDefinitions,
+  resolveCallerCapabilityProjection,
+} from '@/tools/CallerCapabilities';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
@@ -57,6 +67,13 @@ import {
   serializeStructuredValueBounded,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
+import {
+  buildToolExecutionRequestPlan,
+  coerceArgsForSchema,
+  coerceRecordArgs,
+  resolveRuntimeSessionHint,
+  recordArgsEqual,
+} from '@/tools/eagerEventExecution';
 import {
   attachSubagentResumeManifest,
   SUBAGENT_PARENT_BATCH_CONFIG_KEY,
@@ -69,13 +86,6 @@ import {
   isIntentLabelProperty,
   outcomeFieldsFromResult,
 } from '@/tools/intentArg';
-import {
-  buildToolExecutionRequestPlan,
-  coerceArgsForSchema,
-  coerceRecordArgs,
-  resolveRuntimeSessionHint,
-  recordArgsEqual,
-} from '@/tools/eagerEventExecution';
 import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
@@ -96,16 +106,9 @@ import {
   resolveLocalToolRegistry,
   resolveLocalExecutionTools,
 } from '@/tools/local';
-import {
-  type CallerCapabilityProjection,
-  createCallerCapabilityProjectionSnapshot,
-  isToolDefinitionActive,
-  isProgrammaticControlTool,
-  mergeCallerCapabilityDefinitions,
-  resolveCallerCapabilityProjection,
-} from '@/tools/CallerCapabilities';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
+import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { attachRunStepResumeState } from '@/tools/runStepResume';
 
 /** Host-facing batch requests must not carry the batch's breaker scope —
@@ -793,6 +796,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private getBreakerSignal?: () => AbortSignal | undefined;
   /** Owning graph's immutable run scope; captured once per batch. */
   private getRunScope?: () => RunBreakerScope;
+  private preparedSubagents?: PreparedSubagents;
   /**
    * Monotonic counter used to mint a unique scope id for anonymous
    * batches (ones invoked without a `run_id` in
@@ -842,6 +846,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     fileCheckpointer,
     getBreakerSignal,
     getRunScope,
+    preparedSubagents,
     restoreRunStepResumeState,
     createRunStepResumeState,
   }: t.ToolNodeConstructorParams) {
@@ -927,6 +932,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.toolExecution = toolExecution;
     this.getBreakerSignal = getBreakerSignal;
     this.getRunScope = getRunScope;
+    this.preparedSubagents = preparedSubagents;
     // Caller-provided checkpointer wins. Graphs use this to share a
     // single per-Run instance across every ToolNode they compile so
     // `Run.rewindFiles()` reaches the same snapshot store regardless
@@ -961,6 +967,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     options?: Partial<RunnableConfig>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ): Promise<any> {
+    return this.withToolScope(options, (scoped) => super.invoke(input, scoped));
+  }
+
+  private withToolScope<R>(
+    options: Partial<RunnableConfig> | undefined,
+    invoke: (config: Partial<RunnableConfig> | undefined) => Promise<R>
+  ): Promise<R> {
     // Explicit agent identity for tool callbacks: node-name parsing is
     // ambiguous when agent ids themselves embed node prefixes, so the
     // handler prefers this metadata (see `isForeignScope`).
@@ -995,7 +1008,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         // `LangfuseRuntimeContext.agentId`).
         agentId: this.executingAgentId,
       }),
-      () => super.invoke(input, scopedOptions)
+      () => invoke(scopedOptions)
     );
   }
 
@@ -1280,6 +1293,146 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
+   * Forward the graph state as langgraph 1.4's `runtime.state` so
+   * tools can read it off their second argument instead of the
+   * deprecated `getCurrentTaskInput()` (which relies on
+   * `node:async_hooks` and is browser-incompatible). Shape mirrors
+   * langgraph's prebuilt ToolNode runtime exactly.
+   */
+  private invokeWithRuntime(
+    tool: t.GenericTool,
+    invokeParams: Record<string, unknown>,
+    call: ToolCall,
+    config: RunnableConfig,
+    runInput?: RunToolBatchContext<T>['runInput']
+  ): Promise<unknown> {
+    const lgConfig = config as LangGraphRunnableConfig;
+    const runtime: ToolRuntime<T> = {
+      ...config,
+      state: runInput as ToolRuntime<T>['state'],
+      toolCallId: call.id ?? '',
+      config,
+      context: lgConfig.context as ToolRuntime<T>['context'],
+      store: (lgConfig.store ?? null) as ToolRuntime<T>['store'],
+      writer:
+        lgConfig.writer ??
+        (config.configurable?.writer as ToolRuntime<T>['writer']) ??
+        null,
+    };
+    this.throwIfBreakerTripped(config);
+    config.signal?.throwIfAborted();
+    return tool.invoke(invokeParams, runtime);
+  }
+
+  /** Only Graph's built-in subagent binding is allowed to call this seam. */
+  prestartSubagent(
+    call: ToolCall,
+    attempt: string,
+    config: RunnableConfig,
+    capacity: number
+  ): void {
+    const runId = (config.configurable?.run_id as string | undefined) ?? '';
+    if (
+      call.name !== Constants.SUBAGENT ||
+      call.id == null ||
+      call.args.run_in_background === true ||
+      call.args.subagent_thread_id != null ||
+      this.humanInTheLoop?.enabled === true ||
+      this.hookRegistry?.hasResultAlteringHooks(runId) === true ||
+      this.eagerEventToolExecution?.excludeToolNames?.includes(call.name) ===
+        true
+    ) {
+      return;
+    }
+    const tool = this.toolMap.get(call.name);
+    if (tool == null || this.preparedSubagents == null) {
+      return;
+    }
+    const scope = this.getRunScope?.();
+    const capturedConfig = {
+      ...config,
+      configurable: {
+        ...config.configurable,
+        [RUN_BREAKER_SCOPE_CONFIG_KEY]: scope,
+        [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: attempt,
+      },
+    };
+    const args = JSON.parse(JSON.stringify(call.args)) as ToolCall['args'];
+    const preparedCall = { ...call, args };
+    this.preparedSubagents.start(
+      attempt,
+      this.executingAgentId ?? '',
+      preparedCall,
+      capacity,
+      (signal) => {
+        const turn = this.toolUsageCount.get(call.name) ?? 0;
+        this.toolUsageCount.set(call.name, turn + 1);
+        this.directPathTurns.set(call.id!, turn);
+        // An early call is its own dispatch, before the completed batch exists.
+        // Give it a real chain parent instead of borrowing the model's callback
+        // parent or attempting to reparent already-exported observations later.
+        return this.withToolScope(capturedConfig, async (scopedConfig) => {
+          let output: unknown;
+          let failure: { error: unknown } | undefined;
+          const dispatchOptions = {
+            ...scopedConfig,
+            runName: `tools=${this.executingAgentId ?? ''}`,
+          };
+          delete dispatchOptions.runId;
+          delete dispatchOptions.signal;
+          delete dispatchOptions.timeout;
+          // Isolate ambient cancellation too: RunnableLambda races its signal,
+          // but capacity must remain owned until the actual tool settles.
+          await AsyncLocalStorageProviderSingleton.runWithConfig(
+            dispatchOptions,
+            () =>
+              RunnableLambda.from(async (_input, dispatchConfig) => {
+                try {
+                  output = await this.invokeWithRuntime(
+                    tool,
+                    {
+                      ...preparedCall,
+                      type: 'tool_call',
+                      turn,
+                      stepId: this.toolCallStepIds?.get(call.id!),
+                    },
+                    preparedCall,
+                    {
+                      ...dispatchConfig,
+                      signal: composeAbortSignals(
+                        signal,
+                        composeAbortSignals(
+                          config.signal,
+                          scope?.controller.signal
+                        )
+                      ),
+                    }
+                  );
+                  // Raw output belongs to the tool observation, whose redaction policy
+                  // knows the tool name. A chain's scalar output has no such identity.
+                  return { status: 'completed' };
+                } catch (error) {
+                  failure = { error };
+                  return { status: 'failed' };
+                }
+              }).invoke(
+                {
+                  messages: [
+                    new AIMessage({ content: '', tool_calls: [preparedCall] }),
+                  ],
+                },
+                dispatchOptions
+              )
+          );
+          if (failure != null) {
+            throw failure.error;
+          }
+          return output;
+        });
+      }
+    );
+  }
+  /**
    * Runs a single tool call with error handling.
    *
    * `batchIndex` is the tool's position within the current ToolNode
@@ -1371,6 +1524,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        */
       const usageCount =
         batchContext.usageCount ??
+        this.directPathTurns.get(call.id ?? '') ??
         ((): number => {
           const next = this.toolUsageCount.get(call.name) ?? 0;
           this.toolUsageCount.set(call.name, next + 1);
@@ -1493,31 +1647,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
       }
 
-      /**
-       * Forward the graph state as langgraph 1.4's `runtime.state` so
-       * tools can read it off their second argument instead of the
-       * deprecated `getCurrentTaskInput()` (which relies on
-       * `node:async_hooks` and is browser-incompatible). Shape mirrors
-       * langgraph's prebuilt ToolNode runtime exactly.
-       */
-      const lgConfig = config as LangGraphRunnableConfig;
-      const runtime: ToolRuntime<T> = {
-        ...config,
-        state: runInput as ToolRuntime<T>['state'],
-        toolCallId: call.id ?? '',
-        config,
-        context: lgConfig.context as ToolRuntime<T>['context'],
-        store: (lgConfig.store ?? null) as ToolRuntime<T>['store'],
-        writer:
-          lgConfig.writer ??
-          (config.configurable?.writer as ToolRuntime<T>['writer']) ??
-          null,
-      };
-      /** A sibling can trip the breaker while the PreToolUse hooks above
-       * are awaited; a tool that never inspects its runtime signal would
-       * still run. Recheck at the last moment before execution. */
       this.throwIfBreakerTripped(config);
-      const output = await tool.invoke(invokeParams, runtime);
+      const output = await (this.preparedSubagents?.take(
+        this.executingAgentId ?? '',
+        { ...call, args }
+      ) ?? this.invokeWithRuntime(tool, invokeParams, call, config, runInput));
       if (isCommand(output)) {
         return output;
       }
@@ -1633,7 +1767,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * safety abort, not a tool failure to report back to the model. It
        * passes through like an interrupt so the whole run rejects.
        */
-      if (e instanceof StreamLimitExceededError) {
+      if (
+        e instanceof StreamLimitExceededError ||
+        e instanceof PreparedSubagentError
+      ) {
         throw e;
       }
       if (this.errorHandler) {
@@ -1777,6 +1914,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     config: RunnableConfig,
     batchContext: RunToolBatchContext<T> = {}
   ): Promise<BaseMessage | Command> {
+    if (
+      this.preparedSubagents?.owns(this.executingAgentId ?? '', call) === true &&
+      this.hookRegistry?.hasResultAlteringHooks(
+        (config.configurable?.run_id as string | undefined) ?? ''
+      ) === true
+    ) {
+      this.preparedSubagents.clear();
+      throw new PreparedSubagentError('Tool hooks changed after a subagent started.');
+    }
     const replayController = (
       this.toolMap.get(call.name) as ReplayableSubagentTool | undefined
     )?.[SUBAGENT_REPLAY_CONTROLLER];
@@ -2735,7 +2881,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const signal = config.signal;
     if (
       signal?.aborted === true &&
-      signal.reason instanceof StreamLimitExceededError
+      (signal.reason instanceof StreamLimitExceededError || signal.reason instanceof PreparedSubagentError)
     ) {
       throw signal.reason;
     }
@@ -4435,7 +4581,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      * otherwise perform side effects on a failed run. */
     if (
       composedSignal?.aborted === true &&
-      composedSignal.reason instanceof StreamLimitExceededError
+      (composedSignal.reason instanceof StreamLimitExceededError || composedSignal.reason instanceof PreparedSubagentError)
     ) {
       throw composedSignal.reason;
     }

@@ -51,6 +51,7 @@ import {
 } from '@/llm/providers';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
+import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { safeDispatchCustomEvent } from '@/utils/events';
@@ -702,9 +703,8 @@ export async function attemptInvoke(
     },
   };
   const request = resolveAttemptRequest(params, providerStampedConfig);
-  const configuredModel = providerStampedConfig.metadata?.[
-    Constants.INVOKED_MODEL
-  ];
+  const configuredModel =
+    providerStampedConfig.metadata?.[Constants.INVOKED_MODEL];
   const modelId =
     request.modelId ??
     (typeof configuredModel === 'string' ? configuredModel : undefined);
@@ -745,8 +745,14 @@ export async function attemptInvoke(
   if (leaseTarget != null && generationKey != null) {
     registerActiveStreamLimitGeneration(leaseTarget, generationKey);
   }
+  const prepared =
+    params.context?.eagerEventToolExecution?.enabled === true
+      ? params.context.preparedSubagents
+      : undefined;
+  const preparedAttempt = resolveGenerationKey(stampedConfig.metadata);
+  prepared?.begin(preparedAttempt, stampedConfig);
   try {
-    return await attemptInvokeBody(
+    const result = await attemptInvokeBody(
       {
         request,
         context: params.context,
@@ -755,7 +761,27 @@ export async function attemptInvoke(
       },
       stampedConfig
     );
+    const calls =
+      result.messages?.flatMap((message) =>
+        'tool_calls' in message
+          ? ((message.tool_calls as ToolCall[] | undefined) ?? [])
+          : []
+      ) ?? [];
+    prepared?.finish(preparedAttempt, calls);
+    return result;
+  } catch (error) {
+    prepared?.finish(preparedAttempt, undefined, error);
+    throw error;
   } finally {
+    const chunks = params.context?.eagerEventToolCallChunks;
+    if (prepared != null && chunks != null) {
+      const prefix = `prepared:${preparedAttempt}\u0000`;
+      for (const key of chunks.keys()) {
+        if (key.startsWith(prefix)) {
+          chunks.delete(key);
+        }
+      }
+    }
     if (leaseTarget != null && generationKey != null) {
       releaseStreamLimitGeneration(leaseTarget, generationKey);
     }
@@ -1053,7 +1079,7 @@ async function attemptInvokeBody(
       const signal = config.signal;
       if (
         signal?.aborted === true &&
-        signal.reason instanceof StreamLimitExceededError
+        (signal.reason instanceof StreamLimitExceededError || signal.reason instanceof PreparedSubagentError)
       ) {
         throw signal.reason;
       }
@@ -1290,6 +1316,7 @@ async function attemptInvokeBody(
       const ownAbort =
         restartRoute === 'aborted' &&
         !(error instanceof StreamLimitExceededError) &&
+        !(error instanceof PreparedSubagentError) &&
         config.signal?.aborted !== true;
       if (!ownAbort) {
         throw error;
@@ -1639,7 +1666,7 @@ export async function tryFallbackProviders({
        * a run that must reject. Check before every fallback invocation. */
       if (
         config?.signal?.aborted === true &&
-        config.signal.reason instanceof StreamLimitExceededError
+        (config.signal.reason instanceof StreamLimitExceededError || config.signal.reason instanceof PreparedSubagentError)
       ) {
         throw config.signal.reason;
       }
@@ -1673,7 +1700,7 @@ export async function tryFallbackProviders({
        * provider failure. Continuing would try the remaining fallbacks and a
        * succeeding one would resolve a run that must reject.
        */
-      if (e instanceof StreamLimitExceededError) {
+      if (e instanceof StreamLimitExceededError || e instanceof PreparedSubagentError) {
         throw e;
       }
       /** A parallel sibling's trip aborts this branch's composed signal, and
@@ -1682,7 +1709,7 @@ export async function tryFallbackProviders({
        * abort. Rethrow the breaker's own reason instead. */
       if (
         config?.signal?.aborted === true &&
-        config.signal.reason instanceof StreamLimitExceededError
+        (config.signal.reason instanceof StreamLimitExceededError || config.signal.reason instanceof PreparedSubagentError)
       ) {
         throw config.signal.reason;
       }
