@@ -1262,6 +1262,10 @@ export type ToolSearchArtifact = {
     /** Servers that had tools to search, emitted when a server filter matched
      * nothing so the caller can see what it could have asked for. */
     available_mcp_servers?: string[];
+    /** Requested servers that matched no registered server. */
+    unmatched_mcp_servers?: string[];
+    /** Requested servers that exist but had no tools left to search. */
+    idle_mcp_servers?: string[];
   };
 };
 

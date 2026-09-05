@@ -1283,6 +1283,19 @@ describe('resolveServerFilters', () => {
     ]);
   });
 
+  it('never fuzzy-matches names that canonicalize to nothing', () => {
+    /** `---` and `!!!` both reduce to the empty string; treating that as a
+     * shared key would hand one server's tools to an unrelated request. */
+    const punctuation = ['---'];
+    expect(resolveServerFilters(['!!!'], punctuation)).toEqual({
+      resolved: [],
+      unresolved: ['!!!'],
+    });
+    expect(resolveServerFilters(['---'], punctuation).resolved).toEqual([
+      '---',
+    ]);
+  });
+
   it('reports a name that matches nothing', () => {
     expect(resolveServerFilters(['nope'], available)).toEqual({
       resolved: [],
@@ -1391,6 +1404,35 @@ describe('tool_search mcp_server filtering', () => {
     expect(output).toContain('no tools left to search');
     expect(output).toContain('slack');
     expect(output).not.toContain('No MCP server matched');
+  });
+
+  it('reports the unsearched half of a partly resolved filter', async () => {
+    /** GitHub answers, Slack has nothing deferred. Returning only GitHub
+     * results without saying so would read as though both were searched. */
+    const mixed = new Map(
+      [
+        { name: 'send_message_mcp_slack', defer_loading: false },
+        { name: 'create_issue_mcp_github', defer_loading: true },
+      ].map((tool) => [
+        tool.name,
+        {
+          ...tool,
+          description: tool.name,
+          parameters: { type: 'object', properties: {} },
+        },
+      ])
+    );
+
+    const output = String(
+      await createToolSearch({
+        mode: 'local',
+        toolRegistry: mixed as never,
+      }).invoke({ query: 'create', mcp_server: ['github', 'slack'] })
+    );
+
+    expect(output).toContain('create_issue_mcp_github');
+    expect(output).toContain('no tools left to search');
+    expect(output).toContain('slack');
   });
 
   it('diagnoses an idle server even when nothing at all is deferred', async () => {

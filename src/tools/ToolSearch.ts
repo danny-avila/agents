@@ -223,6 +223,12 @@ function resolveServerFilters(
   const canonical = new Map<string, string[]>();
   for (const name of available) {
     const key = canonicalizeServerName(name);
+    /** A name with no ASCII alphanumerics — `---`, or a Unicode-only name —
+     * canonicalizes to nothing. Indexing it would make every request that also
+     * canonicalizes to nothing resolve to this server. */
+    if (key === '') {
+      continue;
+    }
     const bucket = canonical.get(key);
     if (bucket === undefined) {
       canonical.set(key, [name]);
@@ -239,6 +245,10 @@ function resolveServerFilters(
       continue;
     }
     const key = canonicalizeServerName(want);
+    if (key === '') {
+      unresolved.push(want);
+      continue;
+    }
     const direct = canonical.get(key);
     if (direct !== undefined) {
       resolved.push(...direct);
@@ -1133,6 +1143,29 @@ ${mcpNote}${toolsListSection}
         (name) => searchableServers?.has(name) !== true
       );
 
+      /** A filter naming several servers can resolve only partly. Saying so on
+       * the successful path too stops "searched github and slack" being read
+       * into a result that only ever covered github. */
+      const filterNotes: string[] = [];
+      if (unknownServers.length > 0) {
+        filterNotes.push(
+          `No MCP server matched: ${unknownServers.join(', ')}.`
+        );
+      }
+      if (idleServers.length > 0) {
+        filterNotes.push(
+          `Registered with no tools left to search: ${idleServers.join(', ')}.`
+        );
+      }
+      const filterNotice =
+        filterNotes.length > 0 ? `Note: ${filterNotes.join(' ')}\n\n` : '';
+      const filterMetadata = {
+        ...(unknownServers.length > 0
+          ? { unmatched_mcp_servers: unknownServers }
+          : {}),
+        ...(idleServers.length > 0 ? { idle_mcp_servers: idleServers } : {}),
+      };
+
       if (staged !== undefined) {
         for (const lcTool of staged) {
           if (isFromAnyMcpServer(lcTool.name, activeServers)) {
@@ -1205,13 +1238,14 @@ ${mcpNote}${toolsListSection}
         );
 
         return [
-          formattedOutput,
+          `${filterNotice}${formattedOutput}`,
           {
             tool_references: [],
             metadata: {
               total_available: deferredTools.length,
               mcp_server: serverFilters,
               listing_mode: true,
+              ...filterMetadata,
             },
           },
         ];
@@ -1230,13 +1264,14 @@ ${mcpNote}${toolsListSection}
         );
 
         return [
-          formattedOutput,
+          `${filterNotice}${formattedOutput}`,
           {
             tool_references: searchResponse.tool_references,
             metadata: {
               total_searched: searchResponse.total_tools_searched,
               pattern: searchResponse.pattern_used,
               mcp_server: serverFilters.length > 0 ? serverFilters : undefined,
+              ...filterMetadata,
             },
           },
         ];
@@ -1291,19 +1326,20 @@ ${mcpNote}${toolsListSection}
 
         if (!result.stdout || !result.stdout.trim()) {
           return [
-            `${warningMessage}No tools matched the pattern "${sanitizedPattern}".\nTotal tools searched: ${deferredTools.length}`,
+            `${filterNotice}${warningMessage}No tools matched the pattern "${sanitizedPattern}".\nTotal tools searched: ${deferredTools.length}`,
             {
               tool_references: [],
               metadata: {
                 total_searched: deferredTools.length,
                 pattern: sanitizedPattern,
+                ...filterMetadata,
               },
             },
           ];
         }
 
         const searchResponse = parseSearchResults(result.stdout);
-        const formattedOutput = `${warningMessage}${formatSearchResults(searchResponse, mcpNameFormat)}`;
+        const formattedOutput = `${filterNotice}${warningMessage}${formatSearchResults(searchResponse, mcpNameFormat)}`;
 
         return [
           formattedOutput,
@@ -1312,6 +1348,7 @@ ${mcpNote}${toolsListSection}
             metadata: {
               total_searched: searchResponse.total_tools_searched,
               pattern: searchResponse.pattern_used,
+              ...filterMetadata,
             },
           },
         ];
