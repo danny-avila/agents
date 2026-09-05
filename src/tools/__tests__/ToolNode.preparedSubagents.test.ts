@@ -1,6 +1,7 @@
 import { z } from 'zod';
-import { tool } from '@langchain/core/tools';
 import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import { tool, DynamicStructuredTool } from '@langchain/core/tools';
+import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import { ToolOutputReferenceRegistry } from '../toolOutputReferences';
 import { PreparedSubagents } from '../preparedSubagents';
@@ -15,28 +16,33 @@ const call: ToolCall = {
 };
 const config = { configurable: { run_id: 'run', thread_id: 'thread' } };
 
-function fixture(hookRegistry?: HookRegistry) {
+function fixture(hookRegistry?: HookRegistry, nonCooperative = false) {
   let starts = 0;
   let finish!: (value: string) => void;
+  let fail!: (error: Error) => void;
   let onStarted!: () => void;
   const started = new Promise<void>((resolve) => {
     onStarted = resolve;
   });
-  const result = new Promise<string>((resolve) => {
+  const result = new Promise<string>((resolve, reject) => {
     finish = resolve;
+    fail = reject;
   });
-  const child = tool(
-    async () => {
-      starts++;
-      onStarted();
-      return result;
-    },
-    {
-      name: Constants.SUBAGENT,
-      description: 'Delegate research',
-      schema: z.object({ description: z.string(), subagent_type: z.string() }),
-    }
-  );
+  const func = async () => {
+    starts++;
+    onStarted();
+    return result;
+  };
+  const params = {
+    name: Constants.SUBAGENT,
+    description: 'Delegate research',
+    schema: z.object({ description: z.string(), subagent_type: z.string() }),
+  };
+  // tool() itself races cancellation. Use the direct class to model an
+  // invocation that remains pending after its signal aborts.
+  const child = nonCooperative
+    ? new DynamicStructuredTool({ ...params, func })
+    : tool(func, params);
   const prepared = new PreparedSubagents();
   const registry = new ToolOutputReferenceRegistry();
   const node = new ToolNode({
@@ -49,14 +55,92 @@ function fixture(hookRegistry?: HookRegistry) {
     toolOutputRegistry: registry,
     hookRegistry,
   });
-  return { node, prepared, started, finish, registry, starts: () => starts };
+  return {
+    node,
+    prepared,
+    started,
+    finish,
+    fail,
+    registry,
+    starts: () => starts,
+  };
 }
 
 describe('ToolNode prepared subagent adoption', () => {
+  it('retains capacity until a cancellation-ignoring tool actually settles', async () => {
+    const f = fixture(undefined, true);
+    const controller = new AbortController();
+    const scoped = { ...config, signal: controller.signal };
+    f.prepared.begin('old');
+    AsyncLocalStorageProviderSingleton.runWithConfig(scoped, () =>
+      f.node.prestartSubagent(call, 'old', scoped, 1)
+    );
+    await f.started;
+    controller.abort(new Error('cancelled'));
+    f.prepared.clear();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    f.prepared.begin('new');
+    expect(
+      f.prepared.start(
+        'new',
+        'parent',
+        { ...call, id: 'next' },
+        1,
+        async () => 'next'
+      )
+    ).toBe(false);
+    f.finish('late output');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(
+      f.prepared.start(
+        'new',
+        'parent',
+        { ...call, id: 'next' },
+        1,
+        async () => 'next'
+      )
+    ).toBe(true);
+    f.prepared.clear();
+  });
+
+  it('keeps raw failures out of the dispatch chain while preserving adoption errors', async () => {
+    const f = fixture();
+    const outputs: unknown[] = [];
+    const errors: unknown[] = [];
+    f.prepared.begin('attempt');
+    f.node.prestartSubagent(
+      call,
+      'attempt',
+      {
+        ...config,
+        callbacks: [
+          {
+            handleChainEnd: (output: unknown) => {
+              outputs.push(output);
+            },
+            handleChainError: (error: unknown) => {
+              errors.push(error);
+            },
+          },
+        ],
+      },
+      1
+    );
+    await f.started;
+    f.prepared.finish('attempt', [call]);
+    f.fail(new Error('sensitive failure detail'));
+    await expect(f.prepared.take('parent', call)).rejects.toThrow(
+      'sensitive failure detail'
+    );
+    expect(outputs).toEqual([{ status: 'failed' }]);
+    expect(errors).toEqual([]);
+  });
+
   it('parents each early tool beneath its own dispatch chain', async () => {
     const f = fixture();
     const chains: Array<{ id: string; name?: string; input: unknown }> = [];
     const parents: Array<string | undefined> = [];
+    const chainOutputs = new Map<string, unknown>();
     const tracedConfig = {
       ...config,
       runId: '00000000-0000-4000-8000-000000000001',
@@ -73,6 +157,9 @@ describe('ToolNode prepared subagent adoption', () => {
             name?: string
           ) => {
             chains.push({ id, name, input });
+          },
+          handleChainEnd: (output: unknown, id: string) => {
+            chainOutputs.set(id, output);
           },
           handleToolStart: (
             _tool: unknown,
@@ -97,10 +184,12 @@ describe('ToolNode prepared subagent adoption', () => {
     });
     f.prepared.finish('attempt', [call]);
     f.finish('research complete');
-    await f.node.invoke(
+    const result = await f.node.invoke(
       [new AIMessage({ content: '', tool_calls: [call] })],
       tracedConfig
     );
+    expect(result[0].content).toBe('research complete');
+    expect(chainOutputs.get(dispatch!.id)).toEqual({ status: 'completed' });
     expect(parents).toHaveLength(1);
   });
 

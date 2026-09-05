@@ -1371,34 +1371,67 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         // An early call is its own dispatch, before the completed batch exists.
         // Give it a real chain parent instead of borrowing the model's callback
         // parent or attempting to reparent already-exported observations later.
-        return this.withToolScope(capturedConfig, (scopedConfig) =>
-          RunnableLambda.from(async (_input, dispatchConfig) =>
-            this.invokeWithRuntime(
-              tool,
-              {
-                ...preparedCall,
-                type: 'tool_call',
-                turn,
-                stepId: this.toolCallStepIds?.get(call.id!),
-              },
-              preparedCall,
-              {
-                ...dispatchConfig,
-                signal: composeAbortSignals(
-                  signal,
-                  composeAbortSignals(config.signal, scope?.controller.signal)
-                ),
-              }
-            )
-          ).invoke(
-            { messages: [new AIMessage({ content: '', tool_calls: [preparedCall] })] },
-            { ...scopedConfig, runId: undefined, runName: `tools=${this.executingAgentId ?? ''}` }
-          )
-        );
+        return this.withToolScope(capturedConfig, async (scopedConfig) => {
+          let output: unknown;
+          let failure: { error: unknown } | undefined;
+          const dispatchOptions = {
+            ...scopedConfig,
+            runName: `tools=${this.executingAgentId ?? ''}`,
+          };
+          delete dispatchOptions.runId;
+          delete dispatchOptions.signal;
+          delete dispatchOptions.timeout;
+          // Isolate ambient cancellation too: RunnableLambda races its signal,
+          // but capacity must remain owned until the actual tool settles.
+          await AsyncLocalStorageProviderSingleton.runWithConfig(
+            dispatchOptions,
+            () =>
+              RunnableLambda.from(async (_input, dispatchConfig) => {
+                try {
+                  output = await this.invokeWithRuntime(
+                    tool,
+                    {
+                      ...preparedCall,
+                      type: 'tool_call',
+                      turn,
+                      stepId: this.toolCallStepIds?.get(call.id!),
+                    },
+                    preparedCall,
+                    {
+                      ...dispatchConfig,
+                      signal: composeAbortSignals(
+                        signal,
+                        composeAbortSignals(
+                          config.signal,
+                          scope?.controller.signal
+                        )
+                      ),
+                    }
+                  );
+                  // Raw output belongs to the tool observation, whose redaction policy
+                  // knows the tool name. A chain's scalar output has no such identity.
+                  return { status: 'completed' };
+                } catch (error) {
+                  failure = { error };
+                  return { status: 'failed' };
+                }
+              }).invoke(
+                {
+                  messages: [
+                    new AIMessage({ content: '', tool_calls: [preparedCall] }),
+                  ],
+                },
+                dispatchOptions
+              )
+          );
+          if (failure != null) {
+            throw failure.error;
+          }
+          return output;
+        });
       }
     );
   }
-
   /**
    * Runs a single tool call with error handling.
    *

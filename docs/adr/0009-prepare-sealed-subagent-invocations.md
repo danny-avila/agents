@@ -51,8 +51,7 @@ terminal cleanup cancel unadopted and still-running adopted invocations.
 
 `eagerEventToolExecution.maxPendingSubagents` bounds outstanding early work
 and retained raw results per graph; the default is four and zero disables this
-path. Excess calls execute normally with the completed batch. Cancellation-
-ignoring work keeps its admission slot until it settles. This is an early-work
+path. Excess calls execute normally with the completed batch. An unsettled tool invocation keeps its admission slot until it settles. This is an early-work
 limit, not a new process-wide limit for all foreground subagents.
 
 ## Consequences
@@ -75,3 +74,7 @@ limit, not a new process-wide limit for all foreground subagents.
 ### Trace ownership
 
 Each early invocation opens a singleton tool-dispatch chain before starting its tool and child graph. The normal completed batch collects that result and dispatches deferred calls. This represents the actual streaming timeline without reparenting spans or transferring ownership of a future graph-node span. The dispatch uses the attempt-owned callbacks and the executing agent’s tracing scope, and its input contains only that call.
+
+The early dispatch chain emits only completion status. Raw results stay in the preparation closure and tool observation, preserving tool-specific output redaction even for scalar results that cannot be recursively identified as tool messages.
+
+Capacity tracks outstanding tool invocation promises. Cancellation is still governed by the existing tool and executor contracts: a provider request that outlives a settled cancellation response is not a physical resource this process-local registry can account for. The tracing wrapper must not add an earlier settlement race of its own.
