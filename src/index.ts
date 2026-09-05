@@ -3,6 +3,7 @@ export * from './run';
 export * from './stream';
 export * from './events';
 export * from './messages';
+export { LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY } from './langfuseToolOutputTracing';
 
 /* Graphs */
 export * from './graphs';
