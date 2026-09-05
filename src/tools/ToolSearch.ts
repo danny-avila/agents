@@ -189,14 +189,16 @@ function isFromMcpServer(toolName: string, serverName: string): boolean {
  * equal `☀️`. Collapsing separators is the only equivalence intended here, so
  * it is the only one performed.
  *
- * The uppercase/lowercase round trip approximates Unicode case folding, which
- * `toLowerCase` alone does not do: `ΟΣ` lowercases to `ος` with a final sigma
- * and would otherwise never match a registered `οσ`.
+ * Case is folded with `toLowerCase` alone. A round trip through uppercase
+ * would additionally equate a Greek final sigma with its medial form, but it
+ * also equates dotless `ı` with ASCII `i`, which Unicode case folding keeps
+ * apart — and a false match hands over another server's tools while a missed
+ * one only produces the message naming the servers that do exist. The safe
+ * direction is the one taken here.
  */
 function canonicalizeServerName(serverName: string): string {
   return serverName
     .trim()
-    .toUpperCase()
     .toLowerCase()
     .normalize('NFC')
     .replace(/[-_. ]+/g, '-');
@@ -1131,7 +1133,6 @@ ${mcpNote}${toolsListSection}
         let server: string | undefined;
         if (hasServerFilter) {
           server = extractMcpServerName(lcTool.name);
-          /** `tool_mcp_` yields an empty suffix that no filter can name. */
           if (server !== undefined && server !== '') {
             registeredServers?.add(server);
           } else {

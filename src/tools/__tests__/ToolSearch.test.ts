@@ -1315,10 +1315,11 @@ describe('resolveServerFilters', () => {
     });
   });
 
-  it('matches a Greek name whose case differs in the final letter', () => {
-    expect(
-      resolveServerFilters(['\u039f\u03a3'], ['\u03bf\u03c3']).resolved
-    ).toEqual(['\u03bf\u03c3']);
+  it('keeps dotless i from resolving to an ASCII name', () => {
+    expect(resolveServerFilters(['ifoo'], ['\u0131foo'])).toEqual({
+      resolved: [],
+      unresolved: ['ifoo'],
+    });
   });
 
   it('only strips an mcp prefix at a real token boundary', () => {
@@ -1399,8 +1400,14 @@ describe('canonicalizeServerName', () => {
     );
   });
 
-  it('case-folds past toLowerCase, so a final sigma still matches', () => {
-    expect(canonicalizeServerName('\u039f\u03a3')).toBe(
+  it('keeps dotless and dotted i apart, at the cost of the sigma case', () => {
+    /** Folding through uppercase would match `\u039f\u03a3` to `\u03bf\u03c3`, but it also
+     * equates `\u0131` with `i`. A missed match only produces the message listing
+     * the real servers; a false one hands over their tools. */
+    expect(canonicalizeServerName('\u0131foo')).not.toBe(
+      canonicalizeServerName('ifoo')
+    );
+    expect(canonicalizeServerName('\u039f\u03a3')).not.toBe(
       canonicalizeServerName('\u03bf\u03c3')
     );
   });
@@ -1415,7 +1422,7 @@ describe('tool_search mcp_server filtering', () => {
   /** LangChain's callback manager mints a uuid v7; `globalThis.crypto` is not
    * exposed on Node 18, so invoking a tool there throws before reaching us. */
   beforeAll(() => {
-    if ((globalThis as { crypto?: unknown }).crypto === undefined) {
+    if ((globalThis as { crypto?: Crypto }).crypto === undefined) {
       Object.defineProperty(globalThis, 'crypto', {
         value: nodeWebcrypto,
         configurable: true,
