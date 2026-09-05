@@ -187,15 +187,22 @@ function canonicalizeServerName(serverName: string): string {
 }
 
 /**
- * Drops a leading `mcp` token from an already-canonical name. Servers are
- * commonly keyed by the bare product (`clickhouse`) while the package that
- * implements them is called `mcp-clickhouse`, and a model that has read the
- * package name asks for that instead.
+ * Canonical form of a requested name with a leading `mcp` token removed, or
+ * undefined when it had none. Servers are commonly keyed by the bare product
+ * (`clickhouse`) while the package implementing them is `mcp-clickhouse`, and a
+ * model that read the package name asks for that instead.
+ *
+ * The boundary is checked on the original string, before canonicalization drops
+ * separators: `mcp-clickhouse` names the `clickhouse` server, but `mcparty` is
+ * simply a server called `mcparty` and must never resolve to `arty`.
  */
-function withoutMcpPrefix(canonical: string): string {
-  return canonical.startsWith('mcp') && canonical.length > 3
-    ? canonical.slice(3)
-    : canonical;
+function canonicalizeWithoutMcpPrefix(requested: string): string | undefined {
+  const match = /^mcp[-_. ]+(.+)$/i.exec(requested.trim());
+  if (match === null) {
+    return undefined;
+  }
+  const key = canonicalizeServerName(match[1]);
+  return key === '' ? undefined : key;
 }
 
 /**
@@ -254,7 +261,9 @@ function resolveServerFilters(
       resolved.push(...direct);
       continue;
     }
-    const stripped = canonical.get(withoutMcpPrefix(key));
+    const strippedKey = canonicalizeWithoutMcpPrefix(want);
+    const stripped =
+      strippedKey === undefined ? undefined : canonical.get(strippedKey);
     if (stripped !== undefined) {
       resolved.push(...stripped);
       continue;
@@ -909,12 +918,15 @@ function getDeferredToolsListing(
  * @param tools - Array of tool metadata from the server(s)
  * @param serverNames - The MCP server name(s)
  * @param nameFormat - Whether to show 'full' names (tool_mcp_server) or 'base' names (tool only)
+ * @param notes - Diagnostics about requested servers that were not searched;
+ * carried inside the JSON so the output stays parseable
  * @returns JSON string showing all tools grouped by server
  */
 function formatServerListing(
   tools: t.ToolMetadata[],
   serverNames: string | string[],
-  nameFormat: t.McpNameFormat = 'full'
+  nameFormat: t.McpNameFormat = 'full',
+  notes: string[] = []
 ): string {
   const servers = Array.isArray(serverNames) ? serverNames : [serverNames];
   const useFullName = nameFormat === 'full';
@@ -926,6 +938,7 @@ function formatServerListing(
         servers,
         total_tools: 0,
         tools_by_server: {},
+        ...(notes.length > 0 ? { notes } : {}),
         hint: 'No tools found from the specified MCP server(s).',
       },
       null,
@@ -960,6 +973,7 @@ function formatServerListing(
     servers,
     total_tools: tools.length,
     tools_by_server: toolsByServer,
+    ...(notes.length > 0 ? { notes } : {}),
     hint: `To use a tool, search for it by name (e.g., query: "${exampleToolName}") to load it.`,
   };
 
@@ -1223,6 +1237,7 @@ ${mcpNote}${toolsListSection}
               ...(hasServerFilter
                 ? { available_mcp_servers: availableServers }
                 : {}),
+              ...filterMetadata,
             },
           },
         ];
@@ -1231,14 +1246,17 @@ ${mcpNote}${toolsListSection}
       const isServerListing = hasServerFilter && query === '';
 
       if (isServerListing) {
+        /** The listing's contract is parseable JSON, so the diagnostics go
+         * inside the payload rather than in front of it. */
         const formattedOutput = formatServerListing(
           deferredTools,
           activeServers,
-          mcpNameFormat
+          mcpNameFormat,
+          filterNotes
         );
 
         return [
-          `${filterNotice}${formattedOutput}`,
+          formattedOutput,
           {
             tool_references: [],
             metadata: {

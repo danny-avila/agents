@@ -1283,6 +1283,21 @@ describe('resolveServerFilters', () => {
     ]);
   });
 
+  it('only strips an mcp prefix at a real token boundary', () => {
+    /** `mcparty` is a server name that happens to start with those letters;
+     * resolving it to `arty` would return an unrelated server's tools. */
+    expect(resolveServerFilters(['mcparty'], ['arty'])).toEqual({
+      resolved: [],
+      unresolved: ['mcparty'],
+    });
+    expect(resolveServerFilters(['mcp-arty'], ['arty']).resolved).toEqual([
+      'arty',
+    ]);
+    expect(resolveServerFilters(['mcp_arty'], ['arty']).resolved).toEqual([
+      'arty',
+    ]);
+  });
+
   it('never fuzzy-matches names that canonicalize to nothing', () => {
     /** `---` and `!!!` both reduce to the empty string; treating that as a
      * shared key would hand one server's tools to an unrelated request. */
@@ -1404,6 +1419,36 @@ describe('tool_search mcp_server filtering', () => {
     expect(output).toContain('no tools left to search');
     expect(output).toContain('slack');
     expect(output).not.toContain('No MCP server matched');
+  });
+
+  it('keeps a partial server listing parseable as JSON', async () => {
+    const mixed = new Map(
+      [
+        { name: 'send_message_mcp_slack', defer_loading: false },
+        { name: 'create_issue_mcp_github', defer_loading: true },
+      ].map((tool) => [
+        tool.name,
+        {
+          ...tool,
+          description: tool.name,
+          parameters: { type: 'object', properties: {} },
+        },
+      ])
+    );
+
+    const output = String(
+      await createToolSearch({
+        mode: 'local',
+        toolRegistry: mixed as never,
+      }).invoke({ query: '', mcp_server: ['github', 'slack'] })
+    );
+
+    const parsed = JSON.parse(output) as {
+      listing_mode: boolean;
+      notes?: string[];
+    };
+    expect(parsed.listing_mode).toBe(true);
+    expect(parsed.notes?.join(' ')).toContain('slack');
   });
 
   it('reports the unsearched half of a partly resolved filter', async () => {
