@@ -1267,19 +1267,19 @@ describe('resolveServerFilters', () => {
   });
 
   it('keeps every candidate when registered names share a canonical form', () => {
-    /** `foo-bar` and `foobar` are indistinguishable once separators are
-     * dropped, so an inexact request must not silently pick one. */
-    const ambiguous = ['foo-bar', 'foobar'];
-    expect(resolveServerFilters(['FOOBAR'], ambiguous).resolved).toEqual([
+    /** `foo-bar` and `foo_bar` differ only by a separator, so they share one
+     * canonical key and an inexact request must not silently pick one. */
+    const ambiguous = ['foo-bar', 'foo_bar'];
+    expect(resolveServerFilters(['FOO BAR'], ambiguous).resolved).toEqual([
       'foo-bar',
-      'foobar',
+      'foo_bar',
     ]);
   });
 
   it('still prefers an exact name over an ambiguous canonical form', () => {
-    const ambiguous = ['foo-bar', 'foobar'];
-    expect(resolveServerFilters(['foobar'], ambiguous).resolved).toEqual([
-      'foobar',
+    const ambiguous = ['foo-bar', 'foo_bar'];
+    expect(resolveServerFilters(['foo_bar'], ambiguous).resolved).toEqual([
+      'foo_bar',
     ]);
   });
 
@@ -1308,6 +1308,19 @@ describe('resolveServerFilters', () => {
     expect(resolveServerFilters(['ÉFOO'], ['éfoo']).resolved).toEqual(['éfoo']);
   });
 
+  it('keeps symbol-only names distinct', () => {
+    expect(resolveServerFilters(['\u2600\ufe0f'], ['\u2764\ufe0f'])).toEqual({
+      resolved: [],
+      unresolved: ['\u2600\ufe0f'],
+    });
+  });
+
+  it('matches a Greek name whose case differs in the final letter', () => {
+    expect(
+      resolveServerFilters(['\u039f\u03a3'], ['\u03bf\u03c3']).resolved
+    ).toEqual(['\u03bf\u03c3']);
+  });
+
   it('only strips an mcp prefix at a real token boundary', () => {
     /** `mcparty` is a server name that happens to start with those letters;
      * resolving it to `arty` would return an unrelated server's tools. */
@@ -1323,9 +1336,9 @@ describe('resolveServerFilters', () => {
     ]);
   });
 
-  it('never fuzzy-matches names that canonicalize to nothing', () => {
-    /** `---` and `!!!` both reduce to the empty string; treating that as a
-     * shared key would hand one server's tools to an unrelated request. */
+  it('keeps punctuation-only names distinct from one another', () => {
+    /** An earlier revision reduced both to the empty string, which would have
+     * handed one server's tools to a request for the other. */
     const punctuation = ['---'];
     expect(resolveServerFilters(['!!!'], punctuation)).toEqual({
       resolved: [],
@@ -1363,10 +1376,39 @@ describe('resolveServerFilters', () => {
 });
 
 describe('canonicalizeServerName', () => {
-  it('collapses case and every separator', () => {
-    expect(canonicalizeServerName('ClickHouse Cloud')).toBe('clickhousecloud');
-    expect(canonicalizeServerName('ClickHouse_Cloud')).toBe('clickhousecloud');
-    expect(canonicalizeServerName('clickhouse-cloud')).toBe('clickhousecloud');
+  it('folds case and treats separators as equivalent', () => {
+    expect(canonicalizeServerName('ClickHouse Cloud')).toBe('clickhouse-cloud');
+    expect(canonicalizeServerName('ClickHouse_Cloud')).toBe('clickhouse-cloud');
+    expect(canonicalizeServerName('clickhouse-cloud')).toBe('clickhouse-cloud');
+  });
+
+  it('discards no character, so distinct names keep distinct keys', () => {
+    /** Each pair below was merged by an earlier revision of this function, and
+     * each merge handed one server's tools to a request for the other. */
+    expect(canonicalizeServerName('\u00e9foo')).not.toBe(
+      canonicalizeServerName('foo')
+    );
+    expect(canonicalizeServerName('\u0130foo')).not.toBe(
+      canonicalizeServerName('ifoo')
+    );
+    expect(canonicalizeServerName('\u2764\ufe0f')).not.toBe(
+      canonicalizeServerName('\u2600\ufe0f')
+    );
+    expect(canonicalizeServerName('---')).not.toBe(
+      canonicalizeServerName('!!!')
+    );
+  });
+
+  it('case-folds past toLowerCase, so a final sigma still matches', () => {
+    expect(canonicalizeServerName('\u039f\u03a3')).toBe(
+      canonicalizeServerName('\u03bf\u03c3')
+    );
+  });
+
+  it('composes, so one name written two ways agrees with itself', () => {
+    expect(canonicalizeServerName('e\u0301foo')).toBe(
+      canonicalizeServerName('\u00e9foo')
+    );
   });
 });
 describe('tool_search mcp_server filtering', () => {

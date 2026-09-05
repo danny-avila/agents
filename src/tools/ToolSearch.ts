@@ -177,23 +177,29 @@ function isFromMcpServer(toolName: string, serverName: string): boolean {
 }
 
 /**
- * Reduces a server name to the form used for lenient matching: lowercase, with
- * separators and punctuation removed. A host rewrites characters it cannot put
- * in a tool name (LibreChat turns `ClickHouse Cloud` into `ClickHouse_Cloud`),
- * so a model asking for `clickhouse-cloud` is naming the same server.
+ * Canonical form used for lenient matching. It folds case and treats the
+ * separators a host may rewrite as equivalent — LibreChat turns
+ * `ClickHouse Cloud` into `ClickHouse_Cloud`, so a model asking for
+ * `clickhouse-cloud` is naming the same server.
  *
- * Letters, digits and combining marks are kept whatever their script, and the
- * result is composed so the same name written two ways agrees with itself.
- * Discarding any of them folds distinct names together: dropping non-ASCII
- * makes `éfoo` reduce to `foo`, and dropping marks makes `İfoo` — whose
- * lowercase is `i` plus a combining dot — reduce to `ifoo`. In both cases a
- * request for the plain name would return the other server's tools.
+ * **No character is ever discarded.** Every incorrect match this resolver has
+ * produced came from deleting characters, because deleting merges two distinct
+ * names onto one key: dropping non-ASCII made `éfoo` equal `foo`, dropping
+ * combining marks made `İfoo` equal `ifoo`, and dropping symbols made `❤️`
+ * equal `☀️`. Collapsing separators is the only equivalence intended here, so
+ * it is the only one performed.
+ *
+ * The uppercase/lowercase round trip approximates Unicode case folding, which
+ * `toLowerCase` alone does not do: `ΟΣ` lowercases to `ος` with a final sigma
+ * and would otherwise never match a registered `οσ`.
  */
 function canonicalizeServerName(serverName: string): string {
   return serverName
+    .trim()
+    .toUpperCase()
     .toLowerCase()
     .normalize('NFC')
-    .replace(/[^\p{L}\p{N}\p{M}]+/gu, '');
+    .replace(/[-_. ]+/g, '-');
 }
 
 /**
