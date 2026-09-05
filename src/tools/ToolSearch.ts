@@ -177,6 +177,122 @@ function isFromMcpServer(toolName: string, serverName: string): boolean {
 }
 
 /**
+ * Canonical form used for lenient matching. It folds case and treats the
+ * separators a host may rewrite as equivalent — LibreChat turns
+ * `ClickHouse Cloud` into `ClickHouse_Cloud`, so a model asking for
+ * `clickhouse-cloud` is naming the same server.
+ *
+ * **No character is ever discarded.** Every incorrect match this resolver has
+ * produced came from deleting characters, because deleting merges two distinct
+ * names onto one key: dropping non-ASCII made `éfoo` equal `foo`, dropping
+ * combining marks made `İfoo` equal `ifoo`, and dropping symbols made `❤️`
+ * equal `☀️`. Collapsing separators is the only equivalence intended here, so
+ * it is the only one performed.
+ *
+ * Case is folded with `toLowerCase` alone. A round trip through uppercase
+ * would additionally equate a Greek final sigma with its medial form, but it
+ * also equates dotless `ı` with ASCII `i`, which Unicode case folding keeps
+ * apart — and a false match hands over another server's tools while a missed
+ * one only produces the message naming the servers that do exist. The safe
+ * direction is the one taken here.
+ */
+function canonicalizeServerName(serverName: string): string {
+  return serverName
+    .trim()
+    .toLowerCase()
+    .normalize('NFC')
+    .replace(/[-_. ]+/g, '-');
+}
+
+/**
+ * Canonical form of a requested name with a leading `mcp` token removed, or
+ * undefined when it had none. Servers are commonly keyed by the bare product
+ * (`clickhouse`) while the package implementing them is `mcp-clickhouse`, and a
+ * model that read the package name asks for that instead.
+ *
+ * The boundary is checked on the original string, before canonicalization drops
+ * separators: `mcp-clickhouse` names the `clickhouse` server, but `mcparty` is
+ * simply a server called `mcparty` and must never resolve to `arty`.
+ */
+function canonicalizeWithoutMcpPrefix(requested: string): string | undefined {
+  const match = /^mcp[-_. ]+(.+)$/i.exec(requested.trim());
+  if (match === null) {
+    return undefined;
+  }
+  const key = canonicalizeServerName(match[1]);
+  return key === '' ? undefined : key;
+}
+
+/**
+ * Maps requested server names onto the servers that actually have tools
+ * registered, so a near-miss filters instead of silently returning nothing.
+ *
+ * Exact names win, then case/separator-insensitive matches, then the
+ * mcp-prefix-stripped form. Trying them in that order keeps a deployment that
+ * runs both `github` and `mcp-github` unambiguous: each resolves to itself.
+ *
+ * Several registered names can still share one canonical form (`foo-bar` and
+ * `foobar`). An inexact request cannot choose between them, so every candidate
+ * is returned rather than whichever was seen first: a superset is recoverable
+ * by reading the tool names, an arbitrary pick is not.
+ *
+ * @param requested - Server names as supplied by the caller
+ * @param available - Server names present in the tool registry
+ * @returns The registry names to filter by, and any request that matched none
+ */
+function resolveServerFilters(
+  requested: string[],
+  available: string[]
+): { resolved: string[]; unresolved: string[] } {
+  const exact = new Set(available);
+  const canonical = new Map<string, string[]>();
+  for (const name of available) {
+    const key = canonicalizeServerName(name);
+    /** A name with no ASCII alphanumerics — `---`, or a Unicode-only name —
+     * canonicalizes to nothing. Indexing it would make every request that also
+     * canonicalizes to nothing resolve to this server. */
+    if (key === '') {
+      continue;
+    }
+    const bucket = canonical.get(key);
+    if (bucket === undefined) {
+      canonical.set(key, [name]);
+    } else {
+      bucket.push(name);
+    }
+  }
+
+  const resolved: string[] = [];
+  const unresolved: string[] = [];
+  for (const want of requested) {
+    if (exact.has(want)) {
+      resolved.push(want);
+      continue;
+    }
+    const key = canonicalizeServerName(want);
+    if (key === '') {
+      unresolved.push(want);
+      continue;
+    }
+    const direct = canonical.get(key);
+    if (direct !== undefined) {
+      resolved.push(...direct);
+      continue;
+    }
+    const strippedKey = canonicalizeWithoutMcpPrefix(want);
+    const stripped =
+      strippedKey === undefined ? undefined : canonical.get(strippedKey);
+    if (stripped !== undefined) {
+      resolved.push(...stripped);
+      continue;
+    }
+    unresolved.push(want);
+  }
+
+  return { resolved: Array.from(new Set(resolved)), unresolved };
+}
+
+/**
  * Checks if a tool belongs to any of the specified MCP servers.
  * @param toolName - The full tool name
  * @param serverNames - Array of server names to match
@@ -709,11 +825,14 @@ function parseSearchResults(stdout: string): t.ToolSearchResponse {
  * Formats search results as structured JSON for efficient parsing.
  * @param searchResponse - The parsed search response
  * @param nameFormat - Whether to show 'full' names (tool_mcp_server) or 'base' names (tool only)
+ * @param notes - Diagnostics about requested servers that were not searched;
+ * carried inside the JSON so the output stays parseable
  * @returns JSON string with search results
  */
 function formatSearchResults(
   searchResponse: t.ToolSearchResponse,
-  nameFormat: t.McpNameFormat = 'full'
+  nameFormat: t.McpNameFormat = 'full',
+  notes: string[] = []
 ): string {
   const { tool_references, total_tools_searched, pattern_used } =
     searchResponse;
@@ -729,6 +848,7 @@ function formatSearchResults(
     })),
     total_searched: total_tools_searched,
     query: pattern_used,
+    ...(notes.length > 0 ? { notes } : {}),
   };
 
   return JSON.stringify(output, null, 2);
@@ -820,12 +940,15 @@ function getDeferredToolsListing(
  * @param tools - Array of tool metadata from the server(s)
  * @param serverNames - The MCP server name(s)
  * @param nameFormat - Whether to show 'full' names (tool_mcp_server) or 'base' names (tool only)
+ * @param notes - Diagnostics about requested servers that were not searched;
+ * carried inside the JSON so the output stays parseable
  * @returns JSON string showing all tools grouped by server
  */
 function formatServerListing(
   tools: t.ToolMetadata[],
   serverNames: string | string[],
-  nameFormat: t.McpNameFormat = 'full'
+  nameFormat: t.McpNameFormat = 'full',
+  notes: string[] = []
 ): string {
   const servers = Array.isArray(serverNames) ? serverNames : [serverNames];
   const useFullName = nameFormat === 'full';
@@ -837,6 +960,7 @@ function formatServerListing(
         servers,
         total_tools: 0,
         tools_by_server: {},
+        ...(notes.length > 0 ? { notes } : {}),
         hint: 'No tools found from the specified MCP server(s).',
       },
       null,
@@ -871,6 +995,7 @@ function formatServerListing(
     servers,
     total_tools: tools.length,
     tools_by_server: toolsByServer,
+    ...(notes.length > 0 ? { notes } : {}),
     hint: `To use a tool, search for it by name (e.g., query: "${exampleToolName}") to load it.`,
   };
 
@@ -988,38 +1113,152 @@ ${mcpNote}${toolsListSection}
         ];
       }
 
-      const toolsArray: t.LCTool[] = Array.from(toolRegistry.values());
-      const deferredTools: t.ToolMetadata[] = toolsArray
-        .filter((lcTool) => {
-          if (onlyDeferred === true && lcTool.defer_loading !== true) {
-            return false;
+      const registeredServers = hasServerFilter ? new Set<string>() : undefined;
+      const searchableServers = hasServerFilter ? new Set<string>() : undefined;
+      /** The set to filter by is unknown until the whole registry has been
+       * seen, so a server-filtered search has to stage its candidates. An
+       * unfiltered search is the hot path: it builds the result during the same
+       * single traversal, with no staging array and no copy of the registry. */
+      const staged: t.LCTool[] | undefined = hasServerFilter ? [] : undefined;
+      const deferredTools: t.ToolMetadata[] = [];
+      let searchableCount = 0;
+
+      const describeTool = (lcTool: t.LCTool): t.ToolMetadata => ({
+        name: lcTool.name,
+        description: lcTool.description ?? '',
+        parameters: simplifyParametersForSearch(lcTool.parameters),
+      });
+
+      for (const lcTool of toolRegistry.values()) {
+        let server: string | undefined;
+        if (hasServerFilter) {
+          server = extractMcpServerName(lcTool.name);
+          if (server !== undefined && server !== '') {
+            registeredServers?.add(server);
+          } else {
+            server = undefined;
           }
-          if (
-            hasServerFilter &&
-            !isFromAnyMcpServer(lcTool.name, serverFilters)
-          ) {
-            return false;
+        }
+        if (onlyDeferred === true && lcTool.defer_loading !== true) {
+          continue;
+        }
+        searchableCount += 1;
+        if (staged === undefined) {
+          deferredTools.push(describeTool(lcTool));
+          continue;
+        }
+        staged.push(lcTool);
+        if (server !== undefined) {
+          searchableServers?.add(server);
+        }
+      }
+
+      const availableServers =
+        searchableServers === undefined
+          ? []
+          : Array.from(searchableServers).sort();
+
+      /** Resolve against every registered server, not just the searchable ones,
+       * so a server whose tools are all loaded already is reported as having
+       * nothing left to search instead of as a name that does not exist. */
+      const { resolved: matchedServers, unresolved: unknownServers } =
+        hasServerFilter
+          ? resolveServerFilters(
+            serverFilters,
+            registeredServers === undefined
+              ? []
+              : Array.from(registeredServers)
+          )
+          : { resolved: [], unresolved: [] };
+
+      const activeServers = matchedServers.filter(
+        (name) => searchableServers?.has(name) === true
+      );
+      const idleServers = matchedServers.filter(
+        (name) => searchableServers?.has(name) !== true
+      );
+
+      /** A filter naming several servers can resolve only partly. Saying so on
+       * the successful path too stops "searched github and slack" being read
+       * into a result that only ever covered github. */
+      const filterNotes: string[] = [];
+      if (unknownServers.length > 0) {
+        filterNotes.push(
+          `No MCP server matched: ${unknownServers.join(', ')}.`
+        );
+      }
+      if (idleServers.length > 0) {
+        filterNotes.push(
+          `Registered with no tools left to search: ${idleServers.join(', ')}.`
+        );
+      }
+      const filterNotice =
+        filterNotes.length > 0 ? `Note: ${filterNotes.join(' ')}\n\n` : '';
+      const filterMetadata = {
+        ...(unknownServers.length > 0
+          ? { unmatched_mcp_servers: unknownServers }
+          : {}),
+        ...(idleServers.length > 0 ? { idle_mcp_servers: idleServers } : {}),
+      };
+
+      if (staged !== undefined) {
+        for (const lcTool of staged) {
+          if (isFromAnyMcpServer(lcTool.name, activeServers)) {
+            deferredTools.push(describeTool(lcTool));
           }
-          return true;
-        })
-        .map((lcTool) => ({
-          name: lcTool.name,
-          description: lcTool.description ?? '',
-          parameters: simplifyParametersForSearch(lcTool.parameters),
-        }));
+        }
+      }
 
       if (deferredTools.length === 0) {
-        const serverMsg = hasServerFilter
-          ? ` from MCP server(s): ${serverFilters.join(', ')}`
-          : '';
+        /** Say which of the three it is, so an empty result is not read as an
+         * outage: nothing is registered, the name did not match anything, or
+         * the named server genuinely has no tools. */
+        let message: string;
+        /** The server diagnosis comes first: a registry holding only loaded
+         * tools makes both conditions true, and naming the requested server is
+         * the more useful of the two answers. */
+        if (
+          hasServerFilter &&
+          (unknownServers.length > 0 || idleServers.length > 0)
+        ) {
+          const parts: string[] = [];
+          if (unknownServers.length > 0) {
+            parts.push(`No MCP server matched: ${unknownServers.join(', ')}.`);
+          }
+          if (idleServers.length > 0) {
+            parts.push(
+              `Registered with no tools left to search: ${idleServers.join(', ')}.`
+            );
+          }
+          parts.push(
+            `Server(s) with searchable tools: ${
+              availableServers.length > 0
+                ? availableServers.join(', ')
+                : '(none)'
+            }.`
+          );
+          message = parts.join(' ');
+        } else if (searchableCount === 0) {
+          message =
+            'No tools available to search. The tool registry is empty or no deferred tools are registered.';
+        } else {
+          const serverMsg = hasServerFilter
+            ? ` from MCP server(s): ${serverFilters.join(', ')}`
+            : '';
+          message = `No tools available to search${serverMsg}. The tool registry is empty or no matching deferred tools are registered.`;
+        }
         return [
-          `No tools available to search${serverMsg}. The tool registry is empty or no matching deferred tools are registered.`,
+          message,
           {
             tool_references: [],
             metadata: {
               total_searched: 0,
               pattern: query,
               mcp_server: serverFilters,
+              ...(hasServerFilter
+                ? { available_mcp_servers: availableServers }
+                : {}),
+              ...filterMetadata,
             },
           },
         ];
@@ -1028,10 +1267,13 @@ ${mcpNote}${toolsListSection}
       const isServerListing = hasServerFilter && query === '';
 
       if (isServerListing) {
+        /** The listing's contract is parseable JSON, so the diagnostics go
+         * inside the payload rather than in front of it. */
         const formattedOutput = formatServerListing(
           deferredTools,
-          serverFilters,
-          mcpNameFormat
+          activeServers,
+          mcpNameFormat,
+          filterNotes
         );
 
         return [
@@ -1042,6 +1284,7 @@ ${mcpNote}${toolsListSection}
               total_available: deferredTools.length,
               mcp_server: serverFilters,
               listing_mode: true,
+              ...filterMetadata,
             },
           },
         ];
@@ -1054,9 +1297,11 @@ ${mcpNote}${toolsListSection}
           fields,
           max_results
         );
+        /** Diagnostics ride inside the payload; this output is parsed. */
         const formattedOutput = formatSearchResults(
           searchResponse,
-          mcpNameFormat
+          mcpNameFormat,
+          filterNotes
         );
 
         return [
@@ -1067,6 +1312,7 @@ ${mcpNote}${toolsListSection}
               total_searched: searchResponse.total_tools_searched,
               pattern: searchResponse.pattern_used,
               mcp_server: serverFilters.length > 0 ? serverFilters : undefined,
+              ...filterMetadata,
             },
           },
         ];
@@ -1121,19 +1367,20 @@ ${mcpNote}${toolsListSection}
 
         if (!result.stdout || !result.stdout.trim()) {
           return [
-            `${warningMessage}No tools matched the pattern "${sanitizedPattern}".\nTotal tools searched: ${deferredTools.length}`,
+            `${filterNotice}${warningMessage}No tools matched the pattern "${sanitizedPattern}".\nTotal tools searched: ${deferredTools.length}`,
             {
               tool_references: [],
               metadata: {
                 total_searched: deferredTools.length,
                 pattern: sanitizedPattern,
+                ...filterMetadata,
               },
             },
           ];
         }
 
         const searchResponse = parseSearchResults(result.stdout);
-        const formattedOutput = `${warningMessage}${formatSearchResults(searchResponse, mcpNameFormat)}`;
+        const formattedOutput = `${warningMessage}${formatSearchResults(searchResponse, mcpNameFormat, filterNotes)}`;
 
         return [
           formattedOutput,
@@ -1142,6 +1389,7 @@ ${mcpNote}${toolsListSection}
             metadata: {
               total_searched: searchResponse.total_tools_searched,
               pattern: searchResponse.pattern_used,
+              ...filterMetadata,
             },
           },
         ];
@@ -1179,6 +1427,8 @@ export {
   extractMcpServerName,
   isFromMcpServer,
   isFromAnyMcpServer,
+  resolveServerFilters,
+  canonicalizeServerName,
   normalizeServerFilter,
   getAvailableMcpServers,
   getDeferredToolsListing,

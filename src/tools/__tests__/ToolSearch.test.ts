@@ -4,6 +4,7 @@
  * Tests helper functions and sanitization logic without hitting the API.
  */
 import { describe, it, expect } from '@jest/globals';
+import { webcrypto as nodeWebcrypto } from 'node:crypto';
 import type { ToolMetadata, LCToolRegistry } from '@/types';
 import {
   sanitizeRegex,
@@ -20,6 +21,9 @@ import {
   getDeferredToolsListing,
   getBaseToolName,
   formatServerListing,
+  resolveServerFilters,
+  canonicalizeServerName,
+  createToolSearch,
 } from '../ToolSearch';
 
 describe('ToolSearch', () => {
@@ -518,6 +522,7 @@ describe('ToolSearch', () => {
 
     it('handles edge cases', () => {
       expect(extractMcpServerName('_mcp_server')).toBe('server');
+
       expect(extractMcpServerName('tool_mcp_')).toBe('');
     });
   });
@@ -1223,5 +1228,397 @@ describe('ToolSearch', () => {
       expect(parsed.servers).toEqual(['weather-api']);
       expect(parsed.tools_by_server['weather-api']).toBeDefined();
     });
+  });
+});
+describe('resolveServerFilters', () => {
+  const available = ['clickhouse', 'github', 'ClickHouse_Cloud', 'langfuse'];
+
+  it('resolves an exact name unchanged', () => {
+    expect(resolveServerFilters(['github'], available)).toEqual({
+      resolved: ['github'],
+      unresolved: [],
+    });
+  });
+
+  it('resolves the package name a model is likely to have read', () => {
+    /** The failure this fixes: tools are keyed `clickhouse`, the published
+     * package is `mcp-clickhouse`, and the filter silently matched nothing. */
+    expect(resolveServerFilters(['mcp-clickhouse'], available)).toEqual({
+      resolved: ['clickhouse'],
+      unresolved: [],
+    });
+  });
+
+  it('ignores case and separator differences', () => {
+    expect(
+      resolveServerFilters(['clickhouse-cloud'], available).resolved
+    ).toEqual(['ClickHouse_Cloud']);
+    expect(resolveServerFilters(['GitHub'], available).resolved).toEqual([
+      'github',
+    ]);
+  });
+
+  it('keeps mcp-prefixed and bare servers distinct when both exist', () => {
+    const both = ['github', 'mcp-github'];
+    expect(resolveServerFilters(['mcp-github'], both).resolved).toEqual([
+      'mcp-github',
+    ]);
+    expect(resolveServerFilters(['github'], both).resolved).toEqual(['github']);
+  });
+
+  it('keeps every candidate when registered names share a canonical form', () => {
+    /** `foo-bar` and `foo_bar` differ only by a separator, so they share one
+     * canonical key and an inexact request must not silently pick one. */
+    const ambiguous = ['foo-bar', 'foo_bar'];
+    expect(resolveServerFilters(['FOO BAR'], ambiguous).resolved).toEqual([
+      'foo-bar',
+      'foo_bar',
+    ]);
+  });
+
+  it('still prefers an exact name over an ambiguous canonical form', () => {
+    const ambiguous = ['foo-bar', 'foo_bar'];
+    expect(resolveServerFilters(['foo_bar'], ambiguous).resolved).toEqual([
+      'foo_bar',
+    ]);
+  });
+
+  it('keeps combining marks so cased Unicode does not fold onto ASCII', () => {
+    /** `İ`.toLowerCase() is `i` plus a combining dot above; dropping the
+     * mark would make it indistinguishable from a plain `ifoo` server. */
+    expect(resolveServerFilters(['ifoo'], ['İfoo'])).toEqual({
+      resolved: [],
+      unresolved: ['ifoo'],
+    });
+  });
+
+  it('matches the same name whether composed or decomposed', () => {
+    /** NFC composition means `e` + combining acute and a precomposed `é`
+     * name are one server, not two. */
+    expect(resolveServerFilters(['éfoo'], ['éfoo']).resolved).toEqual(['éfoo']);
+  });
+
+  it('does not fold non-ASCII names onto ASCII ones', () => {
+    /** Stripping non-ASCII would reduce `éfoo` to `foo`, so a request for an
+     * unregistered `foo` would return the other server's tools. */
+    expect(resolveServerFilters(['foo'], ['éfoo'])).toEqual({
+      resolved: [],
+      unresolved: ['foo'],
+    });
+    expect(resolveServerFilters(['ÉFOO'], ['éfoo']).resolved).toEqual(['éfoo']);
+  });
+
+  it('keeps symbol-only names distinct', () => {
+    expect(resolveServerFilters(['\u2600\ufe0f'], ['\u2764\ufe0f'])).toEqual({
+      resolved: [],
+      unresolved: ['\u2600\ufe0f'],
+    });
+  });
+
+  it('keeps dotless i from resolving to an ASCII name', () => {
+    expect(resolveServerFilters(['ifoo'], ['\u0131foo'])).toEqual({
+      resolved: [],
+      unresolved: ['ifoo'],
+    });
+  });
+
+  it('only strips an mcp prefix at a real token boundary', () => {
+    /** `mcparty` is a server name that happens to start with those letters;
+     * resolving it to `arty` would return an unrelated server's tools. */
+    expect(resolveServerFilters(['mcparty'], ['arty'])).toEqual({
+      resolved: [],
+      unresolved: ['mcparty'],
+    });
+    expect(resolveServerFilters(['mcp-arty'], ['arty']).resolved).toEqual([
+      'arty',
+    ]);
+    expect(resolveServerFilters(['mcp_arty'], ['arty']).resolved).toEqual([
+      'arty',
+    ]);
+  });
+
+  it('keeps punctuation-only names distinct from one another', () => {
+    /** An earlier revision reduced both to the empty string, which would have
+     * handed one server's tools to a request for the other. */
+    const punctuation = ['---'];
+    expect(resolveServerFilters(['!!!'], punctuation)).toEqual({
+      resolved: [],
+      unresolved: ['!!!'],
+    });
+    expect(resolveServerFilters(['---'], punctuation).resolved).toEqual([
+      '---',
+    ]);
+  });
+
+  it('reports a name that matches nothing', () => {
+    expect(resolveServerFilters(['nope'], available)).toEqual({
+      resolved: [],
+      unresolved: ['nope'],
+    });
+  });
+
+  it('deduplicates filters that resolve to the same server', () => {
+    expect(
+      resolveServerFilters(
+        ['clickhouse', 'ClickHouse', 'mcp-clickhouse'],
+        available
+      ).resolved
+    ).toEqual(['clickhouse']);
+  });
+
+  it('separates the resolvable from the unresolvable', () => {
+    const { resolved, unresolved } = resolveServerFilters(
+      ['mcp-clickhouse', 'ghost'],
+      available
+    );
+    expect(resolved).toEqual(['clickhouse']);
+    expect(unresolved).toEqual(['ghost']);
+  });
+});
+
+describe('canonicalizeServerName', () => {
+  it('folds case and treats separators as equivalent', () => {
+    expect(canonicalizeServerName('ClickHouse Cloud')).toBe('clickhouse-cloud');
+    expect(canonicalizeServerName('ClickHouse_Cloud')).toBe('clickhouse-cloud');
+    expect(canonicalizeServerName('clickhouse-cloud')).toBe('clickhouse-cloud');
+  });
+
+  it('discards no character, so distinct names keep distinct keys', () => {
+    /** Each pair below was merged by an earlier revision of this function, and
+     * each merge handed one server's tools to a request for the other. */
+    expect(canonicalizeServerName('\u00e9foo')).not.toBe(
+      canonicalizeServerName('foo')
+    );
+    expect(canonicalizeServerName('\u0130foo')).not.toBe(
+      canonicalizeServerName('ifoo')
+    );
+    expect(canonicalizeServerName('\u2764\ufe0f')).not.toBe(
+      canonicalizeServerName('\u2600\ufe0f')
+    );
+    expect(canonicalizeServerName('---')).not.toBe(
+      canonicalizeServerName('!!!')
+    );
+  });
+
+  it('keeps dotless and dotted i apart, at the cost of the sigma case', () => {
+    /** Folding through uppercase would match `\u039f\u03a3` to `\u03bf\u03c3`, but it also
+     * equates `\u0131` with `i`. A missed match only produces the message listing
+     * the real servers; a false one hands over their tools. */
+    expect(canonicalizeServerName('\u0131foo')).not.toBe(
+      canonicalizeServerName('ifoo')
+    );
+    expect(canonicalizeServerName('\u039f\u03a3')).not.toBe(
+      canonicalizeServerName('\u03bf\u03c3')
+    );
+  });
+
+  it('composes, so one name written two ways agrees with itself', () => {
+    expect(canonicalizeServerName('e\u0301foo')).toBe(
+      canonicalizeServerName('\u00e9foo')
+    );
+  });
+});
+describe('tool_search mcp_server filtering', () => {
+  /** LangChain's callback manager mints a uuid v7; `globalThis.crypto` is not
+   * exposed on Node 18, so invoking a tool there throws before reaching us. */
+  beforeAll(() => {
+    if ((globalThis as { crypto?: Crypto }).crypto === undefined) {
+      Object.defineProperty(globalThis, 'crypto', {
+        value: nodeWebcrypto,
+        configurable: true,
+      });
+    }
+  });
+
+  const registry = new Map(
+    [
+      {
+        name: 'run_select_query_mcp_clickhouse',
+        description: 'Run a ClickHouse SELECT',
+      },
+      {
+        name: 'list_databases_mcp_clickhouse',
+        description: 'List ClickHouse databases',
+      },
+      { name: 'create_issue_mcp_github', description: 'Open a GitHub issue' },
+    ].map((tool) => [
+      tool.name,
+      {
+        ...tool,
+        defer_loading: true,
+        parameters: { type: 'object', properties: {} },
+      },
+    ])
+  );
+
+  const search = () =>
+    createToolSearch({ mode: 'local', toolRegistry: registry as never });
+
+  it('finds tools when the model names the package instead of the server key', async () => {
+    /** The reported failure: the server is keyed `clickhouse`, the model asked
+     * for `mcp-clickhouse`, and the exact-match filter returned nothing. */
+    const output = await search().invoke({
+      query: 'select query',
+      mcp_server: 'mcp-clickhouse',
+    });
+
+    expect(String(output)).toContain('run_select_query_mcp_clickhouse');
+    expect(String(output)).not.toContain('create_issue_mcp_github');
+  });
+
+  it('distinguishes a server with nothing left to search from an unknown one', async () => {
+    /** Every Slack tool is already loaded, so it is registered but has nothing
+     * deferred; saying it does not exist would be wrong. */
+    const mixed = new Map(
+      [
+        { name: 'send_message_mcp_slack', defer_loading: false },
+        { name: 'create_issue_mcp_github', defer_loading: true },
+      ].map((tool) => [
+        tool.name,
+        {
+          ...tool,
+          description: tool.name,
+          parameters: { type: 'object', properties: {} },
+        },
+      ])
+    );
+
+    const output = String(
+      await createToolSearch({
+        mode: 'local',
+        toolRegistry: mixed as never,
+      }).invoke({ query: 'anything', mcp_server: 'slack' })
+    );
+
+    expect(output).toContain('no tools left to search');
+    expect(output).toContain('slack');
+    expect(output).not.toContain('No MCP server matched');
+  });
+
+  it('keeps a partial search response parseable as JSON', async () => {
+    const mixed = new Map(
+      [
+        { name: 'send_message_mcp_slack', defer_loading: false },
+        { name: 'create_issue_mcp_github', defer_loading: true },
+      ].map((tool) => [
+        tool.name,
+        {
+          ...tool,
+          description: tool.name,
+          parameters: { type: 'object', properties: {} },
+        },
+      ])
+    );
+
+    const output = String(
+      await createToolSearch({
+        mode: 'local',
+        toolRegistry: mixed as never,
+      }).invoke({ query: 'create', mcp_server: ['github', 'slack'] })
+    );
+
+    const parsed = JSON.parse(output) as {
+      found: number;
+      notes?: string[];
+    };
+    expect(parsed.found).toBe(1);
+    expect(parsed.notes?.join(' ')).toContain('slack');
+  });
+
+  it('keeps a partial server listing parseable as JSON', async () => {
+    const mixed = new Map(
+      [
+        { name: 'send_message_mcp_slack', defer_loading: false },
+        { name: 'create_issue_mcp_github', defer_loading: true },
+      ].map((tool) => [
+        tool.name,
+        {
+          ...tool,
+          description: tool.name,
+          parameters: { type: 'object', properties: {} },
+        },
+      ])
+    );
+
+    const output = String(
+      await createToolSearch({
+        mode: 'local',
+        toolRegistry: mixed as never,
+      }).invoke({ query: '', mcp_server: ['github', 'slack'] })
+    );
+
+    const parsed = JSON.parse(output) as {
+      listing_mode: boolean;
+      notes?: string[];
+    };
+    expect(parsed.listing_mode).toBe(true);
+    expect(parsed.notes?.join(' ')).toContain('slack');
+  });
+
+  it('reports the unsearched half of a partly resolved filter', async () => {
+    /** GitHub answers, Slack has nothing deferred. Returning only GitHub
+     * results without saying so would read as though both were searched. */
+    const mixed = new Map(
+      [
+        { name: 'send_message_mcp_slack', defer_loading: false },
+        { name: 'create_issue_mcp_github', defer_loading: true },
+      ].map((tool) => [
+        tool.name,
+        {
+          ...tool,
+          description: tool.name,
+          parameters: { type: 'object', properties: {} },
+        },
+      ])
+    );
+
+    const output = String(
+      await createToolSearch({
+        mode: 'local',
+        toolRegistry: mixed as never,
+      }).invoke({ query: 'create', mcp_server: ['github', 'slack'] })
+    );
+
+    expect(output).toContain('create_issue_mcp_github');
+    expect(output).toContain('no tools left to search');
+    expect(output).toContain('slack');
+  });
+
+  it('diagnoses an idle server even when nothing at all is deferred', async () => {
+    /** Every tool is loaded, so the registry looks empty to a deferred-only
+     * search while the requested server plainly exists. The server answer is
+     * the useful one and must win over the generic empty-registry message. */
+    const allLoaded = new Map(
+      [{ name: 'send_message_mcp_slack', defer_loading: false }].map((tool) => [
+        tool.name,
+        {
+          ...tool,
+          description: tool.name,
+          parameters: { type: 'object', properties: {} },
+        },
+      ])
+    );
+
+    const output = String(
+      await createToolSearch({
+        mode: 'local',
+        toolRegistry: allLoaded as never,
+      }).invoke({ query: 'anything', mcp_server: 'slack' })
+    );
+
+    expect(output).toContain('no tools left to search');
+    expect(output).toContain('slack');
+    expect(output).not.toContain('The tool registry is empty');
+  });
+
+  it('names the available servers when the filter matches none', async () => {
+    const output = String(
+      await search().invoke({ query: 'anything', mcp_server: 'not-a-server' })
+    );
+
+    expect(output).toContain('not-a-server');
+    expect(output).toContain('clickhouse');
+    expect(output).toContain('github');
+    expect(output).not.toContain('The tool registry is empty');
   });
 });
