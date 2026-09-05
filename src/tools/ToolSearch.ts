@@ -178,12 +178,16 @@ function isFromMcpServer(toolName: string, serverName: string): boolean {
 
 /**
  * Reduces a server name to the form used for lenient matching: lowercase, with
- * every separator removed. A host rewrites characters it cannot put in a tool
- * name (LibreChat turns `ClickHouse Cloud` into `ClickHouse_Cloud`), so a model
- * asking for `clickhouse-cloud` is naming the same server and should match.
+ * separators and punctuation removed. A host rewrites characters it cannot put
+ * in a tool name (LibreChat turns `ClickHouse Cloud` into `ClickHouse_Cloud`),
+ * so a model asking for `clickhouse-cloud` is naming the same server.
+ *
+ * Letters and digits are kept whatever their script. Dropping non-ASCII instead
+ * would fold distinct names together — `éfoo` and `foo` would both reduce to
+ * `foo`, and a request for one would return the other's tools.
  */
 function canonicalizeServerName(serverName: string): string {
-  return serverName.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return serverName.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
 }
 
 /**
@@ -807,11 +811,14 @@ function parseSearchResults(stdout: string): t.ToolSearchResponse {
  * Formats search results as structured JSON for efficient parsing.
  * @param searchResponse - The parsed search response
  * @param nameFormat - Whether to show 'full' names (tool_mcp_server) or 'base' names (tool only)
+ * @param notes - Diagnostics about requested servers that were not searched;
+ * carried inside the JSON so the output stays parseable
  * @returns JSON string with search results
  */
 function formatSearchResults(
   searchResponse: t.ToolSearchResponse,
-  nameFormat: t.McpNameFormat = 'full'
+  nameFormat: t.McpNameFormat = 'full',
+  notes: string[] = []
 ): string {
   const { tool_references, total_tools_searched, pattern_used } =
     searchResponse;
@@ -827,6 +834,7 @@ function formatSearchResults(
     })),
     total_searched: total_tools_searched,
     query: pattern_used,
+    ...(notes.length > 0 ? { notes } : {}),
   };
 
   return JSON.stringify(output, null, 2);
@@ -1276,13 +1284,15 @@ ${mcpNote}${toolsListSection}
           fields,
           max_results
         );
+        /** Diagnostics ride inside the payload; this output is parsed. */
         const formattedOutput = formatSearchResults(
           searchResponse,
-          mcpNameFormat
+          mcpNameFormat,
+          filterNotes
         );
 
         return [
-          `${filterNotice}${formattedOutput}`,
+          formattedOutput,
           {
             tool_references: searchResponse.tool_references,
             metadata: {
@@ -1357,7 +1367,7 @@ ${mcpNote}${toolsListSection}
         }
 
         const searchResponse = parseSearchResults(result.stdout);
-        const formattedOutput = `${filterNotice}${warningMessage}${formatSearchResults(searchResponse, mcpNameFormat)}`;
+        const formattedOutput = `${warningMessage}${formatSearchResults(searchResponse, mcpNameFormat, filterNotes)}`;
 
         return [
           formattedOutput,

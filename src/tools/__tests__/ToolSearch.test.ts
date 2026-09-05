@@ -1283,6 +1283,16 @@ describe('resolveServerFilters', () => {
     ]);
   });
 
+  it('does not fold non-ASCII names onto ASCII ones', () => {
+    /** Stripping non-ASCII would reduce `éfoo` to `foo`, so a request for an
+     * unregistered `foo` would return the other server's tools. */
+    expect(resolveServerFilters(['foo'], ['éfoo'])).toEqual({
+      resolved: [],
+      unresolved: ['foo'],
+    });
+    expect(resolveServerFilters(['ÉFOO'], ['éfoo']).resolved).toEqual(['éfoo']);
+  });
+
   it('only strips an mcp prefix at a real token boundary', () => {
     /** `mcparty` is a server name that happens to start with those letters;
      * resolving it to `arty` would return an unrelated server's tools. */
@@ -1419,6 +1429,36 @@ describe('tool_search mcp_server filtering', () => {
     expect(output).toContain('no tools left to search');
     expect(output).toContain('slack');
     expect(output).not.toContain('No MCP server matched');
+  });
+
+  it('keeps a partial search response parseable as JSON', async () => {
+    const mixed = new Map(
+      [
+        { name: 'send_message_mcp_slack', defer_loading: false },
+        { name: 'create_issue_mcp_github', defer_loading: true },
+      ].map((tool) => [
+        tool.name,
+        {
+          ...tool,
+          description: tool.name,
+          parameters: { type: 'object', properties: {} },
+        },
+      ])
+    );
+
+    const output = String(
+      await createToolSearch({
+        mode: 'local',
+        toolRegistry: mixed as never,
+      }).invoke({ query: 'create', mcp_server: ['github', 'slack'] })
+    );
+
+    const parsed = JSON.parse(output) as {
+      found: number;
+      notes?: string[];
+    };
+    expect(parsed.found).toBe(1);
+    expect(parsed.notes?.join(' ')).toContain('slack');
   });
 
   it('keeps a partial server listing parseable as JSON', async () => {
