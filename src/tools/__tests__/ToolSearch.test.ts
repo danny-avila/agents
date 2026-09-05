@@ -4,6 +4,7 @@
  * Tests helper functions and sanitization logic without hitting the API.
  */
 import { describe, it, expect } from '@jest/globals';
+import { webcrypto as nodeWebcrypto } from 'node:crypto';
 import type { ToolMetadata, LCToolRegistry } from '@/types';
 import {
   sanitizeRegex,
@@ -20,6 +21,9 @@ import {
   getDeferredToolsListing,
   getBaseToolName,
   formatServerListing,
+  resolveServerFilters,
+  canonicalizeServerName,
+  createToolSearch,
 } from '../ToolSearch';
 
 describe('ToolSearch', () => {
@@ -518,6 +522,7 @@ describe('ToolSearch', () => {
 
     it('handles edge cases', () => {
       expect(extractMcpServerName('_mcp_server')).toBe('server');
+
       expect(extractMcpServerName('tool_mcp_')).toBe('');
     });
   });
@@ -1223,5 +1228,133 @@ describe('ToolSearch', () => {
       expect(parsed.servers).toEqual(['weather-api']);
       expect(parsed.tools_by_server['weather-api']).toBeDefined();
     });
+  });
+});
+describe('resolveServerFilters', () => {
+  const available = ['clickhouse', 'github', 'ClickHouse_Cloud', 'langfuse'];
+
+  it('resolves an exact name unchanged', () => {
+    expect(resolveServerFilters(['github'], available)).toEqual({
+      resolved: ['github'],
+      unresolved: [],
+    });
+  });
+
+  it('resolves the package name a model is likely to have read', () => {
+    /** The failure this fixes: tools are keyed `clickhouse`, the published
+     * package is `mcp-clickhouse`, and the filter silently matched nothing. */
+    expect(resolveServerFilters(['mcp-clickhouse'], available)).toEqual({
+      resolved: ['clickhouse'],
+      unresolved: [],
+    });
+  });
+
+  it('ignores case and separator differences', () => {
+    expect(
+      resolveServerFilters(['clickhouse-cloud'], available).resolved
+    ).toEqual(['ClickHouse_Cloud']);
+    expect(resolveServerFilters(['GitHub'], available).resolved).toEqual([
+      'github',
+    ]);
+  });
+
+  it('keeps mcp-prefixed and bare servers distinct when both exist', () => {
+    const both = ['github', 'mcp-github'];
+    expect(resolveServerFilters(['mcp-github'], both).resolved).toEqual([
+      'mcp-github',
+    ]);
+    expect(resolveServerFilters(['github'], both).resolved).toEqual(['github']);
+  });
+
+  it('reports a name that matches nothing', () => {
+    expect(resolveServerFilters(['nope'], available)).toEqual({
+      resolved: [],
+      unresolved: ['nope'],
+    });
+  });
+
+  it('deduplicates filters that resolve to the same server', () => {
+    expect(
+      resolveServerFilters(
+        ['clickhouse', 'ClickHouse', 'mcp-clickhouse'],
+        available
+      ).resolved
+    ).toEqual(['clickhouse']);
+  });
+
+  it('separates the resolvable from the unresolvable', () => {
+    const { resolved, unresolved } = resolveServerFilters(
+      ['mcp-clickhouse', 'ghost'],
+      available
+    );
+    expect(resolved).toEqual(['clickhouse']);
+    expect(unresolved).toEqual(['ghost']);
+  });
+});
+
+describe('canonicalizeServerName', () => {
+  it('collapses case and every separator', () => {
+    expect(canonicalizeServerName('ClickHouse Cloud')).toBe('clickhousecloud');
+    expect(canonicalizeServerName('ClickHouse_Cloud')).toBe('clickhousecloud');
+    expect(canonicalizeServerName('clickhouse-cloud')).toBe('clickhousecloud');
+  });
+});
+describe('tool_search mcp_server filtering', () => {
+  /** LangChain's callback manager mints a uuid v7; `globalThis.crypto` is not
+   * exposed on Node 18, so invoking a tool there throws before reaching us. */
+  beforeAll(() => {
+    if ((globalThis as { crypto?: unknown }).crypto === undefined) {
+      Object.defineProperty(globalThis, 'crypto', {
+        value: nodeWebcrypto,
+        configurable: true,
+      });
+    }
+  });
+
+  const registry = new Map(
+    [
+      {
+        name: 'run_select_query_mcp_clickhouse',
+        description: 'Run a ClickHouse SELECT',
+      },
+      {
+        name: 'list_databases_mcp_clickhouse',
+        description: 'List ClickHouse databases',
+      },
+      { name: 'create_issue_mcp_github', description: 'Open a GitHub issue' },
+    ].map((tool) => [
+      tool.name,
+      {
+        ...tool,
+        defer_loading: true,
+        parameters: { type: 'object', properties: {} },
+      },
+    ])
+  );
+
+  const search = () =>
+    createToolSearch({ mode: 'local', toolRegistry: registry as never });
+
+  it('finds tools when the model names the package instead of the server key', async () => {
+    /** The reported failure: the server is keyed `clickhouse`, the model asked
+     * for `mcp-clickhouse`, and the exact-match filter returned nothing. */
+    const output = await search().invoke({
+      query: 'select query',
+      mcp_server: 'mcp-clickhouse',
+    });
+
+    expect(String(output)).toContain('run_select_query_mcp_clickhouse');
+    expect(String(output)).not.toContain('create_issue_mcp_github');
+  });
+
+  it('names the available servers when the filter matches none', async () => {
+    const output = String(
+      await search().invoke({ query: 'anything', mcp_server: 'not-a-server' })
+    );
+
+    expect(output).toContain('not-a-server');
+    expect(output).toContain('clickhouse');
+    expect(output).toContain('github');
+    expect(output).not.toContain('The tool registry is empty');
   });
 });

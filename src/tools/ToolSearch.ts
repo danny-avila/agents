@@ -177,6 +177,77 @@ function isFromMcpServer(toolName: string, serverName: string): boolean {
 }
 
 /**
+ * Reduces a server name to the form used for lenient matching: lowercase, with
+ * every separator removed. A host rewrites characters it cannot put in a tool
+ * name (LibreChat turns `ClickHouse Cloud` into `ClickHouse_Cloud`), so a model
+ * asking for `clickhouse-cloud` is naming the same server and should match.
+ */
+function canonicalizeServerName(serverName: string): string {
+  return serverName.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+/**
+ * Drops a leading `mcp` token from an already-canonical name. Servers are
+ * commonly keyed by the bare product (`clickhouse`) while the package that
+ * implements them is called `mcp-clickhouse`, and a model that has read the
+ * package name asks for that instead.
+ */
+function withoutMcpPrefix(canonical: string): string {
+  return canonical.startsWith('mcp') && canonical.length > 3
+    ? canonical.slice(3)
+    : canonical;
+}
+
+/**
+ * Maps requested server names onto the servers that actually have tools
+ * registered, so a near-miss filters instead of silently returning nothing.
+ *
+ * Exact names win, then case/separator-insensitive matches, then the
+ * mcp-prefix-stripped form. Trying them in that order keeps a deployment that
+ * runs both `github` and `mcp-github` unambiguous: each resolves to itself.
+ *
+ * @param requested - Server names as supplied by the caller
+ * @param available - Server names present in the tool registry
+ * @returns The registry names to filter by, and any request that matched none
+ */
+function resolveServerFilters(
+  requested: string[],
+  available: string[]
+): { resolved: string[]; unresolved: string[] } {
+  const exact = new Set(available);
+  const canonical = new Map<string, string>();
+  for (const name of available) {
+    const key = canonicalizeServerName(name);
+    if (!canonical.has(key)) {
+      canonical.set(key, name);
+    }
+  }
+
+  const resolved: string[] = [];
+  const unresolved: string[] = [];
+  for (const want of requested) {
+    if (exact.has(want)) {
+      resolved.push(want);
+      continue;
+    }
+    const key = canonicalizeServerName(want);
+    const direct = canonical.get(key);
+    if (direct !== undefined) {
+      resolved.push(direct);
+      continue;
+    }
+    const stripped = canonical.get(withoutMcpPrefix(key));
+    if (stripped !== undefined) {
+      resolved.push(stripped);
+      continue;
+    }
+    unresolved.push(want);
+  }
+
+  return { resolved: Array.from(new Set(resolved)), unresolved };
+}
+
+/**
  * Checks if a tool belongs to any of the specified MCP servers.
  * @param toolName - The full tool name
  * @param serverNames - Array of server names to match
@@ -989,14 +1060,28 @@ ${mcpNote}${toolsListSection}
       }
 
       const toolsArray: t.LCTool[] = Array.from(toolRegistry.values());
-      const deferredTools: t.ToolMetadata[] = toolsArray
+      const searchable = toolsArray.filter(
+        (lcTool) => onlyDeferred !== true || lcTool.defer_loading === true
+      );
+      const availableServers = Array.from(
+        new Set(
+          searchable
+            .map((lcTool) => extractMcpServerName(lcTool.name))
+            .filter((name): name is string => name !== undefined)
+        )
+      ).sort();
+
+      /** A near-miss on the server name filters instead of returning nothing. */
+      const { resolved: activeServers, unresolved: unknownServers } =
+        hasServerFilter
+          ? resolveServerFilters(serverFilters, availableServers)
+          : { resolved: [], unresolved: [] };
+
+      const deferredTools: t.ToolMetadata[] = searchable
         .filter((lcTool) => {
-          if (onlyDeferred === true && lcTool.defer_loading !== true) {
-            return false;
-          }
           if (
             hasServerFilter &&
-            !isFromAnyMcpServer(lcTool.name, serverFilters)
+            !isFromAnyMcpServer(lcTool.name, activeServers)
           ) {
             return false;
           }
@@ -1009,17 +1094,34 @@ ${mcpNote}${toolsListSection}
         }));
 
       if (deferredTools.length === 0) {
-        const serverMsg = hasServerFilter
-          ? ` from MCP server(s): ${serverFilters.join(', ')}`
-          : '';
+        /** Say which of the three it is, so an empty result is not read as an
+         * outage: nothing is registered, the name did not match anything, or
+         * the named server genuinely has no tools. */
+        let message: string;
+        if (searchable.length === 0) {
+          message =
+            'No tools available to search. The tool registry is empty or no deferred tools are registered.';
+        } else if (hasServerFilter && unknownServers.length > 0) {
+          const available =
+            availableServers.length > 0
+              ? availableServers.join(', ')
+              : '(none registered)';
+          message = `No tools matched MCP server(s): ${unknownServers.join(', ')}. Available server(s): ${available}.`;
+        } else {
+          const serverMsg = hasServerFilter
+            ? ` from MCP server(s): ${serverFilters.join(', ')}`
+            : '';
+          message = `No tools available to search${serverMsg}. The tool registry is empty or no matching deferred tools are registered.`;
+        }
         return [
-          `No tools available to search${serverMsg}. The tool registry is empty or no matching deferred tools are registered.`,
+          message,
           {
             tool_references: [],
             metadata: {
               total_searched: 0,
               pattern: query,
               mcp_server: serverFilters,
+              available_mcp_servers: availableServers,
             },
           },
         ];
@@ -1030,7 +1132,7 @@ ${mcpNote}${toolsListSection}
       if (isServerListing) {
         const formattedOutput = formatServerListing(
           deferredTools,
-          serverFilters,
+          activeServers,
           mcpNameFormat
         );
 
@@ -1179,6 +1281,8 @@ export {
   extractMcpServerName,
   isFromMcpServer,
   isFromAnyMcpServer,
+  resolveServerFilters,
+  canonicalizeServerName,
   normalizeServerFilter,
   getAvailableMcpServers,
   getDeferredToolsListing,
