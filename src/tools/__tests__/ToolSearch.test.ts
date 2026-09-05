@@ -1283,6 +1283,21 @@ describe('resolveServerFilters', () => {
     ]);
   });
 
+  it('keeps combining marks so cased Unicode does not fold onto ASCII', () => {
+    /** `İ`.toLowerCase() is `i` plus a combining dot above; dropping the
+     * mark would make it indistinguishable from a plain `ifoo` server. */
+    expect(resolveServerFilters(['ifoo'], ['İfoo'])).toEqual({
+      resolved: [],
+      unresolved: ['ifoo'],
+    });
+  });
+
+  it('matches the same name whether composed or decomposed', () => {
+    /** NFC composition means `e` + combining acute and a precomposed `é`
+     * name are one server, not two. */
+    expect(resolveServerFilters(['éfoo'], ['éfoo']).resolved).toEqual(['éfoo']);
+  });
+
   it('does not fold non-ASCII names onto ASCII ones', () => {
     /** Stripping non-ASCII would reduce `éfoo` to `foo`, so a request for an
      * unregistered `foo` would return the other server's tools. */

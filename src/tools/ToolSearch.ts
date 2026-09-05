@@ -182,12 +182,18 @@ function isFromMcpServer(toolName: string, serverName: string): boolean {
  * in a tool name (LibreChat turns `ClickHouse Cloud` into `ClickHouse_Cloud`),
  * so a model asking for `clickhouse-cloud` is naming the same server.
  *
- * Letters and digits are kept whatever their script. Dropping non-ASCII instead
- * would fold distinct names together — `éfoo` and `foo` would both reduce to
- * `foo`, and a request for one would return the other's tools.
+ * Letters, digits and combining marks are kept whatever their script, and the
+ * result is composed so the same name written two ways agrees with itself.
+ * Discarding any of them folds distinct names together: dropping non-ASCII
+ * makes `éfoo` reduce to `foo`, and dropping marks makes `İfoo` — whose
+ * lowercase is `i` plus a combining dot — reduce to `ifoo`. In both cases a
+ * request for the plain name would return the other server's tools.
  */
 function canonicalizeServerName(serverName: string): string {
-  return serverName.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+  return serverName
+    .toLowerCase()
+    .normalize('NFC')
+    .replace(/[^\p{L}\p{N}\p{M}]+/gu, '');
 }
 
 /**
