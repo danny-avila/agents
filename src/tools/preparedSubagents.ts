@@ -1,3 +1,4 @@
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import { stableStringify, normalizeError } from './eagerEventExecution';
 
@@ -12,7 +13,11 @@ export class PreparedSubagentError extends Error {
 type Outcome =
   | { output: unknown; error?: never }
   | { error: Error; output?: never };
-type Attempt = { keys: Set<string>; cancelled: boolean };
+type Attempt = {
+  keys: Set<string>;
+  cancelled: boolean;
+  config: RunnableConfig;
+};
 
 const PREPARED_INVOCATION = Symbol('prepared-subagent-invocation');
 type PreparedCall = ToolCall & { [PREPARED_INVOCATION]?: symbol };
@@ -39,8 +44,21 @@ export class PreparedSubagents {
   private readonly running = new Set<AbortController>();
   private epoch = 0;
 
-  begin(attempt: string): void {
-    this.attempts.set(attempt, { keys: new Set(), cancelled: false });
+  begin(attempt: string, config: RunnableConfig = {}): void {
+    this.attempts.set(attempt, {
+      keys: new Set(),
+      cancelled: false,
+      config: {
+        ...config,
+        configurable: { ...config.configurable },
+        metadata: { ...config.metadata },
+      },
+    });
+  }
+
+  getConfig(attempt: string): RunnableConfig | undefined {
+    const entry = this.attempts.get(attempt);
+    return entry?.cancelled === false ? entry.config : undefined;
   }
 
   isOpen(attempt: string): boolean {
@@ -147,7 +165,10 @@ export class PreparedSubagents {
 
   owns(owner: string, call: ToolCall): boolean {
     const record = this.reservations.get(JSON.stringify([owner, call.id]));
-    return record != null && (call as PreparedCall)[PREPARED_INVOCATION] === record.token;
+    return (
+      record != null &&
+      (call as PreparedCall)[PREPARED_INVOCATION] === record.token
+    );
   }
 
   take(owner: string, call: ToolCall): Promise<unknown> | undefined {
@@ -158,7 +179,11 @@ export class PreparedSubagents {
       return undefined;
     }
     if (record == null || token !== record.token) {
-      return Promise.reject(new PreparedSubagentError('Eager subagent invocation is no longer owned by this call.'));
+      return Promise.reject(
+        new PreparedSubagentError(
+          'Eager subagent invocation is no longer owned by this call.'
+        )
+      );
     }
     this.reservations.delete(key);
     if (!record.committed || record.fingerprint !== fingerprint(call)) {
@@ -171,7 +196,9 @@ export class PreparedSubagents {
     const epoch = this.epoch;
     return record.outcome.then((result) => {
       if (this.epoch !== epoch) {
-        throw new PreparedSubagentError('Eager subagent result belongs to a retired run.');
+        throw new PreparedSubagentError(
+          'Eager subagent result belongs to a retired run.'
+        );
       }
       record.controller.signal.throwIfAborted();
       if ('error' in result) {

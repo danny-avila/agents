@@ -2747,9 +2747,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     attempt: string,
     agentContext?: AgentContext
   ): void {
+    const config = this.preparedSubagents.getConfig(attempt);
     if (
       !this.canPrestartSubagents(agentContext) ||
-      this.config == null ||
+      config == null ||
       agentContext == null
     ) {
       return;
@@ -2759,7 +2760,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       ?.prestartSubagent(
         call,
         attempt,
-        this.config,
+        config,
         this.eagerEventToolExecution?.maxPendingSubagents ?? 4
       );
   }

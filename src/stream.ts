@@ -1333,7 +1333,9 @@ function startPreparedSubagents(
     (graph as Partial<StandardGraph>).canPrestartSubagents?.(agentContext) !==
       true ||
     graph.preparedSubagents.isOpen(attempt) !== true ||
-    isBatchSensitiveToolExecution(graph, metadata)
+    graph.hookRegistry?.hasResultAlteringHooks(
+      graph.preparedSubagents.getConfig(attempt)?.configurable?.run_id
+    ) === true
   ) {
     return;
   }

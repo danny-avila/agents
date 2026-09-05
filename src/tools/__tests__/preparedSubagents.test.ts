@@ -15,6 +15,30 @@ function deferred<T>() {
 }
 
 describe('Prepared subagent invocation ownership', () => {
+  it('captures configuration separately for parallel model attempts', () => {
+    const owner = new PreparedSubagents();
+    const firstSignal = new AbortController().signal;
+    const config = {
+      configurable: { run_id: 'first' },
+      metadata: { step: 1 },
+      signal: firstSignal,
+    };
+    owner.begin('first', config);
+    config.configurable.run_id = 'second';
+    config.metadata.step = 2;
+    owner.begin('second', config);
+    expect(owner.getConfig('first')).toEqual({
+      configurable: { run_id: 'first' },
+      metadata: { step: 1 },
+      signal: firstSignal,
+    });
+    expect(owner.getConfig('second')?.configurable?.run_id).toBe('second');
+    owner.finish('first', []);
+    expect(owner.getConfig('first')).toBeUndefined();
+    owner.clear();
+    expect(owner.getConfig('second')).toBeUndefined();
+  });
+
   it('starts before attempt completion and adopts the same result once', async () => {
     const owner = new PreparedSubagents();
     const result = deferred<string>();
@@ -37,7 +61,9 @@ describe('Prepared subagent invocation ownership', () => {
     const adopted = owner.take('agent', call);
     result.resolve('child result');
     await expect(adopted).resolves.toBe('child result');
-    await expect(owner.take('agent', call)).rejects.toThrow(PreparedSubagentError);
+    await expect(owner.take('agent', call)).rejects.toThrow(
+      PreparedSubagentError
+    );
     expect(starts).toBe(1);
   });
 
@@ -176,7 +202,9 @@ describe('Prepared subagent invocation ownership', () => {
     owner.begin('new');
     owner.start('new', 'agent', newCall, 4, async () => 'new');
     owner.finish('new', [newCall]);
-    await expect(owner.take('agent', oldCall)).rejects.toThrow(PreparedSubagentError);
+    await expect(owner.take('agent', oldCall)).rejects.toThrow(
+      PreparedSubagentError
+    );
     await expect(owner.take('agent', newCall)).resolves.toBe('new');
   });
 
@@ -190,5 +218,4 @@ describe('Prepared subagent invocation ownership', () => {
     owner.clear();
     await expect(result).rejects.toThrow(PreparedSubagentError);
   });
-
 });

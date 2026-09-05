@@ -750,7 +750,7 @@ export async function attemptInvoke(
       ? params.context.preparedSubagents
       : undefined;
   const preparedAttempt = resolveGenerationKey(stampedConfig.metadata);
-  prepared?.begin(preparedAttempt);
+  prepared?.begin(preparedAttempt, stampedConfig);
   try {
     const result = await attemptInvokeBody(
       {
