@@ -1393,6 +1393,33 @@ describe('tool_search mcp_server filtering', () => {
     expect(output).not.toContain('No MCP server matched');
   });
 
+  it('diagnoses an idle server even when nothing at all is deferred', async () => {
+    /** Every tool is loaded, so the registry looks empty to a deferred-only
+     * search while the requested server plainly exists. The server answer is
+     * the useful one and must win over the generic empty-registry message. */
+    const allLoaded = new Map(
+      [{ name: 'send_message_mcp_slack', defer_loading: false }].map((tool) => [
+        tool.name,
+        {
+          ...tool,
+          description: tool.name,
+          parameters: { type: 'object', properties: {} },
+        },
+      ])
+    );
+
+    const output = String(
+      await createToolSearch({
+        mode: 'local',
+        toolRegistry: allLoaded as never,
+      }).invoke({ query: 'anything', mcp_server: 'slack' })
+    );
+
+    expect(output).toContain('no tools left to search');
+    expect(output).toContain('slack');
+    expect(output).not.toContain('The tool registry is empty');
+  });
+
   it('names the available servers when the filter matches none', async () => {
     const output = String(
       await search().invoke({ query: 'anything', mcp_server: 'not-a-server' })

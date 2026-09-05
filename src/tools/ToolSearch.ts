@@ -1067,25 +1067,42 @@ ${mcpNote}${toolsListSection}
         ];
       }
 
-      const toolsArray: t.LCTool[] = Array.from(toolRegistry.values());
-      /** One pass builds the searchable subset and, only when a server filter
-       * needs them, the two server indexes. An unfiltered search is the hot
-       * path and pays for none of the server bookkeeping. */
-      const searchable: t.LCTool[] = [];
       const registeredServers = hasServerFilter ? new Set<string>() : undefined;
       const searchableServers = hasServerFilter ? new Set<string>() : undefined;
-      for (const lcTool of toolsArray) {
-        const server =
-          registeredServers === undefined
-            ? undefined
-            : extractMcpServerName(lcTool.name);
-        if (server !== undefined) {
-          registeredServers?.add(server);
+      /** The set to filter by is unknown until the whole registry has been
+       * seen, so a server-filtered search has to stage its candidates. An
+       * unfiltered search is the hot path: it builds the result during the same
+       * single traversal, with no staging array and no copy of the registry. */
+      const staged: t.LCTool[] | undefined = hasServerFilter ? [] : undefined;
+      const deferredTools: t.ToolMetadata[] = [];
+      let searchableCount = 0;
+
+      const describeTool = (lcTool: t.LCTool): t.ToolMetadata => ({
+        name: lcTool.name,
+        description: lcTool.description ?? '',
+        parameters: simplifyParametersForSearch(lcTool.parameters),
+      });
+
+      for (const lcTool of toolRegistry.values()) {
+        let server: string | undefined;
+        if (hasServerFilter) {
+          server = extractMcpServerName(lcTool.name);
+          /** `tool_mcp_` yields an empty suffix that no filter can name. */
+          if (server !== undefined && server !== '') {
+            registeredServers?.add(server);
+          } else {
+            server = undefined;
+          }
         }
         if (onlyDeferred === true && lcTool.defer_loading !== true) {
           continue;
         }
-        searchable.push(lcTool);
+        searchableCount += 1;
+        if (staged === undefined) {
+          deferredTools.push(describeTool(lcTool));
+          continue;
+        }
+        staged.push(lcTool);
         if (server !== undefined) {
           searchableServers?.add(server);
         }
@@ -1116,31 +1133,23 @@ ${mcpNote}${toolsListSection}
         (name) => searchableServers?.has(name) !== true
       );
 
-      const deferredTools: t.ToolMetadata[] = searchable
-        .filter((lcTool) => {
-          if (
-            hasServerFilter &&
-            !isFromAnyMcpServer(lcTool.name, activeServers)
-          ) {
-            return false;
+      if (staged !== undefined) {
+        for (const lcTool of staged) {
+          if (isFromAnyMcpServer(lcTool.name, activeServers)) {
+            deferredTools.push(describeTool(lcTool));
           }
-          return true;
-        })
-        .map((lcTool) => ({
-          name: lcTool.name,
-          description: lcTool.description ?? '',
-          parameters: simplifyParametersForSearch(lcTool.parameters),
-        }));
+        }
+      }
 
       if (deferredTools.length === 0) {
         /** Say which of the three it is, so an empty result is not read as an
          * outage: nothing is registered, the name did not match anything, or
          * the named server genuinely has no tools. */
         let message: string;
-        if (searchable.length === 0) {
-          message =
-            'No tools available to search. The tool registry is empty or no deferred tools are registered.';
-        } else if (
+        /** The server diagnosis comes first: a registry holding only loaded
+         * tools makes both conditions true, and naming the requested server is
+         * the more useful of the two answers. */
+        if (
           hasServerFilter &&
           (unknownServers.length > 0 || idleServers.length > 0)
         ) {
@@ -1161,6 +1170,9 @@ ${mcpNote}${toolsListSection}
             }.`
           );
           message = parts.join(' ');
+        } else if (searchableCount === 0) {
+          message =
+            'No tools available to search. The tool registry is empty or no deferred tools are registered.';
         } else {
           const serverMsg = hasServerFilter
             ? ` from MCP server(s): ${serverFilters.join(', ')}`
