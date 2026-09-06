@@ -774,6 +774,8 @@ async function executePreparedSummarization(params: {
   const chunkSummaries: BaseMessage[] = [];
   let usage: Partial<UsageMetadata> | undefined;
   let fallbackResult: SummarizationCallResult['fallbackResult'] = 'primary';
+  let providerReportedInputTokens: number | undefined;
+  let providerReportedMaxTokens: number | undefined;
   let callCount = 0;
   for (let i = 0; i < plan.chunks.length; i++) {
     const chunk = plan.chunks[i] as BaseMessage[];
@@ -795,6 +797,10 @@ async function executePreparedSummarization(params: {
     if (result.fallbackResult === 'fallback') {
       fallbackResult = 'fallback';
     }
+    providerReportedInputTokens =
+      result.providerReportedInputTokens ?? providerReportedInputTokens;
+    providerReportedMaxTokens =
+      result.providerReportedMaxTokens ?? providerReportedMaxTokens;
     if (result.text === '') {
       return {
         ...result,
@@ -850,12 +856,18 @@ async function executePreparedSummarization(params: {
   if (synthesis.fallbackResult === 'fallback') {
     fallbackResult = 'fallback';
   }
+  providerReportedInputTokens =
+    synthesis.providerReportedInputTokens ?? providerReportedInputTokens;
+  providerReportedMaxTokens =
+    synthesis.providerReportedMaxTokens ?? providerReportedMaxTokens;
 
   return {
     ...synthesis,
     usage,
     fallbackResult:
       synthesis.fallbackResult === 'failed' ? 'failed' : fallbackResult,
+    providerReportedInputTokens,
+    providerReportedMaxTokens,
     mode: 'staged',
     chunkCount: plan.chunks.length,
     callCount,
@@ -1206,6 +1218,8 @@ export function createSummarizeNode({
       providerReportedMaxTokens: preparedResult.providerReportedMaxTokens,
       chunkCount: preparedResult.chunkCount,
       summarizationCallCount: preparedResult.callCount,
+      providerAttemptLimit:
+        preparedResult.callCount * (MAX_FALLBACK_PROVIDERS + 1),
       fallbackResult: preparedResult.fallbackResult,
       failureReason: preparedResult.error,
     });
