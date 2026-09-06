@@ -481,6 +481,14 @@ export type FileRef = {
 
 export type FileRefs = FileRef[];
 
+export type ArtifactDeliveryFailure = {
+  code: 'artifact_delivery_failed';
+  status: 'partial' | 'failed';
+  attempted: number;
+  delivered: number;
+  failed: number;
+};
+
 export type ExecuteResult = {
   /**
    * Execution session id — the (transient) sandbox run that produced
@@ -491,6 +499,7 @@ export type ExecuteResult = {
   stdout: string;
   stderr: string;
   files?: FileRefs;
+  artifact_delivery?: ArtifactDeliveryFailure;
   /**
    * Durable runtime session id echoed by a stateful Code API backend
    * (hash of tenant+user+hint). Additive; absent on stateless servers.
@@ -1327,6 +1336,7 @@ export type ProgrammaticExecutionResponse = {
   stdout?: string;
   stderr?: string;
   files?: FileRefs;
+  artifact_delivery?: ArtifactDeliveryFailure;
 
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
@@ -1343,6 +1353,7 @@ export type ProgrammaticExecutionArtifact = {
   /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
   files?: FileRefs;
+  artifact_delivery?: ArtifactDeliveryFailure;
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
   runtime_status?: 'new' | 'reused';
@@ -1409,6 +1420,7 @@ export type CodeExecutionArtifact = {
   /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
   files?: FileRefs;
+  artifact_delivery?: ArtifactDeliveryFailure;
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
   runtime_status?: 'new' | 'reused';

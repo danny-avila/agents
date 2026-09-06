@@ -6,6 +6,10 @@ import type { Readable } from 'node:stream';
 import type { CodeApiMethod } from '@/tools/diagnostics';
 import type * as t from '@/types';
 import {
+  appendArtifactDeliveryWarning,
+  normalizeArtifactDeliveryFailure,
+} from '@/tools/ArtifactDelivery';
+import {
   describeCodeApiError,
   logCodeApiDiagnostic,
 } from '@/tools/diagnostics';
@@ -564,6 +568,13 @@ function createCodeExecutionTool(
           formattedOutput,
           code
         );
+        const artifactDelivery = normalizeArtifactDeliveryFailure(
+          result.artifact_delivery
+        );
+        const outputWithDeliveryWarning = appendArtifactDeliveryWarning(
+          outputWithReminder,
+          artifactDelivery
+        );
         const hasFiles = result.files != null && result.files.length > 0;
         /* Echo the durable runtime session (stateful backends only) so hosts
          * can surface a "session active / was reset" signal later. Additive:
@@ -576,15 +587,21 @@ function createCodeExecutionTool(
             }
             : {};
         return [
-          appendCodeSessionFileSummary(outputWithReminder, result.files),
+          appendCodeSessionFileSummary(outputWithDeliveryWarning, result.files),
           (hasFiles
             ? {
               session_id: result.session_id,
               files: result.files,
+              ...(artifactDelivery != null
+                ? { artifact_delivery: artifactDelivery }
+                : {}),
               ...runtimeEcho,
             }
             : {
               session_id: result.session_id,
+              ...(artifactDelivery != null
+                ? { artifact_delivery: artifactDelivery }
+                : {}),
               ...runtimeEcho,
             }) satisfies t.CodeExecutionArtifact,
         ];

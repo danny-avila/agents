@@ -18,6 +18,10 @@ import {
   resolveCodeApiAuthHeaders,
   selectRuntimeSessionHint,
 } from './CodeExecutor';
+import {
+  appendArtifactDeliveryWarning,
+  normalizeArtifactDeliveryFailure,
+} from '@/tools/ArtifactDelivery';
 import { logCodeApiDiagnostic } from '@/tools/diagnostics';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
@@ -300,6 +304,13 @@ function createBashExecutionTool(
           formattedOutput,
           command
         );
+        const artifactDelivery = normalizeArtifactDeliveryFailure(
+          result.artifact_delivery
+        );
+        const outputWithDeliveryWarning = appendArtifactDeliveryWarning(
+          outputWithReminder,
+          artifactDelivery
+        );
         const hasFiles = result.files != null && result.files.length > 0;
         const runtimeEcho =
           result.runtime_session_id != null
@@ -309,15 +320,21 @@ function createBashExecutionTool(
             }
             : {};
         return [
-          appendCodeSessionFileSummary(outputWithReminder, result.files),
+          appendCodeSessionFileSummary(outputWithDeliveryWarning, result.files),
           (hasFiles
             ? {
               session_id: result.session_id,
               files: result.files,
+              ...(artifactDelivery != null
+                ? { artifact_delivery: artifactDelivery }
+                : {}),
               ...runtimeEcho,
             }
             : {
               session_id: result.session_id,
+              ...(artifactDelivery != null
+                ? { artifact_delivery: artifactDelivery }
+                : {}),
               ...runtimeEcho,
             }) satisfies t.CodeExecutionArtifact,
         ];
