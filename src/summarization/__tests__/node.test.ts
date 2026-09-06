@@ -1,4 +1,5 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { GraphEvents, Providers } from '@/common';
@@ -522,14 +523,15 @@ describe('createSummarizeNode', () => {
       {} as RunnableConfig
     );
 
-    // The raw messages should be sent + instruction appended as the last HumanMessage
-    // messagesToRefine has 3 HumanMessages, instruction adds 1 more
-    expect(capturedMessages.length).toBe(4);
+    // The raw messages should be sent with the instruction merged into a
+    // trailing HumanMessage so providers never receive consecutive user roles.
+    expect(capturedMessages.length).toBe(3);
     expect(capturedMessages[0].type).toBe('human');
     expect(capturedMessages[0].content).toBe('Message 1');
-    expect(capturedMessages[3].type).toBe('human');
+    expect(capturedMessages[2].type).toBe('human');
+    expect(capturedMessages[2].content).toContain('Message 3');
     // The last message should contain the summarization prompt
-    expect(capturedMessages[3].content).toContain(
+    expect(capturedMessages[2].content).toContain(
       'context window is filling up'
     );
   });
@@ -1242,6 +1244,49 @@ describe('emoji-heavy content does not break summarization', () => {
 });
 
 describe('bounded summarization input', () => {
+  it('merges the instruction into a trailing human message', async () => {
+    let capturedMessages: BaseMessage[] = [];
+    const invoke = jest.fn().mockImplementation((messages: BaseMessage[]) => {
+      capturedMessages = messages;
+      return Promise.resolve({ content: 'checkpoint' });
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+    const agentContext = createAgentContext({
+      provider: Providers.BEDROCK,
+      clientOptions: { model: 'anthropic.claude-3-5-sonnet' },
+      maxContextTokens: 2_000,
+      tokenCounter: () => 10,
+    });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    await summarizeNode(
+      {
+        messages: [new HumanMessage('objective')],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(capturedMessages).toHaveLength(1);
+    expect(capturedMessages[0]).toBeInstanceOf(HumanMessage);
+    expect(String(capturedMessages[0]?.content)).toContain('objective');
+    expect(String(capturedMessages[0]?.content)).toContain('## Checkpoint');
+  });
+
   it('recalculates tool-schema overhead for a dedicated Anthropic summarizer', () => {
     const agentContext = createAgentContext({
       provider: Providers.OPENAI,

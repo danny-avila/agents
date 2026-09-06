@@ -74,6 +74,39 @@ describe('summarization input preparation', () => {
     expect(resultChunk).toBe(callChunk);
   });
 
+  it('keeps serialized tool calls with their results', () => {
+    const toolCall = new AIMessage({ content: '' });
+    toolCall.additional_kwargs.tool_calls = [
+      {
+        id: 'call_serialized',
+        type: 'function',
+        function: { name: 'read', arguments: '{}' },
+      },
+    ];
+    const toolResult = new ToolMessage({
+      content: 'result'.repeat(40),
+      tool_call_id: 'call_serialized',
+      name: 'read',
+    });
+    const result = planSummarizationChunks({
+      messages: [
+        new HumanMessage('objective'.repeat(20)),
+        toolCall,
+        toolResult,
+        new HumanMessage('next'.repeat(60)),
+      ],
+      messageBudgetTokens: 600,
+      tokenCounter: (message) => String(message.content).length,
+    });
+
+    expect(result.error).toBeUndefined();
+    const chunks = result.plan?.chunks ?? [];
+    const callChunk = chunks.findIndex((chunk) => chunk.includes(toolCall));
+    const resultChunk = chunks.findIndex((chunk) => chunk.includes(toolResult));
+    expect(callChunk).toBeGreaterThanOrEqual(0);
+    expect(resultChunk).toBe(callChunk);
+  });
+
   it('keeps an unresolved tool call with all following messages', () => {
     const openCall = new AIMessage({
       content: '',

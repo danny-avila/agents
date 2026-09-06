@@ -161,12 +161,31 @@ export function createSummarizationInputBudget(params: {
 }
 
 function getToolCallIds(message: BaseMessage): string[] {
-  if (!(message instanceof AIMessage) || !Array.isArray(message.tool_calls)) {
+  if (!(message instanceof AIMessage)) {
     return [];
   }
-  return message.tool_calls
-    .map((call) => call.id)
-    .filter((id): id is string => typeof id === 'string' && id !== '');
+  const ids = new Set<string>();
+  if (Array.isArray(message.tool_calls)) {
+    for (const call of message.tool_calls) {
+      if (typeof call.id === 'string' && call.id !== '') {
+        ids.add(call.id);
+      }
+    }
+  }
+  const serializedCalls = (message.additional_kwargs as Record<string, unknown>)
+    .tool_calls;
+  if (Array.isArray(serializedCalls)) {
+    for (const call of serializedCalls) {
+      if (call == null || typeof call !== 'object') {
+        continue;
+      }
+      const id = (call as { id?: unknown }).id;
+      if (typeof id === 'string' && id !== '') {
+        ids.add(id);
+      }
+    }
+  }
+  return [...ids];
 }
 
 function buildAtomicMessageUnits(messages: BaseMessage[]): BaseMessage[][] {

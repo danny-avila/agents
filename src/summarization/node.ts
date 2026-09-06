@@ -547,6 +547,30 @@ function describeFallbackError(
   };
 }
 
+function appendSummarizationInstruction(
+  messages: BaseMessage[],
+  instruction: string
+): BaseMessage[] {
+  const lastMessage = messages.at(-1);
+  if (!(lastMessage instanceof HumanMessage)) {
+    return [...messages, new HumanMessage(instruction)];
+  }
+  const mergedContent =
+    typeof lastMessage.content === 'string'
+      ? `${lastMessage.content}\n\n${instruction}`
+      : [...lastMessage.content, { type: 'text' as const, text: instruction }];
+  return [
+    ...messages.slice(0, -1),
+    new HumanMessage({
+      content: mergedContent,
+      additional_kwargs: lastMessage.additional_kwargs,
+      response_metadata: lastMessage.response_metadata,
+      id: lastMessage.id,
+      name: lastMessage.name,
+    }),
+  ];
+}
+
 /**
  * Runs the summarization LLM call with a bounded primary + fallback set.
  * Exhaustion is explicit so callers preserve the original history.
@@ -639,16 +663,14 @@ async function executeSummarizationWithFallback(params: {
         const fbResult = await tryFallbackProviders({
           fallbacks,
           tools: agentContext.getToolsForBinding(),
-          messages: [
-            ...messages,
-            new HumanMessage(
-              buildSummarizationInstruction(
-                clientConfig.promptText,
-                clientConfig.updatePromptText,
-                priorSummaryText
-              )
-            ),
-          ],
+          messages: appendSummarizationInstruction(
+            messages,
+            buildSummarizationInstruction(
+              clientConfig.promptText,
+              clientConfig.updatePromptText,
+              priorSummaryText
+            )
+          ),
           config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
           primaryError,
           onChunk,
@@ -1606,7 +1628,7 @@ async function summarizeWithCacheHit({
     priorSummaryText
   );
 
-  const fullMessages = [...messages, new HumanMessage(instruction)];
+  const fullMessages = appendSummarizationInstruction(messages, instruction);
   const invokeMessages =
     usePromptCache === true ? addCacheControl(fullMessages) : fullMessages;
 
@@ -1640,8 +1662,7 @@ async function summarizeWithCacheHit({
     usageSource = 'usage_metadata';
   } else if (responseMsg != null) {
     const respMeta = responseMsg.response_metadata as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
     const raw = (respMeta?.metadata as Record<string, unknown> | undefined)
       ?.usage as Record<string, unknown> | undefined;
     if (raw != null) {
