@@ -160,7 +160,7 @@ describe('summarization input preparation', () => {
     expect(resultChunk).toBe(callChunk);
   });
 
-  it('keeps an unresolved tool call with all following messages', () => {
+  it('repairs an unresolved tool call before planning later messages', () => {
     const openCall = new AIMessage({
       content: '',
       tool_calls: [{ id: 'open_call', name: 'exec', args: {} }],
@@ -179,7 +179,34 @@ describe('summarization input preparation', () => {
       chunk.includes(following)
     );
     expect(callChunk).toBeGreaterThanOrEqual(0);
-    expect(followingChunk).toBe(callChunk);
+    expect(followingChunk).toBeGreaterThan(callChunk);
+    expect(
+      chunks[callChunk]?.some(
+        (message) =>
+          message instanceof ToolMessage && message.tool_call_id === 'open_call'
+      )
+    ).toBe(true);
+  });
+
+  it('budgets every synthetic result for multiple interrupted calls', () => {
+    const openCalls = new AIMessage({
+      content: '',
+      tool_calls: [
+        { id: 'open_1', name: 'first', args: {} },
+        { id: 'open_2', name: 'second', args: {} },
+      ],
+    });
+    const result = planSummarizationChunks({
+      messages: [new HumanMessage('objective'), openCalls],
+      messageBudgetTokens: 300,
+      tokenCounter: () => 100,
+    });
+
+    expect(result.error).toContain('complete message/tool-call unit');
+    if (result.plan != null) {
+      throw new Error('Expected repaired calls to exceed the input budget');
+    }
+    expect(result.estimatedMessageTokens).toBeGreaterThan(300);
   });
 
   it('does not treat provider-executed server tools as open client calls', () => {

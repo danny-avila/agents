@@ -3,7 +3,6 @@ import {
   ToolMessage,
   HumanMessage,
   SystemMessage,
-  isAIMessage,
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
@@ -14,7 +13,6 @@ import type * as t from '@/types';
 import {
   ANTHROPIC_TOOL_TOKEN_MULTIPLIER,
   ContentTypes,
-  Constants,
   DEFAULT_TOOL_TOKEN_MULTIPLIER,
   GraphEvents,
   StepTypes,
@@ -566,41 +564,10 @@ function appendSummarizationInstruction(
   messages: BaseMessage[],
   instruction: string
 ): BaseMessage[] {
-  const toolResultIds = new Set(
-    messages
-      .filter(
-        (message): message is ToolMessage => message instanceof ToolMessage
-      )
-      .map((message) => message.tool_call_id)
-  );
-  const repairedMessages: BaseMessage[] = [];
-  for (const message of messages) {
-    repairedMessages.push(message);
-    if (!isAIMessage(message)) {
-      continue;
-    }
-    const openCalls = (message.tool_calls ?? []).filter(
-      (call) =>
-        typeof call.id === 'string' &&
-        call.id !== '' &&
-        !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) &&
-        !toolResultIds.has(call.id)
-    );
-    for (const call of openCalls) {
-      repairedMessages.push(
-        new ToolMessage({
-          content: 'Tool execution was interrupted before producing a result.',
-          tool_call_id: call.id as string,
-          name: call.name,
-        })
-      );
-    }
-  }
   const providerMessages =
-    repairedMessages.length > 0 &&
-    !(repairedMessages[0] instanceof HumanMessage)
-      ? [new HumanMessage(CONTINUATION_TURN_BRIDGE), ...repairedMessages]
-      : repairedMessages;
+    messages.length > 0 && !(messages[0] instanceof HumanMessage)
+      ? [new HumanMessage(CONTINUATION_TURN_BRIDGE), ...messages]
+      : [...messages];
   const lastMessage = providerMessages.at(-1);
   if (lastMessage instanceof ToolMessage) {
     return [
@@ -937,7 +904,7 @@ async function executePreparedSummarization(params: {
   if (plan.chunks.length === 1) {
     const result = await executeSummarizationWithFallback({
       agentContext,
-      messages,
+      messages: plan.chunks[0] as BaseMessage[],
       clientConfig,
       summarizeConfig,
       stepId,

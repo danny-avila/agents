@@ -30,6 +30,21 @@ export type SummarizationChunkResult =
   | { plan: SummarizationChunkPlan; error?: never }
   | { plan?: never; error: string; estimatedMessageTokens: number };
 
+interface SerializedToolCall {
+  id?: unknown;
+  name?: unknown;
+  function?: { name?: unknown };
+}
+
+interface ToolCallMetadata {
+  tool_calls?: SerializedToolCall[];
+}
+
+interface ClientToolCall {
+  id: string;
+  name: string;
+}
+
 function estimateContentLength(message: BaseMessage): number {
   let serialized = '';
   try {
@@ -163,11 +178,11 @@ export function createSummarizationInputBudget(params: {
   };
 }
 
-function getToolCallIds(message: BaseMessage): string[] {
+function getClientToolCalls(message: BaseMessage): ClientToolCall[] {
   if (!isAIMessage(message)) {
     return [];
   }
-  const ids = new Set<string>();
+  const calls = new Map<string, ClientToolCall>();
   if (Array.isArray(message.tool_calls)) {
     for (const call of message.tool_calls) {
       if (
@@ -175,11 +190,11 @@ function getToolCallIds(message: BaseMessage): string[] {
         call.id !== '' &&
         !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
       ) {
-        ids.add(call.id);
+        calls.set(call.id, { id: call.id, name: call.name });
       }
     }
   }
-  const serializedCalls = (message.additional_kwargs as Record<string, unknown>)
+  const serializedCalls = (message.additional_kwargs as ToolCallMetadata)
     .tool_calls;
   if (Array.isArray(serializedCalls)) {
     for (const call of serializedCalls) {
@@ -192,11 +207,51 @@ function getToolCallIds(message: BaseMessage): string[] {
         id !== '' &&
         !id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
       ) {
-        ids.add(id);
+        const serializedName =
+          typeof call.name === 'string'
+            ? call.name
+            : typeof call.function?.name === 'string'
+              ? call.function.name
+              : 'interrupted_tool';
+        calls.set(id, { id, name: serializedName });
       }
     }
   }
-  return [...ids];
+  return [...calls.values()];
+}
+
+export function repairInterruptedToolCalls(
+  messages: BaseMessage[]
+): BaseMessage[] {
+  const toolResultIds = new Set<string>();
+  for (const message of messages) {
+    if (
+      message instanceof ToolMessage &&
+      typeof message.tool_call_id === 'string' &&
+      message.tool_call_id !== ''
+    ) {
+      toolResultIds.add(message.tool_call_id);
+    }
+  }
+
+  const repaired: BaseMessage[] = [];
+  for (const message of messages) {
+    repaired.push(message);
+    for (const call of getClientToolCalls(message)) {
+      if (toolResultIds.has(call.id)) {
+        continue;
+      }
+      repaired.push(
+        new ToolMessage({
+          content: 'Tool execution was interrupted before producing a result.',
+          tool_call_id: call.id,
+          name: call.name,
+        })
+      );
+      toolResultIds.add(call.id);
+    }
+  }
+  return repaired;
 }
 
 function buildAtomicMessageUnits(messages: BaseMessage[]): BaseMessage[][] {
@@ -205,9 +260,9 @@ function buildAtomicMessageUnits(messages: BaseMessage[]): BaseMessage[][] {
 
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i] as BaseMessage;
-    for (const id of getToolCallIds(message)) {
-      if (!callStarts.has(id)) {
-        callStarts.set(id, i);
+    for (const call of getClientToolCalls(message)) {
+      if (!callStarts.has(call.id)) {
+        callStarts.set(call.id, i);
       }
     }
     if (
@@ -263,7 +318,9 @@ export function planSummarizationChunks(params: {
     };
   }
 
-  const units = buildAtomicMessageUnits(params.messages);
+  const units = buildAtomicMessageUnits(
+    repairInterruptedToolCalls(params.messages)
+  );
   const unitTokenEstimates: number[] = [];
   let estimatedMessageTokens = 0;
   let oversizedUnitTokens = 0;

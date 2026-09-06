@@ -1360,7 +1360,7 @@ describe('bounded summarization input', () => {
     ).toBe(260);
   });
 
-  it('repairs an interrupted open tool call before the next user turn', async () => {
+  it('repairs a serialized interrupted tool call before the next user turn', async () => {
     const capturedMessages: BaseMessage[] = [];
     jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
       class {
@@ -1381,14 +1381,20 @@ describe('bounded summarization input', () => {
       generateStepId,
     });
 
+    const serializedOpenCall = new AIMessage({ content: '' });
+    serializedOpenCall.additional_kwargs.tool_calls = [
+      {
+        id: 'open_call',
+        type: 'function',
+        function: { name: 'search', arguments: '{}' },
+      },
+    ];
+
     await summarizeNode(
       {
         messages: [
           new HumanMessage('objective'),
-          new AIMessage({
-            content: '',
-            tool_calls: [{ id: 'open_call', name: 'search', args: {} }],
-          }),
+          serializedOpenCall,
           new HumanMessage('continue without the interrupted result'),
         ],
         summarizationRequest: {
