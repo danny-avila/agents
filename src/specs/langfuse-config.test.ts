@@ -76,6 +76,53 @@ describe('createLangfuseHandler', () => {
     });
   });
 
+  it('stamps the configured trace userId over the caller identity', () => {
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+
+    createLangfuseHandler({
+      langfuse: { userId: 'alice@example.com' },
+      userId: 'user-1',
+      sessionId: 'thread-1',
+      tags: ['librechat', 'agent'],
+    });
+
+    expect(MockedCallbackHandler).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: 'alice@example.com', sessionId: 'thread-1' })
+    );
+  });
+
+  it('keeps the caller identity when the configured trace userId is blank', () => {
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+
+    createLangfuseHandler({
+      langfuse: { userId: '   ' },
+      userId: 'user-1',
+      sessionId: 'thread-1',
+    });
+
+    expect(MockedCallbackHandler).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: 'user-1' })
+    );
+  });
+
+  it('does not stamp the configured trace userId on inherited identities', () => {
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+
+    createLangfuseHandler({
+      langfuse: { userId: 'alice@example.com' },
+      userId: 'user-1',
+      sessionId: 'thread-1',
+      inheritTraceIdentity: true,
+    });
+
+    expect(MockedCallbackHandler).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: undefined, sessionId: undefined })
+    );
+  });
+
   it('adds configured trace metadata and tags to the callback handler', () => {
     process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
     process.env.LANGFUSE_SECRET_KEY = 'sk-env';

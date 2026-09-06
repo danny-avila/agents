@@ -895,6 +895,18 @@ function mergeLangfuseTags(
   return merged.length > 0 ? [...new Set(merged)] : undefined;
 }
 
+/**
+ * The trace's user identity: the host-configured `langfuse.userId` when
+ * present, else the caller's (normally `configurable.user_id`).
+ */
+export function resolveLangfuseTraceUserId(
+  langfuse: t.LangfuseConfig | undefined,
+  userId: string | undefined
+): string | undefined {
+  const configured = langfuse?.userId?.trim();
+  return isPresent(configured) ? configured : userId;
+}
+
 export function getLangfuseTraceName(
   traceMetadata?: LangfuseTraceMetadata,
   fallback: string = 'LibreChat Agent'
@@ -942,7 +954,7 @@ export function createLangfuseHandler({
     return undefined;
   }
   return new ScopedLangfuseCallbackHandler({
-    userId,
+    userId: resolveLangfuseTraceUserId(langfuse, userId),
     sessionId,
     traceMetadata:
       inheritTraceIdentity === true
@@ -972,7 +984,10 @@ function createPropagateAttributeParams({
   inheritTraceIdentity,
 }: LangfuseAttributeParams): PropagateAttributesParams {
   return {
-    userId: inheritTraceIdentity === true ? undefined : userId,
+    userId:
+      inheritTraceIdentity === true
+        ? undefined
+        : resolveLangfuseTraceUserId(langfuse, userId),
     sessionId: inheritTraceIdentity === true ? undefined : sessionId,
     traceName: inheritTraceIdentity === true ? undefined : traceName,
     tags: mergeLangfuseTags(tags, langfuse?.tags),
