@@ -1574,6 +1574,7 @@ describe('bounded summarization input', () => {
         model: 'claude-sonnet-4-5',
         retainRecent: { turns: 0 },
         maxContextTokens: 2_000,
+        maxSummaryTokens: 100,
       },
       tokenCounter: () => 1,
     });
@@ -1718,6 +1719,49 @@ describe('bounded summarization input', () => {
         messages: [
           new HumanMessage('x'.repeat(2_250)),
           new AIMessage('y'.repeat(2_250)),
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(invoke).toHaveBeenCalledTimes(3);
+  });
+
+  it('reserves the Anthropic constructor output allowance', async () => {
+    const invoke = jest.fn().mockResolvedValue({ content: 'checkpoint' });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+    const agentContext = createAgentContext({
+      provider: Providers.ANTHROPIC,
+      clientOptions: { model: 'claude-opus-4-7' },
+      maxContextTokens: 20_000,
+      summarizationConfig: {
+        retainRecent: { turns: 0 },
+        maxContextTokens: 20_000,
+      },
+      tokenCounter: (message: { content: unknown }) =>
+        Math.ceil(String(message.content).length / 3),
+    });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    await summarizeNode(
+      {
+        messages: [
+          new HumanMessage('x'.repeat(6_000)),
+          new AIMessage('y'.repeat(6_000)),
         ],
         summarizationRequest: {
           remainingContextTokens: 0,

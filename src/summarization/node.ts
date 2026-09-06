@@ -30,6 +30,7 @@ import {
 import { getMaxOutputTokensKey } from '@/llm/request';
 import { addCacheControl } from '@/messages/cache';
 import { initializeModel } from '@/llm/init';
+import { getAnthropicDefaultMaxOutputTokens } from '@/llm/anthropic';
 import { extractErrorMessage } from '@/utils/errors';
 import { getChunkContent } from '@/stream';
 import { executeHooks } from '@/hooks';
@@ -326,12 +327,18 @@ function buildSummarizationClientConfig(
 
   const outputTokensKey = getMaxOutputTokensKey(provider);
   const inheritedOutputTokens = Number(clientOptions[outputTokensKey]);
+  const constructorDefaultOutputTokens =
+    provider === Providers.ANTHROPIC
+      ? getAnthropicDefaultMaxOutputTokens(
+          String(clientOptions.model ?? modelName ?? '')
+        )
+      : undefined;
   const effectiveMaxSummaryTokens =
     paramMaxSummaryTokens ??
     summarizationConfig?.maxSummaryTokens ??
     (Number.isFinite(inheritedOutputTokens) && inheritedOutputTokens > 0
       ? inheritedOutputTokens
-      : undefined);
+      : constructorDefaultOutputTokens);
 
   if (effectiveMaxSummaryTokens != null) {
     clientOptions[outputTokensKey] = effectiveMaxSummaryTokens;
