@@ -1034,18 +1034,36 @@ export async function traceHostToolResults(
     if (call == null || Object.keys(metadata).length === 0) {
       continue;
     }
-    const observation = tool(async () => LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, {
-      name: call.name,
-      description: 'Host tool execution metadata',
-      schema: { type: 'object', properties: {} },
-    });
-    await observation.invoke(
-      { type: 'tool_call', id: call.id, name: call.name, args: {} },
+    const failure =
+      result.status === 'error'
+        ? new Error('Host tool execution failed')
+        : undefined;
+    const observation = tool(
+      async () => {
+        if (failure != null) {
+          throw failure;
+        }
+        return LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT;
+      },
       {
-        callbacks,
-        metadata: { ...metadata, ...request.metadata },
+        name: call.name,
+        description: 'Host tool execution metadata',
+        schema: { type: 'object', properties: {} },
       }
     );
+    try {
+      await observation.invoke(
+        { type: 'tool_call', id: call.id, name: call.name, args: {} },
+        {
+          callbacks,
+          metadata: { ...metadata, ...request.metadata },
+        }
+      );
+    } catch (error) {
+      if (failure == null || error !== failure) {
+        throw error;
+      }
+    }
   }
 }
 

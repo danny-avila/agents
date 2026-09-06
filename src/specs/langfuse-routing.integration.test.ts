@@ -631,6 +631,11 @@ describe('Langfuse per-run routing integration', () => {
               },
               toolDefinitions: [
                 {
+                  name: 'failed_query',
+                  description: 'Failed query fixture',
+                  parameters: { type: 'object', properties: {} },
+                },
+                {
                   name: 'query',
                   description: 'Query fixture',
                   parameters: { type: 'object', properties: {} },
@@ -657,6 +662,19 @@ describe('Langfuse per-run routing integration', () => {
                   data.resolve(
                     await Promise.all(
                       data.toolCalls.map(async (call) => {
+                        if (call.name === 'failed_query') {
+                          return {
+                            toolCallId: call.id,
+                            status: 'error' as const,
+                            content: 'private failed output',
+                            errorMessage: 'private host error',
+                            artifact: {
+                              [LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]: {
+                                query_error_category: 'timeout',
+                              },
+                            },
+                          };
+                        }
                         if (call.name === 'unannotated') {
                           return {
                             toolCallId: call.id,
@@ -688,6 +706,12 @@ describe('Langfuse per-run routing integration', () => {
           });
           run.Graph?.overrideTestModel(['Querying', 'Done'], 1, [
             {
+              id: `failed-${tenantId}`,
+              name: 'failed_query',
+              args: {},
+              type: 'tool_call',
+            },
+            {
               id: `call-${tenantId}`,
               name: 'query',
               args: {},
@@ -717,6 +741,30 @@ describe('Langfuse per-run routing integration', () => {
       ).toHaveLength(0);
       expect(otherToolEnd).not.toHaveBeenCalled();
       for (const [index, tenantId] of ['host-a', 'host-b'].entries()) {
+        const failedStarts = startsForTenant(tenantId).filter(
+          (span) => span.name === 'failed_query'
+        );
+        expect(failedStarts).toHaveLength(1);
+        expect(failedStarts[0].traceId).toBe(
+          traceIdFromSeed(`routing-${tenantId}`)
+        );
+        const failed = endedSpans.find(
+          (entry) => entry.spanContext().spanId === failedStarts[0].spanId
+        );
+        expect(
+          failed?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]
+        ).toBe('ERROR');
+        expect(
+          failed?.attributes[
+            LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE
+          ]
+        ).toBe('Error: Host tool execution failed');
+        expect(JSON.stringify(failed?.attributes)).not.toContain('private');
+        expect(
+          failed?.attributes[
+            'langfuse.observation.metadata.query_error_category'
+          ]
+        ).toContain('timeout');
         const starts = startsForTenant(tenantId).filter(
           (span) => span.name === 'query'
         );
@@ -725,6 +773,9 @@ describe('Langfuse per-run routing integration', () => {
         const span = endedSpans.find(
           (entry) => entry.spanContext().spanId === starts[0].spanId
         );
+        expect(
+          span?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]
+        ).not.toBe('ERROR');
         expect(
           JSON.parse(
             String(
