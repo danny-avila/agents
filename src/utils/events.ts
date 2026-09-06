@@ -2,7 +2,9 @@
 // src/utils/events.ts
 import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { ToolExecuteBatchRequest } from '@/types/tools';
 import type { AgentLogEvent } from '@/types/graph';
+import { traceHostToolResults } from '@/langfuse';
 import { GraphEvents } from '@/common';
 
 /**
@@ -15,6 +17,23 @@ export async function safeDispatchCustomEvent(
   config?: RunnableConfig
 ): Promise<boolean | void> {
   try {
+    if (event === GraphEvents.ON_TOOL_EXECUTE) {
+      const request = payload as ToolExecuteBatchRequest;
+      payload = {
+        ...request,
+        resolve: (
+          results: Parameters<ToolExecuteBatchRequest['resolve']>[0]
+        ): void => {
+          void traceHostToolResults(request, results, config).then(
+            () => request.resolve(results),
+            () => {
+              console.warn('Failed to record host tool execution metadata');
+              request.resolve(results);
+            }
+          );
+        },
+      } satisfies ToolExecuteBatchRequest;
+    }
     await dispatchCustomEvent(event, payload, config);
     return true;
   } catch (e) {

@@ -21,6 +21,7 @@ jest.mock('@langfuse/langchain', () => {
 });
 
 jest.mock('@langfuse/tracing', () => ({
+  ...jest.requireActual('@langfuse/tracing'),
   getLangfuseTracerProvider: jest.fn(() => ({
     forceFlush: mockForceFlush,
   })),

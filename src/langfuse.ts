@@ -1,3 +1,4 @@
+import { tool } from '@langchain/core/tools';
 import { CallbackHandler } from '@langfuse/langchain';
 import { LangfuseOtelContextKeys } from '@langfuse/core';
 import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
@@ -18,6 +19,7 @@ import type {
   LLMResult,
 } from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { Context, SpanContext } from '@opentelemetry/api';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
@@ -40,9 +42,14 @@ import {
   resolveLangfuseDestinationKey,
 } from '@/langfuseSpanRegistry';
 import {
+  getToolObservationMetadata,
+  LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+} from '@/langfuseToolOutputTracing';
+import {
   readPreemptRestartedRun,
   PREEMPT_RESTART_CONTROL_FLOW,
 } from '@/llm/preempt';
+import { filterCallbacks, findCallback } from '@/utils/callbacks';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
 
 export {
@@ -306,10 +313,10 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private deferredRootStarted = false;
   private deferredRootOutcome:
     | {
-      type: 'end';
-      output: Parameters<CallbackHandler['handleChainEnd']>[0];
-      parentRunId?: string;
-    }
+        type: 'end';
+        output: Parameters<CallbackHandler['handleChainEnd']>[0];
+        parentRunId?: string;
+      }
     | { type: 'error'; error: Error; parentRunId?: string }
     | undefined;
 
@@ -615,11 +622,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     this.deferredRootStarted = false;
     this.deferredRootOutcome = undefined;
     if (outcome.type === 'error') {
-      await super.handleChainError(
-        outcome.error,
-        runId,
-        outcome.parentRunId
-      );
+      await super.handleChainError(outcome.error, runId, outcome.parentRunId);
       return;
     }
     await super.handleChainEnd(outcome.output, runId, outcome.parentRunId);
@@ -1006,6 +1009,44 @@ export function hasExplicitLangfuseConfig(
 
 export function isLangfuseCallbackHandler(value: unknown): boolean {
   return value instanceof CallbackHandler;
+}
+
+/** Host results have passed host output filters. Record only reserved metadata,
+ * not arguments, rows, errors, or attachments. These completion observations
+ * do not measure tool latency; execution timing belongs in the metadata. */
+export async function traceHostToolResults(
+  request: t.ToolExecuteBatchRequest,
+  results: t.ToolExecuteResult[],
+  config?: RunnableConfig
+): Promise<void> {
+  if (findCallback(config?.callbacks, isLangfuseCallbackHandler) == null) {
+    return;
+  }
+  const callbacks = filterCallbacks(
+    config?.callbacks,
+    isLangfuseCallbackHandler
+  );
+  for (const result of results) {
+    const metadata = getToolObservationMetadata(result.artifact);
+    const call = request.toolCalls.find(
+      (entry) => entry.id === result.toolCallId
+    );
+    if (call == null || Object.keys(metadata).length === 0) {
+      continue;
+    }
+    const observation = tool(async () => LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, {
+      name: call.name,
+      description: 'Host tool execution metadata',
+      schema: { type: 'object', properties: {} },
+    });
+    await observation.invoke(
+      { type: 'tool_call', id: call.id, name: call.name, args: {} },
+      {
+        callbacks,
+        metadata: { ...metadata, ...request.metadata },
+      }
+    );
+  }
 }
 
 export async function disposeLangfuseHandler(value: unknown): Promise<void> {

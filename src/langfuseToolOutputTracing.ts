@@ -777,23 +777,17 @@ function getToolMessageArtifact(
   return undefined;
 }
 
-function promoteToolObservationMetadata(
-  span: ReadableSpan,
-  attributes: Record<string, unknown>,
-  config: ResolvedLangfuseToolOutputTracingConfig
-): void {
-  if (!isToolObservation(attributes) || !shouldRedactTool(span.name, config)) {
-    return;
-  }
-
-  const artifact = getToolMessageArtifact(
-    attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]
-  );
+export function getToolObservationMetadata(
+  artifact: unknown
+): Record<string, string | number | boolean> {
   // This reserved artifact field is for trusted host adapters. Never copy
   // arbitrary tool or model output into it without an explicit allowlist.
-  const metadata = artifact?.[LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY];
+  const metadata = isRecord(artifact)
+    ? artifact[LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]
+    : undefined;
+  const result: Record<string, string | number | boolean> = {};
   if (!isRecord(metadata)) {
-    return;
+    return result;
   }
 
   let promoted = 0;
@@ -813,12 +807,30 @@ function promoteToolObservationMetadata(
     if (typeof value === 'number' && !Number.isFinite(value)) {
       continue;
     }
-    const attributeKey = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${key}`;
-    if (Object.prototype.hasOwnProperty.call(attributes, attributeKey)) {
-      continue;
-    }
-    attributes[attributeKey] = value;
+    result[key] = value;
     promoted += 1;
+  }
+  return result;
+}
+
+function promoteToolObservationMetadata(
+  span: ReadableSpan,
+  attributes: Record<string, unknown>,
+  config: ResolvedLangfuseToolOutputTracingConfig
+): void {
+  if (!isToolObservation(attributes) || !shouldRedactTool(span.name, config)) {
+    return;
+  }
+  const metadata = getToolObservationMetadata(
+    getToolMessageArtifact(
+      attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]
+    )
+  );
+  for (const [key, value] of Object.entries(metadata)) {
+    const attributeKey = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${key}`;
+    if (!Object.prototype.hasOwnProperty.call(attributes, attributeKey)) {
+      attributes[attributeKey] = value;
+    }
   }
 }
 
