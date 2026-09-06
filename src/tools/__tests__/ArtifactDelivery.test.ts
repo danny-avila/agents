@@ -14,6 +14,7 @@ describe('artifact delivery failures', () => {
         attempted: 3,
         delivered: 2,
         failed: 1,
+        detail: 'private storage failure',
       })
     ).toEqual({
       code: 'artifact_delivery_failed',

@@ -28,7 +28,13 @@ export function normalizeArtifactDeliveryFailure(
     return undefined;
   }
 
-  return candidate as ArtifactDeliveryFailure;
+  return {
+    code: candidate.code,
+    status: candidate.status,
+    attempted: candidate.attempted,
+    delivered: candidate.delivered,
+    failed: candidate.failed,
+  };
 }
 
 export function appendArtifactDeliveryWarning(
