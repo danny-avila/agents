@@ -830,6 +830,14 @@ export interface LangfuseConfig {
   additionalHeaders?: Record<string, string>;
   metadata?: Record<string, string | number | boolean | null | undefined>;
   /**
+   * User identity stamped on every trace this run emits — the agent stream,
+   * titles, activity and reasoning labels, and phases. Hosts set it when the
+   * observability identity differs from `configurable.user_id` (an email or
+   * IdP subject instead of an internal database id); that id remains the
+   * fallback when unset or blank.
+   */
+  userId?: string;
+  /**
    * Internal OTLP span attributes to attach to Langfuse observations before
    * export. Intended for collector-side routing/filtering; strip these in the
    * collector before forwarding spans to Langfuse.
