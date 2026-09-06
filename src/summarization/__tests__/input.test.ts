@@ -38,7 +38,7 @@ describe('summarization input preparation', () => {
         toolResult,
         new HumanMessage('next'.repeat(60)),
       ],
-      messageBudgetTokens: 320,
+      messageBudgetTokens: 400,
       tokenCounter: (message) => String(message.content).length,
     });
 

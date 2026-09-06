@@ -7,7 +7,6 @@ export const MAX_SUMMARIZATION_CHUNKS = 8;
 
 const DEFAULT_OUTPUT_RESERVE_RATIO = 0.05;
 const MESSAGE_ENVELOPE_TOKENS = 8;
-const CHARS_PER_TOKEN = 3;
 
 export interface SummarizationInputBudget {
   contextTokens: number;
@@ -26,18 +25,21 @@ export type SummarizationChunkResult =
   | { plan: SummarizationChunkPlan; error?: never }
   | { plan?: never; error: string; estimatedMessageTokens: number };
 
-function estimateContentTokens(message: BaseMessage): number {
+function estimateContentLength(message: BaseMessage): number {
   let serialized = '';
   try {
     serialized = JSON.stringify({
       type: message.getType(),
       content: message.content,
       additional_kwargs: message.additional_kwargs,
+      tool_calls: message instanceof AIMessage ? message.tool_calls : undefined,
+      tool_call_id:
+        message instanceof ToolMessage ? message.tool_call_id : undefined,
     });
   } catch {
     serialized = String(message.content);
   }
-  return Math.ceil(serialized.length / CHARS_PER_TOKEN);
+  return serialized.length;
 }
 
 export function estimateMessageTokens(
@@ -56,9 +58,8 @@ export function estimateMessageTokens(
     }
   }
 
-  return (
-    Math.max(counted, estimateContentTokens(message)) + MESSAGE_ENVELOPE_TOKENS
-  );
+  const contentTokens = counted > 0 ? counted : estimateContentLength(message);
+  return contentTokens + MESSAGE_ENVELOPE_TOKENS;
 }
 
 export function estimateMessagesTokens(
