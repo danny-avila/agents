@@ -63,6 +63,8 @@ const CHUNK_SUMMARIZATION_PROMPT = `Create a faithful checkpoint for only this b
 const SYNTHESIS_SUMMARIZATION_PROMPT = `Synthesize the numbered bounded checkpoints into one usable continuation checkpoint. Preserve the original user objective, constraints, exact identifiers, tool outcomes, failures, decisions, current progress, and next steps. Resolve repetition without dropping unique facts. Do not continue the task. Return only the consolidated checkpoint.`;
 
 const TOOL_RESULT_TURN_BRIDGE = 'I have received the tool result.';
+const CONTINUATION_TURN_BRIDGE =
+  'Continue from the prior bounded conversation segment.';
 
 /** Structured checkpoint prompt for fresh summarization (no prior summary). */
 export const DEFAULT_SUMMARIZATION_PROMPT = `Hold on, before you continue I need you to write me a checkpoint of everything so far. Your context window is filling up and this checkpoint replaces the messages above, so capture everything you need to pick right back up.
@@ -553,23 +555,27 @@ function appendSummarizationInstruction(
   messages: BaseMessage[],
   instruction: string
 ): BaseMessage[] {
-  const lastMessage = messages.at(-1);
+  const providerMessages =
+    messages.length > 0 && !(messages[0] instanceof HumanMessage)
+      ? [new HumanMessage(CONTINUATION_TURN_BRIDGE), ...messages]
+      : [...messages];
+  const lastMessage = providerMessages.at(-1);
   if (lastMessage instanceof ToolMessage) {
     return [
-      ...messages,
+      ...providerMessages,
       new AIMessage(TOOL_RESULT_TURN_BRIDGE),
       new HumanMessage(instruction),
     ];
   }
   if (!(lastMessage instanceof HumanMessage)) {
-    return [...messages, new HumanMessage(instruction)];
+    return [...providerMessages, new HumanMessage(instruction)];
   }
   const mergedContent =
     typeof lastMessage.content === 'string'
       ? `${lastMessage.content}\n\n${instruction}`
       : [...lastMessage.content, { type: 'text' as const, text: instruction }];
   return [
-    ...messages.slice(0, -1),
+    ...providerMessages.slice(0, -1),
     new HumanMessage({
       content: mergedContent,
       additional_kwargs: lastMessage.additional_kwargs,
@@ -838,6 +844,10 @@ async function executePreparedSummarization(params: {
     Math.max(...instructionEstimates) +
     estimateMessageTokens(
       new AIMessage(TOOL_RESULT_TURN_BRIDGE),
+      summarizerTokenCounter
+    ) +
+    estimateMessageTokens(
+      new HumanMessage(CONTINUATION_TURN_BRIDGE),
       summarizerTokenCounter
     );
   const summarizerToolSchemaTokens = getSummarizationToolSchemaTokens(
@@ -1154,6 +1164,12 @@ export function createSummarizeNode({
       agentContext,
       agentContext.summarizationConfig
     );
+    if (
+      agentContext.tokenCounter != null &&
+      agentContext.discoveredToolNames.size > 0
+    ) {
+      await agentContext.calculateInstructionTokens(agentContext.tokenCounter);
+    }
     const configuredSummarizerMax = clientConfig.maxContextTokens;
     const maxCtx =
       configuredSummarizerMax != null &&

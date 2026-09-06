@@ -1,7 +1,7 @@
 import {
-  AIMessage,
   SystemMessage,
   ToolMessage,
+  isAIMessage,
 } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { TokenCounter } from '@/types';
@@ -36,7 +36,7 @@ function estimateContentLength(message: BaseMessage): number {
       type: message.getType(),
       content: message.content,
       additional_kwargs: message.additional_kwargs,
-      tool_calls: message instanceof AIMessage ? message.tool_calls : undefined,
+      tool_calls: isAIMessage(message) ? message.tool_calls : undefined,
       tool_call_id:
         message instanceof ToolMessage ? message.tool_call_id : undefined,
     });
@@ -53,7 +53,7 @@ function serializeMetadata(message: BaseMessage): string {
         Object.keys(message.additional_kwargs).length > 0
           ? message.additional_kwargs
           : undefined,
-      tool_calls: message instanceof AIMessage ? message.tool_calls : undefined,
+      tool_calls: isAIMessage(message) ? message.tool_calls : undefined,
       tool_call_id:
         message instanceof ToolMessage ? message.tool_call_id : undefined,
       name: message.name || undefined,
@@ -163,7 +163,7 @@ export function createSummarizationInputBudget(params: {
 }
 
 function getToolCallIds(message: BaseMessage): string[] {
-  if (!(message instanceof AIMessage)) {
+  if (!isAIMessage(message)) {
     return [];
   }
   const ids = new Set<string>();

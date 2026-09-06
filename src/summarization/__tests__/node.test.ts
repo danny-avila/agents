@@ -1336,6 +1336,7 @@ describe('bounded summarization input', () => {
 
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(capturedMessages.map((message) => message.getType())).toEqual([
+      'human',
       'ai',
       'tool',
       'ai',
@@ -1419,6 +1420,7 @@ describe('bounded summarization input', () => {
 
     expect(capturedCalls).toHaveLength(3);
     for (const call of capturedCalls) {
+      expect(call[0]).toBeInstanceOf(HumanMessage);
       const estimatedContentTokens = call.reduce<number>((total, raw) => {
         const message = raw as { content?: unknown };
         return total + Math.ceil(String(message.content ?? '').length / 3);
@@ -1510,6 +1512,41 @@ describe('bounded summarization input', () => {
     );
 
     expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes tool-schema tokens after deferred-tool discovery', async () => {
+    const modelClass = jest.spyOn(providers, 'getChatModelClass');
+    const agentContext = createAgentContext({
+      provider: Providers.OPENAI,
+      clientOptions: { model: 'gpt-4.1' },
+      maxContextTokens: 2_000,
+      tokenCounter: () => 10,
+    });
+    agentContext.discoveredToolNames.add('deferred_tool');
+    const refreshTokens = jest
+      .spyOn(agentContext, 'calculateInstructionTokens')
+      .mockImplementation(async () => {
+        agentContext.toolSchemaTokens = 2_500;
+      });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    await summarizeNode(
+      {
+        messages: [new HumanMessage('objective')],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(refreshTokens).toHaveBeenCalledWith(agentContext.tokenCounter);
+    expect(modelClass).not.toHaveBeenCalled();
   });
 
   it('counts chunks with the dedicated summarizer tokenizer', async () => {
