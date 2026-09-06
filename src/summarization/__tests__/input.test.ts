@@ -33,6 +33,18 @@ describe('summarization input preparation', () => {
     });
   });
 
+  it('applies calibration while preserving an explicit zero reserve ratio', () => {
+    expect(
+      createSummarizationInputBudget({
+        maxContextTokens: 1_000,
+        fixedOverheadTokens: 100,
+        maxSummaryTokens: 100,
+        reserveRatio: 0,
+        calibrationRatio: 2,
+      }).messageBudgetTokens
+    ).toBe(350);
+  });
+
   it('never separates a tool call from its result', () => {
     const toolCall = new AIMessage({
       content: '',
@@ -90,7 +102,7 @@ describe('summarization input preparation', () => {
         { length: MAX_SUMMARIZATION_CHUNKS + 1 },
         (_, index) => new HumanMessage(`message-${index}`)
       ),
-      messageBudgetTokens: 120,
+      messageBudgetTokens: 220,
       tokenCounter: () => 100,
     });
 

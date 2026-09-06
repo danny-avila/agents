@@ -18,7 +18,6 @@ import { splitAtRecencyBoundary } from '@/messages/recency';
 import {
   createSummarizationInputBudget,
   estimateMessageTokens,
-  estimateMessagesTokens,
   planSummarizationChunks,
 } from '@/summarization/input';
 import { getMaxOutputTokensKey } from '@/llm/request';
@@ -646,6 +645,7 @@ async function executeSummarizationWithFallback(params: {
 }
 
 type PreparedSummarizationResult = SummarizationCallResult & {
+  retainedUsage?: Partial<UsageMetadata>;
   mode: 'full' | 'staged';
   chunkCount: number;
   callCount: number;
@@ -690,6 +690,19 @@ async function executePreparedSummarization(params: {
     log,
   } = params;
   const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
+  const configuredContextTokens = clientConfig.maxContextTokens;
+  const maxContextTokens =
+    configuredContextTokens != null &&
+    Number.isFinite(configuredContextTokens) &&
+    configuredContextTokens > 0
+      ? configuredContextTokens
+      : agentContext.maxContextTokens;
+  const calibrationRatio =
+    clientConfig.provider === (agentContext.provider as string) &&
+    Number.isFinite(agentContext.calibrationRatio) &&
+    agentContext.calibrationRatio > 0
+      ? agentContext.calibrationRatio
+      : 1;
   const instructionEstimates = [
     buildSummarizationInstruction(
       clientConfig.promptText,
@@ -710,11 +723,11 @@ async function executePreparedSummarization(params: {
   );
   const instructionTokens = Math.max(...instructionEstimates);
   const budget = createSummarizationInputBudget({
-    maxContextTokens:
-      clientConfig.maxContextTokens ?? agentContext.maxContextTokens,
+    maxContextTokens,
     fixedOverheadTokens: agentContext.instructionTokens + instructionTokens,
     maxSummaryTokens: clientConfig.effectiveMaxSummaryTokens,
     reserveRatio: agentContext.summarizationConfig?.reserveRatio,
+    calibrationRatio,
   });
   const chunkResult = planSummarizationChunks({
     messages,
@@ -722,8 +735,10 @@ async function executePreparedSummarization(params: {
     tokenCounter: agentContext.tokenCounter,
   });
   if (chunkResult.plan == null) {
-    const estimatedInputTokens =
-      budget.fixedOverheadTokens + chunkResult.estimatedMessageTokens;
+    const estimatedInputTokens = Math.ceil(
+      (budget.fixedOverheadTokens + chunkResult.estimatedMessageTokens) *
+        calibrationRatio
+    );
     return {
       text: '',
       fallbackResult: 'failed',
@@ -736,8 +751,10 @@ async function executePreparedSummarization(params: {
     };
   }
   const { plan } = chunkResult;
-  const estimatedInputTokens =
-    budget.fixedOverheadTokens + plan.estimatedMessageTokens;
+  const estimatedInputTokens = Math.ceil(
+    (budget.fixedOverheadTokens + plan.estimatedMessageTokens) *
+      calibrationRatio
+  );
 
   if (plan.chunks.length === 1) {
     const result = await executeSummarizationWithFallback({
@@ -752,6 +769,7 @@ async function executePreparedSummarization(params: {
     });
     return {
       ...result,
+      retainedUsage: result.usage,
       mode: 'full',
       chunkCount: 1,
       callCount: 1,
@@ -767,11 +785,12 @@ async function executePreparedSummarization(params: {
     fixedOverheadTokens: budget.fixedOverheadTokens,
     outputReserveTokens: budget.outputReserveTokens,
     inputBudgetTokens: budget.messageBudgetTokens,
+    calibrationRatio,
     chunkCount: plan.chunks.length,
     chunkTokenEstimates: plan.chunkTokenEstimates,
   });
 
-  const chunkSummaries: BaseMessage[] = [];
+  const chunkSummaries: string[] = [];
   let usage: Partial<UsageMetadata> | undefined;
   let fallbackResult: SummarizationCallResult['fallbackResult'] = 'primary';
   let providerReportedInputTokens: number | undefined;
@@ -813,22 +832,21 @@ async function executePreparedSummarization(params: {
       };
     }
     chunkSummaries.push(
-      new HumanMessage(
-        `<bounded-checkpoint index="${i + 1}">\n${result.text}\n</bounded-checkpoint>`
-      )
+      `<bounded-checkpoint index="${i + 1}">\n${result.text}\n</bounded-checkpoint>`
     );
   }
 
-  const synthesisTokens = estimateMessagesTokens(
-    chunkSummaries,
+  const synthesisPrompt = `${chunkSummaries.join('\n\n')}\n\n${SYNTHESIS_SUMMARIZATION_PROMPT}`;
+  const synthesisCheckpointTokens = estimateMessageTokens(
+    new HumanMessage(chunkSummaries.join('\n\n')),
     agentContext.tokenCounter
   );
-  if (synthesisTokens > budget.messageBudgetTokens) {
+  if (synthesisCheckpointTokens > budget.messageBudgetTokens) {
     return {
       text: '',
       usage,
       fallbackResult: 'failed',
-      error: `Synthesis input requires ${synthesisTokens} tokens but the summarizer input budget is ${budget.messageBudgetTokens}`,
+      error: `Synthesis input requires ${synthesisCheckpointTokens} tokens but the summarizer input budget is ${budget.messageBudgetTokens}`,
       mode: 'staged',
       chunkCount: plan.chunks.length,
       callCount,
@@ -839,11 +857,11 @@ async function executePreparedSummarization(params: {
 
   const synthesis = await executeSummarizationWithFallback({
     agentContext,
-    messages: chunkSummaries,
+    messages: [],
     clientConfig: {
       ...clientConfig,
-      promptText: SYNTHESIS_SUMMARIZATION_PROMPT,
-      updatePromptText: SYNTHESIS_SUMMARIZATION_PROMPT,
+      promptText: synthesisPrompt,
+      updatePromptText: synthesisPrompt,
     },
     summarizeConfig: traceConfig(summarizeConfig, 'synthesis'),
     stepId,
@@ -864,6 +882,7 @@ async function executePreparedSummarization(params: {
   return {
     ...synthesis,
     usage,
+    retainedUsage: synthesis.usage,
     fallbackResult:
       synthesis.fallbackResult === 'failed' ? 'failed' : fallbackResult,
     providerReportedInputTokens,
@@ -1010,7 +1029,14 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
-    const maxCtx = agentContext.maxContextTokens ?? 0;
+    const configuredSummarizerMax =
+      agentContext.summarizationConfig?.maxContextTokens;
+    const maxCtx =
+      configuredSummarizerMax != null &&
+      Number.isFinite(configuredSummarizerMax) &&
+      configuredSummarizerMax > 0
+        ? configuredSummarizerMax
+        : (agentContext.maxContextTokens ?? 0);
     if (maxCtx > 0 && agentContext.instructionTokens >= maxCtx) {
       emitAgentLog(
         config,
@@ -1226,15 +1252,32 @@ export function createSummarizeNode({
 
     if (!rawText) {
       agentContext.markSummarizationTriggered(state.messages.length);
+      const failureReason =
+        preparedResult.error ??
+        'Summarization failed without replacing conversation history';
+      await graph.dispatchRunStepCompleted(
+        stepId,
+        {
+          type: 'summary',
+          summary: {
+            ...placeholderSummary,
+            content: [
+              {
+                type: ContentTypes.TEXT,
+                text: `Summarization failed; conversation history was preserved. ${failureReason}`,
+              },
+            ],
+          },
+        } satisfies t.SummaryCompleted,
+        runnableConfig
+      );
       if (runnableConfig) {
         await safeDispatchCustomEvent(
           GraphEvents.ON_SUMMARIZE_COMPLETE,
           {
             id: stepId,
             agentId: request.agentId,
-            error:
-              preparedResult.error ??
-              'Summarization failed without replacing conversation history',
+            error: failureReason,
           } satisfies t.SummarizeCompleteEvent,
           runnableConfig
         );
@@ -1243,10 +1286,14 @@ export function createSummarizeNode({
     }
 
     const summaryText = enrichSummary(rawText, messagesToRefine);
+    const retainedSummaryUsage =
+      preparedResult.mode === 'staged'
+        ? preparedResult.retainedUsage
+        : summaryUsage;
 
     const tokenCount = computeSummaryTokenCount(
       summaryText,
-      summaryUsage,
+      retainedSummaryUsage,
       agentContext.tokenCounter
     );
 

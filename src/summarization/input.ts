@@ -1,4 +1,8 @@
-import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  SystemMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { TokenCounter } from '@/types';
 
@@ -42,7 +46,7 @@ function estimateContentLength(message: BaseMessage): number {
   return serialized.length;
 }
 
-function estimateMetadataLength(message: BaseMessage): number {
+function serializeMetadata(message: BaseMessage): string {
   try {
     return JSON.stringify({
       additional_kwargs:
@@ -53,9 +57,9 @@ function estimateMetadataLength(message: BaseMessage): number {
       tool_call_id:
         message instanceof ToolMessage ? message.tool_call_id : undefined,
       name: message.name || undefined,
-    }).length;
+    });
   } catch {
-    return estimateContentLength(message);
+    return String(message.additional_kwargs);
   }
 }
 
@@ -75,10 +79,22 @@ export function estimateMessageTokens(
     }
   }
 
-  const contentTokens =
-    counted > 0
-      ? counted + estimateMetadataLength(message)
-      : estimateContentLength(message);
+  let contentTokens = estimateContentLength(message);
+  if (counted > 0) {
+    const serializedMetadata = serializeMetadata(message);
+    let metadataTokens = serializedMetadata.length;
+    if (tokenCounter) {
+      try {
+        const value = tokenCounter(new SystemMessage(serializedMetadata));
+        if (Number.isFinite(value) && value >= 0) {
+          metadataTokens = Math.ceil(value);
+        }
+      } catch {
+        // Keep the conservative character-count fallback.
+      }
+    }
+    contentTokens = counted + metadataTokens;
+  }
   return contentTokens + MESSAGE_ENVELOPE_TOKENS;
 }
 
@@ -98,6 +114,7 @@ export function createSummarizationInputBudget(params: {
   fixedOverheadTokens: number;
   maxSummaryTokens?: number;
   reserveRatio?: number;
+  calibrationRatio?: number;
 }): SummarizationInputBudget {
   const contextTokens =
     params.maxContextTokens != null &&
@@ -114,7 +131,7 @@ export function createSummarizationInputBudget(params: {
   const reserveRatio =
     params.reserveRatio != null &&
     Number.isFinite(params.reserveRatio) &&
-    params.reserveRatio > 0 &&
+    params.reserveRatio >= 0 &&
     params.reserveRatio < 1
       ? params.reserveRatio
       : DEFAULT_OUTPUT_RESERVE_RATIO;
@@ -124,6 +141,12 @@ export function createSummarizationInputBudget(params: {
     0,
     Math.ceil(params.fixedOverheadTokens)
   );
+  const calibrationRatio =
+    params.calibrationRatio != null &&
+    Number.isFinite(params.calibrationRatio) &&
+    params.calibrationRatio > 0
+      ? params.calibrationRatio
+      : 1;
 
   return {
     contextTokens,
@@ -131,7 +154,8 @@ export function createSummarizationInputBudget(params: {
     outputReserveTokens,
     messageBudgetTokens: Math.max(
       0,
-      contextTokens - fixedOverheadTokens - outputReserveTokens
+      Math.floor((contextTokens - outputReserveTokens) / calibrationRatio) -
+        fixedOverheadTokens
     ),
   };
 }
