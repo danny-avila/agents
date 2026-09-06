@@ -1026,11 +1026,10 @@ export async function traceHostToolResults(
     config?.callbacks,
     isLangfuseCallbackHandler
   );
+  const callsById = new Map(request.toolCalls.map((call) => [call.id, call]));
   for (const result of results) {
     const metadata = getToolObservationMetadata(result.artifact);
-    const call = request.toolCalls.find(
-      (entry) => entry.id === result.toolCallId
-    );
+    const call = callsById.get(result.toolCallId);
     if (call == null || Object.keys(metadata).length === 0) {
       continue;
     }
