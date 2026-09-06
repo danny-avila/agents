@@ -275,11 +275,17 @@ function buildSummarizationClientConfig(
     clientOptions.modelName = modelName;
   }
 
+  const outputTokensKey = getMaxOutputTokensKey(provider);
+  const inheritedOutputTokens = Number(clientOptions[outputTokensKey]);
   const effectiveMaxSummaryTokens =
-    paramMaxSummaryTokens ?? summarizationConfig?.maxSummaryTokens;
+    paramMaxSummaryTokens ??
+    summarizationConfig?.maxSummaryTokens ??
+    (Number.isFinite(inheritedOutputTokens) && inheritedOutputTokens > 0
+      ? inheritedOutputTokens
+      : undefined);
 
   if (effectiveMaxSummaryTokens != null) {
-    clientOptions[getMaxOutputTokensKey(provider)] = effectiveMaxSummaryTokens;
+    clientOptions[outputTokensKey] = effectiveMaxSummaryTokens;
   }
 
   return {
@@ -724,7 +730,11 @@ async function executePreparedSummarization(params: {
   const instructionTokens = Math.max(...instructionEstimates);
   const budget = createSummarizationInputBudget({
     maxContextTokens,
-    fixedOverheadTokens: agentContext.instructionTokens + instructionTokens,
+    fixedOverheadTokens:
+      agentContext.systemMessageTokens +
+      agentContext.dynamicInstructionTokens +
+      agentContext.toolSchemaTokens +
+      instructionTokens,
     maxSummaryTokens: clientConfig.effectiveMaxSummaryTokens,
     reserveRatio: agentContext.summarizationConfig?.reserveRatio,
     calibrationRatio,
@@ -1258,17 +1268,9 @@ export function createSummarizeNode({
       await graph.dispatchRunStepCompleted(
         stepId,
         {
-          type: 'summary',
-          summary: {
-            ...placeholderSummary,
-            content: [
-              {
-                type: ContentTypes.TEXT,
-                text: `Summarization failed; conversation history was preserved. ${failureReason}`,
-              },
-            ],
-          },
-        } satisfies t.SummaryCompleted,
+          type: 'summary_error',
+          error: failureReason,
+        } satisfies t.SummaryFailed,
         runnableConfig
       );
       if (runnableConfig) {

@@ -113,7 +113,15 @@ export type SummaryCompleted = {
   summary: SummaryContentBlock;
 };
 
-export type StepCompleted = ToolCallCompleted | SummaryCompleted;
+export type SummaryFailed = {
+  type: 'summary_error';
+  error: string;
+};
+
+export type StepCompleted =
+  | ToolCallCompleted
+  | SummaryCompleted
+  | SummaryFailed;
 
 export type MessageCreationDetails = {
   type: StepTypes.MESSAGE_CREATION;

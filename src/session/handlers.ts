@@ -13,6 +13,7 @@ import { toJsonValue } from './messageSerialization';
 
 type CompletedRunStepResult =
   | t.ToolEndEvent
+  | (t.SummaryFailed & { id: string; index: number })
   | (t.SummaryCompleted & { id: string; index: number });
 
 function isToolCompletion(

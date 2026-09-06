@@ -158,6 +158,7 @@ async function createSummarizationRun(opts: {
       summarizationConfig: {
         provider: opts.summarizationProvider,
         model: opts.summarizationModel,
+        maxContextTokens: 32_000,
         maxSummaryTokens: opts.maxSummaryTokens,
       },
     },
@@ -1381,6 +1382,7 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
           summarizationEnabled: true,
           summarizationConfig: {
             provider: Providers.OPENAI,
+            maxContextTokens: 32_000,
           },
         },
         returnContent: true,
@@ -1611,6 +1613,7 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
           summarizationEnabled: true,
           summarizationConfig: {
             provider: Providers.OPENAI,
+            maxContextTokens: 32_000,
           },
         },
         returnContent: true,
@@ -1866,6 +1869,7 @@ describe('Tight context with oversized tool results (no API keys)', () => {
           summarizationEnabled: true,
           summarizationConfig: {
             provider: Providers.OPENAI,
+            maxContextTokens: 32_000,
           },
         },
         returnContent: true,
@@ -1983,6 +1987,7 @@ describe('Tight context with oversized tool results (no API keys)', () => {
           summarizationEnabled: true,
           summarizationConfig: {
             provider: Providers.OPENAI,
+            maxContextTokens: 32_000,
           },
         },
         returnContent: true,
@@ -2156,6 +2161,7 @@ describe('Tight context with oversized tool results (no API keys)', () => {
           summarizationEnabled: true,
           summarizationConfig: {
             provider: Providers.OPENAI,
+            maxContextTokens: 32_000,
           },
           initialSummary,
         },
@@ -2842,6 +2848,7 @@ describe('Enrichment and prompt selection (no API keys)', () => {
         summarizationEnabled: true,
         summarizationConfig: {
           provider: Providers.OPENAI,
+          maxContextTokens: 32_000,
         },
       },
       returnContent: true,
@@ -3000,6 +3007,7 @@ describe('Summarization deduplication correctness (no API keys)', () => {
           summarizationEnabled: true,
           summarizationConfig: {
             provider: Providers.OPENAI,
+            maxContextTokens: 32_000,
             parameters: {},
           },
         },
@@ -3164,6 +3172,7 @@ describe('Summarization deduplication correctness (no API keys)', () => {
           summarizationEnabled: true,
           summarizationConfig: {
             provider: Providers.OPENAI,
+            maxContextTokens: 32_000,
           },
           initialSummary,
         },

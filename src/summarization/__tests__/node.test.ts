@@ -1390,6 +1390,48 @@ describe('bounded summarization input', () => {
     expect(invoke).toHaveBeenCalledTimes(3);
   });
 
+  it('reserves the inherited model output allowance', async () => {
+    const invoke = jest.fn().mockResolvedValue({ content: 'checkpoint' });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+    const agentContext = createAgentContext({
+      maxContextTokens: 3_000,
+      clientOptions: { maxTokens: 1_500 },
+      summarizationConfig: {
+        retainRecent: { turns: 0 },
+        maxContextTokens: 3_000,
+      },
+      tokenCounter: (message: { content: unknown }) =>
+        Math.ceil(String(message.content).length / 3),
+    });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    await summarizeNode(
+      {
+        messages: [
+          new HumanMessage('x'.repeat(2_250)),
+          new AIMessage('y'.repeat(2_250)),
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(invoke).toHaveBeenCalledTimes(3);
+  });
+
   it('preserves the original history when a staged chunk fails', async () => {
     const events = captureEvents();
     const invoke = jest
@@ -1440,7 +1482,10 @@ describe('bounded summarization input', () => {
     expect(setSummary).not.toHaveBeenCalled();
     expect(onStepCompleted).toHaveBeenCalledWith(
       expect.any(String),
-      expect.objectContaining({ type: 'summary' })
+      expect.objectContaining({
+        type: 'summary_error',
+        error: 'chunk failed',
+      })
     );
     const completion = events.find(
       (event) => event.event === GraphEvents.ON_SUMMARIZE_COMPLETE

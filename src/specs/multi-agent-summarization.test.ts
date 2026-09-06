@@ -146,6 +146,7 @@ describe('Multi-agent summarization', () => {
         summarizationEnabled: true,
         summarizationConfig: {
           provider: Providers.OPENAI,
+          maxContextTokens: 32_000,
         },
       },
       {

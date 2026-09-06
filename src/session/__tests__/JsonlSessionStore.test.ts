@@ -1085,6 +1085,47 @@ describe('JsonlSessionStore', () => {
     expect(compaction?.data.retainedEntryIds).toEqual([]);
   });
 
+  it('does not persist a manual compaction when summarization fails', async () => {
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest.fn().mockRejectedValue(new Error('chunk failed')),
+          };
+        }
+      } as never
+    );
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    await store?.appendMessage(new HumanMessage('old'));
+    await store?.appendMessage(new AIMessage('old answer'));
+
+    await session.compact({ retainRecentTurns: 0 });
+
+    expect(store?.getMessages().map((message) => message.content)).toEqual([
+      'old',
+      'old answer',
+    ]);
+    expect(
+      store
+        ?.getEntries()
+        .some(
+          (entry) => entry.type === 'summary' || entry.type === 'compaction'
+        )
+    ).toBe(false);
+  });
+
   it('carries calibration ratio forward after resumeInterrupt', async () => {
     const mockRun = createMockRun('resumed');
     mockRun.getCalibrationRatio.mockReturnValue(2);
