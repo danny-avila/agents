@@ -154,8 +154,10 @@ export function createSummarizationInputBudget(params: {
     outputReserveTokens,
     messageBudgetTokens: Math.max(
       0,
-      Math.floor((contextTokens - outputReserveTokens) / calibrationRatio) -
-        fixedOverheadTokens
+      Math.floor(
+        (contextTokens - outputReserveTokens - fixedOverheadTokens) /
+          calibrationRatio
+      )
     ),
   };
 }

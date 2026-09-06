@@ -42,7 +42,18 @@ describe('summarization input preparation', () => {
         reserveRatio: 0,
         calibrationRatio: 2,
       }).messageBudgetTokens
-    ).toBe(350);
+    ).toBe(400);
+  });
+
+  it('subtracts fixed overhead before expanding a calibrated raw budget', () => {
+    expect(
+      createSummarizationInputBudget({
+        maxContextTokens: 1_000,
+        fixedOverheadTokens: 200,
+        maxSummaryTokens: 100,
+        calibrationRatio: 0.5,
+      }).messageBudgetTokens
+    ).toBe(1_400);
   });
 
   it('never separates a tool call from its result', () => {

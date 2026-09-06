@@ -62,6 +62,8 @@ const CHUNK_SUMMARIZATION_PROMPT = `Create a faithful checkpoint for only this b
 
 const SYNTHESIS_SUMMARIZATION_PROMPT = `Synthesize the numbered bounded checkpoints into one usable continuation checkpoint. Preserve the original user objective, constraints, exact identifiers, tool outcomes, failures, decisions, current progress, and next steps. Resolve repetition without dropping unique facts. Do not continue the task. Return only the consolidated checkpoint.`;
 
+const TOOL_RESULT_TURN_BRIDGE = 'I have received the tool result.';
+
 /** Structured checkpoint prompt for fresh summarization (no prior summary). */
 export const DEFAULT_SUMMARIZATION_PROMPT = `Hold on, before you continue I need you to write me a checkpoint of everything so far. Your context window is filling up and this checkpoint replaces the messages above, so capture everything you need to pick right back up.
 
@@ -552,6 +554,13 @@ function appendSummarizationInstruction(
   instruction: string
 ): BaseMessage[] {
   const lastMessage = messages.at(-1);
+  if (lastMessage instanceof ToolMessage) {
+    return [
+      ...messages,
+      new AIMessage(TOOL_RESULT_TURN_BRIDGE),
+      new HumanMessage(instruction),
+    ];
+  }
   if (!(lastMessage instanceof HumanMessage)) {
     return [...messages, new HumanMessage(instruction)];
   }
@@ -825,7 +834,12 @@ async function executePreparedSummarization(params: {
   ].map((instruction) =>
     estimateMessageTokens(new HumanMessage(instruction), summarizerTokenCounter)
   );
-  const instructionTokens = Math.max(...instructionEstimates);
+  const instructionTokens =
+    Math.max(...instructionEstimates) +
+    estimateMessageTokens(
+      new AIMessage(TOOL_RESULT_TURN_BRIDGE),
+      summarizerTokenCounter
+    );
   const summarizerToolSchemaTokens = getSummarizationToolSchemaTokens(
     agentContext,
     clientConfig
@@ -844,8 +858,8 @@ async function executePreparedSummarization(params: {
   });
   if (chunkResult.plan == null) {
     const estimatedInputTokens = Math.ceil(
-      (budget.fixedOverheadTokens + chunkResult.estimatedMessageTokens) *
-        calibrationRatio
+      budget.fixedOverheadTokens +
+        chunkResult.estimatedMessageTokens * calibrationRatio
     );
     return {
       text: '',
@@ -860,8 +874,7 @@ async function executePreparedSummarization(params: {
   }
   const { plan } = chunkResult;
   const estimatedInputTokens = Math.ceil(
-    (budget.fixedOverheadTokens + plan.estimatedMessageTokens) *
-      calibrationRatio
+    budget.fixedOverheadTokens + plan.estimatedMessageTokens * calibrationRatio
   );
 
   if (plan.chunks.length === 1) {
@@ -1662,7 +1675,8 @@ async function summarizeWithCacheHit({
     usageSource = 'usage_metadata';
   } else if (responseMsg != null) {
     const respMeta = responseMsg.response_metadata as
-      Record<string, unknown> | undefined;
+      | Record<string, unknown>
+      | undefined;
     const raw = (respMeta?.metadata as Record<string, unknown> | undefined)
       ?.usage as Record<string, unknown> | undefined;
     if (raw != null) {

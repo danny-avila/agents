@@ -1287,6 +1287,63 @@ describe('bounded summarization input', () => {
     expect(String(capturedMessages[0]?.content)).toContain('## Checkpoint');
   });
 
+  it('bridges a trailing tool result before the instruction', async () => {
+    let capturedMessages: BaseMessage[] = [];
+    const invoke = jest.fn().mockImplementation((messages: BaseMessage[]) => {
+      capturedMessages = messages;
+      return Promise.resolve({ content: 'checkpoint' });
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+    const agentContext = createAgentContext({
+      provider: Providers.BEDROCK,
+      clientOptions: { model: 'anthropic.claude-3-5-sonnet' },
+      maxContextTokens: 2_000,
+      tokenCounter: () => 10,
+    });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+    const toolCall = new AIMessage({
+      content: '',
+      tool_calls: [{ id: 'call_1', name: 'read', args: {} }],
+    });
+
+    await summarizeNode(
+      {
+        messages: [
+          toolCall,
+          new ToolMessage({
+            content: 'result',
+            tool_call_id: 'call_1',
+            name: 'read',
+          }),
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(capturedMessages.map((message) => message.getType())).toEqual([
+      'ai',
+      'tool',
+      'ai',
+      'human',
+    ]);
+    expect(String(capturedMessages.at(-1)?.content)).toContain('## Checkpoint');
+  });
+
   it('recalculates tool-schema overhead for a dedicated Anthropic summarizer', () => {
     const agentContext = createAgentContext({
       provider: Providers.OPENAI,
