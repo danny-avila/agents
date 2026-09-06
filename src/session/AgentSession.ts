@@ -519,7 +519,7 @@ function createAgentInputFromGraphConfig(
   const summarizationConfig: t.SummarizationConfig = {
     ...(agent.summarizationConfig ?? {}),
     ...(instructions != null && instructions !== ''
-      ? { prompt: instructions }
+      ? { prompt: instructions, updatePrompt: instructions }
       : {}),
     retainRecent: {
       ...(agent.summarizationConfig?.retainRecent ?? {}),

@@ -5,6 +5,7 @@ import {
 } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { TokenCounter } from '@/types';
+import { Constants } from '@/common';
 
 export const DEFAULT_SUMMARIZATION_CONTEXT_TOKENS = 32_000;
 export const MAX_SUMMARIZATION_CHUNKS = 8;
@@ -169,7 +170,11 @@ function getToolCallIds(message: BaseMessage): string[] {
   const ids = new Set<string>();
   if (Array.isArray(message.tool_calls)) {
     for (const call of message.tool_calls) {
-      if (typeof call.id === 'string' && call.id !== '') {
+      if (
+        typeof call.id === 'string' &&
+        call.id !== '' &&
+        !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+      ) {
         ids.add(call.id);
       }
     }
@@ -182,7 +187,11 @@ function getToolCallIds(message: BaseMessage): string[] {
         continue;
       }
       const id = (call as { id?: unknown }).id;
-      if (typeof id === 'string' && id !== '') {
+      if (
+        typeof id === 'string' &&
+        id !== '' &&
+        !id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+      ) {
         ids.add(id);
       }
     }

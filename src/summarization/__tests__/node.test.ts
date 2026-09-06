@@ -1731,7 +1731,7 @@ describe('bounded summarization input', () => {
     expect(invoke).toHaveBeenCalledTimes(3);
   });
 
-  it('reserves the Anthropic constructor output allowance', async () => {
+  it('reserves the Anthropic constructor output allowance for modelName', async () => {
     const invoke = jest.fn().mockResolvedValue({ content: 'checkpoint' });
     jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
       class {
@@ -1742,7 +1742,7 @@ describe('bounded summarization input', () => {
     );
     const agentContext = createAgentContext({
       provider: Providers.ANTHROPIC,
-      clientOptions: { model: 'claude-opus-4-7' },
+      clientOptions: { modelName: 'claude-opus-4-7' },
       maxContextTokens: 20_000,
       summarizationConfig: {
         retainRecent: { turns: 0 },

@@ -330,7 +330,9 @@ function buildSummarizationClientConfig(
   const constructorDefaultOutputTokens =
     provider === Providers.ANTHROPIC
       ? getAnthropicDefaultMaxOutputTokens(
-          String(clientOptions.model ?? modelName ?? '')
+          String(
+            clientOptions.model ?? clientOptions.modelName ?? modelName ?? ''
+          )
         )
       : undefined;
   const effectiveMaxSummaryTokens =

@@ -182,6 +182,29 @@ describe('summarization input preparation', () => {
     expect(followingChunk).toBe(callChunk);
   });
 
+  it('does not treat provider-executed server tools as open client calls', () => {
+    const serverCall = new AIMessage({
+      content: 'searched the web',
+      tool_calls: [
+        { id: 'srvtoolu_search', name: 'web_search', args: { query: 'news' } },
+      ],
+    });
+    const result = planSummarizationChunks({
+      messages: [
+        new HumanMessage('objective'),
+        serverCall,
+        new HumanMessage('next question'),
+        new AIMessage('next answer'),
+      ],
+      messageBudgetTokens: 250,
+      tokenCounter: () => 100,
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.plan?.chunks).toHaveLength(4);
+    expect(result.plan?.chunks[1]).toContain(serverCall);
+  });
+
   it('fails before invoking a model when the bounded chunk count is exceeded', () => {
     const result = planSummarizationChunks({
       messages: Array.from(
