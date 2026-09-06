@@ -1186,16 +1186,11 @@ export class AgentSession {
         metadata: { run_id: compactRunId },
       }
     );
-    if (graph.summaryError != null) {
+    if (graph.summaryError != null || graph.completedSummary == null) {
       return undefined;
     }
     const completedSummaryText = getSummaryText(graph.completedSummary);
-    const contextSummaryText = agentContext.getSummaryText();
-    let summaryText = completedSummaryText;
-    if (summaryText === '' && contextSummaryText != null) {
-      summaryText = contextSummaryText;
-    }
-    if (summaryText === '') {
+    if (completedSummaryText === '') {
       return undefined;
     }
     const retainedMessages = filterRemoveMessages(
@@ -1212,7 +1207,7 @@ export class AgentSession {
       (entry) => !retainedEntryIdSet.has(entry.id)
     );
     const summary = await store.appendEntryForCompaction({
-      text: summaryText,
+      text: completedSummaryText,
       tokenCount: getSummaryTokenCount(graph.completedSummary),
       retainedEntryIds,
       summarizedEntryIds: summarized.map((entry) => entry.id),

@@ -11,6 +11,7 @@ import {
 } from '@/summarization/node';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
+import * as tokenUtils from '@/utils/tokens';
 import { AgentContext } from '@/agents/AgentContext';
 
 // ---------------------------------------------------------------------------
@@ -1360,6 +1361,94 @@ describe('bounded summarization input', () => {
       {} as RunnableConfig
     );
 
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('rescales tool-schema overhead before dedicated-model preflight', async () => {
+    const invoke = jest.fn().mockResolvedValue({ content: 'checkpoint' });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+    const agentContext = createAgentContext({
+      provider: Providers.ANTHROPIC,
+      clientOptions: { model: 'claude-sonnet-4-5' },
+      maxContextTokens: 4_000,
+      systemMessageTokens: 100,
+      toolSchemaTokens: 2_600,
+      summarizationConfig: {
+        provider: Providers.OPENAI,
+        model: 'gpt-4.1',
+        retainRecent: { turns: 0 },
+        maxContextTokens: 2_000,
+      },
+      tokenCounter: () => 10,
+    });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    await summarizeNode(
+      {
+        messages: [new HumanMessage('objective')],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts chunks with the dedicated summarizer tokenizer', async () => {
+    const invoke = jest.fn().mockResolvedValue({ content: 'checkpoint' });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+    const createCounter = jest
+      .spyOn(tokenUtils, 'createTokenCounter')
+      .mockResolvedValue(() => 10);
+    const agentContext = createAgentContext({
+      provider: Providers.OPENAI,
+      clientOptions: { model: 'gpt-4.1' },
+      maxContextTokens: 2_000,
+      summarizationConfig: {
+        provider: Providers.ANTHROPIC,
+        model: 'claude-sonnet-4-5',
+        retainRecent: { turns: 0 },
+        maxContextTokens: 2_000,
+      },
+      tokenCounter: () => 1,
+    });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    await summarizeNode(
+      {
+        messages: [new HumanMessage('objective')],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(createCounter).toHaveBeenCalledWith('claude');
     expect(invoke).toHaveBeenCalledTimes(1);
   });
 

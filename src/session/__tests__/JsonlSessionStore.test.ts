@@ -1140,6 +1140,50 @@ describe('JsonlSessionStore', () => {
     ).toHaveLength(1);
   });
 
+  it('does not persist a stale summary when re-compaction is a no-op', async () => {
+    const invoke = jest.fn().mockResolvedValue({ content: 'prior summary' });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    await store?.appendMessage(new HumanMessage('old'));
+    await store?.appendMessage(new AIMessage('old answer'));
+    await session.compact({ retainRecentTurns: 0 });
+
+    await store?.appendMessage(new HumanMessage('new question'));
+    await store?.appendMessage(new AIMessage('new answer'));
+    await session.compact({ retainRecentTurns: 1 });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(store?.getMessages().map((message) => message.content)).toEqual([
+      'prior summary',
+      'new question',
+      'new answer',
+    ]);
+    expect(
+      store?.getEntries().filter((entry) => entry.type === 'summary')
+    ).toHaveLength(1);
+    expect(
+      store?.getEntries().filter((entry) => entry.type === 'compaction')
+    ).toHaveLength(1);
+  });
+
   it('carries calibration ratio forward after resumeInterrupt', async () => {
     const mockRun = createMockRun('resumed');
     mockRun.getCalibrationRatio.mockReturnValue(2);

@@ -33,6 +33,7 @@ import { initializeModel } from '@/llm/init';
 import { extractErrorMessage } from '@/utils/errors';
 import { getChunkContent } from '@/stream';
 import { executeHooks } from '@/hooks';
+import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 
 const SUMMARIZATION_PARAM_KEYS = new Set(['maxSummaryTokens']);
 
@@ -257,6 +258,13 @@ function getToolSchemaMultiplier(provider: string, model: unknown): number {
   return isAnthropic
     ? ANTHROPIC_TOOL_TOKEN_MULTIPLIER
     : DEFAULT_TOOL_TOKEN_MULTIPLIER;
+}
+
+function getSummarizationEncoding(provider: string, model: unknown) {
+  if (provider === Providers.ANTHROPIC) {
+    return encodingForModel('claude');
+  }
+  return encodingForModel(String(model ?? ''));
 }
 
 export function getSummarizationToolSchemaTokens(
@@ -740,6 +748,31 @@ async function executePreparedSummarization(params: {
     configuredContextTokens > 0
       ? configuredContextTokens
       : agentContext.maxContextTokens;
+  const summarizerEncoding = getSummarizationEncoding(
+    clientConfig.provider,
+    clientConfig.clientOptions.model ?? clientConfig.modelName
+  );
+  const agentEncoding = getSummarizationEncoding(
+    agentContext.provider as string,
+    (agentContext.clientOptions as Record<string, unknown> | undefined)?.model
+  );
+  let summarizerTokenCounter = agentContext.tokenCounter;
+  if (
+    clientConfig.provider !== (agentContext.provider as string) ||
+    summarizerEncoding !== agentEncoding
+  ) {
+    try {
+      summarizerTokenCounter = await createTokenCounter(summarizerEncoding);
+    } catch (error) {
+      summarizerTokenCounter = undefined;
+      log('warn', 'Unable to initialize the summarizer tokenizer', {
+        provider: clientConfig.provider,
+        model: clientConfig.clientOptions.model,
+        encoding: summarizerEncoding,
+        error: extractErrorMessage(error),
+      });
+    }
+  }
   const calibrationRatio =
     clientConfig.provider === (agentContext.provider as string) &&
     Number.isFinite(agentContext.calibrationRatio) &&
@@ -759,10 +792,7 @@ async function executePreparedSummarization(params: {
       priorSummaryText
     ),
   ].map((instruction) =>
-    estimateMessageTokens(
-      new HumanMessage(instruction),
-      agentContext.tokenCounter
-    )
+    estimateMessageTokens(new HumanMessage(instruction), summarizerTokenCounter)
   );
   const instructionTokens = Math.max(...instructionEstimates);
   const summarizerToolSchemaTokens = getSummarizationToolSchemaTokens(
@@ -783,7 +813,7 @@ async function executePreparedSummarization(params: {
   const chunkResult = planSummarizationChunks({
     messages,
     messageBudgetTokens: budget.messageBudgetTokens,
-    tokenCounter: agentContext.tokenCounter,
+    tokenCounter: summarizerTokenCounter,
   });
   if (chunkResult.plan == null) {
     const estimatedInputTokens = Math.ceil(
@@ -890,7 +920,7 @@ async function executePreparedSummarization(params: {
   const synthesisPrompt = `${chunkSummaries.join('\n\n')}\n\n${SYNTHESIS_SUMMARIZATION_PROMPT}`;
   const synthesisCheckpointTokens = estimateMessageTokens(
     new HumanMessage(chunkSummaries.join('\n\n')),
-    agentContext.tokenCounter
+    summarizerTokenCounter
   );
   if (synthesisCheckpointTokens > budget.messageBudgetTokens) {
     return {
@@ -1080,22 +1110,29 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
-    const configuredSummarizerMax =
-      agentContext.summarizationConfig?.maxContextTokens;
+    const clientConfig = buildSummarizationClientConfig(
+      agentContext,
+      agentContext.summarizationConfig
+    );
+    const configuredSummarizerMax = clientConfig.maxContextTokens;
     const maxCtx =
       configuredSummarizerMax != null &&
       Number.isFinite(configuredSummarizerMax) &&
       configuredSummarizerMax > 0
         ? configuredSummarizerMax
         : (agentContext.maxContextTokens ?? 0);
-    if (maxCtx > 0 && agentContext.instructionTokens >= maxCtx) {
+    const preflightInstructionTokens =
+      agentContext.systemMessageTokens +
+      agentContext.dynamicInstructionTokens +
+      getSummarizationToolSchemaTokens(agentContext, clientConfig);
+    if (maxCtx > 0 && preflightInstructionTokens >= maxCtx) {
       emitAgentLog(
         config,
         'warn',
         'summarize',
         'Summarization skipped, instructions exceed context budget. Reduce the number of tools or increase maxContextTokens.',
         {
-          instructionTokens: agentContext.instructionTokens,
+          instructionTokens: preflightInstructionTokens,
           maxContextTokens: maxCtx,
           breakdown: agentContext.formatTokenBudgetBreakdown(),
         },
@@ -1169,11 +1206,6 @@ export function createSummarizeNode({
       agentContext.markSummarizationTriggered(state.messages.length);
       return { summarizationRequest: undefined };
     }
-
-    const clientConfig = buildSummarizationClientConfig(
-      agentContext,
-      agentContext.summarizationConfig
-    );
 
     const stepKey = `summarize-${request.agentId}`;
     const [stepId, stepIndex] = generateStepId(stepKey);
