@@ -6,6 +6,7 @@ import {
   createSummarizeNode,
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
+  getSummarizationToolSchemaTokens,
   parseProviderContextOverflow,
 } from '@/summarization/node';
 import * as providers from '@/llm/providers';
@@ -1237,6 +1238,21 @@ describe('emoji-heavy content does not break summarization', () => {
 });
 
 describe('bounded summarization input', () => {
+  it('recalculates tool-schema overhead for a dedicated Anthropic summarizer', () => {
+    const agentContext = createAgentContext({
+      provider: Providers.OPENAI,
+      clientOptions: { model: 'gpt-4.1' },
+      toolSchemaTokens: 140,
+    });
+
+    expect(
+      getSummarizationToolSchemaTokens(agentContext, {
+        provider: Providers.ANTHROPIC,
+        clientOptions: { model: 'claude-sonnet-4-5' },
+      })
+    ).toBe(260);
+  });
+
   it('never sends an estimated million-token conversation as one provider request', async () => {
     captureEvents();
     const capturedCalls: unknown[][] = [];

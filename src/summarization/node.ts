@@ -10,7 +10,14 @@ import type { AgentContext } from '@/agents/AgentContext';
 import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
-import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
+import {
+  ANTHROPIC_TOOL_TOKEN_MULTIPLIER,
+  ContentTypes,
+  DEFAULT_TOOL_TOKEN_MULTIPLIER,
+  GraphEvents,
+  StepTypes,
+  Providers,
+} from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { createRemoveAllMessage } from '@/messages/reducer';
@@ -240,6 +247,36 @@ interface SummarizationClientConfig {
   maxContextTokens?: number;
   promptText: string;
   updatePromptText: string;
+}
+
+function getToolSchemaMultiplier(provider: string, model: unknown): number {
+  const isAnthropic =
+    provider !== Providers.BEDROCK &&
+    (provider === Providers.ANTHROPIC ||
+      /anthropic|claude/i.test(String(model)));
+  return isAnthropic
+    ? ANTHROPIC_TOOL_TOKEN_MULTIPLIER
+    : DEFAULT_TOOL_TOKEN_MULTIPLIER;
+}
+
+export function getSummarizationToolSchemaTokens(
+  agentContext: AgentContext,
+  clientConfig: Pick<SummarizationClientConfig, 'provider' | 'clientOptions'>
+): number {
+  if (agentContext.toolSchemaTokens <= 0) {
+    return 0;
+  }
+  const agentMultiplier = getToolSchemaMultiplier(
+    agentContext.provider as string,
+    (agentContext.clientOptions as Record<string, unknown> | undefined)?.model
+  );
+  const summarizerMultiplier = getToolSchemaMultiplier(
+    clientConfig.provider,
+    clientConfig.clientOptions.model
+  );
+  return Math.ceil(
+    (agentContext.toolSchemaTokens / agentMultiplier) * summarizerMultiplier
+  );
 }
 
 /** Assembles the summarization model's client options from agent and config. */
@@ -728,12 +765,16 @@ async function executePreparedSummarization(params: {
     )
   );
   const instructionTokens = Math.max(...instructionEstimates);
+  const summarizerToolSchemaTokens = getSummarizationToolSchemaTokens(
+    agentContext,
+    clientConfig
+  );
   const budget = createSummarizationInputBudget({
     maxContextTokens,
     fixedOverheadTokens:
       agentContext.systemMessageTokens +
       agentContext.dynamicInstructionTokens +
-      agentContext.toolSchemaTokens +
+      summarizerToolSchemaTokens +
       instructionTokens,
     maxSummaryTokens: clientConfig.effectiveMaxSummaryTokens,
     reserveRatio: agentContext.summarizationConfig?.reserveRatio,

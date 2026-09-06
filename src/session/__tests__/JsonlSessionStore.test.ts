@@ -1085,16 +1085,18 @@ describe('JsonlSessionStore', () => {
     expect(compaction?.data.retainedEntryIds).toEqual([]);
   });
 
-  it('does not persist a manual compaction when summarization fails', async () => {
-    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
-      class {
-        constructor() {
-          return {
-            invoke: jest.fn().mockRejectedValue(new Error('chunk failed')),
-          };
-        }
-      } as never
-    );
+  it('does not discard newer history when re-compaction fails', async () => {
+    const modelClassSpy = jest
+      .spyOn(providers, 'getChatModelClass')
+      .mockReturnValue(
+        class {
+          constructor() {
+            return {
+              invoke: jest.fn().mockResolvedValue({ content: 'prior summary' }),
+            };
+          }
+        } as never
+      );
     const session = await createAgentSession({
       cwd: dir,
       runId: 'template-run',
@@ -1110,20 +1112,32 @@ describe('JsonlSessionStore', () => {
     const store = session.getSessionStore();
     await store?.appendMessage(new HumanMessage('old'));
     await store?.appendMessage(new AIMessage('old answer'));
+    await session.compact({ retainRecentTurns: 0 });
 
+    await store?.appendMessage(new HumanMessage('new question'));
+    await store?.appendMessage(new AIMessage('new answer'));
+    modelClassSpy.mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest.fn().mockRejectedValue(new Error('chunk failed')),
+          };
+        }
+      } as never
+    );
     await session.compact({ retainRecentTurns: 0 });
 
     expect(store?.getMessages().map((message) => message.content)).toEqual([
-      'old',
-      'old answer',
+      'prior summary',
+      'new question',
+      'new answer',
     ]);
     expect(
-      store
-        ?.getEntries()
-        .some(
-          (entry) => entry.type === 'summary' || entry.type === 'compaction'
-        )
-    ).toBe(false);
+      store?.getEntries().filter((entry) => entry.type === 'summary')
+    ).toHaveLength(1);
+    expect(
+      store?.getEntries().filter((entry) => entry.type === 'compaction')
+    ).toHaveLength(1);
   });
 
   it('carries calibration ratio forward after resumeInterrupt', async () => {
