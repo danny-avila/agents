@@ -282,6 +282,54 @@ describe('CodeAPI auth header injection', () => {
     ).not.toHaveProperty('authHeaders');
   });
 
+  it('surfaces artifact delivery failures from direct code execution', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        session_id: 'session_123',
+        stdout: 'code completed\n',
+        files: [],
+        artifact_delivery: {
+          code: 'artifact_delivery_failed',
+          status: 'failed',
+          attempted: 1,
+          delivered: 0,
+          failed: 1,
+        },
+      })
+    );
+    const tool = createCodeExecutionTool();
+
+    const output = await tool.invoke({ lang: 'py', code: 'print(1)' });
+
+    expect(output).toContain('stdout:\ncode completed');
+    expect(output).toContain('Artifact delivery warning:');
+    expect(output).toContain('do not rerun automatically');
+  });
+
+  it('surfaces artifact delivery failures from direct bash execution', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        session_id: 'session_123',
+        stdout: 'bash completed\n',
+        files: [],
+        artifact_delivery: {
+          code: 'artifact_delivery_failed',
+          status: 'failed',
+          attempted: 1,
+          delivered: 0,
+          failed: 1,
+        },
+      })
+    );
+    const tool = createBashExecutionTool();
+
+    const output = await tool.invoke({ command: 'echo done' });
+
+    expect(output).toContain('stdout:\nbash completed');
+    expect(output).toContain('Artifact delivery warning:');
+    expect(output).toContain('do not rerun automatically');
+  });
+
   it('routes direct code tools by trusted per-agent profile', async () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ session_id: 'session_123', stdout: '1\n' })

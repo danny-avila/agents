@@ -34,6 +34,10 @@ import {
   resolveCodeApiRunTimeoutMs,
 } from './ptcTimeout';
 import {
+  appendArtifactDeliveryWarning,
+  normalizeArtifactDeliveryFailure,
+} from '@/tools/ArtifactDelivery';
+import {
   describeCodeApiError,
   logCodeApiDiagnostic,
 } from '@/tools/diagnostics';
@@ -871,12 +875,22 @@ export function formatCompletedResponse(
   }
 
   const outputWithReminder = appendTmpScratchReminder(formatted, sourceCode);
+  const artifactDelivery = normalizeArtifactDeliveryFailure(
+    response.artifact_delivery
+  );
+  const outputWithDeliveryWarning = appendArtifactDeliveryWarning(
+    outputWithReminder,
+    artifactDelivery
+  );
 
   return [
-    appendCodeSessionFileSummary(outputWithReminder, response.files),
+    appendCodeSessionFileSummary(outputWithDeliveryWarning, response.files),
     {
       session_id: response.session_id,
       files: response.files,
+      ...(artifactDelivery != null
+        ? { artifact_delivery: artifactDelivery }
+        : {}),
       ...(response.runtime_session_id != null
         ? {
           runtime_session_id: response.runtime_session_id,

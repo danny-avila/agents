@@ -22,17 +22,17 @@ import {
   normalizeBashToolResultsForReplay,
 } from '../BashProgrammaticToolCalling';
 import {
-  projectProgrammaticToolMap,
-  resolveProgrammaticToolDefinitions,
-  selectProgrammaticTools,
-} from '../ProgrammaticCallerPolicy';
-import {
   createProgrammaticToolRegistry,
   createGetTeamMembersTool,
   createGetExpensesTool,
   createGetWeatherTool,
   createCalculatorTool,
 } from '@/test/mockTools';
+import {
+  projectProgrammaticToolMap,
+  resolveProgrammaticToolDefinitions,
+  selectProgrammaticTools,
+} from '../ProgrammaticCallerPolicy';
 import { Constants } from '@/common';
 
 describe('ProgrammaticToolCalling', () => {
@@ -984,9 +984,9 @@ for member in team:
         ['send_email', emailTool],
       ]);
 
-      expect(
-        projectProgrammaticToolMap(toolMap, [{ name: 'search' }])
-      ).toEqual(new Map([['search', searchTool]]));
+      expect(projectProgrammaticToolMap(toolMap, [{ name: 'search' }])).toEqual(
+        new Map([['search', searchTool]])
+      );
     });
   });
 
@@ -1036,6 +1036,30 @@ for member in team:
 
       expect(output).toContain('stdout:\nOutput');
       expect(output).toContain('stderr:\nWarning: deprecated function');
+    });
+
+    it('surfaces artifact delivery failures while preserving execution output', () => {
+      const response: t.ProgrammaticExecutionResponse = {
+        status: 'completed',
+        stdout: 'Code completed\n',
+        stderr: '',
+        files: [],
+        session_id: 'sess_abc123',
+        artifact_delivery: {
+          code: 'artifact_delivery_failed',
+          status: 'failed',
+          attempted: 1,
+          delivered: 0,
+          failed: 1,
+        },
+      };
+
+      const [output, artifact] = formatCompletedResponse(response);
+
+      expect(output).toContain('stdout:\nCode completed');
+      expect(output).toContain('Artifact delivery warning:');
+      expect(output).toContain('do not rerun automatically');
+      expect(artifact.artifact_delivery).toEqual(response.artifact_delivery);
     });
 
     it('adds a /tmp scratch reminder when source code used /tmp', () => {
