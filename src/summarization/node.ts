@@ -3,6 +3,7 @@ import {
   ToolMessage,
   HumanMessage,
   SystemMessage,
+  isAIMessage,
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
@@ -13,6 +14,7 @@ import type * as t from '@/types';
 import {
   ANTHROPIC_TOOL_TOKEN_MULTIPLIER,
   ContentTypes,
+  Constants,
   DEFAULT_TOOL_TOKEN_MULTIPLIER,
   GraphEvents,
   StepTypes,
@@ -564,10 +566,41 @@ function appendSummarizationInstruction(
   messages: BaseMessage[],
   instruction: string
 ): BaseMessage[] {
+  const toolResultIds = new Set(
+    messages
+      .filter(
+        (message): message is ToolMessage => message instanceof ToolMessage
+      )
+      .map((message) => message.tool_call_id)
+  );
+  const repairedMessages: BaseMessage[] = [];
+  for (const message of messages) {
+    repairedMessages.push(message);
+    if (!isAIMessage(message)) {
+      continue;
+    }
+    const openCalls = (message.tool_calls ?? []).filter(
+      (call) =>
+        typeof call.id === 'string' &&
+        call.id !== '' &&
+        !call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) &&
+        !toolResultIds.has(call.id)
+    );
+    for (const call of openCalls) {
+      repairedMessages.push(
+        new ToolMessage({
+          content: 'Tool execution was interrupted before producing a result.',
+          tool_call_id: call.id as string,
+          name: call.name,
+        })
+      );
+    }
+  }
   const providerMessages =
-    messages.length > 0 && !(messages[0] instanceof HumanMessage)
-      ? [new HumanMessage(CONTINUATION_TURN_BRIDGE), ...messages]
-      : [...messages];
+    repairedMessages.length > 0 &&
+    !(repairedMessages[0] instanceof HumanMessage)
+      ? [new HumanMessage(CONTINUATION_TURN_BRIDGE), ...repairedMessages]
+      : repairedMessages;
   const lastMessage = providerMessages.at(-1);
   if (lastMessage instanceof ToolMessage) {
     return [
@@ -1178,11 +1211,15 @@ export function createSummarizeNode({
       agentContext,
       agentContext.summarizationConfig
     );
+    const boundTools = agentContext.getToolsForBinding();
     if (
-      agentContext.tokenCounter != null &&
-      agentContext.discoveredToolNames.size > 0
+      agentContext.discoveredToolNames.size > 0 ||
+      ((boundTools?.length ?? 0) > 0 && agentContext.toolSchemaTokens <= 0)
     ) {
-      await agentContext.calculateInstructionTokens(agentContext.tokenCounter);
+      const schemaTokenCounter =
+        agentContext.tokenCounter ??
+        ((message: BaseMessage) => estimateMessageTokens(message));
+      await agentContext.calculateInstructionTokens(schemaTokenCounter);
     }
     const configuredSummarizerMax = clientConfig.maxContextTokens;
     const maxCtx =

@@ -1360,6 +1360,89 @@ describe('bounded summarization input', () => {
     ).toBe(260);
   });
 
+  it('repairs an interrupted open tool call before the next user turn', async () => {
+    const capturedMessages: BaseMessage[] = [];
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest.fn().mockImplementation(async (messages) => {
+              capturedMessages.push(...messages);
+              return { content: 'checkpoint' };
+            }),
+          };
+        }
+      } as never
+    );
+    const agentContext = createAgentContext();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    await summarizeNode(
+      {
+        messages: [
+          new HumanMessage('objective'),
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'open_call', name: 'search', args: {} }],
+          }),
+          new HumanMessage('continue without the interrupted result'),
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(capturedMessages.map((message) => message.getType())).toEqual([
+      'human',
+      'ai',
+      'tool',
+      'human',
+    ]);
+    expect((capturedMessages[2] as ToolMessage).tool_call_id).toBe('open_call');
+  });
+
+  it('counts bound tool schemas without a supplied token counter', async () => {
+    const modelClass = jest.spyOn(providers, 'getChatModelClass');
+    const agentContext = createAgentContext({
+      maxContextTokens: 1_000,
+      tokenCounter: undefined,
+    });
+    jest
+      .spyOn(agentContext, 'getToolsForBinding')
+      .mockReturnValue([{ name: 'large_tool' }] as never);
+    const calculateTokens = jest
+      .spyOn(agentContext, 'calculateInstructionTokens')
+      .mockImplementation(async () => {
+        agentContext.toolSchemaTokens = 1_200;
+      });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    await summarizeNode(
+      {
+        messages: [new HumanMessage('objective')],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(calculateTokens).toHaveBeenCalledWith(expect.any(Function));
+    expect(modelClass).not.toHaveBeenCalled();
+  });
+
   it('never sends an estimated million-token conversation as one provider request', async () => {
     captureEvents();
     const capturedCalls: unknown[][] = [];
