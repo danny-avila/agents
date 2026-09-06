@@ -629,12 +629,14 @@ describe('DEFAULT_UPDATE_SUMMARIZATION_PROMPT', () => {
   });
 });
 
-describe('budget check — instructions exceed context', () => {
-  it('skips summarization when instructionTokens >= maxContextTokens', async () => {
+describe('summarizer preflight budget', () => {
+  it('skips summarization when tool definitions exceed the context', async () => {
     const events = captureEvents();
     const agentContext = createAgentContext({
+      provider: Providers.OPENAI,
+      clientOptions: { model: 'gpt-4.1' },
       maxContextTokens: 4000,
-      systemMessageTokens: 5000,
+      toolSchemaTokens: 5000,
       formatTokenBudgetBreakdown: () => 'mock breakdown',
     });
 
@@ -669,7 +671,7 @@ describe('budget check — instructions exceed context', () => {
     expect(summarizeEvents).toHaveLength(0);
   });
 
-  it('proceeds normally when instructionTokens < maxContextTokens', async () => {
+  it('does not charge agent-only instructions to the summarizer', async () => {
     captureEvents();
 
     jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
@@ -682,7 +684,8 @@ describe('budget check — instructions exceed context', () => {
 
     const agentContext = createAgentContext({
       maxContextTokens: 8000,
-      systemMessageTokens: 2000,
+      systemMessageTokens: 9000,
+      dynamicInstructionTokens: 1000,
       formatTokenBudgetBreakdown: () => 'mock breakdown',
     });
 
@@ -1483,6 +1486,53 @@ describe('bounded summarization input', () => {
         messages: [
           new HumanMessage('x'.repeat(1_200)),
           new AIMessage('y'.repeat(1_200)),
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(invoke).toHaveBeenCalledTimes(3);
+  });
+
+  it('resets calibration for a different summarizer model', async () => {
+    const invoke = jest.fn().mockResolvedValue({ content: 'checkpoint' });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+    const agentContext = createAgentContext({
+      provider: Providers.OPENAI,
+      clientOptions: { model: 'gpt-4.1' },
+      maxContextTokens: 2_000,
+      calibrationRatio: 0.5,
+      summarizationConfig: {
+        provider: Providers.OPENAI,
+        model: 'gpt-4o-mini',
+        retainRecent: { turns: 0 },
+        maxContextTokens: 2_000,
+        maxSummaryTokens: 100,
+      },
+      tokenCounter: (message: { content: unknown }) =>
+        Math.ceil(String(message.content).length / 3),
+    });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    await summarizeNode(
+      {
+        messages: [
+          new HumanMessage('x'.repeat(3_600)),
+          new AIMessage('y'.repeat(3_600)),
         ],
         summarizationRequest: {
           remainingContextTokens: 0,

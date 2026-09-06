@@ -756,6 +756,13 @@ async function executePreparedSummarization(params: {
     agentContext.provider as string,
     (agentContext.clientOptions as Record<string, unknown> | undefined)?.model
   );
+  const summarizerModel = String(
+    clientConfig.clientOptions.model ?? clientConfig.modelName ?? ''
+  );
+  const agentModel = String(
+    (agentContext.clientOptions as Record<string, unknown> | undefined)
+      ?.model ?? ''
+  );
   let summarizerTokenCounter = agentContext.tokenCounter;
   if (
     clientConfig.provider !== (agentContext.provider as string) ||
@@ -775,6 +782,8 @@ async function executePreparedSummarization(params: {
   }
   const calibrationRatio =
     clientConfig.provider === (agentContext.provider as string) &&
+    summarizerModel === agentModel &&
+    summarizerEncoding === agentEncoding &&
     Number.isFinite(agentContext.calibrationRatio) &&
     agentContext.calibrationRatio > 0
       ? agentContext.calibrationRatio
@@ -801,11 +810,7 @@ async function executePreparedSummarization(params: {
   );
   const budget = createSummarizationInputBudget({
     maxContextTokens,
-    fixedOverheadTokens:
-      agentContext.systemMessageTokens +
-      agentContext.dynamicInstructionTokens +
-      summarizerToolSchemaTokens +
-      instructionTokens,
+    fixedOverheadTokens: summarizerToolSchemaTokens + instructionTokens,
     maxSummaryTokens: clientConfig.effectiveMaxSummaryTokens,
     reserveRatio: agentContext.summarizationConfig?.reserveRatio,
     calibrationRatio,
@@ -1121,18 +1126,18 @@ export function createSummarizeNode({
       configuredSummarizerMax > 0
         ? configuredSummarizerMax
         : (agentContext.maxContextTokens ?? 0);
-    const preflightInstructionTokens =
-      agentContext.systemMessageTokens +
-      agentContext.dynamicInstructionTokens +
-      getSummarizationToolSchemaTokens(agentContext, clientConfig);
-    if (maxCtx > 0 && preflightInstructionTokens >= maxCtx) {
+    const preflightToolSchemaTokens = getSummarizationToolSchemaTokens(
+      agentContext,
+      clientConfig
+    );
+    if (maxCtx > 0 && preflightToolSchemaTokens >= maxCtx) {
       emitAgentLog(
         config,
         'warn',
         'summarize',
-        'Summarization skipped, instructions exceed context budget. Reduce the number of tools or increase maxContextTokens.',
+        'Summarization skipped, tool definitions exceed context budget. Reduce the number of tools or increase maxContextTokens.',
         {
-          instructionTokens: preflightInstructionTokens,
+          toolSchemaTokens: preflightToolSchemaTokens,
           maxContextTokens: maxCtx,
           breakdown: agentContext.formatTokenBudgetBreakdown(),
         },
