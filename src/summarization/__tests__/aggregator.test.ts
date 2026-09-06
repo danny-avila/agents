@@ -179,10 +179,11 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
       } as never,
     });
 
-    const summary = contentParts[0] as t.SummaryContentBlock;
-    expect((summary.content?.[0] as { text: string }).text).toContain(
-      'conversation history was preserved'
-    );
-    expect(summary.boundary).toBeUndefined();
+    const failure = contentParts[0] as {
+      type: ContentTypes.ERROR;
+      error: string;
+    };
+    expect(failure.type).toBe(ContentTypes.ERROR);
+    expect(failure.error).toContain('conversation history was preserved');
   });
 });

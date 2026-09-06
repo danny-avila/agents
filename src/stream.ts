@@ -1472,13 +1472,9 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         contentParts[runStep.index] = result.summary as t.MessageContentComplex;
       } else if (result.type === 'summary_error' && 'error' in result) {
         contentParts[runStep.index] = {
-          type: ContentTypes.SUMMARY,
-          content: [
-            {
-              type: ContentTypes.TEXT,
-              text: `Summarization failed; conversation history was preserved. ${result.error}`,
-            },
-          ],
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]:
+            `Summarization failed; conversation history was preserved. ${result.error}`,
         } as t.MessageContentComplex;
       } else if ('tool_call' in result) {
         const contentPart: t.MessageContentComplex = {

@@ -778,6 +778,11 @@ async function executePreparedSummarization(params: {
     log,
   } = params;
   const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
+  const effectiveConfiguredPrompt =
+    priorSummaryText === ''
+      ? clientConfig.promptText
+      : clientConfig.updatePromptText;
+  const synthesisInstruction = `${SYNTHESIS_SUMMARIZATION_PROMPT}\n\nApply these configured checkpoint requirements:\n${effectiveConfiguredPrompt}`;
   const configuredContextTokens = clientConfig.maxContextTokens;
   const maxContextTokens =
     configuredContextTokens != null &&
@@ -833,7 +838,7 @@ async function executePreparedSummarization(params: {
     ),
     CHUNK_SUMMARIZATION_PROMPT,
     buildSummarizationInstruction(
-      SYNTHESIS_SUMMARIZATION_PROMPT,
+      synthesisInstruction,
       undefined,
       priorSummaryText
     ),
@@ -967,7 +972,7 @@ async function executePreparedSummarization(params: {
     );
   }
 
-  const synthesisPrompt = `${chunkSummaries.join('\n\n')}\n\n${SYNTHESIS_SUMMARIZATION_PROMPT}`;
+  const synthesisPrompt = `${chunkSummaries.join('\n\n')}\n\n${synthesisInstruction}`;
   const synthesisCheckpointTokens = estimateMessageTokens(
     new HumanMessage(chunkSummaries.join('\n\n')),
     summarizerTokenCounter

@@ -1391,6 +1391,7 @@ describe('bounded summarization input', () => {
         retainRecent: { turns: 0 },
         maxContextTokens: 1_000_000,
         maxSummaryTokens: 50_000,
+        prompt: 'Preserve CUSTOM_POLICY identifiers verbatim.',
       },
       tokenCounter: (message: { content: unknown }) =>
         Math.ceil(String(message.content).length / 3),
@@ -1429,6 +1430,9 @@ describe('bounded summarization input', () => {
     }
     expect(capturedCalls[2]).toHaveLength(1);
     expect((capturedCalls[2]?.[0] as HumanMessage).getType()).toBe('human');
+    expect(String((capturedCalls[2]?.[0] as HumanMessage).content)).toContain(
+      'CUSTOM_POLICY'
+    );
     expect(setSummary).toHaveBeenCalledWith('checkpoint-3', 43);
     expect(result.messages?.[0]?._getType()).toBe('remove');
   });
