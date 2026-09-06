@@ -42,6 +42,23 @@ function estimateContentLength(message: BaseMessage): number {
   return serialized.length;
 }
 
+function estimateMetadataLength(message: BaseMessage): number {
+  try {
+    return JSON.stringify({
+      additional_kwargs:
+        Object.keys(message.additional_kwargs).length > 0
+          ? message.additional_kwargs
+          : undefined,
+      tool_calls: message instanceof AIMessage ? message.tool_calls : undefined,
+      tool_call_id:
+        message instanceof ToolMessage ? message.tool_call_id : undefined,
+      name: message.name || undefined,
+    }).length;
+  } catch {
+    return estimateContentLength(message);
+  }
+}
+
 export function estimateMessageTokens(
   message: BaseMessage,
   tokenCounter?: TokenCounter
@@ -58,7 +75,10 @@ export function estimateMessageTokens(
     }
   }
 
-  const contentTokens = counted > 0 ? counted : estimateContentLength(message);
+  const contentTokens =
+    counted > 0
+      ? counted + estimateMetadataLength(message)
+      : estimateContentLength(message);
   return contentTokens + MESSAGE_ENVELOPE_TOKENS;
 }
 

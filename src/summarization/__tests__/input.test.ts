@@ -1,11 +1,23 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import {
   createSummarizationInputBudget,
+  estimateMessageTokens,
   MAX_SUMMARIZATION_CHUNKS,
   planSummarizationChunks,
 } from '@/summarization/input';
 
 describe('summarization input preparation', () => {
+  it('accounts for tool-call metadata omitted by content token counters', () => {
+    const message = new AIMessage({
+      content: 'ok',
+      tool_calls: [
+        { id: 'call_1', name: 'read', args: { path: '/'.repeat(100) } },
+      ],
+    });
+
+    expect(estimateMessageTokens(message, () => 2)).toBeGreaterThan(10);
+  });
+
   it('subtracts instruction overhead and output reserve from the context window', () => {
     expect(
       createSummarizationInputBudget({
