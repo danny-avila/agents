@@ -6,6 +6,7 @@ import {
   createSummarizeNode,
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
+  parseProviderContextOverflow,
 } from '@/summarization/node';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
@@ -293,7 +294,7 @@ describe('createSummarizeNode', () => {
     );
   });
 
-  it('produces metadata stub when all LLM attempts fail', async () => {
+  it('preserves history and emits a recoverable error when all LLM attempts fail', async () => {
     const events = captureEvents();
 
     jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
@@ -334,27 +335,21 @@ describe('createSummarizeNode', () => {
     );
 
     expect(result.summarizationRequest).toBeUndefined();
-    // After summarization, REMOVE_ALL + surviving context is returned
-    expect(result.messages).toBeDefined();
-    expect(result.messages!.length).toBeGreaterThanOrEqual(1);
-    expect(result.messages![0]._getType()).toBe('remove');
+    expect(result.messages).toBeUndefined();
+    expect(setSummary).not.toHaveBeenCalled();
 
-    // Tier 3 fallback: metadata stub is used as summary text
     const completeEvent = events.find(
       (e) => e.event === GraphEvents.ON_SUMMARIZE_COMPLETE
     );
     expect(
-      (
-        (completeEvent?.data as t.SummarizeCompleteEvent).summary!
-          .content?.[0] as { text: string } | undefined
-      )?.text
-    ).toMatch(/^\[Metadata summary:/);
-    expect(
-      (completeEvent?.data as t.SummarizeCompleteEvent).error
+      (completeEvent?.data as t.SummarizeCompleteEvent).summary
     ).toBeUndefined();
+    expect((completeEvent?.data as t.SummarizeCompleteEvent).error).toBe(
+      'Model error'
+    );
   });
 
-  it('catches model initialization errors and falls back to metadata stub', async () => {
+  it('catches model initialization errors without replacing history', async () => {
     captureEvents();
 
     /**
@@ -362,7 +357,7 @@ describe('createSummarizeNode', () => {
      * forwards an unrecognized provider name (custom-endpoint label) that
      * getChatModelClass cannot resolve. Prior to the defense-in-depth fix,
      * this error was thrown outside the try/catch in executeSummarizationWithFallback
-     * and bubbled up silently. Now it is caught and the metadata stub is used.
+     * and bubbled up silently. It is now surfaced without mutating history.
      */
     jest.spyOn(providers, 'getChatModelClass').mockImplementation(() => {
       throw new Error('Unsupported LLM provider: Ollama');
@@ -390,13 +385,10 @@ describe('createSummarizeNode', () => {
       )
     ).resolves.not.toThrow();
 
-    expect(setSummary).toHaveBeenCalledWith(
-      expect.stringContaining('[Metadata summary:'),
-      expect.any(Number)
-    );
+    expect(setSummary).not.toHaveBeenCalled();
   });
 
-  it('falls back to metadata stub when primary LLM call fails', async () => {
+  it('does not persist a structural stub when the primary LLM call fails', async () => {
     captureEvents();
 
     jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
@@ -429,10 +421,7 @@ describe('createSummarizeNode', () => {
       {} as RunnableConfig
     );
 
-    expect(setSummary).toHaveBeenCalledWith(
-      expect.stringContaining('[Metadata summary:'),
-      expect.any(Number)
-    );
+    expect(setSummary).not.toHaveBeenCalled();
   });
 
   it('calls setSummary with the final text', async () => {
@@ -1242,5 +1231,133 @@ describe('emoji-heavy content does not break summarization', () => {
     // Should complete without throwing JSON serialization errors
     expect(result.messages).toBeDefined();
     expect(result.messages!.length).toBeGreaterThan(0);
+  });
+});
+
+describe('bounded summarization input', () => {
+  it('never sends an estimated million-token conversation as one provider request', async () => {
+    captureEvents();
+    const capturedCalls: unknown[][] = [];
+    const invoke = jest.fn().mockImplementation(async (messages: unknown[]) => {
+      capturedCalls.push(messages);
+      return { content: `checkpoint-${capturedCalls.length}` };
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+
+    const setSummary = jest.fn();
+    const agentContext = createAgentContext({
+      maxContextTokens: 1_000_000,
+      summarizationConfig: {
+        retainRecent: { turns: 0 },
+        maxContextTokens: 1_000_000,
+        maxSummaryTokens: 50_000,
+      },
+      tokenCounter: (message: { content: unknown }) =>
+        Math.ceil(String(message.content).length / 3),
+      setSummary,
+    });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+    const payload = 'x'.repeat(1_200_000);
+
+    const result = await summarizeNode(
+      {
+        messages: [
+          new HumanMessage(`objective:${payload}`),
+          new AIMessage(payload),
+          new HumanMessage(payload),
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(capturedCalls).toHaveLength(3);
+    for (const call of capturedCalls) {
+      const estimatedContentTokens = call.reduce<number>((total, raw) => {
+        const message = raw as { content?: unknown };
+        return total + Math.ceil(String(message.content ?? '').length / 3);
+      }, 0);
+      expect(estimatedContentTokens).toBeLessThan(1_000_000);
+    }
+    expect(setSummary).toHaveBeenCalledWith('checkpoint-3', expect.any(Number));
+    expect(result.messages?.[0]?._getType()).toBe('remove');
+  });
+
+  it('preserves the original history when a staged chunk fails', async () => {
+    const events = captureEvents();
+    const invoke = jest
+      .fn()
+      .mockResolvedValueOnce({ content: 'first chunk' })
+      .mockRejectedValueOnce(new Error('chunk failed'));
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke };
+        }
+      } as never
+    );
+
+    const setSummary = jest.fn();
+    const agentContext = createAgentContext({
+      maxContextTokens: 1_000_000,
+      summarizationConfig: {
+        retainRecent: { turns: 0 },
+        maxContextTokens: 1_000_000,
+        maxSummaryTokens: 50_000,
+      },
+      tokenCounter: (message: { content: unknown }) =>
+        Math.ceil(String(message.content).length / 3),
+      setSummary,
+    });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+    const payload = 'x'.repeat(1_800_000);
+
+    const result = await summarizeNode(
+      {
+        messages: [new HumanMessage(payload), new AIMessage(payload)],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(result.messages).toBeUndefined();
+    expect(setSummary).not.toHaveBeenCalled();
+    const completion = events.find(
+      (event) => event.event === GraphEvents.ON_SUMMARIZE_COMPLETE
+    );
+    expect((completion?.data as t.SummarizeCompleteEvent).error).toBe(
+      'chunk failed'
+    );
+  });
+
+  it('parses Bedrock provider-reported prompt limits for telemetry', () => {
+    expect(
+      parseProviderContextOverflow(
+        new Error(
+          'ValidationException: prompt is too long: 1131518 tokens > 1000000 maximum'
+        )
+      )
+    ).toEqual({ inputTokens: 1_131_518, maxTokens: 1_000_000 });
   });
 });

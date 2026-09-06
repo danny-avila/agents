@@ -37,6 +37,8 @@ export type RetainRecentConfig = {
 export type SummarizationConfig = {
   provider?: Providers;
   model?: string;
+  /** Context window of the selected summarizer model. Defaults to the agent context window. */
+  maxContextTokens?: number;
   parameters?: Record<string, unknown>;
   prompt?: string;
   updatePrompt?: string;
