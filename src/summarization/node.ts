@@ -1210,6 +1210,7 @@ export function createSummarizeNode({
       tailStartIndex,
       usedIntraTurnFallback,
     } = splitAtRecencyBoundary(restoredMessages, {
+      provider: agentContext.provider,
       turns: retainTurns,
       tokens: retainRecent?.tokens,
       tokenCounter: recencyTokenCounter,
@@ -1384,7 +1385,7 @@ export function createSummarizeNode({
           compaction_semantic_index_entries: semanticIndex.entryCount,
           compaction_semantic_index_chars: semanticIndex.charCount,
           compaction_semantic_index_omitted_entries:
-            semanticIndex.omittedEntryCount,
+              semanticIndex.omittedEntryCount,
           /**
              * Per-call model attribution for usage consumers (the subagent
              * usage-capture handler): the summarizer's model can differ from

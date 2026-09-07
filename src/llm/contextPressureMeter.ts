@@ -9,6 +9,7 @@ import {
   REPLY_PRIMER_TOKENS,
   isSyntheticProviderContextMessage,
 } from '@/messages';
+import { createToolMessageUsageAccumulator } from '@/messages/budget';
 import { apportionTokenCounts } from '@/utils';
 
 interface ContextPressureUsage {
@@ -19,6 +20,7 @@ interface ContextPressureUsage {
 }
 
 interface ContextPressureMeterParams {
+  provider?: t.ProviderName;
   tokenCounter?: t.TokenCounter;
   tokenCountCache?: ExactTokenCountCache;
   sourceMessages: BaseMessage[];
@@ -230,6 +232,7 @@ function getProviderMessageOriginKey(message: BaseMessage): string | undefined {
 
 /** Measures repeated provider projections while tokenizing each message object once. */
 export function createContextPressureMeter({
+  provider,
   tokenCounter,
   tokenCountCache,
   sourceMessages,
@@ -382,6 +385,22 @@ export function createContextPressureMeter({
         ? availableMessageTokens -
           Math.min(availableMessageTokens, Math.max(0, baselineRemaining))
         : undefined;
+    const toolUsage = createToolMessageUsageAccumulator(provider);
+    const toolUsageState: { error?: Error } = {};
+    const addToolUsage = (
+      message: BaseMessage,
+      getRawTokens: () => number
+    ): void => {
+      if (toolUsageState.error != null) {
+        return;
+      }
+      try {
+        toolUsage.add(message, getRawTokens);
+      } catch (error) {
+        toolUsageState.error =
+          error instanceof Error ? error : new Error(String(error));
+      }
+    };
 
     let projectedMessageTokens: number;
     if (
@@ -423,15 +442,18 @@ export function createContextPressureMeter({
       const usedOrigins = new Set<number>();
       for (const message of messages) {
         const origin = origins.get(message);
+        let rawTokens: number | undefined;
+        const getRawTokens = (): number => (rawTokens ??= count(message));
+        addToolUsage(message, getRawTokens);
         if (origin == null || usedOrigins.has(origin)) {
-          newRawTokens += count(message);
+          newRawTokens += getRawTokens();
           continue;
         }
         usedOrigins.add(origin);
         const projectionDelta =
           message === baseline[origin].message
             ? 0
-            : count(message) - baseline[origin].rawTokens;
+            : getRawTokens() - baseline[origin].rawTokens;
         projectedMessageTokens += Math.max(
           0,
           attribution.attributedByOrigin[origin] +
@@ -442,9 +464,25 @@ export function createContextPressureMeter({
     } else {
       let rawTokens = REPLY_PRIMER_TOKENS;
       for (const message of messages) {
-        rawTokens += count(message);
+        const messageTokens = count(message);
+        addToolUsage(message, () => messageTokens);
+        rawTokens += messageTokens;
       }
       projectedMessageTokens = Math.round(rawTokens * usageRatio);
+    }
+    let measuredToolUsage:
+      | Pick<
+          t.TokenBudgetBreakdown,
+          'toolMessageTokens' | 'toolMessageTokenCounts'
+        >
+      | undefined;
+    try {
+      measuredToolUsage =
+        toolUsageState.error == null ? toolUsage.finish(usageRatio) : undefined;
+    } catch (error) {
+      toolUsageState.error =
+        error instanceof Error ? error : new Error(String(error));
+      measuredToolUsage = undefined;
     }
     return {
       fits: projectedMessageTokens <= availableMessageTokens,
@@ -452,6 +490,10 @@ export function createContextPressureMeter({
       availableMessageTokens,
       contextBudget,
       effectiveInstructionTokens,
+      ...measuredToolUsage,
+      ...(toolUsageState.error == null
+        ? {}
+        : { toolMessageUsageError: toolUsageState.error }),
     };
   };
 

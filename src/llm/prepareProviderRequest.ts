@@ -27,11 +27,7 @@ import {
   stripBedrockCacheControl,
   cloneMessage,
 } from '@/messages/cache';
-import {
-  isAnthropicLike,
-  isGoogleLike,
-  isOpenAILike,
-} from '@/utils/llm';
+import { isAnthropicLike, isGoogleLike, isOpenAILike } from '@/utils/llm';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { getProviderFamily } from '@/llm/providerRegistry';
@@ -90,6 +86,9 @@ export interface ProviderPayloadMeasurement {
   readonly availableMessageTokens?: number;
   readonly contextBudget?: number;
   readonly effectiveInstructionTokens?: number;
+  readonly toolMessageTokens?: number;
+  readonly toolMessageTokenCounts?: Record<string, number>;
+  readonly toolMessageUsageError?: Error;
 }
 
 export interface PreparedProviderRequest {
@@ -380,10 +379,7 @@ function projectAttachmentsForProvider(
       }
       content ??= copyUsableContentPrefix(sourceContent, blockIndex);
       const mimeType = BEDROCK_DOCUMENT_MIME_TYPES[block.document.format];
-      if (
-        mimeType == null ||
-        !canProjectBedrockDocument(provider, mimeType)
-      ) {
+      if (mimeType == null || !canProjectBedrockDocument(provider, mimeType)) {
         continue;
       }
       const standardFile = toStandardFileBlock(block);

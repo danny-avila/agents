@@ -1,7 +1,7 @@
 export * from './core';
 export * from './ids';
 export * from './prune';
-export * from './budget';
+export { syncBudgetDerivedFields } from './budget';
 export * from './format';
 export * from './cache';
 export * from './anthropicToolCache';

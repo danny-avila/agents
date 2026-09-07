@@ -45,25 +45,47 @@ describe('createContextPressureMeter', () => {
       availableMessageTokens: 90,
       contextBudget: 100,
       effectiveInstructionTokens: 10,
+      toolMessageTokens: 0,
+      toolMessageTokenCounts: undefined,
     });
     expect(meter.measure(projected).projectedMessageTokens).toBe(33);
-    /** Stored counts cover the baseline; only the changed projection and its
-     *  baseline subtrahend are tokenized, never the untouched message. */
     expect(tokenCounter).toHaveBeenCalledTimes(2);
   });
 
-  it('reuses stable exact counts across request-scoped meters', () => {
+  it('does not recount unchanged rich content for tool attribution', () => {
+    const retained = new HumanMessage({
+      content: [{ type: 'text', text: 'rich retained content' }],
+    });
+    const tokenCounter = jest.fn(contentLength);
+    const meter = createContextPressureMeter({
+      tokenCounter,
+      sourceMessages: [retained],
+      retainedMessages: [retained],
+      indexTokenCountMap: { 0: 20 },
+      contextUsage: {
+        contextBudget: 100,
+        effectiveInstructionTokens: 10,
+        remainingContextTokens: 70,
+        calibrationRatio: 1,
+      },
+      instructionTokens: 10,
+      calibrationRatio: 1,
+    });
+
+    expect(meter.measure([retained]).toolMessageTokens).toBe(0);
+    expect(tokenCounter).not.toHaveBeenCalled();
+  });
+
+  it('avoids recounting provider-grounded messages across meters', () => {
     const retained = Array.from(
       { length: 100 },
       (_, index) =>
         new HumanMessage({ id: `message-${index}`, content: 'retained' })
     );
     const tokenCounter = jest.fn(contentLength);
-    const tokenCountCache = createExactTokenCountCache(tokenCounter);
     const createMeter = (messages: BaseMessage[]) =>
       createContextPressureMeter({
         tokenCounter,
-        tokenCountCache,
         sourceMessages: messages,
         retainedMessages: messages,
         indexTokenCountMap: Object.fromEntries(
@@ -85,7 +107,7 @@ describe('createContextPressureMeter', () => {
     const appended = [...retained, new HumanMessage('new')];
     createMeter(appended).measure(appended);
 
-    expect(tokenCounter).toHaveBeenCalledTimes(0);
+    expect(tokenCounter).not.toHaveBeenCalled();
   });
 
   it('reuses exact counts across request-scoped meters when no stored counts exist', () => {
@@ -309,6 +331,69 @@ describe('createContextPressureMeter', () => {
       availableMessageTokens: 12,
       contextBudget: 17,
       effectiveInstructionTokens: 5,
+      toolMessageTokens: 0,
+      toolMessageTokenCounts: undefined,
+    });
+  });
+
+  it('measures tool share during the provider-payload pass', () => {
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call-1', name: 'lookup', args: {} }],
+      }),
+      new ToolMessage({
+        content: 'result',
+        tool_call_id: 'call-1',
+      }),
+    ];
+    const tokenCounter = jest.fn(() => 0.5);
+    const meter = createContextPressureMeter({
+      tokenCounter,
+      sourceMessages: messages,
+      retainedMessages: messages,
+      indexTokenCountMap: {},
+      contextUsage: {
+        contextBudget: 100,
+        effectiveInstructionTokens: 10,
+        remainingContextTokens: 90,
+        calibrationRatio: 1,
+      },
+      instructionTokens: 10,
+      calibrationRatio: 1,
+    });
+
+    expect(meter.measure(messages)).toMatchObject({
+      toolMessageTokens: 1,
+      toolMessageTokenCounts: { lookup: 1 },
+    });
+    expect(tokenCounter).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces invalid tool-share counts without invalidating the projection', () => {
+    const message = new ToolMessage({
+      content: 'result',
+      tool_call_id: 'call-1',
+    });
+    const meter = createContextPressureMeter({
+      tokenCounter: () => Number.NaN,
+      sourceMessages: [message],
+      retainedMessages: [message],
+      indexTokenCountMap: { 0: 10 },
+      contextUsage: {
+        contextBudget: 100,
+        effectiveInstructionTokens: 10,
+        remainingContextTokens: 80,
+        calibrationRatio: 1,
+      },
+      instructionTokens: 10,
+      calibrationRatio: 1,
+    });
+
+    expect(meter.measure([message])).toMatchObject({
+      fits: true,
+      projectedMessageTokens: 10,
+      toolMessageUsageError: expect.any(RangeError),
     });
   });
 });

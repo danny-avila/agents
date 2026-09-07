@@ -3535,6 +3535,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * the expansion. Exact counts are memoized across repeated projections.
        */
       const contextPressure = createContextPressureMeter({
+        provider: agentContext.provider,
         tokenCounter: agentContext.tokenCounter,
         tokenCountCache: agentContext.contextPressureTokenCounts,
         sourceMessages: messages,
@@ -4149,12 +4150,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               finalProjection.projectedMessageTokens
           );
         }
+        contextUsage.breakdown.toolMessageTokens =
+          finalProjection.toolMessageTokens;
+        contextUsage.breakdown.toolMessageTokenCounts =
+          finalProjection.toolMessageTokenCounts;
         syncBudgetDerivedFields(
           contextUsage,
-          finalMessages,
-          agentContext.contextPressureTokenCounts?.count ??
-            agentContext.tokenCounter,
-          config
+          undefined,
+          undefined,
+          config,
+          agentContext.provider,
+          finalProjection.toolMessageUsageError
         );
         /** Awaited so async host handlers receive the pre-invoke snapshot
          *  before any model deltas are emitted */
@@ -4337,6 +4343,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const canSummarizeOverflow =
           agentContext.summarizationEnabled === true &&
           splitAtRecencyBoundary(messages, {
+            provider: agentContext.provider,
             turns:
               agentContext.summarizationConfig?.retainRecent?.turns ??
               DEFAULT_RETAIN_RECENT_TURNS,

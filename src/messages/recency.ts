@@ -1,15 +1,17 @@
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ProviderToolCallIndex } from './toolResultTypes';
-import { getProviderSourceMessageIds } from './provenance';
+import type { ProviderName } from '@/types/llm';
 import {
   appendProviderMessageToolCalls,
   appendProviderToolCallDescriptor,
   consumeProviderToolResultPair,
   getBoundedProviderPairingArray,
+  getProviderMessageRole,
   getProviderToolCallPartDescriptor,
   getProviderToolMessageResultDescriptor,
   getProviderToolResultPartDescriptor,
 } from './toolResultTypes';
+import { getProviderSourceMessageIds } from './provenance';
 
 export const DEFAULT_RETAIN_RECENT_TURNS = 2;
 export const DEFAULT_INTRA_TURN_RETAIN_RATIO = 0.16;
@@ -19,6 +21,8 @@ export const DEFAULT_INTRA_TURN_RETAIN_RATIO = 0.16;
  * and a tail (to be preserved verbatim).
  */
 export interface RecencyWindowOptions {
+  /** Serving provider used to interpret generic `ChatMessage` roles. */
+  provider?: ProviderName;
   /**
    * Maximum number of recent user-led turns to keep in the tail. A "turn"
    * begins at a user-authored HumanMessage and includes every following
@@ -96,16 +100,18 @@ export function resolveIntraTurnRetainTokens({
 interface MessagePairingResult {
   completedToolCalls: number;
   trustedHumanToolResult: boolean;
+  userMessage: boolean;
 }
 
 function inspectMessagePairing(
   message: BaseMessage,
-  calls: ProviderToolCallIndex
+  calls: ProviderToolCallIndex,
+  provider?: ProviderName
 ): MessagePairingResult {
-  const isHuman = message.getType() === 'human';
+  const isHuman = getProviderMessageRole(message, provider) === 'user';
   const candidateCalls = isHuman ? new Map(calls) : calls;
   if (!isHuman) {
-    appendProviderMessageToolCalls(message, candidateCalls);
+    appendProviderMessageToolCalls(message, candidateCalls, provider);
   }
   const content = getBoundedProviderPairingArray(message.content);
   let completedToolCalls = 0;
@@ -142,7 +148,10 @@ function inspectMessagePairing(
     }
   }
 
-  const toolMessageResult = getProviderToolMessageResultDescriptor(message);
+  const toolMessageResult = getProviderToolMessageResultDescriptor(
+    message,
+    provider
+  );
   if (
     toolMessageResult != null &&
     consumeProviderToolResultPair(toolMessageResult, candidateCalls)
@@ -161,20 +170,23 @@ function inspectMessagePairing(
     }
   }
   return {
-    completedToolCalls: isHuman && !trustedHumanToolResult
-      ? 0
-      : completedToolCalls,
+    completedToolCalls:
+      isHuman && !trustedHumanToolResult ? 0 : completedToolCalls,
     trustedHumanToolResult,
+    userMessage: isHuman,
   };
 }
 
-function findTurnStarts(messages: BaseMessage[]): number[] {
+function findTurnStarts(
+  messages: BaseMessage[],
+  provider?: ProviderName
+): number[] {
   const turnStarts: number[] = [];
   const calls: ProviderToolCallIndex = new Map();
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i] as BaseMessage;
-    const pairing = inspectMessagePairing(message, calls);
-    if (message.getType() !== 'human' || pairing.trustedHumanToolResult) {
+    const pairing = inspectMessagePairing(message, calls, provider);
+    if (!pairing.userMessage || pairing.trustedHumanToolResult) {
       continue;
     }
     turnStarts.push(i);
@@ -196,7 +208,8 @@ function findIntraTurnBoundary(
   messages: BaseMessage[],
   countMessageAt: (index: number) => number,
   retainTokens: number,
-  earliestRetainedTurnEndIndex: number
+  earliestRetainedTurnEndIndex: number,
+  provider?: ProviderName
 ): number | undefined {
   let remainingTokens = 0;
   for (let i = 0; i < messages.length; i++) {
@@ -229,9 +242,9 @@ function findIntraTurnBoundary(
     const message = messages[i] as BaseMessage;
     remainingTokens -= countMessageAt(i);
 
-    const pairing = inspectMessagePairing(message, pendingToolCalls);
+    const pairing = inspectMessagePairing(message, pendingToolCalls, provider);
     completedToolCalls += pairing.completedToolCalls;
-    if (message.getType() === 'human' && !pairing.trustedHumanToolResult) {
+    if (pairing.userMessage && !pairing.trustedHumanToolResult) {
       pendingToolCalls.clear();
     }
 
@@ -250,7 +263,7 @@ function findIntraTurnBoundary(
       completedToolCalls > 0 &&
       pendingToolCalls.size === 0 &&
       straddlingSourceIds.size === 0 &&
-      (message.getType() !== 'human' || pairing.trustedHumanToolResult)
+      (!pairing.userMessage || pairing.trustedHumanToolResult)
     ) {
       boundary = i + 1;
     }
@@ -292,7 +305,7 @@ export function splitAtRecencyBoundary(
     };
   }
 
-  const turnStarts = findTurnStarts(messages);
+  const turnStarts = findTurnStarts(messages, options.provider);
 
   if (turnStarts.length === 0) {
     return {
@@ -377,7 +390,8 @@ export function splitAtRecencyBoundary(
         messages,
         countMessageAt,
         intraTurnTokens,
-        turnStarts[1] ?? messages.length
+        turnStarts[1] ?? messages.length,
+        options.provider
       );
       if (intraTurnBoundary != null) {
         return {

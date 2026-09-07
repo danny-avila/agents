@@ -37,24 +37,20 @@ function safeCount(value: number): number {
 }
 
 /** Accepts what the `TokenCounter` contract allows, an approximate `number`
- *  such as `length / 4`, unrounded, so sub-token amounts survive aggregation the
- *  way they do on the pruning path. Rejects only what no subset claim can be
- *  derived from: NaN, infinities, negatives and values past the safe range. */
-function toRawCount(value: number): number {
-  if (
-    !Number.isFinite(value) ||
-    value < 0 ||
-    value > Number.MAX_SAFE_INTEGER
-  ) {
+ *  such as `length / 4`, by rounding it, and rejects only what no subset claim
+ *  can be derived from: NaN, infinities, negatives and values past the safe range. */
+function toCount(value: number): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new RangeError('Invalid tool context token count');
+  }
+  return safeCount(Math.round(value));
+}
+
+function safeRawCount(value: number): number {
+  if (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
     throw new RangeError('Invalid tool context token count');
   }
   return value;
-}
-
-/** A total that arrived already aggregated (the breakdown's own fields) is
- *  rounded once and must then be a safe integer. */
-function toCount(value: number): number {
-  return safeCount(Math.round(toRawCount(value)));
 }
 
 let warnedUnavailableToolShare = false;
@@ -75,7 +71,7 @@ function warnUnavailableToolShare(
     config,
     'warn',
     'budget',
-    'Tool-message context share unavailable: the token counter must return safe, non-negative integers',
+    'Tool-message context share unavailable: the token counter must return finite, non-negative counts within the safe range',
     { error: error instanceof Error ? error.message : String(error) }
   );
 }
@@ -156,9 +152,14 @@ interface InvocationScan {
  */
 function scanInvocation(
   message: BaseMessage,
-  calls: ProviderToolCallIndex
+  calls: ProviderToolCallIndex,
+  provider?: t.ProviderName
 ): InvocationScan {
-  let recognizedCalls = appendProviderMessageToolCalls(message, calls);
+  let recognizedCalls = appendProviderMessageToolCalls(
+    message,
+    calls,
+    provider
+  );
   if (typeof message.content === 'string') {
     return { recognizedCalls, toolOnly: BLANK_TEXT.test(message.content) };
   }
@@ -203,9 +204,10 @@ function scanInvocation(
 function getToolMessageResultName(
   message: BaseMessage,
   calls: ProviderToolCallIndex,
-  pendingLegacyName: string | undefined
+  pendingLegacyName: string | undefined,
+  provider?: t.ProviderName
 ): string {
-  const descriptor = getProviderToolMessageResultDescriptor(message);
+  const descriptor = getProviderToolMessageResultDescriptor(message, provider);
   const pairing =
     descriptor == null ? undefined : pairResult(descriptor, calls);
   if (pairing?.name != null) {
@@ -258,76 +260,115 @@ function takeUserToolResultName(
 }
 
 /** Counts retained tool exchanges without serializing arguments or result content. */
-function computeToolMessageUsage(
-  context: readonly BaseMessage[],
-  tokenCounter: t.TokenCounter,
-  calibrationRatio = 1
-): Pick<
-  t.TokenBudgetBreakdown,
-  'toolMessageTokens' | 'toolMessageTokenCounts'
-> {
+export interface ToolMessageUsageAccumulator {
+  add(message: BaseMessage, getRawTokens: () => number): void;
+  finish(
+    calibrationRatio?: number
+  ): Pick<
+    t.TokenBudgetBreakdown,
+    'toolMessageTokens' | 'toolMessageTokenCounts'
+  >;
+}
+
+/** Accumulates tool-share attribution while its caller walks a provider payload. */
+export function createToolMessageUsageAccumulator(
+  provider?: t.ProviderName
+): ToolMessageUsageAccumulator {
   const calls: ProviderToolCallIndex = new Map();
   const counts: Record<string, number> = Object.create(null);
   let pendingLegacyName: string | undefined;
   let total = 0;
   let resultTotal = 0;
-  const countResult = (message: BaseMessage, name: string): void => {
-    const tokens = toRawCount(tokenCounter(message));
-    total = toRawCount(total + tokens);
+  const addRaw = (current: number, increment: number): number =>
+    safeRawCount(current + safeRawCount(increment));
+  const countResult = (tokens: number, name: string): void => {
+    total = addRaw(total, tokens);
     if (tokens === 0) {
       return;
     }
-    counts[name] = toRawCount((counts[name] ?? 0) + tokens);
-    resultTotal = toRawCount(resultTotal + tokens);
+    counts[name] = addRaw(counts[name] ?? 0, tokens);
+    resultTotal = addRaw(resultTotal, tokens);
   };
 
-  for (const message of context) {
-    const role = getProviderMessageRole(message);
+  const add = (message: BaseMessage, getRawTokens: () => number): void => {
+    const readTokens = (): number => safeRawCount(getRawTokens());
+    const role = getProviderMessageRole(message, provider);
     if (role === 'assistant') {
-      const scan = scanInvocation(message, calls);
+      const scan = scanInvocation(message, calls, provider);
       pendingLegacyName = readLegacyFunctionName(message);
       if (scan.recognizedCalls > 0 && scan.toolOnly) {
-        total = toRawCount(total + toRawCount(tokenCounter(message)));
+        total = addRaw(total, readTokens());
       }
-      continue;
+      return;
     }
     if (role === 'tool' || role === 'function') {
       const legacyName = role === 'function' ? pendingLegacyName : undefined;
-      countResult(message, getToolMessageResultName(message, calls, legacyName));
+      countResult(
+        readTokens(),
+        getToolMessageResultName(message, calls, legacyName, provider)
+      );
       if (role === 'function') {
         pendingLegacyName = undefined;
       }
-      continue;
+      return;
     }
     if (role === 'user' && isFoldedToolHistory(message)) {
-      total = toRawCount(total + toRawCount(tokenCounter(message)));
-      continue;
+      total = addRaw(total, readTokens());
+      return;
     }
     const userResultName =
       role === 'user' ? takeUserToolResultName(message, calls) : undefined;
     if (userResultName != null) {
-      countResult(message, userResultName);
-      continue;
+      countResult(readTokens(), userResultName);
+      return;
     }
     if (role === 'user') {
       calls.clear();
     }
     pendingLegacyName = undefined;
-  }
-
-  const ratio =
-    Number.isFinite(calibrationRatio) && calibrationRatio > 0
-      ? calibrationRatio
-      : 1;
-  const toolMessageTokens = toCount(total * ratio);
-  const resultTokens = Math.min(toolMessageTokens, toCount(resultTotal * ratio));
-  return {
-    toolMessageTokens,
-    toolMessageTokenCounts:
-      resultTotal > 0 && resultTokens > 0
-        ? apportionTokenCounts(counts, ratio, resultTokens)
-        : undefined,
   };
+
+  const finish = (
+    calibrationRatio = 1
+  ): Pick<
+    t.TokenBudgetBreakdown,
+    'toolMessageTokens' | 'toolMessageTokenCounts'
+  > => {
+    const ratio =
+      Number.isFinite(calibrationRatio) && calibrationRatio > 0
+        ? calibrationRatio
+        : 1;
+    const toolMessageTokens = safeCount(Math.round(total * ratio));
+    const resultTokens = Math.min(
+      toolMessageTokens,
+      safeCount(Math.round(resultTotal * ratio))
+    );
+    return {
+      toolMessageTokens,
+      toolMessageTokenCounts:
+        resultTotal > 0 && resultTokens > 0
+          ? apportionTokenCounts(counts, ratio, resultTokens)
+          : undefined,
+    };
+  };
+
+  return { add, finish };
+}
+
+function computeToolMessageUsage(
+  context: readonly BaseMessage[],
+  tokenCounter: t.TokenCounter,
+  calibrationRatio = 1,
+  provider?: t.ProviderName
+): Pick<
+  t.TokenBudgetBreakdown,
+  'toolMessageTokens' | 'toolMessageTokenCounts'
+> {
+  const accumulator = createToolMessageUsageAccumulator(provider);
+  for (const message of context) {
+    accumulator.add(message, () => tokenCounter(message));
+  }
+  return accumulator.finish(calibrationRatio);
 }
 
 /** Applies the retained tool share and clamps it to the conversation total it
@@ -335,13 +376,19 @@ function computeToolMessageUsage(
 function syncToolMessageShare(
   usage: t.ContextUsageEvent,
   context?: readonly BaseMessage[],
-  tokenCounter?: t.TokenCounter
+  tokenCounter?: t.TokenCounter,
+  provider?: t.ProviderName
 ): void {
   const { breakdown } = usage;
   if (context != null && tokenCounter != null) {
     Object.assign(
       breakdown,
-      computeToolMessageUsage(context, tokenCounter, usage.calibrationRatio)
+      computeToolMessageUsage(
+        context,
+        tokenCounter,
+        usage.calibrationRatio,
+        provider
+      )
     );
   }
   if (breakdown.toolMessageTokens == null) {
@@ -373,7 +420,9 @@ export function syncBudgetDerivedFields(
   usage: t.ContextUsageEvent,
   context?: readonly BaseMessage[],
   tokenCounter?: t.TokenCounter,
-  config?: RunnableConfig
+  config?: RunnableConfig,
+  provider?: t.ProviderName,
+  toolMessageUsageError?: Error
 ): void {
   const { breakdown, contextBudget, effectiveInstructionTokens } = usage;
   if (effectiveInstructionTokens != null) {
@@ -394,7 +443,10 @@ export function syncBudgetDerivedFields(
     }
   }
   try {
-    syncToolMessageShare(usage, context, tokenCounter);
+    if (toolMessageUsageError != null) {
+      throw toolMessageUsageError;
+    }
+    syncToolMessageShare(usage, context, tokenCounter, provider);
   } catch (error) {
     warnUnavailableToolShare(config, error);
     delete breakdown.toolMessageTokens;
