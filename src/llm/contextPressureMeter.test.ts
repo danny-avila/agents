@@ -210,6 +210,27 @@ describe('createContextPressureMeter', () => {
     expect(tokenCounter).toHaveBeenCalledTimes(2);
   });
 
+  it('does not cache messages carrying mutable raw tool calls', () => {
+    const message = new AIMessage('answer');
+    const tokenCounter = jest.fn(contentLength);
+    const cache = createExactTokenCountCache(tokenCounter);
+
+    cache.count(message);
+    message.additional_kwargs.tool_calls = [
+      {
+        id: 'raw-call',
+        type: 'function',
+        function: { name: 'lookup', arguments: '{}' },
+      },
+    ];
+    cache.count(message);
+    message.additional_kwargs.tool_calls[0]!.function.arguments =
+      '{"query":"changed"}';
+    cache.count(message);
+
+    expect(tokenCounter).toHaveBeenCalledTimes(3);
+  });
+
   it('matches forced recounts across append, replace, reorder, and mutation', () => {
     const first = new HumanMessage({ id: 'first', content: 'one' });
     const second = new HumanMessage({ id: 'second', content: 'two' });

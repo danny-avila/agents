@@ -131,6 +131,13 @@ function getStableTokenSurface(
     return undefined;
   }
   const additionalKwargs = rawAdditionalKwargs;
+  try {
+    if ('tool_calls' in additionalKwargs) {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
   const typeProperty = readDataProperty(additionalKwargs, 'type');
   if (!typeProperty.safe) {
     return undefined;

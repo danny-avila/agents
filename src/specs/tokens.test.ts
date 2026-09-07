@@ -302,6 +302,56 @@ describe('getTokenCountForMessage', () => {
     );
   });
 
+  test('ignores stale raw OpenAI calls when parsed calls drive serialization', () => {
+    const parsed = new AIMessage({
+      content: '',
+      tool_calls: [{ id: 'parsed-call', name: 'lookup', args: {} }],
+    });
+    const stale = new AIMessage({
+      content: '',
+      tool_calls: [{ id: 'parsed-call', name: 'lookup', args: {} }],
+      additional_kwargs: {
+        tool_calls: [
+          {
+            id: 'stale-call',
+            type: 'function',
+            function: {
+              name: 'lookup',
+              arguments: `{"query":"${'x'.repeat(5_000)}"}`,
+            },
+          },
+        ],
+      },
+    });
+
+    expect(getTokenCountForMessage(stale, (text) => text.length)).toBe(
+      getTokenCountForMessage(parsed, (text) => text.length)
+    );
+  });
+
+  test('counts duplicate ids within the raw OpenAI representation', () => {
+    const single = new AIMessage('');
+    const duplicate = new AIMessage('');
+    const rawCall = {
+      id: 'reused-call',
+      type: 'function' as const,
+      function: {
+        name: 'lookup',
+        arguments: `{"query":"${'x'.repeat(5_000)}"}`,
+      },
+    };
+    single.additional_kwargs.tool_calls = [rawCall];
+    duplicate.additional_kwargs.tool_calls = [rawCall, rawCall];
+
+    const singleCount = getTokenCountForMessage(single, (text) => text.length);
+    const duplicateCount = getTokenCountForMessage(
+      duplicate,
+      (text) => text.length
+    );
+
+    expect(duplicateCount).toBeGreaterThan(singleCount + 5_000);
+  });
+
   test('counts inherited raw OpenAI tool calls', () => {
     const message = new AIMessage('');
     Object.setPrototypeOf(message.additional_kwargs, {
@@ -350,6 +400,28 @@ describe('getTokenCountForMessage', () => {
     });
     rawCalls.length = 1;
     message.additional_kwargs.tool_calls = rawCalls;
+
+    expect(() =>
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toThrow(UnsafeTokenMeasurementError);
+    expect(getterCalls).toBe(0);
+  });
+
+  test('rejects nested raw tool-call accessors without invoking them', () => {
+    const message = new AIMessage('');
+    const rawCall = {
+      id: 'raw-call',
+      type: 'function' as const,
+      function: { name: 'lookup', arguments: '{}' },
+    };
+    let getterCalls = 0;
+    Object.defineProperty(rawCall, 'function', {
+      get: () => {
+        getterCalls += 1;
+        throw new Error('must not run');
+      },
+    });
+    message.additional_kwargs.tool_calls = [rawCall];
 
     expect(() =>
       getTokenCountForMessage(message, (text) => text.length)

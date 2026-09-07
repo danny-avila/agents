@@ -1214,7 +1214,6 @@ export function getTokenCountForMessage(
   const messageRole = (message as BaseMessage & { role?: unknown }).role;
   if (messageType === 'ai' || messageRole === 'assistant') {
     const toolCalls = (message as AIMessage).tool_calls ?? [];
-    const parsedToolCallIds = new Set<string>();
     if (isProxy(toolCalls)) {
       throw new UnsafeTokenMeasurementError({
         reason: 'metadata_proxy',
@@ -1234,9 +1233,6 @@ export function getTokenCountForMessage(
       ) {
         continue;
       }
-      if (typeof toolCall.id === 'string' && toolCall.id.length > 0) {
-        parsedToolCallIds.add(toolCall.id);
-      }
       if (typeof toolCall.name === 'string' && toolCall.name.length > 0) {
         numTokens += countText(toolCall.name);
       }
@@ -1249,7 +1245,7 @@ export function getTokenCountForMessage(
       }
     }
     const rawCalls =
-      additionalKwargs == null
+      toolCalls.length > 0 || additionalKwargs == null
         ? undefined
         : readTokenMetadataProperty(
           additionalKwargs,
@@ -1285,32 +1281,39 @@ export function getTokenCountForMessage(
             path: `additional_kwargs.tool_calls[${i}]`,
           });
         }
-        let id: PropertyDescriptor | undefined;
-        try {
-          id = Object.getOwnPropertyDescriptor(rawCall, 'id');
-        } catch {
+        const callPath = `additional_kwargs.tool_calls[${i}]`;
+        if (hasUnsafeStructuredSerialization(rawCall)) {
           throw new UnsafeTokenMeasurementError({
             reason: 'metadata_accessor',
-            path: `additional_kwargs.tool_calls[${i}].id`,
+            path: callPath,
           });
         }
-        if (id != null && !('value' in id)) {
-          throw new UnsafeTokenMeasurementError({
-            reason: 'metadata_accessor',
-            path: `additional_kwargs.tool_calls[${i}].id`,
-          });
+        const callId = readTokenMetadataProperty(
+          rawCall,
+          'id',
+          `${callPath}.id`
+        );
+        const rawFunction = readTokenMetadataProperty(
+          rawCall,
+          'function',
+          `${callPath}.function`
+        );
+        if (rawFunction != null && typeof rawFunction === 'object') {
+          readTokenMetadataProperty(
+            rawFunction,
+            'name',
+            `${callPath}.function.name`
+          );
+          readTokenMetadataProperty(
+            rawFunction,
+            'arguments',
+            `${callPath}.function.arguments`
+          );
         }
-        const callId = id?.value;
-        if (
-          typeof callId === 'string' &&
-          (representedToolCallIds.has(callId) || parsedToolCallIds.has(callId))
-        ) {
+        if (typeof callId === 'string' && representedToolCallIds.has(callId)) {
           continue;
         }
         numTokens += getBoundedStructuredTokenCount(rawCall, countText);
-        if (typeof callId === 'string' && callId.length > 0) {
-          representedToolCallIds.add(callId);
-        }
       }
     }
     let legacyFunctionCall: PropertyDescriptor | undefined;
