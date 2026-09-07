@@ -37,13 +37,24 @@ function safeCount(value: number): number {
 }
 
 /** Accepts what the `TokenCounter` contract allows, an approximate `number`
- *  such as `length / 4`, by rounding it, and rejects only what no subset claim
- *  can be derived from: NaN, infinities, negatives and values past the safe range. */
-function toCount(value: number): number {
-  if (!Number.isFinite(value) || value < 0) {
+ *  such as `length / 4`, unrounded, so sub-token amounts survive aggregation the
+ *  way they do on the pruning path. Rejects only what no subset claim can be
+ *  derived from: NaN, infinities, negatives and values past the safe range. */
+function toRawCount(value: number): number {
+  if (
+    !Number.isFinite(value) ||
+    value < 0 ||
+    value > Number.MAX_SAFE_INTEGER
+  ) {
     throw new RangeError('Invalid tool context token count');
   }
-  return safeCount(Math.round(value));
+  return value;
+}
+
+/** A total that arrived already aggregated (the breakdown's own fields) is
+ *  rounded once and must then be a safe integer. */
+function toCount(value: number): number {
+  return safeCount(Math.round(toRawCount(value)));
 }
 
 let warnedUnavailableToolShare = false;
@@ -261,13 +272,13 @@ function computeToolMessageUsage(
   let total = 0;
   let resultTotal = 0;
   const countResult = (message: BaseMessage, name: string): void => {
-    const tokens = toCount(tokenCounter(message));
-    total = safeCount(total + tokens);
+    const tokens = toRawCount(tokenCounter(message));
+    total = toRawCount(total + tokens);
     if (tokens === 0) {
       return;
     }
-    counts[name] = safeCount((counts[name] ?? 0) + tokens);
-    resultTotal = safeCount(resultTotal + tokens);
+    counts[name] = toRawCount((counts[name] ?? 0) + tokens);
+    resultTotal = toRawCount(resultTotal + tokens);
   };
 
   for (const message of context) {
@@ -276,7 +287,7 @@ function computeToolMessageUsage(
       const scan = scanInvocation(message, calls);
       pendingLegacyName = readLegacyFunctionName(message);
       if (scan.recognizedCalls > 0 && scan.toolOnly) {
-        total = safeCount(total + toCount(tokenCounter(message)));
+        total = toRawCount(total + toRawCount(tokenCounter(message)));
       }
       continue;
     }
@@ -289,7 +300,7 @@ function computeToolMessageUsage(
       continue;
     }
     if (role === 'user' && isFoldedToolHistory(message)) {
-      total = safeCount(total + toCount(tokenCounter(message)));
+      total = toRawCount(total + toRawCount(tokenCounter(message)));
       continue;
     }
     const userResultName =
@@ -308,11 +319,8 @@ function computeToolMessageUsage(
     Number.isFinite(calibrationRatio) && calibrationRatio > 0
       ? calibrationRatio
       : 1;
-  const toolMessageTokens = safeCount(Math.round(total * ratio));
-  const resultTokens = Math.min(
-    toolMessageTokens,
-    safeCount(Math.round(resultTotal * ratio))
-  );
+  const toolMessageTokens = toCount(total * ratio);
+  const resultTokens = Math.min(toolMessageTokens, toCount(resultTotal * ratio));
   return {
     toolMessageTokens,
     toolMessageTokenCounts:

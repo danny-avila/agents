@@ -626,8 +626,23 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
 
     syncBudgetDerivedFields(usage, messages, () => 12.5);
 
-    expect(usage.breakdown.toolMessageTokens).toBe(26);
+    expect(usage.breakdown.toolMessageTokens).toBe(25);
     expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 13 });
+  });
+
+  it('keeps sub-token amounts through aggregation like the pruning path', () => {
+    const usage = snapshot();
+    const messages = [
+      toolResult('a', 'lookup'),
+      toolResult('b', 'lookup'),
+      toolResult('c', 'lookup'),
+      toolResult('d', 'lookup'),
+    ];
+
+    syncBudgetDerivedFields(usage, messages, () => 0.25);
+
+    expect(usage.breakdown.toolMessageTokens).toBe(1);
+    expect(usage.breakdown.toolMessageTokenCounts).toEqual({ lookup: 1 });
   });
 
   it('attributes a reused call id to the call it currently answers', () => {
