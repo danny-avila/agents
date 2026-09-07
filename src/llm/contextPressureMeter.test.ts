@@ -49,9 +49,9 @@ describe('createContextPressureMeter', () => {
       toolMessageTokenCounts: undefined,
     });
     expect(meter.measure(projected).projectedMessageTokens).toBe(33);
-    /** Stored counts cover the baseline; only the changed projection and its
-     *  baseline subtrahend are tokenized, never the untouched message. */
-    expect(tokenCounter).toHaveBeenCalledTimes(2);
+    /** Tool-share attribution needs raw local counts for every retained
+     *  message; the changed projection also recounts its baseline subtrahend. */
+    expect(tokenCounter).toHaveBeenCalledTimes(3);
   });
 
   it('reuses stable exact counts across request-scoped meters', () => {
@@ -87,7 +87,7 @@ describe('createContextPressureMeter', () => {
     const appended = [...retained, new HumanMessage('new')];
     createMeter(appended).measure(appended);
 
-    expect(tokenCounter).toHaveBeenCalledTimes(0);
+    expect(tokenCounter).toHaveBeenCalledTimes(101);
   });
 
   it('reuses exact counts across request-scoped meters when no stored counts exist', () => {
@@ -286,7 +286,7 @@ describe('createContextPressureMeter', () => {
       ]);
     }
 
-    expect(tokenCounter).toHaveBeenCalledTimes(13);
+    expect(tokenCounter).toHaveBeenCalledTimes(113);
   });
 
   it('uses a conservative ratio for fallback payloads', () => {
@@ -348,5 +348,32 @@ describe('createContextPressureMeter', () => {
       toolMessageTokenCounts: { lookup: 1 },
     });
     expect(tokenCounter).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces invalid tool-share counts without invalidating the projection', () => {
+    const message = new ToolMessage({
+      content: 'result',
+      tool_call_id: 'call-1',
+    });
+    const meter = createContextPressureMeter({
+      tokenCounter: () => Number.NaN,
+      sourceMessages: [message],
+      retainedMessages: [message],
+      indexTokenCountMap: { 0: 10 },
+      contextUsage: {
+        contextBudget: 100,
+        effectiveInstructionTokens: 10,
+        remainingContextTokens: 80,
+        calibrationRatio: 1,
+      },
+      instructionTokens: 10,
+      calibrationRatio: 1,
+    });
+
+    expect(meter.measure([message])).toMatchObject({
+      fits: true,
+      projectedMessageTokens: 10,
+      toolMessageUsageError: expect.any(RangeError),
+    });
   });
 });

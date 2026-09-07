@@ -4159,7 +4159,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           undefined,
           undefined,
           config,
-          agentContext.provider
+          agentContext.provider,
+          finalProjection.toolMessageUsageError
         );
         /** Awaited so async host handlers receive the pre-invoke snapshot
          *  before any model deltas are emitted */

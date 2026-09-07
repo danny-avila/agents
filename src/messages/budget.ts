@@ -421,7 +421,8 @@ export function syncBudgetDerivedFields(
   context?: readonly BaseMessage[],
   tokenCounter?: t.TokenCounter,
   config?: RunnableConfig,
-  provider?: t.ProviderName
+  provider?: t.ProviderName,
+  toolMessageUsageError?: Error
 ): void {
   const { breakdown, contextBudget, effectiveInstructionTokens } = usage;
   if (effectiveInstructionTokens != null) {
@@ -442,6 +443,9 @@ export function syncBudgetDerivedFields(
     }
   }
   try {
+    if (toolMessageUsageError != null) {
+      throw toolMessageUsageError;
+    }
     syncToolMessageShare(usage, context, tokenCounter, provider);
   } catch (error) {
     warnUnavailableToolShare(config, error);

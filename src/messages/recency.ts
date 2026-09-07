@@ -100,6 +100,7 @@ export function resolveIntraTurnRetainTokens({
 interface MessagePairingResult {
   completedToolCalls: number;
   trustedHumanToolResult: boolean;
+  userMessage: boolean;
 }
 
 function inspectMessagePairing(
@@ -172,6 +173,7 @@ function inspectMessagePairing(
     completedToolCalls:
       isHuman && !trustedHumanToolResult ? 0 : completedToolCalls,
     trustedHumanToolResult,
+    userMessage: isHuman,
   };
 }
 
@@ -184,10 +186,7 @@ function findTurnStarts(
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i] as BaseMessage;
     const pairing = inspectMessagePairing(message, calls, provider);
-    if (
-      getProviderMessageRole(message, provider) !== 'user' ||
-      pairing.trustedHumanToolResult
-    ) {
+    if (!pairing.userMessage || pairing.trustedHumanToolResult) {
       continue;
     }
     turnStarts.push(i);

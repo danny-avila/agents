@@ -16,7 +16,25 @@ import {
 } from './format';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
 import { stampSyntheticProviderMessage } from './provenance';
+import { registerProvider } from '@/llm/providers';
 import { syncBudgetDerivedFields } from './budget';
+import { FakeChatModel } from '@/llm/fake';
+
+declare module '../provider-registration' {
+  interface CustomProviderOptionsMap {
+    'bedrock-family-budget-test': BedrockFamilyBudgetOptions;
+  }
+}
+
+interface BedrockFamilyBudgetOptions {
+  endpoint?: string;
+}
+
+class BedrockFamilyBudgetTestModel extends FakeChatModel {
+  constructor(_config: BedrockFamilyBudgetOptions) {
+    super({ responses: ['ok'] });
+  }
+}
 import { toLangChainContent } from './langchain';
 import { GraphEvents } from '@/common';
 
@@ -663,6 +681,12 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
     ];
     const openAIUsage = snapshot();
     const bedrockUsage = snapshot();
+    const customBedrockUsage = snapshot();
+    const dispose = registerProvider({
+      provider: 'bedrock-family-budget-test',
+      model: BedrockFamilyBudgetTestModel,
+      family: 'bedrock',
+    });
 
     syncBudgetDerivedFields(
       openAIUsage,
@@ -678,9 +702,18 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
       undefined,
       'bedrock'
     );
+    syncBudgetDerivedFields(
+      customBedrockUsage,
+      messages,
+      () => 10,
+      undefined,
+      'bedrock-family-budget-test'
+    );
+    dispose();
 
     expect(openAIUsage.breakdown.toolMessageTokens).toBe(10);
     expect(bedrockUsage.breakdown.toolMessageTokens).toBe(0);
+    expect(customBedrockUsage.breakdown.toolMessageTokens).toBe(0);
   });
 
   it('attributes a reused call id to the call it currently answers', () => {
@@ -765,6 +798,20 @@ describe('syncBudgetDerivedFields tool-message accounting', () => {
 
     await RunnableLambda.from(
       (_input: unknown, config?: RunnableConfig): void => {
+        const propagated = snapshot();
+        propagated.breakdown.toolMessageTokens = 10;
+        expect(() =>
+          syncBudgetDerivedFields(
+            propagated,
+            undefined,
+            undefined,
+            config,
+            undefined,
+            new RangeError('Invalid tool context token count')
+          )
+        ).not.toThrow();
+        expect(propagated.breakdown.toolMessageTokens).toBeUndefined();
+
         for (const value of [
           Number.NaN,
           Number.POSITIVE_INFINITY,

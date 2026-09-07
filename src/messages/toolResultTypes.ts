@@ -6,6 +6,7 @@ import type {
   ToolMessage,
 } from '@langchain/core/messages';
 import type { ProviderName } from '@/types/llm';
+import { getProviderFamily } from '@/llm/providers';
 
 export type ProviderToolCallKind =
   | 'tool'
@@ -1234,7 +1235,7 @@ export function getProviderMessageRole(
   case 'function':
     return 'function';
   case 'generic': {
-    if (provider === 'bedrock') {
+    if (provider != null && getProviderFamily(provider) === 'bedrock') {
       return 'user';
     }
     const role = (message as Partial<ChatMessage>).role;

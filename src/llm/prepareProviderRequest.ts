@@ -88,6 +88,7 @@ export interface ProviderPayloadMeasurement {
   readonly effectiveInstructionTokens?: number;
   readonly toolMessageTokens?: number;
   readonly toolMessageTokenCounts?: Record<string, number>;
+  readonly toolMessageUsageError?: Error;
 }
 
 export interface PreparedProviderRequest {

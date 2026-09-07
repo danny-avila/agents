@@ -386,15 +386,16 @@ export function createContextPressureMeter({
           Math.min(availableMessageTokens, Math.max(0, baselineRemaining))
         : undefined;
     const toolUsage = createToolMessageUsageAccumulator(provider);
-    const toolUsageState = { available: true };
+    const toolUsageState: { error?: Error } = {};
     const addToolUsage = (message: BaseMessage, rawTokens: number): void => {
-      if (!toolUsageState.available) {
+      if (toolUsageState.error != null) {
         return;
       }
       try {
         toolUsage.add(message, rawTokens);
-      } catch {
-        toolUsageState.available = false;
+      } catch (error) {
+        toolUsageState.error =
+          error instanceof Error ? error : new Error(String(error));
       }
     };
 
@@ -438,12 +439,7 @@ export function createContextPressureMeter({
       const usedOrigins = new Set<number>();
       for (const message of messages) {
         const origin = origins.get(message);
-        const rawTokens =
-          origin != null &&
-          !usedOrigins.has(origin) &&
-          message === baseline[origin].message
-            ? baseline[origin].accountingWeight
-            : count(message);
+        const rawTokens = count(message);
         addToolUsage(message, rawTokens);
         if (origin == null || usedOrigins.has(origin)) {
           newRawTokens += rawTokens;
@@ -477,10 +473,11 @@ export function createContextPressureMeter({
         >
       | undefined;
     try {
-      measuredToolUsage = toolUsageState.available
-        ? toolUsage.finish(usageRatio)
-        : undefined;
-    } catch {
+      measuredToolUsage =
+        toolUsageState.error == null ? toolUsage.finish(usageRatio) : undefined;
+    } catch (error) {
+      toolUsageState.error =
+        error instanceof Error ? error : new Error(String(error));
       measuredToolUsage = undefined;
     }
     return {
@@ -490,6 +487,9 @@ export function createContextPressureMeter({
       contextBudget,
       effectiveInstructionTokens,
       ...measuredToolUsage,
+      ...(toolUsageState.error == null
+        ? {}
+        : { toolMessageUsageError: toolUsageState.error }),
     };
   };
 
